@@ -22,4 +22,19 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+portable-pty = "0.9"
+anyhow = "1"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+[dev-dependencies]
+# Mock runtime for bridge integration tests (no real webview).
+tauri = { version = "2", features = ["test"] }
+# Used by the bridge orphan-process test to probe (via `kill(pid, 0)`) that the
+# child shell is really dead after `pty_close` — i.e. no orphaned PTY process.
+# Already in the dependency tree (transitively via portable-pty); pinned here so
+# the dev-only probe compiles on Unix.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
