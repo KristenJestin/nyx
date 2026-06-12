@@ -2,6 +2,9 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+/* Terminal-only monospace face. Bundled (not a system font) so WebKitGTK/Wayland
+   renders the exact glyphs xterm measures — avoids the "t e s t" mis-spacing. */
+@import "@fontsource-variable/fira-code";
 
 @custom-variant dark (&:is(.dark *));
 

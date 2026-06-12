@@ -12,6 +12,17 @@ dist
 dist-ssr
 *.local
 
+# Vitest browser-mode visual-regression transients (actual/diff renders).
+.vitest-attachments
+
+# Vitest browser-mode visual-regression BASELINE (reference screenshots).
+# CAVEAT: this is a LOCAL-only dev aid, NOT committed. The baseline binary must
+# stay out of the source tree / git diff. On a fresh checkout or CI the dir is
+# absent, so the browser test regenerates the baseline on first run and detects
+# no regression (consistent with PRD 0 having no CI). Visual-regression diffing
+# is therefore only meaningful on a machine that already ran the suite once.
+.vitest-screenshots
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
