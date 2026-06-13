@@ -22,6 +22,13 @@ export interface UsePtyOptions {
    * its default (it inherits nyx's cwd, i.e. home/current).
    */
   cwd?: string;
+  /**
+   * Called with the resolved live PTY id once the spawn completes, and with
+   * `null` when the session ends/teardown clears it. Used by the auto-naming
+   * layer (it needs the PTY id to read `terminal_info`). Optional — the socle /
+   * tests don't need it.
+   */
+  onPtyId?: (id: number | null) => void;
 }
 
 /**
@@ -59,6 +66,8 @@ interface PtySession {
   unlistenOutput?: UnlistenFn;
   unlistenExit?: UnlistenFn;
   disposables: IDisposable[];
+  /** Notify the consumer when the live PTY id resolves / clears (auto-naming). */
+  onPtyId?: (id: number | null) => void;
 }
 
 /**
@@ -108,8 +117,12 @@ export function usePty(
   fitAddon: FitAddon,
   options: UsePtyOptions = {},
 ): () => void {
-  const { cwd } = options;
+  const { cwd, onPtyId } = options;
   const sessionRef = useRef<PtySession | null>(null);
+  // Keep the latest onPtyId on a ref so the session always calls the current one
+  // without re-running the spawn effect when the callback identity changes.
+  const onPtyIdRef = useRef(onPtyId);
+  onPtyIdRef.current = onPtyId;
 
   // Stable across renders: reads the live session off the ref each call, so it
   // is safe to capture in another effect's deps without re-running it.
@@ -136,6 +149,7 @@ export function usePty(
         generation: 0,
         pendingOutput: [],
         disposables: [],
+        onPtyId: (id) => onPtyIdRef.current?.(id),
       };
       sessionRef.current = session;
     } else {
@@ -215,6 +229,7 @@ async function start(
       }]\x1b[0m\r\n`,
     );
     session.id = null;
+    session.onPtyId?.(null);
   });
 
   // LOAD-BEARING StrictMode dedupe: this is the bail that actually guarantees a
@@ -244,6 +259,8 @@ async function start(
     return;
   }
   session.id = id;
+  // Surface the resolved live PTY id (auto-naming needs it to read terminal_info).
+  session.onPtyId?.(id);
 
   // Replay output that arrived before the spawn resolved (while id was null, so
   // it could not be routed and was buffered). Only chunks tagged with OUR id are
@@ -324,6 +341,7 @@ function teardown(session: PtySession): void {
     session.id = null;
     void invoke("pty_close", { id }).catch(() => {});
   }
+  session.onPtyId?.(null);
 }
 
 /** Invoke a possibly-undefined callback, swallowing any throw/rejection. */

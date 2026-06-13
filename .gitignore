@@ -23,6 +23,10 @@ dist-ssr
 # is therefore only meaningful on a machine that already ran the suite once.
 .vitest-screenshots
 
+# e2e Windows WebDriver binary (msedgedriver.exe) — downloaded per-machine to
+# match the local WebView2 runtime version; never committed.
+e2e/.drivers
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

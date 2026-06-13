@@ -250,7 +250,10 @@ Projet = un NOM + N workspaces.   (par défaut : 1 workspace "root")
   plugin fire bien (pas touché par #51420) ; comportement exact si MCP down ;
   reload `/mcp` en session.
 - **Différé v1.1+** : daemon (survive-window-close vivant) ; lien optionnel
-  workspace ↔ PRD depot ; thèmes ; etc.
+  workspace ↔ PRD depot ; thèmes ; **shell par défaut sélectionnable dans les
+  options** (Windows : PowerShell / cmd / Git Bash ; Unix : bash / sh / zsh… —
+  aujourd'hui : `$SHELL` puis défaut natif par OS, cf. `pty.rs::resolve_shell`) ;
+  etc.
 
 ---
 
@@ -308,14 +311,14 @@ le markup ou le code des composants.
   Les tokens sont écrits en `oklch(...)`, que la plupart des consommateurs non-CSS
   (xterm) ne savent pas parser → il faut les convertir en chaîne `#rrggbb`. La
   conversion robuste, agnostique à l'espace de couleur : lire le token
-  (`getPropertyValue`) puis le passer à **`formatHex(raw)` de la lib `culori`**,
-  qui parse l'oklch (et hex/named/rgb/…) et rend la chaîne sRGB `#rrggbb` finale
-  en JS pur (renvoie `undefined` si non parseable → on tombe sur le fallback).
+  (`getPropertyValue`) puis le passer à **`chroma(raw).hex("rgb")` de la lib
+  `chroma-js`**, qui parse l'oklch (et hex/named/rgb/…) et rend la chaîne sRGB
+  `#rrggbb` finale en JS pur (jette si non parseable → on tombe sur le fallback).
   **Les raccourcis évidents NE marchent PAS** : sur Chromium/WebKit actuels,
   `getComputedStyle(el).color` et le `ctx.fillStyle` du canvas **resérialisent**
   l'espace de couleur AUTEUR (CSS Color 4) et rendent un token oklch tel quel
   comme chaîne `oklch(...)` — ils ne downconvertissent pas — donc xterm le
-  rejette. D'où culori, et pas l'astuce naïve via le moteur. Construis ces thèmes
+  rejette. D'où chroma-js, et pas l'astuce naïve via le moteur. Construis ces thèmes
   **au mount** (un vrai DOM est requis pour lire les tokens), avec un **fallback
   sain** pour qu'une résolution échouée ne donne jamais un résultat illisible (ex.
   noir-sur-noir). Voir `src/components/terminal/terminal.tsx` (`resolveCssColor` /

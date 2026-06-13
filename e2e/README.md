@@ -1,11 +1,14 @@
 # nyx e2e (tauri-driver + WebdriverIO)
 
-End-to-end tests that drive the **real** nyx Tauri app on Linux through
-[`tauri-driver`](https://v2.tauri.app/develop/tests/webdriver/) and
-WebdriverIO. They cover what neither the jsdom unit suite nor the mock-runtime
+End-to-end tests that drive the **real** nyx Tauri app through
+[`tauri-driver`](https://v2.tauri.app/develop/tests/webdriver/) and WebdriverIO,
+on **Linux** (WebKitWebDriver) and **Windows** (Microsoft Edge WebDriver /
+WebView2). They cover what neither the jsdom unit suite nor the mock-runtime
 Rust tests can: the actual app process, a real WebView, and a real PTY/shell.
 
-## What is tested (`specs/terminal.e2e.cjs`)
+## What is tested
+
+### Smoke (`specs/terminal.e2e.cjs`)
 
 1. **Env persists** — `export FOO=bar...` then `echo "$FOO"`, asserting the value
    survives between commands.
@@ -16,9 +19,38 @@ Rust tests can: the actual app process, a real WebView, and a real PTY/shell.
 4. **`exit`** — typing `exit` closes the shell; the `[process exited]` notice
    (emitted by the backend, written by `src/components/terminal/use-pty.ts`) appears.
 
-Terminal output is read through `window.__nyx.readBuffer()`, a small inert test
-seam exposed by `src/app.tsx` (xterm paints to a WebGL canvas, so the text is
-not in the DOM and a WebDriver cannot query it directly).
+### Restore scenario (`specs/restore-01-seed.e2e.cjs` → `restore-02-verify.e2e.cjs`)
+
+The big PRD 1 scenario, split across **two app sessions** (a real close + reopen):
+
+- **Seed (session 1)** opens **3 terminals at distinct cwds** (`/tmp`, `/usr`,
+  `/etc`) each running a command with observable output (a unique marker echoed
+  into its scrollback), **reorders** them to a known order, and **closes the
+  auto-created default terminal** voluntarily. The session then ends —
+  tauri-driver kills the app — simulating nyx quitting.
+- **Verify (session 2)** boots a fresh app on the **same SQLite DB** (same
+  `XDG_DATA_HOME`) and asserts the restore contract: the **3 terminals are
+  restored with their scrollback** (each marker is back in its buffer), the
+  voluntarily-closed default is **NOT re-spawned** (no live pane), the
+  **reordered order persists**, and the **auto-naming reflects each cwd**.
+
+The two specs share a fixed data dir (so the relaunch reads the persisted DB) and
+hand off the expected ids/markers/order via a small JSON in that dir; see
+`wdio.conf.cjs` (`specDataDir`, `onPrepare` cleans the data root for a
+deterministic empty start). The dir is pinned via **`NYX_DATA_DIR`** — a portable
+DB-location override honored on every OS by the backend (`resolve_data_dir`), so
+the scenario is deterministic on Windows too, where `XDG_DATA_HOME` has no effect
+(it only steers the Linux data path). Each non-restore spec gets its own isolated
+data dir.
+
+### The test seam
+
+The app exposes an **inert** control seam on `window.__nyx`
+(`src/components/sidebar/terminal-manager.tsx`) plus per-terminal read/input seams
+on `window.__nyxDeck` / `window.__nyxDeckInput` (`terminal-deck.tsx`), all keyed
+by record id. The e2e drives + reads terminals through these because xterm paints
+to a WebGL canvas — the text is not in the DOM and a WebDriver cannot type into
+or query it directly. The seams are inert in production (nothing reads them).
 
 ## Why WebdriverIO v7
 
@@ -31,19 +63,45 @@ capabilities in `wdio.conf.cjs`.
 
 ## Prerequisites
 
+Shared (both OSes):
+
 - **Rust + cargo**, and `tauri-driver`:
   ```sh
-  cargo install tauri-driver --locked   # → ~/.cargo/bin/tauri-driver
+  cargo install tauri-driver --locked   # → ~/.cargo/bin/tauri-driver(.exe)
   ```
+- **bun** (the project's single package manager; it drives the WDIO v7 toolchain
+  in this folder via its own `e2e/bun.lock` — isolated from the root deps).
+
+### Linux
+
 - **WebKitWebDriver** (the native driver tauri-driver shells out to):
   - Arch: `webkit2gtk-4.1` / `webkitgtk-6.0` provide `/usr/bin/WebKitWebDriver`.
   - Debian/Ubuntu (CI): package **`webkit2gtk-driver`**.
 - A **display**. WebKitWebDriver has no headless mode, so either a real X
   server (`$DISPLAY` set) or **`xvfb`** in CI (see below).
-- **bun** (the project's single package manager; it drives the WDIO v7 toolchain
-  in this folder via its own `e2e/bun.lock` — isolated from the root deps).
+
+### Windows
+
+- **Microsoft Edge WebDriver** (`msedgedriver.exe`) whose version **matches the
+  installed WebView2 runtime** — mismatched versions make the WebDriver session
+  hang. Find the runtime version, then grab the matching driver:
+  ```powershell
+  # WebView2 runtime version:
+  (Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}").pv
+  # Download for that EXACT version:
+  #   https://msedgedriver.microsoft.com/<version>/edgedriver_win64.zip
+  ```
+  Put `msedgedriver.exe` on `$PATH`, or point `$env:MSEDGEDRIVER` at it (the
+  config forwards it to tauri-driver via `--native-driver`).
+- **WebView2 runtime** — preinstalled on Windows 11.
+- A **POSIX shell** for the specs (they run `export` / `echo "$FOO"` / `printf`).
+  The app honors `$SHELL` first; `wdio.conf.cjs` auto-detects **Git Bash** when
+  `$SHELL` is unset, so no WSL is required. Set `$SHELL` to override.
+- No display / `xvfb` needed (Edge WebDriver runs windowed).
 
 ## Run locally
+
+### Linux / macOS
 
 ```sh
 # 1) Install the WDIO toolchain (once)
@@ -53,6 +111,15 @@ cd e2e && bun install
 bun run test
 ```
 
+### Windows (PowerShell)
+
+```powershell
+cd e2e; bun install                                 # once
+$env:MSEDGEDRIVER = "C:\path\to\msedgedriver.exe"   # if not on PATH
+# $env:SHELL is auto-detected (Git Bash) when unset; set it to override.
+bun run test                                        # builds nyx.exe, then drives it
+```
+
 `onPrepare` builds the release binary (`bun run tauri build --no-bundle`) so the
 suite is self-contained. To reuse an existing build and skip the (long) compile:
 
@@ -60,8 +127,9 @@ suite is self-contained. To reuse an existing build and skip the (long) compile:
 NYX_E2E_SKIP_BUILD=1 bun run test
 ```
 
-The binary it launches is `src-tauri/target/release/nyx` (the Cargo package is
-named `nyx`); `wdio.conf.cjs` points `tauri:options.application` at it.
+The binary it launches is `src-tauri/target/release/nyx` (`nyx.exe` on Windows;
+the Cargo package is named `nyx`); `wdio.conf.cjs` points
+`tauri:options.application` at it and appends `.exe` on Windows automatically.
 
 ## CI dependencies (not wired up here — documented only)
 
