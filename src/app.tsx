@@ -1,50 +1,19 @@
 import "@/globals.css";
 
-import { useCallback } from "react";
-import type { Terminal as XTerm } from "@xterm/xterm";
-
-import { Terminal } from "@/components/terminal/terminal";
+import { TerminalManager } from "@/components/sidebar/terminal-manager";
 
 /**
- * E2E test seam exposed on `window.__nyx`.
+ * `App` — the nyx shell. The whole multi-terminal experience (frameless chrome,
+ * sidebar navigation, N mounted terminals) lives in `<TerminalManager>`; `App`
+ * just mounts it full-bleed.
  *
- * xterm renders into a WebGL canvas, so the terminal's text is NOT in the DOM
- * and a WebDriver (tauri-driver / WebKitWebDriver) cannot read it by querying
- * elements. To let the end-to-end suite assert on real shell output we expose
- * the live xterm instance plus a `readBuffer()` that flattens the xterm buffer
- * (screen + scrollback) to a string. This is inert in normal use — nothing
- * reads it unless a driver calls `executeScript` — and adds no behavior.
+ * The per-terminal E2E read seam used to live here as `window.__nyx` for the
+ * single-terminal socle; it now lives on `window.__nyxDeck[<record-id>]`, keyed
+ * by record id, so the end-to-end suite can read ANY terminal's xterm buffer
+ * (including hidden ones) — see `<TerminalDeck>`.
  */
-declare global {
-  interface Window {
-    __nyx?: {
-      term: XTerm | null;
-      readBuffer: () => string;
-    };
-  }
-}
-
 function App() {
-  // Stable callback so the Terminal does not see a changing prop each render.
-  const handleInstance = useCallback((instance: XTerm | null) => {
-    const readBuffer = (): string => {
-      if (!instance) return "";
-      const buf = instance.buffer.active;
-      let out = "";
-      for (let i = 0; i < buf.length; i++) {
-        const line = buf.getLine(i);
-        if (line) out += line.translateToString(true) + "\n";
-      }
-      return out;
-    };
-    window.__nyx = { term: instance, readBuffer };
-  }, []);
-
-  return (
-    <main className="h-screen w-screen overflow-hidden bg-background">
-      <Terminal onInstance={handleInstance} />
-    </main>
-  );
+  return <TerminalManager />;
 }
 
 export default App;

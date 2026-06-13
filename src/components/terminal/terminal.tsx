@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef } from "react";
 import { FitAddon } from "@xterm/addon-fit";
-import { WebglAddon } from "@xterm/addon-webgl";
 import type { ITerminalOptions, Terminal as XTerm } from "@xterm/xterm";
-import { formatHex } from "culori";
+import chroma from "chroma-js";
 import { useXTerm } from "react-xtermjs";
 
 import { cn } from "@/lib/utils";
+import { isTerminalNavChord } from "@/components/sidebar/use-terminal-shortcuts";
+import { buildDeadHistory } from "./dead-history";
 import { usePty } from "./use-pty";
+import { useScrollbackPersist } from "./scrollback-persist";
+import { useWebglAddon } from "./use-webgl-addon";
 
 /**
  * Default xterm options for a NORMAL terminal: native scroll, generous
@@ -59,14 +62,14 @@ const FALLBACK_THEME = { background: "#0a0a0a", foreground: "#e6e6e6" } as const
  * `oklch(...)` string that xterm would reject. (Verified empirically in
  * Chromium.)
  *
- * So we hand the raw token to culori's `formatHex`, which parses oklch (and hex,
- * named, rgb, …) and renders the final sRGB `#rrggbb` string in pure JS — no
+ * So we hand the raw token to chroma-js, which parses oklch (and hex, named,
+ * rgb, …) and renders the final sRGB `#rrggbb` string in pure JS — no
  * canvas/paint round-trip. Alpha is dropped intentionally — the xterm
  * background/foreground are opaque.
  *
  * Returns `null` (→ caller falls back) if there is no DOM, the token is empty,
- * or culori cannot parse the value (`formatHex` returns `undefined`), so we
- * never feed xterm an unusable colour.
+ * or chroma-js cannot parse the value (it throws → we swallow it), so we never
+ * feed xterm an unusable colour.
  */
 function resolveCssColor(varName: string): string | null {
   if (typeof document === "undefined") return null;
@@ -77,10 +80,14 @@ function resolveCssColor(varName: string): string | null {
   const raw = getStyle(document.documentElement).getPropertyValue(varName).trim();
   if (!raw) return null;
 
-  // culori parses the authored colour space (oklch, …) and renders concrete
-  // sRGB `#rrggbb`; returns undefined for an empty/garbage token → null → caller
-  // falls back to FALLBACK_THEME.
-  return formatHex(raw) ?? null;
+  // chroma-js parses the authored colour space (oklch, …) and renders concrete
+  // sRGB `#rrggbb`; it THROWS on an empty/garbage token → null → caller falls
+  // back to FALLBACK_THEME. `.hex("rgb")` forces 6 digits (drops any alpha).
+  try {
+    return chroma(raw).hex("rgb");
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -143,6 +150,35 @@ export interface TerminalProps {
    * also the seam used by unit tests to assert on the xterm buffer.
    */
   onInstance?: (instance: XTerm | null) => void;
+  /**
+   * Whether this terminal is the active/visible one. The WebGL renderer is
+   * attached ONLY while active and disposed on blur, so many open terminals
+   * never exhaust the browser's WebGL context pool (~16). Inactive terminals
+   * keep their xterm instance + buffer alive and still receive output; they just
+   * render with the default DOM/canvas renderer while hidden. Defaults to `true`
+   * so a standalone `<Terminal>` (the socle, the tests) keeps WebGL.
+   */
+  active?: boolean;
+  /**
+   * The SQLite RECORD id this terminal is bound to. When set, the terminal's
+   * scrollback is serialized + DEBOUNCED to the backend (`persist_scrollback`)
+   * so it survives a close/restart. Omit for a record-less standalone terminal
+   * (the socle / unit harness) — persistence is then a no-op.
+   */
+  recordId?: string;
+  /**
+   * Prior serialized scrollback to restore as READ-ONLY dead history. Written to
+   * xterm once on mount (followed by a visual separator) so a re-spawned terminal
+   * shows its previous session above a fresh shell. NEVER sent to the PTY — the
+   * history is read-only, the new shell starts clean below the separator.
+   */
+  deadHistory?: string;
+  /**
+   * Called with the live PTY id once the shell spawns (and `null` on exit). The
+   * sidebar's auto-naming needs the PTY id to read `terminal_info` for this
+   * terminal's live cwd + foreground program.
+   */
+  onPtyId?: (id: number | null) => void;
 }
 
 /**
@@ -160,6 +196,10 @@ export function Terminal({
   options,
   cwd,
   onInstance,
+  active = true,
+  recordId,
+  deadHistory,
+  onPtyId,
 }: TerminalProps) {
   // Memoize so `useXTerm`'s effect (deps: [options, addons]) does NOT re-run on
   // every render — re-running would tear down and recreate the terminal.
@@ -175,22 +215,65 @@ export function Terminal({
 
   const { ref, instance } = useXTerm({ options: mergedOptions, addons });
 
-  // Live WebGL addon (or null when on the DOM/canvas fallback). Held on a ref so
-  // the font-gating fit effect can rebuild the glyph atlas once the real font is
-  // loaded — the atlas baked at open() uses the fallback metrics otherwise.
-  const webglRef = useRef<WebglAddon | null>(null);
+  // Attach the WebGL renderer ONLY while this terminal is active (disposed on
+  // blur), so N open terminals never exhaust the browser's WebGL context pool.
+  // Returns `clearAtlas()` so the post-font-load fit can rebuild the glyph atlas
+  // (which was baked at attach against the fallback metrics).
+  const clearWebglAtlas = useWebglAddon(instance ?? null, active);
 
   // Wire the live PTY backend (spawn / IO / resize / teardown). StrictMode-safe.
   // `resyncSize` pushes the terminal's current cols/rows to the PTY out-of-band
   // from xterm's onResize event — used below to make the authoritative
   // post-font fit reach the PTY even if it raced the spawn.
-  const resyncSize = usePty(instance, fitAddon, { cwd });
+  const resyncSize = usePty(instance, fitAddon, { cwd, onPtyId });
+
+  // Serialize + DEBOUNCE this terminal's scrollback to the backend so it can be
+  // restored after a close/restart (no-op when record-less). Persistence is
+  // debounced (never per byte) and also flushes on tab/app close.
+  useScrollbackPersist(instance ?? null, recordId ?? null);
+
+  // RESTORE: write the prior scrollback as read-only DEAD HISTORY (+ a visual
+  // separator) into the buffer ONCE, as soon as the instance exists. This is a
+  // pure xterm write — it NEVER reaches the PTY (usePty only writes keystrokes
+  // via onData), so the old commands are not re-run. The live shell output then
+  // appends BELOW the separator. Guarded by a ref so a re-render / StrictMode
+  // double-invoke can't double-inject the history.
+  const historyInjected = useRef(false);
+  useEffect(() => {
+    if (!instance) return;
+    if (historyInjected.current) return;
+    if (!deadHistory) return;
+    // Separator colour derives from the design-system `--muted-foreground`
+    // token (resolved to #rrggbb), never a hardcoded colour.
+    const sepColor =
+      resolveCssColor("--muted-foreground") ?? FALLBACK_THEME.foreground;
+    const payload = buildDeadHistory(deadHistory, sepColor);
+    if (payload) {
+      instance.write(payload);
+      historyInjected.current = true;
+    }
+  }, [instance, deadHistory]);
 
   // Surface the instance to the parent (and to tests) as it appears/disappears.
   useEffect(() => {
     onInstance?.(instance ?? null);
     return () => onInstance?.(null);
   }, [instance, onInstance]);
+
+  // Let app-level navigation chords (Ctrl/Cmd+T/W, Ctrl+Tab/PageUp/Down) pass
+  // THROUGH xterm untouched so they bubble up to `document`, where the global
+  // TanStack Hotkeys listener handles them. Returning `false` tells xterm not to
+  // process the key (no PTY byte, no preventDefault/stopPropagation). Without
+  // this, xterm consumes the chord and stops propagation, so the shortcut would
+  // only fire when the sidebar — not a terminal — is focused.
+  useEffect(() => {
+    if (!instance) return;
+    instance.attachCustomKeyEventHandler((e) => !isTerminalNavChord(e));
+    return () => {
+      // Restore the default (xterm handles every key) if the instance persists.
+      instance.attachCustomKeyEventHandler(() => true);
+    };
+  }, [instance]);
 
   // Derive the terminal theme from the design-system CSS palette AT MOUNT, so
   // the canvas background/foreground match the shell (`bg-background`) with no
@@ -208,42 +291,8 @@ export function Terminal({
     instance.options.theme = { ...instance.options.theme, background, foreground };
   }, [instance, callerTheme]);
 
-  // Load the WebGL renderer ourselves, AFTER the terminal is open()ed by
-  // useXTerm, so there is a real DOM/canvas to attach to. On any failure (no
-  // WebGL, context creation throws) we dispose the addon and fall back to the
-  // default DOM/canvas renderer — cleanly, without a thrown error reaching the
-  // console.
-  useEffect(() => {
-    if (!instance) return;
-
-    let webgl: WebglAddon | undefined;
-
-    try {
-      webgl = new WebglAddon();
-      // If the GL context is lost at runtime, drop WebGL and let xterm fall
-      // back to its default renderer instead of rendering nothing.
-      webgl.onContextLoss(() => {
-        webgl?.dispose();
-        webgl = undefined;
-        webglRef.current = null;
-      });
-      instance.loadAddon(webgl);
-      webglRef.current = webgl;
-    } catch {
-      // WebGL unavailable (headless / blocklisted GPU / jsdom): clean fallback.
-      webgl?.dispose();
-      webgl = undefined;
-      webglRef.current = null;
-    }
-
-    return () => {
-      webgl?.dispose();
-      webglRef.current = null;
-    };
-    // Effect is keyed on the terminal instance so WebGL re-loads if the
-    // terminal is recreated (e.g. StrictMode remount).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [instance]);
+  // WebGL is now managed by `useWebglAddon` (active-only attach/dispose); see
+  // `clearWebglAtlas` above.
 
   // Fit on open and keep fitting as the container resizes. ResizeObserver is the
   // single source of truth for sizing — no manual layout math, no bottom anchor.
@@ -296,13 +345,10 @@ export function Terminal({
       // spawn. The ResizeObserver is NOT a backstop here (the element size is
       // unchanged — only the cell metric moved — so it would not re-fire).
       resyncSize();
-      // The atlas baked at open() used the fallback metrics — clear it so WebGL
-      // regenerates the glyph cache against the loaded font.
-      try {
-        webglRef.current?.clearTextureAtlas();
-      } catch {
-        // atlas rebuild is best-effort; never let it crash the render.
-      }
+      // The atlas baked at attach used the fallback metrics — clear it so WebGL
+      // regenerates the glyph cache against the loaded font (no-op if inactive /
+      // no live context).
+      clearWebglAtlas();
     });
 
     const observer = new ResizeObserver(() => safeFit());
@@ -312,7 +358,7 @@ export function Terminal({
       cancelled = true;
       observer.disconnect();
     };
-  }, [instance, fitAddon, ref, mergedOptions, resyncSize]);
+  }, [instance, fitAddon, ref, mergedOptions, resyncSize, clearWebglAtlas]);
 
   // OUTER container carries the padding + background; the INNER `ref` div is
   // where xterm opens and is what the ResizeObserver/FitAddon measure. FitAddon

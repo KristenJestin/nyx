@@ -27,25 +27,48 @@ fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Resolve the shell to spawn: `$SHELL`, then `bash`, then `sh`.
+/// Resolve the shell to spawn.
 ///
-/// We don't probe the filesystem; we hand a program name to the PTY layer and
-/// let `execvp` resolve it via `PATH`. `$SHELL` is honored when set and
-/// non-empty (the user's real login shell); otherwise we fall back to `bash`,
-/// then `sh` (POSIX-guaranteed). The chosen name is returned so callers/tests
-/// can assert on it.
+/// `$SHELL` is honored first on every platform when set and non-empty (the
+/// user's chosen shell; also how the e2e suite forces a POSIX bash). Otherwise
+/// the default is per-OS:
+/// - **Unix:** `bash`, then `sh` (POSIX-guaranteed).
+/// - **Windows:** `pwsh.exe`, then `powershell.exe` (the Windows Terminal
+///   default), then `cmd.exe` via `%ComSpec%`. We deliberately do NOT fall back
+///   to `bash`/`sh` there: neither is on `PATH` (a bare `bash` resolves to the
+///   WSL launcher, which needs an installed distro), so doing so would spawn a
+///   missing program and the terminal would come up blank.
+///
+/// TODO(idea): make the default shell user-selectable in settings (see AGENTS.md
+/// §9 "Différé v1.1+"). The chosen name is returned so callers/tests can assert.
 fn resolve_shell() -> String {
-    match std::env::var("SHELL") {
-        Ok(s) if !s.is_empty() => s,
-        _ => {
-            // `bash` is the pragmatic default; `sh` is the last-resort POSIX
-            // shell. We can't cheaply verify existence here without spawning,
-            // so prefer `bash` and rely on the spawn to surface a hard failure.
-            if which_exists("bash") {
-                "bash".to_string()
-            } else {
-                "sh".to_string()
-            }
+    if let Ok(s) = std::env::var("SHELL") {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Prefer PowerShell (pwsh 7+, then Windows PowerShell), else cmd.exe.
+        if which_exists("pwsh.exe") {
+            return "pwsh.exe".to_string();
+        }
+        if which_exists("powershell.exe") {
+            return "powershell.exe".to_string();
+        }
+        // `%ComSpec%` is effectively always set on Windows; hard-code cmd.exe as
+        // a last resort in case it somehow is not.
+        return std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+    }
+
+    #[cfg(not(windows))]
+    {
+        // `bash` is the pragmatic default; `sh` is the last-resort POSIX shell.
+        if which_exists("bash") {
+            "bash".to_string()
+        } else {
+            "sh".to_string()
         }
     }
 }
@@ -68,9 +91,13 @@ fn which_exists(program: &str) -> bool {
 /// the helper threads, so neither threads nor OS handles leak.
 pub struct Pty {
     id: u64,
-    /// Master side of the PTY. Held for the lifetime of the `Pty` so that the
-    /// writer and `resize` keep working; dropping it closes the master fd.
-    master: Box<dyn MasterPty + Send>,
+    /// Master side of the PTY, shared with the waiter thread. Held while the
+    /// child is alive so `resize`/`foreground_pgid` keep working. The waiter
+    /// `take()`s (drops) it the instant the child exits: on Windows/ConPTY the
+    /// reader does NOT EOF on child exit, so closing the master (ClosePseudoConsole)
+    /// is what unblocks the reader and disconnects the output channel that drives
+    /// `pty://exit`.
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     /// Writer onto the PTY master (i.e. the child's stdin).
     writer: Box<dyn Write + Send>,
     /// Independent killer cloned from the child, usable while the waiter thread
@@ -82,6 +109,9 @@ pub struct Pty {
     waiter_handle: Option<JoinHandle<()>>,
     /// Exit code of the child once it has terminated (`None` while running).
     exit_code: Arc<Mutex<Option<i32>>>,
+    /// OS pid of the spawned shell. Used to read live cwd from
+    /// `/proc/<pid>/cwd` (Linux); `None` if the platform/pty can't report it.
+    shell_pid: Option<u32>,
 }
 
 impl Pty {
@@ -122,9 +152,16 @@ impl Pty {
         // it; dropping it ensures we see EOF on the master when the child exits.
         drop(pair.slave);
 
+        // Capture the shell pid before moving `child` into the waiter thread.
+        // This is the anchor for live cwd lookups via `/proc/<pid>/cwd`.
+        let shell_pid = child.process_id();
         let killer = child.clone_killer();
         let writer = pair.master.take_writer()?;
         let mut reader = pair.master.try_clone_reader()?;
+        // Share the master with the waiter thread so it can close it on child
+        // exit (the lever that unblocks the reader on Windows; see the field doc).
+        let master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>> =
+            Arc::new(Mutex::new(Some(pair.master)));
 
         // Reader thread: pump raw bytes onto the channel until EOF.
         let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
@@ -148,10 +185,12 @@ impl Pty {
                 // `tx` drops here → receiver observes disconnect (EOF signal).
             })?;
 
-        // Waiter thread: block until the child exits, record its exit code.
+        // Waiter thread: block until the child exits, record its exit code, then
+        // close the master so the reader unblocks.
         let exit_code = Arc::new(Mutex::new(None::<i32>));
         let waiter_handle = {
             let exit_code = Arc::clone(&exit_code);
+            let master = Arc::clone(&master);
             let mut child: Box<dyn Child + Send + Sync> = child;
             std::thread::Builder::new()
                 .name("nyx-pty-waiter".into())
@@ -159,17 +198,25 @@ impl Pty {
                     if let Ok(status) = child.wait() {
                         *exit_code.lock().unwrap() = Some(status.exit_code() as i32);
                     }
+                    // The child is gone; close the master. On Windows the ConPTY
+                    // read side only EOFs once the pseudoconsole is closed (the
+                    // child exiting is not enough), so without this the reader
+                    // blocks forever and `pty://exit` never fires. Dropping the
+                    // master closes it; on Unix the reader has already EOF'd via
+                    // the slave drop, so this is a harmless no-op.
+                    let _ = master.lock().unwrap().take();
                 })?
         };
 
         let pty = Pty {
             id: next_id(),
-            master: pair.master,
+            master,
             writer,
             killer,
             reader_handle: Some(reader_handle),
             waiter_handle: Some(waiter_handle),
             exit_code,
+            shell_pid,
         };
         Ok((pty, rx))
     }
@@ -177,6 +224,22 @@ impl Pty {
     /// Opaque, process-unique id of this PTY (used by the bridge to key state).
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// OS pid of the spawned shell, if the platform reported it. Anchor for the
+    /// live cwd lookup (`/proc/<pid>/cwd`).
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
+    }
+
+    /// The foreground process group leader of this PTY — i.e. `tcgetpgrp` on the
+    /// master fd, surfaced by `portable-pty` as `process_group_leader`. When a
+    /// full-screen program (htop, vim) runs in the foreground this is that
+    /// program's pgid; at the shell prompt it is the shell's own pgid. Anchor
+    /// for reading the foreground program name from `/proc/<pgid>/comm`.
+    #[cfg(unix)]
+    pub fn foreground_pgid(&self) -> Option<i32> {
+        self.master.lock().unwrap().as_ref()?.process_group_leader()
     }
 
     /// Write bytes to the PTY (the child's stdin). Flushes immediately so
@@ -195,12 +258,16 @@ impl Pty {
         pixel_width: u16,
         pixel_height: u16,
     ) -> anyhow::Result<()> {
-        self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width,
-            pixel_height,
-        })?;
+        // `None` once the child has exited and the waiter closed the master; a
+        // resize then is simply a no-op.
+        if let Some(master) = self.master.lock().unwrap().as_ref() {
+            master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            })?;
+        }
         Ok(())
     }
 
@@ -231,15 +298,32 @@ impl Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         // Ensure the child is dead so both helper threads can terminate:
-        // the waiter unblocks from `wait`, and the reader sees EOF once the
-        // master/child fds close.
+        // the waiter unblocks from `wait`, and (on Unix) the reader sees EOF once
+        // the master/child fds close.
         let _ = self.killer.kill();
         if let Some(handle) = self.waiter_handle.take() {
+            // Fast + reliable: `child.wait()` returns right after the kill, then
+            // the waiter closes the master.
             let _ = handle.join();
         }
+        // The reader thread is platform-split ON PURPOSE:
+        // - On Unix, closing the master EOFs the reader's `read()`, so the join is
+        //   prompt; we join to avoid leaking the thread.
+        // - On Windows, the reader was cloned from the ConPTY master
+        //   (`try_clone_reader`) and blocks in `ReadFile` on its OWN handle.
+        //   `ClosePseudoConsole` on the master does NOT reliably unblock that
+        //   clone, so `join()` can block FOREVER — and because `pty_close` runs on
+        //   the MAIN thread, that froze the whole UI ("Not Responding") on close.
+        //   (Diagnosed with per-stage logging: every freeze was stuck precisely on
+        //   the reader `join()`.) So on Windows we DETACH the reader (drop the
+        //   handle without joining): it terminates on its own once the OS tears
+        //   the pipe down, and the teardown never blocks the caller.
+        #[cfg(not(windows))]
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
         }
+        #[cfg(windows)]
+        drop(self.reader_handle.take());
     }
 }
 
@@ -324,9 +408,10 @@ mod tests {
 
     #[test]
     fn no_thread_or_handle_leak_after_drop() {
-        // Spawn, then drop; Drop must kill the child and JOIN both helper
-        // threads. If a thread leaked (failed to terminate), the joins in Drop
-        // would block forever and this test would hang (caught as a timeout).
+        // Spawn, then drop; Drop must kill the child and return PROMPTLY. On Unix
+        // it joins both helper threads (which terminate once the master closes);
+        // on Windows it joins the waiter and DETACHES the reader (see `Pty::drop`).
+        // Either way Drop must not block — if it did, this test would hang.
         // We also assert the id allocator advances exactly once per spawn (no
         // double-spawn / no stray PTY) without assuming an absolute id, since
         // tests run in parallel against the shared global counter.
@@ -336,7 +421,8 @@ mod tests {
             let (pty, _rx) =
                 Pty::spawn_program("sh", small_size(), None).expect("spawn sh to drop");
             pty.id()
-            // Drop here: kill + join(reader) + join(waiter). Must return promptly.
+            // Drop here: kill + join(waiter) + join/detach(reader). Must return
+            // promptly (never blocks the caller).
         };
         assert!(
             dropped_id > baseline,
@@ -369,5 +455,83 @@ mod tests {
         );
         let code = pty.wait();
         assert_eq!(code, Some(0), "clean exit code should be 0");
+    }
+
+    #[test]
+    fn drop_is_prompt_when_reader_is_blocked() {
+        // REGRESSION (Windows "Not Responding" on close). `Pty::drop` used to
+        // `join()` the reader thread unconditionally. On Windows that reader is
+        // cloned from the ConPTY master and blocks in `ReadFile` on its OWN handle;
+        // `ClosePseudoConsole` on the master does not reliably unblock it, so the
+        // join could block FOREVER — and `pty_close` runs on the MAIN thread, so
+        // the whole UI froze. An idle shell parks the reader in a blocking read:
+        // the exact condition. We run the drop on a worker thread and FAIL (not
+        // hang) if it does not return promptly.
+        let (pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        std::thread::sleep(Duration::from_millis(100)); // let the reader settle in read()
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            drop(pty); // kill + join(waiter) + join/detach(reader): must NOT block
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "Pty::drop did not return within 10s — the close-hang regressed (reader join deadlock)"
+        );
+        worker.join().expect("worker thread");
+        drop(rx);
+    }
+
+    #[test]
+    fn drop_is_prompt_with_active_output() {
+        // Same invariant, but with the reader ACTIVELY cycling through reads (the
+        // shell emits a line every ~20ms): teardown must still return promptly
+        // with output in flight, not only when the reader sits idle.
+        let (mut pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        pty.write(b"i=0; while :; do echo line $i; i=$((i+1)); sleep 0.02; done\n")
+            .expect("write");
+        assert!(
+            read_until(&rx, "line ", Duration::from_secs(5)).contains("line "),
+            "shell should be emitting output before we close it"
+        );
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            drop(pty);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "Pty::drop deadlocked with output in flight (>10s)"
+        );
+        worker.join().expect("worker thread");
+        drop(rx);
+    }
+
+    #[test]
+    fn dropping_many_ptys_is_prompt() {
+        // Mirrors the real repro (closing dozens of terminals back-to-back): every
+        // teardown must return promptly. The whole batch runs under ONE timeout so
+        // a single deadlock surfaces as a FAILURE, not a hung test run.
+        let mut ptys = Vec::new();
+        for _ in 0..8 {
+            ptys.push(Pty::spawn_program("sh", small_size(), None).expect("spawn sh"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            for (pty, rx) in ptys {
+                drop(pty);
+                drop(rx);
+            }
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(20)).is_ok(),
+            "dropping 8 PTYs did not finish within 20s — a teardown deadlocked"
+        );
+        worker.join().expect("worker thread");
     }
 }

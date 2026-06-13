@@ -142,7 +142,7 @@ it("derives the xterm theme from the CSS palette tokens as a parseable hex (oklc
   // Pins the F3 fix: the tokens are authored in oklch(), which xterm cannot
   // parse, and on current Chromium/WebKit the naive getComputedStyle/fillStyle
   // round-trip serialises oklch back unchanged. So the component converts to a
-  // real sRGB hex in JS via culori `formatHex` (in resolveCssColor). This runs
+  // real sRGB hex in JS via chroma-js (in resolveCssColor). This runs
   // in a real browser engine so the conversion is exercised end-to-end.
   const host = document.createElement("div");
   host.style.width = "320px";

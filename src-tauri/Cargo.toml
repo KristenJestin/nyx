@@ -24,6 +24,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = "0.9"
 anyhow = "1"
+# Terminal record ids are UUIDv7 (time-ordered: globally unique + stable for
+# external/MCP references and any future multi-device sync, while keeping index
+# locality). Generated backend-side; stored as TEXT.
+uuid = { version = "1", features = ["v7"] }
+# Persistence layer. SQLite via Diesel (see ADR-0001): query DSL checked at
+# compile time, `schema.rs` committed (no DB needed at build). `bundled` vendors
+# SQLite so there is no system-library dependency. `returning_clauses_for_sqlite_3_35`
+# enables RETURNING on INSERT (round-trips the row without a second SELECT).
+diesel = { version = "2", features = [
+    "sqlite",
+    "returning_clauses_for_sqlite_3_35",
+] }
+diesel_migrations = "2"
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"

@@ -1,28 +1,42 @@
 /* eslint-disable */
-// End-to-end scenarios driving the REAL nyx app (release build) through
-// tauri-driver + WebKitWebDriver. xterm renders to a WebGL canvas, so terminal
-// text is not in the DOM; we read it through the `window.__nyx.readBuffer()`
-// seam exposed by src/App.tsx (see that file for the rationale).
+// Smoke e2e against the REAL nyx app (release build) through tauri-driver +
+// WebKitWebDriver. xterm renders to a WebGL canvas, so terminal text is not in
+// the DOM; we drive + read the ACTIVE terminal through the inert `window.__nyx`
+// control seam exposed by src/components/sidebar/terminal-manager.tsx (it mirrors
+// the per-terminal deck read/input seams, keyed by record id).
+//
+// This is the basic-behaviour smoke (env survives, program output, resize, exit);
+// the big multi-terminal RESTORE scenario lives in restore-01/02-*.e2e.cjs.
 
 const assert = require("assert");
 
-// Type bytes into the live xterm via its public `input()` API and let the PTY
-// echo + execute them. We go through xterm (not raw key events) so the bytes
-// reach the backend exactly as keystrokes would.
-async function typeLine(text) {
-  await browser.execute(function (t) {
-    var term = window.__nyx && window.__nyx.term;
-    if (term) term.input(t, true);
-  }, text);
-}
-
-async function readBuffer() {
+// The active terminal's record id (the visible pane). All seam calls target it.
+async function activeId() {
   return browser.execute(function () {
-    return window.__nyx ? window.__nyx.readBuffer() : "";
+    return window.__nyx ? window.__nyx.activeId() : null;
   });
 }
 
-// Poll readBuffer() until it contains `needle` or we time out.
+// Type bytes into the active terminal via the inert input seam (goes through
+// xterm `input`, so the PTY echoes + executes them — exactly like keystrokes).
+async function typeLine(text) {
+  const id = await activeId();
+  await browser.execute(
+    function (id, t) {
+      if (window.__nyx && id != null) window.__nyx.typeInto(id, t);
+    },
+    id,
+    text,
+  );
+}
+
+async function readBuffer() {
+  const id = await activeId();
+  return browser.execute(function (id) {
+    return window.__nyx && id != null ? window.__nyx.readBuffer(id) : "";
+  }, id);
+}
+
 async function waitForOutput(needle, timeoutMs) {
   const deadline = Date.now() + (timeoutMs || 15000);
   let last = "";
@@ -36,23 +50,24 @@ async function waitForOutput(needle, timeoutMs) {
   );
 }
 
-describe("nyx terminal e2e", function () {
+describe("nyx terminal e2e (smoke)", function () {
   before(async function () {
-    // Wait for the WebView to mount React + the xterm seam.
+    // Wait for the WebView to mount React + the control seam + an active term.
     await browser.waitUntil(
       async function () {
         return browser.execute(function () {
-          return !!(window.__nyx && window.__nyx.term);
+          return !!(
+            window.__nyx && window.__nyx.activeId() != null
+          );
         });
       },
-      { timeout: 30000, timeoutMsg: "window.__nyx.term never appeared" },
+      { timeout: 30000, timeoutMsg: "window.__nyx active terminal never appeared" },
     );
     // Let the shell print its first prompt so subsequent input is at a prompt.
     await browser.pause(1000);
   });
 
   it("preserves the shell environment across commands (export FOO=bar; echo)", async function () {
-    // A unique marker so we don't match the echoed command itself.
     await typeLine("export FOO=bar_e2e_9k1\n");
     await browser.pause(300);
     await typeLine('echo "FOOIS:$FOO"\n');
@@ -71,17 +86,14 @@ describe("nyx terminal e2e", function () {
   });
 
   it("survives a window resize without crashing", async function () {
-    // Resize a few times; the app/WebView must stay alive and the seam must
-    // still respond afterward (reflow is best-effort, no-crash is the contract).
     await browser.setWindowSize(700, 500);
     await browser.pause(300);
     await browser.setWindowSize(1100, 800);
     await browser.pause(300);
     const stillAlive = await browser.execute(function () {
-      return !!(window.__nyx && window.__nyx.term);
+      return !!(window.__nyx && window.__nyx.activeId() != null);
     });
     assert(stillAlive, "app must remain alive after resize");
-    // And the terminal still accepts input after the resize.
     await typeLine('echo "AFTER_RESIZE_OK"\n');
     const buf = await waitForOutput("AFTER_RESIZE_OK", 15000);
     assert(buf.includes("AFTER_RESIZE_OK"), "terminal usable after resize");
