@@ -1,8 +1,11 @@
 mod bridge;
 mod db;
+mod osc7;
+mod pathnorm;
 #[cfg(target_os = "linux")]
 mod proc;
 mod pty;
+mod resolve;
 mod schema;
 
 use std::fs;
@@ -42,8 +45,43 @@ fn setup_db<R: tauri::Runtime>(app: &tauri::App<R>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Apply the WebKitGTK rendering workarounds nyx needs to paint reliably on the
+/// Linux WebView (wry → WebKitGTK). On many Linux/WSLg stacks the default DMABUF
+/// renderer and the accelerated compositing path produce a BLANK WebView (the GL
+/// context never presents), so React mounts but nothing is shown and — under
+/// `tauri-driver`/WebKitWebDriver — the page script never runs to completion,
+/// leaving `window.__nyx` permanently null (the PRD-1 e2e 0/3 failure: the front
+/// bootstrap never reaches `create_terminal`).
+///
+/// `WEBKIT_DISABLE_DMABUF_RENDERER=1` forces the portable (non-DMABUF) software
+/// presentation path; `WEBKIT_DISABLE_COMPOSITING_MODE=1` disables accelerated
+/// compositing. These are the WebKitGTK-documented escape hatches for exactly
+/// this class of blank-render bug and are inert on stacks that didn't need them.
+///
+/// We set them ONLY when UNSET so a user/operator can still override per-launch
+/// (e.g. force-enable DMABUF on a known-good GPU). Set BEFORE the WebView is
+/// created — `WebKitWebProcess` reads them at WebView construction time — so the
+/// very first window paints correctly. Linux-only: these vars don't exist on the
+/// WebView2 (Windows) / WKWebView (macOS) backends.
+#[cfg(target_os = "linux")]
+fn apply_webkit_rendering_workarounds() {
+    for (key, val) in [
+        ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+        ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
+    ] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, val);
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Linux WebKitGTK needs rendering workarounds to avoid a blank WebView; must
+    // be set before the WebView is constructed (see the function docs).
+    #[cfg(target_os = "linux")]
+    apply_webkit_rendering_workarounds();
+
     let mut builder = tauri::Builder::default();
 
     // Single-instance: a second launch of nyx focuses the existing `main`
@@ -62,6 +100,8 @@ pub fn run() {
     }
 
     builder = builder.plugin(tauri_plugin_opener::init());
+    // Native folder picker for the manual add-project / add-workspace flow.
+    builder = builder.plugin(tauri_plugin_dialog::init());
     builder = bridge::init(builder);
 
     builder

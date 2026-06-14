@@ -160,3 +160,66 @@ export function useAutoLabel(
 function defaultPoll(ptyId: number): Promise<TerminalInfo> {
   return invoke<TerminalInfo>("terminal_info", { id: ptyId });
 }
+
+/**
+ * The short SHELL/PROGRAM suffix for the proto-aligned terminal row (the "· zsh"
+ * in `web · zsh`, finding 01KV1NVQPT2Z84KKZHBXGNPMSN). It is the live foreground
+ * program when a real one runs (e.g. `htop`), otherwise the interactive shell
+ * name (e.g. `zsh`, with any login-shell leading `-` stripped). `null` until a
+ * reading is available. Pure given `info`.
+ */
+export function shellSuffix(info: { foreground: string | null } | null | undefined): string | null {
+  const fg = info?.foreground;
+  if (!fg) return null;
+  // Strip a login-shell leading `-` (`-zsh` → `zsh`) for a clean suffix.
+  return fg.startsWith("-") ? fg.slice(1) : fg;
+}
+
+/**
+ * Poll `terminal_info(ptyId)` and return the short shell/program SUFFIX for the
+ * proto row (see {@link shellSuffix}). Shares the same backend command + cadence
+ * as {@link useAutoLabel}; the backend debounces the underlying `/proc` reads, so
+ * the two polls together still never hammer the OS. `poll` is injectable for
+ * jsdom tests. Returns `null` while there is no PTY id / reading yet.
+ */
+export function useShellSuffix(
+  ptyId: number | null,
+  options: {
+    poll?: (ptyId: number) => Promise<TerminalInfo>;
+    pollMs?: number;
+  } = {},
+): string | null {
+  const { poll = defaultPoll, pollMs = AUTO_LABEL_POLL_MS } = options;
+  const [suffix, setSuffix] = useState<string | null>(null);
+  const lastRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (ptyId === null) {
+      setSuffix(null);
+      lastRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const info = await poll(ptyId);
+        if (cancelled) return;
+        const next = shellSuffix(info);
+        if (next !== lastRef.current) {
+          lastRef.current = next;
+          setSuffix(next);
+        }
+      } catch {
+        // keep the last suffix on a transient terminal_info failure.
+      }
+    };
+    void tick();
+    const timer = setInterval(() => void tick(), pollMs);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [ptyId, poll, pollMs]);
+
+  return suffix;
+}

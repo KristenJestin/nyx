@@ -42,9 +42,7 @@ describe("useAutoLabel", () => {
   });
 
   it("polls on the cadence — recompute is DEBOUNCED by the fixed interval, not per byte", async () => {
-    const poll = vi.fn(
-      async (): Promise<TerminalInfo> => ({ cwd: "/p", foreground: "bash" }),
-    );
+    const poll = vi.fn(async (): Promise<TerminalInfo> => ({ cwd: "/p", foreground: "bash" }));
     renderHook(() => useAutoLabel(2, { poll, pollMs: 1000 }));
 
     // Prime call.
@@ -57,9 +55,7 @@ describe("useAutoLabel", () => {
   });
 
   it("stops polling after unmount (no leaked interval)", async () => {
-    const poll = vi.fn(
-      async (): Promise<TerminalInfo> => ({ cwd: "/p", foreground: "bash" }),
-    );
+    const poll = vi.fn(async (): Promise<TerminalInfo> => ({ cwd: "/p", foreground: "bash" }));
     const { unmount } = renderHook(() => useAutoLabel(3, { poll, pollMs: 1000 }));
     await vi.waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
 

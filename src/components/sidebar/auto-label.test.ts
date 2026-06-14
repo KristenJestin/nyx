@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  autoLabel,
-  isShellComm,
-  resolveDisplayName,
-} from "./auto-label";
+import { autoLabel, isShellComm, resolveDisplayName, shellSuffix } from "./auto-label";
 
 describe("autoLabel", () => {
   it("uses the basename of the cwd when only the shell is in the foreground", () => {
@@ -46,6 +42,21 @@ describe("isShellComm", () => {
     for (const p of ["htop", "node", "vim", "claude"]) {
       expect(isShellComm(p)).toBe(false);
     }
+  });
+});
+
+describe("shellSuffix (proto row '· zsh')", () => {
+  it("returns the foreground program when one runs", () => {
+    expect(shellSuffix({ foreground: "htop" })).toBe("htop");
+  });
+  it("returns the shell name, stripping a login-shell leading dash", () => {
+    expect(shellSuffix({ foreground: "zsh" })).toBe("zsh");
+    expect(shellSuffix({ foreground: "-zsh" })).toBe("zsh");
+  });
+  it("is null when there is no reading", () => {
+    expect(shellSuffix(null)).toBeNull();
+    expect(shellSuffix(undefined)).toBeNull();
+    expect(shellSuffix({ foreground: null })).toBeNull();
   });
 });
 

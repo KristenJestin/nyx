@@ -1,8 +1,5 @@
 import { cn } from "@/lib/utils";
-import {
-  useWindowControlsVisible,
-  WindowControls,
-} from "@/components/chrome/window-controls";
+import { useWindowControlsVisible, WindowControls } from "@/components/chrome/window-controls";
 
 export interface ChromeBarProps {
   /**
@@ -32,11 +29,7 @@ export interface ChromeBarProps {
  * The controls sit outside the drag region so their clicks are not swallowed by
  * the drag handler.
  */
-export function ChromeBar({
-  title,
-  controlsVisible,
-  className,
-}: ChromeBarProps) {
+export function ChromeBar({ title, controlsVisible, className }: ChromeBarProps) {
   // Runtime-resolved default (OS env via backend); an explicit prop wins.
   const resolved = useWindowControlsVisible();
   const showControls = controlsVisible ?? resolved;
@@ -51,11 +44,7 @@ export function ChromeBar({
       )}
     >
       {/* Left spacer keeps the title visually centered against the controls. */}
-      <div
-        data-tauri-drag-region
-        className="flex-1 basis-0"
-        aria-hidden="true"
-      />
+      <div data-tauri-drag-region className="flex-1 basis-0" aria-hidden="true" />
       {title ? (
         <span
           data-tauri-drag-region

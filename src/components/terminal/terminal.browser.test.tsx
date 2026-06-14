@@ -28,10 +28,7 @@ const SPAWNED_ID = 7;
 beforeEach(() => {
   // Resolve pty_spawn so usePty's start() completes without a real backend;
   // every other command (write/resize/close) is a harmless no-op here.
-  mockIPC(
-    (cmd) => (cmd === "pty_spawn" ? SPAWNED_ID : null),
-    { shouldMockEvents: true },
-  );
+  mockIPC((cmd) => (cmd === "pty_spawn" ? SPAWNED_ID : null), { shouldMockEvents: true });
 });
 
 afterEach(() => {
@@ -48,9 +45,7 @@ afterEach(() => {
  * GL context found (or null if only 2d/none exist — i.e. the DOM/canvas
  * fallback path).
  */
-function findWebglContext(
-  root: HTMLElement,
-): { vendor: string; renderer: string } | null {
+function findWebglContext(root: HTMLElement): { vendor: string; renderer: string } | null {
   const canvases = root.querySelectorAll("canvas");
   for (const canvas of canvases) {
     // Don't *create* a context — only read one that the addon already made.
@@ -133,8 +128,62 @@ it("renders <Terminal> with a REAL WebGL context and matches the visual baseline
   // First run writes the baseline to the gitignored root .vitest-screenshots/
   // dir (see vitest.config.ts); subsequent runs diff against it. A
   // render/flash/layout regression makes the diff fail.
-  await expect(page.getByTestId("terminal-host")).toMatchScreenshot(
-    "terminal-webgl-render",
+  await expect(page.getByTestId("terminal-host")).toMatchScreenshot("terminal-webgl-render");
+});
+
+it("focuses the xterm input when it becomes the active pane (typing fix, finding 01KV1J6C0T2581VSY2P2HKMS6D)", async () => {
+  // Regression for the CRITICAL "cannot type in some terminals" bug: selecting a
+  // terminal flips `active` but must ALSO move keyboard focus to that pane's
+  // xterm, or its hidden textarea never receives keystrokes. We mount it INACTIVE,
+  // park focus on a stand-in for the sidebar button the user just clicked, then
+  // ACTIVATE the terminal and assert focus MOVES to the xterm helper textarea —
+  // i.e. typing now reaches this terminal. (xterm grabs focus on `open()`, so the
+  // load-bearing assertion is the post-activate one, after we steal focus back.)
+  const host = document.createElement("div");
+  host.style.width = "320px";
+  host.style.height = "200px";
+  document.body.appendChild(host);
+
+  // A real element standing in for the sidebar row button the user clicked.
+  const stealFocus = document.createElement("button");
+  stealFocus.textContent = "sidebar";
+  document.body.appendChild(stealFocus);
+
+  let term: XTerm | null = null;
+  const { rerender } = render(<Terminal active={false} onInstance={(t) => (term = t ?? term)} />, {
+    container: host,
+  });
+
+  // Wait for the xterm instance to exist.
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline && !term) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  expect(term, "xterm instance must be created").not.toBeNull();
+
+  // Move focus to the "sidebar button" — exactly what happens when the user
+  // clicks a sidebar row to select a terminal (focus lands on that button, NOT
+  // the terminal). This is the precondition under which the bug manifested.
+  stealFocus.focus();
+  expect(document.activeElement).toBe(stealFocus);
+
+  // Activate it (what selecting it in the sidebar does to the deck).
+  rerender(<Terminal active onInstance={(t) => (term = t ?? term)} />);
+
+  // The focus effect defers one animation frame (the pane was display:none).
+  // Poll until the xterm helper textarea is the active element.
+  const focusDeadline = Date.now() + 3000;
+  let focused = false;
+  while (Date.now() < focusDeadline) {
+    const ae = document.activeElement as HTMLElement | null;
+    if (ae && ae.classList.contains("xterm-helper-textarea")) {
+      focused = true;
+      break;
+    }
+    await new Promise((r) => requestAnimationFrame(() => r(null)));
+  }
+  expect(focused, "activating a terminal must focus its xterm input so typing reaches it").toBe(
+    true,
   );
 });
 
@@ -179,8 +228,6 @@ it("derives the xterm theme from the CSS palette tokens as a parseable hex (oklc
   // --foreground token oklch(0.985 0 0) resolves to a near-white. Sanity-check
   // the contrast so we never ship black-on-black.
   const lum = (h: string) =>
-    parseInt(h.slice(1, 3), 16) +
-    parseInt(h.slice(3, 5), 16) +
-    parseInt(h.slice(5, 7), 16);
+    parseInt(h.slice(1, 3), 16) + parseInt(h.slice(3, 5), 16) + parseInt(h.slice(5, 7), 16);
   expect(lum(bg)).toBeLessThan(lum(fg));
 });

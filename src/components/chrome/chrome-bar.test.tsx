@@ -29,17 +29,13 @@ describe("<ChromeBar>", () => {
 
   it("renders a drag region (data-tauri-drag-region)", () => {
     const { container } = render(<ChromeBar />);
-    expect(
-      container.querySelector("[data-tauri-drag-region]"),
-    ).toBeInTheDocument();
+    expect(container.querySelector("[data-tauri-drag-region]")).toBeInTheDocument();
   });
 
   it("renders the window controls when enabled (default)", () => {
     render(<ChromeBar controlsVisible />);
     expect(screen.getByRole("button", { name: /close/i })).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /minimize/i }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /minimize/i })).toBeInTheDocument();
   });
 
   it("hides the window controls when controlsVisible is false", () => {
@@ -62,18 +58,12 @@ describe("<ChromeBar>", () => {
   it("shows controls by default (no prop) when NYX_WINDOW_CONTROLS is unset/visible", async () => {
     installIpc(true);
     render(<ChromeBar />);
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: /close/i }),
-      ).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByRole("button", { name: /close/i })).toBeInTheDocument());
   });
 
   it("hides controls by default (no prop) when NYX_WINDOW_CONTROLS=0", async () => {
     installIpc(false);
     render(<ChromeBar />);
-    await waitFor(() =>
-      expect(screen.queryByRole("button", { name: /close/i })).toBeNull(),
-    );
+    await waitFor(() => expect(screen.queryByRole("button", { name: /close/i })).toBeNull());
   });
 });

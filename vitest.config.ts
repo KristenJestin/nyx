@@ -63,11 +63,7 @@ export default defineConfig({
                 // (it would put PNGs under `src/`) and key only on the test file
                 // name + arg, so the baseline is `.vitest-screenshots/<file>/<arg>-<browser>-<platform>.png`.
                 resolveScreenshotPath: ({ arg, ext, testFileName, browserName }) =>
-                  resolve(
-                    SCREENSHOT_DIR,
-                    testFileName,
-                    `${arg}-${browserName}-${platform}${ext}`,
-                  ),
+                  resolve(SCREENSHOT_DIR, testFileName, `${arg}-${browserName}-${platform}${ext}`),
               },
             },
           },

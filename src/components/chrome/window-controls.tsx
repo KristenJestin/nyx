@@ -63,23 +63,24 @@ export function useWindowControlsVisible(): boolean {
  */
 export function WindowControls() {
   const minimize = useCallback(() => {
-    void getCurrentWindow().minimize().catch(() => {});
+    void getCurrentWindow()
+      .minimize()
+      .catch(() => {});
   }, []);
   const toggleMaximize = useCallback(() => {
-    void getCurrentWindow().toggleMaximize().catch(() => {});
+    void getCurrentWindow()
+      .toggleMaximize()
+      .catch(() => {});
   }, []);
   const close = useCallback(() => {
-    void getCurrentWindow().close().catch(() => {});
+    void getCurrentWindow()
+      .close()
+      .catch(() => {});
   }, []);
 
   return (
     <div className="flex items-center gap-0.5">
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        aria-label="Minimize window"
-        onClick={minimize}
-      >
+      <Button variant="ghost" size="icon-sm" aria-label="Minimize window" onClick={minimize}>
         <MinusIcon />
       </Button>
       <Button
@@ -90,12 +91,7 @@ export function WindowControls() {
       >
         <SquareIcon />
       </Button>
-      <Button
-        variant="ghost-destructive"
-        size="icon-sm"
-        aria-label="Close window"
-        onClick={close}
-      >
+      <Button variant="ghost-destructive" size="icon-sm" aria-label="Close window" onClick={close}>
         <XIcon />
       </Button>
     </div>

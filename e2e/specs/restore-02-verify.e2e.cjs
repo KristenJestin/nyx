@@ -12,6 +12,10 @@
 const assert = require("assert");
 const h = require("./restore-helpers.cjs");
 
+// The dead-history separator label written between restored history and the live
+// session (see src/components/terminal/dead-history.ts RESTORE_SEPARATOR_LABEL).
+const RESTORE_SEPARATOR_LABEL = "previous session";
+
 describe("restore scenario — verify (relaunch: 3 restored + scrollback, order kept, closed not re-spawned)", function () {
   let expected;
 
@@ -85,6 +89,53 @@ describe("restore scenario — verify (relaunch: 3 restored + scrollback, order 
       aliveOrder,
       expected.expectedAliveOrder,
       "the reordered (reversed) order must persist across the restart",
+    );
+  });
+
+  it("CRITICAL (01KV3CPAG…): a RESTORED terminal is TYPABLE and the live prompt is BELOW the restored history", async function () {
+    // The Image-16 bug: on a terminal whose scrollback was restored, the
+    // "— previous session —" dead-history block rendered BELOW the live prompt, so
+    // the input sat above dead history and the user COULD NOT TYPE. The fix writes
+    // the dead history as the FIRST bytes of the session (before the PTY output),
+    // so history is ABOVE the live prompt and the input is typable at the bottom.
+    //
+    // We pick a restored terminal (it has its seed marker back as dead history),
+    // make it active, type a FRESH marker as REAL keystrokes through the live
+    // shell, and assert: (a) the fresh marker LANDS in the buffer (input is
+    // typable) and (b) the restored seed marker + the separator appear ABOVE the
+    // fresh marker (correct top-to-bottom order: history, separator, live input).
+    const target = expected.terminals[0];
+    await h.waitForBuffer(target.id, target.marker, 15000); // its history is back
+
+    await browser.execute(function (id) {
+      window.__nyx.setActive(id);
+    }, target.id);
+    await browser.pause(400);
+
+    const liveMarker = "RESTORE_TYPE_" + Date.now();
+    // Type through the live shell (the input must reach the PTY → echo back).
+    await h.typeInto(target.id, 'printf "%s\\n" ' + liveMarker + "\n");
+    const buf = await h.waitForBuffer(target.id, liveMarker, 15000);
+
+    const histAt = buf.indexOf(target.marker);
+    const sepAt = buf.indexOf(RESTORE_SEPARATOR_LABEL);
+    const liveAt = buf.lastIndexOf(liveMarker);
+    assert(histAt !== -1, "the restored history marker must be present");
+    assert(sepAt !== -1, "the 'previous session' separator must be present");
+    assert(liveAt !== -1, "the freshly-typed marker must land (the input is TYPABLE)");
+    // Top-to-bottom: restored history < separator < live input.
+    assert(
+      histAt < sepAt,
+      "restored history must be ABOVE the separator (was hist@" + histAt + " sep@" + sepAt + ")",
+    );
+    assert(
+      sepAt < liveAt,
+      "the separator (end of dead history) must be ABOVE the live input — the prompt is at the " +
+        "BOTTOM and typable (was sep@" +
+        sepAt +
+        " live@" +
+        liveAt +
+        ")",
     );
   });
 

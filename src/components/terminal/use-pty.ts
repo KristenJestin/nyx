@@ -29,6 +29,17 @@ export interface UsePtyOptions {
    * tests don't need it.
    */
   onPtyId?: (id: number | null) => void;
+  /**
+   * Read-only DEAD HISTORY bytes (prior scrollback + separator) to write into the
+   * terminal ONCE, as the VERY FIRST thing the session does — BEFORE the
+   * `pty://output` listener is attached and BEFORE `pty_spawn` — so the restored
+   * history is guaranteed to sit ABOVE the live shell's first prompt (finding
+   * 01KV3CPAG2KTV413C4RVNH6TVN: previously the async dead-history effect could
+   * lose the race to the PTY's first output, landing history BELOW the live input
+   * so the user couldn't type). NEVER sent to the PTY — `start()` writes it to
+   * xterm only. Empty/undefined → nothing written (a brand-new terminal).
+   */
+  deadHistory?: string;
 }
 
 /**
@@ -117,7 +128,7 @@ export function usePty(
   fitAddon: FitAddon,
   options: UsePtyOptions = {},
 ): () => void {
-  const { cwd, onPtyId } = options;
+  const { cwd, onPtyId, deadHistory } = options;
   const sessionRef = useRef<PtySession | null>(null);
   // Keep the latest onPtyId on a ref so the session always calls the current one
   // without re-running the spawn effect when the callback identity changes.
@@ -168,7 +179,7 @@ export function usePty(
     // `pty_spawn` actually reaches the IPC. (Mutation-verified.)
     if (!session.spawnIssued) {
       session.spawnIssued = true;
-      void start(session, fitAddon, cwd);
+      void start(session, fitAddon, cwd, deadHistory);
     }
 
     const myGeneration = session.generation;
@@ -196,37 +207,43 @@ async function start(
   session: PtySession,
   fitAddon: FitAddon,
   cwd: string | undefined,
+  deadHistory: string | undefined,
 ): Promise<void> {
   const { term } = session;
   const decode = (bytes: number[]): Uint8Array => Uint8Array.from(bytes);
   const encoder = new TextEncoder();
+
+  // RESTORE ORDERING (finding 01KV3CPAG…): write the read-only dead history FIRST
+  // — synchronously, before the `pty://output` listener exists and before
+  // `pty_spawn` — so the restored "previous session" block is guaranteed to land
+  // ABOVE the live shell's first prompt. Writing it from the React effect instead
+  // raced the PTY's first output (which arrives via an async event that can beat
+  // a late `instance`-dependent effect), landing history BELOW the live input so
+  // the cursor sat above dead history and the user couldn't type. This write
+  // NEVER reaches the PTY — it is xterm-only.
+  if (deadHistory) term.write(deadHistory);
 
   // Subscribe BEFORE spawning so no early output is dropped. Until the spawn
   // resolves we don't know our id, so we can't route an event yet — buffer it
   // and let `start()` replay the matching chunks once the id is known (see the
   // drain after `pty_spawn`). Filtering on `id === null` alone would DROP output
   // that races ahead of the spawn round-trip (the first prompt under IPC load).
-  session.unlistenOutput = await listen<PtyOutputPayload>(
-    "pty://output",
-    (event) => {
-      if (session.torndown) return;
-      if (session.id === null) {
-        session.pendingOutput.push(event.payload);
-        return;
-      }
-      if (event.payload.id !== session.id) return;
-      term.write(decode(event.payload.bytes));
-    },
-  );
+  session.unlistenOutput = await listen<PtyOutputPayload>("pty://output", (event) => {
+    if (session.torndown) return;
+    if (session.id === null) {
+      session.pendingOutput.push(event.payload);
+      return;
+    }
+    if (event.payload.id !== session.id) return;
+    term.write(decode(event.payload.bytes));
+  });
 
   session.unlistenExit = await listen<PtyExitPayload>("pty://exit", (event) => {
     if (session.torndown || session.id === null) return;
     if (event.payload.id !== session.id) return;
     const code = event.payload.code;
     term.write(
-      `\r\n\x1b[90m[process exited${
-        code === null ? "" : ` with code ${code}`
-      }]\x1b[0m\r\n`,
+      `\r\n\x1b[90m[process exited${code === null ? "" : ` with code ${code}`}]\x1b[0m\r\n`,
     );
     session.id = null;
     session.onPtyId?.(null);
@@ -291,9 +308,7 @@ async function start(
   session.disposables.push(
     term.onResize(({ cols: c, rows: r }) => {
       if (session.id === null) return;
-      void invoke("pty_resize", { id: session.id, cols: c, rows: r }).catch(
-        () => {},
-      );
+      void invoke("pty_resize", { id: session.id, cols: c, rows: r }).catch(() => {});
     }),
   );
 

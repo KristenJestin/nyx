@@ -104,10 +104,7 @@ function mountHost(): HTMLElement {
 }
 
 /** Poll until `pred()` holds or we time out; returns whether it held. */
-async function waitFor(
-  pred: () => boolean,
-  timeoutMs = 5000,
-): Promise<boolean> {
+async function waitFor(pred: () => boolean, timeoutMs = 5000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (pred()) return true;
@@ -130,10 +127,9 @@ it("mounts MANY terminals but keeps exactly ONE live WebGL context (no exhaustio
     record(5, "/e"),
   ];
 
-  const { rerender } = render(
-    <TerminalDeck terminals={terminals} activeId={"1"} />,
-    { container: host },
-  );
+  const { rerender } = render(<TerminalDeck terminals={terminals} activeId={"1"} />, {
+    container: host,
+  });
 
   // The active pane's WebGL addon attaches in an effect after open(); poll until
   // exactly one context exists.
@@ -146,10 +142,7 @@ it("mounts MANY terminals but keeps exactly ONE live WebGL context (no exhaustio
   ).toBe(true);
 
   // And the single live context is healthy (not lost).
-  expect(
-    anyContextLost(host),
-    "the active pane's WebGL context must not be lost",
-  ).toBe(false);
+  expect(anyContextLost(host), "the active pane's WebGL context must not be lost").toBe(false);
 
   // Switching the active terminal MOVES the context (old disposed, new attached)
   // â€” it must STILL be exactly one, never two, never zero, never lost. Do a few

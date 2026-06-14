@@ -87,9 +87,7 @@ describe("createScrollbackPersister", () => {
   it("bounds the serialized snapshot to the line cap before persisting", () => {
     const persist = vi.fn();
     // serialize returns far more lines than the cap.
-    const big = Array.from({ length: SCROLLBACK_MAX_LINES + 500 }, (_, i) => `r${i}`).join(
-      "\n",
-    );
+    const big = Array.from({ length: SCROLLBACK_MAX_LINES + 500 }, (_, i) => `r${i}`).join("\n");
     const p = createScrollbackPersister({
       recordId: "2",
       serialize: () => big,
