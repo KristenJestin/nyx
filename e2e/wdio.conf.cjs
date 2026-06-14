@@ -50,17 +50,11 @@ const EXE = IS_WIN ? ".exe" : "";
 // Absolute path to the release binary built by `tauri build`. The Cargo package
 // is named "nyx", so the binary is target/release/nyx (nyx.exe on Windows).
 const REPO_ROOT = path.resolve(__dirname, "..");
-const APPLICATION = path.resolve(
-  REPO_ROOT,
-  "src-tauri/target/release/nyx" + EXE,
-);
+const APPLICATION = path.resolve(REPO_ROOT, "src-tauri/target/release/nyx" + EXE);
 
 // tauri-driver is installed by `cargo install tauri-driver` into ~/.cargo/bin
 // (tauri-driver.exe on Windows).
-const TAURI_DRIVER = path.resolve(
-  os.homedir(),
-  ".cargo/bin/tauri-driver" + EXE,
-);
+const TAURI_DRIVER = path.resolve(os.homedir(), ".cargo/bin/tauri-driver" + EXE);
 
 // On Windows tauri-driver drives WebView2 through Microsoft Edge WebDriver
 // (msedgedriver.exe) instead of Linux's WebKitWebDriver. tauri-driver finds it
@@ -68,9 +62,7 @@ const TAURI_DRIVER = path.resolve(
 // path via `--native-driver`. The driver version MUST match the installed
 // WebView2 runtime or the WebDriver session hangs. Empty on Linux.
 const NATIVE_DRIVER_ARGS =
-  IS_WIN && process.env.MSEDGEDRIVER
-    ? ["--native-driver", process.env.MSEDGEDRIVER]
-    : [];
+  IS_WIN && process.env.MSEDGEDRIVER ? ["--native-driver", process.env.MSEDGEDRIVER] : [];
 
 // The specs type POSIX shell commands (`export`, `echo "$FOO"`, `printf`, …).
 // The app's PTY backend (src-tauri/src/pty.rs `resolve_shell`) honors $SHELL
@@ -159,15 +151,33 @@ exports.config = {
     fs.mkdirSync(E2E_DATA_ROOT, { recursive: true });
 
     if (process.env.NYX_E2E_SKIP_BUILD === "1") return;
-    const res = spawnSync(
-      "bun",
-      ["run", "tauri", "build", "--no-bundle"],
-      { cwd: REPO_ROOT, stdio: "inherit" },
-    );
+    // The e2e drives the app through `window.__nyx`, which is GATED behind the
+    // build-time flag `VITE_NYX_E2E=1` (so the seam never ships to real
+    // production). We MUST build with `tauri build` (not a bare `cargo build`):
+    // only the Tauri CLI produces a real PRODUCTION binary that serves the
+    // EMBEDDED frontend — a bare `cargo build` yields a binary that points at the
+    // dev server (`devUrl`), so the WebView shows "connection refused" and the
+    // app never mounts. `tauri build` runs the front `beforeBuildCommand` (vite)
+    // in THIS env, so exporting the flag makes the bundled front include the seam.
+    const res = spawnSync("bun", ["run", "tauri", "build", "--no-bundle"], {
+      cwd: REPO_ROOT,
+      stdio: "inherit",
+      env: Object.assign({}, process.env, { VITE_NYX_E2E: "1" }),
+    });
     if (res.status !== 0) {
-      throw new Error(
-        "release build failed (exit " + res.status + "); cannot run e2e",
-      );
+      throw new Error("release build failed (exit " + res.status + "); cannot run e2e");
+    }
+    // `tauri build` writes the binary under the cargo target dir, which is
+    // `$CARGO_TARGET_DIR/release` when that env var is set (e.g. a shared warm
+    // cache) — NOT necessarily `src-tauri/target/release` where `APPLICATION`
+    // points. Copy it into place when the two differ so tauri-driver launches
+    // the binary we just built.
+    if (process.env.CARGO_TARGET_DIR) {
+      const built = path.join(process.env.CARGO_TARGET_DIR, "release", "nyx" + EXE);
+      if (fs.existsSync(built) && path.resolve(built) !== path.resolve(APPLICATION)) {
+        fs.mkdirSync(path.dirname(APPLICATION), { recursive: true });
+        fs.copyFileSync(built, APPLICATION);
+      }
     }
   },
 

@@ -6,9 +6,25 @@ import tsconfigPaths from "vite-tsconfig-paths";
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
+// The e2e build flag. Vite does NOT expose shell `VITE_*` env vars to
+// `import.meta.env` (only vars from `.env` files), so we read it from the build
+// environment here and inject it via `define`. This is what gates the
+// `window.__nyx` e2e seam (src/components/sidebar/terminal-manager.tsx): the e2e
+// build runs with `VITE_NYX_E2E=1` (see the `build:e2e` npm script), a real
+// production `bun run build` leaves it unset → the seam is compiled out.
+// @ts-expect-error process is a nodejs global
+const nyxE2e = process.env.VITE_NYX_E2E === "1" ? "1" : "";
+
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss(), tsconfigPaths()],
+
+  // Statically replace the gate flag at build time so it tree-shakes cleanly:
+  // in a production build this becomes `"" !== "1"` → always true → the seam's
+  // entire `useEffect` body is dead code Vite/esbuild drops from the bundle.
+  define: {
+    "import.meta.env.VITE_NYX_E2E": JSON.stringify(nyxE2e),
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

@@ -2,11 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import {
-  useWindowControlsVisible,
-  WindowControls,
-  windowControlsVisible,
-} from "./window-controls";
+import { useWindowControlsVisible, WindowControls, windowControlsVisible } from "./window-controls";
 
 /** Record the window IPC calls the controls trigger so we can assert wiring. */
 interface IpcRecorder {
@@ -75,9 +71,7 @@ describe("useWindowControlsVisible (runtime env resolution)", () => {
     // Default before the async call resolves is already "visible".
     expect(screen.getByText("visible")).toBeInTheDocument();
     // And stays visible once the command resolves true.
-    await waitFor(() =>
-      expect(screen.getByText("visible")).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText("visible")).toBeInTheDocument());
   });
 
   it("hides when the command resolves false (NYX_WINDOW_CONTROLS=0)", async () => {
@@ -120,9 +114,7 @@ describe("<WindowControls>", () => {
   it("renders minimize, maximize and close buttons", () => {
     render(<WindowControls />);
     expect(screen.getByRole("button", { name: /minimize/i })).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /maximize|restore/i }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /maximize|restore/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /close/i })).toBeInTheDocument();
   });
 

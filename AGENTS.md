@@ -19,7 +19,7 @@
 - **Décisif.** Donne des recommandations tranchées, pas des inventaires
   interminables. Quand tu peux acter, acte.
 - **Distingue les couches.** Beaucoup de douleur est venue de confondre le
-  *rendu* terminal et la *logique*. Garde ça net.
+  _rendu_ terminal et la _logique_. Garde ça net.
 - L'utilisateur est **très technique** : il dev **depot** (un outil de gestion de
   PRD piloté par agents), bosse sur **PalBank**, utilise **Claude Code** + Warp.
 
@@ -33,6 +33,7 @@ terminal est une **commodité** (xterm.js). La **valeur unique** = la couche
 d'**orchestration** que personne ne fait à sa façon.
 
 Né des douleurs de **Warp** :
+
 - **Multi-tab le bordel** : difficile de retrouver/naviguer ; obligé de
   color-coder, nommer groupes/terminaux pour savoir à quoi ça sert. Pas pratique.
 - **Claude Code perd la session** quand on ferme le terminal / éteint le PC.
@@ -41,7 +42,7 @@ Né des douleurs de **Warp** :
   → très chiant à chaque redémarrage.
 
 > ⚠️ **Leçon clé (ne pas re-looper) :** 4 sessions ont été cramées à polir le
-> *rendu* (xterm canvas → wterm DOM → blocs). **Mauvais bout.** Le rendu est un
+> _rendu_ (xterm canvas → wterm DOM → blocs). **Mauvais bout.** Le rendu est un
 > problème résolu. **On ne touche plus au moteur de rendu.** La valeur est dans
 > l'orchestration.
 
@@ -92,19 +93,19 @@ PalBank. **Aucune** logique PalBank/depot/feature-start câblée dans nyx.
 
 ## 4. L'ARCHITECTURE — le contrat (toutes les décisions actées)
 
-| Sujet | Décision |
-|---|---|
-| Shell applicatif | **Tauri 2** (Rust). Choix ferme de l'utilisateur (≠ Wails v3 alpha qui l'a fait galérer). NB : Tauri reste un **webview** (WebKitGTK via WRY sur Linux) — ça ne corrige PAS les bugs webview, ça corrige le **framework/shell** (mature, écosystème). |
-| Rendu terminal | **xterm.js v6 + addon WebGL (`@xterm/addon-webgl`) + `react-xtermjs`** (wrapper React maintenu par Qovery ; les vieux `xterm-for-react`/`react-xterm` sont morts). **GPU dans le webview, gratis.** **Pas de blocs riches sur le live.** |
-| Front | **React** (ferme — "on reste sur du rendu React quoi qu'il arrive"). |
-| PTY | **`portable-pty`** (crate Rust d'Alacritty/wezterm). Léger. |
-| App | **Single-instance** (1 process, N **fenêtres**) → 1 serveur MCP, **port fixe**. Lancer un 2e nyx → focus le 1er (plugin single-instance Tauri). |
-| Persistance | **SQLite** (projets/workspaces/terminaux/commandes/session-ids/scrollback). **Record + resume** : close/reboot → réouverture → `claude --resume <id>`. **Warning à la fermeture si une session claude tourne** (conscience + contrôle, sans démon). |
-| Capture session Claude | **via le plugin** nyx (event `SessionStart`) + un **`NYX_TERMINAL_ID`** injecté par terminal → corrélation `{terminal_id, session_id}` non-ambiguë même à cwd partagé. **Le record SQLite de nyx = l'autorité** (on ne dépend PAS de SessionEnd). |
-| MCP | **hébergé par nyx** (transport **HTTP**, **port fixe**), **enregistré une fois à l'onboarding** (`claude mcp add --scope user`, dans `~/.claude.json`). Outils = lifecycle des commandes managées, **granularité projet/dossier**. **v1.** |
-| portless | **NON intégré.** nyx lance tes **chaînes de commande** telles quelles (qui peuvent contenir `portless …`). Bénéfice de composition uniquement (worktrees + portless = URLs isolées). |
-| feature-start | **nyx ne wrappe RIEN.** Voir §6 (multi-root) : nyx est générique, expose `nyx workspace add` ; c'est l'outil de l'utilisateur qui appelle nyx (inversion), pas l'inverse. |
-| Blocs (Warp-style) | **ABANDONNÉS.** Source de toute la douleur. Aucune exigence n'en a besoin. |
+| Sujet                  | Décision                                                                                                                                                                                                                                              |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shell applicatif       | **Tauri 2** (Rust). Choix ferme de l'utilisateur (≠ Wails v3 alpha qui l'a fait galérer). NB : Tauri reste un **webview** (WebKitGTK via WRY sur Linux) — ça ne corrige PAS les bugs webview, ça corrige le **framework/shell** (mature, écosystème). |
+| Rendu terminal         | **xterm.js v6 + addon WebGL (`@xterm/addon-webgl`) + `react-xtermjs`** (wrapper React maintenu par Qovery ; les vieux `xterm-for-react`/`react-xterm` sont morts). **GPU dans le webview, gratis.** **Pas de blocs riches sur le live.**              |
+| Front                  | **React** (ferme — "on reste sur du rendu React quoi qu'il arrive").                                                                                                                                                                                  |
+| PTY                    | **`portable-pty`** (crate Rust d'Alacritty/wezterm). Léger.                                                                                                                                                                                           |
+| App                    | **Single-instance** (1 process, N **fenêtres**) → 1 serveur MCP, **port fixe**. Lancer un 2e nyx → focus le 1er (plugin single-instance Tauri).                                                                                                       |
+| Persistance            | **SQLite** (projets/workspaces/terminaux/commandes/session-ids/scrollback). **Record + resume** : close/reboot → réouverture → `claude --resume <id>`. **Warning à la fermeture si une session claude tourne** (conscience + contrôle, sans démon).   |
+| Capture session Claude | **via le plugin** nyx (event `SessionStart`) + un **`NYX_TERMINAL_ID`** injecté par terminal → corrélation `{terminal_id, session_id}` non-ambiguë même à cwd partagé. **Le record SQLite de nyx = l'autorité** (on ne dépend PAS de SessionEnd).     |
+| MCP                    | **hébergé par nyx** (transport **HTTP**, **port fixe**), **enregistré une fois à l'onboarding** (`claude mcp add --scope user`, dans `~/.claude.json`). Outils = lifecycle des commandes managées, **granularité projet/dossier**. **v1.**            |
+| portless               | **NON intégré.** nyx lance tes **chaînes de commande** telles quelles (qui peuvent contenir `portless …`). Bénéfice de composition uniquement (worktrees + portless = URLs isolées).                                                                  |
+| feature-start          | **nyx ne wrappe RIEN.** Voir §6 (multi-root) : nyx est générique, expose `nyx workspace add` ; c'est l'outil de l'utilisateur qui appelle nyx (inversion), pas l'inverse.                                                                             |
+| Blocs (Warp-style)     | **ABANDONNÉS.** Source de toute la douleur. Aucune exigence n'en a besoin.                                                                                                                                                                            |
 
 ---
 
@@ -145,14 +146,15 @@ Projet = un NOM + N workspaces.   (par défaut : 1 workspace "root")
 ## 6. Faits Claude Code VÉRIFIÉS (via la doc, juin 2026) + pièges
 
 **Capture/reprise de session :**
+
 - Hook **`SessionStart`** reçoit `{session_id, cwd, transcript_path, hook_event_name,
-  source}` ; `source` ∈ {`startup`,`resume`,`clear`,`compact`}. → un hook peut
+source}` ; `source` ∈ {`startup`,`resume`,`clear`,`compact`}. → un hook peut
   écrire le `session_id` de façon fiable au démarrage. **SÛR.**
 - Sessions stockées : `~/.claude/projects/<hash-cwd>/<session-id>.jsonl`. **SÛR.**
 - Reprise : **`claude --resume <session-id>`** (ID exact). `--continue` = la plus
   récente (≠ choisir une précise). **Pas de flag pour forcer un `--session-id` à
   la création** → on capture **après coup** (hook) ou via `claude -p --output-format
-  json | jq .session_id` (headless). **SÛR.**
+json | jq .session_id` (headless). **SÛR.**
 - **Alternative SANS hook** (si on veut zéro config Claude) : nyx **file-watch**
   `~/.claude/projects/<hash-cwd>/` ; nouveau `<id>.jsonl` après un `claude` lancé →
   c'est l'ID, corrélé par terminal/timing. Moins précis si 2 sessions démarrent au
@@ -168,14 +170,16 @@ Projet = un NOM + N workspaces.   (par défaut : 1 workspace "root")
   sa propre fermeture).
 
 **Plugins / hooks :**
+
 - Un **plugin** peut embarquer des hooks (`hooks/hooks.json`). ⚠️ **PIÈGE** : bug
-  connu #51420 — les hooks *plugin-scope* peuvent **arrêter de fire en cours de
+  connu #51420 — les hooks _plugin-scope_ peuvent **arrêter de fire en cours de
   session**. MAIS ça concerne les hooks qui fire **en boucle** (Stop, par turn).
   **`SessionStart` fire UNE fois au début → non concerné.** → **hooks via le
   plugin = OK** (à valider par un test). **Décision : tout dans le plugin, on ne
   touche pas `~/.claude/settings.json`.**
 
 **MCP (client Claude Code) :**
+
 - Transports : **stdio / HTTP / SSE** (pas de websocket). Pour "app héberge,
   agent se connecte" → **HTTP**. **SÛR.**
 - Scopes : `local` (`~/.claude.json` par projet) / `project` (`.mcp.json` du repo)
@@ -221,7 +225,7 @@ Projet = un NOM + N workspaces.   (par défaut : 1 workspace "root")
 - **wterm (DOM)** : rendu DOM → flash + perf + double-moteur. Le PRD de migration
   wterm a **prouvé** que le rendu DOM tape le même mur que le canvas. **Abandonné.**
 - **`@wterm/ghostty`** : c'est libghostty-vt (parser) **branché sur le renderer DOM
-  de wterm** → upgrade la *correction* (Unicode/SGR/parité CJK/truecolor) mais
+  de wterm** → upgrade la _correction_ (Unicode/SGR/parité CJK/truecolor) mais
   **rien** sur flash/perf/blocs (même rendu DOM). Mauvaise couche.
 - **Le flash "rendu en haut puis tp en bas"** = problème de **layout/ancrage +
   freeze-respawn** dans le FRONT, **pas** d'émulation. Changer de renderer ne le

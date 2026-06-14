@@ -1,6 +1,6 @@
 // @generated automatically by Diesel CLI — kept in sync by hand here because the
 // project builds without the `diesel` CLI installed. It MUST stay consistent
-// with `migrations/00000000000001_create_terminals/up.sql`; the test
+// with the SQL migrations under `migrations/`; the test
 // `db::tests::schema_matches_migration` round-trips every column to enforce that.
 //
 // Mapping notes:
@@ -12,6 +12,12 @@
 // - timestamps are epoch MILLISECONDS as `INTEGER` (SQLite has no native
 //   datetime) → `BigInt` (i64). `created_at`/`updated_at` are NOT NULL;
 //   `closed_at` is `Nullable<BigInt>` (NULL until the terminal is closed).
+// - v2 (PRD-2) added `projects`, `workspaces`, and the `terminals.workspace_id`
+//   / `terminals.workspace_binding_mode` columns. `is_root` and `collapsed` are
+//   SQLite INTEGER booleans (0/1) mapped as Diesel `Bool` ↔ Rust `bool`.
+//   `collapsed` (on both `projects` and `workspaces`) is the persisted sidebar
+//   open/closed disclosure state (0 = open). Column ORDER here must match the SQL
+//   migration exactly (Diesel's positional `Queryable` decoding relies on it).
 
 diesel::table! {
     terminals (id) {
@@ -26,5 +32,36 @@ diesel::table! {
         updated_at -> BigInt,
         closed_at -> Nullable<BigInt>,
         last_active_at -> Nullable<BigInt>,
+        workspace_id -> Nullable<Text>,
+        workspace_binding_mode -> Text,
     }
 }
+
+diesel::table! {
+    projects (id) {
+        id -> Text,
+        name -> Text,
+        collapsed -> Bool,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    workspaces (id) {
+        id -> Text,
+        project_id -> Text,
+        name -> Text,
+        path -> Text,
+        branch -> Nullable<Text>,
+        is_root -> Bool,
+        collapsed -> Bool,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::joinable!(workspaces -> projects (project_id));
+diesel::joinable!(terminals -> workspaces (workspace_id));
+
+diesel::allow_tables_to_appear_in_same_query!(projects, terminals, workspaces,);

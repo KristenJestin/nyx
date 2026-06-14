@@ -55,25 +55,15 @@ describe("<TerminalDeck>", () => {
   });
 
   it("mounts one terminal container per record, all present in the DOM", async () => {
-    const { container } = render(
-      <TerminalDeck terminals={records} activeId={"1"} />,
-    );
-    await waitFor(() =>
-      expect(container.querySelectorAll("[data-terminal-id]")).toHaveLength(3),
-    );
+    const { container } = render(<TerminalDeck terminals={records} activeId={"1"} />);
+    await waitFor(() => expect(container.querySelectorAll("[data-terminal-id]")).toHaveLength(3));
   });
 
   it("shows only the active terminal; inactive ones are hidden but mounted", async () => {
-    const { container } = render(
-      <TerminalDeck terminals={records} activeId={"2"} />,
-    );
-    await waitFor(() =>
-      expect(container.querySelectorAll("[data-terminal-id]")).toHaveLength(3),
-    );
+    const { container } = render(<TerminalDeck terminals={records} activeId={"2"} />);
+    await waitFor(() => expect(container.querySelectorAll("[data-terminal-id]")).toHaveLength(3));
 
-    const panes = Array.from(
-      container.querySelectorAll<HTMLElement>("[data-terminal-id]"),
-    );
+    const panes = Array.from(container.querySelectorAll<HTMLElement>("[data-terminal-id]"));
     for (const pane of panes) {
       const id = Number(pane.getAttribute("data-terminal-id"));
       const hidden = pane.getAttribute("data-active") !== "true";

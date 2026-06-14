@@ -27,6 +27,28 @@ dist-ssr
 # match the local WebView2 runtime version; never committed.
 e2e/.drivers
 
+# Review-evidence screenshots captured from the real WebKitGTK release build
+# under WSLg (e.g. .shots/modal-mid-exit.png). A LOCAL-only dev aid proving the
+# Motion enter/exit visibly animates — binary, never committed.
+/.shots/
+
+# Review-evidence capture specs. These `*.screenshot.cjs` helpers are
+# INTENTIONAL local dev tooling: they drive the release app to grab the
+# evidence screenshots above. They're deliberately NOT part of the e2e gate
+# (the suite globs `**/*.e2e.cjs`, never `*.screenshot.cjs`) and are kept out of
+# the tree so a `git add -A` can't accidentally commit them. Run them explicitly
+# per the header in each file.
+e2e/specs/*.screenshot.cjs
+
+# Depot scratch / prototype mockup HTML (e.g. .depot-tmp/R1-*.html) — transient
+# tooling output, never committed.
+.depot-tmp/
+
+# Claude Code local working dir (agent worktrees, image cache, settings) and
+# scratch diff dumps — local-only tooling artifacts, never committed.
+.claude/
+.difftmp/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -57,9 +57,11 @@ describe("restore scenario — seed (open 3 @ distinct cwd, reorder, close one)"
     // Reorder the 3 opened terminals to a known NON-creation order: reverse them
     // (T3, T2, T1). We reorder among ALL current ids but place the 3 opened in
     // reverse; the default stays wherever — it is about to be closed anyway.
-    const reversedOpened = opened.map(function (o) {
-      return o.id;
-    }).reverse();
+    const reversedOpened = opened
+      .map(function (o) {
+        return o.id;
+      })
+      .reverse();
     // Full id list with the opened ones reversed at the front, default last.
     const fullOrder = reversedOpened.concat([defaultId]);
     await h.reorder(fullOrder);
@@ -79,14 +81,9 @@ describe("restore scenario — seed (open 3 @ distinct cwd, reorder, close one)"
     assert.strictEqual(
       aliveIds.length,
       3,
-      "exactly 3 terminals must be alive after closing the default (got " +
-        aliveIds.length +
-        ")",
+      "exactly 3 terminals must be alive after closing the default (got " + aliveIds.length + ")",
     );
-    assert(
-      aliveIds.indexOf(defaultId) === -1,
-      "the closed default must no longer be alive",
-    );
+    assert(aliveIds.indexOf(defaultId) === -1, "the closed default must no longer be alive");
 
     // The persisted ALIVE order is the reversed-opened order (default removed).
     const aliveOrder = after

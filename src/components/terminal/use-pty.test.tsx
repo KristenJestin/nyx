@@ -83,9 +83,7 @@ describe("usePty (hook, stable instance)", () => {
       </StrictMode>,
     );
 
-    await waitFor(() =>
-      expect(ipc.callsTo("pty_spawn").length).toBeGreaterThan(0),
-    );
+    await waitFor(() => expect(ipc.callsTo("pty_spawn").length).toBeGreaterThan(0));
     // Let any erroneous second spawn / deferred teardown settle.
     await act(async () => {
       await new Promise((r) => setTimeout(r, 20));

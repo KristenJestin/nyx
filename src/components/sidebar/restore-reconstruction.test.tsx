@@ -93,9 +93,9 @@ describe("restore reconstruction at launch", () => {
       const panes = container.querySelectorAll("[data-terminal-id]");
       expect(panes).toHaveLength(2);
     });
-    const ids = Array.from(
-      container.querySelectorAll("[data-terminal-id]"),
-    ).map((p) => p.getAttribute("data-terminal-id"));
+    const ids = Array.from(container.querySelectorAll("[data-terminal-id]")).map((p) =>
+      p.getAttribute("data-terminal-id"),
+    );
     // Order preserved (1 then 3); the closed id 2 is absent.
     expect(ids).toEqual(["1", "3"]);
   });

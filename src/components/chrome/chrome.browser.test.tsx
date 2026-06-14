@@ -4,7 +4,7 @@ import { page } from "vitest/browser";
 import { afterEach, beforeEach, expect, it } from "vitest";
 
 import { ChromeBar } from "./chrome-bar";
-import { Sidebar } from "@/components/sidebar/sidebar";
+import { AppSidebar } from "@/components/sidebar/app-sidebar";
 import type { TerminalRecord } from "@/components/sidebar/use-terminals";
 
 /**
@@ -52,6 +52,9 @@ function record(id: number, cwd: string): TerminalRecord {
     created_at: 0,
     updated_at: 0,
     closed_at: null,
+    // No workspace → these render in the loose TERMINALS section of <AppSidebar>,
+    // which is the same `Reorder` row motion (`ReorderTerminalItem`) we screenshot.
+    workspace_id: null,
   };
 }
 
@@ -82,14 +85,19 @@ function mountChrome(): HTMLElement {
     <div className="flex h-full w-full flex-col bg-background">
       <ChromeBar title="api" controlsVisible />
       <div className="flex min-h-0 flex-1">
-        <Sidebar
+        {/* The WHOLE app sidebar (renamed from ProjectSidebar). No projects → the
+            terminals render in the loose TERMINALS section as `Reorder` rows, so
+            this still screenshots the chrome + the motion-animated row list. */}
+        <AppSidebar
+          projects={[]}
           terminals={TERMINALS}
           activeId={"1"}
           onSelect={noop}
           onClose={noop}
-          onCreate={noop}
-          onReorder={noop}
-          onRename={noop}
+          onNewTerminal={noop}
+          onNewLooseTerminal={noop}
+          onAddProject={noop}
+          onAddWorkspace={noop}
         />
       </div>
     </div>,
@@ -107,16 +115,23 @@ async function waitFor(pred: () => boolean, timeoutMs = 5000): Promise<boolean> 
   return pred();
 }
 
+// The TERMINAL rows are the `<li>`s that carry a per-row "Close terminal"
+// button (the loose TERMINALS rows). We scope to those so the empty-state
+// "No projects yet" <li> (rendered by <AppSidebar> when projects=[]) is not
+// counted as a terminal row.
+const terminalRows = (host: HTMLElement) =>
+  Array.from(host.querySelectorAll<HTMLLIElement>("li")).filter((li) =>
+    li.querySelector('[aria-label^="Close terminal"]'),
+  );
+
 it("renders Motion-animated sidebar rows (chrome animations actually present)", async () => {
   const host = mountChrome();
 
-  // One <li> per terminal — these are `motion.li` rows inside <AnimatePresence>.
-  const rows = await waitFor(
-    () => host.querySelectorAll("li").length === TERMINALS.length,
-  );
+  // One drag-sortable row per terminal — these are motion `Reorder.Item` <li>s.
+  const rows = await waitFor(() => terminalRows(host).length === TERMINALS.length);
   expect(rows, "one animated row per terminal").toBe(true);
 
-  const items = host.querySelectorAll<HTMLLIElement>("li");
+  const items = terminalRows(host);
   expect(items.length).toBe(TERMINALS.length);
 
   // Motion drives these rows: as it animates the enter (opacity 0→1, height
@@ -137,13 +152,10 @@ it("renders Motion-animated sidebar rows (chrome animations actually present)", 
 it("matches the chrome + sidebar visual baseline (toMatchScreenshot)", async () => {
   mountChrome();
 
-  // Wait for the rows to be present + Motion to settle to its resting state so
-  // the baseline is taken against the final layout (not mid-spring).
-  await waitFor(
-    () =>
-      document.querySelectorAll('[data-testid="chrome-host"] li').length ===
-      TERMINALS.length,
-  );
+  // Wait for the terminal rows to be present + Motion to settle to its resting
+  // state so the baseline is taken against the final layout (not mid-spring).
+  const host = document.querySelector<HTMLElement>('[data-testid="chrome-host"]')!;
+  await waitFor(() => terminalRows(host).length === TERMINALS.length);
   // Fonts must be loaded before the screenshot or the baseline is unstable.
   await document.fonts.ready;
   // Let the enter spring settle.
@@ -153,7 +165,5 @@ it("matches the chrome + sidebar visual baseline (toMatchScreenshot)", async () 
   // dir (see vitest.config.ts resolveScreenshotPath); later runs diff against
   // it. A chrome layout/styling regression makes the diff fail. The baseline is
   // NOT committed (CLAUDE.md §4) — it regenerates locally on first run.
-  await expect(page.getByTestId("chrome-host")).toMatchScreenshot(
-    "chrome-sidebar",
-  );
+  await expect(page.getByTestId("chrome-host")).toMatchScreenshot("chrome-sidebar");
 });

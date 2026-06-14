@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
-use crate::db::{self, Db, Terminal};
+use crate::db::{self, Db, Project, Terminal, Workspace};
 use crate::pty::Pty;
 
 /// Flush cadence for coalesced output: ~60fps.
@@ -75,6 +75,27 @@ struct CachedInfo {
 #[derive(Default)]
 pub struct TerminalInfoCache {
     by_id: Mutex<HashMap<u64, CachedInfo>>,
+}
+
+/// Managed state: the latest OSC 7 cwd seen per PTY id. This is the PORTABLE cwd
+/// source (Windows/macOS, and a fallback elsewhere): the output pump scans the
+/// raw PTY stream for OSC 7 sequences and records the most recent decoded path
+/// here. `terminal_info` then prefers `/proc` (Linux live cwd) and falls back to
+/// this OSC 7 cwd, so the auto-attach resolver gets a cwd on every platform.
+#[derive(Default)]
+pub struct Osc7Cache {
+    by_id: Mutex<HashMap<u64, String>>,
+}
+
+impl Osc7Cache {
+    /// Record the latest OSC 7 cwd for a PTY id (raw, host-stripped path).
+    fn set(&self, id: u64, cwd: String) {
+        self.by_id.lock().unwrap().insert(id, cwd);
+    }
+    /// The latest OSC 7 cwd for a PTY id, if any has been seen.
+    fn get(&self, id: u64) -> Option<String> {
+        self.by_id.lock().unwrap().get(&id).cloned()
+    }
 }
 
 /// Spawn the default shell in a new PTY and start streaming its output.
@@ -159,6 +180,7 @@ fn pty_close(state: State<'_, PtyManager>, id: u64) -> Result<(), String> {
 fn terminal_info(
     pty_state: State<'_, PtyManager>,
     cache: State<'_, TerminalInfoCache>,
+    osc7: State<'_, Osc7Cache>,
     id: u64,
 ) -> Result<TerminalInfo, String> {
     // Fast path: a fresh cached reading short-circuits before any /proc access.
@@ -181,7 +203,14 @@ fn terminal_info(
         (pty.shell_pid(), foreground_pgid(pty))
     };
 
-    let info = read_terminal_info(shell_pid, fg_pgid);
+    let mut info = read_terminal_info(shell_pid, fg_pgid);
+
+    // Portable cwd fallback: when `/proc` did not yield a cwd (non-Linux, or the
+    // read failed), use the latest OSC 7 cwd recorded from the output stream.
+    // `/proc` (when present) is preferred as the live, kernel-truthful source.
+    if info.cwd.is_none() {
+        info.cwd = osc7.get(id);
+    }
 
     cache.by_id.lock().unwrap().insert(
         id,
@@ -248,6 +277,13 @@ fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8
                 let wait = FLUSH_INTERVAL.saturating_sub(since);
                 match rx.recv_timeout(wait) {
                     Ok(chunk) => {
+                        // Portable cwd source: scan the raw stream for OSC 7 and
+                        // record the most recent decoded cwd for this PTY. Cheap
+                        // (a substring scan); the auto-attach resolver reads it
+                        // via `terminal_info`/`auto_attach_terminal`.
+                        if let Some(cwd) = crate::osc7::extract_last_cwd(&chunk) {
+                            app.state::<Osc7Cache>().set(id, cwd);
+                        }
                         pending.extend_from_slice(&chunk);
                         if last_flush.elapsed() >= FLUSH_INTERVAL {
                             flush(&app, &mut pending);
@@ -351,6 +387,245 @@ fn persist_scrollback(db: State<'_, Db>, id: String, serialized: String) -> Resu
         .map_err(|e| e.to_string())
 }
 
+// --- Project / Workspace commands (SQLite via Diesel, PRD-2 v2) ----------
+//
+// Thin wrappers over the unit-tested `crate::db` CRUD. `create_project` creates
+// the project + its single root workspace; paths are normalized in the db layer.
+// A duplicate path within a project surfaces as a stringified UNIQUE error.
+
+/// JSON payload returned by `create_project`: the project and its root workspace.
+#[derive(Clone, Serialize)]
+struct ProjectWithRoot {
+    project: Project,
+    root: Workspace,
+}
+
+/// Create a project and its single, explicitly-named root workspace at
+/// `root_path`. `root_name` defaults to "root" when omitted.
+#[tauri::command]
+fn create_project(
+    db: State<'_, Db>,
+    name: String,
+    root_path: String,
+    root_name: Option<String>,
+) -> Result<ProjectWithRoot, String> {
+    db.with_conn(|c| db::create_project(c, &name, &root_path, root_name.as_deref()))
+        .map(|(project, root)| ProjectWithRoot { project, root })
+        .map_err(|e| e.to_string())
+}
+
+/// List all projects.
+#[tauri::command]
+fn list_projects(db: State<'_, Db>) -> Result<Vec<Project>, String> {
+    db.with_conn(db::list_projects).map_err(|e| e.to_string())
+}
+
+/// Rename a project's display `name`. Returns ().
+#[tauri::command]
+fn update_project(db: State<'_, Db>, id: String, name: String) -> Result<(), String> {
+    db.with_conn(|c| db::update_project(c, &id, &name))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a project and its workspaces (ON DELETE CASCADE). Terminals bound to
+/// those workspaces are DETACHED (workspace_id → NULL via ON DELETE SET NULL),
+/// not killed — they survive as loose terminals. Returns ().
+#[tauri::command]
+fn delete_project(db: State<'_, Db>, id: String) -> Result<(), String> {
+    db.with_conn(|c| db::delete_project(c, &id))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Persist a project's sidebar `collapsed` (open/closed) state so the band's
+/// disclosure survives a restart. Returns ().
+#[tauri::command]
+fn set_project_collapsed(db: State<'_, Db>, id: String, collapsed: bool) -> Result<(), String> {
+    db.with_conn(|c| db::set_project_collapsed(c, &id, collapsed))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Create a (non-root) workspace in `project_id` at `path`. Rejects a path
+/// already present in the SAME project (UNIQUE(project_id, path)).
+#[tauri::command]
+fn create_workspace(
+    db: State<'_, Db>,
+    project_id: String,
+    name: String,
+    path: String,
+) -> Result<Workspace, String> {
+    db.with_conn(|c| db::create_workspace(c, &project_id, &name, &path))
+        .map_err(|e| e.to_string())
+}
+
+/// List the workspaces of `project_id` (root first).
+#[tauri::command]
+fn list_workspaces(db: State<'_, Db>, project_id: String) -> Result<Vec<Workspace>, String> {
+    db.with_conn(|c| db::list_workspaces(c, &project_id))
+        .map_err(|e| e.to_string())
+}
+
+/// Rename a workspace's display `name` (the path is immutable). Returns ().
+#[tauri::command]
+fn rename_workspace(db: State<'_, Db>, id: String, name: String) -> Result<(), String> {
+    db.with_conn(|c| db::rename_workspace(c, &id, &name))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Persist a workspace's sidebar `collapsed` (open/closed) state so the band's
+/// disclosure survives a restart. Returns ().
+#[tauri::command]
+fn set_workspace_collapsed(db: State<'_, Db>, id: String, collapsed: bool) -> Result<(), String> {
+    db.with_conn(|c| db::set_workspace_collapsed(c, &id, collapsed))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Attach a terminal record to a workspace with an explicit binding `mode`
+/// (`auto`|`manual`).
+#[tauri::command]
+fn attach_terminal(
+    db: State<'_, Db>,
+    terminal_id: String,
+    workspace_id: String,
+    mode: String,
+) -> Result<(), String> {
+    db.with_conn(|c| db::attach_terminal(c, &terminal_id, &workspace_id, &mode))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Detach a terminal record from any workspace (mode resets to `auto`).
+#[tauri::command]
+fn detach_terminal(db: State<'_, Db>, terminal_id: String) -> Result<(), String> {
+    db.with_conn(|c| db::detach_terminal(c, &terminal_id))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Pin a terminal record to a workspace (mode `manual`; a later `cd` no longer
+/// moves it).
+#[tauri::command]
+fn pin_terminal_workspace(
+    db: State<'_, Db>,
+    terminal_id: String,
+    workspace_id: String,
+) -> Result<(), String> {
+    db.with_conn(|c| db::pin_terminal_workspace(c, &terminal_id, &workspace_id))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Unpin a terminal record (mode `auto`; auto-attach resumes).
+#[tauri::command]
+fn unpin_terminal_workspace(db: State<'_, Db>, terminal_id: String) -> Result<(), String> {
+    db.with_conn(|c| db::unpin_terminal_workspace(c, &terminal_id))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+// --- Auto-attach (cwd → known workspace) ---------------------------------
+
+/// Outcome of an auto-attach pass, returned to the front so it can reflect the
+/// (possibly unchanged) binding. `workspace_id` is the terminal's binding AFTER
+/// the pass (`None` = unattached); `changed` says whether this call moved it.
+#[derive(Clone, Serialize)]
+pub struct AutoAttachResult {
+    pub workspace_id: Option<String>,
+    pub changed: bool,
+}
+
+/// Build the platform-appropriate [`crate::resolve::CwdProvider`] for a raw cwd
+/// string. On Linux the live cwd is the `/proc` reading; everywhere else it is
+/// the OSC 7 reading. Either way the provider normalizes it into the one form
+/// the resolver compares against stored workspace paths. A `None` cwd is the
+/// explicit "no reliable source" signal (`CwdProvider::None`).
+fn cwd_provider(cwd: Option<String>) -> crate::resolve::CwdProvider {
+    use crate::resolve::CwdProvider;
+    match cwd {
+        None => CwdProvider::None,
+        #[cfg(target_os = "linux")]
+        Some(c) => CwdProvider::Proc(Some(c)),
+        #[cfg(not(target_os = "linux"))]
+        Some(c) => CwdProvider::Osc7(Some(c)),
+    }
+}
+
+/// Auto-attach a terminal RECORD to the longest-ancestor KNOWN workspace for the
+/// given live `cwd`. The cwd comes from the platform-agnostic provider chain
+/// (`/proc` on Linux, OSC 7 elsewhere) — the front reads it from `terminal_info`
+/// and passes it here; `None`/empty means "no reliable cwd" and is a no-op.
+///
+/// The hybrid rule is applied in [`crate::resolve::decide_attachment`]:
+/// - a `manual`-pinned terminal is never moved;
+/// - `auto` mode follows the resolved cwd;
+/// - NO project/workspace is created, and an unmatched cwd leaves the binding
+///   untouched (no guessing).
+#[tauri::command]
+fn auto_attach_terminal(
+    db: State<'_, Db>,
+    terminal_id: String,
+    cwd: Option<String>,
+) -> Result<AutoAttachResult, String> {
+    use crate::resolve::{
+        decide_attachment, Attachment, BindingMode, CurrentBinding, WorkspaceMatch,
+    };
+
+    // Wrap the incoming cwd in the platform-appropriate provider, then take its
+    // NORMALIZED cwd — the single code path the resolver consumes regardless of
+    // source (/proc on Linux, OSC 7 elsewhere). A `None`/empty cwd surfaces as
+    // "no reliable source" and the resolver makes no change.
+    let provider = cwd_provider(cwd);
+    let normalized = provider.normalized_cwd();
+
+    db.with_conn(|c| {
+        // Current binding of the terminal record. Unknown id ⇒ no-op (unattached).
+        let term = db::get_terminal(c, &terminal_id)?;
+        let Some(term) = term else {
+            return Ok(AutoAttachResult {
+                workspace_id: None,
+                changed: false,
+            });
+        };
+        let mode = if term.workspace_binding_mode == db::BINDING_MANUAL {
+            BindingMode::Manual
+        } else {
+            BindingMode::Auto
+        };
+        let current = CurrentBinding {
+            workspace_id: term.workspace_id.clone(),
+            mode,
+        };
+
+        // The candidate set is ONLY the already-known workspaces.
+        let known: Vec<WorkspaceMatch> = db::all_workspaces(c)?
+            .into_iter()
+            .map(|w| WorkspaceMatch {
+                id: w.id,
+                path: w.path,
+            })
+            .collect();
+
+        match decide_attachment(&current, normalized.as_deref(), &known) {
+            Attachment::AttachAuto(ws) => {
+                db::attach_terminal(c, &terminal_id, &ws, db::BINDING_AUTO)?;
+                Ok(AutoAttachResult {
+                    workspace_id: Some(ws),
+                    changed: true,
+                })
+            }
+            Attachment::Unchanged => Ok(AutoAttachResult {
+                workspace_id: term.workspace_id,
+                changed: false,
+            }),
+        }
+    })
+    .map_err(|e: diesel::result::Error| e.to_string())
+}
+
 /// Decide whether the custom window controls (min / max / close) are shown, from
 /// the raw `NYX_WINDOW_CONTROLS` env value. Pure so it is unit-testable without
 /// touching the real process env.
@@ -378,6 +653,7 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .manage(PtyManager::default())
         .manage(TerminalInfoCache::default())
+        .manage(Osc7Cache::default())
         .invoke_handler(tauri::generate_handler![
             pty_spawn,
             pty_write,
@@ -391,7 +667,21 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             rename,
             set_active,
             persist_scrollback,
-            window_controls_visible
+            window_controls_visible,
+            create_project,
+            list_projects,
+            update_project,
+            delete_project,
+            set_project_collapsed,
+            create_workspace,
+            list_workspaces,
+            rename_workspace,
+            set_workspace_collapsed,
+            attach_terminal,
+            detach_terminal,
+            pin_terminal_workspace,
+            unpin_terminal_workspace,
+            auto_attach_terminal
         ])
 }
 
@@ -456,6 +746,7 @@ mod tests {
         terminal_info(
             app.state::<PtyManager>(),
             app.state::<TerminalInfoCache>(),
+            app.state::<Osc7Cache>(),
             id,
         )
     }
@@ -1429,6 +1720,393 @@ mod tests {
         for id in spawned {
             let _ = close(&app, id);
         }
+    }
+
+    // --- Project / Workspace / attach / pin / auto-attach through the COMMANDS --
+    //
+    // ZE1: integration tests on the tauri::test MOCK RUNTIME that drive the REAL
+    // `#[tauri::command]` bodies (`create_project`/`create_workspace`/`attach_terminal`/
+    // `detach_terminal`/`pin_terminal_workspace`/`unpin_terminal_workspace`/
+    // `auto_attach_terminal`) against an in-memory `Db` managed on the mock app.
+    // These exercise command ROUTING + PERSISTENCE — that the IPC-facing wrappers
+    // map their args correctly and persist `workspace_id` + `workspace_binding_mode`
+    // — distinct from the pure DB/resolver unit tests in `db.rs`/`resolve.rs`.
+    //
+    // The "injected cwd provider" is `auto_attach_terminal`'s `cwd: Option<String>`
+    // argument: the bridge wraps it in the platform `CwdProvider` and normalizes it,
+    // so passing an explicit cwd here injects the live-cwd reading deterministically
+    // without a real `/proc`/OSC7 source. `None` is the "no reliable cwd" signal.
+    //
+    // Paths are Unix-form: these tests run on Linux (the phase-3 target), where
+    // `pathnorm::normalize` uses the Unix rules.
+
+    /// Thin invokers over the command bodies with the mock app's `Db` state, so the
+    /// tests read as a sequence of command calls (the IPC surface the front drives).
+    fn cmd_create_project(
+        app: &App<MockRuntime>,
+        name: &str,
+        root_path: &str,
+        root_name: Option<&str>,
+    ) -> Result<ProjectWithRoot, String> {
+        create_project(
+            app.state::<Db>(),
+            name.into(),
+            root_path.into(),
+            root_name.map(Into::into),
+        )
+    }
+    fn cmd_create_workspace(
+        app: &App<MockRuntime>,
+        project_id: &str,
+        name: &str,
+        path: &str,
+    ) -> Result<Workspace, String> {
+        create_workspace(
+            app.state::<Db>(),
+            project_id.into(),
+            name.into(),
+            path.into(),
+        )
+    }
+    fn cmd_attach(
+        app: &App<MockRuntime>,
+        terminal_id: &str,
+        workspace_id: &str,
+        mode: &str,
+    ) -> Result<(), String> {
+        attach_terminal(
+            app.state::<Db>(),
+            terminal_id.into(),
+            workspace_id.into(),
+            mode.into(),
+        )
+    }
+    fn cmd_detach(app: &App<MockRuntime>, terminal_id: &str) -> Result<(), String> {
+        detach_terminal(app.state::<Db>(), terminal_id.into())
+    }
+    fn cmd_pin(
+        app: &App<MockRuntime>,
+        terminal_id: &str,
+        workspace_id: &str,
+    ) -> Result<(), String> {
+        pin_terminal_workspace(app.state::<Db>(), terminal_id.into(), workspace_id.into())
+    }
+    fn cmd_unpin(app: &App<MockRuntime>, terminal_id: &str) -> Result<(), String> {
+        unpin_terminal_workspace(app.state::<Db>(), terminal_id.into())
+    }
+    fn cmd_auto_attach(
+        app: &App<MockRuntime>,
+        terminal_id: &str,
+        cwd: Option<&str>,
+    ) -> Result<AutoAttachResult, String> {
+        auto_attach_terminal(app.state::<Db>(), terminal_id.into(), cwd.map(Into::into))
+    }
+    /// Read a terminal record's (workspace_id, binding_mode) straight from the Db —
+    /// the persistence the commands must have written.
+    fn binding_of(app: &App<MockRuntime>, terminal_id: &str) -> (Option<String>, String) {
+        app.state::<Db>()
+            .with_conn(|c| db::get_terminal(c, terminal_id))
+            .unwrap()
+            .map(|t| (t.workspace_id, t.workspace_binding_mode))
+            .expect("terminal record exists")
+    }
+
+    /// FULL command cycle (ZE1 done-criterion #1): create project + workspace,
+    /// attach → detach → pin → unpin, then auto-attach — all through the command
+    /// bodies — asserting each step ROUTES and PERSISTS `workspace_id` +
+    /// `workspace_binding_mode`. One test so a regression in ANY command's wiring
+    /// breaks here.
+    #[test]
+    fn project_workspace_attach_pin_unpin_auto_attach_cycle_via_commands() {
+        let app = build_app_with_db();
+
+        // create_project → project + its single root workspace persisted.
+        let created = cmd_create_project(&app, "demo", "/home/kris/demo", None)
+            .expect("create_project command");
+        assert_eq!(created.project.name, "demo");
+        assert!(
+            created.root.is_root,
+            "create_project persists a root workspace"
+        );
+        let root_id = created.root.id.clone();
+        let project_id = created.project.id.clone();
+
+        // list_projects routes back the new project.
+        let projects = list_projects(app.state::<Db>()).expect("list_projects");
+        assert!(projects.iter().any(|p| p.id == project_id));
+
+        // create_workspace → a non-root workspace persisted under the project.
+        let feat = cmd_create_workspace(&app, &project_id, "feat", "/home/kris/demo/feat")
+            .expect("create_workspace command");
+        assert!(!feat.is_root);
+        let workspaces =
+            list_workspaces(app.state::<Db>(), project_id.clone()).expect("list_workspaces");
+        assert_eq!(workspaces.len(), 2, "root + feat persisted, root first");
+        assert!(workspaces[0].is_root);
+
+        // A terminal record to bind.
+        let t = create_terminal(app.state::<Db>(), "/home/kris/demo".into(), None)
+            .expect("create_terminal");
+
+        // attach (explicit auto) → persists workspace_id + mode auto.
+        cmd_attach(&app, &t.id, &root_id, db::BINDING_AUTO).expect("attach command");
+        let (ws, mode) = binding_of(&app, &t.id);
+        assert_eq!(
+            ws.as_deref(),
+            Some(root_id.as_str()),
+            "attach persisted workspace_id"
+        );
+        assert_eq!(mode, db::BINDING_AUTO, "attach persisted mode auto");
+
+        // detach → clears workspace_id, resets mode to auto.
+        cmd_detach(&app, &t.id).expect("detach command");
+        let (ws, mode) = binding_of(&app, &t.id);
+        assert_eq!(ws, None, "detach cleared workspace_id");
+        assert_eq!(mode, db::BINDING_AUTO);
+
+        // pin → sets workspace_id + mode MANUAL.
+        cmd_pin(&app, &t.id, &feat.id).expect("pin command");
+        let (ws, mode) = binding_of(&app, &t.id);
+        assert_eq!(
+            ws.as_deref(),
+            Some(feat.id.as_str()),
+            "pin persisted workspace_id"
+        );
+        assert_eq!(mode, db::BINDING_MANUAL, "pin persisted mode manual");
+
+        // unpin → mode back to AUTO, workspace KEPT.
+        cmd_unpin(&app, &t.id).expect("unpin command");
+        let (ws, mode) = binding_of(&app, &t.id);
+        assert_eq!(
+            ws.as_deref(),
+            Some(feat.id.as_str()),
+            "unpin keeps workspace_id"
+        );
+        assert_eq!(mode, db::BINDING_AUTO, "unpin restores mode auto");
+
+        // auto_attach with a cwd inside `feat` while currently on `feat` ⇒ no change.
+        let r = cmd_auto_attach(&app, &t.id, Some("/home/kris/demo/feat/src"))
+            .expect("auto_attach command");
+        assert!(!r.changed, "already on the resolved workspace ⇒ unchanged");
+        assert_eq!(r.workspace_id.as_deref(), Some(feat.id.as_str()));
+
+        // auto_attach with a cwd under the ROOT (outside feat) ⇒ moves to root.
+        let r = cmd_auto_attach(&app, &t.id, Some("/home/kris/demo/docs"))
+            .expect("auto_attach command");
+        assert!(r.changed, "cd under root resolves to root ⇒ moved");
+        assert_eq!(r.workspace_id.as_deref(), Some(root_id.as_str()));
+        let (ws, mode) = binding_of(&app, &t.id);
+        assert_eq!(
+            ws.as_deref(),
+            Some(root_id.as_str()),
+            "auto-attach persisted the move"
+        );
+        assert_eq!(mode, db::BINDING_AUTO, "an auto-attach move is mode auto");
+    }
+
+    /// GUARD (ZE1 done-criterion #2): a `manual`-mode terminal is NEVER moved by
+    /// auto-attach. We pin the terminal to `root`, then auto-attach with a cwd that
+    /// resolves to `feat` — the command must leave the binding on `root`/manual.
+    /// A regression that let auto-attach move a pinned terminal fails here.
+    #[test]
+    fn auto_attach_does_not_move_a_manual_pinned_terminal() {
+        let app = build_app_with_db();
+        let created = cmd_create_project(&app, "p", "/home/kris/p", None).expect("create_project");
+        let root_id = created.root.id.clone();
+        let project_id = created.project.id.clone();
+        let feat = cmd_create_workspace(&app, &project_id, "feat", "/home/kris/p/feat")
+            .expect("create_workspace");
+
+        let t = create_terminal(app.state::<Db>(), "/home/kris/p".into(), None).unwrap();
+        // PIN to root (mode manual).
+        cmd_pin(&app, &t.id, &root_id).expect("pin");
+
+        // A cwd deep inside feat would resolve to `feat` in auto mode — but the
+        // terminal is pinned, so auto-attach must NOT move it.
+        let r = cmd_auto_attach(&app, &t.id, Some("/home/kris/p/feat/src")).expect("auto_attach");
+        assert!(!r.changed, "a manual pin must not be moved by auto-attach");
+        assert_eq!(
+            r.workspace_id.as_deref(),
+            Some(root_id.as_str()),
+            "the pinned binding is reported unchanged"
+        );
+        let (ws, mode) = binding_of(&app, &t.id);
+        assert_eq!(
+            ws.as_deref(),
+            Some(root_id.as_str()),
+            "the persisted binding stays on root (NOT moved to feat)"
+        );
+        assert_eq!(mode, db::BINDING_MANUAL, "and stays manual");
+        assert_ne!(
+            ws.as_deref(),
+            Some(feat.id.as_str()),
+            "auto-attach must never relocate a pinned terminal to the resolved workspace"
+        );
+    }
+
+    /// GUARD (ZE1 done-criterion #3): the absence of a reliable cwd (`None`) must
+    /// NOT produce a created/invented attachment. With an UNATTACHED auto-mode
+    /// terminal and `cwd: None`, the command degrades explicitly: no change, no
+    /// workspace invented, the binding stays `None`. Also covers a cwd that matches
+    /// NO known workspace (also "no invention").
+    #[test]
+    fn auto_attach_with_no_reliable_cwd_invents_nothing() {
+        let app = build_app_with_db();
+        // A known workspace exists, so a match WOULD be possible IF we guessed.
+        let created = cmd_create_project(&app, "p", "/home/kris/p", None).expect("create_project");
+        let root_id = created.root.id.clone();
+
+        let t = create_terminal(app.state::<Db>(), "/home/kris/p".into(), None).unwrap();
+        assert_eq!(
+            binding_of(&app, &t.id),
+            (None, db::BINDING_AUTO.to_string())
+        );
+
+        // No reliable cwd ⇒ explicit degradation: unchanged, still unattached.
+        let r = cmd_auto_attach(&app, &t.id, None).expect("auto_attach None");
+        assert!(!r.changed, "no reliable cwd ⇒ no change");
+        assert_eq!(r.workspace_id, None, "no cwd ⇒ no invented attachment");
+        assert_eq!(
+            binding_of(&app, &t.id),
+            (None, db::BINDING_AUTO.to_string()),
+            "the record stays unattached/auto (nothing created)"
+        );
+
+        // An empty-string cwd is also "no reliable cwd" (normalizes to empty).
+        let r = cmd_auto_attach(&app, &t.id, Some("")).expect("auto_attach empty");
+        assert!(!r.changed && r.workspace_id.is_none());
+
+        // A cwd that matches NO known workspace ⇒ likewise nothing is created.
+        let r = cmd_auto_attach(&app, &t.id, Some("/somewhere/else/entirely"))
+            .expect("auto_attach unmatched");
+        assert!(!r.changed, "an unmatched cwd creates nothing");
+        assert_eq!(r.workspace_id, None);
+
+        // And no stray workspace was minted under the project (still just root).
+        let workspaces = list_workspaces(app.state::<Db>(), created.project.id.clone())
+            .expect("list_workspaces");
+        assert_eq!(
+            workspaces.len(),
+            1,
+            "no workspace was invented by auto-attach"
+        );
+        assert_eq!(workspaces[0].id, root_id);
+    }
+
+    /// `create_workspace` surfaces a duplicate-path rejection as a stringified Err
+    /// through the command boundary (the front renders it inline). The SAME path in
+    /// a DIFFERENT project is accepted — the routing preserves the per-project
+    /// UNIQUE(project_id, path) semantics.
+    #[test]
+    fn create_workspace_command_rejects_dup_path_allows_across_projects() {
+        let app = build_app_with_db();
+        let p1 = cmd_create_project(&app, "p1", "/work", None).expect("p1");
+        let p2 = cmd_create_project(&app, "p2", "/other", None).expect("p2");
+
+        cmd_create_workspace(&app, &p1.project.id, "feat", "/work/feat").expect("first add");
+        // Same normalized path again in p1 ⇒ Err surfaced through the command.
+        let dup = cmd_create_workspace(&app, &p1.project.id, "dup", "/work//feat/");
+        assert!(
+            dup.is_err(),
+            "duplicate path in same project is rejected via the command"
+        );
+        // Same path in p2 ⇒ accepted.
+        cmd_create_workspace(&app, &p2.project.id, "feat", "/work/feat")
+            .expect("same path in a different project is accepted");
+    }
+
+    /// `update_project` + `delete_project` through the COMMAND bodies: rename
+    /// routes + persists; delete removes the project + its workspaces and DETACHES
+    /// (not deletes) its terminals. Mirrors the db unit tests at the IPC surface.
+    #[test]
+    fn update_and_delete_project_commands_route_and_persist() {
+        let app = build_app_with_db();
+
+        let created = cmd_create_project(&app, "old", "/home/kris/proj", None)
+            .expect("create_project command");
+        let project_id = created.project.id.clone();
+        let root_id = created.root.id.clone();
+
+        // update_project renames; list_projects reflects it.
+        update_project(app.state::<Db>(), project_id.clone(), "renamed".into())
+            .expect("update_project command");
+        let projects = list_projects(app.state::<Db>()).expect("list_projects");
+        let got = projects.iter().find(|p| p.id == project_id).unwrap();
+        assert_eq!(
+            got.name, "renamed",
+            "rename routes + persists via the command"
+        );
+
+        // Bind a terminal to the root, then delete the project: the terminal must
+        // survive, DETACHED (workspace_id NULL), and the workspaces are gone.
+        let t = create_terminal(app.state::<Db>(), "/home/kris/proj".into(), None).unwrap();
+        cmd_attach(&app, &t.id, &root_id, db::BINDING_MANUAL).expect("attach");
+
+        delete_project(app.state::<Db>(), project_id.clone()).expect("delete_project command");
+        let projects = list_projects(app.state::<Db>()).expect("list after delete");
+        assert!(
+            projects.iter().all(|p| p.id != project_id),
+            "delete_project removes the project via the command"
+        );
+        assert!(
+            list_workspaces(app.state::<Db>(), project_id.clone())
+                .unwrap()
+                .is_empty(),
+            "the project's workspaces cascaded away"
+        );
+        let (ws, _mode) = binding_of(&app, &t.id);
+        assert_eq!(
+            ws, None,
+            "the terminal survived the project delete, detached (workspace_id NULL)"
+        );
+    }
+
+    /// `set_project_collapsed` + `set_workspace_collapsed` route through the
+    /// COMMAND bodies and PERSIST the sidebar disclosure state: `list_projects` /
+    /// `list_workspaces` read back the flag a reload restores the bands from.
+    #[test]
+    fn set_collapsed_commands_route_and_persist() {
+        let app = build_app_with_db();
+
+        let created = cmd_create_project(&app, "p", "/home/kris/p", None).expect("create_project");
+        let project_id = created.project.id.clone();
+        let root_id = created.root.id.clone();
+        let feat = cmd_create_workspace(&app, &project_id, "feat", "/home/kris/p/feat")
+            .expect("create_workspace");
+
+        // Fresh project + workspaces are OPEN (collapsed = false) by default.
+        assert!(!created.project.collapsed && !created.root.collapsed && !feat.collapsed);
+
+        // Collapse the project via the command; list_projects reflects it.
+        set_project_collapsed(app.state::<Db>(), project_id.clone(), true)
+            .expect("set_project_collapsed command");
+        let projects = list_projects(app.state::<Db>()).expect("list_projects");
+        assert!(
+            projects.iter().find(|pr| pr.id == project_id).unwrap().collapsed,
+            "collapse routes + persists via the project command"
+        );
+
+        // Collapse the feat workspace via the command; the root stays open.
+        set_workspace_collapsed(app.state::<Db>(), feat.id.clone(), true)
+            .expect("set_workspace_collapsed command");
+        let workspaces = list_workspaces(app.state::<Db>(), project_id.clone()).expect("list_ws");
+        assert!(
+            workspaces.iter().find(|w| w.id == feat.id).unwrap().collapsed,
+            "collapse routes + persists via the workspace command"
+        );
+        assert!(
+            !workspaces.iter().find(|w| w.id == root_id).unwrap().collapsed,
+            "a sibling workspace is left open"
+        );
+
+        // Re-open the project (the toggle round-trips both ways).
+        set_project_collapsed(app.state::<Db>(), project_id.clone(), false)
+            .expect("re-open project");
+        let projects = list_projects(app.state::<Db>()).expect("list_projects again");
+        assert!(
+            !projects.iter().find(|pr| pr.id == project_id).unwrap().collapsed,
+            "the project re-opens via the command"
+        );
     }
 
     // --- window_controls_visible toggle parsing (interim NYX_WINDOW_CONTROLS) -

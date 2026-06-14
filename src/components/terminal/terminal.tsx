@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import type { ITerminalOptions, Terminal as XTerm } from "@xterm/xterm";
 import chroma from "chroma-js";
@@ -28,8 +28,7 @@ const DEFAULT_OPTIONS: ITerminalOptions = {
   // the glyph actually rendered → "t e s t" spacing. We bundle the face and gate
   // the first fit on its load (see ensureTerminalFontLoaded + the fit effect
   // below) so the measurement always matches the rendered glyph.
-  fontFamily:
-    '"Fira Code Variable", "Fira Code", ui-monospace, "Liberation Mono", monospace',
+  fontFamily: '"Fira Code Variable", "Fira Code", ui-monospace, "Liberation Mono", monospace',
   fontSize: 14,
   // Pin letterSpacing to 0 so react-xtermjs / xterm defaults never inject extra
   // inter-glyph spacing on top of a correctly-measured monospace cell.
@@ -73,8 +72,7 @@ const FALLBACK_THEME = { background: "#0a0a0a", foreground: "#e6e6e6" } as const
  */
 function resolveCssColor(varName: string): string | null {
   if (typeof document === "undefined") return null;
-  const getStyle =
-    typeof getComputedStyle === "function" ? getComputedStyle : null;
+  const getStyle = typeof getComputedStyle === "function" ? getComputedStyle : null;
   if (!getStyle) return null;
 
   const raw = getStyle(document.documentElement).getPropertyValue(varName).trim();
@@ -113,10 +111,7 @@ function resolveThemeFromCss(): { background: string; foreground: string } {
  * Resolves (never rejects) even where `document.fonts` is absent (older jsdom)
  * so callers can always `await` it without guarding.
  */
-async function ensureTerminalFontLoaded(
-  fontFamily: string,
-  fontSize: number,
-): Promise<void> {
+async function ensureTerminalFontLoaded(fontFamily: string, fontSize: number): Promise<void> {
   const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
   if (!fonts) return; // no FontFaceSet (e.g. jsdom): nothing to gate on.
   try {
@@ -221,38 +216,79 @@ export function Terminal({
   // (which was baked at attach against the fallback metrics).
   const clearWebglAtlas = useWebglAddon(instance ?? null, active);
 
+  // Build the read-only DEAD HISTORY payload (prior scrollback + a dim separator)
+  // ONCE from the design-token muted-foreground colour. It is handed to `usePty`,
+  // which writes it as the VERY FIRST bytes of the session — before the PTY's
+  // output listener and before spawn — so the restored history is guaranteed to
+  // sit ABOVE the live prompt and the input stays typable at the bottom (finding
+  // 01KV3CPAG2KTV413C4RVNH6TVN). Memoized on `deadHistory` so a re-render does not
+  // rebuild it (and so the value handed to `usePty` is stable). `""` when there is
+  // no meaningful prior scrollback → nothing is written.
+  const deadHistoryPayload = useMemo(() => {
+    if (!deadHistory) return "";
+    const sepColor = resolveCssColor("--muted-foreground") ?? FALLBACK_THEME.foreground;
+    return buildDeadHistory(deadHistory, sepColor);
+  }, [deadHistory]);
+
   // Wire the live PTY backend (spawn / IO / resize / teardown). StrictMode-safe.
   // `resyncSize` pushes the terminal's current cols/rows to the PTY out-of-band
   // from xterm's onResize event — used below to make the authoritative
-  // post-font fit reach the PTY even if it raced the spawn.
-  const resyncSize = usePty(instance, fitAddon, { cwd, onPtyId });
+  // post-font fit reach the PTY even if it raced the spawn. `deadHistory` is
+  // written by the hook before spawn (see above) so its ordering vs. live output
+  // is deterministic.
+  const resyncSize = usePty(instance, fitAddon, {
+    cwd,
+    onPtyId,
+    deadHistory: deadHistoryPayload,
+  });
+
+  // FOCUS-ON-ACTIVATE (fixes the critical "cannot type in some terminals" bug):
+  // selecting a terminal in the sidebar only flips `active` — it does NOT move
+  // keyboard focus to the newly-shown pane. Clicking the sidebar row leaves
+  // focus on that <button> (or wherever it was), so the visible xterm's hidden
+  // input never receives keystrokes and typing appears to do nothing in any
+  // terminal the user switches to via the sidebar. xterm only captures input
+  // while its textarea is focused, so we must focus the instance whenever it
+  // becomes the active pane (also covers becoming active after a reorder, since
+  // that re-runs with the same active instance and re-focuses it).
+  //
+  // We focus on the next frame: a freshly-activated pane was `display:none` (see
+  // TerminalDeck) and an element cannot take focus while not displayed; the
+  // style flip and this effect commit in the same React pass, so we defer one
+  // rAF to focus after the pane is actually visible/laid-out.
+  useEffect(() => {
+    if (!instance || !active) return;
+    let raf = 0;
+    const frame =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (cb: FrameRequestCallback) => setTimeout(() => cb(0), 0);
+    const cancel =
+      typeof cancelAnimationFrame === "function"
+        ? cancelAnimationFrame
+        : (id: number) => clearTimeout(id);
+    raf = frame(() => {
+      try {
+        instance.focus();
+      } catch {
+        // focus is best-effort: a detached/closing instance must never throw.
+      }
+    }) as unknown as number;
+    return () => cancel(raf);
+  }, [instance, active]);
 
   // Serialize + DEBOUNCE this terminal's scrollback to the backend so it can be
   // restored after a close/restart (no-op when record-less). Persistence is
   // debounced (never per byte) and also flushes on tab/app close.
   useScrollbackPersist(instance ?? null, recordId ?? null);
 
-  // RESTORE: write the prior scrollback as read-only DEAD HISTORY (+ a visual
-  // separator) into the buffer ONCE, as soon as the instance exists. This is a
-  // pure xterm write — it NEVER reaches the PTY (usePty only writes keystrokes
-  // via onData), so the old commands are not re-run. The live shell output then
-  // appends BELOW the separator. Guarded by a ref so a re-render / StrictMode
-  // double-invoke can't double-inject the history.
-  const historyInjected = useRef(false);
-  useEffect(() => {
-    if (!instance) return;
-    if (historyInjected.current) return;
-    if (!deadHistory) return;
-    // Separator colour derives from the design-system `--muted-foreground`
-    // token (resolved to #rrggbb), never a hardcoded colour.
-    const sepColor =
-      resolveCssColor("--muted-foreground") ?? FALLBACK_THEME.foreground;
-    const payload = buildDeadHistory(deadHistory, sepColor);
-    if (payload) {
-      instance.write(payload);
-      historyInjected.current = true;
-    }
-  }, [instance, deadHistory]);
+  // RESTORE ordering note: the dead history is NOT written here any more. Writing
+  // it from an `instance`-dependent effect raced the PTY's first output (an async
+  // event) and could land the restored block BELOW the live prompt, so the input
+  // sat above dead history and the user couldn't type (the Image-16 bug). It is
+  // now written by `usePty.start()` as the first bytes of the session — before the
+  // output listener and before spawn — so history is deterministically ABOVE the
+  // live prompt. See `deadHistoryPayload` + `usePty`'s `deadHistory` option above.
 
   // Surface the instance to the parent (and to tests) as it appears/disappears.
   useEffect(() => {
@@ -329,8 +365,7 @@ export function Terminal({
 
     // Resolve the live font family/size from the merged options so the load
     // gate targets exactly what xterm will measure.
-    const fontFamily =
-      mergedOptions.fontFamily ?? (DEFAULT_OPTIONS.fontFamily as string);
+    const fontFamily = mergedOptions.fontFamily ?? (DEFAULT_OPTIONS.fontFamily as string);
     const fontSize = mergedOptions.fontSize ?? (DEFAULT_OPTIONS.fontSize as number);
 
     void ensureTerminalFontLoaded(fontFamily, fontSize).then(() => {
@@ -349,6 +384,17 @@ export function Terminal({
       // regenerates the glyph cache against the loaded font (no-op if inactive /
       // no live context).
       clearWebglAtlas();
+      // RESTORE viewport (finding 01KV3CPAG…): after the authoritative fit, anchor
+      // the viewport at the BOTTOM so the live prompt is in view (not scrolled up
+      // above the restored dead history) and WebKitGTK does not leave a phantom
+      // scrollbar from a stale viewport that scrolls nothing. Idempotent on a
+      // fresh terminal (already at bottom). Best-effort: a detached instance must
+      // never throw here.
+      try {
+        instance.scrollToBottom();
+      } catch {
+        // ignore (detached / closing instance)
+      }
     });
 
     const observer = new ResizeObserver(() => safeFit());
@@ -366,12 +412,7 @@ export function Terminal({
   // dimensions plus a visual margin — no edge column/row gets clipped, and we do
   // NOT touch xterm's native scroll or reintroduce any custom bottom anchor.
   return (
-    <div
-      className={cn(
-        "h-full w-full overflow-hidden bg-background p-2.5",
-        className,
-      )}
-    >
+    <div className={cn("h-full w-full overflow-hidden bg-background p-2.5", className)}>
       <div ref={ref} className="h-full w-full overflow-hidden" />
     </div>
   );

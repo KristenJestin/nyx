@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from "react";
-import { XIcon } from "lucide-react";
+import { SquareTerminalIcon, XIcon } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { resolveDisplayName, useAutoLabel } from "./auto-label";
+import { resolveDisplayName, useAutoLabel, useShellSuffix } from "./auto-label";
 import { itemTransition, itemVariants } from "./item-motion";
+import { TerminalStateBadge } from "./run-state";
 import type { TerminalRecord } from "./use-terminals";
 
 /**
@@ -31,120 +31,103 @@ export interface TerminalItemProps {
   ptyId?: number | null;
   onSelect: (id: string) => void;
   onClose: (id: string) => void;
-  /** Persist a manual rename (`null` clears it back to auto-naming). */
-  onRename?: (id: string, label: string | null) => void;
 }
 
 /**
- * The className for a sidebar terminal row. Shared by the standalone
- * `<TerminalItem>` (a `motion.li`) and the sortable `<ReorderTerminalItem>` (a
- * `Reorder.Item`) so both rows look identical. `dragging` dims the row while it
- * is being dragged.
+ * The className for the VISUAL terminal row — the clickable inner element inside
+ * `<TerminalItem>`'s height-collapsing `motion.li` wrapper. `dragging` is kept for
+ * the legacy `<ReorderTerminalItem>` (no longer rendered live) and is a no-op for
+ * the live row.
+ *
+ * `cursor-pointer`: the WHOLE row is one click target — a click ANYWHERE selects
+ * it (finding 01KV3CND2GKZCG8MQCHF7W32Q5: no dead zone), since the row element
+ * itself owns the click (no inner button whose bounds a click could miss). Drag
+ * reorder was removed with Motion's Reorder (it could not coexist with a clean
+ * height-collapse animation — see `item-motion.ts`).
+ *
+ * SELECTION CHANNEL: there is NO magenta BACKGROUND fill and no per-row magenta —
+ * the magenta lives only in the SINGLE shared `<ActiveRail>` (a `layoutId`
+ * element) rendered inside the active row, which Motion FLIPs between rows.
+ * Selection is expressed on the row via the v6 DIMMED/ACTIVE model: inactive rows
+ * sit at reduced opacity, the active row is full-opacity and its name goes
+ * bold/white. `relative` anchors the rail. `overflow-hidden` is REQUIRED so the
+ * enter/exit height collapse clips the row content.
  */
 export function terminalRowClassName(active: boolean, dragging = false): string {
   return cn(
-    // `select-none`: dragging a row by its grip must never text-select the
-    // names (the rename input opts back into selection with `select-text`).
-    "group flex items-center gap-1 overflow-hidden rounded-md px-2 py-1.5 text-sm select-none",
+    // `select-none`: a click-drag on a row must never text-select the names.
+    // Symmetric `px-2`: the row spans the band full-width with no left inset
+    // (matches the workspace header band; the old `pl-5.5` indent was dropped).
+    "group relative flex cursor-pointer items-center gap-2 overflow-hidden rounded-md px-2 py-1.5 text-left text-sm transition select-none",
     active
-      ? "bg-sidebar-accent text-sidebar-accent-foreground"
-      : "text-sidebar-foreground hover:bg-sidebar-accent/50",
+      ? "font-medium text-sidebar-foreground opacity-100 hover:bg-sidebar-accent/40"
+      : "text-sidebar-foreground/70 opacity-60 hover:bg-sidebar-accent/40 hover:opacity-90",
     dragging && "opacity-60",
   );
 }
 
 /**
- * The INNER content of a terminal row — drag-handle slot, the name (with inline
- * rename), and the hover-revealed close (`x`) — WITHOUT the row element itself.
- * Wrapper-agnostic so it can live inside either a plain `motion.li`
- * (`<TerminalItem>`, used in isolation tests) or a `Reorder.Item`
- * (`<ReorderTerminalItem>`, used by the live sidebar).
+ * The INNER content of a terminal row — the lead glyph (with run-state badge),
+ * the name (+ shell suffix), and the hover-revealed close (`x`) — WITHOUT the row
+ * element itself. Wrapper-agnostic so it can live inside either a plain
+ * `motion.li` (`<TerminalItem>`, used in isolation tests) or a `Reorder.Item`
+ * (`<ReorderTerminalItem>`, used by the live sidebar — the WHOLE row is the drag
+ * affordance, no separate grip).
  *
- * The displayed name is AUTO-COMPUTED (cwd basename + foreground program, live
- * from `terminal_info`) unless the user set a MANUAL label, which always wins
- * and persists. Double-click the name to rename inline; Enter commits, Escape
- * cancels, an empty value clears back to auto-naming. The close button stops
- * propagation so clicking `x` closes the terminal without also selecting it.
+ * Selection is owned by the ROW (a click anywhere selects — see the wrappers);
+ * this body renders the active rail and the controls only. There is NO inline
+ * rename here any more (finding 01KV3CNPDMBDWYKZZKPJ8RWKQX removed double-click
+ * editing entirely; renaming will return as a proper flow later). The displayed
+ * name is AUTO-COMPUTED (cwd basename + foreground program, live from
+ * `terminal_info`) unless the user set a MANUAL label, which always wins. The
+ * close button stops propagation so clicking `x` closes without also selecting.
  */
 export function TerminalItemBody({
   record,
   index,
   active,
   ptyId = null,
-  onSelect,
   onClose,
-  onRename,
-  dragHandle,
-}: TerminalItemProps & {
-  /** Optional drag-handle slot (the sortable wrapper injects the grip here). */
-  dragHandle?: React.ReactNode;
-}) {
+}: TerminalItemProps) {
   // Live auto label (debounced via the backend cache + a fixed poll). Manual
   // label takes precedence inside resolveDisplayName below.
   const auto = useAutoLabel(ptyId);
   const name = resolveDisplayName(record, index, auto);
+  // Live shell/program suffix for the proto row (`web · zsh`). Same backend poll.
+  const shell = useShellSuffix(ptyId);
 
-  // Inline rename state. `editing` swaps the button for a text input.
-  const [editing, setEditing] = useState(false);
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  // Once a rename is committed OR cancelled, suppress the trailing `onBlur` that
-  // fires as the input unmounts so we never double-persist or resurrect a
-  // cancelled edit.
-  const settledRef = useRef(false);
-  useEffect(() => {
-    if (editing) {
-      settledRef.current = false;
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    }
-  }, [editing]);
-
-  const commit = (raw: string) => {
-    if (settledRef.current) return;
-    settledRef.current = true;
-    setEditing(false);
-    if (!onRename) return;
-    const trimmed = raw.trim();
-    // Empty → clear back to auto-naming; otherwise persist the manual override.
-    onRename(record.id, trimmed === "" ? null : trimmed);
-  };
-
-  const cancel = () => {
-    settledRef.current = true;
-    setEditing(false);
-  };
+  const state = record.exec_state ?? "idle";
 
   return (
     <>
-      {dragHandle}
-      {editing ? (
-        <input
-          ref={inputRef}
-          type="text"
-          aria-label={`Rename terminal ${name}`}
-          defaultValue={record.label ?? name}
-          onClick={(e) => e.stopPropagation()}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") commit((e.target as HTMLInputElement).value);
-            else if (e.key === "Escape") cancel();
-          }}
-          onBlur={(e) => commit(e.target.value)}
-          className="min-w-0 flex-1 rounded-sm bg-background px-1 text-sm text-foreground outline-none ring-1 ring-sidebar-ring select-text"
+      {/* The magenta selection bar is no longer rendered per-row: a single MEASURED
+          rail (see `useActiveRail` / `<SelectionRail>` in `<AppSidebar>`) tracks the
+          active row by `[data-rail-row][aria-current]`. */}
+      {/* Lead glyph + run-state corner badge (the run-state channel, orthogonal
+          to selection). The badge is suppressed on idle / on an active terminal
+          (unread model) — see <TerminalStateBadge>. The wrapper is NOT
+          `aria-hidden` so the badge's `role="status"` stays in the a11y tree;
+          only the decorative icon itself is hidden. */}
+      <span className="relative flex shrink-0 items-center">
+        <SquareTerminalIcon
+          aria-hidden
+          className={cn("size-3.5", active ? "text-sidebar-foreground" : "text-muted-foreground")}
         />
-      ) : (
-        <button
-          type="button"
-          onClick={() => onSelect(record.id)}
-          onDoubleClick={() => onRename && setEditing(true)}
-          className="min-w-0 flex-1 cursor-pointer truncate text-left outline-none"
-        >
-          {name}
-        </button>
-      )}
+        <TerminalStateBadge state={state} active={active} />
+      </span>
+      <span className="flex min-w-0 flex-1 items-baseline gap-1 truncate">
+        <span className="min-w-0 truncate">{name}</span>
+        {/* Shell/program suffix ("· zsh") — muted, hidden while there's no room. */}
+        {shell && <span className="shrink-0 text-xs text-muted-foreground">· {shell}</span>}
+      </span>
       <Button
         variant="ghost-destructive"
         size="icon-xs"
         aria-label={`Close terminal ${name}`}
+        // Stop propagation so closing never also selects the row (the row owns
+        // the select click). `onPointerDown` stop keeps the drag controller from
+        // treating an x-click as the start of a row drag.
+        onPointerDown={(e) => e.stopPropagation()}
         onClick={(e) => {
           e.stopPropagation();
           onClose(record.id);
@@ -161,11 +144,19 @@ export function TerminalItemBody({
 }
 
 /**
- * Standalone presentational row: a `motion.li` hosting `<TerminalItemBody>`.
- * Used in isolation tests (and anywhere a row is rendered outside a Reorder
- * context); the live sidebar uses `<ReorderTerminalItem>` instead, which makes
- * the row drag-sortable. The row fades IN on mount (opacity); all positional
- * motion is owned by Reorder in the sortable variant (see item-motion).
+ * The LIVE sidebar terminal row: a height-collapsing `motion.li` wrapper hosting
+ * the clickable visual row + `<TerminalItemBody>`. This is THE row the sidebar
+ * renders everywhere now (the old `Reorder.Item`-based `<ReorderTerminalItem>` was
+ * dropped — Motion's Reorder could not coexist with a clean height collapse).
+ *
+ * TWO LEVELS on purpose:
+ *  - the OUTER `motion.li` is the SINGLE animator (height 0↔auto, opacity, a tiny
+ *    translate via `itemVariants`) and carries NO `layout` prop, so the animated
+ *    height reflows neighbours + parent bands in normal flow with nothing to fight
+ *    (the double-tp fix). `overflow-hidden` clips the content as it collapses;
+ *  - the INNER `div` is the visual, clickable row (its `py` padding lives INSIDE
+ *    the clip, so the collapse reaches a true 0 — no padding residual / leftover
+ *    pop). A click anywhere on it selects the terminal.
  *
  * Animation is chrome-only and never touches the xterm viewport (a hard rule).
  */
@@ -176,11 +167,17 @@ export function TerminalItem(props: TerminalItemProps) {
       variants={itemVariants}
       initial="initial"
       animate="animate"
+      exit="exit"
       transition={itemTransition(reduced)}
+      onClick={() => props.onSelect(props.record.id)}
       aria-current={props.active ? "true" : undefined}
-      className={terminalRowClassName(props.active)}
+      data-rail-row
+      className="overflow-hidden"
+      style={{ listStyle: "none" }}
     >
-      <TerminalItemBody {...props} />
+      <div className={terminalRowClassName(props.active)}>
+        <TerminalItemBody {...props} />
+      </div>
     </motion.li>
   );
 }

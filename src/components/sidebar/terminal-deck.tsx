@@ -45,11 +45,7 @@ function readBuffer(term: XTerm | null): string {
  * layer above (and the tests) can reason about visibility without inspecting
  * styles. The active pane is the only one without `display:none`.
  */
-export function TerminalDeck({
-  terminals,
-  activeId,
-  onPtyId,
-}: TerminalDeckProps) {
+export function TerminalDeck({ terminals, activeId, onPtyId }: TerminalDeckProps) {
   // Per-record xterm instances, for the read seam. Lazy-init the Map once so we
   // don't allocate (and throw away) a fresh Map on every render.
   const instancesRef = useRef<Map<string, XTerm | null> | null>(null);
@@ -118,9 +114,20 @@ export function TerminalDeck({
     return cb;
   };
 
+  // Render the panes in a STABLE order (by record id), INDEPENDENT of the sidebar
+  // order. The deck only ever SHOWS the active pane (the others are
+  // absolutely-positioned + `display:none`), so their DOM order is visually
+  // irrelevant — but it matters MECHANICALLY: if a sidebar drag-reorder changed
+  // this order, React would MOVE the active pane's DOM node among its siblings,
+  // detaching + reattaching its live xterm canvas and forcing a visible "refresh".
+  // The record id never changes on reorder, so sorting by it pins each pane's DOM
+  // slot; reordering the sidebar no longer disturbs the running terminal. Add/close
+  // still mount/unmount as expected.
+  const ordered = [...terminals].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
   return (
     <div className="relative h-full w-full">
-      {terminals.map((t) => {
+      {ordered.map((t) => {
         const active = t.id === activeId;
         return (
           <div

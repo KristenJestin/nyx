@@ -65,8 +65,7 @@ describe("useWebglAddon", () => {
     const { term } = makeFakeXterm();
     const { factory, created } = makeFactory();
     const { rerender } = renderHook(
-      ({ active }: { active: boolean }) =>
-        useWebglAddon(term, active, { factory }),
+      ({ active }: { active: boolean }) => useWebglAddon(term, active, { factory }),
       { initialProps: { active: true } },
     );
     expect(created).toHaveLength(1);
@@ -81,8 +80,7 @@ describe("useWebglAddon", () => {
     const { term } = makeFakeXterm();
     const { factory, created } = makeFactory();
     const { rerender } = renderHook(
-      ({ active }: { active: boolean }) =>
-        useWebglAddon(term, active, { factory }),
+      ({ active }: { active: boolean }) => useWebglAddon(term, active, { factory }),
       { initialProps: { active: true } },
     );
     rerender({ active: false });
@@ -98,8 +96,7 @@ describe("useWebglAddon", () => {
     const { term } = makeFakeXterm();
     const { factory, created } = makeFactory();
     const { rerender } = renderHook(
-      ({ active }: { active: boolean }) =>
-        useWebglAddon(term, active, { factory }),
+      ({ active }: { active: boolean }) => useWebglAddon(term, active, { factory }),
       { initialProps: { active: true } },
     );
     // Re-render with the SAME active value: must not create a 2nd context.
@@ -111,9 +108,7 @@ describe("useWebglAddon", () => {
   it("disposes on unmount", () => {
     const { term } = makeFakeXterm();
     const { factory, created } = makeFactory();
-    const { unmount } = renderHook(() =>
-      useWebglAddon(term, true, { factory }),
-    );
+    const { unmount } = renderHook(() => useWebglAddon(term, true, { factory }));
     expect((created[0] as FakeAddon).disposed).toBe(false);
     unmount();
     expect((created[0] as FakeAddon).disposed).toBe(true);
@@ -125,9 +120,7 @@ describe("useWebglAddon", () => {
       throw new Error("no webgl");
     });
     // Must not throw out of the hook.
-    expect(() =>
-      renderHook(() => useWebglAddon(term, true, { factory })),
-    ).not.toThrow();
+    expect(() => renderHook(() => useWebglAddon(term, true, { factory }))).not.toThrow();
   });
 
   it("is inert with a null instance", () => {

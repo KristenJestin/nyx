@@ -1,8 +1,10 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { DragDropProvider } from "@dnd-kit/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { TerminalItem } from "./terminal-item";
+import { SortableTerminalItem } from "./sortable-terminal-item";
 import type { TerminalInfo } from "./auto-label";
 import type { TerminalRecord } from "./use-terminals";
 
@@ -10,6 +12,7 @@ function row(
   id: number,
   cwd: string,
   label: string | null = null,
+  exec_state: TerminalRecord["exec_state"] = "idle",
 ): TerminalRecord {
   return {
     id: String(id),
@@ -21,6 +24,7 @@ function row(
     created_at: 0,
     updated_at: 0,
     closed_at: null,
+    exec_state,
   };
 }
 
@@ -32,7 +36,7 @@ function mockTerminalInfo(info: TerminalInfo): void {
   });
 }
 
-describe("<TerminalItem> auto-naming + rename", () => {
+describe("<TerminalItem> auto-naming", () => {
   it("auto-names from the cwd basename when only the shell runs", async () => {
     mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
     render(
@@ -64,9 +68,7 @@ describe("<TerminalItem> auto-naming + rename", () => {
         />
       </ul>,
     );
-    await waitFor(() =>
-      expect(screen.getByText("projetA · htop")).toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.getByText("projetA · htop")).toBeInTheDocument());
   });
 
   it("a MANUAL label wins over the live auto label", async () => {
@@ -93,9 +95,11 @@ describe("<TerminalItem> auto-naming + rename", () => {
     expect(screen.queryByText("projetA · htop")).not.toBeInTheDocument();
   });
 
-  it("double-click → type → Enter persists a manual rename via onRename", () => {
+  it("has NO inline rename: double-clicking the name shows no edit input (finding 01KV3CNPD…)", () => {
+    // The double-click-to-edit inline rename was removed entirely. Double-clicking
+    // the name must NOT reveal a text input — rows are click-select + hover-close
+    // only now.
     mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
-    const onRename = vi.fn();
     render(
       <ul>
         <TerminalItem
@@ -105,71 +109,195 @@ describe("<TerminalItem> auto-naming + rename", () => {
           ptyId={50}
           onSelect={vi.fn()}
           onClose={vi.fn()}
-          onRename={onRename}
-        />
-      </ul>,
-    );
-
-    // Enter edit mode and rename.
-    fireEvent.doubleClick(screen.getByText("projetA"));
-    const input = screen.getByLabelText(/rename terminal/i);
-    fireEvent.change(input, { target: { value: "backend api" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-
-    // The manual label is persisted (record id + new label).
-    expect(onRename).toHaveBeenCalledWith("7", "backend api");
-  });
-
-  it("renaming to an empty value clears back to auto-naming (null)", () => {
-    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
-    const onRename = vi.fn();
-    render(
-      <ul>
-        <TerminalItem
-          record={row(7, "/home/x/projetA", "old-name")}
-          index={0}
-          active={false}
-          ptyId={50}
-          onSelect={vi.fn()}
-          onClose={vi.fn()}
-          onRename={onRename}
-        />
-      </ul>,
-    );
-
-    fireEvent.doubleClick(screen.getByText("old-name"));
-    const input = screen.getByLabelText(/rename terminal/i);
-    fireEvent.change(input, { target: { value: "   " } });
-    fireEvent.keyDown(input, { key: "Enter" });
-
-    // Whitespace-only → clear the override (null), restoring auto-naming.
-    expect(onRename).toHaveBeenCalledWith("7", null);
-  });
-
-  it("Escape cancels the rename without persisting", () => {
-    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
-    const onRename = vi.fn();
-    render(
-      <ul>
-        <TerminalItem
-          record={row(7, "/home/x/projetA")}
-          index={0}
-          active={false}
-          ptyId={50}
-          onSelect={vi.fn()}
-          onClose={vi.fn()}
-          onRename={onRename}
         />
       </ul>,
     );
 
     fireEvent.doubleClick(screen.getByText("projetA"));
-    const input = screen.getByLabelText(/rename terminal/i);
-    fireEvent.change(input, { target: { value: "discarded" } });
-    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByLabelText(/rename terminal/i)).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+});
 
-    expect(onRename).not.toHaveBeenCalled();
-    // Back to the auto/cwd name, edit cancelled.
-    expect(screen.getByText("projetA")).toBeInTheDocument();
+describe("<SortableTerminalItem> whole-item drag (dnd-kit)", () => {
+  it("a plain CLICK on the name selects the terminal (drag does not swallow the click)", () => {
+    // The WHOLE row is the drag affordance, but a click (no pointer movement past
+    // the sensor distance) must still fire onSelect → focus-on-activate. The row
+    // (li) owns the click, so a tap anywhere — name included — selects.
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    const onSelect = vi.fn();
+    render(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(7, "/home/x/projetA")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={onSelect}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    // Click the name → selection fires with the record id.
+    fireEvent.click(screen.getByText("projetA"));
+    expect(onSelect).toHaveBeenCalledWith("7");
+  });
+
+  it("CLICK-ANYWHERE: clicking the ROW itself (below the text — no dead zone) selects", () => {
+    // Finding 01KV3CND2…: a click anywhere on the row (not just the name) selects,
+    // because the row element (li) owns the click.
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    const onSelect = vi.fn();
+    render(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(7, "/home/x/projetA")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={onSelect}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    // Click the row LISTITEM (the whole-row affordance), not the inner name.
+    fireEvent.click(screen.getByRole("listitem"));
+    expect(onSelect).toHaveBeenCalledWith("7");
+  });
+
+  it("there is NO separate grip handle — the whole row is draggable", () => {
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    render(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(7, "/home/x/projetA")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    // No grip handle is rendered (whole-item drag).
+    expect(screen.queryByLabelText(/reorder terminal/i)).toBeNull();
+  });
+
+  it("renders the shared magenta ActiveRail ONLY on the active row (selection channel)", () => {
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    // Two rows: only the active one carries aria-current (a single shared layoutId
+    // bar glides between them — finding 01KV304Y7WA5YPZBAFJ7V4ANHX).
+    const { rerender } = render(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(1, "/a")}
+            index={0}
+            active
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+          <SortableTerminalItem
+            record={row(2, "/b")}
+            index={1}
+            active={false}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    // The active row carries aria-current; the inactive one does not.
+    const actives = screen
+      .getAllByRole("listitem")
+      .filter((li) => li.getAttribute("aria-current") === "true");
+    expect(actives).toHaveLength(1);
+    // Move selection to row 2 → still exactly one active row.
+    rerender(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(1, "/a")}
+            index={0}
+            active={false}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+          <SortableTerminalItem
+            record={row(2, "/b")}
+            index={1}
+            active
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    expect(
+      screen.getAllByRole("listitem").filter((li) => li.getAttribute("aria-current") === "true"),
+    ).toHaveLength(1);
+  });
+
+  it("a NON-active terminal shows its run-state badge; the ACTIVE one clears it (unread model)", () => {
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    // Non-active + success → unread badge present.
+    const { rerender } = render(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(1, "/a", null, "success")}
+            index={0}
+            active={false}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    expect(screen.getByRole("status", { name: /terminal status: success/i })).toBeInTheDocument();
+    // Selecting it (active) clears the unread badge.
+    rerender(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(1, "/a", null, "success")}
+            index={0}
+            active
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    expect(screen.queryByRole("status", { name: /terminal status: success/i })).toBeNull();
+  });
+
+  it("clicking the close (x) closes WITHOUT selecting (stopPropagation kept)", () => {
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    const onSelect = vi.fn();
+    const onClose = vi.fn();
+    render(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(7, "/home/x/projetA")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={onSelect}
+            onClose={onClose}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    fireEvent.click(screen.getByLabelText(/close terminal/i));
+    expect(onClose).toHaveBeenCalledWith("7");
+    expect(onSelect).not.toHaveBeenCalled();
   });
 });

@@ -45,9 +45,7 @@ async function waitForOutput(needle, timeoutMs) {
     if (last.includes(needle)) return last;
     await browser.pause(200);
   }
-  throw new Error(
-    "timed out waiting for '" + needle + "'. Buffer was:\n" + last,
-  );
+  throw new Error("timed out waiting for '" + needle + "'. Buffer was:\n" + last);
 }
 
 describe("nyx terminal e2e (smoke)", function () {
@@ -56,9 +54,7 @@ describe("nyx terminal e2e (smoke)", function () {
     await browser.waitUntil(
       async function () {
         return browser.execute(function () {
-          return !!(
-            window.__nyx && window.__nyx.activeId() != null
-          );
+          return !!(window.__nyx && window.__nyx.activeId() != null);
         });
       },
       { timeout: 30000, timeoutMsg: "window.__nyx active terminal never appeared" },
@@ -72,10 +68,7 @@ describe("nyx terminal e2e (smoke)", function () {
     await browser.pause(300);
     await typeLine('echo "FOOIS:$FOO"\n');
     const buf = await waitForOutput("FOOIS:bar_e2e_9k1", 15000);
-    assert(
-      buf.includes("FOOIS:bar_e2e_9k1"),
-      "env var FOO must survive between commands",
-    );
+    assert(buf.includes("FOOIS:bar_e2e_9k1"), "env var FOO must survive between commands");
   });
 
   it("runs a program and shows its known output", async function () {
@@ -104,9 +97,6 @@ describe("nyx terminal e2e (smoke)", function () {
     // The backend emits a "[process exited...]" notice into xterm when the PTY
     // closes; the front writes it to the buffer (see usePty.ts).
     const buf = await waitForOutput("process exited", 15000);
-    assert(
-      buf.includes("process exited"),
-      "exit must close the shell and surface the exit notice",
-    );
+    assert(buf.includes("process exited"), "exit must close the shell and surface the exit notice");
   });
 });
