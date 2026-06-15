@@ -1,0 +1,12 @@
+# Enforce LF line endings in the repo and on checkout (all platforms).
+# Prevents Windows CRLF from polluting diffs (cf. the Win -> Linux handoff).
+* text=auto eol=lf
+
+# Binary assets — never normalize.
+*.png   binary
+*.ico   binary
+*.icns  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
