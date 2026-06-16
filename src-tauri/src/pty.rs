@@ -41,7 +41,11 @@ fn next_id() -> u64 {
 ///
 /// TODO(idea): make the default shell user-selectable in settings (see AGENTS.md
 /// §9 "Différé v1.1+"). The chosen name is returned so callers/tests can assert.
-fn resolve_shell() -> String {
+///
+/// `pub(crate)` so the managed-command runtime ([`crate::command`]) spawns its
+/// read-only command PTYs under the SAME shell as the terminals (honors `$SHELL`
+/// identically), instead of duplicating the resolution.
+pub(crate) fn resolve_shell() -> String {
     if let Ok(s) = std::env::var("SHELL") {
         if !s.is_empty() {
             return s;

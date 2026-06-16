@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { resolveDisplayName, useAutoLabel, useShellSuffix } from "./auto-label";
 import { itemTransition, itemVariants } from "./item-motion";
 import { TerminalStateBadge } from "./run-state";
+import { SidebarItemContent, sidebarRowClassName } from "./sidebar-item";
 import type { TerminalRecord } from "./use-terminals";
 
 /**
@@ -54,16 +55,10 @@ export interface TerminalItemProps {
  * enter/exit height collapse clips the row content.
  */
 export function terminalRowClassName(active: boolean, dragging = false): string {
-  return cn(
-    // `select-none`: a click-drag on a row must never text-select the names.
-    // Symmetric `px-2`: the row spans the band full-width with no left inset
-    // (matches the workspace header band; the old `pl-5.5` indent was dropped).
-    "group relative flex cursor-pointer items-center gap-2 overflow-hidden rounded-md px-2 py-1.5 text-left text-sm transition select-none",
-    active
-      ? "font-medium text-sidebar-foreground opacity-100 hover:bg-sidebar-accent/40"
-      : "text-sidebar-foreground/70 opacity-60 hover:bg-sidebar-accent/40 hover:opacity-90",
-    dragging && "opacity-60",
-  );
+  // The row shape is now the SHARED `sidebarRowClassName` (the one gabarit used by
+  // both terminal and command items — finding 01KV63TBV7…). `dragging` is the only
+  // terminal-specific modifier left (the legacy drag-ghost opacity).
+  return cn(sidebarRowClassName(active), dragging && "opacity-60");
 }
 
 /**
@@ -99,47 +94,48 @@ export function TerminalItemBody({
   const state = record.exec_state ?? "idle";
 
   return (
-    <>
-      {/* The magenta selection bar is no longer rendered per-row: a single MEASURED
-          rail (see `useActiveRail` / `<SelectionRail>` in `<AppSidebar>`) tracks the
-          active row by `[data-rail-row][aria-current]`. */}
-      {/* Lead glyph + run-state corner badge (the run-state channel, orthogonal
-          to selection). The badge is suppressed on idle / on an active terminal
-          (unread model) — see <TerminalStateBadge>. The wrapper is NOT
-          `aria-hidden` so the badge's `role="status"` stays in the a11y tree;
-          only the decorative icon itself is hidden. */}
-      <span className="relative flex shrink-0 items-center">
-        <SquareTerminalIcon
-          aria-hidden
-          className={cn("size-3.5", active ? "text-sidebar-foreground" : "text-muted-foreground")}
-        />
-        <TerminalStateBadge state={state} active={active} />
-      </span>
-      <span className="flex min-w-0 flex-1 items-baseline gap-1 truncate">
-        <span className="min-w-0 truncate">{name}</span>
-        {/* Shell/program suffix ("· zsh") — muted, hidden while there's no room. */}
-        {shell && <span className="shrink-0 text-xs text-muted-foreground">· {shell}</span>}
-      </span>
-      <Button
-        variant="ghost-destructive"
-        size="icon-xs"
-        aria-label={`Close terminal ${name}`}
-        // Stop propagation so closing never also selects the row (the row owns
-        // the select click). `onPointerDown` stop keeps the drag controller from
-        // treating an x-click as the start of a row drag.
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => {
-          e.stopPropagation();
-          onClose(record.id);
-        }}
-        className={cn(
-          "size-5 shrink-0 rounded opacity-0 transition focus-visible:opacity-100 group-hover:opacity-100",
-          active && "opacity-100",
-        )}
-      >
-        <XIcon className="size-3.5" />
-      </Button>
-    </>
+    // The SHARED item layout (lead → name → actions). The magenta selection bar is
+    // not per-row: a single MEASURED rail (see `useActiveRail` / `<SelectionRail>`)
+    // tracks the active row by `[data-rail-row][aria-current]`.
+    <SidebarItemContent
+      // Lead glyph + run-state corner badge (the run-state channel, orthogonal to
+      // selection). The badge is suppressed on idle / on an active terminal (unread
+      // model) — see <TerminalStateBadge>. The wrapper is NOT `aria-hidden` so the
+      // badge's `role="status"` stays in the a11y tree; only the icon is hidden.
+      lead={
+        <span className="relative flex shrink-0 items-center">
+          <SquareTerminalIcon
+            aria-hidden
+            className={cn("size-3.5", active ? "text-sidebar-foreground" : "text-muted-foreground")}
+          />
+          <TerminalStateBadge state={state} active={active} />
+        </span>
+      }
+      name={name}
+      // Shell/program suffix ("· zsh") — muted, hidden while there's no room.
+      suffix={shell && <span className="shrink-0 text-xs text-muted-foreground">· {shell}</span>}
+      actions={
+        <Button
+          variant="ghost-destructive"
+          size="icon-xs"
+          aria-label={`Close terminal ${name}`}
+          // Stop propagation so closing never also selects the row (the row owns
+          // the select click). `onPointerDown` stop keeps the drag controller from
+          // treating an x-click as the start of a row drag.
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onClose(record.id);
+          }}
+          className={cn(
+            "size-5 shrink-0 rounded opacity-0 transition focus-visible:opacity-100 group-hover:opacity-100",
+            active && "opacity-100",
+          )}
+        >
+          <XIcon className="size-3.5" />
+        </Button>
+      }
+    />
   );
 }
 

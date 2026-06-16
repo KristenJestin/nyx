@@ -18,6 +18,13 @@
 //   `collapsed` (on both `projects` and `workspaces`) is the persisted sidebar
 //   open/closed disclosure state (0 = open). Column ORDER here must match the SQL
 //   migration exactly (Diesel's positional `Queryable` decoding relies on it).
+// - v3 (PRD-3) added `managed_commands` (per-project command templates, with
+//   optional package.json provenance) and `command_instances` (one materialized
+//   instance per template per workspace, carrying run state + scrollback +
+//   shutdown snapshot). `restart_on_startup` / `was_running_on_shutdown` are
+//   SQLite INTEGER 0/1 booleans mapped as Diesel `Bool` ↔ Rust `bool`. The
+//   `managed_commands."order"` keyword column is exposed as `order_index` like
+//   `terminals`. `source_*` / `package_manager` are nullable provenance metadata.
 
 diesel::table! {
     terminals (id) {
@@ -61,7 +68,49 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    managed_commands (id) {
+        id -> Text,
+        project_id -> Text,
+        name -> Text,
+        command -> Text,
+        subfolder -> Nullable<Text>,
+        restart_on_startup -> Bool,
+        #[sql_name = "order"]
+        order_index -> Integer,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        source_kind -> Nullable<Text>,
+        source_package_json_path -> Nullable<Text>,
+        source_script_name -> Nullable<Text>,
+        source_script_command_snapshot -> Nullable<Text>,
+        package_manager -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    command_instances (id) {
+        id -> Text,
+        command_id -> Text,
+        workspace_id -> Text,
+        last_state -> Text,
+        scrollback -> Text,
+        was_running_on_shutdown -> Bool,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
+diesel::joinable!(managed_commands -> projects (project_id));
+diesel::joinable!(command_instances -> managed_commands (command_id));
+diesel::joinable!(command_instances -> workspaces (workspace_id));
 
-diesel::allow_tables_to_appear_in_same_query!(projects, terminals, workspaces,);
+diesel::allow_tables_to_appear_in_same_query!(
+    command_instances,
+    managed_commands,
+    projects,
+    terminals,
+    workspaces,
+);

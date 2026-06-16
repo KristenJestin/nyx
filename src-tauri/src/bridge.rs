@@ -48,6 +48,158 @@ pub struct PtyManager {
     ptys: Mutex<HashMap<u64, Pty>>,
 }
 
+// --- Managed-command runtime wiring (PRD-3 Phase 2) ----------------------
+//
+// The state machine + process-tree lifecycle live in `crate::command` (decoupled
+// from Tauri and unit-tested there). This is the THIN Tauri layer that turns a
+// runner transition into the front-facing events and the DB persistence — the
+// mirror of the terminal output pump above. The lifecycle `#[tauri::command]`s
+// that drive `start`/`stop`/`relaunch` land in Phase 3; until then the runner +
+// sink are constructed by the tests and that later command surface, so the type
+// carries the same `#[cfg_attr(not(test), allow(dead_code))]` deferral the Phase-1
+// db helpers use for their not-yet-wired runner consumer.
+
+/// Payload of the `command://state` event: an instance's derived run state plus
+/// the natural exit code (for success/error; `null` otherwise).
+///
+/// `rename_all = "camelCase"` is load-bearing: the front filters every event on
+/// `event.payload.instanceId` (camelCase), so a snake_case `instance_id` would
+/// surface as `undefined` there and EVERY live state transition would be dropped
+/// (the dot would only ever update on a cold rehydrate). See the mirror
+/// `CommandOutputPayload`.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandStatePayload {
+    /// `command_instances.id` the transition is for.
+    instance_id: String,
+    /// `idle` | `running` | `success` | `error` (the DB CHECK vocabulary).
+    state: String,
+    /// Natural exit code for success/error transitions; `null` otherwise.
+    code: Option<i32>,
+}
+
+/// Payload of the `command://output` event: coalesced output for one instance.
+///
+/// `rename_all = "camelCase"` is load-bearing for the SAME reason as
+/// [`CommandStatePayload`]: the front filters on `event.payload.instanceId`, so a
+/// snake_case key would make every live output chunk be dropped (output would only
+/// ever appear via the cold `command_output` rehydrate, never stream live).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandOutputPayload {
+    instance_id: String,
+    /// Output bytes since the last flush (raw; the front decodes/writes them).
+    bytes: Vec<u8>,
+}
+
+/// Production [`crate::command::RunnerSink`]: emits `command://state` /
+/// `command://output` over the `AppHandle` and persists `last_state` + bounded
+/// scrollback via the managed [`Db`]. Holds the `AppHandle` so the pump thread can
+/// reach managed state off the main thread (same pattern as the terminal pump).
+pub struct TauriRunnerSink<R: Runtime> {
+    app: AppHandle<R>,
+}
+
+impl<R: Runtime> crate::command::RunnerSink for TauriRunnerSink<R> {
+    fn on_state(&self, instance_id: &str, state: crate::command::RunState, exit_code: Option<i32>) {
+        // Persist the new last_state (DB CHECK vocabulary) BEFORE emitting, so a
+        // listener that reads the row on the event sees the committed value.
+        let db_state = state.as_db_str();
+        self.app
+            .state::<Db>()
+            .with_conn(|c| db::set_last_state(c, instance_id, db_state))
+            .ok();
+        let _ = self.app.emit(
+            "command://state",
+            CommandStatePayload {
+                instance_id: instance_id.to_string(),
+                state: db_state.to_string(),
+                code: exit_code,
+            },
+        );
+    }
+
+    fn on_output(&self, instance_id: &str, bytes: &[u8]) {
+        let _ = self.app.emit(
+            "command://output",
+            CommandOutputPayload {
+                instance_id: instance_id.to_string(),
+                bytes: bytes.to_vec(),
+            },
+        );
+    }
+
+    fn persist_scrollback(&self, instance_id: &str, serialized: &str) {
+        self.app
+            .state::<Db>()
+            .with_conn(|c| db::persist_instance_scrollback(c, instance_id, serialized))
+            .ok();
+    }
+}
+
+/// Managed state: the live [`crate::command::CommandRunner`] over the production
+/// Tauri sink, keyed by `command_instances.id`. Registered as managed state in
+/// [`manage_command_runner`] during setup so the lifecycle commands can reach it.
+pub type ManagedCommandRunner<R> = crate::command::CommandRunner<TauriRunnerSink<R>>;
+
+/// Build a [`ManagedCommandRunner`] bound to `app`'s event + DB plumbing, sized
+/// for the off-screen command PTYs.
+pub fn build_command_runner<R: Runtime>(app: AppHandle<R>) -> ManagedCommandRunner<R> {
+    // A modest off-screen size: managed commands are watch-only services, not
+    // interactive full-screen TUIs, so an 80x24 grid is plenty for their output.
+    let size = portable_pty::PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    crate::command::CommandRunner::new(TauriRunnerSink { app }, size)
+}
+
+/// Register the [`ManagedCommandRunner`] as managed state on a built `App`. Called
+/// from the setup hook (after the `Db` is managed) so the lifecycle commands have a
+/// live runner. The runner holds the `AppHandle` it emits/persists through.
+pub fn manage_command_runner<R: Runtime>(app: &AppHandle<R>) {
+    let runner = build_command_runner(app.clone());
+    app.manage(runner);
+}
+
+/// Run the BOOT restoration from an `AppHandle`: read the managed `Db` + runner and
+/// relaunch the instances the shutdown snapshot marked, normalizing the rest. A
+/// thin handle-reaching wrapper over [`restore_commands_on_boot`] for the setup
+/// hook (which only has the handle).
+pub fn restore_commands_from_handle<R: Runtime>(app: &AppHandle<R>) {
+    let db = app.state::<Db>();
+    let runner = app.state::<ManagedCommandRunner<R>>();
+    restore_commands_on_boot(&db, &runner);
+}
+
+/// Run the SHUTDOWN snapshot from an `AppHandle`: read the managed `Db` + runner and
+/// persist `was_running_on_shutdown` for every instance. A thin handle-reaching
+/// wrapper over [`snapshot_commands_on_shutdown`] for the window-close / exit hook.
+pub fn snapshot_commands_from_handle<R: Runtime>(app: &AppHandle<R>) {
+    // The managed state may be absent if the snapshot fires before setup completed
+    // (e.g. an early close); be defensive and no-op in that case.
+    let Some(db) = app.try_state::<Db>() else {
+        return;
+    };
+    let Some(runner) = app.try_state::<ManagedCommandRunner<R>>() else {
+        return;
+    };
+    // The window event fires for BOTH `CloseRequested` and `Destroyed`; run the
+    // shutdown snapshot + reap exactly once so the second event does not re-snapshot
+    // AFTER the kill (which would clear `was_running_on_shutdown` to false).
+    if !runner.begin_shutdown() {
+        return;
+    }
+    // Persist which instances were running (for restart-on-startup) BEFORE killing,
+    // then reap the live process trees so managed commands are not orphaned past
+    // exit (the pump owns the `CommandPty` on a detached thread; the runner map
+    // alone would not kill the children).
+    snapshot_commands_on_shutdown(&db, &runner);
+    runner.kill_all_running();
+}
+
 /// Live introspection of a terminal: its real cwd and foreground program name
 /// (Linux `/proc`). Both are `Option` because the lookup can fail (process gone,
 /// permission, non-Linux). Payload of the `terminal_info` command.
@@ -431,8 +583,27 @@ fn update_project(db: State<'_, Db>, id: String, name: String) -> Result<(), Str
 /// Delete a project and its workspaces (ON DELETE CASCADE). Terminals bound to
 /// those workspaces are DETACHED (workspace_id → NULL via ON DELETE SET NULL),
 /// not killed — they survive as loose terminals. Returns ().
+///
+/// REFUSED if any command instance of the project is currently running (deleting
+/// would cascade-remove a live service's instance, orphaning the process). The
+/// user must stop the running services first. Note `update_project`,
+/// `rename_workspace`, and the collapse commands are NOT guarded — they change
+/// neither a path nor the runtime.
 #[tauri::command]
-fn delete_project(db: State<'_, Db>, id: String) -> Result<(), String> {
+fn delete_project<R: Runtime>(
+    _app: AppHandle<R>,
+    db: State<'_, Db>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    id: String,
+) -> Result<(), String> {
+    let instance_ids = db
+        .with_conn(|c| db::instance_ids_for_project(c, &id))
+        .map_err(|e| e.to_string())?;
+    if runner.any_running(&instance_ids) {
+        return Err(
+            "this project has a running command — stop it before deleting the project".to_string(),
+        );
+    }
     db.with_conn(|c| db::delete_project(c, &id))
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -525,6 +696,682 @@ fn unpin_terminal_workspace(db: State<'_, Db>, terminal_id: String) -> Result<()
     db.with_conn(|c| db::unpin_terminal_workspace(c, &terminal_id))
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+// --- Managed command (template / instance / lifecycle / source) ----------
+//
+// The INTERNAL Tauri API the PRD-3 UI consumes. This is NOT the public MCP
+// contract (PRD-4 owns that, its tool names and its hard-to-reverse ADR); these
+// are plain internal `#[tauri::command]`s, thin wrappers over the unit-tested
+// `crate::db` CRUD + the `crate::command` runner, with a few RUNTIME GUARDS that
+// refuse a mutation while an affected instance is running. Errors are stringified
+// for the IPC boundary, like every other command here.
+
+/// Create a per-project command template. `subfolder` is an optional run path
+/// relative to the workspace; `restart_on_startup` toggles boot relaunch; the
+/// `source_*` group carries optional package.json provenance. Materializes one
+/// instance per existing workspace of the project (in the db layer).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn command_create(
+    db: State<'_, Db>,
+    project_id: String,
+    name: String,
+    command: String,
+    subfolder: Option<String>,
+    restart_on_startup: Option<bool>,
+    source_kind: Option<String>,
+    source_package_json_path: Option<String>,
+    source_script_name: Option<String>,
+    source_script_command_snapshot: Option<String>,
+    package_manager: Option<String>,
+) -> Result<db::ManagedCommand, String> {
+    let source = db::CommandSource {
+        source_kind,
+        source_package_json_path,
+        source_script_name,
+        source_script_command_snapshot,
+        package_manager,
+    };
+    db.with_conn(|c| {
+        let created = db::create_template(
+            c,
+            &project_id,
+            &name,
+            &command,
+            subfolder.as_deref(),
+            source,
+        )?;
+        // Apply the restart flag if the caller asked for it (the template defaults
+        // to false at creation).
+        if restart_on_startup == Some(true) {
+            db::set_restart_on_startup(c, &created.id, true)?;
+        }
+        db::get_template(c, &created.id).map(|t| t.unwrap_or(created))
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// List a project's command templates in sidebar order.
+#[tauri::command]
+fn command_list(db: State<'_, Db>, project_id: String) -> Result<Vec<db::ManagedCommand>, String> {
+    db.with_conn(|c| db::list_templates(c, &project_id))
+        .map_err(|e| e.to_string())
+}
+
+/// Update a template's editable fields (`name`, `command`, `subfolder`,
+/// `restart_on_startup`). REFUSED if any of the template's instances is running
+/// (the user must stop the service before editing what affects its runtime).
+///
+/// SOURCE DETACH ON MANUAL EDIT: a package.json-linked command's link survives
+/// only while the command is still the canonical call for its source script.
+/// When this update CHANGES the `command` of a sourced template to a value that
+/// is neither the package-manager runner call (`pnpm dev`, …) NOR the current
+/// raw script snapshot, the source is DETACHED in the same write — the command
+/// is now hand-authored and no longer tracks the script. Editing only the name /
+/// subfolder / restart flag (command unchanged), or re-typing exactly the runner
+/// call or the raw script, keeps the link. (Resync is the explicit path that
+/// adopts a new script value WITHOUT detaching — see [`command_resync_source`].)
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn command_update<R: Runtime>(
+    _app: AppHandle<R>,
+    db: State<'_, Db>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    id: String,
+    name: String,
+    command: String,
+    subfolder: Option<String>,
+    restart_on_startup: Option<bool>,
+) -> Result<(), String> {
+    guard_template_not_running(&db, &runner, &id)?;
+    db.with_conn(|c| {
+        // Decide whether this edit must detach a package.json source: only when the
+        // template IS sourced and the new `command` drifts away from BOTH the runner
+        // call and the raw script body it was tracking. We read the current row first
+        // so we can compare the incoming command against the canonical values.
+        let detach = match db::get_template(c, &id)? {
+            Some(t) if t.source_script_name.is_some() => command_detaches_source(&t, &command),
+            _ => false,
+        };
+        db::update_template(c, &id, &name, &command, subfolder.as_deref())?;
+        if detach {
+            // The manual edit broke the link to the source script → drop provenance.
+            db::set_template_source(c, &id, db::CommandSource::default())?;
+        }
+        if let Some(flag) = restart_on_startup {
+            db::set_restart_on_startup(c, &id, flag)?;
+        }
+        Ok::<_, diesel::result::Error>(())
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Whether replacing a sourced template's command with `new_command` should
+/// DETACH its package.json source. It detaches when the new command is neither
+/// the detected package-manager runner invocation for the source script (`pnpm
+/// dev`, `npm run dev`, …) NOR the current raw script snapshot — i.e. the user
+/// edited the command away from the canonical call so it no longer tracks the
+/// script. Callers only invoke this for an actually-sourced template.
+fn command_detaches_source(template: &db::ManagedCommand, new_command: &str) -> bool {
+    let Some(script) = template.source_script_name.as_deref() else {
+        return false; // not sourced → nothing to detach
+    };
+    let runner = template
+        .package_manager
+        .as_deref()
+        .and_then(parse_package_manager)
+        .unwrap_or(crate::pkgjson::PackageManager::Npm)
+        .run_script(script);
+    if new_command == runner {
+        return false; // still the canonical runner call → keep the link
+    }
+    if template.source_script_command_snapshot.as_deref() == Some(new_command) {
+        return false; // exactly the raw script body → keep the link
+    }
+    true
+}
+
+/// Delete a template (its instances cascade away). REFUSED if any of its instances
+/// is running.
+#[tauri::command]
+fn command_delete<R: Runtime>(
+    _app: AppHandle<R>,
+    db: State<'_, Db>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    id: String,
+) -> Result<(), String> {
+    guard_template_not_running(&db, &runner, &id)?;
+    db.with_conn(|c| db::delete_template(c, &id))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Persist a project's template order: each id's order becomes its index in `ids`.
+#[tauri::command]
+fn command_reorder(db: State<'_, Db>, ids: Vec<String>) -> Result<(), String> {
+    db.with_conn(|c| db::reorder_templates(c, &ids))
+        .map_err(|e| e.to_string())
+}
+
+/// List a workspace's command instances, each joined to its template's display
+/// fields (`name`, `command`, `subfolder`, the `source_*` provenance, order) and
+/// its workspace path. Each row's `cwd` is filled here with the resolved run
+/// directory (`workspace_path` + `subfolder`, best-effort) so the front's command
+/// info bar can show where the command runs without re-resolving.
+#[tauri::command]
+fn command_instance_list(
+    db: State<'_, Db>,
+    workspace_id: String,
+) -> Result<Vec<db::InstanceWithTemplate>, String> {
+    let mut rows = db
+        .with_conn(|c| db::list_instances_for_workspace(c, &workspace_id))
+        .map_err(|e| e.to_string())?;
+    for row in &mut rows {
+        // Best-effort (infallible) resolution for display: shows the real cwd a
+        // spawn would use, falling back to the lexical workspace+subfolder join when
+        // the subfolder is missing/unsafe — the listing must never fail on that.
+        row.cwd = Some(crate::subfolder::resolve_run_dir_lossy(
+            &row.workspace_path,
+            row.subfolder.as_deref(),
+        ));
+    }
+    Ok(rows)
+}
+
+/// Start (or restart-from-terminal-state) an instance: resolve its command line +
+/// cwd (the workspace path joined with the validated subfolder) and spawn through
+/// the runner. Idempotent on a running instance (no second spawn). Returns the
+/// `last_state` string after the call.
+#[tauri::command]
+fn command_start<R: Runtime>(
+    _app: AppHandle<R>,
+    db: State<'_, Db>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    instance_id: String,
+) -> Result<String, String> {
+    let (command, cwd) = resolve_command_and_cwd(&db, &instance_id)?;
+    runner
+        .start(&instance_id, &command, Some(&cwd))
+        .map(|s| s.as_db_str().to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Stop a running instance (best-effort process-tree kill, then idle). Idempotent
+/// on a non-running instance. Returns the `last_state` string after the call.
+#[tauri::command]
+fn command_stop<R: Runtime>(
+    _app: AppHandle<R>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    instance_id: String,
+) -> Result<String, String> {
+    runner
+        .stop(&instance_id)
+        .map(|s| s.as_db_str().to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Relaunch an instance: stop-then-start if running, else a direct start. Never
+/// leaves two live processes. Returns the `last_state` string after the call.
+#[tauri::command]
+fn command_relaunch<R: Runtime>(
+    _app: AppHandle<R>,
+    db: State<'_, Db>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    instance_id: String,
+) -> Result<String, String> {
+    let (command, cwd) = resolve_command_and_cwd(&db, &instance_id)?;
+    runner
+        .relaunch(&instance_id, &command, Some(&cwd))
+        .map(|s| s.as_db_str().to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Acknowledge a FINISHED one-shot when it is opened/selected: if the instance is in
+/// a terminal state (`success`/`error`), reset it to `idle` so the "unseen result"
+/// dot clears once the user has seen it (the output stays in the panel). A `running`
+/// instance is NEVER acknowledged (no-op), nor is one already `idle`.
+///
+/// Two paths, both honouring the SAME camelCase `command://state` idle shape the
+/// front listens on:
+///   - LIVE terminal entry (a run that finished this session): the runner flips it
+///     to idle and the sink persists `last_state=idle` + emits `command://state`.
+///   - PERSISTED terminal state with NO live entry (e.g. a `success`/`error` restored
+///     at boot, never re-run): the runner has nothing to flip, so we persist idle and
+///     emit the idle event here directly — same payload shape — so the dot still
+///     reverts. The last-run exit code (finding 1) is decoupled from this dot, so it
+///     is untouched by the acknowledge.
+///
+/// Returns the `last_state` string after the call.
+#[tauri::command]
+fn command_acknowledge<R: Runtime>(
+    app: AppHandle<R>,
+    db: State<'_, Db>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    instance_id: String,
+) -> Result<String, String> {
+    // Never acknowledge a live process — that would lie about its state.
+    if runner.is_running(&instance_id) {
+        return Ok(crate::command::RunState::Running.as_db_str().to_string());
+    }
+    // LIVE terminal entry (a run that finished this session): the runner flips it to
+    // idle and (via the sink) persists `last_state=idle` + emits the idle event. A
+    // no-op for a runner that has no live terminal entry to flip — that case is the
+    // persisted check below. Called for its side effect; the committed state is then
+    // re-read to decide whether anything still needs clearing.
+    runner.acknowledge(&instance_id);
+    // PERSISTED terminal state with no live entry: clear it here so a restored
+    // success/error dot also reverts on select. Re-read the committed last_state —
+    // if the runner already cleared it above, this now reads `idle` and we no-op.
+    let last_state = db
+        .with_conn(|c| db::get_instance(c, &instance_id))
+        .map_err(|e| e.to_string())?
+        .map(|inst| inst.last_state)
+        .ok_or_else(|| format!("unknown command instance {instance_id}"))?;
+    if last_state == db::STATE_SUCCESS || last_state == db::STATE_ERROR {
+        db.with_conn(|c| db::set_last_state(c, &instance_id, db::STATE_IDLE))
+            .map_err(|e| e.to_string())?;
+        let _ = app.emit(
+            "command://state",
+            CommandStatePayload {
+                instance_id: instance_id.clone(),
+                state: db::STATE_IDLE.to_string(),
+                code: None,
+            },
+        );
+        return Ok(db::STATE_IDLE.to_string());
+    }
+    // Already idle (or the runner just made it idle and persisted it): no-op.
+    Ok(last_state)
+}
+
+/// Return an instance's output history: the LIVE in-memory buffer if it is running,
+/// else the persisted scrollback read back from the DB (cold rehydration). The front
+/// feeds it into the read-only output panel on open.
+///
+/// While running, the runner keeps a bounded live scrollback tail in memory and
+/// streams `command://output` events on top of it; the persisted DB row is only
+/// debounced (`PERSIST_DEBOUNCE`) plus a final persist on exit, so it can lag the
+/// true tail. Reading the live buffer when running makes this one-shot call reflect
+/// the current output, not a row that can be up to a debounce window stale. When the
+/// instance is idle/success/error there is no live buffer, so we rehydrate cold from
+/// the persisted scrollback.
+#[tauri::command]
+fn command_output<R: Runtime>(
+    _app: AppHandle<R>,
+    db: State<'_, Db>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    instance_id: String,
+) -> Result<String, String> {
+    // Live path: a running instance returns the runner's in-memory tail directly.
+    if let Some(live) = runner.live_output(&instance_id) {
+        return Ok(live);
+    }
+    // Cold path: idle/success/error (or absent live map) rehydrates the persisted
+    // scrollback row from the DB.
+    db.with_conn(|c| db::get_instance(c, &instance_id))
+        .map_err(|e| e.to_string())?
+        .map(|inst| inst.scrollback)
+        .ok_or_else(|| format!("unknown command instance {instance_id}"))
+}
+
+// --- Source actions (NO implicit rewrite of `command`) -------------------
+//
+// `refresh` updates only the snapshot + a derived status; it NEVER touches
+// `command`. The one action that DOES change `command` is the explicit `resync`
+// (re-reads the package.json at click time, rewrites the command to the current
+// raw script value, and KEEPS the link). `unlink` drops the source_* fields,
+// turning the template into a plain manual command. (There is no longer a
+// "reset to script runner" action — adopting the runner call is just a manual
+// edit, which detaches per [`command_update`].)
+
+/// Result of a source refresh: the freshness status + the (possibly updated)
+/// snapshot. `command` is deliberately ABSENT — refresh never rewrites it.
+#[derive(Clone, Serialize)]
+struct SourceRefreshResult {
+    /// `fresh` | `stale` | `missing package.json` | `missing script`.
+    status: String,
+    /// The script's current raw body, when the file + script still exist.
+    snapshot: Option<String>,
+}
+
+/// Re-read the template's source `package.json` and update ONLY the snapshot +
+/// status. Does NOT modify `command` (no implicit rewrite). Status is `fresh` when
+/// the on-disk script body equals the stored snapshot, `stale` when it differs,
+/// `missing package.json` / `missing script` when the file/script is gone.
+#[tauri::command]
+fn command_source_refresh(db: State<'_, Db>, id: String) -> Result<SourceRefreshResult, String> {
+    let template = db
+        .with_conn(|c| db::get_template(c, &id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("unknown command {id}"))?;
+
+    let Some(pkg_path) = template.source_package_json_path.clone() else {
+        return Err(format!("command {id} has no linked package.json source"));
+    };
+    let Some(script_name) = template.source_script_name.clone() else {
+        return Err(format!("command {id} has no linked source script"));
+    };
+
+    match read_script_body(&pkg_path, &script_name) {
+        ScriptLookup::Missing => Ok(SourceRefreshResult {
+            status: "missing package.json".to_string(),
+            snapshot: template.source_script_command_snapshot,
+        }),
+        ScriptLookup::NoScript => Ok(SourceRefreshResult {
+            status: "missing script".to_string(),
+            snapshot: template.source_script_command_snapshot,
+        }),
+        ScriptLookup::Body(body) => {
+            // Update the stored snapshot (provenance freshness) but never `command`.
+            let status = if template.source_script_command_snapshot.as_deref() == Some(&body) {
+                "fresh"
+            } else {
+                "stale"
+            };
+            let source = db::CommandSource {
+                source_kind: template.source_kind.clone(),
+                source_package_json_path: template.source_package_json_path.clone(),
+                source_script_name: template.source_script_name.clone(),
+                source_script_command_snapshot: Some(body.clone()),
+                package_manager: template.package_manager.clone(),
+            };
+            db.with_conn(|c| db::set_template_source(c, &id, source))
+                .map_err(|e| e.to_string())?;
+            Ok(SourceRefreshResult {
+                status: status.to_string(),
+                snapshot: Some(body),
+            })
+        }
+    }
+}
+
+/// EXPLICITLY RESYNC the command to the source script's CURRENT raw body, re-read
+/// from the package.json AT CLICK TIME (not the snapshot). Modifies `command`.
+/// KEEPS the source fields (the link is preserved — this is the explicit "adopt
+/// the new script value" path that does NOT detach) + refreshes the snapshot.
+/// REFUSED if any instance is running. Errors if the file/script no longer exists.
+#[tauri::command]
+fn command_resync_source<R: Runtime>(
+    _app: AppHandle<R>,
+    db: State<'_, Db>,
+    runner: State<'_, ManagedCommandRunner<R>>,
+    id: String,
+) -> Result<String, String> {
+    guard_template_not_running(&db, &runner, &id)?;
+    let template = db
+        .with_conn(|c| db::get_template(c, &id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("unknown command {id}"))?;
+    let pkg_path = template
+        .source_package_json_path
+        .clone()
+        .ok_or_else(|| format!("command {id} has no linked package.json source"))?;
+    let script = template
+        .source_script_name
+        .clone()
+        .ok_or_else(|| format!("command {id} has no linked source script"))?;
+
+    // Re-read the package.json AT CLICK TIME (the snapshot is not the authority).
+    let body = match read_script_body(&pkg_path, &script) {
+        ScriptLookup::Body(b) => b,
+        ScriptLookup::Missing => {
+            return Err(format!(
+                "the source package.json '{pkg_path}' no longer exists"
+            ))
+        }
+        ScriptLookup::NoScript => {
+            return Err(format!("the source script '{script}' no longer exists"))
+        }
+    };
+
+    db.with_conn(|c| {
+        // Update command to the raw body AND refresh the snapshot (now fresh).
+        db::update_template(c, &id, &template.name, &body, template.subfolder.as_deref())?;
+        let source = db::CommandSource {
+            source_kind: template.source_kind.clone(),
+            source_package_json_path: template.source_package_json_path.clone(),
+            source_script_name: template.source_script_name.clone(),
+            source_script_command_snapshot: Some(body.clone()),
+            package_manager: template.package_manager.clone(),
+        };
+        db::set_template_source(c, &id, source)
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+/// EXPLICITLY detach the package.json source: clears all `source_*` fields +
+/// `package_manager`, turning the template into a plain manual command. `command`
+/// is left exactly as-is.
+#[tauri::command]
+fn command_unlink_source(db: State<'_, Db>, id: String) -> Result<(), String> {
+    db.with_conn(|c| db::set_template_source(c, &id, db::CommandSource::default()))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+// --- Package.json import (discovery + create from selection) -------------
+
+/// Discover the package.json scripts under a WORKSPACE (root + subfolders), each
+/// with an editable proposed name + default runner command + source metadata. The
+/// front renders these for selection; an empty list means nothing importable.
+#[tauri::command]
+fn command_import_scripts(
+    db: State<'_, Db>,
+    workspace_id: String,
+) -> Result<Vec<crate::pkgjson::DiscoveredScript>, String> {
+    let path = db
+        .with_conn(|c| db::workspace_path(c, &workspace_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("unknown workspace {workspace_id}"))?;
+    Ok(crate::pkgjson::discover_package_scripts(&path))
+}
+
+/// Create a template from a SELECTED import row: the (user-edited) name + command,
+/// the package.json subfolder, and the source metadata. Refused with a clear error
+/// if the final name already exists in the project.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn command_import_create(
+    db: State<'_, Db>,
+    project_id: String,
+    name: String,
+    command: String,
+    subfolder: String,
+    source_package_json_path: String,
+    source_script_name: String,
+    source_script_command_snapshot: String,
+    package_manager: String,
+) -> Result<db::ManagedCommand, String> {
+    let source = db::CommandSource {
+        source_kind: Some(db::SOURCE_KIND_PACKAGE_JSON.to_string()),
+        source_package_json_path: Some(source_package_json_path),
+        source_script_name: Some(source_script_name),
+        source_script_command_snapshot: Some(source_script_command_snapshot),
+        package_manager: Some(package_manager),
+    };
+    db.with_conn(|c| {
+        crate::pkgjson::import_command(c, &project_id, &name, &command, &subfolder, source)
+    })
+}
+
+// --- Shutdown snapshot + boot restoration (PRD-3 Phase 3, task 16) --------
+//
+// The auto-relaunch-on-startup contract, driven by TWO signals (never
+// `last_state` alone):
+//   - at SHUTDOWN, snapshot `was_running_on_shutdown = (the runner reports the
+//     instance running)` for every instance;
+//   - at BOOT, relaunch an instance ONLY when its template's `restart_on_startup`
+//     is ON AND its `was_running_on_shutdown` snapshot is true; then reset the
+//     snapshot so the next boot cannot relaunch a ghost; and normalize a stale
+//     `running` (a dead/orphaned process) down to `idle` while keeping
+//     `success`/`error` for the dot.
+
+/// Snapshot the shutdown state: for every command instance, persist
+/// `was_running_on_shutdown` = whether the runner currently has it running. Called
+/// from the window-close / app-exit hook. The runner's LIVE map is the source of
+/// truth (a `last_state` of `running` that the runner does not back is NOT a
+/// running process).
+pub fn snapshot_commands_on_shutdown<R: Runtime>(db: &Db, runner: &ManagedCommandRunner<R>) {
+    let rows = match db.with_conn(db::all_instances_for_restore) {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    db.with_conn(|c| {
+        for row in &rows {
+            let running = runner.is_running(&row.instance_id);
+            let _ = db::set_was_running_on_shutdown(c, &row.instance_id, running);
+        }
+    });
+}
+
+/// Restore command instances at boot from the shutdown snapshot.
+///
+/// For every instance:
+///   - if its template `restart_on_startup` is ON **and**
+///     `was_running_on_shutdown` is true → `command_start` it through the runner
+///     (resolving cwd via the validated subfolder);
+///   - otherwise it is NOT relaunched; if its persisted `last_state` was `running`
+///     (a process that did not survive the restart), normalize it to `idle` so the
+///     UI never shows a phantom running dot. `success`/`error` are kept as-is.
+///   - in ALL cases the `was_running_on_shutdown` snapshot is reset to false after
+///     the boot decision, so a subsequent boot cannot relaunch a ghost.
+///
+/// Returns the ids that were relaunched (handy for tests/logging).
+pub fn restore_commands_on_boot<R: Runtime>(
+    db: &Db,
+    runner: &ManagedCommandRunner<R>,
+) -> Vec<String> {
+    let rows = match db.with_conn(db::all_instances_for_restore) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut relaunched = Vec::new();
+    for row in &rows {
+        let should_relaunch = row.restart_on_startup && row.was_running_on_shutdown;
+
+        if should_relaunch {
+            // Resolve the cwd (workspace + validated subfolder) and start. A failure
+            // to resolve (e.g. the subfolder no longer exists) must not abort the
+            // whole restore: skip this instance and normalize it instead.
+            match crate::subfolder::resolve_run_dir(&row.workspace_path, row.subfolder.as_deref()) {
+                Ok(cwd) => {
+                    if runner
+                        .start(&row.instance_id, &row.command, Some(&cwd))
+                        .is_ok()
+                    {
+                        relaunched.push(row.instance_id.clone());
+                    } else {
+                        normalize_unrelaunched(db, row);
+                    }
+                }
+                Err(_) => normalize_unrelaunched(db, row),
+            }
+        } else {
+            normalize_unrelaunched(db, row);
+        }
+
+        // Reset the snapshot AFTER the boot decision so a future boot cannot relaunch
+        // a ghost from a stale snapshot.
+        db.with_conn(|c| {
+            let _ = db::set_was_running_on_shutdown(c, &row.instance_id, false);
+        });
+    }
+    relaunched
+}
+
+/// Normalize an instance that was NOT relaunched at boot: a persisted `running`
+/// (the process did not survive the restart, so it is an orphan/dead) becomes
+/// `idle`; `success`/`error`/`idle` are left untouched (the dot keeps its color).
+fn normalize_unrelaunched(db: &Db, row: &db::RestoreRow) {
+    if row.last_state == db::STATE_RUNNING {
+        db.with_conn(|c| {
+            let _ = db::set_last_state(c, &row.instance_id, db::STATE_IDLE);
+        });
+    }
+}
+
+// --- Internal guard + resolution helpers ---------------------------------
+
+/// Refuse a template mutation while any of its instances is running. The runner's
+/// LIVE map is authoritative; the persisted `last_state` is only a mirror. Returns
+/// a clear user-facing error when blocked.
+fn guard_template_not_running<R: Runtime>(
+    db: &State<'_, Db>,
+    runner: &State<'_, ManagedCommandRunner<R>>,
+    template_id: &str,
+) -> Result<(), String> {
+    let instance_ids = db
+        .with_conn(|c| db::instance_ids_for_template(c, template_id))
+        .map_err(|e| e.to_string())?;
+    if runner.any_running(&instance_ids) {
+        return Err(
+            "this command is running in at least one workspace — stop it before editing or deleting it"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Resolve an instance's command line + run cwd: the template `command`, and the
+/// workspace path joined with the VALIDATED subfolder (anti path-traversal /
+/// existence, via [`crate::subfolder`]). Errors before any spawn on an unknown
+/// instance or an invalid/missing subfolder.
+fn resolve_command_and_cwd(
+    db: &State<'_, Db>,
+    instance_id: &str,
+) -> Result<(String, String), String> {
+    let ctx = db
+        .with_conn(|c| db::instance_run_context(c, instance_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("unknown command instance {instance_id}"))?;
+    let cwd = crate::subfolder::resolve_run_dir(&ctx.workspace_path, ctx.subfolder.as_deref())?;
+    Ok((ctx.command, cwd))
+}
+
+/// Parse a stored `package_manager` string into a [`crate::pkgjson::PackageManager`].
+fn parse_package_manager(s: &str) -> Option<crate::pkgjson::PackageManager> {
+    use crate::pkgjson::PackageManager;
+    match s {
+        "npm" => Some(PackageManager::Npm),
+        "pnpm" => Some(PackageManager::Pnpm),
+        "yarn" => Some(PackageManager::Yarn),
+        "bun" => Some(PackageManager::Bun),
+        _ => None,
+    }
+}
+
+/// Outcome of looking up a script body in a package.json on disk.
+enum ScriptLookup {
+    /// The file is gone / unreadable / unparsable.
+    Missing,
+    /// The file exists but does not contain the named script.
+    NoScript,
+    /// The script's current raw body.
+    Body(String),
+}
+
+/// Read the current raw body of `script_name` from the package.json at `pkg_path`.
+/// Used by `refresh` / `swap` to re-read the source AT CALL TIME (never the
+/// snapshot). Distinguishes a missing file from a missing script.
+fn read_script_body(pkg_path: &str, script_name: &str) -> ScriptLookup {
+    let Ok(text) = std::fs::read_to_string(pkg_path) else {
+        return ScriptLookup::Missing;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return ScriptLookup::Missing;
+    };
+    match json
+        .get("scripts")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(script_name))
+        .and_then(|v| v.as_str())
+    {
+        Some(body) => ScriptLookup::Body(body.to_string()),
+        None => ScriptLookup::NoScript,
+    }
 }
 
 // --- Auto-attach (cwd → known workspace) ---------------------------------
@@ -681,7 +1528,23 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             detach_terminal,
             pin_terminal_workspace,
             unpin_terminal_workspace,
-            auto_attach_terminal
+            auto_attach_terminal,
+            command_create,
+            command_list,
+            command_update,
+            command_delete,
+            command_reorder,
+            command_instance_list,
+            command_start,
+            command_stop,
+            command_relaunch,
+            command_acknowledge,
+            command_output,
+            command_source_refresh,
+            command_resync_source,
+            command_unlink_source,
+            command_import_scripts,
+            command_import_create
         ])
 }
 
@@ -1076,7 +1939,11 @@ mod tests {
         resize(&app, c, 100, 30);
         // The closed one is gone: re-closing it is an error, not a hang.
         assert!(close(&app, b).is_err(), "re-closing a gone PTY must error");
-        assert_eq!(live_pty_count(&app), 2, "survivors remain after the re-close");
+        assert_eq!(
+            live_pty_count(&app),
+            2,
+            "survivors remain after the re-close"
+        );
     }
 
     #[test]
@@ -1092,7 +1959,11 @@ mod tests {
         for id in ids {
             close(&app, id).expect("pty_close");
         }
-        assert_eq!(live_pty_count(&app), 0, "no PTY may remain after closing all");
+        assert_eq!(
+            live_pty_count(&app),
+            0,
+            "no PTY may remain after closing all"
+        );
         assert!(
             start.elapsed() < Duration::from_secs(15),
             "closing 6 PTYs took too long ({:?}) — a teardown stalled",
@@ -1535,7 +2406,11 @@ mod tests {
             .into_iter()
             .map(|t| t.id)
             .collect();
-        assert_eq!(ordered, vec![b.id.clone(), a.id.clone()], "reorder reflected by list");
+        assert_eq!(
+            ordered,
+            vec![b.id.clone(), a.id.clone()],
+            "reorder reflected by list"
+        );
 
         // close → status closed (row retained)
         close_terminal(dbs(), a.id.clone()).expect("close");
@@ -2020,7 +2895,7 @@ mod tests {
     /// (not deletes) its terminals. Mirrors the db unit tests at the IPC surface.
     #[test]
     fn update_and_delete_project_commands_route_and_persist() {
-        let app = build_app_with_db();
+        let app = build_app_with_runner();
 
         let created = cmd_create_project(&app, "old", "/home/kris/proj", None)
             .expect("create_project command");
@@ -2042,7 +2917,13 @@ mod tests {
         let t = create_terminal(app.state::<Db>(), "/home/kris/proj".into(), None).unwrap();
         cmd_attach(&app, &t.id, &root_id, db::BINDING_MANUAL).expect("attach");
 
-        delete_project(app.state::<Db>(), project_id.clone()).expect("delete_project command");
+        delete_project(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            project_id.clone(),
+        )
+        .expect("delete_project command");
         let projects = list_projects(app.state::<Db>()).expect("list after delete");
         assert!(
             projects.iter().all(|p| p.id != project_id),
@@ -2082,7 +2963,11 @@ mod tests {
             .expect("set_project_collapsed command");
         let projects = list_projects(app.state::<Db>()).expect("list_projects");
         assert!(
-            projects.iter().find(|pr| pr.id == project_id).unwrap().collapsed,
+            projects
+                .iter()
+                .find(|pr| pr.id == project_id)
+                .unwrap()
+                .collapsed,
             "collapse routes + persists via the project command"
         );
 
@@ -2091,11 +2976,19 @@ mod tests {
             .expect("set_workspace_collapsed command");
         let workspaces = list_workspaces(app.state::<Db>(), project_id.clone()).expect("list_ws");
         assert!(
-            workspaces.iter().find(|w| w.id == feat.id).unwrap().collapsed,
+            workspaces
+                .iter()
+                .find(|w| w.id == feat.id)
+                .unwrap()
+                .collapsed,
             "collapse routes + persists via the workspace command"
         );
         assert!(
-            !workspaces.iter().find(|w| w.id == root_id).unwrap().collapsed,
+            !workspaces
+                .iter()
+                .find(|w| w.id == root_id)
+                .unwrap()
+                .collapsed,
             "a sibling workspace is left open"
         );
 
@@ -2104,7 +2997,11 @@ mod tests {
             .expect("re-open project");
         let projects = list_projects(app.state::<Db>()).expect("list_projects again");
         assert!(
-            !projects.iter().find(|pr| pr.id == project_id).unwrap().collapsed,
+            !projects
+                .iter()
+                .find(|pr| pr.id == project_id)
+                .unwrap()
+                .collapsed,
             "the project re-opens via the command"
         );
     }
@@ -2134,5 +3031,1485 @@ mod tests {
         assert!(controls_visible_from_env(Some("true".into())));
         assert!(controls_visible_from_env(Some(String::new())));
         assert!(controls_visible_from_env(Some("00".into())));
+    }
+
+    // --- command event payloads serialize in camelCase (live-event contract) -
+    //
+    // The front filters EVERY `command://state` / `command://output` event on
+    // `event.payload.instanceId` (camelCase). If these payloads serialized the
+    // field as snake_case `instance_id`, the front would read `undefined` and DROP
+    // every live event — the headline "the dot never updates / output never streams
+    // live" bug. These tests pin the wire key so a regression fails here, not in a
+    // hard-to-trace dogfood session.
+
+    #[test]
+    fn command_state_payload_serializes_instance_id_as_camel_case() {
+        let payload = CommandStatePayload {
+            instance_id: "inst-42".to_string(),
+            state: "running".to_string(),
+            code: None,
+        };
+        let v = serde_json::to_value(&payload).expect("serialize CommandStatePayload");
+        assert_eq!(
+            v.get("instanceId").and_then(|x| x.as_str()),
+            Some("inst-42"),
+            "command://state must serialize instanceId in camelCase (the front filters on it)"
+        );
+        assert!(
+            v.get("instance_id").is_none(),
+            "the snake_case key must NOT be present (it would make the front drop the event)"
+        );
+    }
+
+    #[test]
+    fn command_output_payload_serializes_instance_id_as_camel_case() {
+        let payload = CommandOutputPayload {
+            instance_id: "inst-7".to_string(),
+            bytes: vec![1, 2, 3],
+        };
+        let v = serde_json::to_value(&payload).expect("serialize CommandOutputPayload");
+        assert_eq!(
+            v.get("instanceId").and_then(|x| x.as_str()),
+            Some("inst-7"),
+            "command://output must serialize instanceId in camelCase (the front filters on it)"
+        );
+        assert!(
+            v.get("instance_id").is_none(),
+            "the snake_case key must NOT be present"
+        );
+    }
+
+    // --- Managed-command runtime: production sink on the mock runtime --------
+    //
+    // Validates the THIN Tauri layer wired in this phase: `build_command_runner`
+    // + `TauriRunnerSink` must (1) emit `command://state` and `command://output`
+    // over the AppHandle and (2) persist `last_state` through the managed `Db`.
+    // The state-machine logic itself is unit-tested in `crate::command`; here we
+    // prove the production event + persistence plumbing end-to-end on the mock
+    // app. (The fuller start->running->output->exit integration matrix is the
+    // Phase-5 `tauri::test` task; this is the minimal contract for THIS phase.)
+
+    /// Create a project (with its root workspace) + one template, returning the
+    /// materialized instance id for the root workspace. Pins `$SHELL` POSIX so the
+    /// command runs deterministically under `sh -c`.
+    #[cfg(not(windows))]
+    fn seed_instance(app: &App<MockRuntime>) -> String {
+        std::env::set_var("SHELL", "/bin/sh");
+        let db = app.state::<Db>();
+        db.with_conn(|c| {
+            let pr = db::create_project(c, "proj", "/tmp/nyx-cmd-test", None).expect("project");
+            // Materializes one instance of this template into the root workspace.
+            let tpl =
+                db::create_template(c, &pr.0.id, "svc", "echo SVC_OUT", None, Default::default())
+                    .expect("template");
+            let instances = db::list_instances_for_workspace(c, &pr.1.id).expect("instances");
+            let inst = instances
+                .iter()
+                .find(|i| i.command_id == tpl.id)
+                .expect("materialized instance");
+            inst.id.clone()
+        })
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn production_runner_emits_events_and_persists_last_state() {
+        use std::sync::mpsc::channel;
+        let app = build_app_with_db();
+        let instance_id = seed_instance(&app);
+
+        // Capture command://state + command://output for our instance.
+        let (state_tx, state_rx) = channel::<(String, Option<i32>)>();
+        {
+            let id = instance_id.clone();
+            app.listen("command://state", move |event| {
+                let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                if v["instance_id"] == id {
+                    let st = v["state"].as_str().unwrap().to_string();
+                    let code = v["code"].as_i64().map(|n| n as i32);
+                    let _ = state_tx.send((st, code));
+                }
+            });
+        }
+        let (out_tx, out_rx) = channel::<String>();
+        {
+            let id = instance_id.clone();
+            app.listen("command://output", move |event| {
+                let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                if v["instance_id"] == id {
+                    let bytes: Vec<u8> = v["bytes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|n| n.as_u64().unwrap() as u8)
+                        .collect();
+                    let _ = out_tx.send(String::from_utf8_lossy(&bytes).into_owned());
+                }
+            });
+        }
+
+        // Build the PRODUCTION runner (Tauri sink + managed Db) and run the
+        // template's command line through it.
+        let runner = build_command_runner(app.handle().clone());
+        runner
+            .start(&instance_id, "echo SVC_OUT", None)
+            .expect("start");
+
+        // 1) A running state event fires.
+        let mut saw_running = false;
+        let mut saw_success = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline && !(saw_running && saw_success) {
+            if let Ok((st, code)) = state_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                if st == "running" {
+                    saw_running = true;
+                }
+                if st == "success" {
+                    assert_eq!(code, Some(0), "success must carry exit code 0");
+                    saw_success = true;
+                }
+            }
+        }
+        assert!(
+            saw_running,
+            "command://state must emit a running transition"
+        );
+        assert!(
+            saw_success,
+            "command://state must emit a success transition on exit 0"
+        );
+
+        // 2) The output event relayed the command's stdout.
+        let mut out = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !out.contains("SVC_OUT") {
+            if let Ok(chunk) = out_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                out.push_str(&chunk);
+            }
+        }
+        assert!(
+            out.contains("SVC_OUT"),
+            "command://output must relay the command stdout, got: {out:?}"
+        );
+
+        // 3) The DB row's last_state was persisted to success (committed before the
+        // success event, so by now it must read back as success).
+        let persisted = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .expect("get_instance")
+            .expect("instance row");
+        assert_eq!(
+            persisted.last_state, "success",
+            "the runner must persist last_state to the DB on each transition"
+        );
+        // And the scrollback was persisted (contains the output).
+        assert!(
+            persisted.scrollback.contains("SVC_OUT"),
+            "the runner must persist bounded scrollback, got: {:?}",
+            persisted.scrollback
+        );
+    }
+
+    // --- Internal command surface (PRD-3 Phase 3, task 5) --------------------
+    //
+    // These exercise the `command_*` `#[tauri::command]` BODIES directly with the
+    // mock app's handle + managed state (the same direct-invoke pattern the PTY
+    // tests use; app-defined ACL permissions are absent under `mock_context`). We
+    // manage the PRODUCTION runner so the lifecycle commands have a live runner and
+    // the running-mutation guards see real live state.
+
+    /// A mock app with an in-memory `Db` AND the production command runner managed,
+    /// so the `command_*` lifecycle commands and their guards work end-to-end.
+    fn build_app_with_runner() -> App<MockRuntime> {
+        let app = build_app_with_db();
+        manage_command_runner(&app.handle().clone());
+        app
+    }
+
+    fn runner_state(app: &App<MockRuntime>) -> State<'_, ManagedCommandRunner<MockRuntime>> {
+        app.state::<ManagedCommandRunner<MockRuntime>>()
+    }
+
+    /// A real temp workspace directory (canonicalized), cleaned on drop, so
+    /// `command_start`'s subfolder/cwd resolution has an existing folder to run in.
+    struct TempWs {
+        root: std::path::PathBuf,
+    }
+    impl TempWs {
+        fn new(tag: &str) -> Self {
+            let mut root = std::env::temp_dir();
+            root.push(format!(
+                "nyx_bridge_{}_{}_{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let root = std::fs::canonicalize(&root).unwrap();
+            TempWs { root }
+        }
+        fn path(&self) -> String {
+            self.root.to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for TempWs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Poll the DB `last_state` of an instance until it equals `want` or times out.
+    #[cfg(not(windows))]
+    fn wait_db_state(app: &App<MockRuntime>, instance_id: &str, want: &str, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            let st = app
+                .state::<Db>()
+                .with_conn(|c| db::get_instance(c, instance_id))
+                .unwrap()
+                .map(|i| i.last_state)
+                .unwrap_or_default();
+            if st == want {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        false
+    }
+
+    /// `command_create` carries subfolder + restart_on_startup + the four source
+    /// fields; `command_list` returns it; `command_reorder` persists a new order.
+    #[test]
+    fn create_carries_subfolder_restart_source_and_reorder_persists() {
+        let app = build_app_with_db();
+        let db = app.state::<Db>();
+        let project_id = db
+            .with_conn(|c| db::create_project(c, "p", "/tmp/p", None))
+            .unwrap()
+            .0
+            .id;
+
+        let created = command_create(
+            app.state::<Db>(),
+            project_id.clone(),
+            "dev".into(),
+            "pnpm dev".into(),
+            Some("packages/api".into()),
+            Some(true),
+            Some("package_json".into()),
+            Some("/tmp/p/packages/api/package.json".into()),
+            Some("dev".into()),
+            Some("vite".into()),
+            Some("pnpm".into()),
+        )
+        .expect("command_create");
+        assert_eq!(created.subfolder.as_deref(), Some("packages/api"));
+        assert!(created.restart_on_startup, "restart_on_startup carried");
+        assert_eq!(created.source_kind.as_deref(), Some("package_json"));
+        assert_eq!(created.source_script_name.as_deref(), Some("dev"));
+        assert_eq!(created.package_manager.as_deref(), Some("pnpm"));
+
+        // A second template, then reorder them and confirm the order persists.
+        let second = command_create(
+            app.state::<Db>(),
+            project_id.clone(),
+            "build".into(),
+            "pnpm build".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("second");
+
+        let listed = command_list(app.state::<Db>(), project_id.clone()).expect("list");
+        assert_eq!(listed.len(), 2);
+
+        command_reorder(
+            app.state::<Db>(),
+            vec![second.id.clone(), created.id.clone()],
+        )
+        .expect("reorder");
+        let reordered = command_list(app.state::<Db>(), project_id).expect("list2");
+        assert_eq!(
+            reordered.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+            vec![second.id, created.id],
+            "reorder must persist the new template order"
+        );
+    }
+
+    /// Full lifecycle through the COMMAND surface: start -> running, output relayed,
+    /// natural exit -> success, and `command_output` returns the persisted history.
+    #[test]
+    #[cfg(not(windows))]
+    fn start_running_output_success_through_commands() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("lifecycle");
+        let (project_id, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", &ws.path(), None).unwrap();
+            (pr.0.id, pr.1.id)
+        });
+
+        // A template that echoes a marker and exits 0.
+        let tpl = command_create(
+            app.state::<Db>(),
+            project_id,
+            "svc".into(),
+            "echo LIFECYCLE_MARKER".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("template");
+
+        let instance_id = app
+            .state::<Db>()
+            .with_conn(|c| db::list_instances_for_workspace(c, &workspace_id))
+            .unwrap()
+            .into_iter()
+            .find(|i| i.command_id == tpl.id)
+            .expect("instance")
+            .id;
+
+        // start -> running (then it exits 0 -> success).
+        let st = command_start(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_start");
+        assert_eq!(st, "running", "start returns running");
+
+        assert!(
+            wait_db_state(&app, &instance_id, "success", 8),
+            "the command must reach success after a natural exit 0"
+        );
+
+        // command_output returns the persisted scrollback (cold history) containing
+        // the marker.
+        let out = command_output(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_output");
+        assert!(
+            out.contains("LIFECYCLE_MARKER"),
+            "command_output must return the output history, got: {out:?}"
+        );
+    }
+
+    /// `command_output` branch contract (T5 done_criterion): the LIVE in-memory
+    /// buffer while running, the persisted scrollback once terminal. We start a
+    /// command that emits a marker then sleeps so the instance stays `running` with
+    /// output already buffered. The live read must surface the marker straight from
+    /// the runner — even before the debounced DB persist has written the row — and
+    /// after we stop it, the same call must rehydrate the persisted cold scrollback.
+    #[test]
+    #[cfg(not(windows))]
+    fn command_output_reads_live_buffer_while_running_then_persisted_cold() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("liveoutput");
+        let (project_id, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", &ws.path(), None).unwrap();
+            (pr.0.id, pr.1.id)
+        });
+
+        // Emit a marker, then sleep so the instance stays running (no natural exit).
+        let tpl = command_create(
+            app.state::<Db>(),
+            project_id,
+            "svc".into(),
+            "echo LIVE_MARKER; sleep 30".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("template");
+
+        let instance_id = app
+            .state::<Db>()
+            .with_conn(|c| db::list_instances_for_workspace(c, &workspace_id))
+            .unwrap()
+            .into_iter()
+            .find(|i| i.command_id == tpl.id)
+            .expect("instance")
+            .id;
+
+        let st = command_start(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_start");
+        assert_eq!(st, "running", "start returns running");
+
+        // Poll the LIVE read until the marker appears. This proves the running
+        // branch returns the runner's in-memory buffer: it is sourced from the live
+        // map (`is_running`), not the DB row — and it can show the marker before the
+        // debounced persist (PERSIST_DEBOUNCE) has even written the scrollback row.
+        let live_read = || {
+            command_output(
+                app.handle().clone(),
+                app.state::<Db>(),
+                runner_state(&app),
+                instance_id.clone(),
+            )
+            .expect("command_output (live)")
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_marker = false;
+        while std::time::Instant::now() < deadline {
+            if live_read().contains("LIVE_MARKER") {
+                saw_marker = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            saw_marker,
+            "while running, command_output must return the live in-memory buffer with the marker"
+        );
+        // The runner reports the instance as live; the live read is the running branch.
+        assert!(
+            runner_state(&app).is_running(&instance_id),
+            "instance must still be running for the live-branch assertion"
+        );
+
+        // Stop -> idle. The live buffer is gone, so command_output now rehydrates the
+        // persisted cold scrollback. The pump's final persist on disconnect wrote the
+        // marker into the DB row, so the cold read still surfaces it.
+        let stopped = command_stop(
+            app.handle().clone(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_stop");
+        assert_eq!(stopped, "idle", "stop returns idle");
+        assert!(
+            !runner_state(&app).is_running(&instance_id),
+            "instance must be idle after stop (no live buffer)"
+        );
+
+        let cold = command_output(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_output (cold)");
+        let persisted = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .map(|i| i.scrollback)
+            .unwrap_or_default();
+        assert_eq!(
+            cold, persisted,
+            "after stop, command_output must return the persisted scrollback row verbatim"
+        );
+        assert!(
+            cold.contains("LIVE_MARKER"),
+            "the persisted cold scrollback must still contain the marker, got: {cold:?}"
+        );
+    }
+
+    /// `command_acknowledge` clears a PERSISTED terminal dot with NO live entry (the
+    /// restore-at-boot shape: a `success`/`error` row, never re-run this session) back
+    /// to idle, persisting `last_state=idle`. This is the bridge-only path (the runner
+    /// has nothing to flip), proving the dot reverts on select even after a restart.
+    #[test]
+    #[cfg(not(windows))]
+    fn acknowledge_clears_persisted_terminal_state_without_live_entry() {
+        let app = build_app_with_runner();
+        let ws = TempWs::new("ack_persisted");
+        let (project_id, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", &ws.path(), None).unwrap();
+            (pr.0.id, pr.1.id)
+        });
+        let tpl = command_create(
+            app.state::<Db>(),
+            project_id,
+            "svc".into(),
+            "true".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("template");
+        let instance_id = app
+            .state::<Db>()
+            .with_conn(|c| db::list_instances_for_workspace(c, &workspace_id))
+            .unwrap()
+            .into_iter()
+            .find(|i| i.command_id == tpl.id)
+            .expect("instance")
+            .id;
+
+        // Persist a terminal state directly (simulating a restored success row), with
+        // NO live runner entry for it.
+        app.state::<Db>()
+            .with_conn(|c| db::set_last_state(c, &instance_id, db::STATE_ERROR))
+            .expect("seed error state");
+        assert!(
+            !runner_state(&app).is_running(&instance_id),
+            "no live entry: the runner does not back this terminal state"
+        );
+
+        // Acknowledge: returns idle and persists last_state=idle.
+        let st = command_acknowledge(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_acknowledge");
+        assert_eq!(st, "idle", "acknowledge clears the persisted terminal state");
+        let persisted = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .expect("row")
+            .last_state;
+        assert_eq!(persisted, "idle", "last_state was persisted to idle");
+
+        // A second acknowledge is a no-op (already idle).
+        let st2 = command_acknowledge(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_acknowledge (2)");
+        assert_eq!(st2, "idle", "acknowledge on idle is a no-op returning idle");
+    }
+
+    /// `command_acknowledge` is a NO-OP on a running instance: it must never clear a
+    /// live process's state. The instance keeps running.
+    #[test]
+    #[cfg(not(windows))]
+    fn acknowledge_running_instance_is_a_noop() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("ack_running");
+        let (project_id, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", &ws.path(), None).unwrap();
+            (pr.0.id, pr.1.id)
+        });
+        let tpl = command_create(
+            app.state::<Db>(),
+            project_id,
+            "svc".into(),
+            "sleep 30".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("template");
+        let instance_id = app
+            .state::<Db>()
+            .with_conn(|c| db::list_instances_for_workspace(c, &workspace_id))
+            .unwrap()
+            .into_iter()
+            .find(|i| i.command_id == tpl.id)
+            .expect("instance")
+            .id;
+
+        command_start(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_start");
+        assert!(
+            runner_state(&app).is_running(&instance_id),
+            "instance must be running before the acknowledge no-op check"
+        );
+
+        let st = command_acknowledge(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_acknowledge");
+        assert_eq!(st, "running", "acknowledge on running returns running (no-op)");
+        assert!(
+            runner_state(&app).is_running(&instance_id),
+            "the running instance must be untouched by acknowledge"
+        );
+
+        // Cleanup: stop the live process.
+        command_stop(app.handle().clone(), runner_state(&app), instance_id).expect("cleanup stop");
+    }
+
+    /// stop is idempotent on a non-running instance, and relaunch on idle is a
+    /// direct start. (Run cheaply with a long-lived `sleep` so timing is robust.)
+    #[test]
+    #[cfg(not(windows))]
+    fn stop_and_relaunch_through_commands() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("stop_relaunch");
+        let (project_id, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", &ws.path(), None).unwrap();
+            (pr.0.id, pr.1.id)
+        });
+
+        let tpl = command_create(
+            app.state::<Db>(),
+            project_id,
+            "svc".into(),
+            "sleep 30".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("template");
+        let instance_id = app
+            .state::<Db>()
+            .with_conn(|c| db::list_instances_for_workspace(c, &workspace_id))
+            .unwrap()
+            .into_iter()
+            .find(|i| i.command_id == tpl.id)
+            .unwrap()
+            .id;
+
+        // stop on a never-started instance: idempotent no-op, idle.
+        let st = command_stop(
+            app.handle().clone(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("stop noop");
+        assert_eq!(st, "idle");
+
+        // relaunch on idle = direct start -> running.
+        let st = command_relaunch(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("relaunch");
+        assert_eq!(st, "running", "relaunch on idle starts directly");
+        assert!(wait_db_state(&app, &instance_id, "running", 4));
+
+        // stop the running instance -> idle.
+        let st = command_stop(
+            app.handle().clone(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("stop running");
+        assert_eq!(st, "idle", "stop on running goes idle");
+    }
+
+    /// Full lifecycle driven through the `command_*` SURFACE while every transition
+    /// and output chunk is observed via `app.listen` (the front's only signal):
+    /// `command_start` -> `command://state` running + `command://output` marker ->
+    /// natural exit 0 -> `command://state` success; then a fresh start, `command_stop`
+    /// -> `command://state` idle; then `command_relaunch` -> running again. Proves the
+    /// done-criterion "start/stop/relaunch/output observables via app.listen" end-to-end
+    /// over the real command surface, and that relaunch never leaves two live instances.
+    #[test]
+    #[cfg(not(windows))]
+    fn lifecycle_through_commands_is_observable_via_listen() {
+        use std::sync::mpsc::channel;
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("listen_lifecycle");
+        let (project_id, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", &ws.path(), None).unwrap();
+            (pr.0.id, pr.1.id)
+        });
+
+        // A template that emits a marker then sleeps so it stays running until we act.
+        let tpl = command_create(
+            app.state::<Db>(),
+            project_id,
+            "svc".into(),
+            "echo LISTEN_MARKER; sleep 30".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("template");
+        let instance_id = app
+            .state::<Db>()
+            .with_conn(|c| db::list_instances_for_workspace(c, &workspace_id))
+            .unwrap()
+            .into_iter()
+            .find(|i| i.command_id == tpl.id)
+            .unwrap()
+            .id;
+
+        // Subscribe to BOTH command events, filtered to our instance, BEFORE starting.
+        let (state_tx, state_rx) = channel::<(String, Option<i32>)>();
+        {
+            let id = instance_id.clone();
+            app.listen("command://state", move |event| {
+                let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                if v["instance_id"] == id {
+                    let st = v["state"].as_str().unwrap().to_string();
+                    let code = v["code"].as_i64().map(|n| n as i32);
+                    let _ = state_tx.send((st, code));
+                }
+            });
+        }
+        let (out_tx, out_rx) = channel::<String>();
+        {
+            let id = instance_id.clone();
+            app.listen("command://output", move |event| {
+                let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                if v["instance_id"] == id {
+                    let bytes: Vec<u8> = v["bytes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|n| n.as_u64().unwrap() as u8)
+                        .collect();
+                    let _ = out_tx.send(String::from_utf8_lossy(&bytes).into_owned());
+                }
+            });
+        }
+
+        // Wait until a `command://state` event of `want` is observed (with its code).
+        let wait_state = |want: &str, secs: u64| -> Option<Option<i32>> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            while std::time::Instant::now() < deadline {
+                if let Ok((st, code)) =
+                    state_rx.recv_timeout(std::time::Duration::from_millis(150))
+                {
+                    if st == want {
+                        return Some(code);
+                    }
+                }
+            }
+            None
+        };
+
+        // 1) command_start -> a `running` state event is broadcast over app.listen.
+        let st = command_start(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_start");
+        assert_eq!(st, "running", "command_start returns running");
+        assert!(
+            wait_state("running", 6).is_some(),
+            "command://state must broadcast a running transition for the started instance"
+        );
+
+        // 2) the command's stdout is relayed as a `command://output` event.
+        let mut out = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline && !out.contains("LISTEN_MARKER") {
+            if let Ok(chunk) = out_rx.recv_timeout(std::time::Duration::from_millis(150)) {
+                out.push_str(&chunk);
+            }
+        }
+        assert!(
+            out.contains("LISTEN_MARKER"),
+            "command://output must relay the command stdout, got: {out:?}"
+        );
+
+        // 3) command_stop -> the instance goes idle and an `idle` state event fires.
+        let st = command_stop(
+            app.handle().clone(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_stop");
+        assert_eq!(st, "idle", "command_stop returns idle");
+        assert!(
+            wait_state("idle", 6).is_some(),
+            "command://state must broadcast an idle transition after stop"
+        );
+        // Exactly one live entry max — stop left no orphan running.
+        assert!(
+            !runner_state(&app).is_running(&instance_id),
+            "after stop the instance is not running"
+        );
+
+        // 4) command_relaunch on the idle instance -> running again, observable.
+        let st = command_relaunch(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("command_relaunch");
+        assert_eq!(st, "running", "command_relaunch returns running");
+        assert!(
+            wait_state("running", 6).is_some(),
+            "command://state must broadcast a running transition after relaunch"
+        );
+        // A relaunch never leaves two live instances for one command: the runner
+        // keys live entries by instance_id, so a relaunch replaces (never doubles)
+        // the entry — the process-death proof lives in the `command::` unit test
+        // `relaunch_never_leaves_two_live_instances`; here we confirm the post-state
+        // is a single running entry for the instance.
+        assert!(
+            runner_state(&app).is_running(&instance_id),
+            "the relaunched instance is running with a single live entry"
+        );
+
+        // Clean up the live process.
+        command_stop(app.handle().clone(), runner_state(&app), instance_id).expect("final stop");
+    }
+
+    /// update/delete of a template with a RUNNING instance is refused with a clear
+    /// error; delete_project is refused while an instance is running, then allowed
+    /// after stop.
+    #[test]
+    #[cfg(not(windows))]
+    fn running_mutations_are_guarded() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("guards");
+        let (project_id, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", &ws.path(), None).unwrap();
+            (pr.0.id, pr.1.id)
+        });
+        let tpl = command_create(
+            app.state::<Db>(),
+            project_id.clone(),
+            "svc".into(),
+            "sleep 30".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("template");
+        let instance_id = app
+            .state::<Db>()
+            .with_conn(|c| db::list_instances_for_workspace(c, &workspace_id))
+            .unwrap()
+            .into_iter()
+            .find(|i| i.command_id == tpl.id)
+            .unwrap()
+            .id;
+
+        command_start(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("start");
+        assert!(wait_db_state(&app, &instance_id, "running", 4));
+
+        // update is refused while running.
+        let err = command_update(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            tpl.id.clone(),
+            "svc".into(),
+            "sleep 99".into(),
+            None,
+            None,
+        )
+        .expect_err("update of a running template must be refused");
+        assert!(err.contains("running"), "clear error: {err}");
+
+        // delete is refused while running.
+        let err = command_delete(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            tpl.id.clone(),
+        )
+        .expect_err("delete of a running template must be refused");
+        assert!(err.contains("running"), "clear error: {err}");
+
+        // delete_project is refused while an instance is running.
+        let err = delete_project(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            project_id.clone(),
+        )
+        .expect_err("delete_project must be refused while an instance is running");
+        assert!(err.contains("running"), "clear error: {err}");
+
+        // update_project / rename_workspace are NOT guarded (no path/runtime change).
+        update_project(app.state::<Db>(), project_id.clone(), "renamed".into())
+            .expect("update_project must pass even while a command runs");
+        rename_workspace(app.state::<Db>(), workspace_id.clone(), "ws2".into())
+            .expect("rename_workspace must pass even while a command runs");
+
+        // Stop, then the guarded mutations are allowed.
+        command_stop(
+            app.handle().clone(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("stop");
+        // Give the runner a beat to settle the live entry to idle.
+        assert!(wait_db_state(&app, &instance_id, "idle", 4));
+        delete_project(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            project_id,
+        )
+        .expect("delete_project must pass once nothing is running");
+    }
+
+    /// Source actions: `refresh` updates snapshot+status WITHOUT touching `command`;
+    /// `resync_source` re-reads the package.json and rewrites `command` to the current
+    /// raw script value while KEEPING the link; `unlink_source` drops the source
+    /// fields. No implicit rewrite anywhere.
+    #[test]
+    #[cfg(not(windows))]
+    fn source_actions_have_no_implicit_rewrite() {
+        let app = build_app_with_runner();
+        let ws = TempWs::new("source");
+        // A real package.json whose `dev` script the template links to.
+        let pkg_path = ws.root.join("package.json");
+        std::fs::write(
+            &pkg_path,
+            r#"{ "scripts": { "dev": "vite --host 0.0.0.0" } }"#,
+        )
+        .unwrap();
+        let pkg_path_str = std::fs::canonicalize(&pkg_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let project_id = app
+            .state::<Db>()
+            .with_conn(|c| db::create_project(c, "p", &ws.path(), None))
+            .unwrap()
+            .0
+            .id;
+
+        // Import the dev script: default command is the runner `pnpm dev`, snapshot
+        // is the raw body.
+        let created = command_import_create(
+            app.state::<Db>(),
+            project_id,
+            "dev".into(),
+            "pnpm dev".into(),
+            String::new(),
+            pkg_path_str.clone(),
+            "dev".into(),
+            "vite --host 0.0.0.0".into(),
+            "pnpm".into(),
+        )
+        .expect("import_create");
+        assert_eq!(created.command, "pnpm dev");
+
+        // 1) refresh: snapshot is identical -> fresh, command UNCHANGED.
+        let refreshed =
+            command_source_refresh(app.state::<Db>(), created.id.clone()).expect("refresh");
+        assert_eq!(refreshed.status, "fresh", "snapshot matches => fresh");
+        let after_refresh = app
+            .state::<Db>()
+            .with_conn(|c| db::get_template(c, &created.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_refresh.command, "pnpm dev",
+            "refresh must NOT rewrite command"
+        );
+
+        // Change the file: refresh now reports `stale`, still no command rewrite.
+        std::fs::write(&pkg_path, r#"{ "scripts": { "dev": "vite --port 4000" } }"#).unwrap();
+        let refreshed2 =
+            command_source_refresh(app.state::<Db>(), created.id.clone()).expect("refresh2");
+        assert_eq!(refreshed2.status, "stale", "changed body => stale");
+        let after_refresh2 = app
+            .state::<Db>()
+            .with_conn(|c| db::get_template(c, &created.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_refresh2.command, "pnpm dev", "still no rewrite");
+
+        // 2) resync_source: explicitly replaces command with the CURRENT raw body
+        // (re-read at click time, not the snapshot) AND keeps the link.
+        let resynced = command_resync_source(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            created.id.clone(),
+        )
+        .expect("resync");
+        assert_eq!(
+            resynced, "vite --port 4000",
+            "resync reads the file at click time"
+        );
+        let after_resync = app
+            .state::<Db>()
+            .with_conn(|c| db::get_template(c, &created.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_resync.command, "vite --port 4000");
+        // Source fields are preserved (provenance KEPT — resync does not detach).
+        assert_eq!(after_resync.source_script_name.as_deref(), Some("dev"));
+        assert_eq!(
+            after_resync.source_kind.as_deref(),
+            Some(db::SOURCE_KIND_PACKAGE_JSON),
+            "resync keeps the link"
+        );
+
+        // 3) unlink_source: source fields cleared, command left as-is.
+        command_unlink_source(app.state::<Db>(), created.id.clone()).expect("unlink");
+        let after_unlink = app
+            .state::<Db>()
+            .with_conn(|c| db::get_template(c, &created.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_unlink.source_kind, None, "source_kind cleared");
+        assert_eq!(after_unlink.source_package_json_path, None);
+        assert_eq!(after_unlink.source_script_name, None);
+        assert_eq!(after_unlink.package_manager, None);
+        assert_eq!(
+            after_unlink.command, "vite --port 4000",
+            "unlink must leave the command untouched"
+        );
+    }
+
+    /// `command_update` DETACHES a package.json source when the command is edited
+    /// away from both the runner call and the raw script body; editing the command
+    /// to exactly the runner call (or only touching name/subfolder) KEEPS the link.
+    #[test]
+    #[cfg(not(windows))]
+    fn update_detaches_source_only_on_manual_command_change() {
+        let app = build_app_with_runner();
+        let ws = TempWs::new("detach");
+        let pkg_path = ws.root.join("package.json");
+        std::fs::write(&pkg_path, r#"{ "scripts": { "dev": "vite --host" } }"#).unwrap();
+        let pkg_path_str = std::fs::canonicalize(&pkg_path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let project_id = app
+            .state::<Db>()
+            .with_conn(|c| db::create_project(c, "p", &ws.path(), None))
+            .unwrap()
+            .0
+            .id;
+
+        let created = command_import_create(
+            app.state::<Db>(),
+            project_id,
+            "dev".into(),
+            "pnpm dev".into(),
+            String::new(),
+            pkg_path_str,
+            "dev".into(),
+            "vite --host".into(),
+            "pnpm".into(),
+        )
+        .expect("import_create");
+        assert_eq!(created.command, "pnpm dev");
+
+        // a) Edit only the restart flag, command UNCHANGED (still `pnpm dev`) → link kept.
+        command_update(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            created.id.clone(),
+            "dev".into(),
+            "pnpm dev".into(),
+            None,
+            Some(true),
+        )
+        .expect("update keep");
+        let kept = app
+            .state::<Db>()
+            .with_conn(|c| db::get_template(c, &created.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kept.source_script_name.as_deref(),
+            Some("dev"),
+            "an unchanged command keeps the source"
+        );
+
+        // b) Edit the command to a hand-authored value → source DETACHED.
+        command_update(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            created.id.clone(),
+            "dev".into(),
+            "node server.js".into(),
+            None,
+            None,
+        )
+        .expect("update detach");
+        let detached = app
+            .state::<Db>()
+            .with_conn(|c| db::get_template(c, &created.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(detached.command, "node server.js");
+        assert_eq!(
+            detached.source_kind, None,
+            "a manual command edit detaches the source"
+        );
+        assert_eq!(detached.source_script_name, None);
+        assert_eq!(detached.source_package_json_path, None);
+        assert_eq!(detached.package_manager, None);
+    }
+
+    /// `command_import_scripts` discovers the workspace's package.json scripts and
+    /// `command_import_create` blocks a name already used in the project.
+    #[test]
+    fn import_scripts_discovers_and_create_blocks_collision() {
+        let app = build_app_with_db();
+        let ws = TempWs::new("import");
+        std::fs::write(
+            ws.root.join("package.json"),
+            r#"{ "scripts": { "dev": "vite", "build": "tsc" } }"#,
+        )
+        .unwrap();
+        let (project_id, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", &ws.path(), None).unwrap();
+            (pr.0.id, pr.1.id)
+        });
+
+        let scripts =
+            command_import_scripts(app.state::<Db>(), workspace_id).expect("import_scripts");
+        assert!(
+            scripts.iter().any(|s| s.script_name == "dev"),
+            "discovery surfaces the dev script"
+        );
+
+        // Seed a command named "dev", then importing another "dev" is refused.
+        command_import_create(
+            app.state::<Db>(),
+            project_id.clone(),
+            "dev".into(),
+            "npm run dev".into(),
+            String::new(),
+            "/x/package.json".into(),
+            "dev".into(),
+            "vite".into(),
+            "npm".into(),
+        )
+        .expect("first dev import");
+        let err = command_import_create(
+            app.state::<Db>(),
+            project_id,
+            "dev".into(),
+            "npm run dev".into(),
+            String::new(),
+            "/x/package.json".into(),
+            "dev".into(),
+            "vite".into(),
+            "npm".into(),
+        )
+        .expect_err("a duplicate name import must be refused");
+        assert!(err.contains("already used"), "clear collision error: {err}");
+    }
+
+    // --- Shutdown snapshot + boot restoration (task 16) ----------------------
+
+    /// Seed a project at `ws` with one template (command, restart flag) and return
+    /// (project_id, workspace_id, template_id, instance_id).
+    #[cfg(not(windows))]
+    fn seed_restore(
+        app: &App<MockRuntime>,
+        ws_path: &str,
+        command: &str,
+        restart_on_startup: bool,
+    ) -> (String, String, String, String) {
+        app.state::<Db>().with_conn(|c| {
+            let pr = db::create_project(c, "p", ws_path, None).unwrap();
+            let tpl =
+                db::create_template(c, &pr.0.id, "svc", command, None, Default::default()).unwrap();
+            db::set_restart_on_startup(c, &tpl.id, restart_on_startup).unwrap();
+            let inst = db::list_instances_for_workspace(c, &pr.1.id)
+                .unwrap()
+                .into_iter()
+                .find(|i| i.command_id == tpl.id)
+                .unwrap();
+            (pr.0.id, pr.1.id, tpl.id, inst.id)
+        })
+    }
+
+    fn instance(app: &App<MockRuntime>, id: &str) -> db::CommandInstance {
+        app.state::<Db>()
+            .with_conn(|c| db::get_instance(c, id))
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Shutdown snapshot: a running instance is snapshotted
+    /// `was_running_on_shutdown = true`; a non-running one `false`.
+    #[test]
+    #[cfg(not(windows))]
+    fn shutdown_snapshots_running_instances() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("shutdown_snap");
+        let (_p, _w, _t, instance_id) = seed_restore(&app, &ws.path(), "sleep 30", true);
+
+        let runner = app.state::<ManagedCommandRunner<MockRuntime>>();
+        // Not running yet → snapshot false.
+        snapshot_commands_on_shutdown(app.state::<Db>().inner(), runner.inner());
+        assert!(
+            !instance(&app, &instance_id).was_running_on_shutdown,
+            "an idle instance snapshots was_running_on_shutdown=false"
+        );
+
+        // Start it, then snapshot → true.
+        command_start(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("start");
+        assert!(wait_db_state(&app, &instance_id, "running", 4));
+        snapshot_commands_on_shutdown(app.state::<Db>().inner(), runner_state(&app).inner());
+        assert!(
+            instance(&app, &instance_id).was_running_on_shutdown,
+            "a running instance snapshots was_running_on_shutdown=true"
+        );
+        // Cleanup.
+        command_stop(app.handle().clone(), runner_state(&app), instance_id).expect("stop");
+    }
+
+    /// Boot: an instance with template restart_on_startup ON + snapshot true is
+    /// relaunched; the snapshot is reset to false afterwards.
+    #[test]
+    #[cfg(not(windows))]
+    fn boot_relaunches_when_toggle_on_and_snapshot_true_then_resets() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("boot_on");
+        let (_p, _w, _t, instance_id) = seed_restore(&app, &ws.path(), "sleep 30", true);
+        // Simulate the prior shutdown: this instance WAS running.
+        app.state::<Db>()
+            .with_conn(|c| db::set_was_running_on_shutdown(c, &instance_id, true))
+            .unwrap();
+
+        let relaunched =
+            restore_commands_on_boot(app.state::<Db>().inner(), runner_state(&app).inner());
+        assert!(
+            relaunched.contains(&instance_id),
+            "the instance must be relaunched at boot"
+        );
+        assert!(
+            wait_db_state(&app, &instance_id, "running", 4),
+            "the relaunched instance is running"
+        );
+        // The snapshot was reset so a future boot cannot relaunch a ghost.
+        assert!(
+            !instance(&app, &instance_id).was_running_on_shutdown,
+            "the snapshot must be reset to false after boot"
+        );
+        command_stop(app.handle().clone(), runner_state(&app), instance_id).expect("stop");
+    }
+
+    /// Boot: a template with restart_on_startup OFF that WAS running is NOT
+    /// relaunched, and its displayed state is normalized to idle.
+    #[test]
+    #[cfg(not(windows))]
+    fn boot_does_not_relaunch_toggle_off_and_normalizes_to_idle() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("boot_off");
+        let (_p, _w, _t, instance_id) = seed_restore(&app, &ws.path(), "sleep 30", false);
+        // Prior shutdown: it WAS running (last_state running + snapshot true), but
+        // the toggle is OFF.
+        app.state::<Db>().with_conn(|c| {
+            db::set_last_state(c, &instance_id, db::STATE_RUNNING).unwrap();
+            db::set_was_running_on_shutdown(c, &instance_id, true).unwrap();
+        });
+
+        let relaunched =
+            restore_commands_on_boot(app.state::<Db>().inner(), runner_state(&app).inner());
+        assert!(
+            !relaunched.contains(&instance_id),
+            "a toggle-OFF instance must NOT be relaunched"
+        );
+        let inst = instance(&app, &instance_id);
+        assert_eq!(
+            inst.last_state, "idle",
+            "an orphaned running instance must be normalized to idle"
+        );
+        assert!(!inst.was_running_on_shutdown, "snapshot reset");
+        assert!(
+            !runner_state(&app).is_running(&instance_id),
+            "no process is started for a toggle-OFF instance"
+        );
+    }
+
+    /// Boot: success/error instances keep their last_state (dot color) and are not
+    /// relaunched.
+    #[test]
+    #[cfg(not(windows))]
+    fn boot_keeps_success_and_error_without_relaunch() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("boot_terminal");
+        // Two templates so we get two instances; mark one success, one error. Both
+        // have restart ON. A success/error instance was NOT running at the last
+        // shutdown, so its snapshot is FALSE (exactly what `snapshot_commands_on_
+        // shutdown` records) — proving success/error are never relaunched and keep
+        // their state for the dot.
+        let (project_id, workspace_id, _t, succ_id) = seed_restore(&app, &ws.path(), "true", true);
+        let err_id = app.state::<Db>().with_conn(|c| {
+            let tpl =
+                db::create_template(c, &project_id, "svc2", "false", None, Default::default())
+                    .unwrap();
+            db::set_restart_on_startup(c, &tpl.id, true).unwrap();
+            db::list_instances_for_workspace(c, &workspace_id)
+                .unwrap()
+                .into_iter()
+                .find(|i| i.command_id == tpl.id)
+                .unwrap()
+                .id
+        });
+        app.state::<Db>().with_conn(|c| {
+            db::set_last_state(c, &succ_id, db::STATE_SUCCESS).unwrap();
+            db::set_was_running_on_shutdown(c, &succ_id, false).unwrap();
+            db::set_last_state(c, &err_id, db::STATE_ERROR).unwrap();
+            db::set_was_running_on_shutdown(c, &err_id, false).unwrap();
+        });
+
+        let relaunched =
+            restore_commands_on_boot(app.state::<Db>().inner(), runner_state(&app).inner());
+        assert!(
+            relaunched.is_empty(),
+            "success/error instances must not be relaunched even with snapshot true"
+        );
+        assert_eq!(
+            instance(&app, &succ_id).last_state,
+            "success",
+            "success is preserved for the green dot"
+        );
+        assert_eq!(
+            instance(&app, &err_id).last_state,
+            "error",
+            "error is preserved for the red dot"
+        );
+    }
+
+    /// Boot: `last_state=running` ALONE (no snapshot) must NOT relaunch — the
+    /// snapshot is the load-bearing signal, never `last_state`.
+    #[test]
+    #[cfg(not(windows))]
+    fn boot_does_not_relaunch_from_last_state_running_alone() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("running_alone");
+        let (_p, _w, _t, instance_id) = seed_restore(&app, &ws.path(), "sleep 30", true);
+        // last_state running but the snapshot is FALSE (e.g. it crashed without a
+        // clean shutdown snapshot). Restart toggle is ON, yet without the snapshot
+        // it must NOT relaunch.
+        app.state::<Db>().with_conn(|c| {
+            db::set_last_state(c, &instance_id, db::STATE_RUNNING).unwrap();
+            db::set_was_running_on_shutdown(c, &instance_id, false).unwrap();
+        });
+
+        let relaunched =
+            restore_commands_on_boot(app.state::<Db>().inner(), runner_state(&app).inner());
+        assert!(
+            relaunched.is_empty(),
+            "last_state=running without a snapshot must not relaunch"
+        );
+        assert_eq!(
+            instance(&app, &instance_id).last_state,
+            "idle",
+            "the orphaned running is normalized to idle"
+        );
+        assert!(!runner_state(&app).is_running(&instance_id));
+    }
+
+    /// Boot, finding 01KV6C5RWKJ: the EXACT phantom-running DB state observed in the
+    /// nyx DB — `last_state=running`, `was_running_on_shutdown=1` (never reset),
+    /// `restart_on_startup=0`, and NO live process. The boot restore must force the
+    /// orphan to `idle` AND reset `was_running_on_shutdown` to 0, so there is no
+    /// phantom running dot at launch and a future boot cannot relaunch a ghost.
+    #[test]
+    #[cfg(not(windows))]
+    fn boot_normalizes_phantom_running_and_resets_snapshot() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("phantom_running");
+        // restart_on_startup = false (the observed state).
+        let (_p, _w, _t, instance_id) = seed_restore(&app, &ws.path(), "sleep 30", false);
+        // Reproduce the corrupt-on-disk state: running + snapshot NOT reset.
+        app.state::<Db>().with_conn(|c| {
+            db::set_last_state(c, &instance_id, db::STATE_RUNNING).unwrap();
+            db::set_was_running_on_shutdown(c, &instance_id, true).unwrap();
+        });
+        // Sanity: no live process backs that running state.
+        assert!(
+            !runner_state(&app).is_running(&instance_id),
+            "precondition: the phantom running has no live process"
+        );
+
+        let relaunched =
+            restore_commands_on_boot(app.state::<Db>().inner(), runner_state(&app).inner());
+        assert!(
+            relaunched.is_empty(),
+            "a restart-OFF phantom must NOT be relaunched"
+        );
+
+        let inst = instance(&app, &instance_id);
+        assert_eq!(
+            inst.last_state, "idle",
+            "the phantom running must be normalized to idle (no phantom dot at launch)"
+        );
+        assert!(
+            !inst.was_running_on_shutdown,
+            "was_running_on_shutdown must be reset to 0 so a future boot can't relaunch a ghost"
+        );
+        assert!(
+            !runner_state(&app).is_running(&instance_id),
+            "no process is started for the phantom"
+        );
     }
 }

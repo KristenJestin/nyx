@@ -218,11 +218,18 @@ export function useProjects(): UseProjects {
   }, []);
 
   const deleteProject = useCallback(async (id: string) => {
-    // Drop the project (and its workspaces) from the tree. The backend detaches
-    // bound terminals (workspace_id → null) — `useTerminals` reflects that via
-    // its own list/auto-attach passes; here we only own the project/workspace tree.
+    // Await the backend FIRST, then drop the project from the tree only on success.
+    // `delete_project` REFUSES (Err) when the project still has a running command,
+    // so an optimistic-remove-then-swallow would desync the sidebar from the DB —
+    // the project would vanish locally while it (and its live process) survive, and
+    // its terminals would be detached for nothing. The rejection now PROPAGATES so
+    // the caller skips the terminal detach and the confirm modal surfaces the
+    // message. The backend detaches bound terminals (workspace_id → null);
+    // `useTerminals` reflects that via its own list/auto-attach passes; here we only
+    // own the project/workspace tree. The delete sits behind a confirm dialog with a
+    // submitting spinner, so awaiting first costs no perceptible snappiness.
+    await invoke("delete_project", { id });
     setProjects((prev) => prev.filter((t) => t.project.id !== id));
-    await invoke("delete_project", { id }).catch(() => {});
   }, []);
 
   const renameWorkspace = useCallback(async (id: string, name: string) => {

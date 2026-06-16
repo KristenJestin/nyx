@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { AppSidebar } from "./app-sidebar";
+import { AppSidebar, railKey } from "./app-sidebar";
 import {
   showWorkspaceSection,
   workspaceDisplayLabel,
@@ -91,6 +91,28 @@ function renderSidebar(
     onDeleteProject,
   };
 }
+
+describe("railKey (selection-rail key follows the active terminal OR command)", () => {
+  it("uses the active TERMINAL id when one is active", () => {
+    expect(railKey("term-1", null)).toBe("term-1");
+    // A terminal being active wins even if a command id lingers (it should not).
+    expect(railKey("term-1", "cmd-9")).toBe("term-1");
+  });
+
+  it("falls back to the active COMMAND id when no terminal is active", () => {
+    // This is the fix: while a command is active the sidebar forces activeId=null,
+    // so the rail key must follow activeCommandId — otherwise command→command keeps
+    // the key null both times and the rail never re-glides (review 01KV6F1B…).
+    expect(railKey(null, "cmd-1")).toBe("cmd-1");
+    // command→command: the key CHANGES, so `useActiveRail` re-glides.
+    expect(railKey(null, "cmd-1")).not.toBe(railKey(null, "cmd-2"));
+  });
+
+  it("is null when nothing is selected", () => {
+    expect(railKey(null, null)).toBeNull();
+    expect(railKey(null, undefined)).toBeNull();
+  });
+});
 
 describe("showWorkspaceSection (optional workspace section)", () => {
   it("is HIDDEN for a mono-(root)workspace project", () => {
@@ -296,6 +318,35 @@ describe("<AppSidebar> variant A spine", () => {
     openMenu();
     fireEvent.click(await screen.findByRole("menuitem", { name: /delete project Solo/i }));
     expect(onDeleteProject).toHaveBeenCalledTimes(1);
+  });
+
+  it("the project kebab carries a 'Manage commands' action (PRD-3 modal trigger)", async () => {
+    const onManageCommands = vi.fn();
+    renderSidebar([tree("p1", "Solo", [ws("w", "p1", "root", "/solo", true)])], [], {
+      onManageCommands,
+    });
+    const kebab = screen.getByRole("button", { name: /project actions for Solo/i });
+    fireEvent.pointerDown(kebab, { button: 0 });
+    fireEvent.pointerUp(kebab, { button: 0 });
+    fireEvent.click(kebab);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /manage commands for Solo/i }));
+    expect(onManageCommands).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the COMMANDS subsection from commandsByWorkspace + selects a command", () => {
+    const onSelectCommand = vi.fn();
+    const commandsByWorkspace = new Map([
+      ["w", [{ id: "inst-1", label: "dev", state: "running" as const }]],
+    ]);
+    renderSidebar([tree("p1", "Solo", [ws("w", "p1", "root", "/solo", true)])], [], {
+      commandsByWorkspace,
+      onSelectCommand,
+    });
+    // The COMMANDS band appears (it was hidden when empty) with the command row.
+    expect(screen.getByText("Commands")).toBeInTheDocument();
+    const row = screen.getByText("dev");
+    fireEvent.click(row);
+    expect(onSelectCommand).toHaveBeenCalledWith("inst-1");
   });
 });
 

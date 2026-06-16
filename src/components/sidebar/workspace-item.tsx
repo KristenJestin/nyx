@@ -5,7 +5,7 @@ import { motion, useReducedMotion } from "motion/react";
 import { CollapsibleSection } from "./collapsible-section";
 import { WorkspaceSubsections } from "./workspace-subsections";
 import { itemTransition } from "./item-motion";
-import type { WorkspaceRecord } from "./use-projects";
+import type { CommandRecord, WorkspaceRecord } from "./use-projects";
 import type { TerminalRecord } from "./use-terminals";
 
 export interface WorkspaceItemProps {
@@ -18,7 +18,11 @@ export interface WorkspaceItemProps {
   displayLabel?: string;
   /** Terminals bound to this workspace, in sidebar order. */
   terminals: TerminalRecord[];
+  /** Commands (PRD-3 instances) for this workspace; empty hides the COMMANDS band. */
+  commands?: CommandRecord[];
   activeId: string | null;
+  /** Record id of the active command row (drives the shared selection rail). */
+  activeCommandId?: string | null;
   ptyIds?: Map<string, number | null>;
   /** Whether to render this workspace's own header row. Hidden for the implicit
    *  single-root case where the project row already stands in for the root. */
@@ -29,6 +33,10 @@ export interface WorkspaceItemProps {
   onClose: (id: string) => void;
   /** Launch a new terminal in this workspace (cwd = workspace.path). */
   onNewTerminal: (workspace: WorkspaceRecord) => void;
+  /** Select a command row in this workspace (mounts its view in the main pane). */
+  onSelectCommand?: (id: string) => void;
+  /** Open the manage-commands modal (the COMMANDS band's hover gear). */
+  onManageCommands?: () => void;
   /** Persist a new order for this workspace's terminals (within-workspace only). */
   onReorderTerminals?: (workspaceId: string, ids: string[]) => void;
   /**
@@ -57,13 +65,17 @@ export function WorkspaceItem({
   workspace,
   displayLabel,
   terminals,
+  commands,
   activeId,
+  activeCommandId,
   ptyIds,
   showHeader = true,
   defaultOpen = true,
   onSelect,
   onClose,
   onNewTerminal,
+  onSelectCommand,
+  onManageCommands,
   onReorderTerminals,
   onSetCollapsed,
 }: WorkspaceItemProps) {
@@ -88,10 +100,14 @@ export function WorkspaceItem({
   const subsections = (
     <WorkspaceSubsections
       terminals={terminals}
+      commands={commands}
       activeId={activeId}
+      activeCommandId={activeCommandId}
       ptyIds={ptyIds}
       onSelect={onSelect}
       onClose={onClose}
+      onSelectCommand={onSelectCommand}
+      onManageCommands={onManageCommands}
       onNewTerminal={() => onNewTerminal(workspace)}
       onReorderTerminals={(ids) => onReorderTerminals?.(workspace.id, ids)}
     />

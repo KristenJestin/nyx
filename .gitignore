@@ -15,6 +15,11 @@ dist-ssr
 # Vitest browser-mode visual-regression transients (actual/diff renders).
 .vitest-attachments
 
+# Vitest browser-test screenshot baselines (e.g. chrome.browser.test.tsx's
+# __screenshots__/). Per-machine reference renders committed by mistake; they're
+# regenerated on first run and must never be versioned.
+**/__screenshots__/
+
 # Vitest browser-mode visual-regression BASELINE (reference screenshots).
 # CAVEAT: this is a LOCAL-only dev aid, NOT committed. The baseline binary must
 # stay out of the source tree / git diff. On a fresh checkout or CI the dir is

@@ -7,8 +7,26 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { ProjectItem } from "./project-item";
 import { SelectionRail, useActiveRail } from "./active-rail";
 import { SortableTerminalList } from "./sortable-terminal-list";
-import type { ProjectTree, WorkspaceRecord } from "./use-projects";
+import type { CommandRecord, ProjectTree, WorkspaceRecord } from "./use-projects";
 import type { TerminalRecord } from "./use-terminals";
+
+/**
+ * The selection-rail KEY: the id of whichever row is active — a terminal
+ * (`activeId`) OR a command (`activeCommandId`) — so a glide is triggered on every
+ * selection change, including command→command.
+ *
+ * Why this exists: the sidebar's `activeId` is forced to `null` while a command is
+ * active (see `terminal-manager.tsx`), so keying the rail on `activeId` ALONE kept
+ * the key `null` across a command→command switch and the rail never re-glided
+ * (review 01KV6F1B…). Falling back to `activeCommandId` makes the key change on a
+ * command switch too. Exported so the precedence is unit-tested.
+ */
+export function railKey(
+  activeId: string | null,
+  activeCommandId: string | null | undefined,
+): string | null {
+  return activeId ?? activeCommandId ?? null;
+}
 
 export interface AppSidebarProps {
   /** Projects with their workspaces (root first), in creation order. */
@@ -33,6 +51,17 @@ export interface AppSidebarProps {
   onEditProject?: (tree: ProjectTree) => void;
   /** Open the delete-confirm modal for a project. */
   onDeleteProject?: (tree: ProjectTree) => void;
+  /** Open the "Manage commands" modal for a project (PRD-3). */
+  onManageCommands?: (tree: ProjectTree) => void;
+  /**
+   * Commands (PRD-3 instances) grouped by `workspace_id`. Empty/absent until a
+   * project has command templates. Threaded to each workspace's subsections.
+   */
+  commandsByWorkspace?: Map<string, CommandRecord[]>;
+  /** Record id of the active command (drives the shared selection rail). */
+  activeCommandId?: string | null;
+  /** Select a command row → mount its `<CommandView>` in the main pane. */
+  onSelectCommand?: (id: string) => void;
   /** Persist a new order for a workspace's terminals (within-workspace only). */
   onReorderTerminals?: (workspaceId: string, ids: string[]) => void;
   /**
@@ -86,6 +115,10 @@ export function AppSidebar({
   onAddWorkspace,
   onEditProject,
   onDeleteProject,
+  onManageCommands,
+  commandsByWorkspace,
+  activeCommandId,
+  onSelectCommand,
   onReorderTerminals,
   onReorderLooseTerminals,
   onSetProjectCollapsed,
@@ -115,7 +148,12 @@ export function AppSidebar({
 
   // The single measured selection rail: refs for the host (spans the rows) and the
   // bar itself; re-measures on selection / layout / scroll (see `useActiveRail`).
-  const { hostRef, railRef } = useActiveRail(activeId);
+  // The rail key must follow whichever row is active — a terminal (`activeId`) OR a
+  // command (`activeCommandId`). The sidebar's `activeId` is forced to `null` while
+  // a command is active (see `terminal-manager.tsx`), so command→command would keep
+  // the key `null` both times and never re-glide; falling back to `activeCommandId`
+  // makes a command switch re-glide just like a terminal switch.
+  const { hostRef, railRef } = useActiveRail(railKey(activeId, activeCommandId));
 
   return (
     <aside
@@ -177,6 +215,10 @@ export function AppSidebar({
                 onAddWorkspace={onAddWorkspace}
                 onEditProject={onEditProject}
                 onDeleteProject={onDeleteProject}
+                onManageCommands={onManageCommands}
+                commandsByWorkspace={commandsByWorkspace}
+                activeCommandId={activeCommandId}
+                onSelectCommand={onSelectCommand}
                 onReorderTerminals={onReorderTerminals}
                 onSetCollapsed={onSetProjectCollapsed}
                 onSetWorkspaceCollapsed={onSetWorkspaceCollapsed}
