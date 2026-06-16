@@ -129,26 +129,66 @@ impl Pty {
     /// bytes as the reader thread reads them. The receiver completes (the
     /// sender is dropped) when the PTY reaches EOF — i.e. the child has exited.
     pub fn spawn(size: PtySize, cwd: Option<&str>) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
-        Self::spawn_program(&resolve_shell(), size, cwd)
+        // Resolve the shell, then build its OSC 133 shell-integration plan
+        // (PRD-2.1 task #5): a NON-DESTRUCTIVE per-spawn snippet that makes the
+        // shell emit `133;C`/`133;D` so the bridge can derive exec-state. An
+        // Unsupported shell (sh/cmd/fish/…) or a disabled/failed injection yields an
+        // EMPTY plan → the shell is spawned plain (idle-only degradation; no false
+        // running/success/error). Injection applies ONLY here, on the production
+        // interactive-shell path — never to `spawn_program` (tests / the managed
+        // command runner, which spawn arbitrary non-interactive programs).
+        let shell = resolve_shell();
+        let plan = crate::shellinteg::build(&shell);
+        Self::spawn_program_with_integration(&shell, size, cwd, &plan)
     }
 
-    /// Spawn an arbitrary program (used by tests; production uses [`Pty::spawn`]
-    /// which always launches the default shell).
+    /// Spawn an arbitrary program with NO shell integration (used by tests and the
+    /// managed-command runner; production interactive terminals use [`Pty::spawn`]
+    /// which always launches the default shell WITH integration). `allow(dead_code)`
+    /// in a non-test build: every in-crate caller is `#[cfg(test)]` now that
+    /// `spawn` injects via `spawn_program_with_integration` instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn_program(
         program: &str,
         size: PtySize,
         cwd: Option<&str>,
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
+        Self::spawn_program_with_integration(
+            program,
+            size,
+            cwd,
+            &crate::shellinteg::IntegrationPlan::default(),
+        )
+    }
+
+    /// Spawn `program`, applying a shell-integration [`IntegrationPlan`]'s extra
+    /// args + env (empty plan = plain spawn). The single real spawn path the two
+    /// public constructors share.
+    fn spawn_program_with_integration(
+        program: &str,
+        size: PtySize,
+        cwd: Option<&str>,
+        plan: &crate::shellinteg::IntegrationPlan,
+    ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size)?;
 
         let mut cmd = CommandBuilder::new(program);
+        // Shell-integration args (e.g. bash `--rcfile <tmp> -i`, pwsh `-NoExit
+        // -Command ". '<tmp>'"`) come right after the program name.
+        for arg in &plan.args {
+            cmd.arg(arg);
+        }
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
         // Make $TERM sane for full-screen TUIs (vim/htop) in the absence of one.
         if std::env::var_os("TERM").is_none() {
             cmd.env("TERM", "xterm-256color");
+        }
+        // Shell-integration env (e.g. zsh `ZDOTDIR`/`NYX_REAL_ZDOTDIR`).
+        for (k, v) in &plan.env {
+            cmd.env(k, v);
         }
 
         let child = pair.slave.spawn_command(cmd)?;

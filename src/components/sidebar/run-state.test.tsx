@@ -35,16 +35,16 @@ describe("<StatusDot> (command run-state, all 4 states)", () => {
   });
 });
 
-describe("<TerminalStateBadge> (terminal run-state, unread model)", () => {
+describe("<TerminalStateBadge> (terminal run-state, persisted-unread model)", () => {
   it("renders NO badge for idle (nothing to notify)", () => {
-    const { container } = render(<TerminalStateBadge state="idle" />);
+    const { container } = render(<TerminalStateBadge state="idle" unread />);
     expect(container.firstChild).toBeNull();
   });
 
-  it.each(["running", "success", "error"] as ExecState[])(
-    "renders the %s badge on a NON-active terminal (unread)",
+  it.each(["success", "error"] as ExecState[])(
+    "renders the %s badge while UNREAD (the persisted flag drives visibility)",
     (state) => {
-      render(<TerminalStateBadge state={state} active={false} />);
+      render(<TerminalStateBadge state={state} unread />);
       const badge = screen.getByRole("status", {
         name: new RegExp(`terminal status: ${state}`, "i"),
       });
@@ -52,17 +52,21 @@ describe("<TerminalStateBadge> (terminal run-state, unread model)", () => {
     },
   );
 
-  it("CLEARS the badge on an ACTIVE terminal for settled states (read)", () => {
+  it("HIDES the settled badge once READ — even when the terminal is INACTIVE again (user story #3)", () => {
     for (const state of ["success", "error"] as ExecState[]) {
-      const { container, unmount } = render(<TerminalStateBadge state={state} active />);
-      // Selecting/viewing the terminal marks it read → no badge.
+      // unread=false (the user already viewed it) + active=false (re-deselected):
+      // the badge must NOT re-appear — visibility is driven by `unread`, not `active`.
+      const { container, unmount } = render(
+        <TerminalStateBadge state={state} unread={false} active={false} />,
+      );
       expect(container.firstChild).toBeNull();
       unmount();
     }
   });
 
-  it("KEEPS the running (blue, pulsing) badge even when active (still-running signal)", () => {
-    render(<TerminalStateBadge state="running" active />);
+  it("KEEPS the running (blue, pulsing) badge regardless of unread/active (live state)", () => {
+    // Running is a live state, never gated by the unread flag — shows even active+read.
+    render(<TerminalStateBadge state="running" unread={false} active />);
     const badge = screen.getByRole("status", { name: /terminal status: running/i });
     expect(badge.className).toContain("bg-info");
     expect(badge.className).toContain("animate-pulse");
@@ -74,8 +78,9 @@ describe("<TerminalStateBadge> (terminal run-state, unread model)", () => {
       success: "bg-success",
       error: "bg-destructive",
     };
+    // success/error need `unread` to show; running shows regardless.
     for (const state of ["running", "success", "error"] as ExecState[]) {
-      const { unmount } = render(<TerminalStateBadge state={state} active={false} />);
+      const { unmount } = render(<TerminalStateBadge state={state} unread />);
       const badge = screen.getByRole("status");
       expect(badge).toHaveClass(tokens[state]);
       unmount();

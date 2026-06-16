@@ -163,6 +163,7 @@ export function Terminal({
   // is deterministic.
   const resyncSize = usePty(instance, fitAddon, {
     cwd,
+    recordId,
     onPtyId,
     deadHistory: deadHistoryPayload,
   });

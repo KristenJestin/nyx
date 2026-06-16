@@ -42,6 +42,30 @@ struct ExitPayload {
     code: Option<i32>,
 }
 
+/// Payload of the `terminal://exec-state` event (PRD-2.1 task #6): a terminal
+/// RECORD's exec-state transition. Keyed by the PERSISTENT `terminal_id` (NOT the
+/// live pty_id), so the sidebar — which keys terminals by record id — can filter
+/// it and survive a restart / re-spawn. The fields are deliberately `snake_case`
+/// (NOT `rename_all = "camelCase"` like `CommandStatePayload`): the front's
+/// `TerminalRecord` is the snake_case DB shape (`exec_state`, `exec_exit_code`,
+/// `exec_state_unread`), and the event handler folds this payload straight onto
+/// that record, so matching the column names keeps the two in lockstep.
+#[derive(Clone, Serialize)]
+struct TerminalExecStatePayload {
+    /// The persistent `terminals.id` this transition is for (the sidebar key).
+    terminal_id: String,
+    /// `idle` | `running` | `success` | `error` (the DB CHECK vocabulary).
+    state: String,
+    /// Exit code for a settled state (`success`/`error`); `None` otherwise or when
+    /// the OSC 133 `D` end carried no parseable code.
+    exit_code: Option<i32>,
+    /// Whether this is an UNREAD settled notification (`success`/`error` the user
+    /// has not yet viewed). `running`/`idle` are never unread.
+    unread: bool,
+    /// Epoch ms of this transition (mirrors `exec_state_updated_at`).
+    updated_at: i64,
+}
+
 /// Managed state: all live PTYs keyed by their id.
 #[derive(Default)]
 pub struct PtyManager {
@@ -250,17 +274,131 @@ impl Osc7Cache {
     }
 }
 
+/// Managed state: the association from a LIVE `pty_id` (the per-spawn, process-
+/// unique [`Pty::id`]) to the PERSISTENT terminal RECORD id (the SQLite
+/// `terminals.id` the sidebar keys on). These are two distinct id-spaces: the
+/// backend emits `pty://output`/`pty://exit` by live pty_id, while exec-state
+/// (PRD-2.1) must be persisted and emitted keyed by the durable terminal record
+/// id so it survives a restart / re-spawn. `pty_spawn` records the mapping when
+/// the front passes a `terminal_id`; the output pump and exit handler resolve it
+/// to address the persistent record. A record-less spawn (the socle / a test that
+/// passes no `terminal_id`) simply has no entry — exec-state work is then skipped.
+#[derive(Default)]
+pub struct TerminalIdMap {
+    by_pty: Mutex<HashMap<u64, String>>,
+}
+
+impl TerminalIdMap {
+    /// Associate a live `pty_id` with a persistent terminal record id.
+    fn set(&self, pty_id: u64, terminal_id: String) {
+        self.by_pty.lock().unwrap().insert(pty_id, terminal_id);
+    }
+    /// Resolve the persistent terminal record id for a live `pty_id`, if one was
+    /// recorded at spawn. Used by the output pump + exit handler.
+    fn get(&self, pty_id: u64) -> Option<String> {
+        self.by_pty.lock().unwrap().get(&pty_id).cloned()
+    }
+    /// Drop the mapping for a `pty_id` (on exit/close) so the table does not grow
+    /// without bound across the app's lifetime.
+    fn remove(&self, pty_id: u64) -> Option<String> {
+        self.by_pty.lock().unwrap().remove(&pty_id)
+    }
+}
+
+/// Managed state: a small per-terminal TAIL buffer for OSC 133 scanning. A real
+/// PTY can split an `ESC]133;…` sequence across two read chunks; the pump prepends
+/// this carried tail to the next chunk so a split sequence is recovered (the
+/// `osc133` parser is position-independent — see its `split_sequence_recovered`
+/// test). Keyed by the PERSISTENT terminal record id, not the live pty_id, so the
+/// tail follows the record. Bounded: only an unterminated trailing introducer is
+/// ever carried.
+#[derive(Default)]
+pub struct Osc133Pending {
+    tail: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl Osc133Pending {
+    /// Take the carried tail for `terminal_id` (if any) and return `tail || chunk`
+    /// — the bytes to scan this round. Clears the stored tail; the caller re-sets
+    /// it via [`set_tail`](Self::set_tail) with whatever remains incomplete.
+    fn take_and_prepend(&self, terminal_id: &str, chunk: &[u8]) -> Vec<u8> {
+        let mut map = self.tail.lock().unwrap();
+        match map.remove(terminal_id) {
+            Some(mut tail) if !tail.is_empty() => {
+                tail.extend_from_slice(chunk);
+                tail
+            }
+            _ => chunk.to_vec(),
+        }
+    }
+    /// Store the trailing incomplete OSC 133 bytes to carry into the next chunk.
+    /// An empty `tail` clears the entry (the common case: chunk ended complete).
+    fn set_tail(&self, terminal_id: &str, tail: Vec<u8>) {
+        let mut map = self.tail.lock().unwrap();
+        if tail.is_empty() {
+            map.remove(terminal_id);
+        } else {
+            map.insert(terminal_id.to_string(), tail);
+        }
+    }
+}
+
+/// Managed state: the decoded OSC 133 events recorded per persistent terminal,
+/// in stream order. The output pump appends here as it scans chunks (PRD-2.1 task
+/// #4). The exec-state STATE MACHINE (phase 3, task #6) consumes this log to drive
+/// `running`/`success`/`error`, persist via [`crate::db::set_exec_state`], and emit
+/// `terminal://exec-state`. Decoupling decode (here) from the transition policy
+/// (phase 3) keeps each task's scope clean and the parser/pump unit-testable.
+#[derive(Default)]
+pub struct Osc133Events {
+    by_terminal: Mutex<HashMap<String, Vec<crate::osc133::Osc133Event>>>,
+}
+
+impl Osc133Events {
+    /// Append decoded events for a terminal, in order.
+    fn extend(&self, terminal_id: &str, events: &[crate::osc133::Osc133Event]) {
+        if events.is_empty() {
+            return;
+        }
+        self.by_terminal
+            .lock()
+            .unwrap()
+            .entry(terminal_id.to_string())
+            .or_default()
+            .extend_from_slice(events);
+    }
+    /// Snapshot the recorded events for a terminal (test/phase-3 consumer).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn snapshot(&self, terminal_id: &str) -> Vec<crate::osc133::Osc133Event> {
+        self.by_terminal
+            .lock()
+            .unwrap()
+            .get(terminal_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 /// Spawn the default shell in a new PTY and start streaming its output.
 ///
-/// Returns the new PTY id. The caller (front) subscribes to `pty://output`
+/// Returns the new (live) PTY id. The caller (front) subscribes to `pty://output`
 /// filtered by this id. Output is coalesced on a dedicated thread.
+///
+/// `terminal_id` is the PERSISTENT terminal RECORD id (SQLite `terminals.id`) the
+/// front already knows (TerminalDeck → Terminal → usePty). When present it is
+/// recorded in the [`TerminalIdMap`] so the output pump + exit handler can address
+/// the durable record for exec-state (PRD-2.1) — `pty://output`/`pty://exit` stay
+/// keyed by the live pty_id and are UNCHANGED. A record-less spawn (the socle /
+/// the unit harness) passes `None` and simply gets no mapping entry.
 #[tauri::command]
 fn pty_spawn<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PtyManager>,
+    id_map: State<'_, TerminalIdMap>,
     cwd: Option<String>,
     cols: u16,
     rows: u16,
+    terminal_id: Option<String>,
 ) -> Result<u64, String> {
     let size = portable_pty::PtySize {
         rows,
@@ -272,6 +410,13 @@ fn pty_spawn<R: Runtime>(
     let id = pty.id();
 
     state.ptys.lock().unwrap().insert(id, pty);
+
+    // Record the live pty_id → persistent terminal record id association (when the
+    // front supplied one) BEFORE the pump starts, so the very first output chunk
+    // can already resolve the record. Skipped for a record-less spawn.
+    if let Some(terminal_id) = terminal_id {
+        id_map.set(id, terminal_id);
+    }
 
     // Coalescing pump: own the receiver, batch chunks, flush every FLUSH_INTERVAL.
     spawn_output_pump(app, id, rx);
@@ -404,10 +549,22 @@ fn read_terminal_info(_shell_pid: Option<u32>, _fg_pgid: Option<i32>) -> Termina
 /// emits `pty://output` at most once per [`FLUSH_INTERVAL`]. On disconnect
 /// (child exited / master closed) it flushes the tail, reaps the exit code from
 /// managed state, and emits `pty://exit`.
+///
+/// The pump can resolve this live `id`'s PERSISTENT terminal record id from the
+/// managed [`TerminalIdMap`] (recorded at spawn): it reads it once at start (the
+/// mapping is set before the pump is spawned) and holds it for the lifetime of
+/// the thread. A record-less spawn leaves it `None` and the exec-state work
+/// (OSC 133, a later task) is simply skipped — output/exit are unchanged.
 fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8>>) {
     std::thread::Builder::new()
         .name(format!("nyx-pty-pump-{id}"))
         .spawn(move || {
+            // The durable record this PTY belongs to (if the front passed one at
+            // spawn). The pump resolves it from the live pty_id → terminal_id
+            // mapping; it is the address the exec-state pipeline (OSC 133) will
+            // persist/emit under. `pty://output` itself stays keyed by `id`.
+            let terminal_id: Option<String> = app.state::<TerminalIdMap>().get(id);
+
             let mut pending: Vec<u8> = Vec::new();
             let mut last_flush = Instant::now();
 
@@ -436,6 +593,15 @@ fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8
                         if let Some(cwd) = crate::osc7::extract_last_cwd(&chunk) {
                             app.state::<Osc7Cache>().set(id, cwd);
                         }
+                        // Exec-state source (PRD-2.1): when this PTY is backed by a
+                        // persistent terminal record, scan the SAME raw chunk for
+                        // OSC 133 command-lifecycle events ALONGSIDE OSC 7. This
+                        // does NOT strip bytes from `pending` — xterm still renders
+                        // the full stream below; we only OBSERVE the control
+                        // sequences. (See `handle_osc133_chunk`.)
+                        if let Some(terminal_id) = terminal_id.as_deref() {
+                            handle_osc133_chunk(&app, terminal_id, &chunk);
+                        }
                         pending.extend_from_slice(&chunk);
                         if last_flush.elapsed() >= FLUSH_INTERVAL {
                             flush(&app, &mut pending);
@@ -451,6 +617,17 @@ fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8
                         flush(&app, &mut pending);
                         let code = reap_exit_code(&app, id);
                         let _ = app.emit("pty://exit", ExitPayload { id, code });
+                        // Exec-state (PRD-2.1): a shell/PTY exit must not leave a
+                        // stale `running` badge. Settle a still-`running` record to
+                        // idle (a settled success/error survives untouched). Only a
+                        // real OSC 133 `D` end ever produces success/error.
+                        if let Some(terminal_id) = terminal_id.as_deref() {
+                            normalize_exec_state_on_exit(&app, terminal_id);
+                        }
+                        // Drop the pty_id → terminal_id mapping now that the live
+                        // PTY is gone; the persistent record outlives it, but this
+                        // pty_id will never be reused. Keeps the map bounded.
+                        app.state::<TerminalIdMap>().remove(id);
                         break;
                     }
                 }
@@ -473,6 +650,181 @@ fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8
 fn reap_exit_code<R: Runtime>(app: &AppHandle<R>, id: u64) -> Option<i32> {
     let pty = app.state::<PtyManager>().ptys.lock().unwrap().remove(&id);
     pty.and_then(|mut pty| pty.wait())
+}
+
+/// Scan ONE raw PTY chunk for OSC 133 command-lifecycle events and record the
+/// decoded transitions for the persistent terminal `terminal_id` (PRD-2.1, task
+/// #4). Runs ALONGSIDE the OSC 7 scan in the output pump, over the SAME bytes,
+/// and is purely OBSERVATIONAL: it never mutates the chunk and the pump still
+/// forwards every byte to `pty://output`, so xterm remains the renderer and no
+/// control bytes are stripped.
+///
+/// A real PTY can split an OSC 133 sequence across chunk boundaries, so we keep a
+/// small per-PTY TAIL buffer (the [`Osc133Pending`] managed state, keyed by the
+/// persistent terminal id): we prepend the carried tail, parse complete events,
+/// then carry whatever trailing incomplete-introducer bytes remain. The decoded
+/// [`crate::osc133::Osc133Event`]s are appended to the per-terminal event log
+/// ([`Osc133Events`]) AND fed, in order, to the exec-state STATE MACHINE
+/// ([`drive_exec_state`], task #6) which turns them into `running`/`success`/
+/// `error`, persists each transition via [`crate::db::set_exec_state`], and emits
+/// `terminal://exec-state`.
+fn handle_osc133_chunk<R: Runtime>(app: &AppHandle<R>, terminal_id: &str, chunk: &[u8]) {
+    // Stitch the carried tail (an incomplete sequence from the previous chunk)
+    // ahead of this chunk so a split `ESC]133;…` sequence is recovered. The tail
+    // is bounded (we only ever carry an UNTERMINATED trailing introducer).
+    let pending = app.state::<Osc133Pending>();
+    let stitched = pending.take_and_prepend(terminal_id, chunk);
+
+    let events = crate::osc133::extract_events(&stitched);
+
+    // Carry forward any trailing incomplete OSC 133 introducer (`ESC]133;` seen
+    // with no terminator yet) so the next chunk can complete it. We only retain
+    // from the LAST introducer with no following terminator; everything before it
+    // has been fully parsed already.
+    pending.set_tail(terminal_id, osc133_incomplete_tail(&stitched));
+
+    if !events.is_empty() {
+        // Record the decoded events (the log the phase-2 tests / introspection
+        // consume), then drive the state machine over the SAME events, in order.
+        app.state::<Osc133Events>().extend(terminal_id, &events);
+        for ev in &events {
+            drive_exec_state(app, terminal_id, *ev);
+        }
+    }
+}
+
+/// EXEC-STATE STATE MACHINE (PRD-2.1 task #6). Maps ONE decoded OSC 133 event onto
+/// a terminal RECORD's exec-state, persisting the transition (the DB record is the
+/// authority after restart) and emitting `terminal://exec-state` so the sidebar
+/// updates immediately. The transitions:
+///
+/// - `133;C` (pre-exec) → `running` (exit_code cleared, NOT unread — `running` is
+///   a live state, not a notification). Keyed off `C`, never `B` (a bare Enter at
+///   an empty prompt emits `B` then `D` with no `C` and must not flash running).
+/// - `133;D;0` → `success`; `133;D;<non-zero>` → `error`; a `D` with no parseable
+///   code settles to `error` (a finished-but-unknown result, never a stale
+///   `running`). EVERY settled transition persists `exec_state_unread = 1`: the
+///   backend is the SOLE authority for unread and NEVER inspects UI focus — the
+///   frontend (task #7) owns "mark read immediately while active" by reacting to
+///   the event and calling `terminal_exec_mark_read`.
+/// - `133;A`/`133;B` (prompt/command start) carry no exec-state meaning for nyx
+///   and are inert here (they keep the parser robust to a full prompt stream).
+///
+/// The backend never tracks which terminal is focused, so it cannot (and must not)
+/// decide read vs unread from focus — that separation is exactly what lets the
+/// persisted `exec_state_unread` flag survive a re-deselect (user story #3).
+fn drive_exec_state<R: Runtime>(
+    app: &AppHandle<R>,
+    terminal_id: &str,
+    event: crate::osc133::Osc133Event,
+) {
+    use crate::osc133::Osc133Event;
+    // Decide the transition for this event; `A`/`B` are inert (no transition).
+    let (state, exit_code, unread) = match event {
+        Osc133Event::PreExec => (db::STATE_RUNNING, None, false),
+        Osc133Event::CommandEnd { exit_code } => match exit_code {
+            Some(0) => (db::STATE_SUCCESS, Some(0), true),
+            // Non-zero OR a missing/garbage code: settle to `error` so the
+            // terminal is never left stuck in `running`. A `None` code keeps
+            // `exit_code = None` (we know it failed-ish, not WHICH code).
+            Some(code) => (db::STATE_ERROR, Some(code), true),
+            None => (db::STATE_ERROR, None, true),
+        },
+        // Prompt start / command start: inert for exec-state.
+        Osc133Event::PromptStart | Osc133Event::CommandStart => return,
+    };
+
+    persist_and_emit_exec_state(app, terminal_id, state, exit_code, unread);
+}
+
+/// Persist a terminal exec-state transition (authority for restart) THEN emit
+/// `terminal://exec-state` keyed by `terminal_id`. The DB write happens FIRST so a
+/// listener that re-reads the row on the event sees the committed value (the same
+/// order as `TauriRunnerSink::on_state`). The emitted payload mirrors what was
+/// persisted: state, exit_code, unread, and the transition timestamp. A persist
+/// failure (unknown id, etc.) skips the emit — we never announce a state the DB
+/// does not hold.
+fn persist_and_emit_exec_state<R: Runtime>(
+    app: &AppHandle<R>,
+    terminal_id: &str,
+    state: &str,
+    exit_code: Option<i32>,
+    unread: bool,
+) {
+    let updated_at = app
+        .state::<Db>()
+        .with_conn(|c| {
+            db::set_exec_state(c, terminal_id, state, exit_code, unread)?;
+            // Read back the stamped timestamp so the event's `updated_at` matches
+            // the persisted `exec_state_updated_at` exactly.
+            db::get_terminal(c, terminal_id)
+                .map(|t| t.map(|t| t.exec_state_updated_at))
+        })
+        .ok()
+        .flatten();
+    let Some(updated_at) = updated_at else {
+        // The terminal id was unknown (no row updated / read): do not emit a state
+        // the DB does not hold.
+        return;
+    };
+    let _ = app.emit(
+        "terminal://exec-state",
+        TerminalExecStatePayload {
+            terminal_id: terminal_id.to_string(),
+            state: state.to_string(),
+            exit_code,
+            unread,
+            updated_at,
+        },
+    );
+}
+
+/// Normalize a terminal's exec-state when its shell/PTY EXITS (the pump saw the
+/// reader disconnect). A shell/PTY exit must NOT leave a stale `running` badge:
+/// `running` is only ever settled by a real OSC 133 `D` end event, so on exit we
+/// fall back to `idle` for a terminal still showing `running` (an in-flight
+/// command whose end we never observed — e.g. the shell was killed mid-command,
+/// or an unsupported shell that emitted a bogus `C`). A terminal already at a
+/// SETTLED state (`success`/`error`) or `idle` is left untouched — its last
+/// settled result (and any unread flag) survives the exit.
+fn normalize_exec_state_on_exit<R: Runtime>(app: &AppHandle<R>, terminal_id: &str) {
+    let current = app
+        .state::<Db>()
+        .with_conn(|c| db::get_terminal(c, terminal_id))
+        .ok()
+        .flatten()
+        .map(|t| t.exec_state);
+    if current.as_deref() == Some(db::STATE_RUNNING) {
+        // Settle the stale `running` down to `idle` (not unread — there is no
+        // result to notify; the command never reported an exit).
+        persist_and_emit_exec_state(app, terminal_id, db::STATE_IDLE, None, false);
+    }
+}
+
+/// Return the trailing slice of `buf` that is an INCOMPLETE OSC 133 sequence — an
+/// `ESC ] 133 ;` introducer with no `BEL`/`ST` terminator after it — so the pump
+/// can carry it to the next chunk. Returns an empty slice when the buffer ends on
+/// a complete boundary (the common case). Bounds the carry: if the last introducer
+/// IS terminated, nothing is carried.
+fn osc133_incomplete_tail(buf: &[u8]) -> Vec<u8> {
+    const INTRO: &[u8] = b"\x1b]133;";
+    // Find the last introducer; if everything after it has a terminator, there is
+    // nothing incomplete to carry.
+    let Some(pos) = buf
+        .windows(INTRO.len())
+        .rposition(|w| w == INTRO)
+    else {
+        return Vec::new();
+    };
+    let after = &buf[pos + INTRO.len()..];
+    let terminated = after.iter().enumerate().any(|(i, &b)| {
+        b == 0x07 || (b == 0x1b && after.get(i + 1) == Some(&b'\\'))
+    });
+    if terminated {
+        Vec::new()
+    } else {
+        buf[pos..].to_vec()
+    }
 }
 
 // --- Terminal RECORD commands (SQLite via Diesel) ------------------------
@@ -535,6 +887,22 @@ fn set_active(db: State<'_, Db>, id: String) -> Result<(), String> {
 #[tauri::command]
 fn persist_scrollback(db: State<'_, Db>, id: String, serialized: String) -> Result<(), String> {
     db.with_conn(|c| db::persist_scrollback(c, &id, &serialized))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Mark a terminal's settled exec-state as READ (PRD-2.1 task #6): clear
+/// `exec_state_unread` while PRESERVING the last settled `exec_state` + exit code
+/// (the badge keeps its success/error color but stops being an unread
+/// notification). This is the frontend's mark-read path — the front calls it when
+/// the user VIEWS the terminal, and immediately when a `success`/`error` arrives
+/// for the already-active terminal. The backend owns the unread BIT but never the
+/// focus decision (it does not track which terminal is active), so this command is
+/// the only way `exec_state_unread` is cleared. Deliberately does NOT collapse the
+/// state to idle (that is the managed-command acknowledge model, kept separate).
+#[tauri::command]
+fn terminal_exec_mark_read(db: State<'_, Db>, id: String) -> Result<(), String> {
+    db.with_conn(|c| db::mark_exec_state_read(c, &id))
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -1501,6 +1869,9 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
         .manage(PtyManager::default())
         .manage(TerminalInfoCache::default())
         .manage(Osc7Cache::default())
+        .manage(TerminalIdMap::default())
+        .manage(Osc133Pending::default())
+        .manage(Osc133Events::default())
         .invoke_handler(tauri::generate_handler![
             pty_spawn,
             pty_write,
@@ -1514,6 +1885,7 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             rename,
             set_active,
             persist_scrollback,
+            terminal_exec_mark_read,
             window_controls_visible,
             create_project,
             list_projects,
@@ -1586,13 +1958,38 @@ mod tests {
     }
 
     /// Invoke the `pty_spawn` command body with the mock app's handle + state.
+    /// Record-less (no terminal_id) — the exec-state mapping is exercised by the
+    /// dedicated `spawn_with_record` helper / tests below.
     fn spawn(app: &App<MockRuntime>, cols: u16, rows: u16) -> u64 {
         pty_spawn(
             app.handle().clone(),
             app.state::<PtyManager>(),
+            app.state::<TerminalIdMap>(),
             None,
             cols,
             rows,
+            None,
+        )
+        .expect("pty_spawn")
+    }
+
+    /// Invoke `pty_spawn` WITH a persistent terminal record id, returning the live
+    /// pty id. Used to exercise the pty_id → terminal_id mapping (task #3) and the
+    /// OSC 133 chunk scan (task #4).
+    fn spawn_with_record(
+        app: &App<MockRuntime>,
+        cols: u16,
+        rows: u16,
+        terminal_id: &str,
+    ) -> u64 {
+        pty_spawn(
+            app.handle().clone(),
+            app.state::<PtyManager>(),
+            app.state::<TerminalIdMap>(),
+            None,
+            cols,
+            rows,
+            Some(terminal_id.to_string()),
         )
         .expect("pty_spawn")
     }
@@ -2554,11 +2951,19 @@ mod tests {
             let pty_id = pty_spawn(
                 app.handle().clone(),
                 app.state::<PtyManager>(),
+                app.state::<TerminalIdMap>(),
                 Some(t.cwd.clone()),
                 80,
                 24,
+                Some(t.id.clone()),
             )
             .expect("re-spawn pty for an alive record");
+            // The re-spawn carries the persistent record id, so the live pty_id
+            // resolves back to it (task #3).
+            assert_eq!(
+                app.state::<TerminalIdMap>().get(pty_id).as_deref(),
+                Some(t.id.as_str())
+            );
             spawned.push(pty_id);
         }
         assert_eq!(
@@ -4511,5 +4916,651 @@ mod tests {
             !runner_state(&app).is_running(&instance_id),
             "no process is started for the phantom"
         );
+    }
+
+    // --- PRD-2.1: pty_id → terminal_id mapping + OSC 133 pump scan -----------
+
+    /// Task #3: `pty_spawn` with a persistent terminal record id records the live
+    /// pty_id → terminal_id association in the managed `TerminalIdMap`, so backend
+    /// state can resolve the durable record from the live pty id. A record-less
+    /// spawn records nothing.
+    #[test]
+    fn spawn_with_record_id_is_resolvable_and_record_less_is_not() {
+        let app = build_app();
+        let with = spawn_with_record(&app, 80, 24, "term-record-abc");
+        let without = spawn(&app, 80, 24);
+
+        let map = app.state::<TerminalIdMap>();
+        assert_eq!(
+            map.get(with).as_deref(),
+            Some("term-record-abc"),
+            "the pty_id of a record-bound spawn resolves to its terminal record id"
+        );
+        assert_eq!(
+            map.get(without),
+            None,
+            "a record-less spawn records no mapping"
+        );
+
+        let _ = close(&app, with);
+        let _ = close(&app, without);
+    }
+
+    /// Task #3: the mapping is dropped once the live PTY exits (the pump removes it
+    /// on disconnect), so the table stays bounded. We close the PTY and wait for
+    /// the exit event, then assert the entry is gone.
+    #[test]
+    fn mapping_is_dropped_on_exit() {
+        let app = build_app();
+        let (tx, rx) = channel::<String>();
+        app.listen("pty://exit", move |event| {
+            let _ = tx.send(event.payload().to_string());
+        });
+        let id = spawn_with_record(&app, 80, 24, "term-record-gone");
+        assert!(app.state::<TerminalIdMap>().get(id).is_some());
+        close(&app, id).expect("close");
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("pty://exit fires");
+        // The pump removes the mapping right before breaking; allow a brief grace.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && app.state::<TerminalIdMap>().get(id).is_some() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            app.state::<TerminalIdMap>().get(id),
+            None,
+            "the pty_id → terminal_id mapping is dropped after exit"
+        );
+    }
+
+    /// Task #4: `handle_osc133_chunk` decodes OSC 133 events from a raw chunk and
+    /// records them per terminal, WITHOUT stripping anything (it is given the
+    /// chunk by reference and never mutates it; the pump forwards the same bytes to
+    /// `pty://output` separately — proven by `osc133_scan_does_not_strip_output`).
+    #[test]
+    fn osc133_chunk_decodes_and_records_events() {
+        use crate::osc133::Osc133Event;
+        let app = build_app();
+        let tid = "term-osc133";
+        // A full prompt cycle: pre-exec (running) → end exit 0 (success) → prompt.
+        let chunk = b"\x1b]133;C\x07hello\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07";
+        handle_osc133_chunk(app.handle(), tid, chunk);
+        let events = app.state::<Osc133Events>().snapshot(tid);
+        assert_eq!(
+            events,
+            vec![
+                Osc133Event::PreExec,
+                Osc133Event::CommandEnd { exit_code: Some(0) },
+                Osc133Event::PromptStart,
+                Osc133Event::CommandStart,
+            ],
+            "the pump scan decodes the same events the parser yields"
+        );
+    }
+
+    /// Task #4: a sequence SPLIT across two chunks is recovered via the per-terminal
+    /// tail buffer (`Osc133Pending`). The first chunk ends mid-`D;` (no terminator):
+    /// no event yet, the tail is carried; the second chunk completes it.
+    #[test]
+    fn osc133_split_sequence_recovered_across_chunks() {
+        use crate::osc133::Osc133Event;
+        let app = build_app();
+        let tid = "term-split";
+        // Chunk 1: an incomplete command-end (introducer + `D;` but no BEL/ST).
+        handle_osc133_chunk(app.handle(), tid, b"out\x1b]133;D;");
+        assert!(
+            app.state::<Osc133Events>().snapshot(tid).is_empty(),
+            "no complete event from the split first half"
+        );
+        // Chunk 2: the rest of the code + terminator.
+        handle_osc133_chunk(app.handle(), tid, b"7\x07more");
+        assert_eq!(
+            app.state::<Osc133Events>().snapshot(tid),
+            vec![Osc133Event::CommandEnd { exit_code: Some(7) }],
+            "the split D;7 is recovered once the tail is stitched"
+        );
+    }
+
+    /// Task #4: irrelevant OSC sequences (e.g. OSC 7 cwd) and plain output produce
+    /// no OSC 133 events — the scan does not false-positive.
+    #[test]
+    fn osc133_ignores_unrelated_sequences() {
+        let app = build_app();
+        let tid = "term-noise";
+        handle_osc133_chunk(app.handle(), tid, b"\x1b]7;file:///home/kris\x07plain text\r\n$ ");
+        assert!(
+            app.state::<Osc133Events>().snapshot(tid).is_empty(),
+            "OSC 7 + plain output carry no OSC 133 events"
+        );
+    }
+
+    /// Task #4 (the load-bearing invariant): scanning for OSC 133 must NOT strip
+    /// bytes from `pty://output`. We spawn a record-bound shell, emit a literal
+    /// OSC 133 `D;0` plus a visible marker via `printf`, and assert the marker
+    /// reaches `pty://output` — the renderer still receives the full stream while
+    /// the pump observes the control sequence out-of-band.
+    #[cfg(not(windows))]
+    #[test]
+    fn osc133_scan_does_not_strip_output() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app();
+        let (tx, rx) = channel::<String>();
+        app.listen("pty://output", move |event| {
+            let _ = tx.send(event.payload().to_string());
+        });
+        let id = spawn_with_record(&app, 80, 24, "term-nostrip");
+        // Emit an OSC 133 end sequence followed by a distinctive marker. xterm (the
+        // front) would consume the control bytes invisibly; the marker must arrive.
+        write(&app, id, b"printf '\\033]133;D;0\\007osc133_marker_z9\\n'\n");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut acc = String::new();
+        while Instant::now() < deadline && !acc.contains("osc133_marker_z9") {
+            if let Ok(p) = rx.recv_timeout(Duration::from_millis(200)) {
+                acc.push_str(&output_to_string(&p));
+            }
+        }
+        assert!(
+            acc.contains("osc133_marker_z9"),
+            "the marker after the OSC 133 sequence must still reach pty://output (no stripping), got: {acc:?}"
+        );
+        let _ = close(&app, id);
+    }
+
+    // --- PRD-2.1 task #6: exec-state STATE MACHINE --------------------------
+    //
+    // These drive the state machine over decoded OSC 133 events against a REAL
+    // in-memory migrated DB and assert BOTH the persisted row (the authority for
+    // restart) and the emitted `terminal://exec-state` event. We invoke the
+    // machine through `handle_osc133_chunk` (the production path: scan a raw chunk
+    // → record + transition) so the tests cover decode + transition + persist +
+    // emit as one pipeline. The bodies are called directly with the mock app's
+    // handle — same convention as the rest of this module.
+
+    /// Create a REAL terminal record in the managed in-memory DB and return its id.
+    fn make_record(app: &App<MockRuntime>) -> String {
+        app.state::<Db>()
+            .with_conn(|c| db::create_terminal(c, "/tmp", None))
+            .expect("create_terminal")
+            .id
+    }
+
+    /// Read a terminal record's exec-state tuple (state, exit_code, unread).
+    fn exec_state(app: &App<MockRuntime>, tid: &str) -> (String, Option<i32>, bool) {
+        let t = app
+            .state::<Db>()
+            .with_conn(|c| db::get_terminal(c, tid))
+            .expect("get_terminal")
+            .expect("terminal exists");
+        (t.exec_state, t.exec_exit_code, t.exec_state_unread)
+    }
+
+    /// Collect every `terminal://exec-state` event payload, in order, into a shared
+    /// vec; returns the handle to read after driving the machine.
+    fn collect_exec_events(
+        app: &App<MockRuntime>,
+    ) -> Arc<Mutex<Vec<serde_json::Value>>> {
+        let events: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        app.listen("terminal://exec-state", move |event| {
+            let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+            sink.lock().unwrap().push(v);
+        });
+        events
+    }
+
+    /// Wait until at least `n` exec-state events have been collected (the mock
+    /// runtime delivers `listen` callbacks asynchronously), then snapshot them.
+    fn wait_events(
+        events: &Arc<Mutex<Vec<serde_json::Value>>>,
+        n: usize,
+    ) -> Vec<serde_json::Value> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            {
+                let got = events.lock().unwrap();
+                if got.len() >= n {
+                    return got.clone();
+                }
+            }
+            if Instant::now() >= deadline {
+                return events.lock().unwrap().clone();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Pre-exec (`133;C`) persists + emits `running` (not unread, no exit code) —
+    /// `running` is a live state, never a notification.
+    #[test]
+    fn preexec_transitions_to_running() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let events = collect_exec_events(&app);
+
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07");
+
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_RUNNING.to_string(), None, false),
+            "133;C persists running, not unread, no exit code"
+        );
+        let evs = wait_events(&events, 1);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0]["terminal_id"], tid);
+        assert_eq!(evs[0]["state"], "running");
+        assert!(evs[0]["exit_code"].is_null());
+        assert_eq!(evs[0]["unread"], false);
+        assert!(evs[0]["updated_at"].as_i64().unwrap() > 0);
+    }
+
+    /// A full success cycle: `133;C` → running, `133;D;0` → success WITH exit code 0
+    /// and ALWAYS unread=1. The backend never inspects focus.
+    #[test]
+    fn command_end_exit_zero_is_success_and_always_unread() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let events = collect_exec_events(&app);
+
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07out\x1b]133;D;0\x07");
+
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_SUCCESS.to_string(), Some(0), true),
+            "133;D;0 settles success with exit 0 and unread=1"
+        );
+        let evs = wait_events(&events, 2);
+        assert_eq!(evs.len(), 2, "running then success");
+        assert_eq!(evs[1]["state"], "success");
+        assert_eq!(evs[1]["exit_code"], 0);
+        assert_eq!(evs[1]["unread"], true);
+    }
+
+    /// `133;D;<non-zero>` settles to `error`, stores the exit code, and is unread.
+    #[test]
+    fn command_end_nonzero_is_error_with_code_and_unread() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let events = collect_exec_events(&app);
+
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07\x1b]133;D;3\x07");
+
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_ERROR.to_string(), Some(3), true),
+            "133;D;3 settles error with exit 3, unread"
+        );
+        let evs = wait_events(&events, 2);
+        assert_eq!(evs[1]["state"], "error");
+        assert_eq!(evs[1]["exit_code"], 3);
+        assert_eq!(evs[1]["unread"], true);
+    }
+
+    /// A `133;D` with NO parseable exit code settles to `error` (a finished result
+    /// with no code) — NEVER a stale `running`.
+    #[test]
+    fn command_end_missing_code_settles_error_not_running() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07\x1b]133;D\x07");
+
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_ERROR.to_string(), None, true),
+            "a code-less D settles to error with no exit code, not running"
+        );
+    }
+
+    /// `133;A`/`133;B` (prompt/command start) are INERT — a bare-Enter cycle
+    /// (`B` then `D` with no `C`) must NOT flash running before settling.
+    #[test]
+    fn prompt_and_command_start_are_inert() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let events = collect_exec_events(&app);
+
+        // Prompt start + command start with NO pre-exec: still idle.
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(
+            exec_state(&app, &tid).0,
+            db::STATE_IDLE,
+            "A/B alone never leave idle (no false running)"
+        );
+        // A bare Enter at an empty prompt: B then D;0 with NO C. The ONLY transition
+        // is the settle (success); running is never flashed.
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;D;0\x07");
+        assert_eq!(exec_state(&app, &tid).0, db::STATE_SUCCESS);
+        let evs = wait_events(&events, 1);
+        assert_eq!(evs.len(), 1, "only the settle emits; A/B emit nothing");
+        assert_eq!(evs[0]["state"], "success");
+    }
+
+    /// `terminal_exec_mark_read` clears `exec_state_unread` while PRESERVING the
+    /// settled state + exit code (the badge keeps its color; it stops being unread).
+    #[test]
+    fn mark_read_clears_unread_but_preserves_settled_result() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07\x1b]133;D;2\x07");
+        assert_eq!(exec_state(&app, &tid), (db::STATE_ERROR.to_string(), Some(2), true));
+
+        terminal_exec_mark_read(app.state::<Db>(), tid.clone()).expect("mark read");
+
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_ERROR.to_string(), Some(2), false),
+            "unread cleared; error + exit code preserved (NOT collapsed to idle)"
+        );
+    }
+
+    /// A shell/PTY exit while `running` must NOT leave a stale running badge:
+    /// `normalize_exec_state_on_exit` settles it to idle.
+    #[test]
+    fn exit_while_running_normalizes_to_idle() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let events = collect_exec_events(&app);
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07");
+        assert_eq!(exec_state(&app, &tid).0, db::STATE_RUNNING);
+
+        normalize_exec_state_on_exit(app.handle(), &tid);
+
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_IDLE.to_string(), None, false),
+            "a stale running settles to idle on PTY exit (no false running)"
+        );
+        let evs = wait_events(&events, 2);
+        assert_eq!(evs.last().unwrap()["state"], "idle");
+    }
+
+    /// A shell/PTY exit must NOT clobber a SETTLED result: a `success`/`error`
+    /// (and its unread flag) survives the exit untouched.
+    #[test]
+    fn exit_after_settled_preserves_result() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(exec_state(&app, &tid), (db::STATE_SUCCESS.to_string(), Some(0), true));
+
+        normalize_exec_state_on_exit(app.handle(), &tid);
+
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_SUCCESS.to_string(), Some(0), true),
+            "a settled success survives PTY exit (only stale running is normalized)"
+        );
+    }
+
+    /// An unknown terminal id neither panics nor emits: `persist_and_emit` skips the
+    /// emit when no row was updated (we never announce a state the DB does not hold).
+    #[test]
+    fn unknown_terminal_id_is_a_safe_noop() {
+        let app = build_app_with_db();
+        let events = collect_exec_events(&app);
+        handle_osc133_chunk(app.handle(), "no-such-terminal", b"\x1b]133;C\x07");
+        let evs = wait_events(&events, 1);
+        assert!(evs.is_empty(), "no event for an unknown terminal id");
+    }
+
+    /// Done-criterion (bridge/state): events are emitted for the CORRECT
+    /// `terminal_id`. Two distinct terminal records are driven through DIFFERENT
+    /// OSC 133 streams; every emitted `terminal://exec-state` must carry the id of
+    /// the terminal whose chunk produced it (no cross-talk), and each record's
+    /// PERSISTED row must reflect only its own stream. This proves the pump keys
+    /// transitions by the per-chunk `terminal_id`, not a shared/last-writer slot.
+    #[test]
+    fn events_are_routed_to_the_correct_terminal_id() {
+        let app = build_app_with_db();
+        let ta = make_record(&app);
+        let tb = make_record(&app);
+        let events = collect_exec_events(&app);
+
+        // Terminal A: a command that SUCCEEDS (running → success exit 0).
+        handle_osc133_chunk(app.handle(), &ta, b"\x1b]133;C\x07\x1b]133;D;0\x07");
+        // Terminal B: a command that FAILS (running → error exit 5).
+        handle_osc133_chunk(app.handle(), &tb, b"\x1b]133;C\x07\x1b]133;D;5\x07");
+
+        // Persisted rows: each terminal holds ONLY the outcome of its OWN stream.
+        assert_eq!(
+            exec_state(&app, &ta),
+            (db::STATE_SUCCESS.to_string(), Some(0), true),
+            "terminal A persists its own success"
+        );
+        assert_eq!(
+            exec_state(&app, &tb),
+            (db::STATE_ERROR.to_string(), Some(5), true),
+            "terminal B persists its own error — no cross-talk from A"
+        );
+
+        // Emitted events: 4 in total (2 per terminal), each keyed to its own id.
+        let evs = wait_events(&events, 4);
+        assert_eq!(evs.len(), 4, "two transitions per terminal were emitted");
+        let for_a: Vec<&serde_json::Value> =
+            evs.iter().filter(|e| e["terminal_id"] == ta).collect();
+        let for_b: Vec<&serde_json::Value> =
+            evs.iter().filter(|e| e["terminal_id"] == tb).collect();
+        assert_eq!(for_a.len(), 2, "exactly A's two events carry A's id");
+        assert_eq!(for_b.len(), 2, "exactly B's two events carry B's id");
+        // A's settle is success; B's settle is error — events did not swap ids.
+        assert_eq!(for_a[0]["state"], "running");
+        assert_eq!(for_a[1]["state"], "success");
+        assert_eq!(for_a[1]["exit_code"], 0);
+        assert_eq!(for_b[0]["state"], "running");
+        assert_eq!(for_b[1]["state"], "error");
+        assert_eq!(for_b[1]["exit_code"], 5);
+    }
+
+    // --- PRD-2.1 task #10: DETERMINISTIC SYNTHETIC E2E (dogfood gate) --------
+    //
+    // The phase-5 gate ("Dogfood terminal exec-state on synthetic and real
+    // shells") requires a deterministic e2e that proves the FULL chain
+    //   raw PTY bytes → bridge PUMP → OSC 133 scan → state machine → persist + emit
+    // WITHOUT depending on a real shell or any local shell customization (so CI is
+    // reproducible across machines that have no bash/zsh/pwsh integration set up).
+    //
+    // We drive the production [`spawn_output_pump`] directly with a SYNTHETIC mpsc
+    // receiver instead of a live `Pty::spawn`. The pump is shell-agnostic: it only
+    // sees `Vec<u8>` chunks on its `rx`, scans them for OSC 133 ALONGSIDE
+    // forwarding every byte to `pty://output`, drives the state machine, and on
+    // `rx` disconnect emits `pty://exit` + normalizes a stale `running`. Feeding it
+    // crafted OSC 133 byte sequences is exactly the "synthetic OSC 133 events" the
+    // PRD's testing decisions call for — the real production code path, minus the
+    // real child process.
+    //
+    // NOTE on running these on Windows: the lib TEST BINARY links `portable-pty`
+    // (conpty) and, in CI/dev sandboxes lacking the conpty entrypoint, the test
+    // harness exe fails to LAUNCH with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) —
+    // an environment gap, not a logic failure (the crate compiles + links clean).
+    // These tests themselves spawn NO conpty PTY, so they pass anywhere the harness
+    // can launch (Linux/macOS CI, or a Windows host with conpty present).
+
+    /// Register a live `pty_id` → persistent `terminal_id` mapping (what
+    /// `pty_spawn` does when the front passes a record id) so the pump resolves the
+    /// durable record from the synthetic pty id.
+    fn map_pty_to_record(app: &App<MockRuntime>, pty_id: u64, terminal_id: &str) {
+        app.state::<TerminalIdMap>()
+            .set(pty_id, terminal_id.to_string());
+    }
+
+    /// Drain `pty://output` payloads into one accumulated String (the bytes the
+    /// renderer — xterm — would receive). Used to prove NO byte stripping.
+    fn collect_pty_output(app: &App<MockRuntime>) -> Arc<Mutex<String>> {
+        let acc: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&acc);
+        app.listen("pty://output", move |event| {
+            sink.lock()
+                .unwrap()
+                .push_str(&output_to_string(event.payload()));
+        });
+        acc
+    }
+
+    /// Block until the accumulated `pty://output` contains `needle` (or a deadline
+    /// elapses), returning the final accumulation. The pump coalesces at ~60fps so
+    /// output arrives a frame after it is fed.
+    fn wait_output_contains(acc: &Arc<Mutex<String>>, needle: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            {
+                let got = acc.lock().unwrap();
+                if got.contains(needle) || Instant::now() >= deadline {
+                    return got.clone();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// SYNTHETIC E2E #1 — success path, full chain, no real shell.
+    ///
+    /// Feed the production pump a SYNTHETIC stream that interleaves visible output
+    /// with OSC 133 markers: a pre-exec (`C` → running), real command output, and
+    /// a command-end exit 0 (`D;0` → success). Assert simultaneously:
+    ///  - `terminal://exec-state` fires running → success, keyed to OUR terminal_id;
+    ///  - the persisted DB row settles to success(0)+unread (authority for restart);
+    ///  - `pty://output` still carries EVERY visible byte (the OSC bytes are
+    ///    observed out-of-band, NOT stripped — xterm renders the full stream).
+    #[test]
+    fn synthetic_e2e_running_to_success_through_the_pump() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let pty_id = 90_001u64;
+        map_pty_to_record(&app, pty_id, &tid);
+
+        let exec_events = collect_exec_events(&app);
+        let output = collect_pty_output(&app);
+
+        // The pump owns the receiver end; we own the synthetic transmitter.
+        let (tx, rx) = channel::<Vec<u8>>();
+        spawn_output_pump(app.handle().clone(), pty_id, rx);
+
+        // A realistic, deterministic prompt cycle (the bytes a 133-instrumented
+        // shell would emit), with VISIBLE text around the control sequences.
+        tx.send(b"\x1b]133;A\x07PS C:\\> \x1b]133;B\x07".to_vec())
+            .unwrap(); // prompt drawn (inert)
+        tx.send(b"\x1b]133;C\x07".to_vec()).unwrap(); // pre-exec → running
+        tx.send(b"hello from synthetic shell\r\n".to_vec()).unwrap(); // command output
+        tx.send(b"\x1b]133;D;0\x07".to_vec()).unwrap(); // end exit 0 → success
+        tx.send(b"\x1b]133;A\x07PS C:\\> \x1b]133;B\x07".to_vec())
+            .unwrap(); // next prompt
+
+        // Full-chain assertions on the persisted authority + the emitted events.
+        let evs = wait_events(&exec_events, 2);
+        assert_eq!(evs.len(), 2, "exactly running then success were emitted");
+        assert_eq!(evs[0]["terminal_id"], tid);
+        assert_eq!(evs[0]["state"], "running");
+        assert_eq!(evs[0]["unread"], false, "running is a live state, never unread");
+        assert_eq!(evs[1]["terminal_id"], tid, "settle keyed to OUR terminal");
+        assert_eq!(evs[1]["state"], "success");
+        assert_eq!(evs[1]["exit_code"], 0);
+        assert_eq!(evs[1]["unread"], true, "settled success is an unread notification");
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_SUCCESS.to_string(), Some(0), true),
+            "the DB row is the restart authority: success(0)+unread"
+        );
+
+        // No stripping: the visible command output reached the renderer in full.
+        let acc = wait_output_contains(&output, "hello from synthetic shell");
+        assert!(
+            acc.contains("hello from synthetic shell"),
+            "visible output must reach pty://output unstripped, got: {acc:?}"
+        );
+
+        // Clean shutdown: dropping tx disconnects rx → the pump emits pty://exit
+        // and (record settled) leaves the success result untouched.
+        drop(tx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && app.state::<TerminalIdMap>().get(pty_id).is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            exec_state(&app, &tid),
+            (db::STATE_SUCCESS.to_string(), Some(0), true),
+            "a settled success survives the PTY-exit normalize"
+        );
+    }
+
+    /// SYNTHETIC E2E #2 — error path + normalize-on-exit, no real shell.
+    ///
+    /// One terminal runs a command that FAILS (`C` → running, `D;3` → error), proving
+    /// the running → error transition end-to-end. A SECOND terminal is left mid-run
+    /// (`C` → running, NO `D`) and then has its synthetic PTY disconnect: the pump's
+    /// disconnect path must normalize that stale `running` to `idle` (no false badge
+    /// after a shell/PTY exit). Both run through the production pump with synthetic
+    /// bytes only.
+    #[test]
+    fn synthetic_e2e_running_to_error_and_normalize_on_exit_through_the_pump() {
+        let app = build_app_with_db();
+        let exec_events = collect_exec_events(&app);
+
+        // --- Terminal A: running → error (command failed, exit 3) ---
+        let ta = make_record(&app);
+        let pty_a = 90_011u64;
+        map_pty_to_record(&app, pty_a, &ta);
+        let (tx_a, rx_a) = channel::<Vec<u8>>();
+        spawn_output_pump(app.handle().clone(), pty_a, rx_a);
+        tx_a.send(b"\x1b]133;C\x07".to_vec()).unwrap(); // running
+        tx_a.send(b"boom: command failed\r\n".to_vec()).unwrap();
+        tx_a.send(b"\x1b]133;D;3\x07".to_vec()).unwrap(); // error, exit 3
+
+        // --- Terminal B: running with NO end, then PTY exits mid-command ---
+        let tb = make_record(&app);
+        let pty_b = 90_012u64;
+        map_pty_to_record(&app, pty_b, &tb);
+        let (tx_b, rx_b) = channel::<Vec<u8>>();
+        spawn_output_pump(app.handle().clone(), pty_b, rx_b);
+        tx_b.send(b"\x1b]133;C\x07long running, never ends...\r\n".to_vec())
+            .unwrap(); // running, no D
+
+        // A's error must settle (running → error(3)+unread) on the persisted row.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && exec_state(&app, &ta).0 != db::STATE_ERROR
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            exec_state(&app, &ta),
+            (db::STATE_ERROR.to_string(), Some(3), true),
+            "terminal A: running → error(3)+unread end-to-end through the pump"
+        );
+
+        // B reaches running first; then its PTY disconnects.
+        while Instant::now() < deadline && exec_state(&app, &tb).0 != db::STATE_RUNNING {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(exec_state(&app, &tb).0, db::STATE_RUNNING, "B is running mid-command");
+        drop(tx_b); // PTY exit while running → the pump normalizes the stale badge.
+
+        // No stale running badge after the shell/PTY exit: B settles to idle.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && exec_state(&app, &tb).0 == db::STATE_RUNNING {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            exec_state(&app, &tb),
+            (db::STATE_IDLE.to_string(), None, false),
+            "B: a stale running normalizes to idle on PTY exit (no false running)"
+        );
+
+        // Event-stream cross-check: every emitted event is keyed to the RIGHT id,
+        // and A's settle is error while B's last transition is idle (not error).
+        let evs = wait_events(&exec_events, 4); // A: running,error ; B: running,idle
+        let for_a: Vec<&serde_json::Value> =
+            evs.iter().filter(|e| e["terminal_id"] == ta).collect();
+        let for_b: Vec<&serde_json::Value> =
+            evs.iter().filter(|e| e["terminal_id"] == tb).collect();
+        assert_eq!(for_a.last().unwrap()["state"], "error");
+        assert_eq!(for_a.last().unwrap()["exit_code"], 3);
+        assert_eq!(
+            for_b.last().unwrap()["state"],
+            "idle",
+            "B's terminating event is the normalize to idle, not a false error"
+        );
+
+        drop(tx_a);
     }
 }

@@ -100,6 +100,22 @@ pub struct Terminal {
     /// `auto` (follows resolved cwd) or `manual` (pinned until unpin). See
     /// [`BINDING_AUTO`] / [`BINDING_MANUAL`].
     pub workspace_binding_mode: String,
+    /// Last exec-state of this terminal (PRD-2.1): `idle` | `running` | `success`
+    /// | `error` (CHECK-enforced — see [`STATE_IDLE`] etc., the SAME vocabulary as
+    /// `command_instances.last_state`). Defaults to `idle` so an OLD terminal (a
+    /// row predating migration v4) loads as idle — no false badge on upgrade.
+    pub exec_state: String,
+    /// Exit code of the last finished command (`None` = none yet, or a `133;D`
+    /// end event that carried no parseable code). The state machine maps `Some(0)`
+    /// → success, non-zero → error.
+    pub exec_exit_code: Option<i32>,
+    /// Notification flag: a settled `success`/`error` the user has NOT yet seen on
+    /// an inactive terminal. Kept SEPARATE from `exec_state` so mark-read clears
+    /// the unread flag while preserving the settled result (the deliberate
+    /// difference from the managed-command acknowledge model). SQLite 0/1 boolean.
+    pub exec_state_unread: bool,
+    /// Epoch ms of the last exec-state transition. Stamped on every transition.
+    pub exec_state_updated_at: i64,
 }
 
 /// A new `terminals` row to insert. `id` is a backend-generated UUIDv7;
@@ -117,12 +133,19 @@ pub struct NewTerminal {
     pub order_index: i32,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Stamped explicitly at creation so a fresh terminal carries a real epoch-ms
+    /// (`exec_state` itself stays `idle` via the column DEFAULT). This must be set
+    /// here because the v4 migration's column DEFAULT is the CONSTANT `0` (a
+    /// non-constant DEFAULT is illegal on `ADD COLUMN` for a non-empty table — the
+    /// migration backfills EXISTING rows separately); without stamping it, a new
+    /// row would land on 0 instead of "now".
+    pub exec_state_updated_at: i64,
 }
 
 impl NewTerminal {
     /// A fresh `alive` terminal at `cwd`, with an optional label, placed at the
     /// given sidebar order. Generates a fresh, time-ordered UUIDv7 id and stamps
-    /// `created_at`/`updated_at` with the current epoch-ms.
+    /// `created_at`/`updated_at`/`exec_state_updated_at` with the current epoch-ms.
     pub fn alive(cwd: impl Into<String>, label: Option<String>, order_index: i32) -> Self {
         let now = now_millis();
         NewTerminal {
@@ -133,6 +156,7 @@ impl NewTerminal {
             order_index,
             created_at: now,
             updated_at: now,
+            exec_state_updated_at: now,
         }
     }
 }
@@ -485,6 +509,59 @@ pub fn get_terminal(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option
         .select(Terminal::as_select())
         .first(conn)
         .optional()
+}
+
+// --- Terminal exec-state (PRD-2.1 v4) ------------------------------------
+//
+// The DB record is the AUTHORITY for the sidebar exec-state badge after a
+// restart. These helpers persist a transition's full tuple (state, exit code,
+// unread flag, updated_at) and clear the unread flag on mark-read. The state
+// machine that decides the transition from OSC 133 events lives in a later phase
+// (`crate::command`-style runner); these are the pure persistence primitives it
+// drives, mirroring `set_last_state` for command instances. The constraint set
+// (CHECK on `exec_state` + `exec_state_unread`) is what makes an invalid value
+// un-persistable through this path — see `set_exec_state` below.
+
+/// Persist a terminal's exec-state transition: the new `state` (idle|running|
+/// success|error — the [`STATE_IDLE`] … vocabulary), the last `exit_code`
+/// (`None` clears it), and the `unread` notification flag, stamping
+/// `exec_state_updated_at` with the current epoch-ms. An invalid `state` yields
+/// an `Err` (the CHECK constraint rejects it — no invalid exec_state can be
+/// persisted through normal code paths). Returns rows updated (0 if id unknown).
+pub fn set_exec_state(
+    conn: &mut SqliteConnection,
+    id: &str,
+    state: &str,
+    exit_code: Option<i32>,
+    unread: bool,
+) -> QueryResult<usize> {
+    let now = now_millis();
+    diesel::update(terminals::table.find(id))
+        .set((
+            terminals::exec_state.eq(state),
+            terminals::exec_exit_code.eq(exit_code),
+            terminals::exec_state_unread.eq(unread),
+            terminals::exec_state_updated_at.eq(now),
+            terminals::updated_at.eq(now),
+        ))
+        .execute(conn)
+}
+
+/// Mark a terminal's settled exec-state as READ: clear `exec_state_unread` to
+/// false while LEAVING `exec_state`/`exec_exit_code` intact (the badge keeps its
+/// success/error color but stops being a notification). This is the mark-read
+/// path (the user viewed the terminal); it deliberately does NOT collapse the
+/// state to idle, unlike the managed-command acknowledge model. Stamps
+/// `exec_state_updated_at`. Returns rows updated (0 if id unknown).
+pub fn mark_exec_state_read(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    let now = now_millis();
+    diesel::update(terminals::table.find(id))
+        .set((
+            terminals::exec_state_unread.eq(false),
+            terminals::exec_state_updated_at.eq(now),
+            terminals::updated_at.eq(now),
+        ))
+        .execute(conn)
 }
 
 // --- Project / Workspace CRUD (PRD-2 v2) ---------------------------------
@@ -1470,6 +1547,182 @@ mod tests {
             bad.is_err(),
             "status CHECK must reject values outside alive|closed"
         );
+    }
+
+    // --- Terminal exec-state (PRD-2.1 v4) --------------------------------
+
+    /// A freshly-created terminal loads with the exec-state defaults: `idle`, no
+    /// exit code, NOT unread, and a stamped `exec_state_updated_at`. This is the
+    /// "new terminals must get idle defaults" criterion (and the shape an OLD
+    /// terminal also takes after the ALTER TABLE ADD COLUMN migration runs).
+    #[test]
+    fn new_terminal_defaults_to_idle_exec_state() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).expect("create_terminal");
+        assert_eq!(t.exec_state, STATE_IDLE, "default exec_state is idle");
+        assert_eq!(t.exec_exit_code, None, "no exit code yet");
+        assert!(!t.exec_state_unread, "default unread is false");
+        assert!(
+            t.exec_state_updated_at > 0,
+            "exec_state_updated_at is stamped (DEFAULT julianday-ms)"
+        );
+    }
+
+    /// OLD terminals (a row that predates v4, inserted WITHOUT the exec-state
+    /// columns) migrate to `idle` with `unread = false`. We simulate a pre-v4 row
+    /// by inserting only the v1/v2 columns and letting the migration DEFAULTs fill
+    /// the rest, then read it back through the full `Terminal` model.
+    #[test]
+    fn old_terminal_loads_as_idle_with_unread_false() {
+        let mut conn = open_in_memory();
+        let id = Uuid::now_v7().to_string();
+        // Insert touching ONLY the pre-exec-state columns: the four v4 columns are
+        // filled by their ALTER TABLE DEFAULTs, exactly as a real old row would be.
+        diesel::insert_into(terminals::table)
+            .values((
+                terminals::id.eq(&id),
+                terminals::cwd.eq("/legacy"),
+                terminals::status.eq(STATUS_ALIVE),
+                terminals::order_index.eq(0),
+            ))
+            .execute(&mut conn)
+            .expect("insert legacy-shaped row");
+
+        let got = get_terminal(&mut conn, &id)
+            .expect("get_terminal")
+            .expect("row present");
+        assert_eq!(got.exec_state, STATE_IDLE, "old terminal migrates to idle");
+        assert_eq!(got.exec_exit_code, None);
+        assert!(!got.exec_state_unread, "old terminal is read (unread=false)");
+    }
+
+    /// The GENUINE upgrade path (done-criterion "migration/default tests pass on a
+    /// fresh AND **upgraded** DB"): revert v4 so the schema is the PRE-exec-state
+    /// shape (no `exec_*` columns), insert a terminal into THAT old schema — proving
+    /// it really predates v4 — then RUN the v4 migration (the actual ALTER TABLE ADD
+    /// COLUMN upgrade) and read the row back through the full `Terminal` model. The
+    /// pre-existing row must surface with the idle defaults the ADD COLUMN DEFAULTs
+    /// supply: `idle`, no exit code, unread=false, a stamped `updated_at`. This is
+    /// stronger than `old_terminal_loads_as_idle_with_unread_false` (which inserts a
+    /// legacy-SHAPED row into an already-migrated DB): here the columns genuinely do
+    /// not exist when the row is written, so the migration itself is exercised.
+    #[test]
+    fn migration_v4_upgrade_backfills_old_terminals_with_idle_defaults() {
+        use diesel::sql_query;
+        let mut conn = open_in_memory();
+
+        // Step DOWN one migration (v4) → the four exec-state columns are gone.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v4 cleanly");
+        // Sanity: the column really is absent now — referencing it must error.
+        let exec_col_present: QueryResult<usize> =
+            sql_query("SELECT exec_state FROM terminals").execute(&mut conn);
+        assert!(
+            exec_col_present.is_err(),
+            "after reverting v4 the exec_state column must NOT exist (pre-upgrade schema)"
+        );
+
+        // Insert a terminal into the PRE-v4 schema (only v1/v2 columns exist). A raw
+        // SQL insert is used because the diesel `terminals::table` model now knows
+        // the v4 columns; this writes a row exactly as a pre-v4 build would have.
+        let id = Uuid::now_v7().to_string();
+        sql_query(format!(
+            "INSERT INTO terminals (id, cwd, status, \"order\") \
+             VALUES ('{id}', '/legacy', '{STATUS_ALIVE}', 0)"
+        ))
+        .execute(&mut conn)
+        .expect("insert a pre-v4 terminal row");
+
+        // Now UPGRADE: run the v4 migration (ALTER TABLE ADD COLUMN ...). The old
+        // row must be backfilled by the column DEFAULTs.
+        run_migrations(&mut conn).expect("re-apply v4 (the upgrade)");
+
+        let got = get_terminal(&mut conn, &id)
+            .expect("get_terminal after upgrade")
+            .expect("the pre-v4 row survived the upgrade");
+        assert_eq!(
+            got.exec_state, STATE_IDLE,
+            "an upgraded old terminal backfills to idle — no false badge on upgrade"
+        );
+        assert_eq!(got.exec_exit_code, None, "no exit code on an upgraded row");
+        assert!(
+            !got.exec_state_unread,
+            "an upgraded old terminal is read (unread=false)"
+        );
+        assert!(
+            got.exec_state_updated_at > 0,
+            "the backfill UPDATE (up.sql:58-60) stamps the julianday epoch-ms on the \
+             upgraded row — the column itself is added with a constant DEFAULT 0"
+        );
+    }
+
+    /// `set_exec_state` round-trips the full tuple, and `list`/`get` return it —
+    /// covering the "list/get terminal APIs return the new fields" criterion.
+    #[test]
+    fn set_exec_state_round_trips_through_list_and_get() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+
+        // running: no exit code, and (for an active terminal) read.
+        set_exec_state(&mut conn, &t.id, STATE_RUNNING, None, false).expect("set running");
+        let got = get_terminal(&mut conn, &t.id).unwrap().unwrap();
+        assert_eq!(got.exec_state, STATE_RUNNING);
+        assert_eq!(got.exec_exit_code, None);
+        assert!(!got.exec_state_unread);
+
+        // error with a non-zero exit code, unread (settled on an inactive terminal).
+        set_exec_state(&mut conn, &t.id, STATE_ERROR, Some(3), true).expect("set error");
+        let listed = list_terminals(&mut conn).unwrap();
+        let row = listed.iter().find(|r| r.id == t.id).unwrap();
+        assert_eq!(row.exec_state, STATE_ERROR);
+        assert_eq!(row.exec_exit_code, Some(3));
+        assert!(row.exec_state_unread, "settled error on inactive term is unread");
+
+        // success with exit 0.
+        set_exec_state(&mut conn, &t.id, STATE_SUCCESS, Some(0), true).expect("set success");
+        let got = get_terminal(&mut conn, &t.id).unwrap().unwrap();
+        assert_eq!(got.exec_state, STATE_SUCCESS);
+        assert_eq!(got.exec_exit_code, Some(0));
+    }
+
+    /// `mark_exec_state_read` clears the unread flag but PRESERVES the settled
+    /// state + exit code (the deliberate difference from the acknowledge model).
+    #[test]
+    fn mark_exec_state_read_clears_unread_but_keeps_result() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        set_exec_state(&mut conn, &t.id, STATE_ERROR, Some(2), true).expect("set error unread");
+
+        mark_exec_state_read(&mut conn, &t.id).expect("mark read");
+        let got = get_terminal(&mut conn, &t.id).unwrap().unwrap();
+        assert!(!got.exec_state_unread, "unread cleared on mark-read");
+        assert_eq!(got.exec_state, STATE_ERROR, "settled state preserved");
+        assert_eq!(got.exec_exit_code, Some(2), "exit code preserved");
+    }
+
+    /// The `exec_state` CHECK constraint rejects anything but idle|running|
+    /// success|error — invalid exec_state values cannot be persisted through the
+    /// normal `set_exec_state` path. Proves the migration constraint reached the DB.
+    #[test]
+    fn exec_state_check_constraint_enforced() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let bad = set_exec_state(&mut conn, &t.id, "bogus", None, false);
+        assert!(
+            bad.is_err(),
+            "exec_state CHECK must reject values outside idle|running|success|error"
+        );
+        // A raw insert with a bad exec_state is rejected too (defense in depth).
+        let bad_insert = diesel::insert_into(terminals::table)
+            .values((
+                terminals::id.eq(Uuid::now_v7().to_string()),
+                terminals::cwd.eq("/x"),
+                terminals::status.eq(STATUS_ALIVE),
+                terminals::order_index.eq(0),
+                terminals::exec_state.eq("nope"),
+            ))
+            .execute(&mut conn);
+        assert!(bad_insert.is_err(), "raw insert with bad exec_state rejected");
     }
 
     // --- CRUD (YR done criteria) -----------------------------------------

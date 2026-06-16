@@ -13,6 +13,7 @@ function row(
   cwd: string,
   label: string | null = null,
   exec_state: TerminalRecord["exec_state"] = "idle",
+  exec_state_unread = false,
 ): TerminalRecord {
   return {
     id: String(id),
@@ -25,6 +26,7 @@ function row(
     updated_at: 0,
     closed_at: null,
     exec_state,
+    exec_state_unread,
   };
 }
 
@@ -244,14 +246,15 @@ describe("<SortableTerminalItem> whole-item drag (dnd-kit)", () => {
     ).toHaveLength(1);
   });
 
-  it("a NON-active terminal shows its run-state badge; the ACTIVE one clears it (unread model)", () => {
+  it("shows the settled badge while UNREAD and HIDES it once READ — even when inactive again (PRD-2.1 user story #3)", () => {
     mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
-    // Non-active + success → unread badge present.
+    // UNREAD success on an inactive terminal → badge present (the persisted flag,
+    // not selection, drives visibility).
     const { rerender } = render(
       <DragDropProvider>
         <ul>
           <SortableTerminalItem
-            record={row(1, "/a", null, "success")}
+            record={row(1, "/a", null, "success", true)}
             index={0}
             active={false}
             onSelect={vi.fn()}
@@ -261,14 +264,16 @@ describe("<SortableTerminalItem> whole-item drag (dnd-kit)", () => {
       </DragDropProvider>,
     );
     expect(screen.getByRole("status", { name: /terminal status: success/i })).toBeInTheDocument();
-    // Selecting it (active) clears the unread badge.
+    // After the user viewed it the record is READ (`exec_state_unread = false`).
+    // Re-deselecting (active=false) must NOT re-show the badge — the bug the
+    // persisted-flag refactor fixes (a purely `active`-driven badge would re-appear).
     rerender(
       <DragDropProvider>
         <ul>
           <SortableTerminalItem
-            record={row(1, "/a", null, "success")}
+            record={row(1, "/a", null, "success", false)}
             index={0}
-            active
+            active={false}
             onSelect={vi.fn()}
             onClose={vi.fn()}
           />

@@ -23,6 +23,15 @@ export interface UsePtyOptions {
    */
   cwd?: string;
   /**
+   * The PERSISTENT terminal RECORD id (SQLite `terminals.id`) this session is
+   * bound to. Passed straight through to `pty_spawn` so the backend can map the
+   * live pty_id → terminal record id and address the durable record for
+   * exec-state (PRD-2.1). `undefined` for a record-less standalone terminal (the
+   * socle / unit harness): the backend then records no mapping and skips
+   * exec-state. This is pure plumbing — the record id is NOT a new identity model.
+   */
+  recordId?: string;
+  /**
    * Called with the resolved live PTY id once the spawn completes, and with
    * `null` when the session ends/teardown clears it. Used by the auto-naming
    * layer (it needs the PTY id to read `terminal_info`). Optional — the socle /
@@ -128,7 +137,7 @@ export function usePty(
   fitAddon: FitAddon,
   options: UsePtyOptions = {},
 ): () => void {
-  const { cwd, onPtyId, deadHistory } = options;
+  const { cwd, recordId, onPtyId, deadHistory } = options;
   const sessionRef = useRef<PtySession | null>(null);
   // Keep the latest onPtyId on a ref so the session always calls the current one
   // without re-running the spawn effect when the callback identity changes.
@@ -179,7 +188,7 @@ export function usePty(
     // `pty_spawn` actually reaches the IPC. (Mutation-verified.)
     if (!session.spawnIssued) {
       session.spawnIssued = true;
-      void start(session, fitAddon, cwd, deadHistory);
+      void start(session, fitAddon, cwd, recordId, deadHistory);
     }
 
     const myGeneration = session.generation;
@@ -207,6 +216,7 @@ async function start(
   session: PtySession,
   fitAddon: FitAddon,
   cwd: string | undefined,
+  recordId: string | undefined,
   deadHistory: string | undefined,
 ): Promise<void> {
   const { term } = session;
@@ -268,7 +278,12 @@ async function start(
   const cols = dims?.cols ?? term.cols;
   const rows = dims?.rows ?? term.rows;
 
-  const id = await invoke<number>("pty_spawn", { cwd, cols, rows });
+  // Pass the persistent terminal record id (when bound) so the backend can map
+  // the live pty_id → terminal record id for exec-state (PRD-2.1). `terminalId`
+  // (camelCase) maps to the Rust `terminal_id` param; a record-less terminal
+  // passes `undefined` and the backend records no mapping. This does NOT alter
+  // the StrictMode spawn-dedupe (it is a plain extra argument to the same call).
+  const id = await invoke<number>("pty_spawn", { cwd, cols, rows, terminalId: recordId });
 
   if (session.torndown) {
     // Torn down before the spawn resolved: close the orphan, don't leak.
