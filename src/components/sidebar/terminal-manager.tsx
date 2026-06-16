@@ -135,6 +135,7 @@ export function TerminalManager() {
     activeNext,
     activePrev,
     reorder,
+    markRead,
   } = useTerminals();
 
   // Project/workspace tree behind the variant-A sidebar spine.
@@ -184,13 +185,40 @@ export function TerminalManager() {
     },
     [instances],
   );
+  // Selecting a terminal VIEWS it: switch the deck to it AND mark its settled
+  // exec-state read (PRD-2.1) — viewing a success/error terminal clears its unread
+  // badge (and persists the clear). `running` is unaffected (it has no unread bit);
+  // `markRead` no-ops when the terminal is already read.
   const selectTerminal = useCallback(
     (id: string) => {
       setActiveCommandId(null);
       setActive(id);
+      markRead(id);
     },
-    [setActive],
+    [setActive, markRead],
   );
+
+  // ACTIVE-SETTLE (PRD-2.1): if a `success`/`error` exec-state arrives for the
+  // terminal that is CURRENTLY being VIEWED (the active terminal, with no command
+  // view covering the deck), mark it read at once — the user is already looking at
+  // it, so it must never accumulate an unread badge. `useTerminals` folds the event
+  // onto the record (setting `exec_state_unread`), and this effect reacts to that
+  // record turning unread-while-viewed and calls the mark-read path. A terminal
+  // viewed AFTER it settled is handled by `selectTerminal`'s `markRead`; this covers
+  // the event-arrives-while-already-active case. Gated on `activeCommandId === null`
+  // because an open command view HIDES the deck (the terminal is not truly viewed).
+  const viewedTerminal = useMemo(
+    () =>
+      activeCommandId === null && activeId !== null
+        ? (terminals.find((t) => t.id === activeId) ?? null)
+        : null,
+    [activeCommandId, activeId, terminals],
+  );
+  useEffect(() => {
+    if (viewedTerminal?.exec_state_unread) {
+      markRead(viewedTerminal.id);
+    }
+  }, [viewedTerminal, markRead]);
 
   // Global new/close/next/prev shortcuts. `close` targets the active terminal.
   const closeActive = useCallback(() => {

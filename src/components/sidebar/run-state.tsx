@@ -13,10 +13,15 @@ import type { ExecState } from "./use-terminals";
  *    error).
  *  - `<TerminalStateBadge>` — a tiny ring-punched corner badge on a TERMINAL
  *    row's glyph, with NOTIFICATION/UNREAD semantics: idle → no badge; running →
- *    blue pulsing; success → green static; error → red static. Shown ONLY on a
- *    NON-active terminal (selecting/viewing it CLEARS the badge — the unread
- *    model), though a still-running terminal MAY keep the blue pulse even when
- *    active.
+ *    blue pulsing; success → green static; error → red static. A settled
+ *    (`success`/`error`) badge is shown ONLY while the terminal's PERSISTED
+ *    `exec_state_unread` flag is set — NOT merely while it is non-active. This is
+ *    the load-bearing PRD-2.1 refactor: viewing a terminal calls the backend
+ *    mark-read (clearing `exec_state_unread`), so the settled badge stays hidden
+ *    even after the user re-deselects the terminal (user story #3) — a purely
+ *    `active`-driven badge would WRONGLY re-appear on re-deselect. A still-running
+ *    terminal MAY keep the blue pulse even when active (it is a live state, not a
+ *    notification, so it is never gated by `unread`).
  *
  * Colors come from design-system tokens only: `--muted-foreground` (idle),
  * `--info` (running), `--success`, `--destructive`. The "running" pulse (Tailwind's
@@ -76,11 +81,18 @@ export function StatusDot({ state, className, ref }: StatusDotProps) {
 export interface TerminalStateBadgeProps {
   state: ExecState;
   /**
-   * Whether the terminal this badge belongs to is the ACTIVE (selected/viewed)
-   * one. The badge is the UNREAD indicator, so an active terminal CLEARS it —
-   * `idle`/`success`/`error` render nothing when active. The exception is
-   * `running`, which MAY keep its pulse even when active (it signals "still
-   * running"), per the finding.
+   * Whether the terminal's SETTLED result is UNREAD — mirrors the persisted
+   * `exec_state_unread` flag on the record (PRD-2.1). This — NOT `active` — drives
+   * settled-state visibility: a `success`/`error` badge shows ONLY while unread,
+   * so once the user views the terminal (backend mark-read clears the flag) the
+   * badge stays hidden even after re-deselecting (user story #3). Ignored for
+   * `running` (a live state, never a notification) and `idle` (no badge).
+   */
+  unread?: boolean;
+  /**
+   * Whether the terminal this badge belongs to is the ACTIVE (visible) one. Kept
+   * ONLY so the still-`running` pulse is unambiguous when active; it no longer
+   * gates settled-state visibility (that is `unread`'s job now).
    */
   active?: boolean;
   className?: string;
@@ -92,22 +104,34 @@ export interface TerminalStateBadgeProps {
  * "punches" a ring out of the row background (`ring-sidebar`) so it reads as a
  * notification dot sitting on the glyph.
  *
- * UNREAD MODEL:
- *  - `idle`                 → NO badge (nothing to notify).
- *  - active (selected/read) → NO badge for idle/success/error (cleared on read);
- *    `running` keeps its blue pulse (still-running signal).
- *  - otherwise (unread)     → running (blue, pulse) / success (green) / error
- *    (red), each popping in on appear.
+ * UNREAD MODEL (persisted-flag-driven — PRD-2.1):
+ *  - `idle`            → NO badge (nothing to notify).
+ *  - `running`         → ALWAYS shown (blue, pulsing), even when active — it is a
+ *    live state, not a notification, so it is never gated by `unread`.
+ *  - `success`/`error` → shown ONLY while `unread` (the persisted
+ *    `exec_state_unread` flag). Once read it stays hidden even when the terminal
+ *    later becomes inactive again — the visibility no longer depends on `active`.
  *
  * Returns `null` when there is nothing to show — the lead glyph renders alone.
  */
-export function TerminalStateBadge({ state, active = false, className }: TerminalStateBadgeProps) {
+export function TerminalStateBadge({
+  state,
+  unread = false,
+  active = false,
+  className,
+}: TerminalStateBadgeProps) {
   const reduced = useReducedMotion();
 
-  // Idle never shows a badge. An active terminal clears the unread badge for the
-  // settled states, but a still-running one keeps its pulse.
+  // Idle never shows a badge. `running` always shows (a live state, not a
+  // notification). A settled result (success/error) shows ONLY while unread AND
+  // the terminal is NOT active: it is a notification for a terminal you are not
+  // looking at, so the ACTIVE (viewed) terminal never shows it — this kills the
+  // green/red "flash" when an instant command on the active terminal settles
+  // unread for a frame before the active-settle mark-read clears the flag. The
+  // persisted `unread` flag still gates re-deselect (user story #3): once read it
+  // stays hidden even after the terminal becomes inactive again.
   if (state === "idle") return null;
-  if (active && state !== "running") return null;
+  if (state !== "running" && (!unread || active)) return null;
 
   return (
     <motion.span

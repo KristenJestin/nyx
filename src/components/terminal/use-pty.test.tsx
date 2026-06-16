@@ -36,13 +36,16 @@ function installIpc(): IpcRecorder {
  */
 function StablePtyHarness({
   onReady,
+  recordId,
 }: {
   /** Surfaces the xterm instance and the hook's resyncSize to the test. */
   onReady?: (term: XTerm, resyncSize: () => void) => void;
+  /** Persistent terminal record id to thread through to `pty_spawn`. */
+  recordId?: string;
 } = {}) {
   const term = useMemo(() => new XTerm({ cols: 80, rows: 24 }), []);
   const fit = useMemo(() => new FitAddon(), []);
-  const resyncSize = usePty(term, fit);
+  const resyncSize = usePty(term, fit, { recordId });
   // Re-publish on every render so the test always holds the live callback.
   onReady?.(term, resyncSize);
   return null;
@@ -134,6 +137,27 @@ describe("usePty (hook, stable instance)", () => {
       expect(last.args.cols).toBe(100);
       expect(last.args.rows).toBe(30);
     });
+  });
+
+  // PRD-2.1 task #3: the persistent terminal record id must reach `pty_spawn` as
+  // the `terminalId` arg (Tauri maps it to the Rust `terminal_id` param) so the
+  // backend can associate the live pty_id with the durable record for exec-state.
+  // This is plumbing only — it must NOT perturb the single-spawn dedupe.
+  it("forwards recordId to pty_spawn as terminalId", async () => {
+    render(<StablePtyHarness recordId="term-rec-42" />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+    const spawn = ipc.callsTo("pty_spawn")[0];
+    expect(spawn.args.terminalId).toBe("term-rec-42");
+  });
+
+  // A record-less terminal (the socle / standalone harness) passes no record id,
+  // so `pty_spawn` receives `terminalId: undefined` and the backend records no
+  // mapping. Guards that the plumbing degrades cleanly.
+  it("omits terminalId when no recordId is bound", async () => {
+    render(<StablePtyHarness />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+    const spawn = ipc.callsTo("pty_spawn")[0];
+    expect(spawn.args.terminalId).toBeUndefined();
   });
 
   it("closes the PTY on a real unmount", async () => {

@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { resolveDisplayName, useAutoLabel, useShellSuffix } from "./auto-label";
 import { itemTransition, itemVariants } from "./item-motion";
 import { TerminalStateBadge } from "./run-state";
+import { useRunningDebounce } from "./use-running-debounce";
 import { SidebarItemContent, sidebarRowClassName } from "./sidebar-item";
 import type { TerminalRecord } from "./use-terminals";
 
@@ -91,7 +92,15 @@ export function TerminalItemBody({
   // Live shell/program suffix for the proto row (`web · zsh`). Same backend poll.
   const shell = useShellSuffix(ptyId);
 
-  const state = record.exec_state ?? "idle";
+  // Anti-flicker (finding #14): debounce the `running` indicator so an instant
+  // command (`running`→`success` within a few ms) never flashes the dot. Settled
+  // (`success`/`error`) and `idle` pass through immediately — only a sustained
+  // `running` (> threshold) reveals the dot. Identical for active/inactive rows
+  // (the debounce keys off the raw state only). Persistence/unread are untouched.
+  const state = useRunningDebounce(record.exec_state ?? "idle");
+  // Settled-badge visibility is driven by the PERSISTED unread flag (PRD-2.1),
+  // not by live selection — so a viewed badge stays hidden after re-deselecting.
+  const unread = record.exec_state_unread ?? false;
 
   return (
     // The SHARED item layout (lead → name → actions). The magenta selection bar is
@@ -99,16 +108,17 @@ export function TerminalItemBody({
     // tracks the active row by `[data-rail-row][aria-current]`.
     <SidebarItemContent
       // Lead glyph + run-state corner badge (the run-state channel, orthogonal to
-      // selection). The badge is suppressed on idle / on an active terminal (unread
-      // model) — see <TerminalStateBadge>. The wrapper is NOT `aria-hidden` so the
-      // badge's `role="status"` stays in the a11y tree; only the icon is hidden.
+      // selection). A settled badge shows only while the PERSISTED `exec_state_unread`
+      // flag is set (PRD-2.1); `running` always pulses; `idle` shows nothing — see
+      // <TerminalStateBadge>. The wrapper is NOT `aria-hidden` so the badge's
+      // `role="status"` stays in the a11y tree; only the icon is hidden.
       lead={
         <span className="relative flex shrink-0 items-center">
           <SquareTerminalIcon
             aria-hidden
             className={cn("size-3.5", active ? "text-sidebar-foreground" : "text-muted-foreground")}
           />
-          <TerminalStateBadge state={state} active={active} />
+          <TerminalStateBadge state={state} unread={unread} active={active} />
         </span>
       }
       name={name}

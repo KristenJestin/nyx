@@ -1,6 +1,9 @@
 mod bridge;
 mod command;
 mod db;
+// OSC 133 shell-integration parser + the exec-state gate decision (ADR-0002,
+// PRD 2.1 task #1). Pure parser; wired into the bridge output pump in phase 2.
+mod osc133;
 mod osc7;
 mod pathnorm;
 mod pkgjson;
@@ -9,6 +12,9 @@ mod proc;
 mod pty;
 mod resolve;
 mod schema;
+// Shell-integration injection (OSC 133 emit hooks for bash/zsh/PowerShell;
+// PRD-2.1 task #5). Pure classification + snippet generation; applied in `pty`.
+mod shellinteg;
 mod subfolder;
 
 use std::fs;

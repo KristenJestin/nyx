@@ -25,6 +25,11 @@
 //   SQLite INTEGER 0/1 booleans mapped as Diesel `Bool` ↔ Rust `bool`. The
 //   `managed_commands."order"` keyword column is exposed as `order_index` like
 //   `terminals`. `source_*` / `package_manager` are nullable provenance metadata.
+// - v4 (PRD-2.1) added the `terminals` exec-state columns: `exec_state` (TEXT,
+//   idle|running|success|error CHECK), `exec_exit_code` (Nullable<Integer>),
+//   `exec_state_unread` (SQLite 0/1 INTEGER boolean ↔ Diesel `Bool`), and
+//   `exec_state_updated_at` (epoch ms `BigInt`). Appended after
+//   `workspace_binding_mode`; column ORDER must match the SQL migration.
 
 diesel::table! {
     terminals (id) {
@@ -41,6 +46,10 @@ diesel::table! {
         last_active_at -> Nullable<BigInt>,
         workspace_id -> Nullable<Text>,
         workspace_binding_mode -> Text,
+        exec_state -> Text,
+        exec_exit_code -> Nullable<Integer>,
+        exec_state_unread -> Bool,
+        exec_state_updated_at -> BigInt,
     }
 }
 

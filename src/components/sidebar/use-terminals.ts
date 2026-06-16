@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 /**
  * A `terminals` row as returned by the backend record commands (see
@@ -51,13 +52,31 @@ export interface TerminalRecord {
   workspace_binding_mode?: "auto" | "manual";
   /**
    * Run-state of the terminal's foreground process, the SELECTION-orthogonal
-   * "run-state channel" (finding 01KV305BGS69RWCSWCAF0KD2SJ): drives the
-   * `<TerminalStateBadge>` / `<StatusDot>`. Optional + defaults to `'idle'` —
-   * **NO backend feeds real states in this PRD** (the detection/DB/wiring is the
-   * separate PRD 01KV300RVJ0WSVQ7K57KS37MX9), so live this is always `idle`. The
-   * UI components must still render all four states correctly given the prop.
+   * "run-state channel": drives the `<TerminalStateBadge>` / `<StatusDot>`.
+   * Optional + defaults to `'idle'`. PRD-2.1 feeds REAL states from the backend:
+   * `running` while a foreground command is live, `success`/`error` when it
+   * exits (driven by OSC 133 shell integration), via the `terminal://exec-state`
+   * event keyed by record id and persisted on the record (the authority after a
+   * restart).
    */
   exec_state?: ExecState;
+  /**
+   * Exit code of the last finished command (`null`/absent = none yet, or an end
+   * event with no parseable code). Mirrors `db::Terminal.exec_exit_code`; the
+   * backend maps `0` → `success`, non-zero → `error`.
+   */
+  exec_exit_code?: number | null;
+  /**
+   * Whether the terminal's SETTLED result (`success`/`error`) is UNREAD — the
+   * user has not yet viewed it since it finished. Mirrors the persisted
+   * `db::Terminal.exec_state_unread`. This — NOT live selection — drives the
+   * settled `<TerminalStateBadge>` visibility, so a viewed badge stays hidden
+   * even after re-deselecting the terminal (PRD-2.1 user story #3). The backend
+   * is the sole authority for this bit; the front clears it via
+   * `terminal_exec_mark_read` when the terminal is viewed (and optimistically
+   * mirrors the clear locally).
+   */
+  exec_state_unread?: boolean;
 }
 
 /**
@@ -69,6 +88,22 @@ export interface TerminalRecord {
  *  - `error`   — last process exited non-zero (red `--destructive`, static).
  */
 export type ExecState = "idle" | "running" | "success" | "error";
+
+/**
+ * Payload of the backend `terminal://exec-state` event (PRD-2.1): a terminal
+ * RECORD's exec-state transition, keyed by the persistent `terminal_id`. Mirrors
+ * the Rust `TerminalExecStatePayload` (`bridge.rs`) — deliberately `snake_case`
+ * (the DB-record shape), so it folds straight onto the matching `TerminalRecord`
+ * fields. `unread` is the persisted notification bit; `idle`/`running` are never
+ * unread.
+ */
+export interface TerminalExecStatePayload {
+  terminal_id: string;
+  state: ExecState;
+  exit_code: number | null;
+  unread: boolean;
+  updated_at: number;
+}
 
 /** The imperative surface the sidebar + keyboard shortcuts drive. */
 export interface UseTerminals {
@@ -121,6 +156,16 @@ export interface UseTerminals {
   reorder: (ids: string[]) => Promise<void>;
   /** Rename a terminal's label (optimistic; persisted). */
   rename: (id: string, label: string | null) => Promise<void>;
+  /**
+   * Mark a terminal's settled exec-state as READ (PRD-2.1): clear its local
+   * `exec_state_unread` flag immediately (so the settled badge disappears at
+   * once) and persist the clear via the backend `terminal_exec_mark_read`. The
+   * settled `exec_state` + exit code are PRESERVED — only the unread bit clears.
+   * A no-op for a terminal that is not currently unread. Called when a terminal
+   * is VIEWED, and immediately when a `success`/`error` arrives for the
+   * already-active terminal.
+   */
+  markRead: (id: string) => void;
 }
 
 /**
@@ -171,6 +216,12 @@ export function useTerminals(): UseTerminals {
   const [terminals, setTerminals] = useState<TerminalRecord[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // A live mirror of `terminals` for synchronous reads inside callbacks that must
+  // decide BEFORE scheduling a state update (e.g. `markRead` deciding whether a
+  // backend round-trip is needed). Kept in sync on every commit.
+  const terminalsRef = useRef<TerminalRecord[]>(terminals);
+  terminalsRef.current = terminals;
 
   // Guard against React.StrictMode double-mount creating two default terminals:
   // the bootstrap runs at most once per real mount.
@@ -294,6 +345,40 @@ export function useTerminals(): UseTerminals {
     void invoke("set_active", { id: activeId }).catch(() => {});
   }, [activeId]);
 
+  // Live exec-state (PRD-2.1): fold each backend `terminal://exec-state`
+  // transition onto its record WITHOUT a full re-list, so the sidebar badge
+  // updates immediately. Keyed by `terminal_id`; an event for a record we do not
+  // hold (e.g. a closed one) is ignored. The listener subscribes ONCE (no
+  // `terminals`/`activeId` deps → no churn) and uses the functional updater. The
+  // backend is the authority for `unread`; the consumer owns "mark read while the
+  // terminal is active" (it knows the focused terminal) by calling `markRead`.
+  useEffect(() => {
+    let torndown = false;
+    let unlisten: (() => void) | undefined;
+    void listen<TerminalExecStatePayload>("terminal://exec-state", (event) => {
+      if (torndown) return;
+      const { terminal_id, state, exit_code, unread } = event.payload;
+      setTerminals((prev) => {
+        if (!prev.some((t) => t.id === terminal_id)) return prev;
+        return prev.map((t) =>
+          t.id === terminal_id
+            ? { ...t, exec_state: state, exec_exit_code: exit_code, exec_state_unread: unread }
+            : t,
+        );
+      });
+    }).then((un) => {
+      if (torndown) {
+        void Promise.resolve(un()).catch(() => {});
+        return;
+      }
+      unlisten = un;
+    });
+    return () => {
+      torndown = true;
+      if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
+    };
+  }, []);
+
   const close = useCallback(async (id: string) => {
     setTerminals((prev) => {
       const idx = prev.findIndex((t) => t.id === id);
@@ -351,6 +436,20 @@ export function useTerminals(): UseTerminals {
     await invoke("rename", { id, label }).catch(() => {});
   }, []);
 
+  // Mark a terminal's settled result READ: clear the local unread flag at once
+  // (the settled badge disappears immediately) and persist via the backend.
+  // PRESERVES `exec_state`/`exec_exit_code` — only the unread bit clears. Skips
+  // the work (and the round-trip) when the terminal is already read. The decision
+  // reads the live `terminalsRef` synchronously (not a side-effect in the state
+  // updater), so the persist fires deterministically.
+  const markRead = useCallback((id: string) => {
+    if (!terminalsRef.current.some((t) => t.id === id && t.exec_state_unread)) return;
+    setTerminals((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, exec_state_unread: false } : t)),
+    );
+    void invoke("terminal_exec_mark_read", { id }).catch(() => {});
+  }, []);
+
   return {
     terminals,
     activeId,
@@ -365,5 +464,6 @@ export function useTerminals(): UseTerminals {
     activePrev,
     reorder,
     rename,
+    markRead,
   };
 }
