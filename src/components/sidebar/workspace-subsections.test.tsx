@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { describe, expect, it, vi } from "vitest";
 
 import { WorkspaceSubsections } from "./workspace-subsections";
@@ -88,6 +89,34 @@ describe("<WorkspaceSubsections>", () => {
     expect(screen.getByText("build")).toBeInTheDocument();
   });
 
+  it("a command row uses the SHARED item gabarit: same px-2 row shape, NO pl-5.5 inset", () => {
+    const commands: CommandRecord[] = [{ id: "c1", label: "build" }];
+    render(
+      <WorkspaceSubsections
+        terminals={[]}
+        activeId={null}
+        commands={commands}
+        activeCommandId={null}
+        onSelect={noop}
+        onClose={noop}
+        onSelectCommand={noop}
+        onNewTerminal={noop}
+      />,
+    );
+    // The command row is the shared sidebar item shape: the old command-specific
+    // left inset (`pl-5.5`, which pushed it right of the terminals) is gone, and it
+    // carries the same `px-2`/`py-1.5`/`rounded-md`/`gap-2` row gabarit as a terminal.
+    // The row is a `div[role=button]` carrying `[data-rail-row]` (the controls inside
+    // are `<button>`s, so the row itself must NOT be one).
+    const row = screen.getByText("build").closest("[data-rail-row]") as HTMLElement;
+    expect(row.tagName).toBe("DIV");
+    expect(row.className).not.toMatch(/pl-5\.5/);
+    expect(row.className).toContain("px-2");
+    expect(row.className).toContain("py-1.5");
+    expect(row.className).toContain("rounded-md");
+    expect(row.className).toContain("gap-2");
+  });
+
   it("a command row renders a run-state StatusDot and selects on click", () => {
     const onSelectCommand = vi.fn();
     const commands: CommandRecord[] = [{ id: "c1", label: "build" }];
@@ -107,6 +136,111 @@ describe("<WorkspaceSubsections>", () => {
     expect(screen.getByLabelText(/status: idle/i)).toBeInTheDocument();
     fireEvent.click(screen.getByText("build"));
     expect(onSelectCommand).toHaveBeenCalledWith("c1");
+  });
+
+  it("a command row shows start/stop/relaunch icons with the SAME gating as the view (finding 01KV63TEGB…)", () => {
+    mockIPC(() => null, { shouldMockEvents: true });
+    // idle command: start + relaunch enabled, stop disabled.
+    const { rerender } = render(
+      <WorkspaceSubsections
+        terminals={[]}
+        activeId={null}
+        commands={[{ id: "c1", label: "build", state: "idle" }]}
+        onSelect={noop}
+        onClose={noop}
+        onSelectCommand={noop}
+        onNewTerminal={noop}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /start command/i })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: /stop command/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /relaunch command/i })).not.toBeDisabled();
+
+    // running command: stop enabled, start disabled, relaunch always enabled.
+    rerender(
+      <WorkspaceSubsections
+        terminals={[]}
+        activeId={null}
+        commands={[{ id: "c1", label: "build", state: "running" }]}
+        onSelect={noop}
+        onClose={noop}
+        onSelectCommand={noop}
+        onNewTerminal={noop}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /start command/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /stop command/i })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: /relaunch command/i })).not.toBeDisabled();
+  });
+
+  it("clicking a command row's Start invokes command_start WITHOUT selecting the row", async () => {
+    const calls: string[] = [];
+    mockIPC(
+      (cmd) => {
+        calls.push(cmd);
+        if (cmd === "command_start") return "running";
+        return null;
+      },
+      { shouldMockEvents: true },
+    );
+    const onSelectCommand = vi.fn();
+    render(
+      <WorkspaceSubsections
+        terminals={[]}
+        activeId={null}
+        commands={[{ id: "c1", label: "build", state: "idle" }]}
+        onSelect={noop}
+        onClose={noop}
+        onSelectCommand={onSelectCommand}
+        onNewTerminal={noop}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /start command/i }));
+    await waitFor(() => expect(calls).toContain("command_start"));
+    // Acting on the command must not also select the row (stopPropagation).
+    expect(onSelectCommand).not.toHaveBeenCalled();
+  });
+
+  it("the COMMANDS subsection is NON-collapsible too: no chevron toggle on its label", () => {
+    const commands: CommandRecord[] = [{ id: "c1", label: "build" }];
+    render(
+      <WorkspaceSubsections
+        terminals={[]}
+        activeId={null}
+        commands={commands}
+        onSelect={noop}
+        onClose={noop}
+        onSelectCommand={noop}
+        onNewTerminal={noop}
+      />,
+    );
+    // The Commands label is plain text, not a collapse toggle button (the chevron +
+    // CollapsibleSection were removed — finding 01KV63TD5E…).
+    expect(screen.queryByRole("button", { name: /^commands$/i })).toBeNull();
+    expect(screen.getByText(/^commands$/i)).toBeInTheDocument();
+    // The rows are always present (cannot be collapsed away).
+    expect(screen.getByText("build")).toBeInTheDocument();
+  });
+
+  it("the COMMANDS band shows a GEAR that opens the manage-commands modal", () => {
+    const onManageCommands = vi.fn();
+    const commands: CommandRecord[] = [{ id: "c1", label: "build" }];
+    render(
+      <WorkspaceSubsections
+        terminals={[]}
+        activeId={null}
+        commands={commands}
+        onSelect={noop}
+        onClose={noop}
+        onSelectCommand={noop}
+        onManageCommands={onManageCommands}
+        onNewTerminal={noop}
+      />,
+    );
+    const gear = screen.getByRole("button", { name: /manage commands/i });
+    expect(gear).toBeInTheDocument();
+    fireEvent.click(gear);
+    expect(onManageCommands).toHaveBeenCalledTimes(1);
   });
 
   it("the TERMINALS subsection is NON-collapsible: no chevron toggle, always open (finding 01KV3CNH1…)", () => {

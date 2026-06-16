@@ -43,6 +43,13 @@ libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"
 
+# Process-group (process-tree) kill for managed commands: the runner sends
+# SIGTERM/SIGKILL to the child's process GROUP (`kill(-pgid, …)`) so stopping a
+# service reaps the whole tree, not just the parent shell. Already in the tree
+# transitively via portable-pty; pinned here so `src/command.rs` compiles on Unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Mock runtime for bridge integration tests (no real webview).
 tauri = { version = "2", features = ["test"] }

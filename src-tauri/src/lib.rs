@@ -1,12 +1,15 @@
 mod bridge;
+mod command;
 mod db;
 mod osc7;
 mod pathnorm;
+mod pkgjson;
 #[cfg(target_os = "linux")]
 mod proc;
 mod pty;
 mod resolve;
 mod schema;
+mod subfolder;
 
 use std::fs;
 use std::path::PathBuf;
@@ -104,9 +107,33 @@ pub fn run() {
     builder = builder.plugin(tauri_plugin_dialog::init());
     builder = bridge::init(builder);
 
+    // Shutdown snapshot + reap: when the main window is closing, persist which
+    // command instances are running so the boot flow can relaunch exactly those
+    // (gated by each template's restart_on_startup toggle), THEN tree-kill the live
+    // processes so managed commands are not orphaned past exit. Using
+    // `on_window_event` for `CloseRequested`/`Destroyed` captures both the
+    // user-close and app-quit paths (the reap is latched to run once).
+    builder = builder.on_window_event(|window, event| {
+        use tauri::WindowEvent;
+        if matches!(
+            event,
+            WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+        ) {
+            bridge::snapshot_commands_from_handle(&window.app_handle().clone());
+        }
+    });
+
     builder
         .setup(|app| {
             setup_db(app)?;
+            // Register the managed-command runner (managed state for the lifecycle
+            // commands) now that the AppHandle exists and the Db is managed.
+            let handle = app.handle().clone();
+            bridge::manage_command_runner(&handle);
+            // Boot restoration: relaunch the instances the last shutdown snapshot
+            // marked (restart_on_startup ON + was_running_on_shutdown), normalize
+            // orphaned `running` to idle, and reset the snapshot.
+            bridge::restore_commands_from_handle(&handle);
             Ok(())
         })
         .run(tauri::generate_context!())

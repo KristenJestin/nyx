@@ -35,3 +35,59 @@ export function basename(path: string): string {
   const parts = path.split(/[/\\]+/).filter(Boolean);
   return parts.length > 0 ? parts[parts.length - 1] : "";
 }
+
+/**
+ * True for a Windows-style absolute path: a drive-letter prefix (`C:\…`, `c:/…`)
+ * or any backslash separator. POSIX paths are `/`-only. Used to decide whether the
+ * containment comparison must fold case (NTFS is case-insensitive AND the backend
+ * stores the workspace path lowercased via `pathnorm`).
+ */
+function isWindowsStylePath(path: string): boolean {
+  return path.includes("\\") || /^[a-zA-Z]:/.test(path);
+}
+
+/**
+ * Compute the path of `picked` RELATIVE to `workspacePath`, as a POSIX-ish
+ * (`/`-separated) string the backend's `resolve_subfolder` accepts (relative, no
+ * leading `..`). Both inputs are expected to be ABSOLUTE folder paths; the
+ * comparison is segment-based and separator-agnostic so a Windows (`\`) or POSIX
+ * (`/`) path both work. On Windows the comparison is CASE-INSENSITIVE (NTFS is
+ * case-insensitive, and the backend stores the workspace path lowercased while the
+ * native picker returns OS casing); on POSIX it stays case-sensitive.
+ *
+ * Returns:
+ * - `""` when `picked` IS the workspace root (run at the root, no subfolder);
+ * - a relative `/`-joined string (e.g. `packages/api`) when `picked` is strictly
+ *   INSIDE the workspace;
+ * - `null` when `picked` is OUTSIDE the workspace (a different root/drive, or a
+ *   sibling/ancestor that would require a leading `..`) — the caller surfaces an
+ *   inline error and leaves the field untouched, since the backend would reject
+ *   such a subfolder at launch.
+ *
+ * Pure → unit-testable. No filesystem access (no symlink resolution); the backend
+ * still applies its own canonical containment + existence checks before spawning.
+ */
+export function relativeToWorkspace(workspacePath: string, picked: string): string | null {
+  const wsParts = workspacePath.split(/[/\\]+/).filter(Boolean);
+  const pickedParts = picked.split(/[/\\]+/).filter(Boolean);
+
+  // Fold case for Windows-style paths only: the stored workspace path is
+  // lowercased by the backend's `pathnorm` while the native picker returns OS
+  // casing, so a case-sensitive compare would reject every valid in-workspace pick
+  // at the drive letter (`C:` vs `c:`). POSIX stays case-sensitive (the filesystem
+  // is). `norm` is applied to BOTH sides so a Windows pick still matches a
+  // lowercased workspace path.
+  const fold = isWindowsStylePath(workspacePath) || isWindowsStylePath(picked);
+  const norm = (segment: string) => (fold ? segment.toLowerCase() : segment);
+
+  // `picked` must be a descendant-or-equal of the workspace: every workspace
+  // segment must prefix the picked segments. Anything else (shorter, divergent
+  // root/drive, sibling) is outside → null.
+  if (pickedParts.length < wsParts.length) return null;
+  for (let i = 0; i < wsParts.length; i++) {
+    if (norm(pickedParts[i]) !== norm(wsParts[i])) return null;
+  }
+  // The remaining segments form the relative path (original picked casing); empty
+  // = the workspace root.
+  return pickedParts.slice(wsParts.length).join("/");
+}

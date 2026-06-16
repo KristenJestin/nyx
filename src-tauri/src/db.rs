@@ -19,7 +19,7 @@ use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 use uuid::Uuid;
 
 use crate::pathnorm;
-use crate::schema::{projects, terminals, workspaces};
+use crate::schema::{command_instances, managed_commands, projects, terminals, workspaces};
 
 /// The migrations baked into the binary at compile time from `migrations/`.
 /// Running them is idempotent (Diesel tracks applied versions in
@@ -41,6 +41,27 @@ pub const BINDING_MANUAL: &str = "manual";
 /// Default name of the root workspace `create_project` creates when the caller
 /// does not provide one.
 pub const DEFAULT_ROOT_WORKSPACE_NAME: &str = "root";
+
+/// A command instance's last run state. Stored as TEXT — see the CHECK constraint
+/// in migration v3. `idle` (never run / stopped), `running`, `success` (exit 0),
+/// `error` (non-zero exit / spawn failure). The runner (later phase) drives the
+/// live transitions; this column is the last value persisted across restarts.
+/// `allow(dead_code)` until the runner/bridge (later phases) consume them; the
+/// v3 tests already reference them.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const STATE_IDLE: &str = "idle";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const STATE_RUNNING: &str = "running";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const STATE_SUCCESS: &str = "success";
+#[cfg_attr(not(test), allow(dead_code))]
+pub const STATE_ERROR: &str = "error";
+
+/// A managed command's `source_kind`. Only `package_json` exists today (a template
+/// imported from a package.json script); a hand-authored template has `None`. See
+/// the CHECK constraint in migration v3.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SOURCE_KIND_PACKAGE_JSON: &str = "package_json";
 
 /// Current wall-clock time as epoch MILLISECONDS. All `terminals` timestamps are
 /// stored this way (a plain JS-friendly number on the front). Saturates to 0 if
@@ -173,6 +194,99 @@ struct NewWorkspace {
     path: String,
     branch: Option<String>,
     is_root: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+// --- Managed command / instance models (PRD-3 v3) ------------------------
+
+/// A `managed_commands` row: a per-project command TEMPLATE. `Serialize` for the
+/// IPC boundary. `subfolder` is an optional run path relative to the workspace
+/// (`None` = root). `restart_on_startup` is the 0/1 boolean exposed as Rust
+/// `bool`. `order_index` maps the keyword `"order"` SQL column. The `source_*`
+/// columns + `package_manager` are optional package.json provenance metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = managed_commands)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct ManagedCommand {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub command: String,
+    /// Optional run subfolder, relative to the workspace path (`None` = root).
+    pub subfolder: Option<String>,
+    /// When set, the runner relaunches this template's instances at app start.
+    pub restart_on_startup: bool,
+    /// Sidebar order within the project; SQL column is `"order"` (a keyword).
+    pub order_index: i32,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// `None` for a hand-authored template, or [`SOURCE_KIND_PACKAGE_JSON`].
+    pub source_kind: Option<String>,
+    pub source_package_json_path: Option<String>,
+    pub source_script_name: Option<String>,
+    /// Snapshot of the script's command line at import time (drift detection).
+    pub source_script_command_snapshot: Option<String>,
+    /// Detected package manager (`npm`/`pnpm`/`yarn`/`bun`) when imported.
+    pub package_manager: Option<String>,
+}
+
+/// Optional package.json provenance for a template — passed as a group to
+/// [`create_template`] / [`set_template_source`]. All-`None` means hand-authored.
+#[derive(Debug, Clone, Default)]
+pub struct CommandSource {
+    pub source_kind: Option<String>,
+    pub source_package_json_path: Option<String>,
+    pub source_script_name: Option<String>,
+    pub source_script_command_snapshot: Option<String>,
+    pub package_manager: Option<String>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = managed_commands)]
+struct NewManagedCommand {
+    id: String,
+    project_id: String,
+    name: String,
+    command: String,
+    subfolder: Option<String>,
+    restart_on_startup: bool,
+    order_index: i32,
+    created_at: i64,
+    updated_at: i64,
+    source_kind: Option<String>,
+    source_package_json_path: Option<String>,
+    source_script_name: Option<String>,
+    source_script_command_snapshot: Option<String>,
+    package_manager: Option<String>,
+}
+
+/// A `command_instances` row: the materialization of one template for one
+/// workspace. `Serialize` for the IPC boundary. `last_state` is the last persisted
+/// run state (idle|running|success|error). `was_running_on_shutdown` is the 0/1
+/// boolean snapshot the shutdown flow sets and boot resets.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = command_instances)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct CommandInstance {
+    pub id: String,
+    pub command_id: String,
+    pub workspace_id: String,
+    /// Last persisted run state: idle|running|success|error.
+    pub last_state: String,
+    pub scrollback: String,
+    /// Shutdown snapshot: was this instance running when the app last quit?
+    pub was_running_on_shutdown: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = command_instances)]
+struct NewCommandInstance {
+    id: String,
+    command_id: String,
+    workspace_id: String,
     created_at: i64,
     updated_at: i64,
 }
@@ -327,7 +441,10 @@ pub fn reorder(conn: &mut SqliteConnection, ids: &[String]) -> QueryResult<()> {
 /// Returns rows updated.
 pub fn rename(conn: &mut SqliteConnection, id: &str, label: Option<String>) -> QueryResult<usize> {
     diesel::update(terminals::table.find(id))
-        .set((terminals::label.eq(label), terminals::updated_at.eq(now_millis())))
+        .set((
+            terminals::label.eq(label),
+            terminals::updated_at.eq(now_millis()),
+        ))
         .execute(conn)
 }
 
@@ -420,6 +537,12 @@ pub fn create_project(
             .returning(Workspace::as_returning())
             .get_result(conn)?;
 
+        // Materialize the project's templates as instances for the new root
+        // workspace. A brand-new project has no templates yet, so this is a no-op
+        // here; it keeps the "create workspace → materialize instances" invariant
+        // uniform across both workspace-creation paths (root + added).
+        materialize_instances_for_workspace(conn, &workspace.id)?;
+
         Ok((project, workspace))
     })
 }
@@ -504,6 +627,10 @@ pub fn set_workspace_collapsed(
 /// before storage; the DB's UNIQUE(project_id, path) rejects a path already
 /// present in the SAME project (a different project may hold the same path). The
 /// caller surfaces that as a duplicate error. Returns the new workspace.
+///
+/// On creation the project's command templates are MATERIALIZED as instances for
+/// the new workspace (one per template), in the same transaction as the insert —
+/// so a project with N templates yields N instances for every workspace added.
 pub fn create_workspace(
     conn: &mut SqliteConnection,
     project_id: &str,
@@ -512,19 +639,26 @@ pub fn create_workspace(
 ) -> QueryResult<Workspace> {
     let now = now_millis();
     let normalized = pathnorm::normalize(path);
-    diesel::insert_into(workspaces::table)
-        .values(NewWorkspace {
-            id: Uuid::now_v7().to_string(),
-            project_id: project_id.to_string(),
-            name: name.to_string(),
-            path: normalized,
-            branch: None,
-            is_root: false,
-            created_at: now,
-            updated_at: now,
-        })
-        .returning(Workspace::as_returning())
-        .get_result(conn)
+    conn.transaction(|conn| {
+        let workspace = diesel::insert_into(workspaces::table)
+            .values(NewWorkspace {
+                id: Uuid::now_v7().to_string(),
+                project_id: project_id.to_string(),
+                name: name.to_string(),
+                path: normalized,
+                branch: None,
+                is_root: false,
+                created_at: now,
+                updated_at: now,
+            })
+            .returning(Workspace::as_returning())
+            .get_result(conn)?;
+
+        // Materialize one instance per project template for the new workspace.
+        materialize_instances_for_workspace(conn, &workspace.id)?;
+
+        Ok(workspace)
+    })
 }
 
 /// List the workspaces of `project_id`: the root first (`is_root` desc), then by
@@ -608,6 +742,624 @@ pub fn unpin_terminal_workspace(
             terminals::updated_at.eq(now_millis()),
         ))
         .execute(conn)
+}
+
+// --- Managed command (template) CRUD (PRD-3 v3) --------------------------
+//
+// Pure DB functions taking `&mut SqliteConnection`, unit-tested against an
+// in-memory database; the bridge wraps each in a `#[tauri::command]` in a later
+// phase. A template is a per-project record; instances are materialized from it
+// separately (see the materialization helpers below).
+
+/// Create a per-project command template, appended to the end of the project's
+/// template order (max existing order + 1, or 0 if first). `subfolder` is an
+/// optional run path relative to the workspace (`None` = root). `source` carries
+/// optional package.json provenance (all-`None` = hand-authored). The DB's
+/// UNIQUE(project_id, name) rejects a name already present in the SAME project
+/// (surfaced as an `Err`). Returns the inserted row.
+///
+/// On creation the template is MATERIALIZED as instances across every existing
+/// workspace of its project (one per workspace), in the same transaction as the
+/// insert — so adding a template to a project with M workspaces yields M
+/// instances. The symmetric half of `create_workspace`'s materialization.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_template(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    name: &str,
+    command: &str,
+    subfolder: Option<&str>,
+    source: CommandSource,
+) -> QueryResult<ManagedCommand> {
+    use diesel::dsl::max;
+    let now = now_millis();
+    conn.transaction(|conn| {
+        // Append after the current max order WITHIN this project so creation order
+        // is stable and scoped per project.
+        let next_order = managed_commands::table
+            .filter(managed_commands::project_id.eq(project_id))
+            .select(max(managed_commands::order_index))
+            .first::<Option<i32>>(conn)?
+            .map(|m| m + 1)
+            .unwrap_or(0);
+
+        let template = diesel::insert_into(managed_commands::table)
+            .values(NewManagedCommand {
+                id: Uuid::now_v7().to_string(),
+                project_id: project_id.to_string(),
+                name: name.to_string(),
+                command: command.to_string(),
+                subfolder: subfolder.map(str::to_string),
+                restart_on_startup: false,
+                order_index: next_order,
+                created_at: now,
+                updated_at: now,
+                source_kind: source.source_kind,
+                source_package_json_path: source.source_package_json_path,
+                source_script_name: source.source_script_name,
+                source_script_command_snapshot: source.source_script_command_snapshot,
+                package_manager: source.package_manager,
+            })
+            .returning(ManagedCommand::as_returning())
+            .get_result(conn)?;
+
+        // Materialize one instance per existing project workspace for the new
+        // template.
+        materialize_instances_for_template(conn, &template.id)?;
+
+        Ok(template)
+    })
+}
+
+/// List a project's command templates in sidebar order (`order` asc, then `id`
+/// asc as a stable tiebreaker).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_templates(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Vec<ManagedCommand>> {
+    managed_commands::table
+        .filter(managed_commands::project_id.eq(project_id))
+        .order((
+            managed_commands::order_index.asc(),
+            managed_commands::id.asc(),
+        ))
+        .select(ManagedCommand::as_select())
+        .load(conn)
+}
+
+/// Update a template's editable fields (`name`, `command`, `subfolder`), bumping
+/// `updated_at`. `subfolder` `None` clears it (run at workspace root). Returns
+/// rows updated (0 if the id is unknown). A name colliding with another template
+/// in the same project yields an `Err` (UNIQUE(project_id, name)).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn update_template(
+    conn: &mut SqliteConnection,
+    id: &str,
+    name: &str,
+    command: &str,
+    subfolder: Option<&str>,
+) -> QueryResult<usize> {
+    diesel::update(managed_commands::table.find(id))
+        .set((
+            managed_commands::name.eq(name),
+            managed_commands::command.eq(command),
+            managed_commands::subfolder.eq(subfolder),
+            managed_commands::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Delete a template. Its `command_instances` cascade away (ON DELETE CASCADE on
+/// `command_instances.command_id`). Returns rows deleted (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn delete_template(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::delete(managed_commands::table.find(id)).execute(conn)
+}
+
+/// Set each template's `order` to its position in `ids` (0-based), bumping
+/// `updated_at`. Ids absent from the table are silently skipped. Runs in a single
+/// transaction so the order is never observed half-applied. The caller passes the
+/// ids of ONE project's templates in their new order.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn reorder_templates(conn: &mut SqliteConnection, ids: &[String]) -> QueryResult<()> {
+    let now = now_millis();
+    conn.transaction(|conn| {
+        for (pos, id) in ids.iter().enumerate() {
+            diesel::update(managed_commands::table.find(id.as_str()))
+                .set((
+                    managed_commands::order_index.eq(pos as i32),
+                    managed_commands::updated_at.eq(now),
+                ))
+                .execute(conn)?;
+        }
+        Ok(())
+    })
+}
+
+/// Toggle (set) a template's `restart_on_startup` flag, bumping `updated_at`.
+/// Returns rows updated (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_restart_on_startup(
+    conn: &mut SqliteConnection,
+    id: &str,
+    restart: bool,
+) -> QueryResult<usize> {
+    diesel::update(managed_commands::table.find(id))
+        .set((
+            managed_commands::restart_on_startup.eq(restart),
+            managed_commands::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Set (or clear) a template's package.json provenance fields, bumping
+/// `updated_at`. An all-`None` `source` clears provenance (marks it
+/// hand-authored). Returns rows updated (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_template_source(
+    conn: &mut SqliteConnection,
+    id: &str,
+    source: CommandSource,
+) -> QueryResult<usize> {
+    diesel::update(managed_commands::table.find(id))
+        .set((
+            managed_commands::source_kind.eq(source.source_kind),
+            managed_commands::source_package_json_path.eq(source.source_package_json_path),
+            managed_commands::source_script_name.eq(source.source_script_name),
+            managed_commands::source_script_command_snapshot
+                .eq(source.source_script_command_snapshot),
+            managed_commands::package_manager.eq(source.package_manager),
+            managed_commands::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Read back a single template by id. Used by tests now and the bridge/runner in
+/// a later phase; allow dead_code until that consumer lands.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_template(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<ManagedCommand>> {
+    managed_commands::table
+        .find(id)
+        .select(ManagedCommand::as_select())
+        .first(conn)
+        .optional()
+}
+
+// --- Command instance helpers (PRD-3 v3) ---------------------------------
+//
+// An instance is the materialization of one template for one workspace. The
+// materialization functions themselves live below (PRD-3 Phase 1 task 2); these
+// helpers mutate an existing instance's run-state columns. The runner (later
+// phase) drives them on live transitions.
+
+/// Set an instance's `last_state` (idle|running|success|error), bumping
+/// `updated_at`. An invalid state yields an `Err` (the CHECK constraint). Returns
+/// rows updated (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_last_state(conn: &mut SqliteConnection, id: &str, state: &str) -> QueryResult<usize> {
+    diesel::update(command_instances::table.find(id))
+        .set((
+            command_instances::last_state.eq(state),
+            command_instances::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Persist (overwrite) an instance's serialized scrollback, bounded to
+/// [`MAX_SCROLLBACK_BYTES`] (keeping the tail), bumping `updated_at`. Mirrors the
+/// terminals' `persist_scrollback`. Returns rows updated (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn persist_instance_scrollback(
+    conn: &mut SqliteConnection,
+    id: &str,
+    serialized: &str,
+) -> QueryResult<usize> {
+    let bounded = bound_scrollback(serialized);
+    diesel::update(command_instances::table.find(id))
+        .set((
+            command_instances::scrollback.eq(bounded),
+            command_instances::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Set an instance's `was_running_on_shutdown` snapshot flag, bumping
+/// `updated_at`. The shutdown flow sets it to `true` for running instances; the
+/// boot flow resets it to `false` after restoring. Returns rows updated.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_was_running_on_shutdown(
+    conn: &mut SqliteConnection,
+    id: &str,
+    was_running: bool,
+) -> QueryResult<usize> {
+    diesel::update(command_instances::table.find(id))
+        .set((
+            command_instances::was_running_on_shutdown.eq(was_running),
+            command_instances::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Read back a single instance by id. Used by tests now and the runner in a later
+/// phase; allow dead_code until that consumer lands.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_instance(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<CommandInstance>> {
+    command_instances::table
+        .find(id)
+        .select(CommandInstance::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// Everything the runner needs to SPAWN an instance: its template's `command` +
+/// `subfolder` and its workspace's `path`. A single join so `command_start` /
+/// `command_relaunch` resolve the cwd (via [`crate::subfolder`]) and the command
+/// line in one query. `None` if the instance id is unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceRunContext {
+    pub command: String,
+    pub subfolder: Option<String>,
+    pub workspace_path: String,
+    /// Whether the instance's template relaunches at app start (for restore).
+    pub restart_on_startup: bool,
+}
+
+/// Resolve the [`InstanceRunContext`] for `instance_id` by joining the instance to
+/// its template (`command`, `subfolder`, `restart_on_startup`) and its workspace
+/// (`path`). `None` if the instance does not exist.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn instance_run_context(
+    conn: &mut SqliteConnection,
+    instance_id: &str,
+) -> QueryResult<Option<InstanceRunContext>> {
+    command_instances::table
+        .inner_join(managed_commands::table)
+        .inner_join(workspaces::table)
+        .filter(command_instances::id.eq(instance_id))
+        .select((
+            managed_commands::command,
+            managed_commands::subfolder,
+            workspaces::path,
+            managed_commands::restart_on_startup,
+        ))
+        .first::<(String, Option<String>, String, bool)>(conn)
+        .optional()
+        .map(|opt| {
+            opt.map(
+                |(command, subfolder, workspace_path, restart_on_startup)| InstanceRunContext {
+                    command,
+                    subfolder,
+                    workspace_path,
+                    restart_on_startup,
+                },
+            )
+        })
+}
+
+/// The stored (normalized) `path` of a workspace by id, or `None` if unknown. Used
+/// by the package.json import command to know what folder to scan.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn workspace_path(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<String>> {
+    workspaces::table
+        .find(id)
+        .select(workspaces::path)
+        .first::<String>(conn)
+        .optional()
+}
+
+/// The ids of every instance of `command_id` (one per workspace of the project).
+/// Used by the running-mutation guard: a template cannot be updated/deleted while
+/// ANY of its instances is running.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn instance_ids_for_template(
+    conn: &mut SqliteConnection,
+    command_id: &str,
+) -> QueryResult<Vec<String>> {
+    command_instances::table
+        .filter(command_instances::command_id.eq(command_id))
+        .select(command_instances::id)
+        .load(conn)
+}
+
+/// The ids of every command instance belonging to `project_id` (across all its
+/// templates and workspaces). Used by the `delete_project` guard: a project cannot
+/// be deleted while ANY of its command instances is running.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn instance_ids_for_project(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Vec<String>> {
+    command_instances::table
+        .inner_join(managed_commands::table)
+        .filter(managed_commands::project_id.eq(project_id))
+        .select(command_instances::id)
+        .load(conn)
+}
+
+/// Every command instance across all projects, with the run context needed to
+/// restore it at boot (template `restart_on_startup`, the instance's
+/// `last_state`/`was_running_on_shutdown`, plus the command line + cwd inputs).
+/// Used by the shutdown snapshot + boot restoration flow (task 16).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreRow {
+    pub instance_id: String,
+    pub last_state: String,
+    pub was_running_on_shutdown: bool,
+    pub restart_on_startup: bool,
+    pub command: String,
+    pub subfolder: Option<String>,
+    pub workspace_path: String,
+}
+
+/// Load every instance joined to its template + workspace, returning the rows the
+/// shutdown/boot flow reasons over (task 16). One row per instance.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn all_instances_for_restore(conn: &mut SqliteConnection) -> QueryResult<Vec<RestoreRow>> {
+    command_instances::table
+        .inner_join(managed_commands::table)
+        .inner_join(workspaces::table)
+        .select((
+            command_instances::id,
+            command_instances::last_state,
+            command_instances::was_running_on_shutdown,
+            managed_commands::restart_on_startup,
+            managed_commands::command,
+            managed_commands::subfolder,
+            workspaces::path,
+        ))
+        .load::<(String, String, bool, bool, String, Option<String>, String)>(conn)
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(
+                        instance_id,
+                        last_state,
+                        was_running_on_shutdown,
+                        restart_on_startup,
+                        command,
+                        subfolder,
+                        workspace_path,
+                    )| RestoreRow {
+                        instance_id,
+                        last_state,
+                        was_running_on_shutdown,
+                        restart_on_startup,
+                        command,
+                        subfolder,
+                        workspace_path,
+                    },
+                )
+                .collect()
+        })
+}
+
+// --- Materialization + per-workspace listing (PRD-3 v3, task 2) -----------
+//
+// An instance is the materialization of one template for one workspace. Creating
+// a workspace materializes one instance per template of its project; creating a
+// template materializes one instance per existing workspace of its project. Both
+// are IDEMPOTENT: `INSERT ... ON CONFLICT(command_id, workspace_id) DO NOTHING`
+// relies on the v3 `UNIQUE(command_id, workspace_id)` so re-running never
+// duplicates or errors. They are NOT public spawn/runner logic — only the
+// persistent rows (the runner lands in a later phase).
+
+/// Materialize the project's templates as instances for ONE workspace: for every
+/// `managed_command` of `workspace_id`'s project, ensure a `command_instance`
+/// exists for that (template, workspace) pair. Idempotent (ON CONFLICT DO
+/// NOTHING). Returns the number of instances actually inserted (0 if all already
+/// existed or the project has no templates). Runs in one transaction.
+pub fn materialize_instances_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<usize> {
+    conn.transaction(|conn| {
+        // The project owning this workspace.
+        let project_id: String = workspaces::table
+            .find(workspace_id)
+            .select(workspaces::project_id)
+            .first(conn)?;
+
+        // Every template of that project.
+        let command_ids: Vec<String> = managed_commands::table
+            .filter(managed_commands::project_id.eq(&project_id))
+            .select(managed_commands::id)
+            .load(conn)?;
+
+        let now = now_millis();
+        let mut inserted = 0usize;
+        for command_id in command_ids {
+            inserted += diesel::insert_into(command_instances::table)
+                .values(NewCommandInstance {
+                    id: Uuid::now_v7().to_string(),
+                    command_id,
+                    workspace_id: workspace_id.to_string(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                // Idempotent: a pre-existing (command, workspace) pair is skipped.
+                .on_conflict((
+                    command_instances::command_id,
+                    command_instances::workspace_id,
+                ))
+                .do_nothing()
+                .execute(conn)?;
+        }
+        Ok(inserted)
+    })
+}
+
+/// Materialize ONE template as instances across every existing workspace of its
+/// project: for each `workspace` of the template's project, ensure a
+/// `command_instance` exists for that (template, workspace) pair. Idempotent (ON
+/// CONFLICT DO NOTHING). Returns the number of instances actually inserted. Runs
+/// in one transaction.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn materialize_instances_for_template(
+    conn: &mut SqliteConnection,
+    command_id: &str,
+) -> QueryResult<usize> {
+    conn.transaction(|conn| {
+        // The project owning this template.
+        let project_id: String = managed_commands::table
+            .find(command_id)
+            .select(managed_commands::project_id)
+            .first(conn)?;
+
+        // Every workspace of that project.
+        let workspace_ids: Vec<String> = workspaces::table
+            .filter(workspaces::project_id.eq(&project_id))
+            .select(workspaces::id)
+            .load(conn)?;
+
+        let now = now_millis();
+        let mut inserted = 0usize;
+        for workspace_id in workspace_ids {
+            inserted += diesel::insert_into(command_instances::table)
+                .values(NewCommandInstance {
+                    id: Uuid::now_v7().to_string(),
+                    command_id: command_id.to_string(),
+                    workspace_id,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .on_conflict((
+                    command_instances::command_id,
+                    command_instances::workspace_id,
+                ))
+                .do_nothing()
+                .execute(conn)?;
+        }
+        Ok(inserted)
+    })
+}
+
+/// An instance joined to its template's display fields — the row a per-workspace
+/// listing returns. `Serialize` for the IPC boundary. The instance carries run
+/// state + scrollback; the template fields (`name`, `command`, `subfolder`, the
+/// `source_*` provenance) come from the joined `managed_commands` row, and the
+/// `workspace_path` from the joined `workspaces` row, so the UI can render a
+/// service's info bar (command + run directory + source) without a second query.
+///
+/// `cwd` is NOT a DB column: `list_instances_for_workspace` leaves it `None`; the
+/// bridge fills it with the resolved run directory (`workspace_path` + `subfolder`)
+/// before serializing to the front (see `command_instance_list`). The raw
+/// `workspace_path` + `subfolder` stay on the row so a caller that does not resolve
+/// (e.g. a pure-DB test) still has them.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InstanceWithTemplate {
+    // Instance columns.
+    pub id: String,
+    pub command_id: String,
+    pub workspace_id: String,
+    pub last_state: String,
+    pub scrollback: String,
+    pub was_running_on_shutdown: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    // Joined template columns.
+    pub name: String,
+    pub command: String,
+    pub subfolder: Option<String>,
+    /// The template's sidebar order (so the listing can sort like the project).
+    pub order_index: i32,
+    /// package.json provenance (None for a hand-authored template): the source
+    /// kind, the package.json path, the script name, and the detected manager.
+    pub source_kind: Option<String>,
+    pub source_package_json_path: Option<String>,
+    pub source_script_name: Option<String>,
+    pub package_manager: Option<String>,
+    /// The instance's workspace path (joined from `workspaces`). The base the run
+    /// directory resolves against.
+    pub workspace_path: String,
+    /// The RESOLVED run directory (`workspace_path` + `subfolder`), filled by the
+    /// bridge for the front's info bar. `None` straight out of the DB query.
+    pub cwd: Option<String>,
+}
+
+/// List a workspace's command instances, each JOINED to its template's display
+/// fields (`name`, `command`, `subfolder`, the `source_*` provenance, order) and
+/// its workspace `path`. Ordered by the template's `order` (then `id` as a stable
+/// tiebreaker) so the listing matches the project's template order. Returns one row
+/// per instance of `workspace_id`. `cwd` is left `None` (the bridge resolves it).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_instances_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<Vec<InstanceWithTemplate>> {
+    command_instances::table
+        .inner_join(managed_commands::table)
+        .inner_join(workspaces::table)
+        .filter(command_instances::workspace_id.eq(workspace_id))
+        .order((
+            managed_commands::order_index.asc(),
+            managed_commands::id.asc(),
+        ))
+        .select((
+            command_instances::id,
+            command_instances::command_id,
+            command_instances::workspace_id,
+            command_instances::last_state,
+            command_instances::scrollback,
+            command_instances::was_running_on_shutdown,
+            command_instances::created_at,
+            command_instances::updated_at,
+            managed_commands::name,
+            managed_commands::command,
+            managed_commands::subfolder,
+            managed_commands::order_index,
+            managed_commands::source_kind,
+            managed_commands::source_package_json_path,
+            managed_commands::source_script_name,
+            managed_commands::package_manager,
+            workspaces::path,
+        ))
+        .load::<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            bool,
+            i64,
+            i64,
+            String,
+            String,
+            Option<String>,
+            i32,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        )>(conn)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| InstanceWithTemplate {
+                    id: r.0,
+                    command_id: r.1,
+                    workspace_id: r.2,
+                    last_state: r.3,
+                    scrollback: r.4,
+                    was_running_on_shutdown: r.5,
+                    created_at: r.6,
+                    updated_at: r.7,
+                    name: r.8,
+                    command: r.9,
+                    subfolder: r.10,
+                    order_index: r.11,
+                    source_kind: r.12,
+                    source_package_json_path: r.13,
+                    source_script_name: r.14,
+                    package_manager: r.15,
+                    workspace_path: r.16,
+                    cwd: None,
+                })
+                .collect()
+        })
 }
 
 /// Open an in-memory SQLite database with migrations applied — used by tests so
@@ -1109,11 +1861,18 @@ mod tests {
     fn mutations_on_unknown_id_are_noops() {
         let mut conn = open_in_memory();
         assert_eq!(close_terminal(&mut conn, "no-such-id").unwrap(), 0);
-        assert_eq!(rename(&mut conn, "no-such-id", Some("x".into())).unwrap(), 0);
+        assert_eq!(
+            rename(&mut conn, "no-such-id", Some("x".into())).unwrap(),
+            0
+        );
         assert_eq!(set_active(&mut conn, "no-such-id").unwrap(), 0);
-        assert_eq!(persist_scrollback(&mut conn, "no-such-id", "data").unwrap(), 0);
+        assert_eq!(
+            persist_scrollback(&mut conn, "no-such-id", "data").unwrap(),
+            0
+        );
         // reorder over absent ids is a silent no-op (does not error).
-        reorder(&mut conn, &["no-such-id".to_string(), "nope".to_string()]).expect("reorder absent ids");
+        reorder(&mut conn, &["no-such-id".to_string(), "nope".to_string()])
+            .expect("reorder absent ids");
         assert!(list_terminals(&mut conn).unwrap().is_empty());
     }
 
@@ -1550,8 +2309,7 @@ mod tests {
     #[test]
     fn set_collapsed_persists_for_project_and_workspace() {
         let mut conn = open_in_memory();
-        let (project, root) =
-            create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
         let feat =
             create_workspace(&mut conn, &project.id, "feat", p("/p/feat", "C:\\p\\feat")).unwrap();
 
@@ -1590,7 +2348,10 @@ mod tests {
         let workspaces = list_workspaces(&mut conn, &project.id).unwrap();
         let got_feat = workspaces.iter().find(|w| w.id == feat.id).unwrap();
         let got_root = workspaces.iter().find(|w| w.id == root.id).unwrap();
-        assert!(got_feat.collapsed, "the workspace's collapsed state persists");
+        assert!(
+            got_feat.collapsed,
+            "the workspace's collapsed state persists"
+        );
         assert!(!got_root.collapsed, "a sibling workspace is left open");
         assert_eq!(
             got_feat.path, feat.path,
@@ -1598,7 +2359,10 @@ mod tests {
         );
 
         // Unknown ids are no-ops (0 rows), not errors.
-        assert_eq!(set_project_collapsed(&mut conn, "no-such-id", true).unwrap(), 0);
+        assert_eq!(
+            set_project_collapsed(&mut conn, "no-such-id", true).unwrap(),
+            0
+        );
         assert_eq!(
             set_workspace_collapsed(&mut conn, "no-such-id", true).unwrap(),
             0
@@ -1637,11 +2401,20 @@ mod tests {
 
     /// Migration v2 down→up reversibility: revert v2, the new tables/columns are
     /// gone, re-apply, and the schema round-trips again.
+    ///
+    /// History: PRD-3 added migration **v3** (managed_commands/command_instances)
+    /// on top of v2, so v3 is now "the last migration". To still target v2's
+    /// down→up specifically, we first revert v3 (which references no v2 table the
+    /// v2 down needs, so the order is clean), THEN revert v2 — only after that is
+    /// `projects` gone. Re-applying the whole chain restores a working schema.
     #[test]
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Revert v2 only (the last migration). projects must then be absent.
+        // Revert v3 first (it sits on top of v2), then v2 itself. projects must
+        // then be absent.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v3 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v2 cleanly");
         let after_down: QueryResult<i64> = projects::table.count().get_result(&mut conn);
@@ -1655,5 +2428,1412 @@ mod tests {
         let (_p, root) = create_project(&mut conn, "revived", p("/rev", "C:\\rev"), None)
             .expect("create_project after down→up");
         assert!(root.is_root);
+    }
+
+    // --- Managed command / instance v3 (PRD-3 Phase 1 done-criteria) ------
+
+    /// Migration v3 applied + schema.rs coherent: EVERY column of BOTH new tables
+    /// round-trips through a real insert+select against the migrated in-memory DB.
+    /// A drift between schema.rs and the SQL migration would fail to compile or to
+    /// run here. Covers done-criterion "Les deux tables sont creees et chaque
+    /// colonne round-trip" + "Source fields package.json + package_manager
+    /// round-trippent".
+    #[test]
+    fn migration_v3_schema_roundtrips_commands_and_instances() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+
+        // A template with a full set of distinct non-default values in every column
+        // (incl. subfolder, source provenance, package_manager) so a mismatch
+        // surfaces as wrong data, not just a missing column.
+        let tpl = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            Some("frontend"),
+            CommandSource {
+                source_kind: Some(SOURCE_KIND_PACKAGE_JSON.to_string()),
+                source_package_json_path: Some("frontend/package.json".to_string()),
+                source_script_name: Some("dev".to_string()),
+                source_script_command_snapshot: Some("vite".to_string()),
+                package_manager: Some("pnpm".to_string()),
+            },
+        )
+        .expect("create_template");
+
+        let got = get_template(&mut conn, &tpl.id).unwrap().unwrap();
+        assert_eq!(got, tpl, "select returns the inserted template verbatim");
+        assert_eq!(got.project_id, project.id);
+        assert_eq!(got.name, "dev");
+        assert_eq!(got.command, "npm run dev");
+        assert_eq!(got.subfolder.as_deref(), Some("frontend"));
+        assert!(!got.restart_on_startup, "restart defaults to false");
+        assert_eq!(got.order_index, 0, "first template gets order 0");
+        assert!(got.created_at > 0 && got.updated_at == got.created_at);
+        // Source provenance + package_manager round-trip.
+        assert_eq!(got.source_kind.as_deref(), Some(SOURCE_KIND_PACKAGE_JSON));
+        assert_eq!(
+            got.source_package_json_path.as_deref(),
+            Some("frontend/package.json")
+        );
+        assert_eq!(got.source_script_name.as_deref(), Some("dev"));
+        assert_eq!(got.source_script_command_snapshot.as_deref(), Some("vite"));
+        assert_eq!(got.package_manager.as_deref(), Some("pnpm"));
+
+        // A hand-authored template leaves all source columns NULL (and subfolder).
+        let plain = create_template(
+            &mut conn,
+            &project.id,
+            "build",
+            "make",
+            None,
+            CommandSource::default(),
+        )
+        .expect("create_template plain");
+        assert_eq!(plain.subfolder, None);
+        assert_eq!(plain.source_kind, None);
+        assert_eq!(plain.source_package_json_path, None);
+        assert_eq!(plain.source_script_name, None);
+        assert_eq!(plain.source_script_command_snapshot, None);
+        assert_eq!(plain.package_manager, None);
+        assert_eq!(
+            plain.order_index, 1,
+            "second template appends after the first"
+        );
+
+        // The instance materialized for `tpl` on the root workspace (auto-created
+        // by `create_template`) round-trips every column with its defaults.
+        let inst = insert_instance(&mut conn, &tpl.id, &root.id);
+        let got_inst = get_instance(&mut conn, &inst.id).unwrap().unwrap();
+        assert_eq!(
+            got_inst, inst,
+            "select returns the inserted instance verbatim"
+        );
+        assert_eq!(got_inst.command_id, tpl.id);
+        assert_eq!(got_inst.workspace_id, root.id);
+        assert_eq!(
+            got_inst.last_state, STATE_IDLE,
+            "last_state defaults to idle"
+        );
+        assert_eq!(got_inst.scrollback, "", "scrollback defaults to empty");
+        assert!(
+            !got_inst.was_running_on_shutdown,
+            "was_running_on_shutdown defaults to false"
+        );
+        assert!(got_inst.created_at > 0 && got_inst.updated_at == got_inst.created_at);
+    }
+
+    /// A small helper: ENSURE one instance of `command_id` for `workspace_id`
+    /// exists and return it. Because `create_template`/`create_workspace` now
+    /// auto-materialize instances, the pair may already exist; this helper is
+    /// idempotent (insert ON CONFLICT DO NOTHING, then fetch) so the
+    /// constraint/helper tests can grab a known instance regardless of whether
+    /// materialization already created it.
+    #[cfg(test)]
+    fn insert_instance(
+        conn: &mut SqliteConnection,
+        command_id: &str,
+        workspace_id: &str,
+    ) -> CommandInstance {
+        let now = now_millis();
+        diesel::insert_into(command_instances::table)
+            .values(NewCommandInstance {
+                id: Uuid::now_v7().to_string(),
+                command_id: command_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .on_conflict((
+                command_instances::command_id,
+                command_instances::workspace_id,
+            ))
+            .do_nothing()
+            .execute(conn)
+            .expect("insert instance");
+        command_instances::table
+            .filter(command_instances::command_id.eq(command_id))
+            .filter(command_instances::workspace_id.eq(workspace_id))
+            .select(CommandInstance::as_select())
+            .first(conn)
+            .expect("fetch instance")
+    }
+
+    /// `UNIQUE(project_id, name)` rejects two templates of the same name in ONE
+    /// project but accepts the same name in a DIFFERENT project. Done-criterion
+    /// verbatim: "UNIQUE(project_id,name) bloque deux commandes du meme nom dans
+    /// un projet".
+    #[test]
+    fn template_name_unique_per_project() {
+        let mut conn = open_in_memory();
+        let (p1, _) = create_project(&mut conn, "p1", p("/p1", "C:\\p1"), None).unwrap();
+        let (p2, _) = create_project(&mut conn, "p2", p("/p2", "C:\\p2"), None).unwrap();
+
+        create_template(
+            &mut conn,
+            &p1.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .expect("first dev template");
+        let dup = create_template(
+            &mut conn,
+            &p1.id,
+            "dev",
+            "different command",
+            None,
+            CommandSource::default(),
+        );
+        assert!(
+            dup.is_err(),
+            "a duplicate template name in the same project must be rejected"
+        );
+
+        // The SAME name in another project is fine.
+        create_template(
+            &mut conn,
+            &p2.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .expect("same name in another project is allowed");
+
+        assert_eq!(list_templates(&mut conn, &p1.id).unwrap().len(), 1);
+        assert_eq!(list_templates(&mut conn, &p2.id).unwrap().len(), 1);
+    }
+
+    /// `UNIQUE(command_id, workspace_id)` rejects a second instance of the SAME
+    /// template in the SAME workspace (the idempotency guard) but accepts the same
+    /// template in a DIFFERENT workspace and a different template in the same
+    /// workspace. Done-criterion verbatim.
+    #[test]
+    fn instance_unique_per_command_and_workspace() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let feat =
+            create_workspace(&mut conn, &project.id, "feat", p("/p/feat", "C:\\p\\feat")).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let build = create_template(
+            &mut conn,
+            &project.id,
+            "build",
+            "make",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+
+        insert_instance(&mut conn, &dev.id, &root.id);
+
+        // Same (template, workspace) again → rejected.
+        let now = now_millis();
+        let dup = diesel::insert_into(command_instances::table)
+            .values(NewCommandInstance {
+                id: Uuid::now_v7().to_string(),
+                command_id: dev.id.clone(),
+                workspace_id: root.id.clone(),
+                created_at: now,
+                updated_at: now,
+            })
+            .execute(&mut conn);
+        assert!(
+            dup.is_err(),
+            "a second instance of the same template in the same workspace must be rejected"
+        );
+
+        // Same template in a DIFFERENT workspace is fine.
+        insert_instance(&mut conn, &dev.id, &feat.id);
+        // A DIFFERENT template in the SAME workspace is fine.
+        insert_instance(&mut conn, &build.id, &root.id);
+    }
+
+    /// Invalid foreign keys are rejected: an instance referencing an unknown
+    /// template or an unknown workspace fails (PRAGMA foreign_keys = ON). A
+    /// template referencing an unknown project also fails. Done-criterion: "FK
+    /// invalides echouent".
+    #[test]
+    fn invalid_foreign_keys_are_rejected() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let now = now_millis();
+
+        // Template with an unknown project_id → FK violation.
+        let bad_tpl = diesel::insert_into(managed_commands::table)
+            .values(NewManagedCommand {
+                id: Uuid::now_v7().to_string(),
+                project_id: "no-such-project".to_string(),
+                name: "x".to_string(),
+                command: "echo".to_string(),
+                subfolder: None,
+                restart_on_startup: false,
+                order_index: 0,
+                created_at: now,
+                updated_at: now,
+                source_kind: None,
+                source_package_json_path: None,
+                source_script_name: None,
+                source_script_command_snapshot: None,
+                package_manager: None,
+            })
+            .execute(&mut conn);
+        assert!(
+            bad_tpl.is_err(),
+            "managed_commands.project_id FK must reject an unknown project"
+        );
+
+        // Instance with an unknown command_id → FK violation.
+        let bad_cmd = diesel::insert_into(command_instances::table)
+            .values(NewCommandInstance {
+                id: Uuid::now_v7().to_string(),
+                command_id: "no-such-command".to_string(),
+                workspace_id: root.id.clone(),
+                created_at: now,
+                updated_at: now,
+            })
+            .execute(&mut conn);
+        assert!(
+            bad_cmd.is_err(),
+            "command_instances.command_id FK must reject an unknown template"
+        );
+
+        // Instance with an unknown workspace_id → FK violation.
+        let bad_ws = diesel::insert_into(command_instances::table)
+            .values(NewCommandInstance {
+                id: Uuid::now_v7().to_string(),
+                command_id: dev.id.clone(),
+                workspace_id: "no-such-workspace".to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .execute(&mut conn);
+        assert!(
+            bad_ws.is_err(),
+            "command_instances.workspace_id FK must reject an unknown workspace"
+        );
+    }
+
+    /// Deleting a template, a workspace, OR a project CASCADES its instances away.
+    /// Done-criterion verbatim: "delete template/workspace/project cascade les
+    /// instances".
+    #[test]
+    fn delete_cascades_instances() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let feat =
+            create_workspace(&mut conn, &project.id, "feat", p("/p/feat", "C:\\p\\feat")).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let build = create_template(
+            &mut conn,
+            &project.id,
+            "build",
+            "make",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+
+        // Materialize a full grid: 2 templates × 2 workspaces = 4 instances.
+        let i_dev_root = insert_instance(&mut conn, &dev.id, &root.id);
+        let i_dev_feat = insert_instance(&mut conn, &dev.id, &feat.id);
+        let i_build_root = insert_instance(&mut conn, &build.id, &root.id);
+        let i_build_feat = insert_instance(&mut conn, &build.id, &feat.id);
+        let count = |c: &mut SqliteConnection| -> i64 {
+            command_instances::table.count().get_result(c).unwrap()
+        };
+        assert_eq!(count(&mut conn), 4);
+
+        // Delete one TEMPLATE: only its two instances cascade away.
+        assert_eq!(delete_template(&mut conn, &dev.id).unwrap(), 1);
+        assert_eq!(
+            count(&mut conn),
+            2,
+            "deleting a template removes its instances"
+        );
+        assert!(get_instance(&mut conn, &i_dev_root.id).unwrap().is_none());
+        assert!(get_instance(&mut conn, &i_dev_feat.id).unwrap().is_none());
+        assert!(get_instance(&mut conn, &i_build_root.id).unwrap().is_some());
+
+        // Delete one WORKSPACE: the build instance in that workspace cascades.
+        diesel::delete(workspaces::table.find(&feat.id))
+            .execute(&mut conn)
+            .unwrap();
+        assert_eq!(
+            count(&mut conn),
+            1,
+            "deleting a workspace removes its instances"
+        );
+        assert!(get_instance(&mut conn, &i_build_feat.id).unwrap().is_none());
+        assert!(get_instance(&mut conn, &i_build_root.id).unwrap().is_some());
+
+        // Delete the PROJECT: its templates (and remaining instances) all cascade.
+        delete_project(&mut conn, &project.id).unwrap();
+        assert_eq!(
+            count(&mut conn),
+            0,
+            "deleting the project removes all instances"
+        );
+        assert!(list_templates(&mut conn, &project.id).unwrap().is_empty());
+    }
+
+    /// The `last_state` CHECK rejects anything outside idle|running|success|error.
+    /// Done-criterion verbatim: "CHECK last_state rejette hors
+    /// idle/running/success/error". Also proves `set_last_state` round-trips the
+    /// four valid states.
+    #[test]
+    fn last_state_check_and_set_last_state_roundtrip() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let inst = insert_instance(&mut conn, &dev.id, &root.id);
+
+        // Each valid state round-trips.
+        for state in [STATE_IDLE, STATE_RUNNING, STATE_SUCCESS, STATE_ERROR] {
+            assert_eq!(set_last_state(&mut conn, &inst.id, state).unwrap(), 1);
+            assert_eq!(
+                get_instance(&mut conn, &inst.id)
+                    .unwrap()
+                    .unwrap()
+                    .last_state,
+                state,
+                "set_last_state must persist {state}"
+            );
+        }
+
+        // An invalid state is rejected by the CHECK constraint.
+        let bad = set_last_state(&mut conn, &inst.id, "bogus");
+        assert!(
+            bad.is_err(),
+            "last_state CHECK must reject values outside the enum"
+        );
+        // A raw insert with a bad default-overriding state is also rejected.
+        let now = now_millis();
+        let bad_insert = diesel::insert_into(command_instances::table)
+            .values((
+                command_instances::id.eq(Uuid::now_v7().to_string()),
+                command_instances::command_id.eq(&dev.id),
+                command_instances::workspace_id.eq(&root.id),
+                command_instances::last_state.eq("weird"),
+                command_instances::created_at.eq(now),
+                command_instances::updated_at.eq(now),
+            ))
+            .execute(&mut conn);
+        assert!(
+            bad_insert.is_err(),
+            "an out-of-enum last_state insert must be rejected"
+        );
+    }
+
+    /// `set_was_running_on_shutdown` round-trips and can be reset after boot.
+    /// Done-criterion verbatim: "was_running_on_shutdown round-trip et peut etre
+    /// reset apres boot".
+    #[test]
+    fn was_running_on_shutdown_roundtrips_and_resets() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let inst = insert_instance(&mut conn, &dev.id, &root.id);
+        assert!(
+            !inst.was_running_on_shutdown,
+            "a fresh instance was not running on shutdown"
+        );
+
+        // Shutdown flow sets it true.
+        assert_eq!(
+            set_was_running_on_shutdown(&mut conn, &inst.id, true).unwrap(),
+            1
+        );
+        assert!(
+            get_instance(&mut conn, &inst.id)
+                .unwrap()
+                .unwrap()
+                .was_running_on_shutdown,
+            "the snapshot flag persists true"
+        );
+
+        // Boot flow resets it false.
+        assert_eq!(
+            set_was_running_on_shutdown(&mut conn, &inst.id, false).unwrap(),
+            1
+        );
+        assert!(
+            !get_instance(&mut conn, &inst.id)
+                .unwrap()
+                .unwrap()
+                .was_running_on_shutdown,
+            "the snapshot flag can be reset after boot"
+        );
+
+        // The flag CHECK rejects values outside 0/1.
+        let bad = diesel::sql_query(format!(
+            "UPDATE command_instances SET was_running_on_shutdown = 2 WHERE id = '{}'",
+            inst.id
+        ))
+        .execute(&mut conn);
+        assert!(
+            bad.is_err(),
+            "was_running_on_shutdown CHECK must reject values outside 0/1"
+        );
+    }
+
+    /// CRUD round-trip: create/list/update/delete, reorder, restart_on_startup
+    /// and source-field update all persist. Done-criterion verbatim: "CRUD
+    /// template, reorder, restart_on_startup, set_last_state et persist_scrollback
+    /// borne round-trippent" (set_last_state/scrollback covered by their own
+    /// tests too).
+    #[test]
+    fn template_crud_reorder_and_restart_roundtrip() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+
+        // create + list in order.
+        let a = create_template(
+            &mut conn,
+            &project.id,
+            "a",
+            "cmd-a",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let b = create_template(
+            &mut conn,
+            &project.id,
+            "b",
+            "cmd-b",
+            Some("sub"),
+            CommandSource::default(),
+        )
+        .unwrap();
+        let c = create_template(
+            &mut conn,
+            &project.id,
+            "c",
+            "cmd-c",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        assert!(a.order_index < b.order_index && b.order_index < c.order_index);
+        let listed: Vec<String> = list_templates(&mut conn, &project.id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![a.id.clone(), b.id.clone(), c.id.clone()],
+            "list follows order asc"
+        );
+
+        // update: rename + change command + set subfolder.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(
+            update_template(&mut conn, &a.id, "a2", "cmd-a2", Some("client")).unwrap(),
+            1
+        );
+        let got_a = get_template(&mut conn, &a.id).unwrap().unwrap();
+        assert_eq!(got_a.name, "a2");
+        assert_eq!(got_a.command, "cmd-a2");
+        assert_eq!(got_a.subfolder.as_deref(), Some("client"));
+        assert!(got_a.updated_at > a.updated_at, "update bumps updated_at");
+        assert_eq!(got_a.created_at, a.created_at, "created_at is immutable");
+        // update can clear the subfolder back to root.
+        update_template(&mut conn, &b.id, "b", "cmd-b", None).unwrap();
+        assert_eq!(
+            get_template(&mut conn, &b.id).unwrap().unwrap().subfolder,
+            None
+        );
+
+        // reorder: c, a, b.
+        reorder_templates(&mut conn, &[c.id.clone(), a.id.clone(), b.id.clone()]).unwrap();
+        let after: Vec<String> = list_templates(&mut conn, &project.id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(
+            after,
+            vec![c.id.clone(), a.id.clone(), b.id.clone()],
+            "list reflects the persisted reorder"
+        );
+        assert_eq!(
+            get_template(&mut conn, &c.id).unwrap().unwrap().order_index,
+            0
+        );
+
+        // restart_on_startup toggles and persists.
+        assert!(!got_a.restart_on_startup);
+        set_restart_on_startup(&mut conn, &a.id, true).unwrap();
+        assert!(
+            get_template(&mut conn, &a.id)
+                .unwrap()
+                .unwrap()
+                .restart_on_startup,
+            "restart flag persists true"
+        );
+        set_restart_on_startup(&mut conn, &a.id, false).unwrap();
+        assert!(
+            !get_template(&mut conn, &a.id)
+                .unwrap()
+                .unwrap()
+                .restart_on_startup,
+            "restart flag resets to false"
+        );
+
+        // set_template_source sets then clears provenance.
+        set_template_source(
+            &mut conn,
+            &a.id,
+            CommandSource {
+                source_kind: Some(SOURCE_KIND_PACKAGE_JSON.to_string()),
+                source_package_json_path: Some("package.json".to_string()),
+                source_script_name: Some("a".to_string()),
+                source_script_command_snapshot: Some("cmd-a2".to_string()),
+                package_manager: Some("yarn".to_string()),
+            },
+        )
+        .unwrap();
+        let sourced = get_template(&mut conn, &a.id).unwrap().unwrap();
+        assert_eq!(
+            sourced.source_kind.as_deref(),
+            Some(SOURCE_KIND_PACKAGE_JSON)
+        );
+        assert_eq!(sourced.package_manager.as_deref(), Some("yarn"));
+        // Clear it back to hand-authored.
+        set_template_source(&mut conn, &a.id, CommandSource::default()).unwrap();
+        assert_eq!(
+            get_template(&mut conn, &a.id).unwrap().unwrap().source_kind,
+            None
+        );
+
+        // delete: removes the row; list shrinks.
+        assert_eq!(delete_template(&mut conn, &a.id).unwrap(), 1);
+        assert!(get_template(&mut conn, &a.id).unwrap().is_none());
+        assert_eq!(list_templates(&mut conn, &project.id).unwrap().len(), 2);
+
+        // unknown-id mutations are no-ops (0 rows), not errors.
+        assert_eq!(
+            update_template(&mut conn, "no-such-id", "x", "y", None).unwrap(),
+            0
+        );
+        assert_eq!(
+            set_restart_on_startup(&mut conn, "no-such-id", true).unwrap(),
+            0
+        );
+        assert_eq!(delete_template(&mut conn, "no-such-id").unwrap(), 0);
+        assert_eq!(
+            set_template_source(&mut conn, "no-such-id", CommandSource::default()).unwrap(),
+            0
+        );
+    }
+
+    /// `persist_instance_scrollback` round-trips a string and is BOUNDED to the cap
+    /// (keeping the tail). Done-criterion verbatim: "persist_scrollback borne
+    /// round-trippent" (for instances).
+    #[test]
+    fn persist_instance_scrollback_roundtrips_and_is_bounded() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let inst = insert_instance(&mut conn, &dev.id, &root.id);
+
+        // Exact round-trip of a modest payload with ANSI + CRLF.
+        let payload = "out1\r\n\x1b[32mok\x1b[0m\r\n";
+        assert_eq!(
+            persist_instance_scrollback(&mut conn, &inst.id, payload).unwrap(),
+            1
+        );
+        assert_eq!(
+            get_instance(&mut conn, &inst.id)
+                .unwrap()
+                .unwrap()
+                .scrollback,
+            payload,
+            "instance scrollback round-trips byte-for-byte"
+        );
+
+        // Over-cap payload is stored truncated, keeping the tail, staying valid.
+        let filler = "x".repeat(MAX_SCROLLBACK_BYTES);
+        let big = format!("{filler}INSTANCE_TAIL_END");
+        assert!(big.len() > MAX_SCROLLBACK_BYTES);
+        persist_instance_scrollback(&mut conn, &inst.id, &big).unwrap();
+        let got = get_instance(&mut conn, &inst.id).unwrap().unwrap();
+        assert!(
+            got.scrollback.len() <= MAX_SCROLLBACK_BYTES,
+            "instance scrollback is bounded to the cap"
+        );
+        assert!(
+            got.scrollback.ends_with("INSTANCE_TAIL_END"),
+            "bounding keeps the tail"
+        );
+
+        // Unknown id → no-op.
+        assert_eq!(
+            persist_instance_scrollback(&mut conn, "no-such-id", "x").unwrap(),
+            0
+        );
+    }
+
+    /// Migration v3 down→up reversibility: revert v3, the new tables are gone,
+    /// re-apply, and the schema round-trips a template + instance again.
+    #[test]
+    fn migration_v3_down_then_up_recreates_working_schema() {
+        let mut conn = open_in_memory();
+
+        // Revert v3 (the last migration). managed_commands must then be absent.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v3 cleanly");
+        let after_down: QueryResult<i64> = managed_commands::table.count().get_result(&mut conn);
+        assert!(
+            after_down.is_err(),
+            "after reverting v3, the managed_commands table must be gone"
+        );
+        let inst_after_down: QueryResult<i64> =
+            command_instances::table.count().get_result(&mut conn);
+        assert!(
+            inst_after_down.is_err(),
+            "after reverting v3, the command_instances table must be gone"
+        );
+
+        // Re-apply and round-trip a template + its instance again.
+        run_migrations(&mut conn).expect("re-apply v3");
+        let (project, root) =
+            create_project(&mut conn, "revived", p("/rev", "C:\\rev"), None).unwrap();
+        let tpl = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .expect("create_template after down→up");
+        let inst = insert_instance(&mut conn, &tpl.id, &root.id);
+        assert_eq!(
+            inst.last_state, STATE_IDLE,
+            "rebuilt v3 schema round-trips an instance"
+        );
+    }
+
+    // --- Materialization + per-workspace listing (PRD-3 task 2) -----------
+
+    /// Count all command_instance rows (test convenience).
+    #[cfg(test)]
+    fn instance_count(conn: &mut SqliteConnection) -> i64 {
+        command_instances::table.count().get_result(conn).unwrap()
+    }
+
+    /// Creating a workspace in a project that already has N templates materializes
+    /// N instances linked to that workspace. Done-criterion verbatim: "Creer un
+    /// workspace dans un projet a N templates cree N instances liees".
+    #[test]
+    fn creating_a_workspace_materializes_one_instance_per_template() {
+        let mut conn = open_in_memory();
+        // Project (root workspace) + 3 templates → 3 instances for the root.
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        for name in ["dev", "build", "test"] {
+            create_template(
+                &mut conn,
+                &project.id,
+                name,
+                "cmd",
+                None,
+                CommandSource::default(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            instance_count(&mut conn),
+            3,
+            "3 templates materialize 3 instances on the existing root workspace"
+        );
+
+        // Now ADD a workspace: it must get one instance per existing template (3).
+        let feat =
+            create_workspace(&mut conn, &project.id, "feat", p("/p/feat", "C:\\p\\feat")).unwrap();
+        let feat_instances = list_instances_for_workspace(&mut conn, &feat.id).unwrap();
+        assert_eq!(
+            feat_instances.len(),
+            3,
+            "creating a workspace in a project with N templates creates N instances"
+        );
+        // Every instance is linked to THIS workspace and to a real template.
+        for inst in &feat_instances {
+            assert_eq!(
+                inst.workspace_id, feat.id,
+                "instance is linked to the new workspace"
+            );
+        }
+        // 3 root + 3 feat = 6 instances total.
+        assert_eq!(instance_count(&mut conn), 6);
+
+        // The root workspace's own instances are untouched (still 3).
+        assert_eq!(
+            list_instances_for_workspace(&mut conn, &root.id)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    /// Adding a template to a project that already has M workspaces materializes M
+    /// instances. Done-criterion verbatim: "Ajouter un template a un projet a M
+    /// workspaces cree M instances".
+    #[test]
+    fn adding_a_template_materializes_one_instance_per_workspace() {
+        let mut conn = open_in_memory();
+        // Project (root) + 2 added workspaces = 3 workspaces, no templates yet.
+        let (project, _root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        create_workspace(&mut conn, &project.id, "feat", p("/p/feat", "C:\\p\\feat")).unwrap();
+        create_workspace(&mut conn, &project.id, "api", p("/p/api", "C:\\p\\api")).unwrap();
+        assert_eq!(
+            instance_count(&mut conn),
+            0,
+            "no templates yet → no instances"
+        );
+
+        // Add a template: it materializes one instance per workspace (3).
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            instance_count(&mut conn),
+            3,
+            "adding a template to a project with M=3 workspaces creates 3 instances"
+        );
+        // Each is linked to `dev` and to a distinct workspace.
+        let mut ws_ids: Vec<String> = command_instances::table
+            .filter(command_instances::command_id.eq(&dev.id))
+            .select(command_instances::workspace_id)
+            .load(&mut conn)
+            .unwrap();
+        ws_ids.sort();
+        ws_ids.dedup();
+        assert_eq!(
+            ws_ids.len(),
+            3,
+            "the template materialized once per distinct workspace"
+        );
+
+        // A second template adds another instance per workspace (3 → 6 total).
+        create_template(
+            &mut conn,
+            &project.id,
+            "build",
+            "make",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        assert_eq!(instance_count(&mut conn), 6);
+    }
+
+    /// Materialization is IDEMPOTENT: re-running it for a workspace or a template
+    /// never duplicates or errors (UNIQUE(command_id, workspace_id) + ON CONFLICT
+    /// DO NOTHING). The "idempotente grace a UNIQUE" guarantee from the spec.
+    #[test]
+    fn materialization_is_idempotent() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let feat =
+            create_workspace(&mut conn, &project.id, "feat", p("/p/feat", "C:\\p\\feat")).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        // create_template already materialized for root + feat (2 instances).
+        assert_eq!(instance_count(&mut conn), 2);
+
+        // Re-materializing for the workspace creates 0 new rows (all exist).
+        assert_eq!(
+            materialize_instances_for_workspace(&mut conn, &feat.id).unwrap(),
+            0,
+            "re-materializing an already-materialized workspace inserts nothing"
+        );
+        // Re-materializing for the template creates 0 new rows too.
+        assert_eq!(
+            materialize_instances_for_template(&mut conn, &dev.id).unwrap(),
+            0,
+            "re-materializing an already-materialized template inserts nothing"
+        );
+        assert_eq!(
+            instance_count(&mut conn),
+            2,
+            "count is unchanged after re-runs"
+        );
+        let _ = root; // root participates via create_template's materialization.
+    }
+
+    /// `list_instances_for_workspace` returns the workspace's instances JOINED to
+    /// their template's display fields (name, command, subfolder), ordered by the
+    /// template order. Done-criterion verbatim: "list-par-workspace retourne les
+    /// instances jointes a leur template".
+    #[test]
+    fn list_instances_joins_template_fields_in_order() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        // Three templates with distinct command/subfolder, created in a known order.
+        let a = create_template(
+            &mut conn,
+            &project.id,
+            "alpha",
+            "cmd-a",
+            Some("client"),
+            CommandSource::default(),
+        )
+        .unwrap();
+        let b = create_template(
+            &mut conn,
+            &project.id,
+            "bravo",
+            "cmd-b",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let c = create_template(
+            &mut conn,
+            &project.id,
+            "charlie",
+            "cmd-c",
+            Some("server"),
+            CommandSource::default(),
+        )
+        .unwrap();
+
+        let rows = list_instances_for_workspace(&mut conn, &root.id).unwrap();
+        assert_eq!(rows.len(), 3, "one joined row per materialized instance");
+
+        // Order follows the template order (a, b, c).
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.command_id.clone())
+                .collect::<Vec<_>>(),
+            vec![a.id.clone(), b.id.clone(), c.id.clone()],
+            "listing is ordered by template order"
+        );
+
+        // Each row carries the JOINED template fields verbatim.
+        assert_eq!(rows[0].name, "alpha");
+        assert_eq!(rows[0].command, "cmd-a");
+        assert_eq!(rows[0].subfolder.as_deref(), Some("client"));
+        assert_eq!(rows[1].name, "bravo");
+        assert_eq!(rows[1].command, "cmd-b");
+        assert_eq!(
+            rows[1].subfolder, None,
+            "a null subfolder joins through as None"
+        );
+        assert_eq!(rows[2].name, "charlie");
+        assert_eq!(rows[2].subfolder.as_deref(), Some("server"));
+
+        // The instance columns are present and carry their defaults.
+        assert!(rows.iter().all(|r| r.last_state == STATE_IDLE));
+        assert!(rows.iter().all(|r| r.workspace_id == root.id));
+
+        // The joined WORKSPACE path is carried on every row (the info bar's run-dir
+        // base); a hand-authored template has no source provenance. `cwd` is left
+        // None by the pure-DB query — the bridge resolves it before serializing.
+        assert!(rows.iter().all(|r| r.workspace_path == p("/p", "C:\\p")));
+        assert!(rows.iter().all(|r| r.source_kind.is_none()));
+        assert!(rows.iter().all(|r| r.source_package_json_path.is_none()));
+        assert!(rows.iter().all(|r| r.source_script_name.is_none()));
+        assert!(rows.iter().all(|r| r.package_manager.is_none()));
+        assert!(
+            rows.iter().all(|r| r.cwd.is_none()),
+            "the DB query leaves cwd None; the bridge fills the resolved run dir"
+        );
+
+        // A reorder of the templates is reflected by a subsequent listing.
+        reorder_templates(&mut conn, &[c.id.clone(), a.id.clone(), b.id.clone()]).unwrap();
+        let reordered = list_instances_for_workspace(&mut conn, &root.id).unwrap();
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|r| r.command_id.clone())
+                .collect::<Vec<_>>(),
+            vec![c.id.clone(), a.id.clone(), b.id.clone()],
+            "listing tracks the persisted template order"
+        );
+
+        // The listing is SCOPED to one workspace: an unknown workspace lists empty.
+        assert!(
+            list_instances_for_workspace(&mut conn, "no-such-workspace")
+                .unwrap()
+                .is_empty(),
+            "listing an unknown workspace returns an empty vec (not an error)"
+        );
+    }
+
+    /// A SOURCED (package.json) template's provenance joins through the listing so
+    /// the command info bar can show the source. The instance row carries the
+    /// `source_*` group + `package_manager` from the joined template, and the
+    /// workspace `path` from the joined workspace.
+    #[test]
+    fn list_instances_carries_source_provenance_and_workspace_path() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "pnpm dev",
+            Some("frontend"),
+            CommandSource {
+                source_kind: Some(SOURCE_KIND_PACKAGE_JSON.to_string()),
+                source_package_json_path: Some("frontend/package.json".to_string()),
+                source_script_name: Some("dev".to_string()),
+                source_script_command_snapshot: Some("vite".to_string()),
+                package_manager: Some("pnpm".to_string()),
+            },
+        )
+        .unwrap();
+
+        let rows = list_instances_for_workspace(&mut conn, &root.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.command, "pnpm dev");
+        assert_eq!(r.subfolder.as_deref(), Some("frontend"));
+        assert_eq!(r.workspace_path, p("/p", "C:\\p"));
+        assert_eq!(r.source_kind.as_deref(), Some(SOURCE_KIND_PACKAGE_JSON));
+        assert_eq!(
+            r.source_package_json_path.as_deref(),
+            Some("frontend/package.json")
+        );
+        assert_eq!(r.source_script_name.as_deref(), Some("dev"));
+        assert_eq!(r.package_manager.as_deref(), Some("pnpm"));
+        // The snapshot column is NOT projected into the listing (the bar shows the
+        // source LOCATION, not the snapshot body), and `cwd` is the bridge's job.
+        assert!(r.cwd.is_none());
+    }
+
+    /// Deleting a template OR a workspace removes its instances from the
+    /// per-workspace listing (cascade FK). Done-criterion verbatim: "delete d'un
+    /// template ou d'un workspace retire ses instances (cascade FK)".
+    #[test]
+    fn delete_template_or_workspace_removes_instances_from_listing() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let feat =
+            create_workspace(&mut conn, &project.id, "feat", p("/p/feat", "C:\\p\\feat")).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let build = create_template(
+            &mut conn,
+            &project.id,
+            "build",
+            "make",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+
+        // Full grid: each workspace lists 2 instances (dev, build).
+        assert_eq!(
+            list_instances_for_workspace(&mut conn, &root.id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            list_instances_for_workspace(&mut conn, &feat.id)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Delete the `dev` TEMPLATE: it disappears from BOTH workspaces' listings.
+        delete_template(&mut conn, &dev.id).unwrap();
+        let root_after = list_instances_for_workspace(&mut conn, &root.id).unwrap();
+        let feat_after = list_instances_for_workspace(&mut conn, &feat.id).unwrap();
+        assert_eq!(
+            root_after.len(),
+            1,
+            "the deleted template's instance left the root listing"
+        );
+        assert_eq!(
+            feat_after.len(),
+            1,
+            "the deleted template's instance left the feat listing"
+        );
+        assert!(
+            root_after.iter().all(|r| r.command_id == build.id),
+            "only the surviving template's instance remains"
+        );
+
+        // Delete the `feat` WORKSPACE: its listing is now empty; root is untouched.
+        diesel::delete(workspaces::table.find(&feat.id))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(
+            list_instances_for_workspace(&mut conn, &feat.id)
+                .unwrap()
+                .is_empty(),
+            "deleting a workspace removes its instances from the listing"
+        );
+        assert_eq!(
+            list_instances_for_workspace(&mut conn, &root.id)
+                .unwrap()
+                .len(),
+            1,
+            "the other workspace's listing is unaffected"
+        );
+    }
+
+    // --- Running-mutation guard inputs (the id sets the bridge guard reads) ---
+
+    /// `instance_ids_for_template` returns every instance of a template (one per
+    /// workspace of its project) and nothing from a sibling template. This is the
+    /// id set the bridge running-guard feeds to `runner.any_running(..)` to refuse
+    /// editing/deleting a template while one of its instances runs.
+    #[test]
+    fn instance_ids_for_template_lists_one_per_workspace() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        // 2 extra workspaces → 3 workspaces total.
+        create_workspace(&mut conn, &project.id, "feat", p("/p/feat", "C:\\p\\feat")).unwrap();
+        create_workspace(&mut conn, &project.id, "api", p("/p/api", "C:\\p\\api")).unwrap();
+
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let build = create_template(
+            &mut conn,
+            &project.id,
+            "build",
+            "make",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+
+        let dev_ids = instance_ids_for_template(&mut conn, &dev.id).unwrap();
+        assert_eq!(
+            dev_ids.len(),
+            3,
+            "one instance per workspace for the dev template"
+        );
+        // None of `build`'s instances leak into dev's id set.
+        let build_ids = instance_ids_for_template(&mut conn, &build.id).unwrap();
+        assert!(
+            dev_ids.iter().all(|id| !build_ids.contains(id)),
+            "a template's instance ids are disjoint from a sibling template's"
+        );
+
+        // An unknown template yields an empty set (guard never blocks on nothing).
+        assert!(
+            instance_ids_for_template(&mut conn, "no-such-template")
+                .unwrap()
+                .is_empty(),
+            "unknown template id → no instance ids"
+        );
+    }
+
+    /// `instance_ids_for_project` returns every command instance of a project
+    /// (across all its templates and workspaces) and excludes other projects. This
+    /// is the id set the `delete_project` guard checks before allowing the delete.
+    #[test]
+    fn instance_ids_for_project_spans_all_templates_and_excludes_others() {
+        let mut conn = open_in_memory();
+        let (p1, _root1) = create_project(&mut conn, "p1", p("/p1", "C:\\p1"), None).unwrap();
+        create_workspace(&mut conn, &p1.id, "feat", p("/p1/feat", "C:\\p1\\feat")).unwrap();
+        // p1: 2 templates × 2 workspaces = 4 instances.
+        for name in ["dev", "build"] {
+            create_template(&mut conn, &p1.id, name, "cmd", None, CommandSource::default()).unwrap();
+        }
+
+        // A second project with its own instance must NOT appear in p1's set.
+        let (p2, root2) = create_project(&mut conn, "p2", p("/p2", "C:\\p2"), None).unwrap();
+        let dev2 = create_template(
+            &mut conn,
+            &p2.id,
+            "dev",
+            "cmd",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let p2_inst = list_instances_for_workspace(&mut conn, &root2.id)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.command_id == dev2.id)
+            .unwrap();
+
+        let p1_ids = instance_ids_for_project(&mut conn, &p1.id).unwrap();
+        assert_eq!(p1_ids.len(), 4, "every instance of p1 across templates×ws");
+        assert!(
+            !p1_ids.contains(&p2_inst.id),
+            "a sibling project's instance is excluded from the delete guard set"
+        );
+
+        // Unknown project → empty (the guard never blocks the delete spuriously).
+        assert!(
+            instance_ids_for_project(&mut conn, "no-such-project")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // --- Restore inputs: snapshot + restart_on_startup eligibility -------------
+
+    /// `instance_run_context` joins an instance to its template (command,
+    /// subfolder, restart_on_startup) and its workspace (path) — the inputs the
+    /// runner needs to spawn. Unknown id → None.
+    #[test]
+    fn instance_run_context_joins_template_and_workspace() {
+        let mut conn = open_in_memory();
+        let (project, root) =
+            create_project(&mut conn, "p", p("/srv/p", "C:\\srv\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            Some("frontend"),
+            CommandSource::default(),
+        )
+        .unwrap();
+        set_restart_on_startup(&mut conn, &dev.id, true).unwrap();
+        let inst = list_instances_for_workspace(&mut conn, &root.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let ctx = instance_run_context(&mut conn, &inst.id).unwrap().unwrap();
+        assert_eq!(ctx.command, "npm run dev");
+        assert_eq!(ctx.subfolder.as_deref(), Some("frontend"));
+        assert_eq!(ctx.workspace_path, p("/srv/p", "C:\\srv\\p"));
+        assert!(
+            ctx.restart_on_startup,
+            "the joined template restart flag is surfaced for the restore path"
+        );
+
+        assert!(
+            instance_run_context(&mut conn, "no-such-instance")
+                .unwrap()
+                .is_none(),
+            "unknown instance → no run context"
+        );
+    }
+
+    /// `all_instances_for_restore` returns one row per instance with the two boot
+    /// signals (`restart_on_startup`, `was_running_on_shutdown`) joined in, and the
+    /// boot-eligibility predicate (`restart_on_startup && was_running_on_shutdown`)
+    /// selects ONLY the instance whose template toggle is ON and whose snapshot is
+    /// true. Done-criterion verbatim: "shutdown snapshot + eligibilite
+    /// restart_on_startup".
+    #[test]
+    fn restore_rows_carry_both_signals_and_eligibility_selects_only_on_and_running() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+
+        // toggle ON template, snapshot=running  → eligible.
+        let on = create_template(
+            &mut conn,
+            &project.id,
+            "on",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        set_restart_on_startup(&mut conn, &on.id, true).unwrap();
+        // toggle OFF template, snapshot=running  → NOT eligible (off).
+        let off = create_template(
+            &mut conn,
+            &project.id,
+            "off",
+            "npm run build",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        // toggle ON template but snapshot=not-running → NOT eligible (idle at quit).
+        let on_idle = create_template(
+            &mut conn,
+            &project.id,
+            "on_idle",
+            "npm test",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        set_restart_on_startup(&mut conn, &on_idle.id, true).unwrap();
+
+        let by_cmd = |c: &mut SqliteConnection, command_id: &str| {
+            list_instances_for_workspace(c, &root.id)
+                .unwrap()
+                .into_iter()
+                .find(|i| i.command_id == command_id)
+                .unwrap()
+                .id
+        };
+        let on_inst = by_cmd(&mut conn, &on.id);
+        let off_inst = by_cmd(&mut conn, &off.id);
+        let _on_idle_inst = by_cmd(&mut conn, &on_idle.id);
+
+        // Snapshot: the two "was running at shutdown" instances.
+        set_was_running_on_shutdown(&mut conn, &on_inst, true).unwrap();
+        set_was_running_on_shutdown(&mut conn, &off_inst, true).unwrap();
+        // on_idle stays false (it was idle when the app quit).
+
+        let rows = all_instances_for_restore(&mut conn).unwrap();
+        assert_eq!(rows.len(), 3, "one restore row per instance");
+
+        // The eligibility predicate used by the boot restore (bridge).
+        let eligible: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.restart_on_startup && r.was_running_on_shutdown)
+            .map(|r| r.instance_id.as_str())
+            .collect();
+        assert_eq!(
+            eligible,
+            vec![on_inst.as_str()],
+            "only the (toggle ON × was-running) instance is eligible for boot relaunch"
+        );
+
+        // Sanity: the rows carry the command line + cwd inputs the runner needs.
+        let on_row = rows.iter().find(|r| r.instance_id == on_inst).unwrap();
+        assert_eq!(on_row.command, "npm run dev");
+        assert_eq!(on_row.workspace_path, p("/p", "C:\\p"));
+    }
+
+    // --- Source provenance mutation (set/clear) --------------------------------
+
+    /// `set_template_source` sets the full provenance tuple and an all-`None`
+    /// source clears it (hand-authored), never touching `command`. This is the
+    /// DB-level write behind unlink/import source actions.
+    #[test]
+    fn set_template_source_sets_then_clears_without_touching_command() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "pnpm dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+
+        // Set the package.json provenance.
+        assert_eq!(
+            set_template_source(
+                &mut conn,
+                &dev.id,
+                CommandSource {
+                    source_kind: Some(SOURCE_KIND_PACKAGE_JSON.to_string()),
+                    source_package_json_path: Some("package.json".to_string()),
+                    source_script_name: Some("dev".to_string()),
+                    source_script_command_snapshot: Some("vite".to_string()),
+                    package_manager: Some("pnpm".to_string()),
+                },
+            )
+            .unwrap(),
+            1
+        );
+        let linked = get_template(&mut conn, &dev.id).unwrap().unwrap();
+        assert_eq!(linked.source_kind.as_deref(), Some(SOURCE_KIND_PACKAGE_JSON));
+        assert_eq!(linked.source_script_name.as_deref(), Some("dev"));
+        assert_eq!(linked.package_manager.as_deref(), Some("pnpm"));
+        assert_eq!(linked.command, "pnpm dev", "source set never edits command");
+
+        // Clear it (unlink): all provenance columns go NULL, command untouched.
+        assert_eq!(
+            set_template_source(&mut conn, &dev.id, CommandSource::default()).unwrap(),
+            1
+        );
+        let unlinked = get_template(&mut conn, &dev.id).unwrap().unwrap();
+        assert_eq!(unlinked.source_kind, None);
+        assert_eq!(unlinked.source_package_json_path, None);
+        assert_eq!(unlinked.source_script_name, None);
+        assert_eq!(unlinked.source_script_command_snapshot, None);
+        assert_eq!(unlinked.package_manager, None);
+        assert_eq!(unlinked.command, "pnpm dev", "unlink never edits command");
+
+        // Unknown id → no-op (0 rows).
+        assert_eq!(
+            set_template_source(&mut conn, "no-such-id", CommandSource::default()).unwrap(),
+            0
+        );
     }
 }

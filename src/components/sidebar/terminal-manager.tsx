@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import { ChromeBar } from "@/components/chrome/chrome-bar";
+import { CommandView } from "@/components/command/command-view";
+import { ProjectCommandsDialog } from "@/components/command/project-commands-dialog";
+import { useCommandInstances } from "@/components/command/use-command-instances";
+import type { CommandStatePayload } from "@/components/command/use-command-state";
+import type { InstanceWithTemplate, ManagedCommand } from "@/components/command/use-commands";
 import { resolveDisplayName } from "./auto-label";
 import { AppSidebar } from "./app-sidebar";
 import { TerminalDeck } from "./terminal-deck";
@@ -13,7 +19,7 @@ import {
   type ProjectWithRoot,
   type WorkspaceRecord,
 } from "./use-projects";
-import { useTerminals, type TerminalRecord } from "./use-terminals";
+import { useTerminals, type ExecState, type TerminalRecord } from "./use-terminals";
 import { useTerminalShortcuts } from "./use-terminal-shortcuts";
 
 /**
@@ -76,6 +82,37 @@ interface NyxE2eSeam {
    * binding after the pass. The front then reflects the new `workspace_id`.
    */
   autoAttach: (recordId: string) => Promise<{ workspace_id: string | null; changed: boolean }>;
+
+  // --- PRD-3 managed-command seam -----------------------------------------
+  // These drive the SAME backend commands the command UI uses (`command_create`,
+  // `command_instance_list`, `command_start`/`stop`/`relaunch`, `command_output`)
+  // plus a live read of the run-state dot. xterm paints command output to a WebGL
+  // canvas too, so the e2e reads the instance's output + 4-state run status through
+  // this seam rather than the DOM. INERT in production (nothing reads it).
+
+  /** Create a project command TEMPLATE (materializes one instance per workspace). */
+  createCommand: (
+    projectId: string,
+    name: string,
+    command: string,
+    subfolder?: string | null,
+  ) => Promise<ManagedCommand>;
+  /** List a workspace's command instances (id + live last_state + joined name). */
+  listCommandInstances: (workspaceId: string) => Promise<InstanceWithTemplate[]>;
+  /** Start an instance; resolves to the run state after the call (e.g. "running"). */
+  commandStart: (instanceId: string) => Promise<string>;
+  /** Stop an instance (process-tree kill → idle); resolves to the state after. */
+  commandStop: (instanceId: string) => Promise<string>;
+  /** Relaunch an instance (stop-then-start if running, else direct start). */
+  commandRelaunch: (instanceId: string) => Promise<string>;
+  /**
+   * The instance's LATEST observed run state for the dot (idle|running|success|
+   * error), tracked from the `command://state` event stream — the exact signal the
+   * status dot renders. Falls back to `idle` for an unseen instance.
+   */
+  commandState: (instanceId: string) => ExecState;
+  /** The instance's output history (live buffer while running, else persisted). */
+  commandOutput: (instanceId: string) => Promise<string>;
 }
 
 /**
@@ -110,6 +147,50 @@ export function TerminalManager() {
     setProjectCollapsed,
     setWorkspaceCollapsed,
   } = useProjects();
+
+  // PRD-3 command INSTANCES per workspace (sidebar COMMANDS band + main-pane view).
+  const {
+    instances,
+    commandsByWorkspace,
+    refresh: refreshCommands,
+  } = useCommandInstances(projects);
+
+  // The "Manage commands" modal: which project's commands are being managed.
+  const [manageProject, setManageProject] = useState<ProjectTree | null>(null);
+  // The selected command instance (its `<CommandView>` mounts in the main pane).
+  const [activeCommandId, setActiveCommandId] = useState<string | null>(null);
+  const activeCommand = useMemo(
+    () => instances.find((i) => i.id === activeCommandId) ?? null,
+    [instances, activeCommandId],
+  );
+
+  // Selecting a command shows its view; selecting a TERMINAL clears the active
+  // command (one main-pane surface at a time — terminal deck OR command view).
+  //
+  // ACKNOWLEDGE-ON-SELECT: a finished one-shot's success/error dot is an "unseen
+  // result"; OPENING the command means the user saw it, so we revert the dot to idle
+  // (the output stays in the panel). We invoke `command_acknowledge` only when the
+  // selected instance is in a TERMINAL state — never for a running command (the
+  // backend also no-ops on running/idle, but gating here avoids a useless round-trip).
+  // The backend emits an idle `command://state`, which the sidebar AND view dots
+  // already follow; the last-run exit code (finding 1) is decoupled and survives.
+  const selectCommand = useCallback(
+    (id: string) => {
+      setActiveCommandId(id);
+      const inst = instances.find((i) => i.id === id);
+      if (inst && (inst.state === "success" || inst.state === "error")) {
+        void invoke("command_acknowledge", { instanceId: id }).catch(() => {});
+      }
+    },
+    [instances],
+  );
+  const selectTerminal = useCallback(
+    (id: string) => {
+      setActiveCommandId(null);
+      setActive(id);
+    },
+    [setActive],
+  );
 
   // Global new/close/next/prev shortcuts. `close` targets the active terminal.
   const closeActive = useCallback(() => {
@@ -173,6 +254,10 @@ export function TerminalManager() {
     async (id: string) => {
       const tree = projects.find((p) => p.project.id === id);
       const workspaceIds = tree ? tree.workspaces.map((w) => w.id) : [];
+      // Detach ONLY after a successful delete: `deleteProject` now rejects when the
+      // backend refuses (e.g. a running command), so the throw skips the detach and
+      // propagates to the confirm modal — never detaching terminals of a project
+      // that still exists.
       await deleteProject(id);
       detachFromWorkspaces(workspaceIds);
     },
@@ -206,6 +291,35 @@ export function TerminalManager() {
   ptyIdsRef.current = ptyIds;
   const projectsRef = useRef(projects);
   projectsRef.current = projects;
+
+  // E2E ONLY: a live map of each command instance's latest run state, fed by the
+  // backend `command://state` stream. The command-seam's `commandState(id)` reads
+  // this so the e2e can observe the dot's 4 states (idle/running/success/error)
+  // without the WebGL-painted output. Gated behind the e2e flag so the listener is
+  // dead code (tree-shaken) in a real production build — it never ships to users.
+  const commandStatesRef = useRef<Map<string, ExecState> | null>(null);
+  commandStatesRef.current ??= new Map();
+  const commandStates = commandStatesRef.current;
+  useEffect(() => {
+    if (import.meta.env.VITE_NYX_E2E !== "1") return;
+    let torndown = false;
+    let unlisten: (() => void) | undefined;
+    void listen<CommandStatePayload>("command://state", (event) => {
+      if (torndown) return;
+      const { instanceId, state } = event.payload;
+      commandStates.set(instanceId, state);
+    }).then((un) => {
+      if (torndown) {
+        void Promise.resolve(un()).catch(() => {});
+        return;
+      }
+      unlisten = un;
+    });
+    return () => {
+      torndown = true;
+      if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
+    };
+  }, []);
 
   // Production AUTO-ATTACH loop: for each LOOSE, auto-mode terminal that has a
   // live PTY id, read its live cwd (`terminal_info`) and run the real backend
@@ -324,6 +438,26 @@ export function TerminalManager() {
         }
         return res;
       },
+
+      // --- PRD-3 managed-command seam -----------------------------------
+      // Each method is a thin pass-through to the SAME backend command the
+      // command UI invokes; `commandState` reads the live `command://state` map
+      // above. No production code reads these (inert seam).
+      createCommand: (projectId, name, command, subfolder) =>
+        invoke<ManagedCommand>("command_create", {
+          projectId,
+          name,
+          command,
+          subfolder: subfolder && subfolder.trim() ? subfolder.trim() : null,
+          restartOnStartup: false,
+        }),
+      listCommandInstances: (workspaceId) =>
+        invoke<InstanceWithTemplate[]>("command_instance_list", { workspaceId }),
+      commandStart: (instanceId) => invoke<string>("command_start", { instanceId }),
+      commandStop: (instanceId) => invoke<string>("command_stop", { instanceId }),
+      commandRelaunch: (instanceId) => invoke<string>("command_relaunch", { instanceId }),
+      commandState: (instanceId) => commandStates.get(instanceId) ?? "idle",
+      commandOutput: (instanceId) => invoke<string>("command_output", { instanceId }),
     };
     return () => {
       delete (window as unknown as { __nyx?: NyxE2eSeam }).__nyx;
@@ -354,9 +488,12 @@ export function TerminalManager() {
         <AppSidebar
           projects={projects}
           terminals={terminals}
-          activeId={activeId}
+          activeId={activeCommandId === null ? activeId : null}
           ptyIds={ptyIds}
-          onSelect={setActive}
+          commandsByWorkspace={commandsByWorkspace}
+          activeCommandId={activeCommandId}
+          onSelectCommand={selectCommand}
+          onSelect={selectTerminal}
           onClose={(id) => void close(id)}
           onNewTerminal={(ws) => void newTerminalInWorkspace(ws)}
           onNewLooseTerminal={newLooseTerminal}
@@ -364,16 +501,58 @@ export function TerminalManager() {
           onAddWorkspace={(tree) => void addWorkspace(tree)}
           onEditProject={(tree) => editProject(tree)}
           onDeleteProject={(tree) => removeProject(tree)}
+          onManageCommands={(tree) => setManageProject(tree)}
           onReorderTerminals={reorderWorkspaceTerminals}
           onReorderLooseTerminals={reorderLooseTerminals}
           onSetProjectCollapsed={(id, collapsed) => void setProjectCollapsed(id, collapsed)}
           onSetWorkspaceCollapsed={(id, collapsed) => void setWorkspaceCollapsed(id, collapsed)}
         />
         <div className="min-w-0 flex-1">
-          <TerminalDeck terminals={terminals} activeId={activeId} onPtyId={handlePtyId} />
+          {/* Main pane: the selected COMMAND view (panel + dot + 3 buttons, no
+              stdin) when a command is active, else the terminal deck. The deck
+              stays mounted underneath so its terminals keep their PTYs alive. */}
+          <div className={activeCommand ? "hidden" : "h-full"}>
+            <TerminalDeck terminals={terminals} activeId={activeId} onPtyId={handlePtyId} />
+          </div>
+          {activeCommand && (
+            <CommandView
+              key={activeCommand.id}
+              instanceId={activeCommand.id}
+              name={activeCommand.name}
+              initialState={activeCommand.state}
+              command={activeCommand.command}
+              cwd={activeCommand.cwd}
+              sourceScriptName={activeCommand.sourceScriptName}
+              sourcePackageJsonPath={activeCommand.sourcePackageJsonPath}
+            />
+          )}
         </div>
       </div>
       {dialog}
+      {/* PRD-3 "Manage commands" modal. Scans the project's ROOT workspace for
+          package.json imports (and uses its path to relativize the subfolder
+          picker). On close, re-list the instances so newly created / imported /
+          deleted commands appear (or disappear) in the sidebar band. */}
+      {(() => {
+        // The workspace the modal is scoped to: the ROOT, else the first. Both its
+        // id (import discovery) and path (subfolder picker relativization) come
+        // from the SAME workspace so the picker resolves against what runs.
+        const manageWorkspace =
+          manageProject?.workspaces.find((w) => w.is_root) ?? manageProject?.workspaces[0] ?? null;
+        return (
+          <ProjectCommandsDialog
+            open={manageProject !== null}
+            projectId={manageProject?.project.id ?? null}
+            projectName={manageProject?.project.name ?? ""}
+            importWorkspaceId={manageWorkspace?.id ?? null}
+            workspacePath={manageWorkspace?.path ?? null}
+            onClose={() => {
+              setManageProject(null);
+              void refreshCommands();
+            }}
+          />
+        );
+      })()}
     </div>
   );
 }

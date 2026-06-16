@@ -1,16 +1,13 @@
 import { useState } from "react";
-import { ChevronRightIcon, PlusIcon } from "lucide-react";
-import { motion, useReducedMotion } from "motion/react";
+import { PlusIcon, Settings2Icon } from "lucide-react";
 
-import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
-import { Tooltip } from "@/components/ui/tooltip";
-import { CollapsibleSection } from "./collapsible-section";
+import { CommandControls } from "@/components/command/command-controls";
 import { SortableTerminalList } from "./sortable-terminal-list";
 import { StatusDot } from "./run-state";
-import { itemTransition } from "./item-motion";
+import { SidebarItemContent, sidebarRowClassName } from "./sidebar-item";
+import { SidebarSection } from "./sidebar-section";
 import type { CommandRecord } from "./use-projects";
-import type { TerminalRecord } from "./use-terminals";
+import type { ExecState, TerminalRecord } from "./use-terminals";
 
 export interface WorkspaceSubsectionsProps {
   /** Terminals bound to this workspace (via `workspace_id`), in sidebar order. */
@@ -30,6 +27,12 @@ export interface WorkspaceSubsectionsProps {
   onClose: (id: string) => void;
   /** Select a command row (rail glides to it; no create here). */
   onSelectCommand?: (id: string) => void;
+  /**
+   * Open the "Manage commands" modal (the COMMANDS band's hover gear). Wired to the
+   * EXISTING `project-commands-dialog` (its internals are out of scope — redesigned
+   * separately). Optional so the subsections still render without the wiring.
+   */
+  onManageCommands?: () => void;
   /** Launch a new terminal scoped to THIS workspace (cwd = workspace.path). */
   onNewTerminal: () => void;
   /**
@@ -42,21 +45,23 @@ export interface WorkspaceSubsectionsProps {
 
 /**
  * The TYPED subsections under a workspace — the v6 Terminals/Commands bands, all
- * text in ENGLISH:
+ * text in ENGLISH. Both bands now share ONE non-collapsible `<SidebarSection>`
+ * (finding 01KV63TD5E…): a quiet uppercase label + a single hover-revealed action
+ * icon, NO chevron / NO collapse on EITHER.
  *
- *  - **TERMINALS**: a quiet label header + a compact `+` that launches a terminal
- *    IN THIS workspace. It is ALWAYS OPEN — there is NO chevron and NO collapse
- *    (finding 01KV3CNH1HVAX8RG08GYSEWJFG: a prior round wrongly made it
- *    collapsible by misreading a cut-off message; the user wants it permanently
- *    expanded). The body is the workspace's terminals as a drag-sortable
- *    `<SortableTerminalList>` (dnd-kit) whose closed rows run a height-collapse
- *    EXIT and whose survivors reflow up in normal flow. Empty → a muted hint.
- *  - **COMMANDS**: rendered ONLY when commands exist (hidden until PRD-3 feeds
- *    it). It KEEPS its chevron/collapse. No `+`. Each row is a `<CommandRow>`
- *    carrying a lead `<StatusDot>` (run-state) + the shared selection rail.
+ *  - **TERMINALS**: ALWAYS OPEN (no chevron — finding 01KV3CNH1HVAX8RG08GYSEWJFG).
+ *    Its hover action is the `+` that launches a terminal IN THIS workspace. The
+ *    body is the workspace's terminals as a drag-sortable `<SortableTerminalList>`
+ *    (dnd-kit) whose closed rows height-collapse and whose survivors reflow up.
+ *    Empty → a muted hint.
+ *  - **COMMANDS**: rendered ONLY when commands exist. It NO LONGER carries a chevron
+ *    / collapse — it is the SAME non-collapsible band as TERMINALS now. Its hover
+ *    action is a GEAR that opens the manage-commands modal (the existing
+ *    `project-commands-dialog`). Each row is a `<CommandRow>` carrying a lead
+ *    `<StatusDot>` (run-state) + the shared selection rail.
  *
- * (Project and workspace bands keep their own collapse — only the typed Terminals
- * subsection is non-collapsible.)
+ * (Project and workspace bands keep their own collapse — the typed Terminals/
+ * Commands subsections are the non-collapsible ones.)
  */
 export function WorkspaceSubsections({
   terminals,
@@ -67,36 +72,23 @@ export function WorkspaceSubsections({
   onSelect,
   onClose,
   onSelectCommand,
+  onManageCommands,
   onNewTerminal,
   onReorderTerminals,
 }: WorkspaceSubsectionsProps) {
-  const reduced = useReducedMotion();
-  const [cmdsOpen, setCmdsOpen] = useState(true);
-
   return (
     // FULL-WIDTH band: no left inset, so terminal rows span the sidebar
     // edge-to-edge like the project/workspace header bands.
     <div className="flex flex-col gap-0.5">
-      {/* --- TERMINALS (ALWAYS OPEN: no chevron, no collapse — finding F) ---- */}
-      <div>
-        <div className="group/sub flex items-center gap-1 pr-1 pl-1">
-          <span className="flex min-w-0 flex-1 items-center gap-1 py-0.5 select-none">
-            <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-              Terminals
-            </span>
-          </span>
-          <Tooltip label="New terminal in this workspace">
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label="New terminal in workspace"
-              onClick={onNewTerminal}
-              className="size-5 opacity-0 transition group-hover/sub:opacity-100 focus-visible:opacity-100"
-            >
-              <PlusIcon />
-            </Button>
-          </Tooltip>
-        </div>
+      {/* --- TERMINALS (shared non-collapsible section; `+` action) ---------- */}
+      <SidebarSection
+        title="Terminals"
+        action={{
+          icon: <PlusIcon />,
+          label: "New terminal in workspace",
+          onClick: onNewTerminal,
+        }}
+      >
         {terminals.length > 0 ? (
           // Drag-sortable list (dnd-kit) wrapped in AnimatePresence so a closed
           // row runs its height-collapse exit and the survivors reflow up.
@@ -115,42 +107,35 @@ export function WorkspaceSubsections({
             No terminals — + to start
           </p>
         )}
-      </div>
+      </SidebarSection>
 
-      {/* --- COMMANDS (hidden until it has content; fed in PRD-3) ------ */}
+      {/* --- COMMANDS (shared non-collapsible section; gear opens the modal) --
+          Rendered only when commands exist. The gear is shown only when there is a
+          handler wired (`onManageCommands`). */}
       {commands.length > 0 && (
-        <div>
-          <button
-            type="button"
-            aria-expanded={cmdsOpen}
-            onClick={() => setCmdsOpen((v) => !v)}
-            className="flex w-full items-center gap-1 rounded-md px-1 py-0.5 text-left select-none hover:bg-sidebar-accent/30"
-          >
-            <motion.span
-              aria-hidden
-              animate={{ rotate: cmdsOpen ? 90 : 0 }}
-              transition={itemTransition(reduced)}
-              className="flex shrink-0 items-center text-muted-foreground"
-            >
-              <ChevronRightIcon className="size-3" />
-            </motion.span>
-            <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-              Commands
-            </span>
-          </button>
-          <CollapsibleSection open={cmdsOpen}>
-            <ul className="flex flex-col gap-0.5 pt-0.5">
-              {commands.map((c) => (
-                <CommandRow
-                  key={c.id}
-                  command={c}
-                  active={c.id === activeCommandId}
-                  onSelect={onSelectCommand}
-                />
-              ))}
-            </ul>
-          </CollapsibleSection>
-        </div>
+        <SidebarSection
+          title="Commands"
+          action={
+            onManageCommands
+              ? {
+                  icon: <Settings2Icon />,
+                  label: "Manage commands",
+                  onClick: onManageCommands,
+                }
+              : undefined
+          }
+        >
+          <ul className="flex flex-col gap-0.5 pt-0.5">
+            {commands.map((c) => (
+              <CommandRow
+                key={c.id}
+                command={c}
+                active={c.id === activeCommandId}
+                onSelect={onSelectCommand}
+              />
+            ))}
+          </ul>
+        </SidebarSection>
       )}
     </div>
   );
@@ -163,33 +148,73 @@ interface CommandRowProps {
 }
 
 /**
- * `<CommandRow>` — a single command in the COMMANDS subsection. Selection is the
- * shared `<ActiveRail>` (a `layoutId` bar that FLIPs here when active) + the v6
- * dimmed/active model, exactly like a terminal row (one selection channel across
- * both). Lead glyph is the run-state `<StatusDot>` (idle live this PRD). No create
- * affordance here; a click selects the command. Controls are PRD-3.
+ * `<CommandRow>` — a single command in the COMMANDS subsection. It uses the SHARED
+ * sidebar item gabarit (`sidebarRowClassName` + `<SidebarItemContent>`), so a command
+ * row is the SAME size/alignment as a terminal row: same lead/name/actions structure,
+ * NO command-specific `pl-5.5` inset (finding 01KV63TBV7…). Selection is the shared
+ * measured `<ActiveRail>` + the v6 dimmed/active model, exactly like a terminal row
+ * (one selection channel). Lead glyph is the run-state `<StatusDot>`.
+ *
+ * The actions slot hosts the REUSED `<CommandControls>` (the SAME lifecycle commands
+ * as the main view, with the same state gating: start when not running, stop when
+ * running, relaunch always — finding 01KV63TEGB…). The buttons reveal on row hover
+ * (like the terminal close `x`), and each stops propagation so acting never also
+ * selects the row. A lifecycle failure (finding 01KV63TAG…) is reflected on the lead
+ * dot so a refused action is visible even from the sidebar.
  */
 function CommandRow({ command, active, onSelect }: CommandRowProps) {
   const state = command.state ?? "idle";
+  // A refused lifecycle action surfaces on the lead dot (the row has no output
+  // panel). Cleared when a fresh live state arrives.
+  const [failed, setFailed] = useState(false);
+  const [seenState, setSeenState] = useState(state);
+  if (seenState !== state) {
+    setSeenState(state);
+    if (failed) setFailed(false);
+  }
+  const dotState: ExecState = failed ? "error" : state;
+
   return (
     <li>
-      <button
-        type="button"
+      {/* The row is a `div role="button"` (NOT a `<button>`) so the lifecycle
+          control buttons can nest inside it — a `<button>` may not contain buttons.
+          This mirrors the terminal row, whose clickable element is also a non-button
+          (the `<li>`/`div` owns the select click). Enter/Space activate it. */}
+      <div
+        role="button"
+        tabIndex={0}
         onClick={() => onSelect?.(command.id)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onSelect?.(command.id);
+          }
+        }}
         aria-current={active ? "true" : undefined}
         data-rail-row
-        className={cn(
-          "group relative flex w-full items-center gap-2 rounded-md py-1 pr-2 pl-5.5 text-left text-sm transition select-none",
-          active
-            ? "font-medium text-sidebar-foreground opacity-100 hover:bg-sidebar-accent/40"
-            : "text-sidebar-foreground/70 opacity-60 hover:bg-sidebar-accent/40 hover:opacity-90",
-        )}
+        // The SHARED row shape — identical to a terminal row.
+        className={sidebarRowClassName(active)}
       >
         {/* Selection is the single MEASURED rail (see `useActiveRail`); this row
             just flags itself active via `aria-current` + `data-rail-row`. */}
-        <StatusDot state={state} className="relative" />
-        <span className="min-w-0 flex-1 truncate">{command.label}</span>
-      </button>
+        <SidebarItemContent
+          lead={<StatusDot state={dotState} className="relative" />}
+          name={command.label}
+          actions={
+            <CommandControls
+              instanceId={command.id}
+              state={state}
+              showDot={false}
+              buttonSize="icon-xs"
+              inRow
+              onStateChange={() => setFailed(false)}
+              onError={() => setFailed(true)}
+              // Hover-reveal at the right edge (matches the terminal row's close).
+              className="shrink-0 opacity-0 transition focus-within:opacity-100 group-hover:opacity-100"
+            />
+          }
+        />
+      </div>
     </li>
   );
 }

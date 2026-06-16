@@ -4,6 +4,7 @@ import {
   FolderPlusIcon,
   MoreVerticalIcon,
   PencilIcon,
+  TerminalSquareIcon,
   Trash2Icon,
 } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
@@ -15,7 +16,7 @@ import { CollapsibleSection } from "./collapsible-section";
 import { WorkspaceItem } from "./workspace-item";
 import { itemTransition } from "./item-motion";
 import { showWorkspaceSection, workspaceDisplayLabel } from "./project-item.utils";
-import type { ProjectTree, WorkspaceRecord } from "./use-projects";
+import type { CommandRecord, ProjectTree, WorkspaceRecord } from "./use-projects";
 import type { TerminalRecord } from "./use-terminals";
 
 export interface ProjectItemProps {
@@ -36,6 +37,14 @@ export interface ProjectItemProps {
   onEditProject?: (tree: ProjectTree) => void;
   /** Open the delete-confirm modal for THIS project. */
   onDeleteProject?: (tree: ProjectTree) => void;
+  /** Open the "Manage commands" modal for THIS project (PRD-3 command templates). */
+  onManageCommands?: (tree: ProjectTree) => void;
+  /** Commands (PRD-3 instances) grouped by `workspace_id`, for this project's keys. */
+  commandsByWorkspace?: Map<string, CommandRecord[]>;
+  /** Record id of the active command row (drives the shared selection rail). */
+  activeCommandId?: string | null;
+  /** Select a command row (mounts its view in the main pane). */
+  onSelectCommand?: (id: string) => void;
   /** Persist a new order for a workspace's terminals (within-workspace only). */
   onReorderTerminals?: (workspaceId: string, ids: string[]) => void;
   /**
@@ -73,6 +82,10 @@ export function ProjectItem({
   onAddWorkspace,
   onEditProject,
   onDeleteProject,
+  onManageCommands,
+  commandsByWorkspace,
+  activeCommandId,
+  onSelectCommand,
   onReorderTerminals,
   onSetCollapsed,
   onSetWorkspaceCollapsed,
@@ -99,6 +112,7 @@ export function ProjectItem({
   };
 
   const termsFor = (wsId: string) => terminalsByWorkspace.get(wsId) ?? [];
+  const cmdsFor = (wsId: string) => commandsByWorkspace?.get(wsId) ?? [];
 
   // Collapsed-band summary: a multi-workspace project shows "N ws"; a mono-root
   // shows its terminal count "N term" (proto's quiet mono summary, finding F).
@@ -183,6 +197,15 @@ export function ProjectItem({
             >
               Add workspace
             </MenuItem>
+            {onManageCommands && (
+              <MenuItem
+                icon={<TerminalSquareIcon className="size-4" />}
+                onClick={() => onManageCommands(tree)}
+                aria-label={`Manage commands for ${project.name}`}
+              >
+                Manage commands
+              </MenuItem>
+            )}
             {onDeleteProject && (
               <>
                 <MenuSeparator />
@@ -210,12 +233,16 @@ export function ProjectItem({
                 workspace={ws}
                 displayLabel={workspaceDisplayLabel(ws, project.name)}
                 terminals={termsFor(ws.id)}
+                commands={cmdsFor(ws.id)}
                 activeId={activeId}
+                activeCommandId={activeCommandId}
                 ptyIds={ptyIds}
                 showHeader
                 onSelect={onSelect}
                 onClose={onClose}
                 onNewTerminal={onNewTerminal}
+                onSelectCommand={onSelectCommand}
+                onManageCommands={onManageCommands ? () => onManageCommands(tree) : undefined}
                 onReorderTerminals={onReorderTerminals}
                 onSetCollapsed={onSetWorkspaceCollapsed}
               />
@@ -229,12 +256,16 @@ export function ProjectItem({
               <WorkspaceItem
                 workspace={workspaces[0]}
                 terminals={termsFor(workspaces[0].id)}
+                commands={cmdsFor(workspaces[0].id)}
                 activeId={activeId}
+                activeCommandId={activeCommandId}
                 ptyIds={ptyIds}
                 showHeader={false}
                 onSelect={onSelect}
                 onClose={onClose}
                 onNewTerminal={onNewTerminal}
+                onSelectCommand={onSelectCommand}
+                onManageCommands={onManageCommands ? () => onManageCommands(tree) : undefined}
                 onReorderTerminals={onReorderTerminals}
               />
             </div>
