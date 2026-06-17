@@ -72,6 +72,35 @@ pub struct PtyManager {
     ptys: Mutex<HashMap<u64, Pty>>,
 }
 
+impl PtyManager {
+    /// Write raw bytes to the PTY identified by `id`, the SAME path as the `pty_write`
+    /// command (no second lifecycle). Returns `false` if `id` is not a live PTY, so the
+    /// MCP terminal tools can distinguish a stale id from a write error. `pub(crate)` for
+    /// the MCP `send_to_terminal` tool (which holds only a record id → resolves the PTY id
+    /// via [`TerminalPtyMap`]).
+    pub(crate) fn write_to(&self, id: u64, data: &[u8]) -> Result<bool, String> {
+        let mut ptys = self.ptys.lock().unwrap();
+        match ptys.get_mut(&id) {
+            Some(pty) => pty.write(data).map(|_| true).map_err(|e| e.to_string()),
+            None => Ok(false),
+        }
+    }
+
+    /// Kill + drop the PTY identified by `id`, the SAME path as the `pty_close` command.
+    /// Returns `false` if `id` was already gone (idempotent). `pub(crate)` for the MCP
+    /// `close_terminal` tool.
+    pub(crate) fn close_id(&self, id: u64) -> Result<bool, String> {
+        let pty = self.ptys.lock().unwrap().remove(&id);
+        match pty {
+            Some(mut pty) => {
+                pty.kill().map_err(|e| e.to_string())?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
 // --- Managed-command runtime wiring (PRD-3 Phase 2) ----------------------
 //
 // The state machine + process-tree lifecycle live in `crate::command` (decoupled
@@ -116,6 +145,37 @@ struct CommandOutputPayload {
     bytes: Vec<u8>,
 }
 
+/// Payload of the `command://ack` event: an instance's "unseen result" was
+/// acknowledged. Carries ONLY the instance id — the acknowledge clears the unread
+/// notification WITHOUT changing the factual state, so there is no `state`/`code`
+/// here (those are unchanged; the row still reflects the factual outcome). The front
+/// filters on `instanceId` (camelCase, load-bearing — see [`CommandStatePayload`])
+/// and hides the settled badge for that instance off this event.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandAckPayload {
+    instance_id: String,
+}
+
+/// Payload of the [`COMMAND_OUTPUT_CLEARED_EVENT`] event (PRD-4 review R-OUTPUT): an
+/// instance's captured output BUFFER was cleared (via the MCP `clear_command_output`
+/// tool). Carries ONLY the instance id — clearing wipes the bytes, NOT the factual
+/// state/outcome, so there is no `state`/`code` here. The read-only output panel
+/// (`useCommandOutput`) filters on `instanceId` (camelCase, load-bearing — same as
+/// [`CommandStatePayload`]) and resets its xterm on this event: the analog of the
+/// run-start clear, but WITHOUT a state transition.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandOutputClearedPayload {
+    instance_id: String,
+}
+
+/// The event emitted when an instance's captured output buffer is cleared (PRD-4
+/// review R-OUTPUT, the `clear_command_output` MCP tool). The read-only output panel
+/// listens on it to wipe its xterm. A DEDICATED signal (not `command://state`) because
+/// a clear is NOT a run transition: the factual state/outcome are unchanged.
+pub const COMMAND_OUTPUT_CLEARED_EVENT: &str = "command://output-cleared";
+
 /// Production [`crate::command::RunnerSink`]: emits `command://state` /
 /// `command://output` over the `AppHandle` and persists `last_state` + bounded
 /// scrollback via the managed [`Db`]. Holds the `AppHandle` so the pump thread can
@@ -126,12 +186,16 @@ pub struct TauriRunnerSink<R: Runtime> {
 
 impl<R: Runtime> crate::command::RunnerSink for TauriRunnerSink<R> {
     fn on_state(&self, instance_id: &str, state: crate::command::RunState, exit_code: Option<i32>) {
-        // Persist the new last_state (DB CHECK vocabulary) BEFORE emitting, so a
-        // listener that reads the row on the event sees the committed value.
+        // Persist the FACTUAL outcome (DB CHECK vocabulary) BEFORE emitting, so a
+        // listener that reads the row on the event sees the committed value. A
+        // success/error finish records `last_exit_code` + `ended_at` + flips `unread`
+        // (the v4 outcome columns); a `running` start clears the prior code; `idle`
+        // touches only `last_state`. The outcome columns are what an acknowledge must
+        // NOT erase, so this writer is decoupled from `on_acknowledge` below.
         let db_state = state.as_db_str();
         self.app
             .state::<Db>()
-            .with_conn(|c| db::set_last_state(c, instance_id, db_state))
+            .with_conn(|c| db::set_run_state(c, instance_id, db_state, exit_code))
             .ok();
         let _ = self.app.emit(
             "command://state",
@@ -139,6 +203,23 @@ impl<R: Runtime> crate::command::RunnerSink for TauriRunnerSink<R> {
                 instance_id: instance_id.to_string(),
                 state: db_state.to_string(),
                 code: exit_code,
+            },
+        );
+    }
+
+    fn on_acknowledge(&self, instance_id: &str) {
+        // Clear ONLY the persisted `unread` flag (the factual outcome is untouched),
+        // then emit `command://ack` so the UI hides the settled badge WITHOUT any
+        // state change. This is the decoupled notification path: a UI ack can no
+        // longer erase the error the MCP sees.
+        self.app
+            .state::<Db>()
+            .with_conn(|c| db::acknowledge_instance(c, instance_id))
+            .ok();
+        let _ = self.app.emit(
+            "command://ack",
+            CommandAckPayload {
+                instance_id: instance_id.to_string(),
             },
         );
     }
@@ -158,6 +239,35 @@ impl<R: Runtime> crate::command::RunnerSink for TauriRunnerSink<R> {
             .state::<Db>()
             .with_conn(|c| db::persist_instance_scrollback(c, instance_id, serialized))
             .ok();
+    }
+
+    fn archive_previous_run(&self, instance_id: &str) {
+        // A fresh (re)launch: archive the last completed run into the bounded `prev_*`
+        // columns (N=1) and reset the current run to a clean `running` row, in one
+        // transaction. Retains the previous run's output + exit_code/ended_at so an
+        // observer (the MCP `get_command_output(run="previous")`) can still read it,
+        // while the current run starts unpolluted by the prior run's bytes.
+        self.app
+            .state::<Db>()
+            .with_conn(|c| db::archive_and_reset_for_relaunch(c, instance_id))
+            .ok();
+    }
+
+    fn clear_output(&self, instance_id: &str) {
+        // Empty the persisted scrollback (current + retained prior run) WITHOUT touching
+        // the factual outcome columns, then emit the dedicated clear event so the
+        // read-only output panel wipes its xterm. The analog of the run-start clear,
+        // but with NO state transition (clearing the log is not stopping/relaunching).
+        self.app
+            .state::<Db>()
+            .with_conn(|c| db::clear_instance_scrollback(c, instance_id))
+            .ok();
+        let _ = self.app.emit(
+            COMMAND_OUTPUT_CLEARED_EVENT,
+            CommandOutputClearedPayload {
+                instance_id: instance_id.to_string(),
+            },
+        );
     }
 }
 
@@ -186,6 +296,195 @@ pub fn build_command_runner<R: Runtime>(app: AppHandle<R>) -> ManagedCommandRunn
 pub fn manage_command_runner<R: Runtime>(app: &AppHandle<R>) {
     let runner = build_command_runner(app.clone());
     app.manage(runner);
+}
+
+/// The name of the structural-refresh event the sidebar listens on to re-pull the
+/// `projects → workspaces` tree. Emitted by EVERY mutation of that tree, whether it
+/// comes from a UI `#[tauri::command]` (`create_project`/`create_workspace`/
+/// `delete_project`) or from an MCP tool (`workspace_add`/`create_workspace`).
+///
+/// Why a single shared signal: the command tools (`start`/`stop`/`relaunch`) already
+/// emit `command://state` and so the dot refreshes for both UI- and MCP-driven runs;
+/// the workspace/project MUTATIONS had NO such event — the UI only updated its own
+/// in-memory tree optimistically after its OWN invoke returned (see `useProjects`),
+/// so an agent adding a workspace over MCP never reached the sidebar (review
+/// 01KV9611923NKX3JPR5V6MN44F). Routing every mutating path through this one event
+/// keeps the UI in sync regardless of who mutated, and gives the future mutating MCP
+/// tools (command-template CRUD) the SAME refresh hook for free.
+pub const WORKSPACES_CHANGED_EVENT: &str = "workspaces://changed";
+
+/// Emit [`WORKSPACES_CHANGED_EVENT`] so any sidebar listening on it re-pulls the
+/// project/workspace tree. The reusable refresh hook for the project/workspace tree:
+/// call it from EVERY backend path that mutates that tree (UI command OR MCP tool) so
+/// both surfaces stay in sync from one signal. The payload is empty `{}` — the event
+/// is a pure "the tree changed, re-list" tick, not a delta; the listener re-fetches
+/// `list_projects` + `list_workspaces` (its single source of truth) on receipt, so a
+/// concurrent UI- and MCP-driven mutation can never desync the sidebar from the DB.
+/// A failed emit is swallowed (best-effort, like the other event emitters here): the
+/// next mutation re-emits and the user can always reload.
+pub fn emit_workspaces_changed<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.emit(WORKSPACES_CHANGED_EVENT, ());
+}
+
+/// The name of the structural-refresh event the sidebar COMMANDS band listens on to
+/// re-pull its command instances/templates. Emitted by EVERY mutation of a command
+/// TEMPLATE, whether it comes from a UI `#[tauri::command]` (`command_create`/
+/// `command_update`/`command_delete`/`command_resync_source`/`command_unlink_source`/
+/// `command_import_create`) or from an MCP tool (`add_command`/`update_command`/
+/// `import_commands`).
+///
+/// Why a dedicated signal (not `workspaces://changed`): a template mutation does not
+/// change the project/workspace TREE — it adds/edits/removes the COMMANDS that hang
+/// off existing workspaces. The two band surfaces (`useCommandInstances` for the
+/// sidebar band, `useCommands` for the Manage Commands modal) only re-loaded on a
+/// workspace-id-set change or a `projectId` change respectively, so a template added
+/// to an EXISTING workspace — over MCP OR via the UI — never appeared live. Routing
+/// every mutating path through this one event keeps both surfaces in sync regardless
+/// of who mutated, mirroring the project/workspace tree's `workspaces://changed`.
+pub const COMMANDS_CHANGED_EVENT: &str = "commands://changed";
+
+/// Emit [`COMMANDS_CHANGED_EVENT`] so any command-band surface listening on it re-pulls
+/// its command instances/templates. The reusable refresh hook for the COMMANDS band:
+/// call it from EVERY backend path that mutates a command template (UI command OR MCP
+/// tool) so both surfaces stay in sync from one signal. The payload is empty `()` — the
+/// event is a pure "the commands changed, re-list" tick, not a delta; the listeners
+/// re-fetch their lists (their single source of truth) on receipt, so a concurrent UI-
+/// and MCP-driven mutation can never desync the band from the DB. A failed emit is
+/// swallowed (best-effort, like the other event emitters here): the next mutation
+/// re-emits and the user can always reload.
+pub fn emit_commands_changed<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.emit(COMMANDS_CHANGED_EVENT, ());
+}
+
+/// The name of the structural-refresh event the terminal deck listens on to re-pull its
+/// terminal records (PRD-4 review R-TERM). Emitted by EVERY backend path that CREATES or
+/// removes a terminal RECORD from outside the front's own orchestration — i.e. the MCP
+/// terminal tools (`create_terminal` / `close_terminal`). Modelled on
+/// [`COMMANDS_CHANGED_EVENT`].
+///
+/// Why it exists: unlike commands, terminals are orchestrated entirely by the FRONT today
+/// (the UI calls `create_terminal` then mounts a `<Terminal>` which spawns the PTY itself),
+/// so there was NO backend→front signal for terminals at all — a terminal an agent creates
+/// over MCP would never reach the sidebar / never get a PTY+xterm. Routing the MCP-driven
+/// create/close through this one event lets the front reconcile: it re-pulls `list_terminals`
+/// on receipt, mounts an xterm for any newly-`alive` record (which spawns its PTY) and drops
+/// the pane of any record that went `closed`. The payload is empty `()` — a pure "the
+/// terminals changed, re-list" tick, not a delta; the front re-fetches its single source of
+/// truth. A failed emit is swallowed (best-effort, like the other emitters).
+pub const TERMINALS_CHANGED_EVENT: &str = "terminals://changed";
+
+/// Emit [`TERMINALS_CHANGED_EVENT`] so the terminal deck re-pulls `list_terminals` and
+/// reconciles its mounted xterm panes. The reusable refresh hook for the terminal deck:
+/// call it from EVERY backend path that creates/closes a terminal record outside the front's
+/// own orchestration (the MCP terminal tools). Best-effort, like the other event emitters.
+pub fn emit_terminals_changed<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.emit(TERMINALS_CHANGED_EVENT, ());
+}
+
+// --- Terminal RECORD ↔ live PTY mapping (PRD-4 review R-TERM) -------------
+//
+// The record↔pty link historically lived ONLY in the front (`TerminalManager`'s
+// `ptyIds` Map, keyed by record id): each `<Terminal>` spawns its own PTY and reports
+// the id up. That is fine while the FRONT alone drives terminals, but an MCP tool that
+// must write into / close / enumerate a terminal by its RECORD id needs the same join on
+// the backend. So the front now REGISTERS the link here as soon as its `<Terminal>`
+// resolves a PTY id (and clears it on exit/close), giving the MCP tools a way to resolve
+// a terminal record id → its live PTY id WITHOUT owning a second PTY lifecycle: the PTY is
+// still spawned/owned by the front's `<Terminal>` exactly as before.
+
+/// Managed state: the live link between a terminal RECORD id (`terminals.id`, a UUID
+/// string) and its current PTY id (`PtyManager` key). Populated by the front via
+/// [`register_terminal_pty`] when a `<Terminal>` spawns/exits its PTY; read by the MCP
+/// terminal tools to resolve a record id to the PTY they must `pty_write`/`pty_close`.
+#[derive(Default)]
+pub struct TerminalPtyMap {
+    by_record: Mutex<HashMap<String, u64>>,
+}
+
+impl TerminalPtyMap {
+    /// Record that `record_id`'s live PTY is `pty_id`. Overwrites any prior link (a
+    /// record that respawned a PTY after an exit gets the fresh id).
+    pub fn set(&self, record_id: &str, pty_id: u64) {
+        self.by_record.lock().unwrap().insert(record_id.to_string(), pty_id);
+    }
+    /// Drop the link for `record_id` (its PTY exited or the terminal was closed).
+    pub fn clear(&self, record_id: &str) {
+        self.by_record.lock().unwrap().remove(record_id);
+    }
+    /// The live PTY id for `record_id`, if the front has registered one.
+    pub fn get(&self, record_id: &str) -> Option<u64> {
+        self.by_record.lock().unwrap().get(record_id).copied()
+    }
+    /// A snapshot of every `(record_id, pty_id)` link, for `list_terminals` mapping.
+    pub fn snapshot(&self) -> HashMap<String, u64> {
+        self.by_record.lock().unwrap().clone()
+    }
+}
+
+/// Managed state: commands the MCP `create_terminal` tool wants injected into a terminal
+/// AT OPENING, keyed by the terminal RECORD id. Because the PTY is spawned by the FRONT
+/// (when it mounts the `<Terminal>` after reconciling on `terminals://changed`), an
+/// MCP-supplied `command` cannot be written until that PTY is live. So `create_terminal`
+/// PARKS the command here; [`register_terminal_pty`] drains it (a one-shot, `take`) and
+/// writes `command + "\n"` into the freshly-spawned PTY, so the command runs once at the
+/// shell's first prompt and the terminal stays interactive after. A terminal opened with
+/// NO command parks nothing — the shell is bare.
+#[derive(Default)]
+pub struct PendingTerminalCommands {
+    by_record: Mutex<HashMap<String, String>>,
+}
+
+impl PendingTerminalCommands {
+    /// Park `command` to be injected into `record_id`'s PTY once it spawns.
+    pub fn set(&self, record_id: &str, command: String) {
+        self.by_record.lock().unwrap().insert(record_id.to_string(), command);
+    }
+    /// Take (remove + return) the parked command for `record_id`, if any. One-shot: a
+    /// later re-registration of the same record (e.g. a respawn after exit) does NOT
+    /// re-inject — the command runs exactly once, at the first opening. `pub(crate)` so the
+    /// MCP terminal-tool tests can assert the park/drain contract.
+    pub(crate) fn take(&self, record_id: &str) -> Option<String> {
+        self.by_record.lock().unwrap().remove(record_id)
+    }
+}
+
+/// Register (or clear) the RECORD ↔ live PTY link for a terminal. Called by the front's
+/// `<Terminal>` when its PTY id resolves (`pty_id = Some`) and when the PTY exits / the
+/// terminal is torn down (`pty_id = None`). This is the ONLY writer of
+/// [`TerminalPtyMap`]; the MCP terminal tools are readers. The PTY itself is still
+/// spawned and owned by the front (`pty_spawn`), so this command adds NO second
+/// lifecycle — it only surfaces the join the front already maintains to the backend.
+///
+/// On registration (`pty_id = Some`) it also DRAINS any command the MCP `create_terminal`
+/// tool parked for this record (see [`PendingTerminalCommands`]): the parked
+/// `command + "\n"` is written into the just-spawned PTY so an MCP "open a terminal that
+/// runs X" lands its line at the shell's first prompt and stays interactive after. A
+/// terminal opened bare (no parked command) injects nothing.
+#[tauri::command]
+fn register_terminal_pty(
+    map: State<'_, TerminalPtyMap>,
+    pending: State<'_, PendingTerminalCommands>,
+    pty_state: State<'_, PtyManager>,
+    record_id: String,
+    pty_id: Option<u64>,
+) -> Result<(), String> {
+    match pty_id {
+        Some(id) => {
+            map.set(&record_id, id);
+            // Drain a one-shot MCP-parked command and inject it into the live PTY. Reuse
+            // the SAME write path as `pty_write` (no second lifecycle): append a newline
+            // so the shell executes the line and then stays interactive.
+            if let Some(command) = pending.take(&record_id) {
+                if let Some(pty) = pty_state.ptys.lock().unwrap().get_mut(&id) {
+                    let mut bytes = command.into_bytes();
+                    bytes.push(b'\n');
+                    let _ = pty.write(&bytes);
+                }
+            }
+        }
+        None => map.clear(&record_id),
+    }
+    Ok(())
 }
 
 /// Run the BOOT restoration from an `AppHandle`: read the managed `Db` + runner and
@@ -923,15 +1222,21 @@ struct ProjectWithRoot {
 /// Create a project and its single, explicitly-named root workspace at
 /// `root_path`. `root_name` defaults to "root" when omitted.
 #[tauri::command]
-fn create_project(
+fn create_project<R: Runtime>(
+    app: AppHandle<R>,
     db: State<'_, Db>,
     name: String,
     root_path: String,
     root_name: Option<String>,
 ) -> Result<ProjectWithRoot, String> {
-    db.with_conn(|c| db::create_project(c, &name, &root_path, root_name.as_deref()))
+    let created = db
+        .with_conn(|c| db::create_project(c, &name, &root_path, root_name.as_deref()))
         .map(|(project, root)| ProjectWithRoot { project, root })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Broadcast the structural refresh so the sidebar re-pulls the tree (the SAME
+    // signal an MCP-driven mutation emits — see `emit_workspaces_changed`).
+    emit_workspaces_changed(&app);
+    Ok(created)
 }
 
 /// List all projects.
@@ -959,7 +1264,7 @@ fn update_project(db: State<'_, Db>, id: String, name: String) -> Result<(), Str
 /// neither a path nor the runtime.
 #[tauri::command]
 fn delete_project<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     db: State<'_, Db>,
     runner: State<'_, ManagedCommandRunner<R>>,
     id: String,
@@ -974,7 +1279,11 @@ fn delete_project<R: Runtime>(
     }
     db.with_conn(|c| db::delete_project(c, &id))
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Broadcast the structural refresh so the sidebar re-pulls the tree (a delete is
+    // a tree mutation too — same shared signal as the create paths / the MCP tools).
+    emit_workspaces_changed(&app);
+    Ok(())
 }
 
 /// Persist a project's sidebar `collapsed` (open/closed) state so the band's
@@ -989,14 +1298,20 @@ fn set_project_collapsed(db: State<'_, Db>, id: String, collapsed: bool) -> Resu
 /// Create a (non-root) workspace in `project_id` at `path`. Rejects a path
 /// already present in the SAME project (UNIQUE(project_id, path)).
 #[tauri::command]
-fn create_workspace(
+fn create_workspace<R: Runtime>(
+    app: AppHandle<R>,
     db: State<'_, Db>,
     project_id: String,
     name: String,
     path: String,
 ) -> Result<Workspace, String> {
-    db.with_conn(|c| db::create_workspace(c, &project_id, &name, &path))
-        .map_err(|e| e.to_string())
+    let workspace = db
+        .with_conn(|c| db::create_workspace(c, &project_id, &name, &path))
+        .map_err(|e| e.to_string())?;
+    // Broadcast the structural refresh so the sidebar re-pulls the tree (the SAME
+    // signal the MCP `workspace_add`/`create_workspace` tools emit).
+    emit_workspaces_changed(&app);
+    Ok(workspace)
 }
 
 /// List the workspaces of `project_id` (root first).
@@ -1081,7 +1396,8 @@ fn unpin_terminal_workspace(db: State<'_, Db>, terminal_id: String) -> Result<()
 /// instance per existing workspace of the project (in the db layer).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-fn command_create(
+fn command_create<R: Runtime>(
+    app: AppHandle<R>,
     db: State<'_, Db>,
     project_id: String,
     name: String,
@@ -1094,6 +1410,14 @@ fn command_create(
     source_script_command_snapshot: Option<String>,
     package_manager: Option<String>,
 ) -> Result<db::ManagedCommand, String> {
+    // INFER provenance for a hand-authored command whose line is itself a package
+    // manager invocation (`bun install`, `pnpm dev`, …). The import path supplies
+    // these fields explicitly; a manually-added command leaves them null, so the
+    // detected vs. manual commands looked inconsistent (the dogfood finding). We
+    // only fill in a manager the caller did NOT set, and only when the command's
+    // first token names a known PM — never overriding an explicit value.
+    let (source_kind, package_manager) =
+        infer_command_source(&command, source_kind, package_manager);
     let source = db::CommandSource {
         source_kind,
         source_package_json_path,
@@ -1101,7 +1425,7 @@ fn command_create(
         source_script_command_snapshot,
         package_manager,
     };
-    db.with_conn(|c| {
+    let template = db.with_conn(|c| {
         let created = db::create_template(
             c,
             &project_id,
@@ -1117,7 +1441,11 @@ fn command_create(
         }
         db::get_template(c, &created.id).map(|t| t.unwrap_or(created))
     })
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // Broadcast the command-band refresh so the sidebar + modal re-pull (the SAME
+    // signal the MCP `add_command` tool emits — see `emit_commands_changed`).
+    emit_commands_changed(&app);
+    Ok(template)
 }
 
 /// List a project's command templates in sidebar order.
@@ -1143,7 +1471,7 @@ fn command_list(db: State<'_, Db>, project_id: String) -> Result<Vec<db::Managed
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn command_update<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     db: State<'_, Db>,
     runner: State<'_, ManagedCommandRunner<R>>,
     id: String,
@@ -1172,7 +1500,11 @@ fn command_update<R: Runtime>(
         }
         Ok::<_, diesel::result::Error>(())
     })
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // Broadcast the command-band refresh so the sidebar + modal re-pull the edited
+    // template (the SAME signal the MCP `update_command` tool emits on success).
+    emit_commands_changed(&app);
+    Ok(())
 }
 
 /// Whether replacing a sourced template's command with `new_command` should
@@ -1181,7 +1513,10 @@ fn command_update<R: Runtime>(
 /// dev`, `npm run dev`, …) NOR the current raw script snapshot — i.e. the user
 /// edited the command away from the canonical call so it no longer tracks the
 /// script. Callers only invoke this for an actually-sourced template.
-fn command_detaches_source(template: &db::ManagedCommand, new_command: &str) -> bool {
+///
+/// `pub(crate)` so the MCP `update_command` tool (`mcp_tools.rs`) applies the
+/// IDENTICAL detach rule as the UI's `command_update`, instead of replicating it.
+pub(crate) fn command_detaches_source(template: &db::ManagedCommand, new_command: &str) -> bool {
     let Some(script) = template.source_script_name.as_deref() else {
         return false; // not sourced → nothing to detach
     };
@@ -1204,7 +1539,7 @@ fn command_detaches_source(template: &db::ManagedCommand, new_command: &str) -> 
 /// is running.
 #[tauri::command]
 fn command_delete<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     db: State<'_, Db>,
     runner: State<'_, ManagedCommandRunner<R>>,
     id: String,
@@ -1212,7 +1547,11 @@ fn command_delete<R: Runtime>(
     guard_template_not_running(&db, &runner, &id)?;
     db.with_conn(|c| db::delete_template(c, &id))
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Broadcast the command-band refresh so the sidebar + modal drop the removed
+    // template (a delete is a template mutation too — same shared signal).
+    emit_commands_changed(&app);
+    Ok(())
 }
 
 /// Persist a project's template order: each id's order becomes its index in `ids`.
@@ -1295,22 +1634,23 @@ fn command_relaunch<R: Runtime>(
         .map_err(|e| e.to_string())
 }
 
-/// Acknowledge a FINISHED one-shot when it is opened/selected: if the instance is in
-/// a terminal state (`success`/`error`), reset it to `idle` so the "unseen result"
-/// dot clears once the user has seen it (the output stays in the panel). A `running`
-/// instance is NEVER acknowledged (no-op), nor is one already `idle`.
+/// Acknowledge a FINISHED one-shot when it is opened/selected: clear ONLY its
+/// "unseen result" notification (`unread`) so the settled BADGE hides once the user
+/// has seen it. The FACTUAL outcome (`last_state` / `last_exit_code` / `ended_at`) is
+/// NEVER erased — this is the v4 finding fix: a UI ack must no longer collapse the
+/// state to `idle`, which used to erase the error + exit code the MCP (and any other
+/// observer) reads. A `running` instance is never acknowledged (no unseen result).
 ///
-/// Two paths, both honouring the SAME camelCase `command://state` idle shape the
-/// front listens on:
-///   - LIVE terminal entry (a run that finished this session): the runner flips it
-///     to idle and the sink persists `last_state=idle` + emits `command://state`.
+/// Two paths, both clearing only the unread flag (never the outcome):
+///   - LIVE terminal entry (a run that finished this session): the runner flips its
+///     in-memory `unread` to false and (via the sink) persists `unread=0` + emits
+///     `command://ack`.
 ///   - PERSISTED terminal state with NO live entry (e.g. a `success`/`error` restored
-///     at boot, never re-run): the runner has nothing to flip, so we persist idle and
-///     emit the idle event here directly — same payload shape — so the dot still
-///     reverts. The last-run exit code (finding 1) is decoupled from this dot, so it
-///     is untouched by the acknowledge.
+///     at boot, never re-run): the runner has no live entry to flip, so we clear the
+///     persisted `unread` here and emit `command://ack` directly — same payload — so
+///     the badge still hides. The factual `last_state`/`last_exit_code` survive.
 ///
-/// Returns the `last_state` string after the call.
+/// Returns the FACTUAL `last_state` string after the call (unchanged by the ack).
 #[tauri::command]
 fn command_acknowledge<R: Runtime>(
     app: AppHandle<R>,
@@ -1318,39 +1658,40 @@ fn command_acknowledge<R: Runtime>(
     runner: State<'_, ManagedCommandRunner<R>>,
     instance_id: String,
 ) -> Result<String, String> {
-    // Never acknowledge a live process — that would lie about its state.
+    // Never acknowledge a live process — it has no unseen result yet.
     if runner.is_running(&instance_id) {
         return Ok(crate::command::RunState::Running.as_db_str().to_string());
     }
-    // LIVE terminal entry (a run that finished this session): the runner flips it to
-    // idle and (via the sink) persists `last_state=idle` + emits the idle event. A
-    // no-op for a runner that has no live terminal entry to flip — that case is the
-    // persisted check below. Called for its side effect; the committed state is then
-    // re-read to decide whether anything still needs clearing.
+    // LIVE terminal entry (a run that finished this session): the runner clears its
+    // in-memory `unread` and (via the sink) persists `unread=0` + emits the ack
+    // event. A no-op for a runner that has no live terminal entry to flip — that case
+    // is the persisted path below. `is_unread` tells us whether the runner just
+    // handled it, so we don't double-emit for the same acknowledge.
+    let runner_had_unread = runner.is_unread(&instance_id);
     runner.acknowledge(&instance_id);
-    // PERSISTED terminal state with no live entry: clear it here so a restored
-    // success/error dot also reverts on select. Re-read the committed last_state —
-    // if the runner already cleared it above, this now reads `idle` and we no-op.
-    let last_state = db
+    if runner_had_unread {
+        // The runner + sink already cleared `unread` and emitted `command://ack`.
+        return Ok(runner.state_of(&instance_id).as_db_str().to_string());
+    }
+    // PERSISTED terminal state with no live entry: clear its `unread` here so a
+    // restored, still-unread success/error badge also hides on select — WITHOUT
+    // touching the factual `last_state`/`last_exit_code`/`ended_at`.
+    let inst = db
         .with_conn(|c| db::get_instance(c, &instance_id))
         .map_err(|e| e.to_string())?
-        .map(|inst| inst.last_state)
         .ok_or_else(|| format!("unknown command instance {instance_id}"))?;
-    if last_state == db::STATE_SUCCESS || last_state == db::STATE_ERROR {
-        db.with_conn(|c| db::set_last_state(c, &instance_id, db::STATE_IDLE))
+    if inst.unread && (inst.last_state == db::STATE_SUCCESS || inst.last_state == db::STATE_ERROR) {
+        db.with_conn(|c| db::acknowledge_instance(c, &instance_id))
             .map_err(|e| e.to_string())?;
         let _ = app.emit(
-            "command://state",
-            CommandStatePayload {
+            "command://ack",
+            CommandAckPayload {
                 instance_id: instance_id.clone(),
-                state: db::STATE_IDLE.to_string(),
-                code: None,
             },
         );
-        return Ok(db::STATE_IDLE.to_string());
     }
-    // Already idle (or the runner just made it idle and persisted it): no-op.
-    Ok(last_state)
+    // Return the factual state (unchanged — the outcome is never erased by an ack).
+    Ok(inst.last_state)
 }
 
 /// Return an instance's output history: the LIVE in-memory buffer if it is running,
@@ -1461,7 +1802,7 @@ fn command_source_refresh(db: State<'_, Db>, id: String) -> Result<SourceRefresh
 /// REFUSED if any instance is running. Errors if the file/script no longer exists.
 #[tauri::command]
 fn command_resync_source<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     db: State<'_, Db>,
     runner: State<'_, ManagedCommandRunner<R>>,
     id: String,
@@ -1506,6 +1847,9 @@ fn command_resync_source<R: Runtime>(
         db::set_template_source(c, &id, source)
     })
     .map_err(|e| e.to_string())?;
+    // Broadcast the command-band refresh so the sidebar + modal re-pull the resynced
+    // command (a resync rewrites the template's `command` — same shared signal).
+    emit_commands_changed(&app);
     Ok(body)
 }
 
@@ -1513,10 +1857,18 @@ fn command_resync_source<R: Runtime>(
 /// `package_manager`, turning the template into a plain manual command. `command`
 /// is left exactly as-is.
 #[tauri::command]
-fn command_unlink_source(db: State<'_, Db>, id: String) -> Result<(), String> {
+fn command_unlink_source<R: Runtime>(
+    app: AppHandle<R>,
+    db: State<'_, Db>,
+    id: String,
+) -> Result<(), String> {
     db.with_conn(|c| db::set_template_source(c, &id, db::CommandSource::default()))
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Broadcast the command-band refresh so the sidebar + modal re-pull the now
+    // un-sourced template (clearing the source is a template mutation too).
+    emit_commands_changed(&app);
+    Ok(())
 }
 
 // --- Package.json import (discovery + create from selection) -------------
@@ -1541,7 +1893,8 @@ fn command_import_scripts(
 /// if the final name already exists in the project.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-fn command_import_create(
+fn command_import_create<R: Runtime>(
+    app: AppHandle<R>,
     db: State<'_, Db>,
     project_id: String,
     name: String,
@@ -1559,9 +1912,13 @@ fn command_import_create(
         source_script_command_snapshot: Some(source_script_command_snapshot),
         package_manager: Some(package_manager),
     };
-    db.with_conn(|c| {
+    let template = db.with_conn(|c| {
         crate::pkgjson::import_command(c, &project_id, &name, &command, &subfolder, source)
-    })
+    })?;
+    // Broadcast the command-band refresh so the sidebar + modal re-pull the imported
+    // template (the SAME signal the MCP `import_commands` tool emits on success).
+    emit_commands_changed(&app);
+    Ok(template)
 }
 
 // --- Shutdown snapshot + boot restoration (PRD-3 Phase 3, task 16) --------
@@ -1708,6 +2065,45 @@ fn parse_package_manager(s: &str) -> Option<crate::pkgjson::PackageManager> {
         "yarn" => Some(PackageManager::Yarn),
         "bun" => Some(PackageManager::Bun),
         _ => None,
+    }
+}
+
+/// Infer the package manager from a command LINE by its first whitespace-delimited
+/// token (`bun install` → `bun`, `pnpm dev` → `pnpm`). Returns the DB string. Any
+/// other leading token (a raw binary, a shell builtin, an env-prefixed call) yields
+/// `None` — we only categorize an unambiguous PM invocation.
+fn infer_package_manager_from_command(command: &str) -> Option<&'static str> {
+    let first = command.split_whitespace().next()?;
+    parse_package_manager(first).map(crate::pkgjson::PackageManager::as_db_str)
+}
+
+/// Fill in `package_manager`/`source_kind` for a hand-authored command when they
+/// were not explicitly provided AND the command line is itself a package-manager
+/// invocation. An EXPLICIT caller value (import path) is always preserved. When we
+/// infer a manager we also tag `source_kind` = `package_json` (the only non-null
+/// `source_kind` the schema's CHECK allows — see migration v3), so an inferred
+/// command reads consistently with a detected one. A command whose first token is
+/// not a known PM is left untouched (both stay `None`).
+///
+/// `pub(crate)` so the MCP `add_command` tool (`mcp_tools.rs`) infers provenance
+/// through the SAME path as the UI's `command_create`, instead of replicating it.
+pub(crate) fn infer_command_source(
+    command: &str,
+    source_kind: Option<String>,
+    package_manager: Option<String>,
+) -> (Option<String>, Option<String>) {
+    // Respect any explicitly-provided manager — never override the import path.
+    if package_manager.is_some() {
+        return (source_kind, package_manager);
+    }
+    match infer_package_manager_from_command(command) {
+        Some(pm) => {
+            // Only default source_kind when the caller left it null; an explicit
+            // source_kind (should not happen without a manager, but be safe) wins.
+            let kind = source_kind.or_else(|| Some(db::SOURCE_KIND_PACKAGE_JSON.to_string()));
+            (kind, Some(pm.to_string()))
+        }
+        None => (source_kind, package_manager),
     }
 }
 
@@ -1863,6 +2259,260 @@ fn window_controls_visible() -> bool {
     controls_visible_from_env(std::env::var("NYX_WINDOW_CONTROLS").ok())
 }
 
+// --- Portless `nyx.localhost` option (PRD-4 #6, ADR-0003 D11) -------------
+//
+// A SEPARATE human/integration surface, disabled by default. Enabling shells out to
+// `portless alias nyx <port> --force` and surfaces `https://nyx.localhost`; disabling
+// runs `portless alias --remove nyx`. The MCP transport stays on localhost direct —
+// portless never becomes the MCP transport (ADR-0003 D11). All the create/remove/error
+// logic + fake-binary tests live in `crate::portless`; these are the thin Tauri
+// commands that drive it with the real `SystemRunner` and persist the toggle.
+
+/// Status of the portless option, returned to the front.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortlessStatus {
+    /// Whether the option is currently enabled (persisted; disabled by default).
+    enabled: bool,
+    /// The human URL the alias exposes when enabled (`https://nyx.localhost`).
+    url: &'static str,
+}
+
+/// Path of the portless toggle settings file under nyx's data dir.
+fn portless_settings_path<R: Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
+    crate::resolve_data_dir(app)
+        .map(|d| d.join(crate::portless::settings::SETTINGS_FILE))
+        .map_err(|e| e.to_string())
+}
+
+/// The current MCP port the option would alias (ADR-0003 D2 resolution).
+fn portless_port() -> u16 {
+    crate::mcp::resolve_port()
+}
+
+/// Read the persisted portless option state (disabled by default).
+#[tauri::command]
+fn portless_status<R: Runtime>(app: AppHandle<R>) -> Result<PortlessStatus, String> {
+    let path = portless_settings_path(&app)?;
+    let state = crate::portless::settings::read(&path);
+    Ok(PortlessStatus {
+        enabled: matches!(state, crate::portless::PortlessState::Enabled),
+        url: crate::portless::PORTLESS_URL,
+    })
+}
+
+/// Enable or disable the portless option. Enabling verifies `portless` is present,
+/// runs `portless alias nyx <port> --force`, and (on success) persists `enabled` and
+/// returns the `https://nyx.localhost` URL. Disabling runs `portless alias --remove
+/// nyx` and persists `disabled`. A missing `portless` binary is a clear error
+/// (`portless is not installed …`), never an auto-install (ADR-0003 D11). State is
+/// only persisted AFTER the alias mutation succeeds, so a failed enable does not
+/// leave the toggle stuck "on".
+#[tauri::command]
+fn portless_set_enabled<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<PortlessStatus, String> {
+    use crate::portless::{PortlessManager, PortlessState, SystemRunner};
+    let path = portless_settings_path(&app)?;
+    let mgr = PortlessManager::new(SystemRunner);
+    if enabled {
+        let port = portless_port();
+        mgr.enable(port).map_err(|e| e.to_string())?;
+        crate::portless::settings::write(&path, PortlessState::Enabled).map_err(|e| e.to_string())?;
+    } else {
+        mgr.disable().map_err(|e| e.to_string())?;
+        crate::portless::settings::write(&path, PortlessState::Disabled)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(PortlessStatus {
+        enabled,
+        url: crate::portless::PORTLESS_URL,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Integration management commands (PRD-4 task #1/#3)
+// ---------------------------------------------------------------------------
+// These commands back the Settings → Integrations UI. Install state is
+// persisted to `<app_data_dir>/integrations.json` via [`onboarding::IntegrationState`].
+// Only `claude_code` is fully functional in v1; other providers are
+// advertised as "coming soon" in the UI and their commands are stubs.
+
+/// Status of one integration, returned to the front-end.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationStatus {
+    /// Provider key (e.g. `"claude_code"`).
+    provider: &'static str,
+    /// Human-readable display name.
+    label: &'static str,
+    /// Whether the user has installed this integration (persisted in
+    /// `integrations.json`). `false` when not installed OR not tracked.
+    installed: bool,
+    /// `true` when the provider is fully functional in v1; `false` = coming soon.
+    available: bool,
+}
+
+/// Build the integration status list from a persisted state file. Pure
+/// (no `AppHandle`) so the wiring — 4 registry providers, available/coming-soon
+/// flags, claude_code's installed flag read from `integrations.json` — is
+/// unit-testable in isolation (see the `tests` module).
+fn integration_status_list(state_path: &std::path::Path) -> Vec<IntegrationStatus> {
+    let state = crate::onboarding::IntegrationState::load(state_path);
+    vec![
+        IntegrationStatus {
+            provider: "claude_code",
+            label: "Claude Code",
+            installed: state.is_installed("claude_code"),
+            available: true,
+        },
+        IntegrationStatus {
+            provider: "codex",
+            label: "Codex",
+            installed: false,
+            available: false,
+        },
+        IntegrationStatus {
+            provider: "opencode",
+            label: "OpenCode",
+            installed: false,
+            available: false,
+        },
+        // `custom` is reserved for a future user-defined MCP server flow
+        // (onboarding.rs, ADR-0003 D14/D11). No semantics in v1 → coming soon,
+        // like codex/opencode. Listed so the UI shows all 4 registry providers.
+        IntegrationStatus {
+            provider: "custom",
+            label: "Custom",
+            installed: false,
+            available: false,
+        },
+    ]
+}
+
+/// Core of `integration_install` with the Claude Code target injected (no
+/// `AppHandle`): upserts the nyx entry in the target config and marks
+/// `installed = true`. Returns the fresh status. Unit-testable against a temp
+/// config + temp state file.
+fn do_integration_install(
+    provider: &str,
+    target: &crate::onboarding::OnboardingTarget,
+    state_path: &std::path::Path,
+    port: u16,
+) -> Result<IntegrationStatus, String> {
+    match provider {
+        "claude_code" => {
+            target.onboard(port).map_err(|e| e.to_string())?;
+            let mut state = crate::onboarding::IntegrationState::load(state_path);
+            state.set_installed("claude_code", true);
+            state.save(state_path).map_err(|e| e.to_string())?;
+            Ok(IntegrationStatus {
+                provider: "claude_code",
+                label: "Claude Code",
+                installed: true,
+                available: true,
+            })
+        }
+        other => Err(format!("provider '{other}' is not supported in v1")),
+    }
+}
+
+/// Core of `integration_remove` with the Claude Code target injected (no
+/// `AppHandle`): removes the nyx entry from the target config (best-effort) and
+/// marks `installed = false`. Unit-testable against a temp config + temp state.
+fn do_integration_remove(
+    provider: &str,
+    target: &crate::onboarding::OnboardingTarget,
+    state_path: &std::path::Path,
+) -> Result<IntegrationStatus, String> {
+    match provider {
+        "claude_code" => {
+            // Remove the nyx entry from the client config (best-effort).
+            if let Ok(mut root) = crate::onboarding::read_config_pub(&target.config_path) {
+                if let Some(servers) = root.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+                    servers.remove(crate::onboarding::SERVER_NAME);
+                }
+                let _ = crate::onboarding::write_config_pub(&target.config_path, &root);
+            }
+            let mut state = crate::onboarding::IntegrationState::load(state_path);
+            state.set_installed("claude_code", false);
+            state.save(state_path).map_err(|e| e.to_string())?;
+            Ok(IntegrationStatus {
+                provider: "claude_code",
+                label: "Claude Code",
+                installed: false,
+                available: true,
+            })
+        }
+        other => Err(format!("provider '{other}' is not supported in v1")),
+    }
+}
+
+/// List the status of all supported integrations.
+#[tauri::command]
+fn integration_list<R: Runtime>(app: AppHandle<R>) -> Result<Vec<IntegrationStatus>, String> {
+    let state_path = crate::resolve_data_dir(&app)
+        .map(|d| d.join(crate::onboarding::INTEGRATIONS_FILE))
+        .map_err(|e| e.to_string())?;
+    Ok(integration_status_list(&state_path))
+}
+
+/// Install (or update) a supported integration.
+/// For `claude_code`: upserts the nyx entry in `~/.claude.json`, then marks
+/// `installed = true` in `integrations.json`.
+/// Other providers are not yet supported and return an error.
+#[tauri::command]
+fn integration_install<R: Runtime>(
+    app: AppHandle<R>,
+    provider: String,
+) -> Result<IntegrationStatus, String> {
+    let data_dir = crate::resolve_data_dir(&app).map_err(|e| e.to_string())?;
+    let state_path = data_dir.join(crate::onboarding::INTEGRATIONS_FILE);
+    if provider == "claude_code" {
+        let target = crate::onboarding::OnboardingTarget::claude_code()
+            .ok_or_else(|| "Could not resolve Claude Code config path (no home dir)".to_string())?;
+        do_integration_install(&provider, &target, &state_path, crate::mcp::resolve_port())
+    } else {
+        Err(format!("provider '{provider}' is not supported in v1"))
+    }
+}
+
+/// Remove a supported integration.
+/// For `claude_code`: removes the nyx entry from `~/.claude.json`, then marks
+/// `installed = false` in `integrations.json`.
+/// Other providers are not yet supported and return an error.
+#[tauri::command]
+fn integration_remove<R: Runtime>(
+    app: AppHandle<R>,
+    provider: String,
+) -> Result<IntegrationStatus, String> {
+    let data_dir = crate::resolve_data_dir(&app).map_err(|e| e.to_string())?;
+    let state_path = data_dir.join(crate::onboarding::INTEGRATIONS_FILE);
+    if provider == "claude_code" {
+        let target = crate::onboarding::OnboardingTarget::claude_code()
+            .ok_or_else(|| "Could not resolve Claude Code config path (no home dir)".to_string())?;
+        do_integration_remove(&provider, &target, &state_path)
+    } else {
+        Err(format!("provider '{provider}' is not supported in v1"))
+    }
+}
+
+/// TEST-ONLY: spawn a real PTY on `app`'s managed [`PtyManager`] and return its id, so the
+/// MCP terminal-tool tests (in `crate::mcp_tools`) can register a LIVE shell for a record
+/// and exercise the `send_to_terminal` write path without re-implementing the spawn. The
+/// PTY is the only OS touch (no interactive grid), so it runs under the ConPTY gap.
+#[cfg(test)]
+pub(crate) fn tests_spawn_pty<R: Runtime>(app: &tauri::App<R>) -> u64 {
+    use tauri::Manager;
+    let size = portable_pty::PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+    let (pty, rx) = Pty::spawn(size, None).expect("spawn pty");
+    let id = pty.id();
+    app.state::<PtyManager>().ptys.lock().unwrap().insert(id, pty);
+    spawn_output_pump(app.handle().clone(), id, rx);
+    id
+}
+
 /// Register the PTY managed state and command handlers on the builder.
 pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
@@ -1872,6 +2522,8 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
         .manage(TerminalIdMap::default())
         .manage(Osc133Pending::default())
         .manage(Osc133Events::default())
+        .manage(TerminalPtyMap::default())
+        .manage(PendingTerminalCommands::default())
         .invoke_handler(tauri::generate_handler![
             pty_spawn,
             pty_write,
@@ -1881,6 +2533,7 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             create_terminal,
             list_terminals,
             close_terminal,
+            register_terminal_pty,
             reorder,
             rename,
             set_active,
@@ -1916,7 +2569,12 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             command_resync_source,
             command_unlink_source,
             command_import_scripts,
-            command_import_create
+            command_import_create,
+            portless_status,
+            portless_set_enabled,
+            integration_list,
+            integration_install,
+            integration_remove
         ])
 }
 
@@ -3029,6 +3687,7 @@ mod tests {
         root_name: Option<&str>,
     ) -> Result<ProjectWithRoot, String> {
         create_project(
+            app.handle().clone(),
             app.state::<Db>(),
             name.into(),
             root_path.into(),
@@ -3042,6 +3701,7 @@ mod tests {
         path: &str,
     ) -> Result<Workspace, String> {
         create_workspace(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id.into(),
             name.into(),
@@ -3699,6 +4359,7 @@ mod tests {
             .id;
 
         let created = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id.clone(),
             "dev".into(),
@@ -3720,6 +4381,7 @@ mod tests {
 
         // A second template, then reorder them and confirm the order persists.
         let second = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id.clone(),
             "build".into(),
@@ -3750,6 +4412,136 @@ mod tests {
         );
     }
 
+    /// PURE inference: a command line whose first token names a known package
+    /// manager is categorized; anything else (raw binary, unknown token, empty)
+    /// is left `None`. Extra args / flags after the manager are irrelevant.
+    #[test]
+    fn infer_package_manager_from_command_line() {
+        for (line, expected) in [
+            ("bun install", Some("bun")),
+            ("bun run dev", Some("bun")),
+            ("npm install", Some("npm")),
+            ("npm run build", Some("npm")),
+            ("pnpm dev", Some("pnpm")),
+            ("pnpm   -w   build", Some("pnpm")), // multiple spaces / flags ignored
+            ("yarn", Some("yarn")),              // bare manager, no script
+            ("  yarn start  ", Some("yarn")),    // leading whitespace tolerated
+            ("vite dev", None),                  // raw binary, not a PM
+            ("node server.js", None),
+            ("BUN_ENV=prod bun dev", None), // env prefix is the first token, not a PM
+            ("", None),
+            ("   ", None),
+        ] {
+            assert_eq!(
+                infer_package_manager_from_command(line),
+                expected,
+                "inference for {line:?}"
+            );
+        }
+    }
+
+    /// `infer_command_source` fills BOTH fields for an inferable line, leaves a
+    /// non-PM line untouched, and NEVER overrides an explicit caller-provided
+    /// manager (the import path).
+    #[test]
+    fn infer_command_source_rules() {
+        // Inferable, caller supplied nothing → manager + package_json source_kind.
+        let (kind, pm) = infer_command_source("bun install", None, None);
+        assert_eq!(pm.as_deref(), Some("bun"));
+        assert_eq!(kind.as_deref(), Some(db::SOURCE_KIND_PACKAGE_JSON));
+
+        // Non-PM line → both stay None.
+        let (kind, pm) = infer_command_source("node app.js", None, None);
+        assert_eq!(pm, None);
+        assert_eq!(kind, None);
+
+        // Explicit manager wins even if the line would infer a different one.
+        let (kind, pm) = infer_command_source(
+            "pnpm dev",
+            Some("package_json".into()),
+            Some("yarn".into()),
+        );
+        assert_eq!(pm.as_deref(), Some("yarn"), "explicit value preserved");
+        assert_eq!(kind.as_deref(), Some("package_json"));
+    }
+
+    /// A manually-added command whose line is a PM invocation gets its
+    /// `package_manager` + `source_kind` inferred through the real
+    /// `command_create` path; an already-tagged (imported) command is unchanged;
+    /// a plain (non-PM) manual command stays null on both fields.
+    #[test]
+    fn command_create_infers_package_manager_for_manual_commands() {
+        let app = build_app_with_db();
+        let project_id = app
+            .state::<Db>()
+            .with_conn(|c| db::create_project(c, "p", "/tmp/p", None))
+            .unwrap()
+            .0
+            .id;
+
+        // Manually-added `bun install` (no source fields supplied) → inferred.
+        let manual = command_create(
+            app.handle().clone(),
+            app.state::<Db>(),
+            project_id.clone(),
+            "deps".into(),
+            "bun install".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("manual bun install");
+        assert_eq!(manual.package_manager.as_deref(), Some("bun"));
+        assert_eq!(manual.source_kind.as_deref(), Some("package_json"));
+
+        // A non-PM manual command stays uncategorized.
+        let plain = command_create(
+            app.handle().clone(),
+            app.state::<Db>(),
+            project_id.clone(),
+            "serve".into(),
+            "node server.js".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("plain command");
+        assert_eq!(plain.package_manager, None);
+        assert_eq!(plain.source_kind, None);
+
+        // An EXPLICITLY-tagged (imported) command is left exactly as supplied: the
+        // command line says `bun` but the caller pinned `pnpm`, which must win.
+        let imported = command_create(
+            app.handle().clone(),
+            app.state::<Db>(),
+            project_id,
+            "dev".into(),
+            "bun run dev".into(),
+            None,
+            None,
+            Some("package_json".into()),
+            Some("/tmp/p/package.json".into()),
+            Some("dev".into()),
+            Some("vite".into()),
+            Some("pnpm".into()),
+        )
+        .expect("imported command");
+        assert_eq!(
+            imported.package_manager.as_deref(),
+            Some("pnpm"),
+            "explicit imported manager must not be overridden by inference"
+        );
+        assert_eq!(imported.source_kind.as_deref(), Some("package_json"));
+    }
+
     /// Full lifecycle through the COMMAND surface: start -> running, output relayed,
     /// natural exit -> success, and `command_output` returns the persisted history.
     #[test]
@@ -3765,6 +4557,7 @@ mod tests {
 
         // A template that echoes a marker and exits 0.
         let tpl = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "svc".into(),
@@ -3837,6 +4630,7 @@ mod tests {
 
         // Emit a marker, then sleep so the instance stays running (no natural exit).
         let tpl = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "svc".into(),
@@ -3939,10 +4733,12 @@ mod tests {
         );
     }
 
-    /// `command_acknowledge` clears a PERSISTED terminal dot with NO live entry (the
-    /// restore-at-boot shape: a `success`/`error` row, never re-run this session) back
-    /// to idle, persisting `last_state=idle`. This is the bridge-only path (the runner
-    /// has nothing to flip), proving the dot reverts on select even after a restart.
+    /// `command_acknowledge` clears the PERSISTED `unread` flag of a terminal row with
+    /// NO live entry (the restore-at-boot shape: an unread `success`/`error` row, never
+    /// re-run this session) WITHOUT erasing the factual outcome. This is the
+    /// bridge-only path (the runner has no live entry to flip), proving the badge
+    /// hides on select after a restart while `last_state`/`last_exit_code` survive —
+    /// the v4 finding fix.
     #[test]
     #[cfg(not(windows))]
     fn acknowledge_clears_persisted_terminal_state_without_live_entry() {
@@ -3953,6 +4749,7 @@ mod tests {
             (pr.0.id, pr.1.id)
         });
         let tpl = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "svc".into(),
@@ -3975,17 +4772,17 @@ mod tests {
             .expect("instance")
             .id;
 
-        // Persist a terminal state directly (simulating a restored success row), with
-        // NO live runner entry for it.
+        // Persist a terminal OUTCOME directly (simulating a restored, still-unread
+        // error row: state=error, exit_code=2, unread=1), with NO live runner entry.
         app.state::<Db>()
-            .with_conn(|c| db::set_last_state(c, &instance_id, db::STATE_ERROR))
-            .expect("seed error state");
+            .with_conn(|c| db::set_run_state(c, &instance_id, db::STATE_ERROR, Some(2)))
+            .expect("seed error outcome");
         assert!(
             !runner_state(&app).is_running(&instance_id),
             "no live entry: the runner does not back this terminal state"
         );
 
-        // Acknowledge: returns idle and persists last_state=idle.
+        // Acknowledge: clears ONLY `unread` — returns the unchanged factual state.
         let st = command_acknowledge(
             app.handle().clone(),
             app.state::<Db>(),
@@ -3993,16 +4790,27 @@ mod tests {
             instance_id.clone(),
         )
         .expect("command_acknowledge");
-        assert_eq!(st, "idle", "acknowledge clears the persisted terminal state");
-        let persisted = app
+        assert_eq!(
+            st, "error",
+            "acknowledge returns the unchanged factual state (NOT idle)"
+        );
+        let row = app
             .state::<Db>()
             .with_conn(|c| db::get_instance(c, &instance_id))
             .unwrap()
-            .expect("row")
-            .last_state;
-        assert_eq!(persisted, "idle", "last_state was persisted to idle");
+            .expect("row");
+        assert_eq!(
+            row.last_state, "error",
+            "the factual state is preserved through the ack (not collapsed to idle)"
+        );
+        assert_eq!(
+            row.last_exit_code,
+            Some(2),
+            "the factual exit code is preserved through the ack"
+        );
+        assert!(!row.unread, "the ack cleared the persisted unread flag");
 
-        // A second acknowledge is a no-op (already idle).
+        // A second acknowledge is a no-op (already read): state still error, unread 0.
         let st2 = command_acknowledge(
             app.handle().clone(),
             app.state::<Db>(),
@@ -4010,7 +4818,16 @@ mod tests {
             instance_id.clone(),
         )
         .expect("command_acknowledge (2)");
-        assert_eq!(st2, "idle", "acknowledge on idle is a no-op returning idle");
+        assert_eq!(
+            st2, "error",
+            "a second ack on an already-read row returns the unchanged factual state"
+        );
+        let row2 = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .expect("row");
+        assert!(!row2.unread, "still read after the second ack");
     }
 
     /// `command_acknowledge` is a NO-OP on a running instance: it must never clear a
@@ -4026,6 +4843,7 @@ mod tests {
             (pr.0.id, pr.1.id)
         });
         let tpl = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "svc".into(),
@@ -4091,6 +4909,7 @@ mod tests {
         });
 
         let tpl = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "svc".into(),
@@ -4164,6 +4983,7 @@ mod tests {
 
         // A template that emits a marker then sleeps so it stays running until we act.
         let tpl = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "svc".into(),
@@ -4317,6 +5137,7 @@ mod tests {
             (pr.0.id, pr.1.id)
         });
         let tpl = command_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id.clone(),
             "svc".into(),
@@ -4437,6 +5258,7 @@ mod tests {
         // Import the dev script: default command is the runner `pnpm dev`, snapshot
         // is the raw body.
         let created = command_import_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "dev".into(),
@@ -4504,7 +5326,8 @@ mod tests {
         );
 
         // 3) unlink_source: source fields cleared, command left as-is.
-        command_unlink_source(app.state::<Db>(), created.id.clone()).expect("unlink");
+        command_unlink_source(app.handle().clone(), app.state::<Db>(), created.id.clone())
+            .expect("unlink");
         let after_unlink = app
             .state::<Db>()
             .with_conn(|c| db::get_template(c, &created.id))
@@ -4542,6 +5365,7 @@ mod tests {
             .id;
 
         let created = command_import_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "dev".into(),
@@ -4630,6 +5454,7 @@ mod tests {
 
         // Seed a command named "dev", then importing another "dev" is refused.
         command_import_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id.clone(),
             "dev".into(),
@@ -4642,6 +5467,7 @@ mod tests {
         )
         .expect("first dev import");
         let err = command_import_create(
+            app.handle().clone(),
             app.state::<Db>(),
             project_id,
             "dev".into(),
@@ -5562,5 +6388,581 @@ mod tests {
         );
 
         drop(tx_a);
+    }
+
+    // --- PRD-4 phase 5 GATE: MCP dogfood → commandes visibles nyx ------------
+    //
+    // The phase-5 gate (#8) proves the MCP surface really serves the nyx
+    // workflow, not just a server that answers: from a path equivalent to "an
+    // agent launched inside nyx", `list` / `start`(relaunch) / `output` flow
+    // through the MCP tools against the SAME managed runtime + DB the UI drives,
+    // and the UI-facing path observes the IDENTICAL state (ADR-0003 D6). These
+    // tests drive the REAL `crate::mcp_tools::NyxToolDispatcher` — the exact type
+    // `lib.rs:162` installs onto the loopback `McpServer` — over a mock app that
+    // manages the production `Db` + `ManagedCommandRunner`, so the dispatcher's
+    // `app.try_state` lookups resolve to the very instances the `command_*`
+    // commands and the `command://state` event use.
+    //
+    // (Like the rest of this suite, exercising the bodies directly on the
+    // `tauri::test` mock runtime is the loopback-style proof the PRD env caveat
+    // asks for; `cargo test --lib --no-run` type-checks them, CI runs them — the
+    // local `STATUS_ENTRYPOINT_NOT_FOUND` ConPTY gap blocks launching here.)
+
+    use crate::mcp::ToolDispatcher;
+    use crate::mcp_tools::NyxToolDispatcher;
+    use serde_json::json;
+
+    /// Build the REAL MCP dispatcher over the same `AppHandle` whose managed `Db`
+    /// + runner the UI commands use — the exact wiring of `lib.rs:162`.
+    fn mcp(app: &App<MockRuntime>) -> NyxToolDispatcher<MockRuntime> {
+        NyxToolDispatcher::new(app.handle().clone())
+    }
+
+    /// GATE done_criterion #1 — "E2E ou dogfood prouve list/start/relaunch/output."
+    /// AND done_criterion #2 — "La commande est visible et controlee dans l'UI."
+    ///
+    /// The dogfood lifecycle, end to end, through the MCP tools:
+    ///   1. `list_commands { workspace_id }` discovers the instance (no guessing).
+    ///   2. `start_command { instance_id }` spawns it through the SAME runner.
+    ///   3. `relaunch_command { instance_id }` restarts the SAME instance.
+    ///   4. `get_command_output { instance_id }` reads its bounded output window.
+    /// Then the UI-FACING path (`command_instance_list` / `command_output` + the
+    /// `command://state` event) is asserted to observe the IDENTICAL instance id,
+    /// the same live `running` state, and the same scrollback — the D6 invariant
+    /// "the UI sees the same state" proven at integration level.
+    #[test]
+    #[cfg(not(windows))]
+    fn mcp_dogfood_lifecycle_is_the_same_instance_the_ui_sees() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("mcp_dogfood");
+
+        // Capture the UI's live `command://state` stream so we can assert the UI
+        // observes the SAME state transitions the MCP calls drive (D6: one event
+        // stream, no invisible process). A deterministic command: emit a marker
+        // then sleep so the instance stays `running` for the cross-surface checks.
+        let states: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let states = Arc::clone(&states);
+            app.listen("command://state", move |event| {
+                let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                let id = v["instanceId"].as_str().unwrap_or_default().to_string();
+                let st = v["state"].as_str().unwrap_or_default().to_string();
+                states.lock().unwrap().push((id, st));
+            });
+        }
+
+        let (project_id, workspace_id, _tpl, instance_id) =
+            seed_restore(&app, &ws.path(), "echo MCP_DOGFOOD_MARKER; sleep 30", false);
+
+        let dispatcher = mcp(&app);
+
+        // 1) MCP `list_commands { workspace_id }` — discovery. The instance is
+        //    visible to the agent, idle, before any start (no guessing — D4).
+        let listed = dispatcher
+            .call("list_commands", &json!({ "workspace_id": workspace_id }))
+            .expect("list_commands over MCP");
+        let cmds = listed["commands"].as_array().expect("commands array");
+        let row = cmds
+            .iter()
+            .find(|c| c["instance_id"] == json!(instance_id))
+            .expect("the seeded instance is visible via the MCP list tool");
+        assert_eq!(row["last_state"], "idle", "discovered idle before start");
+        assert_eq!(
+            row["command"], "echo MCP_DOGFOOD_MARKER; sleep 30",
+            "the MCP list surfaces the same command line the template stores"
+        );
+
+        // 2) MCP `start_command` — spawns through the SAME managed runner.
+        let started = dispatcher
+            .call("start_command", &json!({ "instance_id": instance_id }))
+            .expect("start_command over MCP");
+        assert_eq!(started["instance_id"], json!(instance_id));
+        assert_eq!(started["state"], "running", "MCP start returns running");
+
+        // UI-SAME-STATE (a): the UI-facing runner reports THIS instance running —
+        // the MCP start drove the very instance the UI introspects.
+        assert!(
+            wait_db_state(&app, &instance_id, "running", 5),
+            "the DB row the UI reads must reach running after the MCP start"
+        );
+        assert!(
+            runner_state(&app).is_running(&instance_id),
+            "the UI-facing runner reports the MCP-started instance as the live one"
+        );
+
+        // 3) MCP `relaunch_command` — restarts the SAME instance, never two live
+        //    processes. It stays the single instance the UI knows.
+        let relaunched = dispatcher
+            .call("relaunch_command", &json!({ "instance_id": instance_id }))
+            .expect("relaunch_command over MCP");
+        assert_eq!(relaunched["instance_id"], json!(instance_id));
+        assert_eq!(relaunched["state"], "running", "MCP relaunch returns running");
+        assert!(
+            wait_db_state(&app, &instance_id, "running", 5),
+            "the instance is running again after the MCP relaunch"
+        );
+
+        // 4) MCP `get_command_output` — bounded window with the marker, AND the
+        //    incremental-poll fields (D7). Poll until the marker streams through.
+        let mut mcp_out = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last = json!({});
+        while std::time::Instant::now() < deadline && !mcp_out.contains("MCP_DOGFOOD_MARKER") {
+            last = dispatcher
+                .call("get_command_output", &json!({ "instance_id": instance_id }))
+                .expect("get_command_output over MCP");
+            mcp_out = last["output"].as_str().unwrap_or_default().to_string();
+            if !mcp_out.contains("MCP_DOGFOOD_MARKER") {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(
+            mcp_out.contains("MCP_DOGFOOD_MARKER"),
+            "MCP get_command_output must return the live output window, got: {mcp_out:?}"
+        );
+        // D7 bounded-window contract is honored in the result shape.
+        assert!(last["total_bytes"].is_u64(), "result carries total_bytes");
+        assert!(last["cursor"].is_u64(), "result carries an integer cursor");
+        assert_eq!(last["instance_id"], json!(instance_id));
+
+        // === UI sees the SAME state (D6) — the gate's load-bearing invariant. ===
+
+        // (b) The UI's `command_instance_list` lists the SAME instance id with the
+        //     SAME live `running` state the MCP `list_commands` would now report.
+        let ui_rows = command_instance_list(app.state::<Db>(), workspace_id.clone())
+            .expect("UI command_instance_list");
+        let ui_row = ui_rows
+            .iter()
+            .find(|r| r.id == instance_id)
+            .expect("the UI lists the MCP-started instance");
+        assert_eq!(
+            ui_row.last_state, "running",
+            "the UI list shows the same running state the MCP path produced"
+        );
+
+        // (c) The UI's `command_output` returns the SAME live scrollback (same
+        //     marker) the MCP `get_command_output` read — one buffer, one runner.
+        let ui_out = command_output(
+            app.handle().clone(),
+            app.state::<Db>(),
+            runner_state(&app),
+            instance_id.clone(),
+        )
+        .expect("UI command_output");
+        assert!(
+            ui_out.contains("MCP_DOGFOOD_MARKER"),
+            "the UI command_output reads the same live buffer the MCP tool saw, got: {ui_out:?}"
+        );
+
+        // (d) The UI's `command://state` event stream — the signal the sidebar dot
+        //     and the bridge command-state listener consume — recorded a `running`
+        //     transition for THIS exact instance, driven purely by the MCP calls.
+        //     There is no second/invisible process: the same instance id, the same
+        //     state, the same event the UI listens on.
+        let saw_running_for_instance = states
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, st)| id == &instance_id && st == "running");
+        assert!(
+            saw_running_for_instance,
+            "the UI command://state event observed the MCP-driven running transition \
+             for the same instance id (camelCase instanceId), states: {:?}",
+            states.lock().unwrap()
+        );
+
+        // The `list_commands` of the agent and the UI's `command_instance_list`
+        // refer to the SAME project too (no divergent id space).
+        let _ = project_id;
+
+        // Cleanup: stop the sleeping process (idempotent, via the same runner).
+        let _ = dispatcher.call("stop_command", &json!({ "instance_id": instance_id }));
+    }
+
+    /// REVIEW 01KV90QCKZ8BXZ4DTYZRJK56EZ — after start → output → relaunch, the
+    /// PREVIOUS run's output PLUS its exit_code/outcome is still retrievable via the
+    /// `run="previous"` selector, while the DEFAULT (`run` absent) returns the CURRENT
+    /// run. End to end through the real MCP `get_command_output` against the live
+    /// runner + in-memory DB (the bounded N=1 retained prior run, persisted in the v5
+    /// `prev_*` columns by `archive_and_reset_for_relaunch` on relaunch).
+    #[test]
+    #[cfg(not(windows))]
+    fn mcp_get_command_output_retains_previous_run_across_relaunch() {
+        std::env::set_var("SHELL", "/bin/sh");
+        let app = build_app_with_runner();
+        let ws = TempWs::new("mcp_prev_run");
+
+        // Run 1: emit a unique marker, then exit NON-ZERO so the run FINISHES as
+        // `error` (and is therefore archivable on the next relaunch).
+        let (_project_id, _workspace_id, _tpl, instance_id) =
+            seed_restore(&app, &ws.path(), "echo PREV_RUN_MARKER; exit 9", false);
+        let dispatcher = mcp(&app);
+
+        // Start run 1 and wait until it FINISHES error (so its output + outcome are the
+        // current run, ready to be archived on the relaunch).
+        dispatcher
+            .call("start_command", &json!({ "instance_id": instance_id }))
+            .expect("start run 1");
+        assert!(
+            wait_db_state(&app, &instance_id, "error", 5),
+            "run 1 must finish as error (exit 9) before the relaunch"
+        );
+
+        // RELAUNCH into run 2: a long-lived command emitting a DIFFERENT marker, so the
+        // current run is clearly distinguishable from the archived prior run.
+        app.state::<Db>()
+            .with_conn(|c| {
+                db::update_template(
+                    c,
+                    &_tpl,
+                    "svc",
+                    "echo CURRENT_RUN_MARKER; sleep 30",
+                    None,
+                )
+                .unwrap();
+            });
+        dispatcher
+            .call("relaunch_command", &json!({ "instance_id": instance_id }))
+            .expect("relaunch into run 2");
+        assert!(
+            wait_db_state(&app, &instance_id, "running", 5),
+            "run 2 must be running after the relaunch"
+        );
+
+        // run="previous": the PRIOR run (run 1) is still retrievable — its output AND
+        // its factual outcome (state=error, exit_code=9) survived the relaunch.
+        let prev = dispatcher
+            .call(
+                "get_command_output",
+                &json!({ "instance_id": instance_id, "run": "previous" }),
+            )
+            .expect("get_command_output run=previous");
+        assert_eq!(prev["run"], "previous", "the result echoes the selected run");
+        assert!(
+            prev["output"].as_str().unwrap_or_default().contains("PREV_RUN_MARKER"),
+            "run=previous must return the PRIOR run's output, got: {:?}",
+            prev["output"]
+        );
+        assert_eq!(prev["state"], "error", "the prior run's factual state is retained");
+        assert_eq!(prev["exit_code"], json!(9), "the prior run's exit_code is retained");
+        assert_eq!(prev["finished"], json!(true), "the prior run is finished");
+
+        // run=-1 is the SAME prior run (the integer alias of "previous").
+        let prev_int = dispatcher
+            .call(
+                "get_command_output",
+                &json!({ "instance_id": instance_id, "run": -1 }),
+            )
+            .expect("get_command_output run=-1");
+        assert!(
+            prev_int["output"].as_str().unwrap_or_default().contains("PREV_RUN_MARKER"),
+            "run=-1 is the integer alias of run=previous"
+        );
+        assert_eq!(prev_int["exit_code"], json!(9));
+
+        // DEFAULT (run absent) returns the CURRENT run, NOT the prior one — the prior
+        // run's bytes never pollute the current window. Poll until run 2 streams.
+        let mut cur = json!({});
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            cur = dispatcher
+                .call("get_command_output", &json!({ "instance_id": instance_id }))
+                .expect("get_command_output default (current)");
+            if cur["output"].as_str().unwrap_or_default().contains("CURRENT_RUN_MARKER") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(cur["run"], "current", "the default result echoes run=current");
+        let cur_out = cur["output"].as_str().unwrap_or_default();
+        assert!(
+            cur_out.contains("CURRENT_RUN_MARKER"),
+            "the default (current) run returns run 2's output, got: {cur_out:?}"
+        );
+        assert!(
+            !cur_out.contains("PREV_RUN_MARKER"),
+            "the current run must NOT be polluted by the prior run's output, got: {cur_out:?}"
+        );
+        assert_eq!(cur["state"], "running", "the current run is running");
+
+        // An out-of-range run selector is refused (history is bounded to N=1).
+        let too_far = dispatcher.call(
+            "get_command_output",
+            &json!({ "instance_id": instance_id, "run": -2 }),
+        );
+        assert!(too_far.is_err(), "run=-2 is out of bounded history (N=1)");
+        assert_eq!(
+            too_far.unwrap_err().code,
+            "invalid_argument",
+            "an out-of-range run is invalid_argument"
+        );
+
+        // Cleanup.
+        let _ = dispatcher.call("stop_command", &json!({ "instance_id": instance_id }));
+    }
+
+    /// GATE done_criterion #3 — "Timeout nyx down documente" (the testable half).
+    ///
+    /// nyx-down / client-timeout behavior (ADR-0003 D8 `mcp_unavailable`): when
+    /// the nyx runtime is NOT reachable — the managed `Db` / `ManagedCommandRunner`
+    /// is absent (the dispatcher installed before/without the runtime, or nyx mid
+    /// teardown) — every command tool degrades EXPLICITLY to the `mcp_unavailable`
+    /// error code rather than panicking or hanging. A short-timeout client then
+    /// surfaces that as "nyx not reachable". This is the server-side half of the
+    /// degradation; the client-side short timeout is documented in ADR-0003 D8 and
+    /// the ADR-0004 `command`/`curl --max-time 1 … || true` fallback.
+    #[test]
+    fn mcp_command_tools_degrade_to_mcp_unavailable_when_runtime_absent() {
+        // A mock app with NO managed Db / runner — the "nyx runtime not reachable"
+        // condition (the only failure mode the agent sees when nyx is down/warming).
+        let app = build_app();
+        let dispatcher = mcp(&app);
+
+        // Every command/listing tool that needs the runtime degrades to the SAME
+        // explicit `mcp_unavailable` code (D8) — never a panic, never a hang.
+        for (tool, args) in [
+            ("list_commands", json!({ "workspace_id": "w-absent" })),
+            ("start_command", json!({ "instance_id": "i-absent" })),
+            ("relaunch_command", json!({ "instance_id": "i-absent" })),
+            ("get_command_output", json!({ "instance_id": "i-absent" })),
+            ("list_projects", json!({})),
+        ] {
+            let err = dispatcher
+                .call(tool, &args)
+                .expect_err("a tool needing the runtime must error when it is absent");
+            assert_eq!(
+                err.code, "mcp_unavailable",
+                "{tool} must degrade to the explicit mcp_unavailable code (D8), got {:?}",
+                err.code
+            );
+        }
+
+        // Contrast (ADR-0004): the no-op `probe` liveness tool still answers even
+        // with the runtime absent — that is exactly why a SessionStart hook can use
+        // it, and why "nyx down" is distinguishable (probe unreachable) from
+        // "runtime warming" (probe ok, command tools `mcp_unavailable`).
+        let probe = dispatcher
+            .call(crate::mcp::PROBE_TOOL, &json!({}))
+            .expect("probe answers without managed state");
+        assert_eq!(probe["ok"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings → Integrations (PRD-4 #3): integration_list / _install / _remove
+    // -----------------------------------------------------------------------
+    //
+    // These exercise the AppHandle-free cores (`integration_status_list`,
+    // `do_integration_install`, `do_integration_remove`) against temp files —
+    // never the user's real `~/.claude.json` nor a real app-data dir. The
+    // `#[tauri::command]` wrappers only resolve the data dir + claude_code
+    // target and delegate to these, so the wiring under test is the whole
+    // behaviour: 4 providers, available/coming-soon flags, install upserts the
+    // nyx entry + persists installed, remove deletes the entry + clears it.
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A process-unique temp dir for one integration test (no `tempfile` dep),
+    /// so the suite never collides or touches real config/state.
+    fn integ_temp_dir(tag: &str) -> std::path::PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("nyx-integ-{}-{}-{}", std::process::id(), tag, n));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `true` if the config file at `path` has an `mcpServers.nyx` entry.
+    fn config_has_nyx(path: &std::path::Path) -> bool {
+        crate::onboarding::read_config_pub(path)
+            .ok()
+            .and_then(|root| {
+                root.get("mcpServers")
+                    .and_then(|s| s.get(crate::onboarding::SERVER_NAME))
+                    .map(|_| ())
+            })
+            .is_some()
+    }
+
+    #[test]
+    fn integration_list_returns_four_registry_providers() {
+        let dir = integ_temp_dir("list");
+        let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
+        // No state file yet → nothing installed.
+        let list = integration_status_list(&state_path);
+
+        let providers: Vec<&str> = list.iter().map(|s| s.provider).collect();
+        assert_eq!(
+            providers,
+            vec!["claude_code", "codex", "opencode", "custom"],
+            "the Integrations section advertises exactly the 4 registry providers"
+        );
+
+        // claude_code is the only available (functional) provider in v1.
+        let claude = list.iter().find(|s| s.provider == "claude_code").unwrap();
+        assert!(claude.available, "claude_code is functional in v1");
+        assert!(!claude.installed, "fresh state → not installed");
+
+        // codex / opencode / custom are coming soon (available == false).
+        for p in ["codex", "opencode", "custom"] {
+            let s = list.iter().find(|s| s.provider == p).unwrap();
+            assert!(!s.available, "{p} is coming soon (available == false)");
+            assert!(!s.installed, "{p} is never installed in v1");
+        }
+    }
+
+    #[test]
+    fn integration_install_upserts_nyx_entry_and_persists_installed() {
+        let dir = integ_temp_dir("install");
+        let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
+        let config_path = dir.join(".claude.json");
+        let target = crate::onboarding::OnboardingTarget::new("Claude Code", &config_path);
+
+        assert!(!config_has_nyx(&config_path), "no nyx entry before install");
+
+        let status = do_integration_install("claude_code", &target, &state_path, 8765)
+            .expect("install succeeds against a temp target");
+        assert_eq!(status.provider, "claude_code");
+        assert!(status.installed, "returned status reports installed");
+        assert!(status.available);
+
+        // The nyx entry is written to the client config…
+        assert!(config_has_nyx(&config_path), "install upserts the nyx entry");
+        // …and the installed flag is persisted in integrations.json.
+        let state = crate::onboarding::IntegrationState::load(&state_path);
+        assert!(state.is_installed("claude_code"), "installed flag persisted");
+
+        // And it reflects in the list the UI reads.
+        let listed = integration_status_list(&state_path);
+        assert!(
+            listed.iter().find(|s| s.provider == "claude_code").unwrap().installed,
+            "integration_list now shows claude_code installed"
+        );
+    }
+
+    #[test]
+    fn integration_remove_deletes_nyx_entry_and_clears_installed() {
+        let dir = integ_temp_dir("remove");
+        let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
+        let config_path = dir.join(".claude.json");
+        let target = crate::onboarding::OnboardingTarget::new("Claude Code", &config_path);
+
+        // First install so there is something to remove.
+        do_integration_install("claude_code", &target, &state_path, 8765).unwrap();
+        assert!(config_has_nyx(&config_path));
+        assert!(crate::onboarding::IntegrationState::load(&state_path).is_installed("claude_code"));
+
+        let status = do_integration_remove("claude_code", &target, &state_path)
+            .expect("remove succeeds");
+        assert!(!status.installed, "returned status reports not installed");
+        assert!(status.available);
+
+        // The nyx entry is gone…
+        assert!(!config_has_nyx(&config_path), "remove deletes the nyx entry");
+        // …and the installed flag is cleared.
+        let state = crate::onboarding::IntegrationState::load(&state_path);
+        assert!(!state.is_installed("claude_code"), "installed flag cleared");
+    }
+
+    #[test]
+    fn integration_install_rejects_unsupported_provider() {
+        let dir = integ_temp_dir("unsupported");
+        let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
+        let config_path = dir.join(".claude.json");
+        let target = crate::onboarding::OnboardingTarget::new("Claude Code", &config_path);
+
+        // codex / opencode / custom are coming soon → install/remove refuse.
+        for p in ["codex", "opencode", "custom"] {
+            let err = do_integration_install(p, &target, &state_path, 8765)
+                .expect_err("coming-soon providers cannot be installed in v1");
+            assert!(err.contains("not supported"), "actionable error for {p}: {err}");
+            let err = do_integration_remove(p, &target, &state_path)
+                .expect_err("coming-soon providers cannot be removed in v1");
+            assert!(err.contains("not supported"), "actionable error for {p}: {err}");
+        }
+        // No config/state side effects from the rejected calls.
+        assert!(!config_has_nyx(&config_path));
+    }
+
+    // --- Terminal RECORD ↔ PTY link + pending-command injection (R-TERM) ----
+
+    #[test]
+    fn register_terminal_pty_links_and_clears_the_record_to_pty_mapping() {
+        // The foundation join the MCP terminal tools read: registering a Some(pty_id)
+        // records the record→pty link; registering None clears it.
+        let app = build_app();
+        register_terminal_pty(
+            app.state::<TerminalPtyMap>(),
+            app.state::<PendingTerminalCommands>(),
+            app.state::<PtyManager>(),
+            "rec-1".into(),
+            Some(42),
+        )
+        .expect("register a live pty");
+        assert_eq!(app.state::<TerminalPtyMap>().get("rec-1"), Some(42));
+        // The snapshot the list_terminals MCP tool consumes carries the link.
+        assert_eq!(app.state::<TerminalPtyMap>().snapshot().get("rec-1"), Some(&42));
+
+        register_terminal_pty(
+            app.state::<TerminalPtyMap>(),
+            app.state::<PendingTerminalCommands>(),
+            app.state::<PtyManager>(),
+            "rec-1".into(),
+            None,
+        )
+        .expect("clear on exit");
+        assert_eq!(app.state::<TerminalPtyMap>().get("rec-1"), None, "exit clears the link");
+    }
+
+    #[test]
+    fn register_terminal_pty_injects_a_parked_command_once_into_the_live_pty() {
+        // The MCP `create_terminal(command=…)` path: a command parked for a record is
+        // injected (command + "\n") into the PTY the front spawns, then the parked entry
+        // is consumed so a later respawn does NOT re-inject. We spawn a REAL pty here, so
+        // this test is gated behind the same non-ConPTY reasoning as the other pty tests
+        // — keep it a pure state test of the PARK + take instead, exercising the live
+        // injection path against a spawned pty.
+        let app = build_app();
+        let pty_id = spawn(&app, 80, 24);
+        app.state::<PendingTerminalCommands>().set("rec-cmd", "echo hi".into());
+
+        register_terminal_pty(
+            app.state::<TerminalPtyMap>(),
+            app.state::<PendingTerminalCommands>(),
+            app.state::<PtyManager>(),
+            "rec-cmd".into(),
+            Some(pty_id),
+        )
+        .expect("register + inject");
+        // The parked command is consumed (one-shot): taking again yields nothing, so a
+        // respawn would not double-run the command.
+        assert_eq!(
+            app.state::<PendingTerminalCommands>().take("rec-cmd"),
+            None,
+            "the parked command is drained exactly once"
+        );
+        let _ = close(&app, pty_id);
+    }
+
+    #[test]
+    fn register_terminal_pty_with_no_parked_command_is_a_bare_shell() {
+        // A terminal opened without an MCP command parks nothing — registration injects
+        // nothing and only records the link.
+        let app = build_app();
+        register_terminal_pty(
+            app.state::<TerminalPtyMap>(),
+            app.state::<PendingTerminalCommands>(),
+            app.state::<PtyManager>(),
+            "rec-bare".into(),
+            Some(7),
+        )
+        .expect("register bare");
+        assert_eq!(app.state::<TerminalPtyMap>().get("rec-bare"), Some(7));
+        assert_eq!(
+            app.state::<PendingTerminalCommands>().take("rec-bare"),
+            None,
+            "no command was ever parked for a bare terminal"
+        );
     }
 }

@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { ChromeBar } from "@/components/chrome/chrome-bar";
 import { CommandView } from "@/components/command/command-view";
 import { ProjectCommandsDialog } from "@/components/command/project-commands-dialog";
+import { SettingsDialog, type SettingsDialogHandle } from "./settings-dialog";
 import { useCommandInstances } from "@/components/command/use-command-instances";
 import type { CommandStatePayload } from "@/components/command/use-command-state";
 import type { InstanceWithTemplate, ManagedCommand } from "@/components/command/use-commands";
@@ -156,6 +157,16 @@ export function TerminalManager() {
     refresh: refreshCommands,
   } = useCommandInstances(projects);
 
+  // The global Settings modal (gear icon in the sidebar head). The dialog stays
+  // mounted (Motion animates its exit); we pull a fresh provider list ON THE
+  // OPEN EVENT via its imperative handle — not from an effect watching `open`.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsDialogRef = useRef<SettingsDialogHandle>(null);
+  const openSettings = useCallback(() => {
+    setSettingsOpen(true);
+    settingsDialogRef.current?.reload();
+  }, []);
+
   // The "Manage commands" modal: which project's commands are being managed.
   const [manageProject, setManageProject] = useState<ProjectTree | null>(null);
   // The selected command instance (its `<CommandView>` mounts in the main pane).
@@ -168,18 +179,19 @@ export function TerminalManager() {
   // Selecting a command shows its view; selecting a TERMINAL clears the active
   // command (one main-pane surface at a time — terminal deck OR command view).
   //
-  // ACKNOWLEDGE-ON-SELECT: a finished one-shot's success/error dot is an "unseen
-  // result"; OPENING the command means the user saw it, so we revert the dot to idle
-  // (the output stays in the panel). We invoke `command_acknowledge` only when the
-  // selected instance is in a TERMINAL state — never for a running command (the
-  // backend also no-ops on running/idle, but gating here avoids a useless round-trip).
-  // The backend emits an idle `command://state`, which the sidebar AND view dots
-  // already follow; the last-run exit code (finding 1) is decoupled and survives.
+  // ACKNOWLEDGE-ON-SELECT: a finished one-shot's success/error result is an "unseen
+  // result"; OPENING the command means the user saw it, so we clear ONLY its `unread`
+  // flag (PRD-4 v4) — the FACTUAL state + exit code are preserved (the backend emits
+  // `command://ack`, never an idle `command://state`, so the dot keeps the factual
+  // outcome and the MCP still sees the error). We invoke `command_acknowledge` only
+  // for a still-UNREAD terminal result — never for a running/idle command, and never
+  // for an already-acknowledged one (gating here avoids a useless round-trip; the
+  // backend also no-ops).
   const selectCommand = useCallback(
     (id: string) => {
       setActiveCommandId(id);
       const inst = instances.find((i) => i.id === id);
-      if (inst && (inst.state === "success" || inst.state === "error")) {
+      if (inst && inst.unread && (inst.state === "success" || inst.state === "error")) {
         void invoke("command_acknowledge", { instanceId: id }).catch(() => {});
       }
     },
@@ -310,6 +322,14 @@ export function TerminalManager() {
       next.set(recordId, ptyId);
       return next;
     });
+    // Surface the record↔PTY link to the backend so the MCP terminal tools
+    // (send_to_terminal / close / list_terminals) can resolve a record id to its
+    // live PTY. The front still owns the PTY lifecycle (the `<Terminal>` spawned it);
+    // this only publishes the join the front already maintains. Registering a live
+    // id ALSO lets the backend inject any command the MCP `create_terminal` tool
+    // parked for this record at opening. Fire-and-forget: a failed register just
+    // means an agent cannot reach this particular terminal until the next spawn.
+    void invoke("register_terminal_pty", { recordId, ptyId }).catch(() => {});
   }, []);
 
   // Latest `ptyIds` / `projects` read through refs so the e2e seam's
@@ -534,6 +554,7 @@ export function TerminalManager() {
           onReorderLooseTerminals={reorderLooseTerminals}
           onSetProjectCollapsed={(id, collapsed) => void setProjectCollapsed(id, collapsed)}
           onSetWorkspaceCollapsed={(id, collapsed) => void setWorkspaceCollapsed(id, collapsed)}
+          onOpenSettings={openSettings}
         />
         <div className="min-w-0 flex-1">
           {/* Main pane: the selected COMMAND view (panel + dot + 3 buttons, no
@@ -557,6 +578,12 @@ export function TerminalManager() {
         </div>
       </div>
       {dialog}
+      {/* Global Settings modal (gear icon in the sidebar head → Integrations). */}
+      <SettingsDialog
+        ref={settingsDialogRef}
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+      />
       {/* PRD-3 "Manage commands" modal. Scans the project's ROOT workspace for
           package.json imports (and uses its path to relativize the subfolder
           picker). On close, re-list the instances so newly created / imported /

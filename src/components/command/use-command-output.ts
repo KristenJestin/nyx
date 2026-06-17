@@ -15,6 +15,17 @@ interface CommandOutputPayload {
 }
 
 /**
+ * Payload of the backend `command://output-cleared` event (review R-OUTPUT): the
+ * MCP `clear_command_output` tool emptied an instance's captured buffer. Carries
+ * ONLY the instance id (camelCase, load-bearing — mirrors the Rust
+ * `CommandOutputClearedPayload` in `bridge.rs`); clearing wipes the bytes, not the
+ * factual state/outcome, so there is no `state`/`code`.
+ */
+interface CommandOutputClearedPayload {
+  instanceId: string;
+}
+
+/**
  * Wire an xterm instance to a managed-command instance's output stream — STRICTLY
  * READ-ONLY. This is the deliberate contrast with `usePty` (the interactive
  * terminal): there is **no input path at all** here.
@@ -49,6 +60,7 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
     torndown: boolean;
     unlisten?: UnlistenFn;
     unlistenState?: UnlistenFn;
+    unlistenCleared?: UnlistenFn;
     disposables: IDisposable[];
   } | null>(null);
 
@@ -117,6 +129,27 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
       }
       state.unlistenState = unlistenState;
 
+      // CLEAR ON `clear_command_output`: the MCP tool emptied THIS instance's backend
+      // buffer and emits `command://output-cleared` (review R-OUTPUT). It is the analog
+      // of the run-start clear above but WITHOUT a state transition (clearing the log is
+      // not a start/relaunch), so we reuse the exact same reset path: wipe the xterm
+      // (screen + scrollback) and drop any output still buffered pre-rehydrate so it
+      // cannot replay over the cleared panel. Filtered by `instanceId`.
+      const unlistenCleared = await listen<CommandOutputClearedPayload>(
+        "command://output-cleared",
+        (event) => {
+          if (state.torndown) return;
+          if (event.payload.instanceId !== state.instanceId) return;
+          term.reset();
+          pending.length = 0;
+        },
+      );
+      if (state.torndown) {
+        void Promise.resolve(unlistenCleared()).catch(() => {});
+        return;
+      }
+      state.unlistenCleared = unlistenCleared;
+
       // REHYDRATE: the live in-memory buffer if running, else the persisted
       // scrollback (cold history after a nyx restart). Written FIRST so it sits
       // above any live output. Best-effort: a missing instance / IPC failure
@@ -144,6 +177,9 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
       const unlistenState = state.unlistenState;
       state.unlistenState = undefined;
       if (unlistenState) void Promise.resolve(unlistenState()).catch(() => {});
+      const unlistenCleared = state.unlistenCleared;
+      state.unlistenCleared = undefined;
+      if (unlistenCleared) void Promise.resolve(unlistenCleared()).catch(() => {});
     };
     // Re-run only when the instance or the bound xterm changes — re-running per
     // render would re-rehydrate and re-subscribe.

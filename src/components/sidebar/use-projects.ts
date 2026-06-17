@@ -1,7 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import type { ExecState } from "./use-terminals";
+
+/**
+ * Backend event broadcast on EVERY mutation of the project/workspace tree, whether
+ * it originated in a UI `#[tauri::command]` (`create_project`/`create_workspace`/
+ * `delete_project`) or in an MCP tool (`workspace_add`/`create_workspace`). Mirrors
+ * `bridge::WORKSPACES_CHANGED_EVENT`. The hook re-pulls the whole tree on receipt so
+ * an agent-driven mutation (which the UI never invoked, so never optimistically
+ * folded in) shows up in the sidebar WITHOUT a manual reload — the command tools'
+ * `command://state` analogue for the tree (review 01KV9611923NKX3JPR5V6MN44F).
+ */
+const WORKSPACES_CHANGED_EVENT = "workspaces://changed";
 
 /**
  * Project / workspace state for the sidebar spine (PRD-2 Phase 2).
@@ -71,11 +83,18 @@ export interface CommandRecord {
   id: string;
   label: string;
   /**
-   * Run-state for the command's `<StatusDot>` (the run-state channel, finding
-   * 01KV305BGS69RWCSWCAF0KD2SJ). Optional, defaults to `'idle'`; no backend feeds
-   * real states in this PRD (that is PRD 01KV300RVJ0WSVQ7K57KS37MX9).
+   * The FACTUAL run-state for the command's `<StatusDot>` (the run-state channel,
+   * finding 01KV305BGS69RWCSWCAF0KD2SJ). Optional, defaults to `'idle'`. An
+   * acknowledge NEVER changes this — it reflects the true last-run outcome.
    */
   state?: ExecState;
+  /**
+   * The "unseen result" flag (PRD-4 v4): `true` while a finished run's
+   * success/error result has not been acknowledged in the UI. Drives the settled
+   * BADGE's visibility (the row hides it on acknowledge) while `state` keeps showing
+   * the factual outcome. Optional, defaults to `false`.
+   */
+  unread?: boolean;
 }
 
 /** The imperative surface the sidebar + add-flow drive. */
@@ -174,6 +193,38 @@ export function useProjects(): UseProjects {
         setLoading(false);
       }
     })();
+  }, []);
+
+  // Re-pull the whole tree whenever the backend signals it changed. This is the
+  // single refresh path BOTH the UI's own mutations and the MCP tools' mutations
+  // converge on: the UI commands already fold their result in optimistically (so
+  // this is a cheap idempotent re-list for them), but an MCP-driven add/delete — one
+  // the UI never invoked — is reflected ONLY via this event. Re-listing (rather than
+  // applying a delta) keeps the sidebar authoritative against the DB regardless of
+  // who mutated. StrictMode-safe: the listener is torn down on cleanup and a late
+  // resolve after unmount is unlistened immediately.
+  useEffect(() => {
+    let torndown = false;
+    let unlisten: (() => void) | undefined;
+    void listen(WORKSPACES_CHANGED_EVENT, () => {
+      if (torndown) return;
+      void loadProjectTrees()
+        .then((trees) => {
+          if (!torndown) setProjects(trees);
+        })
+        // A transient list failure leaves the current tree; the next event recovers.
+        .catch(() => {});
+    }).then((un) => {
+      if (torndown) {
+        void Promise.resolve(un()).catch(() => {});
+        return;
+      }
+      unlisten = un;
+    });
+    return () => {
+      torndown = true;
+      if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
+    };
   }, []);
 
   /** Re-list a single project's workspaces and fold them into the tree. */

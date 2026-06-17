@@ -1,4 +1,5 @@
 ﻿import { act, renderHook, waitFor } from "@testing-library/react";
+import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { StrictMode } from "react";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -38,84 +39,89 @@ function installBackend(
   };
   let nextId = initial.length + 1;
 
-  mockIPC((cmd, args) => {
-    const a = (args ?? {}) as Record<string, unknown>;
-    switch (cmd) {
-      case "list_terminals":
-        return [...backend.rows].sort(
-          (x, y) => x.order_index - y.order_index || x.id.localeCompare(y.id),
-        );
-      case "create_terminal": {
-        const order = backend.rows.reduce((m, r) => Math.max(m, r.order_index), -1) + 1;
-        const row: TerminalRecord = {
-          id: String(nextId++),
-          cwd: a.cwd as string,
-          label: (a.label as string | null) ?? null,
-          scrollback: "",
-          status: "alive",
-          order_index: order,
-          created_at: 0,
-          updated_at: 0,
-          closed_at: null,
-        };
-        backend.rows.push(row);
-        backend.createdCwds.push(row.cwd);
-        return row;
-      }
-      case "close_terminal": {
-        const id = a.id as string;
-        backend.closed.push(id);
-        const row = backend.rows.find((r) => r.id === id);
-        if (row) row.status = "closed";
-        return null;
-      }
-      case "reorder": {
-        const ids = a.ids as string[];
-        backend.reorders.push(ids);
-        ids.forEach((id, idx) => {
+  // `shouldMockEvents: true` makes `emit`/`listen` work in tests so a test can fire the
+  // backend `terminals://changed` event the hook's reconciliation listener consumes.
+  mockIPC(
+    (cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      switch (cmd) {
+        case "list_terminals":
+          return [...backend.rows].sort(
+            (x, y) => x.order_index - y.order_index || x.id.localeCompare(y.id),
+          );
+        case "create_terminal": {
+          const order = backend.rows.reduce((m, r) => Math.max(m, r.order_index), -1) + 1;
+          const row: TerminalRecord = {
+            id: String(nextId++),
+            cwd: a.cwd as string,
+            label: (a.label as string | null) ?? null,
+            scrollback: "",
+            status: "alive",
+            order_index: order,
+            created_at: 0,
+            updated_at: 0,
+            closed_at: null,
+          };
+          backend.rows.push(row);
+          backend.createdCwds.push(row.cwd);
+          return row;
+        }
+        case "close_terminal": {
+          const id = a.id as string;
+          backend.closed.push(id);
           const row = backend.rows.find((r) => r.id === id);
-          if (row) row.order_index = idx;
-        });
-        return null;
-      }
-      case "rename": {
-        const row = backend.rows.find((r) => r.id === (a.id as string));
-        if (row) row.label = (a.label as string | null) ?? null;
-        return null;
-      }
-      case "attach_terminal": {
-        const row = backend.rows.find((r) => r.id === (a.terminalId as string));
-        if (row) {
-          row.workspace_id = a.workspaceId as string;
-          row.workspace_binding_mode = a.mode as "auto" | "manual";
+          if (row) row.status = "closed";
+          return null;
         }
-        backend.attaches.push({
-          terminalId: a.terminalId as string,
-          workspaceId: a.workspaceId as string,
-          mode: a.mode as string,
-        });
-        return null;
-      }
-      case "auto_attach_terminal": {
-        // The fake resolver: attach to the workspace whose path === the cwd.
-        const id = a.terminalId as string;
-        const cwd = a.cwd as string | null;
-        const row = backend.rows.find((r) => r.id === id);
-        const matchWs = cwd ? backend.workspacePaths[cwd] : undefined;
-        if (row && matchWs && row.workspace_binding_mode !== "manual") {
-          row.workspace_id = matchWs;
-          row.workspace_binding_mode = "auto";
-          return { workspace_id: matchWs, changed: true };
+        case "reorder": {
+          const ids = a.ids as string[];
+          backend.reorders.push(ids);
+          ids.forEach((id, idx) => {
+            const row = backend.rows.find((r) => r.id === id);
+            if (row) row.order_index = idx;
+          });
+          return null;
         }
-        return { workspace_id: row?.workspace_id ?? null, changed: false };
+        case "rename": {
+          const row = backend.rows.find((r) => r.id === (a.id as string));
+          if (row) row.label = (a.label as string | null) ?? null;
+          return null;
+        }
+        case "attach_terminal": {
+          const row = backend.rows.find((r) => r.id === (a.terminalId as string));
+          if (row) {
+            row.workspace_id = a.workspaceId as string;
+            row.workspace_binding_mode = a.mode as "auto" | "manual";
+          }
+          backend.attaches.push({
+            terminalId: a.terminalId as string,
+            workspaceId: a.workspaceId as string,
+            mode: a.mode as string,
+          });
+          return null;
+        }
+        case "auto_attach_terminal": {
+          // The fake resolver: attach to the workspace whose path === the cwd.
+          const id = a.terminalId as string;
+          const cwd = a.cwd as string | null;
+          const row = backend.rows.find((r) => r.id === id);
+          const matchWs = cwd ? backend.workspacePaths[cwd] : undefined;
+          if (row && matchWs && row.workspace_binding_mode !== "manual") {
+            row.workspace_id = matchWs;
+            row.workspace_binding_mode = "auto";
+            return { workspace_id: matchWs, changed: true };
+          }
+          return { workspace_id: row?.workspace_id ?? null, changed: false };
+        }
+        // PTY commands the mounted <Terminal> would issue are not under test here.
+        case "pty_spawn":
+          return 1;
+        default:
+          return null;
       }
-      // PTY commands the mounted <Terminal> would issue are not under test here.
-      case "pty_spawn":
-        return 1;
-      default:
-        return null;
-    }
-  });
+    },
+    { shouldMockEvents: true },
+  );
   return backend;
 }
 
@@ -369,5 +375,73 @@ describe("useTerminals", () => {
 
     expect(result.current.terminals.map((t) => t.id)).toEqual(["3", "1", "2"]);
     expect(backend.reorders[backend.reorders.length - 1]).toEqual(["3", "1", "2"]);
+  });
+});
+
+describe("useTerminals live reconciliation on terminals://changed (PRD-4 R-TERM)", () => {
+  it("mounts a terminal an agent created over MCP (the front never invoked create)", async () => {
+    // The MCP `create_terminal` tool writes a record + emits `terminals://changed`. The
+    // front never invoked `create`, so the new terminal reaches the deck ONLY via the
+    // event: the hook re-lists and appends the new alive record (which the deck then
+    // mounts an xterm for).
+    const backend = installBackend([aliveRow(1, "/a", 0)]);
+    const { result } = renderHook(() => useTerminals());
+    await waitFor(() => expect(result.current.terminals).toHaveLength(1));
+
+    // An out-of-band create (the MCP path): the row lands in the DB the hook re-lists
+    // from, but no UI invoke happened.
+    backend.rows.push(aliveRow(2, "/agent/ws", 1));
+    await act(async () => {
+      await emit("terminals://changed");
+    });
+
+    await waitFor(() => expect(result.current.terminals).toHaveLength(2));
+    expect(result.current.terminals.map((t) => t.id)).toEqual(["1", "2"]);
+    // The new terminal mounts in the background WITHOUT stealing focus from the user's
+    // current terminal — it appears in the sidebar; selecting it switches to it.
+    expect(result.current.activeId).toBe("1");
+  });
+
+  it("drops a terminal an agent closed over MCP and re-targets the active one", async () => {
+    // The MCP `close_terminal` tool flips the record closed + emits `terminals://changed`.
+    // The hook re-lists, drops the now-closed record, and re-targets active if it was it.
+    const backend = installBackend([aliveRow(1, "/a", 0), aliveRow(2, "/b", 1)]);
+    const { result } = renderHook(() => useTerminals());
+    await waitFor(() => expect(result.current.terminals).toHaveLength(2));
+    act(() => result.current.setActive("2"));
+    expect(result.current.activeId).toBe("2");
+
+    // An out-of-band close: the record flips to closed in the DB the hook re-lists from.
+    const row = backend.rows.find((r) => r.id === "2");
+    if (row) row.status = "closed";
+    await act(async () => {
+      await emit("terminals://changed");
+    });
+
+    await waitFor(() => expect(result.current.terminals).toHaveLength(1));
+    expect(result.current.terminals.map((t) => t.id)).toEqual(["1"]);
+    // The active terminal was the closed one → re-targets to the survivor.
+    expect(result.current.activeId).toBe("1");
+  });
+
+  it("leaves the existing terminals untouched when the event re-lists the same set", async () => {
+    // Idempotent: an event whose re-list matches the current set keeps the same record
+    // objects (no churn that would remount a live xterm). The active id is preserved.
+    const backend = installBackend([aliveRow(1, "/a", 0), aliveRow(2, "/b", 1)]);
+    const { result } = renderHook(() => useTerminals());
+    await waitFor(() => expect(result.current.terminals).toHaveLength(2));
+    const before = result.current.terminals;
+    void backend; // the backend is unchanged for this idempotent pass
+
+    await act(async () => {
+      await emit("terminals://changed");
+    });
+
+    await waitFor(() => expect(result.current.terminals).toHaveLength(2));
+    expect(result.current.terminals.map((t) => t.id)).toEqual(["1", "2"]);
+    // Each kept record is the SAME object reference (no needless remount).
+    expect(result.current.terminals[0]).toBe(before[0]);
+    expect(result.current.terminals[1]).toBe(before[1]);
+    expect(result.current.activeId).toBe("1");
   });
 });

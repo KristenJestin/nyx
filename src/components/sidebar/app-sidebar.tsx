@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { FolderPlusIcon, PlusIcon } from "lucide-react";
+import { FolderPlusIcon, PlusIcon, Settings2Icon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -75,6 +75,8 @@ export interface AppSidebarProps {
   onSetProjectCollapsed?: (id: string, collapsed: boolean) => void;
   /** Persist a workspace band's open/closed state (restored on reload). */
   onSetWorkspaceCollapsed?: (id: string, collapsed: boolean) => void;
+  /** Open the global Settings modal (gear icon in the sidebar head). */
+  onOpenSettings?: () => void;
   className?: string;
 }
 
@@ -82,17 +84,17 @@ export interface AppSidebarProps {
  * `<AppSidebar>` — the WHOLE app sidebar, re-aligned to the elected v6 prototype.
  * It renders:
  *
- *  - a sidebar HEAD with the Nyx wordmark + a GLOBAL new-terminal `+` that opens a
- *    LOOSE (unattached) terminal;
+ *  - a sidebar HEAD with the Nyx wordmark + a **Settings gear** (`onOpenSettings`)
+ *    that opens the global Settings modal (Integrations section);
  *  - the scrollable **PROJECTS** section: a sticky band label + one `<ProjectItem>`
  *    per project (full-bleed band header, project dot, collapsed "N" summary,
  *    hover kebab), expanding into workspaces → typed Terminals/Commands;
  *  - a pinned **TERMINALS** footer band listing the loose terminals (no
  *    `workspace_id`); drag-reorderable, with the same enter/exit row animations.
+ *    The TERMINALS footer's `+` (new unattached terminal) stays here unchanged.
  *
- * The head `+`, the Projects band's folder-add and the footer Terminals band's
- * `+` all sit on the SAME right edge (`px-3` + `icon-xs`) so they line up down
- * the right edge (finding 01KV3CP2SQMCZAAQYGNWCNMWKG).
+ * The Projects band's folder-add and the footer Terminals band's `+` sit on the
+ * SAME right edge (`px-3` + `icon-xs`) (finding 01KV3CP2SQMCZAAQYGNWCNMWKG).
  *
  * SELECTION RAIL: a single MEASURED `<SelectionRail>` bar (see `useActiveRail`)
  * lives in a `relative` rail HOST that spans the rows (the scroll section + the
@@ -123,6 +125,7 @@ export function AppSidebar({
   onReorderLooseTerminals,
   onSetProjectCollapsed,
   onSetWorkspaceCollapsed,
+  onOpenSettings,
   className,
 }: AppSidebarProps) {
   // Group terminals by their workspace binding once per terminals change; the
@@ -162,18 +165,14 @@ export function AppSidebar({
         className,
       )}
     >
-      {/* === HEAD: Nyx wordmark + global '+' (new loose/unattached terminal) ===
-            `px-3` matches the Projects band + footer band so the three '+' align. */}
+      {/* === HEAD: Nyx wordmark + gear (Settings) ===
+            `px-3` matches the Projects band + footer band so icons align. The
+            loose-terminal `+` lives in the TERMINALS footer band (unchanged). */}
       <div className="flex items-center justify-between border-b border-sidebar-border px-3 py-2.5">
         <span className="text-sm font-semibold tracking-widest text-sidebar-foreground">Nyx</span>
-        <Tooltip label="New terminal (unattached)">
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label="New terminal"
-            onClick={onNewLooseTerminal}
-          >
-            <PlusIcon />
+        <Tooltip label="Settings">
+          <Button variant="ghost" size="icon-xs" aria-label="Settings" onClick={onOpenSettings}>
+            <Settings2Icon />
           </Button>
         </Tooltip>
       </div>

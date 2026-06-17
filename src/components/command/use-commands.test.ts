@@ -1,9 +1,13 @@
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { emit } from "@tauri-apps/api/event";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { describe, expect, it } from "vitest";
 
 import {
   driftedScriptValue,
   isCustomized,
   runnerCommand,
+  useCommands,
   type DiscoveredScript,
   type ManagedCommand,
 } from "./use-commands";
@@ -118,5 +122,33 @@ describe("driftedScriptValue (passive 'changed in package.json' detection)", () 
       }),
     ];
     expect(driftedScriptValue(cmdRow, found)).toBeNull();
+  });
+});
+
+describe("useCommands (commands://changed re-pull)", () => {
+  it("re-lists templates when commands://changed fires (an MCP/UI template mutation)", async () => {
+    // The modal only re-lists on a projectId change; a template mutated by another
+    // surface (an MCP tool the modal never invoked) must still appear, via the event.
+    let current: ManagedCommand[] = [cmd({ id: "c1", name: "dev" })];
+    mockIPC(
+      (command, args) => {
+        if (command === "command_list") {
+          const a = (args ?? {}) as { projectId?: string };
+          return a.projectId === "p1" ? current : [];
+        }
+        return null;
+      },
+      { shouldMockEvents: true },
+    );
+    const { result } = renderHook(() => useCommands("p1"));
+    await waitFor(() => expect(result.current.templates).toHaveLength(1));
+    expect(result.current.templates[0].name).toBe("dev");
+
+    // A template was added on the project → the next list returns two rows.
+    current = [cmd({ id: "c1", name: "dev" }), cmd({ id: "c2", name: "build" })];
+    await act(async () => {
+      await emit("commands://changed");
+    });
+    await waitFor(() => expect(result.current.templates).toHaveLength(2));
   });
 });

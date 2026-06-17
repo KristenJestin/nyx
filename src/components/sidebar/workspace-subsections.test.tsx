@@ -138,6 +138,46 @@ describe("<WorkspaceSubsections>", () => {
     expect(onSelectCommand).toHaveBeenCalledWith("c1");
   });
 
+  it("the settled badge follows `unread` while the row reflects the factual state (v4)", () => {
+    // An UNREAD error: the settled badge is visible (the dot fill is destructive),
+    // and the factual state is reported on the dot.
+    const { rerender } = render(
+      <WorkspaceSubsections
+        terminals={[]}
+        activeId={null}
+        commands={[{ id: "c1", label: "build", state: "error", unread: true }]}
+        activeCommandId={null}
+        onSelect={noop}
+        onClose={noop}
+        onSelectCommand={noop}
+        onNewTerminal={noop}
+      />,
+    );
+    let dot = screen.getByRole("status", { name: /status: error/i });
+    // Factual state is observable, and the visible fill is the error badge.
+    expect(dot).toHaveAttribute("data-state", "error");
+    expect(dot.className).toContain("bg-destructive");
+
+    // After acknowledge (unread=false): the settled badge HIDES (fill reverts to the
+    // neutral idle muted fill) while the row STILL reflects the factual error state.
+    rerender(
+      <WorkspaceSubsections
+        terminals={[]}
+        activeId={null}
+        commands={[{ id: "c1", label: "build", state: "error", unread: false }]}
+        activeCommandId={null}
+        onSelect={noop}
+        onClose={noop}
+        onSelectCommand={noop}
+        onNewTerminal={noop}
+      />,
+    );
+    dot = screen.getByRole("status", { name: /status: error/i });
+    expect(dot).toHaveAttribute("data-state", "error"); // factual state preserved
+    expect(dot.className).toContain("bg-muted-foreground/50"); // badge hidden
+    expect(dot.className).not.toContain("bg-destructive");
+  });
+
   it("a command row shows start/stop/relaunch icons with the SAME gating as the view (finding 01KV63TEGB…)", () => {
     mockIPC(() => null, { shouldMockEvents: true });
     // idle command: start + relaunch enabled, stop disabled.

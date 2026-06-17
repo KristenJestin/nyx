@@ -73,6 +73,8 @@ function workspace(id: string, projectId: string, path: string): WorkspaceRecord
 interface Inst {
   id: string;
   last_state: string;
+  /** v4: the "unseen result" flag. A finished result is unread until acknowledged. */
+  unread?: boolean;
 }
 
 interface Backend {
@@ -126,6 +128,9 @@ function installBackend(instances: Inst[]): Backend {
                 was_running_on_shutdown: false,
                 created_at: 0,
                 updated_at: 0,
+                last_exit_code: i.last_state === "error" ? 1 : i.last_state === "success" ? 0 : null,
+                ended_at: i.last_state === "success" || i.last_state === "error" ? 1 : null,
+                unread: i.unread ?? false,
                 name: i.id,
                 command: "bun run dev",
                 subfolder: null,
@@ -139,8 +144,10 @@ function installBackend(instances: Inst[]): Backend {
               }))
             : [];
         case "command_acknowledge":
+          // v4: the bridge returns the UNCHANGED factual state (never collapses to
+          // idle); here the seeded instance's last_state is echoed back.
           backend.acknowledge.push(a.instanceId as string);
-          return "idle";
+          return instances.find((i) => i.id === a.instanceId)?.last_state ?? "idle";
         default:
           return null;
       }
@@ -155,8 +162,8 @@ afterEach(() => {
 });
 
 describe("<TerminalManager> acknowledge-on-select", () => {
-  it("acknowledges a SUCCESS command when it is selected", async () => {
-    const backend = installBackend([{ id: "ok", last_state: "success" }]);
+  it("acknowledges an UNREAD SUCCESS command when it is selected", async () => {
+    const backend = installBackend([{ id: "ok", last_state: "success", unread: true }]);
     render(<TerminalManager />);
     const btn = await screen.findByRole("button", { name: "select ok" });
     await act(async () => {
@@ -165,14 +172,27 @@ describe("<TerminalManager> acknowledge-on-select", () => {
     await waitFor(() => expect(backend.acknowledge).toContain("ok"));
   });
 
-  it("acknowledges an ERROR command when it is selected", async () => {
-    const backend = installBackend([{ id: "bad", last_state: "error" }]);
+  it("acknowledges an UNREAD ERROR command when it is selected", async () => {
+    const backend = installBackend([{ id: "bad", last_state: "error", unread: true }]);
     render(<TerminalManager />);
     const btn = await screen.findByRole("button", { name: "select bad" });
     await act(async () => {
       btn.click();
     });
     await waitFor(() => expect(backend.acknowledge).toContain("bad"));
+  });
+
+  it("does NOT re-acknowledge an ALREADY-READ (acknowledged) result on select", async () => {
+    // A settled result that has already been acknowledged (unread=false) must not
+    // trigger another `command_acknowledge` round-trip — the v4 gating.
+    const backend = installBackend([{ id: "seen", last_state: "error", unread: false }]);
+    render(<TerminalManager />);
+    const btn = await screen.findByRole("button", { name: "select seen" });
+    await act(async () => {
+      btn.click();
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    expect(backend.acknowledge).toHaveLength(0);
   });
 
   it("NEVER acknowledges a RUNNING command on select", async () => {
