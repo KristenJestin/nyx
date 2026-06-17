@@ -386,6 +386,12 @@ impl CommandPty {
     /// Spawn `cmdline` read-only under the platform shell ([`resolve_shell`]) at
     /// `cwd`, with the environment inherited from nyx and a sane `$TERM`.
     ///
+    /// `env` is an OPTIONAL per-run set of `KEY=VALUE` overrides MERGED on top of the
+    /// inherited environment (PRD-4 R-WSCMD): each entry is applied AFTER the inherited
+    /// env, so it adds a new variable or overrides an inherited one (e.g. `VAULT_ENV`,
+    /// values from a `.env`). An empty slice is a plain inherited-env spawn. Secret
+    /// VALUES are NEVER logged here — only `cmd.env` receives them.
+    ///
     /// Returns the handle and a [`Receiver`] yielding raw output chunks. The
     /// receiver disconnects (its sender drops) at EOF — i.e. when the command has
     /// exited. No writer is returned: this PTY is read-only by construction.
@@ -393,6 +399,7 @@ impl CommandPty {
         cmdline: &str,
         size: PtySize,
         cwd: Option<&str>,
+        env: &[(String, String)],
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
         let shell = resolve_shell();
         let (program, args) = command_invocation(&shell, cmdline);
@@ -411,6 +418,13 @@ impl CommandPty {
         // for full-screen output when the parent has none (mirrors `Pty::spawn`).
         if std::env::var_os("TERM").is_none() {
             cmd.env("TERM", "xterm-256color");
+        }
+        // Per-run env MERGED on top of the inherited environment (R-WSCMD): applied
+        // last so a provided KEY overrides any inherited value of the same name. The
+        // KEYS may be useful to surface, but the VALUES (potential secrets) are never
+        // logged — only handed to `cmd.env`.
+        for (key, value) in env {
+            cmd.env(key, value);
         }
 
         let child = pair.slave.spawn_command(cmd)?;
@@ -603,6 +617,96 @@ impl RunState {
             RunState::Error => "error",
         }
     }
+
+    /// Parse a persisted `last_state` string back into a [`RunState`]. The inverse of
+    /// [`Self::as_db_str`]; an unrecognized value falls back to `Idle`. Used when a
+    /// reader (the MCP) rehydrates the FACTUAL outcome from the DB row because the
+    /// in-memory runner has no live entry (e.g. after a restart).
+    pub(crate) fn from_db_str(s: &str) -> RunState {
+        match s {
+            "running" => RunState::Running,
+            "success" => RunState::Success,
+            "error" => RunState::Error,
+            _ => RunState::Idle,
+        }
+    }
+}
+
+/// The result of a [`CommandRunner::start`] / `start_with_env` call (R-WSCMD): the
+/// state after the call PLUS whether the instance was ALREADY running when start was
+/// invoked. `was_running:true` means the call was an idempotent NO-OP — it did NOT
+/// spawn a second process (the anti-double-spawn guarantee) — so the MCP `start_command`
+/// ack can report `restarted:false`. `was_running:false` means a fresh process was
+/// spawned (`restarted:false` too — a first start is not a restart; `relaunch` is the
+/// explicit restart). The state is `Running` on a successful spawn / live no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartOutcome {
+    /// State after the call (Running on success / live no-op).
+    pub state: RunState,
+    /// Whether the instance was already running BEFORE this call (→ no-op, no spawn).
+    pub was_running: bool,
+}
+
+/// Default poll interval for [`poll_until`]: how long the bounded wait sleeps between
+/// re-reads of the (observational) state. Small enough to keep the resolve latency low
+/// (≤ this), large enough that a long wait does not spin. Tunable per-call.
+pub(crate) const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The hard ceiling on a bounded wait (`wait_for_command`'s `timeout_ms` cap): a wait
+/// is clamped to AT MOST this so the MCP long-poll is never a true unbounded block
+/// (ADR-0003 D12). A request for more is silently clamped down to this.
+pub(crate) const WAIT_MAX_TIMEOUT: Duration = Duration::from_millis(60_000);
+
+/// The outcome of a bounded [`poll_until`] wait: whether the target was reached, the
+/// state read on the final iteration, and how long the wait actually took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WaitOutcome {
+    /// `true` if `read_state()` returned a state in the target set before `timeout`;
+    /// `false` if `timeout` elapsed first (a NORMAL result, not an error).
+    pub resolved: bool,
+    /// The state observed on the LAST read — the state that satisfied the wait when
+    /// `resolved`, else the state at timeout.
+    pub state: RunState,
+    /// How long the wait actually blocked (≤ the clamped timeout).
+    pub waited: Duration,
+}
+
+/// BOUNDED, observational poll loop backing the `wait_for_command` MCP tool (ADR-0003
+/// D12). Re-reads the current [`RunState`] via the `read_state` closure on a fixed
+/// `interval`, returning as soon as the state is in the `target` set
+/// (`resolved:true`), or when `timeout` elapses (`resolved:false`). It is purely a
+/// reader: it NEVER mutates the runner (no start/stop/acknowledge), so any number of
+/// callers may wait the same instance concurrently, and waiting never clears the
+/// `unread` flag (waiting ≠ acknowledging).
+///
+/// `timeout` is clamped to [`WAIT_MAX_TIMEOUT`] by the caller so this is never an
+/// infinite block. An empty `target` can still time out normally (nothing matches).
+/// The state is checked ONCE up front (a zero-cost resolve when the target is already
+/// reached, e.g. an already-finished command) before any sleep, then on each interval.
+/// `sleep` is injectable so the unit tests drive the loop deterministically without
+/// wall-clock delays.
+pub(crate) fn poll_until(
+    target: &[RunState],
+    timeout: Duration,
+    interval: Duration,
+    mut read_state: impl FnMut() -> RunState,
+    mut sleep: impl FnMut(Duration),
+) -> WaitOutcome {
+    let start = Instant::now();
+    loop {
+        let state = read_state();
+        if target.contains(&state) {
+            return WaitOutcome { resolved: true, state, waited: start.elapsed() };
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            // Timed out: report the LAST observed state. resolved:false is normal.
+            return WaitOutcome { resolved: false, state, waited: elapsed };
+        }
+        // Sleep at most the remaining budget so the wait never overshoots `timeout`.
+        let remaining = timeout - elapsed;
+        sleep(interval.min(remaining));
+    }
 }
 
 /// Side-effects of a runner transition, abstracted so the state machine is
@@ -611,13 +715,42 @@ impl RunState {
 /// tests use a recording mock. (Tauri events are validated by the Phase 5
 /// `tauri::test` integration suite, not here — see the PRD phase plan.)
 pub(crate) trait RunnerSink: Send + Sync + 'static {
-    /// A state transition occurred: persist `last_state` and emit `command://state`.
-    /// `exit_code` is the natural exit code for success/error, else `None`.
+    /// A FACTUAL run-state transition occurred: persist the outcome and emit
+    /// `command://state`. `exit_code` is the natural exit code for success/error,
+    /// else `None`. The production sink persists `last_state` (+ on a success/error
+    /// finish, the v4 `last_exit_code`/`ended_at`/`unread` outcome columns) so the
+    /// factual outcome survives an acknowledge and a restart. This is NEVER called
+    /// for an acknowledge — that goes through [`Self::on_acknowledge`] so the
+    /// outcome is left intact.
     fn on_state(&self, instance_id: &str, state: RunState, exit_code: Option<i32>);
+    /// An acknowledge cleared the instance's "unseen result" flag. The production
+    /// sink clears ONLY the persisted `unread` flag (never the factual outcome) and
+    /// emits a `command://ack` notification so the UI can hide the settled badge
+    /// WITHOUT the factual state changing. Decoupling this from [`Self::on_state`] is
+    /// the whole point of the v4 split: a UI ack must not erase the error the MCP
+    /// (or any other observer) sees.
+    fn on_acknowledge(&self, instance_id: &str);
     /// Coalesced output for an instance: emit `command://output`.
     fn on_output(&self, instance_id: &str, bytes: &[u8]);
     /// Debounced, bounded scrollback persistence for an instance.
     fn persist_scrollback(&self, instance_id: &str, serialized: &str);
+    /// A fresh (re)launch is about to begin for an instance: RETAIN the last completed
+    /// run before the current run's columns are reset. The production sink archives the
+    /// completing run's scrollback + factual outcome into the bounded `prev_*` columns
+    /// (N=1) and resets the CURRENT run to a clean `running` row — so the prior run
+    /// stays retrievable while the new run starts unpolluted. Called by
+    /// [`CommandRunner::start`] in place of a bare `persist_scrollback(id, "")`: it both
+    /// archives and clears in one transaction. A sink with no persistence (tests) can
+    /// no-op or just record the call.
+    fn archive_previous_run(&self, instance_id: &str);
+    /// An agent CLEARED the instance's captured output buffer (PRD-4 review R-OUTPUT,
+    /// the `clear_command_output` tool). The production sink empties the persisted
+    /// `scrollback` + `prev_scrollback` (the factual outcome is left intact) and emits a
+    /// frontend refresh so the read-only output panel wipes its xterm — the analog of
+    /// the run-start clear, but with NO state transition. Decoupled from
+    /// [`Self::on_state`]/[`Self::archive_previous_run`] so a clear never looks like a
+    /// (re)launch. A persistence-free sink (tests) can no-op or just record the call.
+    fn clear_output(&self, instance_id: &str);
 }
 
 /// One live entry in the runner map: the running command PTY's tree-kill handle,
@@ -627,6 +760,21 @@ struct RunnerEntry {
     kill: Option<KillHandle>,
     /// Current derived state.
     state: RunState,
+    /// The natural exit code of the LAST completed run, retained in memory after a
+    /// success/error transition so a reader (the bridge / the MCP surface) can tell a
+    /// crash (non-zero) from a clean run (zero) without a DB column. `None` while the
+    /// instance has never finished a run (idle/running with no prior completion). It
+    /// is the exit code carried by the pump's natural-exit `on_state` (`command.rs`),
+    /// stored here so `get_command_output`/`list_commands` can surface it. A fresh
+    /// `start` clears it so the previous run's code never leaks into a new run.
+    last_exit_code: Option<i32>,
+    /// The "unseen result" flag (v4): set `true` when a run FINISHES
+    /// (success/error), cleared by [`CommandRunner::acknowledge`]. It is the
+    /// notification axis, fully decoupled from `state`/`last_exit_code` (the factual
+    /// outcome): an acknowledge flips ONLY this, so the MCP and any other observer
+    /// still read the true `state` + `last_exit_code` afterwards. A fresh `start`
+    /// resets it to `false` (a running command is not yet an unseen result).
+    unread: bool,
     /// A monotonically increasing generation, bumped on every (re)spawn. The pump
     /// stamps the generation it was started for; a stale pump (from a process that
     /// was already stopped/relaunched) is ignored so a late natural-exit never
@@ -687,6 +835,22 @@ impl<S: RunnerSink> CommandRunner<S> {
         self.state_of(instance_id) == RunState::Running
     }
 
+    /// The natural exit code of the instance's LAST completed run, or `None` when it
+    /// has not finished a run this session (never started, still running, or only ever
+    /// stopped — a stop is a kill, not a natural exit, so it records no code). Read
+    /// straight off the in-memory entry the pump stamps on its success/error
+    /// transition. Superseded in production by [`Self::outcome`] (which also carries
+    /// the live state + `unread` in one snapshot); retained for the runner tests that
+    /// assert an acknowledge preserves the factual exit code.
+    #[cfg(test)]
+    pub(crate) fn last_exit_code(&self, instance_id: &str) -> Option<i32> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .and_then(|e| e.last_exit_code)
+    }
+
     /// The instance's LIVE in-memory scrollback tail when it is `running`, else
     /// `None`. This is the bounded buffer the pump maintains as output streams,
     /// fresher than the debounced-persisted DB row (which can lag by up to
@@ -724,31 +888,58 @@ impl<S: RunnerSink> CommandRunner<S> {
         })
     }
 
-    /// Start (or restart-from-terminal-state) an instance.
-    ///
-    /// - On `idle`/`success`/`error` (or no entry): spawn `cmdline` at `cwd`,
-    ///   transition to `running`, and stream output.
-    /// - On `running`: **idempotent no-op** — returns the current state and does
-    ///   NOT spawn a second process. This is the no-double-spawn guarantee.
-    ///
-    /// Returns the state after the call.
+    /// Start (or restart-from-terminal-state) an instance — the back-compat wrapper
+    /// that returns just the resulting [`RunState`] and passes NO per-run env. Existing
+    /// call sites (the bridge UI command, the boot restorer, the runner tests) keep this
+    /// shape; the MCP layer that needs the `was_running` ack + per-run env uses
+    /// [`Self::start_with_env`] directly.
     pub(crate) fn start(
         &self,
         instance_id: &str,
         cmdline: &str,
         cwd: Option<&str>,
     ) -> anyhow::Result<RunState> {
+        self.start_with_env(instance_id, cmdline, cwd, &[])
+            .map(|o| o.state)
+    }
+
+    /// Start (or restart-from-terminal-state) an instance, with an OPTIONAL per-run
+    /// `env` merged onto the inherited environment, returning a [`StartOutcome`] that
+    /// reports whether the instance was ALREADY running (R-WSCMD).
+    ///
+    /// - On `idle`/`success`/`error` (or no entry): spawn `cmdline` at `cwd` (with
+    ///   `env` merged on top of the inherited environment), transition to `running`,
+    ///   and stream output → `StartOutcome { state: Running, was_running: false }`.
+    /// - On `running`: **idempotent no-op** — returns `StartOutcome { state: Running,
+    ///   was_running: true }` and does NOT spawn a second process. This is the
+    ///   no-double-spawn guarantee, enforced HERE at the runner boundary so neither the
+    ///   UI nor the MCP can double-spawn. A caller wanting an explicit restart uses
+    ///   [`Self::relaunch`] (which stops-then-starts), never a second `start`.
+    ///
+    /// `env` entries are `(KEY, VALUE)` pairs applied after inheritance; secret VALUES
+    /// are never logged by the runner (only passed to the PTY spawn).
+    pub(crate) fn start_with_env(
+        &self,
+        instance_id: &str,
+        cmdline: &str,
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> anyhow::Result<StartOutcome> {
         let mut entries = self.entries.lock().unwrap();
 
-        // Idempotent: a running instance short-circuits. We must NOT spawn again.
+        // Idempotent: a running instance short-circuits. We must NOT spawn again. The
+        // no-op is reported via `was_running:true` so the MCP ack says restarted:false.
         if let Some(entry) = entries.get(instance_id) {
             if entry.state == RunState::Running {
-                return Ok(RunState::Running);
+                return Ok(StartOutcome {
+                    state: RunState::Running,
+                    was_running: true,
+                });
             }
         }
 
         // Spawn the process tree and a fresh generation for it.
-        let (pty, rx) = CommandPty::spawn(cmdline, self.size, cwd)?;
+        let (pty, rx) = CommandPty::spawn(cmdline, self.size, cwd, env)?;
         let kill = pty.kill_handle();
         let generation = entries
             .get(instance_id)
@@ -777,6 +968,12 @@ impl<S: RunnerSink> CommandRunner<S> {
             RunnerEntry {
                 kill: Some(kill),
                 state: RunState::Running,
+                // A fresh run starts with no recorded exit code: the previous run's
+                // code (if any) is cleared here so a crash/clean result reported by
+                // `last_exit_code` always belongs to the CURRENT run, never a stale one.
+                last_exit_code: None,
+                // A running command is not an unseen result yet; a finish sets this.
+                unread: false,
                 generation,
                 pump: Some(pump),
                 live_scrollback,
@@ -784,19 +981,24 @@ impl<S: RunnerSink> CommandRunner<S> {
         );
         drop(entries);
 
-        // Fresh run = fresh scrollback: reset the persisted scrollback row so a cold
-        // rehydrate of this new run never returns the PREVIOUS run's output (the
-        // relaunch-piles-old-output bug). The fresh live buffer above already starts
-        // empty; this clears the DB row to match, before the new pump's first
-        // debounced persist. The front independently clears its xterm on the running
-        // transition below (see `useCommandOutput`).
-        self.sink.persist_scrollback(instance_id, "");
+        // Fresh run = fresh scrollback, but RETAIN the last completed run (v5): archive
+        // the prior run's scrollback + outcome into the bounded `prev_*` columns (N=1),
+        // THEN reset the current row so a cold rehydrate of THIS new run never returns
+        // the previous run's output (the relaunch-piles-old-output bug) — while the
+        // prior run stays retrievable via `get_command_output(run="previous")`. The
+        // fresh live buffer above already starts empty; this archives + clears the DB
+        // row to match, before the new pump's first debounced persist. The front
+        // independently clears its xterm on the running transition below.
+        self.sink.archive_previous_run(instance_id);
 
         // Transition AFTER the entry exists so the persisted state and the live map
         // agree. The natural-exit path may race to overwrite this; it is guarded by
         // the generation stamp (a stale pump never clobbers a fresh running).
         self.sink.on_state(instance_id, RunState::Running, None);
-        Ok(RunState::Running)
+        Ok(StartOutcome {
+            state: RunState::Running,
+            was_running: false,
+        })
     }
 
     /// Stop a running instance: best-effort process-TREE kill (SIGTERM then, after a
@@ -863,7 +1065,25 @@ impl<S: RunnerSink> CommandRunner<S> {
         Ok(RunState::Idle)
     }
 
-    /// Relaunch an instance.
+    /// Relaunch an instance — the back-compat wrapper returning just the resulting
+    /// [`RunState`] and passing NO per-run env. The MCP layer that needs the per-run
+    /// env uses [`Self::relaunch_with_env`].
+    pub(crate) fn relaunch(
+        &self,
+        instance_id: &str,
+        cmdline: &str,
+        cwd: Option<&str>,
+    ) -> anyhow::Result<RunState> {
+        self.relaunch_with_env(instance_id, cmdline, cwd, &[])
+            .map(|o| o.state)
+    }
+
+    /// Relaunch an instance with an OPTIONAL per-run `env` merged onto the inherited
+    /// environment (R-WSCMD), returning a [`StartOutcome`] whose `was_running` reports
+    /// whether a live process was stopped first (so the MCP `relaunch_command` ack can
+    /// say `was_running`). `relaunch` is the EXPLICIT restart (contrast a second
+    /// `start`, which is a no-op on a running instance): it ALWAYS spawns a fresh
+    /// process — so the ack reports `restarted:true`.
     ///
     /// - On `running`: stop (tree kill) then start. If the stop fails, relaunch
     ///   fails and NO second instance is started.
@@ -871,13 +1091,15 @@ impl<S: RunnerSink> CommandRunner<S> {
     ///
     /// Because both legs take the same per-instance lock path, a relaunch can never
     /// leave two live processes for one instance.
-    pub(crate) fn relaunch(
+    pub(crate) fn relaunch_with_env(
         &self,
         instance_id: &str,
         cmdline: &str,
         cwd: Option<&str>,
-    ) -> anyhow::Result<RunState> {
-        if self.state_of(instance_id) == RunState::Running {
+        env: &[(String, String)],
+    ) -> anyhow::Result<StartOutcome> {
+        let was_running = self.state_of(instance_id) == RunState::Running;
+        if was_running {
             // Stop first; only start if the stop made it to idle. A failed/partial
             // stop returns early WITHOUT starting a second instance.
             let stopped = self.stop(instance_id)?;
@@ -887,42 +1109,110 @@ impl<S: RunnerSink> CommandRunner<S> {
                 );
             }
         }
-        self.start(instance_id, cmdline, cwd)
+        // The fresh start reports was_running:false (it spawned into an idle slot); the
+        // relaunch's OWN was_running is whether we stopped a live process above.
+        self.start_with_env(instance_id, cmdline, cwd, env)
+            .map(|o| StartOutcome {
+                state: o.state,
+                was_running,
+            })
     }
 
-    /// Acknowledge a FINISHED one-shot: if the instance is in a terminal state
-    /// (`success` or `error`), reset it to `idle` and emit the idle transition (the
-    /// sink persists `last_state=idle` + broadcasts `command://state` idle). The
-    /// success/error dot models an "unseen result"; selecting/opening the command =
-    /// seeing it, so the dot reverts to idle while the output stays in the panel.
+    /// Acknowledge a FINISHED one-shot: clear ONLY its "unseen result" flag
+    /// (`unread`) — NEVER its factual outcome. A finished run's success/error result
+    /// is the notification; selecting/opening the command = seeing it, so the settled
+    /// BADGE clears (the UI hides it off `unread`) while the factual `state` +
+    /// `last_exit_code` — what the MCP and any other observer read — are LEFT INTACT.
+    /// This is the v4 fix for the finding: a UI acknowledge can no longer erase the
+    /// error the MCP sees.
+    ///
+    /// Emits via [`RunnerSink::on_acknowledge`] (the prod sink clears the persisted
+    /// `unread` flag + broadcasts `command://ack`), NOT `on_state` — so no false
+    /// `idle` transition collapses the outcome.
     ///
     /// **No-op** when the instance is `running` (never acknowledge a live process —
-    /// that would lie about its state) or already `idle`/absent (nothing to clear):
-    /// in those cases NO transition is emitted, so the live state — and finding-1's
-    /// last-run exit code, which is decoupled from this dot — is left untouched.
+    /// it has no unseen result yet) or has nothing unread (already seen / absent /
+    /// idle never-run): in those cases NO event is emitted and the entry is untouched.
     ///
-    /// Returns the state after the call (`idle` once acknowledged, else the unchanged
-    /// current state).
+    /// Returns the FACTUAL state after the call (unchanged — an ack never moves it).
     pub(crate) fn acknowledge(&self, instance_id: &str) -> RunState {
-        // Flip the entry's state under the lock, then emit OUTSIDE it (the sink may
-        // touch the DB / event loop; never hold the entries mutex across that).
+        // Flip ONLY the unread flag under the lock, then emit OUTSIDE it (the sink may
+        // touch the DB / event loop; never hold the entries mutex across that). The
+        // factual `state`/`last_exit_code` are deliberately left untouched.
         let acknowledged = {
             let mut entries = self.entries.lock().unwrap();
             match entries.get_mut(instance_id) {
-                Some(entry) if matches!(entry.state, RunState::Success | RunState::Error) => {
-                    entry.state = RunState::Idle;
+                // Only a finished, still-unread run is acknowledgeable. Never a live
+                // `running` process (it has no settled result), never an already-read
+                // or never-run instance.
+                Some(entry)
+                    if entry.unread
+                        && matches!(entry.state, RunState::Success | RunState::Error) =>
+                {
+                    entry.unread = false;
                     true
                 }
-                // Running, already idle, or absent: nothing to acknowledge.
                 _ => false,
             }
         };
         if acknowledged {
-            self.sink.on_state(instance_id, RunState::Idle, None);
-            RunState::Idle
-        } else {
-            self.state_of(instance_id)
+            self.sink.on_acknowledge(instance_id);
         }
+        // The factual state is unchanged by an acknowledge — return it as-is.
+        self.state_of(instance_id)
+    }
+
+    /// Clear an instance's captured output BUFFER (PRD-4 review R-OUTPUT, the
+    /// `clear_command_output` tool): empties the LIVE in-memory scrollback tail (when a
+    /// running entry holds one) AND, via [`RunnerSink::clear_output`], the persisted
+    /// `scrollback`/`prev_scrollback` + a frontend refresh. The FACTUAL state/outcome is
+    /// left UNTOUCHED — a clear wipes the bytes, never the run result — so this is NOT a
+    /// stop/relaunch and emits no state transition. Safe on any instance: a running one
+    /// keeps streaming (its NEXT chunk lands on the freshly-emptied buffer), an
+    /// idle/finished one simply has its persisted log wiped, an absent one is a no-op on
+    /// the live side and clears only the DB row.
+    ///
+    /// The live buffer is reset under the SAME `entries` lock as [`Self::live_output`]
+    /// so a reader cannot observe it mid-clear, then the sink is called OUTSIDE the lock
+    /// (it touches the DB / event loop — never hold the entries mutex across that).
+    pub(crate) fn clear_output(&self, instance_id: &str) {
+        {
+            let entries = self.entries.lock().unwrap();
+            if let Some(entry) = entries.get(instance_id) {
+                // Empty the shared live tail in place; a running pump's next chunk
+                // appends onto the cleared buffer (the pump writes the same Arc).
+                entry.live_scrollback.lock().unwrap().clear();
+            }
+        }
+        // Persist the clear + emit the refresh OUTSIDE the entries lock.
+        self.sink.clear_output(instance_id);
+    }
+
+    /// Whether the instance's last finished run is still an "unseen result" (the v4
+    /// `unread` flag). `false` for a running, never-run, absent, or already-read
+    /// instance. The MCP surface exposes this so an agent can tell whether the UI has
+    /// acknowledged the result — WITHOUT it affecting the factual outcome.
+    pub(crate) fn is_unread(&self, instance_id: &str) -> bool {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .map(|e| e.unread)
+            .unwrap_or(false)
+    }
+
+    /// The instance's LIVE outcome snapshot — `(state, last_exit_code, unread)` —
+    /// when the runner backs it this session, else `None` (no live entry: never
+    /// started this session, or evicted). `None` is the signal for a reader (the MCP)
+    /// to fall back to the PERSISTED outcome in the DB, so the factual outcome is
+    /// reported correctly even across a restart (when the in-memory map is empty).
+    /// Taken under a single lock so the three fields are a consistent snapshot.
+    pub(crate) fn outcome(&self, instance_id: &str) -> Option<(RunState, Option<i32>, bool)> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(instance_id)
+            .map(|e| (e.state, e.last_exit_code, e.unread))
     }
 
     /// Latch the shutdown so the reap runs exactly once. Returns `true` the FIRST
@@ -1091,6 +1381,15 @@ fn spawn_command_pump<S: RunnerSink>(
                             if entry.generation == generation {
                                 entry.state = next;
                                 entry.kill = None;
+                                // Retain the natural exit code in memory so a reader
+                                // (bridge / MCP) can distinguish a crash (non-zero)
+                                // from a clean run (zero) — the same `code` carried to
+                                // the sink below. Only the live generation records it.
+                                entry.last_exit_code = code;
+                                // A freshly finished run is an "unseen result" until
+                                // the UI acknowledges it (the notification axis, fully
+                                // decoupled from the factual outcome above).
+                                entry.unread = true;
                                 drop(guard);
                                 sink.on_state(&instance_id, next, code);
                             }
@@ -1323,7 +1622,7 @@ mod tests {
     fn echo_produces_output() {
         with_posix_shell();
         let (mut cmd, rx) =
-            CommandPty::spawn("echo nyx_cmd_marker", small_size(), None).expect("spawn echo");
+            CommandPty::spawn("echo nyx_cmd_marker", small_size(), None, &[]).expect("spawn echo");
         let out = read_until(&rx, "nyx_cmd_marker", Duration::from_secs(5));
         assert!(
             out.contains("nyx_cmd_marker"),
@@ -1337,7 +1636,7 @@ mod tests {
     #[cfg(not(windows))]
     fn exit_3_yields_exit_code_3() {
         with_posix_shell();
-        let (mut cmd, _rx) = CommandPty::spawn("exit 3", small_size(), None).expect("spawn exit 3");
+        let (mut cmd, _rx) = CommandPty::spawn("exit 3", small_size(), None, &[]).expect("spawn exit 3");
         let code = cmd.wait();
         assert_eq!(code, Some(3), "`exit 3` must surface exit_code 3");
     }
@@ -1348,7 +1647,7 @@ mod tests {
         with_posix_shell();
         let tmp = std::env::temp_dir();
         let canon = std::fs::canonicalize(&tmp).expect("canonicalize tmp");
-        let (_cmd, rx) = CommandPty::spawn("pwd", small_size(), Some(tmp.to_str().unwrap()))
+        let (_cmd, rx) = CommandPty::spawn("pwd", small_size(), Some(tmp.to_str().unwrap()), &[])
             .expect("spawn pwd in tmp");
         let out = read_until(&rx, &canon.to_string_lossy(), Duration::from_secs(5));
         let got = std::fs::canonicalize(out.trim()).unwrap_or_else(|_| tmp.clone());
@@ -1363,7 +1662,7 @@ mod tests {
     fn kill_terminates_and_exit_code_recoverable() {
         with_posix_shell();
         let (mut cmd, _rx) =
-            CommandPty::spawn("sleep 60", small_size(), None).expect("spawn sleep");
+            CommandPty::spawn("sleep 60", small_size(), None, &[]).expect("spawn sleep");
         std::thread::sleep(Duration::from_millis(150));
         assert!(cmd.exit_code().is_none(), "child should still be running");
         cmd.kill();
@@ -1378,7 +1677,7 @@ mod tests {
     #[cfg(not(windows))]
     fn reader_disconnects_when_command_exits() {
         with_posix_shell();
-        let (mut cmd, rx) = CommandPty::spawn("true", small_size(), None).expect("spawn true");
+        let (mut cmd, rx) = CommandPty::spawn("true", small_size(), None, &[]).expect("spawn true");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut disconnected = false;
         while Instant::now() < deadline {
@@ -1405,7 +1704,7 @@ mod tests {
         // The handle must surface a concrete pid (== pgid on Unix) so the runner
         // has an exploitable tree-kill target, not just the parent shell.
         let (mut cmd, _rx) =
-            CommandPty::spawn("sleep 60", small_size(), None).expect("spawn sleep");
+            CommandPty::spawn("sleep 60", small_size(), None, &[]).expect("spawn sleep");
         let handle = cmd.kill_handle();
         assert!(
             handle.pid().is_some(),
@@ -1427,7 +1726,7 @@ mod tests {
         // Spawn a child sleep, print its pid, then wait on it so the shell stays
         // alive and the group is non-trivial.
         let (mut cmd, rx) =
-            CommandPty::spawn("sleep 120 & echo CHILD:$!; wait", small_size(), None)
+            CommandPty::spawn("sleep 120 & echo CHILD:$!; wait", small_size(), None, &[])
                 .expect("spawn group");
         let out = read_until(&rx, "CHILD:", Duration::from_secs(5));
         let child_pid: i32 = out
@@ -1478,7 +1777,7 @@ mod tests {
         let cmdline = "powershell -NoProfile -Command \"$p = Start-Process powershell \
              -ArgumentList '-NoProfile','-Command','Start-Sleep 120' -PassThru; \
              Write-Output ('CHILD:' + $p.Id); Wait-Process -Id $p.Id\"";
-        let (mut cmd, rx) = CommandPty::spawn(cmdline, small_size(), None).expect("spawn group");
+        let (mut cmd, rx) = CommandPty::spawn(cmdline, small_size(), None, &[]).expect("spawn group");
         let out = read_until(&rx, "CHILD:", Duration::from_secs(20));
         let child_pid: u32 = out
             .lines()
@@ -1534,7 +1833,7 @@ mod tests {
     fn drop_is_prompt_and_kills_tree() {
         with_posix_shell();
         let (cmd, rx) =
-            CommandPty::spawn("sleep 120 & wait", small_size(), None).expect("spawn group");
+            CommandPty::spawn("sleep 120 & wait", small_size(), None, &[]).expect("spawn group");
         std::thread::sleep(Duration::from_millis(100));
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
@@ -1598,14 +1897,40 @@ mod tests {
     #[derive(Default)]
     struct MockSink {
         states: Mutex<Vec<(String, RunState, Option<i32>)>>,
+        /// Every `on_acknowledge` call's instance id, in order — so a test can assert
+        /// an ack emitted the (decoupled) ack notification and NOT a state transition.
+        acks: Mutex<Vec<String>>,
         output: Mutex<HashMap<String, Vec<u8>>>,
         output_events: Mutex<usize>,
         scrollback: Mutex<HashMap<String, String>>,
+        /// Per-instance CURRENT-run outcome `(state, exit_code)`, mirrored from
+        /// `on_state` so `archive_previous_run` can model the DB's archive decision
+        /// (only a finished run is retained). The runner's own state map is the
+        /// authority; this is the sink-side mirror the prod sink keeps in the DB row.
+        cur_outcome: Mutex<HashMap<String, (RunState, Option<i32>)>>,
+        /// The bounded (N=1) RETAINED prior run per instance: its persisted scrollback
+        /// plus factual outcome, as `archive_previous_run` rolled it over on the last
+        /// (re)launch. The v5 analog of the DB `prev_*` columns.
+        prev_run: Mutex<HashMap<String, PrevRun>>,
+        /// Every `clear_output` call's instance id, in order — so a test can assert the
+        /// `clear_command_output` path reached the sink (review R-OUTPUT).
+        cleared: Mutex<Vec<String>>,
+    }
+
+    /// The mock's retained prior run — mirrors the DB `prev_*` columns (v5).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PrevRun {
+        scrollback: String,
+        state: RunState,
+        exit_code: Option<i32>,
     }
 
     impl MockSink {
         fn state_log(&self) -> Vec<(String, RunState, Option<i32>)> {
             self.states.lock().unwrap().clone()
+        }
+        fn ack_log(&self) -> Vec<String> {
+            self.acks.lock().unwrap().clone()
         }
         fn output_of(&self, id: &str) -> String {
             String::from_utf8_lossy(
@@ -1625,6 +1950,14 @@ mod tests {
         fn scrollback_of(&self, id: &str) -> Option<String> {
             self.scrollback.lock().unwrap().get(id).cloned()
         }
+        /// The retained prior run for an instance (v5), or `None` if none retained.
+        fn prev_run_of(&self, id: &str) -> Option<PrevRun> {
+            self.prev_run.lock().unwrap().get(id).cloned()
+        }
+        /// The ids cleared via `clear_output`, in call order (review R-OUTPUT).
+        fn cleared_log(&self) -> Vec<String> {
+            self.cleared.lock().unwrap().clone()
+        }
     }
 
     impl RunnerSink for Arc<MockSink> {
@@ -1633,6 +1966,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((instance_id.to_string(), state, exit_code));
+            // Mirror the CURRENT-run outcome so archive_previous_run can decide what
+            // (if anything) to retain — the prod sink keeps this in the DB row.
+            self.cur_outcome
+                .lock()
+                .unwrap()
+                .insert(instance_id.to_string(), (state, exit_code));
+        }
+        fn on_acknowledge(&self, instance_id: &str) {
+            self.acks.lock().unwrap().push(instance_id.to_string());
         }
         fn on_output(&self, instance_id: &str, bytes: &[u8]) {
             *self.output_events.lock().unwrap() += 1;
@@ -1648,6 +1990,55 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(instance_id.to_string(), serialized.to_string());
+        }
+        fn archive_previous_run(&self, instance_id: &str) {
+            // Mirror `db::archive_and_reset_for_relaunch`: if the CURRENT run finished
+            // (success|error), archive its scrollback + outcome into the bounded (N=1)
+            // prev slot (OVERWRITING any earlier one), then reset the current run's
+            // scrollback to "" so the new run starts unpolluted.
+            let finished = matches!(
+                self.cur_outcome.lock().unwrap().get(instance_id),
+                Some((RunState::Success | RunState::Error, _))
+            );
+            if finished {
+                let (state, exit_code) = *self
+                    .cur_outcome
+                    .lock()
+                    .unwrap()
+                    .get(instance_id)
+                    .expect("checked finished above");
+                let scrollback = self
+                    .scrollback
+                    .lock()
+                    .unwrap()
+                    .get(instance_id)
+                    .cloned()
+                    .unwrap_or_default();
+                self.prev_run.lock().unwrap().insert(
+                    instance_id.to_string(),
+                    PrevRun {
+                        scrollback,
+                        state,
+                        exit_code,
+                    },
+                );
+            }
+            // Reset the current run's persisted scrollback (the archive kept the prior).
+            self.scrollback
+                .lock()
+                .unwrap()
+                .insert(instance_id.to_string(), String::new());
+        }
+        fn clear_output(&self, instance_id: &str) {
+            // Mirror `db::clear_instance_scrollback`: empty the persisted scrollback AND
+            // the retained prior run, leaving the factual outcome (state/exit_code)
+            // untouched. Record it so a runner test can assert the clear propagated.
+            self.scrollback
+                .lock()
+                .unwrap()
+                .insert(instance_id.to_string(), String::new());
+            self.prev_run.lock().unwrap().remove(instance_id);
+            self.cleared.lock().unwrap().push(instance_id.to_string());
         }
     }
 
@@ -1675,6 +2066,31 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         runner.state_of(id) == want
+    }
+
+    #[test]
+    fn clear_output_empties_buffer_via_sink_without_spawning() {
+        // Review R-OUTPUT: clear_output on an idle/absent instance (no live process)
+        // empties the persisted scrollback through the sink and records the clear, with
+        // NO state transition emitted — proving the buffer wipe is decoupled from the
+        // run lifecycle. Spawns nothing, so it runs under the ConPTY gap.
+        let sink = Arc::new(MockSink::default());
+        let runner = CommandRunner::new(Arc::clone(&sink), small_size());
+        // Seed a persisted scrollback + a retained prior run for the instance.
+        sink.persist_scrollback("i1", "noisy 160KiB log\n");
+        sink.prev_run.lock().unwrap().insert(
+            "i1".to_string(),
+            PrevRun { scrollback: "old run\n".to_string(), state: RunState::Success, exit_code: Some(0) },
+        );
+        assert!(sink.scrollback_of("i1").is_some_and(|s| !s.is_empty()), "scrollback seeded");
+
+        runner.clear_output("i1");
+
+        assert_eq!(sink.cleared_log(), vec!["i1".to_string()], "the clear reached the sink once");
+        assert_eq!(sink.scrollback_of("i1").as_deref(), Some(""), "current scrollback emptied");
+        assert!(sink.prev_run_of("i1").is_none(), "retained prior run emptied too");
+        // A clear is NOT a run transition: no state was emitted.
+        assert!(sink.state_log().is_empty(), "clear emits no command://state transition");
     }
 
     #[test]
@@ -1728,6 +2144,105 @@ mod tests {
         // state is still running from the FIRST spawn.
         assert_eq!(runner.state_of("i1"), RunState::Running);
         runner.stop("i1").expect("cleanup stop");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn start_with_env_reports_was_running_and_does_not_double_spawn() {
+        // R-WSCMD #5: start_with_env on a RUNNING instance is a no-op that reports
+        // was_running:true and spawns NO second process; on idle it reports
+        // was_running:false. The pid marker proves the SAME first process survives.
+        let (runner, sink) = new_runner();
+        let first = runner
+            .start_with_env("i1", "echo PID:$$; sleep 30", None, &[])
+            .expect("first start");
+        assert!(!first.was_running, "a fresh start was not already running");
+        assert_eq!(first.state, RunState::Running);
+        assert!(wait_state(&runner, "i1", RunState::Running, Duration::from_secs(2)));
+
+        // Capture the FIRST process's pid from its output.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut first_pid: Option<String> = None;
+        while Instant::now() < deadline && first_pid.is_none() {
+            std::thread::sleep(Duration::from_millis(30));
+            first_pid = sink
+                .output_of("i1")
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("PID:").map(str::to_string));
+        }
+        let first_pid = first_pid.expect("captured the first process pid");
+
+        // Second start on the running instance: no-op, was_running:true, NO new spawn.
+        let second = runner
+            .start_with_env("i1", "echo PID:$$; sleep 30", None, &[])
+            .expect("second start");
+        assert!(second.was_running, "the second start saw an already-running instance");
+        assert_eq!(second.state, RunState::Running);
+        std::thread::sleep(Duration::from_millis(300));
+        // The output must still show ONLY the first pid: a second spawn would emit a
+        // different PID line.
+        let pids: Vec<String> = sink
+            .output_of("i1")
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("PID:").map(str::to_string))
+            .collect();
+        assert_eq!(
+            pids,
+            vec![first_pid],
+            "no second process was spawned (only the first pid appears)"
+        );
+        runner.stop("i1").expect("cleanup stop");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn start_with_env_passes_env_to_the_spawned_process() {
+        // R-WSCMD #7: a per-run env map reaches the spawned process. The command echoes
+        // an env var nyx itself does not set; seeing its value in the output proves the
+        // env was merged onto the inherited environment at spawn.
+        let (runner, sink) = new_runner();
+        let env = vec![("NYX_TEST_VAR".to_string(), "vault-value-123".to_string())];
+        runner
+            .start_with_env("i1", "echo VAR=$NYX_TEST_VAR; true", None, &env)
+            .expect("start with env");
+        // Wait for the run to finish (exit 0 → success) so all output is captured.
+        assert!(
+            wait_state(&runner, "i1", RunState::Success, Duration::from_secs(5)),
+            "the echo command should finish"
+        );
+        let out = sink.output_of("i1");
+        assert!(
+            out.contains("VAR=vault-value-123"),
+            "the per-run env var must reach the spawned process, got: {out:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn relaunch_with_env_restarts_and_applies_env() {
+        // R-WSCMD #5/#7: relaunch ALWAYS restarts (was_running reports a live stop) and
+        // applies the per-run env to the fresh process.
+        let (runner, sink) = new_runner();
+        runner.start("i1", "sleep 30", None).expect("start");
+        assert!(wait_state(&runner, "i1", RunState::Running, Duration::from_secs(2)));
+
+        let env = vec![("NYX_TEST_VAR".to_string(), "relaunch-val".to_string())];
+        let outcome = runner
+            .relaunch_with_env("i1", "echo VAR=$NYX_TEST_VAR; true", None, &env)
+            .expect("relaunch with env");
+        assert!(
+            outcome.was_running,
+            "relaunch on a running instance reports it stopped a live process"
+        );
+        assert!(
+            wait_state(&runner, "i1", RunState::Success, Duration::from_secs(5)),
+            "the relaunched echo command finishes"
+        );
+        let out = sink.output_of("i1");
+        assert!(
+            out.contains("VAR=relaunch-val"),
+            "the relaunch env var must reach the fresh process, got: {out:?}"
+        );
     }
 
     #[test]
@@ -1907,11 +2422,12 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn acknowledge_terminal_success_reverts_to_idle_and_emits() {
-        // A finished one-shot (success) is an "unseen result": acknowledging it (the
-        // user opened it) reverts the dot to idle and emits the idle transition so the
-        // sidebar + view dots clear. The output is untouched (acknowledge never spawns
-        // or kills anything).
+    fn acknowledge_success_clears_unread_but_preserves_the_outcome() {
+        // A finished one-shot (success) is an "unseen result". Acknowledging it (the
+        // user opened it) clears ONLY the `unread` flag — the FACTUAL outcome
+        // (state=success, exit_code=0) is preserved, and an ack notification is
+        // emitted via `on_acknowledge`, NOT a false idle state transition. This is the
+        // v4 finding fix: a UI ack must not erase the outcome an observer reads.
         let (runner, sink) = new_runner();
         runner.start("i1", "true", None).expect("start");
         assert!(wait_state(
@@ -1920,32 +2436,51 @@ mod tests {
             RunState::Success,
             Duration::from_secs(5)
         ));
-        let before = sink.state_log().len();
+        assert!(runner.is_unread("i1"), "a finished run is unread");
+        let states_before = sink.state_log().len();
         let st = runner.acknowledge("i1");
-        assert_eq!(st, RunState::Idle, "acknowledge on success returns idle");
+        // The factual outcome is UNCHANGED by the ack.
+        assert_eq!(
+            st,
+            RunState::Success,
+            "acknowledge returns the unchanged factual state (success)"
+        );
         assert_eq!(
             runner.state_of("i1"),
-            RunState::Idle,
-            "the runner entry is now idle"
-        );
-        // Exactly ONE new transition, an idle with no code (the reset).
-        let after = sink.state_log();
-        assert_eq!(
-            after.len(),
-            before + 1,
-            "acknowledge emits exactly one transition"
+            RunState::Success,
+            "the factual state is preserved (NOT collapsed to idle)"
         );
         assert_eq!(
-            after.last(),
-            Some(&("i1".to_string(), RunState::Idle, None)),
-            "acknowledge emits a command://state idle (no code)"
+            runner.last_exit_code("i1"),
+            Some(0),
+            "the factual exit code is preserved through the ack"
+        );
+        assert!(!runner.is_unread("i1"), "the ack cleared the unread flag");
+        // No NEW state transition — the ack went through on_acknowledge instead.
+        assert_eq!(
+            sink.state_log().len(),
+            states_before,
+            "acknowledge emits NO state transition (the outcome is untouched)"
+        );
+        assert_eq!(
+            sink.ack_log(),
+            vec!["i1".to_string()],
+            "acknowledge emits exactly one ack notification"
+        );
+        // A second ack is a no-op (already read): no new ack notification.
+        runner.acknowledge("i1");
+        assert_eq!(
+            sink.ack_log(),
+            vec!["i1".to_string()],
+            "a second ack on an already-read instance emits nothing"
         );
     }
 
     #[test]
     #[cfg(not(windows))]
-    fn acknowledge_terminal_error_reverts_to_idle() {
-        // The error dot is acknowledgeable the same way as success.
+    fn acknowledge_error_clears_unread_but_preserves_the_error_and_code() {
+        // An error result is acknowledgeable the same way — and crucially the
+        // non-zero exit code survives so the MCP still sees state=error + exit_code!=0.
         let (runner, sink) = new_runner();
         runner.start("i1", "exit 3", None).expect("start");
         assert!(wait_state(
@@ -1955,19 +2490,34 @@ mod tests {
             Duration::from_secs(5)
         ));
         let st = runner.acknowledge("i1");
-        assert_eq!(st, RunState::Idle, "acknowledge on error returns idle");
-        assert!(
-            sink.state_log()
-                .iter()
-                .any(|(id, s, code)| id == "i1" && *s == RunState::Idle && code.is_none()),
-            "acknowledge on error emits an idle transition"
+        assert_eq!(
+            st,
+            RunState::Error,
+            "acknowledge returns the unchanged factual state (error)"
+        );
+        assert_eq!(
+            runner.state_of("i1"),
+            RunState::Error,
+            "the error state is preserved through the ack"
+        );
+        assert_eq!(
+            runner.last_exit_code("i1"),
+            Some(3),
+            "the non-zero exit code is preserved through the ack (the finding's crux)"
+        );
+        assert!(!runner.is_unread("i1"), "the ack cleared the unread flag");
+        assert_eq!(
+            sink.ack_log(),
+            vec!["i1".to_string()],
+            "acknowledge on error emits an ack notification, not a state transition"
         );
     }
 
     #[test]
     #[cfg(not(windows))]
     fn acknowledge_running_is_a_noop() {
-        // NEVER acknowledge a live process — it must keep running and emit nothing new.
+        // NEVER acknowledge a live process — it has no unseen result, so the ack must
+        // be a no-op (no notification, state unchanged).
         let (runner, sink) = new_runner();
         runner.start("i1", "sleep 30", None).expect("start");
         assert!(wait_state(
@@ -1993,6 +2543,10 @@ mod tests {
             before,
             "acknowledge on running emits no transition"
         );
+        assert!(
+            sink.ack_log().is_empty(),
+            "acknowledge on running emits no ack notification"
+        );
         runner.stop("i1").expect("cleanup stop");
     }
 
@@ -2008,7 +2562,7 @@ mod tests {
             "acknowledge on an absent instance returns idle"
         );
         assert!(
-            sink.state_log().is_empty(),
+            sink.state_log().is_empty() && sink.ack_log().is_empty(),
             "acknowledge on an absent instance emits nothing"
         );
         // A genuinely idle entry (started then stopped back to idle).
@@ -2026,7 +2580,11 @@ mod tests {
         assert_eq!(
             sink.state_log().len(),
             before,
-            "acknowledge on a genuinely idle entry emits nothing"
+            "acknowledge on a genuinely idle entry emits no state transition"
+        );
+        assert!(
+            sink.ack_log().is_empty(),
+            "acknowledge on a genuinely idle entry emits no ack notification"
         );
     }
 
@@ -2104,6 +2662,73 @@ mod tests {
             "relaunch must kill the first instance before starting the second"
         );
         assert_eq!(runner.state_of("i1"), RunState::Running);
+        runner.stop("i1").expect("cleanup stop");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn relaunch_retains_previous_run_output_and_outcome() {
+        // The finding's fix (v5): after start → output → relaunch, the PREVIOUS run's
+        // output + its factual outcome (state/exit_code) must still be retrievable
+        // (the bounded N=1 retained prior run), while the CURRENT run's scrollback is
+        // reset so the new run is not polluted by the prior run's bytes.
+        let (runner, sink) = new_runner();
+
+        // Run 1: emit a unique marker, then exit non-zero so it finishes as `error`.
+        runner
+            .start("i1", "echo RUN1_MARKER; exit 5", None)
+            .expect("start run 1");
+        assert!(
+            wait_state(&runner, "i1", RunState::Error, Duration::from_secs(5)),
+            "run 1 must finish as error (exit 5)"
+        );
+        // Run 1's output + outcome are the CURRENT run right now.
+        assert!(
+            sink.scrollback_of("i1").unwrap_or_default().contains("RUN1_MARKER"),
+            "run 1's output is the current persisted scrollback before relaunch"
+        );
+        // No prior run retained yet (run 1 is the first run).
+        assert_eq!(sink.prev_run_of("i1"), None, "no prior run before the first relaunch");
+
+        // RELAUNCH: run 2 emits a DIFFERENT marker, stays running.
+        runner
+            .relaunch("i1", "echo RUN2_MARKER; sleep 30", None)
+            .expect("relaunch into run 2");
+        assert!(
+            wait_state(&runner, "i1", RunState::Running, Duration::from_secs(5)),
+            "run 2 must be running after the relaunch"
+        );
+
+        // The PREVIOUS run (run 1) is RETAINED: its output + factual outcome survive.
+        let prev = sink
+            .prev_run_of("i1")
+            .expect("the previous run must be retained across the relaunch");
+        assert!(
+            prev.scrollback.contains("RUN1_MARKER"),
+            "the retained previous run keeps run 1's output, got {:?}",
+            prev.scrollback
+        );
+        assert_eq!(prev.state, RunState::Error, "the retained outcome is run 1's error");
+        assert_eq!(prev.exit_code, Some(5), "the retained outcome keeps run 1's exit code");
+
+        // Meanwhile the CURRENT run is NOT polluted by run 1's bytes: once run 2 has
+        // streamed, the live/persisted current scrollback shows RUN2 and not RUN1.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut current_clean = false;
+        while Instant::now() < deadline {
+            let cur = runner.live_output("i1").unwrap_or_default();
+            if cur.contains("RUN2_MARKER") {
+                assert!(
+                    !cur.contains("RUN1_MARKER"),
+                    "the current run must not be polluted by run 1's output, got {cur:?}"
+                );
+                current_clean = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(current_clean, "run 2's output must reach the current live buffer");
+
         runner.stop("i1").expect("cleanup stop");
     }
 
@@ -2220,5 +2845,95 @@ mod tests {
         // running state — never two.
         assert_eq!(runner.state_of("i1"), RunState::Running);
         runner.stop("i1").expect("cleanup");
+    }
+
+    // --- poll_until: the bounded wait backing wait_for_command (ADR-0003 D12) ---
+
+    #[test]
+    fn poll_until_resolves_when_state_enters_target_without_sleeping() {
+        // The fast path: the very first read is already in the target set (an
+        // already-finished command), so the wait resolves immediately and NEVER
+        // sleeps — there is no blind-poll latency for a command that has already
+        // settled. A counter proves the injected sleep was not called.
+        let mut sleeps = 0usize;
+        let outcome = poll_until(
+            &[RunState::Success, RunState::Error],
+            Duration::from_secs(60),
+            WAIT_POLL_INTERVAL,
+            || RunState::Success,
+            |_d| sleeps += 1,
+        );
+        assert!(outcome.resolved, "an already-settled command resolves");
+        assert_eq!(outcome.state, RunState::Success, "reports the settled state");
+        assert_eq!(sleeps, 0, "a state already in target never sleeps");
+    }
+
+    #[test]
+    fn poll_until_resolves_after_a_few_polls_when_state_transitions() {
+        // The transition path (resolved-true): the command is `running` for the first
+        // few reads, then finishes `success`. poll_until must keep polling and resolve
+        // on the read that observes the transition — proving it tracks a state change
+        // rather than only the initial state.
+        let mut reads = 0usize;
+        let mut sleeps = 0usize;
+        let outcome = poll_until(
+            &[RunState::Success, RunState::Error],
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+            || {
+                reads += 1;
+                // running, running, running, then success.
+                if reads < 4 { RunState::Running } else { RunState::Success }
+            },
+            |_d| sleeps += 1,
+        );
+        assert!(outcome.resolved, "resolves once the state enters target");
+        assert_eq!(outcome.state, RunState::Success);
+        assert_eq!(reads, 4, "polled until the transition was observed");
+        assert_eq!(sleeps, 3, "slept once between each of the pre-transition reads");
+    }
+
+    #[test]
+    fn poll_until_times_out_with_resolved_false_and_last_state() {
+        // The timeout path (resolved-false): the state stays `running` forever, so the
+        // bounded wait must give up at `timeout` and report resolved:false WITH the
+        // last observed state (running) — NOT an error, NOT a block. A tiny real
+        // timeout keeps the test fast (the manual's "tiny timeout_ms" guidance).
+        let outcome = poll_until(
+            &[RunState::Success, RunState::Error],
+            Duration::from_millis(20),
+            Duration::from_millis(2),
+            || RunState::Running,
+            std::thread::sleep,
+        );
+        assert!(!outcome.resolved, "a never-settling wait times out (resolved:false)");
+        assert_eq!(outcome.state, RunState::Running, "reports the last observed state");
+        assert!(
+            outcome.waited >= Duration::from_millis(20),
+            "the wait blocked for at least the timeout, got {:?}",
+            outcome.waited
+        );
+    }
+
+    #[test]
+    fn poll_until_is_bounded_and_never_overshoots_the_timeout() {
+        // The bounded guarantee: even with an interval LARGER than the timeout, the
+        // wait never overshoots — the final sleep is clamped to the remaining budget,
+        // so the total wait stays close to `timeout` rather than rounding up to a full
+        // interval. (Sanity ceiling, generous for slow CI.)
+        let start = Instant::now();
+        let outcome = poll_until(
+            &[RunState::Success],
+            Duration::from_millis(30),
+            Duration::from_millis(1000), // interval >> timeout
+            || RunState::Running,
+            std::thread::sleep,
+        );
+        let total = start.elapsed();
+        assert!(!outcome.resolved);
+        assert!(
+            total < Duration::from_millis(500),
+            "the wait is bounded to ~timeout, not the (1s) interval, got {total:?}"
+        );
     }
 }

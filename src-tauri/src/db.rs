@@ -289,6 +289,12 @@ struct NewManagedCommand {
 /// workspace. `Serialize` for the IPC boundary. `last_state` is the last persisted
 /// run state (idle|running|success|error). `was_running_on_shutdown` is the 0/1
 /// boolean snapshot the shutdown flow sets and boot resets.
+///
+/// `last_exit_code` / `ended_at` / `unread` (v4) split the FACTUAL run outcome from
+/// the notification: `last_exit_code` + `ended_at` persist the last completed run's
+/// natural exit code + finish time (NULL while never-finished / running) — the
+/// outcome an acknowledge must NEVER erase — and `unread` is the separate
+/// "unseen result" flag a UI acknowledge clears WITHOUT collapsing the outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
 #[diesel(table_name = command_instances)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
@@ -296,13 +302,36 @@ pub struct CommandInstance {
     pub id: String,
     pub command_id: String,
     pub workspace_id: String,
-    /// Last persisted run state: idle|running|success|error.
+    /// Last persisted run state: idle|running|success|error. The FACTUAL outcome —
+    /// an acknowledge never collapses it.
     pub last_state: String,
     pub scrollback: String,
     /// Shutdown snapshot: was this instance running when the app last quit?
     pub was_running_on_shutdown: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Natural exit code of the LAST completed run (v4). `None` while the instance
+    /// has never finished a run (idle never-run / running). Persisted so an observer
+    /// can tell a crash from a clean run even after a cold restart.
+    pub last_exit_code: Option<i32>,
+    /// Epoch-millis the last run finished (v4). `None` while never-finished/running.
+    pub ended_at: Option<i64>,
+    /// "Unseen result" flag (v4): `true` once a run finishes, cleared by an
+    /// acknowledge WITHOUT touching `last_state`/`last_exit_code`/`ended_at`.
+    pub unread: bool,
+    /// Bounded retained scrollback of the LAST completed run (v5), kept across a
+    /// (re)launch so an observer can still read the PREVIOUS run after the current
+    /// run reset the live columns. `""` while no prior run is retained (idle never-run
+    /// / first run). Bounded to N=1 prior run.
+    pub prev_scrollback: String,
+    /// The retained prior run's natural exit code (v5). `None` while none is retained
+    /// (or the prior run had no code).
+    pub prev_exit_code: Option<i32>,
+    /// Epoch-millis the retained prior run finished (v5). `None` while none retained.
+    pub prev_ended_at: Option<i64>,
+    /// The retained prior run's factual outcome string (v5): `success`|`error`, or
+    /// `None` while no prior run is retained.
+    pub prev_last_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -363,11 +392,40 @@ impl Db {
     }
 }
 
-/// Apply all pending embedded migrations. Idempotent.
+/// Apply all pending embedded migrations. Idempotent. Returns `Err` if any
+/// migration fails — the caller (boot setup) must propagate the error, which
+/// causes nyx to refuse to start rather than serving a broken schema (D1).
 pub fn run_migrations(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     conn.run_pending_migrations(MIGRATIONS)
         .map_err(|e| anyhow::anyhow!("failed to run migrations: {e}"))?;
     Ok(())
+}
+
+/// Schema health snapshot (D1 probe check).
+#[derive(Debug, Clone)]
+pub struct SchemaHealth {
+    /// `true` when every embedded migration has been applied; `false` if any
+    /// pending migration was not applied (schema is behind the binary).
+    pub up_to_date: bool,
+    /// The number of migrations that are still pending (0 when `up_to_date`).
+    pub pending_count: usize,
+}
+
+/// Check whether the DB schema matches the embedded migrations. Returns a
+/// [`SchemaHealth`] snapshot. Best-effort: any error reading the migration
+/// table degrades to `up_to_date = false` with a note that the check itself
+/// failed, rather than panicking.
+pub fn schema_health(conn: &mut SqliteConnection) -> SchemaHealth {
+    match conn.pending_migrations(MIGRATIONS) {
+        Ok(pending) => SchemaHealth {
+            pending_count: pending.len(),
+            up_to_date: pending.is_empty(),
+        },
+        Err(_) => SchemaHealth {
+            up_to_date: false,
+            pending_count: usize::MAX, // sentinel: check itself failed
+        },
+    }
 }
 
 /// Upper bound on stored scrollback, in bytes. Scrollback is unbounded history;
@@ -564,6 +622,59 @@ pub fn mark_exec_state_read(conn: &mut SqliteConnection, id: &str) -> QueryResul
         .execute(conn)
 }
 
+// --- Git branch detection (PRD-4 dogfood) --------------------------------
+//
+// A workspace is just a folder (nyx stays git-agnostic), but when the folder IS a
+// git work tree we record its CURRENT HEAD branch as optional metadata, surfaced
+// over MCP via `list_workspaces` (the `Workspace.branch` column). We shell out to
+// the user's `git` rather than take a libgit2/gix dependency: it is a single,
+// short, read-only call at workspace-creation time, and matches whatever git the
+// user already has (worktrees, symlinked dirs, custom configs all "just work").
+mod gitbranch {
+    use std::process::Command;
+
+    /// Turn the stdout of `git rev-parse --abbrev-ref HEAD` into a branch name, or
+    /// `None`. `git` prints the branch name (`main`) on a normal checkout, or the
+    /// literal `HEAD` when the work tree is in DETACHED HEAD state — there is no
+    /// branch to record then, so that maps to `None`. Trailing newline / blank
+    /// output is treated as "no branch".
+    pub(super) fn parse_branch(stdout: &str) -> Option<String> {
+        let name = stdout.trim();
+        if name.is_empty() || name == "HEAD" {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+
+    /// Detect the current HEAD branch of the git work tree at `path`, or `None`
+    /// when `path` is not a git work tree, git is unavailable, the command fails,
+    /// or HEAD is detached. Never errors — branch is best-effort optional metadata,
+    /// so a non-git path (the common case) simply yields `None`.
+    pub(super) fn detect(path: &str) -> Option<String> {
+        let output = Command::new("git")
+            .args(["-C", path, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            // Not a repo, or any git error → no branch (stay git-agnostic).
+            return None;
+        }
+        parse_branch(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
+/// Resolve the CURRENT HEAD branch of the git work tree at `path` LIVE (or `None`
+/// when `path` is not a git work tree, git is unavailable, or HEAD is detached).
+/// The public entry point so a READER (the MCP `list_workspaces`) can refresh the
+/// branch at read time instead of trusting the value captured at workspace-add time
+/// — which goes stale the moment the user switches branches (the dogfood finding:
+/// two worktrees both on `main` reported `branch:null`). The SAME `gitbranch::detect`
+/// the creation path uses, so the read-time value matches the add-time semantics.
+pub fn detect_branch(path: &str) -> Option<String> {
+    gitbranch::detect(path)
+}
+
 // --- Project / Workspace CRUD (PRD-2 v2) ---------------------------------
 //
 // Pure DB functions taking `&mut SqliteConnection`, unit-tested against an
@@ -600,13 +711,14 @@ pub fn create_project(
             .returning(Project::as_returning())
             .get_result(conn)?;
 
+        let branch = gitbranch::detect(&normalized);
         let workspace = diesel::insert_into(workspaces::table)
             .values(NewWorkspace {
                 id: Uuid::now_v7().to_string(),
                 project_id: project_id.clone(),
                 name: workspace_name,
                 path: normalized,
-                branch: None,
+                branch,
                 is_root: true,
                 created_at: now,
                 updated_at: now,
@@ -716,6 +828,7 @@ pub fn create_workspace(
 ) -> QueryResult<Workspace> {
     let now = now_millis();
     let normalized = pathnorm::normalize(path);
+    let branch = gitbranch::detect(&normalized);
     conn.transaction(|conn| {
         let workspace = diesel::insert_into(workspaces::table)
             .values(NewWorkspace {
@@ -723,7 +836,7 @@ pub fn create_workspace(
                 project_id: project_id.to_string(),
                 name: name.to_string(),
                 path: normalized,
-                branch: None,
+                branch,
                 is_root: false,
                 created_at: now,
                 updated_at: now,
@@ -1013,6 +1126,14 @@ pub fn get_template(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option
 /// Set an instance's `last_state` (idle|running|success|error), bumping
 /// `updated_at`. An invalid state yields an `Err` (the CHECK constraint). Returns
 /// rows updated (0 if the id is unknown).
+///
+/// This writes ONLY the `last_state` column — it does NOT touch the v4 outcome
+/// columns (`last_exit_code` / `ended_at` / `unread`). It stays the right call for
+/// transitions that carry no run OUTCOME: a `running` start (use
+/// [`set_run_state`] to also clear a stale code), a `stop` to idle, or boot
+/// normalization of an orphaned `running`. A natural success/error finish must go
+/// through [`set_run_state`] so the factual exit code + finish time + unread flag
+/// are recorded.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn set_last_state(conn: &mut SqliteConnection, id: &str, state: &str) -> QueryResult<usize> {
     diesel::update(command_instances::table.find(id))
@@ -1021,6 +1142,134 @@ pub fn set_last_state(conn: &mut SqliteConnection, id: &str, state: &str) -> Que
             command_instances::updated_at.eq(now_millis()),
         ))
         .execute(conn)
+}
+
+/// Persist a full run-state TRANSITION with the v4 outcome columns kept consistent
+/// — the single DB writer the production runner sink uses for every transition so
+/// the FACTUAL outcome is decoupled from the notification/ack state:
+///
+///  - `running`           → set `last_state='running'`; CLEAR the prior outcome
+///    (`last_exit_code`/`ended_at` → NULL) so a fresh run never reads a stale code;
+///    leave `unread` as-is (a start does not produce an unseen result yet).
+///  - `success` / `error` → set `last_state` + record `last_exit_code` (the natural
+///    code; may be NULL for an unknown exit) + `ended_at = now` + `unread = 1` (a
+///    finished run is an "unseen result" until acknowledged).
+///  - `idle`              → set `last_state='idle'` only (a stop/normalize is not a
+///    run completion: no code, no ended_at, no unread).
+///
+/// This is what makes a UI acknowledge unable to erase the outcome: an ack clears
+/// `unread` via [`acknowledge_instance`] and NEVER calls this with `idle`, so the
+/// persisted `last_state`/`last_exit_code`/`ended_at` survive. Returns rows updated
+/// (0 if the id is unknown). An invalid `state` yields an `Err` (CHECK constraint).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_run_state(
+    conn: &mut SqliteConnection,
+    id: &str,
+    state: &str,
+    exit_code: Option<i32>,
+) -> QueryResult<usize> {
+    let now = now_millis();
+    match state {
+        STATE_SUCCESS | STATE_ERROR => diesel::update(command_instances::table.find(id))
+            .set((
+                command_instances::last_state.eq(state),
+                command_instances::last_exit_code.eq(exit_code),
+                command_instances::ended_at.eq(Some(now)),
+                command_instances::unread.eq(true),
+                command_instances::updated_at.eq(now),
+            ))
+            .execute(conn),
+        STATE_RUNNING => diesel::update(command_instances::table.find(id))
+            .set((
+                command_instances::last_state.eq(state),
+                command_instances::last_exit_code.eq::<Option<i32>>(None),
+                command_instances::ended_at.eq::<Option<i64>>(None),
+                command_instances::updated_at.eq(now),
+            ))
+            .execute(conn),
+        // idle (or any other state): touch only last_state — a stop/normalize is not
+        // a completed run, so it carries no outcome and clears no unread flag.
+        _ => set_last_state(conn, id, state),
+    }
+}
+
+/// Clear an instance's `unread` notification flag — the persisted half of an
+/// acknowledge. It touches ONLY `unread` (+ `updated_at`): the factual outcome
+/// (`last_state` / `last_exit_code` / `ended_at`) is left intact, which is the whole
+/// point of the v4 split (a UI ack must never erase the error the MCP sees). Returns
+/// rows updated (0 if the id is unknown OR it was already read).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn acknowledge_instance(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(command_instances::table.find(id))
+        .filter(command_instances::unread.eq(true))
+        .set((
+            command_instances::unread.eq(false),
+            command_instances::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Archive the LAST completed run into the bounded `prev_*` columns, then reset the
+/// CURRENT run for a fresh (re)launch — the v5 "retain the previous run" writer the
+/// production runner sink calls on `start` (BEFORE the new run's first persist).
+///
+/// Bounded to ONE prior run (N=1): the prior `prev_*` are OVERWRITTEN, never appended,
+/// so history can never grow without limit. The archive only happens when the CURRENT
+/// `last_state` is a finished run (`success`|`error`) — a start over an idle / running
+/// / never-run instance has no completed run to keep, so `prev_*` are left untouched
+/// (the very first launch keeps them at their `''`/NULL defaults).
+///
+/// In one transaction it:
+///  - copies `scrollback`→`prev_scrollback`, `last_exit_code`→`prev_exit_code`,
+///    `ended_at`→`prev_ended_at`, `last_state`→`prev_last_state` (only when the
+///    current run finished);
+///  - resets the CURRENT run: `scrollback=''`, `last_state='running'`,
+///    `last_exit_code=NULL`, `ended_at=NULL` (a fresh run produces no outcome yet),
+///    leaving `unread` as-is (a start is not an unseen result).
+///
+/// This keeps the per-run separation intact: the CURRENT run starts clean (never
+/// polluted by the prior run's bytes), while the prior run stays retrievable through
+/// the `prev_*` columns. Returns rows updated (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn archive_and_reset_for_relaunch(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    let now = now_millis();
+    conn.transaction(|conn| {
+        // Snapshot the row's CURRENT run so we can decide what (if anything) to
+        // archive. Unknown id → 0 rows updated (nothing to do).
+        let Some(inst) = get_instance(conn, id)? else {
+            return Ok(0);
+        };
+
+        // Archive the current run into prev_* ONLY when it actually FINISHED
+        // (success|error). A running / idle / never-run instance has no completed run
+        // to retain, so prev_* are left untouched (the very first launch keeps them at
+        // their ''/NULL defaults). Bounded to ONE prior run: prev_* are OVERWRITTEN,
+        // never appended, so retained history can never grow without limit.
+        if inst.last_state == STATE_SUCCESS || inst.last_state == STATE_ERROR {
+            diesel::update(command_instances::table.find(id))
+                .set((
+                    command_instances::prev_scrollback.eq(&inst.scrollback),
+                    command_instances::prev_exit_code.eq(inst.last_exit_code),
+                    command_instances::prev_ended_at.eq(inst.ended_at),
+                    command_instances::prev_last_state.eq(Some(&inst.last_state)),
+                ))
+                .execute(conn)?;
+        }
+
+        // Reset the CURRENT run for the fresh launch so the new run begins clean
+        // (never polluted by the prior run's bytes). Always runs (even on a first
+        // start over an idle/never-run instance). Leaves `unread` as-is — a start is
+        // not an unseen result yet.
+        diesel::update(command_instances::table.find(id))
+            .set((
+                command_instances::scrollback.eq(""),
+                command_instances::last_state.eq(STATE_RUNNING),
+                command_instances::last_exit_code.eq::<Option<i32>>(None),
+                command_instances::ended_at.eq::<Option<i64>>(None),
+                command_instances::updated_at.eq(now),
+            ))
+            .execute(conn)
+    })
 }
 
 /// Persist (overwrite) an instance's serialized scrollback, bounded to
@@ -1036,6 +1285,24 @@ pub fn persist_instance_scrollback(
     diesel::update(command_instances::table.find(id))
         .set((
             command_instances::scrollback.eq(bounded),
+            command_instances::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Clear an instance's captured output buffer (PRD-4 review R-OUTPUT): empties BOTH
+/// the current-run `scrollback` AND the retained-prior-run `prev_scrollback`, so a
+/// subsequent `get_command_output` (current OR `run="previous"`) returns empty/new-only.
+/// The FACTUAL outcome columns (`last_state`/`last_exit_code`/`ended_at`/`unread` and
+/// the `prev_*` outcome) are LEFT INTACT — a clear wipes the bytes, it does not erase
+/// the run result (an agent must still be able to tell a crash from a clean run after
+/// clearing the noisy log). Bumps `updated_at`. Returns rows updated (0 if id unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn clear_instance_scrollback(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(command_instances::table.find(id))
+        .set((
+            command_instances::scrollback.eq(""),
+            command_instances::prev_scrollback.eq(""),
             command_instances::updated_at.eq(now_millis()),
         ))
         .execute(conn)
@@ -1126,6 +1393,19 @@ pub fn workspace_path(conn: &mut SqliteConnection, id: &str) -> QueryResult<Opti
         .optional()
 }
 
+/// A single workspace row by id, or `None` if unknown. Mirrors
+/// [`get_template`]/[`get_instance`] for the cases that need the FULL row (both the
+/// `project_id` and the `path`) — e.g. the MCP `import_commands` tool's
+/// `workspace_id` form, which scans the one workspace and imports into its project.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_workspace(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Workspace>> {
+    workspaces::table
+        .find(id)
+        .select(Workspace::as_select())
+        .first::<Workspace>(conn)
+        .optional()
+}
+
 /// The ids of every instance of `command_id` (one per workspace of the project).
 /// Used by the running-mutation guard: a template cannot be updated/deleted while
 /// ANY of its instances is running.
@@ -1153,6 +1433,27 @@ pub fn instance_ids_for_project(
         .filter(managed_commands::project_id.eq(project_id))
         .select(command_instances::id)
         .load(conn)
+}
+
+/// The ids of every command instance belonging to `workspace_id`. Used by the
+/// `remove_workspace` guard (A2): a workspace cannot be deleted while ANY of its
+/// command instances is running, same as the project-level guard.
+pub fn instance_ids_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<Vec<String>> {
+    command_instances::table
+        .filter(command_instances::workspace_id.eq(workspace_id))
+        .select(command_instances::id)
+        .load(conn)
+}
+
+/// Delete a workspace (ON DELETE CASCADE removes its command instances, SET NULL
+/// detaches its terminals). Returns rows deleted (0 = workspace not found).
+/// The caller is responsible for guarding against live running instances before
+/// calling this (see `instance_ids_for_workspace` + runner's `any_running`).
+pub fn delete_workspace(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::delete(workspaces::table.find(id)).execute(conn)
 }
 
 /// Every command instance across all projects, with the run context needed to
@@ -1337,6 +1638,12 @@ pub struct InstanceWithTemplate {
     pub was_running_on_shutdown: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// v4 factual-outcome columns: the last completed run's natural exit code +
+    /// finish time (None while never-finished/running), and the separate `unread`
+    /// "unseen result" flag a UI acknowledge clears without erasing the outcome.
+    pub last_exit_code: Option<i32>,
+    pub ended_at: Option<i64>,
+    pub unread: bool,
     // Joined template columns.
     pub name: String,
     pub command: String,
@@ -1384,6 +1691,9 @@ pub fn list_instances_for_workspace(
             command_instances::was_running_on_shutdown,
             command_instances::created_at,
             command_instances::updated_at,
+            command_instances::last_exit_code,
+            command_instances::ended_at,
+            command_instances::unread,
             managed_commands::name,
             managed_commands::command,
             managed_commands::subfolder,
@@ -1403,6 +1713,9 @@ pub fn list_instances_for_workspace(
             bool,
             i64,
             i64,
+            Option<i32>,
+            Option<i64>,
+            bool,
             String,
             String,
             Option<String>,
@@ -1424,15 +1737,18 @@ pub fn list_instances_for_workspace(
                     was_running_on_shutdown: r.5,
                     created_at: r.6,
                     updated_at: r.7,
-                    name: r.8,
-                    command: r.9,
-                    subfolder: r.10,
-                    order_index: r.11,
-                    source_kind: r.12,
-                    source_package_json_path: r.13,
-                    source_script_name: r.14,
-                    package_manager: r.15,
-                    workspace_path: r.16,
+                    last_exit_code: r.8,
+                    ended_at: r.9,
+                    unread: r.10,
+                    name: r.11,
+                    command: r.12,
+                    subfolder: r.13,
+                    order_index: r.14,
+                    source_kind: r.15,
+                    source_package_json_path: r.16,
+                    source_script_name: r.17,
+                    package_manager: r.18,
+                    workspace_path: r.19,
                     cwd: None,
                 })
                 .collect()
@@ -2234,6 +2550,96 @@ mod tests {
         assert!(!root.path.ends_with('/') || root.path == "/");
     }
 
+    /// PURE branch parsing: a normal checkout reports a branch name; DETACHED HEAD
+    /// reports the literal `HEAD`; blank/whitespace output is "no branch". Trailing
+    /// newlines (git always appends one) are trimmed.
+    #[test]
+    fn parse_branch_maps_detached_and_blank_to_none() {
+        assert_eq!(gitbranch::parse_branch("main\n").as_deref(), Some("main"));
+        assert_eq!(
+            gitbranch::parse_branch("feature/foo\n").as_deref(),
+            Some("feature/foo")
+        );
+        // Detached HEAD: git prints the literal `HEAD` → no branch to record.
+        assert_eq!(gitbranch::parse_branch("HEAD\n"), None);
+        assert_eq!(gitbranch::parse_branch(""), None);
+        assert_eq!(gitbranch::parse_branch("   \n"), None);
+    }
+
+    /// Run a git subcommand in `dir`, asserting success. Deterministic identity is
+    /// passed via `-c` so the test never depends on the host's git user config.
+    #[cfg(test)]
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.email=test@nyx", "-c", "user.name=nyx-test"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    /// Make a unique scratch directory under the OS temp dir. Returned path is the
+    /// caller's to remove. (We avoid a `tempfile` dev-dep; uniqueness comes from a
+    /// v7 UUID so parallel test threads never collide.)
+    #[cfg(test)]
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nyx-gitbranch-{tag}-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// `gitbranch::detect` reports the CURRENT HEAD branch of a real git work tree,
+    /// and returns `None` for a non-git path. This exercises the actual `git`
+    /// subprocess the workspace-creation path runs (the dogfood finding: branch was
+    /// always None). The repo is created on a KNOWN branch (`work-prd3`) and a
+    /// commit is made so the branch is born (an unborn branch makes `rev-parse`
+    /// fail → None, which is not the case under test here).
+    ///
+    /// Skipped gracefully if `git` is not on PATH (CI image without git) — the
+    /// detector is itself git-agnostic, so its contract still holds.
+    #[test]
+    fn detect_returns_head_branch_for_a_git_repo_and_none_otherwise() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping detect test: git not available");
+            return;
+        }
+
+        let repo = scratch_dir("repo");
+        let repo_str = repo.to_str().expect("utf8 repo path");
+
+        // Init, pin HEAD to a known branch (portable across git versions that
+        // default to `master` vs `main`), then commit so the branch is born.
+        git_in(&repo, &["init", "-q"]);
+        git_in(&repo, &["symbolic-ref", "HEAD", "refs/heads/work-prd3"]);
+        std::fs::write(repo.join("README.md"), b"nyx").expect("seed file");
+        git_in(&repo, &["add", "README.md"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+
+        assert_eq!(
+            gitbranch::detect(repo_str).as_deref(),
+            Some("work-prd3"),
+            "a git work tree reports its current HEAD branch"
+        );
+
+        // A plain directory (no git) → None.
+        let plain = scratch_dir("plain");
+        assert_eq!(
+            gitbranch::detect(plain.to_str().expect("utf8 plain path")),
+            None,
+            "a non-git path yields no branch"
+        );
+
+        // Best-effort cleanup (ignore failures: temp dir is reclaimed by the OS).
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
     /// `create_workspace` REFUSES a path already present in the SAME project, but
     /// ACCEPTS the same path in a DIFFERENT project (UNIQUE(project_id, path), not
     /// global). Done-criterion verbatim.
@@ -2774,6 +3180,16 @@ mod tests {
             !got_inst.was_running_on_shutdown,
             "was_running_on_shutdown defaults to false"
         );
+        // v4 outcome columns default to "never finished, already seen".
+        assert_eq!(
+            got_inst.last_exit_code, None,
+            "last_exit_code defaults to NULL (never finished)"
+        );
+        assert_eq!(
+            got_inst.ended_at, None,
+            "ended_at defaults to NULL (never finished)"
+        );
+        assert!(!got_inst.unread, "unread defaults to false (no unseen result)");
         assert!(got_inst.created_at > 0 && got_inst.updated_at == got_inst.created_at);
     }
 
@@ -3114,6 +3530,111 @@ mod tests {
         );
     }
 
+    /// v4: `set_run_state` records the FACTUAL outcome (last_state + exit code +
+    /// ended_at + unread) on a finish, and `acknowledge_instance` clears ONLY the
+    /// `unread` flag — the outcome (last_state / last_exit_code / ended_at) is
+    /// preserved. This is the persisted half of the fix: a UI ack can no longer
+    /// erase the error an observer (the MCP) reads. Also proves the `running`
+    /// transition clears a stale code and that `idle` is outcome-free.
+    #[test]
+    fn set_run_state_and_acknowledge_decouple_outcome_from_unread() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let inst = insert_instance(&mut conn, &dev.id, &root.id);
+        let reload = |c: &mut SqliteConnection| get_instance(c, &inst.id).unwrap().unwrap();
+
+        // A non-zero finish records the full outcome + flags the unseen result.
+        assert_eq!(
+            set_run_state(&mut conn, &inst.id, STATE_ERROR, Some(7)).unwrap(),
+            1
+        );
+        let after_err = reload(&mut conn);
+        assert_eq!(after_err.last_state, STATE_ERROR);
+        assert_eq!(after_err.last_exit_code, Some(7), "exit code persisted");
+        assert!(after_err.ended_at.is_some(), "ended_at stamped on finish");
+        assert!(after_err.unread, "a finished run is an unseen result");
+
+        // ACKNOWLEDGE: clears only `unread` — the outcome is untouched (the crux of
+        // the finding: the MCP must still see state=error + exit_code=7 after an ack).
+        assert_eq!(
+            acknowledge_instance(&mut conn, &inst.id).unwrap(),
+            1,
+            "ack clears the unread flag of an unseen result"
+        );
+        let after_ack = reload(&mut conn);
+        assert!(!after_ack.unread, "ack clears the unread flag");
+        assert_eq!(
+            after_ack.last_state, STATE_ERROR,
+            "ack must NOT erase the factual state"
+        );
+        assert_eq!(
+            after_ack.last_exit_code,
+            Some(7),
+            "ack must NOT erase the factual exit code"
+        );
+        assert_eq!(
+            after_ack.ended_at, after_err.ended_at,
+            "ack must NOT erase ended_at"
+        );
+
+        // A second ack is a no-op (already read): 0 rows touched.
+        assert_eq!(
+            acknowledge_instance(&mut conn, &inst.id).unwrap(),
+            0,
+            "ack on an already-read row touches nothing"
+        );
+
+        // A fresh `running` start clears the stale code/ended_at but leaves unread
+        // as-is (a start is not an unseen result yet).
+        assert_eq!(
+            set_run_state(&mut conn, &inst.id, STATE_RUNNING, None).unwrap(),
+            1
+        );
+        let after_run = reload(&mut conn);
+        assert_eq!(after_run.last_state, STATE_RUNNING);
+        assert_eq!(
+            after_run.last_exit_code, None,
+            "a fresh run clears the prior exit code"
+        );
+        assert_eq!(after_run.ended_at, None, "a fresh run clears ended_at");
+        assert!(!after_run.unread, "running is not yet an unseen result");
+
+        // A clean (exit 0) finish records code 0 + unread again.
+        assert_eq!(
+            set_run_state(&mut conn, &inst.id, STATE_SUCCESS, Some(0)).unwrap(),
+            1
+        );
+        let after_ok = reload(&mut conn);
+        assert_eq!(after_ok.last_state, STATE_SUCCESS);
+        assert_eq!(after_ok.last_exit_code, Some(0), "clean exit records 0");
+        assert!(after_ok.unread, "a fresh finish is unseen again");
+
+        // `idle` (a stop / boot-normalize) is outcome-free: only last_state moves.
+        assert_eq!(
+            set_run_state(&mut conn, &inst.id, STATE_IDLE, None).unwrap(),
+            1
+        );
+        let after_idle = reload(&mut conn);
+        assert_eq!(after_idle.last_state, STATE_IDLE);
+
+        // The `unread` CHECK rejects out-of-domain values via a raw update.
+        let bad = diesel::sql_query(format!(
+            "UPDATE command_instances SET unread = 2 WHERE id = '{}'",
+            inst.id
+        ))
+        .execute(&mut conn);
+        assert!(bad.is_err(), "unread CHECK must reject values outside 0|1");
+    }
+
     /// `set_was_running_on_shutdown` round-trips and can be reset after boot.
     /// Done-criterion verbatim: "was_running_on_shutdown round-trip et peut etre
     /// reset apres boot".
@@ -3381,13 +3902,22 @@ mod tests {
         );
     }
 
-    /// Migration v3 down→up reversibility: revert v3, the new tables are gone,
-    /// re-apply, and the schema round-trips a template + instance again.
+    /// Migration v3 down→up reversibility: revert down to before v3, the v3 tables
+    /// are gone, re-apply, and the schema round-trips a template + instance again.
+    ///
+    /// History: v3 used to be the LAST migration, so a single `revert_last_migration`
+    /// reached the v3-absent state. PRD-4 added migration **v4** on top, so reaching
+    /// the v3-absent state now reverts TWO migrations (v4 then v3). The v4-only
+    /// down→up is covered separately by `migration_v4_down_then_up_*`.
     #[test]
     fn migration_v3_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Revert v3 (the last migration). managed_commands must then be absent.
+        // Revert v5, v4, then v3. managed_commands must then be absent.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v5 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v4 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v3 cleanly");
         let after_down: QueryResult<i64> = managed_commands::table.count().get_result(&mut conn);
@@ -3419,6 +3949,187 @@ mod tests {
         assert_eq!(
             inst.last_state, STATE_IDLE,
             "rebuilt v3 schema round-trips an instance"
+        );
+    }
+
+    /// Migration v4 down→up reversibility + safe back-fill: the v4 outcome columns
+    /// (`last_exit_code` / `ended_at` / `unread`) are added with safe defaults for an
+    /// EXISTING row, the down drops them (the table + a pre-v4 row survive), and the
+    /// re-applied up restores them with the same safe defaults — so an upgrade never
+    /// strands a row.
+    #[test]
+    fn migration_v4_down_then_up_recreates_columns_with_safe_defaults() {
+        let mut conn = open_in_memory();
+
+        // Seed a row through the FULL (v4) schema so it exists across the revert.
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let inst = insert_instance(&mut conn, &dev.id, &root.id);
+
+        // Revert v5 then v4. The instance row + its v3 columns survive; the v4 columns
+        // are gone (a typed select of `unread` would now fail to run). v5 is reverted
+        // first because it stacks on top of v4 (migrations revert in reverse order).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v5 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v4 cleanly");
+        let unread_after_down: QueryResult<bool> = command_instances::table
+            .select(command_instances::unread)
+            .filter(command_instances::id.eq(&inst.id))
+            .first(&mut conn);
+        assert!(
+            unread_after_down.is_err(),
+            "after reverting v4, the `unread` column must be gone"
+        );
+        // The row itself (and managed_commands) is still there — v4 is additive.
+        let still_there: i64 = command_instances::table.count().get_result(&mut conn).unwrap();
+        assert_eq!(still_there, 1, "the pre-v4 instance row survives the v4 down");
+
+        // Re-apply v4: the columns return with safe defaults for the EXISTING row
+        // (unread=0 / NULL code / NULL ended_at) — an upgrade does not strand a row.
+        run_migrations(&mut conn).expect("re-apply v4");
+        let back = get_instance(&mut conn, &inst.id).unwrap().unwrap();
+        assert!(!back.unread, "back-filled unread defaults to false (already seen)");
+        assert_eq!(
+            back.last_exit_code, None,
+            "back-filled last_exit_code defaults to NULL"
+        );
+        assert_eq!(back.ended_at, None, "back-filled ended_at defaults to NULL");
+    }
+
+    /// `archive_and_reset_for_relaunch` retains the LAST completed run (v5, the dogfood
+    /// review fix): a finished run's scrollback + outcome roll into the bounded `prev_*`
+    /// columns (N=1) while the current run resets clean. A non-finished start has no run
+    /// to retain. Bounded: a SECOND relaunch overwrites the retained prior run, never
+    /// stacks.
+    #[test]
+    fn archive_and_reset_retains_one_prior_run_bounded() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let inst = insert_instance(&mut conn, &dev.id, &root.id);
+        let reload = |c: &mut SqliteConnection| get_instance(c, &inst.id).unwrap().unwrap();
+
+        // A FRESH start on an idle never-run instance: nothing to retain. prev_* stay
+        // at their defaults; the current run resets to a clean `running` row.
+        assert_eq!(
+            archive_and_reset_for_relaunch(&mut conn, &inst.id).unwrap(),
+            1
+        );
+        let first = reload(&mut conn);
+        assert_eq!(first.prev_scrollback, "", "first start retains no prior run");
+        assert_eq!(first.prev_last_state, None);
+        assert_eq!(first.prev_exit_code, None);
+        assert_eq!(first.last_state, STATE_RUNNING, "the current run is reset to running");
+        assert_eq!(first.scrollback, "", "the current run starts with empty scrollback");
+
+        // Run 1 produces output and FINISHES error(7).
+        persist_instance_scrollback(&mut conn, &inst.id, "RUN1 output\n").unwrap();
+        set_run_state(&mut conn, &inst.id, STATE_ERROR, Some(7)).unwrap();
+
+        // RELAUNCH: the finished run 1 is archived into prev_*; the current run resets.
+        assert_eq!(
+            archive_and_reset_for_relaunch(&mut conn, &inst.id).unwrap(),
+            1
+        );
+        let after_relaunch = reload(&mut conn);
+        assert_eq!(
+            after_relaunch.prev_scrollback, "RUN1 output\n",
+            "the retained prior run keeps run 1's output"
+        );
+        assert_eq!(after_relaunch.prev_last_state.as_deref(), Some(STATE_ERROR));
+        assert_eq!(after_relaunch.prev_exit_code, Some(7), "retained prior exit code");
+        assert!(after_relaunch.prev_ended_at.is_some(), "retained prior ended_at");
+        // The CURRENT run is clean — not polluted by run 1's bytes.
+        assert_eq!(after_relaunch.scrollback, "", "current run resets to empty");
+        assert_eq!(after_relaunch.last_state, STATE_RUNNING);
+        assert_eq!(after_relaunch.last_exit_code, None, "current run has no code yet");
+
+        // Run 2 produces output and finishes success(0).
+        persist_instance_scrollback(&mut conn, &inst.id, "RUN2 output\n").unwrap();
+        set_run_state(&mut conn, &inst.id, STATE_SUCCESS, Some(0)).unwrap();
+
+        // A SECOND relaunch OVERWRITES the retained prior run with run 2 — bounded N=1,
+        // never stacking run 1 + run 2.
+        archive_and_reset_for_relaunch(&mut conn, &inst.id).unwrap();
+        let after_second = reload(&mut conn);
+        assert_eq!(
+            after_second.prev_scrollback, "RUN2 output\n",
+            "the retained prior run is now run 2 (bounded N=1, run 1 evicted)"
+        );
+        assert_eq!(after_second.prev_last_state.as_deref(), Some(STATE_SUCCESS));
+        assert_eq!(after_second.prev_exit_code, Some(0));
+    }
+
+    /// Migration v5 down→up reversibility + safe back-fill: the v5 retained-prior-run
+    /// columns (`prev_scrollback` / `prev_exit_code` / `prev_ended_at` /
+    /// `prev_last_state`) are added with safe defaults for an EXISTING row, the down
+    /// drops them (the table + a pre-v5 row survive), and the re-applied up restores
+    /// them with the same safe defaults. Mirrors the v4 down→up test.
+    #[test]
+    fn migration_v5_down_then_up_recreates_columns_with_safe_defaults() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let dev = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let inst = insert_instance(&mut conn, &dev.id, &root.id);
+
+        // Revert ONLY v5. The instance row + its v3/v4 columns survive; the v5 columns
+        // are gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v5 cleanly");
+        let prev_after_down: QueryResult<String> = command_instances::table
+            .select(command_instances::prev_scrollback)
+            .filter(command_instances::id.eq(&inst.id))
+            .first(&mut conn);
+        assert!(
+            prev_after_down.is_err(),
+            "after reverting v5, the `prev_scrollback` column must be gone"
+        );
+        let still_there: i64 = command_instances::table.count().get_result(&mut conn).unwrap();
+        assert_eq!(still_there, 1, "the pre-v5 instance row survives the v5 down");
+
+        // Re-apply v5: the columns return with safe defaults for the EXISTING row
+        // ('' scrollback / NULL code / NULL ended_at / NULL state).
+        run_migrations(&mut conn).expect("re-apply v5");
+        let back = get_instance(&mut conn, &inst.id).unwrap().unwrap();
+        assert_eq!(back.prev_scrollback, "", "back-filled prev_scrollback defaults to ''");
+        assert_eq!(back.prev_exit_code, None, "back-filled prev_exit_code defaults to NULL");
+        assert_eq!(back.prev_ended_at, None, "back-filled prev_ended_at defaults to NULL");
+        assert_eq!(back.prev_last_state, None, "back-filled prev_last_state defaults to NULL");
+
+        // The `prev_last_state` CHECK rejects an out-of-domain value via a raw update.
+        let bad = diesel::sql_query(format!(
+            "UPDATE command_instances SET prev_last_state = 'running' WHERE id = '{}'",
+            inst.id
+        ))
+        .execute(&mut conn);
+        assert!(
+            bad.is_err(),
+            "prev_last_state CHECK must reject values outside success|error"
         );
     }
 

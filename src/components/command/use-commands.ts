@@ -1,7 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import type { ExecState } from "@/components/sidebar/use-terminals";
+
+/**
+ * Backend event broadcast on EVERY mutation of a command TEMPLATE, whether it
+ * originated in a UI `#[tauri::command]` (`command_create`/`command_update`/
+ * `command_delete`/`command_resync_source`/`command_unlink_source`/
+ * `command_import_create`) or in an MCP tool (`add_command`/`update_command`/
+ * `import_commands`). Mirrors `bridge::COMMANDS_CHANGED_EVENT`. The modal re-lists its
+ * templates on receipt so a template mutated by another surface (notably an MCP tool
+ * the modal never invoked) shows up live WITHOUT a manual reload — the modal otherwise
+ * only re-lists on a `projectId` change.
+ */
+const COMMANDS_CHANGED_EVENT = "commands://changed";
 
 /**
  * Front mirror of the backend `db::ManagedCommand` (a project command template).
@@ -31,11 +44,20 @@ export interface InstanceWithTemplate {
   id: string;
   command_id: string;
   workspace_id: string;
+  /** The FACTUAL run state (idle|running|success|error). An acknowledge never changes it. */
   last_state: ExecState;
   scrollback: string;
   was_running_on_shutdown: boolean;
   created_at: number;
   updated_at: number;
+  /**
+   * v4 factual-outcome columns: the last completed run's natural exit code + finish
+   * time (null while never-finished/running), and `unread` — the separate "unseen
+   * result" flag a UI acknowledge clears WITHOUT touching the factual outcome above.
+   */
+  last_exit_code: number | null;
+  ended_at: number | null;
+  unread: boolean;
   // Joined template fields.
   name: string;
   command: string;
@@ -205,6 +227,32 @@ export function useCommands(projectId: string | null): UseCommands {
       cancelled = true;
     };
   }, [projectId, refresh]);
+
+  // Re-list the templates whenever the backend signals a command template changed.
+  // This is the single refresh path BOTH the UI's own mutations and the MCP tools'
+  // mutations converge on: the modal otherwise only re-lists on a `projectId` change,
+  // so a template mutated by another surface (notably an MCP tool the modal never
+  // invoked) would never appear live. StrictMode-safe: the listener is torn down on
+  // cleanup and a late resolve after unmount is unlistened immediately.
+  useEffect(() => {
+    let torndown = false;
+    let unlisten: (() => void) | undefined;
+    void listen(COMMANDS_CHANGED_EVENT, () => {
+      if (torndown) return;
+      // A transient list failure leaves the current templates; the next event recovers.
+      void refresh().catch(() => {});
+    }).then((un) => {
+      if (torndown) {
+        void Promise.resolve(un()).catch(() => {});
+        return;
+      }
+      unlisten = un;
+    });
+    return () => {
+      torndown = true;
+      if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
+    };
+  }, [refresh]);
 
   const create = useCallback(
     async (values: CommandFormValues) => {

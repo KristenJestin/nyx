@@ -161,9 +161,18 @@ interface CommandRowProps {
  * (like the terminal close `x`), and each stops propagation so acting never also
  * selects the row. A lifecycle failure (finding 01KV63TAG…) is reflected on the lead
  * dot so a refused action is visible even from the sidebar.
+ *
+ * SETTLED-BADGE / UNREAD (PRD-4 v4): the lead dot's SETTLED success/error emphasis is
+ * the "unseen result" notification, driven by `command.unread` — mirroring 2.1's
+ * `TerminalStateBadge` unread model. Once acknowledged (`unread=false`), the settled
+ * badge HIDES (the dot falls back to the neutral idle fill) while the row STILL
+ * reflects the FACTUAL state via `data-state` (and the command view/info bar keep
+ * showing the true last-run outcome). A `running` dot always shows (it is live, not a
+ * notification); a refused action forces the error dot regardless of unread.
  */
 function CommandRow({ command, active, onSelect }: CommandRowProps) {
   const state = command.state ?? "idle";
+  const unread = command.unread ?? false;
   // A refused lifecycle action surfaces on the lead dot (the row has no output
   // panel). Cleared when a fresh live state arrives.
   const [failed, setFailed] = useState(false);
@@ -172,7 +181,14 @@ function CommandRow({ command, active, onSelect }: CommandRowProps) {
     setSeenState(state);
     if (failed) setFailed(false);
   }
-  const dotState: ExecState = failed ? "error" : state;
+  // A refused action always shows the error dot. Otherwise the dot shows the FACTUAL
+  // state, EXCEPT a SETTLED (success/error) result that has been acknowledged
+  // (`!unread`): its notification badge hides, so the dot reverts to the neutral idle
+  // fill. `running` is live (never a notification) so it always shows. The factual
+  // state stays observable on `data-state` (see `<StatusDot>`), so the row still
+  // reflects the true outcome even when the badge is hidden.
+  const settled = state === "success" || state === "error";
+  const dotState: ExecState = failed ? "error" : settled && !unread ? "idle" : state;
 
   return (
     <li>
@@ -196,9 +212,11 @@ function CommandRow({ command, active, onSelect }: CommandRowProps) {
         className={sidebarRowClassName(active)}
       >
         {/* Selection is the single MEASURED rail (see `useActiveRail`); this row
-            just flags itself active via `aria-current` + `data-rail-row`. */}
+            just flags itself active via `aria-current` + `data-rail-row`. The lead
+            dot carries the factual state on `data-state`; `state` here drives only the
+            VISIBLE fill (settled badge hidden once acknowledged). */}
         <SidebarItemContent
-          lead={<StatusDot state={dotState} className="relative" />}
+          lead={<StatusDot state={dotState} factualState={state} className="relative" />}
           name={command.label}
           actions={
             <CommandControls

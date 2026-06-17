@@ -3,6 +3,20 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 /**
+ * Backend event broadcast when a terminal RECORD is created or closed OUTSIDE the
+ * front's own orchestration — i.e. by the MCP terminal tools (`create_terminal` /
+ * `close_terminal`). Mirrors `bridge::TERMINALS_CHANGED_EVENT`.
+ *
+ * Terminals are normally orchestrated by the front (the UI calls `create_terminal`
+ * then mounts a `<Terminal>` which spawns the PTY), so a terminal an agent creates over
+ * MCP would otherwise never reach the sidebar / never get a PTY+xterm. On this event the
+ * deck RECONCILES: it re-pulls `list_terminals`, mounts an xterm for any newly-`alive`
+ * record (which spawns its PTY) and drops the pane of any record that went `closed` — the
+ * terminal analogue of `commands://changed` for the project/workspace tree.
+ */
+const TERMINALS_CHANGED_EVENT = "terminals://changed";
+
+/**
  * A `terminals` row as returned by the backend record commands (see
  * `db::Terminal`). This is the DB-record identity of a terminal — distinct from
  * the live PTY id, which is owned per-`<Terminal>`-instance by `usePty`.
@@ -337,6 +351,63 @@ export function useTerminals(): UseTerminals {
     })();
   }, [create]);
 
+  // Reconcile the in-memory list against the backend on `terminals://changed`. This is
+  // the single path an MCP-driven create/close converges on (the UI's own create/close
+  // already fold their result in optimistically, so this re-list is a cheap idempotent
+  // pass for them). We MERGE rather than replace: an existing record keeps its current
+  // in-memory object (so a UI-created terminal's mounted xterm is never disturbed); a
+  // newly-`alive` record the front never created is APPENDED (the deck mounts a
+  // `<Terminal>` for it, which spawns its PTY); a record that is no longer `alive`
+  // (closed by an agent, or hard-deleted) is DROPPED, and the active id re-targets if it
+  // was the one removed. StrictMode-safe: the listener is torn down on cleanup and a late
+  // resolve after unmount is unlistened immediately.
+  useEffect(() => {
+    let torndown = false;
+    let unlisten: (() => void) | undefined;
+    void listen(TERMINALS_CHANGED_EVENT, () => {
+      if (torndown) return;
+      void invoke<TerminalRecord[]>("list_terminals")
+        .then((rows) => {
+          if (torndown) return;
+          const aliveById = new Map<string, TerminalRecord>();
+          for (const r of rows) {
+            if (r.status === "alive") aliveById.set(r.id, r);
+          }
+          setTerminals((prev) => {
+            // Keep existing records in their current slot/state; append the alive
+            // records the front does not yet know about (MCP-created), preserving the
+            // backend's order; drop any record no longer alive.
+            const kept = prev.filter((t) => aliveById.has(t.id));
+            const known = new Set(kept.map((t) => t.id));
+            const added = rows.filter((r) => aliveById.has(r.id) && !known.has(r.id));
+            const next = [...kept, ...added];
+            // Re-target the active terminal ONLY if it was dropped (closed/removed). A
+            // newly-appended terminal (e.g. one an agent opened over MCP) does NOT steal
+            // focus from the user's current terminal — it simply mounts in the background
+            // and appears in the sidebar; the user (or a follow-up select) switches to it.
+            setActiveId((active) => {
+              if (active && aliveById.has(active)) return active;
+              if (next.length === 0) return null;
+              return next[0].id;
+            });
+            return next;
+          });
+        })
+        // A transient list failure leaves the current list; the next event recovers.
+        .catch(() => {});
+    }).then((un) => {
+      if (torndown) {
+        void Promise.resolve(un()).catch(() => {});
+        return;
+      }
+      unlisten = un;
+    });
+    return () => {
+      torndown = true;
+      if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
+    };
+  }, []);
+
   // Persist the active terminal (stamp `last_active_at`) whenever it changes, so
   // a relaunch reopens on it (see the bootstrap restore above). Fire-and-forget:
   // a failure just means the next launch falls back to the first terminal.
@@ -444,9 +515,7 @@ export function useTerminals(): UseTerminals {
   // updater), so the persist fires deterministically.
   const markRead = useCallback((id: string) => {
     if (!terminalsRef.current.some((t) => t.id === id && t.exec_state_unread)) return;
-    setTerminals((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, exec_state_unread: false } : t)),
-    );
+    setTerminals((prev) => prev.map((t) => (t.id === id ? { ...t, exec_state_unread: false } : t)));
     void invoke("terminal_exec_mark_read", { id }).catch(() => {});
   }, []);
 

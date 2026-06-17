@@ -36,26 +36,37 @@ use serde::Serialize;
 use crate::db::{self, CommandSource, ManagedCommand};
 use crate::pathnorm;
 
-/// Directories never descended into during a scan: package vendors and build
-/// outputs. Scanning them is wasteful and can surface thousands of irrelevant
-/// nested `package.json` files (every dependency ships one). Matched by exact
+/// Directories never descended into during a scan, BEYOND the blanket dotdir rule
+/// ([`is_excluded_dir`] also drops every `.`-prefixed directory). These are the
+/// non-dot package vendors and build outputs whose nested `package.json` files are
+/// noise (every dependency under `node_modules` ships one). Matched by exact
 /// directory name (case-sensitive on Unix; this is the conventional spelling).
 pub const SCAN_EXCLUSIONS: &[&str] = &[
     "node_modules",
-    ".git",
     "dist",
     "build",
     "target",
-    ".next",
-    ".turbo",
-    ".cache",
     "coverage",
+    "out",
+    "vendor",
 ];
 
-/// How deep the scan descends from the workspace root. A generous bound that
-/// covers root + monorepo packages (`packages/api`, `apps/web/sub`, …) while
-/// keeping a pathological tree from being walked forever.
-const MAX_SCAN_DEPTH: usize = 8;
+/// How deep the scan descends from the workspace root WHEN no `workspaces` manifest
+/// bounds it (the non-monorepo / unbounded case). A modest bound that covers root +
+/// conventional monorepo packages (`packages/api`, `apps/web/sub`, …) while keeping a
+/// pathological tree from being walked forever. When a root manifest DECLARES
+/// workspaces (npm/yarn `workspaces`, `pnpm-workspace.yaml`), discovery is bounded by
+/// those globs instead and this depth does not apply (see [`discover_package_scripts`]).
+const MAX_SCAN_DEPTH: usize = 4;
+
+/// Is `name` a directory the scan must never descend into? Drops (a) any hidden
+/// dotdir (`.git`, `.agents`, `.next`, `.cache`, … — every `.`-prefixed name, which
+/// covers tool/config caches without enumerating them), and (b) the explicit
+/// vendor/build [`SCAN_EXCLUSIONS`]. This is the monorepo-noise filter that keeps the
+/// scan from surfacing thousands of irrelevant nested manifests.
+fn is_excluded_dir(name: &str) -> bool {
+    name.starts_with('.') || SCAN_EXCLUSIONS.contains(&name)
+}
 
 /// A detected package manager. Stored as the DB `package_manager` string
 /// (npm/pnpm/yarn/bun — the v3 CHECK vocabulary).
@@ -130,6 +141,339 @@ const LOCKFILE_NAMES: &[&str] = &[
     "package-lock.json",
 ];
 
+// --- .gitignore matching (monorepo-aware discovery filter) ------------------
+//
+// A FOCUSED, dependency-free `.gitignore` matcher: enough to keep discovery from
+// pulling in gitignored trees (vendored deps, build dirs, fixtures the repo ignores)
+// WITHOUT pulling a heavy `ignore`/`globset` crate for a handful of patterns. It
+// honors the common gitignore forms used to exclude directories:
+//   - blank lines and `#` comments are ignored;
+//   - a leading `!` negates (re-includes) a previously ignored path;
+//   - a leading `/` anchors the pattern to the gitignore's own directory;
+//   - a trailing `/` matches directories only (we only ever match dir names);
+//   - `*` matches any run of non-separator chars within a single path segment;
+//   - a pattern with no `/` (other than a trailing one) matches by BASENAME at any
+//     depth (git's "match in any directory" rule);
+//   - otherwise the pattern is matched against the path RELATIVE to the gitignore.
+// Deliberately omitted (rare in the dir-exclusion case this serves): `**`,
+// character classes, and escaped specials — they degrade to a literal match, which
+// is safe (a miss only means we scan a dir we could have skipped, never the reverse).
+
+/// One parsed `.gitignore` line: a glob plus its modifiers.
+struct GitignoreRule {
+    /// The pattern body with `!`, anchoring `/`, and trailing `/` stripped off.
+    pattern: String,
+    /// `!`-prefixed: a match RE-INCLUDES the path instead of ignoring it.
+    negated: bool,
+    /// Leading-`/` (or embedded-`/`) anchored to the gitignore dir; else basename-matchable.
+    anchored: bool,
+    /// Trailing-`/`: matches directories only (always true for our dir-only use).
+    dir_only: bool,
+}
+
+/// A `.gitignore` file's rules, paired with the directory it governs (relative to the
+/// workspace root, `""` = workspace root). Rules apply to paths under that directory.
+struct Gitignore {
+    /// The gitignore's directory, relative to the workspace root (`""` = root).
+    base: String,
+    rules: Vec<GitignoreRule>,
+}
+
+impl Gitignore {
+    /// Parse a `.gitignore` body. `base` is the gitignore's directory relative to the
+    /// workspace root. Empty/comment lines are dropped.
+    fn parse(base: &str, text: &str) -> Self {
+        let mut rules = Vec::new();
+        for raw in text.lines() {
+            let line = raw.trim_end();
+            // Skip blanks and comments (a leading '#'; '\#' would escape it, ignored here).
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let mut p = line.trim();
+            let negated = p.starts_with('!');
+            if negated {
+                p = &p[1..];
+            }
+            let dir_only = p.ends_with('/');
+            let p = p.trim_end_matches('/');
+            // Anchored if it begins with '/', or contains a '/' in the middle (git treats
+            // a slash anywhere but the trailing one as anchoring to the gitignore dir).
+            let inner = p.trim_start_matches('/');
+            let anchored = p.starts_with('/') || inner.contains('/');
+            if inner.is_empty() {
+                continue;
+            }
+            rules.push(GitignoreRule {
+                pattern: inner.to_string(),
+                negated,
+                anchored,
+                dir_only,
+            });
+        }
+        Gitignore {
+            base: base.to_string(),
+            rules,
+        }
+    }
+
+    /// Decide whether `rel_to_ws` (a path RELATIVE to the workspace root, forward-slash
+    /// separated, `dir`-known) is ignored by THIS gitignore. Returns `Some(true)` /
+    /// `Some(false)` when a rule matches (later rules win, so `!`-negation can re-include),
+    /// or `None` when no rule applies.
+    fn verdict(&self, rel_to_ws: &str, is_dir: bool) -> Option<bool> {
+        // Express the path relative to the gitignore's own directory. A path not under
+        // this gitignore's directory yields no verdict.
+        let rel = if self.base.is_empty() {
+            rel_to_ws
+        } else {
+            rel_to_ws
+                .strip_prefix(&self.base)
+                .and_then(|s| s.strip_prefix('/'))?
+        };
+        if rel.is_empty() {
+            return None;
+        }
+        let basename = rel.rsplit('/').next().unwrap_or(rel);
+        let mut verdict = None;
+        for rule in &self.rules {
+            if rule.dir_only && !is_dir {
+                continue;
+            }
+            let hit = if rule.anchored {
+                // Anchored: match against the full path relative to the gitignore dir,
+                // OR a leading sub-path (so `a/b` ignores `a/b/c`).
+                glob_match_path(&rule.pattern, rel)
+            } else {
+                // Unanchored: match the basename at any depth.
+                glob_match_segment(&rule.pattern, basename)
+            };
+            if hit {
+                verdict = Some(!rule.negated);
+            }
+        }
+        verdict
+    }
+}
+
+/// Match a glob `pat` (with `*` = any run of non-`/` chars) against a single path
+/// SEGMENT `seg` (no separators). Anchored at both ends.
+fn glob_match_segment(pat: &str, seg: &str) -> bool {
+    glob_match_impl(pat.as_bytes(), seg.as_bytes(), false)
+}
+
+/// Match a glob `pat` against a RELATIVE PATH `path` (may contain `/`). `*` does not
+/// cross `/`. A pattern matches when it equals the whole path OR a leading directory
+/// prefix of it (so `a/b` matches `a/b/c`), mirroring git's directory-prefix rule.
+fn glob_match_path(pat: &str, path: &str) -> bool {
+    if glob_match_impl(pat.as_bytes(), path.as_bytes(), true) {
+        return true;
+    }
+    // Leading-prefix: try matching `pat` against each directory prefix of `path`, so a
+    // pattern like `a/b` ignores everything under it (`a/b/c`).
+    let bytes = path.as_bytes();
+    for (i, c) in path.char_indices() {
+        if c == '/' && glob_match_impl(pat.as_bytes(), &bytes[..i], true) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Backtracking glob matcher: `*` matches any run of chars (stopping at `/` when
+/// `cross_sep` is false), `?` matches a single non-`/` char, everything else is
+/// literal. Anchored at both ends.
+fn glob_match_impl(pat: &[u8], text: &[u8], cross_sep: bool) -> bool {
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
+    while t < text.len() {
+        if p < pat.len() && (pat[p] == text[t] || (pat[p] == b'?' && text[t] != b'/')) {
+            p += 1;
+            t += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star_p = Some(p);
+            star_t = t;
+            p += 1;
+        } else if let Some(sp) = star_p {
+            // Backtrack: let the last `*` swallow one more char (unless it would cross
+            // a separator and `cross_sep` is false).
+            if !cross_sep && text[star_t] == b'/' {
+                return false;
+            }
+            p = sp + 1;
+            star_t += 1;
+            t = star_t;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+// --- workspaces manifest globs (monorepo-aware discovery bound) -------------
+
+/// Parse the workspace package GLOBS declared at the workspace root, if any. npm/yarn
+/// declare them in `package.json` `workspaces` (an array of globs, OR an object with a
+/// `packages` array); pnpm in `pnpm-workspace.yaml` (`packages:` YAML list). Returns
+/// the glob list when a manifest declares workspaces, else `None` (→ bounded-depth
+/// scan). The globs are package DIRECTORIES relative to the root (e.g. `packages/*`,
+/// `apps/*`, `tools/cli`); a trailing `/*` (`/**`) means "each immediate child dir".
+fn workspace_globs(root: &Path, root_json: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    // 1) npm/yarn `workspaces` in the root package.json.
+    if let Some(json) = root_json {
+        if let Some(ws) = json.get("workspaces") {
+            let globs = match ws {
+                serde_json::Value::Array(arr) => globs_from_json_array(arr),
+                serde_json::Value::Object(obj) => obj
+                    .get("packages")
+                    .and_then(|p| p.as_array())
+                    .map(|a| globs_from_json_array(a))
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            if !globs.is_empty() {
+                return Some(globs);
+            }
+        }
+    }
+    // 2) pnpm-workspace.yaml `packages:` list.
+    if let Ok(text) = std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
+        let globs = pnpm_workspace_packages(&text);
+        if !globs.is_empty() {
+            return Some(globs);
+        }
+    }
+    None
+}
+
+/// Collect the string entries of a JSON array as workspace globs (skipping negations
+/// like `!packages/excluded`, which we treat as "not a positive include").
+fn globs_from_json_array(arr: &[serde_json::Value]) -> Vec<String> {
+    arr.iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| !s.starts_with('!'))
+        .map(normalize_glob)
+        .collect()
+}
+
+/// Minimal `pnpm-workspace.yaml` `packages:` extractor. Reads the `- "glob"` list items
+/// under a top-level `packages:` key. Deliberately tiny (no YAML crate): handles the
+/// conventional shape pnpm emits. Quotes are stripped; `!`-negations are skipped.
+fn pnpm_workspace_packages(text: &str) -> Vec<String> {
+    let mut globs = Vec::new();
+    let mut in_packages = false;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        // Leaving the `packages:` block: a non-indented, non-list key.
+        if in_packages && !line.starts_with(char::is_whitespace) && !trimmed.starts_with('-') {
+            in_packages = false;
+        }
+        if trimmed.starts_with("packages:") {
+            in_packages = true;
+            continue;
+        }
+        if in_packages {
+            if let Some(item) = trimmed.strip_prefix('-') {
+                let g = item.trim().trim_matches(['"', '\'']).trim();
+                if !g.is_empty() && !g.starts_with('!') {
+                    globs.push(normalize_glob(g));
+                }
+            }
+        }
+    }
+    globs
+}
+
+/// Normalize a workspace glob to forward slashes with no leading/trailing slash, so it
+/// composes cleanly with the forward-slash relative subfolders the scan computes.
+fn normalize_glob(g: &str) -> String {
+    g.replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
+}
+
+/// Does a package directory at relative path `subfolder` (forward-slash, `""` = root)
+/// satisfy at least one workspace `glob`? A glob like `packages/*` matches a single
+/// level under `packages/`; `packages/**` (or trailing `/**`) matches any depth; an
+/// exact `tools/cli` matches just that dir. The root (`""`) is always included (the
+/// root manifest's own scripts), independent of the globs.
+fn matches_workspace_glob(subfolder: &str, globs: &[String]) -> bool {
+    if subfolder.is_empty() {
+        return true; // the root package.json is always a candidate
+    }
+    globs.iter().any(|g| workspace_glob_matches(g, subfolder))
+}
+
+/// Match ONE workspace glob against a relative package dir. Handles the package-glob
+/// vocabulary npm/yarn/pnpm use: `*` within a segment, `**` across segments, and the
+/// common trailing `/*` ("immediate children") / `/**` ("any descendant").
+fn workspace_glob_matches(glob: &str, subfolder: &str) -> bool {
+    // `a/**` should also match `a` itself per the common workspace convention, but the
+    // root-vs-package split already covers `""`; for non-root, fall through to matching.
+    let g = glob.as_bytes();
+    let s = subfolder.as_bytes();
+    ws_glob_impl(g, s)
+}
+
+/// Backtracking matcher supporting `*` (within a segment) and `**` (across segments).
+fn ws_glob_impl(pat: &[u8], text: &[u8]) -> bool {
+    // Iterative matcher with `**` support. `**` (optionally followed by `/`) matches any
+    // number of path segments including zero.
+    fn helper(pat: &[u8], text: &[u8]) -> bool {
+        let (mut p, mut t) = (0usize, 0usize);
+        while p < pat.len() {
+            if pat[p] == b'*' && p + 1 < pat.len() && pat[p + 1] == b'*' {
+                // `**`: consume it (and an optional following `/`), then try to match the
+                // remainder at every position of `text`.
+                let mut rest = p + 2;
+                if rest < pat.len() && pat[rest] == b'/' {
+                    rest += 1;
+                }
+                if rest >= pat.len() {
+                    return true; // trailing `**` matches anything remaining
+                }
+                // Try matching the remainder of the pattern at t, then after each '/'.
+                if helper(&pat[rest..], &text[t..]) {
+                    return true;
+                }
+                for i in t..text.len() {
+                    if text[i] == b'/' && helper(&pat[rest..], &text[i + 1..]) {
+                        return true;
+                    }
+                }
+                return false;
+            } else if pat[p] == b'*' {
+                // Single `*`: match any run of non-`/` chars in this segment.
+                let mut rest = p + 1;
+                // Collapse a redundant double handled above; here rest points past `*`.
+                let _ = &mut rest;
+                // Try every split of the current segment.
+                let seg_end = text[t..].iter().position(|&c| c == b'/').map(|i| t + i).unwrap_or(text.len());
+                for split in t..=seg_end {
+                    if helper(&pat[p + 1..], &text[split..]) {
+                        return true;
+                    }
+                }
+                return false;
+            } else if t < text.len() && (pat[p] == text[t]) {
+                p += 1;
+                t += 1;
+            } else {
+                return false;
+            }
+        }
+        t == text.len()
+    }
+    helper(pat, text)
+}
+
 /// One discovered script, ready to surface in the import UI. Carries everything
 /// the import needs: the EDITABLE proposed `name`, the default RUNNER `command`,
 /// the `subfolder` (the package.json's location relative to the workspace), and
@@ -170,30 +514,80 @@ struct PackageFile {
     scripts: Vec<(String, String)>,
 }
 
-/// Discover the package.json scripts under `workspace_path`, grouped by location,
-/// each with an editable proposed name and a default runner command.
+/// The outcome of a discovery scan: the discoverable scripts PLUS a discovery summary
+/// the agent needs to distinguish "no manifest found" from "all already imported".
+/// `manifests_found` counts the retained `package.json` files (root + sub-packages)
+/// — `0` means there was nothing to import because no manifest exists (the
+/// `reason:no_manifest` signal lives at the MCP layer, derived from this count).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryResult {
+    /// Discoverable scripts, with editable proposed names + runner commands.
+    pub scripts: Vec<DiscoveredScript>,
+    /// How many `package.json` manifests the (filtered) scan retained.
+    pub manifests_found: usize,
+}
+
+/// Discover the package.json scripts under `workspace_path` (back-compat shim that
+/// returns just the script list). See [`discover_scripts`] for the richer result that
+/// also carries the manifest count.
+pub fn discover_package_scripts(workspace_path: &str) -> Vec<DiscoveredScript> {
+    discover_scripts(workspace_path).scripts
+}
+
+/// Discover the package.json scripts under `workspace_path`, grouped by location, each
+/// with an editable proposed name and a default runner command, ALONGSIDE a discovery
+/// summary ([`DiscoveryResult::manifests_found`]).
 ///
-/// Walks the workspace tree (root + subfolders) up to [`MAX_SCAN_DEPTH`], skipping
-/// the [`SCAN_EXCLUSIONS`] directories. Every retained `package.json` is
-/// canonicalized and re-checked to be inside the workspace; a file that escapes
-/// (e.g. via a symlink) is dropped. Unreadable / unparsable files are skipped, so a
-/// workspace with no readable package.json yields an EMPTY list (never an error).
+/// **Filtered, monorepo-aware walk.** From the (canonicalized) workspace root the scan
+/// descends child directories, NEVER entering (a) hidden dotdirs (`.git`, `.agents`,
+/// `.next`, … — any `.`-prefixed dir) or the explicit vendor/build [`SCAN_EXCLUSIONS`]
+/// (`node_modules`, `dist`, `target`, …), nor (b) directories ignored by a `.gitignore`
+/// in scope (the workspace's own `.gitignore` plus any nested ones), so a repo's
+/// gitignored trees (vendored deps, fixtures, generated dirs) are not surfaced.
+///
+/// If the ROOT manifest declares workspaces (npm/yarn `package.json` `workspaces`, or
+/// `pnpm-workspace.yaml`), discovery is BOUNDED to the root + directories matching those
+/// globs (so only real workspace packages contribute). Otherwise the walk is bounded by
+/// [`MAX_SCAN_DEPTH`]. Every retained `package.json` is canonicalized and re-checked to
+/// be inside the workspace; a file that escapes (e.g. via a symlink) is dropped.
+/// Unreadable / unparsable files are skipped, so a workspace with no readable
+/// `package.json` yields an EMPTY result (never an error).
 ///
 /// Proposed names: a script name unique across the whole result keeps its bare name
 /// (`dev`); a name appearing in several packages is disambiguated as
 /// `<package-or-folder>:<script>` (`api:dev`).
-pub fn discover_package_scripts(workspace_path: &str) -> Vec<DiscoveredScript> {
+pub fn discover_scripts(workspace_path: &str) -> DiscoveryResult {
     let workspace_norm = pathnorm::normalize(workspace_path);
     // Canonicalize the workspace once so containment is checked against the
     // symlink-resolved root. If the workspace itself is inaccessible, there is
     // nothing to scan.
     let Ok(canon_ws) = std::fs::canonicalize(Path::new(workspace_path)) else {
-        return Vec::new();
+        return DiscoveryResult {
+            scripts: Vec::new(),
+            manifests_found: 0,
+        };
     };
     let canon_ws_norm = pathnorm::normalize(&canon_ws.to_string_lossy());
 
-    let mut files: Vec<PackageFile> = Vec::new();
-    collect_package_files(&canon_ws, &canon_ws_norm, &workspace_norm, 0, &mut files);
+    // Read the ROOT package.json once (if any) to detect declared workspaces. The
+    // presence of `workspaces` / `pnpm-workspace.yaml` switches discovery from
+    // bounded-depth to glob-bounded (only real workspace packages contribute).
+    let root_json: Option<serde_json::Value> = std::fs::read_to_string(canon_ws.join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let globs = workspace_globs(&canon_ws, root_json.as_ref());
+
+    let mut ctx = DiscoveryCtx {
+        canon_ws_norm: &canon_ws_norm,
+        workspace_norm: &workspace_norm,
+        globs: globs.as_deref(),
+        gitignores: Vec::new(),
+        files: Vec::new(),
+    };
+    // Seed the root .gitignore (if any) before walking.
+    ctx.push_gitignore(&canon_ws, "");
+    collect_package_files(&canon_ws, "", 0, &mut ctx);
+    let files = ctx.files;
 
     // Determine which script names are AMBIGUOUS (appear in more than one package),
     // so unique names stay bare and only collisions get the `<label>:` prefix.
@@ -228,36 +622,97 @@ pub fn discover_package_scripts(workspace_path: &str) -> Vec<DiscoveredScript> {
             });
         }
     }
-    out
+    DiscoveryResult {
+        scripts: out,
+        manifests_found: files.len(),
+    }
 }
 
-/// Recursively collect retained `package.json` files under `dir`, honoring the
-/// exclusion list and depth bound. `canon_ws_norm` is the canonical workspace root
-/// (for containment), `workspace_norm` the stored workspace path (for the
-/// human-facing root label / subfolder base).
-fn collect_package_files(
-    dir: &Path,
-    canon_ws_norm: &str,
-    workspace_norm: &str,
-    depth: usize,
-    out: &mut Vec<PackageFile>,
-) {
-    if depth > MAX_SCAN_DEPTH {
-        return;
-    }
+/// Mutable state threaded through the recursive walk: the workspace anchors, the
+/// optional workspace-globs bound, the stack of in-scope `.gitignore` files, and the
+/// accumulating retained manifests.
+struct DiscoveryCtx<'a> {
+    /// Canonical workspace root (containment + relative-subfolder base).
+    canon_ws_norm: &'a str,
+    /// The stored workspace path (for the human-facing root label).
+    workspace_norm: &'a str,
+    /// When `Some`, discovery is bounded to the root + dirs matching these workspace
+    /// globs; when `None`, the walk is bounded by [`MAX_SCAN_DEPTH`].
+    globs: Option<&'a [String]>,
+    /// In-scope `.gitignore` files (root first, then nested), checked newest-last.
+    gitignores: Vec<Gitignore>,
+    /// Retained, parsed manifests.
+    files: Vec<PackageFile>,
+}
 
-    // A package.json directly in this directory?
-    let pkg = dir.join("package.json");
-    if pkg.is_file() {
-        if let Some(file) = read_package_file(&pkg, dir, canon_ws_norm, workspace_norm) {
-            out.push(file);
+impl DiscoveryCtx<'_> {
+    /// Parse and push `dir`'s `.gitignore` (if present) onto the in-scope stack. `rel`
+    /// is `dir`'s path relative to the workspace root (`""` = root).
+    fn push_gitignore(&mut self, dir: &Path, rel: &str) -> bool {
+        if let Ok(text) = std::fs::read_to_string(dir.join(".gitignore")) {
+            self.gitignores.push(Gitignore::parse(rel, &text));
+            true
+        } else {
+            false
         }
     }
 
-    // Descend into child directories, skipping the exclusions.
+    /// Is the path at relative `rel` (a dir when `is_dir`) ignored by any in-scope
+    /// `.gitignore`? The DEEPEST gitignore with a verdict wins, and within one file the
+    /// LAST matching rule wins (so `!`-negation can re-include). A negated final verdict
+    /// (`false`) means "explicitly NOT ignored".
+    fn is_gitignored(&self, rel: &str, is_dir: bool) -> bool {
+        // Walk gitignores from deepest to shallowest; the first that yields a verdict
+        // for this path decides (a deeper .gitignore overrides a shallower one).
+        for gi in self.gitignores.iter().rev() {
+            if let Some(v) = gi.verdict(rel, is_dir) {
+                return v;
+            }
+        }
+        false
+    }
+}
+
+/// Recursively collect retained `package.json` files under `dir`, honoring the dotdir +
+/// vendor exclusions, the `.gitignore` rules in scope, and EITHER the workspace globs
+/// (when declared) OR the depth bound. `rel` is `dir`'s path relative to the workspace
+/// root (`""` = root).
+fn collect_package_files(dir: &Path, rel: &str, depth: usize, ctx: &mut DiscoveryCtx) {
+    // Without a workspace-globs bound, stop at the depth limit. WITH globs, depth is
+    // not the bound (the globs are) — but a sane ceiling still guards a pathological
+    // tree, so cap at a generous multiple.
+    let max_depth = if ctx.globs.is_some() {
+        MAX_SCAN_DEPTH * 3
+    } else {
+        MAX_SCAN_DEPTH
+    };
+    if depth > max_depth {
+        return;
+    }
+
+    // A package.json directly in this directory? Retain it when this dir is a discovery
+    // CANDIDATE: the root always, else (with globs) only a glob-matching dir, else any
+    // dir within the depth bound.
+    let candidate = match ctx.globs {
+        Some(globs) => matches_workspace_glob(rel, globs),
+        None => true,
+    };
+    if candidate {
+        let pkg = dir.join("package.json");
+        if pkg.is_file() {
+            if let Some(file) =
+                read_package_file(&pkg, dir, ctx.canon_ws_norm, ctx.workspace_norm)
+            {
+                ctx.files.push(file);
+            }
+        }
+    }
+
+    // Descend into child directories, skipping the exclusions + gitignored dirs.
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    // Track how many gitignores we push at this level so we can pop them on the way out.
     for entry in entries.flatten() {
         let path = entry.path();
         // Only descend into real directories (never follow a symlink into a
@@ -271,10 +726,25 @@ fn collect_package_files(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if SCAN_EXCLUSIONS.contains(&name) {
+        // (a) dotdirs + explicit vendor/build dirs.
+        if is_excluded_dir(name) {
             continue;
         }
-        collect_package_files(&path, canon_ws_norm, workspace_norm, depth + 1, out);
+        let child_rel = if rel.is_empty() {
+            name.to_string()
+        } else {
+            format!("{rel}/{name}")
+        };
+        // (b) gitignored directories.
+        if ctx.is_gitignored(&child_rel, true) {
+            continue;
+        }
+        // Push this dir's own .gitignore (if any) before descending, pop after.
+        let pushed = ctx.push_gitignore(&path, &child_rel);
+        collect_package_files(&path, &child_rel, depth + 1, ctx);
+        if pushed {
+            ctx.gitignores.pop();
+        }
     }
 }
 
@@ -718,6 +1188,282 @@ mod tests {
             scripts.iter().all(|s| s.script_name != "leak"),
             "a package.json reached only via a symlink outside the workspace must be refused"
         );
+    }
+
+    // --- R-IMPORT #1: filtered, monorepo-aware discovery -----------------
+
+    #[test]
+    fn monorepo_without_root_manifest_finds_sub_package_scripts() {
+        // The palbank shape: NO root package.json, several sub-packages under apps/ and
+        // packages/. The recursive (but filtered) walk must still find their scripts.
+        let tree = TempTree::new("no_root_manifest");
+        tree.mkdir("apps");
+        tree.write(
+            "apps/web/package.json",
+            r#"{ "name": "web", "scripts": { "dev": "next dev" } }"#,
+        );
+        tree.write(
+            "apps/api/package.json",
+            r#"{ "name": "api", "scripts": { "start": "node ." } }"#,
+        );
+        tree.write(
+            "packages/ui/package.json",
+            r#"{ "name": "ui", "scripts": { "build": "tsup" } }"#,
+        );
+        let result = discover_scripts(&tree.path());
+        assert_eq!(
+            result.manifests_found, 3,
+            "all 3 sub-package manifests found despite no root package.json"
+        );
+        assert!(find(&result.scripts, "dev").is_some(), "web dev found");
+        assert!(find(&result.scripts, "start").is_some(), "api start found");
+        assert!(find(&result.scripts, "build").is_some(), "ui build found");
+    }
+
+    #[test]
+    fn hidden_dotdirs_are_excluded_from_discovery() {
+        // A package.json buried in ANY hidden dotdir (.agents, .config, …) must NOT be
+        // discovered — the blanket dotdir rule, beyond the explicit SCAN_EXCLUSIONS.
+        let tree = TempTree::new("dotdirs");
+        tree.write("package.json", r#"{ "scripts": { "dev": "vite" } }"#);
+        for dot in [".agents", ".config", ".vscode", ".husky"] {
+            tree.write(
+                &format!("{dot}/package.json"),
+                r#"{ "scripts": { "leak": "should-not-appear" } }"#,
+            );
+        }
+        let scripts = discover_package_scripts(&tree.path());
+        assert!(
+            scripts.iter().all(|s| s.script_name != "leak"),
+            "no script from a hidden dotdir may surface, got: {:?}",
+            scripts.iter().map(|s| &s.proposed_name).collect::<Vec<_>>()
+        );
+        assert!(find(&scripts, "dev").is_some(), "the real root dev is found");
+    }
+
+    #[test]
+    fn node_modules_is_excluded_from_discovery() {
+        // node_modules (the heavy vendor dir) must never be descended into, even when
+        // it holds thousands of dependency package.json files.
+        let tree = TempTree::new("node_modules");
+        tree.write("package.json", r#"{ "scripts": { "dev": "vite" } }"#);
+        tree.write(
+            "node_modules/some-dep/package.json",
+            r#"{ "scripts": { "leak": "should-not-appear" } }"#,
+        );
+        tree.write(
+            "packages/api/node_modules/nested-dep/package.json",
+            r#"{ "scripts": { "leak2": "should-not-appear" } }"#,
+        );
+        tree.write(
+            "packages/api/package.json",
+            r#"{ "name": "api", "scripts": { "start": "node ." } }"#,
+        );
+        let scripts = discover_package_scripts(&tree.path());
+        assert!(
+            scripts.iter().all(|s| !s.script_name.starts_with("leak")),
+            "no script from node_modules may surface, got: {:?}",
+            scripts.iter().map(|s| &s.proposed_name).collect::<Vec<_>>()
+        );
+        assert!(find(&scripts, "start").is_some(), "the real api package is found");
+    }
+
+    #[test]
+    fn gitignored_directories_are_excluded_from_discovery() {
+        // A directory matched by the workspace .gitignore must not be scanned: the
+        // dogfood case of a vendored / generated tree the repo ignores.
+        let tree = TempTree::new("gitignored");
+        tree.write("package.json", r#"{ "scripts": { "dev": "vite" } }"#);
+        tree.write(".gitignore", "vendored/\n/generated\nfixtures\n");
+        // gitignored dirs holding manifests that must NOT surface.
+        tree.write(
+            "vendored/dep/package.json",
+            r#"{ "scripts": { "leak_vendored": "x" } }"#,
+        );
+        tree.write(
+            "generated/package.json",
+            r#"{ "scripts": { "leak_generated": "x" } }"#,
+        );
+        tree.write(
+            "packages/api/fixtures/package.json",
+            r#"{ "scripts": { "leak_fixtures": "x" } }"#,
+        );
+        // a NON-ignored real package that must surface.
+        tree.write(
+            "packages/api/package.json",
+            r#"{ "name": "api", "scripts": { "start": "node ." } }"#,
+        );
+        let scripts = discover_package_scripts(&tree.path());
+        assert!(
+            scripts.iter().all(|s| !s.script_name.starts_with("leak_")),
+            "no script from a gitignored dir may surface, got: {:?}",
+            scripts.iter().map(|s| &s.proposed_name).collect::<Vec<_>>()
+        );
+        assert!(find(&scripts, "dev").is_some(), "root dev surfaces");
+        assert!(find(&scripts, "start").is_some(), "non-ignored api surfaces");
+    }
+
+    #[test]
+    fn npm_workspaces_manifest_bounds_discovery_to_declared_globs() {
+        // With a root `workspaces` declaration, ONLY the root + glob-matching packages
+        // contribute — a stray package.json outside the declared globs is ignored even
+        // though it is not in an excluded/ignored dir.
+        let tree = TempTree::new("npm_workspaces");
+        tree.write(
+            "package.json",
+            r#"{ "name": "root", "workspaces": ["apps/*", "packages/*"], "scripts": { "lint": "eslint" } }"#,
+        );
+        tree.write(
+            "apps/web/package.json",
+            r#"{ "name": "web", "scripts": { "dev": "next" } }"#,
+        );
+        tree.write(
+            "packages/ui/package.json",
+            r#"{ "name": "ui", "scripts": { "build": "tsup" } }"#,
+        );
+        // OUTSIDE the declared globs: must NOT be imported (a tool/script dir, an example).
+        tree.write(
+            "examples/demo/package.json",
+            r#"{ "scripts": { "leak_example": "x" } }"#,
+        );
+        let result = discover_scripts(&tree.path());
+        assert!(find(&result.scripts, "lint").is_some(), "root lint found");
+        assert!(find(&result.scripts, "dev").is_some(), "apps/web dev found");
+        assert!(find(&result.scripts, "build").is_some(), "packages/ui build found");
+        assert!(
+            result.scripts.iter().all(|s| s.script_name != "leak_example"),
+            "a package outside the declared workspace globs must NOT be imported, got: {:?}",
+            result.scripts.iter().map(|s| &s.proposed_name).collect::<Vec<_>>()
+        );
+        // root + apps/web + packages/ui = 3 manifests (examples/demo excluded).
+        assert_eq!(result.manifests_found, 3);
+    }
+
+    #[test]
+    fn npm_workspaces_object_form_packages_key() {
+        // The object form `"workspaces": { "packages": [...] }` (yarn) is honored too.
+        let tree = TempTree::new("npm_workspaces_obj");
+        tree.write(
+            "package.json",
+            r#"{ "workspaces": { "packages": ["modules/*"] }, "scripts": { "ci": "turbo run" } }"#,
+        );
+        tree.write(
+            "modules/core/package.json",
+            r#"{ "name": "core", "scripts": { "test": "vitest" } }"#,
+        );
+        tree.write(
+            "other/package.json",
+            r#"{ "scripts": { "leak_other": "x" } }"#,
+        );
+        let scripts = discover_package_scripts(&tree.path());
+        assert!(find(&scripts, "ci").is_some(), "root ci found");
+        assert!(find(&scripts, "test").is_some(), "modules/core test found");
+        assert!(
+            scripts.iter().all(|s| s.script_name != "leak_other"),
+            "a package outside the declared globs must NOT surface"
+        );
+    }
+
+    #[test]
+    fn pnpm_workspace_yaml_bounds_discovery() {
+        // pnpm declares its workspace globs in pnpm-workspace.yaml, not package.json.
+        let tree = TempTree::new("pnpm_workspace");
+        tree.write(
+            "package.json",
+            r#"{ "name": "root", "scripts": { "release": "changeset" } }"#,
+        );
+        tree.write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'apps/*'\n  - \"packages/*\"\n",
+        );
+        tree.write(
+            "apps/web/package.json",
+            r#"{ "name": "web", "scripts": { "dev": "next" } }"#,
+        );
+        tree.write(
+            "packages/ui/package.json",
+            r#"{ "name": "ui", "scripts": { "build": "tsup" } }"#,
+        );
+        tree.write(
+            "scratch/package.json",
+            r#"{ "scripts": { "leak_scratch": "x" } }"#,
+        );
+        let result = discover_scripts(&tree.path());
+        assert!(find(&result.scripts, "release").is_some(), "root release found");
+        assert!(find(&result.scripts, "dev").is_some(), "apps/web dev found");
+        assert!(find(&result.scripts, "build").is_some(), "packages/ui build found");
+        assert!(
+            result.scripts.iter().all(|s| s.script_name != "leak_scratch"),
+            "a package outside the pnpm workspace globs must NOT surface"
+        );
+        assert_eq!(result.manifests_found, 3);
+    }
+
+    #[test]
+    fn unbounded_walk_respects_max_scan_depth() {
+        // Without a workspaces manifest the walk is bounded by MAX_SCAN_DEPTH; a manifest
+        // deeper than that is NOT discovered.
+        let tree = TempTree::new("depth_bound");
+        tree.write("package.json", r#"{ "scripts": { "dev": "vite" } }"#);
+        // Build a path deeper than MAX_SCAN_DEPTH (4): a/b/c/d/e/package.json (depth 5).
+        tree.write(
+            "a/b/c/d/e/package.json",
+            r#"{ "scripts": { "too_deep": "x" } }"#,
+        );
+        // And one just within the bound (depth 2): a/b/package.json.
+        tree.write(
+            "a/b/package.json",
+            r#"{ "name": "shallow", "scripts": { "shallow_ok": "x" } }"#,
+        );
+        let scripts = discover_package_scripts(&tree.path());
+        assert!(
+            scripts.iter().all(|s| s.script_name != "too_deep"),
+            "a manifest deeper than MAX_SCAN_DEPTH must NOT surface in the unbounded walk"
+        );
+        assert!(find(&scripts, "shallow_ok").is_some(), "a within-bound manifest surfaces");
+    }
+
+    #[test]
+    fn gitignore_negation_reincludes_a_sibling_dir() {
+        // `!` negation re-includes a sibling that an earlier wildcard ignored — git's
+        // last-rule-wins semantics, applied where the parent dir itself is NOT excluded
+        // (git cannot re-include under an excluded parent, which we honor by pruning the
+        // walk at the ignored parent; see node_modules/gitignored-dir tests).
+        let tree = TempTree::new("gitignore_negate");
+        tree.write("package.json", r#"{ "scripts": { "dev": "vite" } }"#);
+        // Ignore every `tmp-*` dir at the root, but re-include `tmp-keep`.
+        tree.write(".gitignore", "tmp-*\n!tmp-keep\n");
+        tree.write(
+            "tmp-drop/package.json",
+            r#"{ "scripts": { "leak_drop": "x" } }"#,
+        );
+        tree.write(
+            "tmp-keep/package.json",
+            r#"{ "name": "keep", "scripts": { "kept": "x" } }"#,
+        );
+        let scripts = discover_package_scripts(&tree.path());
+        assert!(
+            scripts.iter().all(|s| s.script_name != "leak_drop"),
+            "the ignored tmp-drop must NOT surface"
+        );
+        assert!(
+            find(&scripts, "kept").is_some(),
+            "the re-included tmp-keep must surface, got: {:?}",
+            scripts.iter().map(|s| &s.proposed_name).collect::<Vec<_>>()
+        );
+    }
+
+    // --- R-IMPORT #3: manifest count summary -----------------------------
+
+    #[test]
+    fn discovery_reports_zero_manifests_when_none_exist() {
+        // The no-manifest case: an explicit manifests_found:0, distinct from a manifest
+        // with no scripts (which still counts? no — no usable scripts => not retained).
+        let tree = TempTree::new("no_manifest_summary");
+        tree.mkdir("src");
+        let result = discover_scripts(&tree.path());
+        assert_eq!(result.manifests_found, 0, "no package.json => manifests_found 0");
+        assert!(result.scripts.is_empty());
     }
 
     // --- import_command: storage + collision blocking --------------------

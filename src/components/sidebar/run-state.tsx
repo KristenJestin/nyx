@@ -50,7 +50,16 @@ function stateBgClass(state: ExecState): string {
 }
 
 export interface StatusDotProps {
+  /** The VISIBLE state — drives the dot fill + the running pulse. */
   state: ExecState;
+  /**
+   * The FACTUAL run state, when it differs from the visible `state`. Used by a
+   * command row whose SETTLED badge is hidden after an acknowledge (`state` reverts
+   * to `idle` so the badge disappears) while the row must still REFLECT the true
+   * last-run outcome: `data-state` + the a11y label carry this factual value. When
+   * omitted, it falls back to `state` (the common case — visible == factual).
+   */
+  factualState?: ExecState;
   className?: string;
   /** Optional ref to the dot element — lets a command row anchor the sliding rail. */
   ref?: React.Ref<HTMLSpanElement>;
@@ -59,15 +68,19 @@ export interface StatusDotProps {
 /**
  * `<StatusDot>` — the lead-position run-state dot for a COMMAND row. Renders for
  * every state including idle (a command row always reserves the dot, unlike a
- * terminal badge which is suppressed when idle). The running state pulses.
+ * terminal badge which is suppressed when idle). The running state pulses. The FILL
+ * follows the visible `state`; `data-state` reports the `factualState` (defaulting to
+ * `state`) so the factual outcome stays observable even when a settled badge is
+ * hidden on acknowledge.
  */
-export function StatusDot({ state, className, ref }: StatusDotProps) {
+export function StatusDot({ state, factualState, className, ref }: StatusDotProps) {
+  const factual = factualState ?? state;
   return (
     <span
       ref={ref}
       role="status"
-      aria-label={`Status: ${state}`}
-      data-state={state}
+      aria-label={`Status: ${factual}`}
+      data-state={factual}
       className={cn(
         "inline-block size-2 shrink-0 rounded-full",
         stateBgClass(state),

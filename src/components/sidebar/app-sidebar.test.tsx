@@ -159,12 +159,32 @@ describe("defaultWorkspaceLabel (smart distinguishing default)", () => {
 });
 
 describe("<AppSidebar> variant A spine", () => {
-  it("renders an Add project button AND a global new-terminal +", () => {
-    const { onAddProject, onNewLooseTerminal } = renderSidebar([]);
+  it("renders an Add project button, a Settings gear (head), and a TERMINALS-footer new-terminal +", () => {
+    const onAddProject = vi.fn();
+    const onNewLooseTerminal = vi.fn();
+    const onOpenSettings = vi.fn();
+    render(
+      <AppSidebar
+        projects={[]}
+        terminals={[]}
+        activeId={null}
+        onSelect={noop}
+        onClose={noop}
+        onNewTerminal={noop}
+        onNewLooseTerminal={onNewLooseTerminal}
+        onAddProject={onAddProject}
+        onAddWorkspace={noop}
+        onOpenSettings={onOpenSettings}
+      />,
+    );
+    // Add project button works.
     fireEvent.click(screen.getByRole("button", { name: /add project/i }));
     expect(onAddProject).toHaveBeenCalledTimes(1);
-    // The global new-terminal '+' opens a loose terminal.
-    fireEvent.click(screen.getByRole("button", { name: /^new terminal$/i }));
+    // The HEAD gear opens Settings (not a new terminal anymore).
+    fireEvent.click(screen.getByRole("button", { name: /^settings$/i }));
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+    // The TERMINALS footer '+' is still there and opens a loose terminal.
+    fireEvent.click(screen.getByRole("button", { name: /new unattached terminal/i }));
     expect(onNewLooseTerminal).toHaveBeenCalledTimes(1);
   });
 

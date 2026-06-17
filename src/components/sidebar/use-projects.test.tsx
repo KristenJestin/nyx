@@ -1,4 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
+import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -48,35 +49,40 @@ function installBackend(
     setWorkspaceCollapsed: [],
   };
 
-  mockIPC((cmd, args) => {
-    const a = (args ?? {}) as Record<string, unknown>;
-    switch (cmd) {
-      case "list_projects":
-        return backend.projects;
-      case "list_workspaces":
-        return backend.workspaces[a.projectId as string] ?? [];
-      case "set_project_collapsed": {
-        const id = a.id as string;
-        const collapsed = a.collapsed as boolean;
-        backend.setProjectCollapsed.push({ id, collapsed });
-        const row = backend.projects.find((p) => p.id === id);
-        if (row) row.collapsed = collapsed;
-        return null;
-      }
-      case "set_workspace_collapsed": {
-        const id = a.id as string;
-        const collapsed = a.collapsed as boolean;
-        backend.setWorkspaceCollapsed.push({ id, collapsed });
-        for (const list of Object.values(backend.workspaces)) {
-          const row = list.find((w) => w.id === id);
+  // `shouldMockEvents: true` makes `emit`/`listen` work in tests, so a test can fire
+  // the backend `workspaces://changed` event the hook's listener consumes.
+  mockIPC(
+    (cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      switch (cmd) {
+        case "list_projects":
+          return backend.projects;
+        case "list_workspaces":
+          return backend.workspaces[a.projectId as string] ?? [];
+        case "set_project_collapsed": {
+          const id = a.id as string;
+          const collapsed = a.collapsed as boolean;
+          backend.setProjectCollapsed.push({ id, collapsed });
+          const row = backend.projects.find((p) => p.id === id);
           if (row) row.collapsed = collapsed;
+          return null;
         }
-        return null;
+        case "set_workspace_collapsed": {
+          const id = a.id as string;
+          const collapsed = a.collapsed as boolean;
+          backend.setWorkspaceCollapsed.push({ id, collapsed });
+          for (const list of Object.values(backend.workspaces)) {
+            const row = list.find((w) => w.id === id);
+            if (row) row.collapsed = collapsed;
+          }
+          return null;
+        }
+        default:
+          return null;
       }
-      default:
-        return null;
-    }
-  });
+    },
+    { shouldMockEvents: true },
+  );
   return backend;
 }
 
@@ -128,5 +134,57 @@ describe("useProjects collapsed persistence", () => {
     expect(ws2?.collapsed).toBe(true);
     expect(ws1?.collapsed).toBe(false); // a sibling is untouched
     expect(backend.setWorkspaceCollapsed).toContainEqual({ id: "w2", collapsed: true });
+  });
+});
+
+describe("useProjects live refresh on workspaces://changed (review 01KV9611923NKX3JPR5V6MN44F)", () => {
+  beforeEach(() => {
+    installBackend([], {});
+  });
+
+  it("re-pulls the tree when the backend signals a workspace mutation (MCP-driven add)", async () => {
+    // The finding: an agent adds a workspace over MCP. The UI never invoked the add,
+    // so it never optimistically folded it in — the sidebar updates ONLY via the
+    // backend `workspaces://changed` event. Simulate the MCP add by mutating the
+    // fake backend WITHOUT going through the hook's own mutators, then firing the
+    // event the backend would emit, and assert the hook re-listed and shows it.
+    const backend = installBackend([project("p1")], { p1: [workspace("root", "p1")] });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.projects[0].workspaces).toHaveLength(1);
+
+    // An out-of-band mutation (the MCP `workspace_add`/`create_workspace` path): the
+    // row lands in the DB the hook re-lists from, but no UI invoke happened.
+    backend.workspaces.p1.push(workspace("feat", "p1"));
+
+    await act(async () => {
+      await emit("workspaces://changed");
+    });
+
+    await waitFor(() => expect(result.current.projects[0].workspaces).toHaveLength(2));
+    expect(result.current.projects[0].workspaces.map((w) => w.id)).toEqual(["root", "feat"]);
+  });
+
+  it("reflects an out-of-band project add (and removal) via the event", async () => {
+    // The same refresh path covers project create/delete too: a whole new project
+    // appearing (or a deleted one vanishing) is reflected by re-listing on the event.
+    const backend = installBackend([project("p1")], { p1: [workspace("root", "p1")] });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.projects).toHaveLength(1);
+
+    backend.projects.push(project("p2"));
+    backend.workspaces.p2 = [workspace("root2", "p2")];
+    await act(async () => {
+      await emit("workspaces://changed");
+    });
+    await waitFor(() => expect(result.current.projects).toHaveLength(2));
+
+    // And a delete: the project is gone from the backend; the event re-lists it away.
+    backend.projects = backend.projects.filter((p) => p.id !== "p1");
+    await act(async () => {
+      await emit("workspaces://changed");
+    });
+    await waitFor(() => expect(result.current.projects.map((t) => t.project.id)).toEqual(["p2"]));
   });
 });

@@ -30,6 +30,20 @@
 //   `exec_state_unread` (SQLite 0/1 INTEGER boolean ↔ Diesel `Bool`), and
 //   `exec_state_updated_at` (epoch ms `BigInt`). Appended after
 //   `workspace_binding_mode`; column ORDER must match the SQL migration.
+// - v4 (PRD-4) split a command instance's FACTUAL run outcome from its
+//   notification/ack state on `command_instances`: `last_exit_code`
+//   (Nullable<Integer>) + `ended_at` (Nullable<BigInt>) persist the last completed
+//   run's natural exit code and finish time (the outcome an ack must NEVER erase),
+//   and `unread` (SQLite INTEGER 0/1 boolean ↔ Diesel `Bool`) is the separate
+//   "unseen result" flag a UI acknowledge clears WITHOUT collapsing the outcome.
+//   All three are appended last (Diesel positional decoding) and back-fill safely
+//   (unread defaults 0; the nullable columns default NULL).
+// - v5 (PRD-4 dogfood review) retains the LAST completed run across a (re)launch on
+//   `command_instances`: `prev_scrollback` (Text, default '') holds the prior run's
+//   bounded scrollback tail, and `prev_exit_code` (Nullable<Integer>) /
+//   `prev_ended_at` (Nullable<BigInt>) / `prev_last_state` (Nullable<Text>, CHECKed
+//   success|error) carry its factual outcome. Bounded to ONE prior run (N=1). All
+//   four are appended last (positional decoding) and back-fill safely ('' / NULL).
 
 diesel::table! {
     terminals (id) {
@@ -107,6 +121,13 @@ diesel::table! {
         was_running_on_shutdown -> Bool,
         created_at -> BigInt,
         updated_at -> BigInt,
+        last_exit_code -> Nullable<Integer>,
+        ended_at -> Nullable<BigInt>,
+        unread -> Bool,
+        prev_scrollback -> Text,
+        prev_exit_code -> Nullable<Integer>,
+        prev_ended_at -> Nullable<BigInt>,
+        prev_last_state -> Nullable<Text>,
     }
 }
 

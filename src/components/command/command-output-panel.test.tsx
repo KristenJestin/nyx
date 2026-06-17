@@ -209,6 +209,63 @@ describe("<CommandOutputPanel> (read-only command output, T8)", () => {
     expect(readBuffer(term)).toContain("KEEP_THIS_OUTPUT");
   });
 
+  it("resets the panel on command://output-cleared for its instance (clear_command_output)", async () => {
+    // The MCP `clear_command_output` tool empties the backend buffer and emits
+    // `command://output-cleared` (review R-OUTPUT). The panel must wipe its xterm so
+    // it does not keep showing stale scrollback — the analog of the run-start clear
+    // but with NO state transition.
+    installIpc({ inst7: "STALE_SCROLLBACK\r\n" });
+    let term: XTerm | null = null;
+    render(
+      <CommandOutputPanel
+        instanceId="inst7"
+        onInstance={(t) => {
+          term = t;
+        }}
+      />,
+    );
+    await waitFor(() => expect(term).not.toBeNull());
+    await waitFor(() => expect(readBuffer(term)).toContain("STALE_SCROLLBACK"));
+
+    // The cleared event for THIS instance wipes the panel (no state/code in payload).
+    await act(async () => {
+      await emit("command://output-cleared", { instanceId: "inst7" });
+    });
+    await waitFor(() => expect(readBuffer(term)).not.toContain("STALE_SCROLLBACK"));
+
+    // Fresh output streams onto the cleared panel, alone.
+    const fresh = Array.from(new TextEncoder().encode("AFTER_CLEAR\r\n"));
+    await act(async () => {
+      await emit("command://output", { instanceId: "inst7", bytes: fresh });
+    });
+    await waitFor(() => expect(readBuffer(term)).toContain("AFTER_CLEAR"));
+    expect(readBuffer(term)).not.toContain("STALE_SCROLLBACK");
+  });
+
+  it("ignores command://output-cleared for a DIFFERENT instance (no spurious clear)", async () => {
+    installIpc({ inst8: "KEEP_AFTER_OTHER_CLEAR\r\n" });
+    let term: XTerm | null = null;
+    render(
+      <CommandOutputPanel
+        instanceId="inst8"
+        onInstance={(t) => {
+          term = t;
+        }}
+      />,
+    );
+    await waitFor(() => expect(term).not.toBeNull());
+    await waitFor(() => expect(readBuffer(term)).toContain("KEEP_AFTER_OTHER_CLEAR"));
+
+    // A cleared event for ANOTHER instance must NOT wipe this panel.
+    await act(async () => {
+      await emit("command://output-cleared", { instanceId: "other77" });
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(readBuffer(term)).toContain("KEEP_AFTER_OTHER_CLEAR");
+  });
+
   it("NEVER sends a keystroke/stdin/resize to the backend (read-only strict)", async () => {
     const spy = installIpc({ inst4: "HELLO\r\n" });
     let term: XTerm | null = null;
