@@ -1,5 +1,6 @@
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
+import Icons from "unplugin-icons/vite";
 import { defineConfig } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 
@@ -17,7 +18,16 @@ const nyxE2e = process.env.VITE_NYX_E2E === "1" ? "1" : "";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [react(), tailwindcss(), tsconfigPaths()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    tsconfigPaths(),
+    // Provider brand logos (finding #55): build-time, tree-shaken, OFFLINE (the SVG
+    // bodies are bundled from the local `@iconify-json/simple-icons` set, no network).
+    // `~icons/<collection>/<slug>` imports become real React components (jsx compiler).
+    // We keep lucide for the rest of the UI — this is only the agent-provider logos.
+    Icons({ compiler: "jsx", jsx: "react" }),
+  ],
 
   // Statically replace the gate flag at build time so it tree-shakes cleanly:
   // in a production build this becomes `"" !== "1"` → always true → the seam's

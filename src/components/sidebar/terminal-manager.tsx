@@ -145,6 +145,7 @@ export function TerminalManager() {
     createProject,
     createWorkspace,
     updateProject,
+    setProjectResumeAgentSessions,
     deleteProject,
     setProjectCollapsed,
     setWorkspaceCollapsed,
@@ -309,6 +310,7 @@ export function TerminalManager() {
     createProject,
     createWorkspace,
     updateProject,
+    setProjectResumeAgentSessions,
     deleteProject: deleteProjectAndDetach,
   });
 

@@ -19,7 +19,14 @@ interface FakeBackend {
 }
 
 function project(id: string, collapsed = false): ProjectRecord {
-  return { id, name: id.toUpperCase(), collapsed, created_at: 0, updated_at: 0 };
+  return {
+    id,
+    name: id.toUpperCase(),
+    collapsed,
+    created_at: 0,
+    updated_at: 0,
+    resume_agent_sessions: false,
+  };
 }
 
 function workspace(id: string, projectId: string, collapsed = false): WorkspaceRecord {

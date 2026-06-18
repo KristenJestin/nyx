@@ -42,6 +42,14 @@ export interface ProjectRecord {
   created_at: number;
   /** Epoch milliseconds. */
   updated_at: number;
+  /**
+   * Per-project opt-in (default `false`) to RESUME this project's terminals'
+   * active agent sessions at relaunch (PRD-5 #5): when `true`, nyx injects
+   * `claude --resume <id>` into the respawned shell instead of a bare shell.
+   * Mirrors `db::Project.resume_agent_sessions`. Default OFF also means closing a
+   * terminal with a live session here triggers the close-warning (#6).
+   */
+  resume_agent_sessions: boolean;
 }
 
 /** A `workspaces` row, mirroring `db::Workspace` across the IPC boundary. */
@@ -131,6 +139,11 @@ export interface UseProjects {
    * the project is dropped from the in-memory tree.
    */
   deleteProject: (id: string) => Promise<void>;
+  /**
+   * Persist a project's `resume_agent_sessions` opt-in (PRD-5 #5). Optimistically
+   * reflected on the tree, then persisted via `set_project_resume_agent_sessions`.
+   */
+  setProjectResumeAgentSessions: (id: string, resume: boolean) => Promise<void>;
   /**
    * Persist a project band's open/closed state. Optimistically reflected on the
    * tree (so the next reload restores the same disclosure), then persisted via
@@ -294,6 +307,19 @@ export function useProjects(): UseProjects {
     await invoke("rename_workspace", { id, name }).catch(() => {});
   }, []);
 
+  const setProjectResumeAgentSessions = useCallback(async (id: string, resume: boolean) => {
+    // Optimistically reflect the toggle so the dialog/header repaint immediately,
+    // then persist. A failure leaves the optimistic flag; the next list corrects it.
+    setProjects((prev) =>
+      prev.map((t) =>
+        t.project.id === id
+          ? { ...t, project: { ...t.project, resume_agent_sessions: resume } }
+          : t,
+      ),
+    );
+    await invoke("set_project_resume_agent_sessions", { id, resume }).catch(() => {});
+  }, []);
+
   const setProjectCollapsed = useCallback(async (id: string, collapsed: boolean) => {
     // Optimistically reflect the disclosure on the tree (so a re-list / reload
     // restores the same open state), then persist. A failure leaves the
@@ -323,6 +349,7 @@ export function useProjects(): UseProjects {
     updateProject,
     deleteProject,
     renameWorkspace,
+    setProjectResumeAgentSessions,
     setProjectCollapsed,
     setWorkspaceCollapsed,
   };

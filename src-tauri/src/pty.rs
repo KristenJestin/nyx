@@ -18,6 +18,16 @@ use std::thread::JoinHandle;
 
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
+/// Env var carrying nyx's PERSISTENT terminal record id (`terminals.id`) into the
+/// spawned shell and everything it launches (PRD-5 task #3). An agent integration
+/// running INSIDE the shell (e.g. the Claude plugin's SessionStart hook) reads this
+/// to correlate its session event back to the exact nyx terminal — unambiguously,
+/// even when two sessions share a cwd. Injected on the production interactive-shell
+/// spawn path ([`Pty::spawn`]) whenever the caller supplies the record id; it then
+/// propagates to child processes via normal env inheritance on every OS. The value
+/// is exactly the `terminals.id` the bridge passed (see `pty_spawn`).
+pub const NYX_TERMINAL_ID_ENV: &str = "NYX_TERMINAL_ID";
+
 /// Monotonic source of PTY ids. Forward-compatible with PRD 1 multi-terminal:
 /// the bridge keys its managed state by this id.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -125,10 +135,20 @@ impl Pty {
     /// child inherits nyx's cwd. The environment is inherited from the current
     /// process (`CommandBuilder` copies the live env by default).
     ///
+    /// `terminal_id` is nyx's PERSISTENT terminal record id (`terminals.id`). When
+    /// supplied it is exported into the shell as [`NYX_TERMINAL_ID_ENV`] so an agent
+    /// integration running inside (and any child the shell spawns) can correlate its
+    /// session events back to THIS terminal (PRD-5 task #3). `None` (the socle / a
+    /// record-less spawn) exports nothing.
+    ///
     /// Returns the [`Pty`] handle and a [`Receiver`] yielding chunks of output
     /// bytes as the reader thread reads them. The receiver completes (the
     /// sender is dropped) when the PTY reaches EOF — i.e. the child has exited.
-    pub fn spawn(size: PtySize, cwd: Option<&str>) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
+    pub fn spawn(
+        size: PtySize,
+        cwd: Option<&str>,
+        terminal_id: Option<&str>,
+    ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
         // Resolve the shell, then build its OSC 133 shell-integration plan
         // (PRD-2.1 task #5): a NON-DESTRUCTIVE per-spawn snippet that makes the
         // shell emit `133;C`/`133;D` so the bridge can derive exec-state. An
@@ -139,7 +159,7 @@ impl Pty {
         // command runner, which spawn arbitrary non-interactive programs).
         let shell = resolve_shell();
         let plan = crate::shellinteg::build(&shell);
-        Self::spawn_program_with_integration(&shell, size, cwd, &plan)
+        Self::spawn_program_with_integration(&shell, size, cwd, &plan, terminal_id)
     }
 
     /// Spawn an arbitrary program with NO shell integration (used by tests and the
@@ -153,22 +173,52 @@ impl Pty {
         size: PtySize,
         cwd: Option<&str>,
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
+        // No terminal-record id on the program path: tests / the managed-command
+        // runner spawn arbitrary non-interactive programs that carry no agent session.
         Self::spawn_program_with_integration(
             program,
             size,
             cwd,
             &crate::shellinteg::IntegrationPlan::default(),
+            None,
         )
+    }
+
+    /// TEST-ONLY: spawn `program` with the given `args`, exporting `terminal_id` as
+    /// [`NYX_TERMINAL_ID_ENV`], so the env-injection path (PRD-5 task #3) can be
+    /// exercised on a controllable program per-OS (a POSIX `sh -c` on Unix, `cmd /C`
+    /// on Windows) WITHOUT depending on which interactive shell `resolve_shell`
+    /// picks. Production code uses [`Pty::spawn`], which carries the id from the
+    /// bridge; this reuses the SAME single env-injection line via an
+    /// [`crate::shellinteg::IntegrationPlan`] that only carries the args.
+    #[cfg(test)]
+    pub fn spawn_program_with_terminal_id(
+        program: &str,
+        args: &[&str],
+        size: PtySize,
+        cwd: Option<&str>,
+        terminal_id: Option<&str>,
+    ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
+        let plan = crate::shellinteg::IntegrationPlan {
+            args: args.iter().map(std::ffi::OsString::from).collect(),
+            ..Default::default()
+        };
+        Self::spawn_program_with_integration(program, size, cwd, &plan, terminal_id)
     }
 
     /// Spawn `program`, applying a shell-integration [`IntegrationPlan`]'s extra
     /// args + env (empty plan = plain spawn). The single real spawn path the two
     /// public constructors share.
+    ///
+    /// `terminal_id`, when `Some`, is exported as [`NYX_TERMINAL_ID_ENV`] so the
+    /// child shell (and everything it launches) carries nyx's persistent terminal
+    /// record id for agent-session correlation (PRD-5 task #3).
     fn spawn_program_with_integration(
         program: &str,
         size: PtySize,
         cwd: Option<&str>,
         plan: &crate::shellinteg::IntegrationPlan,
+        terminal_id: Option<&str>,
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size)?;
@@ -189,6 +239,16 @@ impl Pty {
         // Shell-integration env (e.g. zsh `ZDOTDIR`/`NYX_REAL_ZDOTDIR`).
         for (k, v) in &plan.env {
             cmd.env(k, v);
+        }
+        // Agent-session correlation (PRD-5 task #3): export nyx's persistent terminal
+        // record id so an agent integration inside the shell — and any child it
+        // spawns — can attribute its session events to THIS terminal unambiguously.
+        // `CommandBuilder::env` is OS-portable (it populates the child's environment
+        // block on Windows and the env array on Unix), so the var reaches bash/zsh on
+        // Unix and pwsh/powershell/cmd on Windows identically. Set last so nothing in
+        // the integration plan can shadow it.
+        if let Some(tid) = terminal_id {
+            cmd.env(NYX_TERMINAL_ID_ENV, tid);
         }
 
         let child = pair.slave.spawn_command(cmd)?;
@@ -551,6 +611,104 @@ mod tests {
         );
         worker.join().expect("worker thread");
         drop(rx);
+    }
+
+    // --- NYX_TERMINAL_ID injection (PRD-5 task #3) -----------------------
+
+    /// Unix: a shell spawned WITH a terminal record id sees `NYX_TERMINAL_ID` set to
+    /// EXACTLY that id. We run `sh -c 'echo $NYX_TERMINAL_ID'` so the value the child
+    /// prints is the env the parent injected — proving the var reaches the shell and
+    /// matches the record id the bridge passed.
+    #[cfg(not(windows))]
+    #[test]
+    fn nyx_terminal_id_is_exported_to_unix_shell() {
+        let tid = "term-abc-123";
+        let (mut pty, rx) = Pty::spawn_program_with_terminal_id(
+            "sh",
+            &["-c", "echo NYXTID=[$NYX_TERMINAL_ID]"],
+            small_size(),
+            None,
+            Some(tid),
+        )
+        .expect("spawn sh -c");
+        let out = read_until(&rx, "NYXTID=[", Duration::from_secs(5));
+        assert!(
+            out.contains(&format!("NYXTID=[{tid}]")),
+            "child shell must see NYX_TERMINAL_ID == the record id; got: {out:?}"
+        );
+        let _ = pty.kill();
+    }
+
+    /// Windows: same invariant via `cmd /C echo`. `%NYX_TERMINAL_ID%` expands to the
+    /// injected value in the child's environment block.
+    #[cfg(windows)]
+    #[test]
+    fn nyx_terminal_id_is_exported_to_windows_shell() {
+        let tid = "term-win-456";
+        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+        let (mut pty, rx) = Pty::spawn_program_with_terminal_id(
+            &comspec,
+            &["/C", "echo NYXTID=[%NYX_TERMINAL_ID%]"],
+            small_size(),
+            None,
+            Some(tid),
+        )
+        .expect("spawn cmd /C");
+        let out = read_until(&rx, "NYXTID=[", Duration::from_secs(10));
+        assert!(
+            out.contains(&format!("NYXTID=[{tid}]")),
+            "child cmd must see %NYX_TERMINAL_ID% == the record id; got: {out:?}"
+        );
+        let _ = pty.kill();
+    }
+
+    /// A record-less spawn (`terminal_id = None`, the socle path) injects NOTHING:
+    /// the var is UNSET in the child, so it expands to empty. This proves the
+    /// injection is conditional on the bridge supplying an id, never a stray export.
+    #[cfg(not(windows))]
+    #[test]
+    fn no_nyx_terminal_id_when_record_less_unix() {
+        // Ensure the parent process itself doesn't carry the var (it must come ONLY
+        // from injection), so a None spawn genuinely shows it empty.
+        std::env::remove_var(NYX_TERMINAL_ID_ENV);
+        let (mut pty, rx) = Pty::spawn_program_with_terminal_id(
+            "sh",
+            &["-c", "echo NYXTID=[${NYX_TERMINAL_ID:-UNSET}]"],
+            small_size(),
+            None,
+            None,
+        )
+        .expect("spawn sh -c");
+        let out = read_until(&rx, "NYXTID=[", Duration::from_secs(5));
+        assert!(
+            out.contains("NYXTID=[UNSET]"),
+            "a record-less spawn must NOT export NYX_TERMINAL_ID; got: {out:?}"
+        );
+        let _ = pty.kill();
+    }
+
+    /// The injection reaches a CHILD of the shell, not just the shell itself — the
+    /// real correlation path (an agent CLI launched inside the terminal reads the
+    /// var). We start a subshell that runs another `sh -c` reading the var; it must
+    /// still see the inherited value.
+    #[cfg(not(windows))]
+    #[test]
+    fn nyx_terminal_id_propagates_to_grandchild_unix() {
+        let tid = "term-inherit-789";
+        let (mut pty, rx) = Pty::spawn_program_with_terminal_id(
+            "sh",
+            &["-c", "sh -c 'echo NYXTID=[$NYX_TERMINAL_ID]'"],
+            small_size(),
+            None,
+            Some(tid),
+        )
+        .expect("spawn nested sh");
+        let out = read_until(&rx, "NYXTID=[", Duration::from_secs(5));
+        assert!(
+            out.contains(&format!("NYXTID=[{tid}]")),
+            "the var must inherit into a child process of the shell; got: {out:?}"
+        );
+        let _ = pty.kill();
     }
 
     #[test]

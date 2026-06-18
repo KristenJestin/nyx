@@ -14,6 +14,11 @@ import { Spinner } from "@/components/ui/spinner";
 interface IntegrationStatus {
   provider: string;
   label: string;
+  /**
+   * Whether the nyx integration (the ONE bundled plugin: MCP server + session-capture
+   * hooks) is installed for this provider. A single flag — no more split MCP/plugin
+   * state (findings #44/#45/#46).
+   */
   installed: boolean;
   /** `false` = coming soon, no actions available yet. */
   available: boolean;
@@ -30,52 +35,45 @@ interface ProviderCardProps {
 }
 
 /**
- * One integration row. The install/remove side effect is owned HERE (per card),
- * so its in-flight state stays local: the spinner renders ON THE CLICKED BUTTON
- * (the `Button`'s built-in `loading` prop) and the rest of the list — and the
- * whole modal — stays mounted. We never lift this `busy` flag up to a list-level
- * loading branch that would unmount the providers and flash the modal (review
- * finding 01KVAQAAW3D7TKPTVKMTBKDDPY).
+ * One integration row with a SINGLE Install/Uninstall button (findings #45/#49). The
+ * nyx Claude integration is now ONE bundled plugin (MCP server + session-capture hooks),
+ * so there is one control driving the whole integration — no separate MCP/plugin buttons.
+ *
+ * The install/remove side effect is owned HERE (per card), so the in-flight state stays
+ * local: the button shows a loading spinner + disables while the op runs (it takes a few
+ * seconds — copy + the `claude` CLI), and an error (claude absent / CLI failure) is
+ * surfaced verbatim below the button. The card — and the whole modal — stays mounted, so
+ * there is no full-pane flash (review finding 01KVAQAAW3D7TKPTVKMTBKDDPY).
  */
 function ProviderCard({ status, onRefresh }: ProviderCardProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleInstall = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await invoke("integration_install", { provider: status.provider });
-      onRefresh();
-    } catch (e) {
-      setError(typeof e === "string" ? e : "Install failed");
-    } finally {
-      setBusy(false);
-    }
-  }, [status.provider, onRefresh]);
-
-  const handleRemove = useCallback(async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await invoke("integration_remove", { provider: status.provider });
-      onRefresh();
-    } catch (e) {
-      setError(typeof e === "string" ? e : "Remove failed");
-    } finally {
-      setBusy(false);
-    }
-  }, [status.provider, onRefresh]);
+  const run = useCallback(
+    async (cmd: "integration_install" | "integration_remove") => {
+      setBusy(true);
+      setError(null);
+      try {
+        await invoke(cmd, { provider: status.provider });
+        onRefresh();
+      } catch (e) {
+        setError(typeof e === "string" ? e : "Operation failed");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [status.provider, onRefresh],
+  );
 
   return (
     <div
       className={cn(
-        "flex items-center justify-between rounded-lg border px-4 py-3",
+        "flex flex-col rounded-lg border px-4 py-3",
         status.available ? "border-border bg-card" : "border-border/50 bg-card/50 opacity-60",
       )}
     >
-      {/* Left: icon + label + status badge */}
-      <div className="flex min-w-0 flex-col gap-0.5">
+      {/* Header: label + (installed badge / coming soon badge) + the single action. */}
+      <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-card-foreground">{status.label}</span>
           {status.available && status.installed && (
@@ -84,34 +82,22 @@ function ProviderCard({ status, onRefresh }: ProviderCardProps) {
               Installed
             </span>
           )}
-          {!status.available && (
-            <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
-              Coming soon
-            </span>
-          )}
         </div>
-        {error && (
-          <p className="flex items-center gap-1 text-xs text-destructive">
-            <XCircleIcon className="size-3 shrink-0" />
-            {error}
-          </p>
+        {!status.available && (
+          <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+            Coming soon
+          </span>
         )}
-      </div>
-
-      {/* Right: action button (only for available providers). The spinner shows
-          ON the clicked button via the Button's built-in `loading` state — the
-          button stays in place, the row never unmounts, no full-modal flash. */}
-      {status.available && (
-        <div className="ml-4 flex shrink-0 items-center gap-2">
-          {status.installed ? (
+        {status.available &&
+          (status.installed ? (
             <Button
               variant="destructive-outline"
               size="xs"
               loading={busy}
               disabled={busy}
-              onClick={() => void handleRemove()}
+              onClick={() => void run("integration_remove")}
             >
-              Remove
+              Uninstall
             </Button>
           ) : (
             <Button
@@ -119,12 +105,18 @@ function ProviderCard({ status, onRefresh }: ProviderCardProps) {
               size="xs"
               loading={busy}
               disabled={busy}
-              onClick={() => void handleInstall()}
+              onClick={() => void run("integration_install")}
             >
               Install
             </Button>
-          )}
-        </div>
+          ))}
+      </div>
+
+      {error && (
+        <p className="mt-2 flex items-center gap-1 text-xs text-destructive">
+          <XCircleIcon className="size-3 shrink-0" />
+          {error}
+        </p>
       )}
     </div>
   );
@@ -235,15 +227,18 @@ export interface SettingsDialogHandle {
  * mirrors the Commands-modal navigation pattern (a rail of selectable entries +
  * a detail surface), rendered with nyx's design tokens.
  *
- * The **Integrations** section lists all supported MCP provider integrations:
- * - **Claude Code** — functional in v1: Install writes nyx's entry to
- *   `~/.claude.json` and marks `installed = true` in `integrations.json` so
- *   future boots only reconcile (never silently re-create). Remove inverts both.
- * - **Codex** / **OpenCode** / **Custom** — coming soon (UI disabled, no actions).
+ * The **Integrations** section lists all supported provider integrations. Each
+ * available provider has a SINGLE Install/Uninstall control (findings #44/#45/#46): the
+ * nyx Claude integration is now ONE bundled plugin that registers a local marketplace +
+ * an `enabledPlugins` reference in `~/.claude/settings.json` and bundles BOTH the nyx MCP
+ * server (its `.mcp.json`) AND the SessionStart/SessionEnd session-capture hooks. Install
+ * copies + registers the plugin via the `claude` CLI (and strips any legacy standalone
+ * MCP); uninstall removes the plugin + all nyx residue. Codex / OpenCode / Custom are
+ * coming soon (UI disabled, no actions).
  *
- * Install state is persisted by the Rust backend; this component only reads and
- * triggers mutations via `integration_list` / `integration_install` /
- * `integration_remove` Tauri commands.
+ * Install state is derived from Claude Code's REAL config by the Rust backend; this
+ * component only reads and triggers mutations via `integration_list` /
+ * `integration_install` / `integration_remove` Tauri commands.
  *
  * The dialog stays mounted across open/close (its exit is Motion-animated, so an
  * immediate unmount would cut the animation short). The provider list is loaded

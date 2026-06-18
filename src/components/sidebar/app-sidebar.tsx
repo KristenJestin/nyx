@@ -7,6 +7,7 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { ProjectItem } from "./project-item";
 import { SelectionRail, useActiveRail } from "./active-rail";
 import { SortableTerminalList } from "./sortable-terminal-list";
+import { AgentSessionsProvider } from "./use-agent-sessions";
 import type { CommandRecord, ProjectTree, WorkspaceRecord } from "./use-projects";
 import type { TerminalRecord } from "./use-terminals";
 
@@ -159,117 +160,122 @@ export function AppSidebar({
   const { hostRef, railRef } = useActiveRail(railKey(activeId, activeCommandId));
 
   return (
-    <aside
-      className={cn(
-        "flex h-full w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar",
-        className,
-      )}
-    >
-      {/* === HEAD: Nyx wordmark + gear (Settings) ===
+    // The provider owns the SINGLE active-agent-session subscription (finding #55); every
+    // terminal row below reads its agent via context, so the icon swaps live with no
+    // prop-drilling through the project → workspace → list → item chain.
+    <AgentSessionsProvider>
+      <aside
+        className={cn(
+          "flex h-full w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar",
+          className,
+        )}
+      >
+        {/* === HEAD: Nyx wordmark + gear (Settings) ===
             `px-3` matches the Projects band + footer band so icons align. The
             loose-terminal `+` lives in the TERMINALS footer band (unchanged). */}
-      <div className="flex items-center justify-between border-b border-sidebar-border px-3 py-2.5">
-        <span className="text-sm font-semibold tracking-widest text-sidebar-foreground">Nyx</span>
-        <Tooltip label="Settings">
-          <Button variant="ghost" size="icon-xs" aria-label="Settings" onClick={onOpenSettings}>
-            <Settings2Icon />
-          </Button>
-        </Tooltip>
-      </div>
+        <div className="flex items-center justify-between border-b border-sidebar-border px-3 py-2.5">
+          <span className="text-sm font-semibold tracking-widest text-sidebar-foreground">Nyx</span>
+          <Tooltip label="Settings">
+            <Button variant="ghost" size="icon-xs" aria-label="Settings" onClick={onOpenSettings}>
+              <Settings2Icon />
+            </Button>
+          </Tooltip>
+        </div>
 
-      {/* Rail HOST: a `relative` container spanning the rows so the single
+        {/* Rail HOST: a `relative` container spanning the rows so the single
             measured selection bar can be positioned over the active row. */}
-      <div ref={hostRef} className="relative flex min-h-0 flex-1 flex-col">
-        <SelectionRail railRef={railRef} />
+        <div ref={hostRef} className="relative flex min-h-0 flex-1 flex-col">
+          <SelectionRail railRef={railRef} />
 
-        {/* === PROJECTS (scrollable): sticky band label + one band per project === */}
-        <section className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
-          <div className="sticky top-0 z-20 flex items-center justify-between border-b border-sidebar-border bg-sidebar px-3 py-1.5">
-            <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-              Projects
-            </span>
-            <Tooltip label="Add project">
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="Add project"
-                onClick={onAddProject}
-              >
-                <FolderPlusIcon />
-              </Button>
-            </Tooltip>
-          </div>
+          {/* === PROJECTS (scrollable): sticky band label + one band per project === */}
+          <section className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
+            <div className="sticky top-0 z-20 flex items-center justify-between border-b border-sidebar-border bg-sidebar px-3 py-1.5">
+              <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+                Projects
+              </span>
+              <Tooltip label="Add project">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="Add project"
+                  onClick={onAddProject}
+                >
+                  <FolderPlusIcon />
+                </Button>
+              </Tooltip>
+            </div>
 
-          <ul className="flex flex-col">
-            {projects.map((tree) => (
-              <ProjectItem
-                key={tree.project.id}
-                tree={tree}
-                terminalsByWorkspace={terminalsByWorkspace}
+            <ul className="flex flex-col">
+              {projects.map((tree) => (
+                <ProjectItem
+                  key={tree.project.id}
+                  tree={tree}
+                  terminalsByWorkspace={terminalsByWorkspace}
+                  activeId={activeId}
+                  ptyIds={ptyIds}
+                  onSelect={onSelect}
+                  onClose={onClose}
+                  onNewTerminal={onNewTerminal}
+                  onAddWorkspace={onAddWorkspace}
+                  onEditProject={onEditProject}
+                  onDeleteProject={onDeleteProject}
+                  onManageCommands={onManageCommands}
+                  commandsByWorkspace={commandsByWorkspace}
+                  activeCommandId={activeCommandId}
+                  onSelectCommand={onSelectCommand}
+                  onReorderTerminals={onReorderTerminals}
+                  onSetCollapsed={onSetProjectCollapsed}
+                  onSetWorkspaceCollapsed={onSetWorkspaceCollapsed}
+                />
+              ))}
+              {projects.length === 0 && (
+                <li className="px-3 py-6 text-center text-xs text-muted-foreground">
+                  No projects yet. Add one with the button above.
+                </li>
+              )}
+            </ul>
+          </section>
+
+          {/* === TERMINALS (pinned footer): loose/unattached terminals ===
+            The band uses `px-3` (matching the head + Projects band) so its '+'
+            lands on the same right edge as the other two. */}
+          <section className="shrink-0 border-t border-sidebar-border px-2 pt-2 pb-2">
+            <div className="flex items-center justify-between px-1 py-1">
+              <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+                Terminals
+              </span>
+              <Tooltip label="New terminal (unattached)">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="New unattached terminal"
+                  onClick={onNewLooseTerminal}
+                >
+                  <PlusIcon />
+                </Button>
+              </Tooltip>
+            </div>
+            {looseTerminals.length > 0 ? (
+              // Drag-sortable loose list (dnd-kit): a closed loose row runs its
+              // height-collapse exit and the survivors reflow up (same enter/exit as
+              // the workspace lists).
+              <SortableTerminalList
+                terminals={looseTerminals}
                 activeId={activeId}
                 ptyIds={ptyIds}
                 onSelect={onSelect}
                 onClose={onClose}
-                onNewTerminal={onNewTerminal}
-                onAddWorkspace={onAddWorkspace}
-                onEditProject={onEditProject}
-                onDeleteProject={onDeleteProject}
-                onManageCommands={onManageCommands}
-                commandsByWorkspace={commandsByWorkspace}
-                activeCommandId={activeCommandId}
-                onSelectCommand={onSelectCommand}
-                onReorderTerminals={onReorderTerminals}
-                onSetCollapsed={onSetProjectCollapsed}
-                onSetWorkspaceCollapsed={onSetWorkspaceCollapsed}
+                onReorder={onReorderLooseTerminals}
+                className="flex flex-col"
               />
-            ))}
-            {projects.length === 0 && (
-              <li className="px-3 py-6 text-center text-xs text-muted-foreground">
-                No projects yet. Add one with the button above.
-              </li>
+            ) : (
+              <p className="px-2 py-1 text-xs text-muted-foreground/70 italic select-none">
+                No terminals — + to start
+              </p>
             )}
-          </ul>
-        </section>
-
-        {/* === TERMINALS (pinned footer): loose/unattached terminals ===
-            The band uses `px-3` (matching the head + Projects band) so its '+'
-            lands on the same right edge as the other two. */}
-        <section className="shrink-0 border-t border-sidebar-border px-2 pt-2 pb-2">
-          <div className="flex items-center justify-between px-1 py-1">
-            <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-              Terminals
-            </span>
-            <Tooltip label="New terminal (unattached)">
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label="New unattached terminal"
-                onClick={onNewLooseTerminal}
-              >
-                <PlusIcon />
-              </Button>
-            </Tooltip>
-          </div>
-          {looseTerminals.length > 0 ? (
-            // Drag-sortable loose list (dnd-kit): a closed loose row runs its
-            // height-collapse exit and the survivors reflow up (same enter/exit as
-            // the workspace lists).
-            <SortableTerminalList
-              terminals={looseTerminals}
-              activeId={activeId}
-              ptyIds={ptyIds}
-              onSelect={onSelect}
-              onClose={onClose}
-              onReorder={onReorderLooseTerminals}
-              className="flex flex-col"
-            />
-          ) : (
-            <p className="px-2 py-1 text-xs text-muted-foreground/70 italic select-none">
-              No terminals — + to start
-            </p>
-          )}
-        </section>
-      </div>
-    </aside>
+          </section>
+        </div>
+      </aside>
+    </AgentSessionsProvider>
   );
 }

@@ -4,6 +4,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { MinusIcon, SquareIcon, XIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { CloseWarningDialog } from "./close-warning-dialog";
+import { fetchCloseWarnings, type CloseWarning } from "./close-warning";
 
 /**
  * Decide whether the custom window controls (min / max / close) are shown,
@@ -62,6 +64,10 @@ export function useWindowControlsVisible(): boolean {
  * the chrome (e.g. if the call races window teardown).
  */
 export function WindowControls() {
+  // The live agent sessions a close would drop (PRD-5 #6). `null` = no pending close
+  // prompt; a non-empty array opens the confirm dialog.
+  const [warnings, setWarnings] = useState<CloseWarning[] | null>(null);
+
   const minimize = useCallback(() => {
     void getCurrentWindow()
       .minimize()
@@ -72,11 +78,29 @@ export function WindowControls() {
       .toggleMaximize()
       .catch(() => {});
   }, []);
-  const close = useCallback(() => {
+
+  /** Actually close the window (swallows IPC errors so a teardown race never throws). */
+  const doClose = useCallback(() => {
     void getCurrentWindow()
       .close()
       .catch(() => {});
   }, []);
+
+  /**
+   * Close request: first ask the backend whether any LIVE agent session would be
+   * dropped (a project that does NOT auto-resume). If none, close immediately; if some,
+   * open the confirm dialog and let the user decide. Fail-open — `fetchCloseWarnings`
+   * returns `[]` on error so a backend hiccup never traps the window.
+   */
+  const requestClose = useCallback(() => {
+    void fetchCloseWarnings().then((w) => {
+      if (w.length === 0) {
+        doClose();
+      } else {
+        setWarnings(w);
+      }
+    });
+  }, [doClose]);
 
   return (
     <div className="flex items-center gap-0.5">
@@ -91,9 +115,24 @@ export function WindowControls() {
       >
         <SquareIcon />
       </Button>
-      <Button variant="ghost-destructive" size="icon-sm" aria-label="Close window" onClick={close}>
+      <Button
+        variant="ghost-destructive"
+        size="icon-sm"
+        aria-label="Close window"
+        onClick={requestClose}
+      >
         <XIcon />
       </Button>
+
+      <CloseWarningDialog
+        open={warnings !== null}
+        warnings={warnings ?? []}
+        onConfirm={() => {
+          setWarnings(null);
+          doClose();
+        }}
+        onCancel={() => setWarnings(null)}
+      />
     </div>
   );
 }

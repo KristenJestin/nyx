@@ -145,6 +145,18 @@ pub const CLOSE_TERMINAL_TOOL: &str = "close_terminal";
 /// kept out of [`V1_TOOLS`] (same pattern as the other interactive-terminal tools).
 pub const READ_TERMINAL_TOOL: &str = "read_terminal";
 
+/// The `agent_session_event` tool name (PRD-5 #4, ADR-0004 / ADR-0010). The channel
+/// a Claude Code `SessionStart`/`SessionEnd` hook of type `mcp_tool` reaches nyx on:
+/// it is addressed `mcp__nyx__agent_session_event` and carries the agent's raw hook
+/// payload (`hook_event_name`, `session_id`, `cwd`, `transcript_path`, `source`,
+/// `NYX_TERMINAL_ID`). nyx normalizes it through the `claude_code` adapter and
+/// upserts/ends the matching `agent_sessions` row. Advertised in `tools/list`, kept
+/// OUT of [`V1_TOOLS`] (same pattern as `probe` and the other extension tools: it is
+/// a PRD-5 capability layered over the existing DB, not part of the frozen contract
+/// clients onboard against). Like `probe` it answers even with no managed runtime —
+/// it just reports `mcp_unavailable` so the best-effort hook degrades cleanly.
+pub const AGENT_SESSION_EVENT_TOOL: &str = "agent_session_event";
+
 /// The frozen MCP v1 tool surface (ADR-0003). Phase-1 advertises these names in
 /// the `tools/list` handshake; the call bodies are wired in phase 2 over the PRD-3
 /// runtime/DB layer (D6). Order is the ADR's listing order.
@@ -1013,6 +1025,36 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["terminal_id"],
         },
     }));
+    // Append the agent-session-event channel (PRD-5 #4, ADR-0004 / ADR-0010): the MCP
+    // tool a Claude Code SessionStart/SessionEnd hook calls so nyx can capture/end the
+    // agent session bound to a terminal. Advertised alongside the v1 surface, kept OUT
+    // of V1_TOOLS for the SAME reason as `probe`: it is a PRD-5 capability over the
+    // existing DB, not part of the frozen contract clients onboard against. The schema
+    // accepts the raw Claude hook fields directly so a `mcp_tool` hook can forward its
+    // input verbatim.
+    descriptors.push(json!({
+        "name": AGENT_SESSION_EVENT_TOOL,
+        "description": "Report an agent session lifecycle event to nyx (used by the nyx Claude \
+                        Code plugin's SessionStart/SessionEnd hooks, not normally called by \
+                        hand). Pass the hook's fields — `hook_event_name` (SessionStart or \
+                        SessionEnd), `session_id`, and on start `cwd`, `transcript_path`, \
+                        `source` — plus the `NYX_TERMINAL_ID` of the terminal the agent runs in \
+                        so nyx can bind the session to that terminal. nyx records the session so \
+                        it can be resumed later; SessionEnd marks it cleanly ended.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hook_event_name": str_prop("the Claude hook event: \"SessionStart\" or \"SessionEnd\""),
+                "session_id": str_prop("the agent's own session id (Claude session_id) — what resume is built from"),
+                "NYX_TERMINAL_ID": str_prop("the nyx terminal record id the agent runs in (exported into the shell by nyx); used to correlate the session to a terminal"),
+                "cwd": str_prop("working directory of the session (SessionStart)"),
+                "transcript_path": str_prop("path to the agent transcript file (SessionStart, optional)"),
+                "source": str_prop("SessionStart source: startup | resume | clear (optional)"),
+                "agent_kind": str_prop("which agent this is (default \"claude_code\")"),
+            },
+            "required": ["hook_event_name", "session_id"],
+        },
+    }));
     descriptors
 }
 
@@ -1164,9 +1206,14 @@ mod tests {
     /// Internal/dev jargon markers that must never appear in agent-facing strings
     /// (the `instructions` and every advertised tool description). These are words
     /// written for nyx developers, not the consuming agent.
+    ///
+    /// NOTE: `SessionStart`/`SessionEnd` are deliberately NOT blacklisted — they are
+    /// Claude Code's PUBLIC hook event names, i.e. the literal `hook_event_name`
+    /// values an agent forwards to the PRD-5 `agent_session_event` tool. Naming them
+    /// in that tool's description is agent-facing guidance, not internal dev-speak.
     fn assert_no_internal_jargon(what: &str, text: &str) {
         let lc = text.to_lowercase();
-        for marker in ["prd", "spike", "sessionstart", "adr-", "dogfood", "phase-2", "phase 2"] {
+        for marker in ["prd", "spike", "adr-", "dogfood", "phase-2", "phase 2"] {
             assert!(
                 !lc.contains(marker),
                 "{what} leaks internal jargon marker {marker:?}: {text}"
@@ -1289,13 +1336,19 @@ mod tests {
         assert!(names.contains(&CLOSE_TERMINAL_TOOL), "close_terminal tool must be listed");
         // PRD-4.1 #1: the read_terminal scrollback-read tool advertised alongside, kept OUT of V1_TOOLS.
         assert!(names.contains(&READ_TERMINAL_TOOL), "read_terminal tool must be listed");
+        // PRD-5 #4 (ADR-0004): the agent-session channel advertised alongside, kept OUT of V1_TOOLS.
+        assert!(
+            names.contains(&AGENT_SESSION_EVENT_TOOL),
+            "agent_session_event tool must be listed"
+        );
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 15,
+            V1_TOOLS.len() + 16,
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
-             create_terminal/send_to_terminal/list_terminals/close_terminal/read_terminal extension tools"
+             create_terminal/send_to_terminal/list_terminals/close_terminal/read_terminal + \
+             agent_session_event extension tools"
         );
     }
 
@@ -1469,6 +1522,50 @@ mod tests {
         assert_eq!(v["result"]["isError"], false);
         assert_eq!(v["result"]["structuredContent"]["ok"], true);
         assert_eq!(v["result"]["structuredContent"]["server"], SERVER_NAME);
+    }
+
+    #[test]
+    fn agent_session_event_round_trips_over_loopback() {
+        // PRD-5 #4 (ADR-0004): drive `tools/call agent_session_event` over a REAL
+        // 127.0.0.1 HTTP socket — exactly the JSON-RPC a Claude Code SessionStart
+        // `mcp_tool` hook (`mcp__nyx__agent_session_event`) sends, carrying the hook
+        // payload (`hook_event_name`, `session_id`, `cwd`, `source`, `NYX_TERMINAL_ID`)
+        // as the tool `arguments` — and confirm the captured-session result is wrapped
+        // in the MCP envelope. A tiny in-test dispatcher echoes the captured fields so
+        // this proves the TRANSPORT path (the same wire the real hook uses); the
+        // SAME tool against the real `NyxToolDispatcher` + a live DB is proven in
+        // `mcp_tools::tests::session_start_creates_active_row`. Together they cover the
+        // loopback transport here and the DB-backed capture there.
+        struct SessionChannel;
+        impl ToolDispatcher for SessionChannel {
+            fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError> {
+                if name == "agent_session_event" {
+                    // Echo the correlation + capture the hook sent (the shape the real
+                    // tool persists), proving the arguments reached the dispatcher.
+                    Ok(json!({
+                        "event": arguments.get("hook_event_name"),
+                        "terminal_id": arguments.get("NYX_TERMINAL_ID"),
+                        "external_session_id": arguments.get("session_id"),
+                        "state": "active",
+                    }))
+                } else {
+                    Err(RpcError::new("method_not_found", format!("unknown tool '{name}'")))
+                }
+            }
+        }
+        let server = start_on_port(19024);
+        server.set_dispatcher(Arc::new(SessionChannel));
+        // The EXACT JSON-RPC a SessionStart `mcp_tool` hook would send.
+        let req = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"agent_session_event","arguments":{"hook_event_name":"SessionStart","session_id":"claude-sid-1","cwd":"/work/proj","source":"startup","NYX_TERMINAL_ID":"term-xyz"}}}"#;
+        let (status, body) = http_request(19024, "POST", "/mcp", Some(req));
+        assert!(status.contains("200"), "session event call 200, got {status}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        let sc = &v["result"]["structuredContent"];
+        assert_eq!(sc["event"], "SessionStart");
+        assert_eq!(sc["terminal_id"], "term-xyz", "NYX_TERMINAL_ID round-trips as the correlation key");
+        assert_eq!(sc["external_session_id"], "claude-sid-1");
+        assert_eq!(sc["state"], "active");
     }
 
     #[test]

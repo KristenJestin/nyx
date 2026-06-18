@@ -21,7 +21,7 @@ function ws(id: string, name: string, path: string, isRoot: boolean): WorkspaceR
 
 function tree(id: string, name: string, workspaces: WorkspaceRecord[] = []): ProjectTree {
   return {
-    project: { id, name, collapsed: false, created_at: 0, updated_at: 0 },
+    project: { id, name, collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false },
     workspaces,
   };
 }

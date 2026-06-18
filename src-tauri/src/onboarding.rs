@@ -1,47 +1,48 @@
-//! Claude Code MCP onboarding (PRD-4 #5, ADR-0003 D10/D11).
+//! Claude Code integration config helpers (PRD-4 #5 / PRD-5, ADR-0003 D10/D11).
 //!
-//! nyx writes/updates the **user-scope** MCP config of supported agent clients so
-//! they find nyx without fragile manual setup. PRD-4 implements **Claude Code** at
-//! minimum; other clients can be *detected* but are not auto-configured until their
-//! format is validated (ADR-0003 D10).
+//! ## The ONE bundled plugin (MCP + hooks) — finding #44/#45/#46
+//! The nyx Claude integration is now a SINGLE bundled plugin that provides BOTH the MCP
+//! server (declared in the plugin's `.mcp.json`, port-templated at copy time — connects as
+//! `plugin:nyx-claude-integration:nyx`) AND the SessionStart/SessionEnd session-capture
+//! hooks. nyx no longer writes a SEPARATE standalone `mcpServers.nyx` entry into
+//! `~/.claude.json` — that double-declaration desynced. The plugin install/reconcile/
+//! uninstall lives in [`crate::plugin`]; THIS module now only:
+//! - resolves the Claude config path ([`OnboardingTarget`] / `NYX_CLAUDE_CONFIG`);
+//! - reads the legacy standalone-MCP signal ([`claude_mcp_installed`] /
+//!   [`mcp_server_present`]) and **strips** that residue on install/uninstall
+//!   ([`remove_legacy_mcp_server`]), so a migrated user keeps a single MCP declaration;
+//! - persists the non-authoritative install cache ([`IntegrationState`]) and drives the
+//!   conservative boot reconcile of the plugin ([`reconcile_installed_providers`]).
 //!
-//! Claude Code's user-scope config lives in a single JSON file at
-//! `~/.claude.json` with a top-level `mcpServers` object that maps a server name to
-//! its transport config. For nyx's HTTP loopback transport the entry is
-//! `{ "type": "http", "url": "http://127.0.0.1:<port>/mcp" }` — **localhost direct**,
-//! never the portless `nyx.localhost` URL (ADR-0003 D11). This mirrors what
-//! `claude mcp add --transport http --scope user nyx <url>` writes.
+//! ## Legacy standalone-MCP merge helpers (retained, tested, NOT wired in production)
+//! The pure `mcpServers.nyx` merge/onboard helpers (`mcp_url`, `merge_nyx_server`,
+//! `OnboardingTarget::onboard`, `reconcile_providers_with_targets`,
+//! `OnboardConfigChange`) are the OLD separate-MCP install path. They are no longer wired
+//! into any production flow (the plugin owns the MCP now), but are kept + unit-tested
+//! because they document the exact `{ "type": "http", "url": "http://127.0.0.1:<port>/mcp" }`
+//! entry shape the bundled `.mcp.json` mirrors, and the strip path round-trips the same
+//! config. The module-level `#![cfg_attr(not(test), allow(dead_code))]` keeps the
+//! non-test build warning-free while the tests prove the merge logic (same convention as
+//! `agent.rs` / `db.rs` for tested-but-phased helpers).
 //!
-//! ## Properties this module guarantees
-//! - **Idempotent** (done-criterion): re-running onboarding with the same port
-//!   leaves the file byte-for-byte stable and never duplicates the `nyx` entry —
-//!   the `mcpServers` map is keyed by name, and we upsert by [`SERVER_NAME`].
-//! - **Clean port-change update** (testingDecisions): if the resolved port changes,
-//!   the existing `nyx` entry's `url` is rewritten in place to the new port; no
-//!   stale duplicate is left behind.
-//! - **Preserves the rest of the file**: every other top-level key and every other
-//!   `mcpServers` entry is round-tripped untouched — we parse, mutate only nyx's
-//!   slice, and re-serialize.
-//!
-//! ## Boot reconciliation (task #1)
-//! nyx no longer silently auto-installs itself into every client config at boot.
-//! Instead, [`reconcile_installed_providers`] runs at boot and operates only on
-//! providers the user has explicitly installed (tracked in
-//! `<app_data_dir>/integrations.json` via [`IntegrationState`]):
-//! - **Present in provider config** → keep it up to date (`url`/`port` only).
-//! - **Absent from provider config** → do nothing (never create silently).
-//! - **Not marked installed** → skip entirely (not our entry to manage).
-//!
-//! The install/update/remove UI actions (Settings → Integrations) write the
-//! `integrations.json` state and immediately call the relevant provider mutation.
+//! ## Boot reconciliation (keyed on REAL state — review #40/#41)
+//! [`reconcile_installed_providers`] keys PURELY off the client's REAL plugin registry:
+//! plugin **present** → refresh (re-copy/re-template/propagate a version bump, finding
+//! #47); plugin **absent** → no-op (never install silently on boot). The same real-state
+//! rule drives the install STATUS the UI shows (`enabledPlugins`, finding #46), so a plugin
+//! the user removed DIRECTLY in Claude Code reads as uninstalled instead of nyx's stored
+//! flag lying. `<app_data_dir>/integrations.json` ([`IntegrationState`]) is a
+//! NON-authoritative cache the UI writes on its own clicks; never the source of truth.
 //!
 //! ## Safety / testability
-//! The config path is **injectable**: [`OnboardingTarget::claude_code`] resolves the
-//! real `~/.claude.json`, but [`OnboardingTarget::new`] takes an arbitrary path so
-//! tests (and any caller that must not touch the user's real config) point at a
-//! temp file. The pure JSON merge logic ([`merge_nyx_server`]) is a free function
-//! over `serde_json::Value` with no IO, unit-tested directly.
-//! [`IntegrationState`] IO is similarly injectable via [`reconcile_providers`].
+//! The config path is **injectable**: [`OnboardingTarget::claude_code`] resolves the real
+//! `~/.claude.json`, but [`OnboardingTarget::new`] takes an arbitrary path so tests point
+//! at a temp file — the suite never mutates the user's real config.
+
+// The legacy standalone-MCP merge/onboard helpers below are retained + unit-tested but no
+// longer wired into any production flow (the bundled plugin owns the MCP — finding #45);
+// this keeps the non-test build warning-free, matching the agent.rs / db.rs convention.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,7 @@ impl OnboardingTarget {
         }
         Ok(change)
     }
+
 }
 
 /// Resolve the Claude Code user-scope config path. `NYX_CLAUDE_CONFIG` wins (an
@@ -130,7 +132,8 @@ fn claude_config_path() -> Option<PathBuf> {
 
 /// The user's home directory, from `$HOME` (Unix/macOS) or `$USERPROFILE`
 /// (Windows). std-only — avoids adding a `dirs`/`home` dependency for one lookup.
-fn home_dir() -> Option<PathBuf> {
+/// `pub(crate)` so `plugin.rs` reuses the SAME resolver (no second copy to drift).
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
@@ -141,6 +144,59 @@ fn home_dir() -> Option<PathBuf> {
 /// (e.g. the `integration_remove` Tauri command in `bridge.rs`).
 pub fn read_config_pub(path: &Path) -> std::io::Result<Value> {
     read_config(path)
+}
+
+/// Whether nyx's MCP server is present in Claude Code's REAL config — the authoritative
+/// install signal for the MCP component (review #41), symmetric to the plugin's
+/// `enabledPlugins` check. Reads `~/.claude.json` (injectable via `NYX_CLAUDE_CONFIG`)
+/// and returns `true` only when `mcpServers.nyx` exists — exactly the slice
+/// [`merge_nyx_server`] writes and [`reconcile_providers_with_targets`] checks. This
+/// tracks reality (a user removing the server in Claude flips it to `false`), NOT nyx's
+/// own stored `integrations.json` flag. A missing file / unresolvable path / absent
+/// entry all read as `false`.
+pub fn claude_mcp_installed() -> bool {
+    match claude_config_path() {
+        Some(path) => mcp_server_present(&path),
+        None => false,
+    }
+}
+
+/// Pure check: is the `nyx` MCP server entry present in the config file at `path`? A
+/// missing file, a parse error or an absent `mcpServers.nyx` all read as `false`.
+/// Factored out (no path resolution) so it is unit-testable against a temp config.
+pub fn mcp_server_present(path: &Path) -> bool {
+    match read_config(path) {
+        Ok(root) => root
+            .get("mcpServers")
+            .and_then(|s| s.get(SERVER_NAME))
+            .is_some(),
+        Err(_) => false,
+    }
+}
+
+/// Remove the LEGACY standalone `mcpServers.nyx` entry from the config file at `path`, if
+/// present (finding #45). The nyx MCP is now bundled IN the plugin (`.mcp.json`), so the
+/// separate `~/.claude.json` declaration is no longer written on install — and any residue
+/// from the old separate-MCP flow is stripped on uninstall so no double-declaration
+/// lingers. A missing file / absent entry is a no-op. Returns whether anything was
+/// removed. Best-effort (a read/parse error is swallowed as "nothing to remove").
+pub fn remove_legacy_mcp_server(path: &Path) -> std::io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut root = match read_config(path) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    let removed = root
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .map(|servers| servers.remove(SERVER_NAME).is_some())
+        .unwrap_or(false);
+    if removed {
+        write_config(path, &root)?;
+    }
+    Ok(removed)
 }
 
 /// Public re-export of [`write_config`] for callers that hold a config path directly.
@@ -255,15 +311,6 @@ impl Provider {
         }
     }
 
-    /// Build the [`OnboardingTarget`] for this provider (injectable config path
-    /// is the real user-scope config). Returns `None` if the path cannot be
-    /// resolved (e.g. no home dir).
-    pub fn target(&self) -> Option<OnboardingTarget> {
-        match self {
-            Provider::ClaudeCode => OnboardingTarget::claude_code(),
-        }
-    }
-
     /// All providers nyx tracks install state for.
     fn all() -> &'static [Provider] {
         &[Provider::ClaudeCode]
@@ -312,48 +359,111 @@ impl IntegrationState {
         write_config(path, &Value::Object(obj))
     }
 
-    /// Whether the given provider key is marked as installed.
+    /// Whether the given (component) key is marked as installed in the NON-authoritative
+    /// cache. The key may be a bare provider (`"claude_code"`, the MCP server) or a
+    /// component-qualified key (`"claude_code:plugin"`) — the store is a generic
+    /// `key → bool` map so MCP and plugin install state are tracked INDEPENDENTLY
+    /// (finding #23).
+    ///
+    /// Since review #40/#41 this cache is **no longer the source of truth** for install
+    /// status or boot reconcile — both key off Claude Code's REAL config. The cache read
+    /// is retained for the tests that assert the UI's own click is recorded; production
+    /// status reads reality, so this has no non-test caller.
+    #[allow(dead_code)]
     pub fn is_installed(&self, key: &str) -> bool {
         self.providers.get(key).copied().unwrap_or(false)
     }
 
-    /// Mark a provider as installed (persists separately via [`save`]).
+    /// Mark a (component) key as installed (persists separately via [`save`]).
     pub fn set_installed(&mut self, key: &str, installed: bool) {
         self.providers.insert(key.to_string(), installed);
     }
 }
 
+// (The old per-component plugin state key — `plugin_state_key` / `PLUGIN_COMPONENT_SUFFIX`
+// — was dropped with the split MCP/plugin install: there is now ONE integration unit, so
+// `IntegrationState` tracks a single bare provider key, finding #45/#46.)
+
 // ---------------------------------------------------------------------------
 // Boot reconciliation (task #1)
 // ---------------------------------------------------------------------------
 
-/// Boot-time reconciliation: update the `nyx` entry in every provider config
-/// that the user has already installed, keyed on `integrations.json` state.
+/// One provider's resolved plugin-reconcile input: its [`crate::plugin::PluginInstall`]
+/// descriptor + its CLI driver, or `None` when the bundled plugin / stable dir / CLI
+/// could not be resolved. Built by the provider's adapter (no agent specifics leak into
+/// the generic reconcile loop — finding #25).
+pub type PluginReconcileEntry = Option<(crate::plugin::PluginInstall, Box<dyn crate::plugin::PluginCli>)>;
+
+/// Boot-time reconciliation for the ONE bundled nyx plugin per provider (finding #45/#47).
 ///
-/// **Never creates a new entry** for a provider not already installed — this is
-/// the fundamental invariant that replaces the old auto-onboard behavior:
-/// - Provider **installed** and `nyx` entry **present** in its config → update
-///   `url`/`port` in place (port may have changed since last boot).
-/// - Provider **installed** but `nyx` entry **absent** from its config → no-op
-///   (the user may have manually removed it; we do not re-create silently).
-/// - Provider **not installed** → skip entirely.
+/// The nyx Claude integration is now a SINGLE plugin that bundles BOTH the MCP server (its
+/// `.mcp.json`, port-templated at copy time) AND the session-capture hooks — so the boot
+/// reconcile only has to keep that plugin current; there is no separate standalone MCP
+/// entry to refresh anymore (the old `mcpServers.nyx` write is gone).
 ///
-/// This is called from `lib.rs` after the MCP server is bound and its port is
-/// known. Best-effort: any IO error on a per-provider update is logged and
-/// skipped; it never causes a boot failure.
+/// **Never installs on boot.** The plugin reconcile is conservative:
+/// - plugin **absent** from the real registry → no-op (the user removed it; we never
+///   re-install silently);
+/// - plugin **present** → re-copy the bundled content (re-templating the live MCP port,
+///   picking up a bundled version bump) + re-register at the stable path, and on a content
+///   change propagate the bump through Claude's caches (`marketplace update` + `plugin
+///   update`, finding #47). Idempotent when nothing changed.
 ///
-/// For testability the state path and the per-provider config paths are
-/// injectable — see [`reconcile_providers`] below.
-pub fn reconcile_installed_providers(port: u16, state_path: &Path) {
-    let state = IntegrationState::load(state_path);
-    let targets: Vec<(&'static str, Option<OnboardingTarget>)> = Provider::all()
+/// The legacy standalone `mcpServers.nyx` residue is NOT touched at boot — boot stays
+/// purely conservative (a user mid-migration who still relies on the standalone MCP keeps
+/// it working). It is stripped only on an explicit install/uninstall click (the bridge
+/// cores call [`remove_legacy_mcp_server`]), where the bundled MCP replaces it.
+///
+/// `resolve_plugin` supplies each provider's [`crate::plugin::PluginInstall`] descriptor +
+/// its CLI driver (built by its adapter, so no agent specifics leak into this generic loop
+/// — finding #25). Called from `lib.rs` after the MCP server is bound. Best-effort: any IO
+/// error is logged and skipped, never a boot failure. `_state_path` is retained for
+/// signature stability (the stored flag is a non-authoritative cache the UI writes).
+pub fn reconcile_installed_providers(
+    _port: u16,
+    _state_path: &Path,
+    resolve_plugin: impl Fn(&str) -> PluginReconcileEntry,
+) {
+    // Plugin reconcile: every provider — absent from the real registry → no-op (never
+    // install on boot); present → re-copy (re-template port / pick up a version bump) +
+    // re-register + propagate the bump (finding #47).
+    let plugins: Vec<(&'static str, PluginReconcileEntry)> = Provider::all()
         .iter()
-        .filter(|p| state.is_installed(p.key()))
-        .map(|p| (p.key(), p.target()))
+        .map(|p| (p.key(), resolve_plugin(p.key())))
         .collect();
-    reconcile_providers_with_targets(port, &targets);
+    reconcile_installed_plugins(&plugins);
+
     for client in detect_unsupported_clients() {
         eprintln!("nyx: detected MCP client '{client}' (not auto-configured in v1; add manually)");
+    }
+}
+
+/// Testable core of the boot PLUGIN reconcile: for a pre-built list of
+/// `(provider_key, Option<(PluginInstall, PluginCli)>)`, reconcile each installed
+/// provider's plugin via [`crate::plugin::reconcile_with`]. Conservative (finding #24):
+/// plugin **absent** from the real registry → no-op; **present** → re-copy the bundled
+/// content + re-register at the stable path, healing a drifted/dead path (review #34). A
+/// `None` (unresolvable bundled plugin / stable dir / CLI) is skipped silently.
+/// Best-effort: a CLI error (e.g. `claude` not on PATH) is logged and skipped, never a
+/// boot failure.
+pub fn reconcile_installed_plugins(plugins: &[(&str, PluginReconcileEntry)]) {
+    for (key, maybe) in plugins {
+        let Some((install, cli)) = maybe else {
+            eprintln!("nyx: skipping plugin reconcile for '{key}' (plugin path / CLI not resolvable)");
+            continue;
+        };
+        match crate::plugin::reconcile_with(install, cli.as_ref()) {
+            Ok(crate::plugin::ReconcileOutcome::SkippedAbsent) => {
+                eprintln!("nyx: plugin reconcile skipped for {key} (plugin absent; not re-installing)");
+            }
+            Ok(crate::plugin::ReconcileOutcome::Unchanged) => {
+                eprintln!("nyx: {key} plugin unchanged");
+            }
+            Ok(crate::plugin::ReconcileOutcome::Updated) => {
+                eprintln!("nyx: refreshed {key} plugin (re-copied + re-registered at the stable path)");
+            }
+            Err(e) => eprintln!("nyx: could not reconcile {key} plugin: {e}"),
+        }
     }
 }
 
@@ -672,6 +782,98 @@ mod tests {
         assert_eq!(v["mcpServers"].as_object().unwrap().len(), 1);
     }
 
+    // --- REAL MCP install status from ~/.claude.json (review #41) ---------
+
+    /// `mcpServers.nyx` present → installed. The REAL signal `merge_nyx_server` writes,
+    /// read against a temp config (symmetric to the plugin's enabledPlugins check).
+    #[test]
+    fn mcp_present_when_nyx_server_entry_exists() {
+        let path = temp_config("mcp-present");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"nyx":{"type":"http","url":"http://127.0.0.1:8765/mcp"},"other":{}}}"#,
+        )
+        .unwrap();
+        assert!(mcp_server_present(&path));
+    }
+
+    /// `mcpServers.nyx` ABSENT → not installed — even when OTHER servers are present. This
+    /// is the state after a user removes nyx's MCP server directly in Claude Code.
+    #[test]
+    fn mcp_absent_when_nyx_server_entry_missing() {
+        let path = temp_config("mcp-absent");
+        std::fs::write(&path, r#"{"mcpServers":{"other":{"type":"http","url":"http://x/mcp"}}}"#).unwrap();
+        assert!(!mcp_server_present(&path));
+        // And a config with no mcpServers at all.
+        let path2 = temp_config("mcp-none");
+        std::fs::write(&path2, r#"{"numStartups":3}"#).unwrap();
+        assert!(!mcp_server_present(&path2));
+    }
+
+    /// A missing config file → not installed (no panic).
+    #[test]
+    fn mcp_absent_when_config_missing() {
+        let path = temp_config("mcp-missing");
+        std::fs::remove_file(&path).ok();
+        assert!(!path.exists());
+        assert!(!mcp_server_present(&path));
+    }
+
+    // --- legacy standalone-MCP strip (finding #45) ------------------------
+
+    /// `remove_legacy_mcp_server` strips ONLY the `mcpServers.nyx` entry — leaving sibling
+    /// servers and other top-level keys intact — and reports whether it removed anything.
+    /// A second strip is a no-op (idempotent); a missing/empty config is a clean no-op.
+    #[test]
+    fn remove_legacy_mcp_server_strips_only_nyx() {
+        let path = temp_config("strip-legacy-mcp");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"nyx":{"type":"http","url":"http://127.0.0.1:8765/mcp"},"other":{"type":"http","url":"http://x/mcp"}},"numStartups":3}"#,
+        )
+        .unwrap();
+        assert!(remove_legacy_mcp_server(&path).unwrap(), "nyx present → stripped");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v["mcpServers"].get("nyx").is_none(), "nyx MCP entry gone");
+        assert!(v["mcpServers"].get("other").is_some(), "sibling server preserved");
+        assert_eq!(v["numStartups"], 3, "unrelated top-level key preserved");
+        // Idempotent: a second strip removes nothing.
+        assert!(!remove_legacy_mcp_server(&path).unwrap(), "already-stripped → no-op");
+
+        // A missing file is a clean no-op.
+        let missing = temp_config("strip-missing");
+        std::fs::remove_file(&missing).ok();
+        assert!(!remove_legacy_mcp_server(&missing).unwrap(), "missing config → nothing to strip");
+    }
+
+    /// `claude_mcp_installed` resolves the `NYX_CLAUDE_CONFIG` seam and reads the real
+    /// presence — present→true / absent→false — WITHOUT touching the user's `~/.claude.json`.
+    #[test]
+    fn claude_mcp_installed_honors_the_config_seam() {
+        // Genuinely exercises the `NYX_CLAUDE_CONFIG` env RESOLUTION, so it mutates the
+        // process-global seam. It takes the ONE crate-wide lock every seam-mutating test
+        // shares (review #42/#43) — NOT a private mutex — so it never interleaves with a
+        // seam mutation in another module. Prior value restored on exit (no leak).
+        let _g = crate::CLAUDE_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os("NYX_CLAUDE_CONFIG");
+
+        let path = temp_config("seam-mcp");
+        std::env::set_var("NYX_CLAUDE_CONFIG", &path);
+
+        // Present → installed.
+        std::fs::write(&path, r#"{"mcpServers":{"nyx":{"type":"http","url":"http://127.0.0.1:8765/mcp"}}}"#).unwrap();
+        assert!(claude_mcp_installed(), "mcpServers.nyx present → installed via the seam");
+
+        // Absent → not installed (the direct-removal case).
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        assert!(!claude_mcp_installed(), "mcpServers.nyx gone → not installed via the seam");
+
+        match prev {
+            Some(v) => std::env::set_var("NYX_CLAUDE_CONFIG", v),
+            None => std::env::remove_var("NYX_CLAUDE_CONFIG"),
+        }
+    }
+
     /// Reconcile with already-current url: file must not be touched (no write).
     #[test]
     fn reconcile_present_unchanged_url_is_noop() {
@@ -690,5 +892,94 @@ mod tests {
             mtime_before, mtime_after,
             "file must not be rewritten when url is already current"
         );
+    }
+
+    // --- boot PLUGIN reconcile orchestration (PRD-5 #24 / review #34) ------
+
+    /// A recording fake of the plugin CLI for the boot-reconcile orchestration tests:
+    /// models a single optional `nyx` marketplace registration in memory so reconcile's
+    /// absent-vs-present branches are observable without the real `claude` binary.
+    #[derive(Default)]
+    struct FakeReconcileCli {
+        registered: std::cell::RefCell<Option<std::path::PathBuf>>,
+    }
+
+    impl crate::plugin::PluginCli for FakeReconcileCli {
+        fn marketplace_add(&self, dir: &Path) -> Result<(), crate::plugin::PluginError> {
+            *self.registered.borrow_mut() = Some(dir.to_path_buf());
+            Ok(())
+        }
+        fn install(&self, _id: &str) -> Result<(), crate::plugin::PluginError> {
+            Ok(())
+        }
+        fn uninstall(&self, _id: &str) -> Result<(), crate::plugin::PluginError> {
+            Ok(())
+        }
+        fn marketplace_remove(&self, _m: &str) -> Result<(), crate::plugin::PluginError> {
+            *self.registered.borrow_mut() = None;
+            Ok(())
+        }
+        fn marketplace_update(&self, _m: &str) -> Result<(), crate::plugin::PluginError> {
+            Ok(())
+        }
+        fn plugin_update(&self, _id: &str) -> Result<(), crate::plugin::PluginError> {
+            Ok(())
+        }
+        fn marketplace_list(&self) -> Result<Vec<crate::plugin::MarketplaceEntry>, crate::plugin::PluginError> {
+            Ok(self
+                .registered
+                .borrow()
+                .clone()
+                .map(|p| vec![crate::plugin::MarketplaceEntry { name: "nyx".to_string(), path: Some(p) }])
+                .unwrap_or_default())
+        }
+    }
+
+    fn plugin_install_for(source: &Path, stable: &Path, settings: &Path) -> crate::plugin::PluginInstall {
+        std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+        std::fs::write(source.join(".claude-plugin").join("marketplace.json"), "{}").unwrap();
+        crate::plugin::PluginInstall {
+            marketplace: crate::plugin::CLAUDE_MARKETPLACE.to_string(),
+            plugin: crate::plugin::CLAUDE_PLUGIN_NAME.to_string(),
+            source_dir: source.to_path_buf(),
+            install_dir: stable.to_path_buf(),
+            settings_path: settings.to_path_buf(),
+            mcp_port: 8765,
+        }
+    }
+
+    /// Boot plugin reconcile when the plugin is ABSENT from the real registry: NEVER
+    /// install on boot — no copy, no CLI write.
+    #[test]
+    fn reconcile_plugin_absent_is_noop() {
+        let base = temp_config("recon-plugin-absent").with_file_name("recon-absent");
+        std::fs::create_dir_all(&base).unwrap();
+        let inst = plugin_install_for(&base.join("src"), &base.join("stable"), &base.join("settings.json"));
+        let cli = FakeReconcileCli::default(); // nothing registered
+
+        reconcile_installed_plugins(&[("claude_code", Some((inst, Box::new(cli))))]);
+
+        // Stable dir never created: the plugin was NOT installed silently.
+        assert!(!base.join("stable").exists(), "absent → no copy on boot");
+    }
+
+    /// Boot plugin reconcile when the plugin IS present but registered at a STALE path
+    /// (dev→packaged drift / the user's dead-path state): re-copy + re-register at the
+    /// stable path, healing the entry (review #34).
+    #[test]
+    fn reconcile_plugin_present_heals_drifted_path() {
+        let base = temp_config("recon-plugin-heal").with_file_name("recon-heal");
+        std::fs::create_dir_all(&base).unwrap();
+        let stable = base.join("stable");
+        let inst = plugin_install_for(&base.join("src"), &stable, &base.join("settings.json"));
+        let cli = FakeReconcileCli::default();
+        // Present but at a STALE/dead path (no stable copy yet).
+        *cli.registered.borrow_mut() = Some(base.join("DEAD-stale-path"));
+        let cli: Box<dyn crate::plugin::PluginCli> = Box::new(cli);
+
+        reconcile_installed_plugins(&[("claude_code", Some((inst, cli)))]);
+
+        // Healed: content copied to the stable dir.
+        assert!(stable.join(".claude-plugin").join("marketplace.json").exists(), "content re-copied to the stable dir on heal");
     }
 }

@@ -32,7 +32,7 @@ function ws(
 
 function tree(projectId: string, name: string, workspaces: WorkspaceRecord[]): ProjectTree {
   return {
-    project: { id: projectId, name, collapsed: false, created_at: 0, updated_at: 0 },
+    project: { id: projectId, name, collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false },
     workspaces,
   };
 }

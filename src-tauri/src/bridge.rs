@@ -381,6 +381,20 @@ pub fn emit_terminals_changed<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(TERMINALS_CHANGED_EVENT, ());
 }
 
+/// "Some agent session started or ended" — a coalescing refresh tick (no payload). The
+/// sidebar re-pulls `agent_active_sessions` to swap the provider-aware icon on the right
+/// terminal rows (finding #55). Emitted from the `agent_session_event` MCP tool after a
+/// successful SessionStart/SessionEnd. Like the other `*_CHANGED` events, this is a
+/// "re-fetch your source of truth" signal, not a delta.
+pub const AGENT_SESSIONS_CHANGED_EVENT: &str = "agent-sessions://changed";
+
+/// Emit [`AGENT_SESSIONS_CHANGED_EVENT`] so the sidebar re-pulls the set of terminals
+/// with a live agent session and updates each row's icon. Best-effort (a dropped emit
+/// just means the icon updates on the next change / re-pull).
+pub fn emit_agent_sessions_changed<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.emit(AGENT_SESSIONS_CHANGED_EVENT, ());
+}
+
 // --- Terminal RECORD ↔ live PTY mapping (PRD-4 review R-TERM) -------------
 //
 // The record↔pty link historically lived ONLY in the front (`TerminalManager`'s
@@ -448,6 +462,43 @@ impl PendingTerminalCommands {
     }
 }
 
+/// One parked agent-session RESUME for a terminal record (PRD-5 #5). Produced by the
+/// boot resume scan ([`restore_agent_sessions_on_boot`]) and drained by
+/// [`register_terminal_pty`] into the freshly-respawned shell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingResume {
+    /// The `agent_sessions.id` being resumed — so a delivery failure can mark exactly
+    /// that row `resume_failed`.
+    pub session_id: String,
+    /// The exact shell command to inject (e.g. `claude --resume <id>`).
+    pub command: String,
+    /// `true` when the candidate was an `unknown` (stale / probable-kill) session —
+    /// resumed anyway, but the doubt is recorded.
+    pub uncertain: bool,
+}
+
+/// Managed state: per-record agent-session RESUME commands to inject at the terminal's
+/// first respawn after a relaunch (PRD-5 #5). Mirrors [`PendingTerminalCommands`] but
+/// carries the `agent_sessions.id` so a delivery failure marks that exact row
+/// `resume_failed`. Populated ONCE at boot by [`restore_agent_sessions_on_boot`] and
+/// drained one-shot by [`register_terminal_pty`] — a respawn-after-exit within the same
+/// run finds nothing parked, so resume happens exactly once, at the post-relaunch open.
+#[derive(Default)]
+pub struct PendingResumes {
+    by_record: Mutex<HashMap<String, PendingResume>>,
+}
+
+impl PendingResumes {
+    /// Park a resume for `record_id` to be injected when its PTY next registers.
+    pub fn set(&self, record_id: &str, resume: PendingResume) {
+        self.by_record.lock().unwrap().insert(record_id.to_string(), resume);
+    }
+    /// Take (remove + return) the parked resume for `record_id`, if any. One-shot.
+    pub(crate) fn take(&self, record_id: &str) -> Option<PendingResume> {
+        self.by_record.lock().unwrap().remove(record_id)
+    }
+}
+
 /// Register (or clear) the RECORD ↔ live PTY link for a terminal. Called by the front's
 /// `<Terminal>` when its PTY id resolves (`pty_id = Some`) and when the PTY exits / the
 /// terminal is torn down (`pty_id = None`). This is the ONLY writer of
@@ -462,8 +513,10 @@ impl PendingTerminalCommands {
 /// terminal opened bare (no parked command) injects nothing.
 #[tauri::command]
 fn register_terminal_pty(
+    db: State<'_, Db>,
     map: State<'_, TerminalPtyMap>,
     pending: State<'_, PendingTerminalCommands>,
+    resumes: State<'_, PendingResumes>,
     pty_state: State<'_, PtyManager>,
     record_id: String,
     pty_id: Option<u64>,
@@ -471,15 +524,45 @@ fn register_terminal_pty(
     match pty_id {
         Some(id) => {
             map.set(&record_id, id);
-            // Drain a one-shot MCP-parked command and inject it into the live PTY. Reuse
-            // the SAME write path as `pty_write` (no second lifecycle): append a newline
-            // so the shell executes the line and then stays interactive.
-            if let Some(command) = pending.take(&record_id) {
-                if let Some(pty) = pty_state.ptys.lock().unwrap().get_mut(&id) {
-                    let mut bytes = command.into_bytes();
-                    bytes.push(b'\n');
-                    let _ = pty.write(&bytes);
+            // Drain the one-shot parked lines for this record: an MCP `create_terminal`
+            // command (see [`PendingTerminalCommands`]) and a boot-scan agent RESUME
+            // (PRD-5 #5). Both are written into the freshly-spawned PTY under a SINGLE lock
+            // acquisition (command first, then `claude --resume <id>`), each with a
+            // trailing newline so the shell runs the line and stays interactive — the SAME
+            // write path as `pty_write` (no second lifecycle). A terminal opened bare
+            // injects nothing.
+            let parked_command = pending.take(&record_id);
+            let parked_resume = resumes.take(&record_id);
+            // Returns the resume's session id when the resume could NOT be delivered (PTY
+            // gone or write failed) so we can mark that row `resume_failed` — but OUTSIDE
+            // the PTY lock, since the DB write must not run while the mutex is held.
+            let resume_to_fail = {
+                let mut guard = pty_state.ptys.lock().unwrap();
+                match guard.get_mut(&id) {
+                    Some(pty) => {
+                        if let Some(command) = parked_command {
+                            let mut bytes = command.into_bytes();
+                            bytes.push(b'\n');
+                            let _ = pty.write(&bytes);
+                        }
+                        match parked_resume {
+                            Some(resume) => {
+                                let mut bytes = resume.command.into_bytes();
+                                bytes.push(b'\n');
+                                // Delivered → the session stays `active` (a live `resume`
+                                // SessionStart refreshes `last_seen_at`); failed write →
+                                // mark it `resume_failed` so the next launch won't retry.
+                                if pty.write(&bytes).is_ok() { None } else { Some(resume.session_id) }
+                            }
+                            None => None,
+                        }
+                    }
+                    // PTY gone: the parked resume can't be injected → it failed to resume.
+                    None => parked_resume.map(|r| r.session_id),
                 }
+            };
+            if let Some(session_id) = resume_to_fail {
+                let _ = db.with_conn(|c| db::mark_session_resume_failed(c, &session_id));
             }
         }
         None => map.clear(&record_id),
@@ -495,6 +578,95 @@ pub fn restore_commands_from_handle<R: Runtime>(app: &AppHandle<R>) {
     let db = app.state::<Db>();
     let runner = app.state::<ManagedCommandRunner<R>>();
     restore_commands_on_boot(&db, &runner);
+}
+
+/// Run the BOOT agent-session RESUME scan from an `AppHandle` (PRD-5 #5). A thin
+/// handle-reaching wrapper over [`restore_agent_sessions_on_boot`] for the setup hook.
+pub fn restore_agent_sessions_from_handle<R: Runtime>(app: &AppHandle<R>) {
+    let db = app.state::<Db>();
+    let resumes = app.state::<PendingResumes>();
+    restore_agent_sessions_on_boot(&db, &resumes);
+}
+
+/// The BOOT agent-session resume scan (PRD-5 #5). In order:
+///   1. SWEEP stale `active` sessions to `unknown` (the kill-then-relaunch path leaves
+///      a row `active`; this rebascules a long-silent one and flags the doubt).
+///   2. Gather the resume CANDIDATES (alive terminal + `active`/`unknown` session +
+///      the project's resume flag) via [`db::resume_candidates_on_boot`].
+///   3. For each, run the PURE resume DECISION ([`crate::agent_resume::decide_resume`])
+///      with the resolved target shell + the agent's adapter, and — when it says
+///      RESUME — PARK the exact command in [`PendingResumes`] so the terminal's first
+///      respawn after relaunch injects it. The `closed_voluntarily` gate is structural
+///      (a closed terminal is not `alive`, so it never appears as a candidate).
+///
+/// Returns the record ids a resume was parked for (handy for tests/logging). The
+/// actual injection happens later, in [`register_terminal_pty`], when the front mounts
+/// each restored terminal's PTY.
+pub fn restore_agent_sessions_on_boot(db: &Db, resumes: &PendingResumes) -> Vec<String> {
+    use crate::agent::AgentRegistry;
+    use crate::agent_resume::{decide_resume, ResumeInputs, ResumeTarget, SessionState};
+
+    // 1. Sweep stale active → unknown (probable kills since the last clean run).
+    let _ = db.with_conn(|c| db::sweep_stale_active_sessions(c, db::SESSION_STALE_AFTER_MS));
+
+    // 2. Gather candidates.
+    let candidates = match db.with_conn(db::resume_candidates_on_boot) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    // The execution target is fixed per run by the resolved default shell (resume
+    // targets a native Linux shell or WSL under Windows; native Windows is out of v1).
+    let target = ResumeTarget::classify_shell(&crate::pty::resolve_shell());
+    let registry = AgentRegistry::default();
+
+    let mut parked = Vec::new();
+    for cand in candidates {
+        // A session whose state string is somehow unrecognized is skipped defensively.
+        let Some(state) = SessionState::from_db(&cand.session_state) else {
+            continue;
+        };
+        let Some(adapter) = registry.get(&cand.agent_kind) else {
+            continue;
+        };
+        // #53: a candidate is only resumable if its conversation EXISTS on disk. Claude
+        // writes `transcript_path` only on the first message, so a session the user
+        // never typed into (or one whose conversation was deleted) has a session id but
+        // no `.jsonl` — `claude --resume` would fail "No conversation found" and break
+        // the respawned terminal. A single `stat` on the already-captured path (no FS
+        // scan); a missing/absent path → `transcript_exists = false` → the pure decision
+        // skips with `NoConversation`.
+        let transcript_exists = cand
+            .transcript_path
+            .as_deref()
+            .map(|p| std::path::Path::new(p).exists())
+            .unwrap_or(false);
+        let inputs = ResumeInputs {
+            project_resume_on: cand.project_resume_on,
+            // A candidate is, by construction, an ALIVE terminal — a voluntary close
+            // flips the terminal to `closed` (excluded by the candidate query), so it
+            // never reaches here. So `closed_voluntarily` is always false at boot.
+            closed_voluntarily: false,
+            session_state: state,
+            external_session_id: &cand.external_session_id,
+            transcript_exists,
+            target,
+        };
+        if let crate::agent_resume::ResumeDecision::Resume { command, resume_uncertain } =
+            decide_resume(&inputs, adapter)
+        {
+            resumes.set(
+                &cand.terminal_id,
+                PendingResume {
+                    session_id: cand.session_id,
+                    command,
+                    uncertain: resume_uncertain,
+                },
+            );
+            parked.push(cand.terminal_id);
+        }
+    }
+    parked
 }
 
 /// Run the SHUTDOWN snapshot from an `AppHandle`: read the managed `Db` + runner and
@@ -705,7 +877,12 @@ fn pty_spawn<R: Runtime>(
         pixel_width: 0,
         pixel_height: 0,
     };
-    let (pty, rx) = Pty::spawn(size, cwd.as_deref()).map_err(|e| e.to_string())?;
+    // Inject NYX_TERMINAL_ID into the shell (PRD-5 task #3): the SAME persistent
+    // record id the front passed (`terminals.id`) is exported into the spawned shell
+    // so an agent integration inside it can correlate its session events to THIS
+    // terminal. Passed by reference here, then moved into the id_map below.
+    let (pty, rx) =
+        Pty::spawn(size, cwd.as_deref(), terminal_id.as_deref()).map_err(|e| e.to_string())?;
     let id = pty.id();
 
     state.ptys.lock().unwrap().insert(id, pty);
@@ -1293,6 +1470,76 @@ fn set_project_collapsed(db: State<'_, Db>, id: String, collapsed: bool) -> Resu
     db.with_conn(|c| db::set_project_collapsed(c, &id, collapsed))
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Persist a project's `resume_agent_sessions` opt-in (PRD-5 #5): when `true`, nyx
+/// resumes the project's terminals' active agent sessions at relaunch. Default OFF.
+/// Returns ().
+#[tauri::command]
+fn set_project_resume_agent_sessions(
+    db: State<'_, Db>,
+    id: String,
+    resume: bool,
+) -> Result<(), String> {
+    db.with_conn(|c| db::set_project_resume_agent_sessions(c, &id, resume))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// One close-warning entry returned by [`agent_close_warnings`] (PRD-5 #6): a live
+/// agent session a close would silently drop. `message` is the ready-to-show line
+/// (names the agent + terminal + workspace); the structured fields let the front group
+/// / link if it wants.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CloseWarningEntry {
+    pub terminal_id: String,
+    pub agent_kind: String,
+    pub message: String,
+}
+
+/// The agent-session CLOSE WARNINGS (PRD-5 #6): the live (`active`/`unknown`) sessions
+/// whose project does NOT auto-resume — i.e. the ones a close would drop without nyx
+/// bringing them back. An EMPTY list means "no warning needed; close freely". The front
+/// calls this on a close request and, when non-empty, shows the confirm dialog before
+/// actually closing. The message names the AGENT (Claude/Codex/OpenCode/custom) and the
+/// TERMINAL (label or id) + workspace.
+#[tauri::command]
+fn agent_close_warnings(db: State<'_, Db>) -> Result<Vec<CloseWarningEntry>, String> {
+    use crate::agent_resume::{close_warning_message, should_warn_on_close, SessionState};
+    let rows = db
+        .with_conn(db::close_warning_candidates)
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .filter(|w| {
+            // The single warn/no-warn policy point: a resume-ON project never warns;
+            // only a live (active/unknown) session in a non-resuming project does. An
+            // unrecognized state string is treated as not-warnable (defensive).
+            SessionState::from_db(&w.session_state)
+                .is_some_and(|s| should_warn_on_close(s, w.project_resume_on))
+        })
+        .map(|w| CloseWarningEntry {
+            message: close_warning_message(
+                &w.agent_kind,
+                w.terminal_label.as_deref(),
+                &w.terminal_id,
+                w.workspace_name.as_deref(),
+            ),
+            terminal_id: w.terminal_id,
+            agent_kind: w.agent_kind,
+        })
+        .collect())
+}
+
+/// The terminals that currently host a LIVE (`active`) agent session, each with the
+/// agent kind (finding #55). The sidebar reads this on mount and on every
+/// `agent-sessions://changed` event, then maps `agent_kind` through its provider
+/// registry to render the agent's logo in place of the generic terminal glyph for those
+/// rows (reverting when the session ends and the terminal drops out of this list). An
+/// EMPTY list means "no terminal has a live session" (every row shows the terminal icon).
+#[tauri::command]
+fn agent_active_sessions(db: State<'_, Db>) -> Result<Vec<db::ActiveAgentSession>, String> {
+    db.with_conn(db::active_agent_sessions).map_err(|e| e.to_string())
 }
 
 /// Create a (non-root) workspace in `project_id` at `path`. Rejects a path
@@ -2369,7 +2616,10 @@ fn portless_set_enabled<R: Runtime>(
 // Only `claude_code` is fully functional in v1; other providers are
 // advertised as "coming soon" in the UI and their commands are stubs.
 
-/// Status of one integration, returned to the front-end.
+/// Status of one integration, returned to the front-end. The nyx Claude integration is
+/// now ONE bundled plugin that provides BOTH the MCP server and the session-capture hooks
+/// (finding #44/#45), so there is a SINGLE `installed` flag — no more split MCP/plugin
+/// state to desync (finding #46).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationStatus {
@@ -2377,122 +2627,176 @@ pub struct IntegrationStatus {
     provider: &'static str,
     /// Human-readable display name.
     label: &'static str,
-    /// Whether the user has installed this integration (persisted in
-    /// `integrations.json`). `false` when not installed OR not tracked.
+    /// Whether the nyx integration (the ONE bundled plugin: MCP + hooks) is installed for
+    /// this provider. Derived from Claude Code's REAL config — `enabledPlugins[
+    /// "nyx-claude-integration@nyx"] == true` — not nyx's stored flag (finding #46).
     installed: bool,
     /// `true` when the provider is fully functional in v1; `false` = coming soon.
     available: bool,
 }
 
-/// Build the integration status list from a persisted state file. Pure
-/// (no `AppHandle`) so the wiring — 4 registry providers, available/coming-soon
-/// flags, claude_code's installed flag read from `integrations.json` — is
-/// unit-testable in isolation (see the `tests` module).
-fn integration_status_list(state_path: &std::path::Path) -> Vec<IntegrationStatus> {
-    let state = crate::onboarding::IntegrationState::load(state_path);
+/// Build the integration status list. Pure (no `AppHandle`) so the wiring — 4 registry
+/// providers, available/coming-soon flags — is unit-testable in isolation (see the
+/// `tests` module). claude_code's single install flag is derived from Claude Code's REAL
+/// config (finding #46): `enabledPlugins["nyx-claude-integration@nyx"]` in
+/// `~/.claude/settings.json` (`NYX_CLAUDE_SETTINGS`). So a plugin removed DIRECTLY in
+/// Claude Code reads as uninstalled at the next status refresh, instead of nyx's flag
+/// lying.
+fn integration_status_list() -> Vec<IntegrationStatus> {
     vec![
-        IntegrationStatus {
-            provider: "claude_code",
-            label: "Claude Code",
-            installed: state.is_installed("claude_code"),
-            available: true,
-        },
-        IntegrationStatus {
-            provider: "codex",
-            label: "Codex",
-            installed: false,
-            available: false,
-        },
-        IntegrationStatus {
-            provider: "opencode",
-            label: "OpenCode",
-            installed: false,
-            available: false,
-        },
+        claude_status(),
+        IntegrationStatus { provider: "codex", label: "Codex", installed: false, available: false },
+        IntegrationStatus { provider: "opencode", label: "OpenCode", installed: false, available: false },
         // `custom` is reserved for a future user-defined MCP server flow
         // (onboarding.rs, ADR-0003 D14/D11). No semantics in v1 → coming soon,
         // like codex/opencode. Listed so the UI shows all 4 registry providers.
-        IntegrationStatus {
-            provider: "custom",
-            label: "Custom",
-            installed: false,
-            available: false,
-        },
+        IntegrationStatus { provider: "custom", label: "Custom", installed: false, available: false },
     ]
 }
 
-/// Core of `integration_install` with the Claude Code target injected (no
-/// `AppHandle`): upserts the nyx entry in the target config and marks
-/// `installed = true`. Returns the fresh status. Unit-testable against a temp
-/// config + temp state file.
+/// The `claude_code` integration status, derived from Claude Code's REAL config (finding
+/// #46) rather than nyx's stored `integrations.json` flag: a SINGLE `installed` flag from
+/// `enabledPlugins["nyx-claude-integration@nyx"] == true` in `~/.claude/settings.json`
+/// ([`crate::plugin::claude_plugin_enabled`]). The plugin now provides the MCP too, so
+/// there is no separate MCP status to read. Honors the injectable `NYX_CLAUDE_SETTINGS`
+/// seam, so callers never touch the real `~/.claude` under test.
+fn claude_status() -> IntegrationStatus {
+    IntegrationStatus {
+        provider: "claude_code",
+        label: "Claude Code",
+        installed: crate::plugin::claude_plugin_enabled(),
+        available: true,
+    }
+}
+
+/// Same as [`claude_status`] but reads the REAL Claude `settings.json` at an EXPLICIT path
+/// instead of resolving the `NYX_CLAUDE_SETTINGS` seam. Used by the install/remove cores so
+/// they report the post-mutation status from the very file the plugin CLI just wrote —
+/// keeping the `AppHandle`-free cores testable against temp paths with no process-global
+/// env (finding #46).
+fn claude_status_at(settings_path: &std::path::Path) -> IntegrationStatus {
+    IntegrationStatus {
+        provider: "claude_code",
+        label: "Claude Code",
+        installed: crate::plugin::plugin_enabled_in_settings(
+            settings_path,
+            &crate::plugin::claude_plugin_install_id(),
+        ),
+        available: true,
+    }
+}
+
+/// Core of `integration_install` (no `AppHandle`). Installs the ONE nyx Claude integration
+/// — the bundled plugin that provides BOTH the MCP server and the session-capture hooks
+/// (finding #44/#45). There is no separate MCP write anymore: the plugin's `.mcp.json`
+/// declares the MCP, so to AVOID a double-declaration we also strip any legacy standalone
+/// `mcpServers.nyx` from `~/.claude.json` left by the old separate-MCP flow. A missing
+/// `claude` CLI surfaces as a typed error (no fake success — review #35), shown verbatim
+/// in the UI. Unit-testable against temp paths.
 fn do_integration_install(
     provider: &str,
     target: &crate::onboarding::OnboardingTarget,
+    plugin_install: Option<&crate::plugin::PluginInstall>,
+    plugin_cli: Option<&dyn crate::plugin::PluginCli>,
     state_path: &std::path::Path,
-    port: u16,
 ) -> Result<IntegrationStatus, String> {
-    match provider {
-        "claude_code" => {
-            target.onboard(port).map_err(|e| e.to_string())?;
-            let mut state = crate::onboarding::IntegrationState::load(state_path);
-            state.set_installed("claude_code", true);
-            state.save(state_path).map_err(|e| e.to_string())?;
-            Ok(IntegrationStatus {
-                provider: "claude_code",
-                label: "Claude Code",
-                installed: true,
-                available: true,
-            })
-        }
-        other => Err(format!("provider '{other}' is not supported in v1")),
+    if provider != "claude_code" {
+        return Err(format!("provider '{provider}' is not supported in v1"));
     }
+    let descriptor = plugin_install
+        .ok_or_else(|| "Could not resolve the bundled nyx plugin (no plugin dir / app data dir)".to_string())?;
+    let cli = plugin_cli
+        .ok_or_else(|| "Could not resolve the Claude plugin CLI driver".to_string())?;
+    // Install the ONE plugin (copy + port-template + register via the CLI). The plugin
+    // bundles the MCP, so this is the whole integration.
+    crate::plugin::install_with(descriptor, cli).map_err(|e| e.to_string())?;
+    // Drop any legacy standalone MCP so it is not declared twice (the plugin now owns it).
+    let _ = crate::onboarding::remove_legacy_mcp_server(&target.config_path);
+
+    // Mark nyx's own (non-authoritative) install cache flag, kept for back-compat — the
+    // real status is read from Claude's config below.
+    let mut state = crate::onboarding::IntegrationState::load(state_path);
+    state.set_installed("claude_code", true);
+    state.save(state_path).map_err(|e| e.to_string())?;
+    Ok(claude_status_at(&claude_settings_path_for(plugin_install)))
 }
 
-/// Core of `integration_remove` with the Claude Code target injected (no
-/// `AppHandle`): removes the nyx entry from the target config (best-effort) and
-/// marks `installed = false`. Unit-testable against a temp config + temp state.
+/// The Claude `settings.json` path to read the post-mutation plugin status from: the
+/// plugin descriptor's `settings_path` when one was resolved (the same file the CLI
+/// install/uninstall writes `enabledPlugins` into), else the resolved real seam
+/// (`NYX_CLAUDE_SETTINGS` / `~/.claude/settings.json`). Keeps the install/remove cores
+/// reading the REAL file they just affected without a process-global env (review #40).
+fn claude_settings_path_for(plugin_install: Option<&crate::plugin::PluginInstall>) -> std::path::PathBuf {
+    plugin_install
+        .map(|p| p.settings_path.clone())
+        .or_else(crate::plugin::claude_settings_path)
+        .unwrap_or_default()
+}
+
+/// Core of `integration_remove` (no `AppHandle`). The mirror of install: uninstalls the
+/// ONE nyx plugin (CLI uninstall + marketplace remove) AND cleans every legacy residue so
+/// nothing nyx lingers (finding #45) — the legacy standalone `mcpServers.nyx` in
+/// `~/.claude.json`, plus the legacy hand-written settings keys
+/// (`extraKnownMarketplaces.nyx` / `enabledPlugins[…]`) from the old approach. Best-effort:
+/// a `None` descriptor / CLI still clears the legacy MCP + the state flag. Unit-testable
+/// against temp paths.
 fn do_integration_remove(
     provider: &str,
     target: &crate::onboarding::OnboardingTarget,
+    plugin_install: Option<&crate::plugin::PluginInstall>,
+    plugin_cli: Option<&dyn crate::plugin::PluginCli>,
     state_path: &std::path::Path,
 ) -> Result<IntegrationStatus, String> {
-    match provider {
-        "claude_code" => {
-            // Remove the nyx entry from the client config (best-effort).
-            if let Ok(mut root) = crate::onboarding::read_config_pub(&target.config_path) {
-                if let Some(servers) = root.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-                    servers.remove(crate::onboarding::SERVER_NAME);
-                }
-                let _ = crate::onboarding::write_config_pub(&target.config_path, &root);
-            }
-            let mut state = crate::onboarding::IntegrationState::load(state_path);
-            state.set_installed("claude_code", false);
-            state.save(state_path).map_err(|e| e.to_string())?;
-            Ok(IntegrationStatus {
-                provider: "claude_code",
-                label: "Claude Code",
-                installed: false,
-                available: true,
-            })
-        }
-        other => Err(format!("provider '{other}' is not supported in v1")),
+    if provider != "claude_code" {
+        return Err(format!("provider '{provider}' is not supported in v1"));
     }
+    // Uninstall the plugin + remove the marketplace + strip legacy settings keys.
+    if let (Some(descriptor), Some(cli)) = (plugin_install, plugin_cli) {
+        let _ = crate::plugin::remove_with(descriptor, cli);
+    }
+    // Strip the legacy standalone MCP server entry (residue from the old separate-MCP flow).
+    let _ = crate::onboarding::remove_legacy_mcp_server(&target.config_path);
+
+    let mut state = crate::onboarding::IntegrationState::load(state_path);
+    state.set_installed("claude_code", false);
+    state.save(state_path).map_err(|e| e.to_string())?;
+    Ok(claude_status_at(&claude_settings_path_for(plugin_install)))
 }
 
-/// List the status of all supported integrations.
-#[tauri::command]
-fn integration_list<R: Runtime>(app: AppHandle<R>) -> Result<Vec<IntegrationStatus>, String> {
-    let state_path = crate::resolve_data_dir(&app)
-        .map(|d| d.join(crate::onboarding::INTEGRATIONS_FILE))
-        .map_err(|e| e.to_string())?;
-    Ok(integration_status_list(&state_path))
+/// Resolve the Claude Code plugin install descriptor from an `AppHandle`: the bundled
+/// plugin SOURCE dir (via the resource dir), the STABLE install dir (under the Tauri app
+/// data dir — review #33), and the settings path (for legacy cleanup). `None` when any
+/// of those cannot be resolved.
+fn claude_plugin_install<R: Runtime>(app: &AppHandle<R>) -> Option<crate::plugin::PluginInstall> {
+    use crate::agent::AgentAdapter;
+    use tauri::Manager;
+    let resource_dir = app.path().resource_dir().ok();
+    let app_data_dir = crate::resolve_data_dir(app).ok();
+    crate::agent::ClaudeCodeAdapter.plugin_install(resource_dir.as_deref(), app_data_dir.as_deref())
 }
 
-/// Install (or update) a supported integration.
-/// For `claude_code`: upserts the nyx entry in `~/.claude.json`, then marks
-/// `installed = true` in `integrations.json`.
-/// Other providers are not yet supported and return an error.
+/// Resolve the Claude Code plugin CLI driver (shells out to `claude plugin …`).
+fn claude_plugin_cli() -> Option<Box<dyn crate::plugin::PluginCli>> {
+    use crate::agent::AgentAdapter;
+    crate::agent::ClaudeCodeAdapter.plugin_cli()
+}
+
+/// List the status of all supported integrations (the ONE bundled plugin per provider).
+/// The claude_code install flag is derived from Claude Code's REAL config (finding #46),
+/// so no `AppHandle`/data-dir lookup is needed — the status helper resolves the real
+/// `~/.claude/settings.json` (or its injectable seam).
 #[tauri::command]
+fn integration_list<R: Runtime>(_app: AppHandle<R>) -> Result<Vec<IntegrationStatus>, String> {
+    Ok(integration_status_list())
+}
+
+/// Install the ONE nyx integration for a provider — the bundled plugin that provides BOTH
+/// the MCP server and the session-capture hooks (finding #44/#45). For `claude_code`:
+/// copies the bundled plugin into a stable app-data dir (port-templating the bundled MCP),
+/// registers it via the `claude` CLI (`marketplace add` + `install`; the CLI owns
+/// `settings.json`), and strips any legacy standalone `mcpServers.nyx` so the MCP is not
+/// declared twice. Other providers are not yet supported and return an error.
+#[tauri::command(async)]
 fn integration_install<R: Runtime>(
     app: AppHandle<R>,
     provider: String,
@@ -2502,17 +2806,20 @@ fn integration_install<R: Runtime>(
     if provider == "claude_code" {
         let target = crate::onboarding::OnboardingTarget::claude_code()
             .ok_or_else(|| "Could not resolve Claude Code config path (no home dir)".to_string())?;
-        do_integration_install(&provider, &target, &state_path, crate::mcp::resolve_port())
+        let plugin = claude_plugin_install(&app);
+        let cli = claude_plugin_cli();
+        do_integration_install(&provider, &target, plugin.as_ref(), cli.as_deref(), &state_path)
     } else {
         Err(format!("provider '{provider}' is not supported in v1"))
     }
 }
 
-/// Remove a supported integration.
-/// For `claude_code`: removes the nyx entry from `~/.claude.json`, then marks
-/// `installed = false` in `integrations.json`.
-/// Other providers are not yet supported and return an error.
-#[tauri::command]
+/// Uninstall the ONE nyx integration for a provider — the mirror of install (finding #45).
+/// For `claude_code`: uninstalls the bundled plugin via the `claude` CLI (+ removes the
+/// marketplace), strips the legacy standalone `mcpServers.nyx` from `~/.claude.json`, and
+/// strips any leftover legacy hand-written settings keys — leaving no nyx residue. Other
+/// providers are not yet supported and return an error.
+#[tauri::command(async)]
 fn integration_remove<R: Runtime>(
     app: AppHandle<R>,
     provider: String,
@@ -2522,7 +2829,9 @@ fn integration_remove<R: Runtime>(
     if provider == "claude_code" {
         let target = crate::onboarding::OnboardingTarget::claude_code()
             .ok_or_else(|| "Could not resolve Claude Code config path (no home dir)".to_string())?;
-        do_integration_remove(&provider, &target, &state_path)
+        let plugin = claude_plugin_install(&app);
+        let cli = claude_plugin_cli();
+        do_integration_remove(&provider, &target, plugin.as_ref(), cli.as_deref(), &state_path)
     } else {
         Err(format!("provider '{provider}' is not supported in v1"))
     }
@@ -2536,7 +2845,7 @@ fn integration_remove<R: Runtime>(
 pub(crate) fn tests_spawn_pty<R: Runtime>(app: &tauri::App<R>) -> u64 {
     use tauri::Manager;
     let size = portable_pty::PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
-    let (pty, rx) = Pty::spawn(size, None).expect("spawn pty");
+    let (pty, rx) = Pty::spawn(size, None, None).expect("spawn pty");
     let id = pty.id();
     app.state::<PtyManager>().ptys.lock().unwrap().insert(id, pty);
     spawn_output_pump(app.handle().clone(), id, rx);
@@ -2554,6 +2863,7 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
         .manage(Osc133Events::default())
         .manage(TerminalPtyMap::default())
         .manage(PendingTerminalCommands::default())
+        .manage(PendingResumes::default())
         .invoke_handler(tauri::generate_handler![
             pty_spawn,
             pty_write,
@@ -2575,6 +2885,9 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             update_project,
             delete_project,
             set_project_collapsed,
+            set_project_resume_agent_sessions,
+            agent_close_warnings,
+            agent_active_sessions,
             create_workspace,
             list_workspaces,
             rename_workspace,
@@ -3872,6 +4185,344 @@ mod tests {
             "auto-attach persisted the move"
         );
         assert_eq!(mode, db::BINDING_AUTO, "an auto-attach move is mode auto");
+    }
+
+    /// `agent_close_warnings` (PRD-5 #6) end-to-end through the command: a live agent
+    /// session in a NON-resuming project WARNS (the message names the agent + terminal);
+    /// turning the project's resume ON makes the SAME session stop warning. Covers the
+    /// "Tests couvrent option ON/OFF" + "Warning seulement quand necessaire" criteria at
+    /// the command boundary.
+    #[test]
+    fn agent_close_warnings_warns_only_when_resume_off() {
+        let app = build_app_with_db();
+        let created = cmd_create_project(&app, "demo", "/home/kris/demo", None).unwrap();
+        let ws_id = created.root.id.clone();
+        let project_id = created.project.id.clone();
+
+        // A terminal attached to the project's workspace, hosting a live Claude session.
+        let t = create_terminal(app.state::<Db>(), "/home/kris/demo".into(), Some("build".into()))
+            .unwrap();
+        cmd_attach(&app, &t.id, &ws_id, db::BINDING_AUTO).unwrap();
+        app.state::<Db>().with_conn(|c| {
+            db::record_session_start(
+                c,
+                &t.id,
+                db::AGENT_KIND_CLAUDE_CODE,
+                db::SessionCapture {
+                    workspace_id: Some(ws_id.clone()),
+                    external_session_id: "sid-1".into(),
+                    cwd: "/home/kris/demo".into(),
+                    transcript_path: None,
+                    metadata_json: None,
+                },
+            )
+        })
+        .unwrap();
+
+        // Project resume OFF (default) → the live session WARNS, naming agent + terminal.
+        let warnings = agent_close_warnings(app.state::<Db>()).expect("agent_close_warnings");
+        assert_eq!(warnings.len(), 1, "a live session in a non-resuming project warns");
+        assert_eq!(warnings[0].terminal_id, t.id);
+        assert_eq!(warnings[0].agent_kind, db::AGENT_KIND_CLAUDE_CODE);
+        assert!(
+            warnings[0].message.contains("Claude Code") && warnings[0].message.contains("build"),
+            "the message names the agent and the terminal: {}",
+            warnings[0].message
+        );
+
+        // Turn project resume ON → the SAME session no longer warns (nyx will resume it).
+        set_project_resume_agent_sessions(app.state::<Db>(), project_id, true).unwrap();
+        let warnings_on = agent_close_warnings(app.state::<Db>()).expect("agent_close_warnings on");
+        assert!(warnings_on.is_empty(), "resume-ON project suppresses the warning");
+    }
+
+    /// Serialize `$SHELL` mutation across tests that depend on the resolved resume
+    /// TARGET (resume only parks for a Unix/WSL shell). Returns a guard holding the lock
+    /// and restoring the prior value on drop.
+    fn force_unix_shell() -> impl Drop {
+        struct ShellGuard {
+            prev: Option<String>,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for ShellGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var("SHELL", v),
+                    None => std::env::remove_var("SHELL"),
+                }
+            }
+        }
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("SHELL").ok();
+        std::env::set_var("SHELL", "/bin/bash");
+        ShellGuard { prev, _lock: lock }
+    }
+
+    /// Create a real (non-empty) `.jsonl` transcript file in a process-unique temp path
+    /// and return it, so the boot-scan tests exercise the #53 "conversation exists on
+    /// disk" gate against a path that actually `stat`s as present (mirrors Claude only
+    /// writing the transcript once the user has typed). No `tempfile` dep in the tree.
+    fn boot_temp_transcript(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("nyx-resume-transcript-{}-{}-{}", std::process::id(), tag, n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{tag}.jsonl"));
+        std::fs::write(&path, b"{\"role\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        path
+    }
+
+    /// `restore_agent_sessions_on_boot` (PRD-5 #5) parks a resume ONLY for an alive
+    /// terminal whose project opts IN and whose session is resumable. We force a Unix
+    /// `$SHELL` so the resume target is supported on this host. Covers: option ON parks
+    /// `claude --resume <id>`; option OFF parks nothing; an ended session parks nothing.
+    /// The ON session has a REAL transcript on disk so the #53 conversation gate opens.
+    #[test]
+    fn restore_agent_sessions_on_boot_parks_resume_when_opted_in() {
+        let _shell = force_unix_shell();
+        let app = build_app_with_db();
+
+        // A real transcript file on disk so the #53 "conversation exists" gate opens.
+        let transcript = boot_temp_transcript("sid-on");
+
+        // Project ON, an attached alive terminal with a live session → should park.
+        let on = cmd_create_project(&app, "on", "/on", None).unwrap();
+        set_project_resume_agent_sessions(app.state::<Db>(), on.project.id.clone(), true).unwrap();
+        let t_on = create_terminal(app.state::<Db>(), "/on".into(), None).unwrap();
+        cmd_attach(&app, &t_on.id, &on.root.id, db::BINDING_AUTO).unwrap();
+        app.state::<Db>()
+            .with_conn(|c| {
+                db::record_session_start(
+                    c,
+                    &t_on.id,
+                    db::AGENT_KIND_CLAUDE_CODE,
+                    db::SessionCapture {
+                        workspace_id: Some(on.root.id.clone()),
+                        external_session_id: "sid-on".into(),
+                        cwd: "/on".into(),
+                        transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                        metadata_json: None,
+                    },
+                )
+            })
+            .unwrap();
+
+        // Project OFF (default), attached alive terminal with a live session → no park.
+        let off = cmd_create_project(&app, "off", "/off", None).unwrap();
+        let t_off = create_terminal(app.state::<Db>(), "/off".into(), None).unwrap();
+        cmd_attach(&app, &t_off.id, &off.root.id, db::BINDING_AUTO).unwrap();
+        app.state::<Db>()
+            .with_conn(|c| {
+                db::record_session_start(
+                    c,
+                    &t_off.id,
+                    db::AGENT_KIND_CLAUDE_CODE,
+                    db::SessionCapture {
+                        workspace_id: Some(off.root.id.clone()),
+                        external_session_id: "sid-off".into(),
+                        cwd: "/off".into(),
+                        transcript_path: None,
+                        metadata_json: None,
+                    },
+                )
+            })
+            .unwrap();
+
+        let resumes = PendingResumes::default();
+        let parked = restore_agent_sessions_on_boot(app.state::<Db>().inner(), &resumes);
+
+        assert_eq!(parked, vec![t_on.id.clone()], "only the resume-ON terminal parks a resume");
+        let r = resumes.take(&t_on.id).expect("a resume is parked for the ON terminal");
+        assert_eq!(r.command, "claude --resume sid-on", "exact-id resume command");
+        assert!(!r.uncertain, "an active (not unknown) session is not flagged uncertain");
+        assert!(resumes.take(&t_off.id).is_none(), "the resume-OFF terminal parks nothing");
+    }
+
+    /// #53: a resume-ON, alive, active candidate whose `transcript_path` does NOT exist
+    /// on disk (user never typed → Claude never wrote the `.jsonl`, or the conversation
+    /// was deleted) is NOT resumed at boot — the bridge `stat`s the missing path, the
+    /// pure decision skips with `NoConversation`, and nothing is parked. Otherwise nyx
+    /// would inject a `claude --resume` that fails "No conversation found" and breaks the
+    /// respawned terminal. A `None` transcript_path is treated the same (no path to stat).
+    #[test]
+    fn boot_scan_skips_resume_when_transcript_missing() {
+        let _shell = force_unix_shell();
+        let app = build_app_with_db();
+
+        // (a) transcript_path points at a path that does NOT exist on disk.
+        let on = cmd_create_project(&app, "on", "/on", None).unwrap();
+        set_project_resume_agent_sessions(app.state::<Db>(), on.project.id.clone(), true).unwrap();
+        let t_missing = create_terminal(app.state::<Db>(), "/on".into(), None).unwrap();
+        cmd_attach(&app, &t_missing.id, &on.root.id, db::BINDING_AUTO).unwrap();
+        let absent = std::env::temp_dir()
+            .join(format!("nyx-resume-absent-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&absent); // ensure it really does not exist
+        app.state::<Db>()
+            .with_conn(|c| {
+                db::record_session_start(
+                    c,
+                    &t_missing.id,
+                    db::AGENT_KIND_CLAUDE_CODE,
+                    db::SessionCapture {
+                        workspace_id: Some(on.root.id.clone()),
+                        external_session_id: "sid-no-conv".into(),
+                        cwd: "/on".into(),
+                        transcript_path: Some(absent.to_string_lossy().into_owned()),
+                        metadata_json: None,
+                    },
+                )
+            })
+            .unwrap();
+
+        // (b) transcript_path is None (never captured) → also no conversation to resume.
+        let t_none = create_terminal(app.state::<Db>(), "/on".into(), None).unwrap();
+        cmd_attach(&app, &t_none.id, &on.root.id, db::BINDING_AUTO).unwrap();
+        app.state::<Db>()
+            .with_conn(|c| {
+                db::record_session_start(
+                    c,
+                    &t_none.id,
+                    db::AGENT_KIND_CLAUDE_CODE,
+                    db::SessionCapture {
+                        workspace_id: Some(on.root.id.clone()),
+                        external_session_id: "sid-no-path".into(),
+                        cwd: "/on".into(),
+                        transcript_path: None,
+                        metadata_json: None,
+                    },
+                )
+            })
+            .unwrap();
+
+        let resumes = PendingResumes::default();
+        let parked = restore_agent_sessions_on_boot(app.state::<Db>().inner(), &resumes);
+
+        assert!(parked.is_empty(), "no conversation on disk → no resume parked: {parked:?}");
+        assert!(resumes.take(&t_missing.id).is_none(), "missing transcript parks nothing");
+        assert!(resumes.take(&t_none.id).is_none(), "absent transcript_path parks nothing");
+    }
+
+    /// The kill→relaunch path end-to-end: a session left STALE-active (a probable app
+    /// kill: `last_seen_at` far in the past, no clean SessionEnd) is swept to `unknown`
+    /// by the boot scan and STILL parked as a resume — flagged `uncertain`. Ties
+    /// together the active→unknown péremption sweep and "unknown is a resume candidate".
+    #[test]
+    fn boot_scan_sweeps_stale_active_to_unknown_and_still_resumes_uncertain() {
+        use diesel::connection::SimpleConnection;
+        let _shell = force_unix_shell();
+        let app = build_app_with_db();
+
+        let on = cmd_create_project(&app, "on", "/on", None).unwrap();
+        set_project_resume_agent_sessions(app.state::<Db>(), on.project.id.clone(), true).unwrap();
+        let t = create_terminal(app.state::<Db>(), "/on".into(), None).unwrap();
+        cmd_attach(&app, &t.id, &on.root.id, db::BINDING_AUTO).unwrap();
+
+        // A real transcript on disk so the #53 conversation gate opens for the resume.
+        let transcript = boot_temp_transcript("sid-stale");
+
+        // Record a normal active session, then BACKDATE its last_seen_at well past the
+        // staleness threshold — the shape an app kill leaves behind (active, never
+        // cleanly ended, long silent). A raw UPDATE since there is no public setter.
+        let session = app
+            .state::<Db>()
+            .with_conn(|c| {
+                db::record_session_start(
+                    c,
+                    &t.id,
+                    db::AGENT_KIND_CLAUDE_CODE,
+                    db::SessionCapture {
+                        workspace_id: Some(on.root.id.clone()),
+                        external_session_id: "sid-stale".into(),
+                        cwd: "/on".into(),
+                        transcript_path: Some(transcript.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+        let past = db::now_millis() - db::SESSION_STALE_AFTER_MS - 60_000;
+        let session_id = session.id.clone();
+        app.state::<Db>()
+            .with_conn(|c| {
+                c.batch_execute(&format!(
+                    "UPDATE agent_sessions SET last_seen_at = {past} WHERE id = '{session_id}'"
+                ))
+            })
+            .expect("backdate last_seen_at");
+
+        let resumes = PendingResumes::default();
+        let parked = restore_agent_sessions_on_boot(app.state::<Db>().inner(), &resumes);
+
+        // The boot scan swept the row to `unknown` (péremption) but still parked it.
+        let row = app
+            .state::<Db>()
+            .with_conn(|c| db::get_session(c, &session_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, db::SESSION_STATE_UNKNOWN, "stale active swept to unknown");
+        assert_eq!(parked, vec![t.id.clone()], "the unknown session is still a resume candidate");
+        let r = resumes.take(&t.id).expect("a resume is parked for the unknown session");
+        assert_eq!(r.command, "claude --resume sid-stale");
+        assert!(r.uncertain, "an unknown (probable-kill) session is flagged uncertain");
+    }
+
+    /// `register_terminal_pty` marks a parked resume `resume_failed` when delivery is
+    /// impossible (no live PTY for the id). Covers the resume_failed transition through
+    /// the real injection path (the PTY-present happy path is the dogfood/E2E gate).
+    #[test]
+    fn parked_resume_with_dead_pty_marks_resume_failed() {
+        let app = build_app_with_db();
+        let t = create_terminal(app.state::<Db>(), "/work".into(), None).unwrap();
+        let session = app
+            .state::<Db>()
+            .with_conn(|c| {
+                db::record_session_start(
+                    c,
+                    &t.id,
+                    db::AGENT_KIND_CLAUDE_CODE,
+                    db::SessionCapture {
+                        external_session_id: "sid-x".into(),
+                        cwd: "/work".into(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+
+        // Park a resume, then register a PTY id that has NO live Pty in the manager
+        // (delivery will fail) → the session must flip to resume_failed.
+        app.state::<PendingResumes>().set(
+            &t.id,
+            PendingResume {
+                session_id: session.id.clone(),
+                command: "claude --resume sid-x".into(),
+                uncertain: false,
+            },
+        );
+        register_terminal_pty(
+            app.state::<Db>(),
+            app.state::<TerminalPtyMap>(),
+            app.state::<PendingTerminalCommands>(),
+            app.state::<PendingResumes>(),
+            app.state::<PtyManager>(),
+            t.id.clone(),
+            Some(999_999), // no Pty with this id is registered → delivery fails
+        )
+        .expect("register");
+
+        let got = app
+            .state::<Db>()
+            .with_conn(|c| db::get_session(c, &session.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.state,
+            db::SESSION_STATE_RESUME_FAILED,
+            "a resume that could not be delivered marks the session resume_failed"
+        );
     }
 
     /// GUARD (ZE1 done-criterion #2): a `manual`-mode terminal is NEVER moved by
@@ -6815,13 +7466,115 @@ mod tests {
             .is_some()
     }
 
+    /// A fake bundled-plugin descriptor pointing at temp paths, so the plugin tests
+    /// never touch the user's real `~/.claude` and never shell out. The source dir holds
+    /// a minimal manifest so the copy-to-stable step has something to mirror; the stable
+    /// install dir + settings file are temp paths.
+    fn temp_plugin_install(dir: &std::path::Path) -> crate::plugin::PluginInstall {
+        let source = dir.join("claude-plugin");
+        std::fs::create_dir_all(source.join(".claude-plugin")).unwrap();
+        std::fs::write(source.join(".claude-plugin").join("marketplace.json"), "{}").unwrap();
+        crate::plugin::PluginInstall {
+            marketplace: crate::plugin::CLAUDE_MARKETPLACE.to_string(),
+            plugin: crate::plugin::CLAUDE_PLUGIN_NAME.to_string(),
+            source_dir: source,
+            install_dir: dir.join("stable-claude-plugin"),
+            settings_path: dir.join("settings.json"),
+            mcp_port: 8765,
+        }
+    }
+
+    /// A recording fake of the Claude plugin CLI for the bridge plugin tests — models a
+    /// single optional `nyx` marketplace registration in memory, so install/remove are
+    /// observable without the real `claude` binary. When a `settings_path` is wired, it
+    /// also models the REAL CLI's ownership of `settings.json.enabledPlugins`: `install`
+    /// sets `enabledPlugins[<id>] = true`, `uninstall` removes it — exactly the signal the
+    /// post-mutation status now reads (review #40), so the status-reading tests observe a
+    /// faithful enabledPlugins state without shelling out.
+    #[derive(Default)]
+    struct FakeBridgeCli {
+        registered: std::cell::RefCell<Option<std::path::PathBuf>>,
+        /// When set, `install`/`uninstall` write/clear `enabledPlugins[<id>]` here,
+        /// mirroring the real `claude plugin` CLI that owns this file.
+        settings_path: Option<std::path::PathBuf>,
+    }
+
+    impl FakeBridgeCli {
+        /// A CLI fake that models the real `enabledPlugins` write into `settings_path`.
+        fn with_settings(settings_path: std::path::PathBuf) -> Self {
+            Self { registered: std::cell::RefCell::new(None), settings_path: Some(settings_path) }
+        }
+
+        /// Toggle `enabledPlugins[<id>]` in the wired settings file (no-op when unwired),
+        /// mirroring the real CLI's ownership of `settings.json`.
+        fn set_enabled_plugin(&self, install_id: &str, enabled: bool) {
+            let Some(path) = self.settings_path.as_deref() else { return };
+            let mut root = crate::onboarding::read_config_pub(path).unwrap_or(serde_json::json!({}));
+            let obj = root.as_object_mut().expect("read_config yields an object");
+            let plugins = obj
+                .entry("enabledPlugins")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            let plugins = plugins.as_object_mut().expect("enabledPlugins is an object");
+            if enabled {
+                plugins.insert(install_id.to_string(), serde_json::Value::Bool(true));
+            } else {
+                plugins.remove(install_id);
+            }
+            crate::onboarding::write_config_pub(path, &root).expect("write fake settings");
+        }
+    }
+
+    impl crate::plugin::PluginCli for FakeBridgeCli {
+        fn marketplace_add(&self, dir: &std::path::Path) -> Result<(), crate::plugin::PluginError> {
+            *self.registered.borrow_mut() = Some(dir.to_path_buf());
+            Ok(())
+        }
+        fn install(&self, install_id: &str) -> Result<(), crate::plugin::PluginError> {
+            self.set_enabled_plugin(install_id, true);
+            Ok(())
+        }
+        fn uninstall(&self, install_id: &str) -> Result<(), crate::plugin::PluginError> {
+            self.set_enabled_plugin(install_id, false);
+            Ok(())
+        }
+        fn marketplace_remove(&self, _marketplace: &str) -> Result<(), crate::plugin::PluginError> {
+            *self.registered.borrow_mut() = None;
+            Ok(())
+        }
+        fn marketplace_update(&self, _marketplace: &str) -> Result<(), crate::plugin::PluginError> {
+            Ok(())
+        }
+        fn plugin_update(&self, _install_id: &str) -> Result<(), crate::plugin::PluginError> {
+            Ok(())
+        }
+        fn marketplace_list(&self) -> Result<Vec<crate::plugin::MarketplaceEntry>, crate::plugin::PluginError> {
+            Ok(self
+                .registered
+                .borrow()
+                .clone()
+                .map(|p| vec![crate::plugin::MarketplaceEntry {
+                    name: crate::plugin::CLAUDE_MARKETPLACE.to_string(),
+                    path: Some(p),
+                }])
+                .unwrap_or_default())
+        }
+    }
+
+    /// `true` if the fake CLI currently has nyx's plugin registered (the bridge install
+    /// drives `marketplace_add` at the stable dir; remove clears it). Replaces the old
+    /// settings-file probe — the CLI now owns the registration, not settings.json.
+    fn cli_has_nyx_plugin(cli: &FakeBridgeCli) -> bool {
+        cli.registered.borrow().is_some()
+    }
+
     #[test]
     fn integration_list_returns_four_registry_providers() {
-        let dir = integ_temp_dir("list");
-        let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
-        // No state file yet → nothing installed.
-        let list = integration_status_list(&state_path);
-
+        // The list SHAPE (4 providers, available/coming-soon flags) is independent of the
+        // env seams — only claude_code's single installed flag derives from the real config.
+        // We assert the shape from the live list and the claude_code flag via the path-param
+        // core `claude_status_at`, so this test mutates NO process-global env (review
+        // #42/#43) — no shared lock needed.
+        let list = integration_status_list();
         let providers: Vec<&str> = list.iter().map(|s| s.provider).collect();
         assert_eq!(
             providers,
@@ -6832,9 +7585,14 @@ mod tests {
         // claude_code is the only available (functional) provider in v1.
         let claude = list.iter().find(|s| s.provider == "claude_code").unwrap();
         assert!(claude.available, "claude_code is functional in v1");
-        assert!(!claude.installed, "fresh state → not installed");
 
-        // codex / opencode / custom are coming soon (available == false).
+        // The single installed flag against ABSENT settings reads "not installed", derived
+        // through the same core the list uses (finding #46) — no env touched.
+        let dir = integ_temp_dir("list");
+        let absent = claude_status_at(&dir.join("absent-settings.json"));
+        assert!(!absent.installed, "absent real settings → integration not installed");
+
+        // codex / opencode / custom are coming soon (available == false), never installed.
         for p in ["codex", "opencode", "custom"] {
             let s = list.iter().find(|s| s.provider == p).unwrap();
             assert!(!s.available, "{p} is coming soon (available == false)");
@@ -6842,57 +7600,70 @@ mod tests {
         }
     }
 
+    /// The ONE install drives the whole integration: the bundled plugin (which provides
+    /// the MCP) is registered via the CLI, AND any legacy standalone `mcpServers.nyx` is
+    /// stripped so the MCP is not declared twice (finding #45). Status flips to installed,
+    /// derived from the REAL `enabledPlugins` the fake CLI writes (finding #46).
     #[test]
-    fn integration_install_upserts_nyx_entry_and_persists_installed() {
-        let dir = integ_temp_dir("install");
+    fn integration_install_registers_plugin_and_strips_legacy_mcp() {
+        let dir = integ_temp_dir("install-one");
         let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
         let config_path = dir.join(".claude.json");
+        // Seed a LEGACY standalone MCP entry (residue from the old separate-MCP flow).
+        std::fs::write(&config_path, r#"{"mcpServers":{"nyx":{"type":"http","url":"http://127.0.0.1:8765/mcp"}},"autoConnectIde":true}"#).unwrap();
         let target = crate::onboarding::OnboardingTarget::new("Claude Code", &config_path);
+        let plugin = temp_plugin_install(&dir);
+        let cli = FakeBridgeCli::with_settings(plugin.settings_path.clone());
 
-        assert!(!config_has_nyx(&config_path), "no nyx entry before install");
+        let status = do_integration_install("claude_code", &target, Some(&plugin), Some(&cli), &state_path)
+            .expect("install succeeds");
+        assert!(status.installed, "status reports the integration installed (enabledPlugins set)");
 
-        let status = do_integration_install("claude_code", &target, &state_path, 8765)
-            .expect("install succeeds against a temp target");
-        assert_eq!(status.provider, "claude_code");
-        assert!(status.installed, "returned status reports installed");
-        assert!(status.available);
-
-        // The nyx entry is written to the client config…
-        assert!(config_has_nyx(&config_path), "install upserts the nyx entry");
-        // …and the installed flag is persisted in integrations.json.
-        let state = crate::onboarding::IntegrationState::load(&state_path);
-        assert!(state.is_installed("claude_code"), "installed flag persisted");
-
-        // And it reflects in the list the UI reads.
-        let listed = integration_status_list(&state_path);
-        assert!(
-            listed.iter().find(|s| s.provider == "claude_code").unwrap().installed,
-            "integration_list now shows claude_code installed"
-        );
+        // Plugin registered via the CLI at the STABLE dir; bundled content copied.
+        assert!(cli_has_nyx_plugin(&cli), "plugin registered via the CLI");
+        assert_eq!(cli.registered.borrow().as_deref(), Some(plugin.install_dir.as_path()), "registered the stable dir");
+        assert!(plugin.install_dir.join(".claude-plugin").join("marketplace.json").exists(), "bundled content copied to stable dir");
+        // The legacy standalone MCP entry was stripped (no double-declaration); other keys survive.
+        assert!(!config_has_nyx(&config_path), "legacy standalone mcpServers.nyx stripped on install");
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(cfg["autoConnectIde"], true, "unrelated config preserved");
+        // nyx's own cache flag is set (non-authoritative).
+        assert!(crate::onboarding::IntegrationState::load(&state_path).is_installed("claude_code"));
     }
 
+    /// Uninstall is the mirror: it uninstalls the plugin (CLI uninstall + marketplace
+    /// remove) AND cleans every nyx residue — the legacy standalone MCP and the legacy
+    /// hand-written settings keys — leaving nothing behind (finding #45).
     #[test]
-    fn integration_remove_deletes_nyx_entry_and_clears_installed() {
-        let dir = integ_temp_dir("remove");
+    fn integration_remove_uninstalls_plugin_and_cleans_all_residue() {
+        let dir = integ_temp_dir("remove-one");
         let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
         let config_path = dir.join(".claude.json");
         let target = crate::onboarding::OnboardingTarget::new("Claude Code", &config_path);
+        let plugin = temp_plugin_install(&dir);
+        let cli = FakeBridgeCli::with_settings(plugin.settings_path.clone());
 
-        // First install so there is something to remove.
-        do_integration_install("claude_code", &target, &state_path, 8765).unwrap();
-        assert!(config_has_nyx(&config_path));
-        assert!(crate::onboarding::IntegrationState::load(&state_path).is_installed("claude_code"));
+        // Install, then seed a legacy standalone MCP + legacy hand-written settings keys.
+        do_integration_install("claude_code", &target, Some(&plugin), Some(&cli), &state_path).unwrap();
+        std::fs::write(&config_path, r#"{"mcpServers":{"nyx":{"type":"http","url":"http://127.0.0.1:8765/mcp"}}}"#).unwrap();
+        std::fs::write(
+            &plugin.settings_path,
+            r#"{"enabledPlugins":{"nyx-claude-integration@nyx":true},"extraKnownMarketplaces":{"nyx":{}}}"#,
+        )
+        .unwrap();
+        assert!(cli_has_nyx_plugin(&cli));
 
-        let status = do_integration_remove("claude_code", &target, &state_path)
+        let status = do_integration_remove("claude_code", &target, Some(&plugin), Some(&cli), &state_path)
             .expect("remove succeeds");
-        assert!(!status.installed, "returned status reports not installed");
-        assert!(status.available);
+        assert!(!status.installed, "status reports uninstalled");
 
-        // The nyx entry is gone…
-        assert!(!config_has_nyx(&config_path), "remove deletes the nyx entry");
-        // …and the installed flag is cleared.
-        let state = crate::onboarding::IntegrationState::load(&state_path);
-        assert!(!state.is_installed("claude_code"), "installed flag cleared");
+        // Everything nyx is gone: plugin registration, legacy MCP, legacy settings keys.
+        assert!(!cli_has_nyx_plugin(&cli), "plugin registration removed");
+        assert!(!config_has_nyx(&config_path), "legacy standalone mcpServers.nyx stripped on uninstall");
+        let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&plugin.settings_path).unwrap()).unwrap();
+        assert!(settings["enabledPlugins"].get("nyx-claude-integration@nyx").is_none(), "legacy enabledPlugins stripped");
+        assert!(settings["extraKnownMarketplaces"].get("nyx").is_none(), "legacy marketplace stripped");
+        assert!(!crate::onboarding::IntegrationState::load(&state_path).is_installed("claude_code"));
     }
 
     #[test]
@@ -6901,18 +7672,69 @@ mod tests {
         let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
         let config_path = dir.join(".claude.json");
         let target = crate::onboarding::OnboardingTarget::new("Claude Code", &config_path);
+        let plugin = temp_plugin_install(&dir);
+        let cli = FakeBridgeCli::default();
 
         // codex / opencode / custom are coming soon → install/remove refuse.
         for p in ["codex", "opencode", "custom"] {
-            let err = do_integration_install(p, &target, &state_path, 8765)
+            let err = do_integration_install(p, &target, Some(&plugin), Some(&cli), &state_path)
                 .expect_err("coming-soon providers cannot be installed in v1");
             assert!(err.contains("not supported"), "actionable error for {p}: {err}");
-            let err = do_integration_remove(p, &target, &state_path)
+            let err = do_integration_remove(p, &target, Some(&plugin), Some(&cli), &state_path)
                 .expect_err("coming-soon providers cannot be removed in v1");
             assert!(err.contains("not supported"), "actionable error for {p}: {err}");
         }
         // No config/state side effects from the rejected calls.
         assert!(!config_has_nyx(&config_path));
+        assert!(!cli_has_nyx_plugin(&cli));
+    }
+
+    /// REGRESSION (finding #46): the single status is derived from Claude Code's REAL config
+    /// (`enabledPlugins`), not nyx's stored `integrations.json` flag. The plugin was
+    /// uninstalled DIRECTLY in Claude Code (`enabledPlugins` entry gone) — status must read
+    /// FALSE even though a stale `integrations.json` says installed.
+    #[test]
+    fn status_reflects_real_config_not_stale_integrations_json() {
+        let dir = integ_temp_dir("real-vs-stale");
+
+        // The user uninstalled the plugin directly in Claude Code: the enabledPlugins entry
+        // is gone (only the marketplace lingers, which is NOT the signal).
+        let settings = dir.join("settings.json");
+        std::fs::write(&settings, r#"{"enabledPlugins":{"warp@claude-code-warp":true},"extraKnownMarketplaces":{"nyx":{}}}"#).unwrap();
+
+        // A STALE integrations.json that lies: installed (the pre-fix source of truth).
+        let state_path = dir.join(crate::onboarding::INTEGRATIONS_FILE);
+        let mut stale = crate::onboarding::IntegrationState::default();
+        stale.set_installed("claude_code", true);
+        stale.save(&state_path).unwrap();
+
+        // Derive via the path-param core (finding #46): reads ONLY the REAL settings file at
+        // an explicit temp path and never consults `integrations.json` — no env, no lock.
+        let claude = claude_status_at(&settings);
+        assert!(
+            !claude.installed,
+            "plugin uninstalled in Claude Code (enabledPlugins entry gone) → NOT installed, \
+             even though integrations.json still says true"
+        );
+    }
+
+    /// The single status is derived from the REAL `enabledPlugins` flag: present/true →
+    /// installed, absent/false → not (finding #46).
+    #[test]
+    fn status_derives_from_enabled_plugins_flag() {
+        // Exercised through the path-param core `claude_status_at` against temp files — no
+        // process-global env, no shared lock (review #42/#43).
+        let dir = integ_temp_dir("status-flag");
+        let settings = dir.join("settings.json");
+
+        for (plugin_cfg, want) in [
+            (r#"{"enabledPlugins":{"nyx-claude-integration@nyx":true}}"#, true),
+            (r#"{"enabledPlugins":{"nyx-claude-integration@nyx":false}}"#, false),
+            (r#"{"enabledPlugins":{}}"#, false),
+        ] {
+            std::fs::write(&settings, plugin_cfg).unwrap();
+            assert_eq!(claude_status_at(&settings).installed, want, "status from {plugin_cfg}");
+        }
     }
 
     // --- Terminal RECORD ↔ PTY link + pending-command injection (R-TERM) ----
@@ -6921,10 +7743,12 @@ mod tests {
     fn register_terminal_pty_links_and_clears_the_record_to_pty_mapping() {
         // The foundation join the MCP terminal tools read: registering a Some(pty_id)
         // records the record→pty link; registering None clears it.
-        let app = build_app();
+        let app = build_app_with_db();
         register_terminal_pty(
+            app.state::<Db>(),
             app.state::<TerminalPtyMap>(),
             app.state::<PendingTerminalCommands>(),
+            app.state::<PendingResumes>(),
             app.state::<PtyManager>(),
             "rec-1".into(),
             Some(42),
@@ -6935,8 +7759,10 @@ mod tests {
         assert_eq!(app.state::<TerminalPtyMap>().snapshot().get("rec-1"), Some(&42));
 
         register_terminal_pty(
+            app.state::<Db>(),
             app.state::<TerminalPtyMap>(),
             app.state::<PendingTerminalCommands>(),
+            app.state::<PendingResumes>(),
             app.state::<PtyManager>(),
             "rec-1".into(),
             None,
@@ -6953,13 +7779,15 @@ mod tests {
         // this test is gated behind the same non-ConPTY reasoning as the other pty tests
         // — keep it a pure state test of the PARK + take instead, exercising the live
         // injection path against a spawned pty.
-        let app = build_app();
+        let app = build_app_with_db();
         let pty_id = spawn(&app, 80, 24);
         app.state::<PendingTerminalCommands>().set("rec-cmd", "echo hi".into());
 
         register_terminal_pty(
+            app.state::<Db>(),
             app.state::<TerminalPtyMap>(),
             app.state::<PendingTerminalCommands>(),
+            app.state::<PendingResumes>(),
             app.state::<PtyManager>(),
             "rec-cmd".into(),
             Some(pty_id),
@@ -6979,10 +7807,12 @@ mod tests {
     fn register_terminal_pty_with_no_parked_command_is_a_bare_shell() {
         // A terminal opened without an MCP command parks nothing — registration injects
         // nothing and only records the link.
-        let app = build_app();
+        let app = build_app_with_db();
         register_terminal_pty(
+            app.state::<Db>(),
             app.state::<TerminalPtyMap>(),
             app.state::<PendingTerminalCommands>(),
+            app.state::<PendingResumes>(),
             app.state::<PtyManager>(),
             "rec-bare".into(),
             Some(7),

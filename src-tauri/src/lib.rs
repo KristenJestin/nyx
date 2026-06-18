@@ -1,9 +1,26 @@
+// Generic agent-session adapter contract + registry (PRD-5, Phase 1; ADR-0010).
+// Pure contract/registry: resolves an `agent_kind` to its adapter (production
+// `claude_code`, representable placeholders for codex/opencode/custom), normalizes
+// session start/end events, builds resume commands, and exposes per-adapter limits.
+mod agent;
+// Agent-session RESUME DECISION + close-warning policy (PRD-5 Phase 3, #5/#6). Pure
+// policy over plain inputs (project option, session state, voluntary close, target
+// shell); the bridge gathers the inputs and executes the chosen action.
+mod agent_resume;
 mod bridge;
 mod command;
 mod db;
 mod mcp;
 mod mcp_tools;
 mod onboarding;
+// Generic agent-PLUGIN install vehicle (PRD-5 phase 2; ADR-0004/ADR-0010). Installs an
+// agent's session-capture glue as a real, on-disk bundled plugin by copying it into a
+// stable app-data dir and registering it via the agent's plugin CLI (Claude: `claude`
+// `marketplace add` + `install`), DECOUPLED from the MCP server install in `onboarding`.
+// Provider-agnostic reconcile/uninstall (uninstall via the CLI, plus stripping any
+// leftover legacy hand-written settings keys); the Claude specifics (which
+// marketplace/plugin/dir) are supplied by the adapter.
+mod plugin;
 // OSC 133 shell-integration parser + the exec-state gate decision (ADR-0002,
 // PRD 2.1 task #1). Pure parser; wired into the bridge output pump in phase 2.
 mod osc133;
@@ -29,6 +46,21 @@ use tauri::Manager;
 
 use db::Db;
 use mcp::McpServer;
+
+/// ONE process-global lock for every test that mutates a `NYX_CLAUDE_*` env seam
+/// (`NYX_CLAUDE_CONFIG` / `NYX_CLAUDE_SETTINGS` / `NYX_CLAUDE_BIN` /
+/// `NYX_CLAUDE_PLUGIN_DIR` / `NYX_CLAUDE_STABLE_PLUGIN_DIR`). These vars are
+/// PROCESS-GLOBAL, but `cargo test --lib` runs `#[test]`s in parallel threads in ONE
+/// process, so per-module mutexes give NO mutual exclusion across modules: one test's
+/// `set_var`/`remove_var` would interleave between another module's `set_var` and its
+/// read, flipping the seam mid-resolution and producing non-deterministic reds
+/// (review #42/#43). Every env-seam-resolving test in `bridge`/`plugin`/`onboarding`/
+/// `agent` takes THIS single lock (not a private one), serializing all seam mutation
+/// across the whole crate. Tests that can use a path-param pure function instead should
+/// do that and avoid the seam (and this lock) entirely. Poison is recovered: each holder
+/// restores/removes the env on exit, so a panicking test never leaves a stale seam.
+#[cfg(test)]
+pub(crate) static CLAUDE_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// File name of nyx's SQLite database inside `app_data_dir`.
 const DB_FILE: &str = "nyx.db";
@@ -161,6 +193,11 @@ pub fn run() {
             // marked (restart_on_startup ON + was_running_on_shutdown), normalize
             // orphaned `running` to idle, and reset the snapshot.
             bridge::restore_commands_from_handle(&handle);
+            // Boot agent-session resume scan (PRD-5 #5): sweep stale active sessions to
+            // `unknown`, then PARK a `claude --resume <id>` for every alive terminal
+            // whose project opts in and whose session is resumable — injected into the
+            // respawned shell when the front mounts each restored terminal's PTY.
+            bridge::restore_agent_sessions_from_handle(&handle);
             // Local MCP HTTP server (PRD-4, ADR-0003): one loopback server on the
             // fixed/configurable port, owned by this single live nyx process. A
             // second nyx focuses the existing window (single-instance plugin) and
@@ -177,14 +214,34 @@ pub fn run() {
             match server.start() {
                 Ok(port) => {
                     eprintln!("nyx MCP server listening on http://127.0.0.1:{port}/mcp");
-                    // Boot reconciliation (PRD-4 task #1, ADR-0003 D10/D11): update the
-                    // `nyx` MCP entry in every provider config the user has explicitly
-                    // installed via Settings → Integrations. Only updates already-present
-                    // entries (url/port) — never creates a new entry silently. Best-effort:
+                    // Boot reconciliation (PRD-4 task #1 / PRD-5 #24, ADR-0003 D10/D11):
+                    // update the `nyx` MCP entry AND the session-capture plugin in every
+                    // provider the user has explicitly installed via Settings →
+                    // Integrations. Only updates already-present installs (MCP url/port,
+                    // plugin source path) — NEVER installs silently on boot. Best-effort:
                     // a failure (no $HOME, unwritable file) is a warning, never a boot
-                    // failure — the UI must still come up.
+                    // failure — the UI must still come up. The plugin descriptor per
+                    // provider is built by its agent adapter, so no agent specifics leak
+                    // into the generic reconcile (finding #25); the resource dir lets a
+                    // packaged build resolve the bundled plugin (finding #26).
                     let state_path = data_dir.join(onboarding::INTEGRATIONS_FILE);
-                    onboarding::reconcile_installed_providers(port, &state_path);
+                    let resource_dir = app.path().resource_dir().ok();
+                    let app_data_dir = data_dir.clone();
+                    // Run OFF the setup/main thread: the reconcile shells out to the agent's
+                    // `claude` CLI (a child-process round-trip — `marketplace list`, and on a
+                    // drift `marketplace/plugin update`), which would otherwise BLOCK the
+                    // first window paint on every boot. Detached + best-effort; nothing in
+                    // setup depends on its result.
+                    std::thread::spawn(move || {
+                        let registry = agent::AgentRegistry::default();
+                        onboarding::reconcile_installed_providers(port, &state_path, |provider_key| {
+                            let adapter = registry.get(provider_key)?;
+                            let install =
+                                adapter.plugin_install(resource_dir.as_deref(), Some(&app_data_dir))?;
+                            let cli = adapter.plugin_cli()?;
+                            Some((install, cli))
+                        });
+                    });
                 }
                 Err(e) => eprintln!("nyx MCP server did not start: {e}"),
             }
