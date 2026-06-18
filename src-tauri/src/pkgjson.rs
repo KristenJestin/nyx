@@ -68,6 +68,16 @@ fn is_excluded_dir(name: &str) -> bool {
     name.starts_with('.') || SCAN_EXCLUSIONS.contains(&name)
 }
 
+/// Is `dir` the root of a git repository — i.e. does it directly contain a `.git`
+/// entry? (PRD-4.1 #2, repo-of-repos.) A standard repo has a `.git` DIRECTORY; a git
+/// worktree / submodule has a `.git` FILE (a gitdir pointer). Either form counts, so a
+/// nested sub-repo the parent gitignores is still recognized as a scan candidate. We
+/// only check for the `.git` entry's existence — we never descend INTO it (`.git` is a
+/// dotdir, dropped by [`is_excluded_dir`]).
+fn is_git_repo_dir(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
 /// A detected package manager. Stored as the DB `package_manager` string
 /// (npm/pnpm/yarn/bun — the v3 CHECK vocabulary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +555,14 @@ pub fn discover_package_scripts(workspace_path: &str) -> Vec<DiscoveredScript> {
 /// in scope (the workspace's own `.gitignore` plus any nested ones), so a repo's
 /// gitignored trees (vendored deps, fixtures, generated dirs) are not surfaced.
 ///
+/// **Repo-of-repos exception (PRD-4.1 #2).** A directory that is itself a git repo (it
+/// directly contains a `.git` entry — see [`is_git_repo_dir`]) is scanned EVEN WHEN the
+/// parent's `.gitignore` ignores it: in the umbrella / repo-of-repos layout the parent
+/// gitignores its nested sub-repos, but those are exactly the folders holding the real
+/// `package.json` files. Only the gitignore skip is overridden for such a dir; the dotdir
+/// and `node_modules` exclusions still apply, a gitignored NON-repo dir is still skipped,
+/// and the scan never descends into the `.git` directory itself.
+///
 /// If the ROOT manifest declares workspaces (npm/yarn `package.json` `workspaces`, or
 /// `pnpm-workspace.yaml`), discovery is BOUNDED to the root + directories matching those
 /// globs (so only real workspace packages contribute). Otherwise the walk is bounded by
@@ -726,7 +744,8 @@ fn collect_package_files(dir: &Path, rel: &str, depth: usize, ctx: &mut Discover
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        // (a) dotdirs + explicit vendor/build dirs.
+        // (a) dotdirs + explicit vendor/build dirs. This drops `.git` itself (a dotdir),
+        // so the scan never descends INTO a `.git` directory.
         if is_excluded_dir(name) {
             continue;
         }
@@ -735,15 +754,49 @@ fn collect_package_files(dir: &Path, rel: &str, depth: usize, ctx: &mut Discover
         } else {
             format!("{rel}/{name}")
         };
-        // (b) gitignored directories.
-        if ctx.is_gitignored(&child_rel, true) {
+        // (b) gitignored directories — UNLESS the directory is itself a git repo.
+        //
+        // Repo-of-repos (PRD-4.1 #2, the PalBank layout): an umbrella repo gitignores its
+        // nested sub-repos, but those sub-repos are exactly the folders holding the real
+        // `package.json` files. So a directory that CONTAINS a `.git` entry is a legitimate
+        // scan candidate even when the parent's `.gitignore` ignores it — we override the
+        // gitignore skip for it. All OTHER exclusions still hold: dotdirs (incl. `.agents`)
+        // and `node_modules` were already dropped above (a), and a gitignored NON-repo dir
+        // is still skipped here. We never scan inside `.git` itself (it is a dotdir, (a)).
+        //
+        // The override is LIMITED to the workspace's DIRECT children (`depth == 0` means we
+        // are iterating the workspace ROOT's entries): the umbrella / repo-of-repos layout
+        // puts its sub-repos at the TOP level, so a gitignored `.git`-dir there is a real
+        // scan candidate; a gitignored `.git`-dir buried DEEPER (a vendored clone, a tool
+        // cache, a checked-out dependency) stays excluded as the user intended — we do not
+        // un-ignore arbitrarily nested repos (arbitration B).
+        let gitignored = ctx.is_gitignored(&child_rel, true);
+        let is_subrepo = depth == 0 && is_git_repo_dir(&path);
+        if gitignored && !is_subrepo {
             continue;
         }
+        // RE-ROOT the gitignore scope at a gitignored sub-repo (finding #10). When the
+        // override above lets us into a nested repo the PARENT excluded, the umbrella's
+        // `.gitignore` must NOT govern that repo's tree — only the sub-repo's OWN
+        // `.gitignore` does, exactly as git treats an independent repo boundary. Otherwise
+        // a broad umbrella rule (e.g. `sub-repo/`) would still match `sub-repo/packages/…`
+        // and silently drop the sub-repo's nested packages. So for that descent we swap in
+        // a fresh stack and restore it after. (A non-ignored nested dir keeps the inherited
+        // stack — its rules legitimately apply.) The dotdir/`node_modules` exclusions in
+        // (a) are gitignore-independent, so they keep protecting the sub-repo's tree.
+        let saved = if gitignored && is_subrepo {
+            Some(std::mem::take(&mut ctx.gitignores))
+        } else {
+            None
+        };
         // Push this dir's own .gitignore (if any) before descending, pop after.
         let pushed = ctx.push_gitignore(&path, &child_rel);
         collect_package_files(&path, &child_rel, depth + 1, ctx);
         if pushed {
             ctx.gitignores.pop();
+        }
+        if let Some(saved) = saved {
+            ctx.gitignores = saved;
         }
     }
 }
@@ -1301,6 +1354,132 @@ mod tests {
         );
         assert!(find(&scripts, "dev").is_some(), "root dev surfaces");
         assert!(find(&scripts, "start").is_some(), "non-ignored api surfaces");
+    }
+
+    #[test]
+    fn gitignored_nested_git_repo_is_still_discovered_repo_of_repos() {
+        // PRD-4.1 #2 (the PalBank repo-of-repos layout): an umbrella parent gitignores its
+        // nested sub-repos, but those sub-repos hold the real package.json files. A
+        // gitignored sub-DIR that itself contains `.git` must still be discovered, while
+        // dotdirs (.agents), node_modules, and gitignored NON-repo dirs stay excluded.
+        let tree = TempTree::new("repo_of_repos");
+        // The umbrella gitignores its sub-repos AND a plain vendored dir.
+        tree.write(".gitignore", "sub-repo/\nvendored/\n");
+        // A nested GIT REPO (has .git) that the parent gitignores → MUST surface.
+        tree.mkdir("sub-repo/.git"); // a real repo has a .git directory
+        tree.write(
+            "sub-repo/package.json",
+            r#"{ "name": "sub", "scripts": { "build_subrepo": "tsc" } }"#,
+        );
+        // A nested git repo using the worktree/submodule `.git` FILE form → MUST surface too.
+        tree.write("submodule/.git", "gitdir: ../.git/modules/submodule\n");
+        tree.write(
+            "submodule/package.json",
+            r#"{ "name": "submod", "scripts": { "build_submodule": "tsc" } }"#,
+        );
+        // A gitignored NON-repo dir (no .git) → still excluded.
+        tree.write(
+            "vendored/package.json",
+            r#"{ "scripts": { "leak_vendored": "x" } }"#,
+        );
+        // A dotdir (.agents) holding a manifest → still excluded (even though it has no .git).
+        tree.write(
+            ".agents/package.json",
+            r#"{ "scripts": { "leak_agents": "x" } }"#,
+        );
+        // node_modules inside the discovered sub-repo → still excluded.
+        tree.write(
+            "sub-repo/node_modules/dep/package.json",
+            r#"{ "scripts": { "leak_nm": "x" } }"#,
+        );
+
+        let result = discover_scripts(&tree.path());
+        assert!(
+            find(&result.scripts, "build_subrepo").is_some(),
+            "the gitignored nested .git-DIR sub-repo is discovered, got: {:?}",
+            result.scripts.iter().map(|s| &s.proposed_name).collect::<Vec<_>>()
+        );
+        assert!(
+            find(&result.scripts, "build_submodule").is_some(),
+            "the gitignored nested .git-FILE sub-repo is discovered too"
+        );
+        assert!(
+            result.scripts.iter().all(|s| !s.script_name.starts_with("leak_")),
+            "no script from .agents / node_modules / a gitignored non-repo may surface, got: {:?}",
+            result.scripts.iter().map(|s| &s.proposed_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn gitignored_subrepo_rerooting_surfaces_nested_packages_but_honors_its_own_gitignore() {
+        // PRD-4.1 #2, finding #10: when a gitignored sub-repo is scanned via the override,
+        // the gitignore scope RE-ROOTS at the sub-repo. A broad umbrella rule (`sub-repo/`)
+        // would otherwise still match `sub-repo/packages/…` and silently drop the sub-repo's
+        // NESTED packages; after re-rooting only the sub-repo's OWN .gitignore governs its tree.
+        let tree = TempTree::new("subrepo_reroot");
+        // The umbrella gitignores the whole sub-repo (a rule that also matches everything under it).
+        tree.write(".gitignore", "sub-repo/\n");
+        tree.mkdir("sub-repo/.git");
+        tree.write(
+            "sub-repo/package.json",
+            r#"{ "name": "sub", "scripts": { "build_root": "tsc" } }"#,
+        );
+        // A NESTED package inside the sub-repo: must surface now that scope re-roots (it would
+        // be dropped if the umbrella's `sub-repo/` rule still applied inside the sub-repo).
+        tree.write(
+            "sub-repo/packages/inner/package.json",
+            r#"{ "name": "inner", "scripts": { "build_nested": "tsc" } }"#,
+        );
+        // The sub-repo's OWN .gitignore must STILL be honored after re-rooting.
+        tree.write("sub-repo/.gitignore", "private/\n");
+        tree.write(
+            "sub-repo/private/package.json",
+            r#"{ "scripts": { "leak_private": "x" } }"#,
+        );
+
+        let result = discover_scripts(&tree.path());
+        let names: Vec<&String> = result.scripts.iter().map(|s| &s.script_name).collect();
+        assert!(
+            find(&result.scripts, "build_root").is_some(),
+            "the sub-repo root package surfaces, got: {names:?}"
+        );
+        assert!(
+            find(&result.scripts, "build_nested").is_some(),
+            "the sub-repo's NESTED package surfaces after re-rooting, got: {names:?}"
+        );
+        assert!(
+            result.scripts.iter().all(|s| s.script_name != "leak_private"),
+            "the sub-repo's OWN .gitignore (`private/`) is still honored, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn gitignored_git_repo_below_the_top_level_stays_excluded() {
+        // Arbitration B: the repo-of-repos override only un-ignores the workspace's DIRECT
+        // children. A gitignored `.git`-dir buried DEEPER (a vendored clone, a tool cache,
+        // a checked-out dependency) stays excluded — we don't surface arbitrarily nested
+        // repos the user deliberately gitignored.
+        let tree = TempTree::new("deep_vendored_repo");
+        tree.write(".gitignore", "vendored-clone/\n");
+        // A normal (non-ignored) nested dir at the top level is scanned...
+        tree.write("outer/package.json", r#"{ "scripts": { "build_outer": "tsc" } }"#);
+        // ...but a gitignored dir that is ITSELF a git repo, nested at depth 2, is NOT.
+        tree.mkdir("outer/vendored-clone/.git");
+        tree.write(
+            "outer/vendored-clone/package.json",
+            r#"{ "scripts": { "leak_deep_clone": "x" } }"#,
+        );
+
+        let result = discover_scripts(&tree.path());
+        let names: Vec<&String> = result.scripts.iter().map(|s| &s.script_name).collect();
+        assert!(
+            find(&result.scripts, "build_outer").is_some(),
+            "the non-ignored nested dir is still scanned, got: {names:?}"
+        );
+        assert!(
+            result.scripts.iter().all(|s| s.script_name != "leak_deep_clone"),
+            "a gitignored .git-dir below the top level stays excluded, got: {names:?}"
+        );
     }
 
     #[test]
