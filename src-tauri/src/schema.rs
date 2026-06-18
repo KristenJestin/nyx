@@ -44,6 +44,21 @@
 //   `prev_ended_at` (Nullable<BigInt>) / `prev_last_state` (Nullable<Text>, CHECKed
 //   success|error) carry its factual outcome. Bounded to ONE prior run (N=1). All
 //   four are appended last (positional decoding) and back-fill safely ('' / NULL).
+// - v7 (PRD-5) added `agent_sessions` (the GENERIC agent-session model, ADR-0010):
+//   one row per captured agent session, anchored to a `terminal_id` (CASCADE) and an
+//   OPTIONAL `workspace_id` (SET NULL) — the project is derived via the workspace, so
+//   there is NO `project_id` column and NO agent-specific column on `terminals`.
+//   `agent_kind` / `state` are TEXT with CHECK vocabularies (claude_code|codex|
+//   opencode|custom ; active|ended|unknown|resume_failed). `external_session_id` /
+//   `cwd` are first-class NOT NULL columns; `transcript_path` / `ended_at` are
+//   nullable; `metadata_json` is a NOT NULL adapter JSON bag (default '{}');
+//   `started_at` / `last_seen_at` are epoch-ms `BigInt`. Column ORDER here must match
+//   the SQL migration exactly (Diesel positional decoding).
+// - v8 (PRD-5 Phase 3) added `projects.resume_agent_sessions`: the per-project,
+//   default-OFF opt-in to RESUME an active agent session at relaunch (e.g. inject
+//   `claude --resume <id>` into the respawned shell). A SQLite INTEGER 0/1 boolean ↔
+//   Diesel `Bool`, appended LAST on `projects` (positional decoding) and back-filling
+//   safely (DEFAULT 0 → OFF for old projects — no surprise resume on upgrade).
 
 diesel::table! {
     terminals (id) {
@@ -74,6 +89,7 @@ diesel::table! {
         collapsed -> Bool,
         created_at -> BigInt,
         updated_at -> BigInt,
+        resume_agent_sessions -> Bool,
     }
 }
 
@@ -131,13 +147,33 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    agent_sessions (id) {
+        id -> Text,
+        terminal_id -> Text,
+        workspace_id -> Nullable<Text>,
+        agent_kind -> Text,
+        external_session_id -> Text,
+        cwd -> Text,
+        state -> Text,
+        transcript_path -> Nullable<Text>,
+        metadata_json -> Text,
+        started_at -> BigInt,
+        ended_at -> Nullable<BigInt>,
+        last_seen_at -> BigInt,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
 diesel::joinable!(managed_commands -> projects (project_id));
 diesel::joinable!(command_instances -> managed_commands (command_id));
 diesel::joinable!(command_instances -> workspaces (workspace_id));
+diesel::joinable!(agent_sessions -> terminals (terminal_id));
+diesel::joinable!(agent_sessions -> workspaces (workspace_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
+    agent_sessions,
     command_instances,
     managed_commands,
     projects,

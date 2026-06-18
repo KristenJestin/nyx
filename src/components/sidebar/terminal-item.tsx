@@ -8,6 +8,8 @@ import { itemTransition, itemVariants } from "./item-motion";
 import { TerminalStateBadge } from "./run-state";
 import { useRunningDebounce } from "./use-running-debounce";
 import { SidebarItemContent, sidebarRowClassName } from "./sidebar-item";
+import { agentProviderFor } from "./agent-providers";
+import { useTerminalAgentKind } from "./use-agent-sessions";
 import type { TerminalRecord } from "./use-terminals";
 
 /**
@@ -102,6 +104,16 @@ export function TerminalItemBody({
   // not by live selection — so a viewed badge stays hidden after re-deselecting.
   const unread = record.exec_state_unread ?? false;
 
+  // Provider-aware lead glyph (finding #55): while this terminal hosts a LIVE agent
+  // session, show the agent's brand logo (Claude) instead of the generic terminal icon,
+  // reverting the moment the session ends. The active `agent_kind` comes from the shared
+  // agent-sessions context (one subscription for all rows); an unknown/absent kind →
+  // `undefined` provider → the terminal icon. Reactive: the context updates on
+  // `agent-sessions://changed`, so the icon swaps live.
+  const agentKind = useTerminalAgentKind(record.id);
+  const provider = agentProviderFor(agentKind);
+  const LeadIcon = provider?.icon ?? SquareTerminalIcon;
+
   return (
     // The SHARED item layout (lead → name → actions). The magenta selection bar is
     // not per-row: a single MEASURED rail (see `useActiveRail` / `<SelectionRail>`)
@@ -113,8 +125,13 @@ export function TerminalItemBody({
       // <TerminalStateBadge>. The wrapper is NOT `aria-hidden` so the badge's
       // `role="status"` stays in the a11y tree; only the icon is hidden.
       lead={
-        <span className="relative flex shrink-0 items-center">
-          <SquareTerminalIcon
+        <span
+          className="relative flex shrink-0 items-center"
+          // Label the glyph when it is an agent logo so the swap is discoverable to AT
+          // (the generic terminal icon stays decorative / aria-hidden).
+          title={provider?.label}
+        >
+          <LeadIcon
             aria-hidden
             className={cn("size-3.5", active ? "text-sidebar-foreground" : "text-muted-foreground")}
           />

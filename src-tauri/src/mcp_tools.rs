@@ -33,11 +33,12 @@ use std::time::Duration;
 use crate::bridge::{ManagedCommandRunner, PendingTerminalCommands, PtyManager, TerminalPtyMap};
 use crate::command::{poll_until, RunState, WAIT_MAX_TIMEOUT, WAIT_POLL_INTERVAL};
 use crate::db::{self, Db};
+use crate::agent::{AgentEvent, AgentRegistry};
 use crate::mcp::{
-    RpcError, ToolDispatcher, ADD_COMMAND_TOOL, CLEAR_COMMAND_OUTPUT_TOOL, CLOSE_TERMINAL_TOOL,
-    CREATE_TERMINAL_TOOL, IMPORT_COMMANDS_TOOL, LIST_IMPORTABLE_SCRIPTS_TOOL, LIST_TERMINALS_TOOL,
-    PROBE_TOOL, READ_TERMINAL_TOOL, REMOVE_COMMANDS_TOOL, REMOVE_COMMAND_TOOL, REMOVE_WORKSPACE_TOOL,
-    SEND_TO_TERMINAL_TOOL, UPDATE_COMMAND_TOOL, WAIT_FOR_COMMAND_TOOL,
+    RpcError, ToolDispatcher, ADD_COMMAND_TOOL, AGENT_SESSION_EVENT_TOOL, CLEAR_COMMAND_OUTPUT_TOOL,
+    CLOSE_TERMINAL_TOOL, CREATE_TERMINAL_TOOL, IMPORT_COMMANDS_TOOL, LIST_IMPORTABLE_SCRIPTS_TOOL,
+    LIST_TERMINALS_TOOL, PROBE_TOOL, READ_TERMINAL_TOOL, REMOVE_COMMANDS_TOOL, REMOVE_COMMAND_TOOL,
+    REMOVE_WORKSPACE_TOOL, SEND_TO_TERMINAL_TOOL, UPDATE_COMMAND_TOOL, WAIT_FOR_COMMAND_TOOL,
 };
 
 /// Default `tail_bytes` window for `get_command_output` / `wait_for_command`
@@ -1043,6 +1044,138 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         Ok(result)
     }
 
+    /// `agent_session_event` — the Claude Code SessionStart/SessionEnd channel
+    /// (PRD-5 #4, ADR-0004 / ADR-0010). A `mcp_tool` (or best-effort `command`) hook
+    /// forwards its raw payload here; nyx normalizes it through the `claude_code`
+    /// adapter ([`AgentRegistry`]) and persists the `agent_sessions` row:
+    ///
+    ///   - **SessionStart** → [`db::record_session_start`]: UPSERT the single ACTIVE
+    ///     session for `(terminal_id, agent_kind)`, capturing `external_session_id`,
+    ///     `cwd`, `transcript_path`, `metadata_json` (at least `source`) and
+    ///     refreshing `last_seen_at = now`. The session anchors to the terminal's
+    ///     workspace (so the project is derivable, ADR-0010) — read live from the
+    ///     terminal row, NOT trusted from the hook payload.
+    ///   - **SessionEnd** → [`db::mark_session_ended`]: mark the matching ACTIVE
+    ///     session `ended` (the clean-end case). SQLite stays the authority: a brutal
+    ///     kill never fires SessionEnd, and the row simply stays `active` (resumable)
+    ///     until the staleness sweep — nyx never depends on SessionEnd for cleanup.
+    ///
+    /// Correlation is by `NYX_TERMINAL_ID` (the terminal record id nyx exports into
+    /// the shell). An unknown terminal → `invalid_id`; a payload that is not a
+    /// recognizable session event (or lacks a `session_id`) → `invalid_argument`.
+    /// Like [`Self::probe`], a not-yet-warm runtime degrades to `mcp_unavailable`
+    /// (via [`Self::db`]) so a best-effort hook never wedges the agent's startup.
+    fn agent_session_event(&self, args: &Value) -> Result<Value, RpcError> {
+        // The agent kind selects the adapter; default to claude_code (the only v1
+        // production adapter, and the only one that installs this hook).
+        let agent_kind = optional_str(args, "agent_kind")?.unwrap_or(db::AGENT_KIND_CLAUDE_CODE);
+        let registry = AgentRegistry::default();
+        let adapter = registry.get(agent_kind).ok_or_else(|| {
+            RpcError::new("invalid_argument", format!("unknown agent_kind '{agent_kind}'"))
+        })?;
+
+        // The terminal correlation id is required: without it nyx cannot bind the
+        // session to a terminal (and resume would have no shell to respawn into).
+        let terminal_id = require_str(args, "NYX_TERMINAL_ID")?;
+
+        // Normalize the raw hook payload through the adapter (start / end / None).
+        let event = adapter.parse_event(args).ok_or_else(|| {
+            RpcError::new(
+                "invalid_argument",
+                "payload is not a recognizable agent session event (need hook_event_name + session_id)",
+            )
+        })?;
+
+        let db = self.db()?;
+        match event {
+            AgentEvent::Start(start) => {
+                // Resolve the terminal's CURRENT workspace anchor live from the row —
+                // the project is derived from it (ADR-0010), and the hook must not be
+                // trusted to assert a workspace. An unknown terminal → invalid_id.
+                let session = db
+                    .with_conn(|c| -> Result<Option<db::AgentSession>, diesel::result::Error> {
+                        let Some(terminal) = db::get_terminal(c, terminal_id)? else {
+                            return Ok(None);
+                        };
+                        let capture = db::SessionCapture {
+                            workspace_id: terminal.workspace_id,
+                            external_session_id: start.external_session_id,
+                            cwd: start.cwd,
+                            transcript_path: start.transcript_path,
+                            metadata_json: start.metadata_json,
+                        };
+                        let row = db::record_session_start(c, terminal_id, agent_kind, capture)?;
+                        Ok(Some(row))
+                    })
+                    .map_err(internal_db("record agent session start"))?;
+                let Some(session) = session else {
+                    return Err(RpcError::new(
+                        "invalid_id",
+                        format!("unknown terminal {terminal_id}"),
+                    ));
+                };
+                // A new ACTIVE session exists → the sidebar should swap this terminal's
+                // row to the agent's icon (finding #55). Emit the coalescing refresh so
+                // the front re-pulls `agent_active_sessions`.
+                crate::bridge::emit_agent_sessions_changed(&self.app);
+                Ok(json!({
+                    "event": "SessionStart",
+                    "session_id": session.id,
+                    "terminal_id": session.terminal_id,
+                    "agent_kind": session.agent_kind,
+                    "external_session_id": session.external_session_id,
+                    "state": session.state,
+                    "workspace_id": session.workspace_id,
+                }))
+            }
+            AgentEvent::End(end) => {
+                // Find the ACTIVE session for this terminal+agent and, only when its
+                // external id matches the ended one, mark it ended. A mismatch (or no
+                // active row) is reported as ended:false — SQLite is the authority, so
+                // a stray/duplicate end never corrupts state.
+                let outcome = db
+                    .with_conn(|c| -> Result<Option<(String, bool)>, diesel::result::Error> {
+                        let Some(active) = db::active_session_for(c, terminal_id, agent_kind)? else {
+                            return Ok(None);
+                        };
+                        if active.external_session_id != end.external_session_id {
+                            // The active session is a different one — do not end it.
+                            return Ok(Some((active.id, false)));
+                        }
+                        db::mark_session_ended(c, &active.id)?;
+                        Ok(Some((active.id, true)))
+                    })
+                    .map_err(internal_db("end agent session"))?;
+                match outcome {
+                    Some((session_id, true)) => {
+                        // The active session ended → the terminal row reverts to the
+                        // generic terminal icon (finding #55). Refresh the sidebar.
+                        crate::bridge::emit_agent_sessions_changed(&self.app);
+                        Ok(json!({
+                            "event": "SessionEnd",
+                            "session_id": session_id,
+                            "terminal_id": terminal_id,
+                            "ended": true,
+                        }))
+                    }
+                    Some((session_id, false)) => Ok(json!({
+                        "event": "SessionEnd",
+                        "session_id": session_id,
+                        "terminal_id": terminal_id,
+                        "ended": false,
+                        "reason": "active session id does not match the ended session",
+                    })),
+                    None => Ok(json!({
+                        "event": "SessionEnd",
+                        "terminal_id": terminal_id,
+                        "ended": false,
+                        "reason": "no active session for this terminal",
+                    })),
+                }
+            }
+        }
+    }
+
     /// Confirm `instance_id` names a real instance, mapping an unknown id to
     /// `invalid_id`. Used by tools (e.g. `stop_command`) whose runner call is
     /// idempotent on an absent instance and so would otherwise silently succeed. An
@@ -2006,6 +2139,11 @@ impl<R: Runtime> ToolDispatcher for NyxToolDispatcher<R> {
             // Advertised scrollback-read extension (NOT in V1_TOOLS, PRD-4.1 #1): the read
             // counterpart to send_to_terminal, over the EXISTING front-serialized scrollback.
             READ_TERMINAL_TOOL => self.read_terminal(arguments),
+            // Advertised agent-session channel (NOT in V1_TOOLS, PRD-5 #4 / ADR-0004):
+            // the Claude Code SessionStart/SessionEnd hook target. Normalizes the raw
+            // hook payload through the claude_code adapter and persists the
+            // `agent_sessions` row (capture on start, end on SessionEnd).
+            AGENT_SESSION_EVENT_TOOL => self.agent_session_event(arguments),
             "workspace_add" => self.workspace_add(arguments),
             "create_workspace" => self.create_workspace(arguments),
             other => Err(RpcError::new(
@@ -4686,9 +4824,21 @@ mod tests {
 
     /// Run a git subcommand in `dir`, asserting success, with a deterministic identity
     /// so the test never depends on the host's git config. Mirrors `db::tests::git_in`.
+    /// Commit signing is forced OFF: a developer host may set `commit.gpgsign=true`
+    /// globally, which would make the non-interactive test commit prompt for a key
+    /// passphrase and fail. The test only needs a commit to exist, not a signed one.
     fn git_in(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
-            .args(["-c", "user.email=test@nyx", "-c", "user.name=nyx-test"])
+            .args([
+                "-c",
+                "user.email=test@nyx",
+                "-c",
+                "user.name=nyx-test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+            ])
             .args(args)
             .current_dir(dir)
             .status()
@@ -6904,5 +7054,193 @@ mod tests {
 
         // Clean up the live PTY (the only OS resource this test holds).
         let _ = app.state::<PtyManager>().close_id(pty_id);
+    }
+
+    // --- agent_session_event channel (PRD-5 #4, ADR-0004 / ADR-0010) -------
+    //
+    // The Claude Code SessionStart/SessionEnd hook target, driven through the REAL
+    // NyxToolDispatcher over an in-memory Db (same mock-runtime seam as the rest of
+    // this suite; `cargo test --lib` can't launch on this host — the ConPTY gap — but
+    // `--no-run` type-checks them and CI runs them).
+
+    /// Make a real terminal record and return its id (the NYX_TERMINAL_ID a hook sends).
+    fn new_terminal(app: &tauri::App<MockRuntime>) -> String {
+        app.state::<Db>()
+            .with_conn(|c| db::create_terminal(c, "/work", None).map(|t| t.id))
+            .expect("create terminal")
+    }
+
+    /// SessionStart creates an `agent_sessions` row (state=active), capturing the
+    /// external id / cwd / transcript / source, bound to the terminal.
+    #[test]
+    fn session_start_creates_active_row() {
+        let (d, app, _c) = seed_terminal_app();
+        let tid = new_terminal(&app);
+        let res = d
+            .call(
+                AGENT_SESSION_EVENT_TOOL,
+                &json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "claude-sid-1",
+                    "cwd": "/work/proj",
+                    "transcript_path": "/home/u/.claude/projects/h/claude-sid-1.jsonl",
+                    "source": "startup",
+                    "NYX_TERMINAL_ID": tid,
+                }),
+            )
+            .expect("session start recorded");
+        assert_eq!(res["event"], "SessionStart");
+        assert_eq!(res["state"], db::SESSION_STATE_ACTIVE);
+        assert_eq!(res["external_session_id"], "claude-sid-1");
+
+        // The active row exists with the captured fields + source metadata.
+        let row = app
+            .state::<Db>()
+            .with_conn(|c| db::active_session_for(c, &tid, db::AGENT_KIND_CLAUDE_CODE))
+            .unwrap()
+            .expect("an active session for the terminal");
+        assert_eq!(row.external_session_id, "claude-sid-1");
+        assert_eq!(row.cwd, "/work/proj");
+        assert_eq!(row.transcript_path.as_deref(), Some("/home/u/.claude/projects/h/claude-sid-1.jsonl"));
+        assert!(row.metadata_json.contains("startup"), "source stashed in metadata");
+    }
+
+    /// A second SessionStart on the SAME terminal (a resume) UPSERTS the one active
+    /// row and pushes `last_seen_at` forward — never a duplicate active row.
+    #[test]
+    fn session_start_upserts_and_refreshes_last_seen() {
+        let (d, app, _c) = seed_terminal_app();
+        let tid = new_terminal(&app);
+        d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionStart", "session_id": "sid-a", "cwd": "/w", "source": "startup", "NYX_TERMINAL_ID": tid,
+        })).expect("first start");
+        let first = app.state::<Db>()
+            .with_conn(|c| db::active_session_for(c, &tid, db::AGENT_KIND_CLAUDE_CODE)).unwrap().unwrap();
+
+        // Sleep a hair so the millisecond clock advances, then resume.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionStart", "session_id": "sid-b", "cwd": "/w", "source": "resume", "NYX_TERMINAL_ID": tid,
+        })).expect("resume start");
+
+        let all = app.state::<Db>().with_conn(|c| db::sessions_for_terminal(c, &tid)).unwrap();
+        assert_eq!(all.len(), 1, "upsert keeps ONE row, not two");
+        let after = &all[0];
+        assert_eq!(after.id, first.id, "same row updated in place");
+        assert_eq!(after.external_session_id, "sid-b", "external id refreshed");
+        assert!(after.last_seen_at >= first.last_seen_at, "last_seen_at moved forward");
+    }
+
+    /// SessionEnd on the clean case marks the matching active session `ended`.
+    #[test]
+    fn session_end_marks_session_ended() {
+        let (d, app, _c) = seed_terminal_app();
+        let tid = new_terminal(&app);
+        d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionStart", "session_id": "sid-end", "cwd": "/w", "NYX_TERMINAL_ID": tid,
+        })).expect("start");
+        let res = d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionEnd", "session_id": "sid-end", "NYX_TERMINAL_ID": tid,
+        })).expect("end");
+        assert_eq!(res["ended"], json!(true));
+        // No active row remains; the row is now `ended` with an ended_at stamp.
+        assert!(app.state::<Db>()
+            .with_conn(|c| db::active_session_for(c, &tid, db::AGENT_KIND_CLAUDE_CODE)).unwrap().is_none(),
+            "no active session after a clean end");
+        let row = app.state::<Db>().with_conn(|c| db::sessions_for_terminal(c, &tid)).unwrap().pop().unwrap();
+        assert_eq!(row.state, db::SESSION_STATE_ENDED);
+        assert!(row.ended_at.is_some(), "clean end stamps ended_at");
+    }
+
+    /// A brutal kill never fires SessionEnd: with no end event, the row stays `active`
+    /// and resumable. We simulate "kill" as the absence of an end event and assert the
+    /// row is still active (SQLite is the authority, ADR-0004 / ADR-0010).
+    #[test]
+    fn brutal_kill_leaves_session_resumable() {
+        let (d, app, _c) = seed_terminal_app();
+        let tid = new_terminal(&app);
+        d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionStart", "session_id": "sid-kill", "cwd": "/w", "NYX_TERMINAL_ID": tid,
+        })).expect("start");
+        // No SessionEnd is delivered (a SIGKILL / app crash). The row must remain active.
+        let row = app.state::<Db>()
+            .with_conn(|c| db::active_session_for(c, &tid, db::AGENT_KIND_CLAUDE_CODE)).unwrap()
+            .expect("session still active after a kill (no clean end)");
+        assert_eq!(row.state, db::SESSION_STATE_ACTIVE, "a killed session stays a resume candidate");
+        assert!(row.ended_at.is_none(), "no ended_at without a clean SessionEnd");
+    }
+
+    /// A SessionEnd carrying a DIFFERENT external id does not end the active session
+    /// (SQLite stays the authority; a stray end never corrupts state).
+    #[test]
+    fn session_end_with_mismatched_id_does_not_end() {
+        let (d, app, _c) = seed_terminal_app();
+        let tid = new_terminal(&app);
+        d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionStart", "session_id": "sid-live", "cwd": "/w", "NYX_TERMINAL_ID": tid,
+        })).expect("start");
+        let res = d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionEnd", "session_id": "some-other-id", "NYX_TERMINAL_ID": tid,
+        })).expect("end call returns");
+        assert_eq!(res["ended"], json!(false), "a mismatched end does not end the live session");
+        assert_eq!(app.state::<Db>()
+            .with_conn(|c| db::active_session_for(c, &tid, db::AGENT_KIND_CLAUDE_CODE)).unwrap().unwrap().state,
+            db::SESSION_STATE_ACTIVE);
+    }
+
+    /// An unknown terminal id → invalid_id (the D8 vocabulary).
+    #[test]
+    fn session_start_unknown_terminal_is_invalid_id() {
+        let (d, _app, _c) = seed_terminal_app();
+        let err = d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionStart", "session_id": "x", "cwd": "/w", "NYX_TERMINAL_ID": "no-such-terminal",
+        })).expect_err("unknown terminal");
+        assert_eq!(err.code, "invalid_id");
+    }
+
+    /// A payload without NYX_TERMINAL_ID, or that is not a recognizable event, is an
+    /// invalid_argument (the contract's error path).
+    #[test]
+    fn session_event_invalid_payloads_are_invalid_argument() {
+        let (d, app, _c) = seed_terminal_app();
+        let tid = new_terminal(&app);
+        // Missing NYX_TERMINAL_ID.
+        let e1 = d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionStart", "session_id": "x", "cwd": "/w",
+        })).expect_err("missing terminal id");
+        assert_eq!(e1.code, "invalid_argument");
+        // Unrecognized hook event.
+        let e2 = d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "PreToolUse", "session_id": "x", "NYX_TERMINAL_ID": tid,
+        })).expect_err("not a session event");
+        assert_eq!(e2.code, "invalid_argument");
+    }
+
+    /// The session anchors to the terminal's CURRENT workspace (so the project is
+    /// derivable, ADR-0010) — read live from the terminal row, not the hook payload.
+    #[test]
+    fn session_start_anchors_to_terminal_workspace() {
+        let (d, app, _c) = seed_terminal_app();
+        // A workspace + a terminal attached to it.
+        let ws_path = std::env::temp_dir().join(format!("nyx-sess-ws-{}", uuid_like()));
+        std::fs::create_dir_all(&ws_path).unwrap();
+        let (tid, workspace_id) = app.state::<Db>().with_conn(|c| {
+            let (_p, w) = db::create_project(c, "proj", &ws_path.to_string_lossy(), None)?;
+            let t = db::create_terminal(c, "/work", None)?;
+            db::attach_terminal(c, &t.id, &w.id, db::BINDING_AUTO)?;
+            Ok::<_, diesel::result::Error>((t.id, w.id))
+        }).unwrap();
+
+        d.call(AGENT_SESSION_EVENT_TOOL, &json!({
+            "hook_event_name": "SessionStart", "session_id": "sid-ws", "cwd": "/work", "NYX_TERMINAL_ID": tid,
+        })).expect("start");
+
+        let row = app.state::<Db>()
+            .with_conn(|c| db::active_session_for(c, &tid, db::AGENT_KIND_CLAUDE_CODE)).unwrap().unwrap();
+        assert_eq!(row.workspace_id.as_deref(), Some(workspace_id.as_str()),
+            "session anchors to the terminal's workspace");
+        // And the project is derivable via the workspace (no denormalized project_id).
+        let project = app.state::<Db>().with_conn(|c| db::project_id_for_session(c, &row.id)).unwrap();
+        assert!(project.is_some(), "project derivable from the session's workspace");
     }
 }

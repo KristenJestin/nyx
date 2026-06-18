@@ -4,6 +4,7 @@ import { Input } from "@base-ui/react/input";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogBackdrop, DialogPopup } from "@/components/ui/dialog";
+import { Switch } from "@/components/ui/switch";
 
 /** Which flow the project dialog is driving. */
 export type ProjectDialogMode = "create" | "edit" | "delete";
@@ -24,6 +25,17 @@ export interface ProjectDialogProps {
   error?: string | null;
   /** True while the create/edit/delete command is in flight. */
   submitting?: boolean;
+  /**
+   * EDIT only — the project's current `resume_agent_sessions` opt-in (PRD-5 #5).
+   * When provided alongside [`onResumeAgentSessionsChange`], the edit dialog shows a
+   * toggle that resumes the project's terminals' active agent sessions at relaunch.
+   */
+  resumeAgentSessions?: boolean;
+  /**
+   * EDIT only — persist a change to the resume opt-in. Called as the user flips the
+   * toggle (independent of the name Save, so the toggle takes effect immediately).
+   */
+  onResumeAgentSessionsChange?: (resume: boolean) => void;
   /** Confirm: create/edit pass the (edited) name; delete ignores it. */
   onConfirm: (name: string) => void;
   /** Dismiss without acting (cancel / backdrop / Escape). */
@@ -52,6 +64,8 @@ export function ProjectDialog({
   defaultName,
   error,
   submitting = false,
+  resumeAgentSessions,
+  onResumeAgentSessionsChange,
   onConfirm,
   onCancel,
 }: ProjectDialogProps) {
@@ -144,6 +158,30 @@ export function ProjectDialog({
                     )}
                   />
                 </label>
+
+                {mode === "edit" && onResumeAgentSessionsChange && (
+                  <label
+                    htmlFor="resume-agent-sessions"
+                    className="flex items-start justify-between gap-3"
+                  >
+                    <span className="flex flex-col gap-0.5">
+                      <span className="text-sm font-medium text-foreground">
+                        Resume agent sessions
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        On relaunch, resume this project's active Claude sessions (exact
+                        <code className="mx-1">--resume</code>) instead of a bare shell. Off by
+                        default.
+                      </span>
+                    </span>
+                    <Switch
+                      id="resume-agent-sessions"
+                      aria-label="Resume agent sessions on relaunch"
+                      checked={resumeAgentSessions ?? false}
+                      onCheckedChange={(checked) => onResumeAgentSessionsChange(checked)}
+                    />
+                  </label>
+                )}
 
                 {error && (
                   <p role="alert" className="text-sm text-destructive">

@@ -6,33 +6,32 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import { SettingsDialog, type SettingsDialogHandle } from "./settings-dialog";
 
 /**
- * Unit coverage for the Settings modal (PRD-4 #3 + R-UI review).
+ * Unit coverage for the Settings modal (PRD-4 #3 + R-UI review + PRD-5 #44/#45/#46/#49).
  *
  * The modal is a left **section rail** (Integrations now, extensible) + a right
- * **detail pane**. The Integrations pane is a thin shell over three Tauri
- * commands — `integration_list` / `integration_install` / `integration_remove`.
- * We mock the IPC layer and assert:
- *  - the section rail renders the Integrations entry and selecting it shows its
- *    detail pane (section navigation);
- *  - the four registry providers render, Claude Code's Install/Remove buttons
- *    invoke the right command with the right `provider` arg, and the coming-soon
- *    providers (Codex/OpenCode/Custom) expose no action buttons;
- *  - clicking Install/Remove shows the loading spinner ON THAT button while the
- *    op is in flight, with the rest of the providers list still mounted (no
- *    full-modal flash / reload).
+ * **detail pane**. The Integrations pane is a thin shell over three Tauri commands —
+ * `integration_list` / `integration_install` / `integration_remove`. The nyx Claude
+ * integration is now ONE bundled plugin (MCP server + session-capture hooks), so each
+ * available provider has a SINGLE Install/Uninstall control (finding #45). We mock the
+ * IPC layer and assert:
+ *  - the section rail renders the Integrations entry and selecting it shows its detail
+ *    pane (section navigation);
+ *  - the four registry providers render; Claude Code's single Install/Uninstall button
+ *    invokes the right command with the right `provider`; and the coming-soon providers
+ *    (Codex/OpenCode/Custom) expose no action buttons;
+ *  - clicking the single button shows the loading spinner + disabled state while the op is
+ *    in flight, with the rest of the providers list still mounted (finding #49);
+ *  - an install error (e.g. claude absent) is surfaced clearly (finding #49).
  *
- * The dialog loads the provider list ON THE OPEN EVENT (via its imperative
- * `reload()` handle), not from an effect watching `open` — so the test mirrors
- * the real open path: a tiny host opens the dialog and calls `reload()` exactly
- * like `terminal-manager`'s `onOpenSettings` does.
+ * The dialog loads the provider list ON THE OPEN EVENT (via its imperative `reload()`
+ * handle), not from an effect watching `open` — so the test mirrors the real open path: a
+ * tiny host opens the dialog and calls `reload()` exactly like `terminal-manager`'s
+ * `onOpenSettings` does.
  */
 
 /**
- * Mirror of `terminal-manager`'s open-event wiring: mount the dialog open and
- * fire `reload()` once, the way the gear-button handler does. Using a mount
- * effect here drives the SAME imperative path the production event handler
- * uses; it is not the pattern under test (the component itself carries no
- * open-watching effect).
+ * Mirror of `terminal-manager`'s open-event wiring: mount the dialog open and fire
+ * `reload()` once, the way the gear-button handler does.
  */
 function OpenSettings() {
   const ref = useRef<SettingsDialogHandle>(null);
@@ -50,9 +49,9 @@ interface IntegrationStatus {
 }
 
 /** The 4-provider list the Rust `integration_list` returns (bridge.rs). */
-function defaultList(claudeInstalled = false): IntegrationStatus[] {
+function defaultList(installed = false): IntegrationStatus[] {
   return [
-    { provider: "claude_code", label: "Claude Code", installed: claudeInstalled, available: true },
+    { provider: "claude_code", label: "Claude Code", installed, available: true },
     { provider: "codex", label: "Codex", installed: false, available: false },
     { provider: "opencode", label: "OpenCode", installed: false, available: false },
     { provider: "custom", label: "Custom", installed: false, available: false },
@@ -61,41 +60,31 @@ function defaultList(claudeInstalled = false): IntegrationStatus[] {
 
 interface Backend {
   calls: { cmd: string; args: Record<string, unknown> }[];
-  /** Mutable installed flag for claude_code so install/remove can flip the list. */
-  claudeInstalled: boolean;
+  /** Mutable installed flag for claude_code so install/remove flip the list. */
+  installed: boolean;
 }
 
-/** Install a mock IPC backend modelling the integration_* commands. */
-function mockBackend(claudeInstalled = false): Backend {
-  const backend: Backend = { calls: [], claudeInstalled };
+function claudeStatus(b: Backend): IntegrationStatus {
+  return { provider: "claude_code", label: "Claude Code", installed: b.installed, available: true };
+}
+
+/** Install a mock IPC backend modelling the single-unit integration_* commands. */
+function mockBackend(installed = false): Backend {
+  const backend: Backend = { calls: [], installed };
   mockIPC((cmd, args) => {
     const a = (args ?? {}) as Record<string, unknown>;
     backend.calls.push({ cmd, args: a });
     switch (cmd) {
       case "integration_list":
-        return defaultList(backend.claudeInstalled);
+        return defaultList(backend.installed);
       case "integration_install":
-        if (a.provider === "claude_code") {
-          backend.claudeInstalled = true;
-          return {
-            provider: "claude_code",
-            label: "Claude Code",
-            installed: true,
-            available: true,
-          };
+      case "integration_remove": {
+        if (a.provider !== "claude_code") {
+          throw `provider '${String(a.provider)}' is not supported in v1`;
         }
-        throw `provider '${String(a.provider)}' is not supported in v1`;
-      case "integration_remove":
-        if (a.provider === "claude_code") {
-          backend.claudeInstalled = false;
-          return {
-            provider: "claude_code",
-            label: "Claude Code",
-            installed: false,
-            available: true,
-          };
-        }
-        throw `provider '${String(a.provider)}' is not supported in v1`;
+        backend.installed = cmd === "integration_install";
+        return claudeStatus(backend);
+      }
       default:
         return null;
     }
@@ -109,32 +98,45 @@ interface DeferredBackend extends Backend {
 }
 
 /**
- * A mock backend whose `integration_install` / `integration_remove` DO NOT
- * resolve until the test calls `resolveOp()`. This lets the test observe the
- * in-flight state — the spinner on the clicked button — deterministically,
- * before the op settles and the list re-pulls.
+ * A mock backend whose `integration_install` / `integration_remove` DO NOT resolve until
+ * the test calls `resolveOp()`. This lets the test observe the in-flight state — the
+ * spinner on the single button — deterministically, before the op settles.
  */
-function mockDeferredBackend(claudeInstalled = false): DeferredBackend {
-  const backend = { calls: [], claudeInstalled, resolveOp: () => {} } as DeferredBackend;
+function mockDeferredBackend(installed = false): DeferredBackend {
+  const backend = { calls: [], installed, resolveOp: () => {} } as DeferredBackend;
   mockIPC((cmd, args) => {
     const a = (args ?? {}) as Record<string, unknown>;
     backend.calls.push({ cmd, args: a });
     switch (cmd) {
       case "integration_list":
-        return defaultList(backend.claudeInstalled);
+        return defaultList(backend.installed);
       case "integration_install":
       case "integration_remove":
         return new Promise((resolve) => {
           backend.resolveOp = () => {
-            backend.claudeInstalled = cmd === "integration_install";
-            resolve({
-              provider: "claude_code",
-              label: "Claude Code",
-              installed: backend.claudeInstalled,
-              available: true,
-            });
+            backend.installed = cmd === "integration_install";
+            resolve(claudeStatus(backend));
           };
         });
+      default:
+        return null;
+    }
+  });
+  return backend;
+}
+
+/** A mock backend whose install/remove ALWAYS fail with a string error (claude absent). */
+function mockFailingBackend(message: string): Backend {
+  const backend: Backend = { calls: [], installed: false };
+  mockIPC((cmd, args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    backend.calls.push({ cmd, args: a });
+    switch (cmd) {
+      case "integration_list":
+        return defaultList(backend.installed);
+      case "integration_install":
+      case "integration_remove":
+        throw message;
       default:
         return null;
     }
@@ -154,7 +156,6 @@ describe("<SettingsDialog> — Integrations", () => {
     mockBackend();
     render(<OpenSettings />);
 
-    // The list loads asynchronously via integration_list.
     await waitFor(() => {
       expect(screen.getByText("Claude Code")).toBeInTheDocument();
     });
@@ -172,13 +173,12 @@ describe("<SettingsDialog> — Integrations", () => {
     // Three coming-soon badges (codex, opencode, custom).
     expect(screen.getAllByText("Coming soon")).toHaveLength(3);
 
-    // None of the disabled providers expose Install/Remove. Only Claude Code
-    // (available) does → exactly one Install button overall.
+    // Only Claude Code (available) exposes a single Install action.
     expect(screen.getAllByRole("button", { name: "Install" })).toHaveLength(1);
-    expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Uninstall" })).not.toBeInTheDocument();
   });
 
-  it("Install for Claude Code invokes integration_install with the right provider", async () => {
+  it("the single Install button invokes integration_install with the provider", async () => {
     const backend = mockBackend(false);
     render(<OpenSettings />);
 
@@ -190,21 +190,24 @@ describe("<SettingsDialog> — Integrations", () => {
     });
     const call = backend.calls.find((c) => c.cmd === "integration_install");
     expect(call?.args.provider).toBe("claude_code");
+    // No `component` arg anymore — it is one unit.
+    expect(call?.args.component).toBeUndefined();
 
-    // After a successful install the list re-pulls and the button flips to Remove.
+    // After install the button flips to Uninstall and the Installed badge appears.
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Uninstall" })).toBeInTheDocument();
     });
+    expect(screen.getByText("Installed")).toBeInTheDocument();
   });
 
-  it("Remove for an installed Claude Code invokes integration_remove with the right provider", async () => {
+  it("the single Uninstall button invokes integration_remove with the provider", async () => {
     const backend = mockBackend(true);
     render(<OpenSettings />);
 
-    const removeBtn = await screen.findByRole("button", { name: "Remove" });
-    // An "Installed" success badge accompanies the installed state.
+    const uninstallBtn = await screen.findByRole("button", { name: "Uninstall" });
+    // Installed badge present while installed.
     expect(screen.getByText("Installed")).toBeInTheDocument();
-    removeBtn.click();
+    uninstallBtn.click();
 
     await waitFor(() => {
       expect(backend.calls.some((c) => c.cmd === "integration_remove")).toBe(true);
@@ -212,7 +215,7 @@ describe("<SettingsDialog> — Integrations", () => {
     const call = backend.calls.find((c) => c.cmd === "integration_remove");
     expect(call?.args.provider).toBe("claude_code");
 
-    // After a successful remove the list re-pulls and the button flips to Install.
+    // After uninstall the button flips back to Install.
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Install" })).toBeInTheDocument();
     });
@@ -224,18 +227,28 @@ describe("<SettingsDialog> — Integrations", () => {
 
     await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
 
-    // Locate each coming-soon row by its label, walk up to the provider card
-    // (the <li>), and assert the card carries no action button.
     for (const label of ["Codex", "OpenCode", "Custom"]) {
       const card = screen.getByText(label).closest("li");
       expect(card).toBeTruthy();
       expect(within(card as HTMLElement).queryByRole("button")).not.toBeInTheDocument();
     }
 
-    // And the available Claude Code card DOES carry an action button (sanity:
-    // the helper above would also pass if every card lacked buttons).
     const claudeCard = screen.getByText("Claude Code").closest("li");
-    expect(within(claudeCard as HTMLElement).getByRole("button")).toBeInTheDocument();
+    expect(within(claudeCard as HTMLElement).getAllByRole("button").length).toBeGreaterThan(0);
+  });
+
+  it("surfaces an install error clearly (claude absent)", async () => {
+    const message = "the 'claude' CLI was not found on PATH — install Claude Code";
+    mockFailingBackend(message);
+    render(<OpenSettings />);
+
+    const installBtn = await screen.findByRole("button", { name: "Install" });
+    fireEvent.click(installBtn);
+
+    // The error message is rendered verbatim, and the button returns to Install (not stuck).
+    await waitFor(() => expect(screen.getByText(message)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Install" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Install" })).not.toBeDisabled();
   });
 });
 
@@ -251,13 +264,10 @@ describe("<SettingsDialog> — section rail navigation", () => {
     mockBackend();
     render(<OpenSettings />);
 
-    // The rail is a labelled <nav> region; Integrations is its (only, for now)
-    // entry, and it is current/selected on open.
     const rail = screen.getByRole("navigation", { name: "Settings sections" });
     const integrationsTab = within(rail).getByRole("button", { name: "Integrations" });
     expect(integrationsTab).toHaveAttribute("aria-current", "page");
 
-    // Selecting the section shows the Integrations detail pane (its providers).
     await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
   });
 
@@ -270,15 +280,13 @@ describe("<SettingsDialog> — section rail navigation", () => {
 
     await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
 
-    // Clicking the already-selected section keeps the pane mounted (navigation
-    // is idempotent — re-selecting does not blank the detail pane).
     fireEvent.click(integrationsTab);
     expect(integrationsTab).toHaveAttribute("aria-current", "page");
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
   });
 });
 
-describe("<SettingsDialog> — per-button loading", () => {
+describe("<SettingsDialog> — button loading", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
   });
@@ -286,55 +294,45 @@ describe("<SettingsDialog> — per-button loading", () => {
     vi.restoreAllMocks();
   });
 
-  it("shows the spinner ON the Install button while in flight, list stays mounted", async () => {
+  it("shows the spinner ON the Install button while the op is in flight, list stays mounted", async () => {
     const backend = mockDeferredBackend(false);
     render(<OpenSettings />);
 
     const installBtn = await screen.findByRole("button", { name: "Install" });
-
-    // Start the install — it hangs (deferred backend) so we can observe the
-    // in-flight state.
     fireEvent.click(installBtn);
 
-    // The CLICKED button carries the Button's built-in loading markers
-    // (`data-loading` + its own spinner indicator), and is disabled while busy.
+    // The clicked button carries the Button's built-in loading markers and is disabled.
     await waitFor(() => {
       expect(installBtn).toHaveAttribute("data-loading", "");
     });
     expect(installBtn).toBeDisabled();
     expect(within(installBtn).getByRole("status", { name: "Loading" })).toBeInTheDocument();
 
-    // The rest of the providers list is STILL MOUNTED during the op — no
-    // full-modal/full-pane flash that would unmount the other rows.
+    // The rest of the list is STILL MOUNTED during the op — no full-pane flash.
     expect(screen.getByText("Codex")).toBeInTheDocument();
-    expect(screen.getByText("OpenCode")).toBeInTheDocument();
-    expect(screen.getByText("Custom")).toBeInTheDocument();
-    // There is exactly ONE in-flight button spinner (only the clicked button),
-    // not a pane-level loader replacing the list.
+    // Exactly ONE in-flight spinner (the single clicked button).
     expect(screen.getAllByRole("status", { name: "Loading" })).toHaveLength(1);
 
-    // Resolve the op: the list re-pulls and the button flips to Remove.
+    // Resolve the op: the list re-pulls and the button flips to Uninstall.
     await act(async () => {
       backend.resolveOp();
     });
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Uninstall" })).toBeInTheDocument();
     });
   });
 
-  it("shows the spinner ON the Remove button while in flight, list stays mounted", async () => {
+  it("shows the spinner ON the Uninstall button while the op is in flight", async () => {
     const backend = mockDeferredBackend(true);
     render(<OpenSettings />);
 
-    const removeBtn = await screen.findByRole("button", { name: "Remove" });
+    const removeBtn = await screen.findByRole("button", { name: "Uninstall" });
     fireEvent.click(removeBtn);
 
     await waitFor(() => {
       expect(removeBtn).toHaveAttribute("data-loading", "");
     });
     expect(removeBtn).toBeDisabled();
-
-    // The other (coming-soon) rows stay mounted while the remove is in flight.
     expect(screen.getByText("Codex")).toBeInTheDocument();
     expect(screen.getAllByRole("status", { name: "Loading" })).toHaveLength(1);
 

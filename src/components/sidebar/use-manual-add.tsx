@@ -11,6 +11,8 @@ export interface UseManualAddDeps {
   createWorkspace: (projectId: string, name: string, path: string) => Promise<WorkspaceRecord>;
   /** Rename a project's display name (backend `update_project`). */
   updateProject?: (id: string, name: string) => Promise<void>;
+  /** Toggle a project's resume-agent-sessions opt-in (PRD-5 #5). */
+  setProjectResumeAgentSessions?: (id: string, resume: boolean) => Promise<void>;
   /** Delete a project + its workspaces (terminals detached, kept). */
   deleteProject?: (id: string) => Promise<void>;
   /** Folder picker; injectable so tests stub it instead of the Tauri plugin. */
@@ -46,6 +48,8 @@ interface ProjectDialogState {
   /** Present for `edit`/`delete`: the target project's id. */
   projectId?: string;
   defaultName: string;
+  /** Present for `edit`: the project's current resume-agent-sessions opt-in. */
+  resumeAgentSessions?: boolean;
 }
 
 /**
@@ -68,6 +72,7 @@ export function useManualAdd({
   createProject,
   createWorkspace,
   updateProject,
+  setProjectResumeAgentSessions,
   deleteProject,
   pick = pickDirectory,
 }: UseManualAddDeps): UseManualAdd {
@@ -122,6 +127,7 @@ export function useManualAdd({
       mode: "edit",
       projectId: tree.project.id,
       defaultName: tree.project.name,
+      resumeAgentSessions: tree.project.resume_agent_sessions,
     });
   }, []);
 
@@ -233,6 +239,21 @@ export function useManualAdd({
         mode={projDialog?.mode ?? "create"}
         path={projDialog?.path}
         defaultName={projDialog?.defaultName ?? ""}
+        resumeAgentSessions={projDialog?.resumeAgentSessions}
+        onResumeAgentSessionsChange={
+          setProjectResumeAgentSessions
+            ? (resume) => {
+                if (!projDialog?.projectId) return;
+                const id = projDialog.projectId;
+                // Reflect the toggle locally so the switch tracks immediately, then
+                // persist (takes effect at once, independent of the name Save).
+                setProjDialog((prev) =>
+                  prev ? { ...prev, resumeAgentSessions: resume } : prev,
+                );
+                void setProjectResumeAgentSessions(id, resume);
+              }
+            : undefined
+        }
         error={error}
         submitting={submitting}
         onConfirm={(name) => void confirmProject(name)}

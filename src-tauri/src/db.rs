@@ -19,7 +19,9 @@ use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 use uuid::Uuid;
 
 use crate::pathnorm;
-use crate::schema::{command_instances, managed_commands, projects, terminals, workspaces};
+use crate::schema::{
+    agent_sessions, command_instances, managed_commands, projects, terminals, workspaces,
+};
 
 /// The migrations baked into the binary at compile time from `migrations/`.
 /// Running them is idempotent (Diesel tracks applied versions in
@@ -62,6 +64,44 @@ pub const STATE_ERROR: &str = "error";
 /// the CHECK constraint in migration v3.
 #[cfg_attr(not(test), allow(dead_code))]
 pub const SOURCE_KIND_PACKAGE_JSON: &str = "package_json";
+
+// --- Agent session vocabularies (PRD-5 v7, ADR-0010) ---------------------
+//
+// An agent session's `agent_kind` and `state` are stored as TEXT with a CHECK
+// constraint enforcing these vocabularies (see migration v7). Exposed as consts so
+// callers never type the strings inline. Only `claude_code` is put into production
+// by this PRD; the other kinds are representable for future adapters (Codex /
+// OpenCode are spikes of PRD-6). `allow(dead_code)` until the adapters/bridge of
+// later phases consume them; the v7 tests already reference them.
+
+/// `agent_sessions.agent_kind` — Claude Code (the only v1 production adapter).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const AGENT_KIND_CLAUDE_CODE: &str = "claude_code";
+/// `agent_sessions.agent_kind` — Codex (representable; spike of PRD-6, no adapter here).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const AGENT_KIND_CODEX: &str = "codex";
+/// `agent_sessions.agent_kind` — OpenCode (representable; spike of PRD-6, no adapter here).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const AGENT_KIND_OPENCODE: &str = "opencode";
+/// `agent_sessions.agent_kind` — a custom/other agent (representable; no adapter here).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const AGENT_KIND_CUSTOM: &str = "custom";
+
+/// `agent_sessions.state` — in progress, or left as-is after an app kill (still a
+/// resume candidate; SQLite is the authority, not a clean `SessionEnd`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SESSION_STATE_ACTIVE: &str = "active";
+/// `agent_sessions.state` — a clean `SessionEnd` was observed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SESSION_STATE_ENDED: &str = "ended";
+/// `agent_sessions.state` — was `active` but `last_seen_at` exceeded the staleness
+/// threshold without a clean end (probable kill, state unconfirmed). Still a resume
+/// candidate, but signals the doubt.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SESSION_STATE_UNKNOWN: &str = "unknown";
+/// `agent_sessions.state` — a resume was attempted but failed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SESSION_STATE_RESUME_FAILED: &str = "resume_failed";
 
 /// Current wall-clock time as epoch MILLISECONDS. All `terminals` timestamps are
 /// stored this way (a plain JS-friendly number on the front). Saturates to 0 if
@@ -176,6 +216,12 @@ pub struct Project {
     pub collapsed: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Per-project, default-OFF opt-in to RESUME an active agent session at relaunch
+    /// (PRD-5 #5): when `true`, nyx injects the adapter's exact-resume command (e.g.
+    /// `claude --resume <id>`) into a respawned shell instead of leaving a bare shell.
+    /// `false` (the default, and the only value for a project predating v8) means no
+    /// auto-resume — which is also what the close-warning (#6) keys on.
+    pub resume_agent_sessions: bool,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -489,16 +535,43 @@ pub fn list_terminals(conn: &mut SqliteConnection) -> QueryResult<Vec<Terminal>>
 
 /// Mark a terminal `closed` (it is no longer re-spawned at launch), stamping
 /// `closed_at` (and bumping `updated_at`) with the current epoch-ms. Returns the
-/// number of rows updated (0 if the id is unknown).
+/// number of `terminals` rows updated (0 if the id is unknown).
+///
+/// Also marks any of the terminal's live agent sessions (`active`/`unknown`) as
+/// `ended` (stamping `ended_at = now`): a voluntarily-closed terminal is logically
+/// dead, so its session must not linger `active`/`unknown` forever (review #58) —
+/// otherwise a sessions-history UI would show it active by mistake. Resume is
+/// unaffected: `resume_candidates_on_boot` filters `terminals.status = ALIVE`, so a
+/// closed terminal is never a boot candidate regardless of its session state. Both
+/// writes run in one transaction so the terminal/session states are never observed
+/// half-applied.
 pub fn close_terminal(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
     let now = now_millis();
-    diesel::update(terminals::table.find(id))
+    conn.transaction(|conn| {
+        // Mark the terminal's still-live sessions ended (logically dead with it).
+        diesel::update(
+            agent_sessions::table
+                .filter(agent_sessions::terminal_id.eq(id))
+                .filter(
+                    agent_sessions::state
+                        .eq(SESSION_STATE_ACTIVE)
+                        .or(agent_sessions::state.eq(SESSION_STATE_UNKNOWN)),
+                ),
+        )
         .set((
-            terminals::status.eq(STATUS_CLOSED),
-            terminals::closed_at.eq(now),
-            terminals::updated_at.eq(now),
+            agent_sessions::state.eq(SESSION_STATE_ENDED),
+            agent_sessions::ended_at.eq(Some(now)),
         ))
-        .execute(conn)
+        .execute(conn)?;
+        // Flip the terminal itself to closed.
+        diesel::update(terminals::table.find(id))
+            .set((
+                terminals::status.eq(STATUS_CLOSED),
+                terminals::closed_at.eq(now),
+                terminals::updated_at.eq(now),
+            ))
+            .execute(conn)
+    })
 }
 
 /// Set a terminal's `order` to its position in `ids` (0-based), bumping
@@ -782,6 +855,47 @@ pub fn set_project_collapsed(
             projects::updated_at.eq(now_millis()),
         ))
         .execute(conn)
+}
+
+/// Persist a project's `resume_agent_sessions` opt-in (PRD-5 #5), bumping
+/// `updated_at`. `true` makes nyx RESUME an active agent session for that project's
+/// terminals at relaunch (inject the adapter's exact-resume command); `false` (the
+/// default) leaves a bare shell. Returns rows updated (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_project_resume_agent_sessions(
+    conn: &mut SqliteConnection,
+    id: &str,
+    resume: bool,
+) -> QueryResult<usize> {
+    diesel::update(projects::table.find(id))
+        .set((
+            projects::resume_agent_sessions.eq(resume),
+            projects::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Whether the PROJECT owning `terminal_id` opts in to agent-session resume
+/// (PRD-5 #5). Resolves the terminal's workspace → project → `resume_agent_sessions`
+/// in one join. Returns `false` when the terminal is unknown, has NO workspace (a
+/// loose terminal with no project — OFF by construction per the PRD), or its
+/// workspace/project was deleted. This is the per-project, default-OFF gate the
+/// resume flow and the close-warning both consult.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn project_resumes_for_terminal(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+) -> QueryResult<bool> {
+    let resume: Option<bool> = terminals::table
+        .inner_join(
+            workspaces::table.on(workspaces::id.nullable().eq(terminals::workspace_id)),
+        )
+        .inner_join(projects::table.on(projects::id.eq(workspaces::project_id)))
+        .filter(terminals::id.eq(terminal_id))
+        .select(projects::resume_agent_sessions)
+        .first::<bool>(conn)
+        .optional()?;
+    Ok(resume.unwrap_or(false))
 }
 
 /// Rename a workspace's display `name`, bumping `updated_at`. Returns rows
@@ -1754,6 +1868,454 @@ pub fn list_instances_for_workspace(
         })
 }
 
+// --- Agent session models + CRUD (PRD-5 v7, ADR-0010) --------------------
+//
+// The GENERIC agent-session record: one row per captured agent session, anchored
+// to a terminal (CASCADE) and an OPTIONAL workspace (SET NULL — the project is
+// derived via the workspace, never denormalized). Pure DB functions taking
+// `&mut SqliteConnection`, unit-tested against an in-memory database; the adapter
+// registry + bridge of later phases wrap them. Only `claude_code` is produced in
+// v1, but every helper is agent-agnostic (keyed by `agent_kind`).
+//
+// `allow(dead_code)` on the not-yet-wired functions until the registry/bridge
+// (later phases) consume them; the v7 tests already exercise them.
+
+/// An `agent_sessions` row as read from the database. `Serialize` so the bridge can
+/// return it across the Tauri IPC boundary. Timestamps are epoch ms; `ended_at` is
+/// `None` until a clean end. `state`/`agent_kind` are the CHECK-enforced vocabularies
+/// ([`SESSION_STATE_ACTIVE`] … / [`AGENT_KIND_CLAUDE_CODE`] …). `metadata_json` is a
+/// raw adapter JSON bag (default `"{}"`).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = agent_sessions)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct AgentSession {
+    pub id: String,
+    /// The terminal hosting this session (FK → `terminals`, CASCADE on delete).
+    pub terminal_id: String,
+    /// Optional workspace anchor (`None` = unattached). FK → `workspaces`, SET NULL
+    /// on delete. The project is DERIVED via this workspace — there is no project_id.
+    pub workspace_id: Option<String>,
+    /// Which agent (`claude_code` | `codex` | `opencode` | `custom`). CHECK-enforced.
+    pub agent_kind: String,
+    /// The agent's OWN session id — what the resume command is built from.
+    pub external_session_id: String,
+    /// The working directory the session was captured in.
+    pub cwd: String,
+    /// Lifecycle state (`active` | `ended` | `unknown` | `resume_failed`). CHECK-enforced.
+    pub state: String,
+    /// Optional path to the agent's transcript (e.g. Claude's `<id>.jsonl`).
+    pub transcript_path: Option<String>,
+    /// Adapter-specific JSON bag (default `"{}"`). No key required at the common level.
+    pub metadata_json: String,
+    pub started_at: i64,
+    /// `None` until a clean end stamps it.
+    pub ended_at: Option<i64>,
+    /// Refreshed on every `SessionStart` event; the staleness probe compares it
+    /// against a threshold to flip a long-silent `active` row to `unknown`.
+    pub last_seen_at: i64,
+}
+
+/// A new `agent_sessions` row to insert. `id` is a backend-generated UUIDv7;
+/// `started_at`/`last_seen_at` are set explicitly to the same instant so creation is
+/// deterministic and testable. `state` defaults to `active` (column default) but is
+/// set explicitly here. `ended_at` is left NULL (column default).
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = agent_sessions)]
+struct NewAgentSession {
+    id: String,
+    terminal_id: String,
+    workspace_id: Option<String>,
+    agent_kind: String,
+    external_session_id: String,
+    cwd: String,
+    state: String,
+    transcript_path: Option<String>,
+    metadata_json: String,
+    started_at: i64,
+    last_seen_at: i64,
+}
+
+/// The fields an adapter captures for a session — passed as a group to
+/// [`record_session_start`]. `metadata_json` is an adapter JSON bag; `None` stores
+/// the empty object `"{}"`.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct SessionCapture {
+    pub workspace_id: Option<String>,
+    pub external_session_id: String,
+    pub cwd: String,
+    pub transcript_path: Option<String>,
+    pub metadata_json: Option<String>,
+}
+
+/// Record an agent `SessionStart` for `terminal_id` + `agent_kind`: UPSERT the
+/// single ACTIVE session for that pair.
+///
+/// SessionStart is the authoritative "this terminal now hosts a live session"
+/// signal. Because at most ONE `active` row may exist per `(terminal_id, agent_kind)`
+/// (partial unique index), this:
+///   * UPDATEs the existing active row in place when one exists — refreshing
+///     `external_session_id` / `cwd` / `transcript_path` / `metadata_json` and
+///     stamping `last_seen_at = now` (a `resume` SessionStart on the SAME terminal
+///     keeps one row, not two);
+///   * otherwise INSERTs a fresh `active` row.
+///
+/// Runs in a transaction so the find-then-write is atomic. Returns the active row.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn record_session_start(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+    agent_kind: &str,
+    capture: SessionCapture,
+) -> QueryResult<AgentSession> {
+    let now = now_millis();
+    let metadata = capture
+        .metadata_json
+        .unwrap_or_else(|| "{}".to_string());
+    conn.transaction(|conn| {
+        // Is there already an active session for this terminal+agent? (the partial
+        // unique index guarantees at most one).
+        let existing: Option<String> = agent_sessions::table
+            .filter(agent_sessions::terminal_id.eq(terminal_id))
+            .filter(agent_sessions::agent_kind.eq(agent_kind))
+            .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
+            .select(agent_sessions::id)
+            .first::<String>(conn)
+            .optional()?;
+
+        if let Some(id) = existing {
+            // Refresh the live row in place (a resume on the same terminal keeps ONE
+            // row). last_seen_at + started fields move forward; state stays active.
+            diesel::update(agent_sessions::table.find(&id))
+                .set((
+                    agent_sessions::workspace_id.eq(capture.workspace_id),
+                    agent_sessions::external_session_id.eq(capture.external_session_id),
+                    agent_sessions::cwd.eq(capture.cwd),
+                    agent_sessions::transcript_path.eq(capture.transcript_path),
+                    agent_sessions::metadata_json.eq(metadata),
+                    agent_sessions::last_seen_at.eq(now),
+                ))
+                .returning(AgentSession::as_returning())
+                .get_result(conn)
+        } else {
+            // No live row. A `resume` SessionStart re-attaches to a session that may have
+            // been swept to `unknown` (stale active, probable kill) on boot — or left
+            // `resume_failed` / cleanly `ended` — carrying the SAME external id. REVIVE
+            // that exact row to `active` instead of inserting a duplicate: a blind insert
+            // would ORPHAN the prior row, which keeps re-qualifying as a resume +
+            // close-warning candidate on every boot and accumulates one orphan per
+            // kill→resume cycle (it contradicts this fn's "keeps ONE row, not two" intent).
+            // Match on the agent's OWN session id (the resume correlation) so a genuinely
+            // NEW session (new id) still inserts its own distinct row.
+            let prior: Option<String> = agent_sessions::table
+                .filter(agent_sessions::terminal_id.eq(terminal_id))
+                .filter(agent_sessions::agent_kind.eq(agent_kind))
+                .filter(agent_sessions::external_session_id.eq(&capture.external_session_id))
+                .select(agent_sessions::id)
+                .first::<String>(conn)
+                .optional()?;
+            if let Some(id) = prior {
+                diesel::update(agent_sessions::table.find(&id))
+                    .set((
+                        agent_sessions::workspace_id.eq(capture.workspace_id),
+                        agent_sessions::cwd.eq(capture.cwd),
+                        agent_sessions::transcript_path.eq(capture.transcript_path),
+                        agent_sessions::metadata_json.eq(metadata),
+                        agent_sessions::state.eq(SESSION_STATE_ACTIVE),
+                        // It is live again — clear any stale end stamp.
+                        agent_sessions::ended_at.eq(None::<i64>),
+                        agent_sessions::last_seen_at.eq(now),
+                    ))
+                    .returning(AgentSession::as_returning())
+                    .get_result(conn)
+            } else {
+                diesel::insert_into(agent_sessions::table)
+                    .values(NewAgentSession {
+                        id: Uuid::now_v7().to_string(),
+                        terminal_id: terminal_id.to_string(),
+                        workspace_id: capture.workspace_id,
+                        agent_kind: agent_kind.to_string(),
+                        external_session_id: capture.external_session_id,
+                        cwd: capture.cwd,
+                        state: SESSION_STATE_ACTIVE.to_string(),
+                        transcript_path: capture.transcript_path,
+                        metadata_json: metadata,
+                        started_at: now,
+                        last_seen_at: now,
+                    })
+                    .returning(AgentSession::as_returning())
+                    .get_result(conn)
+            }
+        }
+    })
+}
+
+/// The live (`active`) session for `terminal_id` + `agent_kind`, if any. At most one
+/// exists (partial unique index). The resume flow reads this to decide whether a
+/// terminal has a session worth resuming.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn active_session_for(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+    agent_kind: &str,
+) -> QueryResult<Option<AgentSession>> {
+    agent_sessions::table
+        .filter(agent_sessions::terminal_id.eq(terminal_id))
+        .filter(agent_sessions::agent_kind.eq(agent_kind))
+        .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
+        .select(AgentSession::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// One ACTIVE agent session, reduced to what the sidebar provider-aware icon needs
+/// (finding #55): which terminal hosts a live session and of which agent kind. The
+/// front maps `agent_kind` through its provider registry to pick the logo to show in
+/// place of the generic terminal glyph.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, serde::Serialize)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ActiveAgentSession {
+    pub terminal_id: String,
+    pub agent_kind: String,
+}
+
+/// Every `active` agent session across ALL terminals, as `(terminal_id, agent_kind)`
+/// pairs (finding #55). At most one active session exists per terminal+agent (partial
+/// unique index), so the sidebar reads this once on mount and on the
+/// `agent-sessions://changed` event to know which terminal rows should swap to the
+/// agent's icon. Ordered by terminal for deterministic iteration/tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn active_agent_sessions(
+    conn: &mut SqliteConnection,
+) -> QueryResult<Vec<ActiveAgentSession>> {
+    agent_sessions::table
+        .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
+        .order((agent_sessions::terminal_id.asc(), agent_sessions::agent_kind.asc()))
+        .select((agent_sessions::terminal_id, agent_sessions::agent_kind))
+        .load::<ActiveAgentSession>(conn)
+}
+
+/// All sessions of `terminal_id` (every state), newest started last
+/// (`started_at` asc, `id` asc tiebreak). A terminal keeps many historical rows.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sessions_for_terminal(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+) -> QueryResult<Vec<AgentSession>> {
+    agent_sessions::table
+        .filter(agent_sessions::terminal_id.eq(terminal_id))
+        .order((
+            agent_sessions::started_at.asc(),
+            agent_sessions::id.asc(),
+        ))
+        .select(AgentSession::as_select())
+        .load(conn)
+}
+
+/// Read back a single session by id.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_session(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<AgentSession>> {
+    agent_sessions::table
+        .find(id)
+        .select(AgentSession::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// Mark a session `ended` (a clean `SessionEnd`): set `state='ended'` and stamp
+/// `ended_at = now`. The transition that vacates the partial-unique `active` slot so
+/// a later SessionStart can take it. Returns rows updated (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn mark_session_ended(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    let now = now_millis();
+    diesel::update(agent_sessions::table.find(id))
+        .set((
+            agent_sessions::state.eq(SESSION_STATE_ENDED),
+            agent_sessions::ended_at.eq(Some(now)),
+        ))
+        .execute(conn)
+}
+
+/// Mark a session `resume_failed` (a resume was attempted but failed). Does NOT
+/// stamp `ended_at` — the session did not end cleanly, it failed to resume. Returns
+/// rows updated (0 if the id is unknown).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn mark_session_resume_failed(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(agent_sessions::table.find(id))
+        .set(agent_sessions::state.eq(SESSION_STATE_RESUME_FAILED))
+        .execute(conn)
+}
+
+/// Default staleness threshold (ms) for the active→unknown sweep: an `active`
+/// session whose `last_seen_at` is older than this without a clean end is treated as
+/// a probable kill (state unconfirmed). 30 minutes is generous — a live Claude
+/// session refreshes `last_seen_at` on every SessionStart (incl. resume), so a row
+/// only goes stale when the terminal/app was killed without a clean `SessionEnd`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const SESSION_STALE_AFTER_MS: i64 = 30 * 60 * 1000;
+
+/// Sweep `active` sessions whose `last_seen_at` is older than `now - threshold_ms`
+/// to `unknown` (probable kill, state unconfirmed). Idempotent: a row already
+/// `unknown`/`ended`/`resume_failed` is untouched (the filter is `state='active'`),
+/// and a still-fresh `active` row is left alone. An `unknown` row STAYS a resume
+/// candidate (the resume flow reads active OR unknown); this only records the doubt.
+/// Returns the number of rows flipped. Run on each boot/scan (the kill-then-relaunch
+/// path leaves a row `active`, and this rebascules it on the next scan).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sweep_stale_active_sessions(
+    conn: &mut SqliteConnection,
+    threshold_ms: i64,
+) -> QueryResult<usize> {
+    let cutoff = now_millis() - threshold_ms;
+    diesel::update(
+        agent_sessions::table
+            .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
+            .filter(agent_sessions::last_seen_at.lt(cutoff)),
+    )
+    .set(agent_sessions::state.eq(SESSION_STATE_UNKNOWN))
+    .execute(conn)
+}
+
+/// Derive the PROJECT id of a session via its workspace anchor (PRD-2 derivation —
+/// no denormalized `project_id`). `None` when the session is unattached
+/// (`workspace_id IS NULL`) or its workspace was deleted. A single join, exactly as
+/// "sessions by project" filtering is meant to work (ADR-0010).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn project_id_for_session(
+    conn: &mut SqliteConnection,
+    session_id: &str,
+) -> QueryResult<Option<String>> {
+    agent_sessions::table
+        .inner_join(workspaces::table.on(
+            workspaces::id.nullable().eq(agent_sessions::workspace_id),
+        ))
+        .filter(agent_sessions::id.eq(session_id))
+        .select(workspaces::project_id)
+        .first::<String>(conn)
+        .optional()
+}
+
+/// One resume CANDIDATE row for the boot resume scan (PRD-5 #5): a terminal that is
+/// still `alive`, has a resume-candidate session (`active` or `unknown`), and carries
+/// its project's `resume_agent_sessions` flag (derived via workspace → project). The
+/// bridge feeds these into the pure resume decision. `project_resume_on` is `false`
+/// when the terminal has no workspace/project (loose terminal = OFF), thanks to the
+/// LEFT join below.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct ResumeCandidate {
+    pub terminal_id: String,
+    pub session_id: String,
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub session_state: String,
+    /// The agent's captured transcript path (`agent_sessions.transcript_path`), or
+    /// `None` when the session has no transcript recorded. The bridge `stat`s this path
+    /// (finding #53) to decide whether a real conversation exists before resuming — a
+    /// candidate with a missing/absent transcript is skipped (`claude --resume` would
+    /// otherwise fail "No conversation found").
+    pub transcript_path: Option<String>,
+    pub project_resume_on: bool,
+}
+
+/// Gather the resume CANDIDATES across all `alive` terminals (PRD-5 #5): every
+/// `active`/`unknown` agent session whose terminal is still alive, joined to the
+/// project's `resume_agent_sessions` flag (via the optional workspace → project — a
+/// loose terminal yields `project_resume_on = false`, OFF by construction). The bridge
+/// runs the pure resume decision per row; the OPTION gate and the `closed_voluntarily`
+/// gate are NOT applied here (the latter is structural: a voluntarily-closed terminal
+/// is `closed`, so it is excluded by the `alive` filter and never restored at all).
+/// Newest started last for deterministic iteration.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn resume_candidates_on_boot(
+    conn: &mut SqliteConnection,
+) -> QueryResult<Vec<ResumeCandidate>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::Bool;
+    agent_sessions::table
+        .inner_join(terminals::table.on(terminals::id.eq(agent_sessions::terminal_id)))
+        .left_join(workspaces::table.on(
+            workspaces::id.nullable().eq(agent_sessions::workspace_id),
+        ))
+        .left_join(projects::table.on(
+            projects::id.nullable().eq(workspaces::project_id.nullable()),
+        ))
+        .filter(terminals::status.eq(STATUS_ALIVE))
+        .filter(
+            agent_sessions::state
+                .eq(SESSION_STATE_ACTIVE)
+                .or(agent_sessions::state.eq(SESSION_STATE_UNKNOWN)),
+        )
+        .order((agent_sessions::started_at.asc(), agent_sessions::id.asc()))
+        .select((
+            agent_sessions::terminal_id,
+            agent_sessions::id,
+            agent_sessions::agent_kind,
+            agent_sessions::external_session_id,
+            agent_sessions::state,
+            agent_sessions::transcript_path,
+            // COALESCE the optional project flag to 0 (false): a loose terminal (no
+            // workspace/project) is OFF by construction.
+            sql::<Bool>("COALESCE(projects.resume_agent_sessions, 0)"),
+        ))
+        .load::<ResumeCandidate>(conn)
+}
+
+/// One CLOSE-WARNING candidate (PRD-5 #6): an alive terminal hosting a LIVE
+/// (`active`/`unknown`) agent session, joined with its project's resume flag (loose
+/// terminal → `false`) and the fields the warning message needs (agent kind, terminal
+/// label/id, optional workspace name). The bridge applies the PURE gate
+/// [`crate::agent_resume::should_warn_on_close`] to each row so the warn/resume policy
+/// lives in ONE place (not duplicated in SQL).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct CloseWarning {
+    pub terminal_id: String,
+    pub terminal_label: Option<String>,
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub session_state: String,
+    pub workspace_name: Option<String>,
+    pub project_resume_on: bool,
+}
+
+/// Gather every alive terminal's LIVE (`active`/`unknown`) agent session with the data
+/// the close-warning needs (PRD-5 #6). The actual warn/no-warn decision is the bridge's
+/// (it applies [`crate::agent_resume::should_warn_on_close`] per row), so a resume-ON
+/// project's sessions are RETURNED here but the bridge filters them out — keeping the
+/// policy single-sourced in `agent_resume`. Newest started last for deterministic order.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn close_warning_candidates(conn: &mut SqliteConnection) -> QueryResult<Vec<CloseWarning>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::Bool;
+    agent_sessions::table
+        .inner_join(terminals::table.on(terminals::id.eq(agent_sessions::terminal_id)))
+        .left_join(workspaces::table.on(
+            workspaces::id.nullable().eq(agent_sessions::workspace_id),
+        ))
+        .left_join(projects::table.on(
+            projects::id.nullable().eq(workspaces::project_id.nullable()),
+        ))
+        .filter(terminals::status.eq(STATUS_ALIVE))
+        .filter(
+            agent_sessions::state
+                .eq(SESSION_STATE_ACTIVE)
+                .or(agent_sessions::state.eq(SESSION_STATE_UNKNOWN)),
+        )
+        .order((agent_sessions::started_at.asc(), agent_sessions::id.asc()))
+        .select((
+            agent_sessions::terminal_id,
+            terminals::label.nullable(),
+            agent_sessions::agent_kind,
+            agent_sessions::external_session_id,
+            agent_sessions::state,
+            workspaces::name.nullable(),
+            // COALESCE the optional project flag to false (loose terminal = OFF).
+            sql::<Bool>("COALESCE(projects.resume_agent_sessions, 0)"),
+        ))
+        .load::<CloseWarning>(conn)
+}
+
 /// Open an in-memory SQLite database with migrations applied — used by tests so
 /// they never touch the real `app_data_dir` DB.
 #[cfg(test)]
@@ -1926,9 +2488,14 @@ mod tests {
         use diesel::sql_query;
         let mut conn = open_in_memory();
 
-        // Step DOWN one migration (v4) → the four exec-state columns are gone.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v4 cleanly");
+        // Step DOWN to the pre-v4 schema → the four exec-state columns are gone. The
+        // exec-state migration is dir #4; later PRDs stacked dirs #5..#8 on top, so
+        // reaching the pre-v4 schema peels all of them then dir #4 itself (5 reverts,
+        // reverse order).
+        for _ in 0..5 {
+            conn.revert_last_migration(MIGRATIONS)
+                .expect("revert migration cleanly down to (and including) exec_state");
+        }
         // Sanity: the column really is absent now — referencing it must error.
         let exec_col_present: QueryResult<usize> =
             sql_query("SELECT exec_state FROM terminals").execute(&mut conn);
@@ -2098,6 +2665,48 @@ mod tests {
             list_terminals(&mut conn).unwrap().len(),
             1,
             "closed terminals are retained in the list"
+        );
+    }
+
+    /// Closing a terminal that hosts a live agent session ENDS that session
+    /// (review #58): a voluntarily-closed terminal is logically dead, so its
+    /// `active` session must not linger `active`/`unknown` forever — `close_terminal`
+    /// flips it to `ended` (stamping `ended_at`) in the same write. Resume is
+    /// unaffected (a closed terminal is never a boot candidate), so this only makes
+    /// the DB reflect reality.
+    #[test]
+    fn close_terminal_ends_its_active_agent_session() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let s = record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("ext-1"))
+            .expect("record_session_start");
+        assert_eq!(s.state, SESSION_STATE_ACTIVE, "fresh session is active");
+        assert_eq!(s.ended_at, None, "fresh session has not ended");
+
+        let n = close_terminal(&mut conn, &t.id).expect("close_terminal");
+        assert_eq!(n, 1, "exactly one terminal row closed");
+
+        // The terminal is closed (unchanged behavior).
+        let got_t = get_terminal(&mut conn, &t.id).unwrap().expect("terminal row");
+        assert_eq!(got_t.status, STATUS_CLOSED, "terminal flipped to closed");
+
+        // The previously-active session is now ended with ended_at stamped.
+        let got_s = get_session(&mut conn, &s.id).unwrap().expect("session row");
+        assert_eq!(
+            got_s.state, SESSION_STATE_ENDED,
+            "the terminal's active session is ended on close"
+        );
+        assert!(
+            got_s.ended_at.is_some(),
+            "ending the session stamps ended_at (was None before)"
+        );
+
+        // Resume behavior is unchanged: a closed terminal is never a boot resume
+        // candidate, regardless of its (now ended) session state.
+        let candidates = resume_candidates_on_boot(&mut conn).unwrap();
+        assert!(
+            candidates.iter().all(|c| c.terminal_id != t.id),
+            "a closed terminal is never a boot resume candidate"
         );
     }
 
@@ -2567,10 +3176,23 @@ mod tests {
 
     /// Run a git subcommand in `dir`, asserting success. Deterministic identity is
     /// passed via `-c` so the test never depends on the host's git user config.
+    /// Commit/tag signing is forced OFF too: a developer host may set
+    /// `commit.gpgsign=true` globally, which would make this non-interactive commit
+    /// prompt for a signing-key passphrase and fail. The test only needs a commit to
+    /// exist, not a signed one.
     #[cfg(test)]
     fn git_in(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
-            .args(["-c", "user.email=test@nyx", "-c", "user.name=nyx-test"])
+            .args([
+                "-c",
+                "user.email=test@nyx",
+                "-c",
+                "user.name=nyx-test",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+            ])
             .args(args)
             .current_dir(dir)
             .status()
@@ -3060,21 +3682,22 @@ mod tests {
     /// Migration v2 down→up reversibility: revert v2, the new tables/columns are
     /// gone, re-apply, and the schema round-trips again.
     ///
-    /// History: PRD-3 added migration **v3** (managed_commands/command_instances)
-    /// on top of v2, so v3 is now "the last migration". To still target v2's
-    /// down→up specifically, we first revert v3 (which references no v2 table the
-    /// v2 down needs, so the order is clean), THEN revert v2 — only after that is
-    /// `projects` gone. Re-applying the whole chain restores a working schema.
+    /// History: every later PRD stacked another migration on top of v2 (PRD-3 → v3,
+    /// PRD-4 → v4/v5, PRD-5 → v7/v8), so to still target v2's down→up specifically we
+    /// peel ALL the migrations above v2 first (in reverse order), THEN revert v2 —
+    /// only after that is `projects` gone. Re-applying the whole chain restores a
+    /// working schema.
     #[test]
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Revert v3 first (it sits on top of v2), then v2 itself. projects must
-        // then be absent.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v3 cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v2 cleanly");
+        // Peel every migration stacked above the projects migration (dirs #8 → #3),
+        // then the projects migration (dir #2) itself — 7 reverts in reverse order.
+        // projects must then be absent.
+        for _ in 0..7 {
+            conn.revert_last_migration(MIGRATIONS)
+                .expect("revert migration cleanly down to (and including) projects");
+        }
         let after_down: QueryResult<i64> = projects::table.count().get_result(&mut conn);
         assert!(
             after_down.is_err(),
@@ -3905,20 +4528,20 @@ mod tests {
     /// are gone, re-apply, and the schema round-trips a template + instance again.
     ///
     /// History: v3 used to be the LAST migration, so a single `revert_last_migration`
-    /// reached the v3-absent state. PRD-4 added migration **v4** on top, so reaching
-    /// the v3-absent state now reverts TWO migrations (v4 then v3). The v4-only
-    /// down→up is covered separately by `migration_v4_down_then_up_*`.
+    /// reached the v3-absent state. Later PRDs stacked migrations on top (PRD-4 → v4/v5,
+    /// PRD-5 → v7/v8), so reaching the v3-absent state now peels all of them first. The
+    /// v4-only down→up is covered separately by `migration_v4_down_then_up_*`.
     #[test]
     fn migration_v3_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Revert v5, v4, then v3. managed_commands must then be absent.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v5 cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v4 cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v3 cleanly");
+        // Peel every migration stacked above the managed_commands migration (dirs
+        // #8 → #4), then the managed_commands migration (dir #3) itself — 6 reverts in
+        // reverse order. managed_commands must then be absent.
+        for _ in 0..6 {
+            conn.revert_last_migration(MIGRATIONS)
+                .expect("revert migration cleanly down to (and including) managed_commands");
+        }
         let after_down: QueryResult<i64> = managed_commands::table.count().get_result(&mut conn);
         assert!(
             after_down.is_err(),
@@ -3973,9 +4596,15 @@ mod tests {
         .unwrap();
         let inst = insert_instance(&mut conn, &dev.id, &root.id);
 
-        // Revert v5 then v4. The instance row + its v3 columns survive; the v4 columns
-        // are gone (a typed select of `unread` would now fail to run). v5 is reverted
-        // first because it stacks on top of v4 (migrations revert in reverse order).
+        // Revert down to the v4-absent state. Migrations stack v8, v7, v5 ON TOP of v4
+        // (PRD-5 added v7/v8; PRD-4 added v5), so reaching the v4-absent state peels
+        // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row +
+        // its v3 columns survive; the v4 columns are gone (a typed select of `unread`
+        // would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v8 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v7 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v5 cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -4096,8 +4725,15 @@ mod tests {
         .unwrap();
         let inst = insert_instance(&mut conn, &dev.id, &root.id);
 
-        // Revert ONLY v5. The instance row + its v3/v4 columns survive; the v5 columns
+        // Revert down to the v5-absent state. PRD-5 stacked migrations v7
+        // (agent_sessions) and v8 (project resume option) ON TOP of v5/prev_run, so
+        // reaching the v5-absent state now peels v8, v7, then v5 (migrations revert in
+        // reverse order). The instance row + its v3/v4 columns survive; the v5 columns
         // are gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v8 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v7 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v5 cleanly");
         let prev_after_down: QueryResult<String> = command_instances::table
@@ -4798,5 +5434,719 @@ mod tests {
             set_template_source(&mut conn, "no-such-id", CommandSource::default()).unwrap(),
             0
         );
+    }
+
+    // --- Agent sessions (PRD-5 v7, ADR-0010) -----------------------------
+
+    /// A capture for `terminal_id` with the given external id, unattached and at a
+    /// fixed cwd. Keeps the session tests terse.
+    fn capture(external: &str) -> SessionCapture {
+        SessionCapture {
+            workspace_id: None,
+            external_session_id: external.to_string(),
+            cwd: "/work".to_string(),
+            transcript_path: None,
+            metadata_json: None,
+        }
+    }
+
+    /// schema.rs ↔ migration v7 consistency: exercise EVERY `agent_sessions` column
+    /// through a real insert (via `record_session_start`) + select, covering both
+    /// branches of every nullable column and the keyword-free columns. A drift in
+    /// name/type/order would fail to compile (`check_for_backend`) or to run here.
+    #[test]
+    fn agent_sessions_schema_matches_migration() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).expect("create_terminal");
+        let (_p, ws) = create_project(&mut conn, "proj", "/work", None).expect("create_project");
+
+        let s = record_session_start(
+            &mut conn,
+            &t.id,
+            AGENT_KIND_CLAUDE_CODE,
+            SessionCapture {
+                workspace_id: Some(ws.id.clone()),
+                external_session_id: "ext-abc".to_string(),
+                cwd: "/work/sub".to_string(),
+                transcript_path: Some("/home/u/.claude/x.jsonl".to_string()),
+                metadata_json: Some(r#"{"source":"startup"}"#.to_string()),
+            },
+        )
+        .expect("record_session_start");
+
+        let got = get_session(&mut conn, &s.id).unwrap().unwrap();
+        assert_eq!(got, s, "select returns the inserted row");
+        assert_eq!(got.terminal_id, t.id);
+        assert_eq!(got.workspace_id.as_deref(), Some(ws.id.as_str()));
+        assert_eq!(got.agent_kind, AGENT_KIND_CLAUDE_CODE);
+        assert_eq!(got.external_session_id, "ext-abc");
+        assert_eq!(got.cwd, "/work/sub");
+        assert_eq!(got.state, SESSION_STATE_ACTIVE, "fresh session is active");
+        assert_eq!(got.transcript_path.as_deref(), Some("/home/u/.claude/x.jsonl"));
+        assert_eq!(got.metadata_json, r#"{"source":"startup"}"#);
+        assert!(got.started_at > 0);
+        assert_eq!(got.ended_at, None, "fresh session has not ended");
+        assert_eq!(got.last_seen_at, got.started_at, "fresh: last_seen == started");
+    }
+
+    /// `metadata_json` defaults to the empty object when the capture omits it.
+    #[test]
+    fn agent_session_metadata_defaults_to_empty_object() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let s = record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("e1"))
+            .unwrap();
+        assert_eq!(s.metadata_json, "{}", "omitted metadata stores '{{}}'");
+    }
+
+    /// The `agent_kind` CHECK rejects anything outside the v1 vocabulary — proves
+    /// the migration constraint reached the DB.
+    #[test]
+    fn agent_kind_check_constraint_enforced() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let bad = diesel::insert_into(agent_sessions::table)
+            .values((
+                agent_sessions::id.eq(Uuid::now_v7().to_string()),
+                agent_sessions::terminal_id.eq(&t.id),
+                agent_sessions::agent_kind.eq("not_an_agent"),
+                agent_sessions::external_session_id.eq("e"),
+                agent_sessions::cwd.eq("/work"),
+            ))
+            .execute(&mut conn);
+        assert!(bad.is_err(), "agent_kind CHECK must reject unknown kinds");
+    }
+
+    /// The `state` CHECK rejects anything outside active|ended|unknown|resume_failed.
+    #[test]
+    fn session_state_check_constraint_enforced() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let bad = diesel::insert_into(agent_sessions::table)
+            .values((
+                agent_sessions::id.eq(Uuid::now_v7().to_string()),
+                agent_sessions::terminal_id.eq(&t.id),
+                agent_sessions::agent_kind.eq(AGENT_KIND_CLAUDE_CODE),
+                agent_sessions::external_session_id.eq("e"),
+                agent_sessions::cwd.eq("/work"),
+                agent_sessions::state.eq("bogus"),
+            ))
+            .execute(&mut conn);
+        assert!(bad.is_err(), "state CHECK must reject unknown states");
+    }
+
+    /// At most ONE active session per (terminal_id, agent_kind): a SECOND raw active
+    /// insert for the same pair violates the partial unique index.
+    #[test]
+    fn one_active_session_per_terminal_agent_enforced() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("e1")).unwrap();
+
+        // A raw insert of a SECOND active row for the same terminal+agent must be
+        // rejected by `idx_one_active_session_per_terminal_agent`.
+        let dup = diesel::insert_into(agent_sessions::table)
+            .values(NewAgentSession {
+                id: Uuid::now_v7().to_string(),
+                terminal_id: t.id.clone(),
+                workspace_id: None,
+                agent_kind: AGENT_KIND_CLAUDE_CODE.to_string(),
+                external_session_id: "e2".to_string(),
+                cwd: "/work".to_string(),
+                state: SESSION_STATE_ACTIVE.to_string(),
+                transcript_path: None,
+                metadata_json: "{}".to_string(),
+                started_at: now_millis(),
+                last_seen_at: now_millis(),
+            })
+            .execute(&mut conn);
+        assert!(
+            dup.is_err(),
+            "a second active session for the same terminal+agent must be rejected"
+        );
+    }
+
+    /// A different `agent_kind` on the SAME terminal CAN be active simultaneously
+    /// (the uniqueness is per terminal+agent, not per terminal). And two DIFFERENT
+    /// terminals can each host an active claude_code session.
+    #[test]
+    fn distinct_agents_and_terminals_each_keep_an_active_session() {
+        let mut conn = open_in_memory();
+        let t1 = create_terminal(&mut conn, "/w1", None).unwrap();
+        let t2 = create_terminal(&mut conn, "/w2", None).unwrap();
+
+        record_session_start(&mut conn, &t1.id, AGENT_KIND_CLAUDE_CODE, capture("c1")).unwrap();
+        // Same terminal, DIFFERENT agent → allowed.
+        record_session_start(&mut conn, &t1.id, AGENT_KIND_CODEX, capture("x1")).unwrap();
+        // Different terminal, same agent → allowed.
+        record_session_start(&mut conn, &t2.id, AGENT_KIND_CLAUDE_CODE, capture("c2")).unwrap();
+
+        assert!(active_session_for(&mut conn, &t1.id, AGENT_KIND_CLAUDE_CODE)
+            .unwrap()
+            .is_some());
+        assert!(active_session_for(&mut conn, &t1.id, AGENT_KIND_CODEX)
+            .unwrap()
+            .is_some());
+        assert!(active_session_for(&mut conn, &t2.id, AGENT_KIND_CLAUDE_CODE)
+            .unwrap()
+            .is_some());
+    }
+
+    /// A `resume` SessionStart on the SAME terminal+agent UPDATES the live row in
+    /// place (one row, not two): the external id / last_seen advance, no new row.
+    #[test]
+    fn record_session_start_upserts_the_active_row() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let first =
+            record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("e1")).unwrap();
+
+        let second = record_session_start(
+            &mut conn,
+            &t.id,
+            AGENT_KIND_CLAUDE_CODE,
+            SessionCapture {
+                external_session_id: "e2".to_string(),
+                metadata_json: Some(r#"{"source":"resume"}"#.to_string()),
+                ..capture("ignored")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(second.id, first.id, "the SAME row is refreshed, not a new one");
+        assert_eq!(second.external_session_id, "e2");
+        assert_eq!(second.metadata_json, r#"{"source":"resume"}"#);
+        assert_eq!(
+            sessions_for_terminal(&mut conn, &t.id).unwrap().len(),
+            1,
+            "a resume keeps exactly ONE row for the terminal"
+        );
+    }
+
+    /// A `resume` SessionStart for a session that was swept to `unknown` (stale active,
+    /// probable kill) REVIVES that exact row back to `active` rather than inserting a
+    /// second row — so a kill→resume cycle never orphans the original (which would keep
+    /// re-qualifying as a resume + close-warning candidate every boot).
+    #[test]
+    fn record_session_start_revives_a_swept_unknown_row() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let first =
+            record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("e1")).unwrap();
+        // Simulate the boot sweep flipping the stale active row to `unknown`.
+        diesel::update(agent_sessions::table.find(&first.id))
+            .set(agent_sessions::state.eq(SESSION_STATE_UNKNOWN))
+            .execute(&mut conn)
+            .unwrap();
+
+        // The resume re-attaches with the SAME external id → revive the same row.
+        let revived =
+            record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("e1")).unwrap();
+        assert_eq!(revived.id, first.id, "the unknown row is revived, not duplicated");
+        assert_eq!(revived.state, SESSION_STATE_ACTIVE, "revived back to active");
+        assert_eq!(
+            sessions_for_terminal(&mut conn, &t.id).unwrap().len(),
+            1,
+            "a resume of a swept session keeps exactly ONE row (no orphan)"
+        );
+    }
+
+    /// Clean end: `mark_session_ended` flips state→ended, stamps `ended_at`, and
+    /// VACATES the active slot so a fresh SessionStart can take it (yielding a second,
+    /// distinct row).
+    #[test]
+    fn end_then_restart_yields_a_new_active_row() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let s1 =
+            record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("e1")).unwrap();
+
+        assert_eq!(mark_session_ended(&mut conn, &s1.id).unwrap(), 1);
+        let ended = get_session(&mut conn, &s1.id).unwrap().unwrap();
+        assert_eq!(ended.state, SESSION_STATE_ENDED);
+        assert!(ended.ended_at.is_some(), "ended_at is stamped on a clean end");
+        assert!(
+            active_session_for(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE)
+                .unwrap()
+                .is_none(),
+            "no active session after a clean end"
+        );
+
+        // The active slot is free again → a new SessionStart inserts a distinct row.
+        let s2 =
+            record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("e2")).unwrap();
+        assert_ne!(s2.id, s1.id, "a post-end restart is a NEW session row");
+        assert_eq!(s2.state, SESSION_STATE_ACTIVE);
+        assert_eq!(
+            sessions_for_terminal(&mut conn, &t.id).unwrap().len(),
+            2,
+            "the ended row is kept as history alongside the new active one"
+        );
+    }
+
+    /// resume_failed transition: state flips, `ended_at` is NOT stamped (it did not
+    /// end cleanly), and the active slot is vacated.
+    #[test]
+    fn mark_resume_failed_transitions_without_ended_at() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let s =
+            record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("e1")).unwrap();
+
+        assert_eq!(mark_session_resume_failed(&mut conn, &s.id).unwrap(), 1);
+        let got = get_session(&mut conn, &s.id).unwrap().unwrap();
+        assert_eq!(got.state, SESSION_STATE_RESUME_FAILED);
+        assert_eq!(got.ended_at, None, "resume_failed does not stamp ended_at");
+        assert!(
+            active_session_for(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE)
+                .unwrap()
+                .is_none(),
+            "resume_failed vacates the active slot"
+        );
+    }
+
+    /// active→unknown by `last_seen_at` péremption: a stale active row (last_seen far
+    /// in the past) is swept to `unknown`; a FRESH active row and a non-active row are
+    /// left untouched. The unknown row is still readable (a resume candidate).
+    #[test]
+    fn sweep_stale_active_sessions_flips_only_stale_active_rows() {
+        let mut conn = open_in_memory();
+        let t_stale = create_terminal(&mut conn, "/stale", None).unwrap();
+        let t_fresh = create_terminal(&mut conn, "/fresh", None).unwrap();
+        let t_ended = create_terminal(&mut conn, "/ended", None).unwrap();
+
+        // A stale active row: insert directly with last_seen_at well in the past.
+        let stale_id = Uuid::now_v7().to_string();
+        let past = now_millis() - SESSION_STALE_AFTER_MS - 60_000; // an hour-ish ago
+        diesel::insert_into(agent_sessions::table)
+            .values(NewAgentSession {
+                id: stale_id.clone(),
+                terminal_id: t_stale.id.clone(),
+                workspace_id: None,
+                agent_kind: AGENT_KIND_CLAUDE_CODE.to_string(),
+                external_session_id: "stale".to_string(),
+                cwd: "/stale".to_string(),
+                state: SESSION_STATE_ACTIVE.to_string(),
+                transcript_path: None,
+                metadata_json: "{}".to_string(),
+                started_at: past,
+                last_seen_at: past,
+            })
+            .execute(&mut conn)
+            .unwrap();
+
+        // A fresh active row (last_seen = now).
+        let fresh =
+            record_session_start(&mut conn, &t_fresh.id, AGENT_KIND_CLAUDE_CODE, capture("fresh"))
+                .unwrap();
+        // An ended row (must never be swept).
+        let ended =
+            record_session_start(&mut conn, &t_ended.id, AGENT_KIND_CLAUDE_CODE, capture("ended"))
+                .unwrap();
+        mark_session_ended(&mut conn, &ended.id).unwrap();
+
+        let flipped = sweep_stale_active_sessions(&mut conn, SESSION_STALE_AFTER_MS).unwrap();
+        assert_eq!(flipped, 1, "exactly the one stale active row is swept");
+
+        assert_eq!(
+            get_session(&mut conn, &stale_id).unwrap().unwrap().state,
+            SESSION_STATE_UNKNOWN,
+            "the stale active row became unknown"
+        );
+        assert_eq!(
+            get_session(&mut conn, &fresh.id).unwrap().unwrap().state,
+            SESSION_STATE_ACTIVE,
+            "a fresh active row is left active"
+        );
+        assert_eq!(
+            get_session(&mut conn, &ended.id).unwrap().unwrap().state,
+            SESSION_STATE_ENDED,
+            "an ended row is never swept"
+        );
+
+        // The sweep is idempotent: a second pass flips nothing more.
+        assert_eq!(
+            sweep_stale_active_sessions(&mut conn, SESSION_STALE_AFTER_MS).unwrap(),
+            0,
+            "second sweep is a no-op (unknown rows are not active)"
+        );
+    }
+
+    /// An `unknown` session no longer occupies the active slot, so the partial unique
+    /// index does NOT block a fresh SessionStart on the same terminal (the relaunch
+    /// path). This proves `unknown` is genuinely outside the active uniqueness scope.
+    #[test]
+    fn unknown_session_frees_the_active_slot() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let past = now_millis() - SESSION_STALE_AFTER_MS - 60_000;
+        let stale_id = Uuid::now_v7().to_string();
+        diesel::insert_into(agent_sessions::table)
+            .values(NewAgentSession {
+                id: stale_id.clone(),
+                terminal_id: t.id.clone(),
+                workspace_id: None,
+                agent_kind: AGENT_KIND_CLAUDE_CODE.to_string(),
+                external_session_id: "old".to_string(),
+                cwd: "/work".to_string(),
+                state: SESSION_STATE_ACTIVE.to_string(),
+                transcript_path: None,
+                metadata_json: "{}".to_string(),
+                started_at: past,
+                last_seen_at: past,
+            })
+            .execute(&mut conn)
+            .unwrap();
+        sweep_stale_active_sessions(&mut conn, SESSION_STALE_AFTER_MS).unwrap();
+
+        // A fresh SessionStart now inserts a NEW active row (the unknown row no longer
+        // holds the unique active slot).
+        let s =
+            record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("new")).unwrap();
+        assert_ne!(s.id, stale_id);
+        assert_eq!(s.state, SESSION_STATE_ACTIVE);
+        assert_eq!(sessions_for_terminal(&mut conn, &t.id).unwrap().len(), 2);
+    }
+
+    /// The project is DERIVED via the workspace (no project_id column). An attached
+    /// session resolves to its workspace's project; an unattached session resolves to
+    /// None.
+    #[test]
+    fn project_id_for_session_derives_via_workspace() {
+        let mut conn = open_in_memory();
+        let (project, ws) =
+            create_project(&mut conn, "proj", "/work", None).expect("create_project");
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+
+        let attached = record_session_start(
+            &mut conn,
+            &t.id,
+            AGENT_KIND_CLAUDE_CODE,
+            SessionCapture {
+                workspace_id: Some(ws.id.clone()),
+                ..capture("attached")
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            project_id_for_session(&mut conn, &attached.id).unwrap(),
+            Some(project.id.clone()),
+            "an attached session derives its project via the workspace"
+        );
+
+        let t2 = create_terminal(&mut conn, "/loose", None).unwrap();
+        let loose =
+            record_session_start(&mut conn, &t2.id, AGENT_KIND_CLAUDE_CODE, capture("loose"))
+                .unwrap();
+        assert_eq!(
+            project_id_for_session(&mut conn, &loose.id).unwrap(),
+            None,
+            "an unattached session has no derivable project"
+        );
+    }
+
+    /// FK behaviour: deleting a terminal CASCADES its sessions away; deleting a
+    /// workspace SET-NULLs the anchor (the session survives, unattached).
+    #[test]
+    fn session_fk_cascade_on_terminal_and_set_null_on_workspace() {
+        let mut conn = open_in_memory();
+        let (_p, ws) = create_project(&mut conn, "proj", "/work", None).unwrap();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let s = record_session_start(
+            &mut conn,
+            &t.id,
+            AGENT_KIND_CLAUDE_CODE,
+            SessionCapture {
+                workspace_id: Some(ws.id.clone()),
+                ..capture("e")
+            },
+        )
+        .unwrap();
+
+        // Deleting the WORKSPACE detaches the session (SET NULL), it survives.
+        diesel::delete(workspaces::table.find(&ws.id))
+            .execute(&mut conn)
+            .unwrap();
+        let after_ws = get_session(&mut conn, &s.id).unwrap().unwrap();
+        assert_eq!(after_ws.workspace_id, None, "workspace delete SET-NULLs anchor");
+
+        // Deleting the TERMINAL cascades the session away.
+        close_terminal(&mut conn, &t.id).unwrap(); // status change is fine; now hard-delete
+        diesel::delete(terminals::table.find(&t.id))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(
+            get_session(&mut conn, &s.id).unwrap().is_none(),
+            "terminal delete CASCADEs its sessions away"
+        );
+    }
+
+    // --- Project resume option (PRD-5 #5, schema v8) ---------------------
+
+    /// A fresh project defaults to resume OFF, and `set_project_resume_agent_sessions`
+    /// round-trips the flag (the per-project opt-in, default OFF).
+    #[test]
+    fn project_resume_option_defaults_off_and_round_trips() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "proj", "/work", None).unwrap();
+        assert!(
+            !project.resume_agent_sessions,
+            "a fresh project defaults to resume OFF"
+        );
+
+        assert_eq!(
+            set_project_resume_agent_sessions(&mut conn, &project.id, true).unwrap(),
+            1
+        );
+        let got = list_projects(&mut conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project.id)
+            .unwrap();
+        assert!(got.resume_agent_sessions, "the ON flag is persisted");
+
+        set_project_resume_agent_sessions(&mut conn, &project.id, false).unwrap();
+        let off = list_projects(&mut conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project.id)
+            .unwrap();
+        assert!(!off.resume_agent_sessions, "toggling back to OFF persists");
+    }
+
+    /// The v8 UPGRADE path: revert v8 so `resume_agent_sessions` is gone, insert a
+    /// pre-v8 project row, then re-apply the migration. The old project must backfill
+    /// to resume OFF (DEFAULT 0) — no surprise resume on upgrade.
+    #[test]
+    fn migration_v8_upgrade_backfills_projects_with_resume_off() {
+        use diesel::sql_query;
+        let mut conn = open_in_memory();
+
+        // Step DOWN v8 → the resume_agent_sessions column is gone.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v8 cleanly");
+        let col_present: QueryResult<usize> =
+            sql_query("SELECT resume_agent_sessions FROM projects").execute(&mut conn);
+        assert!(
+            col_present.is_err(),
+            "after reverting v8 the resume_agent_sessions column must NOT exist"
+        );
+
+        // Insert a project into the PRE-v8 schema (raw SQL: the diesel model now knows
+        // the v8 column).
+        let id = Uuid::now_v7().to_string();
+        sql_query(format!(
+            "INSERT INTO projects (id, name) VALUES ('{id}', 'legacy')"
+        ))
+        .execute(&mut conn)
+        .expect("insert a pre-v8 project row");
+
+        // UPGRADE: re-apply v8. The old row backfills to the DEFAULT 0 (OFF).
+        run_migrations(&mut conn).expect("re-apply v8 (the upgrade)");
+        let got = list_projects(&mut conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == id)
+            .expect("the pre-v8 project survived the upgrade");
+        assert!(
+            !got.resume_agent_sessions,
+            "an upgraded old project backfills to resume OFF — no surprise resume"
+        );
+    }
+
+    /// `project_resumes_for_terminal`: a terminal attached to a resume-ON project's
+    /// workspace → true; attached to a resume-OFF project → false; a loose terminal
+    /// (no workspace/project) → false (OFF by construction).
+    #[test]
+    fn project_resumes_for_terminal_resolves_via_workspace() {
+        let mut conn = open_in_memory();
+        let (project, ws) = create_project(&mut conn, "proj", "/work", None).unwrap();
+
+        // A loose terminal (no workspace) → false.
+        let loose = create_terminal(&mut conn, "/loose", None).unwrap();
+        assert!(
+            !project_resumes_for_terminal(&mut conn, &loose.id).unwrap(),
+            "a loose terminal (no project) is OFF by construction"
+        );
+
+        // Attach a terminal to the project's workspace; OFF by default → false.
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        attach_terminal(&mut conn, &t.id, &ws.id, BINDING_AUTO).unwrap();
+        assert!(
+            !project_resumes_for_terminal(&mut conn, &t.id).unwrap(),
+            "attached to a resume-OFF project → false"
+        );
+
+        // Turn the project's resume ON → true.
+        set_project_resume_agent_sessions(&mut conn, &project.id, true).unwrap();
+        assert!(
+            project_resumes_for_terminal(&mut conn, &t.id).unwrap(),
+            "attached to a resume-ON project → true"
+        );
+
+        // An unknown terminal → false (no panic).
+        assert!(!project_resumes_for_terminal(&mut conn, "nope").unwrap());
+    }
+
+    /// `resume_candidates_on_boot`: only ALIVE terminals with `active`/`unknown`
+    /// sessions are candidates; the project flag is COALESCED (loose → false); a
+    /// `closed` terminal and an `ended` session are excluded.
+    #[test]
+    fn resume_candidates_on_boot_gathers_alive_candidates_with_flag() {
+        let mut conn = open_in_memory();
+        let (project, ws) = create_project(&mut conn, "proj", "/work", None).unwrap();
+        set_project_resume_agent_sessions(&mut conn, &project.id, true).unwrap();
+
+        // 1) Alive terminal attached to the resume-ON project, active session → candidate.
+        //    Carries a transcript_path so the query surfaces it for the #53 bridge stat.
+        let t_on = create_terminal(&mut conn, "/work", None).unwrap();
+        attach_terminal(&mut conn, &t_on.id, &ws.id, BINDING_AUTO).unwrap();
+        let s_on = record_session_start(
+            &mut conn,
+            &t_on.id,
+            AGENT_KIND_CLAUDE_CODE,
+            SessionCapture {
+                workspace_id: Some(ws.id.clone()),
+                transcript_path: Some("/home/u/.claude/on-id.jsonl".to_string()),
+                ..capture("on-id")
+            },
+        )
+        .unwrap();
+
+        // 2) Alive LOOSE terminal (no project), active session → candidate, flag false.
+        let t_loose = create_terminal(&mut conn, "/loose", None).unwrap();
+        record_session_start(&mut conn, &t_loose.id, AGENT_KIND_CLAUDE_CODE, capture("loose-id"))
+            .unwrap();
+
+        // 3) CLOSED terminal with an active session → NOT a candidate (status filter).
+        let t_closed = create_terminal(&mut conn, "/closed", None).unwrap();
+        record_session_start(&mut conn, &t_closed.id, AGENT_KIND_CLAUDE_CODE, capture("closed-id"))
+            .unwrap();
+        close_terminal(&mut conn, &t_closed.id).unwrap();
+
+        // 4) Alive terminal whose session is ENDED → NOT a candidate (state filter).
+        let t_ended = create_terminal(&mut conn, "/ended", None).unwrap();
+        let ended =
+            record_session_start(&mut conn, &t_ended.id, AGENT_KIND_CLAUDE_CODE, capture("ended-id"))
+                .unwrap();
+        mark_session_ended(&mut conn, &ended.id).unwrap();
+
+        let candidates = resume_candidates_on_boot(&mut conn).unwrap();
+        let by_session: std::collections::HashMap<&str, &ResumeCandidate> =
+            candidates.iter().map(|c| (c.session_id.as_str(), c)).collect();
+
+        // Exactly the two alive+active sessions are candidates.
+        assert_eq!(candidates.len(), 2, "only the two alive+active sessions are candidates");
+
+        let on = by_session.get(s_on.id.as_str()).expect("the resume-ON candidate is present");
+        assert!(on.project_resume_on, "the attached resume-ON project flag is true");
+        assert_eq!(on.external_session_id, "on-id");
+        assert_eq!(on.session_state, SESSION_STATE_ACTIVE);
+        assert_eq!(
+            on.transcript_path.as_deref(),
+            Some("/home/u/.claude/on-id.jsonl"),
+            "the captured transcript_path is surfaced for the #53 stat"
+        );
+
+        let loose = candidates
+            .iter()
+            .find(|c| c.external_session_id == "loose-id")
+            .expect("the loose candidate is present");
+        assert!(!loose.project_resume_on, "a loose terminal coalesces to resume OFF");
+        assert_eq!(loose.transcript_path, None, "no transcript captured → None");
+    }
+
+    /// `active_agent_sessions` (finding #55) returns ONE `(terminal_id, agent_kind)` pair
+    /// per ACTIVE session and excludes ended ones — the set the sidebar maps to a
+    /// provider icon. Ending a session drops it from the list (the icon reverts).
+    #[test]
+    fn active_agent_sessions_lists_active_pairs_and_drops_ended() {
+        let mut conn = open_in_memory();
+
+        // Two terminals with an active Claude session.
+        let t1 = create_terminal(&mut conn, "/a", None).unwrap();
+        record_session_start(&mut conn, &t1.id, AGENT_KIND_CLAUDE_CODE, capture("a-id")).unwrap();
+        let t2 = create_terminal(&mut conn, "/b", None).unwrap();
+        record_session_start(&mut conn, &t2.id, AGENT_KIND_CLAUDE_CODE, capture("b-id")).unwrap();
+
+        // A third terminal whose session is ENDED → excluded.
+        let t3 = create_terminal(&mut conn, "/c", None).unwrap();
+        let ended =
+            record_session_start(&mut conn, &t3.id, AGENT_KIND_CLAUDE_CODE, capture("c-id")).unwrap();
+        mark_session_ended(&mut conn, &ended.id).unwrap();
+
+        let active = active_agent_sessions(&mut conn).unwrap();
+        assert_eq!(active.len(), 2, "only the two active sessions are listed");
+        assert!(
+            active.iter().any(|s| s.terminal_id == t1.id && s.agent_kind == AGENT_KIND_CLAUDE_CODE),
+            "terminal 1's active claude session is present"
+        );
+        assert!(active.iter().any(|s| s.terminal_id == t2.id), "terminal 2 is present");
+        assert!(
+            !active.iter().any(|s| s.terminal_id == t3.id),
+            "the ended session's terminal is NOT present (icon reverts)"
+        );
+
+        // Ending t1's session drops it from the list.
+        let t1_session = active_session_for(&mut conn, &t1.id, AGENT_KIND_CLAUDE_CODE)
+            .unwrap()
+            .expect("t1 has an active session");
+        mark_session_ended(&mut conn, &t1_session.id).unwrap();
+        let after = active_agent_sessions(&mut conn).unwrap();
+        assert_eq!(after.len(), 1, "after ending t1, only t2 remains active");
+        assert_eq!(after[0].terminal_id, t2.id);
+    }
+
+    /// `close_warning_candidates` (PRD-5 #6) returns every alive terminal's LIVE
+    /// session with its project flag + the message fields. The bridge applies the pure
+    /// warn gate; here we assert the QUERY surfaces the right rows and data: a closed
+    /// terminal and an ended session are excluded; the project flag is COALESCED; the
+    /// terminal label + workspace name come through.
+    #[test]
+    fn close_warning_candidates_surface_live_sessions_with_message_fields() {
+        let mut conn = open_in_memory();
+        let (project, ws) = create_project(&mut conn, "proj", "/work", None).unwrap();
+
+        // Resume-ON project + active session, with a terminal label.
+        set_project_resume_agent_sessions(&mut conn, &project.id, true).unwrap();
+        let t_on = create_terminal(&mut conn, "/work", Some("build".to_string())).unwrap();
+        attach_terminal(&mut conn, &t_on.id, &ws.id, BINDING_AUTO).unwrap();
+        record_session_start(
+            &mut conn,
+            &t_on.id,
+            AGENT_KIND_CLAUDE_CODE,
+            SessionCapture { workspace_id: Some(ws.id.clone()), ..capture("on-id") },
+        )
+        .unwrap();
+
+        // A loose alive terminal with an active session (no project → flag false).
+        let t_loose = create_terminal(&mut conn, "/loose", None).unwrap();
+        record_session_start(&mut conn, &t_loose.id, AGENT_KIND_CODEX, capture("loose-id"))
+            .unwrap();
+
+        // A closed terminal + an ended session must NOT surface.
+        let t_closed = create_terminal(&mut conn, "/c", None).unwrap();
+        record_session_start(&mut conn, &t_closed.id, AGENT_KIND_CLAUDE_CODE, capture("c-id"))
+            .unwrap();
+        close_terminal(&mut conn, &t_closed.id).unwrap();
+        let t_ended = create_terminal(&mut conn, "/e", None).unwrap();
+        let ended =
+            record_session_start(&mut conn, &t_ended.id, AGENT_KIND_CLAUDE_CODE, capture("e-id"))
+                .unwrap();
+        mark_session_ended(&mut conn, &ended.id).unwrap();
+
+        let rows = close_warning_candidates(&mut conn).unwrap();
+        assert_eq!(rows.len(), 2, "only the two alive+live sessions surface");
+
+        let on = rows.iter().find(|w| w.external_session_id == "on-id").unwrap();
+        assert!(on.project_resume_on, "resume-ON flag surfaces (bridge will filter it out)");
+        assert_eq!(on.terminal_label.as_deref(), Some("build"), "terminal label comes through");
+        assert_eq!(on.workspace_name.as_deref(), Some("root"), "workspace name comes through");
+        assert_eq!(on.agent_kind, AGENT_KIND_CLAUDE_CODE);
+
+        let loose = rows.iter().find(|w| w.external_session_id == "loose-id").unwrap();
+        assert!(!loose.project_resume_on, "loose terminal coalesces to OFF → will warn");
+        assert_eq!(loose.agent_kind, AGENT_KIND_CODEX);
+        assert_eq!(loose.workspace_name, None);
     }
 }

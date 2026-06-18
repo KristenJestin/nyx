@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { platform } from "node:process";
 
 import react from "@vitejs/plugin-react";
+import Icons from "unplugin-icons/vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
@@ -29,7 +30,10 @@ const SCREENSHOT_DIR = resolve(__dirname, ".vitest-screenshots");
  * the browser suite with `bun run test:browser`. `bun run test` runs both.
  */
 export default defineConfig({
-  plugins: [react(), tsconfigPaths()],
+  // `Icons` resolves `~icons/<set>/<slug>` brand-logo imports (finding #55) the same way
+  // the app build does, so component tests importing a terminal row don't fail on the
+  // unresolved virtual module. Same compiler/jsx as `vite.config.ts`.
+  plugins: [react(), tsconfigPaths(), Icons({ compiler: "jsx", jsx: "react" })],
   test: {
     projects: [
       {

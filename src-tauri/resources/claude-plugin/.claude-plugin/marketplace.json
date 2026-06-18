@@ -1,0 +1,12 @@
+{
+  "name": "nyx",
+  "description": "nyx local marketplace: bundles the nyx Claude integration (MCP server + session-capture hooks) shipped on disk with the nyx app.",
+  "owner": { "name": "nyx" },
+  "plugins": [
+    {
+      "name": "nyx-claude-integration",
+      "source": "./",
+      "description": "nyx Claude integration: bundles the nyx MCP server AND SessionStart/SessionEnd hooks that report agent sessions to nyx."
+    }
+  ]
+}
