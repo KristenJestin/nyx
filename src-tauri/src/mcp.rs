@@ -135,6 +135,16 @@ pub const LIST_TERMINALS_TOOL: &str = "list_terminals";
 /// kept out of [`V1_TOOLS`].
 pub const CLOSE_TERMINAL_TOOL: &str = "close_terminal";
 
+/// The `read_terminal` tool name (PRD-4.1 task #1). Reads the BOUNDED tail of a terminal's
+/// scrollback by terminal id — symmetric to `get_command_output`, so an agent that
+/// `send_to_terminal`-ed can now read the result. It reuses the EXISTING front-serialized
+/// scrollback (the blob the xterm `SerializeAddon` persists via `db::persist_scrollback`); it
+/// introduces NO second buffer and NO backend PTY capture. Reads reflect the LAST front-persisted
+/// (debounced) scrollback, so a read immediately after `send_to_terminal` may be slightly behind —
+/// a documented trade-off of reusing the front serializer, not a bug. Advertised in `tools/list`,
+/// kept out of [`V1_TOOLS`] (same pattern as the other interactive-terminal tools).
+pub const READ_TERMINAL_TOOL: &str = "read_terminal";
+
 /// The frozen MCP v1 tool surface (ADR-0003). Phase-1 advertises these names in
 /// the `tools/list` handshake; the call bodies are wired in phase 2 over the PRD-3
 /// runtime/DB layer (D6). Order is the ADR's listing order.
@@ -238,11 +248,16 @@ pub trait ToolDispatcher: Send + Sync + 'static {
 }
 
 /// A standardized MCP/JSON-RPC error (ADR-0003 D8). `code` is the stable string
-/// vocabulary; `message` is human-readable; `details` is optional structured data.
+/// vocabulary; `message` is human-readable; `data` is OPTIONAL structured detail
+/// merged into the wire envelope's `error.data` ALONGSIDE the string `code` (e.g.
+/// `output_too_large` carries `{ requested, limit }` so an agent can react without
+/// parsing the prose). It must be a JSON object (its keys are merged in); a non-object
+/// `data` is ignored.
 #[derive(Debug, Clone)]
 pub struct RpcError {
     pub code: &'static str,
     pub message: String,
+    pub data: Option<Value>,
 }
 
 impl RpcError {
@@ -250,7 +265,18 @@ impl RpcError {
     /// Phase-2 tool implementations build their failures through this.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), data: None }
+    }
+
+    /// Attach structured `data` (a JSON OBJECT) carried into the wire envelope's
+    /// `error.data` alongside the string `code` (PRD-4.1 task #3). The object's keys are
+    /// merged into `error.data` so e.g. `output_too_large` exposes machine-readable
+    /// `requested`/`limit`. Builder form so existing `RpcError::new(...)` sites are
+    /// unaffected.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
     }
     /// JSON-RPC numeric code for the transport envelope. We keep all tool/domain
     /// errors as `-32000` (server error) and reserve the reserved range for
@@ -440,9 +466,19 @@ impl McpServer {
                 ),
                 Err(e) => {
                     let mut env = rpc_error_envelope(id, e.rpc_code(), &e.message);
-                    // Carry the ADR-0003 D8 string code in `error.data.code`.
+                    // Carry the ADR-0003 D8 string code in `error.data.code`, plus any
+                    // structured detail the error attached (e.g. output_too_large's
+                    // `requested`/`limit`), merged in alongside `code` (PRD-4.1 task #3).
+                    // We seed `data` from the attached object (when present) and stamp
+                    // `code` LAST, so the stable string code can never be clobbered by a
+                    // `data` key that happens to be named "code".
                     if let Some(err) = env.get_mut("error") {
-                        err["data"] = json!({ "code": e.code });
+                        let mut data = match e.data.as_ref().and_then(Value::as_object) {
+                            Some(obj) => Value::Object(obj.clone()),
+                            None => json!({}),
+                        };
+                        data["code"] = json!(e.code);
+                        err["data"] = data;
                     }
                     env
                 }
@@ -505,7 +541,7 @@ fn tool_descriptors() -> Vec<Value> {
             "start_command" => "Start a managed command (e.g. a dev server, build watcher, or test run) so nyx supervises it and captures its output. Identify it by `instance_id` from list_commands, or by `name` within a `workspace_id`. Starting an already-running command is a no-op (it does NOT launch a second process): the result reports `was_running:true, restarted:false` so you can tell — use relaunch_command to actually restart. Pass an optional `env` map (KEY→VALUE strings, e.g. {\"VAULT_ENV\":\"dev\"}) to add environment variables for this run, merged onto the inherited environment. After starting, read its output with get_command_output to see logs, errors, or a server URL.",
             "stop_command" => "Stop a running managed command. Identify it by its `instance_id` from list_commands. The result reports `changed` (whether a live process was actually stopped) and `was_running`, so a stop on an already-idle command is a clear no-op rather than a false success.",
             "relaunch_command" => "Restart a managed command in place (stop then start the same instance) — useful after a config or code change. This ALWAYS restarts (unlike start_command, which no-ops on a running command); the result reports `restarted:true`. Identify it by its `instance_id` from list_commands. Pass an optional `env` map (KEY→VALUE strings) to set environment variables for the fresh run, merged onto the inherited environment.",
-            "get_command_output" => "Read a managed command's captured output (logs, errors, a dev server's URL, test results). Identify the command by `instance_id`, or by `name` within a `workspace_id`. Returns a token-safe tail by default, with terminal color/control codes already stripped (set strip_ansi:false for raw bytes). Use `grep` to return only matching lines (e.g. errors) or `tail_lines` for the last N lines. Reads are incremental: the result includes a `cursor` you can pass back as `since` to fetch only new output on the next read.",
+            "get_command_output" => "Read a managed command's captured output (logs, errors, a dev server's URL, test results). Identify the command by `instance_id`, or by `name` within a `workspace_id`. Returns a token-safe tail by default, with terminal color/control codes already stripped (set strip_ansi:false for raw bytes). Use `grep` to return only matching lines (e.g. errors) or `tail_lines` for the last N lines. Reads are incremental: the result includes a `cursor` you can pass back as `since` to fetch only new output on the next read. Oversize handling: a request whose window exceeds the 1 MiB ceiling fails with a structured error carrying `error.data.code=\"output_too_large\"` plus `error.data.requested`/`error.data.limit` (bytes) — detect that code and retry with a smaller `tail_bytes` rather than guessing.",
             "workspace_add" => "Register an EXISTING on-disk folder as a workspace under a project, so nyx tracks it and can run commands in it. The folder must already exist — a non-existent path or a file (not a directory) is rejected. Use create_workspace instead when nyx should CREATE the folder.",
             "create_workspace" => "CREATE a new folder on disk (mkdir -p, including any missing parents) and register it as a workspace under a project. Use when the folder does not exist yet and the user wants nyx to start tracking a brand-new working folder. To register a folder that already exists, use workspace_add (which does NOT create anything).",
             _ => "",
@@ -565,12 +601,13 @@ fn tool_descriptors() -> Vec<Value> {
                                                (default 12288, a token-safe window; max 1048576). Use this \
                                                for the typical case. Semantics: effective window = \
                                                min(tail_bytes, max_bytes)."),
-                        "since": int_prop("byte offset from a previous `cursor` for incremental polling"),
+                        "since": int_prop("byte offset from a previous `cursor` for incremental polling. If the buffer was cleared since (your `since` is past the new end) the response carries `reset:true` and returns the fresh output from the start instead of an empty window"),
                         "max_bytes": int_prop("alternative hard ceiling on the returned window \
                                               (default 1048576). If both tail_bytes and max_bytes are set, \
                                               the smaller wins. Prefer tail_bytes for normal use; max_bytes \
                                               is a safety guard. Either above 1048576 → output_too_large."),
                         "strip_ansi": json!({ "type": "boolean", "description": "when true (the DEFAULT), `output` is the window with ANSI/terminal control sequences stripped — a single readable field. Set false to get the raw bytes in `output` instead. `cursor`/`total_bytes` are byte-exact either way." }),
+                        "mark_read": json!({ "type": "boolean", "description": "when true, this read ALSO acknowledges the command's unseen result — flipping `unread` to false EXACTLY as a UI acknowledge does, while the factual outcome (state/exit_code) is left intact. Default false: a passive (polling) read NEVER consumes the `unread` notification. Only meaningful for the current run (a `previous`-selector read targets a settled prior run with no live `unread`)." }),
                         "grep": str_prop("optional regular expression; when set, `output` contains only the lines matching it (matched on the ANSI-stripped text). Use it to pull just the error lines instead of the whole tail."),
                         "tail_lines": int_prop("optional: keep only the last N lines of the window (applied after `grep`). A line-based alternative to tail_bytes for \"show me the last 20 lines\"."),
                         "run": json!({ "description": "which run to read: 0/\"current\" (default, the latest run) or -1/\"previous\" (the one retained prior run, with its own exit_code/state). History is bounded to N=1; any other value is rejected. The result echoes `run`.", "oneOf": [ { "type": "integer" }, { "type": "string", "enum": ["current", "latest", "previous", "prev"] } ] }),
@@ -635,7 +672,11 @@ fn tool_descriptors() -> Vec<Value> {
                         the output produced AFTER this call (not the whole existing \
                         scrollback), with terminal control codes stripped. The returned \
                         `cursor` chains directly into get_command_output(since=cursor) so \
-                        you can fetch the new output with no gap or duplication.",
+                        you can fetch the new output with no gap or duplication. Oversize \
+                        handling: a tail_bytes/max_bytes request above the 1 MiB ceiling fails \
+                        with a structured error carrying `error.data.code=\"output_too_large\"` \
+                        plus `error.data.requested`/`error.data.limit` (bytes) — detect that code \
+                        and retry with a smaller `tail_bytes` rather than guessing.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -895,13 +936,23 @@ fn tool_descriptors() -> Vec<Value> {
     }));
     descriptors.push(json!({
         "name": LIST_TERMINALS_TOOL,
-        "description": "List the terminals currently open in nyx, each with its `terminal_id` \
-                        (the id you pass to send_to_terminal / close_terminal), its working \
-                        directory, label, and workspace (if attached). Each entry also reports \
-                        whether it is `live` (its shell has fully started and can accept input) \
-                        and its internal `pty_id`. Read-only — use it to discover what you can \
-                        write to before calling send_to_terminal.",
-        "inputSchema": { "type": "object", "properties": {}, "required": [] },
+        "description": "List the terminals in nyx, each with its `terminal_id` \
+                        (the id you pass to send_to_terminal / close_terminal / read_terminal), its \
+                        working \
+                        directory, label, and workspace (if attached). Each entry also reports its \
+                        `status` (\"alive\" or \"closed\"), whether it is `live` (its shell has fully \
+                        started and can accept input) and its internal `pty_id`. By default only \
+                        OPEN terminals are listed; pass `include_closed:true` to ALSO list closed \
+                        ones — a closed terminal can no longer be written to, but read_terminal \
+                        still returns its last saved scrollback, so this is how you rediscover a \
+                        finished terminal's id to read its output. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_closed": { "type": "boolean", "description": "when true, also list CLOSED terminals (each carries status:\"closed\"); default false lists only open terminals" },
+            },
+            "required": [],
+        },
     }));
     descriptors.push(json!({
         "name": CLOSE_TERMINAL_TOOL,
@@ -913,6 +964,51 @@ fn tool_descriptors() -> Vec<Value> {
             "type": "object",
             "properties": {
                 "terminal_id": str_prop("id of the open terminal to close (from list_terminals)"),
+            },
+            "required": ["terminal_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": READ_TERMINAL_TOOL,
+        "description": "Read the recent output (scrollback) of a terminal by its `terminal_id` \
+                        — the read counterpart to send_to_terminal. Get the id from list_terminals \
+                        (use list_terminals with include_closed:true to also find CLOSED \
+                        terminals) or from the create_terminal response (which you can keep \
+                        to read a terminal even AFTER it closes). Returns \
+                        a bounded tail of the terminal's text (~12 KB by default, ANSI colors \
+                        stripped), so after send_to_terminal you can read what the command \
+                        produced. Tune the window with `tail_bytes` / `max_bytes`, set \
+                        `strip_ansi:false` for raw output, and (for steady line output) page with \
+                        `since` (pass back the previous call's `cursor`). NOTE: the read reflects \
+                        the LAST \
+                        scrollback nyx persisted for the terminal, which is updated a moment after \
+                        new output appears (debounced by the UI); a read immediately after \
+                        send_to_terminal may be slightly behind — retry to see the latest. A \
+                        closed terminal still returns its last saved scrollback as long as nyx \
+                        remembers it; an unknown id is an error. INCREMENTAL READS ARE BEST-EFFORT: \
+                        scrollback is the re-serialized terminal grid, not an append-only log, so a \
+                        resize/reflow, a full-screen (alt-screen) app, a `clear`, or eviction can \
+                        rewrite it; an incremental read pages forward without dropping the head of \
+                        a burst, and if the buffer shrank below your cursor the result carries \
+                        `reset:true` with the fresh content (re-read WITHOUT `since` to resync). \
+                        FIDELITY: normal command output \
+                        (line-based echo) is reproduced faithfully; output from a full-screen \
+                        (alt-screen) TUI app is rendered by cursor positioning rather than literal \
+                        spaces, so reading it with strip_ansi may COALESCE runs of spaces (e.g. \
+                        adjacent words may join) — not a bug, just the limit of serializing a TUI \
+                        grid; pixel-perfect TUI capture is out of scope. Oversize handling: a \
+                        tail_bytes/max_bytes request above the 1 MiB ceiling fails with a \
+                        structured error carrying `error.data.code=\"output_too_large\"` plus \
+                        `error.data.requested`/`error.data.limit` (bytes) — detect that code and \
+                        retry with a smaller `tail_bytes` rather than guessing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "terminal_id": str_prop("id of the terminal to read (from list_terminals)"),
+                "tail_bytes": int_prop("how many bytes from the END of the scrollback to return (default 12288, a token-safe window). Capped by max_bytes; above 1048576 → output_too_large"),
+                "max_bytes": int_prop("alternative hard ceiling on the returned window (default 1048576; the smaller of tail_bytes/max_bytes wins; either above 1048576 → output_too_large)"),
+                "since": int_prop("byte offset to resume from (pass back a previous call's `cursor` to read only what is new); omit to read the tail. BEST-EFFORT for terminals — reliable for steady line output, but a reflow/clear can rewrite the scrollback; check `reset` in the response and re-read without `since` if it is true"),
+                "strip_ansi": { "type": "boolean", "description": "strip ANSI escape sequences from the returned output (default true). false returns the raw bytes" },
             },
             "required": ["terminal_id"],
         },
@@ -1191,13 +1287,15 @@ mod tests {
         );
         assert!(names.contains(&LIST_TERMINALS_TOOL), "list_terminals tool must be listed");
         assert!(names.contains(&CLOSE_TERMINAL_TOOL), "close_terminal tool must be listed");
+        // PRD-4.1 #1: the read_terminal scrollback-read tool advertised alongside, kept OUT of V1_TOOLS.
+        assert!(names.contains(&READ_TERMINAL_TOOL), "read_terminal tool must be listed");
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 14,
+            V1_TOOLS.len() + 15,
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
-             create_terminal/send_to_terminal/list_terminals/close_terminal extension tools"
+             create_terminal/send_to_terminal/list_terminals/close_terminal/read_terminal extension tools"
         );
     }
 
@@ -1293,6 +1391,55 @@ mod tests {
             );
             assert_eq!(v["error"]["code"], numeric, "{name} numeric JSON-RPC code");
         }
+    }
+
+    #[test]
+    fn tools_call_error_data_merges_structured_detail_alongside_code() {
+        // PRD-4.1 #3: an RpcError's structured `data` (e.g. output_too_large's
+        // `requested`/`limit`) is merged into the wire `error.data` ALONGSIDE the string
+        // `code`, so an agent can react to size info without parsing the prose message.
+        struct OversizeWithData;
+        impl ToolDispatcher for OversizeWithData {
+            fn call(&self, _name: &str, _arguments: &Value) -> Result<Value, RpcError> {
+                Err(RpcError::new("output_too_large", "requested window exceeds max_bytes (1048576)")
+                    .with_data(json!({ "requested": 2_000_000, "limit": 1_048_576 })))
+            }
+        }
+        let server = start_on_port(19031);
+        server.set_dispatcher(Arc::new(OversizeWithData));
+        let req = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_terminal","arguments":{}}}"#;
+        let (_status, body) = http_request(19031, "POST", "/mcp", Some(req));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        // The string code is still present (not clobbered by the merge)...
+        assert_eq!(v["error"]["data"]["code"], "output_too_large", "code stays on error.data");
+        // ...and the structured detail is merged in alongside it.
+        assert_eq!(v["error"]["data"]["requested"], 2_000_000, "requested is on the wire");
+        assert_eq!(v["error"]["data"]["limit"], 1_048_576, "limit is on the wire");
+        assert_eq!(v["error"]["code"], -32000, "numeric JSON-RPC code unchanged");
+    }
+
+    #[test]
+    fn tools_call_error_data_code_is_never_clobbered_by_attached_data() {
+        // Defense in depth: even if an error attaches a `data` object that itself
+        // carries a key named "code", the canonical ADR-0003 D8 string code is stamped
+        // LAST and wins — an agent dispatching on `error.data.code` is never misled.
+        struct CodeKeyInData;
+        impl ToolDispatcher for CodeKeyInData {
+            fn call(&self, _name: &str, _arguments: &Value) -> Result<Value, RpcError> {
+                Err(RpcError::new("invalid_argument", "bad input")
+                    .with_data(json!({ "code": "ATTACKER_OVERRIDE", "field": "x" })))
+            }
+        }
+        let server = start_on_port(19032);
+        server.set_dispatcher(Arc::new(CodeKeyInData));
+        let req = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"probe","arguments":{}}}"#;
+        let (_status, body) = http_request(19032, "POST", "/mcp", Some(req));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["error"]["data"]["code"], "invalid_argument",
+            "the canonical string code wins over a `code` key in attached data"
+        );
+        assert_eq!(v["error"]["data"]["field"], "x", "other attached keys still merge through");
     }
 
     #[test]

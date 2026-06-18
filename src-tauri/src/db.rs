@@ -1198,7 +1198,6 @@ pub fn set_run_state(
 /// (`last_state` / `last_exit_code` / `ended_at`) is left intact, which is the whole
 /// point of the v4 split (a UI ack must never erase the error the MCP sees). Returns
 /// rows updated (0 if the id is unknown OR it was already read).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn acknowledge_instance(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
     diesel::update(command_instances::table.find(id))
         .filter(command_instances::unread.eq(true))

@@ -1658,40 +1658,70 @@ fn command_acknowledge<R: Runtime>(
     runner: State<'_, ManagedCommandRunner<R>>,
     instance_id: String,
 ) -> Result<String, String> {
+    // The acknowledge core is shared with the MCP `mark_read` path so a UI ack and an
+    // MCP consuming read converge on ONE behavior (clear only `unread`, emit
+    // `command://ack`, never touch the outcome). An unknown id surfaces here as the
+    // command's error string.
+    acknowledge_unread(&app, &db, &runner, &instance_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("unknown command instance {instance_id}"))
+}
+
+/// Acknowledge a FINISHED one-shot's "unseen result": clear ONLY its `unread` flag and
+/// emit `command://ack`, NEVER its factual outcome (`last_state`/`last_exit_code`/
+/// `ended_at`). The SHARED core behind both the UI `command_acknowledge` command and the
+/// MCP `get_command_output(mark_read:true)` path, so a UI ack and an MCP consuming read
+/// are byte-for-byte the same operation (the v4 split: an ack must never erase the error
+/// the MCP sees, and the MCP must reuse — not re-implement — the UI's acknowledge).
+///
+/// Two paths, identical to the original UI command:
+///   - LIVE entry (a run that finished this session): the runner flips its in-memory
+///     `unread` to false and (via the sink) persists `unread=0` + emits `command://ack`.
+///   - PERSISTED-only state (no live entry, e.g. a `success`/`error` row restored at
+///     boot): clear the persisted `unread` here and emit `command://ack` directly.
+///
+/// A `running` instance is never acknowledged (no unseen result yet). Returns
+/// `Ok(Some(factual_last_state))` (unchanged by the ack), or `Ok(None)` when the id names
+/// no instance (the caller maps that to its own not-found error). A DB error propagates.
+pub(crate) fn acknowledge_unread<R: Runtime>(
+    app: &AppHandle<R>,
+    db: &Db,
+    runner: &ManagedCommandRunner<R>,
+    instance_id: &str,
+) -> diesel::QueryResult<Option<String>> {
     // Never acknowledge a live process — it has no unseen result yet.
-    if runner.is_running(&instance_id) {
-        return Ok(crate::command::RunState::Running.as_db_str().to_string());
+    if runner.is_running(instance_id) {
+        return Ok(Some(crate::command::RunState::Running.as_db_str().to_string()));
     }
     // LIVE terminal entry (a run that finished this session): the runner clears its
     // in-memory `unread` and (via the sink) persists `unread=0` + emits the ack
     // event. A no-op for a runner that has no live terminal entry to flip — that case
     // is the persisted path below. `is_unread` tells us whether the runner just
     // handled it, so we don't double-emit for the same acknowledge.
-    let runner_had_unread = runner.is_unread(&instance_id);
-    runner.acknowledge(&instance_id);
+    let runner_had_unread = runner.is_unread(instance_id);
+    runner.acknowledge(instance_id);
     if runner_had_unread {
         // The runner + sink already cleared `unread` and emitted `command://ack`.
-        return Ok(runner.state_of(&instance_id).as_db_str().to_string());
+        return Ok(Some(runner.state_of(instance_id).as_db_str().to_string()));
     }
     // PERSISTED terminal state with no live entry: clear its `unread` here so a
     // restored, still-unread success/error badge also hides on select — WITHOUT
     // touching the factual `last_state`/`last_exit_code`/`ended_at`.
-    let inst = db
-        .with_conn(|c| db::get_instance(c, &instance_id))
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("unknown command instance {instance_id}"))?;
+    let inst = match db.with_conn(|c| db::get_instance(c, instance_id))? {
+        Some(inst) => inst,
+        None => return Ok(None),
+    };
     if inst.unread && (inst.last_state == db::STATE_SUCCESS || inst.last_state == db::STATE_ERROR) {
-        db.with_conn(|c| db::acknowledge_instance(c, &instance_id))
-            .map_err(|e| e.to_string())?;
+        db.with_conn(|c| db::acknowledge_instance(c, instance_id))?;
         let _ = app.emit(
             "command://ack",
             CommandAckPayload {
-                instance_id: instance_id.clone(),
+                instance_id: instance_id.to_string(),
             },
         );
     }
     // Return the factual state (unchanged — the outcome is never erased by an ack).
-    Ok(inst.last_state)
+    Ok(Some(inst.last_state))
 }
 
 /// Return an instance's output history: the LIVE in-memory buffer if it is running,

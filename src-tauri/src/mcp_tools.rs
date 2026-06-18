@@ -36,7 +36,7 @@ use crate::db::{self, Db};
 use crate::mcp::{
     RpcError, ToolDispatcher, ADD_COMMAND_TOOL, CLEAR_COMMAND_OUTPUT_TOOL, CLOSE_TERMINAL_TOOL,
     CREATE_TERMINAL_TOOL, IMPORT_COMMANDS_TOOL, LIST_IMPORTABLE_SCRIPTS_TOOL, LIST_TERMINALS_TOOL,
-    PROBE_TOOL, REMOVE_COMMANDS_TOOL, REMOVE_COMMAND_TOOL, REMOVE_WORKSPACE_TOOL,
+    PROBE_TOOL, READ_TERMINAL_TOOL, REMOVE_COMMANDS_TOOL, REMOVE_COMMAND_TOOL, REMOVE_WORKSPACE_TOOL,
     SEND_TO_TERMINAL_TOOL, UPDATE_COMMAND_TOOL, WAIT_FOR_COMMAND_TOOL,
 };
 
@@ -535,19 +535,13 @@ impl<R: Runtime> NyxToolDispatcher<R> {
     fn get_command_output(&self, args: &Value) -> Result<Value, RpcError> {
         let instance_id = self.resolve_instance_id(args)?;
         let instance_id = instance_id.as_str();
-        // `tail_bytes`: requested tail window (default DEFAULT_TAIL_BYTES).
-        // `max_bytes`: alternative safety ceiling (default MAX_TAIL_BYTES).
-        // SEMANTICS (C3): effective window = min(tail_bytes, max_bytes).
-        // `tail_bytes` is the normal knob for "I want N bytes from the tail".
-        // `max_bytes` is a safety guard that caps the window regardless. Both
-        // are capped at MAX_TAIL_BYTES and any value above that is refused.
-        let tail_bytes = optional_usize(args, "tail_bytes")?.unwrap_or(DEFAULT_TAIL_BYTES);
-        let since = optional_usize(args, "since")?;
-        let max_bytes = optional_usize(args, "max_bytes")?;
-        // strip_ansi defaults to TRUE (review R-OUTPUT): a default read returns ONE
-        // cleaned `output` field, not raw escapes (which an agent cannot read and which
-        // bloat the JSON). Set strip_ansi:false explicitly to get the raw window back.
-        let strip = optional_bool(args, "strip_ansi")?.unwrap_or(true);
+        // Token-safe windowing knobs (`tail_bytes`/`max_bytes`/`since`/`strip_ansi`),
+        // parsed + ceiling-checked by the SHARED helper so the contract (default sizes,
+        // the 1 MiB cap, min(tail,max), output_too_large) is identical across the three
+        // output flows. `effective_tail = min(tail_bytes, max_bytes)`.
+        let knobs = parse_window_knobs(args)?;
+        let since = knobs.since;
+        let strip = knobs.strip;
         // Line modes (task #4): optional regex `grep` (matched on the stripped text) and
         // a `tail_lines` line-window. Both are applied to the rendered text AFTER the
         // byte window, so they never widen the token cost beyond the byte bound.
@@ -557,16 +551,15 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         // the CURRENT/latest run; `run=-1` or `run="previous"` reads the ONE retained
         // prior run (bounded N=1). An out-of-range run → `invalid_argument`.
         let run = optional_run_selector(args, "run")?;
-        // A request for a window beyond the hard ceiling is refused (D7/D8), not
-        // silently clamped — the agent asked for more than the contract serves.
-        // Either tail_bytes or max_bytes above MAX_TAIL_BYTES → output_too_large.
-        let ceiling = max_bytes.unwrap_or(MAX_TAIL_BYTES);
-        if tail_bytes > MAX_TAIL_BYTES || ceiling > MAX_TAIL_BYTES {
-            return Err(RpcError::new(
-                "output_too_large",
-                format!("requested window exceeds max_bytes ({MAX_TAIL_BYTES})"),
-            ));
-        }
+        // `mark_read` (PRD-4.1 task #5): an EXPLICIT, opt-in consumption flag (default
+        // FALSE) so passive polling never consumes the `unread` notification. When true,
+        // the read ALSO acknowledges the instance's unseen result — flipping `unread` to
+        // false EXACTLY as a UI acknowledge does (the SHARED `acknowledge_unread` core) —
+        // after the output window is computed, so the read still returns the output it
+        // observed. A default (or false) read is purely observational and leaves `unread`
+        // intact. Only meaningful for the CURRENT run (the `previous` selector reads a
+        // settled prior run that carries no live `unread`).
+        let mark_read = optional_bool(args, "mark_read")?.unwrap_or(false);
 
         // Resolve the output text + status for the SELECTED run. The previous-run
         // selector is served entirely from the persisted `prev_*` columns (it is, by
@@ -599,39 +592,49 @@ impl<R: Runtime> NyxToolDispatcher<R> {
                 // Live path: a running instance returns the runner's in-memory tail. A
                 // missing runner (very early boot) degrades to the cold DB path instead
                 // of failing the read.
-                let live = self.runner().ok().and_then(|r| r.live_output(instance_id));
-                let full = if let Some(live) = live {
-                    live
+                let runner = self.runner().ok();
+                let live = runner.as_ref().and_then(|r| r.live_output(instance_id));
+                if let Some(live) = live {
+                    // Running: the live tail + the runner-backed status (a no-DB fast path
+                    // in `factual_status` when the entry is live).
+                    let status = self
+                        .factual_status(instance_id)
+                        .unwrap_or_else(|_| status_json(RunState::Idle, None, false));
+                    (live, status, false)
                 } else {
                     // Cold path: idle/success/error (or absent live map) rehydrates the
-                    // persisted scrollback row. An unknown instance → `invalid_id`.
+                    // persisted scrollback row ONCE and derives the run status from that
+                    // SAME row — unless the runner still holds a finished-this-session
+                    // outcome, which is preferred (it carries the authoritative in-memory
+                    // `unread` before persistence). Reusing the row we just loaded avoids
+                    // the redundant re-read `factual_status` would do here (finding #13).
+                    // An unknown instance → `invalid_id` (disambiguates a template id).
                     let db = self.db()?;
-                    match db
+                    let inst = match db
                         .with_conn(|c| db::get_instance(c, instance_id))
                         .map_err(internal_db("read command output"))?
                     {
-                        Some(inst) => inst.scrollback,
-                        // Disambiguate a template command_id from an unknown id
-                        // (finding #14), same as the action tools.
+                        Some(inst) => inst,
                         None => return Err(self.bad_instance_id_error(instance_id)),
-                    }
-                };
-                // Surface the run status alongside the output (finding #13 + v4): an
-                // agent reading output also needs to know if the command is still
-                // `running` or `finished` and, if finished, whether it crashed
-                // (`exit_code ≠ 0`) — and whether the UI has acknowledged it
-                // (`unread`). The FACTUAL outcome is the live runner's when it backs the
-                // instance, else the persisted DB outcome (so a crash signal survives a
-                // restart AND a UI acknowledge). A missing runner degrades to the DB.
-                let status = self
-                    .factual_status(instance_id)
-                    .unwrap_or_else(|_| status_json(RunState::Idle, None, false));
-                (full, status, false)
+                    };
+                    // Surface the run status alongside the output (finding #13 + v4): an
+                    // agent reading output also needs to know if the command is still
+                    // `running` or `finished` and, if finished, whether it crashed
+                    // (`exit_code ≠ 0`) and whether the UI has acknowledged it (`unread`).
+                    let status = match runner.as_ref().and_then(|r| r.outcome(instance_id)) {
+                        Some((state, exit_code, unread)) => status_json(state, exit_code, unread),
+                        None => status_json(
+                            RunState::from_db_str(&inst.last_state),
+                            inst.last_exit_code,
+                            inst.unread,
+                        ),
+                    };
+                    (inst.scrollback, status, false)
+                }
             }
         };
 
-        let effective_tail = tail_bytes.min(ceiling);
-        let window = bound_output(&full, effective_tail, since);
+        let window = bound_output(&full, knobs.effective_tail, since);
         // Render the `output` field per the token-safe contract (review R-OUTPUT):
         // strip_ansi=true → ONE cleaned view (no raw output+text duplication);
         // strip_ansi=false → the raw byte window. `grep`/`tail_lines` further reduce
@@ -647,6 +650,10 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             "total_bytes": window.total_bytes,
             "returned_bytes": window.returned_bytes,
             "truncated": window.truncated,
+            // `reset` is true when the supplied `since` was beyond the current end —
+            // the buffer shrank (a `clear`/reset) so the prior cursor is stale; the
+            // window then carries the fresh content rather than an empty result.
+            "reset": window.reset,
             // `cursor` is an integer byte offset (one past the end of what was
             // returned), so it round-trips verbatim as the next `since` — both are
             // integers per ADR-0003 §7 and the advertised descriptor schema. It is the
@@ -658,6 +665,25 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         if let (Some(map), Some(status_map)) = (result.as_object_mut(), status.as_object()) {
             for (k, v) in status_map {
                 map.insert(k.clone(), v.clone());
+            }
+        }
+        // Explicit consumption (task #5): only when `mark_read:true` AND this is the
+        // CURRENT run (a `previous`-selector read targets a settled prior run with no live
+        // `unread` to consume). The acknowledge reuses the SHARED `bridge::acknowledge_unread`
+        // — the IDENTICAL operation the UI's `command_acknowledge` runs — so it clears only
+        // `unread` (+ emits `command://ack`) and NEVER erases the factual outcome the read
+        // just reported. The `unread` field already splatted into `result` reflects the
+        // PRE-mark snapshot, which is the honest answer for "what did this read observe?".
+        if mark_read && !previous {
+            // Best-effort consumption, SYMMETRIC to the passive read above: a missing
+            // runner/db STATE (e.g. very early boot) must not fail a read that already
+            // produced output — the passive path uses `self.runner().ok()`, so the
+            // consuming path degrades the same way instead of propagating with `?`
+            // (finding #12). When the state IS present, a genuine DB error during the
+            // acknowledge still propagates, exactly as the passive read's DB reads do.
+            if let (Ok(runner), Ok(db)) = (self.runner(), self.db()) {
+                crate::bridge::acknowledge_unread(&self.app, &db, &runner, instance_id)
+                    .map_err(internal_db("mark command output read"))?;
             }
         }
         Ok(result)
@@ -704,18 +730,12 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         // Default 30 s, clamped to the ~60 s hard ceiling so the wait is bounded.
         let timeout_ms = optional_u64(args, "timeout_ms")?.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
         let timeout = Duration::from_millis(timeout_ms).min(WAIT_MAX_TIMEOUT);
-        // Token-safe windowing knobs, identical to get_command_output (D7/R-OUTPUT).
-        let tail_bytes = optional_usize(args, "tail_bytes")?.unwrap_or(DEFAULT_TAIL_BYTES);
-        let max_bytes = optional_usize(args, "max_bytes")?;
-        let strip = optional_bool(args, "strip_ansi")?.unwrap_or(true);
-        let ceiling = max_bytes.unwrap_or(MAX_TAIL_BYTES);
-        if tail_bytes > MAX_TAIL_BYTES || ceiling > MAX_TAIL_BYTES {
-            return Err(RpcError::new(
-                "output_too_large",
-                format!("requested window exceeds max_bytes ({MAX_TAIL_BYTES})"),
-            ));
-        }
-        let effective_tail = tail_bytes.min(ceiling);
+        // Token-safe windowing knobs, identical to get_command_output (D7/R-OUTPUT),
+        // parsed + ceiling-checked by the SHARED helper. `since` is taken un-resolved
+        // here because wait supplies its own first-call default below.
+        let knobs = parse_window_knobs(args)?;
+        let strip = knobs.strip;
+        let effective_tail = knobs.effective_tail;
 
         // FIRST-CALL BOUNDING (D12): when the caller passes no `since`, default it to the
         // CURRENT end-of-buffer captured BEFORE the wait, so `output_tail` returns only
@@ -723,7 +743,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         // A caller resuming a poll passes the prior `cursor` back as `since` and that
         // takes precedence. Measuring on the same `current_output` source the result
         // window reads keeps the byte cursor consistent.
-        let since = match optional_usize(args, "since")? {
+        let since = match knobs.since {
             Some(s) => s,
             None => self.current_output(&instance_id)?.len(),
         };
@@ -765,6 +785,9 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             "waited_ms": outcome.waited.as_millis() as u64,
             // Chains verbatim into get_command_output(since=cursor).
             "cursor": window.cursor,
+            // True when the scrollback shrank below our start cursor during the wait
+            // (a `clear`): `output_tail` then carries the fresh content from the new start.
+            "reset": window.reset,
             "output_tail": output_tail,
         }))
     }
@@ -990,7 +1013,15 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             "version": env!("CARGO_PKG_VERSION"),
             // Short git SHA injected at build time by build.rs (best-effort; "unknown"
             // when git is unavailable at build time, e.g. a clean CI checkout without .git).
+            // INTACT — no `-dirty` suffix (that would corrupt the sha); dirtiness is the
+            // separate `build_dirty` boolean below (PRD-4.1 task #6).
             "build_sha": env!("NYX_BUILD_SHA"),
+            // Whether the working tree was DIRTY when this binary was built (baked by
+            // build.rs from `git status --porcelain`). A clean committed build reports
+            // false; a build off an uncommitted working tree reports true — so an agent
+            // can tell a reproducible release build from a local dev build WITHOUT the
+            // `build_sha` ever being polluted. Parsed from the baked "true"/"false" env.
+            "build_dirty": env!("NYX_BUILD_DIRTY") == "true",
             // D1 schema health: false when pending migrations are detected. A probe
             // returning schema_ok:false means the binary was upgraded without running
             // migrations — callers should not rely on any data-dependent tools.
@@ -1187,6 +1218,10 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             std::collections::HashSet::new();
 
         let db = self.db()?;
+        // In preview mode this collects the WOULD-import rows (no DB write); in a real
+        // import it collects the ACTUAL created templates. The result field is named
+        // accordingly below (`would_import` for a preview, `imported` for a real import)
+        // so a preview never falsely claims it `imported` anything (PRD-4.1 task #6).
         let mut imported: Vec<Value> = Vec::new();
         let mut skipped: Vec<Value> = Vec::new();
         // De-duplicate by proposed name so two workspaces exposing the same script do not
@@ -1277,8 +1312,21 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         if !preview && !imported.is_empty() {
             crate::bridge::emit_commands_changed(&self.app);
         }
+        // PRD-4.1 task #6: a PREVIEW created nothing, so it reports its candidate rows
+        // under `would_import` and leaves `imported` an EMPTY array (it truthfully imported
+        // nothing); a REAL import reports its creations under `imported` and leaves
+        // `would_import` empty. BOTH keys are ALWAYS present as arrays — the unused one is
+        // `[]`, never absent — so a consumer that reads `result["imported"]` never gets
+        // null, while `preview` plus the populated field still disambiguate the two cases
+        // unambiguously. (Keeping the keys stable avoids breaking any reader of `imported`.)
+        let (imported_rows, would_import_rows) = if preview {
+            (json!([]), json!(imported))
+        } else {
+            (json!(imported), json!([]))
+        };
         Ok(json!({
-            "imported": imported,
+            "imported": imported_rows,
+            "would_import": would_import_rows,
             "skipped": skipped,
             "manifests_found": manifests_found,
             "preview": preview,
@@ -1710,12 +1758,16 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         Ok(json!({ "terminal_id": terminal_id, "sent": true }))
     }
 
-    /// `list_terminals` — `{}` → `{ terminals: [{ terminal_id, cwd, label, workspace_id,
-    /// pty_id, live }] }`. List the OPEN (alive) terminal records with their id + the live
+    /// `list_terminals` — `{ include_closed? }` → `{ terminals: [{ terminal_id, cwd, label,
+    /// workspace_id, status, pty_id, live }] }`. List terminal records with their id + the live
     /// record↔PTY mapping (so the agent knows which it can write to). `live` is true when a PTY
-    /// is registered for the record (its shell has started); `pty_id` is that live id or null.
+    /// is registered for the record (its shell has started); `pty_id` is that live id or null;
+    /// `status` is `"alive"` or `"closed"`. By default only OPEN (alive) terminals are listed;
+    /// pass `include_closed:true` to ALSO list closed terminals, so an agent can rediscover a
+    /// finished terminal's id and read its last scrollback via `read_terminal` (arbitration C).
     /// Read-only.
-    fn list_terminals(&self) -> Result<Value, RpcError> {
+    fn list_terminals(&self, args: &Value) -> Result<Value, RpcError> {
+        let include_closed = optional_bool(args, "include_closed")?.unwrap_or(false);
         let db = self.db()?;
         let records = db
             .with_conn(db::list_terminals)
@@ -1723,7 +1775,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let map = self.terminal_pty_map()?.snapshot();
         let terminals: Vec<Value> = records
             .into_iter()
-            .filter(|t| t.status == db::STATUS_ALIVE)
+            .filter(|t| include_closed || t.status == db::STATUS_ALIVE)
             .map(|t| {
                 let pty_id = map.get(&t.id).copied();
                 json!({
@@ -1731,6 +1783,9 @@ impl<R: Runtime> NyxToolDispatcher<R> {
                     "cwd": t.cwd,
                     "label": t.label,
                     "workspace_id": t.workspace_id,
+                    // "alive" | "closed" — a closed terminal has no live PTY but its record
+                    // (and last scrollback) survives, so read_terminal still serves it.
+                    "status": t.status,
                     "pty_id": pty_id,
                     "live": pty_id.is_some(),
                 })
@@ -1767,6 +1822,108 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         // Retire the pane on the front (the SAME signal create emits).
         crate::bridge::emit_terminals_changed(&self.app);
         Ok(json!({ "terminal_id": terminal_id, "closed": true }))
+    }
+
+    /// `read_terminal` — `{ terminal_id, tail_bytes?, max_bytes?, since?, strip_ansi? }` →
+    /// `{ terminal_id, output, total_bytes, returned_bytes, truncated, reset, cursor }`. The READ
+    /// counterpart to `send_to_terminal` (PRD-4.1 task #1): a BOUNDED window over a terminal's
+    /// scrollback, symmetric to [`Self::get_command_output`].
+    ///
+    /// **Source — the EXISTING front scrollback, no second buffer.** The text read is the
+    /// terminal record's persisted `scrollback` column (`db::get_terminal(...).scrollback`),
+    /// i.e. the blob the front xterm `SerializeAddon` serializes and `db::persist_scrollback`
+    /// stores (PRD 1). `read_terminal` introduces NO parallel backend PTY capture and NO second
+    /// buffer; it reads the LAST front-persisted snapshot. Because that persistence is DEBOUNCED
+    /// on the front, a read immediately after `send_to_terminal` may reflect a slightly stale
+    /// snapshot — a documented trade-off of reusing the serializer (the agent re-reads to catch
+    /// up), not a bug.
+    ///
+    /// **Bounding — identical knobs to `get_command_output`.** `tail_bytes` defaults to the
+    /// token-safe [`DEFAULT_TAIL_BYTES`] (12 KiB) and `max_bytes`/`tail_bytes` over
+    /// [`MAX_TAIL_BYTES`] (1 MiB) are refused with `output_too_large` (the SAME bound as the two
+    /// command flows). `strip_ansi` defaults to **`true`** so the single `output` field is the
+    /// cleaned view.
+    ///
+    /// **`since` is BEST-EFFORT here, not the strict cursor it is for `get_command_output`.**
+    /// A command's captured output is an APPEND-ONLY stream, so a byte `cursor` is a stable
+    /// resume point. A terminal's `scrollback` is instead the front `SerializeAddon` dump of the
+    /// xterm GRID, RE-serialized in full on each debounced persist — it grows by append in the
+    /// common line-echo case, but a reflow (resize), an alt-screen repaint (a TUI opening/closing),
+    /// a `clear`, or scrollback eviction can REWRITE it so a prior byte offset no longer denotes
+    /// the same content. We make the common cases safe — an incremental read pages forward
+    /// CONTIGUOUSLY (it never silently drops the head of a burst), and a `since` beyond the new end
+    /// (the buffer shrank) returns `reset:true` with the fresh content instead of an empty window —
+    /// but on a same-length rewrite a `since=cursor` read can still return shifted/garbled content.
+    /// So: `since` is a polling convenience for steady line output; whenever `reset` is true, or the
+    /// output looks misaligned, re-read WITHOUT `since` to resync. Pixel-perfect cross-snapshot
+    /// incremental fidelity is out of scope (see the arbitration note in the PR review).
+    ///
+    /// **Fidelity limit on alt-screen TUI output (documented, not a bug).** This reads the front
+    /// `SerializeAddon` dump of the terminal grid. For NORMAL command output (line-based echo) the
+    /// text is reproduced faithfully. For a full-screen (alt-screen) TUI app — which paints by
+    /// cursor positioning rather than emitting literal spaces — a `strip_ansi` read can COALESCE
+    /// runs of spaces (so adjacent on-screen words may join), because the serialized grid lacks the
+    /// real whitespace the TUI never wrote. Pixel-perfect TUI rendering is explicitly OUT of scope
+    /// (PRD-4.1); normal command output is unaffected.
+    ///
+    /// **Closed vs unknown (ADR-0003 D8).** As long as the terminal RECORD exists, the last
+    /// persisted scrollback is returned — even for a CLOSED terminal (the record outlives the
+    /// PTY). An UNKNOWN / no-longer-existing record is the structured `invalid_id`. Out of
+    /// `V1_TOOLS`; D8 errors.
+    fn read_terminal(&self, args: &Value) -> Result<Value, RpcError> {
+        let terminal_id = require_str(args, "terminal_id")?;
+        // Token-safe windowing knobs (`tail_bytes`/`max_bytes`/`since`/`strip_ansi`),
+        // parsed + ceiling-checked by the SHARED helper — identical contract and
+        // structured `output_too_large` payload as the two command flows.
+        let knobs = parse_window_knobs(args)?;
+        let since = knobs.since;
+        let strip = knobs.strip;
+        let effective_tail = knobs.effective_tail;
+
+        // Read the EXISTING front-serialized scrollback for the record. An unknown record (the
+        // row is gone / id was never valid) is the disambiguating invalid_id — symmetric to the
+        // command flows' invalid_id on an unknown instance. A CLOSED terminal whose record still
+        // exists falls through and returns its last persisted scrollback (decided: the record
+        // outlives the PTY).
+        let db = self.db()?;
+        let scrollback = match db
+            .with_conn(|c| db::get_terminal(c, terminal_id))
+            .map_err(internal_db("read terminal scrollback"))?
+        {
+            Some(record) => record.scrollback,
+            // A read targets the RECORD, which a closed terminal still has — so unlike
+            // send_to_terminal (which needs a LIVE pty and rejects "unknown or closed"),
+            // the ONLY way to reach here is a record that genuinely does not exist. Use a
+            // message that says exactly that, not the live-tool's "or closed" wording.
+            None => {
+                return Err(RpcError::new(
+                    "invalid_id",
+                    format!(
+                        "unknown terminal {terminal_id} (no such terminal record; use a \
+                         terminal_id from list_terminals, or one returned by create_terminal)"
+                    ),
+                ))
+            }
+        };
+
+        // Bound + render through the SAME path as get_command_output (single output field).
+        let window = bound_output(&scrollback, effective_tail, since);
+        let output = render_output(&window.output, strip, None, None);
+        Ok(json!({
+            "terminal_id": terminal_id,
+            "output": output,
+            "total_bytes": window.total_bytes,
+            "returned_bytes": window.returned_bytes,
+            "truncated": window.truncated,
+            // `reset` is true when the supplied `since` was beyond the new end — the
+            // serialized scrollback shrank (a `clear`/reflow), so the prior cursor is stale
+            // and `output` carries the fresh content rather than an empty window.
+            "reset": window.reset,
+            // `cursor` is the RAW-byte offset one past the end of what was returned. It
+            // round-trips as the next `since` for steady line output; see the doc comment for
+            // the best-effort caveat on a re-serialized (reflowed/cleared) scrollback.
+            "cursor": window.cursor,
+        }))
     }
 
     /// Resolve an OPEN terminal record id to its live PTY id, or the actionable `invalid_id`
@@ -1844,8 +2001,11 @@ impl<R: Runtime> ToolDispatcher for NyxToolDispatcher<R> {
             // terminal record + PTY primitives (no second terminal lifecycle).
             CREATE_TERMINAL_TOOL => self.create_terminal(arguments),
             SEND_TO_TERMINAL_TOOL => self.send_to_terminal(arguments),
-            LIST_TERMINALS_TOOL => self.list_terminals(),
+            LIST_TERMINALS_TOOL => self.list_terminals(arguments),
             CLOSE_TERMINAL_TOOL => self.close_terminal(arguments),
+            // Advertised scrollback-read extension (NOT in V1_TOOLS, PRD-4.1 #1): the read
+            // counterpart to send_to_terminal, over the EXISTING front-serialized scrollback.
+            READ_TERMINAL_TOOL => self.read_terminal(arguments),
             "workspace_add" => self.workspace_add(arguments),
             "create_workspace" => self.create_workspace(arguments),
             other => Err(RpcError::new(
@@ -1856,15 +2016,51 @@ impl<R: Runtime> ToolDispatcher for NyxToolDispatcher<R> {
     }
 }
 
-/// A bounded output window (ADR-0003 D7). `output` is at most `tail_bytes`, taken
-/// from the TAIL (most recent) of the available text; `total_bytes` is the full
-/// size before bounding; `cursor` is the byte offset one past the end of what was
-/// returned, fed back as the next `since` for incremental polling.
+/// The token-safe windowing knobs shared by the THREE output flows
+/// (`get_command_output`, `wait_for_command`, `read_terminal`): the parsed
+/// `tail_bytes`/`since`/`strip_ansi`, plus the resolved `effective_tail`
+/// (`min(tail_bytes, max_bytes)`). Built by [`parse_window_knobs`].
+struct WindowKnobs {
+    /// Raw `since` byte offset (a prior `cursor`), or `None` to read the tail.
+    /// `wait_for_command` supplies its own default (the current end-of-buffer) when
+    /// this is `None`, so it is exposed un-resolved.
+    since: Option<usize>,
+    /// `strip_ansi`, defaulting to `true` (one cleaned `output` field).
+    strip: bool,
+    /// The effective window size = `min(tail_bytes, max_bytes)`, after the ceiling guard.
+    effective_tail: usize,
+}
+
+/// Parse + validate the windowing knobs common to the three output flows so the
+/// token-safe contract lives in ONE place (D7/D8): `tail_bytes` (default
+/// [`DEFAULT_TAIL_BYTES`]), `max_bytes` (alternative ceiling), `since`, and
+/// `strip_ansi` (default `true`). A `tail_bytes` OR `max_bytes` above
+/// [`MAX_TAIL_BYTES`] is refused with the shared `output_too_large` error (carrying
+/// structured `requested`/`limit`) rather than silently clamped. Returns the resolved
+/// [`WindowKnobs`] (incl. `effective_tail = min(tail_bytes, ceiling)`).
+fn parse_window_knobs(args: &Value) -> Result<WindowKnobs, RpcError> {
+    let tail_bytes = optional_usize(args, "tail_bytes")?.unwrap_or(DEFAULT_TAIL_BYTES);
+    let since = optional_usize(args, "since")?;
+    let max_bytes = optional_usize(args, "max_bytes")?;
+    let strip = optional_bool(args, "strip_ansi")?.unwrap_or(true);
+    let ceiling = max_bytes.unwrap_or(MAX_TAIL_BYTES);
+    if tail_bytes > MAX_TAIL_BYTES || ceiling > MAX_TAIL_BYTES {
+        return Err(output_too_large_error(tail_bytes, ceiling));
+    }
+    Ok(WindowKnobs { since, strip, effective_tail: tail_bytes.min(ceiling) })
+}
+
+/// A bounded output window (ADR-0003 D7). `output` is at most `tail_bytes`;
+/// `total_bytes` is the full size before bounding; `cursor` is the byte offset one
+/// past the end of what was returned, fed back as the next `since` for incremental
+/// polling. `reset` flags that the caller's `since` was beyond the current end —
+/// the buffer SHRANK (a `clear`/reset) so the old offsets no longer apply.
 struct OutputWindow {
     output: String,
     total_bytes: usize,
     returned_bytes: usize,
     truncated: bool,
+    reset: bool,
     cursor: usize,
 }
 
@@ -1874,14 +2070,31 @@ struct OutputWindow {
 ///
 /// - `since` (a byte offset from a previous `cursor`): only bytes at/after it are
 ///   considered, so polling never re-returns what the agent already read. A `since`
-///   past the end yields an empty window with the cursor pinned at the end.
-/// - `tail_bytes`: from the remaining bytes, keep at most the LAST `tail_bytes`
-///   (the most recent). If that drops earlier bytes, `truncated` is `true`.
-/// - `cursor`: the absolute end offset of what was returned (== `total_bytes` when
-///   the tail reaches the end), so the next call's `since` resumes right after.
+///   exactly AT the end yields an empty window with the cursor pinned there. A
+///   `since` BEYOND the end means the buffer shrank since the caller's last read (a
+///   `clear`/reset, or a terminal re-serialized to a smaller grid): the old offsets
+///   are gone, so we set `reset` and fall back to a fresh read (`since`-less) of the
+///   new content instead of silently returning empty with a backward-moving cursor.
+/// - `tail_bytes` bounds the window. Without a `since` (a one-shot/tail read) keep
+///   the LAST `tail_bytes` (most recent). WITH a `since` (incremental paging) keep
+///   the FIRST `tail_bytes` of the new region instead, so repeated `since=cursor`
+///   reads page forward CONTIGUOUSLY — no gap (the head of a burst is never
+///   silently dropped) and no duplicate. Either way `truncated` flags that the
+///   window did not cover the whole remaining region.
+/// - `cursor`: one past the end of what was ACTUALLY returned, so the next call's
+///   `since` resumes exactly there (== `total_bytes` when the window reaches the end).
 fn bound_output(full: &str, tail_bytes: usize, since: Option<usize>) -> OutputWindow {
     let bytes = full.as_bytes();
     let total_bytes = bytes.len();
+
+    // A `since` PAST the current end means the buffer shrank since the caller last
+    // read (a `clear`/reset, or a terminal re-serialized smaller): the old byte
+    // offsets are stale. Signal it and fall back to a since-less tail read so the
+    // caller sees the post-reset content rather than an empty window + a cursor that
+    // silently moved backward. (`since == total_bytes` is the ordinary "nothing new
+    // yet" case, NOT a reset.)
+    let reset = since.is_some_and(|s| s > total_bytes);
+    let since = if reset { None } else { since };
 
     // Apply the incremental cursor first: drop everything the caller already saw.
     // Snap `since` up to a char boundary so the slice below is valid UTF-8.
@@ -1889,23 +2102,36 @@ fn bound_output(full: &str, tail_bytes: usize, since: Option<usize>) -> OutputWi
     let start_after = ceil_char_boundary(full, start_after);
     let remaining = &bytes[start_after..];
 
-    // From the remaining bytes, keep at most the last `tail_bytes` (the tail).
-    let (mut window_start, truncated) = if remaining.len() > tail_bytes {
-        (start_after + (remaining.len() - tail_bytes), true)
+    // Bound the remaining region to `tail_bytes`. Forward-page on an incremental
+    // (`since`) read so the head of a burst is never dropped; tail on a one-shot read
+    // so the most-recent output is what's returned.
+    let (raw_start, raw_end, truncated) = if remaining.len() > tail_bytes {
+        if since.is_some() {
+            // Incremental: keep the FIRST `tail_bytes` of the new region; the cursor
+            // then advances only to the end of what we returned, so the next
+            // `since=cursor` continues contiguously.
+            (start_after, start_after + tail_bytes, true)
+        } else {
+            // One-shot: keep the LAST `tail_bytes` (the most recent), dropping the head.
+            (start_after + (remaining.len() - tail_bytes), total_bytes, true)
+        }
     } else {
-        (start_after, false)
+        (start_after, total_bytes, false)
     };
-    // Snap the tail cut up to a char boundary (only matters when truncated).
-    window_start = ceil_char_boundary(full, window_start);
+    // Snap both cut points up to char boundaries (only matters when truncated), and
+    // keep end ≥ start after snapping.
+    let window_start = ceil_char_boundary(full, raw_start);
+    let window_end = ceil_char_boundary(full, raw_end).min(total_bytes).max(window_start);
 
-    let slice = &full[window_start..];
+    let slice = &full[window_start..window_end];
     OutputWindow {
         output: slice.to_string(),
         total_bytes,
         returned_bytes: slice.len(),
         truncated,
-        // The next `since`: one past the end of what we returned (== total here).
-        cursor: total_bytes,
+        reset,
+        // The next `since`: one past the end of what we ACTUALLY returned.
+        cursor: window_end,
     }
 }
 
@@ -2040,6 +2266,24 @@ fn map_create_workspace_err(project_id: &str, e: diesel::result::Error) -> RpcEr
 /// fault (a bad query/connection, not a bad id).
 fn internal_db(op: &'static str) -> impl Fn(diesel::result::Error) -> RpcError {
     move |e| RpcError::new("internal", format!("{op}: {e}"))
+}
+
+/// The shared `output_too_large` error for the THREE output flows (`get_command_output`,
+/// `wait_for_command`, `read_terminal`) when a requested window exceeds the hard ceiling
+/// (PRD-4.1 task #3). The structured `data` carries machine-readable `requested` (the larger
+/// of the offending `tail_bytes`/`max_bytes`, i.e. what the caller asked for) and `limit`
+/// ([`MAX_TAIL_BYTES`]) so an agent can retry a smaller window WITHOUT parsing the prose
+/// message. The error `code` (`output_too_large`) and the prose are kept EXACTLY as the two
+/// pre-existing flows emitted them (non-regression); only the structured `data` is added.
+fn output_too_large_error(tail_bytes: usize, ceiling: usize) -> RpcError {
+    // `requested` reflects what the caller asked for that tripped the ceiling: the larger of
+    // the two knobs they set (either one above MAX_TAIL_BYTES is the trigger).
+    let requested = tail_bytes.max(ceiling);
+    RpcError::new(
+        "output_too_large",
+        format!("requested window exceeds max_bytes ({MAX_TAIL_BYTES})"),
+    )
+    .with_data(json!({ "requested": requested, "limit": MAX_TAIL_BYTES }))
 }
 
 /// The JSON view of a command TEMPLATE returned by the command-CRUD tools
@@ -2762,12 +3006,39 @@ mod tests {
     }
 
     #[test]
-    fn bound_output_since_and_tail_compose() {
-        // Skip the first 2 bytes (since=2 → "23456789"), then keep the last 3.
+    fn bound_output_since_and_tail_page_forward_without_gap() {
+        // Skip the first 2 bytes (since=2 → remaining "23456789"); the remaining
+        // region (8 bytes) exceeds tail_bytes=3. With a `since`, we page FORWARD —
+        // keep the FIRST 3 bytes ("234") and advance the cursor to 5, NOT tail to
+        // "789" and jump the cursor to 10 (which would silently drop "234567").
         let w = bound_output("0123456789", 3, Some(2));
-        assert_eq!(w.output, "789", "tail applies AFTER the since skip");
-        assert!(w.truncated, "the since-window itself was tail-truncated");
-        assert_eq!(w.cursor, 10);
+        assert_eq!(w.output, "234", "incremental read keeps the HEAD of the new region");
+        assert!(w.truncated, "more remains after this window");
+        assert_eq!(w.cursor, 5, "cursor advances only past what was returned");
+        // The next since=cursor read continues contiguously: no gap, no dup.
+        let w2 = bound_output("0123456789", 3, Some(w.cursor));
+        assert_eq!(w2.output, "567", "resumes exactly where the last window ended");
+        assert_eq!(w2.cursor, 8);
+        let w3 = bound_output("0123456789", 3, Some(w2.cursor));
+        assert_eq!(w3.output, "89", "final partial window");
+        assert!(!w3.truncated, "the tail now fits → not truncated");
+        assert_eq!(w3.cursor, 10);
+    }
+
+    #[test]
+    fn bound_output_since_past_end_signals_reset_and_returns_new_content() {
+        // The buffer SHRANK below the caller's cursor (a `clear`/reset): a stale
+        // since=20 over a 10-byte buffer must NOT silently return empty. We flag
+        // `reset` and fall back to a fresh tail read so the caller sees the new
+        // content rather than nothing.
+        let w = bound_output("0123456789", 1024, Some(20));
+        assert!(w.reset, "since beyond the end is a reset signal");
+        assert_eq!(w.output, "0123456789", "falls back to the new content, not empty");
+        assert_eq!(w.cursor, 10, "cursor reflects the new (smaller) end");
+        // The ordinary 'nothing new yet' case (since == total) is NOT a reset.
+        let at_end = bound_output("0123456789", 1024, Some(10));
+        assert!(!at_end.reset, "since exactly at the end is not a reset");
+        assert_eq!(at_end.output, "");
     }
 
     #[test]
@@ -3291,6 +3562,19 @@ mod tests {
         assert!(result["version"].is_string(), "probe carries the nyx version");
         // D1: probe must carry build_sha (C1 + D1) and schema_ok.
         assert!(result["build_sha"].is_string(), "probe carries build_sha");
+        // PRD-4.1 task #6: probe exposes a BOOLEAN build_dirty, and build_sha is INTACT
+        // (no `-dirty` suffix that would corrupt the sha). The value is build-env
+        // dependent (true off an uncommitted tree, false off a clean commit), so we
+        // assert only the TYPE + the sha's non-corruption here.
+        assert!(
+            result["build_dirty"].is_boolean(),
+            "probe exposes build_dirty as a boolean, got {:?}",
+            result["build_dirty"]
+        );
+        assert!(
+            !result["build_sha"].as_str().unwrap().ends_with("-dirty"),
+            "build_sha must stay intact — dirtiness lives in build_dirty, not a sha suffix"
+        );
         // Without a managed Db, schema_ok defaults to true (no evidence of lag).
         assert_eq!(result["schema_ok"], true, "no Db → schema_ok defaults to true");
     }
@@ -3918,6 +4202,111 @@ mod tests {
             }))
             .expect_err("an over-ceiling window is refused");
         assert_eq!(err.code, "output_too_large");
+        // PRD-4.1 #3: the payload carries structured requested/limit (not only prose).
+        let data = err.data.as_ref().expect("output_too_large carries structured data");
+        assert_eq!(data["requested"], json!(MAX_TAIL_BYTES + 1), "requested echoes the ask");
+        assert_eq!(data["limit"], json!(MAX_TAIL_BYTES), "limit is the hard ceiling");
+    }
+
+    #[test]
+    fn get_command_output_over_the_ceiling_is_output_too_large_with_requested_limit() {
+        // PRD-4.1 #3: the pre-existing output_too_large code on get_command_output stays, and
+        // its payload now carries machine-readable requested/limit (non-regression on code/prose).
+        let (d, instance_id, _app) = seed_wait_dispatcher();
+        let err = d
+            .get_command_output(&json!({
+                "instance_id": instance_id, "max_bytes": MAX_TAIL_BYTES + 7,
+            }))
+            .expect_err("an over-ceiling window is refused");
+        assert_eq!(err.code, "output_too_large", "the code is unchanged");
+        let data = err.data.as_ref().expect("output_too_large carries structured data");
+        assert_eq!(data["requested"], json!(MAX_TAIL_BYTES + 7), "requested echoes the ask");
+        assert_eq!(data["limit"], json!(MAX_TAIL_BYTES), "limit is the hard ceiling");
+    }
+
+    // --- mark_read: explicit, opt-in unread consumption (PRD-4.1 task #5) ------
+    //
+    // A passive read (default / mark_read:false) must NEVER consume the `unread`
+    // notification, so an agent polling output does not silently acknowledge a result
+    // the UI has not seen. Only an explicit `mark_read:true` flips `unread=false`,
+    // EXACTLY as a UI acknowledge does (via the shared `bridge::acknowledge_unread`),
+    // while the factual outcome (state/exit_code) survives.
+
+    #[test]
+    fn get_command_output_passive_read_does_not_consume_unread() {
+        // The default read (no mark_read) is purely observational: a finished, UNREAD run
+        // stays unread after the read. This is the crux of #5 — passive polling must not
+        // acknowledge a result the UI has not seen.
+        let (d, instance_id, app) = seed_wait_dispatcher();
+        app.state::<Db>()
+            .with_conn(|c| {
+                db::set_run_state(c, &instance_id, db::STATE_ERROR, Some(2))?;
+                db::persist_instance_scrollback(c, &instance_id, "boom\n")
+            })
+            .expect("seed a crashed, unread run");
+        // Precondition: the row is unread before the read.
+        let before = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .unwrap();
+        assert!(before.unread, "a fresh finish is unread before the read");
+
+        let out = d
+            .get_command_output(&json!({ "instance_id": instance_id }))
+            .expect("default get_command_output runs");
+        // The read still SEES the unread flag (the pre-mark snapshot) and the factual crash.
+        assert_eq!(out["unread"], json!(true), "the read reports the still-unread result");
+        assert_eq!(out["exit_code"], json!(2), "the factual crash code is reported");
+
+        // The crux: a passive read did NOT clear `unread`.
+        let after = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .unwrap();
+        assert!(after.unread, "a passive (default) read must NOT consume unread");
+        // Belt-and-braces: mark_read:false is the same as omitting it.
+        d.get_command_output(&json!({ "instance_id": instance_id, "mark_read": false }))
+            .expect("explicit mark_read:false runs");
+        let after_false = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .unwrap();
+        assert!(after_false.unread, "mark_read:false also leaves unread intact");
+    }
+
+    #[test]
+    fn get_command_output_mark_read_true_consumes_unread_but_keeps_outcome() {
+        // An EXPLICIT mark_read:true flips unread=false (an acknowledge), exactly as a UI
+        // acknowledge does — while the FACTUAL outcome (state=error + exit_code=2) survives.
+        let (d, instance_id, app) = seed_wait_dispatcher();
+        app.state::<Db>()
+            .with_conn(|c| {
+                db::set_run_state(c, &instance_id, db::STATE_ERROR, Some(2))?;
+                db::persist_instance_scrollback(c, &instance_id, "boom\n")
+            })
+            .expect("seed a crashed, unread run");
+        let before = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .unwrap();
+        assert!(before.unread, "unread before the consuming read");
+
+        d.get_command_output(&json!({ "instance_id": instance_id, "mark_read": true }))
+            .expect("consuming get_command_output runs");
+
+        let after = app
+            .state::<Db>()
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .unwrap();
+        assert!(!after.unread, "mark_read:true consumes the unread flag");
+        // The factual outcome is UNTOUCHED — an acknowledge never erases the crash.
+        assert_eq!(after.last_state, db::STATE_ERROR, "the error state survives the mark");
+        assert_eq!(after.last_exit_code, Some(2), "the crash exit code survives the mark");
     }
 
     // --- get_command_output token-safe contract end-to-end (review R-OUTPUT) ---
@@ -5440,7 +5829,16 @@ mod tests {
             )
             .expect("preview import runs");
         assert_eq!(result["preview"], true, "the result echoes preview:true");
-        let listed = result["imported"].as_array().expect("imported (preview) array");
+        // PRD-4.1 task #6: a preview reports its rows under `would_import` and leaves
+        // `imported` an EMPTY array (it created nothing) — both keys are always present so
+        // a consumer reading `imported` never gets null, while `would_import` carries the rows.
+        assert_eq!(
+            result["imported"].as_array().map(|a| a.len()),
+            Some(0),
+            "a preview's `imported` is present but empty (it imported nothing), got {:?}",
+            result.get("imported")
+        );
+        let listed = result["would_import"].as_array().expect("would_import (preview) array");
         // Preview rows carry name/package/script_name/body/command — NOT a command_id.
         let dev = listed
             .iter()
@@ -5460,6 +5858,44 @@ mod tests {
             templates["commands"].as_array().unwrap().is_empty(),
             "preview created NO template, got {:?}",
             templates["commands"]
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn import_commands_real_import_reports_creations_under_imported_not_would_import() {
+        // PRD-4.1 task #6 (the real-import half): a REAL import (no preview) reports its
+        // actual creations under `imported` and leaves `would_import` an EMPTY array — the
+        // inverse of the preview. Both keys are always present (the unused one is `[]`), so
+        // `preview` plus the populated field disambiguate a dry-run from a real run.
+        let tmp = std::env::temp_dir().join(format!("nyx-import-real-field-{}", uuid_like()));
+        std::fs::create_dir_all(&tmp).expect("temp workspace dir");
+        std::fs::write(tmp.join("package.json"), r#"{ "scripts": { "dev": "vite" } }"#)
+            .expect("write package.json");
+        let root = tmp.to_string_lossy().to_string();
+        let s = seed_crud_dispatcher(&root);
+
+        let result = s
+            .dispatcher
+            .call("import_commands", &json!({ "project_id": s.project_id }))
+            .expect("real import runs");
+        assert_eq!(result["preview"], false, "a real import echoes preview:false");
+        // A real import carries `imported` (with the created template) and an EMPTY `would_import`.
+        assert_eq!(
+            result["would_import"].as_array().map(|a| a.len()),
+            Some(0),
+            "a real import's `would_import` is present but empty, got {:?}",
+            result.get("would_import")
+        );
+        let imported = result["imported"].as_array().expect("imported array on a real import");
+        let dev = imported
+            .iter()
+            .find(|c| c["name"] == "dev")
+            .expect("dev imported");
+        assert!(
+            dev["command_id"].is_string(),
+            "a real import row carries the created template's command_id"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -6083,6 +6519,56 @@ mod tests {
     }
 
     #[test]
+    fn list_terminals_include_closed_surfaces_closed_records_for_rediscovery() {
+        // Arbitration C: by default list_terminals hides CLOSED terminals, but
+        // include_closed:true surfaces them (each carrying status:"closed") so an agent can
+        // rediscover a finished terminal's id and read its last scrollback via read_terminal.
+        let (d, _app, _count) = seed_terminal_app();
+        let terminal_id = d
+            .call("create_terminal", &json!({}))
+            .expect("create")["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // An open terminal carries status:"alive".
+        let open = d.call("list_terminals", &json!({})).expect("list");
+        let alive_row = open["terminals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["terminal_id"] == json!(terminal_id))
+            .expect("the alive terminal is listed by default");
+        assert_eq!(alive_row["status"], json!("alive"), "an open terminal is alive");
+
+        // Close it: the record stays but flips to closed.
+        d.call("close_terminal", &json!({ "terminal_id": terminal_id }))
+            .expect("close");
+
+        // Default list HIDES the closed terminal...
+        let default_list = d.call("list_terminals", &json!({})).expect("default list");
+        assert!(
+            default_list["terminals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["terminal_id"] != json!(terminal_id)),
+            "a closed terminal is hidden from the default list"
+        );
+        // ...but include_closed:true surfaces it with status:"closed".
+        let with_closed = d
+            .call("list_terminals", &json!({ "include_closed": true }))
+            .expect("list including closed");
+        let closed_row = with_closed["terminals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["terminal_id"] == json!(terminal_id))
+            .expect("include_closed surfaces the closed terminal");
+        assert_eq!(closed_row["status"], json!("closed"), "it is reported as closed");
+        assert_eq!(closed_row["live"], json!(false), "a closed terminal has no live PTY");
+    }
+
+    #[test]
     fn send_to_terminal_writes_a_command_to_the_live_pty() {
         // send_to_terminal resolves the record id → live PTY and writes the command+newline.
         // We spawn a REAL pty (the write path needs a live PTY) and register the link; the
@@ -6158,5 +6644,265 @@ mod tests {
             .expect_err("unknown terminal id");
         assert_eq!(err.code, "invalid_id", "unknown id → invalid_id");
         assert_eq!(term_ticks(&count), 0, "a rejected close emits nothing");
+    }
+
+    // --- read_terminal (PRD-4.1 #1): read the front-serialized scrollback -------
+    //
+    // These drive the REAL dispatcher over a terminal record whose persisted scrollback was
+    // seeded via the SAME `db::persist_scrollback` the front uses. No second buffer, no PTY:
+    // read_terminal reads exactly the last persisted snapshot.
+
+    #[test]
+    fn read_terminal_unknown_id_is_invalid_id() {
+        // An unknown / no-longer-existing terminal record → structured invalid_id (D8).
+        let (d, _app, _count) = seed_terminal_app();
+        let err = d
+            .call("read_terminal", &json!({ "terminal_id": "no-such" }))
+            .expect_err("unknown terminal id");
+        assert_eq!(err.code, "invalid_id", "unknown record → invalid_id");
+    }
+
+    #[test]
+    fn read_terminal_default_strips_ansi_and_returns_single_output_field() {
+        // A default read (no strip_ansi) returns ONE cleaned `output` field — no raw escapes.
+        let (d, app, _count) = seed_terminal_app();
+        let res = d.call("create_terminal", &json!({})).expect("create");
+        let terminal_id = res["terminal_id"].as_str().unwrap().to_string();
+        // Seed the persisted scrollback with ANSI-laced text (what SerializeAddon emits).
+        let raw = "\x1b[32mgreen\x1b[0m\nplain\n";
+        app.state::<Db>()
+            .with_conn(|c| db::persist_scrollback(c, &terminal_id, raw))
+            .expect("seed scrollback");
+
+        let out = d
+            .call("read_terminal", &json!({ "terminal_id": terminal_id }))
+            .expect("read_terminal");
+        assert_eq!(
+            out["output"].as_str().unwrap(),
+            "green\nplain\n",
+            "default read strips ANSI to one cleaned output field"
+        );
+        // total_bytes is the RAW length (cursor/round-trip is byte-exact even when stripped).
+        assert_eq!(out["total_bytes"], json!(raw.len()));
+        assert_eq!(out["cursor"], json!(raw.len()), "cursor is one past the raw end");
+        assert!(out.get("text").is_none(), "no parallel raw output+text pair");
+    }
+
+    #[test]
+    fn read_terminal_strip_false_returns_raw_window() {
+        let (d, app, _count) = seed_terminal_app();
+        let terminal_id = d
+            .call("create_terminal", &json!({}))
+            .expect("create")["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let raw = "\x1b[31mred\x1b[0m\n";
+        app.state::<Db>()
+            .with_conn(|c| db::persist_scrollback(c, &terminal_id, raw))
+            .expect("seed scrollback");
+        let out = d
+            .call("read_terminal", &json!({ "terminal_id": terminal_id, "strip_ansi": false }))
+            .expect("read raw");
+        assert_eq!(out["output"].as_str().unwrap(), raw, "strip_ansi:false returns the raw window");
+    }
+
+    #[test]
+    fn read_terminal_tail_bytes_bounds_the_window_from_the_end() {
+        // tail_bytes keeps only the LAST N bytes and marks truncated.
+        let (d, app, _count) = seed_terminal_app();
+        let terminal_id = d
+            .call("create_terminal", &json!({}))
+            .expect("create")["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let raw = "0123456789"; // 10 bytes, ANSI-free so strip is a no-op
+        app.state::<Db>()
+            .with_conn(|c| db::persist_scrollback(c, &terminal_id, raw))
+            .expect("seed scrollback");
+        let out = d
+            .call("read_terminal", &json!({ "terminal_id": terminal_id, "tail_bytes": 4 }))
+            .expect("bounded read");
+        assert_eq!(out["output"].as_str().unwrap(), "6789", "tail keeps the last 4 bytes");
+        assert_eq!(out["truncated"], json!(true), "earlier bytes were dropped → truncated");
+        assert_eq!(out["total_bytes"], json!(10), "total is the full scrollback length");
+        assert_eq!(out["cursor"], json!(10), "cursor still points one past the full end");
+    }
+
+    #[test]
+    fn read_terminal_over_the_ceiling_is_output_too_large() {
+        // tail_bytes/max_bytes over MAX_TAIL_BYTES → output_too_large, the SAME bound as the
+        // command flows (PRD-4.1 #3 ports the code onto read_terminal).
+        let (d, _app, _count) = seed_terminal_app();
+        let terminal_id = d
+            .call("create_terminal", &json!({}))
+            .expect("create")["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let err = d
+            .call(
+                "read_terminal",
+                &json!({ "terminal_id": terminal_id, "tail_bytes": MAX_TAIL_BYTES + 1 }),
+            )
+            .expect_err("over the ceiling");
+        assert_eq!(err.code, "output_too_large", "over-cap read is output_too_large");
+        // The enriched payload (PRD-4.1 #3) carries machine-readable requested/limit.
+        let data = err.data.as_ref().expect("output_too_large carries structured data");
+        assert_eq!(data["requested"], json!(MAX_TAIL_BYTES + 1), "requested echoes the ask");
+        assert_eq!(data["limit"], json!(MAX_TAIL_BYTES), "limit is the hard ceiling");
+    }
+
+    #[test]
+    fn read_terminal_since_is_incremental_without_gap_or_dup() {
+        // since (a prior cursor) reads only what is NEW: chaining read_terminal(since=cursor)
+        // returns the bytes appended after, with no gap and no duplicate.
+        let (d, app, _count) = seed_terminal_app();
+        let terminal_id = d
+            .call("create_terminal", &json!({}))
+            .expect("create")["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let first = "line one\n";
+        app.state::<Db>()
+            .with_conn(|c| db::persist_scrollback(c, &terminal_id, first))
+            .expect("seed initial scrollback");
+        let r1 = d
+            .call("read_terminal", &json!({ "terminal_id": terminal_id }))
+            .expect("first read");
+        let cursor = r1["cursor"].as_u64().unwrap();
+        assert_eq!(cursor as usize, first.len(), "cursor is one past the seeded end");
+
+        // The terminal produces more output; the front persists the GROWN scrollback.
+        let grown = "line one\nline two\n";
+        app.state::<Db>()
+            .with_conn(|c| db::persist_scrollback(c, &terminal_id, grown))
+            .expect("persist grown scrollback");
+        let r2 = d
+            .call("read_terminal", &json!({ "terminal_id": terminal_id, "since": cursor }))
+            .expect("incremental read");
+        assert_eq!(
+            r2["output"].as_str().unwrap(),
+            "line two\n",
+            "since=cursor returns only the newly-appended bytes (no gap, no dup)"
+        );
+        assert_eq!(r2["cursor"], json!(grown.len()), "cursor advances to the new end");
+    }
+
+    #[test]
+    fn read_terminal_closed_record_returns_last_persisted_scrollback() {
+        // DECIDED: as long as the record EXISTS, a CLOSED terminal returns its last persisted
+        // scrollback (the record outlives the PTY). Only a missing record → invalid_id.
+        let (d, app, _count) = seed_terminal_app();
+        let terminal_id = d
+            .call("create_terminal", &json!({}))
+            .expect("create")["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let raw = "final output before close\n";
+        app.state::<Db>()
+            .with_conn(|c| db::persist_scrollback(c, &terminal_id, raw))
+            .expect("seed scrollback");
+        // Close the terminal — the record stays, flipped to `closed`.
+        d.call("close_terminal", &json!({ "terminal_id": terminal_id }))
+            .expect("close");
+        // The read still succeeds and returns the last persisted scrollback.
+        let out = d
+            .call("read_terminal", &json!({ "terminal_id": terminal_id }))
+            .expect("read a closed terminal's last scrollback");
+        assert_eq!(
+            out["output"].as_str().unwrap(),
+            raw,
+            "a closed-but-still-recorded terminal returns its last persisted scrollback"
+        );
+    }
+
+    // --- MCP terminal loop integration: create → send → read (PRD-4.1 task #3) ----
+    //
+    // The AUTOMATED regression for the exact hole the PRD-4 dogfood found: an agent could
+    // open a terminal and send a command via MCP but had NO way to READ its output
+    // (`send_to_terminal` returned only `{sent:true}`). This test drives the WHOLE loop
+    // through the MCP dispatcher — `create_terminal` → `send_to_terminal` → `read_terminal`
+    // — and asserts the command's output is verifiable from the `read_terminal` MCP
+    // response ALONE, with NO UI inspection.
+    //
+    // Front dependency, made EXPLICIT (the PRD's assumed reserve): a terminal's PTY is
+    // spawned by the FRONT when its `<Terminal>` mounts, and the scrollback is serialized
+    // by the front's xterm `SerializeAddon` and persisted (debounced) via
+    // `persist_scrollback`. A pure-Rust test has no xterm, so — exactly as the other
+    // `read_terminal_*` tests and the PRD testing decision sanction — this test MODELS the
+    // two front-owned steps: it registers a real live PTY as the terminal's shell (what
+    // `register_terminal_pty` does on mount) and persists the rendered scrollback (what the
+    // front does after output streams back). The MCP path itself — create, send, read — is
+    // exercised end-to-end through the real dispatcher; only the xterm rendering is modeled.
+
+    #[test]
+    fn mcp_create_send_read_terminal_loop_is_verifiable_from_the_response_alone() {
+        let (d, app, _count) = seed_terminal_app();
+
+        // 1) An agent OPENS a terminal via MCP. This is the dogfood entry point: the
+        //    response carries the terminal_id the agent then drives.
+        let created = d
+            .call("create_terminal", &json!({}))
+            .expect("create_terminal via MCP");
+        let terminal_id = created["terminal_id"]
+            .as_str()
+            .expect("the MCP response carries a terminal_id")
+            .to_string();
+
+        // FRONT DEPENDENCY (modeled): the front mounts <Terminal>, spawns the PTY, and
+        // registers the record→pty link via `register_terminal_pty`. We do the same with a
+        // REAL live PTY so the MCP write path has a live shell to target.
+        let pty_id = crate::bridge::tests_spawn_pty(&app);
+        app.state::<TerminalPtyMap>().set(&terminal_id, pty_id);
+
+        // 2) The agent SENDS a command via MCP. Before the fix this was the dead end —
+        //    `{sent:true}` with no way to observe the result. The write goes to the live PTY
+        //    through the SAME PtyManager path `pty_write` uses.
+        let marker = "nyx-loop-marker-7f3a";
+        let sent = d
+            .call(
+                "send_to_terminal",
+                &json!({ "terminal_id": terminal_id, "command": format!("echo {marker}") }),
+            )
+            .expect("send_to_terminal via MCP");
+        assert_eq!(sent["sent"], json!(true), "the command was written to the live PTY");
+
+        // FRONT DEPENDENCY (modeled): the PTY's output streams back through `pty://output`;
+        // the front's xterm renders it and its SerializeAddon serializes the scrollback,
+        // which is persisted (debounced) via `persist_scrollback`. We persist the scrollback
+        // the front WOULD have captured — the echoed marker line — so the read has the last
+        // front-persisted snapshot to serve (the documented debounce/staleness reserve).
+        let rendered_scrollback = format!("$ echo {marker}\n{marker}\n");
+        app.state::<Db>()
+            .with_conn(|c| db::persist_scrollback(c, &terminal_id, &rendered_scrollback))
+            .expect("front persists the rendered scrollback");
+
+        // 3) The agent READS the output via MCP — the new capability that closes the loop.
+        let read = d
+            .call("read_terminal", &json!({ "terminal_id": terminal_id }))
+            .expect("read_terminal via MCP");
+
+        // The crux: the command's output is verifiable from the MCP `read_terminal`
+        // response ALONE — no UI inspection. The agent sees the marker it just echoed.
+        let output = read["output"].as_str().expect("read_terminal returns an output string");
+        assert!(
+            output.contains(marker),
+            "the sent command's output is readable from the MCP response alone, got {output:?}"
+        );
+        // And the read carries the bounded-window metadata an agent needs to keep reading
+        // (cursor for the next incremental `since`), all from the same MCP response.
+        assert_eq!(
+            read["total_bytes"].as_u64().unwrap() as usize,
+            rendered_scrollback.len(),
+            "total_bytes reflects the full persisted scrollback"
+        );
+        assert!(read["cursor"].is_u64(), "the response carries a cursor for incremental reads");
+
+        // Clean up the live PTY (the only OS resource this test holds).
+        let _ = app.state::<PtyManager>().close_id(pty_id);
     }
 }
