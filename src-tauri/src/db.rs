@@ -453,8 +453,11 @@ pub struct SchemaHealth {
     /// `true` when every embedded migration has been applied; `false` if any
     /// pending migration was not applied (schema is behind the binary).
     pub up_to_date: bool,
-    /// The number of migrations that are still pending (0 when `up_to_date`).
-    pub pending_count: usize,
+    /// The number of migrations that are still pending (`Some(0)` when `up_to_date`),
+    /// or `None` when the check itself failed (the migration table could not be read).
+    /// Modelled as an explicit `Option` rather than a magic sentinel so a failed check
+    /// can never leak an absurd count (e.g. `usize::MAX`) onto the probe wire.
+    pub pending_count: Option<usize>,
 }
 
 /// Check whether the DB schema matches the embedded migrations. Returns a
@@ -464,12 +467,12 @@ pub struct SchemaHealth {
 pub fn schema_health(conn: &mut SqliteConnection) -> SchemaHealth {
     match conn.pending_migrations(MIGRATIONS) {
         Ok(pending) => SchemaHealth {
-            pending_count: pending.len(),
+            pending_count: Some(pending.len()),
             up_to_date: pending.is_empty(),
         },
         Err(_) => SchemaHealth {
             up_to_date: false,
-            pending_count: usize::MAX, // sentinel: check itself failed
+            pending_count: None, // the check itself failed (can't read the migration table)
         },
     }
 }
@@ -1324,6 +1327,12 @@ pub fn set_run_state(
                 command_instances::last_state.eq(state),
                 command_instances::last_exit_code.eq::<Option<i32>>(None),
                 command_instances::ended_at.eq::<Option<i64>>(None),
+                // A (re)start clears any stale unseen-result flag carried over from a
+                // PRIOR finished run: the new run has produced no outcome yet, so it can
+                // never be "unread". Without this, relaunching a finished-but-unacked
+                // command leaves unread=1 on a now-`running` row → a phantom "unseen
+                // result" surfaces after a cold restart (DB read, no live runner).
+                command_instances::unread.eq(false),
                 command_instances::updated_at.eq(now),
             ))
             .execute(conn),
@@ -1364,7 +1373,8 @@ pub fn acknowledge_instance(conn: &mut SqliteConnection, id: &str) -> QueryResul
 ///    current run finished);
 ///  - resets the CURRENT run: `scrollback=''`, `last_state='running'`,
 ///    `last_exit_code=NULL`, `ended_at=NULL` (a fresh run produces no outcome yet),
-///    leaving `unread` as-is (a start is not an unseen result).
+///    `unread=false` (a start is not an unseen result, and a stale unread from the
+///    now-archived prior run must not survive onto the fresh `running` row).
 ///
 /// This keeps the per-run separation intact: the CURRENT run starts clean (never
 /// polluted by the prior run's bytes), while the prior run stays retrievable through
@@ -1397,14 +1407,17 @@ pub fn archive_and_reset_for_relaunch(conn: &mut SqliteConnection, id: &str) -> 
 
         // Reset the CURRENT run for the fresh launch so the new run begins clean
         // (never polluted by the prior run's bytes). Always runs (even on a first
-        // start over an idle/never-run instance). Leaves `unread` as-is — a start is
-        // not an unseen result yet.
+        // start over an idle/never-run instance). Clears `unread`: a (re)start is not
+        // an unseen result, and any stale unread=1 from the prior finished run (now
+        // archived into prev_*) must not survive onto the fresh `running` row — else a
+        // cold restart would surface a phantom "unseen result" on a run with no outcome.
         diesel::update(command_instances::table.find(id))
             .set((
                 command_instances::scrollback.eq(""),
                 command_instances::last_state.eq(STATE_RUNNING),
                 command_instances::last_exit_code.eq::<Option<i32>>(None),
                 command_instances::ended_at.eq::<Option<i64>>(None),
+                command_instances::unread.eq(false),
                 command_instances::updated_at.eq(now),
             ))
             .execute(conn)
@@ -1589,8 +1602,10 @@ pub fn instance_ids_for_workspace(
 
 /// Delete a workspace (ON DELETE CASCADE removes its command instances, SET NULL
 /// detaches its terminals). Returns rows deleted (0 = workspace not found).
-/// The caller is responsible for guarding against live running instances before
-/// calling this (see `instance_ids_for_workspace` + runner's `any_running`).
+/// The caller is responsible for guarding against (a) live running instances (see
+/// `instance_ids_for_workspace` + runner's `any_running`) AND (b) deleting a project's
+/// ROOT workspace — removing the root would leave a rootless project (see the
+/// `remove_workspace` MCP handler, which refuses `is_root` rows).
 pub fn delete_workspace(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
     diesel::delete(workspaces::table.find(id)).execute(conn)
 }

@@ -35,7 +35,7 @@ use crate::command::{poll_until, RunState, WAIT_MAX_TIMEOUT, WAIT_POLL_INTERVAL}
 use crate::db::{self, Db};
 use crate::agent::{AgentEvent, AgentRegistry};
 use crate::mcp::{
-    RpcError, ToolDispatcher, ADD_COMMAND_TOOL, AGENT_SESSION_EVENT_TOOL, CLEAR_COMMAND_OUTPUT_TOOL,
+    RpcCode, RpcError, ToolDispatcher, ADD_COMMAND_TOOL, AGENT_SESSION_EVENT_TOOL, CLEAR_COMMAND_OUTPUT_TOOL,
     CLOSE_TERMINAL_TOOL, CREATE_TERMINAL_TOOL, IMPORT_COMMANDS_TOOL, LIST_IMPORTABLE_SCRIPTS_TOOL,
     LIST_TERMINALS_TOOL, PROBE_TOOL, READ_TERMINAL_TOOL, REMOVE_COMMANDS_TOOL, REMOVE_COMMAND_TOOL,
     REMOVE_WORKSPACE_TOOL, SEND_TO_TERMINAL_TOOL, UPDATE_COMMAND_TOOL, WAIT_FOR_COMMAND_TOOL,
@@ -80,13 +80,13 @@ impl<R: Runtime> NyxToolDispatcher<R> {
     fn db(&self) -> Result<tauri::State<'_, Db>, RpcError> {
         self.app
             .try_state::<Db>()
-            .ok_or_else(|| RpcError::new("mcp_unavailable", "nyx runtime not reachable: db"))
+            .ok_or_else(|| RpcError::new(RpcCode::McpUnavailable, "nyx runtime not reachable: db"))
     }
 
     /// The managed command runner (same instance the UI lifecycle commands use).
     fn runner(&self) -> Result<tauri::State<'_, ManagedCommandRunner<R>>, RpcError> {
         self.app.try_state::<ManagedCommandRunner<R>>().ok_or_else(|| {
-            RpcError::new("mcp_unavailable", "nyx runtime not reachable: command runner")
+            RpcError::new(RpcCode::McpUnavailable, "nyx runtime not reachable: command runner")
         })
     }
 
@@ -94,7 +94,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
     /// `register_terminal_pty`). `mcp_unavailable` if the runtime is not yet set up.
     fn terminal_pty_map(&self) -> Result<tauri::State<'_, TerminalPtyMap>, RpcError> {
         self.app.try_state::<TerminalPtyMap>().ok_or_else(|| {
-            RpcError::new("mcp_unavailable", "nyx runtime not reachable: terminal map")
+            RpcError::new(RpcCode::McpUnavailable, "nyx runtime not reachable: terminal map")
         })
     }
 
@@ -102,7 +102,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
     /// `register_terminal_pty` once the front spawns the PTY). `mcp_unavailable` if absent.
     fn pending_terminal_commands(&self) -> Result<tauri::State<'_, PendingTerminalCommands>, RpcError> {
         self.app.try_state::<PendingTerminalCommands>().ok_or_else(|| {
-            RpcError::new("mcp_unavailable", "nyx runtime not reachable: terminal command park")
+            RpcError::new(RpcCode::McpUnavailable, "nyx runtime not reachable: terminal command park")
         })
     }
 
@@ -111,7 +111,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
     fn pty_manager(&self) -> Result<tauri::State<'_, PtyManager>, RpcError> {
         self.app
             .try_state::<PtyManager>()
-            .ok_or_else(|| RpcError::new("mcp_unavailable", "nyx runtime not reachable: pty manager"))
+            .ok_or_else(|| RpcError::new(RpcCode::McpUnavailable, "nyx runtime not reachable: pty manager"))
     }
 
     /// The FACTUAL run status of an instance as [`status_json`], reported the way the
@@ -237,7 +237,22 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let path = require_str(args, "path")?;
         let name = match optional_str(args, "name")? {
             Some(n) => n.to_string(),
-            None => basename(path),
+            None => {
+                // Derive the name from the path's last segment — but reject an EMPTY
+                // result (e.g. path "/" or all-separators), which would register a
+                // workspace named "" rather than failing.
+                let derived = basename(path);
+                if derived.is_empty() {
+                    return Err(RpcError::new(
+                        RpcCode::InvalidArgument,
+                        format!(
+                            "could not derive a workspace name from path '{path}' — \
+                             pass an explicit `name`"
+                        ),
+                    ));
+                }
+                derived
+            }
         };
         // The contract: workspace_add registers an EXISTING directory. Validate that
         // on disk before touching the DB so a non-existent / non-dir path is rejected
@@ -396,7 +411,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             return Ok(json!({ "commands": commands }));
         }
         Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             "list_commands requires either workspace_id (instances) or project_id (templates)",
         ))
     }
@@ -429,7 +444,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let runner = self.runner()?;
         let outcome = runner
             .start_with_env(instance_id, &command, Some(&cwd), &env)
-            .map_err(|e| RpcError::new("internal", format!("start failed: {e}")))?;
+            .map_err(|e| RpcError::new(RpcCode::Internal, format!("start failed: {e}")))?;
         // Explicit mutation ack (R-WSCMD #4/#5): `was_running` (was it already running
         // when start was called → the call was a no-op) and `restarted` (always false
         // for start — a fresh start is not a restart, and a running instance is a no-op,
@@ -459,17 +474,22 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         // Capture liveness BEFORE the stop so we can report changed/was_running. The
         // runner is the source of truth for "running right now".
         let was_running = runner.is_running(instance_id);
-        runner
+        let state_after = runner
             .stop(instance_id)
-            .map_err(|e| RpcError::new("internal", format!("stop failed: {e}")))?;
+            .map_err(|e| RpcError::new(RpcCode::Internal, format!("stop failed: {e}")))?;
+        // `changed` ⇔ OUR stop actually killed a live process. Derive it from stop()'s own
+        // result (the state AFTER the stop), not just the pre-stop liveness snapshot: if
+        // the command finished NATURALLY in the race window between the snapshot and the
+        // stop, stop() is a no-op that returns the settled success/error state — reporting
+        // that as a user-initiated stop (changed:true) would mislabel a natural exit. Only
+        // a running snapshot that the stop transitioned to `idle` counts as a real change.
+        let changed = was_running && state_after == RunState::Idle;
         // Surface the run status (finding #13 + v4). A stop is a kill, not a natural
         // exit, so it transitions to `idle` with no `exit_code` — distinct from a
         // `success`/`error` finish, which carries its code.
         let mut result = status_result(instance_id, self.runner_status(&runner, instance_id));
         if let Some(map) = result.as_object_mut() {
-            // `changed` ⇔ the stop killed a live process. A stop on an idle/finished
-            // instance is a no-op (changed:false), not a phantom success.
-            map.insert("changed".to_string(), json!(was_running));
+            map.insert("changed".to_string(), json!(changed));
             map.insert("was_running".to_string(), json!(was_running));
         }
         Ok(result)
@@ -497,7 +517,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let runner = self.runner()?;
         let outcome = runner
             .relaunch_with_env(instance_id, &command, Some(&cwd), &env)
-            .map_err(|e| RpcError::new("internal", format!("relaunch failed: {e}")))?;
+            .map_err(|e| RpcError::new(RpcCode::Internal, format!("relaunch failed: {e}")))?;
         // Explicit mutation ack (R-WSCMD #4/#5): a relaunch always restarts
         // (`restarted:true`); `was_running` reports whether a live process was stopped.
         let mut result = status_result(instance_id, self.runner_status(&runner, instance_id));
@@ -635,13 +655,19 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             }
         };
 
-        let window = bound_output(&full, knobs.effective_tail, since);
+        // `since` is a CURRENT-run byte cursor. The previous-run buffer is a DIFFERENT
+        // byte stream, so applying a current-run cursor to it would slice at a meaningless
+        // offset — typically reporting the prior run as empty (or spuriously "reset"). A
+        // previous read is therefore a one-shot bounded tail; `since` is ignored for it
+        // (cursors are only meaningful within the current run, per the mark_read note).
+        let effective_since = if previous { None } else { since };
+        let window = bound_output(&full, knobs.effective_tail, effective_since);
         // Render the `output` field per the token-safe contract (review R-OUTPUT):
         // strip_ansi=true → ONE cleaned view (no raw output+text duplication);
         // strip_ansi=false → the raw byte window. `grep`/`tail_lines` further reduce
         // the rendered text to matching/last-N lines. `cursor`/`total_bytes`/`returned_
         // bytes`/`truncated` stay computed on the RAW bytes so the byte cursor is exact.
-        let output = render_output(&window.output, strip, grep.as_ref(), tail_lines);
+        let output = render_output(&window.output, strip, grep.as_ref(), tail_lines, window.head_truncated);
         let mut result = json!({
             "instance_id": instance_id,
             // Echo which run this window is for, so a polling agent can tell a
@@ -773,7 +799,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         // rendered through the SAME token-safe path (strip/clean) as get_command_output.
         let full = self.current_output(&instance_id)?;
         let window = bound_output(&full, effective_tail, Some(since));
-        let output_tail = render_output(&window.output, strip, None, None);
+        let output_tail = render_output(&window.output, strip, None, None, window.head_truncated);
 
         Ok(json!({
             "instance_id": instance_id,
@@ -835,7 +861,15 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             .map_err(internal_db("read command outcome"))?;
         match live {
             Some((state, exit_code, _unread)) => {
-                let ended_at = inst.as_ref().and_then(|i| i.ended_at);
+                // `ended_at` is persisted to the DB row asynchronously (the pump flips the
+                // in-memory state BEFORE on_state persists ended_at), so a run that JUST
+                // finished can be live-success here while the row's ended_at is still null.
+                // Don't report a finished run with ended_at:null — fall back to "now" for a
+                // settled state (a close approximation; the precise persisted timestamp
+                // lands a moment later). A still-running run legitimately has no ended_at.
+                let ended_at = inst.as_ref().and_then(|i| i.ended_at).or_else(|| {
+                    matches!(state, RunState::Success | RunState::Error).then(db::now_millis)
+                });
                 Ok((state, exit_code, ended_at))
             }
             None => match inst {
@@ -890,7 +924,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             Some(name) => name,
             None => {
                 return Err(RpcError::new(
-                    "invalid_argument",
+                    RpcCode::InvalidArgument,
                     "provide instance_id, or { name, workspace_id } to resolve by name",
                 ))
             }
@@ -899,7 +933,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             Some(ws) => ws,
             None => {
                 return Err(RpcError::new(
-                    "invalid_argument",
+                    RpcCode::InvalidArgument,
                     "resolving a command by name requires workspace_id alongside name",
                 ))
             }
@@ -911,7 +945,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let mut matches = rows.into_iter().filter(|r| r.name == name);
         let first = matches.next().ok_or_else(|| {
             RpcError::new(
-                "invalid_id",
+                RpcCode::InvalidId,
                 format!("no command named '{name}' in workspace {workspace_id}"),
             )
         })?;
@@ -921,7 +955,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             let mut ids = vec![first.id, second.id];
             ids.extend(matches.map(|r| r.id));
             return Err(RpcError::new(
-                "invalid_state",
+                RpcCode::InvalidState,
                 format!(
                     "command name '{name}' is ambiguous in workspace {workspace_id} \
                      ({} instances: {}); pass an explicit instance_id",
@@ -951,7 +985,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             None => return Err(self.bad_instance_id_error(instance_id)),
         };
         let cwd = crate::subfolder::resolve_run_dir(&ctx.workspace_path, ctx.subfolder.as_deref())
-            .map_err(|e| RpcError::new("invalid_argument", e))?;
+            .map_err(|e| RpcError::new(RpcCode::InvalidArgument, e))?;
         Ok((ctx.command, cwd))
     }
 
@@ -972,7 +1006,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             .is_some();
         if is_template {
             RpcError::new(
-                "invalid_id",
+                RpcCode::InvalidId,
                 format!(
                     "'{id}' is a command TEMPLATE id (command_id), which is not launchable. \
                      Pass an instance_id from list_commands(workspace_id=…) — command_id names \
@@ -981,7 +1015,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             )
         } else {
             RpcError::new(
-                "invalid_id",
+                RpcCode::InvalidId,
                 format!(
                     "unknown command instance {id} (if this is a command_id from \
                      list_commands(project_id=…), pass instead an instance_id from \
@@ -1029,15 +1063,22 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             "schema_ok": schema_ok,
         });
         if !schema_ok {
-            // Surface a clear warning so the agent / operator knows why tools fail,
-            // plus the count of pending migrations (usize::MAX = the check itself failed).
+            // Surface a clear warning so the agent / operator knows why tools fail.
+            // `pending_count` is `Some(n)` for a real pending count, or `None` when the
+            // health check itself failed — surfaced as a distinct `schema_check_failed`
+            // flag rather than an absurd sentinel count on the wire.
             if let Some(map) = result.as_object_mut() {
                 map.insert(
                     "schema_warning".to_string(),
                     json!("schema has pending migrations — restart nyx to apply them"),
                 );
-                if let Some(count) = health.as_ref().map(|h| h.pending_count) {
-                    map.insert("pending_migrations".to_string(), json!(count));
+                match health.as_ref().and_then(|h| h.pending_count) {
+                    Some(count) => {
+                        map.insert("pending_migrations".to_string(), json!(count));
+                    }
+                    None => {
+                        map.insert("schema_check_failed".to_string(), json!(true));
+                    }
                 }
             }
         }
@@ -1071,7 +1112,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let agent_kind = optional_str(args, "agent_kind")?.unwrap_or(db::AGENT_KIND_CLAUDE_CODE);
         let registry = AgentRegistry::default();
         let adapter = registry.get(agent_kind).ok_or_else(|| {
-            RpcError::new("invalid_argument", format!("unknown agent_kind '{agent_kind}'"))
+            RpcError::new(RpcCode::InvalidArgument, format!("unknown agent_kind '{agent_kind}'"))
         })?;
 
         // The terminal correlation id is required: without it nyx cannot bind the
@@ -1081,7 +1122,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         // Normalize the raw hook payload through the adapter (start / end / None).
         let event = adapter.parse_event(args).ok_or_else(|| {
             RpcError::new(
-                "invalid_argument",
+                RpcCode::InvalidArgument,
                 "payload is not a recognizable agent session event (need hook_event_name + session_id)",
             )
         })?;
@@ -1110,7 +1151,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
                     .map_err(internal_db("record agent session start"))?;
                 let Some(session) = session else {
                     return Err(RpcError::new(
-                        "invalid_id",
+                        RpcCode::InvalidId,
                         format!("unknown terminal {terminal_id}"),
                     ));
                 };
@@ -1485,7 +1526,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
                         .with_conn(|c| db::get_workspace(c, workspace_id))
                         .map_err(internal_db("resolve workspace for import"))?
                         .ok_or_else(|| {
-                            RpcError::new("invalid_id", format!("unknown workspace {workspace_id}"))
+                            RpcError::new(RpcCode::InvalidId, format!("unknown workspace {workspace_id}"))
                         })?;
                     (ws.project_id, vec![ws.path])
                 }
@@ -1495,7 +1536,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
                         .map_err(internal_db("list workspaces for import"))?;
                     if workspaces.is_empty() {
                         return Err(RpcError::new(
-                            "invalid_id",
+                            RpcCode::InvalidId,
                             format!(
                                 "unknown project {project_id} (or it has no workspaces to scan)"
                             ),
@@ -1506,7 +1547,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
                 }
                 (None, None) => {
                     return Err(RpcError::new(
-                        "invalid_argument",
+                        RpcCode::InvalidArgument,
                         "import_commands requires project_id (scan all workspaces) or \
                          workspace_id (scan one)",
                     ))
@@ -1556,7 +1597,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let runner = self.runner()?;
         if runner.any_running(&instance_ids) {
             return Err(RpcError::new(
-                "invalid_state",
+                RpcCode::InvalidState,
                 format!(
                     "command {command_id} is running in at least one workspace; stop it \
                      before editing the command"
@@ -1580,7 +1621,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             .is_some();
         if is_instance {
             RpcError::new(
-                "invalid_id",
+                RpcCode::InvalidId,
                 format!(
                     "'{id}' is a launchable INSTANCE id (instance_id), not a command TEMPLATE. \
                      Pass a command_id from list_commands(project_id=…) — add_command/\
@@ -1589,7 +1630,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             )
         } else {
             RpcError::new(
-                "invalid_id",
+                RpcCode::InvalidId,
                 format!("unknown command template {id} (command_id from list_commands(project_id=…))"),
             )
         }
@@ -1607,6 +1648,32 @@ impl<R: Runtime> NyxToolDispatcher<R> {
     fn remove_workspace(&self, args: &Value) -> Result<Value, RpcError> {
         let workspace_id = require_str(args, "workspace_id")?;
         let db = self.db()?;
+        // Guard: refuse to delete a project's ROOT workspace. A project requires exactly
+        // one root (idx_one_root_per_project) and the root anchors its folder; deleting it
+        // would leave a rootless project husk (no path, list_workspaces empty, no way to
+        // materialize instances). The UI has no per-workspace delete — only whole-project
+        // delete — so this MCP tool is the only path that could reach a root row.
+        let workspace = db
+            .with_conn(|c| db::get_workspace(c, workspace_id))
+            .map_err(internal_db("read workspace"))?;
+        match workspace {
+            None => {
+                return Err(RpcError::new(
+                    RpcCode::InvalidId,
+                    format!("unknown workspace {workspace_id}"),
+                ));
+            }
+            Some(ws) if ws.is_root => {
+                return Err(RpcError::new(
+                    RpcCode::InvalidState,
+                    format!(
+                        "workspace {workspace_id} is the project's root — it cannot be \
+                         removed on its own; delete the whole project instead"
+                    ),
+                ));
+            }
+            Some(_) => {}
+        }
         // Guard: refuse if any instance in this workspace is running — same as the
         // project-delete guard in bridge::delete_project.
         let instance_ids = db
@@ -1615,7 +1682,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let runner = self.runner()?;
         if runner.any_running(&instance_ids) {
             return Err(RpcError::new(
-                "invalid_state",
+                RpcCode::InvalidState,
                 format!(
                     "workspace {workspace_id} has a running command — stop it before \
                      removing the workspace"
@@ -1630,7 +1697,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             .map_err(internal_db("delete workspace"))?;
         if deleted == 0 {
             return Err(RpcError::new(
-                "invalid_id",
+                RpcCode::InvalidId,
                 format!("unknown workspace {workspace_id}"),
             ));
         }
@@ -1684,7 +1751,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let runner = self.runner()?;
         if runner.any_running(&instance_ids) {
             return Err(RpcError::new(
-                "invalid_state",
+                RpcCode::InvalidState,
                 format!(
                     "command {command_id} is running in at least one workspace; stop it \
                      before removing the command"
@@ -1729,7 +1796,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
                 Err(e) => results.push(json!({
                     "command_id": id,
                     "removed": false,
-                    "error": { "code": e.code, "message": e.message },
+                    "error": { "code": e.code.as_str(), "message": e.message },
                 })),
             }
         }
@@ -1882,7 +1949,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
         let written = self
             .pty_manager()?
             .write_to(pty_id, &bytes)
-            .map_err(|e| RpcError::new("internal", format!("write to terminal failed: {e}")))?;
+            .map_err(|e| RpcError::new(RpcCode::Internal, format!("write to terminal failed: {e}")))?;
         if !written {
             // The map had a pty id but it is no longer live (raced an exit). Surface the
             // same actionable invalid_id as an unknown id.
@@ -1974,6 +2041,11 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             let _ = self.pty_manager()?.close_id(pty_id);
         }
         self.terminal_pty_map()?.clear(terminal_id);
+        // Drain any command parked by `create_terminal` for this record. If the terminal
+        // is closed BEFORE its PTY ever registered (the front never mounted the xterm),
+        // `register_terminal_pty` never runs, so the only other drain never fires and the
+        // parked command would leak in PendingTerminalCommands forever.
+        let _ = self.pending_terminal_commands()?.take(terminal_id);
         // Retire the pane on the front (the SAME signal create emits).
         crate::bridge::emit_terminals_changed(&self.app);
         Ok(json!({ "terminal_id": terminal_id, "closed": true }))
@@ -2052,7 +2124,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             // message that says exactly that, not the live-tool's "or closed" wording.
             None => {
                 return Err(RpcError::new(
-                    "invalid_id",
+                    RpcCode::InvalidId,
                     format!(
                         "unknown terminal {terminal_id} (no such terminal record; use a \
                          terminal_id from list_terminals, or one returned by create_terminal)"
@@ -2063,7 +2135,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
 
         // Bound + render through the SAME path as get_command_output (single output field).
         let window = bound_output(&scrollback, effective_tail, since);
-        let output = render_output(&window.output, strip, None, None);
+        let output = render_output(&window.output, strip, None, None, window.head_truncated);
         Ok(json!({
             "terminal_id": terminal_id,
             "output": output,
@@ -2098,7 +2170,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             .get(terminal_id)
             .ok_or_else(|| {
                 RpcError::new(
-                    "invalid_state",
+                    RpcCode::InvalidState,
                     format!(
                         "terminal {terminal_id} has no live shell yet (it may still be \
                          starting up); try again, or open one with create_terminal"
@@ -2111,7 +2183,7 @@ impl<R: Runtime> NyxToolDispatcher<R> {
     /// valid id comes from (mirrors the command tools' disambiguating errors).
     fn bad_terminal_id_error(&self, terminal_id: &str) -> RpcError {
         RpcError::new(
-            "invalid_id",
+            RpcCode::InvalidId,
             format!(
                 "unknown or closed terminal {terminal_id} (use a terminal_id from \
                  list_terminals)"
@@ -2169,7 +2241,7 @@ impl<R: Runtime> ToolDispatcher for NyxToolDispatcher<R> {
             "workspace_add" => self.workspace_add(arguments),
             "create_workspace" => self.create_workspace(arguments),
             other => Err(RpcError::new(
-                "method_not_found",
+                RpcCode::MethodNotFound,
                 format!("unknown tool '{other}'"),
             )),
         }
@@ -2222,6 +2294,12 @@ struct OutputWindow {
     truncated: bool,
     reset: bool,
     cursor: usize,
+    /// Whether the window begins PAST byte 0 of the full buffer (a tail/`since` cut at
+    /// the head). Only then can the first bytes be the orphaned tail of an ANSI escape
+    /// whose `ESC[` introducer fell before the window — i.e. only then may the
+    /// leading-orphan guard run. A full-buffer read (`head_truncated == false`) must keep
+    /// its first bytes verbatim.
+    head_truncated: bool,
 }
 
 /// Compute the bounded output window (ADR-0003 D7). Operates on BYTES so the bound
@@ -2292,6 +2370,8 @@ fn bound_output(full: &str, tail_bytes: usize, since: Option<usize>) -> OutputWi
         reset,
         // The next `since`: one past the end of what we ACTUALLY returned.
         cursor: window_end,
+        // The window starts past byte 0 ⇒ its head may be a chopped escape's orphan tail.
+        head_truncated: window_start > 0,
     }
 }
 
@@ -2333,14 +2413,14 @@ fn validate_existing_dir(path: &str) -> Result<(), RpcError> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_dir() => Ok(()),
         Ok(_) => Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!(
                 "path '{path}' exists but is not a directory; workspace_add registers an \
                  existing folder (use create_workspace to create a new folder)"
             ),
         )),
         Err(_) => Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!(
                 "path '{path}' does not exist; workspace_add registers an EXISTING folder \
                  (use create_workspace to create the folder first)"
@@ -2363,7 +2443,7 @@ fn ensure_dir_created(path: &str) -> Result<(), RpcError> {
             return Ok(()); // already a directory: idempotent create.
         }
         return Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!(
                 "path '{path}' exists but is not a directory; cannot create a workspace folder there"
             ),
@@ -2371,7 +2451,7 @@ fn ensure_dir_created(path: &str) -> Result<(), RpcError> {
     }
     std::fs::create_dir_all(path).map_err(|e| {
         RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!("could not create directory '{path}': {e}"),
         )
     })
@@ -2395,11 +2475,11 @@ fn map_create_workspace_err(project_id: &str, e: diesel::result::Error) -> RpcEr
     use diesel::result::{DatabaseErrorKind, Error as DieselError};
     match &e {
         DieselError::DatabaseError(DatabaseErrorKind::ForeignKeyViolation, _) => RpcError::new(
-            "invalid_id",
+            RpcCode::InvalidId,
             format!("unknown project {project_id}"),
         ),
         DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _) => RpcError::new(
-            "invalid_state",
+            RpcCode::InvalidState,
             "a workspace with this path already exists in the project",
         ),
         // SQLite sometimes reports the FK failure as a generic constraint message
@@ -2407,17 +2487,17 @@ fn map_create_workspace_err(project_id: &str, e: diesel::result::Error) -> RpcEr
         DieselError::DatabaseError(_, info) => {
             let msg = info.message().to_ascii_lowercase();
             if msg.contains("foreign key") {
-                RpcError::new("invalid_id", format!("unknown project {project_id}"))
+                RpcError::new(RpcCode::InvalidId, format!("unknown project {project_id}"))
             } else if msg.contains("unique") {
                 RpcError::new(
-                    "invalid_state",
+                    RpcCode::InvalidState,
                     "a workspace with this path already exists in the project",
                 )
             } else {
-                RpcError::new("internal", format!("create workspace failed: {e}"))
+                RpcError::new(RpcCode::Internal, format!("create workspace failed: {e}"))
             }
         }
-        _ => RpcError::new("internal", format!("create workspace failed: {e}")),
+        _ => RpcError::new(RpcCode::Internal, format!("create workspace failed: {e}")),
     }
 }
 
@@ -2425,7 +2505,7 @@ fn map_create_workspace_err(project_id: &str, e: diesel::result::Error) -> RpcEr
 /// failing operation, for the listing tools whose failures are never the caller's
 /// fault (a bad query/connection, not a bad id).
 fn internal_db(op: &'static str) -> impl Fn(diesel::result::Error) -> RpcError {
-    move |e| RpcError::new("internal", format!("{op}: {e}"))
+    move |e| RpcError::new(RpcCode::Internal, format!("{op}: {e}"))
 }
 
 /// The shared `output_too_large` error for the THREE output flows (`get_command_output`,
@@ -2440,7 +2520,7 @@ fn output_too_large_error(tail_bytes: usize, ceiling: usize) -> RpcError {
     // the two knobs they set (either one above MAX_TAIL_BYTES is the trigger).
     let requested = tail_bytes.max(ceiling);
     RpcError::new(
-        "output_too_large",
+        RpcCode::OutputTooLarge,
         format!("requested window exceeds max_bytes ({MAX_TAIL_BYTES})"),
     )
     .with_data(json!({ "requested": requested, "limit": MAX_TAIL_BYTES }))
@@ -2491,26 +2571,26 @@ fn map_template_write_err(project_id: &str, e: diesel::result::Error) -> RpcErro
     use diesel::result::{DatabaseErrorKind, Error as DieselError};
     match &e {
         DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _) => RpcError::new(
-            "invalid_state",
+            RpcCode::InvalidState,
             "a command with this name already exists in the project — choose a unique name",
         ),
         DieselError::DatabaseError(DatabaseErrorKind::ForeignKeyViolation, _) => {
-            RpcError::new("invalid_id", format!("unknown project {project_id}"))
+            RpcError::new(RpcCode::InvalidId, format!("unknown project {project_id}"))
         }
         DieselError::DatabaseError(_, info) => {
             let msg = info.message().to_ascii_lowercase();
             if msg.contains("unique") {
                 RpcError::new(
-                    "invalid_state",
+                    RpcCode::InvalidState,
                     "a command with this name already exists in the project — choose a unique name",
                 )
             } else if msg.contains("foreign key") {
-                RpcError::new("invalid_id", format!("unknown project {project_id}"))
+                RpcError::new(RpcCode::InvalidId, format!("unknown project {project_id}"))
             } else {
-                RpcError::new("internal", format!("create command failed: {e}"))
+                RpcError::new(RpcCode::Internal, format!("create command failed: {e}"))
             }
         }
-        _ => RpcError::new("internal", format!("create command failed: {e}")),
+        _ => RpcError::new(RpcCode::Internal, format!("create command failed: {e}")),
     }
 }
 
@@ -2521,18 +2601,18 @@ fn map_template_write_err_generic(e: diesel::result::Error) -> RpcError {
     use diesel::result::{DatabaseErrorKind, Error as DieselError};
     match &e {
         DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _) => RpcError::new(
-            "invalid_state",
+            RpcCode::InvalidState,
             "a command with this name already exists in the project — choose a unique name",
         ),
         DieselError::DatabaseError(_, info)
             if info.message().to_ascii_lowercase().contains("unique") =>
         {
             RpcError::new(
-                "invalid_state",
+                RpcCode::InvalidState,
                 "a command with this name already exists in the project — choose a unique name",
             )
         }
-        _ => RpcError::new("internal", format!("update command failed: {e}")),
+        _ => RpcError::new(RpcCode::Internal, format!("update command failed: {e}")),
     }
 }
 
@@ -2588,7 +2668,7 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
     match args.get(key).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(s),
         _ => Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!("missing or empty required argument '{key}'"),
         )),
     }
@@ -2603,7 +2683,7 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, RpcEr
         Some(Value::String(s)) if s.is_empty() => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
         Some(_) => Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!("argument '{key}' must be a string"),
         )),
     }
@@ -2617,11 +2697,11 @@ fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, RpcError> {
         None | Some(Value::Null) => Ok(None),
         Some(v) => {
             let n = v.as_i64().ok_or_else(|| {
-                RpcError::new("invalid_argument", format!("argument '{key}' must be an integer"))
+                RpcError::new(RpcCode::InvalidArgument, format!("argument '{key}' must be an integer"))
             })?;
             if n < 0 {
                 return Err(RpcError::new(
-                    "invalid_argument",
+                    RpcCode::InvalidArgument,
                     format!("argument '{key}' must be >= 0"),
                 ));
             }
@@ -2639,11 +2719,11 @@ fn optional_u64(args: &Value, key: &str) -> Result<Option<u64>, RpcError> {
         None | Some(Value::Null) => Ok(None),
         Some(v) => {
             let n = v.as_i64().ok_or_else(|| {
-                RpcError::new("invalid_argument", format!("argument '{key}' must be an integer"))
+                RpcError::new(RpcCode::InvalidArgument, format!("argument '{key}' must be an integer"))
             })?;
             if n < 0 {
                 return Err(RpcError::new(
-                    "invalid_argument",
+                    RpcCode::InvalidArgument,
                     format!("argument '{key}' must be >= 0"),
                 ));
             }
@@ -2669,7 +2749,7 @@ fn parse_until(args: &Value) -> Result<Vec<RunState>, RpcError> {
         Some(Value::Array(items)) => items,
         Some(_) => {
             return Err(RpcError::new(
-                "invalid_argument",
+                RpcCode::InvalidArgument,
                 "argument 'until' must be an array of state strings \
                  (idle|running|success|error|exited)",
             ))
@@ -2684,7 +2764,7 @@ fn parse_until(args: &Value) -> Result<Vec<RunState>, RpcError> {
     for item in raw {
         let s = item.as_str().ok_or_else(|| {
             RpcError::new(
-                "invalid_argument",
+                RpcCode::InvalidArgument,
                 "each 'until' entry must be a state string \
                  (idle|running|success|error|exited)",
             )
@@ -2701,7 +2781,7 @@ fn parse_until(args: &Value) -> Result<Vec<RunState>, RpcError> {
             }
             other => {
                 return Err(RpcError::new(
-                    "invalid_argument",
+                    RpcCode::InvalidArgument,
                     format!(
                         "unknown 'until' state '{other}' \
                          (accepted: idle|running|success|error|exited)"
@@ -2738,7 +2818,7 @@ enum RunSelector {
 fn optional_run_selector(args: &Value, key: &str) -> Result<RunSelector, RpcError> {
     let too_far = || {
         RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!(
                 "argument '{key}' selects a run: 0/\"current\" (default, latest) or \
                  -1/\"previous\" (the one retained prior run); history is bounded to N=1"
@@ -2757,7 +2837,7 @@ fn optional_run_selector(args: &Value, key: &str) -> Result<RunSelector, RpcErro
             Some(-1) => Ok(RunSelector::Previous),
             Some(_) => Err(too_far()),
             None => Err(RpcError::new(
-                "invalid_argument",
+                RpcCode::InvalidArgument,
                 format!("argument '{key}' must be an integer (0/-1) or a string"),
             )),
         },
@@ -2771,7 +2851,7 @@ fn optional_bool(args: &Value, key: &str) -> Result<Option<bool>, RpcError> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!("argument '{key}' must be a boolean"),
         )),
     }
@@ -2796,7 +2876,7 @@ fn optional_str_array(
                     }
                     None => {
                         return Err(RpcError::new(
-                            "invalid_argument",
+                            RpcCode::InvalidArgument,
                             format!("argument '{key}[{i}]' must be a string"),
                         ));
                     }
@@ -2805,7 +2885,7 @@ fn optional_str_array(
             Ok(Some(set))
         }
         Some(_) => Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!("argument '{key}' must be an array of strings"),
         )),
     }
@@ -2824,7 +2904,7 @@ fn require_str_array(args: &Value, key: &str) -> Result<Vec<String>, RpcError> {
                     Some(s) if !s.is_empty() => out.push(s.to_string()),
                     _ => {
                         return Err(RpcError::new(
-                            "invalid_argument",
+                            RpcCode::InvalidArgument,
                             format!("argument '{key}[{i}]' must be a non-empty string"),
                         ))
                     }
@@ -2833,7 +2913,7 @@ fn require_str_array(args: &Value, key: &str) -> Result<Vec<String>, RpcError> {
             Ok(out)
         }
         _ => Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!("missing or invalid required argument '{key}' (expected an array of strings)"),
         )),
     }
@@ -2858,7 +2938,7 @@ fn optional_env(args: &Value, key: &str) -> Result<Vec<(String, String)>, RpcErr
             for (k, v) in map {
                 if k.is_empty() {
                     return Err(RpcError::new(
-                        "invalid_argument",
+                        RpcCode::InvalidArgument,
                         format!("argument '{key}' has an empty environment variable name"),
                     ));
                 }
@@ -2868,7 +2948,7 @@ fn optional_env(args: &Value, key: &str) -> Result<Vec<(String, String)>, RpcErr
                     // secret): name only the key and its JSON type.
                     other => {
                         return Err(RpcError::new(
-                            "invalid_argument",
+                            RpcCode::InvalidArgument,
                             format!(
                                 "environment variable '{k}' in '{key}' must be a string \
                                  (got a {})",
@@ -2881,7 +2961,7 @@ fn optional_env(args: &Value, key: &str) -> Result<Vec<(String, String)>, RpcErr
             Ok(pairs)
         }
         Some(_) => Err(RpcError::new(
-            "invalid_argument",
+            RpcCode::InvalidArgument,
             format!("argument '{key}' must be an object mapping KEY to VALUE strings"),
         )),
     }
@@ -2911,23 +2991,13 @@ fn json_type_name(v: &Value) -> &'static str {
 /// drops the escape framing that buries the message, which is exactly the finding's
 /// ask, without trying to interpret cursor motion into a reconstructed screen.
 ///
-/// Leading-orphan guard (review `01KV9618K0YEPER69A05CF52R6`): the `tail_bytes`
-/// window in [`bound_output`] is sliced by BYTE offset, so it can begin in the
-/// MIDDLE of an ANSI escape whose `ESC[` introducer fell before the window start.
-/// `strip_ansi` then never sees an `ESC` for that sequence, so its orphan tail
-/// (e.g. `1m`, `0;31m`, `2K`) would leak at the very front of the cleaned text.
-/// We drop exactly that: a leading run of CSI params (`[0-9;]`) optionally closed
-/// by one CSI final byte (`0x40..=0x7E`), but ONLY at offset 0 and ONLY when not
-/// itself introduced by `ESC[`. The raw `output` field is untouched — only this
-/// convenience `text` view is cleaned, so the byte cursor stays exact.
+/// Note: the leading-orphan guard ([`strip_leading_csi_orphan`]) is NOT applied here —
+/// it is only valid on a window that was cut at the head (see [`render_output`], which
+/// applies it conditionally on `head_truncated`). Applying it unconditionally would
+/// silently eat legitimate leading text like `2K…`/`0m…` from a full-buffer read.
 fn strip_ansi(input: &str) -> String {
     const ESC: char = '\u{1b}';
     const BEL: char = '\u{7}';
-
-    // Snap past a leading orphan CSI/SGR fragment cut from the head of the window.
-    // Only meaningful at the start: a `;`/digit run is harmless mid-text, but at
-    // offset 0 with a following final byte it is the residue of a chopped escape.
-    let input = strip_leading_csi_orphan(input);
 
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -2937,13 +3007,25 @@ fn strip_ansi(input: &str) -> String {
             continue;
         }
         match chars.next() {
-            // CSI: ESC [ … <final byte 0x40..=0x7E>. Consume params/intermediates
-            // up to and including the final byte.
+            // CSI: ESC [ <params/intermediates 0x20..=0x3F> <final byte 0x40..=0x7E>.
+            // Bound the scan so a malformed/unterminated CSI mid-buffer (params with no
+            // final byte) can't swallow the rest of the output: a real CSI param run is
+            // short. Consume only valid param/intermediate bytes up to a cap; a final byte
+            // ends the sequence (consumed), and any other byte (or exceeding the cap) stops
+            // WITHOUT consuming it, so it stays as text.
             Some('[') => {
-                for p in chars.by_ref() {
+                const CSI_MAX: usize = 64;
+                let mut n = 0;
+                while let Some(&p) = chars.peek() {
                     if ('\u{40}'..='\u{7e}').contains(&p) {
+                        chars.next(); // final byte — end of the CSI
                         break;
                     }
+                    if n >= CSI_MAX || !('\u{20}'..='\u{3f}').contains(&p) {
+                        break; // not a valid CSI body (or too long) → leave as text
+                    }
+                    chars.next();
+                    n += 1;
                 }
             }
             // OSC: ESC ] … terminated by BEL or ST (ESC \). Consume to the terminator.
@@ -3046,10 +3128,20 @@ fn render_output(
     strip: bool,
     grep: Option<&regex::Regex>,
     tail_lines: Option<usize>,
+    head_truncated: bool,
 ) -> String {
+    // The leading-orphan guard only makes sense when the window was cut at the HEAD (a
+    // tail/`since` slice can begin mid-escape) AND we are cleaning. A full-buffer read, or
+    // a raw (strip=false) read, keeps its first bytes verbatim — otherwise legitimate
+    // leading text such as `2K…`/`0m…` (a digit + a final-byte letter) is silently eaten.
+    let cleaned_source = if strip && head_truncated {
+        strip_leading_csi_orphan(raw_window)
+    } else {
+        raw_window
+    };
     // Cleaned text drives matching AND, when `strip`, the emitted text. When NOT
     // stripping we still match on cleaned lines but emit the corresponding raw lines.
-    let cleaned = strip_ansi(raw_window);
+    let cleaned = strip_ansi(cleaned_source);
 
     // Fast path: no line modes → just honor `strip`.
     if grep.is_none() && tail_lines.is_none() {
@@ -3058,10 +3150,21 @@ fn render_output(
 
     // Line modes work line-by-line. We pair each RAW line with its cleaned form so the
     // regex anchors on readable text while we can still emit the raw line when
-    // strip=false. `str::lines` drops the trailing newline; we re-join with '\n' and
-    // preserve a final newline if the source had one.
+    // strip=false. We re-join with '\n' and preserve a final newline if the source had
+    // one. In RAW mode we split on '\n' WITHOUT dropping a preceding '\r' — `str::lines`
+    // strips it, which would silently rewrite CRLF→LF and break the raw-verbatim promise;
+    // a trailing '\n' yields a final empty element we drop here. In strip mode the
+    // cleaned text may normalize line endings, which is acceptable.
     let emit_source = if strip { cleaned.as_str() } else { raw_window };
-    let raw_lines: Vec<&str> = emit_source.lines().collect();
+    let raw_lines: Vec<&str> = if strip {
+        emit_source.lines().collect()
+    } else {
+        let mut v: Vec<&str> = emit_source.split('\n').collect();
+        if emit_source.ends_with('\n') {
+            v.pop();
+        }
+        v
+    };
     // For matching we need the cleaned form of each emitted line. When strip=true the
     // emitted lines ARE the cleaned lines; when strip=false strip each raw line so the
     // pattern is not foiled by escapes embedded in that line.
@@ -3079,9 +3182,11 @@ fn render_output(
         }
         kept.push((*line).to_string());
     }
-    // tail_lines: keep at most the last N matching lines.
+    // tail_lines: keep at most the last N matching lines. `n == 0` means "no line cap"
+    // (keep all), NOT "drop everything": draining to zero lines would return empty output
+    // while returned_bytes>0 — a misleading "no output" on a non-empty window.
     if let Some(n) = tail_lines {
-        if kept.len() > n {
+        if n > 0 && kept.len() > n {
             kept.drain(0..kept.len() - n);
         }
     }
@@ -3102,7 +3207,7 @@ fn optional_regex(args: &Value, key: &str) -> Result<Option<regex::Regex>, RpcEr
         None => Ok(None),
         Some(pat) => regex::Regex::new(pat).map(Some).map_err(|e| {
             RpcError::new(
-                "invalid_argument",
+                RpcCode::InvalidArgument,
                 format!("argument '{key}' is not a valid regex: {e}"),
             )
         }),
@@ -3501,34 +3606,39 @@ mod tests {
     }
 
     #[test]
-    fn strip_ansi_drops_leading_orphan_csi_fragment_cut_from_window_head() {
-        // The finding: an ESC[1m whose `ESC[` fell BEFORE the tail window start —
-        // strip_ansi sees only the orphan tail `1m...` and must NOT leak it.
-        assert_eq!(strip_ansi("1mbuild failed\n"), "build failed\n");
-        // Multi-param SGR orphan (`ESC[0;31m` cut after `ESC[`).
-        assert_eq!(strip_ansi("0;31merror here"), "error here");
-        // Private-mode / non-`m` finals are orphans too (e.g. `ESC[?25l`, `ESC[2K`).
-        assert_eq!(strip_ansi("?25lhidden cursor"), "hidden cursor");
-        assert_eq!(strip_ansi("2Kcleared line"), "cleared line");
-        // And the orphan composes with the rest of the window being stripped normally.
+    fn render_output_drops_leading_orphan_only_on_a_head_cut() {
+        // The finding: a tail/`since` window can begin right after an `ESC[` introducer,
+        // leaving its orphan tail (`1m`, `0;31m`, `?25l`, `2K`) at offset 0. The slice
+        // helper drops exactly that fragment...
+        assert_eq!(strip_leading_csi_orphan("1mbuild failed\n"), "build failed\n");
+        assert_eq!(strip_leading_csi_orphan("0;31merror here"), "error here");
+        assert_eq!(strip_leading_csi_orphan("?25lhidden cursor"), "hidden cursor");
+        assert_eq!(strip_leading_csi_orphan("2Kcleared line"), "cleared line");
+        // ...and render_output applies it ONLY on a head-cut window (head_truncated=true),
+        // composing with the rest of the window being stripped normally.
         assert_eq!(
-            strip_ansi("1mfailed\u{1b}[0m done"),
+            render_output("1mfailed\u{1b}[0m done", true, None, None, true),
             "failed done"
         );
     }
 
     #[test]
-    fn strip_ansi_orphan_guard_does_not_eat_legitimate_leading_text() {
-        // Only an orphan ENDING in a CSI final byte is stripped. A bare param run
-        // with no final letter, or ordinary text, must survive untouched.
-        assert_eq!(strip_ansi("100; done"), "100; done");
-        assert_eq!(strip_ansi(";leading semicolon"), ";leading semicolon");
-        assert_eq!(strip_ansi("12345 widgets"), "12345 widgets");
-        // A real intact escape at the front is handled by the normal loop, not eaten
-        // as an orphan (no over-consumption past its own final byte).
+    fn full_buffer_read_never_eats_leading_digit_letter_text() {
+        // Finding #11: the orphan guard must NOT run on a full-buffer (head_truncated=false)
+        // read. strip_ansi alone never strips a leading orphan, so legitimate leading text
+        // like "2K…"/"0m…"/"4K…" (a digit + a final-byte letter) survives verbatim.
+        assert_eq!(strip_ansi("2Kcleared line"), "2Kcleared line");
+        assert_eq!(strip_ansi("0m left on the clock"), "0m left on the clock");
+        assert_eq!(strip_ansi("4K video ready\n"), "4K video ready\n");
+        assert_eq!(
+            render_output("2Kcleared line", true, None, None, false),
+            "2Kcleared line"
+        );
+        // Real (intact) escapes are still stripped on a full-buffer read, and ordinary
+        // leading text always survives.
         assert_eq!(strip_ansi("\u{1b}[1mbold\u{1b}[0m tail"), "bold tail");
-        // A non-CSI leading letter is plain text.
         assert_eq!(strip_ansi("mostly clean"), "mostly clean");
+        assert_eq!(strip_ansi("12345 widgets"), "12345 widgets");
     }
 
     #[test]
@@ -3547,9 +3657,10 @@ mod tests {
         assert_eq!(window.output, "1mfailed\n");
         assert!(window.output.starts_with("1m"));
         assert!(window.truncated);
-
-        // The cleaned text drops the orphan — no leading `1m` residue.
-        let text = strip_ansi(&window.output);
+        // The window was cut at the head, so the orphan guard is eligible...
+        assert!(window.head_truncated);
+        // ...and render_output drops the orphan — no leading `1m` residue.
+        let text = render_output(&window.output, true, None, None, window.head_truncated);
         assert_eq!(text, "failed\n");
         assert!(!text.starts_with("1m"));
     }
@@ -3576,7 +3687,7 @@ mod tests {
         // strip_ansi=true (the default) returns ONE cleaned `output` — NOT a raw output
         // plus a parallel `text`. The escapes are gone; the readable text remains.
         let raw = "\u{1b}[31merror:\u{1b}[0m boom\n";
-        let out = render_output(raw, true, None, None);
+        let out = render_output(raw, true, None, None, false);
         assert_eq!(out, "error: boom\n", "stripped output is the single cleaned view");
         assert!(!out.contains('\u{1b}'), "no escape bytes leak into the cleaned output");
     }
@@ -3586,7 +3697,7 @@ mod tests {
         // strip_ansi=false returns the RAW window byte-for-byte (escapes preserved), so
         // an agent that wants the raw bytes can still get them.
         let raw = "\u{1b}[31merror:\u{1b}[0m boom\n";
-        let out = render_output(raw, false, None, None);
+        let out = render_output(raw, false, None, None, false);
         assert_eq!(out, raw, "raw output is byte-exact when strip_ansi=false");
     }
 
@@ -3596,7 +3707,7 @@ mod tests {
         // ANSI-stripped text so color codes never foil the pattern.
         let raw = "\u{1b}[32mstarting up\u{1b}[0m\n\u{1b}[31mERROR: boom\u{1b}[0m\nlistening on :3000\n";
         let re = regex::Regex::new("ERROR").unwrap();
-        let out = render_output(raw, true, Some(&re), None);
+        let out = render_output(raw, true, Some(&re), None, false);
         assert_eq!(out, "ERROR: boom\n", "only the matching line, cleaned");
     }
 
@@ -3606,7 +3717,7 @@ mod tests {
         // matching line (escapes preserved in the emitted output).
         let raw = "ok\n\u{1b}[31mERROR boom\u{1b}[0m\n";
         let re = regex::Regex::new("ERROR").unwrap();
-        let out = render_output(raw, false, Some(&re), None);
+        let out = render_output(raw, false, Some(&re), None, false);
         assert_eq!(
             out, "\u{1b}[31mERROR boom\u{1b}[0m\n",
             "raw matching line is emitted (escapes preserved), trailing newline kept"
@@ -3617,7 +3728,7 @@ mod tests {
     fn render_output_tail_lines_keeps_last_n_lines() {
         // task #4: `tail_lines` keeps the last N lines of the window.
         let raw = "l1\nl2\nl3\nl4\nl5\n";
-        let out = render_output(raw, true, None, Some(2));
+        let out = render_output(raw, true, None, Some(2), false);
         assert_eq!(out, "l4\nl5\n", "keeps the last 2 lines, trailing newline preserved");
     }
 
@@ -3626,7 +3737,7 @@ mod tests {
         // grep first (keep matching), then tail_lines (last N of the matches).
         let raw = "a: ok\nb: ERR\nc: ok\nd: ERR\ne: ERR\n";
         let re = regex::Regex::new("ERR").unwrap();
-        let out = render_output(raw, true, Some(&re), Some(2));
+        let out = render_output(raw, true, Some(&re), Some(2), false);
         assert_eq!(out, "d: ERR\ne: ERR\n", "last 2 of the matching lines");
     }
 

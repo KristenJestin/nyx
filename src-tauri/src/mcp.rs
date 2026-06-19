@@ -259,24 +259,89 @@ pub trait ToolDispatcher: Send + Sync + 'static {
     fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError>;
 }
 
-/// A standardized MCP/JSON-RPC error (ADR-0003 D8). `code` is the stable string
-/// vocabulary; `message` is human-readable; `data` is OPTIONAL structured detail
+/// The ADR-0003 D8 error-code vocabulary, as a CLOSED enum. Modelling the code as a type
+/// (not a free `&'static str`) means a typo can't compile, `rpc_code` maps it
+/// EXHAUSTIVELY (no silent `_ => -32000` fallthrough for an unknown string), and the wire
+/// `error.data.code` is always [`RpcCode::as_str`]. Adding a code is one edit here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcCode {
+    /// An argument is missing, the wrong type, or otherwise invalid.
+    InvalidArgument,
+    /// A referenced id (instance / command / workspace / terminal) does not exist.
+    InvalidId,
+    /// The operation is invalid for the current state (e.g. stop a non-running run).
+    InvalidState,
+    /// The requested output window exceeds the byte ceiling.
+    OutputTooLarge,
+    /// The managed runtime (or a state it needs) is not available yet.
+    McpUnavailable,
+    /// The tool / method name is not recognized.
+    MethodNotFound,
+    /// An unexpected internal failure (DB error, etc.).
+    Internal,
+}
+
+impl RpcCode {
+    /// The stable wire string emitted in `error.data.code`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RpcCode::InvalidArgument => "invalid_argument",
+            RpcCode::InvalidId => "invalid_id",
+            RpcCode::InvalidState => "invalid_state",
+            RpcCode::OutputTooLarge => "output_too_large",
+            RpcCode::McpUnavailable => "mcp_unavailable",
+            RpcCode::MethodNotFound => "method_not_found",
+            RpcCode::Internal => "internal",
+        }
+    }
+
+    /// The JSON-RPC numeric code for the transport envelope: reserved-range codes for
+    /// protocol-level faults, `-32000` (server error) for every domain/tool error.
+    fn json_rpc(self) -> i64 {
+        match self {
+            RpcCode::MethodNotFound => -32601,
+            RpcCode::InvalidArgument => -32602,
+            RpcCode::InvalidId
+            | RpcCode::InvalidState
+            | RpcCode::OutputTooLarge
+            | RpcCode::McpUnavailable
+            | RpcCode::Internal => -32000,
+        }
+    }
+}
+
+impl std::fmt::Display for RpcCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Compare directly against the wire string so tests keep reading naturally, e.g.
+/// `assert_eq!(err.code, "invalid_id")`.
+impl PartialEq<&str> for RpcCode {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+/// A standardized MCP/JSON-RPC error (ADR-0003 D8). `code` is the typed D8 vocabulary
+/// ([`RpcCode`]); `message` is human-readable; `data` is OPTIONAL structured detail
 /// merged into the wire envelope's `error.data` ALONGSIDE the string `code` (e.g.
 /// `output_too_large` carries `{ requested, limit }` so an agent can react without
 /// parsing the prose). It must be a JSON object (its keys are merged in); a non-object
 /// `data` is ignored.
 #[derive(Debug, Clone)]
 pub struct RpcError {
-    pub code: &'static str,
+    pub code: RpcCode,
     pub message: String,
     pub data: Option<Value>,
 }
 
 impl RpcError {
-    /// Construct an error with the ADR-0003 D8 string `code` and a message.
+    /// Construct an error with the ADR-0003 D8 `code` and a message.
     /// Phase-2 tool implementations build their failures through this.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(code: RpcCode, message: impl Into<String>) -> Self {
         Self { code, message: message.into(), data: None }
     }
 
@@ -290,15 +355,9 @@ impl RpcError {
         self.data = Some(data);
         self
     }
-    /// JSON-RPC numeric code for the transport envelope. We keep all tool/domain
-    /// errors as `-32000` (server error) and reserve the reserved range for
-    /// protocol-level faults (parse / invalid request / method not found).
+    /// JSON-RPC numeric code for the transport envelope (delegates to the typed code).
     fn rpc_code(&self) -> i64 {
-        match self.code {
-            "method_not_found" => -32601,
-            "invalid_argument" => -32602,
-            _ => -32000,
-        }
+        self.code.json_rpc()
     }
 }
 
@@ -378,8 +437,12 @@ impl McpServer {
         let method = request.method().clone();
         let url = request.url().to_string();
         // Anti DNS-rebinding (D9): reject a cross-origin browser request before it
-        // reaches the MCP surface. Non-browser clients send no Origin → allowed.
-        if !origin_is_local(&request) {
+        // reaches the MCP surface. The Host header is the primary gate — a rebinding
+        // page's Host is the attacker's hostname (resolving to 127.0.0.1), NOT a loopback
+        // literal, so it is rejected here even when the page strips its Origin. Any
+        // PRESENT Origin must also be local. Browsers always send Host; non-browser MCP
+        // clients connect to 127.0.0.1/localhost and so pass both checks.
+        if !host_is_local(&request) || !origin_is_local(&request) {
             let _ = request.respond(text_response(403, "forbidden origin"));
             return;
         }
@@ -489,7 +552,7 @@ impl McpServer {
                             Some(obj) => Value::Object(obj.clone()),
                             None => json!({}),
                         };
-                        data["code"] = json!(e.code);
+                        data["code"] = json!(e.code.as_str());
                         err["data"] = data;
                     }
                     env
@@ -499,10 +562,27 @@ impl McpServer {
     }
 }
 
-/// Whether the request's `Origin`/`Host` is local (ADR-0003 D9). A missing Origin
-/// (non-browser clients, incl. MCP CLIs) is allowed; a present Origin must point at
-/// `localhost`/`127.0.0.1`. This blocks a malicious web page from driving the
-/// loopback server via the user's browser (DNS-rebinding).
+/// Whether the request's `Host` header is a loopback authority (ADR-0003 D9). This is
+/// the PRIMARY anti-DNS-rebinding gate: a rebinding page's Host is the attacker's
+/// hostname (which resolves to 127.0.0.1) — not a loopback literal — so it is rejected
+/// here even when the page omits its Origin. An HTTP/1.1 request without a Host is
+/// malformed and is treated as non-local (strict). Browsers always send Host; legitimate
+/// MCP clients connect to `127.0.0.1`/`localhost` and so send a loopback Host too.
+fn host_is_local(request: &tiny_http::Request) -> bool {
+    match request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Host"))
+        .map(|h| h.value.as_str().to_string())
+    {
+        None => false,
+        Some(h) => authority_is_loopback(&h),
+    }
+}
+
+/// Whether the request's `Origin` is local OR absent (ADR-0003 D9). A present Origin must
+/// point at a loopback host; absence is allowed here (non-browser clients, incl. MCP
+/// CLIs, send none) — the [`host_is_local`] gate is what actually blocks rebinding.
 fn origin_is_local(request: &tiny_http::Request) -> bool {
     let origin = request
         .headers()
@@ -512,17 +592,41 @@ fn origin_is_local(request: &tiny_http::Request) -> bool {
     match origin {
         None => true,
         Some(o) => {
-            let host = o
+            // Strip scheme + path, keep the `host[:port]` authority.
+            let authority = o
                 .split("://")
                 .nth(1)
                 .unwrap_or(&o)
                 .split('/')
                 .next()
                 .unwrap_or("");
-            let host = host.split(':').next().unwrap_or("");
-            host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1"
+            authority_is_loopback(authority)
         }
     }
+}
+
+/// Case-insensitive loopback check on a `host[:port]` authority. Handles bracketed IPv6
+/// (`[::1]:port`) and any `127.0.0.0/8` literal (not just `127.0.0.1`), plus `localhost`
+/// and `::1`. Per RFC, the Origin/Host host is case-insensitive, so `LOCALHOST` matches.
+fn authority_is_loopback(authority: &str) -> bool {
+    let authority = authority.trim();
+    // Separate host from port. Bracketed IPv6 `[::1]:port` → host `::1`; otherwise the
+    // host is everything before the first `:` (a bare IPv6 like `::1` has no port form
+    // in an authority and is handled by the literal match below).
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if authority.matches(':').count() == 1 {
+        authority.split(':').next().unwrap_or("")
+    } else {
+        authority
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// The `tools/list` descriptors for the frozen v1 surface (ADR-0003). Phase-2 fills
@@ -1411,13 +1515,13 @@ mod tests {
             fn call(&self, name: &str, _arguments: &Value) -> Result<Value, RpcError> {
                 // The tool name doubles as the D8 code to emit, so one dispatcher
                 // covers every code in the vocabulary.
-                let code: &'static str = match name {
-                    "output_too_large" => "output_too_large",
-                    "invalid_id" => "invalid_id",
-                    "invalid_state" => "invalid_state",
-                    "mcp_unavailable" => "mcp_unavailable",
-                    "internal" => "internal",
-                    _ => "invalid_argument",
+                let code: RpcCode = match name {
+                    "output_too_large" => RpcCode::OutputTooLarge,
+                    "invalid_id" => RpcCode::InvalidId,
+                    "invalid_state" => RpcCode::InvalidState,
+                    "mcp_unavailable" => RpcCode::McpUnavailable,
+                    "internal" => RpcCode::Internal,
+                    _ => RpcCode::InvalidArgument,
                 };
                 Err(RpcError::new(code, format!("synthetic {code}")))
             }
@@ -1472,7 +1576,7 @@ mod tests {
         struct OversizeWithData;
         impl ToolDispatcher for OversizeWithData {
             fn call(&self, _name: &str, _arguments: &Value) -> Result<Value, RpcError> {
-                Err(RpcError::new("output_too_large", "requested window exceeds max_bytes (1048576)")
+                Err(RpcError::new(RpcCode::OutputTooLarge, "requested window exceeds max_bytes (1048576)")
                     .with_data(json!({ "requested": 2_000_000, "limit": 1_048_576 })))
             }
         }
@@ -1497,7 +1601,7 @@ mod tests {
         struct CodeKeyInData;
         impl ToolDispatcher for CodeKeyInData {
             fn call(&self, _name: &str, _arguments: &Value) -> Result<Value, RpcError> {
-                Err(RpcError::new("invalid_argument", "bad input")
+                Err(RpcError::new(RpcCode::InvalidArgument, "bad input")
                     .with_data(json!({ "code": "ATTACKER_OVERRIDE", "field": "x" })))
             }
         }
@@ -1527,7 +1631,7 @@ mod tests {
                 if name == PROBE_TOOL {
                     Ok(json!({ "ok": true, "server": SERVER_NAME, "version": SERVER_VERSION }))
                 } else {
-                    Err(RpcError::new("method_not_found", format!("unknown tool '{name}'")))
+                    Err(RpcError::new(RpcCode::MethodNotFound, format!("unknown tool '{name}'")))
                 }
             }
         }
@@ -1567,7 +1671,7 @@ mod tests {
                         "state": "active",
                     }))
                 } else {
-                    Err(RpcError::new("method_not_found", format!("unknown tool '{name}'")))
+                    Err(RpcError::new(RpcCode::MethodNotFound, format!("unknown tool '{name}'")))
                 }
             }
         }
@@ -1631,7 +1735,7 @@ mod tests {
                         "cursor": 6,
                     })),
                     other => Err(RpcError::new(
-                        "method_not_found",
+                        RpcCode::MethodNotFound,
                         format!("unknown tool '{other}'"),
                     )),
                 }
@@ -1736,5 +1840,32 @@ mod tests {
             (raw2.lines().next().unwrap_or("").to_string(), ())
         };
         assert!(status_ok.contains("200"), "localhost Origin allowed, got {status_ok}");
+    }
+
+    #[test]
+    fn rejects_rebinding_host_even_without_origin() {
+        // DNS-rebinding (D9): a page on attacker.com rebound to 127.0.0.1 issues a
+        // SAME-ORIGIN request that carries NO Origin header but a Host of the attacker's
+        // hostname. The Host gate must reject it even though Origin is absent — this is
+        // the bypass the Origin-only check missed.
+        let port = 19040;
+        start_on_port(port);
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let req = "POST /mcp HTTP/1.1\r\nHost: attacker.example.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let status = raw.lines().next().unwrap_or("");
+        assert!(status.contains("403"), "rebinding Host with no Origin → 403, got {status}");
+
+        // A loopback Host with no Origin (a legitimate non-browser MCP client, incl.
+        // case-insensitive `localhost`) is allowed.
+        let mut s = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let r = "GET /health HTTP/1.1\r\nHost: LOCALHOST:1420\r\nConnection: close\r\n\r\n";
+        s.write_all(r.as_bytes()).unwrap();
+        let mut raw2 = String::new();
+        s.read_to_string(&mut raw2).unwrap();
+        let status_ok = raw2.lines().next().unwrap_or("");
+        assert!(status_ok.contains("200"), "loopback Host, no Origin → 200, got {status_ok}");
     }
 }
