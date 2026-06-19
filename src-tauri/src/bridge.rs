@@ -1269,11 +1269,26 @@ fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8
             };
 
             loop {
-                // Wait at most until the next scheduled flush so a steady flood
-                // still flushes on cadence rather than only when idle.
-                let since = last_flush.elapsed();
-                let wait = FLUSH_INTERVAL.saturating_sub(since);
-                match rx.recv_timeout(wait) {
+                // LEADING-EDGE coalescing. The wait strategy depends on whether we
+                // are idle or mid-flood:
+                //   - `pending` EMPTY (idle / between keystrokes): BLOCK on
+                //     `recv()`. No busy-spin on the 16ms cadence, and — crucially —
+                //     `last_flush` is NOT refreshed while we sleep, so it stays
+                //     "old". When the next byte arrives, `last_flush.elapsed() >=
+                //     FLUSH_INTERVAL` holds and the Ok branch flushes it
+                //     IMMEDIATELY (leading edge, retention ≈ 0). A disconnect while
+                //     blocked maps to the Disconnected branch unchanged.
+                //   - `pending` NON-EMPTY (mid-flood): wait at most until the next
+                //     scheduled flush so a steady flood still coalesces on the
+                //     16ms cadence (trailing edge, anti event-DoS) rather than
+                //     emitting per chunk.
+                let recv = if pending.is_empty() {
+                    rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                } else {
+                    let wait = FLUSH_INTERVAL.saturating_sub(last_flush.elapsed());
+                    rx.recv_timeout(wait)
+                };
+                match recv {
                     Ok(chunk) => {
                         // Portable cwd source: scan the raw stream for OSC 7 and
                         // record the most recent decoded cwd for this PTY. Cheap
@@ -3873,6 +3888,99 @@ mod tests {
             events < bytes / 50,
             "events ({events}) must be << byte volume ({bytes}); coalescing failed"
         );
+    }
+
+    /// LEADING-EDGE non-regression (companion to `flood_is_coalesced_…`). The
+    /// flood test proves the pump still COALESCES under a steady stream; this one
+    /// proves the complementary property the leading-edge fix added: a chunk that
+    /// arrives AFTER a quiet gap (≥ FLUSH_INTERVAL) is emitted PROMPTLY, not held
+    /// for ~16ms by the coalescing window. That promptness is the interactive-echo
+    /// latency the fix removed.
+    ///
+    /// We drive the production [`spawn_output_pump`] directly with a SYNTHETIC mpsc
+    /// receiver (same harness as the OSC-133 synthetic e2e tests) so the test is
+    /// shell-agnostic and deterministic: it depends only on the pump's wait/flush
+    /// logic, not on any child process timing.
+    ///
+    /// Method: send a FIRST chunk to prime the pump and wait for its event, sleep
+    /// well past FLUSH_INTERVAL so the pump goes idle (blocks on `recv()`, with
+    /// `last_flush` left "old"), then send a SECOND chunk and measure how long
+    /// until its `pty://output` event lands. With the leading edge that delay is
+    /// ≈0 (the byte flushes on arrival); a regression to trailing-only coalescing
+    /// would push it toward FLUSH_INTERVAL (~16ms).
+    ///
+    /// ANTI-FLAKY: the threshold is DELIBERATELY GENEROUS. We assert the event
+    /// arrives in < FLUSH_INTERVAL * 4 (~64ms), i.e. comfortably below the
+    /// ~16ms-and-climbing a trailing-edge regression would exhibit, yet well above
+    /// the real ≈0ms so OS scheduler jitter / loaded-CR runners (the listener hop,
+    /// thread wake-up) cannot make it flake. The point is to catch a REGRESSION TO
+    /// HELD-FOR-A-FULL-INTERVAL, not to pin a tight latency number — so a loose
+    /// upper bound is the correct, durable assertion here.
+    #[test]
+    fn leading_edge_emits_a_chunk_after_idle_promptly() {
+        let app = build_app();
+
+        // Per-event arrival timestamps (monotonic). The pump emits `pty://output`
+        // with a `{id, bytes}` payload; we only need the WHEN, so we just stamp.
+        let stamps: Arc<Mutex<Vec<Instant>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let s = Arc::clone(&stamps);
+            app.listen("pty://output", move |_event| {
+                s.lock().unwrap().push(Instant::now());
+            });
+        }
+
+        // The pump owns the receiver; we own the synthetic transmitter, so we
+        // control exactly WHEN bytes are offered — no shell, no read() jitter.
+        let (tx, rx) = channel::<Vec<u8>>();
+        spawn_output_pump(app.handle().clone(), 70_001u64, rx);
+
+        // 1) Prime: first chunk + wait until its event is observed. This drains
+        //    the startup state and lets the pump return to a blocked `recv()`.
+        tx.send(b"first\r\n".to_vec()).unwrap();
+        let primed_deadline = Instant::now() + Duration::from_secs(2);
+        while stamps.lock().unwrap().is_empty() && Instant::now() < primed_deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            stamps.lock().unwrap().len(),
+            1,
+            "the priming chunk must produce exactly one event before the idle gap"
+        );
+
+        // 2) Idle gap WELL past FLUSH_INTERVAL so the pump is parked on `recv()`
+        //    with `pending` empty and `last_flush` now older than FLUSH_INTERVAL.
+        std::thread::sleep(FLUSH_INTERVAL * 5);
+
+        // 3) Send the post-idle chunk and time its event. With leading-edge this
+        //    flushes on arrival (retention ≈ 0).
+        let sent_at = Instant::now();
+        tx.send(b"echo\r\n".to_vec()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut arrived_at = None;
+        while arrived_at.is_none() && Instant::now() < deadline {
+            if stamps.lock().unwrap().len() >= 2 {
+                arrived_at = Some(*stamps.lock().unwrap().last().unwrap());
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let arrived_at = arrived_at.expect("post-idle chunk must produce a second event");
+        let latency = arrived_at.saturating_duration_since(sent_at);
+
+        // Generous bound (see doc comment): ~64ms, vs the ~16ms-floor a
+        // trailing-edge regression would impose. Comfortably catches the
+        // regression without flaking on jittery runners.
+        let bound = FLUSH_INTERVAL * 4;
+        assert!(
+            latency < bound,
+            "post-idle chunk must be emitted promptly (leading edge): \
+             latency {latency:?} should be < {bound:?} (FLUSH_INTERVAL={FLUSH_INTERVAL:?})"
+        );
+
+        drop(tx);
     }
 
     // --- terminal_info (live cwd + foreground program via /proc) ----------
