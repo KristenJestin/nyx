@@ -1892,13 +1892,22 @@ impl<R: Runtime> NyxToolDispatcher<R> {
     }
 
     /// `list_terminals` — `{ include_closed? }` → `{ terminals: [{ terminal_id, cwd, label,
-    /// workspace_id, status, pty_id, live }] }`. List terminal records with their id + the live
-    /// record↔PTY mapping (so the agent knows which it can write to). `live` is true when a PTY
-    /// is registered for the record (its shell has started); `pty_id` is that live id or null;
-    /// `status` is `"alive"` or `"closed"`. By default only OPEN (alive) terminals are listed;
-    /// pass `include_closed:true` to ALSO list closed terminals, so an agent can rediscover a
+    /// workspace_id, status, pty_id, live, busy, exec_state, exec_state_updated_at,
+    /// exec_exit_code }] }`. List terminal records with their id + the live record↔PTY mapping
+    /// (so the agent knows which it can write to). `live` is true when a PTY is registered for
+    /// the record (its shell has started); `pty_id` is that live id or null; `status` is
+    /// `"alive"` or `"closed"`. By default only OPEN (alive) terminals are listed; pass
+    /// `include_closed:true` to ALSO list closed terminals, so an agent can rediscover a
     /// finished terminal's id and read its last scrollback via `read_terminal` (arbitration C).
-    /// Read-only.
+    ///
+    /// `busy` is the OS-AUTHORITATIVE bit (task #4) — `true` when a command is running in the
+    /// terminal's foreground (the kernel foreground process group differs from the shell's),
+    /// `false` at an idle prompt. It is the SAME signal that drives the UI running dot, so the
+    /// agent sees exactly what the user sees; `null` when it cannot be derived (no live PTY, or
+    /// a platform without a foreground process group). `exec_state` (`idle`|`running`|`success`
+    /// |`error`), `exec_exit_code`, and `exec_state_updated_at` (epoch ms of the last transition)
+    /// mirror the settled OSC-133 ANNOTATION (success/error + exit code), the same vocabulary the
+    /// managed-command tools expose. Read-only.
     fn list_terminals(&self, args: &Value) -> Result<Value, RpcError> {
         let include_closed = optional_bool(args, "include_closed")?.unwrap_or(false);
         let db = self.db()?;
@@ -1906,11 +1915,16 @@ impl<R: Runtime> NyxToolDispatcher<R> {
             .with_conn(db::list_terminals)
             .map_err(internal_db("list terminals"))?;
         let map = self.terminal_pty_map()?.snapshot();
+        let pty_manager = self.pty_manager()?;
         let terminals: Vec<Value> = records
             .into_iter()
             .filter(|t| include_closed || t.status == db::STATUS_ALIVE)
             .map(|t| {
                 let pty_id = map.get(&t.id).copied();
+                // OS busy bit (task #4): the SAME `foreground_pgid != shell pgid` authority the
+                // UI dot reads, derived live from the kernel via the PTY manager. `null` for a
+                // record with no live PTY (or a non-Unix platform) — never a stale/phantom bit.
+                let busy = pty_id.and_then(|id| pty_manager.busy_of(id));
                 json!({
                     "terminal_id": t.id,
                     "cwd": t.cwd,
@@ -1921,6 +1935,14 @@ impl<R: Runtime> NyxToolDispatcher<R> {
                     "status": t.status,
                     "pty_id": pty_id,
                     "live": pty_id.is_some(),
+                    // OS-derived running bit (authority for the dot) — see fn doc.
+                    "busy": busy,
+                    // Settled OSC-133 annotation (success/error + exit code) + the monotone
+                    // signal. `exec_state_updated_at` is the epoch-ms an agent captures BEFORE
+                    // send_to_terminal and polls past to detect a command's end (task #4).
+                    "exec_state": t.exec_state,
+                    "exec_exit_code": t.exec_exit_code,
+                    "exec_state_updated_at": t.exec_state_updated_at,
                 })
             })
             .collect();
@@ -6716,6 +6738,107 @@ mod tests {
             .expect("include_closed surfaces the closed terminal");
         assert_eq!(closed_row["status"], json!("closed"), "it is reported as closed");
         assert_eq!(closed_row["live"], json!(false), "a closed terminal has no live PTY");
+    }
+
+    #[test]
+    fn list_terminals_carries_busy_and_the_exec_state_marker_fields() {
+        // Task #4: every listed terminal carries the OS `busy` bit + the settled exec-state
+        // marker (`exec_state`, `exec_exit_code`, `exec_state_updated_at`), the SAME vocabulary
+        // the managed-command tools expose. A fresh terminal with no live PTY has busy:null
+        // (cannot be derived) and idle exec_state with a stamped timestamp.
+        let (d, _app, _count) = seed_terminal_app();
+        let terminal_id = d
+            .call("create_terminal", &json!({}))
+            .expect("create")["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let listed = d.call("list_terminals", &json!({})).expect("list_terminals");
+        let row = listed["terminals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["terminal_id"] == json!(terminal_id))
+            .expect("the created terminal is listed")
+            .clone();
+        // No live PTY yet → busy cannot be derived from the OS → null (never a phantom bit).
+        assert!(row["busy"].is_null(), "no live PTY → busy is null, got {}", row["busy"]);
+        // The settled-result marker fields are present, defaulting to idle for a fresh terminal.
+        assert_eq!(row["exec_state"], json!("idle"), "fresh terminal is idle");
+        assert!(row["exec_exit_code"].is_null(), "no exit code yet");
+        assert!(
+            row["exec_state_updated_at"].as_i64().is_some_and(|t| t > 0),
+            "exec_state_updated_at is a stamped epoch-ms, got {}",
+            row["exec_state_updated_at"]
+        );
+    }
+
+    #[test]
+    fn agent_detects_short_command_end_via_advancing_exec_state_marker() {
+        // Task #4 DONE criterion (the integration test): an agent detects that a command sent
+        // via send_to_terminal has FINISHED — even an ULTRA-SHORT one that starts and finishes
+        // between two polls — by capturing `exec_state_updated_at` BEFORE the send and polling
+        // list_terminals until it ADVANCES to a settled state. A `busy` boolean alone would race
+        // (the short command could be entirely missed between polls → false negative); the
+        // monotone timestamp catches it. We drive the SAME exec-state persistence path the
+        // OSC-133 annotation uses (`db::set_exec_state`) to model the command's running→success
+        // transition, decoupled from any real shell emission.
+        let (d, app, _count) = seed_terminal_app();
+        let res = d.call("create_terminal", &json!({})).expect("create");
+        let terminal_id = res["terminal_id"].as_str().unwrap().to_string();
+        // A live PTY backs the record so send_to_terminal has somewhere to write (the OS touch).
+        let pty_id = crate::bridge::tests_spawn_pty(&app);
+        app.state::<TerminalPtyMap>().set(&terminal_id, pty_id);
+
+        // The agent's protocol step 1: snapshot the marker BEFORE sending.
+        let before = d.call("list_terminals", &json!({})).expect("list before");
+        let baseline = before["terminals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["terminal_id"] == json!(terminal_id))
+            .unwrap()["exec_state_updated_at"]
+            .as_i64()
+            .expect("baseline exec_state_updated_at");
+
+        // Send the command. (The newline write is the real send path; the output/exec-state
+        // would be driven by the pump+annotation in production.)
+        d.call("send_to_terminal", &json!({ "terminal_id": terminal_id, "command": "true" }))
+            .expect("send_to_terminal");
+
+        // Model an ULTRA-SHORT command: it ran and finished settling to success ENTIRELY between
+        // two polls — so a busy snapshot taken now reads idle/false as if nothing happened. The
+        // settle stamps a NEW exec_state_updated_at (a small wait guarantees the wall-clock ms
+        // advances even on a fast machine — the same time the send + run consumes in practice).
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.state::<Db>()
+            .with_conn(|c| db::set_exec_state(c, &terminal_id, db::STATE_RUNNING, None, false))
+            .expect("running");
+        app.state::<Db>()
+            .with_conn(|c| db::set_exec_state(c, &terminal_id, db::STATE_SUCCESS, Some(0), true))
+            .expect("settle success");
+
+        // The agent's protocol step 2: poll until the marker ADVANCES past the baseline AND the
+        // state is settled. It sees the finish despite never catching busy:true.
+        let after = d.call("list_terminals", &json!({})).expect("list after");
+        let row = after["terminals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["terminal_id"] == json!(terminal_id))
+            .unwrap()
+            .clone();
+        let updated = row["exec_state_updated_at"].as_i64().expect("updated at");
+        assert!(
+            updated > baseline,
+            "the monotone marker advanced (baseline {baseline} → {updated}), so the agent \
+             detects the command finished even though it was missed by a busy snapshot"
+        );
+        assert_eq!(row["exec_state"], json!("success"), "settled to success");
+        assert_eq!(row["exec_exit_code"], json!(0), "carries the exit code");
+
+        let _ = app.state::<PtyManager>().close_id(pty_id);
     }
 
     #[test]

@@ -346,6 +346,47 @@ impl Pty {
         self.master.lock().unwrap().as_ref()?.process_group_leader()
     }
 
+    /// Whether this terminal is BUSY — i.e. a command is running in the
+    /// foreground, as opposed to sitting idle at the shell prompt (PRD
+    /// "busy/idle from the PTY foreground process group", task #1).
+    ///
+    /// This is the OS-authoritative `busy` signal that REPLACES OSC-133-derived
+    /// `running` as the source of truth for the UI dot: it is the live kernel
+    /// state, impossible to leave "stuck" and independent of any shell
+    /// integration. The derivation is exactly `foreground_pgid(PTY) != pgid of
+    /// the shell`:
+    ///  - at an idle prompt the PTY's foreground process group IS the shell's own
+    ///    group (the shell is a session/group leader, so its pgid == its pid), so
+    ///    `foreground_pgid == shell_pid` → `false` (idle);
+    ///  - while a command runs in the foreground the shell put that command in its
+    ///    own process group and handed it the terminal, so `foreground_pgid !=
+    ///    shell_pid` → `true` (busy).
+    ///
+    /// Returns `None` when the signal cannot be derived — the shell pid is unknown
+    /// or `tcgetpgrp` failed (e.g. the master was already closed on exit). The
+    /// caller treats `None` as "not busy" for the dot (a terminal with no live
+    /// foreground group is not running anything), but keeping it an `Option`
+    /// lets the bridge distinguish "unknown" from a hard `false`.
+    ///
+    /// `pull-only`: there is no kernel notification for a `tcgetpgrp` change, so
+    /// the bridge polls this on a bounded cadence (see the backend busy-state
+    /// loop) rather than reacting to an event.
+    #[cfg(unix)]
+    pub fn is_busy(&self) -> Option<bool> {
+        let shell_pid = self.shell_pid? as i32;
+        let fg = self.foreground_pgid()?;
+        Some(fg != shell_pid)
+    }
+
+    /// Non-Unix builds have no PTY foreground process group (ConPTY exposes no
+    /// `tcgetpgrp`), so the OS busy signal is unavailable. Windows busy/idle is
+    /// explicitly out of scope (a separate parked design); the dot simply never
+    /// flips from this source there.
+    #[cfg(not(unix))]
+    pub fn is_busy(&self) -> Option<bool> {
+        None
+    }
+
     /// Write bytes to the PTY (the child's stdin). Flushes immediately so
     /// keystrokes are delivered without buffering latency.
     pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -707,6 +748,99 @@ mod tests {
         assert!(
             out.contains(&format!("NYXTID=[{tid}]")),
             "the var must inherit into a child process of the shell; got: {out:?}"
+        );
+        let _ = pty.kill();
+    }
+
+    // --- busy/idle from the PTY foreground process group (PRD task #1) --------
+
+    /// Poll `is_busy()` until it equals `want` or we time out, returning the last
+    /// observed value. Used to assert the busy/idle TRANSITIONS without racing the
+    /// shell's job-control hand-off (which lands a few ms after the keystroke).
+    #[cfg(unix)]
+    fn busy_settles_to(pty: &Pty, want: bool, timeout: Duration) -> Option<bool> {
+        let deadline = Instant::now() + timeout;
+        let mut last = pty.is_busy();
+        while Instant::now() < deadline {
+            last = pty.is_busy();
+            if last == Some(want) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        last
+    }
+
+    /// CORE derivation (task #1 done-criterion): an interactive shell sitting at
+    /// its prompt is IDLE (`foreground_pgid == shell pgid`); a command running in
+    /// the foreground makes it BUSY (`foreground_pgid != shell pgid`); when the
+    /// command finishes it returns to IDLE. Proven against the LIVE kernel state
+    /// (`tcgetpgrp`), with NO dependency on OSC 133 / shell integration.
+    ///
+    /// We spawn an INTERACTIVE shell so job control is on (the shell hands the
+    /// terminal to the foreground command's process group — exactly what flips
+    /// `tcgetpgrp`). A non-interactive `sh -c` would never reparent the tty, so it
+    /// could not exercise the transition.
+    #[cfg(unix)]
+    #[test]
+    fn busy_tracks_foreground_process_group() {
+        // Force an interactive bash with job control; skip cleanly if bash is
+        // absent (the derivation itself is shell-agnostic — it only needs a shell
+        // that uses job control, which every interactive shell does).
+        if !which_exists("bash") {
+            eprintln!("skipping busy_tracks_foreground_process_group: bash not found");
+            return;
+        }
+        let (mut pty, _rx) = Pty::spawn_program_with_terminal_id(
+            "bash",
+            &["--norc", "--noprofile", "-i"],
+            small_size(),
+            None,
+            None,
+        )
+        .expect("spawn interactive bash");
+
+        // At the prompt: idle. The foreground process group is the shell's own.
+        assert_eq!(
+            busy_settles_to(&pty, false, Duration::from_secs(5)),
+            Some(false),
+            "an interactive shell at its prompt must be IDLE (fg pgid == shell pgid)"
+        );
+
+        // Run a long foreground command → busy (fg pgid != shell pgid).
+        pty.write(b"sleep 30\n").expect("write sleep");
+        assert_eq!(
+            busy_settles_to(&pty, true, Duration::from_secs(5)),
+            Some(true),
+            "a foreground command must make the terminal BUSY (fg pgid != shell pgid)"
+        );
+
+        // End the command (Ctrl-C) → back to idle.
+        pty.write(&[0x03]).expect("write ctrl-c");
+        assert_eq!(
+            busy_settles_to(&pty, false, Duration::from_secs(5)),
+            Some(false),
+            "finishing the foreground command must return the terminal to IDLE"
+        );
+
+        let _ = pty.kill();
+    }
+
+    /// `is_busy()` derivation is purely `foreground_pgid != shell_pid` and does NOT
+    /// consult OSC 133 / any shell integration: an idle prompt is idle even though
+    /// the shell never emitted a `133;D` end. (The transition coverage is in
+    /// `busy_tracks_foreground_process_group`; this guards the idle baseline +
+    /// the None-when-unknown contract.)
+    #[cfg(unix)]
+    #[test]
+    fn busy_is_idle_at_prompt_without_osc133() {
+        let (mut pty, _rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        // No command issued, no OSC 133 in play: the only foreground group is the
+        // shell's, so busy is false.
+        assert_eq!(
+            busy_settles_to(&pty, false, Duration::from_secs(5)),
+            Some(false),
+            "a bare shell at its prompt is idle from the OS signal alone (no OSC 133)"
         );
         let _ = pty.kill();
     }

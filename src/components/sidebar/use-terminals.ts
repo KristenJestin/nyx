@@ -91,6 +91,19 @@ export interface TerminalRecord {
    * mirrors the clear locally).
    */
   exec_state_unread?: boolean;
+  /**
+   * Whether a command is RUNNING in this terminal's foreground — the OS-derived
+   * busy/idle signal (PRD task #1), the AUTHORITY for the running dot. It is
+   * `foreground_pgid(PTY) != shell pgid`, polled by the backend (~300ms) and
+   * pushed via the `terminal://busy-state` event keyed by record id. This
+   * REPLACES the OSC-133-derived `exec_state === 'running'` as the running source:
+   * it is live kernel state, so it can never be left "stuck" and is independent of
+   * shell integration. NOT persisted — a restored terminal with no foreground
+   * command is idle by construction (task #2). Defaults to `false` (idle) until
+   * the first busy-state event arrives. `exec_state` still drives the SETTLED
+   * success/error notification (OSC 133 annotation); `busy` drives only running.
+   */
+  busy?: boolean;
 }
 
 /**
@@ -117,6 +130,18 @@ export interface TerminalExecStatePayload {
   exit_code: number | null;
   unread: boolean;
   updated_at: number;
+}
+
+/**
+ * Payload of the backend `terminal://busy-state` event (PRD task #1): a terminal's
+ * OS-derived busy/idle TRANSITION, keyed by the persistent `terminal_id`. Mirrors
+ * the Rust `TerminalBusyStatePayload` (`bridge.rs`). The backend emits it ONLY on a
+ * change (transition-only), so each event is a real flip of the running dot. This
+ * is the AUTHORITY for `running`, decoupled from OSC 133 / `exec_state`.
+ */
+export interface TerminalBusyStatePayload {
+  terminal_id: string;
+  busy: boolean;
 }
 
 /** The imperative surface the sidebar + keyboard shortcuts drive. */
@@ -436,6 +461,35 @@ export function useTerminals(): UseTerminals {
             ? { ...t, exec_state: state, exec_exit_code: exit_code, exec_state_unread: unread }
             : t,
         );
+      });
+    }).then((un) => {
+      if (torndown) {
+        void Promise.resolve(un()).catch(() => {});
+        return;
+      }
+      unlisten = un;
+    });
+    return () => {
+      torndown = true;
+      if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
+    };
+  }, []);
+
+  // Live busy/idle (PRD task #1): fold each backend `terminal://busy-state`
+  // transition onto its record's `busy` flag WITHOUT a re-list, so the running dot
+  // updates immediately. This is the AUTHORITY for the dot, derived from the OS
+  // foreground process group — INDEPENDENT of OSC 133 / `exec_state`. The backend
+  // emits on transition only (keyed by `terminal_id`); an event for a record we do
+  // not hold is ignored. Subscribes ONCE (no deps → no churn), functional updater.
+  useEffect(() => {
+    let torndown = false;
+    let unlisten: (() => void) | undefined;
+    void listen<TerminalBusyStatePayload>("terminal://busy-state", (event) => {
+      if (torndown) return;
+      const { terminal_id, busy } = event.payload;
+      setTerminals((prev) => {
+        if (!prev.some((t) => t.id === terminal_id)) return prev;
+        return prev.map((t) => (t.id === terminal_id ? { ...t, busy } : t));
       });
     }).then((un) => {
       if (torndown) {

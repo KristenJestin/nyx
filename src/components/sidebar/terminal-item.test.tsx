@@ -14,6 +14,7 @@ function row(
   label: string | null = null,
   exec_state: TerminalRecord["exec_state"] = "idle",
   exec_state_unread = false,
+  busy = false,
 ): TerminalRecord {
   return {
     id: String(id),
@@ -27,6 +28,7 @@ function row(
     closed_at: null,
     exec_state,
     exec_state_unread,
+    busy,
   };
 }
 
@@ -281,6 +283,50 @@ describe("<SortableTerminalItem> whole-item drag (dnd-kit)", () => {
       </DragDropProvider>,
     );
     expect(screen.queryByRole("status", { name: /terminal status: success/i })).toBeNull();
+  });
+
+  it("the RUNNING dot is driven by the OS `busy` flag, NOT by exec_state (PRD task #1)", async () => {
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    // busy=true with exec_state='idle' (no OSC 133) → the running badge appears
+    // after the anti-flicker delay. Proves the dot comes from the OS signal.
+    render(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(1, "/a", null, "idle", false, true)}
+            index={0}
+            active={false}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("status", { name: /terminal status: running/i })).toBeInTheDocument(),
+    );
+  });
+
+  it("a legacy exec_state='running' (OSC 133) with busy=false shows NO running dot", async () => {
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    // exec_state says 'running' (the OLD OSC-133 source) but the OS busy flag is
+    // false: the dot must NOT show running — busy is the sole running authority now.
+    render(
+      <DragDropProvider>
+        <ul>
+          <SortableTerminalItem
+            record={row(1, "/a", null, "running", false, false)}
+            index={0}
+            active={false}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </DragDropProvider>,
+    );
+    // Give the debounce window time to elapse; the running badge must never appear.
+    await new Promise((r) => setTimeout(r, 150));
+    expect(screen.queryByRole("status", { name: /terminal status: running/i })).toBeNull();
   });
 
   it("clicking the close (x) closes WITHOUT selecting (stopPropagation kept)", () => {

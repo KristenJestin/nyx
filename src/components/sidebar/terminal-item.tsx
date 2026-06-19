@@ -10,7 +10,7 @@ import { useRunningDebounce } from "./use-running-debounce";
 import { SidebarItemContent, sidebarRowClassName } from "./sidebar-item";
 import { agentProviderFor } from "./agent-providers";
 import { useTerminalAgentKind } from "./use-agent-sessions";
-import type { TerminalRecord } from "./use-terminals";
+import type { ExecState, TerminalRecord } from "./use-terminals";
 
 /**
  * The human label for a terminal item, given a record + its list index, using
@@ -94,12 +94,22 @@ export function TerminalItemBody({
   // Live shell/program suffix for the proto row (`web · zsh`). Same backend poll.
   const shell = useShellSuffix(ptyId);
 
+  // Run-state authority split (PRD task #1): the RUNNING dot is driven by the
+  // OS busy signal (`record.busy`, from `terminal://busy-state`), NOT by the
+  // OSC-133-derived `exec_state === 'running'`. The SETTLED success/error badge
+  // still comes from `exec_state` (OSC 133 annotation). We collapse the two into
+  // the single state the badge renders: `busy` → `running` wins; otherwise show
+  // the settled state (success/error/idle). A live `exec_state === 'running'`
+  // (legacy OSC 133) is deliberately ignored as a running source — busy decides.
+  const settled: ExecState =
+    record.exec_state === "success" || record.exec_state === "error" ? record.exec_state : "idle";
+  const rawState: ExecState = record.busy ? "running" : settled;
   // Anti-flicker (finding #14): debounce the `running` indicator so an instant
-  // command (`running`→`success` within a few ms) never flashes the dot. Settled
+  // command (busy flips true→false within a few ms) never flashes the dot. Settled
   // (`success`/`error`) and `idle` pass through immediately — only a sustained
   // `running` (> threshold) reveals the dot. Identical for active/inactive rows
   // (the debounce keys off the raw state only). Persistence/unread are untouched.
-  const state = useRunningDebounce(record.exec_state ?? "idle");
+  const state = useRunningDebounce(rawState);
   // Settled-badge visibility is driven by the PERSISTED unread flag (PRD-2.1),
   // not by live selection — so a viewed badge stays hidden after re-deselecting.
   const unread = record.exec_state_unread ?? false;
