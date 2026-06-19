@@ -193,11 +193,26 @@ pub fn run() {
             // marked (restart_on_startup ON + was_running_on_shutdown), normalize
             // orphaned `running` to idle, and reset the snapshot.
             bridge::restore_commands_from_handle(&handle);
+            // Terminal boot normalization (PRD task #2): settle any terminal left at
+            // a persisted `exec_state = running` (a force-quit/restore artefact) to
+            // idle, so no phantom running badge survives a restart. Busy/idle is
+            // derived live from the OS now, so this is defensive — the dot reads the
+            // busy-state signal, never the persisted field — but it also clears the
+            // stored value so the dogfood symptom (terminals stuck running in the DB)
+            // disappears entirely.
+            bridge::normalize_terminals_from_handle(&handle);
             // Boot agent-session resume scan (PRD-5 #5): sweep stale active sessions to
             // `unknown`, then PARK a `claude --resume <id>` for every alive terminal
             // whose project opts in and whose session is resumable — injected into the
             // respawned shell when the front mounts each restored terminal's PTY.
             bridge::restore_agent_sessions_from_handle(&handle);
+            // Busy/idle authority loop (PRD task #1, decision 1-B): poll the
+            // foreground process group of every open PTY ~300ms and emit
+            // `terminal://busy-state` on TRANSITION only. This is the OS-derived
+            // running-dot signal that replaces OSC 133; a restored terminal with no
+            // foreground command samples idle by construction (task #2 — no phantom
+            // running survives a restart).
+            bridge::start_busy_state_loop(&handle);
             // Local MCP HTTP server (PRD-4, ADR-0003): one loopback server on the
             // fixed/configurable port, owned by this single live nyx process. A
             // second nyx focuses the existing window (single-instance plugin) and

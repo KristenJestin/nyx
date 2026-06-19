@@ -66,6 +66,60 @@ struct TerminalExecStatePayload {
     updated_at: i64,
 }
 
+/// Payload of the `terminal://busy-state` event (PRD task #1): a terminal's
+/// OS-derived busy/idle TRANSITION. Keyed by the PERSISTENT `terminal_id` (the
+/// sidebar key), exactly like `terminal://exec-state`, so the front can fold it
+/// onto the matching record and the signal survives re-spawn.
+///
+/// `busy` is the kernel-truthful "a command is running in the foreground" bit
+/// (`foreground_pgid != shell pgid`) — the AUTHORITY for the running dot, REPLACING
+/// the OSC-133-derived `running`. Emitted only on a CHANGE (the poll loop diffs the
+/// last emitted value), never every tick, so the front sees one event per real
+/// transition. `snake_case` (not camelCase) to match the snake_case `TerminalRecord`
+/// shape the front folds it onto — same convention as `TerminalExecStatePayload`.
+#[derive(Clone, Serialize)]
+struct TerminalBusyStatePayload {
+    /// The persistent `terminals.id` this transition is for (the sidebar key).
+    terminal_id: String,
+    /// `true` = a foreground command is running; `false` = idle at the prompt.
+    busy: bool,
+}
+
+/// The `terminal://busy-state` event name (PRD task #1) — the OS busy/idle signal
+/// that drives the UI dot, decoupled from OSC 133. Public so tests assert on it.
+pub const TERMINAL_BUSY_STATE_EVENT: &str = "terminal://busy-state";
+
+/// Managed state: the last busy value EMITTED per persistent terminal id, so the
+/// poll loop emits `terminal://busy-state` only on a TRANSITION (not every tick).
+/// Keyed by the durable `terminal_id` (the event key), not the live pty_id, so a
+/// re-spawn under the same record re-evaluates against the last announced value.
+#[derive(Default)]
+pub struct BusyStateTracker {
+    last: Mutex<HashMap<String, bool>>,
+}
+
+impl BusyStateTracker {
+    /// Record `busy` for `terminal_id` and return whether it CHANGED from the last
+    /// recorded value (treating a never-seen id as a change only when `busy` is
+    /// true — a fresh terminal defaults to idle, so its first `false` is not a
+    /// spurious transition to announce). One lock per call; cheap.
+    fn changed(&self, terminal_id: &str, busy: bool) -> bool {
+        let mut map = self.last.lock().unwrap();
+        match map.insert(terminal_id.to_string(), busy) {
+            Some(prev) => prev != busy,
+            // Unseen id: announce only the first BUSY (idle is the implicit default
+            // the front already shows), so boot/restore never emits a redundant
+            // `false` for every idle terminal.
+            None => busy,
+        }
+    }
+    /// Drop the tracked value for a terminal id (on PTY exit/close) so the table
+    /// does not grow without bound and a future re-spawn starts clean.
+    fn forget(&self, terminal_id: &str) {
+        self.last.lock().unwrap().remove(terminal_id);
+    }
+}
+
 /// Managed state: all live PTYs keyed by their id.
 #[derive(Default)]
 pub struct PtyManager {
@@ -98,6 +152,19 @@ impl PtyManager {
             }
             None => Ok(false),
         }
+    }
+
+    /// The OS-derived busy bit of the PTY identified by `id` (task #4): `Some(true)`
+    /// when a command runs in its foreground (`foreground_pgid != shell pgid`),
+    /// `Some(false)` at an idle prompt, `None` when `id` is not a live PTY or the
+    /// signal cannot be derived (non-Unix, or master already closed). This is the
+    /// SAME OS authority the busy-state poll loop reads — it goes through
+    /// [`pty_busy`], the one derivation point — so the MCP `list_terminals` busy
+    /// field is consistent with the UI dot. `pub(crate)` for that tool (which holds
+    /// a record id → resolves the PTY id via [`TerminalPtyMap`]). The lock is held
+    /// for one cheap `tcgetpgrp`, then released.
+    pub(crate) fn busy_of(&self, id: u64) -> Option<bool> {
+        self.ptys.lock().unwrap().get(&id).and_then(pty_busy)
     }
 }
 
@@ -580,6 +647,32 @@ pub fn restore_commands_from_handle<R: Runtime>(app: &AppHandle<R>) {
     restore_commands_on_boot(&db, &runner);
 }
 
+/// BOOT NORMALIZATION of phantom-running terminals (PRD task #2): settle any
+/// terminal left at a persisted `exec_state = 'running'` down to `idle` at launch,
+/// so a force-quit/restore can never resurface a phantom running badge. This is the
+/// TERMINAL analogue of the managed-command `normalize_unrelaunched` (which already
+/// settles orphaned `running` instances at boot).
+///
+/// Busy/idle is derived live from the OS now (task #1), so this normalization is
+/// DEFENSIVE/cosmetic rather than the authority: a restored terminal with no
+/// foreground process samples idle by construction, and the dot reads the
+/// `terminal://busy-state` signal — never the persisted `exec_state`. But settling
+/// the stored field too means even a transient read before the first busy poll (and
+/// any other consumer of the persisted value) sees idle, fully eliminating the
+/// dogfood symptom (terminals stuck `running` in the DB). Best-effort: a DB error is
+/// swallowed (the UI must still come up); returns the count for tests/logging.
+pub fn normalize_terminals_on_boot(db: &Db) -> usize {
+    db.with_conn(db::normalize_phantom_running_terminals)
+        .unwrap_or(0)
+}
+
+/// Run the terminal boot normalization from an `AppHandle`. A thin handle-reaching
+/// wrapper over [`normalize_terminals_on_boot`] for the setup hook.
+pub fn normalize_terminals_from_handle<R: Runtime>(app: &AppHandle<R>) {
+    let db = app.state::<Db>();
+    normalize_terminals_on_boot(&db);
+}
+
 /// Run the BOOT agent-session RESUME scan from an `AppHandle` (PRD-5 #5). A thin
 /// handle-reaching wrapper over [`restore_agent_sessions_on_boot`] for the setup hook.
 pub fn restore_agent_sessions_from_handle<R: Runtime>(app: &AppHandle<R>) {
@@ -996,14 +1089,117 @@ fn terminal_info(
 }
 
 /// Extract the foreground process group id from a `Pty` (`tcgetpgrp(master)`),
-/// abstracted so the non-Linux build compiles (where it is always `None`).
-#[cfg(target_os = "linux")]
+/// abstracted so the non-Unix build compiles (where it is always `None`).
+///
+/// Widened from Linux-only to ALL Unix (task #1): `tcgetpgrp` works on macOS too,
+/// so the OS busy/idle signal — and the foreground-program name lookup wherever a
+/// `/proc`-equivalent exists — is available on every Unix. Only the `/proc`-backed
+/// NAME read ([`read_terminal_info`]) stays Linux-gated; the busy BOOLEAN
+/// ([`pty_busy`]) needs none of `/proc`.
+#[cfg(unix)]
 fn foreground_pgid(pty: &Pty) -> Option<i32> {
     pty.foreground_pgid()
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn foreground_pgid(_pty: &Pty) -> Option<i32> {
     None
+}
+
+/// The OS-AUTHORITATIVE busy/idle signal for a terminal (task #1): `true` when a
+/// command runs in the PTY's foreground (`foreground_pgid != pgid of the shell`),
+/// `false` at an idle prompt, `None` when it cannot be derived (shell pid unknown,
+/// `tcgetpgrp` failed, or non-Unix where there is no foreground process group).
+///
+/// This is the single OS-agnostic point the bridge reads — the busy-state poll
+/// loop and any future MCP exposure go through here, so the derivation lives in
+/// ONE place. It is INDEPENDENT of OSC 133: the dot no longer needs the shell to
+/// emit a `133;C`/`133;D` to know a command is running. Delegates straight to
+/// [`Pty::is_busy`] (which encodes the `fg_pgid != shell_pid` rule); on non-Unix
+/// it is always `None` (Windows busy/idle is out of scope — ConPTY has no
+/// foreground process group).
+fn pty_busy(pty: &Pty) -> Option<bool> {
+    pty.is_busy()
+}
+
+/// Cadence of the backend busy-state poll (PRD task #1, decision 1-B). `tcgetpgrp`
+/// is pull-only (no kernel notification), so the bridge SAMPLES the foreground
+/// process group of every open PTY on this fixed interval and emits a
+/// `terminal://busy-state` event only when a terminal's busy bit CHANGED. ~300ms is
+/// snappy enough for the dot while keeping the per-tick syscall cost negligible
+/// (one `tcgetpgrp` per open terminal).
+const BUSY_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// ONE busy-state sweep: snapshot the busy bit of every live PTY, resolve each to
+/// its persistent terminal id, and return the `(terminal_id, busy)` pairs whose
+/// value CHANGED since the last sweep (per the [`BusyStateTracker`]). The caller
+/// emits a `terminal://busy-state` for each — so only TRANSITIONS reach the front,
+/// never one event per tick.
+///
+/// Cost is mutualized exactly like [`terminal_info`]: a SINGLE pass collects
+/// `(pty_id, busy)` while holding the `ptys` lock (one cheap `tcgetpgrp` per PTY),
+/// then the lock is released BEFORE the id-map lookups and the change diff, so the
+/// registry is not held across that work. A PTY whose busy bit cannot be derived
+/// (`None` — non-Unix, or master already closed) is treated as idle (`false`): a
+/// terminal with no live foreground group is not running anything.
+fn scan_busy_once<R: Runtime>(app: &AppHandle<R>) -> Vec<(String, bool)> {
+    // Snapshot busy per live pty_id under the lock (cheap: one tcgetpgrp each),
+    // then drop the lock before resolving ids / diffing.
+    let snapshot: Vec<(u64, bool)> = {
+        let ptys = app.state::<PtyManager>();
+        let map = ptys.ptys.lock().unwrap();
+        map.iter()
+            .map(|(&id, pty)| (id, pty_busy(pty).unwrap_or(false)))
+            .collect()
+    };
+
+    let id_map = app.state::<TerminalIdMap>();
+    let tracker = app.state::<BusyStateTracker>();
+    let mut transitions = Vec::new();
+    for (pty_id, busy) in snapshot {
+        // Only record-backed terminals have a durable id to key the event on; a
+        // record-less spawn (socle / test) has no sidebar dot to drive.
+        let Some(terminal_id) = id_map.get(pty_id) else {
+            continue;
+        };
+        if tracker.changed(&terminal_id, busy) {
+            transitions.push((terminal_id, busy));
+        }
+    }
+    transitions
+}
+
+/// Emit `terminal://busy-state` for each busy/idle transition found this sweep.
+/// Pure side-effect wrapper over [`scan_busy_once`] so the loop body — and tests —
+/// share the same "diff then emit on change only" logic.
+fn poll_and_emit_busy_state<R: Runtime>(app: &AppHandle<R>) {
+    for (terminal_id, busy) in scan_busy_once(app) {
+        let _ = app.emit(
+            TERMINAL_BUSY_STATE_EVENT,
+            TerminalBusyStatePayload { terminal_id, busy },
+        );
+    }
+}
+
+/// Start the backend busy-state poll loop (PRD task #1, decision 1-B): a dedicated
+/// thread that every [`BUSY_POLL_INTERVAL`] samples the foreground process group of
+/// every open PTY and emits `terminal://busy-state` ONLY for terminals whose busy
+/// bit changed. This is the AUTHORITY for the UI running dot, derived live from the
+/// OS — so a force-quit/restore can never leave a phantom running (a restored
+/// terminal with no foreground command samples idle by construction, task #2).
+///
+/// The loop holds no PTY across a sleep; each tick is a bounded sweep (one
+/// `tcgetpgrp` per open terminal) under the registry lock, released before the
+/// emit. Runs for the app's lifetime — there is no teardown handle because the
+/// process owns exactly one of these and it costs nothing while no PTYs are open.
+pub fn start_busy_state_loop<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("nyx-busy-state-poll".into())
+        .spawn(move || loop {
+            std::thread::sleep(BUSY_POLL_INTERVAL);
+            poll_and_emit_busy_state(&app);
+        })
+        .expect("failed to spawn busy-state poll thread");
 }
 
 /// Resolve cwd + foreground program from raw pids via `/proc` (Linux). Split
@@ -1099,6 +1295,11 @@ fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8
                         // real OSC 133 `D` end ever produces success/error.
                         if let Some(terminal_id) = terminal_id.as_deref() {
                             normalize_exec_state_on_exit(&app, terminal_id);
+                            // Forget the last-emitted busy bit for this record so the
+                            // tracker does not grow unbounded and a re-spawn under the
+                            // same record starts clean (task #1). The dead PTY samples
+                            // idle anyway; this just drops the bookkeeping entry.
+                            app.state::<BusyStateTracker>().forget(terminal_id);
                         }
                         // Drop the pty_id → terminal_id mapping now that the live
                         // PTY is gone; the persistent record outlives it, but this
@@ -1141,9 +1342,10 @@ fn reap_exit_code<R: Runtime>(app: &AppHandle<R>, id: u64) -> Option<i32> {
 /// then carry whatever trailing incomplete-introducer bytes remain. The decoded
 /// [`crate::osc133::Osc133Event`]s are appended to the per-terminal event log
 /// ([`Osc133Events`]) AND fed, in order, to the exec-state STATE MACHINE
-/// ([`drive_exec_state`], task #6) which turns them into `running`/`success`/
-/// `error`, persists each transition via [`crate::db::set_exec_state`], and emits
-/// `terminal://exec-state`.
+/// ([`drive_exec_state`], task #3) which — since OSC 133 was retrograded to result
+/// annotation — turns a `D` end into a `success`/`error` BADGE (never `running`,
+/// which the OS busy signal owns), persists each settled transition via
+/// [`crate::db::set_exec_state`], and emits `terminal://exec-state`.
 fn handle_osc133_chunk<R: Runtime>(app: &AppHandle<R>, terminal_id: &str, chunk: &[u8]) {
     // Stitch the carried tail (an incomplete sequence from the previous chunk)
     // ahead of this chunk so a split `ESC]133;…` sequence is recovered. The tail
@@ -1169,22 +1371,34 @@ fn handle_osc133_chunk<R: Runtime>(app: &AppHandle<R>, terminal_id: &str, chunk:
     }
 }
 
-/// EXEC-STATE STATE MACHINE (PRD-2.1 task #6). Maps ONE decoded OSC 133 event onto
-/// a terminal RECORD's exec-state, persisting the transition (the DB record is the
-/// authority after restart) and emitting `terminal://exec-state` so the sidebar
-/// updates immediately. The transitions:
+/// EXEC-STATE STATE MACHINE — OSC 133 RETROGRADED TO RESULT ANNOTATION (PRD task
+/// #3). Maps ONE decoded OSC 133 event onto a terminal RECORD's exec-state. Since
+/// phase 1 the AUTHORITY for "a command is running" is the OS — the PTY's foreground
+/// process group, exposed via `terminal://busy-state` and read by the dot — so
+/// OSC 133 NO LONGER drives `running`. It survives ONLY to ANNOTATE the RESULT
+/// (success/error + exit code), a best-effort signal the kernel cannot give us
+/// (only the shell knows `$?`). Each settled transition is persisted (the DB record
+/// is the authority for the badge after restart) and emitted via
+/// `terminal://exec-state` so the sidebar badge updates immediately. The transitions:
 ///
-/// - `133;C` (pre-exec) → `running` (exit_code cleared, NOT unread — `running` is
-///   a live state, not a notification). Keyed off `C`, never `B` (a bare Enter at
-///   an empty prompt emits `B` then `D` with no `C` and must not flash running).
+/// - `133;C` (pre-exec) → INERT. It used to post `running` as the dot's source; it
+///   no longer does — the OS busy signal owns `running`. Driving `running` from `C`
+///   here would re-introduce the very phantom-running bug this PRD fixes (a `D`
+///   never emitted by an unsupported/coupled shell would leave a stuck `running`).
 /// - `133;D;0` → `success`; `133;D;<non-zero>` → `error`; a `D` with no parseable
-///   code settles to `error` (a finished-but-unknown result, never a stale
-///   `running`). EVERY settled transition persists `exec_state_unread = 1`: the
-///   backend is the SOLE authority for unread and NEVER inspects UI focus — the
-///   frontend (task #7) owns "mark read immediately while active" by reacting to
-///   the event and calling `terminal_exec_mark_read`.
+///   code settles to `error` (a finished-but-unknown result). This ONLY annotates
+///   the color/exit code — it does NOT touch the OS-derived running bit. EVERY
+///   settled transition persists `exec_state_unread = 1`: the backend is the SOLE
+///   authority for unread and NEVER inspects UI focus — the frontend (task #7) owns
+///   "mark read immediately while active" by reacting to the event and calling
+///   `terminal_exec_mark_read`.
 /// - `133;A`/`133;B` (prompt/command start) carry no exec-state meaning for nyx
 ///   and are inert here (they keep the parser robust to a full prompt stream).
+///
+/// GRACEFUL DEGRADATION (the point of the retrograde): a missing `D` loses AT WORST
+/// the badge COLOR (success/error) — NEVER a phantom `running`, because `running`
+/// comes from the OS. A shell with no OSC 133 integration still gets correct
+/// busy/idle, just no green/red.
 ///
 /// The backend never tracks which terminal is focused, so it cannot (and must not)
 /// decide read vs unread from focus — that separation is exactly what lets the
@@ -1195,22 +1409,27 @@ fn drive_exec_state<R: Runtime>(
     event: crate::osc133::Osc133Event,
 ) {
     use crate::osc133::Osc133Event;
-    // Decide the transition for this event; `A`/`B` are inert (no transition).
-    let (state, exit_code, unread) = match event {
-        Osc133Event::PreExec => (db::STATE_RUNNING, None, false),
+    // Decide the transition for this event. Only a `D` end (the result annotation)
+    // produces a transition now; `A`/`B`/`C` are inert. `C` (pre-exec) is
+    // DELIBERATELY inert: the OS busy signal (task #1) is the sole authority for
+    // `running`, so OSC 133 must not post a `running` exec-state.
+    let (state, exit_code) = match event {
         Osc133Event::CommandEnd { exit_code } => match exit_code {
-            Some(0) => (db::STATE_SUCCESS, Some(0), true),
-            // Non-zero OR a missing/garbage code: settle to `error` so the
-            // terminal is never left stuck in `running`. A `None` code keeps
-            // `exit_code = None` (we know it failed-ish, not WHICH code).
-            Some(code) => (db::STATE_ERROR, Some(code), true),
-            None => (db::STATE_ERROR, None, true),
+            Some(0) => (db::STATE_SUCCESS, Some(0)),
+            // Non-zero OR a missing/garbage code: settle to `error` so a finished
+            // command is colored as such. A `None` code keeps `exit_code = None`
+            // (we know it failed-ish, not WHICH code).
+            Some(code) => (db::STATE_ERROR, Some(code)),
+            None => (db::STATE_ERROR, None),
         },
-        // Prompt start / command start: inert for exec-state.
-        Osc133Event::PromptStart | Osc133Event::CommandStart => return,
+        // Pre-exec / prompt start / command start: inert for exec-state. `C` no
+        // longer drives `running` — the OS busy signal does (PRD task #3).
+        Osc133Event::PreExec | Osc133Event::PromptStart | Osc133Event::CommandStart => return,
     };
 
-    persist_and_emit_exec_state(app, terminal_id, state, exit_code, unread);
+    // A `D` end is always an UNREAD settled notification (success/error). It never
+    // affects the OS-derived running bit.
+    persist_and_emit_exec_state(app, terminal_id, state, exit_code, true);
 }
 
 /// Persist a terminal exec-state transition (authority for restart) THEN emit
@@ -1256,13 +1475,13 @@ fn persist_and_emit_exec_state<R: Runtime>(
 }
 
 /// Normalize a terminal's exec-state when its shell/PTY EXITS (the pump saw the
-/// reader disconnect). A shell/PTY exit must NOT leave a stale `running` badge:
-/// `running` is only ever settled by a real OSC 133 `D` end event, so on exit we
-/// fall back to `idle` for a terminal still showing `running` (an in-flight
-/// command whose end we never observed — e.g. the shell was killed mid-command,
-/// or an unsupported shell that emitted a bogus `C`). A terminal already at a
-/// SETTLED state (`success`/`error`) or `idle` is left untouched — its last
-/// settled result (and any unread flag) survives the exit.
+/// reader disconnect). DEFENSIVE since OSC 133 was retrograded (PRD task #3):
+/// `drive_exec_state` no longer posts `running` to the persisted `exec_state`, so a
+/// fresh terminal cannot reach `running` via OSC 133. This still settles any
+/// `running` left in the DB by an OLDER build (a pre-migration row, or a value
+/// persisted before this PRD) down to `idle` on exit, so no stale `running` badge
+/// survives. A terminal already at a SETTLED state (`success`/`error`) or `idle` is
+/// left untouched — its last settled result (and any unread flag) survives the exit.
 fn normalize_exec_state_on_exit<R: Runtime>(app: &AppHandle<R>, terminal_id: &str) {
     let current = app
         .state::<Db>()
@@ -2861,6 +3080,7 @@ pub fn init<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
         .manage(TerminalIdMap::default())
         .manage(Osc133Pending::default())
         .manage(Osc133Events::default())
+        .manage(BusyStateTracker::default())
         .manage(TerminalPtyMap::default())
         .manage(PendingTerminalCommands::default())
         .manage(PendingResumes::default())
@@ -3010,6 +3230,30 @@ mod tests {
             app.state::<Osc7Cache>(),
             id,
         )
+    }
+
+    /// Spawn an INTERACTIVE `bash` PTY directly (job control ON, so the foreground
+    /// process group flips when a command runs — the exact condition the busy
+    /// signal reads), register it on the manager AND map its live id to a
+    /// persistent `terminal_id`, mirroring what `pty_spawn` wires. Used by the
+    /// busy-state tests so they do not depend on which shell `$SHELL` resolves to.
+    /// Returns the live pty id.
+    #[cfg(unix)]
+    fn spawn_interactive_bash_record(app: &App<MockRuntime>, terminal_id: &str) -> u64 {
+        let size = portable_pty::PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        let (pty, rx) = Pty::spawn_program_with_terminal_id(
+            "bash",
+            &["--norc", "--noprofile", "-i"],
+            size,
+            None,
+            Some(terminal_id),
+        )
+        .expect("spawn interactive bash");
+        let id = pty.id();
+        app.state::<PtyManager>().ptys.lock().unwrap().insert(id, pty);
+        app.state::<TerminalIdMap>().set(id, terminal_id.to_string());
+        spawn_output_pump(app.handle().clone(), id, rx);
+        id
     }
 
     /// Decode an emitted `pty://output` payload (JSON `{id, bytes:[..]}`) to a String.
@@ -3757,6 +4001,178 @@ mod tests {
             info(&app, 999_999).is_err(),
             "terminal_info on an unknown id must error"
         );
+    }
+
+    // --- OS busy/idle signal + transition-only emission (PRD task #1) --------
+
+    /// True when `bash` is on PATH (the busy tests need an interactive shell with
+    /// job control; the derivation itself is shell-agnostic).
+    #[cfg(unix)]
+    fn bash_available() -> bool {
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d.join("bash").is_file()))
+            .unwrap_or(false)
+    }
+
+    /// Sweep `scan_busy_once` until it reports a `(terminal_id, want)` transition or
+    /// we time out; returns whether it was seen. Drives the same path the poll loop
+    /// uses (snapshot → resolve id → diff against the tracker), so only TRANSITIONS
+    /// show up — a steady state yields an empty sweep.
+    #[cfg(unix)]
+    fn busy_transition_seen(
+        app: &App<MockRuntime>,
+        terminal_id: &str,
+        want: bool,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            for (tid, busy) in scan_busy_once(app.handle()) {
+                if tid == terminal_id && busy == want {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// CORE done-criteria (task #1): the dot's authority is the OS busy signal,
+    /// emitted via `terminal://busy-state` on TRANSITION ONLY, with NO dependency on
+    /// OSC 133. We spawn an interactive bash record, then drive `scan_busy_once`
+    /// (the exact loop body) and assert:
+    ///  - idle prompt → NO transition (a fresh idle terminal emits nothing);
+    ///  - a foreground `sleep` → a single `busy=true` transition, and a re-scan
+    ///    while still running emits NOTHING (steady state, not every tick);
+    ///  - ending the command → a single `busy=false` transition.
+    ///
+    /// None of this consults OSC 133 — it is purely `foreground_pgid != shell pgid`.
+    #[cfg(unix)]
+    #[test]
+    fn busy_state_scan_emits_only_on_transition() {
+        if !bash_available() {
+            eprintln!("skipping busy_state_scan_emits_only_on_transition: bash not found");
+            return;
+        }
+        let app = build_app_with_db();
+        let tid = "term-busy-1";
+        let _id = spawn_interactive_bash_record(&app, tid);
+
+        // The shell starts at an idle prompt: its foreground group is its own, so
+        // busy is false. The tracker suppresses the first idle (idle is the default
+        // the front already shows), so NO transition is reported. Sweep a few times
+        // to give the prompt time to settle and confirm it stays silent.
+        for _ in 0..6 {
+            let transitions = scan_busy_once(app.handle());
+            assert!(
+                !transitions.iter().any(|(t, _)| t == tid),
+                "an idle prompt must NOT emit a busy transition; got {transitions:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Run a long foreground command → a single busy=true transition.
+        write(&app, _id, b"sleep 30\n");
+        assert!(
+            busy_transition_seen(&app, tid, true, Duration::from_secs(5)),
+            "a foreground command must produce a busy=true transition"
+        );
+        // Still running: a re-scan must report NOTHING (transition-only, not per tick).
+        let steady = scan_busy_once(app.handle());
+        assert!(
+            !steady.iter().any(|(t, _)| t == tid),
+            "a still-running terminal must NOT re-emit busy every tick; got {steady:?}"
+        );
+
+        // End the command (Ctrl-C) → a single busy=false transition.
+        write(&app, _id, &[0x03]);
+        assert!(
+            busy_transition_seen(&app, tid, false, Duration::from_secs(5)),
+            "ending the foreground command must produce a busy=false transition"
+        );
+
+        let _ = close(&app, _id);
+    }
+
+    /// The transition tracker fires the event end-to-end: `poll_and_emit_busy_state`
+    /// emits `terminal://busy-state` on the OS busy flip, captured via `app.listen`.
+    /// Proves the loop body actually emits the front-facing event (not just computes
+    /// transitions), keyed by the persistent terminal id.
+    #[cfg(unix)]
+    #[test]
+    fn busy_state_event_is_emitted_on_transition() {
+        if !bash_available() {
+            eprintln!("skipping busy_state_event_is_emitted_on_transition: bash not found");
+            return;
+        }
+        let app = build_app_with_db();
+        let tid = "term-busy-evt";
+
+        // Capture every emitted busy-state payload.
+        let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            app.listen(TERMINAL_BUSY_STATE_EVENT, move |event| {
+                let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                let t = v["terminal_id"].as_str().unwrap().to_string();
+                let b = v["busy"].as_bool().unwrap();
+                seen.lock().unwrap().push((t, b));
+            });
+        }
+
+        let id = spawn_interactive_bash_record(&app, tid);
+        // Let the idle prompt settle while polling: no busy event should be emitted.
+        for _ in 0..6 {
+            poll_and_emit_busy_state(app.handle());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Foreground command → expect a busy=true event.
+        write(&app, id, b"sleep 30\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            poll_and_emit_busy_state(app.handle());
+            if seen.lock().unwrap().iter().any(|(t, b)| t == tid && *b) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let events = seen.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|(t, b)| t == tid && *b),
+            "a busy=true terminal://busy-state event must be emitted; got {events:?}"
+        );
+        // No idle event was emitted before the command (idle is the suppressed default).
+        assert!(
+            !events.iter().any(|(t, b)| t == tid && !*b),
+            "no busy=false event must precede the first busy=true; got {events:?}"
+        );
+
+        let _ = close(&app, id);
+    }
+
+    /// The tracker reports a change ONLY when the busy bit actually flips, and never
+    /// announces the first idle (the front's default). Pure unit over the diff logic
+    /// — no PTY, no shell — so the transition-only contract is locked down
+    /// deterministically alongside the live-shell tests.
+    #[test]
+    fn busy_tracker_reports_only_real_transitions() {
+        let tracker = BusyStateTracker::default();
+        // First-seen idle is suppressed (no spurious idle transition at boot).
+        assert!(!tracker.changed("t", false), "first idle is not a transition");
+        // Idle → busy is a transition.
+        assert!(tracker.changed("t", true), "idle→busy is a transition");
+        // Busy → busy (steady state) is NOT.
+        assert!(!tracker.changed("t", true), "busy→busy is not a transition");
+        // Busy → idle is a transition.
+        assert!(tracker.changed("t", false), "busy→idle is a transition");
+        // First-seen BUSY (a different id) IS a transition (it differs from the
+        // implicit idle default the front shows).
+        assert!(tracker.changed("u", true), "first-seen busy is a transition");
+        // forget() resets so a re-spawn under the same id starts clean.
+        tracker.forget("u");
+        assert!(!tracker.changed("u", false), "after forget, first idle is suppressed again");
     }
 
     // --- Terminal RECORD commands through the bridge (YR) -----------------
@@ -6425,6 +6841,53 @@ mod tests {
         );
     }
 
+    /// PRD task #2 — the TERMINAL analogue of `boot_normalizes_phantom_running_*`:
+    /// after a restart, a terminal left at a persisted `exec_state = running` (a
+    /// force-quit artefact — the EXACT dogfood symptom) is settled to idle by the
+    /// boot normalization, so no phantom running survives whatever was persisted.
+    /// A settled `success`/`error` and an `idle` terminal are left untouched. Runs
+    /// the real bridge boot hook (`normalize_terminals_on_boot`) against an
+    /// in-memory Db, then asserts via the `list_terminals` command (the surface the
+    /// front reads on startup).
+    #[test]
+    fn boot_normalizes_phantom_running_terminals() {
+        let app = build_app_with_db();
+        let dbs = || app.state::<Db>();
+
+        // Three records; reproduce the corrupt-on-disk state: one stuck `running`
+        // (no live PTY backs it — a force-quit), one settled `success` (unread), one
+        // plain `idle`.
+        let running = create_terminal(dbs(), "/running".into(), None).expect("create running");
+        let success = create_terminal(dbs(), "/success".into(), None).expect("create success");
+        let _idle = create_terminal(dbs(), "/idle".into(), None).expect("create idle");
+        dbs()
+            .with_conn(|c| {
+                db::set_exec_state(c, &running.id, db::STATE_RUNNING, None, false)?;
+                db::set_exec_state(c, &success.id, db::STATE_SUCCESS, Some(0), true)
+            })
+            .expect("seed exec states");
+
+        // Boot normalization (the setup hook path).
+        normalize_terminals_on_boot(&dbs());
+
+        // list_terminals (what the front reads at startup) shows NO running terminal.
+        let listed = list_terminals(dbs()).expect("list");
+        assert!(
+            listed.iter().all(|t| t.exec_state != db::STATE_RUNNING),
+            "no terminal may be left running after boot, whatever was persisted; got {:?}",
+            listed.iter().map(|t| (&t.id, &t.exec_state)).collect::<Vec<_>>()
+        );
+        // The phantom is now idle with no exit code / not unread.
+        let r = listed.iter().find(|t| t.id == running.id).unwrap();
+        assert_eq!(r.exec_state, db::STATE_IDLE, "phantom running settled to idle");
+        assert_eq!(r.exec_exit_code, None);
+        assert!(!r.exec_state_unread);
+        // The settled success result SURVIVES (its badge/unread persist across boot).
+        let s = listed.iter().find(|t| t.id == success.id).unwrap();
+        assert_eq!(s.exec_state, db::STATE_SUCCESS, "settled result survives restart");
+        assert!(s.exec_state_unread, "settled success keeps its unread flag");
+    }
+
     // --- PRD-2.1: pty_id → terminal_id mapping + OSC 133 pump scan -----------
 
     /// Task #3: `pty_spawn` with a persistent terminal record id records the live
@@ -6637,10 +7100,13 @@ mod tests {
         }
     }
 
-    /// Pre-exec (`133;C`) persists + emits `running` (not unread, no exit code) —
-    /// `running` is a live state, never a notification.
+    /// OSC 133 RETROGRADED (PRD task #3): pre-exec (`133;C`) is now INERT — it must
+    /// NOT post a `running` exec-state. `running` is owned by the OS busy signal
+    /// (`terminal://busy-state`), so a `C` here neither persists `running` nor emits
+    /// any `terminal://exec-state`. Driving `running` from `C` would re-introduce the
+    /// phantom-running bug (a `D` an unsupported shell never emits would stick).
     #[test]
-    fn preexec_transitions_to_running() {
+    fn preexec_does_not_drive_running() {
         let app = build_app_with_db();
         let tid = make_record(&app);
         let events = collect_exec_events(&app);
@@ -6648,21 +7114,21 @@ mod tests {
         handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07");
 
         assert_eq!(
-            exec_state(&app, &tid),
-            (db::STATE_RUNNING.to_string(), None, false),
-            "133;C persists running, not unread, no exit code"
+            exec_state(&app, &tid).0,
+            db::STATE_IDLE,
+            "133;C is inert: it never posts a `running` exec-state (the OS owns running)"
         );
         let evs = wait_events(&events, 1);
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0]["terminal_id"], tid);
-        assert_eq!(evs[0]["state"], "running");
-        assert!(evs[0]["exit_code"].is_null());
-        assert_eq!(evs[0]["unread"], false);
-        assert!(evs[0]["updated_at"].as_i64().unwrap() > 0);
+        assert!(
+            evs.is_empty(),
+            "133;C emits NO terminal://exec-state (running comes from busy-state), got {evs:?}"
+        );
     }
 
-    /// A full success cycle: `133;C` → running, `133;D;0` → success WITH exit code 0
-    /// and ALWAYS unread=1. The backend never inspects focus.
+    /// A success cycle: `133;C` is inert (no running), `133;D;0` ANNOTATES success
+    /// WITH exit code 0 and ALWAYS unread=1. Only the `D` emits — the `C` does not
+    /// flash a `running` (the OS busy signal owns running). The backend never
+    /// inspects focus.
     #[test]
     fn command_end_exit_zero_is_success_and_always_unread() {
         let app = build_app_with_db();
@@ -6676,14 +7142,15 @@ mod tests {
             (db::STATE_SUCCESS.to_string(), Some(0), true),
             "133;D;0 settles success with exit 0 and unread=1"
         );
-        let evs = wait_events(&events, 2);
-        assert_eq!(evs.len(), 2, "running then success");
-        assert_eq!(evs[1]["state"], "success");
-        assert_eq!(evs[1]["exit_code"], 0);
-        assert_eq!(evs[1]["unread"], true);
+        let evs = wait_events(&events, 1);
+        assert_eq!(evs.len(), 1, "only the D settle emits; C drives no running");
+        assert_eq!(evs[0]["state"], "success");
+        assert_eq!(evs[0]["exit_code"], 0);
+        assert_eq!(evs[0]["unread"], true);
     }
 
-    /// `133;D;<non-zero>` settles to `error`, stores the exit code, and is unread.
+    /// `133;D;<non-zero>` ANNOTATES `error`, stores the exit code, and is unread. The
+    /// `133;C` before it is inert (no running event), so the ONLY emit is the error.
     #[test]
     fn command_end_nonzero_is_error_with_code_and_unread() {
         let app = build_app_with_db();
@@ -6697,14 +7164,15 @@ mod tests {
             (db::STATE_ERROR.to_string(), Some(3), true),
             "133;D;3 settles error with exit 3, unread"
         );
-        let evs = wait_events(&events, 2);
-        assert_eq!(evs[1]["state"], "error");
-        assert_eq!(evs[1]["exit_code"], 3);
-        assert_eq!(evs[1]["unread"], true);
+        let evs = wait_events(&events, 1);
+        assert_eq!(evs.len(), 1, "only the D settle emits; C drives no running");
+        assert_eq!(evs[0]["state"], "error");
+        assert_eq!(evs[0]["exit_code"], 3);
+        assert_eq!(evs[0]["unread"], true);
     }
 
     /// A `133;D` with NO parseable exit code settles to `error` (a finished result
-    /// with no code) — NEVER a stale `running`.
+    /// with no code) — NEVER a stale `running`. The `133;C` before it is inert.
     #[test]
     fn command_end_missing_code_settles_error_not_running() {
         let app = build_app_with_db();
@@ -6716,6 +7184,34 @@ mod tests {
             exec_state(&app, &tid),
             (db::STATE_ERROR.to_string(), None, true),
             "a code-less D settles to error with no exit code, not running"
+        );
+    }
+
+    /// GRACEFUL DEGRADATION (PRD task #3 done-criterion): a command whose `133;D`
+    /// end is NEVER emitted (an unsupported / OSC-133-coupled shell) must NOT leave a
+    /// phantom `running` exec-state. With `C` retrograded to inert, a lone `133;C`
+    /// (no `D`) keeps the persisted `exec_state` at `idle` — the WORST case is a
+    /// missing success/error COLOR, never a stuck running. busy/idle (the OS signal)
+    /// is unaffected: it is derived from the foreground pgroup, independent of OSC 133.
+    #[test]
+    fn missing_command_end_leaves_no_phantom_running() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let events = collect_exec_events(&app);
+
+        // A full prompt + pre-exec stream with NO `133;D` (the shell never reported
+        // the result): the classic "stuck running" trigger under the OLD model.
+        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C\x07");
+
+        assert_eq!(
+            exec_state(&app, &tid).0,
+            db::STATE_IDLE,
+            "a missing D never leaves a phantom running in exec_state (OS owns running)"
+        );
+        let evs = wait_events(&events, 1);
+        assert!(
+            evs.is_empty(),
+            "no terminal://exec-state at all without a D — running is not OSC-driven, got {evs:?}"
         );
     }
 
@@ -6761,14 +7257,19 @@ mod tests {
         );
     }
 
-    /// A shell/PTY exit while `running` must NOT leave a stale running badge:
-    /// `normalize_exec_state_on_exit` settles it to idle.
+    /// A shell/PTY exit while a `running` is left in the DB (a value persisted by an
+    /// OLDER build — OSC 133 no longer posts `running`) must NOT leave a stale running
+    /// badge: `normalize_exec_state_on_exit` settles it to idle. We seed the stale
+    /// `running` directly (OSC 133 can no longer produce it).
     #[test]
     fn exit_while_running_normalizes_to_idle() {
         let app = build_app_with_db();
         let tid = make_record(&app);
         let events = collect_exec_events(&app);
-        handle_osc133_chunk(app.handle(), &tid, b"\x1b]133;C\x07");
+        // Simulate a pre-migration persisted `running` (no OSC path produces it now).
+        app.state::<Db>()
+            .with_conn(|c| db::set_exec_state(c, &tid, db::STATE_RUNNING, None, false))
+            .expect("seed stale running");
         assert_eq!(exec_state(&app, &tid).0, db::STATE_RUNNING);
 
         normalize_exec_state_on_exit(app.handle(), &tid);
@@ -6778,7 +7279,7 @@ mod tests {
             (db::STATE_IDLE.to_string(), None, false),
             "a stale running settles to idle on PTY exit (no false running)"
         );
-        let evs = wait_events(&events, 2);
+        let evs = wait_events(&events, 1);
         assert_eq!(evs.last().unwrap()["state"], "idle");
     }
 
@@ -6800,13 +7301,14 @@ mod tests {
         );
     }
 
-    /// An unknown terminal id neither panics nor emits: `persist_and_emit` skips the
-    /// emit when no row was updated (we never announce a state the DB does not hold).
+    /// An unknown terminal id neither panics nor emits: a `133;D` end (which DOES
+    /// drive a persist+emit) hits `persist_and_emit`, which skips the emit when no
+    /// row was updated (we never announce a state the DB does not hold).
     #[test]
     fn unknown_terminal_id_is_a_safe_noop() {
         let app = build_app_with_db();
         let events = collect_exec_events(&app);
-        handle_osc133_chunk(app.handle(), "no-such-terminal", b"\x1b]133;C\x07");
+        handle_osc133_chunk(app.handle(), "no-such-terminal", b"\x1b]133;D;0\x07");
         let evs = wait_events(&events, 1);
         assert!(evs.is_empty(), "no event for an unknown terminal id");
     }
@@ -6841,22 +7343,21 @@ mod tests {
             "terminal B persists its own error — no cross-talk from A"
         );
 
-        // Emitted events: 4 in total (2 per terminal), each keyed to its own id.
-        let evs = wait_events(&events, 4);
-        assert_eq!(evs.len(), 4, "two transitions per terminal were emitted");
+        // Emitted events: 2 in total (ONE settle per terminal — `C` is inert now),
+        // each keyed to its own id.
+        let evs = wait_events(&events, 2);
+        assert_eq!(evs.len(), 2, "one settle transition per terminal was emitted");
         let for_a: Vec<&serde_json::Value> =
             evs.iter().filter(|e| e["terminal_id"] == ta).collect();
         let for_b: Vec<&serde_json::Value> =
             evs.iter().filter(|e| e["terminal_id"] == tb).collect();
-        assert_eq!(for_a.len(), 2, "exactly A's two events carry A's id");
-        assert_eq!(for_b.len(), 2, "exactly B's two events carry B's id");
+        assert_eq!(for_a.len(), 1, "exactly A's settle carries A's id");
+        assert_eq!(for_b.len(), 1, "exactly B's settle carries B's id");
         // A's settle is success; B's settle is error — events did not swap ids.
-        assert_eq!(for_a[0]["state"], "running");
-        assert_eq!(for_a[1]["state"], "success");
-        assert_eq!(for_a[1]["exit_code"], 0);
-        assert_eq!(for_b[0]["state"], "running");
-        assert_eq!(for_b[1]["state"], "error");
-        assert_eq!(for_b[1]["exit_code"], 5);
+        assert_eq!(for_a[0]["state"], "success");
+        assert_eq!(for_a[0]["exit_code"], 0);
+        assert_eq!(for_b[0]["state"], "error");
+        assert_eq!(for_b[0]["exit_code"], 5);
     }
 
     // --- PRD-2.1 task #10: DETERMINISTIC SYNTHETIC E2E (dogfood gate) --------
@@ -6923,9 +7424,11 @@ mod tests {
     /// SYNTHETIC E2E #1 — success path, full chain, no real shell.
     ///
     /// Feed the production pump a SYNTHETIC stream that interleaves visible output
-    /// with OSC 133 markers: a pre-exec (`C` → running), real command output, and
-    /// a command-end exit 0 (`D;0` → success). Assert simultaneously:
-    ///  - `terminal://exec-state` fires running → success, keyed to OUR terminal_id;
+    /// with OSC 133 markers: a pre-exec (`C` — inert since the retrograde), real
+    /// command output, and a command-end exit 0 (`D;0` → success ANNOTATION). Assert
+    /// simultaneously:
+    ///  - `terminal://exec-state` fires ONLY the success settle (no `running` from
+    ///    OSC 133 — that is the OS busy signal's job), keyed to OUR terminal_id;
     ///  - the persisted DB row settles to success(0)+unread (authority for restart);
     ///  - `pty://output` still carries EVERY visible byte (the OSC bytes are
     ///    observed out-of-band, NOT stripped — xterm renders the full stream).
@@ -6947,22 +7450,20 @@ mod tests {
         // shell would emit), with VISIBLE text around the control sequences.
         tx.send(b"\x1b]133;A\x07PS C:\\> \x1b]133;B\x07".to_vec())
             .unwrap(); // prompt drawn (inert)
-        tx.send(b"\x1b]133;C\x07".to_vec()).unwrap(); // pre-exec → running
+        tx.send(b"\x1b]133;C\x07".to_vec()).unwrap(); // pre-exec (inert; OS owns running)
         tx.send(b"hello from synthetic shell\r\n".to_vec()).unwrap(); // command output
         tx.send(b"\x1b]133;D;0\x07".to_vec()).unwrap(); // end exit 0 → success
         tx.send(b"\x1b]133;A\x07PS C:\\> \x1b]133;B\x07".to_vec())
             .unwrap(); // next prompt
 
-        // Full-chain assertions on the persisted authority + the emitted events.
-        let evs = wait_events(&exec_events, 2);
-        assert_eq!(evs.len(), 2, "exactly running then success were emitted");
-        assert_eq!(evs[0]["terminal_id"], tid);
-        assert_eq!(evs[0]["state"], "running");
-        assert_eq!(evs[0]["unread"], false, "running is a live state, never unread");
-        assert_eq!(evs[1]["terminal_id"], tid, "settle keyed to OUR terminal");
-        assert_eq!(evs[1]["state"], "success");
-        assert_eq!(evs[1]["exit_code"], 0);
-        assert_eq!(evs[1]["unread"], true, "settled success is an unread notification");
+        // Full-chain assertions on the persisted authority + the emitted events:
+        // ONLY the success settle is emitted (no OSC-driven running).
+        let evs = wait_events(&exec_events, 1);
+        assert_eq!(evs.len(), 1, "exactly the success settle was emitted (no running)");
+        assert_eq!(evs[0]["terminal_id"], tid, "settle keyed to OUR terminal");
+        assert_eq!(evs[0]["state"], "success");
+        assert_eq!(evs[0]["exit_code"], 0);
+        assert_eq!(evs[0]["unread"], true, "settled success is an unread notification");
         assert_eq!(
             exec_state(&app, &tid),
             (db::STATE_SUCCESS.to_string(), Some(0), true),
@@ -6990,39 +7491,43 @@ mod tests {
         );
     }
 
-    /// SYNTHETIC E2E #2 — error path + normalize-on-exit, no real shell.
+    /// SYNTHETIC E2E #2 — error ANNOTATION + defensive normalize-on-exit, no real shell.
     ///
-    /// One terminal runs a command that FAILS (`C` → running, `D;3` → error), proving
-    /// the running → error transition end-to-end. A SECOND terminal is left mid-run
-    /// (`C` → running, NO `D`) and then has its synthetic PTY disconnect: the pump's
-    /// disconnect path must normalize that stale `running` to `idle` (no false badge
-    /// after a shell/PTY exit). Both run through the production pump with synthetic
-    /// bytes only.
+    /// One terminal runs a command that FAILS (`C` inert, `D;3` → error), proving the
+    /// success/error ANNOTATION path end-to-end after the retrograde — with NO OSC
+    /// `running` emitted. A SECOND terminal carries a stale `running` persisted by an
+    /// OLDER build (OSC 133 can no longer produce `running`); its synthetic PTY then
+    /// disconnects and the pump's defensive disconnect path normalizes that stale
+    /// `running` to `idle` (no false badge after a shell/PTY exit). Both run through
+    /// the production pump with synthetic bytes only.
     #[test]
     fn synthetic_e2e_running_to_error_and_normalize_on_exit_through_the_pump() {
         let app = build_app_with_db();
         let exec_events = collect_exec_events(&app);
 
-        // --- Terminal A: running → error (command failed, exit 3) ---
+        // --- Terminal A: error annotation (command failed, exit 3), no running ---
         let ta = make_record(&app);
         let pty_a = 90_011u64;
         map_pty_to_record(&app, pty_a, &ta);
         let (tx_a, rx_a) = channel::<Vec<u8>>();
         spawn_output_pump(app.handle().clone(), pty_a, rx_a);
-        tx_a.send(b"\x1b]133;C\x07".to_vec()).unwrap(); // running
+        tx_a.send(b"\x1b]133;C\x07".to_vec()).unwrap(); // pre-exec (inert; OS owns running)
         tx_a.send(b"boom: command failed\r\n".to_vec()).unwrap();
         tx_a.send(b"\x1b]133;D;3\x07".to_vec()).unwrap(); // error, exit 3
 
-        // --- Terminal B: running with NO end, then PTY exits mid-command ---
+        // --- Terminal B: a STALE persisted `running` (older build), PTY then exits ---
         let tb = make_record(&app);
         let pty_b = 90_012u64;
         map_pty_to_record(&app, pty_b, &tb);
         let (tx_b, rx_b) = channel::<Vec<u8>>();
         spawn_output_pump(app.handle().clone(), pty_b, rx_b);
-        tx_b.send(b"\x1b]133;C\x07long running, never ends...\r\n".to_vec())
-            .unwrap(); // running, no D
+        // Seed the stale `running` directly: no OSC path produces it post-retrograde.
+        app.state::<Db>()
+            .with_conn(|c| db::set_exec_state(c, &tb, db::STATE_RUNNING, None, false))
+            .expect("seed stale running on B");
+        tx_b.send(b"long running, never ends...\r\n".to_vec()).unwrap();
 
-        // A's error must settle (running → error(3)+unread) on the persisted row.
+        // A's error must settle (→ error(3)+unread) on the persisted row.
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline
             && exec_state(&app, &ta).0 != db::STATE_ERROR
@@ -7032,14 +7537,11 @@ mod tests {
         assert_eq!(
             exec_state(&app, &ta),
             (db::STATE_ERROR.to_string(), Some(3), true),
-            "terminal A: running → error(3)+unread end-to-end through the pump"
+            "terminal A: error(3)+unread end-to-end through the pump (no OSC running)"
         );
 
-        // B reaches running first; then its PTY disconnects.
-        while Instant::now() < deadline && exec_state(&app, &tb).0 != db::STATE_RUNNING {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(exec_state(&app, &tb).0, db::STATE_RUNNING, "B is running mid-command");
+        // B holds the seeded stale running; then its PTY disconnects.
+        assert_eq!(exec_state(&app, &tb).0, db::STATE_RUNNING, "B holds a stale running");
         drop(tx_b); // PTY exit while running → the pump normalizes the stale badge.
 
         // No stale running badge after the shell/PTY exit: B settles to idle.
@@ -7053,9 +7555,9 @@ mod tests {
             "B: a stale running normalizes to idle on PTY exit (no false running)"
         );
 
-        // Event-stream cross-check: every emitted event is keyed to the RIGHT id,
-        // and A's settle is error while B's last transition is idle (not error).
-        let evs = wait_events(&exec_events, 4); // A: running,error ; B: running,idle
+        // Event-stream cross-check: every emitted event is keyed to the RIGHT id.
+        // A emits ONLY its error settle (no running); B emits ONLY its idle normalize.
+        let evs = wait_events(&exec_events, 2); // A: error ; B: idle
         let for_a: Vec<&serde_json::Value> =
             evs.iter().filter(|e| e["terminal_id"] == ta).collect();
         let for_b: Vec<&serde_json::Value> =

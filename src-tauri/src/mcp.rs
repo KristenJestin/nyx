@@ -957,7 +957,22 @@ fn tool_descriptors() -> Vec<Value> {
                         OPEN terminals are listed; pass `include_closed:true` to ALSO list closed \
                         ones — a closed terminal can no longer be written to, but read_terminal \
                         still returns its last saved scrollback, so this is how you rediscover a \
-                        finished terminal's id to read its output. Read-only.",
+                        finished terminal's id to read its output. \
+                        Each entry ALSO reports `busy` (true while a command is running in the \
+                        foreground — the SAME live OS signal as the running dot the user sees; \
+                        false at an idle prompt, null if it cannot be derived), and the settled \
+                        result of the last command: `exec_state` (\"idle\"|\"running\"|\"success\"|\
+                        \"error\"), `exec_exit_code`, and `exec_state_updated_at` (epoch ms of the \
+                        last state change). \
+                        TO RELIABLY DETECT THAT A COMMAND YOU SENT HAS FINISHED: do NOT poll `busy` \
+                        alone — a very short command can start and finish between two polls, so you \
+                        could miss it and read `busy:false` as if nothing ran (a false negative). \
+                        Instead, capture `exec_state_updated_at` from list_terminals BEFORE calling \
+                        send_to_terminal, then poll list_terminals until that timestamp ADVANCES to \
+                        a settled state (`exec_state` becomes \"success\" or \"error\", with \
+                        `exec_exit_code`). The advancing timestamp is a monotone marker that catches \
+                        even an instantaneous command; once it settles, read_terminal returns that \
+                        command's output. Read-only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -995,7 +1010,10 @@ fn tool_descriptors() -> Vec<Value> {
                         the LAST \
                         scrollback nyx persisted for the terminal, which is updated a moment after \
                         new output appears (debounced by the UI); a read immediately after \
-                        send_to_terminal may be slightly behind — retry to see the latest. A \
+                        send_to_terminal may be slightly behind — retry to see the latest. To avoid \
+                        reading mid-command, first wait for the command to FINISH: poll \
+                        list_terminals until that terminal's `exec_state_updated_at` advances to a \
+                        settled `exec_state` (see list_terminals), then read. A \
                         closed terminal still returns its last saved scrollback as long as nyx \
                         remembers it; an unknown id is an error. INCREMENTAL READS ARE BEST-EFFORT: \
                         scrollback is the re-serialized terminal grid, not an append-only log, so a \

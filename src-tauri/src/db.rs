@@ -678,6 +678,32 @@ pub fn set_exec_state(
         .execute(conn)
 }
 
+/// BOOT NORMALIZATION (PRD task #2): settle every terminal stuck at a persisted
+/// `exec_state = 'running'` down to `idle`, clearing the exit code and unread flag.
+///
+/// Busy/idle is now derived LIVE from the OS foreground process group (task #1), so
+/// a persisted `running` is never the authority for the dot any more — it is at most
+/// a stale artefact of a force-quit (the exact dogfood symptom: terminals left
+/// `running` in the DB after `tauri dev` restarted the app mid-command). A live PTY
+/// has no foreground command after a restart (the process did not survive), so it is
+/// idle by construction; this call makes the PERSISTED field agree, so nothing — not
+/// even a transient read before the first busy-state poll — can resurface a phantom
+/// running. SETTLED results (`success`/`error`) and `idle` are LEFT UNTOUCHED (their
+/// badge/unread survive the restart, like the managed-command `normalize_unrelaunched`).
+/// Returns the number of rows normalized.
+pub fn normalize_phantom_running_terminals(conn: &mut SqliteConnection) -> QueryResult<usize> {
+    let now = now_millis();
+    diesel::update(terminals::table.filter(terminals::exec_state.eq(STATE_RUNNING)))
+        .set((
+            terminals::exec_state.eq(STATE_IDLE),
+            terminals::exec_exit_code.eq(None::<i32>),
+            terminals::exec_state_unread.eq(false),
+            terminals::exec_state_updated_at.eq(now),
+            terminals::updated_at.eq(now),
+        ))
+        .execute(conn)
+}
+
 /// Mark a terminal's settled exec-state as READ: clear `exec_state_unread` to
 /// false while LEAVING `exec_state`/`exec_exit_code` intact (the badge keeps its
 /// success/error color but stops being a notification). This is the mark-read
@@ -2565,6 +2591,54 @@ mod tests {
         let got = get_terminal(&mut conn, &t.id).unwrap().unwrap();
         assert_eq!(got.exec_state, STATE_SUCCESS);
         assert_eq!(got.exec_exit_code, Some(0));
+    }
+
+    /// BOOT NORMALIZATION (PRD task #2): `normalize_phantom_running_terminals`
+    /// settles every terminal stuck at a persisted `running` to `idle` (clearing the
+    /// exit code + unread), while LEAVING `success`/`error`/`idle` untouched. This is
+    /// the terminal analogue of the managed-command boot normalize — the exact
+    /// dogfood symptom (terminals left `running` in the DB after a force-quit) is
+    /// erased at launch.
+    #[test]
+    fn boot_normalizes_phantom_running_terminals() {
+        let mut conn = open_in_memory();
+        // A phantom running (force-quit mid-command), plus the three states that must
+        // SURVIVE the normalization untouched.
+        let running = create_terminal(&mut conn, "/running", None).unwrap();
+        let success = create_terminal(&mut conn, "/success", None).unwrap();
+        let error = create_terminal(&mut conn, "/error", None).unwrap();
+        let idle = create_terminal(&mut conn, "/idle", None).unwrap();
+        set_exec_state(&mut conn, &running.id, STATE_RUNNING, None, false).unwrap();
+        set_exec_state(&mut conn, &success.id, STATE_SUCCESS, Some(0), true).unwrap();
+        set_exec_state(&mut conn, &error.id, STATE_ERROR, Some(2), true).unwrap();
+        // `idle` keeps the default idle state.
+
+        let normalized = normalize_phantom_running_terminals(&mut conn).expect("normalize");
+        assert_eq!(normalized, 1, "exactly the one phantom-running row is normalized");
+
+        // The phantom running is now idle, with no exit code and not unread.
+        let got = get_terminal(&mut conn, &running.id).unwrap().unwrap();
+        assert_eq!(got.exec_state, STATE_IDLE, "phantom running settled to idle");
+        assert_eq!(got.exec_exit_code, None, "phantom exit code cleared");
+        assert!(!got.exec_state_unread, "phantom is not an unread notification");
+
+        // Settled results + idle survive untouched (their badge/unread persist).
+        let s = get_terminal(&mut conn, &success.id).unwrap().unwrap();
+        assert_eq!(s.exec_state, STATE_SUCCESS);
+        assert_eq!(s.exec_exit_code, Some(0));
+        assert!(s.exec_state_unread, "settled success keeps its unread flag");
+        let e = get_terminal(&mut conn, &error.id).unwrap().unwrap();
+        assert_eq!(e.exec_state, STATE_ERROR);
+        assert_eq!(e.exec_exit_code, Some(2));
+        let i = get_terminal(&mut conn, &idle.id).unwrap().unwrap();
+        assert_eq!(i.exec_state, STATE_IDLE);
+
+        // Idempotent: a second pass normalizes nothing (no running left).
+        assert_eq!(
+            normalize_phantom_running_terminals(&mut conn).unwrap(),
+            0,
+            "second boot normalize is a no-op (no phantom running remains)"
+        );
     }
 
     /// `mark_exec_state_read` clears the unread flag but PRESERVES the settled
