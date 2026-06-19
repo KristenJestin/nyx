@@ -589,7 +589,7 @@ impl PendingResumes {
 /// `command + "\n"` is written into the just-spawned PTY so an MCP "open a terminal that
 /// runs X" lands its line at the shell's first prompt and stays interactive after. A
 /// terminal opened bare (no parked command) injects nothing.
-#[tauri::command]
+#[tauri::command(async)]
 fn register_terminal_pty(
     db: State<'_, Db>,
     map: State<'_, TerminalPtyMap>,
@@ -965,7 +965,7 @@ impl Osc133Events {
 /// the durable record for exec-state (PRD-2.1) — `pty://output`/`pty://exit` stay
 /// keyed by the live pty_id and are UNCHANGED. A record-less spawn (the socle /
 /// the unit harness) passes `None` and simply gets no mapping entry.
-#[tauri::command]
+#[tauri::command(async)]
 fn pty_spawn<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PtyManager>,
@@ -1035,7 +1035,7 @@ fn pty_resize(state: State<'_, PtyManager>, id: u64, cols: u16, rows: u16) -> Re
 /// The `pty://exit` event is emitted by the output pump once the child is
 /// reaped, so closing here only needs to terminate the process; dropping the
 /// removed [`Pty`] also kills/joins as a safety net.
-#[tauri::command]
+#[tauri::command(async)]
 fn pty_close(state: State<'_, PtyManager>, id: u64) -> Result<(), String> {
     let pty = state.ptys.lock().unwrap().remove(&id);
     match pty {
@@ -1059,7 +1059,7 @@ fn pty_close(state: State<'_, PtyManager>, id: u64) -> Result<(), String> {
 /// foreground pgid (`tcgetpgrp` on the master, for the program name) from the
 /// live `Pty`, then hit `/proc`. An unknown id yields `Err`. A closed/exited
 /// terminal (no live Pty) also yields `Err` — there is nothing to introspect.
-#[tauri::command]
+#[tauri::command(async)]
 fn terminal_info(
     pty_state: State<'_, PtyManager>,
     cache: State<'_, TerminalInfoCache>,
@@ -1574,7 +1574,7 @@ fn osc133_incomplete_tail(buf: &[u8]) -> Vec<u8> {
 // its tests live there. Errors are stringified for the IPC boundary.
 
 /// Create a terminal record at `cwd` (optional `label`) and return the new row.
-#[tauri::command]
+#[tauri::command(async)]
 fn create_terminal(
     db: State<'_, Db>,
     cwd: String,
@@ -1585,13 +1585,13 @@ fn create_terminal(
 }
 
 /// List all terminal records in sidebar order (closed ones included).
-#[tauri::command]
+#[tauri::command(async)]
 fn list_terminals(db: State<'_, Db>) -> Result<Vec<Terminal>, String> {
     db.with_conn(db::list_terminals).map_err(|e| e.to_string())
 }
 
 /// Mark a terminal record `closed` (no re-spawn at launch).
-#[tauri::command]
+#[tauri::command(async)]
 fn close_terminal(db: State<'_, Db>, id: String) -> Result<(), String> {
     db.with_conn(|c| db::close_terminal(c, &id))
         .map(|_| ())
@@ -1599,14 +1599,14 @@ fn close_terminal(db: State<'_, Db>, id: String) -> Result<(), String> {
 }
 
 /// Persist the sidebar order: each id's `order` becomes its index in `ids`.
-#[tauri::command]
+#[tauri::command(async)]
 fn reorder(db: State<'_, Db>, ids: Vec<String>) -> Result<(), String> {
     db.with_conn(|c| db::reorder(c, &ids))
         .map_err(|e| e.to_string())
 }
 
 /// Rename a terminal record (`label`; `None` clears it).
-#[tauri::command]
+#[tauri::command(async)]
 fn rename(db: State<'_, Db>, id: String, label: Option<String>) -> Result<(), String> {
     db.with_conn(|c| db::rename(c, &id, label))
         .map(|_| ())
@@ -1615,7 +1615,7 @@ fn rename(db: State<'_, Db>, id: String, label: Option<String>) -> Result<(), St
 
 /// Record `id` as the active terminal (stamps `last_active_at`) so a relaunch
 /// reopens on it.
-#[tauri::command]
+#[tauri::command(async)]
 fn set_active(db: State<'_, Db>, id: String) -> Result<(), String> {
     db.with_conn(|c| db::set_active(c, &id))
         .map(|_| ())
@@ -1623,7 +1623,7 @@ fn set_active(db: State<'_, Db>, id: String) -> Result<(), String> {
 }
 
 /// Persist a terminal's serialized scrollback (bounded). The caller debounces.
-#[tauri::command]
+#[tauri::command(async)]
 fn persist_scrollback(db: State<'_, Db>, id: String, serialized: String) -> Result<(), String> {
     db.with_conn(|c| db::persist_scrollback(c, &id, &serialized))
         .map(|_| ())
@@ -1639,7 +1639,7 @@ fn persist_scrollback(db: State<'_, Db>, id: String, serialized: String) -> Resu
 /// focus decision (it does not track which terminal is active), so this command is
 /// the only way `exec_state_unread` is cleared. Deliberately does NOT collapse the
 /// state to idle (that is the managed-command acknowledge model, kept separate).
-#[tauri::command]
+#[tauri::command(async)]
 fn terminal_exec_mark_read(db: State<'_, Db>, id: String) -> Result<(), String> {
     db.with_conn(|c| db::mark_exec_state_read(c, &id))
         .map(|_| ())
@@ -1661,7 +1661,7 @@ struct ProjectWithRoot {
 
 /// Create a project and its single, explicitly-named root workspace at
 /// `root_path`. `root_name` defaults to "root" when omitted.
-#[tauri::command]
+#[tauri::command(async)]
 fn create_project<R: Runtime>(
     app: AppHandle<R>,
     db: State<'_, Db>,
@@ -1680,13 +1680,13 @@ fn create_project<R: Runtime>(
 }
 
 /// List all projects.
-#[tauri::command]
+#[tauri::command(async)]
 fn list_projects(db: State<'_, Db>) -> Result<Vec<Project>, String> {
     db.with_conn(db::list_projects).map_err(|e| e.to_string())
 }
 
 /// Rename a project's display `name`. Returns ().
-#[tauri::command]
+#[tauri::command(async)]
 fn update_project(db: State<'_, Db>, id: String, name: String) -> Result<(), String> {
     db.with_conn(|c| db::update_project(c, &id, &name))
         .map(|_| ())
@@ -1702,7 +1702,7 @@ fn update_project(db: State<'_, Db>, id: String, name: String) -> Result<(), Str
 /// user must stop the running services first. Note `update_project`,
 /// `rename_workspace`, and the collapse commands are NOT guarded — they change
 /// neither a path nor the runtime.
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_project<R: Runtime>(
     app: AppHandle<R>,
     db: State<'_, Db>,
@@ -1728,7 +1728,7 @@ fn delete_project<R: Runtime>(
 
 /// Persist a project's sidebar `collapsed` (open/closed) state so the band's
 /// disclosure survives a restart. Returns ().
-#[tauri::command]
+#[tauri::command(async)]
 fn set_project_collapsed(db: State<'_, Db>, id: String, collapsed: bool) -> Result<(), String> {
     db.with_conn(|c| db::set_project_collapsed(c, &id, collapsed))
         .map(|_| ())
@@ -1738,7 +1738,7 @@ fn set_project_collapsed(db: State<'_, Db>, id: String, collapsed: bool) -> Resu
 /// Persist a project's `resume_agent_sessions` opt-in (PRD-5 #5): when `true`, nyx
 /// resumes the project's terminals' active agent sessions at relaunch. Default OFF.
 /// Returns ().
-#[tauri::command]
+#[tauri::command(async)]
 fn set_project_resume_agent_sessions(
     db: State<'_, Db>,
     id: String,
@@ -1766,7 +1766,7 @@ pub struct CloseWarningEntry {
 /// calls this on a close request and, when non-empty, shows the confirm dialog before
 /// actually closing. The message names the AGENT (Claude/Codex/OpenCode/custom) and the
 /// TERMINAL (label or id) + workspace.
-#[tauri::command]
+#[tauri::command(async)]
 fn agent_close_warnings(db: State<'_, Db>) -> Result<Vec<CloseWarningEntry>, String> {
     use crate::agent_resume::{close_warning_message, should_warn_on_close, SessionState};
     let rows = db
@@ -1800,14 +1800,14 @@ fn agent_close_warnings(db: State<'_, Db>) -> Result<Vec<CloseWarningEntry>, Str
 /// registry to render the agent's logo in place of the generic terminal glyph for those
 /// rows (reverting when the session ends and the terminal drops out of this list). An
 /// EMPTY list means "no terminal has a live session" (every row shows the terminal icon).
-#[tauri::command]
+#[tauri::command(async)]
 fn agent_active_sessions(db: State<'_, Db>) -> Result<Vec<db::ActiveAgentSession>, String> {
     db.with_conn(db::active_agent_sessions).map_err(|e| e.to_string())
 }
 
 /// Create a (non-root) workspace in `project_id` at `path`. Rejects a path
 /// already present in the SAME project (UNIQUE(project_id, path)).
-#[tauri::command]
+#[tauri::command(async)]
 fn create_workspace<R: Runtime>(
     app: AppHandle<R>,
     db: State<'_, Db>,
@@ -1825,14 +1825,14 @@ fn create_workspace<R: Runtime>(
 }
 
 /// List the workspaces of `project_id` (root first).
-#[tauri::command]
+#[tauri::command(async)]
 fn list_workspaces(db: State<'_, Db>, project_id: String) -> Result<Vec<Workspace>, String> {
     db.with_conn(|c| db::list_workspaces(c, &project_id))
         .map_err(|e| e.to_string())
 }
 
 /// Rename a workspace's display `name` (the path is immutable). Returns ().
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_workspace(db: State<'_, Db>, id: String, name: String) -> Result<(), String> {
     db.with_conn(|c| db::rename_workspace(c, &id, &name))
         .map(|_| ())
@@ -1841,7 +1841,7 @@ fn rename_workspace(db: State<'_, Db>, id: String, name: String) -> Result<(), S
 
 /// Persist a workspace's sidebar `collapsed` (open/closed) state so the band's
 /// disclosure survives a restart. Returns ().
-#[tauri::command]
+#[tauri::command(async)]
 fn set_workspace_collapsed(db: State<'_, Db>, id: String, collapsed: bool) -> Result<(), String> {
     db.with_conn(|c| db::set_workspace_collapsed(c, &id, collapsed))
         .map(|_| ())
@@ -1850,7 +1850,7 @@ fn set_workspace_collapsed(db: State<'_, Db>, id: String, collapsed: bool) -> Re
 
 /// Attach a terminal record to a workspace with an explicit binding `mode`
 /// (`auto`|`manual`).
-#[tauri::command]
+#[tauri::command(async)]
 fn attach_terminal(
     db: State<'_, Db>,
     terminal_id: String,
@@ -1863,7 +1863,7 @@ fn attach_terminal(
 }
 
 /// Detach a terminal record from any workspace (mode resets to `auto`).
-#[tauri::command]
+#[tauri::command(async)]
 fn detach_terminal(db: State<'_, Db>, terminal_id: String) -> Result<(), String> {
     db.with_conn(|c| db::detach_terminal(c, &terminal_id))
         .map(|_| ())
@@ -1872,7 +1872,7 @@ fn detach_terminal(db: State<'_, Db>, terminal_id: String) -> Result<(), String>
 
 /// Pin a terminal record to a workspace (mode `manual`; a later `cd` no longer
 /// moves it).
-#[tauri::command]
+#[tauri::command(async)]
 fn pin_terminal_workspace(
     db: State<'_, Db>,
     terminal_id: String,
@@ -1884,7 +1884,7 @@ fn pin_terminal_workspace(
 }
 
 /// Unpin a terminal record (mode `auto`; auto-attach resumes).
-#[tauri::command]
+#[tauri::command(async)]
 fn unpin_terminal_workspace(db: State<'_, Db>, terminal_id: String) -> Result<(), String> {
     db.with_conn(|c| db::unpin_terminal_workspace(c, &terminal_id))
         .map(|_| ())
@@ -1904,7 +1904,7 @@ fn unpin_terminal_workspace(db: State<'_, Db>, terminal_id: String) -> Result<()
 /// relative to the workspace; `restart_on_startup` toggles boot relaunch; the
 /// `source_*` group carries optional package.json provenance. Materializes one
 /// instance per existing workspace of the project (in the db layer).
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn command_create<R: Runtime>(
     app: AppHandle<R>,
@@ -1959,7 +1959,7 @@ fn command_create<R: Runtime>(
 }
 
 /// List a project's command templates in sidebar order.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_list(db: State<'_, Db>, project_id: String) -> Result<Vec<db::ManagedCommand>, String> {
     db.with_conn(|c| db::list_templates(c, &project_id))
         .map_err(|e| e.to_string())
@@ -1978,7 +1978,7 @@ fn command_list(db: State<'_, Db>, project_id: String) -> Result<Vec<db::Managed
 /// subfolder / restart flag (command unchanged), or re-typing exactly the runner
 /// call or the raw script, keeps the link. (Resync is the explicit path that
 /// adopts a new script value WITHOUT detaching — see [`command_resync_source`].)
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn command_update<R: Runtime>(
     app: AppHandle<R>,
@@ -2047,7 +2047,7 @@ pub(crate) fn command_detaches_source(template: &db::ManagedCommand, new_command
 
 /// Delete a template (its instances cascade away). REFUSED if any of its instances
 /// is running.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_delete<R: Runtime>(
     app: AppHandle<R>,
     db: State<'_, Db>,
@@ -2065,7 +2065,7 @@ fn command_delete<R: Runtime>(
 }
 
 /// Persist a project's template order: each id's order becomes its index in `ids`.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_reorder(db: State<'_, Db>, ids: Vec<String>) -> Result<(), String> {
     db.with_conn(|c| db::reorder_templates(c, &ids))
         .map_err(|e| e.to_string())
@@ -2076,7 +2076,7 @@ fn command_reorder(db: State<'_, Db>, ids: Vec<String>) -> Result<(), String> {
 /// its workspace path. Each row's `cwd` is filled here with the resolved run
 /// directory (`workspace_path` + `subfolder`, best-effort) so the front's command
 /// info bar can show where the command runs without re-resolving.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_instance_list(
     db: State<'_, Db>,
     workspace_id: String,
@@ -2100,7 +2100,7 @@ fn command_instance_list(
 /// cwd (the workspace path joined with the validated subfolder) and spawn through
 /// the runner. Idempotent on a running instance (no second spawn). Returns the
 /// `last_state` string after the call.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_start<R: Runtime>(
     _app: AppHandle<R>,
     db: State<'_, Db>,
@@ -2116,7 +2116,7 @@ fn command_start<R: Runtime>(
 
 /// Stop a running instance (best-effort process-tree kill, then idle). Idempotent
 /// on a non-running instance. Returns the `last_state` string after the call.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_stop<R: Runtime>(
     _app: AppHandle<R>,
     runner: State<'_, ManagedCommandRunner<R>>,
@@ -2130,7 +2130,7 @@ fn command_stop<R: Runtime>(
 
 /// Relaunch an instance: stop-then-start if running, else a direct start. Never
 /// leaves two live processes. Returns the `last_state` string after the call.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_relaunch<R: Runtime>(
     _app: AppHandle<R>,
     db: State<'_, Db>,
@@ -2161,7 +2161,7 @@ fn command_relaunch<R: Runtime>(
 ///     the badge still hides. The factual `last_state`/`last_exit_code` survive.
 ///
 /// Returns the FACTUAL `last_state` string after the call (unchanged by the ack).
-#[tauri::command]
+#[tauri::command(async)]
 fn command_acknowledge<R: Runtime>(
     app: AppHandle<R>,
     db: State<'_, Db>,
@@ -2245,7 +2245,7 @@ pub(crate) fn acknowledge_unread<R: Runtime>(
 /// the current output, not a row that can be up to a debounce window stale. When the
 /// instance is idle/success/error there is no live buffer, so we rehydrate cold from
 /// the persisted scrollback.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_output<R: Runtime>(
     _app: AppHandle<R>,
     db: State<'_, Db>,
@@ -2288,7 +2288,7 @@ struct SourceRefreshResult {
 /// status. Does NOT modify `command` (no implicit rewrite). Status is `fresh` when
 /// the on-disk script body equals the stored snapshot, `stale` when it differs,
 /// `missing package.json` / `missing script` when the file/script is gone.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_source_refresh(db: State<'_, Db>, id: String) -> Result<SourceRefreshResult, String> {
     let template = db
         .with_conn(|c| db::get_template(c, &id))
@@ -2340,7 +2340,7 @@ fn command_source_refresh(db: State<'_, Db>, id: String) -> Result<SourceRefresh
 /// KEEPS the source fields (the link is preserved — this is the explicit "adopt
 /// the new script value" path that does NOT detach) + refreshes the snapshot.
 /// REFUSED if any instance is running. Errors if the file/script no longer exists.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_resync_source<R: Runtime>(
     app: AppHandle<R>,
     db: State<'_, Db>,
@@ -2396,7 +2396,7 @@ fn command_resync_source<R: Runtime>(
 /// EXPLICITLY detach the package.json source: clears all `source_*` fields +
 /// `package_manager`, turning the template into a plain manual command. `command`
 /// is left exactly as-is.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_unlink_source<R: Runtime>(
     app: AppHandle<R>,
     db: State<'_, Db>,
@@ -2416,7 +2416,7 @@ fn command_unlink_source<R: Runtime>(
 /// Discover the package.json scripts under a WORKSPACE (root + subfolders), each
 /// with an editable proposed name + default runner command + source metadata. The
 /// front renders these for selection; an empty list means nothing importable.
-#[tauri::command]
+#[tauri::command(async)]
 fn command_import_scripts(
     db: State<'_, Db>,
     workspace_id: String,
@@ -2431,7 +2431,7 @@ fn command_import_scripts(
 /// Create a template from a SELECTED import row: the (user-edited) name + command,
 /// the package.json subfolder, and the source metadata. Refused with a clear error
 /// if the final name already exists in the project.
-#[tauri::command]
+#[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 fn command_import_create<R: Runtime>(
     app: AppHandle<R>,
@@ -2709,7 +2709,7 @@ fn cwd_provider(cwd: Option<String>) -> crate::resolve::CwdProvider {
 /// - `auto` mode follows the resolved cwd;
 /// - NO project/workspace is created, and an unmatched cwd leaves the binding
 ///   untouched (no guessing).
-#[tauri::command]
+#[tauri::command(async)]
 fn auto_attach_terminal(
     db: State<'_, Db>,
     terminal_id: String,
@@ -2825,7 +2825,7 @@ fn portless_port() -> u16 {
 }
 
 /// Read the persisted portless option state (disabled by default).
-#[tauri::command]
+#[tauri::command(async)]
 fn portless_status<R: Runtime>(app: AppHandle<R>) -> Result<PortlessStatus, String> {
     let path = portless_settings_path(&app)?;
     let state = crate::portless::settings::read(&path);
@@ -2842,7 +2842,7 @@ fn portless_status<R: Runtime>(app: AppHandle<R>) -> Result<PortlessStatus, Stri
 /// (`portless is not installed …`), never an auto-install (ADR-0003 D11). State is
 /// only persisted AFTER the alias mutation succeeds, so a failed enable does not
 /// leave the toggle stuck "on".
-#[tauri::command]
+#[tauri::command(async)]
 fn portless_set_enabled<R: Runtime>(
     app: AppHandle<R>,
     enabled: bool,
@@ -3054,7 +3054,7 @@ fn claude_plugin_cli() -> Option<Box<dyn crate::plugin::PluginCli>> {
 /// The claude_code install flag is derived from Claude Code's REAL config (finding #46),
 /// so no `AppHandle`/data-dir lookup is needed — the status helper resolves the real
 /// `~/.claude/settings.json` (or its injectable seam).
-#[tauri::command]
+#[tauri::command(async)]
 fn integration_list<R: Runtime>(_app: AppHandle<R>) -> Result<Vec<IntegrationStatus>, String> {
     Ok(integration_status_list())
 }
