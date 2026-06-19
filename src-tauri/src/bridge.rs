@@ -1295,11 +1295,31 @@ fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8
                         // real OSC 133 `D` end ever produces success/error.
                         if let Some(terminal_id) = terminal_id.as_deref() {
                             normalize_exec_state_on_exit(&app, terminal_id);
-                            // Forget the last-emitted busy bit for this record so the
-                            // tracker does not grow unbounded and a re-spawn under the
-                            // same record starts clean (task #1). The dead PTY samples
-                            // idle anyway; this just drops the bookkeeping entry.
-                            app.state::<BusyStateTracker>().forget(terminal_id);
+                            // The dot's running authority is now the OS busy signal, so
+                            // the EXIT path must clear THAT channel too — not just
+                            // exec_state above. `reap_exit_code` already removed this PTY
+                            // from the registry, so the busy poll loop will never sample
+                            // it again: if we last announced this terminal BUSY (a
+                            // foreground command was running when the shell/PTY died,
+                            // e.g. killed mid-command), nobody else will ever emit the
+                            // `busy=false` that clears the running dot. Emit it here —
+                            // the dead PTY is idle by definition — but ONLY on a real
+                            // busy→idle transition (the tracker suppresses it for a
+                            // terminal that exited from an idle prompt, the common case,
+                            // so a mass-close does not flood redundant events).
+                            let tracker = app.state::<BusyStateTracker>();
+                            if tracker.changed(terminal_id, false) {
+                                let _ = app.emit(
+                                    TERMINAL_BUSY_STATE_EVENT,
+                                    TerminalBusyStatePayload {
+                                        terminal_id: terminal_id.to_string(),
+                                        busy: false,
+                                    },
+                                );
+                            }
+                            // Drop the tracked value so the table does not grow unbounded
+                            // and a re-spawn under the same record starts clean (task #1).
+                            tracker.forget(terminal_id);
                         }
                         // Drop the pty_id → terminal_id mapping now that the live
                         // PTY is gone; the persistent record outlives it, but this
@@ -4173,6 +4193,114 @@ mod tests {
         // forget() resets so a re-spawn under the same id starts clean.
         tracker.forget("u");
         assert!(!tracker.changed("u", false), "after forget, first idle is suppressed again");
+    }
+
+    /// REGRESSION (PRD task #1): a PTY that dies while BUSY must clear the running
+    /// dot. The dot's authority moved from OSC-133 `exec_state` to the OS `busy`
+    /// signal, so the pump's exit path — which already settles a stale `running`
+    /// `exec_state` — must ALSO emit a final `busy=false` on the busy channel.
+    /// Otherwise nobody ever clears it: `reap_exit_code` removes the PTY before the
+    /// poll loop can sample it, the Tauri `list_terminals` record carries no `busy`,
+    /// and the `terminals://changed` merge keeps the stale in-memory record — so the
+    /// front's `record.busy` stays `true` and the dot is stuck lit forever.
+    ///
+    /// We pre-seed the tracker to the state the poll loop leaves after announcing a
+    /// foreground command (`busy=true`), drive a real pump to disconnect (the shell
+    /// died mid-command), and assert exactly ONE `terminal://busy-state {busy:false}`
+    /// keyed to OUR terminal is emitted.
+    #[test]
+    fn pty_exit_while_busy_emits_a_final_busy_false() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let pty_id = 90_021u64;
+        map_pty_to_record(&app, pty_id, &tid);
+
+        // The poll loop announced this terminal BUSY (a foreground command ran).
+        assert!(
+            app.state::<BusyStateTracker>().changed(&tid, true),
+            "precondition: tracker records the terminal as busy"
+        );
+
+        // Capture every emitted busy-state payload.
+        let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            app.listen(TERMINAL_BUSY_STATE_EVENT, move |event| {
+                let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                let t = v["terminal_id"].as_str().unwrap().to_string();
+                let b = v["busy"].as_bool().unwrap();
+                seen.lock().unwrap().push((t, b));
+            });
+        }
+
+        // The shell/PTY dies mid-command: spawn the real pump, then disconnect it.
+        let (tx, rx) = channel::<Vec<u8>>();
+        spawn_output_pump(app.handle().clone(), pty_id, rx);
+        drop(tx); // reader disconnect → the pump's exit path runs.
+
+        // The exit path must emit a single busy=false transition for OUR terminal.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if seen.lock().unwrap().iter().any(|(t, b)| t == &tid && !*b) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let events = seen.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().filter(|(t, _)| t == &tid).count(),
+            1,
+            "exactly one busy-state event for our terminal on exit; got {events:?}"
+        );
+        assert_eq!(
+            events.iter().find(|(t, _)| t == &tid),
+            Some(&(tid.clone(), false)),
+            "the exit event clears the running dot (busy=false); got {events:?}"
+        );
+        // The tracker entry is dropped so a re-spawn starts clean: a fresh
+        // `changed(tid, false)` hits the never-seen arm and is suppressed (false),
+        // proving the id was forgotten rather than left recorded as `false`.
+        assert!(
+            !app.state::<BusyStateTracker>().changed(&tid, false),
+            "after exit the tracker forgot the id (first idle is suppressed again)",
+        );
+    }
+
+    /// COMPLEMENT to the above: a terminal that exits from an IDLE prompt (the common
+    /// case — no foreground command was running) must NOT emit a spurious busy=false,
+    /// so a mass-close does not flood redundant events. The tracker was never set to
+    /// busy, so the exit path's transition check suppresses the emit.
+    #[test]
+    fn pty_exit_while_idle_emits_no_busy_event() {
+        let app = build_app_with_db();
+        let tid = make_record(&app);
+        let pty_id = 90_022u64;
+        map_pty_to_record(&app, pty_id, &tid);
+        // No busy ever announced: the tracker has no entry for tid (idle is the
+        // implicit default the front already shows).
+
+        let seen: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            app.listen(TERMINAL_BUSY_STATE_EVENT, move |event| {
+                let v: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+                let t = v["terminal_id"].as_str().unwrap().to_string();
+                let b = v["busy"].as_bool().unwrap();
+                seen.lock().unwrap().push((t, b));
+            });
+        }
+
+        let (tx, rx) = channel::<Vec<u8>>();
+        spawn_output_pump(app.handle().clone(), pty_id, rx);
+        drop(tx);
+
+        // Give the exit path time to run, then assert no busy event for our terminal.
+        std::thread::sleep(Duration::from_millis(150));
+        let events = seen.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|(t, _)| t == &tid),
+            "an exit from idle must not emit a busy event; got {events:?}"
+        );
     }
 
     // --- Terminal RECORD commands through the bridge (YR) -----------------
