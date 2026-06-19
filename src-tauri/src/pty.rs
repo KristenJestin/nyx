@@ -112,8 +112,11 @@ pub struct Pty {
     /// is what unblocks the reader and disconnects the output channel that drives
     /// `pty://exit`.
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
-    /// Writer onto the PTY master (i.e. the child's stdin).
-    writer: Box<dyn Write + Send>,
+    /// Writer onto the PTY master (i.e. the child's stdin). Behind its OWN `Arc<Mutex>`
+    /// (not the `PtyManager` registry lock) so a caller can clone the handle, release the
+    /// registry lock, and only THEN do the potentially-blocking write — a stuck child
+    /// then stalls writes to its own pty, never every pty (see `PtyManager::write_to`).
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Independent killer cloned from the child, usable while the waiter thread
     /// is blocked in `wait`.
     killer: Box<dyn ChildKiller + Send + Sync>,
@@ -260,7 +263,8 @@ impl Pty {
         // This is the anchor for live cwd lookups via `/proc/<pid>/cwd`.
         let shell_pid = child.process_id();
         let killer = child.clone_killer();
-        let writer = pair.master.take_writer()?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
         // Share the master with the waiter thread so it can close it on child
         // exit (the lever that unblocks the reader on Windows; see the field doc).
@@ -388,10 +392,19 @@ impl Pty {
     }
 
     /// Write bytes to the PTY (the child's stdin). Flushes immediately so
-    /// keystrokes are delivered without buffering latency.
-    pub fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+    /// keystrokes are delivered without buffering latency. Takes `&self` (the writer is
+    /// `Arc<Mutex>`-guarded), so it never requires the registry lock.
+    pub fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut w = self.writer.lock().unwrap();
+        w.write_all(bytes)?;
+        w.flush()
+    }
+
+    /// A clone-able handle to this PTY's writer, so a caller can drop the `PtyManager`
+    /// registry lock BEFORE the (potentially blocking) write — see
+    /// [`PtyManager::write_to`]. Writes through the handle serialize only on THIS pty.
+    pub(crate) fn writer_handle(&self) -> Arc<Mutex<Box<dyn Write + Send>>> {
+        Arc::clone(&self.writer)
     }
 
     /// Resize the PTY window. Informs the kernel (which delivers SIGWINCH to the
@@ -633,7 +646,7 @@ mod tests {
         // Same invariant, but with the reader ACTIVELY cycling through reads (the
         // shell emits a line every ~20ms): teardown must still return promptly
         // with output in flight, not only when the reader sits idle.
-        let (mut pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let (pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
         pty.write(b"i=0; while :; do echo line $i; i=$((i+1)); sleep 0.02; done\n")
             .expect("write");
         assert!(

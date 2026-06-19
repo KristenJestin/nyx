@@ -233,6 +233,28 @@ export function TerminalManager() {
     }
   }, [viewedTerminal, markRead]);
 
+  // ACTIVE-SETTLE for COMMANDS (the command-side mirror of `viewedTerminal`): a one-shot
+  // that FINISHES (success/error) WHILE its CommandView is already open and active is
+  // never acked by `selectCommand` (that only acks at SELECT time, when the command may
+  // still be running). Without this, the sidebar "unseen result" badge stays lit on the
+  // very command the user is looking at. Ack it here; `command://ack` then clears the
+  // `unread` flag. Keyed on the id alone (a primitive) so it fires once per settle, not on
+  // every unrelated `instances` change.
+  const viewedCommandId = useMemo(
+    () =>
+      activeCommand &&
+      activeCommand.unread &&
+      (activeCommand.state === "success" || activeCommand.state === "error")
+        ? activeCommand.id
+        : null,
+    [activeCommand],
+  );
+  useEffect(() => {
+    if (viewedCommandId) {
+      void invoke("command_acknowledge", { instanceId: viewedCommandId }).catch(() => {});
+    }
+  }, [viewedCommandId]);
+
   // Global new/close/next/prev shortcuts. `close` targets the active terminal.
   const closeActive = useCallback(() => {
     if (activeId !== null) void close(activeId);

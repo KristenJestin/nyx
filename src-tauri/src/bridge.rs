@@ -133,11 +133,22 @@ impl PtyManager {
     /// the MCP `send_to_terminal` tool (which holds only a record id → resolves the PTY id
     /// via [`TerminalPtyMap`]).
     pub(crate) fn write_to(&self, id: u64, data: &[u8]) -> Result<bool, String> {
-        let mut ptys = self.ptys.lock().unwrap();
-        match ptys.get_mut(&id) {
-            Some(pty) => pty.write(data).map(|_| true).map_err(|e| e.to_string()),
-            None => Ok(false),
-        }
+        use std::io::Write as _;
+        // Resolve the per-pty writer handle under the registry lock, then RELEASE the lock
+        // before the (potentially blocking) write — a child that stops draining its tty
+        // then stalls writes to ITS pty only, not every pty op behind the registry mutex.
+        let writer = {
+            let ptys = self.ptys.lock().unwrap();
+            match ptys.get(&id) {
+                Some(pty) => pty.writer_handle(),
+                None => return Ok(false),
+            }
+        };
+        let mut w = writer.lock().unwrap();
+        w.write_all(data)
+            .and_then(|_| w.flush())
+            .map(|_| true)
+            .map_err(|e| e.to_string())
     }
 
     /// Kill + drop the PTY identified by `id`, the SAME path as the `pty_close` command.
@@ -996,11 +1007,17 @@ fn pty_spawn<R: Runtime>(
 /// Write bytes (e.g. keystrokes) to the PTY identified by `id`.
 #[tauri::command]
 fn pty_write(state: State<'_, PtyManager>, id: u64, data: Vec<u8>) -> Result<(), String> {
-    let mut ptys = state.ptys.lock().unwrap();
-    let pty = ptys
-        .get_mut(&id)
-        .ok_or_else(|| format!("unknown pty id {id}"))?;
-    pty.write(&data).map_err(|e| e.to_string())
+    use std::io::Write as _;
+    // Resolve the writer handle under the registry lock, then RELEASE it before the
+    // blocking write (see PtyManager::write_to for the rationale).
+    let writer = {
+        let ptys = state.ptys.lock().unwrap();
+        ptys.get(&id)
+            .ok_or_else(|| format!("unknown pty id {id}"))?
+            .writer_handle()
+    };
+    let mut w = writer.lock().unwrap();
+    w.write_all(&data).and_then(|_| w.flush()).map_err(|e| e.to_string())
 }
 
 /// Resize the PTY identified by `id` to `cols`x`rows` cells.
@@ -1320,6 +1337,13 @@ fn spawn_output_pump<R: Runtime>(app: AppHandle<R>, id: u64, rx: Receiver<Vec<u8
                             // Drop the tracked value so the table does not grow unbounded
                             // and a re-spawn under the same record starts clean (task #1).
                             tracker.forget(terminal_id);
+                            // Evict the record→pty mapping too (the MCP-facing one read by
+                            // list_terminals/send_to_terminal/close_terminal). The backend
+                            // is the single authority on PTY liveness now, so it must clear
+                            // BOTH directions here — otherwise list_terminals reports this
+                            // dead pty as `live` until the front happens to call
+                            // register_terminal_pty(record, None). Idempotent with that path.
+                            app.state::<TerminalPtyMap>().clear(terminal_id);
                         }
                         // Drop the pty_id → terminal_id mapping now that the live
                         // PTY is gone; the persistent record outlives it, but this
@@ -2573,15 +2597,9 @@ fn resolve_command_and_cwd(
 }
 
 /// Parse a stored `package_manager` string into a [`crate::pkgjson::PackageManager`].
+/// Delegates to the single source of the manager vocabulary, `PackageManager::from_name`.
 fn parse_package_manager(s: &str) -> Option<crate::pkgjson::PackageManager> {
-    use crate::pkgjson::PackageManager;
-    match s {
-        "npm" => Some(PackageManager::Npm),
-        "pnpm" => Some(PackageManager::Pnpm),
-        "yarn" => Some(PackageManager::Yarn),
-        "bun" => Some(PackageManager::Bun),
-        _ => None,
-    }
+    crate::pkgjson::PackageManager::from_name(s)
 }
 
 /// Infer the package manager from a command LINE by its first whitespace-delimited
@@ -2953,10 +2971,14 @@ fn do_integration_install(
     let _ = crate::onboarding::remove_legacy_mcp_server(&target.config_path);
 
     // Mark nyx's own (non-authoritative) install cache flag, kept for back-compat — the
-    // real status is read from Claude's config below.
+    // real status is read from Claude's config below. Best-effort: this flag is NOT the
+    // status authority, and the plugin is already installed, so a save failure must NOT
+    // fail the install (which would leave a confusing "plugin installed but call failed").
     let mut state = crate::onboarding::IntegrationState::load(state_path);
     state.set_installed("claude_code", true);
-    state.save(state_path).map_err(|e| e.to_string())?;
+    if let Err(e) = state.save(state_path) {
+        eprintln!("integration_install: persisting install cache flag failed (non-fatal): {e}");
+    }
     Ok(claude_status_at(&claude_settings_path_for(plugin_install)))
 }
 
@@ -2990,15 +3012,23 @@ fn do_integration_remove(
         return Err(format!("provider '{provider}' is not supported in v1"));
     }
     // Uninstall the plugin + remove the marketplace + strip legacy settings keys.
+    // Best-effort, but don't swallow the error SILENTLY: the returned status is read from
+    // Claude's real config (so it stays honest), yet a failed CLI uninstall should be
+    // surfaced rather than vanishing into a `let _ =`.
     if let (Some(descriptor), Some(cli)) = (plugin_install, plugin_cli) {
-        let _ = crate::plugin::remove_with(descriptor, cli);
+        if let Err(e) = crate::plugin::remove_with(descriptor, cli) {
+            eprintln!("integration_remove: plugin uninstall failed (best-effort): {e}");
+        }
     }
     // Strip the legacy standalone MCP server entry (residue from the old separate-MCP flow).
     let _ = crate::onboarding::remove_legacy_mcp_server(&target.config_path);
 
+    // Non-authoritative cache flag (see install) — best-effort, never fatal.
     let mut state = crate::onboarding::IntegrationState::load(state_path);
     state.set_installed("claude_code", false);
-    state.save(state_path).map_err(|e| e.to_string())?;
+    if let Err(e) = state.save(state_path) {
+        eprintln!("integration_remove: persisting install cache flag failed (non-fatal): {e}");
+    }
     Ok(claude_status_at(&claude_settings_path_for(plugin_install)))
 }
 

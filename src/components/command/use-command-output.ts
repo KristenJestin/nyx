@@ -81,6 +81,11 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
     // above the rehydrated scrollback (the same ordering guarantee `usePty` makes
     // for dead history).
     let rehydrated = false;
+    // Bumped by every clear (a run-start `running` reset, or `command://output-cleared`).
+    // The rehydrate captures this before its round-trip and re-checks it after, so a clear
+    // that lands DURING the round-trip WINS: we must not paint the pre-clear history over
+    // the freshly cleared panel (output that arrived after the clear still drains).
+    let generation = 0;
     const pending: CommandOutputPayload[] = [];
 
     void (async () => {
@@ -108,8 +113,8 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
       // clean panel. The backend also resets the instance's scrollback at run start
       // (see `CommandRunner::start`), so a later cold rehydrate is clean too.
       // `term.reset()` clears the screen AND the scrollback (vs `clear()`, which
-      // keeps the current row). We re-arm the rehydrate gate so any output buffered
-      // before this point is not replayed on top of the cleared panel.
+      // keeps the current row). We bump `generation` so an in-flight rehydrate cannot
+      // paint pre-clear history on top of the cleared panel.
       const unlistenState = await listen<{ instanceId: string; state: string }>(
         "command://state",
         (event) => {
@@ -118,8 +123,9 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
           if (event.payload.state === "running") {
             term.reset();
             // Drop anything still buffered from a prior run so it can't replay over
-            // the cleared panel.
+            // the cleared panel, and invalidate any in-flight rehydrate.
             pending.length = 0;
+            generation += 1;
           }
         },
       );
@@ -142,6 +148,7 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
           if (event.payload.instanceId !== state.instanceId) return;
           term.reset();
           pending.length = 0;
+          generation += 1;
         },
       );
       if (state.torndown) {
@@ -154,9 +161,13 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
       // scrollback (cold history after a nyx restart). Written FIRST so it sits
       // above any live output. Best-effort: a missing instance / IPC failure
       // leaves the panel empty rather than throwing.
+      const gen = generation;
       const history = await invoke<string>("command_output", { instanceId }).catch(() => "");
       if (state.torndown) return;
-      if (history) term.write(history);
+      // Paint the rehydrated history ONLY if no clear landed during the round-trip — a
+      // clear bumps `generation`, and its cleared panel must win over stale pre-clear
+      // history. Output that arrived AFTER the clear is in `pending` and still drains below.
+      if (gen === generation && history) term.write(history);
 
       // Drain any output that arrived during the rehydrate round-trip, in order,
       // then switch to live writes.

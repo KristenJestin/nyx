@@ -204,13 +204,21 @@ pub fn write_config_pub(path: &Path, root: &Value) -> std::io::Result<()> {
     write_config(path, root)
 }
 
-/// Read a client config file into a JSON object. A missing file → an empty object
-/// (first onboarding). A present-but-non-object root is replaced by an empty object
-/// rather than failing, so a corrupt scalar can't wedge onboarding.
+/// Read a client config file into a JSON object. A MISSING file → an empty object
+/// (first onboarding). A present-but-MALFORMED file → an `Err` (NOT an empty object):
+/// returning `{}` here would make a subsequent merge+write OVERWRITE and DESTROY the
+/// user's entire config on a transient corruption or a concurrent writer (e.g. Claude
+/// Code mid-write). A present-but-non-object root (a stray scalar/array) is still
+/// coerced to an empty object rather than failing, so it can't wedge onboarding.
 fn read_config(path: &Path) -> std::io::Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(raw) => {
-            let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+            let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("config at {} is not valid JSON: {e}", path.display()),
+                )
+            })?;
             Ok(if parsed.is_object() { parsed } else { json!({}) })
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
@@ -263,19 +271,44 @@ pub fn merge_nyx_server(root: &mut Value, url: &str) -> OnboardConfigChange {
 
     let desired = json!({ "type": "http", "url": url });
 
-    match servers.get(SERVER_NAME) {
-        // Exact match already present → idempotent no-op.
-        Some(existing) if existing == &desired => OnboardConfigChange::Unchanged,
-        // Present but differs (e.g. the port changed, or a hand-edited entry) →
-        // rewrite in place. Capture the prior url for the log, if any.
-        Some(existing) => {
-            let previous_url = existing
+    // Classify the existing nyx slot under an immutable borrow, then mutate — keeps the
+    // borrow checker happy and lets us PRESERVE any extra keys the user/another tool put
+    // inside nyx's own entry (headers, auth, env, a stdio `command` form). We only ever
+    // touch `url` (and ensure `type: http`); everything else in the entry survives.
+    let existing_is_object = match servers.get(SERVER_NAME) {
+        None => None,
+        Some(v) => Some(v.is_object()),
+    };
+    match existing_is_object {
+        // Present as an object → patch in place, preserving sibling keys. Decide
+        // Unchanged-vs-Updated on the `url` (and `type` presence) alone so extra keys
+        // neither force a needless rewrite nor get dropped.
+        Some(true) => {
+            let entry = servers
+                .get_mut(SERVER_NAME)
+                .and_then(Value::as_object_mut)
+                .expect("just classified as object");
+            let previous_url = entry
                 .get("url")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            let type_ok = entry.get("type").and_then(Value::as_str) == Some("http");
+            entry.insert("url".to_string(), json!(url));
+            entry.insert("type".to_string(), json!("http"));
+            if previous_url == url && type_ok {
+                OnboardConfigChange::Unchanged
+            } else {
+                OnboardConfigChange::Updated { previous_url }
+            }
+        }
+        // Present but NOT an object (corrupt / hand-broken) → replace wholesale (nothing
+        // worth preserving), reporting an unknown previous url.
+        Some(false) => {
             servers.insert(SERVER_NAME.to_string(), desired);
-            OnboardConfigChange::Updated { previous_url }
+            OnboardConfigChange::Updated {
+                previous_url: String::new(),
+            }
         }
         // Absent → add.
         None => {

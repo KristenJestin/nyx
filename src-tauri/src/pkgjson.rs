@@ -99,6 +99,19 @@ impl PackageManager {
         }
     }
 
+    /// Parse a package-manager NAME (`"npm"`, `"pnpm"`, `"yarn"`, `"bun"`) into a
+    /// [`PackageManager`]. This is the ONE source of the manager name vocabulary; callers
+    /// with a `packageManager` field carrying an optional `@version` strip that first.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "npm" => Some(PackageManager::Npm),
+            "pnpm" => Some(PackageManager::Pnpm),
+            "yarn" => Some(PackageManager::Yarn),
+            "bun" => Some(PackageManager::Bun),
+            _ => None,
+        }
+    }
+
     /// The RUNNER invocation for `script` under this manager — the default command
     /// an imported template runs. NOT the raw script body: importing `dev` yields
     /// `pnpm dev` / `bun run dev` / `yarn dev` / `npm run dev`, which is what a
@@ -120,13 +133,7 @@ impl PackageManager {
 /// unrecognized name yields `None` (the caller falls back to lockfile/npm).
 fn manager_from_field(value: &str) -> Option<PackageManager> {
     let name = value.split('@').next().unwrap_or("").trim();
-    match name {
-        "npm" => Some(PackageManager::Npm),
-        "pnpm" => Some(PackageManager::Pnpm),
-        "yarn" => Some(PackageManager::Yarn),
-        "bun" => Some(PackageManager::Bun),
-        _ => None,
-    }
+    PackageManager::from_name(name)
 }
 
 /// Map a lockfile NAME to its package manager. The lockfile is the second-priority
@@ -276,14 +283,19 @@ fn glob_match_segment(pat: &str, seg: &str) -> bool {
 /// cross `/`. A pattern matches when it equals the whole path OR a leading directory
 /// prefix of it (so `a/b` matches `a/b/c`), mirroring git's directory-prefix rule.
 fn glob_match_path(pat: &str, path: &str) -> bool {
-    if glob_match_impl(pat.as_bytes(), path.as_bytes(), true) {
+    // `cross_sep = false`: a single `*` segment must NOT cross `/` (git semantics, and
+    // what this fn's own contract above promises). Crossing `/` made an anchored
+    // multi-segment pattern like `packages/*/build` wrongly match `packages/api/sub/build`
+    // (the `*` swallowing `api/sub`), over-pruning nested package dirs and hiding their
+    // scripts. The leading-prefix loop below still implements git's directory-prefix rule.
+    if glob_match_impl(pat.as_bytes(), path.as_bytes(), false) {
         return true;
     }
     // Leading-prefix: try matching `pat` against each directory prefix of `path`, so a
     // pattern like `a/b` ignores everything under it (`a/b/c`).
     let bytes = path.as_bytes();
     for (i, c) in path.char_indices() {
-        if c == '/' && glob_match_impl(pat.as_bytes(), &bytes[..i], true) {
+        if c == '/' && glob_match_impl(pat.as_bytes(), &bytes[..i], false) {
             return true;
         }
     }
@@ -369,9 +381,11 @@ fn globs_from_json_array(arr: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// Minimal `pnpm-workspace.yaml` `packages:` extractor. Reads the `- "glob"` list items
-/// under a top-level `packages:` key. Deliberately tiny (no YAML crate): handles the
-/// conventional shape pnpm emits. Quotes are stripped; `!`-negations are skipped.
+/// Minimal `pnpm-workspace.yaml` `packages:` extractor. Reads both the block form
+/// (`- "glob"` list items under a top-level `packages:` key) AND the flow form
+/// (`packages: ['a/*', 'b/*']` inline array). Deliberately tiny (no YAML crate): handles
+/// the conventional shapes pnpm emits. Quotes are stripped, trailing `# comments` are
+/// ignored, and `!`-negations are skipped.
 fn pnpm_workspace_packages(text: &str) -> Vec<String> {
     let mut globs = Vec::new();
     let mut in_packages = false;
@@ -385,20 +399,46 @@ fn pnpm_workspace_packages(text: &str) -> Vec<String> {
         if in_packages && !line.starts_with(char::is_whitespace) && !trimmed.starts_with('-') {
             in_packages = false;
         }
-        if trimmed.starts_with("packages:") {
+        if let Some(rest) = trimmed.strip_prefix("packages:") {
             in_packages = true;
+            // Flow form: `packages: ['apps/*', 'packages/*']` — the inline array sits on
+            // the SAME line, so it must be parsed here (the old code dropped it).
+            let rest = rest.trim();
+            if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                for item in inner.split(',') {
+                    push_pnpm_glob(item, &mut globs);
+                }
+            }
             continue;
         }
         if in_packages {
             if let Some(item) = trimmed.strip_prefix('-') {
-                let g = item.trim().trim_matches(['"', '\'']).trim();
-                if !g.is_empty() && !g.starts_with('!') {
-                    globs.push(normalize_glob(g));
-                }
+                push_pnpm_glob(item, &mut globs);
             }
         }
     }
     globs
+}
+
+/// Parse one pnpm `packages` list item into a glob. For a QUOTED value, take the text up
+/// to the matching closing quote and ignore anything after it (e.g. a trailing
+/// `# comment`); for an UNQUOTED value, cut at the first ` #` comment. Skips empties and
+/// `!`-negations. This fixes the old `trim_matches(['"','\''])` which left a trailing
+/// `' # comment` glued onto the glob, corrupting it so it matched nothing.
+fn push_pnpm_glob(item: &str, globs: &mut Vec<String>) {
+    let item = item.trim();
+    let value = if let Some(rest) = item.strip_prefix(['"', '\'']) {
+        let quote = item.as_bytes()[0] as char;
+        match rest.split(quote).next() {
+            Some(v) => v,
+            None => return,
+        }
+    } else {
+        item.split(" #").next().unwrap_or(item).trim()
+    };
+    if !value.is_empty() && !value.starts_with('!') {
+        globs.push(normalize_glob(value));
+    }
 }
 
 /// Normalize a workspace glob to forward slashes with no leading/trailing slash, so it
@@ -432,56 +472,52 @@ fn workspace_glob_matches(glob: &str, subfolder: &str) -> bool {
     ws_glob_impl(g, s)
 }
 
-/// Backtracking matcher supporting `*` (within a segment) and `**` (across segments).
+/// Matcher supporting `*` (within a segment) and `**` (across segments).
+///
+/// Implemented segment-by-segment in LINEAR time: split both pattern and text on `/`,
+/// treat `**` as a segment-wildcard that matches zero or more whole text segments, and
+/// match every other pattern segment against one text segment via the linear single-`*`
+/// matcher [`glob_match_impl`] (`cross_sep=false`). Segment alignment uses the classic
+/// two-pointer "remember the last `**`" algorithm — O(#segments) with at most one
+/// backtrack point.
+///
+/// The previous implementation recursed over EVERY split of EVERY segment, which is
+/// exponential: a crafted glob like `a*a*a*…*b` from a target repo's `workspaces` /
+/// `pnpm-workspace.yaml` (untrusted input, reachable via `import_commands` /
+/// `list_importable_scripts`) against a long no-separator dir name hung discovery for
+/// seconds-to-hours (a self-DoS). This form has no such blowup.
 fn ws_glob_impl(pat: &[u8], text: &[u8]) -> bool {
-    // Iterative matcher with `**` support. `**` (optionally followed by `/`) matches any
-    // number of path segments including zero.
-    fn helper(pat: &[u8], text: &[u8]) -> bool {
-        let (mut p, mut t) = (0usize, 0usize);
-        while p < pat.len() {
-            if pat[p] == b'*' && p + 1 < pat.len() && pat[p + 1] == b'*' {
-                // `**`: consume it (and an optional following `/`), then try to match the
-                // remainder at every position of `text`.
-                let mut rest = p + 2;
-                if rest < pat.len() && pat[rest] == b'/' {
-                    rest += 1;
-                }
-                if rest >= pat.len() {
-                    return true; // trailing `**` matches anything remaining
-                }
-                // Try matching the remainder of the pattern at t, then after each '/'.
-                if helper(&pat[rest..], &text[t..]) {
-                    return true;
-                }
-                for i in t..text.len() {
-                    if text[i] == b'/' && helper(&pat[rest..], &text[i + 1..]) {
-                        return true;
-                    }
-                }
-                return false;
-            } else if pat[p] == b'*' {
-                // Single `*`: match any run of non-`/` chars in this segment.
-                let mut rest = p + 1;
-                // Collapse a redundant double handled above; here rest points past `*`.
-                let _ = &mut rest;
-                // Try every split of the current segment.
-                let seg_end = text[t..].iter().position(|&c| c == b'/').map(|i| t + i).unwrap_or(text.len());
-                for split in t..=seg_end {
-                    if helper(&pat[p + 1..], &text[split..]) {
-                        return true;
-                    }
-                }
-                return false;
-            } else if t < text.len() && (pat[p] == text[t]) {
-                p += 1;
-                t += 1;
-            } else {
-                return false;
-            }
+    let pat_segs: Vec<&[u8]> = pat.split(|&c| c == b'/').collect();
+    let text_segs: Vec<&[u8]> = text.split(|&c| c == b'/').collect();
+
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Backtrack point for the most recent `**` segment.
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+    while ti < text_segs.len() {
+        if pi < pat_segs.len() && pat_segs[pi] == b"**" {
+            // `**` matches zero or more whole segments — record the resume point and
+            // tentatively consume zero segments here.
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if pi < pat_segs.len() && glob_match_impl(pat_segs[pi], text_segs[ti], false) {
+            pi += 1;
+            ti += 1;
+        } else if let Some(sp) = star_pi {
+            // Mismatch under an active `**`: let it swallow one more text segment.
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
-        t == text.len()
     }
-    helper(pat, text)
+    // Trailing `**` segments match the (now empty) remaining text.
+    while pi < pat_segs.len() && pat_segs[pi] == b"**" {
+        pi += 1;
+    }
+    pi == pat_segs.len()
 }
 
 /// One discovered script, ready to surface in the import UI. Carries everything
