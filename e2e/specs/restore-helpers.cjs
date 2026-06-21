@@ -1,7 +1,7 @@
 /* eslint-disable */
 // Shared helpers for the multi-terminal RESTORE e2e (restore-01 seed →
-// restore-02 verify). The two specs run as separate app sessions sharing one
-// XDG_DATA_HOME (see wdio.conf.cjs specDataDir), so they communicate the
+// restore-02 verify). The two specs run as separate Electron app sessions sharing one
+// NYX_DATA_DIR (see wdio.conf.cjs specDataDir), so they communicate the
 // expected ids/markers/order through a small JSON file in that dir.
 
 const fs = require("fs");

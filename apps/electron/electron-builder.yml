@@ -1,0 +1,77 @@
+# electron-builder configuration for the nyx Electron shell.
+#
+# Verified against the official electron-builder docs (Application Contents):
+#   - `asar: true` bundles the app into `app.asar`; a native `.node` CANNOT live
+#     inside an asar, so `asarUnpack` extracts the matching files to
+#     `app.asar.unpacked/` (Electron resolves the unpacked path transparently).
+#   - the core-host entry is spawned as a real file via `ELECTRON_RUN_AS_NODE`, so
+#     it is unpacked too (a spawned main-module script from a real path, not asar).
+#   - the bundled Claude plugin (read by the core-host through `resourceDir`) is also
+#     unpacked: nyx-core's `resolve_bundled_plugin_dir` reads it from disk, which
+#     cannot happen from inside the asar.
+#
+# The Electron runtime version is PINNED to the POC's 42.4.1 (same as the napi ABI
+# target and the `electron` devDependency) — never "latest".
+#
+# Phase-6 (task #20) FINAL packaging: AppImage on Linux, NSIS installer on Windows.
+# The early `--dir` SMOKE path (task #23) still works: the `scripts/package.cjs`
+# helper passes `--dir` on the CLI, which overrides the per-OS `target` below with a
+# throwaway unpacked dir (no installer) so the `.node` embedding can be smoke-tested
+# fast on the host OS. The installer targets here are what a real release builds.
+
+appId: com.netsirk.nyx
+productName: nyx
+# Pin the runtime to the POC's Electron (matches the napi ABI 146); do NOT float.
+electronVersion: 42.4.1
+
+directories:
+  output: release
+  # buildResources default (build/) — no icons wired in this early smoke.
+
+# The app is self-contained in apps/electron: compiled main/preload/core-host, the
+# copied renderer, the staged native addon, and the runtime deps. We ship exactly
+# the built `dist/` + package.json (the source `src/` and scripts are excluded).
+files:
+  - "dist/**/*"
+  - "package.json"
+  - "!src/**"
+  - "!scripts/**"
+  - "!electron-builder.yml"
+  - "!tsconfig.json"
+
+# A native `.node` cannot be mmap'd from inside the asar → keep the staged native
+# addon AND the core-host entry OUTSIDE the archive (in app.asar.unpacked). The
+# bundled Claude plugin (`dist/resources/**`) is unpacked too so the core-host
+# resolves it from a real on-disk path: nyx-core's `resolve_bundled_plugin_dir`
+# reads `<resource_dir>/resources/claude-plugin`, where the main process resolves
+# `<resource_dir> = <app>/resources/app.asar.unpacked` — so the unpacked layout
+# becomes `…/app.asar.unpacked/resources/claude-plugin`, exactly what it expects.
+asar: true
+asarUnpack:
+  - "dist/native/**"
+  - "dist/core-host/**"
+  - "dist/resources/**"
+
+# FINAL release targets (task #20). The `scripts/package.cjs` smoke passes `--dir` on
+# the CLI, which overrides these with a throwaway unpacked dir for the .node smoke.
+linux:
+  # AppImage: the single-file, no-install Linux distribution the PRD mandates. Built
+  # on a Linux host (electron-builder does NOT cross-compile the native `.node`; the
+  # `.node` must be built natively first — see PACKAGING.md). Category is required by
+  # the AppImage desktop entry.
+  category: Development
+  target:
+    - AppImage
+win:
+  # NSIS: the Windows installer. one-click, per-user (no admin) by default below.
+  target:
+    - nsis
+
+# NSIS installer behavior — per-user install (no elevation), with the usual
+# desktop/start-menu shortcuts and the ability to choose the directory.
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true

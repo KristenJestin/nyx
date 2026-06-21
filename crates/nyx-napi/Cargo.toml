@@ -1,0 +1,37 @@
+[package]
+name = "nyx-napi"
+version = "0.1.0"
+edition = "2021"
+description = "napi-rs module exposing nyx-core to Node (the Electron core-host). Builds a .node native addon + generated TypeScript declarations. Exposes the full interactive-PTY surface: spawn (new), write/resize/kill/setPaused/id, plus output/exit/OSC-7/OSC-133 callbacks streamed via a ThreadsafeFunction (the EventSink frontier bridged to Node), with lossless flow-control backpressure."
+
+[lib]
+name = "nyx_napi"
+# cdylib: napi-rs compiles a native Node addon (.node). The `rlib` is kept so the
+# crate can also be unit-tested with plain `cargo test` without the Node ABI.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# napi-rs v2 — PINNED to the major the POC validated (a known, stable ThreadsafeFunction
+# API). v3 (the npm default of @napi-rs/cli 3.x) has a different streaming API; we lock v2
+# deliberately so the ABI/API surface matches the validated POC and does not drift.
+napi = { version = "2", default-features = false, features = ["napi6"] }
+napi-derive = "2"
+# The shell-agnostic core. This module wires the full PTY surface (`pty`) plus the OSC
+# observers (`osc7`/`osc133`) of nyx-core. nyx-core carries no Tauri/Electron type, so the
+# napi module never pulls a shell dependency.
+nyx-core = { path = "../nyx-core" }
+# For `PtySize` passed into `nyx_core::pty::Pty::spawn`. Same crate + version nyx-core uses.
+portable-pty = "0.9"
+# The MCP dispatcher's pool-backed tools return JSON results; the DB layer maps
+# diesel errors. Same crate + version nyx-core uses (no extra SQLite feature needed —
+# only `diesel::result::Error` is referenced).
+serde_json = "1"
+# Used only for the `Serialize` trait bound on the generic DB-command dispatcher's
+# result serializer (the nyx-core DB rows already derive it). No derive feature needed
+# here — we only name the trait. Same major as nyx-core's serde.
+serde = "1"
+diesel = { version = "2", features = ["sqlite"] }
+
+[build-dependencies]
+# Generates the napi register glue at build time.
+napi-build = "2"

@@ -61,7 +61,7 @@ async function waitForApp() {
 
 const listRecords = () => browser.execute(() => (window.__nyx ? window.__nyx.list() : []));
 
-describe("sidebar redesign — RELEASE evidence (tauri-driver, WebKitGTK)", function () {
+describe("sidebar redesign — RELEASE evidence (Electron, Chromium)", function () {
   before(async function () {
     await waitForApp();
   });

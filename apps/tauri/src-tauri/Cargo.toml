@@ -1,0 +1,82 @@
+[package]
+name = "nyx"
+version = "0.2.0"
+# RELEASE DISCIPLINE: bump this version on every release before tagging.
+# The probe MCP tool (`probe`) reports CARGO_PKG_VERSION + NYX_BUILD_SHA so
+# operators and agents can always tell which build is running. Never ship two
+# releases with the same semver; bump PATCH for bug-fixes, MINOR for new features.
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "nyx_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The shell-agnostic core (PTY, OSC, DB, MCP, agents, commands, sessions) + the four
+# frontiers. This Tauri crate is now a thin adapter OVER nyx-core: the #[tauri::command]
+# layer (`bridge.rs`) and the AppHandle-backed service container / MCP dispatcher
+# (`mcp_tools.rs`) implement the frontiers; all business logic lives in nyx-core.
+nyx-core = { path = "../../../crates/nyx-core" }
+tauri = { version = "2", features = [] }
+# Native folder picker for the manual add-project / add-workspace flow (PRD-2
+# Phase 2): `open({ directory: true })` on the JS side. The folder/open
+# permission is granted in `capabilities/default.json`.
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.9"
+anyhow = "1"
+# Terminal record ids are UUIDv7 (time-ordered: globally unique + stable for
+# external/MCP references and any future multi-device sync, while keeping index
+# locality). Generated backend-side; stored as TEXT.
+uuid = { version = "1", features = ["v7"] }
+# Persistence layer. SQLite via Diesel (see ADR-0001): query DSL checked at
+# compile time, `schema.rs` committed (no DB needed at build). `bundled` vendors
+# SQLite so there is no system-library dependency. `returning_clauses_for_sqlite_3_35`
+# enables RETURNING on INSERT (round-trips the row without a second SELECT).
+diesel = { version = "2", features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
+diesel_migrations = "2"
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+# Local MCP HTTP server (PRD-4): a small, self-contained BLOCKING HTTP server for
+# nyx's loopback MCP surface (`http://127.0.0.1:<port>/mcp` + `/health`). Chosen
+# over hyper/axum to avoid pulling an async runtime + feature-flag surface for what
+# is a handful of short, synchronous JSON-RPC requests on localhost. Bound strictly
+# to 127.0.0.1 and owned single-instance by the live nyx process (see `src/mcp.rs`).
+tiny_http = "0.12"
+# Server-side `grep` filtering for `get_command_output` (PRD-4 review R-OUTPUT): an
+# agent reading a dev server's output wants the error lines, not 160 KiB of bytes, so
+# `get_command_output` accepts a regex matched per-line on the ANSI-stripped text.
+# Already in the dependency tree transitively (via the toolchain); pinned here so
+# `src/mcp_tools.rs` can depend on it directly.
+regex = "1"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+# Process-group (process-tree) kill for managed commands: the runner sends
+# SIGTERM/SIGKILL to the child's process GROUP (`kill(-pgid, …)`) so stopping a
+# service reaps the whole tree, not just the parent shell. Already in the tree
+# transitively via portable-pty; pinned here so `src/command.rs` compiles on Unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Mock runtime for bridge integration tests (no real webview).
+tauri = { version = "2", features = ["test"] }
+# Used by the bridge orphan-process test to probe (via `kill(pid, 0)`) that the
+# child shell is really dead after `pty_close` — i.e. no orphaned PTY process.
+# Already in the dependency tree (transitively via portable-pty); pinned here so
+# the dev-only probe compiles on Unix.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+

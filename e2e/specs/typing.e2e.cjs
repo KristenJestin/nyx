@@ -87,7 +87,7 @@ function activeTermIsFocused() {
   });
 }
 
-describe("CRITICAL typing-in-every-terminal (tauri-driver, release build)", function () {
+describe("CRITICAL typing-in-every-terminal (Electron, e2e build)", function () {
   // A project root so we have a workspace to ATTACH a terminal to, plus loose
   // terminals — covering both kinds the finding calls out.
   const WS_ROOT = mkdir("workspace-root");

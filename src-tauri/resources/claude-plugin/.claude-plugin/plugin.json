@@ -1,7 +1,0 @@
-{
-  "name": "nyx-claude-integration",
-  "version": "0.4.0",
-  "description": "nyx Claude integration: bundles the nyx MCP server AND SessionStart/SessionEnd hooks that report agent sessions to nyx.",
-  "author": { "name": "nyx" },
-  "mcpServers": "./.mcp.json"
-}

@@ -1,9 +1,10 @@
 /* eslint-disable */
-// Smoke e2e against the REAL nyx app (release build) through tauri-driver +
-// WebKitWebDriver. xterm renders to a WebGL canvas, so terminal text is not in
+// Smoke e2e against the REAL nyx ELECTRON app through wdio-electron-service +
+// Chromedriver. xterm renders to a WebGL canvas, so terminal text is not in
 // the DOM; we drive + read the ACTIVE terminal through the inert `window.__nyx`
 // control seam exposed by src/components/sidebar/terminal-manager.tsx (it mirrors
-// the per-terminal deck read/input seams, keyed by record id).
+// the per-terminal deck read/input seams, keyed by record id). The seam is
+// renderer-side React, so these specs are shell-agnostic (ported from Tauri, #27).
 //
 // This is the basic-behaviour smoke (env survives, program output, resize, exit);
 // the big multi-terminal RESTORE scenario lives in restore-01/02-*.e2e.cjs.

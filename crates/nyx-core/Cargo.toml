@@ -1,0 +1,42 @@
+[package]
+name = "nyx-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shell-agnostic core of nyx (PTY, OSC, DB, MCP, agents, commands, sessions). No Tauri or Electron types cross its API; shells adapt to it via the EventSink / AppPaths / service-container / boot-shutdown frontiers."
+
+[lib]
+name = "nyx_core"
+# `rlib` only: nyx-core is a plain Rust library consumed by the Tauri adapter
+# (apps/tauri/src-tauri) and the napi module (crates/nyx-napi). It is never a
+# cdylib/staticlib itself — the shells own that.
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Interactive + managed-command PTYs (the same crate the Tauri shell used). No cmake.
+portable-pty = "0.9"
+anyhow = "1"
+# Terminal record ids are UUIDv7 (time-ordered).
+uuid = { version = "1", features = ["v7"] }
+# Persistence: SQLite via Diesel. `bundled` vendors SQLite (no system lib).
+# `returning_clauses_for_sqlite_3_35` enables RETURNING on INSERT.
+# `r2d2` pulls in diesel's re-exported r2d2 connection pool (the PRD-frozen pool —
+# NOT deadpool-diesel, NO Tokio): `diesel::r2d2::{Pool, ConnectionManager,
+# CustomizeConnection}`. One pool shared by the napi worker pool (libuv) AND the MCP
+# server threads, with WAL + foreign_keys set on EVERY checkout via a customizer.
+diesel = { version = "2", features = ["sqlite", "returning_clauses_for_sqlite_3_35", "r2d2"] }
+diesel_migrations = "2"
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+# Local MCP HTTP server: small synchronous loopback HTTP, bound to 127.0.0.1.
+tiny_http = "0.12"
+
+# Process-group (process-tree) kill for managed commands on Unix: SIGTERM/SIGKILL to
+# the child's process GROUP so stopping a service reaps the whole tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Probe (via kill(pid, 0)) that a child shell is really dead after pty close.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

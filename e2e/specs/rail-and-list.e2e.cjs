@@ -58,7 +58,7 @@ function distinctRounded(values) {
   return Array.from(new Set(values.map((v) => Math.round(v))));
 }
 
-describe("rail + list animations — RELEASE evidence (tauri-driver, WebKitGTK)", function () {
+describe("rail + list animations — RELEASE evidence (Electron, Chromium)", function () {
   before(async function () {
     await waitForApp();
   });

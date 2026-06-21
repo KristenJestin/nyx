@@ -1,0 +1,27 @@
+{
+  "name": "@nyx/napi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "npm wrapper around the nyx-napi Rust crate: builds the native .node addon + TypeScript declarations that the Electron core-host loads.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "nyx-napi"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "//abi": "Build the .node against ELECTRON's embedded Node ABI, then verify it loads via the Electron binary in ELECTRON_RUN_AS_NODE=1 (see scripts/verify-abi.cjs).",
+    "verify:abi": "node scripts/verify-abi.cjs",
+    "//core": "Smoke the NyxCore surface (r2d2 pool + non-blocking AsyncTask DB + MCP-shares-pool) under Electron-as-Node (see scripts/verify-core.cjs).",
+    "verify:core": "node scripts/verify-core.cjs",
+    "//exec-state": "Smoke exec-state DB persistence + boot normalization (PRD-5 #1) under Electron-as-Node (see scripts/verify-exec-state.cjs).",
+    "verify:exec-state": "node scripts/verify-exec-state.cjs",
+    "//command-runtime": "Smoke the managed-command runtime (createCommandRunner + MCP runtime tools at parity + restore/snapshot) under Electron-as-Node (see scripts/verify-command-runtime.cjs).",
+    "verify:command-runtime": "node scripts/verify-command-runtime.cjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4",
+    "electron": "42.4.1"
+  }
+}

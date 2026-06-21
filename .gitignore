@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# electron-builder output (throwaway smoke packages + final installers); large
+# binary artifacts, rebuildable per-OS, never committed.
+release/
+
 # Vitest browser-mode visual-regression transients (actual/diff renders).
 .vitest-attachments
 
@@ -54,6 +58,20 @@ e2e/specs/*.screenshot.cjs
 .claude/
 .difftmp/
 
+# napi-rs native build artifacts (e.g. crates/nyx-napi/nyx-napi.win32-x64-msvc.node):
+# platform-suffixed binaries produced by `napi build`, rebuildable per-platform and
+# never committed. The generated loader (index.js) and types (index.d.ts) ARE
+# versioned — only the compiled `.node` is ignored.
+*.node
+
+# Electron smoke-test stdout/stderr redirection dumps. When a smoke is run by
+# hand with shell redirection (e.g. `electron scripts/smoke-single-instance.cjs
+# >out.txt 2>err.txt`), these land in apps/electron/. They're throwaway run
+# output, never referenced by any script, and must not be committed. Scoped to
+# apps/electron so legitimate out.txt/err.txt elsewhere stay tracked.
+apps/electron/out.txt
+apps/electron/err.txt
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -64,3 +82,6 @@ e2e/specs/*.screenshot.cjs
 *.njsproj
 *.sln
 *.sw?
+
+# Cargo workspace build output (root target dir after monorepo restructure)
+/target
