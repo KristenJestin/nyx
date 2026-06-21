@@ -462,13 +462,17 @@ export function useTerminals(): UseTerminals {
             : t,
         );
       });
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      })
+      // Swallow a missing event bridge (test/host without Tauri) so it never becomes an
+      // unhandled rejection — the same guard as `useActiveAgentSessions`.
+      .catch(() => {});
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
@@ -491,13 +495,17 @@ export function useTerminals(): UseTerminals {
         if (!prev.some((t) => t.id === terminal_id)) return prev;
         return prev.map((t) => (t.id === terminal_id ? { ...t, busy } : t));
       });
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      })
+      // Swallow a missing event bridge (test/host without Tauri) so it never becomes an
+      // unhandled rejection — the same guard as `useActiveAgentSessions`.
+      .catch(() => {});
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});

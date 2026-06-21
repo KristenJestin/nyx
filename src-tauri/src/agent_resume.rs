@@ -64,12 +64,6 @@ impl SessionState {
             _ => None,
         }
     }
-
-    /// Is this state a resume CANDIDATE (`active` or `unknown`)? `ended` /
-    /// `resume_failed` are not.
-    fn is_resume_candidate(self) -> bool {
-        matches!(self, SessionState::Active | SessionState::Unknown)
-    }
 }
 
 /// The execution target for the resume command. The v1 resume targets a Unix shell:
@@ -213,18 +207,15 @@ pub fn decide_resume(inputs: &ResumeInputs, adapter: &dyn AgentAdapter) -> Resum
     if inputs.closed_voluntarily {
         return ResumeDecision::Skip(ResumeSkipReason::ClosedVoluntarily);
     }
-    if !inputs.session_state.is_resume_candidate() {
-        // Only `ended` and `resume_failed` are non-candidates.
-        return match inputs.session_state {
-            SessionState::Ended => ResumeDecision::Skip(ResumeSkipReason::SessionEnded),
-            SessionState::ResumeFailed => {
-                ResumeDecision::Skip(ResumeSkipReason::AlreadyResumeFailed)
-            }
-            // Unreachable: active/unknown ARE candidates, handled below.
-            SessionState::Active | SessionState::Unknown => {
-                ResumeDecision::Skip(ResumeSkipReason::SessionEnded)
-            }
-        };
+    // Only `ended`/`resume_failed` are non-candidates; `active`/`unknown` fall through to
+    // the resume path below. A direct match keeps this exhaustive — no unreachable arm
+    // returning a misleading skip reason.
+    match inputs.session_state {
+        SessionState::Ended => return ResumeDecision::Skip(ResumeSkipReason::SessionEnded),
+        SessionState::ResumeFailed => {
+            return ResumeDecision::Skip(ResumeSkipReason::AlreadyResumeFailed)
+        }
+        SessionState::Active | SessionState::Unknown => {}
     }
     if !inputs.transcript_exists {
         // The session id exists but there is no conversation on disk (never typed into,

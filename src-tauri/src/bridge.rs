@@ -614,14 +614,29 @@ fn register_terminal_pty(
             // Returns the resume's session id when the resume could NOT be delivered (PTY
             // gone or write failed) so we can mark that row `resume_failed` — but OUTSIDE
             // the PTY lock, since the DB write must not run while the mutex is held.
-            let resume_to_fail = {
-                let mut guard = pty_state.ptys.lock().unwrap();
-                match guard.get_mut(&id) {
-                    Some(pty) => {
+            let resume_to_fail = if parked_command.is_none() && parked_resume.is_none() {
+                // A bare terminal injects nothing — never touch the registry.
+                None
+            } else {
+                use std::io::Write as _;
+                // Resolve the per-pty writer handle UNDER the registry lock, then RELEASE the
+                // lock before the (potentially blocking) writes — a child that stops draining
+                // its tty stalls writes to ITS pty only, not every pty op behind the registry
+                // mutex (the SAME discipline as `PtyManager::write_to` / `pty_write`).
+                let writer = {
+                    let ptys = pty_state.ptys.lock().unwrap();
+                    ptys.get(&id).map(|pty| pty.writer_handle())
+                };
+                match writer {
+                    Some(writer) => {
+                        let mut w = writer.lock().unwrap();
+                        // Command first (MCP `create_terminal`), then the boot-scan resume —
+                        // each with a trailing newline so the shell runs the line and stays
+                        // interactive. Writes serialize only on THIS pty's writer.
                         if let Some(command) = parked_command {
                             let mut bytes = command.into_bytes();
                             bytes.push(b'\n');
-                            let _ = pty.write(&bytes);
+                            let _ = w.write_all(&bytes).and_then(|_| w.flush());
                         }
                         match parked_resume {
                             Some(resume) => {
@@ -630,7 +645,11 @@ fn register_terminal_pty(
                                 // Delivered → the session stays `active` (a live `resume`
                                 // SessionStart refreshes `last_seen_at`); failed write →
                                 // mark it `resume_failed` so the next launch won't retry.
-                                if pty.write(&bytes).is_ok() { None } else { Some(resume.session_id) }
+                                if w.write_all(&bytes).and_then(|_| w.flush()).is_ok() {
+                                    None
+                                } else {
+                                    Some(resume.session_id)
+                                }
                             }
                             None => None,
                         }

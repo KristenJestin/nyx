@@ -2052,6 +2052,11 @@ pub fn record_session_start(
                 .filter(agent_sessions::terminal_id.eq(terminal_id))
                 .filter(agent_sessions::agent_kind.eq(agent_kind))
                 .filter(agent_sessions::external_session_id.eq(&capture.external_session_id))
+                // Several historical rows can share one external id on the same terminal
+                // (e.g. an `ended` row plus a later `resume_failed` row for the same
+                // conversation), so pin the revive to the MOST RECENT one — otherwise
+                // `.first()` would revive an arbitrary (storage-order) row.
+                .order(agent_sessions::started_at.desc())
                 .select(agent_sessions::id)
                 .first::<String>(conn)
                 .optional()?;
