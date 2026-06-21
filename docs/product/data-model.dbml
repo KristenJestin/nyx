@@ -1,0 +1,881 @@
+// nyx V2 - modele de domaine cible (PDR-0008)
+// Import direct dans https://dbdiagram.io
+//
+// Principes :
+// - IDs UUIDv7 stockes en varchar ; timestamps UTC.
+// - Project est la racine produit durable.
+// - Workspace est un dossier physique et le PIVOT unique intention/runtime.
+//   Deux roles : primary (durable) designe par projects.primary_workspace_id,
+//   et worktrees per-PRD (ephemeres, nettoyes au merge).
+// - Il n'y a PAS d'entite Execution. La relation PRD -> dev est la colonne prds.workspace_id.
+// - PRD est un ticket durable ; son historique vit sur le ticket (review, branche/commit, ligne workspace conservee).
+// - Le runtime (terminaux, sessions agents, commandes, services) appartient au workspace.
+// - La ligne workspace est permanente : folder_removed_at marque le nettoyage du worktree, jamais de delete auto.
+// - Repository est une identite logique Nyx ; WorkspaceRepository est son checkout concret.
+// - AgentSession survit a son terminal courant afin de rester reprenable.
+// - Attention Inbox est une projection des etats/evenements, pas une table mutable universelle.
+// - Les remotes, branches courantes et dirty states sont detectes depuis Git, pas autoritaires en DB.
+// - Design-system projet en base (tables design + design_components, PDR-0010). Le sous-systeme
+//   prototype detaille (prototypes/pages/variants/rounds/feedback) s'absorbe a v2.6 (PDR-0009).
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+Enum milestone_status {
+  planned
+  active
+  completed
+  cancelled
+}
+
+Enum prd_status {
+  draft
+  ready
+  active
+  blocked
+  in_review
+  completed
+  cancelled
+  archived
+}
+
+Enum task_type {
+  implementation
+  investigation
+  validation
+  documentation
+  migration
+}
+
+Enum task_status {
+  todo
+  ready
+  active
+  blocked
+  in_review
+  done
+  cancelled
+}
+
+Enum dependency_type {
+  blocks
+  relates_to
+}
+
+Enum human_action_status {
+  open
+  acknowledged
+  completed
+  cancelled
+}
+
+Enum terminal_status {
+  open
+  closed
+  interrupted
+}
+
+Enum agent_session_status {
+  starting
+  working
+  waiting
+  resumable
+  resuming
+  ended
+  interrupted
+  resume_failed
+}
+
+Enum command_run_status {
+  starting
+  running
+  success
+  error
+  stopped
+  interrupted
+}
+
+Enum review_status {
+  open
+  closed
+}
+
+Enum review_variety {
+  living
+  pinned
+}
+
+Enum review_comment_status {
+  open
+  resolved
+}
+
+Enum severity {
+  info
+  low
+  medium
+  high
+  critical
+}
+
+Enum idea_status {
+  inbox
+  exploring
+  promoted
+  rejected
+  archived
+}
+
+Enum adr_status {
+  proposed
+  accepted
+  rejected
+  superseded
+}
+
+Enum document_kind {
+  note
+  specification
+  annex
+  runbook
+  research
+  migration_report
+}
+
+Enum author_type {
+  human
+  agent
+  system
+}
+
+Enum event_source {
+  ui
+  mcp
+  agent_hook
+  runtime
+  migration
+  system
+}
+
+Enum import_status {
+  planned
+  running
+  completed
+  failed
+  rolled_back
+}
+
+// -----------------------------------------------------------------------------
+// STRUCTURE LOCALE : PROJECT / WORKSPACE / REPOSITORY
+// -----------------------------------------------------------------------------
+
+Table projects {
+  id varchar [pk]
+  name varchar [not null]
+  primary_workspace_id varchar
+  resume_agent_sessions boolean [not null, default: false]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  archived_at datetime
+
+  Note: 'primary_workspace_id est la source de verite du workspace de base durable.'
+}
+
+Table workspaces {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  root_path varchar [not null]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  folder_removed_at datetime
+  archived_at datetime
+
+  indexes {
+    (project_id, root_path) [unique]
+    (project_id, name)
+  }
+
+  Note: 'Dossier physique, git-agnostique et pivot intention/runtime. Ligne permanente : folder_removed_at marque le nettoyage du worktree au merge ; aucune suppression auto.'
+}
+
+Ref project_primary_workspace: projects.primary_workspace_id > workspaces.id
+
+Table repositories {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  relative_path varchar [not null]
+  optional boolean [not null, default: false]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  archived_at datetime
+
+  indexes {
+    (project_id, name) [unique]
+    (project_id, relative_path) [unique]
+  }
+
+  Note: 'Identite logique Nyx + chemin conventionnel dans le projet (relative_path ; "." en mono-repo). optional = pas worktree par defaut au start (= nyxignore en DB). Pas de table de checkout : un workspace porte les repos non-optional au chemin workspace.root_path + relative_path ; branche/HEAD/dirty relus depuis Git (PDR-0013).'
+}
+
+// -----------------------------------------------------------------------------
+// ORGANISATION DU TRAVAIL
+// -----------------------------------------------------------------------------
+
+Table milestones {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  description text
+  status milestone_status [not null, default: 'planned']
+  target_at datetime
+  position integer [not null, default: 0]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id, name) [unique]
+  }
+}
+
+Table tags {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  color_token varchar
+  created_at datetime [not null]
+
+  indexes {
+    (project_id, name) [unique]
+  }
+}
+
+Table prds {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  milestone_id varchar [ref: > milestones.id]
+  workspace_id varchar [ref: > workspaces.id]
+  title varchar [not null]
+  slug varchar
+  status prd_status [not null, default: 'draft']
+  current_revision_number integer [not null, default: 1]
+  position integer [not null, default: 0]
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  completed_at datetime
+  archived_at datetime
+
+  indexes {
+    (project_id, slug) [unique]
+    (project_id, status)
+  }
+
+  Note: 'Ticket durable. workspace_id = pointeur unique vers le worktree de dev, pose au lancement, ecrasable, jamais perdu.'
+}
+
+Table prd_revisions {
+  id varchar [pk]
+  prd_id varchar [not null, ref: > prds.id]
+  revision_number integer [not null]
+  title varchar [not null]
+  body text [not null]
+  summary text
+  change_reason text
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+
+  indexes {
+    (prd_id, revision_number) [unique]
+  }
+}
+
+Table prd_tags {
+  prd_id varchar [not null, ref: > prds.id]
+  tag_id varchar [not null, ref: > tags.id]
+
+  indexes {
+    (prd_id, tag_id) [pk]
+  }
+}
+
+Table tasks {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  prd_id varchar [ref: > prds.id]
+  review_id varchar [ref: > reviews.id]
+  severity severity
+  parent_task_id varchar [ref: > tasks.id]
+  title varchar [not null]
+  description text
+  acceptance_criteria text
+  type task_type [not null, default: 'implementation']
+  status task_status [not null, default: 'todo']
+  priority integer [not null, default: 0]
+  position integer [not null, default: 0]
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  completed_at datetime
+
+  indexes {
+    (prd_id, position)
+    (project_id, status)
+  }
+
+  Note: 'Une task peut exister sans PRD (travail leger). Une task liee a un review (review_id) est un finding ; severity optionnelle. Le coder ne travaille que sur des tasks.'
+}
+
+Table task_dependencies {
+  task_id varchar [not null, ref: > tasks.id]
+  depends_on_task_id varchar [not null, ref: > tasks.id]
+  type dependency_type [not null, default: 'blocks']
+  created_at datetime [not null]
+
+  indexes {
+    (task_id, depends_on_task_id) [pk]
+  }
+}
+
+Table task_tags {
+  task_id varchar [not null, ref: > tasks.id]
+  tag_id varchar [not null, ref: > tags.id]
+
+  indexes {
+    (task_id, tag_id) [pk]
+  }
+}
+
+Table human_actions {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  prd_id varchar [ref: > prds.id]
+  task_id varchar [ref: > tasks.id]
+  workspace_id varchar [ref: > workspaces.id]
+  title varchar [not null]
+  description text
+  status human_action_status [not null, default: 'open']
+  requested_by_type author_type [not null]
+  requested_by_id varchar
+  assigned_to varchar
+  due_at datetime
+  created_at datetime [not null]
+  completed_at datetime
+}
+
+// -----------------------------------------------------------------------------
+// RUNTIME : TERMINAUX, AGENTS, COMMANDES (rattaches au workspace)
+// -----------------------------------------------------------------------------
+
+Table terminals {
+  id varchar [pk]
+  workspace_id varchar [not null, ref: > workspaces.id]
+  label varchar
+  cwd varchar [not null]
+  shell varchar
+  status terminal_status [not null, default: 'open']
+  cols integer
+  rows integer
+  position integer [not null, default: 0]
+  last_active_at datetime
+  created_at datetime [not null]
+  closed_at datetime
+
+  indexes {
+    (workspace_id, position)
+  }
+}
+
+Table terminal_scrollback_chunks {
+  id varchar [pk]
+  terminal_id varchar [not null, ref: > terminals.id]
+  sequence integer [not null]
+  data blob [not null]
+  byte_length integer [not null]
+  created_at datetime [not null]
+
+  indexes {
+    (terminal_id, sequence) [unique]
+  }
+}
+
+Table agent_sessions {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  workspace_id varchar [ref: > workspaces.id]
+  provider varchar [not null]
+  external_session_id varchar [not null]
+  status agent_session_status [not null]
+  resumable boolean [not null, default: true]
+  transcript_path varchar
+  started_at datetime [not null]
+  last_activity_at datetime
+  ended_at datetime
+  updated_at datetime [not null]
+
+  indexes {
+    (provider, external_session_id) [unique]
+    (project_id, status)
+    (workspace_id, status)
+  }
+
+  Note: 'Session durable et reprenable, rattachee au workspace, independante du terminal actuellement attache.'
+}
+
+Table agent_session_terminal_bindings {
+  id varchar [pk]
+  agent_session_id varchar [not null, ref: > agent_sessions.id]
+  terminal_id varchar [not null, ref: > terminals.id]
+  attached_at datetime [not null]
+  detached_at datetime
+
+  indexes {
+    (agent_session_id, attached_at)
+    (terminal_id, attached_at)
+  }
+}
+
+Table agent_context_snapshots {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  workspace_id varchar [ref: > workspaces.id]
+  agent_session_id varchar [ref: > agent_sessions.id]
+  provider varchar [not null]
+  content_hash varchar [not null]
+  content text [not null]
+  generated_at datetime [not null]
+
+  indexes {
+    (project_id, generated_at)
+  }
+}
+
+Table managed_commands {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  command text [not null]
+  repository_id varchar [ref: > repositories.id]
+  subfolder varchar
+  restart_on_startup boolean [not null, default: false]
+  position integer [not null, default: 0]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id, name) [unique]
+  }
+
+  Note: 'Cible : soit repository_id (resolu par workspace, robuste), soit subfolder litteral. PDR-0013.'
+}
+
+Table command_instances {
+  id varchar [pk]
+  managed_command_id varchar [not null, ref: > managed_commands.id]
+  workspace_id varchar [not null, ref: > workspaces.id]
+  last_status command_run_status
+  was_running_on_shutdown boolean [not null, default: false]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (managed_command_id, workspace_id) [unique]
+  }
+}
+
+Table command_runs {
+  id varchar [pk]
+  command_instance_id varchar [not null, ref: > command_instances.id]
+  status command_run_status [not null]
+  pid integer
+  exit_code integer
+  started_at datetime [not null]
+  ended_at datetime
+  interrupted_at datetime
+
+  indexes {
+    (command_instance_id, started_at)
+  }
+}
+
+Table command_output_chunks {
+  id varchar [pk]
+  command_run_id varchar [not null, ref: > command_runs.id]
+  sequence integer [not null]
+  data blob [not null]
+  byte_length integer [not null]
+  created_at datetime [not null]
+
+  indexes {
+    (command_run_id, sequence) [unique]
+  }
+}
+
+// -----------------------------------------------------------------------------
+// REVIEW LOCALE MULTI-REPO
+// -----------------------------------------------------------------------------
+
+// Un review = le diff d'UN repo + ses commentaires. Un par repo ; nyx agrege en UI.
+Table reviews {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  workspace_id varchar [not null, ref: > workspaces.id]
+  repository_id varchar [not null, ref: > repositories.id]
+  prd_id varchar [ref: > prds.id]
+  base_ref varchar
+  target_ref varchar
+  variety review_variety [not null, default: 'living']
+  pinned_sha varchar
+  status review_status [not null, default: 'open']
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  archived_at datetime
+
+  indexes {
+    (workspace_id, repository_id, status)
+  }
+
+  Note: 'Par repo. living = suit target_ref vs base_ref ; pinned = fige pinned_sha. PRD facultatif. Archivee au merge/suppression de la cible.'
+}
+
+// Un commentaire = annotation ancree (file/ligne/plage) ou globale. Auteur humain ou agent. Threade par parent_id.
+Table review_comments {
+  id varchar [pk]
+  review_id varchar [not null, ref: > reviews.id]
+  parent_id varchar [ref: > review_comments.id]
+  author_type author_type [not null]
+  author_id varchar
+  file_path varchar
+  old_file_path varchar
+  side varchar
+  line_start integer
+  line_end integer
+  base_blob_oid varchar
+  snippet text
+  anchor_context_before text
+  anchor_context_after text
+  outdated boolean [not null, default: false]
+  body text [not null]
+  status review_comment_status [not null, default: 'open']
+  resolved_by_type author_type
+  resolved_by_id varchar
+  created_at datetime [not null]
+  edited_at datetime
+  resolved_at datetime
+
+  indexes {
+    (review_id, created_at)
+    (parent_id)
+  }
+
+  Note: 'parent_id nul = racine de thread. file_path nul = commentaire global. Resolution humain-seul ; l agent repond uniquement.'
+}
+
+// Promotion : un commentaire devient une task pour le coder (= finding). M:N.
+Table review_comment_tasks {
+  review_comment_id varchar [not null, ref: > review_comments.id]
+  task_id varchar [not null, ref: > tasks.id]
+  created_at datetime [not null]
+
+  indexes {
+    (review_comment_id, task_id) [pk]
+  }
+
+  Note: 'Le coder ne voit que les tasks. Un commentaire non promu reste une discussion.'
+}
+
+// -----------------------------------------------------------------------------
+// KNOWLEDGE ET MEMOIRE PROJET
+// -----------------------------------------------------------------------------
+
+Table ideas {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  promoted_prd_id varchar [ref: > prds.id]
+  title varchar [not null]
+  body text
+  status idea_status [not null, default: 'inbox']
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+}
+
+Table adrs {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  supersedes_adr_id varchar [ref: > adrs.id]
+  title varchar [not null]
+  status adr_status [not null, default: 'proposed']
+  context text
+  decision text
+  consequences text
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  decided_at datetime
+  updated_at datetime [not null]
+}
+
+Table directives {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  title varchar [not null]
+  body text [not null]
+  scope varchar
+  priority integer [not null, default: 0]
+  enabled boolean [not null, default: true]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+}
+
+Table documents {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  kind document_kind [not null]
+  title varchar [not null]
+  current_revision_number integer [not null, default: 1]
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  archived_at datetime
+}
+
+Table document_revisions {
+  id varchar [pk]
+  document_id varchar [not null, ref: > documents.id]
+  revision_number integer [not null]
+  body text [not null]
+  change_reason text
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+
+  indexes {
+    (document_id, revision_number) [unique]
+  }
+}
+
+// Design-system projet impose comme contexte agent (PDR-0010).
+Table design {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  content text [not null]
+  theme_tokens_json json
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id) [unique]
+  }
+
+  Note: 'Format DESIGN.md (markdown souple). theme_tokens_json est derive pour construire la config Tailwind injectee dans l iframe. Source = nyx, exportable en DESIGN.md.'
+}
+
+Table design_components {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  source_repository_id varchar [ref: > repositories.id]
+  source_path varchar
+  visual_hash varchar
+  template text [not null]
+  params_json json
+  states_json json
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id, name) [unique]
+  }
+
+  Note: 'Lib de composants imposee. template = Handlebars compile dans le sidecar. visual_hash = md5 de la partie visuelle du composant source (template+styles), pour reconciliation incrementale. source nul = composant ne en greenfield.'
+}
+
+// Fichier stocke une seule fois, rattache explicitement aux domaines autorises.
+Table attachments {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  storage_path varchar [not null]
+  filename varchar [not null]
+  media_type varchar
+  byte_length integer [not null]
+  sha256 varchar [not null]
+  created_at datetime [not null]
+
+  indexes {
+    (project_id, sha256)
+  }
+}
+
+Table prd_attachments {
+  prd_id varchar [not null, ref: > prds.id]
+  attachment_id varchar [not null, ref: > attachments.id]
+
+  indexes {
+    (prd_id, attachment_id) [pk]
+  }
+}
+
+Table review_comment_attachments {
+  review_comment_id varchar [not null, ref: > review_comments.id]
+  attachment_id varchar [not null, ref: > attachments.id]
+
+  indexes {
+    (review_comment_id, attachment_id) [pk]
+  }
+
+  Note: 'Screenshots colles sur un commentaire de review.'
+}
+
+Table document_attachments {
+  document_id varchar [not null, ref: > documents.id]
+  attachment_id varchar [not null, ref: > attachments.id]
+
+  indexes {
+    (document_id, attachment_id) [pk]
+  }
+}
+
+// -----------------------------------------------------------------------------
+// EVENEMENTS, TEMPS REEL ET LECTURE
+// -----------------------------------------------------------------------------
+
+Table domain_events {
+  id varchar [pk]
+  sequence integer [not null, unique]
+  project_id varchar [not null, ref: > projects.id]
+  workspace_id varchar [ref: > workspaces.id]
+  aggregate_type varchar [not null]
+  aggregate_id varchar [not null]
+  event_type varchar [not null]
+  source event_source [not null]
+  actor_type author_type [not null]
+  actor_id varchar
+  payload_json json
+  occurred_at datetime [not null]
+
+  indexes {
+    (project_id, sequence)
+    (workspace_id, sequence)
+    (aggregate_type, aggregate_id, sequence)
+  }
+
+  Note: 'Evenements metier utiles. Ne jamais stocker chaque octet terminal ici.'
+}
+
+Table read_cursors {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  subject_type varchar [not null]
+  subject_id varchar [not null]
+  reader_id varchar [not null]
+  last_seen_sequence integer [not null, default: 0]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id, subject_type, subject_id, reader_id) [unique]
+  }
+
+  Note: 'Support des compteurs non lus. Attention Inbox reste une projection.'
+}
+
+// -----------------------------------------------------------------------------
+// MIGRATION DE DEPOT ET TRAÇABILITE
+// -----------------------------------------------------------------------------
+
+Table import_runs {
+  id varchar [pk]
+  source_system varchar [not null]
+  source_version varchar
+  status import_status [not null, default: 'planned']
+  source_path varchar
+  backup_path varchar
+  report_path varchar
+  started_at datetime
+  completed_at datetime
+  error_message text
+  created_at datetime [not null]
+}
+
+Table legacy_id_mappings {
+  import_run_id varchar [not null, ref: > import_runs.id]
+  source_type varchar [not null]
+  source_id varchar [not null]
+  target_type varchar [not null]
+  target_id varchar [not null]
+  source_hash varchar
+  imported_at datetime [not null]
+
+  indexes {
+    (import_run_id, source_type, source_id) [pk]
+    (target_type, target_id)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// GROUPES VISUELS DBML
+// -----------------------------------------------------------------------------
+
+TableGroup structure_locale {
+  projects
+  workspaces
+  repositories
+}
+
+TableGroup work_prd_tasks {
+  milestones
+  tags
+  prds
+  prd_revisions
+  prd_tags
+  tasks
+  task_dependencies
+  task_tags
+  human_actions
+}
+
+TableGroup runtime {
+  terminals
+  terminal_scrollback_chunks
+  agent_sessions
+  agent_session_terminal_bindings
+  agent_context_snapshots
+  managed_commands
+  command_instances
+  command_runs
+  command_output_chunks
+}
+
+TableGroup review {
+  reviews
+  review_comments
+  review_comment_tasks
+}
+
+TableGroup knowledge {
+  ideas
+  adrs
+  directives
+  documents
+  document_revisions
+  design
+  design_components
+  attachments
+  prd_attachments
+  review_comment_attachments
+  document_attachments
+}
+
+TableGroup realtime_migration {
+  domain_events
+  read_cursors
+  import_runs
+  legacy_id_mappings
+}
