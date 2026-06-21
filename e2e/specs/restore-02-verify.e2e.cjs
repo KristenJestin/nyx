@@ -1,6 +1,6 @@
 /* eslint-disable */
-// RESTORE scenario, VERIFY half (session 2 — the RELAUNCH). A fresh nyx app
-// boots on the SAME XDG_DATA_HOME (same SQLite DB) the seed spec persisted. We
+// RESTORE scenario, VERIFY half (session 2 — the RELAUNCH). A fresh nyx Electron app
+// boots on the SAME NYX_DATA_DIR (same SQLite DB) the seed spec persisted. We
 // assert the full restore contract:
 //   - the 3 alive terminals are restored WITH their scrollback (each marker is
 //     back in its buffer, re-injected as read-only dead history);

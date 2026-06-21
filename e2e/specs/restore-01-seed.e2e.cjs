@@ -6,8 +6,9 @@
 //   - closes the app's auto-created default terminal VOLUNTARILY (so the verify
 //     half can prove it is NOT re-spawned).
 // It records the expected ids / markers / order to a handoff file in the shared
-// data dir; the app session ends after this spec (tauri-driver kills it),
-// simulating nyx quitting. The DB persists in XDG_DATA_HOME for restore-02.
+// data dir; the app session ends after this spec (wdio-electron-service closes the
+// Electron app, whose before-quit stops the core-host), simulating nyx quitting. The
+// DB persists in the shared NYX_DATA_DIR for restore-02.
 
 const assert = require("assert");
 const os = require("os");

@@ -1,0 +1,14 @@
+# Root Cargo workspace for the nyx monorepo.
+#
+# One workspace, one `Cargo.lock` at the repo root, one shared `target/` dir.
+# Members:
+#   - apps/tauri/src-tauri  the Tauri shell (kept green through the migration)
+#   - crates/nyx-core       the shell-agnostic core
+#   - crates/nyx-napi       the napi-rs module exposing nyx-core to Node
+[workspace]
+resolver = "2"
+members = [
+    "apps/tauri/src-tauri",
+    "crates/nyx-core",
+    "crates/nyx-napi",
+]

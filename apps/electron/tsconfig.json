@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    // Electron's main + preload run in Node (CommonJS), but the actual CJS output is
+    // produced by esbuild (`scripts/bundle.cjs`, `format: "cjs"`) — this tsconfig is
+    // TYPECHECK-ONLY (`tsc --noEmit`). Because every entry is BUNDLED, we use
+    // `moduleResolution: "bundler"` so relative imports need NO `.js` extension (the
+    // bundler resolves the `.ts` source directly) — matching how esbuild resolves them.
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023"],
+    "types": ["node", "electron"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": true,
+    "declaration": false,
+    "resolveJsonModule": true
+  },
+  "include": ["src/**/*.ts"]
+}

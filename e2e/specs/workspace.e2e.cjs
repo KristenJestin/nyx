@@ -126,7 +126,7 @@ async function openTerminalAt(dir) {
   return fresh[fresh.length - 1].id;
 }
 
-describe("PRD-2 workspaces + auto-attach (tauri-driver, Linux /proc)", function () {
+describe("PRD-2 workspaces + auto-attach (Electron, Linux /proc)", function () {
   before(async function () {
     await waitForApp();
   });
