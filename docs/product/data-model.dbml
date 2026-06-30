@@ -1,0 +1,940 @@
+// nyx V2 - modele de domaine cible (PDR-0008)
+// Import direct dans https://dbdiagram.io
+//
+// Principes :
+// - IDs UUIDv7 stockes en varchar ; timestamps UTC.
+// - Project est la racine produit durable.
+// - Workspace est un dossier physique et le PIVOT unique intention/runtime.
+//   Deux roles : primary (durable) designe par projects.primary_workspace_id,
+//   et worktrees per-Spec (ephemeres, nettoyes au merge).
+// - Il n'y a PAS d'entite Execution. La relation Spec -> dev est la colonne specs.workspace_id.
+// - Spec est un ticket durable ; son historique vit sur le ticket (review, branche/commit, ligne workspace conservee).
+// - Le runtime (terminaux, sessions agents, commandes, services) appartient au workspace.
+// - La ligne workspace est permanente : folder_removed_at marque le nettoyage du worktree, jamais de delete auto.
+// - Repository est une identite logique Nyx ; pas de table de checkout (workspace_repositories supprimee,
+//   PDR-0013) : l'appartenance est derivee (repos non-optional) et l'etat Git est relu depuis Git.
+// - Spec = unite de travail de l'humain ; cle Linear (projects.key + specs.number). Les taches sont la
+//   decomposition geree par l'agent (pas de cle humaine). Priorite = enum string (PDR-0014).
+// - AgentSession survit a son terminal courant afin de rester reprenable.
+// - Attention Inbox est une projection des etats/evenements, pas une table mutable universelle.
+// - Les remotes, branches courantes et dirty states sont detectes depuis Git, pas autoritaires en DB.
+// - Design-system projet en base (tables design + design_components, PDR-0010). Le sous-systeme
+//   prototype detaille (prototypes/pages/variants/rounds/feedback) s'absorbe a v2.6 (PDR-0009).
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+Enum milestone_status {
+  planned
+  active
+  completed
+  cancelled
+}
+
+Enum spec_status {
+  draft
+  ready
+  in_progress
+  blocked
+  in_review
+  completed
+  cancelled
+  archived
+}
+
+Enum task_type {
+  implementation
+  investigation
+  validation
+  documentation
+  migration
+}
+
+Enum task_status {
+  todo
+  ready
+  in_progress
+  blocked
+  in_review
+  done
+  cancelled
+}
+
+Enum priority {
+  urgent
+  high
+  med
+  low
+}
+
+Enum spec_mode {
+  stepped
+  autopilot
+}
+
+Enum agent_type {
+  spec
+  dev
+  doc
+  subagent
+}
+
+Enum dependency_type {
+  blocks
+  relates_to
+}
+
+Enum task_executor {
+  agent
+  human
+}
+
+Enum terminal_status {
+  open
+  closed
+  interrupted
+}
+
+Enum agent_session_status {
+  starting
+  working
+  waiting
+  resumable
+  resuming
+  ended
+  interrupted
+  resume_failed
+}
+
+Enum command_run_status {
+  starting
+  running
+  success
+  error
+  stopped
+  interrupted
+}
+
+Enum review_comment_status {
+  open
+  resolved
+}
+
+Enum severity {
+  info
+  low
+  medium
+  high
+  critical
+}
+
+Enum idea_status {
+  inbox
+  exploring
+  promoted
+  rejected
+  archived
+}
+
+Enum adr_status {
+  proposed
+  accepted
+  rejected
+  superseded
+}
+
+Enum document_kind {
+  note
+  specification
+  annex
+  runbook
+  research
+  migration_report
+}
+
+Enum author_type {
+  human
+  agent
+  system
+}
+
+Enum event_source {
+  ui
+  mcp
+  agent_hook
+  runtime
+  migration
+  system
+}
+
+Enum import_status {
+  planned
+  running
+  completed
+  failed
+  rolled_back
+}
+
+// -----------------------------------------------------------------------------
+// STRUCTURE LOCALE : PROJECT / WORKSPACE / REPOSITORY
+// -----------------------------------------------------------------------------
+
+Table projects {
+  id varchar [pk]
+  name varchar [not null]
+  key varchar [not null, unique]
+  primary_workspace_id varchar
+  workflow_id varchar [ref: > workflows.id]
+  resume_agent_sessions boolean [not null, default: false]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  archived_at datetime
+
+  Note: 'key = prefixe Linear du projet (ex. NYX) ; la cle humaine d un Spec est key + "-" + specs.number. primary_workspace_id est la source de verite du workspace de base durable.'
+}
+
+Table workspaces {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  root_path varchar [not null]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  folder_removed_at datetime
+  archived_at datetime
+
+  indexes {
+    (project_id, root_path) [unique]
+    (project_id, name)
+  }
+
+  Note: 'Dossier physique, git-agnostique et pivot intention/runtime. Ligne permanente : folder_removed_at marque le nettoyage du worktree au merge ; aucune suppression auto.'
+}
+
+Ref project_primary_workspace: projects.primary_workspace_id > workspaces.id
+
+Table repositories {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  relative_path varchar [not null]
+  optional boolean [not null, default: false]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  archived_at datetime
+
+  indexes {
+    (project_id, name) [unique]
+    (project_id, relative_path) [unique]
+  }
+
+  Note: 'Identite logique Nyx + chemin conventionnel dans le projet (relative_path ; "." en mono-repo). optional = pas worktree par defaut au start (= nyxignore en DB). Pas de table de checkout : un workspace porte les repos non-optional au chemin workspace.root_path + relative_path ; branche/HEAD/dirty relus depuis Git (PDR-0013).'
+}
+
+// -----------------------------------------------------------------------------
+// ORGANISATION DU TRAVAIL
+// -----------------------------------------------------------------------------
+
+Table milestones {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  description text
+  status milestone_status [not null, default: 'planned']
+  target_at datetime
+  position integer [not null, default: 0]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id, name) [unique]
+  }
+}
+
+// Categorie = axe UNIQUE de classification d'un Spec (1 par Spec, PDR-0017). Set par projet,
+// cure par l'humain : l'agent assigne depuis l'existant et peut en CREER une (non bloquant),
+// flaggee proposee (created_by_type=agent + confirmed_at null) jusqu'a curation. Remplace les tags.
+Table categories {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  color_token varchar
+  position integer [not null, default: 0]
+  created_by_type author_type [not null]
+  confirmed_at datetime
+  created_at datetime [not null]
+
+  indexes {
+    (project_id, name) [unique]
+  }
+
+  Note: 'Set human-curated. created_by_type=agent + confirmed_at null = proposee, a curer (confirmer/renommer/fusionner). L agent prefere reutiliser ; creation = fallback non bloquant (PDR-0017).'
+}
+
+Table specs {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  milestone_id varchar [ref: > milestones.id]
+  workspace_id varchar [ref: > workspaces.id]
+  title varchar [not null]
+  slug varchar
+  number integer [not null]
+  priority priority [not null, default: 'med']
+  category_id varchar [ref: > categories.id]
+  status spec_status [not null, default: 'draft']
+  mode spec_mode [not null, default: 'stepped']
+  phases json [note: 'liste ordonnee [{number,name}] (PDR-0022) ; tasks.phase indexe cette liste ; statut de phase derive des tasks, pas de table de phases']
+  current_revision_number integer [not null, default: 1]
+  position integer [not null, default: 0]
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  completed_at datetime
+  archived_at datetime
+
+  indexes {
+    (project_id, slug) [unique]
+    (project_id, number) [unique]
+    (project_id, status)
+  }
+
+  Note: 'Ticket durable et unite de travail de l humain (PDR-0014). Cle humaine = projects.key + "-" + number (ex. NYX-42) ; slug descriptif conserve pour l URL. priority stockee (string). workspace_id = pointeur unique vers le worktree de dev, pose au lancement, ecrasable, jamais perdu.'
+}
+
+Table spec_revisions {
+  id varchar [pk]
+  spec_id varchar [not null, ref: > specs.id]
+  revision_number integer [not null]
+  title varchar [not null]
+  body text [not null]
+  summary text
+  change_reason text
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+
+  indexes {
+    (spec_id, revision_number) [unique]
+  }
+}
+
+// spec_tags supprime : un Spec a une categorie unique (specs.category_id), pas des tags (PDR-0017).
+
+Table tasks {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  spec_id varchar [ref: > specs.id]
+  severity severity
+  parent_task_id varchar [ref: > tasks.id]
+  title varchar [not null]
+  description text
+  acceptance_criteria text
+  type task_type [not null, default: 'implementation']
+  executor task_executor [not null, default: 'agent']
+  status task_status [not null, default: 'todo']
+  priority priority [not null, default: 'med']
+  phase integer
+  position integer [not null, default: 0]
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  completed_at datetime
+
+  indexes {
+    (spec_id, position)
+    (project_id, status)
+  }
+
+  Note: 'Decomposition geree par l agent, pas administree a la main par l humain (PDR-0014) : pas de cle humaine (ULID). phase nullable = regroupement optionnel pose par l agent (pas de table de phases ; pas de phase = tasks a plat). priority = enum string. executor agent|human : une task executor=human = ex human_action (surfacee dans l Attention Inbox, pas geree a la main ; peut bloquer une task agent via task_dependencies). Une task peut exister sans Spec (travail leger). Une task promue depuis un commentaire de review (review_comment_tasks) est un finding ; severity optionnelle. Le coder ne travaille que sur des tasks.'
+}
+
+Table task_dependencies {
+  task_id varchar [not null, ref: > tasks.id]
+  depends_on_task_id varchar [not null, ref: > tasks.id]
+  type dependency_type [not null, default: 'blocks']
+  created_at datetime [not null]
+
+  indexes {
+    (task_id, depends_on_task_id) [pk]
+  }
+}
+
+// task_tags supprime : pas de classification sur les taches (territoire agent, PDR-0017).
+
+// human_actions supprimee (PDR-0014) : une action humaine = une task executor='human',
+// surfacee dans l'Attention Inbox. Les 3 saveurs (agent/human/finding) convergent dans tasks.
+
+// -----------------------------------------------------------------------------
+// RUNTIME : TERMINAUX, AGENTS, COMMANDES (rattaches au workspace)
+// -----------------------------------------------------------------------------
+
+Table terminals {
+  id varchar [pk]
+  workspace_id varchar [not null, ref: > workspaces.id]
+  label varchar
+  cwd varchar [not null]
+  shell varchar
+  status terminal_status [not null, default: 'open']
+  cols integer
+  rows integer
+  position integer [not null, default: 0]
+  last_active_at datetime
+  created_at datetime [not null]
+  closed_at datetime
+
+  indexes {
+    (workspace_id, position)
+  }
+}
+
+Table terminal_scrollback_chunks {
+  id varchar [pk]
+  terminal_id varchar [not null, ref: > terminals.id]
+  sequence integer [not null]
+  data blob [not null]
+  byte_length integer [not null]
+  created_at datetime [not null]
+
+  indexes {
+    (terminal_id, sequence) [unique]
+  }
+}
+
+Table agent_sessions {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  workspace_id varchar [ref: > workspaces.id]
+  provider varchar [not null]
+  external_session_id varchar [not null]
+  status agent_session_status [not null]
+  resumable boolean [not null, default: true]
+  transcript_path varchar
+  started_at datetime [not null]
+  last_activity_at datetime
+  ended_at datetime
+  updated_at datetime [not null]
+
+  indexes {
+    (provider, external_session_id) [unique]
+    (project_id, status)
+    (workspace_id, status)
+  }
+
+  Note: 'Session durable et reprenable, rattachee au workspace, independante du terminal actuellement attache.'
+}
+
+Table agent_session_terminal_bindings {
+  id varchar [pk]
+  agent_session_id varchar [not null, ref: > agent_sessions.id]
+  terminal_id varchar [not null, ref: > terminals.id]
+  attached_at datetime [not null]
+  detached_at datetime
+
+  indexes {
+    (agent_session_id, attached_at)
+    (terminal_id, attached_at)
+  }
+}
+
+Table agent_context_snapshots {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  workspace_id varchar [ref: > workspaces.id]
+  agent_session_id varchar [ref: > agent_sessions.id]
+  provider varchar [not null]
+  content_hash varchar [not null]
+  content text [not null]
+  generated_at datetime [not null]
+
+  indexes {
+    (project_id, generated_at)
+  }
+}
+
+Table managed_commands {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  command text [not null]
+  repository_id varchar [ref: > repositories.id]
+  subfolder varchar
+  restart_on_startup boolean [not null, default: false]
+  gate varchar
+  blocking boolean [not null, default: false]
+  position integer [not null, default: 0]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id, name) [unique]
+  }
+
+  Note: 'Cible : soit repository_id (resolu par workspace, robuste), soit subfolder litteral (PDR-0013). gate (nullable) = point lifecycle ou la commande sert de CHECK deterministe (ex. pre-review : lint/test ; pre-ship : secrets) ; blocking = stoppe le flux si echec (PDR-0020). gate null = simple service managé.'
+}
+
+Table command_instances {
+  id varchar [pk]
+  managed_command_id varchar [not null, ref: > managed_commands.id]
+  workspace_id varchar [not null, ref: > workspaces.id]
+  last_status command_run_status
+  was_running_on_shutdown boolean [not null, default: false]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (managed_command_id, workspace_id) [unique]
+  }
+}
+
+Table command_runs {
+  id varchar [pk]
+  command_instance_id varchar [not null, ref: > command_instances.id]
+  status command_run_status [not null]
+  pid integer
+  exit_code integer
+  started_at datetime [not null]
+  ended_at datetime
+  interrupted_at datetime
+
+  indexes {
+    (command_instance_id, started_at)
+  }
+}
+
+Table command_output_chunks {
+  id varchar [pk]
+  command_run_id varchar [not null, ref: > command_runs.id]
+  sequence integer [not null]
+  data blob [not null]
+  byte_length integer [not null]
+  created_at datetime [not null]
+
+  indexes {
+    (command_run_id, sequence) [unique]
+  }
+}
+
+// -----------------------------------------------------------------------------
+// REVIEW LOCALE MULTI-REPO
+// -----------------------------------------------------------------------------
+
+// Review = VUE DERIVEE, pas de table (PDR-0015). Le diff d'un repo se relit depuis Git
+// (base = point de fork, target = worktree/HEAD). Les commentaires s'ancrent directement
+// sur (workspace, repository) + un spec_id optionnel ; pas d'entite review stockee, pas de
+// statut de review (il suit le Spec), pas de snapshot pinned.
+
+// Un commentaire = annotation ancree (file/ligne/plage) ou globale, posee sur le diff d'un repo.
+// Ancre directe sur (workspace, repository) ; spec_id optionnel (null = review generique sans Spec).
+// La "review" est la vue calculee de ces commentaires sur le diff Git. Auteur humain ou agent.
+Table review_comments {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  workspace_id varchar [not null, ref: > workspaces.id]
+  repository_id varchar [not null, ref: > repositories.id]
+  spec_id varchar [ref: > specs.id]
+  parent_id varchar [ref: > review_comments.id]
+  author_type author_type [not null]
+  author_id varchar
+  file_path varchar
+  old_file_path varchar
+  side varchar
+  line_start integer
+  line_end integer
+  base_blob_oid varchar
+  snippet text
+  anchor_context_before text
+  anchor_context_after text
+  outdated boolean [not null, default: false]
+  body text [not null]
+  status review_comment_status [not null, default: 'open']
+  resolved_by_type author_type
+  resolved_by_id varchar
+  created_at datetime [not null]
+  edited_at datetime
+  resolved_at datetime
+
+  indexes {
+    (workspace_id, repository_id, created_at)
+    (spec_id, status)
+    (parent_id)
+  }
+
+  Note: 'Pas d entite review : la review est la vue derivee de ces commentaires sur le diff Git. spec_id null = review generique (workspace sans Spec). parent_id nul = racine de thread. file_path nul = commentaire global. base_blob_oid + anchor_context = remap/outdated. Resolution humain-seul ; l agent repond ou promeut en task.'
+}
+
+// Promotion : un commentaire devient une task pour le coder (= finding). M:N.
+Table review_comment_tasks {
+  review_comment_id varchar [not null, ref: > review_comments.id]
+  task_id varchar [not null, ref: > tasks.id]
+  created_at datetime [not null]
+
+  indexes {
+    (review_comment_id, task_id) [pk]
+  }
+
+  Note: 'Le coder ne voit que les tasks. Un commentaire non promu reste une discussion.'
+}
+
+// -----------------------------------------------------------------------------
+// KNOWLEDGE ET MEMOIRE PROJET
+// -----------------------------------------------------------------------------
+
+Table ideas {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  promoted_spec_id varchar [ref: > specs.id]
+  title varchar [not null]
+  body text
+  status idea_status [not null, default: 'inbox']
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+}
+
+Table adrs {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  supersedes_adr_id varchar [ref: > adrs.id]
+  title varchar [not null]
+  status adr_status [not null, default: 'proposed']
+  context text
+  decision text
+  consequences text
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  decided_at datetime
+  updated_at datetime [not null]
+}
+
+// Directives = les RULES (PDR-0020) : consignes advisory projet, injectees dans le contexte d'un agent.
+// Les CHECKS deterministes vivent sur managed_commands (gate) ; les roles/hooks sur agents/workflows.
+Table directives {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  title varchar [not null]
+  body text [not null]
+  target agent_type
+  scope varchar
+  priority integer [not null, default: 0]
+  enabled boolean [not null, default: true]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  Note: 'RULE (PDR-0020) = consigne advisory injectee dans le contexte d un agent (rendu live par nyx-core). target = type d agent vise (spec/dev/doc/subagent ; null = tous) ; scope = quand (always, pre-review...). Ex : "Angular v20 idioms". Les checks deterministes = managed_commands.gate ; les roles = agents.'
+}
+
+Table documents {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  kind document_kind [not null]
+  title varchar [not null]
+  current_revision_number integer [not null, default: 1]
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+  archived_at datetime
+}
+
+Table document_revisions {
+  id varchar [pk]
+  document_id varchar [not null, ref: > documents.id]
+  revision_number integer [not null]
+  body text [not null]
+  change_reason text
+  created_by_type author_type [not null]
+  created_by_id varchar
+  created_at datetime [not null]
+
+  indexes {
+    (document_id, revision_number) [unique]
+  }
+}
+
+// Design-system projet impose comme contexte agent (PDR-0010).
+Table design {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  content text [not null]
+  theme_tokens_json json
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id) [unique]
+  }
+
+  Note: 'Format DESIGN.md (markdown souple). theme_tokens_json est derive pour construire la config Tailwind injectee dans l iframe. Source = nyx, exportable en DESIGN.md.'
+}
+
+Table design_components {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  name varchar [not null]
+  source_repository_id varchar [ref: > repositories.id]
+  source_path varchar
+  visual_hash varchar
+  template text [not null]
+  params_json json
+  states_json json
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id, name) [unique]
+  }
+
+  Note: 'Lib de composants imposee. template = Handlebars compile dans le sidecar. visual_hash = md5 de la partie visuelle du composant source (template+styles), pour reconciliation incrementale. source nul = composant ne en greenfield.'
+}
+
+// Stockage interne (blob deduplique sha256). PAS un concept produit (PDR-0016) :
+// reutilise sous le capot par les annexes de Spec et les images de commentaires de review.
+Table attachments {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  storage_path varchar [not null]
+  filename varchar [not null]
+  media_type varchar
+  byte_length integer [not null]
+  sha256 varchar [not null]
+  created_at datetime [not null]
+
+  indexes {
+    (project_id, sha256)
+  }
+}
+
+// Annexe = artefact nomme d'un Spec (concept produit, PDR-0016). Trois sources possibles,
+// une seule a la fois : body (texte inline), attachment_id (blob interne), ou path (reference
+// fichier, contenu lu en live ; resolu via repository_id, robuste aux worktrees).
+Table spec_annexes {
+  id varchar [pk]
+  spec_id varchar [not null, ref: > specs.id]
+  name varchar [not null]
+  kind varchar [not null]
+  body text
+  attachment_id varchar [ref: > attachments.id]
+  path varchar
+  repository_id varchar [ref: > repositories.id]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (spec_id, name) [unique]
+  }
+
+  Note: 'kind = prototype_html | data_sample | image | doc | ... Source = body (inline, snapshot) XOR attachment_id (blob interne, snapshot) XOR path (reference fichier, VIVANT ; resolu via repository_id optionnel comme les managed_commands, PDR-0013). Remplace spec_attachments (PDR-0016).'
+}
+
+Table review_comment_attachments {
+  review_comment_id varchar [not null, ref: > review_comments.id]
+  attachment_id varchar [not null, ref: > attachments.id]
+
+  indexes {
+    (review_comment_id, attachment_id) [pk]
+  }
+
+  Note: 'Screenshots colles sur un commentaire de review.'
+}
+
+Table document_attachments {
+  document_id varchar [not null, ref: > documents.id]
+  attachment_id varchar [not null, ref: > attachments.id]
+
+  indexes {
+    (document_id, attachment_id) [pk]
+  }
+}
+
+// -----------------------------------------------------------------------------
+// AGENTIQUE : AGENTS & WORKFLOWS (PDR-0020)
+// -----------------------------------------------------------------------------
+
+// Definition d'agent = bibliotheque reutilisable. project_id null = defaut nyx / partage (reutilisable
+// entre projets) ; renseigne = custom prive. spec/dev/doc = principaux (1 chacun par workflow,
+// declenchables /nspec /ndev /ndoc) ; subagent = lance par un principal via le Task du provider (N par workflow).
+Table agents {
+  id varchar [pk]
+  project_id varchar [ref: > projects.id]
+  name varchar [not null]
+  type agent_type [not null]
+  prompt_template text [not null]
+  tools_json json
+  model varchar
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  Note: 'Bibliotheque reutilisable (project_id null = builtin nyx, forkable + partageable entre projets). prompt_template = statique + marqueurs rules/checks/donnees live, rendu par nyx-core et injecte via hooks (additionalContext). tools_json = outils/skills (ex. agent-browser pour un ui-tester). Subagents = Task du provider, observes via SubagentStart/Stop.'
+}
+
+// Workflow = composition reutilisable (defaut nyx forkable), assignee a un projet via projects.workflow_id.
+Table workflows {
+  id varchar [pk]
+  project_id varchar [ref: > projects.id]
+  name varchar [not null]
+  builtin boolean [not null, default: false]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  Note: 'project_id null + builtin = workflow par defaut nyx. Compose 1 spec + 1 dev + 1 doc + N subagents via workflow_agents.'
+}
+
+// Liaison workflow -> agents. slot spec/dev/doc = unique par workflow ; slot subagent = multiple.
+Table workflow_agents {
+  id varchar [pk]
+  workflow_id varchar [not null, ref: > workflows.id]
+  agent_id varchar [not null, ref: > agents.id]
+  slot agent_type [not null]
+  scope varchar
+  position integer [not null, default: 0]
+
+  indexes {
+    (workflow_id, slot, position)
+  }
+
+  Note: 'slot = role dans le workflow. spec/dev/doc : un seul par workflow. subagent : plusieurs ; scope = point d injection (ex. pre-handoff pour ui-tester). dev lance les subagents via le Task du provider.'
+}
+
+// -----------------------------------------------------------------------------
+// EVENEMENTS, TEMPS REEL ET LECTURE
+// -----------------------------------------------------------------------------
+
+Table domain_events {
+  id varchar [pk]
+  sequence integer [not null, unique]
+  project_id varchar [not null, ref: > projects.id]
+  workspace_id varchar [ref: > workspaces.id]
+  aggregate_type varchar [not null]
+  aggregate_id varchar [not null]
+  event_type varchar [not null]
+  source event_source [not null]
+  actor_type author_type [not null]
+  actor_id varchar
+  payload_json json
+  occurred_at datetime [not null]
+
+  indexes {
+    (project_id, sequence)
+    (workspace_id, sequence)
+    (aggregate_type, aggregate_id, sequence)
+  }
+
+  Note: 'Evenements metier utiles, captures genereusement. Ne jamais stocker chaque octet terminal ici. event_type couvre les familles Spec/Task/Review/Runtime/Knowledge/Human/Prototype/Migration (liste canonique dans absorption.md, PDR-0016).'
+}
+
+Table read_cursors {
+  id varchar [pk]
+  project_id varchar [not null, ref: > projects.id]
+  subject_type varchar [not null]
+  subject_id varchar [not null]
+  reader_id varchar [not null]
+  last_seen_sequence integer [not null, default: 0]
+  updated_at datetime [not null]
+
+  indexes {
+    (project_id, subject_type, subject_id, reader_id) [unique]
+  }
+
+  Note: 'Support des compteurs non lus. Attention Inbox reste une projection.'
+}
+
+// -----------------------------------------------------------------------------
+// MIGRATION DE DEPOT ET TRAÇABILITE
+// -----------------------------------------------------------------------------
+
+Table import_runs {
+  id varchar [pk]
+  source_system varchar [not null]
+  source_version varchar
+  status import_status [not null, default: 'planned']
+  source_path varchar
+  backup_path varchar
+  report_path varchar
+  started_at datetime
+  completed_at datetime
+  error_message text
+  created_at datetime [not null]
+}
+
+Table legacy_id_mappings {
+  import_run_id varchar [not null, ref: > import_runs.id]
+  source_type varchar [not null]
+  source_id varchar [not null]
+  target_type varchar [not null]
+  target_id varchar [not null]
+  source_hash varchar
+  imported_at datetime [not null]
+
+  indexes {
+    (import_run_id, source_type, source_id) [pk]
+    (target_type, target_id)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// GROUPES VISUELS DBML
+// -----------------------------------------------------------------------------
+
+TableGroup structure_locale {
+  projects
+  workspaces
+  repositories
+}
+
+TableGroup work_spec_tasks {
+  milestones
+  categories
+  specs
+  spec_revisions
+  tasks
+  task_dependencies
+}
+
+TableGroup runtime {
+  terminals
+  terminal_scrollback_chunks
+  agent_sessions
+  agent_session_terminal_bindings
+  agent_context_snapshots
+  managed_commands
+  command_instances
+  command_runs
+  command_output_chunks
+}
+
+TableGroup review {
+  review_comments
+  review_comment_tasks
+}
+
+TableGroup knowledge {
+  ideas
+  adrs
+  directives
+  documents
+  document_revisions
+  design
+  design_components
+  attachments
+  spec_annexes
+  review_comment_attachments
+  document_attachments
+}
+
+TableGroup realtime_migration {
+  domain_events
+  read_cursors
+  import_runs
+  legacy_id_mappings
+}
+
+TableGroup agentique {
+  agents
+  workflows
+  workflow_agents
+}

@@ -1,0 +1,14 @@
+# deps / build
+node_modules/
+dist/
+target/
+.tanstack/
+
+# prototype2 = repo de référence (design source), porté à la main, non suivi ici
+prototype2/
+
+# env / local
+.env
+.env.*
+.DS_Store
+.claude/settings.local.json
