@@ -47,7 +47,9 @@ describe("<WindowControls> close warning (PRD-5 #6)", () => {
   // Done-criterion: when a live session in a NON-resuming project exists, the close is
   // WITHHELD and the warning dialog is shown listing the session — close not yet called.
   it("opens the warning dialog (and withholds close) when a live session would be dropped", async () => {
-    const ipc = installIpc([warn("t1", "Claude Code has an active session in build that won't be resumed.")]);
+    const ipc = installIpc([
+      warn("t1", "Claude Code has an active session in build that won't be resumed."),
+    ]);
     render(<WindowControls />);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /close/i }));
@@ -61,7 +63,9 @@ describe("<WindowControls> close warning (PRD-5 #6)", () => {
   });
 
   it("closes anyway on confirm", async () => {
-    const ipc = installIpc([warn("t1", "Claude Code has an active session in build that won't be resumed.")]);
+    const ipc = installIpc([
+      warn("t1", "Claude Code has an active session in build that won't be resumed."),
+    ]);
     render(<WindowControls />);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /close/i }));
@@ -77,7 +81,9 @@ describe("<WindowControls> close warning (PRD-5 #6)", () => {
   });
 
   it("keeps the window open on cancel (no close call)", async () => {
-    const ipc = installIpc([warn("t1", "Claude Code has an active session in build that won't be resumed.")]);
+    const ipc = installIpc([
+      warn("t1", "Claude Code has an active session in build that won't be resumed."),
+    ]);
     render(<WindowControls />);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /close/i }));

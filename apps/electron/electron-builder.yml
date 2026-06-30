@@ -55,6 +55,10 @@ asarUnpack:
 # FINAL release targets (task #20). The `scripts/package.cjs` smoke passes `--dir` on
 # the CLI, which overrides these with a throwaway unpacked dir for the .node smoke.
 linux:
+  # The package name is scoped (@nyx/electron) → electron-builder derives an unsafe
+  # executableName ("@nyxelectron", with a "@" illegal in AppImage file paths). Pin a
+  # clean binary name so the AppImage builds and the binary is just "nyx".
+  executableName: nyx
   # AppImage: the single-file, no-install Linux distribution the PRD mandates. Built
   # on a Linux host (electron-builder does NOT cross-compile the native `.node`; the
   # `.node` must be built natively first — see PACKAGING.md). Category is required by

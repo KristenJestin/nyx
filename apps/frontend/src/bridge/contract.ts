@@ -180,7 +180,11 @@ export interface NyxBridge {
    *  methods below; this exists so the inventory's long tail of one-off commands
    *  (project/workspace/command CRUD) is covered without 40 bespoke signatures.
    *  Every typed method is implementable in terms of this. */
-  invoke<R>(command: BackendCommand, args?: Record<string, unknown>, opts?: RequestOptions): Promise<R>;
+  invoke<R>(
+    command: BackendCommand,
+    args?: Record<string, unknown>,
+    opts?: RequestOptions,
+  ): Promise<R>;
 
   /**
    * Low-level subscription escape hatch: deliver the RAW payload of `event` to
@@ -282,16 +286,21 @@ export type BackendCommand =
   | "reorder"
   | "terminal_exec_mark_read"
   | "persist_scrollback"
+  // FEEDBACK #32: persist a terminal's live cwd into its record so a relaunch
+  // re-spawns at the LAST directory, not the stale spawn-time cwd.
+  | "set_terminal_cwd"
   // projects / workspaces
   | "list_projects"
   | "create_project"
   | "update_project"
   | "delete_project"
+  | "projects_reorder"
   | "set_project_collapsed"
   | "set_project_resume_agent_sessions"
   | "list_workspaces"
   | "create_workspace"
   | "rename_workspace"
+  | "workspace_delete"
   | "set_workspace_collapsed"
   // managed commands
   | "command_list"
@@ -312,6 +321,13 @@ export type BackendCommand =
   // agents
   | "agent_active_sessions"
   | "agent_close_warnings"
+  // The RUNTIME agent-activity map (the live dot): which terminals are working/waiting
+  // or carry a "response ready" notification. NEVER persisted — an in-memory read off the
+  // same store the Claude per-turn hooks write. Re-pulled on `agent-sessions://changed`.
+  | "agent_activity_snapshot"
+  // Clear the focus-aware "response ready" notification for a viewed terminal (the
+  // activity analogue of `terminal_exec_mark_read`). `{ terminalId }`. Idempotent.
+  | "agent_mark_ready_read"
   // integrations
   | "integration_list"
   | "integration_install"
@@ -333,6 +349,8 @@ export type BackendEvent =
   | "command://ack"
   | "terminal://busy-state"
   | "terminal://exec-state"
+  // Per-terminal CPU%/RAM live readings (FEEDBACK #28).
+  | "terminal://stats"
   // Coarse "this collection changed → re-fetch it" invalidations (the
   // ChangedTopic axis). The components subscribe to these by their channel string.
   | "commands://changed"

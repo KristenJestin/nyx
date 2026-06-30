@@ -18,10 +18,14 @@ import { ExecStatePersister } from "./exec-state";
 import { ResumeParks } from "./resume-parks";
 import { CommandManager } from "./command-manager";
 import type { BusyStatePoller } from "./busy-state";
+import type { StatsPoller } from "./stats-state";
 
 export class HostServices {
   /** The OS busy-state poll loop (set by the lifecycle at boot; PRD-5 #1). */
   busyPoller: BusyStatePoller | null = null;
+
+  /** The per-terminal CPU%/RAM poll loop (set by the lifecycle at boot; FEEDBACK #28). */
+  statsPoller: StatsPoller | null = null;
 
   /**
    * The shared-core handle: the r2d2 DB pool (PRD-5 #2) + the MCP server (PRD-5 #3).

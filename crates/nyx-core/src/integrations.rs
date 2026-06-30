@@ -272,9 +272,6 @@ mod tests {
         fn marketplace_update(&self, _marketplace: &str) -> Result<(), plugin::PluginError> {
             Ok(())
         }
-        fn plugin_update(&self, _install_id: &str) -> Result<(), plugin::PluginError> {
-            Ok(())
-        }
     }
 
     /// Build a `PluginInstall` descriptor over temp dirs with a minimal bundled plugin tree so

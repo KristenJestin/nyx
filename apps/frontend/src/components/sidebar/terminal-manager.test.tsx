@@ -222,7 +222,16 @@ describe("<TerminalManager> production auto-attach loop", () => {
     // deck stub) reports cwd "/work/ws", which is a known workspace path.
     const backend = installBackend({
       rows: [term(1, "/work/ws")],
-      projects: [{ id: "p1", name: "P", collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false }],
+      projects: [
+        {
+          id: "p1",
+          name: "P",
+          collapsed: false,
+          created_at: 0,
+          updated_at: 0,
+          resume_agent_sessions: false,
+        },
+      ],
       workspaces: { p1: [workspace("ws-1", "p1", "/work/ws")] },
       cwdByPty: { 1: "/work/ws" },
       workspaceByPath: { "/work/ws": "ws-1" },
@@ -260,7 +269,16 @@ describe("<TerminalManager> production auto-attach loop", () => {
         term(1, "/work/ws", { mode: "manual" }), // pinned → never auto-attached
         term(2, "/work/ws", { wsId: "ws-1", mode: "auto" }), // already attached
       ],
-      projects: [{ id: "p1", name: "P", collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false }],
+      projects: [
+        {
+          id: "p1",
+          name: "P",
+          collapsed: false,
+          created_at: 0,
+          updated_at: 0,
+          resume_agent_sessions: false,
+        },
+      ],
       workspaces: { p1: [workspace("ws-1", "p1", "/work/ws")] },
       cwdByPty: { 1: "/work/ws", 2: "/work/ws" },
       workspaceByPath: { "/work/ws": "ws-1" },
@@ -302,7 +320,16 @@ describe("<TerminalManager> production auto-attach loop", () => {
     const cwdByPty: Record<number, string> = { 1: "/elsewhere" };
     const backend = installBackend({
       rows: [term(1, "/elsewhere")],
-      projects: [{ id: "p1", name: "P", collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false }],
+      projects: [
+        {
+          id: "p1",
+          name: "P",
+          collapsed: false,
+          created_at: 0,
+          updated_at: 0,
+          resume_agent_sessions: false,
+        },
+      ],
       workspaces: { p1: [workspace("ws-1", "p1", "/work/ws")] },
       cwdByPty,
       workspaceByPath: { "/work/ws": "ws-1" },
@@ -342,7 +369,16 @@ describe("<TerminalManager> production auto-attach loop", () => {
     vi.stubEnv("VITE_NYX_E2E", "1");
     const backend = installBackend({
       rows: [term(1, "/work/ws")],
-      projects: [{ id: "p1", name: "P", collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false }],
+      projects: [
+        {
+          id: "p1",
+          name: "P",
+          collapsed: false,
+          created_at: 0,
+          updated_at: 0,
+          resume_agent_sessions: false,
+        },
+      ],
       workspaces: { p1: [workspace("ws-1", "p1", "/work/ws")] },
       cwdByPty: { 1: "/work/ws" },
       workspaceByPath: { "/work/ws": "ws-1" },

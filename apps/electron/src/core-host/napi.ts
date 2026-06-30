@@ -82,6 +82,53 @@ export interface NyxPtyInstance {
    * a clean degradation. Polled on a bounded ~1s cadence by the auto-label loop.
    */
   terminalInfo(): { cwd: string | null; foreground: string | null };
+  /**
+   * This terminal's ROOT pid — the shell process id, the anchor of its process tree
+   * (FEEDBACK #28). The host's per-terminal stats poll passes this to
+   * `NyxProcStats.treeStats` to sum the shell + all descendants' CPU%/RAM. `null` when
+   * the shell pid is unknown. Portable — every OS exposes the child pid.
+   */
+  shellPid(): number | null;
+}
+
+/**
+ * One terminal's process-tree resource usage (FEEDBACK #28): the summed CPU% + RSS of
+ * the shell AND all transitive descendants. Mirrors the napi `TreeStats`.
+ */
+export interface TreeStats {
+  /** Summed CPU usage of the tree, in PERCENT (per single core, so can exceed 100). */
+  cpuPct: number;
+  /** Summed resident memory of the tree, in BYTES (RSS). */
+  memBytes: number;
+}
+
+/**
+ * Cross-platform per-terminal CPU%/RAM introspector (FEEDBACK #28). Owns ONE live
+ * `sysinfo::System` kept ALIVE across calls so per-process CPU% deltas are meaningful
+ * (a fresh System per call would always read 0%). The host builds exactly ONE at boot
+ * and calls `treeStats` once per live terminal each poll tick. Cross-platform via
+ * `sysinfo` (Linux/macOS/Windows), NOT `/proc`.
+ */
+export interface NyxProcStatsInstance {
+  /**
+   * Refresh the process table and return the summed CPU%/RAM of the tree rooted at
+   * `rootPid` (a terminal's shell pid). A gone pid yields the all-zero reading — never
+   * an error, so the per-tick poll degrades gracefully when a terminal just closed.
+   * SYNCHRONOUS; the poll uses `treeStatsBatch` so the scan never blocks the Node loop.
+   */
+  treeStats(rootPid: number): TreeStats;
+  /**
+   * Refresh the process table ONCE, then return one `TreeStats` per root in `roots`, IN
+   * THE SAME ORDER — OFF the Node main thread (FEEDBACK #28 perf). The host calls this
+   * ONCE per poll tick with EVERY live terminal's shell pid: the expensive `/proc` scan
+   * runs once per tick (not once per terminal) on a libuv worker, so keystroke IPC + PTY
+   * output keep flowing while it is in flight. A gone pid yields zero at its slot.
+   */
+  treeStatsBatch(roots: number[]): Promise<TreeStats[]>;
+}
+
+export interface NyxProcStatsCtor {
+  new (): NyxProcStatsInstance;
 }
 
 /**
@@ -108,6 +155,34 @@ export interface ExecStatePersist {
   updated: boolean;
   /** The stamped `exec_state_updated_at` (epoch-ms); 0 when `updated` is false. */
   updatedAt: number;
+}
+
+/**
+ * One terminal's RUNTIME agent activity (the live dot). Mirrors the napi
+ * `AgentActivitySnapshot`. The `activity` enum is flattened to a string the front maps
+ * to the dot: `"working"` (running) | `"waiting"` (attention) | `"idle"`. `readyUnread`
+ * is the focus-aware "response ready" green-dot notification, cleared on focus exactly
+ * like `execStateUnread`. Read off the in-memory store — NEVER persisted (the
+ * anti-phantom contract: empty at boot, so a resumed session starts idle).
+ */
+export interface AgentActivitySnapshot {
+  terminalId: string;
+  /** `working` | `waiting` | `idle`. */
+  activity: string;
+  /** A turn finished and the user has not yet viewed the terminal. */
+  readyUnread: boolean;
+  /**
+   * The RED analogue of `readyUnread` — the last turn ended on an API error (`StopFailure`)
+   * and the user has not yet viewed the terminal (#35). Cleared on focus, a new turn, and
+   * session restart.
+   */
+  errorUnread: boolean;
+  /**
+   * `true` when the plugin THIS session loaded is OLDER/different than the version nyx
+   * bundles (#18b) — the per-session "plugin périmé" badge inviting a session restart.
+   * Set once at SessionStart, runtime-only (never persisted), cleared on session restart.
+   */
+  pluginOutdated: boolean;
 }
 
 /** A parked agent-session resume (PRD-5 task #5) — injected at the terminal's first
@@ -249,6 +324,25 @@ export interface NyxCoreInstance {
    */
   unregisterTerminalPty(recordId: string): void;
   /**
+   * Snapshot the RUNTIME agent activity of every terminal with something live to show
+   * (working/waiting OR a pending "ready" notification). Synchronous (an in-memory map
+   * read; never the Node loop / DB). The host reads this on the `agent-sessions` change
+   * tick to build the live-dot map the renderer consumes. NEVER persisted.
+   */
+  agentActivitySnapshot(): AgentActivitySnapshot[];
+  /**
+   * FORCE a terminal's runtime activity to idle + drop its "ready" notification — the
+   * anti-phantom clear called on PTY death / terminal close (the agent-activity analogue
+   * of "emit busy=false on PTY death"). Synchronous, idempotent.
+   */
+  clearAgentActivity(terminalId: string): void;
+  /**
+   * Clear ONLY the focus-aware "response ready" notification for a terminal (the activity
+   * mark-read), leaving any live `working` activity intact. Called when the user VIEWS the
+   * terminal — the same focus-aware clear as `terminal_exec_mark_read`. Synchronous.
+   */
+  markAgentReadyRead(terminalId: string): void;
+  /**
    * Run the backend auto-attach for a terminal RECORD given its live `cwd` (the
    * `auto_attach_terminal` command). The shared nyx-core resolver applies the hybrid
    * auto/manual rule + persists the decided binding; resolves to `{ workspaceId, changed }`.
@@ -318,6 +412,8 @@ export interface NyxNapi {
   version(): string;
   NyxPty: NyxPtyCtor;
   NyxCore: NyxCoreCtor;
+  /** Per-terminal CPU%/RAM introspector (FEEDBACK #28). One owned by the host. */
+  NyxProcStats: NyxProcStatsCtor;
 }
 
 /**
@@ -353,9 +449,12 @@ export function loadNapi(): NyxNapi {
   if (
     typeof addon.version !== "function" ||
     typeof addon.NyxPty !== "function" ||
-    typeof addon.NyxCore !== "function"
+    typeof addon.NyxCore !== "function" ||
+    typeof addon.NyxProcStats !== "function"
   ) {
-    throw new Error(`nyx-napi loaded from ${loader} but is missing version()/NyxPty/NyxCore`);
+    throw new Error(
+      `nyx-napi loaded from ${loader} but is missing version()/NyxPty/NyxCore/NyxProcStats`,
+    );
   }
   return addon;
 }

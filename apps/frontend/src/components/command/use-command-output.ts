@@ -90,15 +90,18 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
     void (async () => {
       // Subscribe BEFORE the rehydrate round-trip so no live chunk is dropped in
       // the gap. While not yet rehydrated we buffer; once rehydrated we write live.
-      const unlisten = await nyxBridge.subscribe<CommandOutputPayload>("command://output", (payload) => {
-        if (state.torndown) return;
-        if (payload.instanceId !== state.instanceId) return;
-        if (!rehydrated) {
-          pending.push(payload);
-          return;
-        }
-        term.write(decode(payload.bytes));
-      });
+      const unlisten = await nyxBridge.subscribe<CommandOutputPayload>(
+        "command://output",
+        (payload) => {
+          if (state.torndown) return;
+          if (payload.instanceId !== state.instanceId) return;
+          if (!rehydrated) {
+            pending.push(payload);
+            return;
+          }
+          term.write(decode(payload.bytes));
+        },
+      );
       if (state.torndown) {
         // Torn down while awaiting the subscription: drop it, don't leak.
         void Promise.resolve(unlisten()).catch(() => {});
@@ -161,7 +164,9 @@ export function useCommandOutput(term: XTerm | null, instanceId: string | null):
       // above any live output. Best-effort: a missing instance / IPC failure
       // leaves the panel empty rather than throwing.
       const gen = generation;
-      const history = await nyxBridge.invoke<string>("command_output", { instanceId }).catch(() => "");
+      const history = await nyxBridge
+        .invoke<string>("command_output", { instanceId })
+        .catch(() => "");
       if (state.torndown) return;
       // Paint the rehydrated history ONLY if no clear landed during the round-trip — a
       // clear bumps `generation`, and its cleared panel must win over stale pre-clear

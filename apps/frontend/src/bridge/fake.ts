@@ -98,7 +98,11 @@ export class FakeNyxBridge implements NyxBridge {
   }
 
   // --- NyxBridge ----------------------------------------------------------
-  invoke<R>(command: BackendCommand, args?: Record<string, unknown>, _opts?: RequestOptions): Promise<R> {
+  invoke<R>(
+    command: BackendCommand,
+    args?: Record<string, unknown>,
+    _opts?: RequestOptions,
+  ): Promise<R> {
     this.calls.push({ command, args });
     // Per-command stub wins; otherwise the catch-all (the `mockIPC` drop-in).
     const h = this.handlers.get(command);

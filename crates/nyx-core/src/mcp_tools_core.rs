@@ -40,6 +40,7 @@
 use serde_json::{json, Value};
 
 use crate::agent::{AgentEvent, AgentRegistry};
+use crate::agent_activity::{ActivityEvent, AgentActivityStore};
 use crate::command::{CommandRunner, RunState, RunnerSink};
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
@@ -122,6 +123,15 @@ pub trait TerminalHost: Send + Sync {
     /// no live PTY (unknown/closed/not-yet-spawned), or `Err` on a real write failure.
     fn send_to_terminal(&self, terminal_id: &str, command: &str) -> Result<bool, String>;
 
+    /// Write RAW `bytes` into the terminal's live shell WITHOUT any appended newline (the
+    /// `send_keys` path). The byte sequence the caller already resolved from literal text and
+    /// named keys is delivered verbatim, so it can drive a raw-mode TUI (arrows, Esc, Ctrl+C,
+    /// typing without submitting). Returns `Ok(true)` when written, `Ok(false)` when the
+    /// terminal has no live PTY (unknown/closed/not-yet-spawned), or `Err` on a real write
+    /// failure. Same liveness contract as [`Self::send_to_terminal`]; the ONLY difference is
+    /// no forced `\r`.
+    fn send_keys(&self, terminal_id: &str, bytes: &[u8]) -> Result<bool, String>;
+
     /// Kill the terminal's live PTY if one is registered (the SAME path as `pty_close`),
     /// and drop any parked opening command. Idempotent — a no-op when nothing is live.
     fn close_terminal_pty(&self, terminal_id: &str);
@@ -143,6 +153,9 @@ pub struct NoTerminalHost;
 impl TerminalHost for NoTerminalHost {
     fn park_opening_command(&self, _terminal_id: &str, _command: &str) {}
     fn send_to_terminal(&self, _terminal_id: &str, _command: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn send_keys(&self, _terminal_id: &str, _bytes: &[u8]) -> Result<bool, String> {
         Ok(false)
     }
     fn close_terminal_pty(&self, _terminal_id: &str) {}
@@ -526,6 +539,63 @@ pub fn add_command(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     Ok(ToolOutcome::changed(
         json!({ "command": template_json(&template) }),
         ChangedTopic::Commands,
+    ))
+}
+
+/// `set_project_settings` — `{ project_id, name?, resume_agent_sessions? }` → `{ project }`.
+/// Modify an EXISTING project's mutable settings (rename + the PRD-5 #5 resume opt-in),
+/// the MCP mirror of the UI's project-settings modal. It reuses the SAME `db::update_project`
+/// / `db::set_project_resume_agent_sessions` writes the UI bridge drives, so both surfaces
+/// converge on one code path. Partial update: only the supplied fields change. Returns the
+/// project's post-write state and a `workspaces` changed effect so any open front re-pulls
+/// (the agent-driven mutation the UI never invoked is reflected without a manual reload).
+pub fn set_project_settings(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let project_id = require_str(args, "project_id")?;
+    let new_name = optional_str(args, "name")?;
+    let new_resume = optional_bool(args, "resume_agent_sessions")?;
+
+    // Validate the id up front so an unknown project yields a clean `invalid_id` rather
+    // than a silent zero-row no-op (the writes return rows-updated, not Err, on a bad id).
+    if db
+        .with_conn(|c| db::get_project(c, project_id))
+        .map_err(internal_db)?
+        .is_none()
+    {
+        return Err(RpcError::new(
+            RpcCode::InvalidId,
+            format!("unknown project {project_id}"),
+        ));
+    }
+
+    // A rename to an empty/blank name is refused (parity with the UI's non-empty + trim
+    // validation) so the project never loses its label.
+    if let Some(name) = new_name {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                "name must not be blank",
+            ));
+        }
+        db.with_conn(|c| db::update_project(c, project_id, trimmed))
+            .map_err(internal_db)?;
+    }
+
+    if let Some(resume) = new_resume {
+        db.with_conn(|c| db::set_project_resume_agent_sessions(c, project_id, resume))
+            .map_err(internal_db)?;
+    }
+
+    // Re-read so the result reflects the persisted state (and any unchanged fields).
+    let project = db
+        .with_conn(|c| db::get_project(c, project_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::new(RpcCode::InvalidId, format!("unknown project {project_id}"))
+        })?;
+    Ok(ToolOutcome::changed(
+        json!({ "project": project }),
+        ChangedTopic::Workspaces,
     ))
 }
 
@@ -949,9 +1019,124 @@ pub fn clear_command_output<S: RunnerSink>(
 
 // --- Agent-session channel -------------------------------------------------
 
-/// `agent_session_event` — the Claude Code SessionStart/SessionEnd hook target. Parity
-/// with the Tauri `agent_session_event` (over the shared `agent`/`db` layer).
-pub fn agent_session_event(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+/// The version string nyx BUNDLES for its Claude plugin — the SINGLE SOURCE OF TRUTH for
+/// "what the plugin should be" (#18b). Parsed ONCE (lazily) from the bundled
+/// `plugin.json` compiled into the binary via `include_str!`, so there is NO hand-kept
+/// constant to drift from the manifest: bumping `plugin.json` (which the reconcile #18
+/// re-caches on a version change) automatically bumps the expected version here too.
+///
+/// A malformed/blank manifest version yields `None`, which DISABLES the stale check
+/// (everything reads as "unknown ⇒ not stale") rather than mis-flagging every session —
+/// the manifest is ours and always valid, so `None` is only a defensive floor.
+static EXPECTED_PLUGIN_VERSION: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| {
+        const MANIFEST: &str =
+            include_str!("../resources/claude-plugin/.claude-plugin/plugin.json");
+        serde_json::from_str::<Value>(MANIFEST)
+            .ok()
+            .and_then(|v| {
+                v.get("version")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+    });
+
+/// Decide, from the hook-reported `plugin_version`, whether the session's loaded plugin is
+/// STALE relative to the version nyx bundles (#18b). The rule (per the spec): a reported
+/// version that is PRESENT and DIFFERS from the expected version is stale ("older or
+/// different" — we do not parse semver, a mismatch is enough). A MISSING/blank reported
+/// version is UNKNOWN ⇒ NOT stale (an old hook that does not report its version must not be
+/// flagged). When the expected version cannot be resolved (defensive `None`), nothing is
+/// ever flagged.
+fn plugin_is_outdated(reported: Option<&str>) -> bool {
+    let reported = match reported.map(str::trim) {
+        Some(v) if !v.is_empty() => v,
+        _ => return false, // unknown reported version ⇒ not stale.
+    };
+    match EXPECTED_PLUGIN_VERSION.as_deref() {
+        Some(expected) => reported != expected,
+        None => false, // expected version unresolved ⇒ never flag.
+    }
+}
+
+/// Whether `hook_event_name` is a per-turn ACTIVITY hook (the live dot), as opposed to a
+/// SESSION-lifecycle hook (`SessionStart`/`SessionEnd`). The activity hooks are resolved
+/// + short-circuited in [`agent_session_event`] so they never fall through to the
+/// session-row parse (which would reject them). Kept in sync with
+/// [`crate::agent_activity::ActivityEvent::from_hook`]'s recognized names — listing them
+/// here lets a recognized-but-no-dot-transition hook (e.g. a `Notification` of an ignored
+/// type) be acknowledged as a no-op instead of erroring.
+fn is_activity_hook(name: &str) -> bool {
+    matches!(
+        name,
+        "UserPromptSubmit"
+            | "PreToolUse"
+            | "PostToolUse"
+            | "PostToolUseFailure"
+            | "SubagentStart"
+            | "SubagentStop"
+            | "Notification"
+            | "Stop"
+            | "StopFailure"
+    )
+}
+
+/// Build the MINIMAL one-line nyx context injected into a STARTING agent session as the
+/// SessionStart hook's `additionalContext` (FEEDBACK #22), so the agent situates itself
+/// inside nyx AND can act on the MCP tools WITHOUT discovery:
+/// `You're in nyx — project "<P>" (project_id=<pid>) · workspace "<W>" (workspace_id=<wid>)
+/// · terminal_id=<tid>`. Read-only, resolved from the session's workspace → project; a
+/// LOOSE terminal (no workspace) yields `You're in nyx — terminal_id=<tid>`.
+///
+/// The IDs are the point: they let the agent call e.g. `list_commands(workspace_id=…)`
+/// directly instead of `list_projects` + `list_workspaces` first (cutting useless calls).
+/// Deliberately LEAN — NO path (already in the agent's cwd/context) and NO sibling-workspace
+/// list (rarely useful every session); the generic "what/when/how to use nyx" stays in the
+/// MCP server instructions, not re-injected here each turn.
+fn session_context_line(db: &Db, session: &db::AgentSession) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ws_id) = session.workspace_id.as_deref() {
+        if let Some(ws) = db.with_conn(|c| db::get_workspace(c, ws_id)).ok().flatten() {
+            if let Some(proj) = db
+                .with_conn(|c| db::get_project(c, &ws.project_id))
+                .ok()
+                .flatten()
+            {
+                parts.push(format!("project \"{}\" (project_id={})", proj.name, proj.id));
+            }
+            parts.push(format!("workspace \"{}\" (workspace_id={})", ws.name, ws.id));
+        }
+    }
+    parts.push(format!("terminal_id={}", session.terminal_id));
+    format!("You're in nyx — {}", parts.join(" · "))
+}
+
+/// `agent_session_event` — the Claude Code hook target. Handles BOTH:
+///   * SESSION lifecycle (`SessionStart`/`SessionEnd`) → persisted `agent_sessions`
+///     rows (the icon / resume candidate authority) + the `agent-sessions` topic;
+///   * per-turn ACTIVITY (`UserPromptSubmit`/`Pre`/`PostToolUse`/`Subagent*`/
+///     `Notification`/`Stop`/`StopFailure`) → the RUNTIME [`AgentActivityStore`] (the
+///     live dot), which is NEVER persisted (the anti-phantom contract — see
+///     [`crate::agent_activity`]).
+///
+/// The activity path is checked FIRST (via [`is_activity_hook`]) and resolved off
+/// `hook_event_name` + the `tool_name`/`notification_type` discriminators, then
+/// short-circuited (the per-turn hooks are NOT session events, so the adapter's
+/// `parse_event` would reject them). A `SubagentStop` only decrements the in-flight
+/// counter (a sub-agent finishing is not the main turn finishing); a `Notification` of an
+/// ignored type is acknowledged as a no-op rather than rejected. A `SessionEnd` also
+/// CLEARS the runtime activity (the clean-end anti-phantom reflex) on top of marking the
+/// row `ended`.
+///
+/// `activity` is the host's runtime store. Parity with the Tauri `agent_session_event`
+/// for the session half (over the shared `agent`/`db` layer).
+pub fn agent_session_event(
+    db: &Db,
+    activity: &AgentActivityStore,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
     let agent_kind = optional_str(args, "agent_kind")?.unwrap_or(db::AGENT_KIND_CLAUDE_CODE);
     let registry = AgentRegistry::default();
     let adapter = registry.get(agent_kind).ok_or_else(|| {
@@ -961,6 +1146,50 @@ pub fn agent_session_event(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
         )
     })?;
     let terminal_id = require_str(args, "NYX_TERMINAL_ID")?;
+
+    // --- Per-turn ACTIVITY hooks (the live dot; never persisted) --------------
+    // Resolve the runtime activity transition from the raw hook name + the relevant
+    // payload discriminators BEFORE the session-event parse, because these hooks are not
+    // session lifecycle events (the adapter would reject them). The `.cjs` hook forwards
+    // the full Claude stdin, so `tool_name` (PreToolUse/PostToolUse) and
+    // `notification_type` (Notification) are available here and let one hook name resolve
+    // to different states (AskUserQuestion → Waiting, permission_prompt → Waiting,
+    // idle_prompt → turn-end, …). A recognized activity hook updates the store and returns
+    // the `agent-sessions` change topic so the front re-pulls the live dot.
+    if let Some(hook_name) = args.get("hook_event_name").and_then(|v| v.as_str()) {
+        // The hooks that move the live dot are NOT session events — resolve them here and
+        // short-circuit so they never fall through to the session-row parse (which would
+        // reject them). `is_activity_hook` covers the recognized-but-no-op case (e.g. a
+        // `Notification` whose type we ignore) so it is still acknowledged, not errored.
+        if is_activity_hook(hook_name) {
+            let tool_name = args.get("tool_name").and_then(|v| v.as_str());
+            let notification_type = args.get("notification_type").and_then(|v| v.as_str());
+            if let Some(activity_event) =
+                ActivityEvent::from_hook(hook_name, tool_name, notification_type)
+            {
+                activity.apply(terminal_id, activity_event);
+                return Ok(ToolOutcome::changed(
+                    json!({
+                        "event": hook_name,
+                        "terminal_id": terminal_id,
+                        "activity": true,
+                    }),
+                    ChangedTopic::AgentSessions,
+                ));
+            }
+            // A recognized activity hook that resolves to no transition (e.g. a
+            // `Notification` of an ignored type, or a `SubagentStop` — kept as a no-op
+            // dot-wise even though the counter logic lives in `from_hook`). Acknowledge it
+            // so the best-effort hook never sees an error, but emit no change.
+            return Ok(ToolOutcome::read(json!({
+                "event": hook_name,
+                "terminal_id": terminal_id,
+                "activity": false,
+                "reason": "activity hook with no dot transition",
+            })));
+        }
+    }
+
     let event = adapter.parse_event(args).ok_or_else(|| {
         RpcError::new(
             RpcCode::InvalidArgument,
@@ -993,6 +1222,19 @@ pub fn agent_session_event(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
                     format!("unknown terminal {terminal_id}"),
                 ));
             };
+            // STALE-PLUGIN verdict (#18b): the session reports the plugin version it loaded
+            // at start; compare it to the version nyx bundles and record a RUNTIME (never
+            // persisted) per-terminal flag on the same activity store the sidebar already
+            // reads. A session keeps its loaded hooks until it restarts, so this is the only
+            // moment we learn the loaded version — set it ONCE here. A missing/unknown
+            // reported version reads as "not stale" (an old hook simply omits the field).
+            let plugin_version = optional_str(args, "plugin_version")?;
+            let plugin_outdated = plugin_is_outdated(plugin_version);
+            activity.set_plugin_outdated(terminal_id, plugin_outdated);
+            // The MINIMAL nyx-context line the SessionStart hook injects as
+            // `additionalContext` (#22). Returned in `structuredContent.context` so the
+            // `.cjs` hook can relay it WITHOUT any new per-spawn env injection.
+            let context = session_context_line(db, &session);
             Ok(ToolOutcome::changed(
                 json!({
                     "event": "SessionStart",
@@ -1002,11 +1244,35 @@ pub fn agent_session_event(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
                     "external_session_id": session.external_session_id,
                     "state": session.state,
                     "workspace_id": session.workspace_id,
+                    "plugin_outdated": plugin_outdated,
+                    "context": context,
                 }),
                 ChangedTopic::AgentSessions,
             ))
         }
         AgentEvent::End(end) => {
+            // INTERNAL-TRANSITION GUARD (the "icône qui saute après /clear" fix): a
+            // `/clear` or `/resume` makes Claude fire SessionEnd { reason } and then,
+            // immediately, SessionStart { source } on the SAME terminal — the session is
+            // replaced in place, it does not actually end. Marking the row `ended` here
+            // would vacate the `active` slot for the gap until the SessionStart lands, so
+            // `active_agent_sessions` would briefly omit this terminal and the sidebar
+            // icon would fall back to the generic terminal glyph (and the running dot
+            // vanish) for a frame. So for these we do NOTHING: the row stays `active`
+            // (the following SessionStart refreshes its external id in place), and the
+            // live activity is left untouched. A real end (logout, prompt_input_exit, …)
+            // falls through to the normal end path below.
+            if end.is_internal_transition() {
+                return Ok(ToolOutcome::read(json!({
+                    "event": "SessionEnd",
+                    "terminal_id": terminal_id,
+                    "ended": false,
+                    "reason": "internal transition (clear/resume) — session kept active",
+                })));
+            }
+            // A real SessionEnd ALSO clears the runtime activity (the anti-phantom
+            // reflex on the clean-end path — no live turn survives the session ending).
+            activity.clear(terminal_id);
             let outcome = db
                 .with_conn(
                     |c| -> Result<Option<(String, bool)>, diesel::result::Error> {
@@ -1163,6 +1429,102 @@ pub fn send_to_terminal(
     ))
 }
 
+/// Resolve ONE `keys` array element to the control bytes it injects. An element is treated
+/// as a NAMED KEY only when it matches the vocabulary EXACTLY (case-insensitive) — `enter`,
+/// the arrows/navigation keys, `ctrl+<letter>`, … ; ANY other string is LITERAL text and is
+/// written verbatim (its own UTF-8 bytes, no newline added). This is the seam that lets
+/// `send_keys` both TYPE into a TUI and send bare keystrokes, with no forced `\r`.
+///
+/// Kept as a PURE function (no I/O, no host) so the whole vocabulary is unit-testable.
+fn resolve_key_element(element: &str) -> Vec<u8> {
+    let lower = element.to_ascii_lowercase();
+    // A generic `ctrl+<letter>` → the control byte (ascii & 0x1f), covering the named
+    // ctrl+c/d/u/l/a/e below AND any other single letter (ctrl+x, ctrl+w, …).
+    if let Some(rest) = lower.strip_prefix("ctrl+") {
+        let bytes = rest.as_bytes();
+        if bytes.len() == 1 && bytes[0].is_ascii_alphabetic() {
+            return vec![bytes[0] & 0x1f];
+        }
+    }
+    let named: &[u8] = match lower.as_str() {
+        "enter" => b"\r",
+        "tab" => b"\t",
+        "escape" | "esc" => b"\x1b",
+        "backspace" => b"\x7f",
+        "space" => b" ",
+        "up" => b"\x1b[A",
+        "down" => b"\x1b[B",
+        "right" => b"\x1b[C",
+        "left" => b"\x1b[D",
+        "home" => b"\x1b[H",
+        "end" => b"\x1b[F",
+        "pageup" => b"\x1b[5~",
+        "pagedown" => b"\x1b[6~",
+        "delete" => b"\x1b[3~",
+        // Explicit ctrl shortcuts also covered by the generic ctrl+<letter> above; listed
+        // for completeness/clarity (they resolve identically).
+        "ctrl+c" => b"\x03",
+        "ctrl+d" => b"\x04",
+        "ctrl+u" => b"\x15",
+        "ctrl+l" => b"\x0c",
+        "ctrl+a" => b"\x01",
+        "ctrl+e" => b"\x05",
+        // Not a named key → LITERAL text, written verbatim (its own UTF-8 bytes, no newline).
+        _ => return element.as_bytes().to_vec(),
+    };
+    named.to_vec()
+}
+
+/// Resolve a `keys` array (left-to-right) into ONE raw byte sequence: each element is either
+/// LITERAL text (written verbatim) or a NAMED KEY resolved to its control bytes (see
+/// [`resolve_key_element`]). NO trailing `\r` is ever appended — the caller asks for `enter`
+/// explicitly when it wants to submit. Pure (testable) companion to [`send_keys`].
+fn resolve_keys(elements: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for element in elements {
+        out.extend_from_slice(&resolve_key_element(element));
+    }
+    out
+}
+
+/// `send_keys` — `{ terminal_id, keys }` (keys: an ARRAY of literal-text / named-key
+/// strings) → `{ terminal_id, sent: true, bytes }`. Validates the alive record, resolves
+/// `keys` to RAW bytes (named keys → control bytes; literal text → verbatim), then writes
+/// them into the live shell WITHOUT any appended `\r` via the shell's [`TerminalHost`]. The
+/// raw-key counterpart to `send_to_terminal` (which always appends a newline): this drives a
+/// raw-mode TUI (arrows, Esc, Ctrl+C, typing without submitting). Same liveness /
+/// `invalid_state` semantics as `send_to_terminal`.
+pub fn send_keys(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let terminal_id = require_str(args, "terminal_id")?;
+    let keys = require_str_vec(args, "keys")?;
+    // The id must name an ALIVE record first (so "unknown id" is distinct from "no PTY").
+    let record = db
+        .with_conn(|c| db::get_terminal(c, terminal_id))
+        .map_err(internal_db)?;
+    match record {
+        Some(r) if r.status == db::STATUS_ALIVE => {}
+        _ => return Err(bad_terminal_id_error(terminal_id)),
+    }
+    let bytes = resolve_keys(&keys);
+    let written = host
+        .send_keys(terminal_id, &bytes)
+        .map_err(|e| RpcError::new(RpcCode::Internal, format!("write to terminal failed: {e}")))?;
+    if !written {
+        return Err(RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "terminal {terminal_id} has no live shell yet (it may still be starting up, or \
+                 has already exited); try again, or open one with create_terminal"
+            ),
+        ));
+    }
+    Ok(ToolOutcome::read(json!({
+        "terminal_id": terminal_id,
+        "sent": true,
+        "bytes": bytes.len(),
+    })))
+}
+
 /// `list_terminals` — `{ include_closed? }` → `{ terminals }`. Lists records + the live
 /// `live`/`busy` bits from the shell's [`TerminalHost`]. Parity with the Tauri
 /// `list_terminals`.
@@ -1277,6 +1639,7 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
     host: &dyn TerminalHost,
+    activity: &AgentActivityStore,
     name: &str,
     args: &Value,
 ) -> Option<Result<ToolOutcome, RpcError>> {
@@ -1289,6 +1652,8 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         "list_workspaces" => read(list_workspaces(db, args)),
         "list_commands" => read(list_commands(db, runner, args)),
         crate::mcp::LIST_IMPORTABLE_SCRIPTS_TOOL => read(list_importable_scripts(db, args)),
+        // Project settings (rename + resume opt-in) — mutating → workspaces changed.
+        crate::mcp::SET_PROJECT_SETTINGS_TOOL => Some(set_project_settings(db, args)),
         // Command-template CRUD (mutating → carry a `changed` effect).
         crate::mcp::ADD_COMMAND_TOOL => Some(add_command(db, args)),
         crate::mcp::UPDATE_COMMAND_TOOL => Some(update_command(db, runner, args)),
@@ -1297,11 +1662,12 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         crate::mcp::REMOVE_COMMAND_TOOL => Some(remove_command(db, runner, args)),
         crate::mcp::REMOVE_COMMANDS_TOOL => Some(remove_commands(db, runner, args)),
         crate::mcp::CLEAR_COMMAND_OUTPUT_TOOL => Some(clear_command_output(db, runner, args)),
-        // Agent-session channel.
-        crate::mcp::AGENT_SESSION_EVENT_TOOL => Some(agent_session_event(db, args)),
+        // Agent-session channel (session lifecycle + runtime activity).
+        crate::mcp::AGENT_SESSION_EVENT_TOOL => Some(agent_session_event(db, activity, args)),
         // Interactive-terminal tools (DB-record half + the shell's TerminalHost).
         crate::mcp::CREATE_TERMINAL_TOOL => Some(create_terminal(db, host, args)),
         crate::mcp::SEND_TO_TERMINAL_TOOL => Some(send_to_terminal(db, host, args)),
+        crate::mcp::SEND_KEYS_TOOL => Some(send_keys(db, host, args)),
         crate::mcp::LIST_TERMINALS_TOOL => read(list_terminals(db, host, args)),
         crate::mcp::CLOSE_TERMINAL_TOOL => Some(close_terminal(db, host, args)),
         crate::mcp::READ_TERMINAL_TOOL => read(read_terminal(db, args)),
@@ -1423,6 +1789,82 @@ mod tests {
         assert_eq!(err.code, RpcCode::InvalidId);
     }
 
+    // --- send_keys: the PURE key resolver (named keys, ctrl+<x>, literal, mixed) -------
+
+    #[test]
+    fn resolve_keys_named_keys_map_to_control_bytes() {
+        // Each named key (case-insensitive) resolves to its documented control bytes.
+        assert_eq!(resolve_key_element("enter"), b"\r");
+        assert_eq!(resolve_key_element("ENTER"), b"\r");
+        assert_eq!(resolve_key_element("tab"), b"\t");
+        assert_eq!(resolve_key_element("escape"), b"\x1b");
+        assert_eq!(resolve_key_element("esc"), b"\x1b");
+        assert_eq!(resolve_key_element("backspace"), b"\x7f");
+        assert_eq!(resolve_key_element("space"), b" ");
+        assert_eq!(resolve_key_element("up"), b"\x1b[A");
+        assert_eq!(resolve_key_element("Down"), b"\x1b[B");
+        assert_eq!(resolve_key_element("right"), b"\x1b[C");
+        assert_eq!(resolve_key_element("left"), b"\x1b[D");
+        assert_eq!(resolve_key_element("home"), b"\x1b[H");
+        assert_eq!(resolve_key_element("end"), b"\x1b[F");
+        assert_eq!(resolve_key_element("pageup"), b"\x1b[5~");
+        assert_eq!(resolve_key_element("pagedown"), b"\x1b[6~");
+        assert_eq!(resolve_key_element("delete"), b"\x1b[3~");
+    }
+
+    #[test]
+    fn resolve_keys_ctrl_letter_is_generic_and_case_insensitive() {
+        // The named ctrl shortcuts...
+        assert_eq!(resolve_key_element("ctrl+c"), b"\x03");
+        assert_eq!(resolve_key_element("ctrl+d"), b"\x04");
+        assert_eq!(resolve_key_element("ctrl+u"), b"\x15");
+        assert_eq!(resolve_key_element("ctrl+l"), b"\x0c");
+        assert_eq!(resolve_key_element("ctrl+a"), b"\x01");
+        assert_eq!(resolve_key_element("ctrl+e"), b"\x05");
+        // ...are just the generic ctrl+<letter> rule (byte = letter ascii & 0x1f), which
+        // also covers any other letter and is case-insensitive.
+        assert_eq!(resolve_key_element("Ctrl+C"), b"\x03");
+        assert_eq!(resolve_key_element("ctrl+x"), &[0x18]); // 'x' & 0x1f
+        assert_eq!(resolve_key_element("ctrl+z"), &[0x1a]); // 'z' & 0x1f
+    }
+
+    #[test]
+    fn resolve_keys_literal_text_passes_through_verbatim() {
+        // Anything not in the vocabulary is literal text — its own UTF-8 bytes, no newline.
+        assert_eq!(resolve_key_element("hello"), b"hello");
+        assert_eq!(resolve_key_element("my message"), b"my message");
+        // A near-miss is still literal (only an EXACT match is a named key).
+        assert_eq!(resolve_key_element("enter "), b"enter ");
+        assert_eq!(resolve_key_element("ctrl+"), b"ctrl+");
+        assert_eq!(resolve_key_element("ctrl+cc"), b"ctrl+cc");
+        // Multi-byte UTF-8 literals survive verbatim.
+        assert_eq!(resolve_key_element("é"), "é".as_bytes());
+    }
+
+    #[test]
+    fn resolve_keys_mixed_array_concatenates_and_adds_no_forced_newline() {
+        // ["my message", "enter"] → the text bytes THEN a single \r (the explicit submit) —
+        // and NOTHING else: no second/forced \r is appended by the resolver.
+        let bytes = resolve_keys(&["my message".to_string(), "enter".to_string()]);
+        assert_eq!(bytes, b"my message\r");
+
+        // A bare keystroke array carries only that key's bytes (no newline).
+        assert_eq!(resolve_keys(&["up".to_string()]), b"\x1b[A");
+        assert_eq!(resolve_keys(&["ctrl+c".to_string()]), b"\x03");
+
+        // Typing WITHOUT submitting: literal text alone never gains a trailing newline.
+        assert_eq!(resolve_keys(&["draft".to_string()]), b"draft");
+
+        // A richer mix resolves left-to-right into one contiguous sequence.
+        let bytes = resolve_keys(&[
+            "ab".to_string(),
+            "left".to_string(),
+            "X".to_string(),
+            "enter".to_string(),
+        ]);
+        assert_eq!(bytes, b"ab\x1b[DX\r");
+    }
+
     #[test]
     fn add_then_remove_command_roundtrips() {
         let _g = db_guard();
@@ -1448,6 +1890,77 @@ mod tests {
     }
 
     #[test]
+    fn set_project_settings_renames_and_toggles_resume_and_persists() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "Old", "/tmp/sps", None))
+            .unwrap();
+        // A fresh project defaults to resume OFF.
+        assert!(!project.resume_agent_sessions);
+
+        // Rename + flip resume ON in one call.
+        let out = set_project_settings(
+            &db,
+            &json!({ "project_id": project.id, "name": "New", "resume_agent_sessions": true }),
+        )
+        .unwrap();
+        // The returned project reflects both writes…
+        assert_eq!(out.result["project"]["name"], json!("New"));
+        assert_eq!(out.result["project"]["resume_agent_sessions"], json!(true));
+        // …and a workspaces refresh is requested so the front re-pulls.
+        assert_eq!(out.effects, vec![ChangedTopic::Workspaces]);
+
+        // The writes are PERSISTED (a fresh read sees them).
+        let got = db
+            .with_conn(|c| db::get_project(c, &project.id))
+            .unwrap()
+            .expect("project still exists");
+        assert_eq!(got.name, "New");
+        assert!(got.resume_agent_sessions);
+
+        // A partial update touches only the supplied field (resume back OFF, name kept).
+        set_project_settings(
+            &db,
+            &json!({ "project_id": project.id, "resume_agent_sessions": false }),
+        )
+        .unwrap();
+        let after = db
+            .with_conn(|c| db::get_project(c, &project.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.name, "New", "omitted name is unchanged");
+        assert!(!after.resume_agent_sessions, "resume toggled back OFF");
+    }
+
+    #[test]
+    fn set_project_settings_unknown_id_is_invalid_id() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let err =
+            set_project_settings(&db, &json!({ "project_id": "nope", "name": "X" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+    }
+
+    #[test]
+    fn set_project_settings_blank_name_is_invalid_argument() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "Keep", "/tmp/spsb", None))
+            .unwrap();
+        let err = set_project_settings(&db, &json!({ "project_id": project.id, "name": "   " }))
+            .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        // The original name is untouched (the blank rename was refused before any write).
+        let got = db
+            .with_conn(|c| db::get_project(c, &project.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.name, "Keep");
+    }
+
+    #[test]
     fn probe_reports_ok() {
         let _g = db_guard();
         let db = Db::in_memory();
@@ -1462,5 +1975,595 @@ mod tests {
         let db = Db::in_memory();
         let err = read_terminal(&db, &json!({ "terminal_id": "nope" })).unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidId);
+    }
+
+    // --- agent_session_event: runtime ACTIVITY (the live dot) ----------------
+
+    use crate::agent_activity::{Activity, AgentActivityStore};
+
+    /// A `UserPromptSubmit` hook drives the runtime activity to `working` (the live dot)
+    /// WITHOUT touching the persisted `agent_sessions` table, and emits the
+    /// `agent-sessions` change topic so the front re-pulls. The terminal need not have a
+    /// DB session row — activity is independent of the session lifecycle.
+    #[test]
+    fn agent_session_event_prompt_marks_working_and_changes() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let out = agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        assert_eq!(out.effects, vec![ChangedTopic::AgentSessions]);
+        assert_eq!(out.result["activity"], json!(true));
+        assert!(activity.snapshot(&tid).unwrap().activity == Activity::Working);
+    }
+
+    /// A `Stop` hook drives activity back to `idle` AND raises the focus-aware "response
+    /// ready" notification (the green dot), again over the runtime store only.
+    #[test]
+    fn agent_session_event_stop_idles_and_raises_ready() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "Stop", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Idle);
+        assert!(
+            snap.ready_unread,
+            "Stop raises the response-ready notification"
+        );
+    }
+
+    /// `SubagentStart`/`SubagentStop` move the in-flight counter but must NOT lower the
+    /// main running dot: a sub-agent finishing is not the main turn finishing, so the dot
+    /// stays `working` (and is never raised to `ready`). The best-effort hook never errors.
+    #[test]
+    fn agent_session_event_subagent_lifecycle_keeps_main_turn_working() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "SubagentStart", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        assert!(activity.snapshot(&tid).unwrap().activity == Activity::Working);
+        let out = agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "SubagentStop", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        // A recognized activity hook → change topic emitted (the front re-pulls), but the
+        // resolved dot is still working (the main turn never ended).
+        assert_eq!(out.result["activity"], json!(true));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Working);
+        assert!(!snap.ready_unread, "a sub-agent stop never raises ready");
+    }
+
+    /// THE #21 FIX over the MCP boundary: a BACKGROUND sub-agent whose hook order is
+    /// `SubagentStart` → `Stop` → `SubagentStop`. The `Stop` must NOT green the dot while the
+    /// background sub-agent is still in flight — the dot stays `working` until the trailing
+    /// `SubagentStop`, which then idles + raises ready. A SYNCHRONOUS sub-agent
+    /// (`SubagentStart` → `SubagentStop` → `Stop`) greens normally at the `Stop`.
+    #[test]
+    fn agent_session_event_background_subagent_defers_ready_until_subagent_stop() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let send = |args: serde_json::Value| agent_session_event(&db, &activity, &args).unwrap();
+
+        // --- BACKGROUND: SubagentStart → Stop → SubagentStop ---
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
+        send(json!({ "hook_event_name": "SubagentStart", "NYX_TERMINAL_ID": tid }));
+        // The main turn ends while the background sub-agent runs: still working, NO green.
+        send(json!({ "hook_event_name": "Stop", "NYX_TERMINAL_ID": tid }));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(
+            snap.activity,
+            Activity::Working,
+            "Stop with a background sub-agent in flight stays working — no premature green"
+        );
+        assert!(!snap.ready_unread, "the green is deferred while the background runs");
+        // The background sub-agent finishes → NOW idle + ready.
+        send(json!({ "hook_event_name": "SubagentStop", "NYX_TERMINAL_ID": tid }));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Idle, "the last sub-agent settles the turn");
+        assert!(snap.ready_unread, "the green is raised on the trailing SubagentStop");
+
+        // --- SYNCHRONOUS: SubagentStart → SubagentStop → Stop (greens at the Stop) ---
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
+        send(json!({ "hook_event_name": "SubagentStart", "NYX_TERMINAL_ID": tid }));
+        send(json!({ "hook_event_name": "SubagentStop", "NYX_TERMINAL_ID": tid }));
+        // Sub-agent already gone → the Stop idles + greens immediately.
+        assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Working);
+        send(json!({ "hook_event_name": "Stop", "NYX_TERMINAL_ID": tid }));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Idle);
+        assert!(snap.ready_unread, "a synchronous sub-agent greens at the Stop");
+    }
+
+    /// A single long-running tool keeps the dot `working` between its `PreToolUse` and
+    /// `PostToolUse` with NO timer, and `AskUserQuestion` drives the `waiting` (yellow)
+    /// state end-to-end through the MCP tool. Also covers `permission_prompt` → waiting and
+    /// `idle_prompt` → idle+ready (the notification discrimination via the payload).
+    #[test]
+    fn agent_session_event_tool_counter_and_waiting_states() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let send = |args: serde_json::Value| agent_session_event(&db, &activity, &args).unwrap();
+
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
+        // A long tool: PreToolUse with no Post → stays working across reads.
+        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "NYX_TERMINAL_ID": tid }));
+        assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Working);
+        send(
+            json!({ "hook_event_name": "PostToolUse", "tool_name": "Bash", "NYX_TERMINAL_ID": tid }),
+        );
+        assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Working);
+
+        // AskUserQuestion → waiting (yellow), then its Post resumes working.
+        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }));
+        assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Waiting);
+        send(json!({ "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }));
+        assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Working);
+
+        // A permission prompt → waiting.
+        send(json!({ "hook_event_name": "Notification", "notification_type": "permission_prompt", "NYX_TERMINAL_ID": tid }));
+        assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Waiting);
+
+        // idle_prompt → idle + ready (a turn end via Notification).
+        send(json!({ "hook_event_name": "Notification", "notification_type": "idle_prompt", "NYX_TERMINAL_ID": tid }));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Idle);
+        assert!(snap.ready_unread, "idle_prompt raises the ready notification");
+
+        // StopFailure also finishes the turn (a new prompt then a StopFailure).
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
+        let out = send(json!({ "hook_event_name": "StopFailure", "NYX_TERMINAL_ID": tid }));
+        assert_eq!(out.result["activity"], json!(true));
+        assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Idle);
+
+        // A Notification of an unknown type is acknowledged as a no-op (no error, no
+        // change), leaving the dot where it was.
+        let out = send(json!({ "hook_event_name": "Notification", "notification_type": "weird_unknown", "NYX_TERMINAL_ID": tid }));
+        assert!(out.effects.is_empty());
+        assert_eq!(out.result["activity"], json!(false));
+    }
+
+    /// #26 — the "chat about this" decline on an `AskUserQuestion` must NOT leave the dot
+    /// stuck yellow. Drives the WHOLE flow through the real hook routing (`from_hook` +
+    /// `apply`): a question raises `Waiting`, then the agent resumes working via a tool hook
+    /// (the empirically-uncertain resume path) and the dot must read `Working`, not `Waiting`.
+    /// Covered both for a tool's `PreToolUse` and a `PostToolUse`.
+    #[test]
+    fn agent_session_event_decline_question_clears_waiting() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let send = |args: serde_json::Value| agent_session_event(&db, &activity, &args).unwrap();
+
+        // A question blocks the agent → yellow.
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
+        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }));
+        assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Waiting);
+        // "chat about this": the agent resumes by running a tool — the dot must clear to blue
+        // even though no AskUserQuestion PostToolUse arrived.
+        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "NYX_TERMINAL_ID": tid }));
+        assert_eq!(
+            activity.snapshot(&tid).unwrap().activity,
+            Activity::Working,
+            "a tool starting after a declined question clears the stuck yellow (#26)"
+        );
+
+        // And via a UserPromptSubmit resume path (a fresh chat message) on a NEW terminal.
+        let created2 = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid2 = created2.result["terminal_id"].as_str().unwrap().to_string();
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid2 }));
+        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid2 }));
+        assert_eq!(activity.snapshot(&tid2).unwrap().activity, Activity::Waiting);
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid2 }));
+        assert_eq!(
+            activity.snapshot(&tid2).unwrap().activity,
+            Activity::Working,
+            "a new prompt after a declined question clears the stuck yellow (#26)"
+        );
+    }
+
+    /// A clean `SessionEnd` clears the runtime activity too (the clean-end anti-phantom
+    /// reflex): a session ending mid-`working` drops the live dot. Drives a real
+    /// SessionStart→prompt→SessionEnd over a terminal with a DB session row.
+    #[test]
+    fn agent_session_event_session_end_clears_activity() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        // Record the session (so SessionEnd has a row to end).
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-1",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        // A prompt → working.
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        assert!(activity.snapshot(&tid).unwrap().activity == Activity::Working);
+        // SessionEnd → clears the runtime activity (no phantom).
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "sid-1",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        assert!(
+            activity.snapshot(&tid).is_none(),
+            "SessionEnd clears the live dot"
+        );
+    }
+
+    /// SessionStart returns a MINIMAL nyx `context` line (#22) in `structuredContent` so the
+    /// hook can inject it as `additionalContext`. A LOOSE terminal (no workspace) yields
+    /// `You're in nyx — terminal_id=<id>` (no project/workspace segment).
+    #[test]
+    fn agent_session_event_start_returns_minimal_nyx_context() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let out = agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-ctx",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        let ctx = out.result["context"]
+            .as_str()
+            .expect("SessionStart carries a `context` line");
+        assert!(
+            ctx.starts_with("You're in nyx"),
+            "context opens with the nyx orientation: {ctx}"
+        );
+        assert!(
+            ctx.contains(&format!("terminal_id={tid}")),
+            "context names the terminal id: {ctx}"
+        );
+        assert!(
+            !ctx.contains("workspace_id="),
+            "a loose terminal has no workspace segment: {ctx}"
+        );
+    }
+
+    /// The #22 ENRICHMENT: SessionStart on a WORKSPACE-bound terminal carries the
+    /// `project_id` + `workspace_id` (and names) in the context line, so the agent can call
+    /// e.g. `list_commands(workspace_id=…)` directly — no `list_projects`/`list_workspaces`
+    /// discovery first.
+    #[test]
+    fn agent_session_event_start_context_carries_project_and_workspace_ids() {
+        use crate::schema::terminals;
+        use diesel::prelude::*;
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let (project, workspace) = db
+            .with_conn(|c| db::create_project(c, "palbank", "/tmp/pb", None))
+            .unwrap();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        // Bind the terminal to the project's root workspace.
+        db.with_conn(|c| {
+            diesel::update(terminals::table.find(&tid))
+                .set(terminals::workspace_id.eq(Some(workspace.id.clone())))
+                .execute(c)
+        })
+        .unwrap();
+
+        let out = agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-ws",
+                "cwd": "/tmp/pb",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        let ctx = out.result["context"].as_str().unwrap();
+        assert!(
+            ctx.contains(&format!("project_id={}", project.id)),
+            "context carries the project_id: {ctx}"
+        );
+        assert!(
+            ctx.contains(&format!("workspace_id={}", workspace.id)),
+            "context carries the workspace_id: {ctx}"
+        );
+        assert!(
+            ctx.contains("project \"palbank\""),
+            "context names the project: {ctx}"
+        );
+    }
+
+    /// #18b — the STALE-PLUGIN verdict at SessionStart. A reported `plugin_version` that
+    /// DIFFERS from the bundled (expected) version flags the terminal `plugin_outdated`
+    /// (runtime, on the activity store + in the result); the CURRENT bundled version does
+    /// NOT; and a MISSING reported version is treated as unknown ⇒ NOT stale. The expected
+    /// version is sourced from the bundled `plugin.json` at runtime (the single source of
+    /// truth) — this test reads it the SAME way so it never hard-codes a number to drift.
+    #[test]
+    fn agent_session_event_start_flags_stale_plugin() {
+        let _g = db_guard();
+        // The expected version is parsed from the bundled manifest (must resolve for the
+        // check to be meaningful).
+        let expected = EXPECTED_PLUGIN_VERSION
+            .as_deref()
+            .expect("bundled plugin.json carries a version");
+
+        // 1) A STALE (older/different) reported version → flagged outdated.
+        {
+            let db = Db::in_memory();
+            let host = NoTerminalHost;
+            let activity = AgentActivityStore::new();
+            let created = create_terminal(&db, &host, &json!({})).unwrap();
+            let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+            let out = agent_session_event(
+                &db,
+                &activity,
+                &json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "sid-stale",
+                    "cwd": "/work",
+                    "NYX_TERMINAL_ID": tid,
+                    "plugin_version": "0.0.1-old",
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                out.result["plugin_outdated"],
+                json!(true),
+                "a stale reported version flags the session outdated"
+            );
+            assert!(
+                activity.snapshot(&tid).unwrap().plugin_outdated,
+                "the stale verdict is recorded on the runtime activity store"
+            );
+        }
+
+        // 2) The CURRENT bundled version → NOT outdated.
+        {
+            let db = Db::in_memory();
+            let host = NoTerminalHost;
+            let activity = AgentActivityStore::new();
+            let created = create_terminal(&db, &host, &json!({})).unwrap();
+            let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+            let out = agent_session_event(
+                &db,
+                &activity,
+                &json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "sid-current",
+                    "cwd": "/work",
+                    "NYX_TERMINAL_ID": tid,
+                    "plugin_version": expected,
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                out.result["plugin_outdated"],
+                json!(false),
+                "the current bundled version is not outdated"
+            );
+            // No outdated entry materialized for a current (and otherwise idle) session.
+            assert!(
+                activity.snapshot(&tid).map(|s| s.plugin_outdated) != Some(true),
+                "a current plugin leaves no stale badge"
+            );
+        }
+
+        // 3) A MISSING reported version (an OLD hook that does not report it) → unknown ⇒
+        // NOT outdated (must never be flagged on the absence of the field).
+        {
+            let db = Db::in_memory();
+            let host = NoTerminalHost;
+            let activity = AgentActivityStore::new();
+            let created = create_terminal(&db, &host, &json!({})).unwrap();
+            let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+            let out = agent_session_event(
+                &db,
+                &activity,
+                &json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": "sid-unknown",
+                    "cwd": "/work",
+                    "NYX_TERMINAL_ID": tid,
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                out.result["plugin_outdated"],
+                json!(false),
+                "a missing reported version is unknown ⇒ not stale"
+            );
+        }
+    }
+
+    /// THE `/clear` ICON FIX: a `SessionEnd { reason: "clear" }` is an INTERNAL transition
+    /// (the session is immediately re-opened on the SAME terminal), so it must NOT mark the
+    /// row `ended` and must NOT drop the runtime activity — otherwise the active-session row
+    /// blinks out for the gap until the following SessionStart lands and the sidebar icon
+    /// falls back to the generic terminal glyph (the "icône qui saute" bug). After the
+    /// clear-end the terminal is STILL the host of an active session and STILL working.
+    #[test]
+    fn agent_session_event_clear_keeps_session_active_and_working() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        // A live session + an in-flight turn (the dot is on).
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-1",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+
+        // `/clear` → SessionEnd { reason: clear }. The guard keeps everything live.
+        let out = agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "sid-1",
+                "reason": "clear",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        assert_eq!(out.result["ended"], json!(false));
+        assert!(
+            out.effects.is_empty(),
+            "an internal transition emits no agent-sessions change (no blink)"
+        );
+        // The DB row is STILL active → the icon never falls back.
+        let actives = db.with_conn(db::active_agent_sessions).unwrap();
+        assert!(
+            actives.iter().any(|a| a.terminal_id == tid),
+            "the session stays active across a /clear"
+        );
+        // The runtime activity is STILL working → the dot never blinks.
+        assert_eq!(
+            activity.snapshot(&tid).unwrap().activity,
+            Activity::Working,
+            "the live dot survives a /clear transition"
+        );
+
+        // The following SessionStart { source: clear } refreshes the row in place (new id),
+        // keeping ONE active row — not two.
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-2",
+                "source": "clear",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        let actives = db.with_conn(db::active_agent_sessions).unwrap();
+        assert_eq!(
+            actives.iter().filter(|a| a.terminal_id == tid).count(),
+            1,
+            "still exactly one active session after the clear→start cycle"
+        );
+    }
+
+    /// A bogus hook (neither an activity hook nor a session event) still errors as before
+    /// — the activity path does not swallow genuinely unrecognizable payloads. (Note:
+    /// `PreToolUse` is now a recognized ACTIVITY hook, so it is NOT a valid bogus name; we
+    /// use a hook name Claude never emits.)
+    #[test]
+    fn agent_session_event_unrecognized_payload_still_errors() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        let err = agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "TotallyUnknownHook", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
     }
 }

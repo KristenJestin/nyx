@@ -1,10 +1,17 @@
 import { useCallback, useRef, useState } from "react";
+import { isBridgeError } from "@/bridge";
 
+import { toast } from "@/components/ui/toast";
 import { AddWorkspaceDialog } from "./add-workspace-dialog";
 import { ProjectDialog, type ProjectDialogMode } from "./project-dialog";
 import { basename, pickDirectory } from "./folder-picker";
 import { DEFAULT_ROOT_LABEL, defaultWorkspaceLabel } from "./project-item.utils";
 import type { ProjectTree, ProjectWithRoot, WorkspaceRecord } from "./use-projects";
+
+/** Extract the real backend reason from a caught bridge/IPC error (see FEEDBACK #9). */
+function errorReason(e: unknown, fallback: string): string {
+  return isBridgeError(e) ? e.message : typeof e === "string" ? e : fallback;
+}
 
 export interface UseManualAddDeps {
   createProject: (name: string, rootPath: string, rootName?: string) => Promise<ProjectWithRoot>;
@@ -15,6 +22,8 @@ export interface UseManualAddDeps {
   setProjectResumeAgentSessions?: (id: string, resume: boolean) => Promise<void>;
   /** Delete a project + its workspaces (terminals detached, kept). */
   deleteProject?: (id: string) => Promise<void>;
+  /** Delete a single (non-root) workspace (its instances cascade, terminals detached). */
+  deleteWorkspace?: (id: string) => Promise<void>;
   /** Folder picker; injectable so tests stub it instead of the Tauri plugin. */
   pick?: (title?: string) => Promise<string | null>;
 }
@@ -28,6 +37,12 @@ export interface UseManualAdd {
   editProject: (tree: ProjectTree) => void;
   /** Open the project DELETE confirmation modal for `tree`'s project. */
   removeProject: (tree: ProjectTree) => void;
+  /**
+   * Open the workspace DELETE confirmation modal for a single (non-root)
+   * `workspace`. No-op for the root workspace (the backend rejects it; the UI
+   * never offers the action there) — guarded so a stray call is inert.
+   */
+  removeWorkspace: (workspace: WorkspaceRecord) => void;
   /** The mounted dialogs (render once near the app root). */
   dialog: React.ReactNode;
 }
@@ -43,10 +58,18 @@ interface WorkspaceDialogState {
 /** Internal state of the project create/edit/delete dialog. */
 interface ProjectDialogState {
   mode: ProjectDialogMode;
+  /**
+   * The entity the `delete` flow targets (default `"project"`). `"workspace"`
+   * reuses the same destructive-confirm dialog but removes a single workspace via
+   * `deleteWorkspace`; create/edit are always projects.
+   */
+  entity?: "project" | "workspace";
   /** Present for `create`: the picked folder path. */
   path?: string;
-  /** Present for `edit`/`delete`: the target project's id. */
+  /** Present for `edit`/project-`delete`: the target project's id. */
   projectId?: string;
+  /** Present for workspace-`delete`: the target workspace's id. */
+  workspaceId?: string;
   defaultName: string;
   /** Present for `edit`: the project's current resume-agent-sessions opt-in. */
   resumeAgentSessions?: boolean;
@@ -74,6 +97,7 @@ export function useManualAdd({
   updateProject,
   setProjectResumeAgentSessions,
   deleteProject,
+  deleteWorkspace,
   pick = pickDirectory,
 }: UseManualAddDeps): UseManualAdd {
   const [wsDialog, setWsDialog] = useState<WorkspaceDialogState | null>(null);
@@ -140,6 +164,19 @@ export function useManualAdd({
     });
   }, []);
 
+  const removeWorkspace = useCallback((workspace: WorkspaceRecord) => {
+    // The root workspace can NEVER be removed on its own (the backend rejects it and
+    // the sidebar hides the action there); guard so a stray call is inert.
+    if (workspace.is_root) return;
+    setError(null);
+    setProjDialog({
+      mode: "delete",
+      entity: "workspace",
+      workspaceId: workspace.id,
+      defaultName: workspace.name,
+    });
+  }, []);
+
   const confirmProject = useCallback(
     async (name: string) => {
       if (!projDialog) return;
@@ -151,19 +188,34 @@ export function useManualAdd({
           // the smart "main" default — never the folder name (kills the
           // Image-3/4 duplication). Both are editable afterwards.
           await createProject(name, projDialog.path, DEFAULT_ROOT_LABEL);
+          toast.success(`Project “${name}” created`);
         } else if (projDialog.mode === "edit" && projDialog.projectId) {
           await updateProject?.(projDialog.projectId, name);
+          toast.success("Project renamed");
+        } else if (
+          projDialog.mode === "delete" &&
+          projDialog.entity === "workspace" &&
+          projDialog.workspaceId
+        ) {
+          await deleteWorkspace?.(projDialog.workspaceId);
+          toast.success(`Workspace “${projDialog.defaultName}” removed`);
         } else if (projDialog.mode === "delete" && projDialog.projectId) {
           await deleteProject?.(projDialog.projectId);
+          toast.success(`Project “${projDialog.defaultName}” deleted`);
         }
         setProjDialog(null); // success → close
       } catch (e) {
-        setError(typeof e === "string" ? e : "Could not complete the action. Please try again.");
+        // The error toast carries the REAL backend reason (e.g. a delete refused
+        // because a command is still running, or removing the root workspace); a
+        // trimmed line stays inline too.
+        const reason = errorReason(e, "Could not complete the action. Please try again.");
+        setError(reason);
+        toast.error(reason);
       } finally {
         setSubmitting(false);
       }
     },
-    [projDialog, createProject, updateProject, deleteProject],
+    [projDialog, createProject, updateProject, deleteProject, deleteWorkspace],
   );
 
   // --- Workspace add --------------------------------------------------------
@@ -195,14 +247,16 @@ export function useManualAdd({
       try {
         await createWorkspace(wsDialog.projectId, name, wsDialog.path);
         setWsDialog(null); // success → close
+        toast.success(`Workspace “${name}” added`);
       } catch (e) {
-        // Surface the backend rejection (e.g. duplicate path in this project)
-        // inline; keep the dialog open so the user can pick a different folder.
-        setError(
-          typeof e === "string"
-            ? e
-            : "Could not add this folder (it may already be a workspace in this project).",
+        // Surface the backend rejection (e.g. duplicate path in this project) both
+        // inline (kept open so the user can pick a different folder) and as a toast.
+        const reason = errorReason(
+          e,
+          "Could not add this folder (it may already be a workspace in this project).",
         );
+        setError(reason);
+        toast.error(reason);
       } finally {
         setSubmitting(false);
       }
@@ -237,6 +291,7 @@ export function useManualAdd({
         key={projKey}
         open={projDialog !== null}
         mode={projDialog?.mode ?? "create"}
+        entity={projDialog?.entity}
         path={projDialog?.path}
         defaultName={projDialog?.defaultName ?? ""}
         resumeAgentSessions={projDialog?.resumeAgentSessions}
@@ -246,11 +301,17 @@ export function useManualAdd({
                 if (!projDialog?.projectId) return;
                 const id = projDialog.projectId;
                 // Reflect the toggle locally so the switch tracks immediately, then
-                // persist (takes effect at once, independent of the name Save).
-                setProjDialog((prev) =>
-                  prev ? { ...prev, resumeAgentSessions: resume } : prev,
+                // persist (takes effect at once, independent of the name Save). The
+                // toast surfaces the outcome (the real reason on a backend failure).
+                setProjDialog((prev) => (prev ? { ...prev, resumeAgentSessions: resume } : prev));
+                void setProjectResumeAgentSessions(id, resume).then(
+                  () =>
+                    toast.success(
+                      resume ? "Agent-session resume enabled" : "Agent-session resume disabled",
+                    ),
+                  (e: unknown) =>
+                    toast.error(errorReason(e, "Could not update the resume setting.")),
                 );
-                void setProjectResumeAgentSessions(id, resume);
               }
             : undefined
         }
@@ -265,5 +326,5 @@ export function useManualAdd({
     </>
   );
 
-  return { addProject, addWorkspace, editProject, removeProject, dialog };
+  return { addProject, addWorkspace, editProject, removeProject, removeWorkspace, dialog };
 }

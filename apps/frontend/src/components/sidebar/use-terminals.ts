@@ -285,20 +285,24 @@ export function useTerminals(): UseTerminals {
           t.id === id ? { ...t, workspace_id: workspaceId, workspace_binding_mode: mode } : t,
         ),
       );
-      await nyxBridge.invoke("attach_terminal", {
-        terminalId: id,
-        workspaceId,
-        mode,
-      }).catch(() => {});
+      await nyxBridge
+        .invoke("attach_terminal", {
+          terminalId: id,
+          workspaceId,
+          mode,
+        })
+        .catch(() => {});
     },
     [],
   );
 
   const autoAttach = useCallback(async (id: string, cwd: string | null) => {
-    const res = await nyxBridge.invoke<{
-      workspace_id: string | null;
-      changed: boolean;
-    }>("auto_attach_terminal", { terminalId: id, cwd }).catch(() => null);
+    const res = await nyxBridge
+      .invoke<{
+        workspace_id: string | null;
+        changed: boolean;
+      }>("auto_attach_terminal", { terminalId: id, cwd })
+      .catch(() => null);
     if (res?.changed && res.workspace_id) {
       // Reflect the (auto) binding so the spine moves it under the workspace.
       setTerminals((prev) =>
@@ -387,44 +391,47 @@ export function useTerminals(): UseTerminals {
   useEffect(() => {
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe(TERMINALS_CHANGED_EVENT, () => {
-      if (torndown) return;
-      void nyxBridge.invoke<TerminalRecord[]>("list_terminals")
-        .then((rows) => {
-          if (torndown) return;
-          const aliveById = new Map<string, TerminalRecord>();
-          for (const r of rows) {
-            if (r.status === "alive") aliveById.set(r.id, r);
-          }
-          setTerminals((prev) => {
-            // Keep existing records in their current slot/state; append the alive
-            // records the front does not yet know about (MCP-created), preserving the
-            // backend's order; drop any record no longer alive.
-            const kept = prev.filter((t) => aliveById.has(t.id));
-            const known = new Set(kept.map((t) => t.id));
-            const added = rows.filter((r) => aliveById.has(r.id) && !known.has(r.id));
-            const next = [...kept, ...added];
-            // Re-target the active terminal ONLY if it was dropped (closed/removed). A
-            // newly-appended terminal (e.g. one an agent opened over MCP) does NOT steal
-            // focus from the user's current terminal — it simply mounts in the background
-            // and appears in the sidebar; the user (or a follow-up select) switches to it.
-            setActiveId((active) => {
-              if (active && aliveById.has(active)) return active;
-              if (next.length === 0) return null;
-              return next[0].id;
+    void nyxBridge
+      .subscribe(TERMINALS_CHANGED_EVENT, () => {
+        if (torndown) return;
+        void nyxBridge
+          .invoke<TerminalRecord[]>("list_terminals")
+          .then((rows) => {
+            if (torndown) return;
+            const aliveById = new Map<string, TerminalRecord>();
+            for (const r of rows) {
+              if (r.status === "alive") aliveById.set(r.id, r);
+            }
+            setTerminals((prev) => {
+              // Keep existing records in their current slot/state; append the alive
+              // records the front does not yet know about (MCP-created), preserving the
+              // backend's order; drop any record no longer alive.
+              const kept = prev.filter((t) => aliveById.has(t.id));
+              const known = new Set(kept.map((t) => t.id));
+              const added = rows.filter((r) => aliveById.has(r.id) && !known.has(r.id));
+              const next = [...kept, ...added];
+              // Re-target the active terminal ONLY if it was dropped (closed/removed). A
+              // newly-appended terminal (e.g. one an agent opened over MCP) does NOT steal
+              // focus from the user's current terminal — it simply mounts in the background
+              // and appears in the sidebar; the user (or a follow-up select) switches to it.
+              setActiveId((active) => {
+                if (active && aliveById.has(active)) return active;
+                if (next.length === 0) return null;
+                return next[0].id;
+              });
+              return next;
             });
-            return next;
-          });
-        })
-        // A transient list failure leaves the current list; the next event recovers.
-        .catch(() => {});
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+          })
+          // A transient list failure leaves the current list; the next event recovers.
+          .catch(() => {});
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
@@ -449,18 +456,19 @@ export function useTerminals(): UseTerminals {
   useEffect(() => {
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe<TerminalExecStatePayload>("terminal://exec-state", (payload) => {
-      if (torndown) return;
-      const { terminal_id, state, exit_code, unread } = payload;
-      setTerminals((prev) => {
-        if (!prev.some((t) => t.id === terminal_id)) return prev;
-        return prev.map((t) =>
-          t.id === terminal_id
-            ? { ...t, exec_state: state, exec_exit_code: exit_code, exec_state_unread: unread }
-            : t,
-        );
-      });
-    })
+    void nyxBridge
+      .subscribe<TerminalExecStatePayload>("terminal://exec-state", (payload) => {
+        if (torndown) return;
+        const { terminal_id, state, exit_code, unread } = payload;
+        setTerminals((prev) => {
+          if (!prev.some((t) => t.id === terminal_id)) return prev;
+          return prev.map((t) =>
+            t.id === terminal_id
+              ? { ...t, exec_state: state, exec_exit_code: exit_code, exec_state_unread: unread }
+              : t,
+          );
+        });
+      })
       .then((un) => {
         if (torndown) {
           void Promise.resolve(un()).catch(() => {});
@@ -486,14 +494,15 @@ export function useTerminals(): UseTerminals {
   useEffect(() => {
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe<TerminalBusyStatePayload>("terminal://busy-state", (payload) => {
-      if (torndown) return;
-      const { terminal_id, busy } = payload;
-      setTerminals((prev) => {
-        if (!prev.some((t) => t.id === terminal_id)) return prev;
-        return prev.map((t) => (t.id === terminal_id ? { ...t, busy } : t));
-      });
-    })
+    void nyxBridge
+      .subscribe<TerminalBusyStatePayload>("terminal://busy-state", (payload) => {
+        if (torndown) return;
+        const { terminal_id, busy } = payload;
+        setTerminals((prev) => {
+          if (!prev.some((t) => t.id === terminal_id)) return prev;
+          return prev.map((t) => (t.id === terminal_id ? { ...t, busy } : t));
+        });
+      })
       .then((un) => {
         if (torndown) {
           void Promise.resolve(un()).catch(() => {});

@@ -56,7 +56,22 @@ export function useImportRows(
   useEffect(() => {
     if (seededIdentity.current !== identity) {
       seededIdentity.current = identity;
-      setRows(toRows(scripts));
+      // MERGE, don't replace: carry over each surviving row's selection + edits by
+      // key, so a re-list / future INCREMENTAL discovery (more package.json files
+      // appended) can NEVER wipe selections already made in the other files — the
+      // exact #1 "sélection multi-fichiers écrasée" failure mode. A genuinely new
+      // script seeds fresh; a vanished one drops. (Today's discovery is one-shot, so
+      // on the first real seed `prev` is empty and this is a plain seed — this only
+      // hardens the invariant if discovery ever becomes incremental.)
+      setRows((prev) => {
+        const prior = new Map(prev.map((r) => [r.key, r]));
+        return toRows(scripts).map((seed) => {
+          const kept = prior.get(seed.key);
+          return kept
+            ? { ...seed, selected: kept.selected, name: kept.name, command: kept.command }
+            : seed;
+        });
+      });
     }
     // `scripts` is intentionally read through the identity gate.
     // eslint-disable-next-line react-hooks/exhaustive-deps

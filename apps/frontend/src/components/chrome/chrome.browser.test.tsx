@@ -1,5 +1,5 @@
 import { render } from "@testing-library/react";
-import { mockIPC } from "@/bridge/test-harness";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { page } from "vitest/browser";
 import { afterEach, beforeEach, expect, it } from "vitest";
 
@@ -127,23 +127,25 @@ const terminalRows = (host: HTMLElement) =>
 it("renders Motion-animated sidebar rows (chrome animations actually present)", async () => {
   const host = mountChrome();
 
-  // One drag-sortable row per terminal — these are motion `Reorder.Item` <li>s.
+  // One drag-sortable row per terminal.
   const rows = await waitFor(() => terminalRows(host).length === TERMINALS.length);
   expect(rows, "one animated row per terminal").toBe(true);
 
   const items = terminalRows(host);
   expect(items.length).toBe(TERMINALS.length);
 
-  // Motion drives these rows: as it animates the enter (opacity 0→1, height
-  // 0→auto) it writes inline styles on the element. In a real browser those
-  // inline styles are present (in jsdom Motion no-ops them). We assert each row
-  // carries a Motion-managed inline style — the observable proof the animation
-  // is wired on the chrome (and not a static, un-animated list).
+  // dnd-kit owns the outer <li>; Motion owns the inner wrapper so drag transforms
+  // and open/close height animation do not fight each other. In a real browser
+  // Motion writes inline styles on that inner wrapper (jsdom no-ops them). Assert
+  // the wrapper carries a Motion-managed style — the observable proof the chrome
+  // still animates the rows.
   for (const li of items) {
-    const inline = li.getAttribute("style") ?? "";
+    const motionWrapper = li.firstElementChild;
+    expect(motionWrapper, "a sortable row must have a Motion wrapper").not.toBeNull();
+    const inline = motionWrapper?.getAttribute("style") ?? "";
     expect(
       /opacity|transform|height|will-change/.test(inline),
-      `a Motion-animated sidebar row must carry an inline animated style, ` +
+      `a Motion-animated sidebar row wrapper must carry an inline animated style, ` +
         `got style="${inline}"`,
     ).toBe(true);
   }

@@ -5,6 +5,7 @@ import { useXTerm } from "react-xtermjs";
 
 import { cn } from "@/lib/utils";
 import { useWebglAddon } from "@/components/terminal/use-webgl-addon";
+import { copySelection, isCopyChord } from "@/components/terminal/terminal-clipboard";
 import { ensureTerminalFontLoaded, resolveThemeFromCss } from "@/components/terminal/xterm-theme";
 import { useCommandOutput } from "./use-command-output";
 
@@ -98,6 +99,25 @@ export function CommandOutputPanel({
     onInstance?.(instance ?? null);
     return () => onInstance?.(null);
   }, [instance, onInstance]);
+
+  // COPY chord (Ctrl+Shift+C) on this READ-ONLY surface. There is no paste here
+  // (`disableStdin` — the panel never sends a byte to the process), so only copy
+  // is wired. Returning `false` keeps xterm from doing anything else with the
+  // chord. Every other key is left to xterm (which, being stdin-disabled, drops
+  // it). Shares the one clipboard implementation with `<Terminal>`.
+  useEffect(() => {
+    if (!instance) return;
+    instance.attachCustomKeyEventHandler((e) => {
+      if (e.type === "keydown" && isCopyChord(e)) {
+        void copySelection(instance);
+        return false;
+      }
+      return true;
+    });
+    return () => {
+      instance.attachCustomKeyEventHandler(() => true);
+    };
+  }, [instance]);
 
   // Derive the terminal theme from the design-system palette at mount (oklch
   // tokens need the browser to convert; we resolve in an effect against the live

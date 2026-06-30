@@ -8370,9 +8370,6 @@ mod tests {
         fn marketplace_update(&self, _marketplace: &str) -> Result<(), crate::plugin::PluginError> {
             Ok(())
         }
-        fn plugin_update(&self, _install_id: &str) -> Result<(), crate::plugin::PluginError> {
-            Ok(())
-        }
         fn marketplace_list(&self) -> Result<Vec<crate::plugin::MarketplaceEntry>, crate::plugin::PluginError> {
             Ok(self
                 .registered

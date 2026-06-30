@@ -74,10 +74,31 @@ pub struct SessionStart {
     pub metadata_json: Option<String>,
 }
 
-/// The fields captured from an agent SessionEnd payload.
+/// The fields captured from an agent SessionEnd payload. `reason` is the raw Claude
+/// `SessionEnd` reason (`clear` | `resume` | `logout` | `prompt_input_exit` |
+/// `bypass_permissions_disabled` | `other`); the common layer uses it to tell an
+/// INTERNAL transition (a `/clear` or `/resume` immediately re-opens a session on the
+/// SAME terminal) apart from a real end, so the icon/dot do not blink during the
+/// transition (finding: the Claude icon "jumps" after `/clear`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionEnd {
     pub external_session_id: String,
+    pub reason: Option<String>,
+}
+
+impl SessionEnd {
+    /// `true` when this end is an INTERNAL transition rather than a real session end:
+    /// a `/clear` or `/resume` makes Claude emit `SessionEnd { reason }` IMMEDIATELY
+    /// followed by `SessionStart { source }` on the SAME terminal — the session never
+    /// actually goes away, it is replaced in place. nyx must NOT mark the row `ended`
+    /// (nor drop the runtime activity) for these, otherwise the active-session row blinks
+    /// out for the gap between the two events and the sidebar icon falls back to the
+    /// generic terminal glyph (and the dot disappears) for a frame — the "icône qui
+    /// saute après /clear" bug. For every OTHER reason (logout, prompt_input_exit, a
+    /// brutal kill that did fire, …) the session really ends and the row is marked.
+    pub fn is_internal_transition(&self) -> bool {
+        matches!(self.reason.as_deref(), Some("clear") | Some("resume"))
+    }
 }
 
 /// Outcome of [`AgentAdapter::install_integration`]. The end-to-end install is
@@ -348,6 +369,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
             }
             "SessionEnd" => Some(AgentEvent::End(SessionEnd {
                 external_session_id: session_id,
+                reason: payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             })),
             _ => None,
         }
@@ -410,6 +435,8 @@ impl AgentAdapter for ClaudeCodeAdapter {
 /// - `claude plugin uninstall <plugin>@<marketplace> --scope user -y` (`-y` required
 ///   when stdout is not a TTY; best-effort — already-absent exits 0 with a message).
 /// - `claude plugin marketplace remove <marketplace> --scope user` (best-effort).
+/// - `claude plugin marketplace update <marketplace>` (re-reads the source dir into the
+///   marketplace cache — the first step of the forced re-cache, finding #47).
 /// - `claude plugin marketplace list --json` → `[{name, source, path, installLocation}]`.
 ///
 /// The binary is resolved off `PATH` (overridable via `NYX_CLAUDE_BIN` for tests/ops); a
@@ -615,17 +642,9 @@ impl crate::plugin::PluginCli for ClaudePluginCli {
     fn marketplace_update(&self, marketplace: &str) -> Result<(), crate::plugin::PluginError> {
         // Refresh Claude's marketplace cache from the source dir (finding #47). Verified
         // against 2.1.170: `claude plugin marketplace update <name>` re-reads the dir (a
-        // plain `marketplace add` on an existing entry does not).
+        // plain `marketplace add` on an existing entry does not), so the subsequent
+        // uninstall+reinstall pulls the NEW content rather than the stale marketplace cache.
         self.run(&["plugin", "marketplace", "update", marketplace], false)?;
-        Ok(())
-    }
-
-    fn plugin_update(&self, install_id: &str) -> Result<(), crate::plugin::PluginError> {
-        // Move the installed plugin to the version now in the refreshed marketplace cache
-        // (finding #47). Verified against 2.1.170: `claude plugin update <plugin>@<mkt>`
-        // bumps the installed plugin (idempotent — exits 0 "already at latest" otherwise).
-        // Best-effort so an "already up to date" non-zero variant never fails reconcile.
-        self.run(&["plugin", "update", install_id, "--scope", "user"], true)?;
         Ok(())
     }
 
@@ -938,7 +957,9 @@ mod tests {
         }
     }
 
-    /// claude_code normalizes a SessionEnd payload into an End event carrying the id.
+    /// claude_code normalizes a SessionEnd payload into an End event carrying the id AND
+    /// the `reason` — `clear` is an INTERNAL transition (a `/clear` immediately re-opens a
+    /// session), so the common layer keeps the row active rather than blinking the icon.
     #[test]
     fn claude_parses_session_end() {
         let claude = ClaudeCodeAdapter;
@@ -948,9 +969,39 @@ mod tests {
             "reason": "clear"
         });
         match claude.parse_event(&payload) {
-            Some(AgentEvent::End(e)) => assert_eq!(e.external_session_id, "sid-2"),
+            Some(AgentEvent::End(e)) => {
+                assert_eq!(e.external_session_id, "sid-2");
+                assert_eq!(e.reason.as_deref(), Some("clear"));
+                assert!(
+                    e.is_internal_transition(),
+                    "clear is an internal transition — the session is kept active"
+                );
+            }
             other => panic!("expected End, got {other:?}"),
         }
+    }
+
+    /// The end-reason classifier: only `clear`/`resume` are internal transitions (the
+    /// session is replaced in place); every real end reason — and an absent reason — is
+    /// a genuine end that vacates the active slot.
+    #[test]
+    fn session_end_reason_classifies_internal_transitions() {
+        let mk = |reason: Option<&str>| SessionEnd {
+            external_session_id: "x".to_string(),
+            reason: reason.map(str::to_string),
+        };
+        assert!(mk(Some("clear")).is_internal_transition());
+        assert!(mk(Some("resume")).is_internal_transition());
+        for real in ["logout", "prompt_input_exit", "bypass_permissions_disabled", "other"] {
+            assert!(
+                !mk(Some(real)).is_internal_transition(),
+                "{real} is a real end"
+            );
+        }
+        assert!(
+            !mk(None).is_internal_transition(),
+            "an absent reason is treated as a real end (safe default)"
+        );
     }
 
     /// A payload that is not a recognizable session event (or lacks a session_id)

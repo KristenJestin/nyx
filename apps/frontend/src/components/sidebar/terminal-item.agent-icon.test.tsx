@@ -3,7 +3,7 @@ import { mockIPC, emit } from "@/bridge/test-harness";
 import { act } from "react";
 import { describe, expect, it, vi } from "vitest";
 
-import { TerminalItem } from "./terminal-item";
+import { TerminalItem, dropAgentProgramToken } from "./terminal-item";
 import { AgentSessionsProvider } from "./use-agent-sessions";
 import type { TerminalRecord } from "./use-terminals";
 
@@ -124,5 +124,112 @@ describe("sidebar terminal row — provider-aware icon (#55)", () => {
       await emit("agent-sessions://changed");
     });
     await waitFor(() => expect(screen.queryByTitle("Claude Code")).not.toBeInTheDocument());
+  });
+
+  it("DECLUTTERS the redundant agent program text (FEEDBACK #29)", async () => {
+    // The lead logo already says "Claude", so the agent foreground program (`claude`) is
+    // redundant text. It leaks into BOTH the auto-name (`work · claude`) and the muted
+    // shell suffix (`· claude`) — the screenshot's `work · claude · claude`. With an active
+    // agent session the row must read just `work`, with NO trailing `· claude` anywhere.
+    mockIPC(
+      (cmd) => {
+        switch (cmd) {
+          case "agent_active_sessions":
+            return [{ terminal_id: "1", agent_kind: "claude_code" }];
+          case "agent_activity_snapshot":
+            return [];
+          case "terminal_info":
+            return { cwd: "/home/x/work", foreground: "claude" };
+          default:
+            return null;
+        }
+      },
+      { shouldMockEvents: true },
+    );
+    render(
+      <AgentSessionsProvider>
+        <ul>
+          <TerminalItem
+            record={row(1, "/home/x/work")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </AgentSessionsProvider>,
+    );
+
+    // The logo swapped in (agent session live) …
+    await waitFor(() => expect(screen.getByTitle("Claude Code")).toBeInTheDocument());
+    // … the name is the bare workspace, NOT `work · claude` …
+    await waitFor(() => expect(screen.getByText("work")).toBeInTheDocument());
+    expect(screen.queryByText(/· claude/)).not.toBeInTheDocument();
+    expect(screen.queryByText("work · claude")).not.toBeInTheDocument();
+  });
+
+  it("keeps the Claude logo when a re-pull's IPC read FAILS (no transient blink)", async () => {
+    // The "icône qui saute" resilience: a transient IPC failure must NOT collapse into
+    // "no session" and drop the logo. The hook keeps the last good icon and recovers on
+    // the next good event.
+    const state = { sessions: [{ terminal_id: "1", agent_kind: "claude_code" }], fail: false };
+    mockIPC(
+      (cmd) => {
+        switch (cmd) {
+          case "agent_active_sessions":
+            if (state.fail) throw new Error("transient IPC failure");
+            return [...state.sessions];
+          case "agent_activity_snapshot":
+            if (state.fail) throw new Error("transient IPC failure");
+            return [];
+          case "terminal_info":
+            return { cwd: null, foreground: null };
+          default:
+            return null;
+        }
+      },
+      { shouldMockEvents: true },
+    );
+    renderRow();
+
+    // The logo is shown after the initial good pull.
+    await waitFor(() => expect(screen.getByTitle("Claude Code")).toBeInTheDocument());
+
+    // A change tick whose reads FAIL must keep the logo (not blink to the terminal icon).
+    state.fail = true;
+    await act(async () => {
+      await emit("agent-sessions://changed");
+    });
+    // Give the failed pull time to settle; the logo must still be present.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByTitle("Claude Code")).toBeInTheDocument();
+
+    // A subsequent GOOD event still resolves normally.
+    state.fail = false;
+    await act(async () => {
+      await emit("agent-sessions://changed");
+    });
+    await waitFor(() => expect(screen.getByTitle("Claude Code")).toBeInTheDocument());
+  });
+});
+
+describe("dropAgentProgramToken (FEEDBACK #29)", () => {
+  it("strips a trailing ` · <program>` that matches the agent foreground program", () => {
+    expect(dropAgentProgramToken("nyx-v2 · claude", "claude")).toBe("nyx-v2");
+    expect(dropAgentProgramToken("work · claude", "claude")).toBe("work");
+  });
+
+  it("leaves the label untouched when the trailing token is NOT the agent program", () => {
+    // A real cwd basename / a different program must survive — the user still tells rows apart.
+    expect(dropAgentProgramToken("projetA · htop", "claude")).toBe("projetA · htop");
+    expect(dropAgentProgramToken("claude", "claude")).toBe("claude");
+    expect(dropAgentProgramToken("my-claude", "claude")).toBe("my-claude");
+  });
+
+  it("is a no-op when there is no auto label or no program (non-agent rows)", () => {
+    expect(dropAgentProgramToken(null, "claude")).toBeNull();
+    expect(dropAgentProgramToken("nyx-v2 · claude", null)).toBe("nyx-v2 · claude");
+    expect(dropAgentProgramToken(null, null)).toBeNull();
   });
 });

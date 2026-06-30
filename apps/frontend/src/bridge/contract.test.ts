@@ -32,7 +32,9 @@ import { FakeNyxBridge } from "./fake";
  * records `ptyAck` for the flow-control assertion. Returns a teardown that detaches
  * the globals.
  */
-function installFakeNyxCore(handlers: Record<string, (args?: Record<string, unknown>) => unknown>): {
+function installFakeNyxCore(
+  handlers: Record<string, (args?: Record<string, unknown>) => unknown>,
+): {
   emitEvent: (event: string, payload: unknown) => void;
   ackCalls: Array<{ ptyId: number; bytes: number }>;
   cleanup: () => void;
@@ -164,8 +166,7 @@ runBridgeContract("fake", () => {
   return {
     bridge: fake,
     // The fake's transport IS the contract shape: emit Uint8Array directly.
-    emitPtyOutput: (id, bytes) =>
-      fake.emit("pty://output", { id, bytes: Uint8Array.from(bytes) }),
+    emitPtyOutput: (id, bytes) => fake.emit("pty://output", { id, bytes: Uint8Array.from(bytes) }),
     deterministicUnsub: true,
     windowTestable: true,
   };

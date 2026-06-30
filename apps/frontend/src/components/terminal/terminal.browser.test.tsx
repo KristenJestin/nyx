@@ -1,5 +1,11 @@
+// Load xterm's own stylesheet exactly as the app entry (main.tsx) does. It carries
+// the LOAD-BEARING canvas-positioning rules; the render layers fall into normal
+// flow without it (FEEDBACK.md #3). Importing it here lets the browser suite
+// assert those rules actually apply to the live DOM.
+import "@xterm/xterm/css/xterm.css";
+
 import { render } from "@testing-library/react";
-import { mockIPC } from "@/bridge/test-harness";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import type { Terminal as XTerm } from "@xterm/xterm";
 import { page } from "vitest/browser";
 import { afterEach, beforeEach, expect, it } from "vitest";
@@ -25,10 +31,20 @@ import { Terminal } from "./terminal";
 
 const SPAWNED_ID = 7;
 
+/** Records every invoke so a test can assert a `pty_resize` (the SIGWINCH path) fired. */
+let ipcCalls: { cmd: string; args: Record<string, unknown> }[] = [];
+
 beforeEach(() => {
+  ipcCalls = [];
   // Resolve pty_spawn so usePty's start() completes without a real backend;
   // every other command (write/resize/close) is a harmless no-op here.
-  mockIPC((cmd) => (cmd === "pty_spawn" ? SPAWNED_ID : null), { shouldMockEvents: true });
+  mockIPC(
+    (cmd, args) => {
+      ipcCalls.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
+      return cmd === "pty_spawn" ? SPAWNED_ID : null;
+    },
+    { shouldMockEvents: true },
+  );
 });
 
 afterEach(() => {
@@ -230,4 +246,134 @@ it("derives the xterm theme from the CSS palette tokens as a parseable hex (oklc
   const lum = (h: string) =>
     parseInt(h.slice(1, 3), 16) + parseInt(h.slice(3, 5), 16) + parseInt(h.slice(5, 7), 16);
   expect(lum(bg)).toBeLessThan(lum(fg));
+});
+
+it("reconciles geometry when a hidden pane reappears: re-attaches WebGL + pushes a PTY resize (SIGWINCH) — #20/#23", async () => {
+  // The dimensions/garbled-render fix in the real engine. We reproduce the #20
+  // shape: the terminal pane is mounted but its CONTAINER is display:none (exactly
+  // what the deck does for an inactive terminal, and what wraps the whole deck
+  // behind a CommandView). While hidden the WebGL renderer must NOT be attached
+  // (no context built at 0×0). When the pane is shown again, the activation
+  // reconcile must (a) re-attach a live WebGL context and (b) push a `pty_resize`
+  // so the child gets a SIGWINCH and redraws — even though the size is unchanged.
+  const host = document.createElement("div");
+  host.style.width = "480px";
+  host.style.height = "300px";
+  host.style.position = "fixed";
+  host.style.top = "0";
+  host.style.left = "0";
+  document.body.appendChild(host);
+
+  // The pane wrapper the deck controls: start HIDDEN (display:none → 0×0 box).
+  const pane = document.createElement("div");
+  pane.style.width = "100%";
+  pane.style.height = "100%";
+  pane.style.display = "none";
+  host.appendChild(pane);
+
+  let term: XTerm | null = null;
+  let ptyId: number | null = null;
+  // active=true but the wrapper is display:none, so the element box is 0×0 — the
+  // exact stale-geometry condition. WebGL must stay OFF while hidden.
+  render(
+    <Terminal
+      active
+      onInstance={(t) => (term = t ?? term)}
+      onPtyId={(id) => {
+        ptyId = id;
+      }}
+    />,
+    { container: pane },
+  );
+
+  // Let the instance create + the spawn resolve all the way through usePty, so a
+  // later geometry resync has a concrete PTY id to target.
+  const spawnDeadline = Date.now() + 5000;
+  while (Date.now() < spawnDeadline && ptyId !== SPAWNED_ID) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  expect(term, "xterm instance must be created").not.toBeNull();
+  expect(ptyId, "pty_spawn must resolve before revealing the hidden pane").toBe(SPAWNED_ID);
+
+  // While hidden (0×0) no WebGL context should exist — building one at 0×0 is the
+  // bug. (The DOM/canvas fallback may exist; findWebglContext only counts a real
+  // GL context.)
+  expect(
+    findWebglContext(host),
+    "no WebGL context must be built while the pane is display:none (0×0)",
+  ).toBeNull();
+
+  // Reveal the pane (what selecting the terminal / closing the command view does).
+  const resizesBefore = ipcCalls.filter((c) => c.cmd === "pty_resize").length;
+  pane.style.display = "block";
+
+  // The activation reconcile (rAF) + the ResizeObserver 0→N transition now run the
+  // pipeline: WebGL re-attaches and a pty_resize is pushed. Poll for both.
+  const deadline = Date.now() + 5000;
+  let gl: ReturnType<typeof findWebglContext> = null;
+  let resized = false;
+  while (Date.now() < deadline) {
+    gl = findWebglContext(host);
+    resized = ipcCalls.filter((c) => c.cmd === "pty_resize").length > resizesBefore;
+    if (gl && resized) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  expect(
+    gl,
+    "showing a hidden pane must (re)attach a live WebGL context against the real size",
+  ).not.toBeNull();
+  expect(
+    resized,
+    "showing a hidden pane must push a pty_resize so the child gets a SIGWINCH and redraws",
+  ).toBe(true);
+  // The reattached context must be healthy.
+  const canvases = host.querySelectorAll("canvas");
+  let lost = false;
+  for (const c of canvases) {
+    const ctx =
+      (c.getContext("webgl2") as WebGL2RenderingContext | null) ??
+      (c.getContext("webgl") as WebGLRenderingContext | null);
+    if (ctx && typeof ctx.isContextLost === "function" && ctx.isContextLost()) lost = true;
+  }
+  expect(lost, "the reattached WebGL context must not be lost").toBe(false);
+});
+
+it("positions the renderer canvases absolutely (xterm.css loaded — guards the 'click jumps the content' bug)", async () => {
+  // Regression for FEEDBACK.md #3: when `@xterm/xterm/css/xterm.css` is NOT
+  // imported, `.xterm-screen` and its <canvas> layers default to `position:
+  // static` and fall into NORMAL FLOW — the canvases stack vertically, so the
+  // viewport goes mostly black with stray glyphs at the top and the real content
+  // is pushed down, only "repairing" on the full repaint a selection drag forces.
+  // The fix imports xterm.css globally (see main.tsx). This proves the
+  // load-bearing rule (`.xterm-screen canvas { position: absolute }`) is actually
+  // in effect on the live DOM in a real browser.
+  const host = document.createElement("div");
+  host.style.width = "320px";
+  host.style.height = "200px";
+  document.body.appendChild(host);
+
+  let term: XTerm | null = null;
+  render(<Terminal onInstance={(t) => (term = t ?? term)} />, { container: host });
+
+  // Poll until xterm has opened and the renderer appended a <canvas> under
+  // `.xterm-screen` (the WebGL/canvas layer mounts in an effect after open()).
+  const deadline = Date.now() + 5000;
+  let canvas: HTMLCanvasElement | null = null;
+  let screen: HTMLElement | null = null;
+  while (Date.now() < deadline) {
+    screen = host.querySelector(".xterm-screen");
+    canvas = screen?.querySelector("canvas") ?? null;
+    if (canvas) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  expect(term, "xterm instance must be created").not.toBeNull();
+  expect(screen, "the .xterm-screen element must exist").not.toBeNull();
+  expect(canvas, "the renderer must append a <canvas> under .xterm-screen").not.toBeNull();
+
+  // The load-bearing rules from xterm.css. Without the stylesheet these are
+  // `static` and the canvases stack in flow (the reported bug).
+  expect(getComputedStyle(screen as HTMLElement).position).toBe("relative");
+  expect(getComputedStyle(canvas as HTMLCanvasElement).position).toBe("absolute");
 });

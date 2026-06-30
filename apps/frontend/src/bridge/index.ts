@@ -31,7 +31,10 @@ import { tauriBridge } from "./tauri";
  * where `window` may be undefined.
  */
 function isElectronShell(): boolean {
-  return typeof window !== "undefined" && typeof (window as { nyxCore?: unknown }).nyxCore !== "undefined";
+  return (
+    typeof window !== "undefined" &&
+    typeof (window as { nyxCore?: unknown }).nyxCore !== "undefined"
+  );
 }
 
 /**

@@ -21,6 +21,13 @@ export interface ProjectDialogProps {
   path?: string;
   /** Default/initial display name (folder basename for create, current for edit). */
   defaultName: string;
+  /**
+   * DELETE only — the entity being removed (default `"project"`). `"workspace"`
+   * reuses the very same destructive-confirm shell but swaps the title, the
+   * explanatory copy, and the confirm-button label to talk about a single
+   * workspace instead of the whole project. `create`/`edit` are always projects.
+   */
+  entity?: "project" | "workspace";
   /** A submission error to surface inline. */
   error?: string | null;
   /** True while the create/edit/delete command is in flight. */
@@ -62,6 +69,7 @@ export function ProjectDialog({
   mode,
   path,
   defaultName,
+  entity = "project",
   error,
   submitting = false,
   resumeAgentSessions,
@@ -75,11 +83,25 @@ export function ProjectDialog({
 
   const trimmed = name.trim();
   const isDelete = mode === "delete";
+  const isWorkspaceDelete = isDelete && entity === "workspace";
   const canSubmit = isDelete ? !submitting : trimmed.length > 0 && !submitting;
 
   const title =
-    mode === "create" ? "Add project" : mode === "edit" ? "Rename project" : "Delete project";
-  const confirmLabel = mode === "create" ? "Add project" : mode === "edit" ? "Save" : "Delete";
+    mode === "create"
+      ? "Add project"
+      : mode === "edit"
+        ? "Rename project"
+        : isWorkspaceDelete
+          ? "Remove workspace"
+          : "Delete project";
+  const confirmLabel =
+    mode === "create"
+      ? "Add project"
+      : mode === "edit"
+        ? "Save"
+        : isWorkspaceDelete
+          ? "Remove workspace"
+          : "Delete";
 
   return (
     <Dialog.Root
@@ -96,9 +118,20 @@ export function ProjectDialog({
           {isDelete ? (
             <>
               <Dialog.Description className="mt-1 text-sm text-muted-foreground">
-                Delete <span className="font-medium text-foreground">{defaultName}</span> and its
-                workspaces. Any open terminals are kept (they just become loose, unattached
-                terminals) — nothing is closed.
+                {isWorkspaceDelete ? (
+                  <>
+                    Remove the workspace{" "}
+                    <span className="font-medium text-foreground">{defaultName}</span> from this
+                    project. Any open terminals are kept (they just become loose, unattached
+                    terminals) — nothing is closed.
+                  </>
+                ) : (
+                  <>
+                    Delete <span className="font-medium text-foreground">{defaultName}</span> and
+                    its workspaces. Any open terminals are kept (they just become loose, unattached
+                    terminals) — nothing is closed.
+                  </>
+                )}
               </Dialog.Description>
               {error && (
                 <p role="alert" className="mt-3 text-sm text-destructive">

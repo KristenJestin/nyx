@@ -90,6 +90,8 @@ diesel::table! {
         created_at -> BigInt,
         updated_at -> BigInt,
         resume_agent_sessions -> Bool,
+        #[sql_name = "order"]
+        order_index -> Integer,
     }
 }
 

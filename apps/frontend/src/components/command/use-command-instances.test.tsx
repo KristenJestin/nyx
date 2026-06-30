@@ -53,7 +53,14 @@ function instance(overrides: Partial<InstanceWithTemplate>): InstanceWithTemplat
 
 const tree: ProjectTree[] = [
   {
-    project: { id: "p1", name: "p", collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false },
+    project: {
+      id: "p1",
+      name: "p",
+      collapsed: false,
+      created_at: 0,
+      updated_at: 0,
+      resume_agent_sessions: false,
+    },
     workspaces: [
       {
         id: "ws1",

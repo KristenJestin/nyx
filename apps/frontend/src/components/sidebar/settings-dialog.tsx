@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogBackdrop, DialogPopup } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
+import { toast } from "@/components/ui/toast";
 
 // ---------------------------------------------------------------------------
 // Types (mirror the Tauri IntegrationStatus struct)
@@ -56,10 +57,22 @@ function ProviderCard({ status, onRefresh }: ProviderCardProps) {
       try {
         await nyxBridge.invoke(cmd, { provider: status.provider });
         onRefresh();
+        toast.success(
+          cmd === "integration_install"
+            ? `${status.label} integration installed`
+            : `${status.label} integration removed`,
+        );
       } catch (e) {
         // The bridge serializes a backend `Err` into a BridgeError whose `message`
         // is the original backend string; fall back for a raw string / unknown.
-        setError(isBridgeError(e) ? e.message : typeof e === "string" ? e : "Operation failed");
+        const reason = isBridgeError(e)
+          ? e.message
+          : typeof e === "string"
+            ? e
+            : "Operation failed";
+        // Surface the real reason both inline (under the button) and as a toast.
+        setError(reason);
+        toast.error(reason);
       } finally {
         setBusy(false);
       }

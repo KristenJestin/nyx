@@ -116,10 +116,7 @@ export function CommandInfoBar({
           The live run state is the header DOT's job — not repeated here. */}
       {showExit && (
         <span
-          className={cn(
-            "shrink-0 font-mono",
-            exitCode === 0 ? "text-success" : "text-destructive",
-          )}
+          className={cn("shrink-0 font-mono", exitCode === 0 ? "text-success" : "text-destructive")}
         >
           exit {exitCode}
         </span>

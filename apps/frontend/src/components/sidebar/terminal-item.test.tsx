@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { TerminalItem } from "./terminal-item";
 import { SortableTerminalItem } from "./sortable-terminal-item";
+import { TerminalRenameProvider } from "./use-terminal-rename";
 import type { TerminalInfo } from "./auto-label";
 import type { TerminalRecord } from "./use-terminals";
 
@@ -98,16 +99,18 @@ describe("<TerminalItem> auto-naming", () => {
     expect(screen.getByText("my-shell")).toBeInTheDocument();
     expect(screen.queryByText("projetA · htop")).not.toBeInTheDocument();
   });
+});
 
-  it("has NO inline rename: double-clicking the name shows no edit input (finding 01KV3CNPD…)", () => {
-    // The double-click-to-edit inline rename was removed entirely. Double-clicking
-    // the name must NOT reveal a text input — rows are click-select + hover-close
-    // only now.
-    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+describe("<TerminalItem> shell suffix declutter (FEEDBACK #29, 2nd pass)", () => {
+  it("a non-agent BASH row shows NO `· bash` suffix and renders the FULL name", async () => {
+    // The screenshot bug: a plain shell row showed a muted `· bash` the user rejected, and
+    // that `shrink-0` suffix ate the width so `palbank` was pre-truncated to `pal…`. With the
+    // suffix dropped for a bare login shell, the name keeps the full row width.
+    mockTerminalInfo({ cwd: "/home/x/palbank", foreground: "bash" });
     render(
       <ul>
         <TerminalItem
-          record={row(7, "/home/x/projetA")}
+          record={row(1, "/home/x/palbank")}
           index={0}
           active={false}
           ptyId={50}
@@ -116,10 +119,202 @@ describe("<TerminalItem> auto-naming", () => {
         />
       </ul>,
     );
+    // The full name is rendered (not pre-truncated — the DOM text is the whole word; the
+    // visual ellipsis is CSS-only).
+    await waitFor(() => expect(screen.getByText("palbank")).toBeInTheDocument());
+    // No muted `· bash` suffix anywhere on the row.
+    expect(screen.queryByText(/· bash/)).not.toBeInTheDocument();
+    expect(screen.queryByText("bash")).not.toBeInTheDocument();
+  });
+
+  it("suppresses the suffix for OTHER bare login shells too (zsh)", async () => {
+    mockTerminalInfo({ cwd: "/home/x/palbank", foreground: "-zsh" });
+    render(
+      <ul>
+        <TerminalItem
+          record={row(1, "/home/x/palbank")}
+          index={0}
+          active={false}
+          ptyId={50}
+          onSelect={vi.fn()}
+          onClose={vi.fn()}
+        />
+      </ul>,
+    );
+    await waitFor(() => expect(screen.getByText("palbank")).toBeInTheDocument());
+    expect(screen.queryByText(/· zsh/)).not.toBeInTheDocument();
+  });
+
+  it("STILL shows the suffix for a real foreground program (vim) — genuinely useful", async () => {
+    // The decluttering only targets bare shells; a real program suffix stays (it tells the
+    // user what is running) so the row keeps the muted `· vim` beside the name. The auto
+    // label itself also reflects the program (`projetA · vim`), so we target the muted suffix
+    // span by its class to assert the suffix specifically renders.
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "vim" });
+    const { container } = render(
+      <ul>
+        <TerminalItem
+          record={row(1, "/home/x/projetA")}
+          index={0}
+          active={false}
+          ptyId={50}
+          onSelect={vi.fn()}
+          onClose={vi.fn()}
+        />
+      </ul>,
+    );
+    await waitFor(() => {
+      const suffix = container.querySelector("span.text-muted-foreground.text-xs");
+      expect(suffix?.textContent).toBe("· vim");
+    });
+  });
+});
+
+describe("<TerminalItem> rename (FEEDBACK #30)", () => {
+  it("double-clicking the name opens an inline editor; Enter commits a MANUAL label (trimmed)", async () => {
+    // The auto label would be "projetA"; renaming pins a manual one that wins.
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    const onRename = vi.fn();
+    render(
+      <TerminalRenameProvider rename={onRename}>
+        <ul>
+          <TerminalItem
+            record={row(7, "/home/x/projetA")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </TerminalRenameProvider>,
+    );
+
+    // Double-click the auto name → an inline editor appears.
+    fireEvent.doubleClick(screen.getByText("projetA"));
+    const input = screen.getByLabelText(/rename terminal/i) as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+
+    // Type a new name (with surrounding whitespace) and commit with Enter.
+    fireEvent.change(input, { target: { value: "  my-shell  " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    // The rename callback fires with the TRIMMED manual label.
+    expect(onRename).toHaveBeenCalledWith("7", "my-shell");
+    // The editor closes (back to a plain name span).
+    await waitFor(() => expect(screen.queryByLabelText(/rename terminal/i)).toBeNull());
+  });
+
+  it("the kebab 'Rename' action opens the same inline editor", () => {
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    render(
+      <TerminalRenameProvider rename={vi.fn()}>
+        <ul>
+          <TerminalItem
+            record={row(7, "/home/x/projetA")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </TerminalRenameProvider>,
+    );
+
+    // Open the row's actions kebab, then click "Rename".
+    fireEvent.click(screen.getByLabelText(/terminal actions for/i));
+    fireEvent.click(screen.getByRole("menuitem", { name: /rename terminal/i }));
+    expect(screen.getByLabelText(/rename terminal/i)).toBeInTheDocument();
+  });
+
+  it("an empty name CLEARS the label back to auto-naming (null)", () => {
+    // The terminal already has a manual label; clearing it returns to the auto name.
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    const onRename = vi.fn();
+    render(
+      <TerminalRenameProvider rename={onRename}>
+        <ul>
+          <TerminalItem
+            record={row(7, "/home/x/projetA", "pinned")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </TerminalRenameProvider>,
+    );
+
+    fireEvent.doubleClick(screen.getByText("pinned"));
+    const input = screen.getByLabelText(/rename terminal/i) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "   " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    // Empty → null clears the manual label (auto-naming resumes).
+    expect(onRename).toHaveBeenCalledWith("7", null);
+  });
+
+  it("Escape cancels the edit WITHOUT renaming", () => {
+    mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
+    const onRename = vi.fn();
+    render(
+      <TerminalRenameProvider rename={onRename}>
+        <ul>
+          <TerminalItem
+            record={row(7, "/home/x/projetA")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </TerminalRenameProvider>,
+    );
 
     fireEvent.doubleClick(screen.getByText("projetA"));
+    const input = screen.getByLabelText(/rename terminal/i) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "discard-me" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    // No rename, editor closed, the auto name remains.
+    expect(onRename).not.toHaveBeenCalled();
     expect(screen.queryByLabelText(/rename terminal/i)).toBeNull();
-    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.getByText("projetA")).toBeInTheDocument();
+  });
+
+  it("a MANUAL label is shown and is NOT clobbered by an auto-name poll update", async () => {
+    // The crux of #30: a manual label wins at DISPLAY time and the live terminal_info
+    // poll (which feeds the auto label) never overwrites it — the auto name is only a
+    // fallback under a blank label, never persisted into the record.
+    let foreground = "bash";
+    mockIPC((cmd) => {
+      if (cmd === "terminal_info") return { cwd: "/home/x/projetA", foreground };
+      return null;
+    });
+    render(
+      <TerminalRenameProvider rename={vi.fn()}>
+        <ul>
+          <TerminalItem
+            record={row(7, "/home/x/projetA", "renamed")}
+            index={0}
+            active={false}
+            ptyId={50}
+            onSelect={vi.fn()}
+            onClose={vi.fn()}
+          />
+        </ul>
+      </TerminalRenameProvider>,
+    );
+
+    // The manual label renders immediately.
+    expect(screen.getByText("renamed")).toBeInTheDocument();
+    // Now a program comes to the foreground — the auto label would become
+    // "projetA · htop", but it must NEVER replace the manual label.
+    foreground = "htop";
+    await new Promise((r) => setTimeout(r, 30));
+    expect(screen.getByText("renamed")).toBeInTheDocument();
+    expect(screen.queryByText("projetA · htop")).not.toBeInTheDocument();
   });
 });
 
@@ -248,7 +443,7 @@ describe("<SortableTerminalItem> whole-item drag (dnd-kit)", () => {
     ).toHaveLength(1);
   });
 
-  it("shows the settled badge while UNREAD and HIDES it once READ — even when inactive again (PRD-2.1 user story #3)", () => {
+  it("shows the settled badge while UNREAD and HIDES it once READ — even when inactive again (PRD-2.1 user story #3)", async () => {
     mockTerminalInfo({ cwd: "/home/x/projetA", foreground: "bash" });
     // UNREAD success on an inactive terminal → badge present (the persisted flag,
     // not selection, drives visibility).
@@ -282,7 +477,13 @@ describe("<SortableTerminalItem> whole-item drag (dnd-kit)", () => {
         </ul>
       </DragDropProvider>,
     );
-    expect(screen.queryByRole("status", { name: /terminal status: success/i })).toBeNull();
+    // The badge now leaves via an EXIT animation (the prior round cut it instantly), so it
+    // is no longer immediately gone — wait for the node to finish animating out.
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("status", { name: /terminal status: success/i }),
+      ).not.toBeInTheDocument(),
+    );
   });
 
   it("the RUNNING dot is driven by the OS `busy` flag, NOT by exec_state (PRD task #1)", async () => {

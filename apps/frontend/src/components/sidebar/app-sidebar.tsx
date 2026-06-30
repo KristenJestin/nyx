@@ -4,10 +4,12 @@ import { FolderPlusIcon, PlusIcon, Settings2Icon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
-import { ProjectItem } from "./project-item";
 import { SelectionRail, useActiveRail } from "./active-rail";
+import { SortableProjectList } from "./sortable-project-list";
 import { SortableTerminalList } from "./sortable-terminal-list";
 import { AgentSessionsProvider } from "./use-agent-sessions";
+import { TerminalStatsProvider } from "./use-terminal-stats";
+import { TerminalRenameProvider, type RenameTerminal } from "./use-terminal-rename";
 import type { CommandRecord, ProjectTree, WorkspaceRecord } from "./use-projects";
 import type { TerminalRecord } from "./use-terminals";
 
@@ -40,6 +42,14 @@ export interface AppSidebarProps {
   ptyIds?: Map<string, number | null>;
   onSelect: (id: string) => void;
   onClose: (id: string) => void;
+  /**
+   * Rename a terminal (FEEDBACK #30): pin a MANUAL label (wins over the auto name)
+   * or clear it back to auto-naming (`null`). Threaded to every terminal row via
+   * context, so the row's kebab / inline edit can commit a rename without
+   * prop-drilling. Optional so the sidebar still renders without rename wiring
+   * (isolation tests fall back to a no-op).
+   */
+  onRenameTerminal?: RenameTerminal;
   /** Launch a new terminal in `workspace` (cwd = workspace.path). */
   onNewTerminal: (workspace: WorkspaceRecord) => void;
   /** Open an UNATTACHED (loose) terminal (no project/workspace, mode auto). */
@@ -52,6 +62,8 @@ export interface AppSidebarProps {
   onEditProject?: (tree: ProjectTree) => void;
   /** Open the delete-confirm modal for a project. */
   onDeleteProject?: (tree: ProjectTree) => void;
+  /** Open the delete-confirm flow for a single (non-root) workspace. */
+  onDeleteWorkspace?: (workspace: WorkspaceRecord) => void;
   /** Open the "Manage commands" modal for a project (PRD-3). */
   onManageCommands?: (tree: ProjectTree) => void;
   /**
@@ -72,6 +84,12 @@ export interface AppSidebarProps {
    * tests).
    */
   onReorderLooseTerminals?: (ids: string[]) => void;
+  /**
+   * Persist a new top-level PROJECT order after a drag-reorder (FEEDBACK #11): the
+   * dragged project-id sequence. Optional so the sidebar still renders without
+   * reorder wiring (isolation tests).
+   */
+  onReorderProjects?: (ids: string[]) => void;
   /** Persist a project band's open/closed state (restored on reload). */
   onSetProjectCollapsed?: (id: string, collapsed: boolean) => void;
   /** Persist a workspace band's open/closed state (restored on reload). */
@@ -112,18 +130,21 @@ export function AppSidebar({
   ptyIds,
   onSelect,
   onClose,
+  onRenameTerminal,
   onNewTerminal,
   onNewLooseTerminal,
   onAddProject,
   onAddWorkspace,
   onEditProject,
   onDeleteProject,
+  onDeleteWorkspace,
   onManageCommands,
   commandsByWorkspace,
   activeCommandId,
   onSelectCommand,
   onReorderTerminals,
   onReorderLooseTerminals,
+  onReorderProjects,
   onSetProjectCollapsed,
   onSetWorkspaceCollapsed,
   onOpenSettings,
@@ -164,118 +185,132 @@ export function AppSidebar({
     // terminal row below reads its agent via context, so the icon swaps live with no
     // prop-drilling through the project → workspace → list → item chain.
     <AgentSessionsProvider>
-      <aside
-        className={cn(
-          "flex h-full w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar",
-          className,
-        )}
-      >
-        {/* === HEAD: Nyx wordmark + gear (Settings) ===
+      <TerminalStatsProvider>
+        <TerminalRenameProvider rename={onRenameTerminal ?? (() => {})}>
+          <aside
+            className={cn(
+              "flex h-full w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar",
+              className,
+            )}
+          >
+            {/* === HEAD: Nyx wordmark + gear (Settings) ===
             `px-3` matches the Projects band + footer band so icons align. The
             loose-terminal `+` lives in the TERMINALS footer band (unchanged). */}
-        <div className="flex items-center justify-between border-b border-sidebar-border px-3 py-2.5">
-          <span className="text-sm font-semibold tracking-widest text-sidebar-foreground">Nyx</span>
-          <Tooltip label="Settings">
-            <Button variant="ghost" size="icon-xs" aria-label="Settings" onClick={onOpenSettings}>
-              <Settings2Icon />
-            </Button>
-          </Tooltip>
-        </div>
-
-        {/* Rail HOST: a `relative` container spanning the rows so the single
-            measured selection bar can be positioned over the active row. */}
-        <div ref={hostRef} className="relative flex min-h-0 flex-1 flex-col">
-          <SelectionRail railRef={railRef} />
-
-          {/* === PROJECTS (scrollable): sticky band label + one band per project === */}
-          <section className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
-            <div className="sticky top-0 z-20 flex items-center justify-between border-b border-sidebar-border bg-sidebar px-3 py-1.5">
-              <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-                Projects
+            <div className="flex items-center justify-between border-b border-sidebar-border px-3 py-2.5">
+              <span className="text-sm font-semibold tracking-widest text-sidebar-foreground">
+                Nyx
               </span>
-              <Tooltip label="Add project">
+              <Tooltip label="Settings">
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  aria-label="Add project"
-                  onClick={onAddProject}
+                  aria-label="Settings"
+                  onClick={onOpenSettings}
                 >
-                  <FolderPlusIcon />
+                  <Settings2Icon />
                 </Button>
               </Tooltip>
             </div>
 
-            <ul className="flex flex-col">
-              {projects.map((tree) => (
-                <ProjectItem
-                  key={tree.project.id}
-                  tree={tree}
-                  terminalsByWorkspace={terminalsByWorkspace}
-                  activeId={activeId}
-                  ptyIds={ptyIds}
-                  onSelect={onSelect}
-                  onClose={onClose}
-                  onNewTerminal={onNewTerminal}
-                  onAddWorkspace={onAddWorkspace}
-                  onEditProject={onEditProject}
-                  onDeleteProject={onDeleteProject}
-                  onManageCommands={onManageCommands}
-                  commandsByWorkspace={commandsByWorkspace}
-                  activeCommandId={activeCommandId}
-                  onSelectCommand={onSelectCommand}
-                  onReorderTerminals={onReorderTerminals}
-                  onSetCollapsed={onSetProjectCollapsed}
-                  onSetWorkspaceCollapsed={onSetWorkspaceCollapsed}
-                />
-              ))}
-              {projects.length === 0 && (
-                <li className="px-3 py-6 text-center text-xs text-muted-foreground">
-                  No projects yet. Add one with the button above.
-                </li>
-              )}
-            </ul>
-          </section>
+            {/* Rail HOST: a `relative` container spanning the rows so the single
+            measured selection bar can be positioned over the active row. */}
+            <div ref={hostRef} className="relative flex min-h-0 flex-1 flex-col">
+              <SelectionRail railRef={railRef} />
 
-          {/* === TERMINALS (pinned footer): loose/unattached terminals ===
+              {/* === PROJECTS (scrollable): sticky band label + one band per project === */}
+              <section className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
+                <div className="sticky top-0 z-20 flex items-center justify-between border-b border-sidebar-border bg-sidebar px-3 py-1.5">
+                  <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+                    Projects
+                  </span>
+                  <Tooltip label="Add project">
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Add project"
+                      onClick={onAddProject}
+                    >
+                      <FolderPlusIcon />
+                    </Button>
+                  </Tooltip>
+                </div>
+
+                {projects.length > 0 ? (
+                  // Drag-sortable project list (dnd-kit, FEEDBACK #11): each project band
+                  // carries a grip handle; a drop persists the new order via
+                  // `onReorderProjects` → `useProjects.reorderProjects`.
+                  <SortableProjectList
+                    projects={projects}
+                    terminalsByWorkspace={terminalsByWorkspace}
+                    activeId={activeId}
+                    ptyIds={ptyIds}
+                    onSelect={onSelect}
+                    onClose={onClose}
+                    onNewTerminal={onNewTerminal}
+                    onAddWorkspace={onAddWorkspace}
+                    onEditProject={onEditProject}
+                    onDeleteProject={onDeleteProject}
+                    onDeleteWorkspace={onDeleteWorkspace}
+                    onManageCommands={onManageCommands}
+                    commandsByWorkspace={commandsByWorkspace}
+                    activeCommandId={activeCommandId}
+                    onSelectCommand={onSelectCommand}
+                    onReorderTerminals={onReorderTerminals}
+                    onReorderProjects={onReorderProjects}
+                    onSetProjectCollapsed={onSetProjectCollapsed}
+                    onSetWorkspaceCollapsed={onSetWorkspaceCollapsed}
+                  />
+                ) : (
+                  <ul className="flex flex-col">
+                    <li className="px-3 py-6 text-center text-xs text-muted-foreground">
+                      No projects yet. Add one with the button above.
+                    </li>
+                  </ul>
+                )}
+              </section>
+
+              {/* === TERMINALS (pinned footer): loose/unattached terminals ===
             The band uses `px-3` (matching the head + Projects band) so its '+'
             lands on the same right edge as the other two. */}
-          <section className="shrink-0 border-t border-sidebar-border px-2 pt-2 pb-2">
-            <div className="flex items-center justify-between px-1 py-1">
-              <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-                Terminals
-              </span>
-              <Tooltip label="New terminal (unattached)">
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label="New unattached terminal"
-                  onClick={onNewLooseTerminal}
-                >
-                  <PlusIcon />
-                </Button>
-              </Tooltip>
+              <section className="shrink-0 border-t border-sidebar-border px-2 pt-2 pb-2">
+                <div className="flex items-center justify-between px-1 py-1">
+                  <span className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+                    Terminals
+                  </span>
+                  <Tooltip label="New terminal (unattached)">
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="New unattached terminal"
+                      onClick={onNewLooseTerminal}
+                    >
+                      <PlusIcon />
+                    </Button>
+                  </Tooltip>
+                </div>
+                {looseTerminals.length > 0 ? (
+                  // Drag-sortable loose list (dnd-kit): a closed loose row runs its
+                  // height-collapse exit and the survivors reflow up (same enter/exit as
+                  // the workspace lists).
+                  <SortableTerminalList
+                    terminals={looseTerminals}
+                    activeId={activeId}
+                    ptyIds={ptyIds}
+                    onSelect={onSelect}
+                    onClose={onClose}
+                    onReorder={onReorderLooseTerminals}
+                    className="flex flex-col"
+                  />
+                ) : (
+                  <p className="px-2 py-1 text-xs text-muted-foreground/70 italic select-none">
+                    No terminals — + to start
+                  </p>
+                )}
+              </section>
             </div>
-            {looseTerminals.length > 0 ? (
-              // Drag-sortable loose list (dnd-kit): a closed loose row runs its
-              // height-collapse exit and the survivors reflow up (same enter/exit as
-              // the workspace lists).
-              <SortableTerminalList
-                terminals={looseTerminals}
-                activeId={activeId}
-                ptyIds={ptyIds}
-                onSelect={onSelect}
-                onClose={onClose}
-                onReorder={onReorderLooseTerminals}
-                className="flex flex-col"
-              />
-            ) : (
-              <p className="px-2 py-1 text-xs text-muted-foreground/70 italic select-none">
-                No terminals — + to start
-              </p>
-            )}
-          </section>
-        </div>
-      </aside>
+          </aside>
+        </TerminalRenameProvider>
+      </TerminalStatsProvider>
     </AgentSessionsProvider>
   );
 }

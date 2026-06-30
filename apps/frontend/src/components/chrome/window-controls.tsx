@@ -38,7 +38,8 @@ export function useWindowControlsVisible(): boolean {
   const [visible, setVisible] = useState(true);
   useEffect(() => {
     let cancelled = false;
-    void nyxBridge.invoke<boolean>("window_controls_visible")
+    void nyxBridge
+      .invoke<boolean>("window_controls_visible")
       .then((v) => {
         if (!cancelled) setVisible(v);
       })

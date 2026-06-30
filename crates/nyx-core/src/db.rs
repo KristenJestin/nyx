@@ -248,6 +248,11 @@ pub struct Project {
     /// `false` (the default, and the only value for a project predating v8) means no
     /// auto-resume — which is also what the close-warning (#6) keys on.
     pub resume_agent_sessions: bool,
+    /// Sidebar order (PRD-#11). SQL column is `"order"` (a keyword) exposed as
+    /// `order_index`, same shape as `terminals`/`managed_commands`. Lower sorts first;
+    /// ties broken by `created_at`/`id`. A v9 migration backfills it from the prior
+    /// created-at order so existing projects keep their position.
+    pub order_index: i32,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -257,6 +262,8 @@ struct NewProject {
     name: String,
     created_at: i64,
     updated_at: i64,
+    /// Sidebar order; set to MAX(order)+1 at creation so a new project appends LAST.
+    order_index: i32,
 }
 
 /// A `workspaces` row. `path` is the canonical (normalized) absolute folder.
@@ -733,6 +740,22 @@ pub fn persist_scrollback(
         .execute(conn)
 }
 
+/// Persist a terminal's working directory into its durable record, bumping
+/// `updated_at` (FEEDBACK #32). The auto-naming poll reads the LIVE cwd from
+/// `/proc` (for the sidebar label) but, before this, never wrote it back into the
+/// record — so a relaunch re-spawned the shell at the STALE original `cwd` (the
+/// workspace root) instead of the last directory the user `cd`'d into. The
+/// front-side polls this on cwd CHANGE (debounced), so a respawn resumes where the
+/// user left off. Mirrors `rename`. Returns rows updated (0 if the id is unknown).
+pub fn set_terminal_cwd(conn: &mut SqliteConnection, id: &str, cwd: &str) -> QueryResult<usize> {
+    diesel::update(terminals::table.find(id))
+        .set((
+            terminals::cwd.eq(cwd),
+            terminals::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
 /// Read back a single terminal by id. Used by the CRUD tests now and by the
 /// re-spawn flow in a later PRD; allow dead_code until that consumer lands.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -902,12 +925,22 @@ pub fn create_project(
     };
 
     conn.transaction(|conn| {
+        use diesel::dsl::max;
+        // Append after the current max order so a new project lands LAST in the sidebar
+        // (mirrors create_template / create_terminal). No rows yet → 0.
+        let next_order = projects::table
+            .select(max(projects::order_index))
+            .first::<Option<i32>>(conn)?
+            .map(|m| m + 1)
+            .unwrap_or(0);
+
         let project = diesel::insert_into(projects::table)
             .values(NewProject {
                 id: project_id.clone(),
                 name: name.to_string(),
                 created_at: now,
                 updated_at: now,
+                order_index: next_order,
             })
             .returning(Project::as_returning())
             .get_result(conn)?;
@@ -937,12 +970,49 @@ pub fn create_project(
     })
 }
 
-/// List all projects, newest-created last (`created_at` asc, `id` asc tiebreak).
+/// List all projects in SIDEBAR ORDER (`order` asc, then `created_at`/`id` asc as a
+/// stable tiebreak). The order column is user-controlled via [`reorder_projects`]; the
+/// v9 backfill seeds it from the prior created-at order so this is unchanged on upgrade.
 pub fn list_projects(conn: &mut SqliteConnection) -> QueryResult<Vec<Project>> {
     projects::table
-        .order((projects::created_at.asc(), projects::id.asc()))
+        .order((
+            projects::order_index.asc(),
+            projects::created_at.asc(),
+            projects::id.asc(),
+        ))
         .select(Project::as_select())
         .load(conn)
+}
+
+/// Set each project's `order` to its position in `ids` (0-based), bumping `updated_at`.
+/// Ids absent from the table are silently skipped. Runs in a single transaction so the
+/// order is never observed half-applied. The caller passes ALL project ids in their new
+/// order. Mirrors [`reorder`] (terminals) / [`reorder_templates`] (commands).
+pub fn reorder_projects(conn: &mut SqliteConnection, ids: &[String]) -> QueryResult<()> {
+    let now = now_millis();
+    conn.transaction(|conn| {
+        for (pos, id) in ids.iter().enumerate() {
+            diesel::update(projects::table.find(id.as_str()))
+                .set((
+                    projects::order_index.eq(pos as i32),
+                    projects::updated_at.eq(now),
+                ))
+                .execute(conn)?;
+        }
+        Ok(())
+    })
+}
+
+/// Fetch ONE project by id, or `None` when the id is unknown. The read companion
+/// to the project mutations (`update_project` / `set_project_resume_agent_sessions`),
+/// used by the MCP `set_project_settings` tool to return the project's post-write
+/// state and to validate the id before mutating.
+pub fn get_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Project>> {
+    projects::table
+        .find(id)
+        .select(Project::as_select())
+        .first(conn)
+        .optional()
 }
 
 /// Rename a project's display `name`, bumping `updated_at`. Returns rows updated
@@ -2822,10 +2892,10 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Step DOWN to the pre-v4 schema → the four exec-state columns are gone. The
-        // exec-state migration is dir #4; later PRDs stacked dirs #5..#8 on top, so
-        // reaching the pre-v4 schema peels all of them then dir #4 itself (5 reverts,
+        // exec-state migration is dir #4; later PRDs stacked dirs #5..#9 on top, so
+        // reaching the pre-v4 schema peels all of them then dir #4 itself (6 reverts,
         // reverse order).
-        for _ in 0..5 {
+        for _ in 0..6 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -3235,6 +3305,43 @@ mod tests {
         );
     }
 
+    /// `reorder_projects` persists a new project order and `list_projects` reflects it
+    /// (FEEDBACK #11); also covers the append-last invariant on create.
+    #[test]
+    fn reorder_projects_persists_new_order() {
+        let mut conn = open_in_memory();
+        let (a, _) = create_project(&mut conn, "A", "/a", None).unwrap();
+        let (b, _) = create_project(&mut conn, "B", "/b", None).unwrap();
+        let (c, _) = create_project(&mut conn, "C", "/c", None).unwrap();
+
+        // Created in order → order_index 0,1,2 (append-last), so the list is A,B,C.
+        let initial: Vec<String> = list_projects(&mut conn)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(initial, vec![a.id.clone(), b.id.clone(), c.id.clone()]);
+
+        // New order: C, A, B.
+        reorder_projects(&mut conn, &[c.id.clone(), a.id.clone(), b.id.clone()]).expect("reorder");
+
+        let ids: Vec<String> = list_projects(&mut conn)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![c.id.clone(), a.id.clone(), b.id.clone()],
+            "list_projects must reflect the persisted reorder"
+        );
+
+        // The stored order_index values are 0,1,2 in the new sequence.
+        assert_eq!(get_project(&mut conn, &c.id).unwrap().unwrap().order_index, 0);
+        assert_eq!(get_project(&mut conn, &a.id).unwrap().unwrap().order_index, 1);
+        assert_eq!(get_project(&mut conn, &b.id).unwrap().unwrap().order_index, 2);
+    }
+
     /// `rename` persists the label and clears it on `None` (criterion 3b).
     #[test]
     fn rename_persists_label_and_clears() {
@@ -3258,6 +3365,41 @@ mod tests {
             get_terminal(&mut conn, &t.id).unwrap().unwrap().label,
             None,
             "rename(None) must clear the label"
+        );
+    }
+
+    /// FEEDBACK #32: `set_terminal_cwd` overwrites the record's `cwd` and bumps
+    /// `updated_at`, so a relaunch re-spawns the shell at the LAST directory the
+    /// user was in (the live `/proc` cwd the front-side persists on change), not
+    /// the stale original workspace-root cwd. A no-op on an unknown id.
+    #[test]
+    fn set_terminal_cwd_persists_cwd_and_bumps_updated_at() {
+        let mut conn = open_in_memory();
+        let t = create_terminal(&mut conn, "/work/palbank", None).unwrap();
+        assert_eq!(t.cwd, "/work/palbank", "fresh terminal keeps its spawn cwd");
+
+        // A real `cd` clock would always be later; sleep so the bump is observable
+        // even on a fast clock (mirrors set_active's timing assertion).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let rows = set_terminal_cwd(&mut conn, &t.id, "/work/palbank/pfm-palbank-tests")
+            .expect("set cwd");
+        assert_eq!(rows, 1, "the existing terminal row is updated");
+
+        let after = get_terminal(&mut conn, &t.id).unwrap().unwrap();
+        assert_eq!(
+            after.cwd, "/work/palbank/pfm-palbank-tests",
+            "set_terminal_cwd must persist the new (subdir) cwd"
+        );
+        assert!(
+            after.updated_at > t.updated_at,
+            "set_terminal_cwd is a content mutation: updated_at must move forward"
+        );
+
+        // Unknown id is a silent no-op (no panic, no spurious insert).
+        assert_eq!(
+            set_terminal_cwd(&mut conn, "no-such-id", "/elsewhere").unwrap(),
+            0,
+            "set_terminal_cwd on an unknown id affects zero rows"
         );
     }
 
@@ -4089,10 +4231,10 @@ mod tests {
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the projects migration (dirs #8 → #3),
-        // then the projects migration (dir #2) itself — 7 reverts in reverse order.
+        // Peel every migration stacked above the projects migration (dirs #9 → #3),
+        // then the projects migration (dir #2) itself — 8 reverts in reverse order.
         // projects must then be absent.
-        for _ in 0..7 {
+        for _ in 0..8 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -4937,9 +5079,9 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Peel every migration stacked above the managed_commands migration (dirs
-        // #8 → #4), then the managed_commands migration (dir #3) itself — 6 reverts in
+        // #9 → #4), then the managed_commands migration (dir #3) itself — 7 reverts in
         // reverse order. managed_commands must then be absent.
-        for _ in 0..6 {
+        for _ in 0..7 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -4997,11 +5139,13 @@ mod tests {
         .unwrap();
         let inst = insert_instance(&mut conn, &dev.id, &root.id);
 
-        // Revert down to the v4-absent state. Migrations stack v8, v7, v5 ON TOP of v4
-        // (PRD-5 added v7/v8; PRD-4 added v5), so reaching the v4-absent state peels
-        // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row +
-        // its v3 columns survive; the v4 columns are gone (a typed select of `unread`
-        // would now fail to run).
+        // Revert down to the v4-absent state. Migrations stack v9, v8, v7, v5 ON TOP of
+        // v4 (#11 added v9; PRD-5 added v7/v8; PRD-4 added v5), so reaching the v4-absent
+        // state peels v9, v8, v7, v5, then v4 (migrations revert in reverse order). The
+        // instance row + its v3 columns survive; the v4 columns are gone (a typed select
+        // of `unread` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v9 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v8 cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -5154,11 +5298,13 @@ mod tests {
         .unwrap();
         let inst = insert_instance(&mut conn, &dev.id, &root.id);
 
-        // Revert down to the v5-absent state. PRD-5 stacked migrations v7
-        // (agent_sessions) and v8 (project resume option) ON TOP of v5/prev_run, so
-        // reaching the v5-absent state now peels v8, v7, then v5 (migrations revert in
-        // reverse order). The instance row + its v3/v4 columns survive; the v5 columns
-        // are gone (a typed select of `prev_scrollback` would now fail to run).
+        // Revert down to the v5-absent state. Migrations v9 (#11 project order), v8
+        // (project resume option) and v7 (agent_sessions) stack ON TOP of v5/prev_run,
+        // so reaching the v5-absent state now peels v9, v8, v7, then v5 (migrations
+        // revert in reverse order). The instance row + its v3/v4 columns survive; the v5
+        // columns are gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v9 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v8 cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -6411,7 +6557,10 @@ mod tests {
         use diesel::sql_query;
         let mut conn = open_in_memory();
 
-        // Step DOWN v8 → the resume_agent_sessions column is gone.
+        // Step DOWN past v9 (#11 project order) then v8 → the resume_agent_sessions
+        // column is gone.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v9 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v8 cleanly");
         let col_present: QueryResult<usize> =

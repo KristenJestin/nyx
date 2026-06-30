@@ -34,6 +34,9 @@ export default defineConfig({
   // the app build does, so component tests importing a terminal row don't fail on the
   // unresolved virtual module. Same compiler/jsx as `vite.config.ts`.
   plugins: [react(), tsconfigPaths(), Icons({ compiler: "jsx", jsx: "react" })],
+  optimizeDeps: {
+    include: ["@tauri-apps/api/mocks"],
+  },
   test: {
     projects: [
       {

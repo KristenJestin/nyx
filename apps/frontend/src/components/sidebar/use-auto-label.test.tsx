@@ -64,4 +64,107 @@ describe("useAutoLabel", () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(poll.mock.calls.length).toBe(callsAtUnmount);
   });
+
+  // FEEDBACK #32 — persist the live cwd into the record on change (debounced).
+  it("persists a CHANGED cwd into the record, debounced (incl. same-workspace subdir)", async () => {
+    let info: TerminalInfo = { cwd: "/work/palbank", foreground: "bash" };
+    const poll = vi.fn(async (): Promise<TerminalInfo> => info);
+    const persistCwd = vi.fn();
+    renderHook(() =>
+      useAutoLabel(7, {
+        poll,
+        pollMs: 1000,
+        recordId: "rec-1",
+        persistCwd,
+        persistDebounceMs: 1500,
+      }),
+    );
+
+    // Prime: first reading observes the initial cwd. It is a NEW value, so it
+    // schedules a debounced write; let the debounce elapse.
+    await vi.waitFor(() => expect(poll).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(persistCwd).toHaveBeenLastCalledWith("rec-1", "/work/palbank");
+    const callsAfterPrime = persistCwd.mock.calls.length;
+
+    // A `cd` into a SUBDIR of the SAME workspace (auto_attach would NOT fire — the
+    // binding is unchanged) must still be persisted.
+    info = { cwd: "/work/palbank/pfm-palbank-tests", foreground: "bash" };
+    await vi.advanceTimersByTimeAsync(1000); // next poll observes the new cwd
+    // Not yet written — still inside the debounce window.
+    expect(persistCwd.mock.calls.length).toBe(callsAfterPrime);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(persistCwd).toHaveBeenLastCalledWith("rec-1", "/work/palbank/pfm-palbank-tests");
+  });
+
+  it("does NOT persist when the cwd is unchanged across polls", async () => {
+    const poll = vi.fn(
+      async (): Promise<TerminalInfo> => ({ cwd: "/work/palbank", foreground: "bash" }),
+    );
+    const persistCwd = vi.fn();
+    renderHook(() =>
+      useAutoLabel(8, {
+        poll,
+        pollMs: 1000,
+        recordId: "rec-2",
+        persistCwd,
+        persistDebounceMs: 1500,
+      }),
+    );
+
+    // One write for the initial reading, then NO further writes for a stationary
+    // terminal even across many polls (the change-gate, not one write per poll).
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(persistCwd).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(persistCwd).toHaveBeenCalledTimes(1);
+  });
+
+  it("rapid cd's collapse into a SINGLE debounced write", async () => {
+    let info: TerminalInfo = { cwd: "/a", foreground: "bash" };
+    const poll = vi.fn(async (): Promise<TerminalInfo> => info);
+    const persistCwd = vi.fn();
+    renderHook(() =>
+      useAutoLabel(9, {
+        poll,
+        pollMs: 1000,
+        recordId: "rec-3",
+        persistCwd,
+        persistDebounceMs: 1500,
+      }),
+    );
+
+    // Prime then drain the first write so the burst below is measured cleanly.
+    await vi.advanceTimersByTimeAsync(1500);
+    persistCwd.mockClear();
+
+    // Three quick cd's, each observed by a poll within the debounce window: the
+    // timer keeps resetting, so only the LAST one is written, once. Advance one
+    // poll cadence between each so a poll observes the new cwd (and resets the
+    // pending debounce); none fires yet because each reset lands before 1500ms.
+    info = { cwd: "/b", foreground: "bash" };
+    await vi.advanceTimersByTimeAsync(1000);
+    info = { cwd: "/c", foreground: "bash" };
+    await vi.advanceTimersByTimeAsync(1000);
+    info = { cwd: "/d", foreground: "bash" };
+    await vi.advanceTimersByTimeAsync(1000); // a poll observes /d, resets the timer
+    expect(persistCwd).not.toHaveBeenCalled(); // still mid-debounce on /d
+    // Now go quiet (no further cd): the debounce settles on the LAST cwd, once.
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(persistCwd).toHaveBeenCalledTimes(1);
+    expect(persistCwd).toHaveBeenCalledWith("rec-3", "/d");
+  });
+
+  it("does not persist when there is no recordId (record-less terminal)", async () => {
+    let info: TerminalInfo = { cwd: "/a", foreground: "bash" };
+    const poll = vi.fn(async (): Promise<TerminalInfo> => info);
+    const persistCwd = vi.fn();
+    renderHook(() => useAutoLabel(10, { poll, pollMs: 1000, persistCwd, persistDebounceMs: 1500 }));
+
+    await vi.advanceTimersByTimeAsync(1500);
+    info = { cwd: "/b", foreground: "bash" };
+    await vi.advanceTimersByTimeAsync(2500);
+    expect(persistCwd).not.toHaveBeenCalled();
+  });
 });

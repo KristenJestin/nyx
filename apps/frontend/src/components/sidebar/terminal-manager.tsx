@@ -3,12 +3,13 @@ import { nyxBridge } from "@/bridge";
 
 import { ChromeBar } from "@/components/chrome/chrome-bar";
 import { CommandView } from "@/components/command/command-view";
-import { ProjectCommandsDialog } from "@/components/command/project-commands-dialog";
+import { ProjectSettingsDialog, type ProjectSettingsSection } from "./project-settings-dialog";
 import { SettingsDialog, type SettingsDialogHandle } from "./settings-dialog";
 import { useCommandInstances } from "@/components/command/use-command-instances";
 import type { CommandStatePayload } from "@/components/command/use-command-state";
 import type { InstanceWithTemplate, ManagedCommand } from "@/components/command/use-commands";
 import { resolveDisplayName } from "./auto-label";
+import { resolveNewTerminalWorkspace } from "./resolve-new-terminal-workspace";
 import { AppSidebar } from "./app-sidebar";
 import { TerminalDeck } from "./terminal-deck";
 import { spliceWorkspaceOrder } from "./reorder-utils";
@@ -135,6 +136,7 @@ export function TerminalManager() {
     activeNext,
     activePrev,
     reorder,
+    rename,
     markRead,
   } = useTerminals();
 
@@ -146,6 +148,8 @@ export function TerminalManager() {
     updateProject,
     setProjectResumeAgentSessions,
     deleteProject,
+    deleteWorkspace,
+    reorderProjects,
     setProjectCollapsed,
     setWorkspaceCollapsed,
   } = useProjects();
@@ -167,8 +171,20 @@ export function TerminalManager() {
     settingsDialogRef.current?.reload();
   }, []);
 
-  // The "Manage commands" modal: which project's commands are being managed.
-  const [manageProject, setManageProject] = useState<ProjectTree | null>(null);
+  // The project-settings modal (Global / Commands): which project is targeted and
+  // which section it opens on. `null` = closed. The kebab "Project settings" opens
+  // on Global; "Manage commands" opens on Commands — both drive the SAME modal.
+  const [projectSettings, setProjectSettings] = useState<{
+    tree: ProjectTree;
+    section: ProjectSettingsSection;
+  } | null>(null);
+  // A per-open generation counter folded into the dialog `key` so each open REMOUNTS
+  // the dialog (its `initialSection` seed re-applies, and the Global rename field
+  // re-seeds from the project's current name). Bumped on the closed→open edge.
+  const settingsGen = useRef(0);
+  const settingsWasOpen = useRef(false);
+  if (projectSettings !== null && !settingsWasOpen.current) settingsGen.current += 1;
+  settingsWasOpen.current = projectSettings !== null;
   // The selected command instance (its `<CommandView>` mounts in the main pane).
   const [activeCommandId, setActiveCommandId] = useState<string | null>(null);
   const activeCommand = useMemo(
@@ -197,17 +213,27 @@ export function TerminalManager() {
     },
     [instances],
   );
+  // Clear the focus-aware AGENT "response ready" notification (the green dot) for a
+  // terminal the user just VIEWED — the activity analogue of `markRead`. Best-effort
+  // (runtime-only; the backend nudges `agent-sessions://changed` so the cleared dot
+  // disappears). A no-op for a terminal with no pending ready (the backend is idempotent).
+  const markAgentReadyRead = useCallback((id: string) => {
+    void nyxBridge.invoke("agent_mark_ready_read", { terminalId: id }).catch(() => {});
+  }, []);
+
   // Selecting a terminal VIEWS it: switch the deck to it AND mark its settled
   // exec-state read (PRD-2.1) — viewing a success/error terminal clears its unread
   // badge (and persists the clear). `running` is unaffected (it has no unread bit);
-  // `markRead` no-ops when the terminal is already read.
+  // `markRead` no-ops when the terminal is already read. The agent "response ready"
+  // notification is cleared the SAME way (focus-aware) via `markAgentReadyRead`.
   const selectTerminal = useCallback(
     (id: string) => {
       setActiveCommandId(null);
       setActive(id);
       markRead(id);
+      markAgentReadyRead(id);
     },
-    [setActive, markRead],
+    [setActive, markRead, markAgentReadyRead],
   );
 
   // ACTIVE-SETTLE (PRD-2.1): if a `success`/`error` exec-state arrives for the
@@ -259,8 +285,23 @@ export function TerminalManager() {
     if (activeId !== null) void close(activeId);
   }, [activeId, close]);
 
+  // Ctrl+T "new terminal" (FEEDBACK #27): open in the SAME workspace as the
+  // ACTIVE terminal — created at that workspace's path and bound to it, exactly
+  // like the per-workspace "+" (`newTerminalInWorkspace`). FALLS BACK to a LOOSE
+  // terminal when the active terminal has no workspace (or there is none / its
+  // binding is stale). The resolution is the pure `resolveNewTerminalWorkspace`.
+  const newTerminalSmart = useCallback(async () => {
+    const target = resolveNewTerminalWorkspace(activeId, terminals, projects);
+    if (target) {
+      const row = await create(target.path);
+      await attach(row.id, target.workspaceId, "manual");
+      return;
+    }
+    await create();
+  }, [activeId, terminals, projects, create, attach]);
+
   useTerminalShortcuts({
-    onNew: () => void create(),
+    onNew: () => void newTerminalSmart(),
     onClose: closeActive,
     onNext: activeNext,
     onPrev: activePrev,
@@ -326,13 +367,30 @@ export function TerminalManager() {
     [projects, deleteProject, detachFromWorkspaces],
   );
 
+  // Same detach-after-success contract for a SINGLE workspace delete: the backend
+  // detaches the workspace's terminals (workspace_id → NULL) so they survive loose,
+  // but the local tree would keep showing them under the now-deleted workspace until
+  // a relaunch. Detach the workspace's terminals locally ONLY after the backend
+  // confirms the delete (a rejection — root / running command — throws and skips the
+  // detach, leaving the workspace and its terminals intact).
+  const deleteWorkspaceAndDetach = useCallback(
+    async (id: string) => {
+      await deleteWorkspace(id);
+      detachFromWorkspaces([id]);
+    },
+    [deleteWorkspace, detachFromWorkspaces],
+  );
+
   // Manual add / edit / delete flows (folder-picker-driven).
-  const { addProject, addWorkspace, editProject, removeProject, dialog } = useManualAdd({
+  // The project-settings modal (below) now owns the rename + resume-opt-in flows, so
+  // `useManualAdd` is used only for the folder-picker-driven create / add-workspace /
+  // delete dialogs. `updateProject` / `setProjectResumeAgentSessions` are threaded to
+  // the settings modal instead (its Global pane).
+  const { addProject, addWorkspace, removeProject, removeWorkspace, dialog } = useManualAdd({
     createProject,
     createWorkspace,
-    updateProject,
-    setProjectResumeAgentSessions,
     deleteProject: deleteProjectAndDetach,
+    deleteWorkspace: deleteWorkspaceAndDetach,
   });
 
   // Live record→PTY id map, populated by the deck as each shell spawns/exits.
@@ -375,17 +433,19 @@ export function TerminalManager() {
     if (import.meta.env.VITE_NYX_E2E !== "1") return;
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe<CommandStatePayload>("command://state", (payload) => {
-      if (torndown) return;
-      const { instanceId, state } = payload;
-      commandStates.set(instanceId, state);
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    void nyxBridge
+      .subscribe<CommandStatePayload>("command://state", (payload) => {
+        if (torndown) return;
+        const { instanceId, state } = payload;
+        commandStates.set(instanceId, state);
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
@@ -422,9 +482,11 @@ export function TerminalManager() {
         if (cancelled) return;
         const ptyId = ptyIdsRef.current.get(id);
         if (ptyId == null) continue;
-        const info = await nyxBridge.invoke<{ cwd: string | null }>("terminal_info", {
-          id: ptyId,
-        }).catch(() => null);
+        const info = await nyxBridge
+          .invoke<{ cwd: string | null }>("terminal_info", {
+            id: ptyId,
+          })
+          .catch(() => null);
         if (cancelled) return;
         await autoAttach(id, info?.cwd ?? null);
       }
@@ -478,9 +540,12 @@ export function TerminalManager() {
       terminalInfo: async (recordId) => {
         const ptyId = ptyIdsRef.current.get(recordId);
         if (ptyId == null) return null;
-        return nyxBridge.invoke<{ cwd: string | null; foreground: string | null }>("terminal_info", {
-          id: ptyId,
-        });
+        return nyxBridge.invoke<{ cwd: string | null; foreground: string | null }>(
+          "terminal_info",
+          {
+            id: ptyId,
+          },
+        );
       },
       autoAttach: async (recordId) => {
         // Read the terminal's live cwd from the backend (`/proc` on Linux),
@@ -488,9 +553,11 @@ export function TerminalManager() {
         const ptyId = ptyIdsRef.current.get(recordId);
         let cwd: string | null = null;
         if (ptyId != null) {
-          const info = await nyxBridge.invoke<{ cwd: string | null }>("terminal_info", {
-            id: ptyId,
-          }).catch(() => null);
+          const info = await nyxBridge
+            .invoke<{ cwd: string | null }>("terminal_info", {
+              id: ptyId,
+            })
+            .catch(() => null);
           cwd = info?.cwd ?? null;
         }
         const res = await nyxBridge.invoke<{
@@ -566,15 +633,18 @@ export function TerminalManager() {
           onSelectCommand={selectCommand}
           onSelect={selectTerminal}
           onClose={(id) => void close(id)}
+          onRenameTerminal={(id, label) => void rename(id, label)}
           onNewTerminal={(ws) => void newTerminalInWorkspace(ws)}
           onNewLooseTerminal={newLooseTerminal}
           onAddProject={() => void addProject()}
           onAddWorkspace={(tree) => void addWorkspace(tree)}
-          onEditProject={(tree) => editProject(tree)}
+          onEditProject={(tree) => setProjectSettings({ tree, section: "global" })}
           onDeleteProject={(tree) => removeProject(tree)}
-          onManageCommands={(tree) => setManageProject(tree)}
+          onDeleteWorkspace={(ws) => removeWorkspace(ws)}
+          onManageCommands={(tree) => setProjectSettings({ tree, section: "commands" })}
           onReorderTerminals={reorderWorkspaceTerminals}
           onReorderLooseTerminals={reorderLooseTerminals}
+          onReorderProjects={(ids) => void reorderProjects(ids)}
           onSetProjectCollapsed={(id, collapsed) => void setProjectCollapsed(id, collapsed)}
           onSetWorkspaceCollapsed={(id, collapsed) => void setWorkspaceCollapsed(id, collapsed)}
           onOpenSettings={openSettings}
@@ -607,25 +677,44 @@ export function TerminalManager() {
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
       />
-      {/* PRD-3 "Manage commands" modal. Scans the project's ROOT workspace for
-          package.json imports (and uses its path to relativize the subfolder
-          picker). On close, re-list the instances so newly created / imported /
-          deleted commands appear (or disappear) in the sidebar band. */}
+      {/* Project-settings modal (Global / Commands). Opened from the project kebab —
+          "Project settings" (Global) or "Manage commands" (Commands). The Commands
+          pane scans the project's ROOT workspace for package.json imports (and uses
+          its path to relativize the subfolder picker). On close, re-list the
+          instances so newly created / imported / deleted commands appear (or
+          disappear) in the sidebar band. */}
       {(() => {
-        // The workspace the modal is scoped to: the ROOT, else the first. Both its
-        // id (import discovery) and path (subfolder picker relativization) come
+        // Resolve the LIVE tree from `projects` (not the captured snapshot) so the
+        // Global pane's name + resume toggle reflect the optimistic tree updates
+        // immediately; fall back to the captured tree until the live one is found.
+        const targetId = projectSettings?.tree.project.id ?? null;
+        const liveTree =
+          (targetId != null ? projects.find((t) => t.project.id === targetId) : null) ??
+          projectSettings?.tree ??
+          null;
+        // The workspace the Commands pane is scoped to: the ROOT, else the first. Both
+        // its id (import discovery) and path (subfolder picker relativization) come
         // from the SAME workspace so the picker resolves against what runs.
         const manageWorkspace =
-          manageProject?.workspaces.find((w) => w.is_root) ?? manageProject?.workspaces[0] ?? null;
+          liveTree?.workspaces.find((w) => w.is_root) ?? liveTree?.workspaces[0] ?? null;
         return (
-          <ProjectCommandsDialog
-            open={manageProject !== null}
-            projectId={manageProject?.project.id ?? null}
-            projectName={manageProject?.project.name ?? ""}
+          <ProjectSettingsDialog
+            // Remount per open so `initialSection` re-seeds and the rename field
+            // re-initializes from the current name (see `settingsGen`).
+            key={`project-settings:${settingsGen.current}`}
+            open={projectSettings !== null}
+            projectId={liveTree?.project.id ?? null}
+            projectName={liveTree?.project.name ?? ""}
+            resumeAgentSessions={liveTree?.project.resume_agent_sessions ?? false}
             importWorkspaceId={manageWorkspace?.id ?? null}
             workspacePath={manageWorkspace?.path ?? null}
+            initialSection={projectSettings?.section ?? "global"}
+            onRename={(name) => (targetId ? updateProject(targetId, name) : Promise.resolve())}
+            onResumeChange={(resume) =>
+              targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve()
+            }
             onClose={() => {
-              setManageProject(null);
+              setProjectSettings(null);
               void refreshCommands();
             }}
           />

@@ -67,8 +67,12 @@ export function SidebarItemContent({ lead, name, suffix, actions }: SidebarItemC
   return (
     <>
       {lead}
-      <span className="flex min-w-0 flex-1 items-baseline gap-1 truncate">
-        <span className="min-w-0 truncate">{name}</span>
+      <span className="flex min-w-0 flex-1 items-baseline gap-1">
+        {/* The name takes the available width (`flex-1`) and only ellipsizes when the row
+            is genuinely too narrow — so a short name like `palbank` shows in FULL instead
+            of being pre-truncated to `pal…` by a `shrink-0` suffix eating the room
+            (FEEDBACK #29, 2nd pass). The optional muted suffix stays `shrink-0` beside it. */}
+        <span className="min-w-0 flex-1 truncate">{name}</span>
         {suffix}
       </span>
       {actions}

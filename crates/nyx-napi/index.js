@@ -310,9 +310,10 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { NyxCommandRunner, NyxCore, version, NyxPty } = nativeBinding
+const { NyxCommandRunner, NyxCore, version, NyxPty, NyxProcStats } = nativeBinding
 
 module.exports.NyxCommandRunner = NyxCommandRunner
 module.exports.NyxCore = NyxCore
 module.exports.version = version
 module.exports.NyxPty = NyxPty
+module.exports.NyxProcStats = NyxProcStats
