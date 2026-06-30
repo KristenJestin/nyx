@@ -37,11 +37,7 @@ import type {
 } from "./contract";
 
 /** Build a {@link BridgeError} from a caught Tauri/IPC failure. */
-function toBridgeError(
-  kind: BridgeError["kind"],
-  cause: unknown,
-  source?: string,
-): BridgeError {
+function toBridgeError(kind: BridgeError["kind"], cause: unknown, source?: string): BridgeError {
   const message =
     cause instanceof Error
       ? cause.message
@@ -55,11 +51,7 @@ function toBridgeError(
  * Run a promise under the request options: a timeout (reject `timeout`) and/or an
  * abort signal (reject `canceled`). With neither, returns the promise unchanged.
  */
-function withRequestOptions<R>(
-  p: Promise<R>,
-  source: string,
-  opts?: RequestOptions,
-): Promise<R> {
+function withRequestOptions<R>(p: Promise<R>, source: string, opts?: RequestOptions): Promise<R> {
   if (!opts || (!opts.timeoutMs && !opts.signal)) return p;
   return new Promise<R>((resolve, reject) => {
     let settled = false;
@@ -71,8 +63,7 @@ function withRequestOptions<R>(
       if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
       fn();
     };
-    const onAbort = () =>
-      done(() => reject(toBridgeError("canceled", "aborted", source)));
+    const onAbort = () => done(() => reject(toBridgeError("canceled", "aborted", source)));
     if (opts.signal) {
       if (opts.signal.aborted) return onAbort();
       opts.signal.addEventListener("abort", onAbort);
@@ -262,11 +253,7 @@ export const tauriBridge: NyxBridge = {
     );
   },
   subscribeCommandAck(listener: Listener<CommandAck>) {
-    return subscribe<{ id: string }, CommandAck>(
-      "command://ack",
-      (w) => ({ id: w.id }),
-      listener,
-    );
+    return subscribe<{ id: string }, CommandAck>("command://ack", (w) => ({ id: w.id }), listener);
   },
 
   subscribeTerminalBusyState(listener: Listener<TerminalBusyState>) {

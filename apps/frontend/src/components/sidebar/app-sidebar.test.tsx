@@ -32,7 +32,14 @@ function ws(
 
 function tree(projectId: string, name: string, workspaces: WorkspaceRecord[]): ProjectTree {
   return {
-    project: { id: projectId, name, collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false },
+    project: {
+      id: projectId,
+      name,
+      collapsed: false,
+      created_at: 0,
+      updated_at: 0,
+      resume_agent_sessions: false,
+    },
     workspaces,
   };
 }
@@ -320,7 +327,9 @@ describe("<AppSidebar> variant A spine", () => {
       tree("p1", "Solo", [ws("w", "p1", "root", "/solo", true)]),
     ]);
     // The inline action icons are now consolidated into ONE hover-revealed kebab
-    // menu (finding 01KV1NPRZV97GVT1GKWTT6NH25). Open it, then click Rename.
+    // menu (finding 01KV1NPRZV97GVT1GKWTT6NH25). Open it, then click Project settings
+    // (the former "Rename" item — it now opens the project-settings modal on Global,
+    // where the rename lives alongside the resume toggle).
     const kebab = screen.getByRole("button", {
       name: /project actions for Solo/i,
     });
@@ -332,7 +341,7 @@ describe("<AppSidebar> variant A spine", () => {
       fireEvent.click(kebab);
     };
     openMenu();
-    fireEvent.click(await screen.findByRole("menuitem", { name: /rename project Solo/i }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /project settings for Solo/i }));
     expect(onEditProject).toHaveBeenCalledTimes(1);
     // Reopen the menu (it closed on the first item click) and click Delete.
     openMenu();

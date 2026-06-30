@@ -139,6 +139,24 @@ export interface UseProjects {
    */
   deleteProject: (id: string) => Promise<void>;
   /**
+   * Delete a SINGLE (non-root) workspace by id. The backend REFUSES the project's
+   * root (delete the whole project instead) and refuses while one of the
+   * workspace's commands is running; the rejection PROPAGATES so the caller can
+   * toast the real reason. Its command instances cascade-delete, its terminals are
+   * detached (workspace_id → null) and survive loose. The workspace is dropped from
+   * the in-memory tree only on success.
+   */
+  deleteWorkspace: (id: string) => Promise<void>;
+  /**
+   * Reorder the top-level project list to match `ids` (the new drag order, FEEDBACK
+   * #11). Optimistically reorders the in-memory tree so the sidebar repaints
+   * immediately, then persists the new order via the backend `projects_reorder`
+   * (which rewrites each project's `order` column). Mirrors the optimistic terminal
+   * reorder: a failed persist leaves the optimistic order; the next list /
+   * `workspaces://changed` re-list reconciles it.
+   */
+  reorderProjects: (ids: string[]) => Promise<void>;
+  /**
    * Persist a project's `resume_agent_sessions` opt-in (PRD-5 #5). Optimistically
    * reflected on the tree, then persisted via `set_project_resume_agent_sessions`.
    */
@@ -218,21 +236,23 @@ export function useProjects(): UseProjects {
   useEffect(() => {
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe(WORKSPACES_CHANGED_EVENT, () => {
-      if (torndown) return;
-      void loadProjectTrees()
-        .then((trees) => {
-          if (!torndown) setProjects(trees);
-        })
-        // A transient list failure leaves the current tree; the next event recovers.
-        .catch(() => {});
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    void nyxBridge
+      .subscribe(WORKSPACES_CHANGED_EVENT, () => {
+        if (torndown) return;
+        void loadProjectTrees()
+          .then((trees) => {
+            if (!torndown) setProjects(trees);
+          })
+          // A transient list failure leaves the current tree; the next event recovers.
+          .catch(() => {});
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
@@ -272,12 +292,14 @@ export function useProjects(): UseProjects {
   );
 
   const updateProject = useCallback(async (id: string, name: string) => {
-    // Optimistically reflect the new name so the header repaints immediately,
-    // then persist. A failure leaves the optimistic name; the next list corrects.
+    // Optimistically reflect the new name so the header repaints immediately, then
+    // persist. The rejection PROPAGATES (so the caller can toast the real reason and
+    // the next list corrects the optimistic name); a `workspaces://changed` re-list
+    // or the next load reconciles the tree on failure.
     setProjects((prev) =>
       prev.map((t) => (t.project.id === id ? { ...t, project: { ...t.project, name } } : t)),
     );
-    await nyxBridge.invoke("update_project", { id, name }).catch(() => {});
+    await nyxBridge.invoke("update_project", { id, name });
   }, []);
 
   const deleteProject = useCallback(async (id: string) => {
@@ -295,6 +317,22 @@ export function useProjects(): UseProjects {
     setProjects((prev) => prev.filter((t) => t.project.id !== id));
   }, []);
 
+  const deleteWorkspace = useCallback(async (id: string) => {
+    // Await the backend FIRST, then drop the workspace from its project's tree only on
+    // success. `workspace_delete` REFUSES (Err) the root workspace and a workspace with
+    // a running command, so an optimistic-remove-then-swallow would desync the sidebar
+    // from the DB (the workspace would vanish locally while it — and its live process —
+    // survive). The rejection PROPAGATES so the confirm modal surfaces the real reason.
+    // The backend detaches bound terminals (workspace_id → null); `useTerminals`
+    // reflects that via its own list/auto-attach passes — here we only own the tree. The
+    // delete sits behind a confirm dialog with a submitting spinner, so awaiting first
+    // costs no perceptible snappiness.
+    await nyxBridge.invoke("workspace_delete", { id });
+    setProjects((prev) =>
+      prev.map((t) => ({ ...t, workspaces: t.workspaces.filter((w) => w.id !== id) })),
+    );
+  }, []);
+
   const renameWorkspace = useCallback(async (id: string, name: string) => {
     // Optimistically reflect the new workspace name across the tree, then persist.
     setProjects((prev) =>
@@ -306,9 +344,28 @@ export function useProjects(): UseProjects {
     await nyxBridge.invoke("rename_workspace", { id, name }).catch(() => {});
   }, []);
 
+  const reorderProjects = useCallback(async (ids: string[]) => {
+    // Optimistically reorder the project trees to match the dragged id order so the
+    // sidebar repaints immediately, then persist (mirrors the optimistic terminal
+    // reorder in `useTerminals`). Trees absent from `ids` (defensive; normally all)
+    // are appended in their current order so a stale/foreign id never drops a row.
+    setProjects((prev) => {
+      const byId = new Map(prev.map((t) => [t.project.id, t]));
+      const reordered = ids
+        .map((id) => byId.get(id))
+        .filter((t): t is ProjectTree => t !== undefined);
+      const missing = prev.filter((t) => !ids.includes(t.project.id));
+      return [...reordered, ...missing];
+    });
+    // A failed persist leaves the optimistic order; the next list /
+    // `workspaces://changed` re-list reconciles the tree against the DB.
+    await nyxBridge.invoke("projects_reorder", { ids }).catch(() => {});
+  }, []);
+
   const setProjectResumeAgentSessions = useCallback(async (id: string, resume: boolean) => {
-    // Optimistically reflect the toggle so the dialog/header repaint immediately,
-    // then persist. A failure leaves the optimistic flag; the next list corrects it.
+    // Optimistically reflect the toggle so the dialog/header repaint immediately, then
+    // persist. The rejection PROPAGATES so the caller can toast the real reason; the
+    // optimistic flag is corrected by the next list/`workspaces://changed` re-list.
     setProjects((prev) =>
       prev.map((t) =>
         t.project.id === id
@@ -316,7 +373,7 @@ export function useProjects(): UseProjects {
           : t,
       ),
     );
-    await nyxBridge.invoke("set_project_resume_agent_sessions", { id, resume }).catch(() => {});
+    await nyxBridge.invoke("set_project_resume_agent_sessions", { id, resume });
   }, []);
 
   const setProjectCollapsed = useCallback(async (id: string, collapsed: boolean) => {
@@ -347,7 +404,9 @@ export function useProjects(): UseProjects {
     createWorkspace,
     updateProject,
     deleteProject,
+    deleteWorkspace,
     renameWorkspace,
+    reorderProjects,
     setProjectResumeAgentSessions,
     setProjectCollapsed,
     setWorkspaceCollapsed,

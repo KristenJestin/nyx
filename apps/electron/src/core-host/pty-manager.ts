@@ -34,6 +34,13 @@ export interface BusyReading {
   busy: boolean;
 }
 
+/** One `(terminalId, shellPid)` reading the per-terminal STATS poll loop consumes
+ * (FEEDBACK #28): the root pid whose process tree's CPU%/RAM is summed for the row. */
+export interface StatsReading {
+  terminalId: string;
+  shellPid: number;
+}
+
 /** A sink the manager notifies when a record-backed PTY exits (so the busy-state
  * tracker forgets it). Set by the lifecycle once the poller exists. */
 export type PtyExitObserver = (terminalId: string) => void;
@@ -51,8 +58,9 @@ interface PtyEntry {
 
 export class PtyManager {
   private readonly entries = new Map<number, PtyEntry>();
-  /** Notified when a record-backed PTY exits (busy-state tracker cleanup). */
-  private exitObserver: PtyExitObserver | null = null;
+  /** Notified when a record-backed PTY exits (e.g. the busy-state + stats trackers'
+   *  cleanup). Multiple observers may register — each is invoked on exit. */
+  private readonly exitObservers: PtyExitObserver[] = [];
   /**
    * MCP `create_terminal` OPENING-COMMAND parks (PRD-5 review #68), keyed by terminal
    * RECORD id. The MCP `create_terminal` tool parks a `command` here; when that
@@ -75,9 +83,11 @@ export class PtyManager {
     private readonly core: NyxCoreInstance,
   ) {}
 
-  /** Register the exit observer (the busy-state poller's `forget`). */
+  /** Register an exit observer (e.g. a poller's `forget`). Each registered observer is
+   *  invoked when a record-backed PTY exits — both the busy-state and the stats poller
+   *  register one. */
   onPtyExit(observer: PtyExitObserver): void {
-    this.exitObserver = observer;
+    this.exitObservers.push(observer);
   }
 
   /**
@@ -91,6 +101,24 @@ export class PtyManager {
     for (const e of this.entries.values()) {
       if (e.terminalId === null) continue;
       out.push({ terminalId: e.terminalId, busy: e.pty.busy() === true });
+    }
+    return out;
+  }
+
+  /**
+   * A snapshot of `(terminalId, shellPid)` for every record-backed live PTY whose shell
+   * pid is known — the input to the per-terminal STATS poll loop (FEEDBACK #28). The
+   * poller passes each `shellPid` to `NyxProcStats.treeStats` to sum the shell + its
+   * descendants' CPU%/RAM. Record-less PTYs (no durable id) and PTYs with no resolvable
+   * pid are skipped (nothing to attribute the consumption to).
+   */
+  statsSnapshot(): StatsReading[] {
+    const out: StatsReading[] = [];
+    for (const e of this.entries.values()) {
+      if (e.terminalId === null) continue;
+      const shellPid = e.pty.shellPid();
+      if (shellPid === null) continue;
+      out.push({ terminalId: e.terminalId, shellPid });
     }
     return out;
   }
@@ -201,6 +229,9 @@ export class PtyManager {
    */
   closeTerminal(terminalId: string): void {
     this.openingParks.delete(terminalId);
+    // Anti-phantom: closing the terminal drops its runtime agent activity immediately
+    // (the PTY-exit path also clears, but a close should not wait for the async exit).
+    this.core.clearAgentActivity(terminalId);
     for (const e of this.entries.values()) {
       if (e.terminalId === terminalId) {
         e.pty.kill();
@@ -318,9 +349,17 @@ export class PtyManager {
       // here (not only on the renderer's null-register) so a crashed/exited shell is retracted
       // even if the front never publishes the unbind.
       this.core.unregisterTerminalPty(terminalId);
+      // AGENT ACTIVITY anti-phantom clear: a dead shell means a dead Claude — its live
+      // dot (a `working`/`waiting` turn that may never have sent `Stop`) must NOT linger.
+      // Force the runtime activity to idle (the agent-activity analogue of the "emit
+      // busy=false on PTY death" reflex), then nudge the renderer to re-pull the live-dot
+      // map. Runtime-only, so nothing is persisted — a re-spawn re-evaluates clean.
+      this.core.clearAgentActivity(terminalId);
+      this.events.changed("agent-sessions");
       // The busy dot's authority is the OS signal, so forget this terminal's tracked
-      // busy value (a future re-spawn re-evaluates clean).
-      this.exitObserver?.(terminalId);
+      // busy value (a future re-spawn re-evaluates clean). Notify EVERY registered
+      // observer (busy-state + the FEEDBACK #28 stats tracker).
+      for (const observe of this.exitObservers) observe(terminalId);
     }
   }
 

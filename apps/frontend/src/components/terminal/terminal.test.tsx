@@ -56,6 +56,8 @@ describe("<Terminal>", () => {
   afterEach(() => {
     // clearMocks() runs in vitest.setup.ts afterEach.
     vi.useRealTimers();
+    // Drop any per-test navigator/clipboard stub so it never leaks across tests.
+    vi.unstubAllGlobals();
   });
 
   it("writes bytes received on pty://output into the xterm buffer", async () => {
@@ -154,6 +156,181 @@ describe("<Terminal>", () => {
       .join("");
     expect(joined).toContain("ls");
     expect(writes[0].args.id).toBe(SPAWNED_ID);
+  });
+
+  it("copies the selection on Ctrl+Shift+C without sending ^C to the PTY", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+
+    // Seed a known selection. We stub hasSelection/getSelection on the live
+    // instance (xterm's selection model needs a painted viewport jsdom lacks),
+    // so the copy path reads a deterministic value.
+    const t = term as unknown as XTerm;
+    vi.spyOn(t, "hasSelection").mockReturnValue(true);
+    vi.spyOn(t, "getSelection").mockReturnValue("selected-text-1a2b");
+
+    const textarea = document.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement;
+    expect(textarea, "xterm helper textarea must exist").not.toBeNull();
+
+    await act(async () => {
+      textarea.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "KeyC",
+          key: "C",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("selected-text-1a2b"));
+    // The chord must NOT reach the PTY (no ^C byte written for it).
+    const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+    expect(writes).not.toContain(0x03); // ETX / Ctrl+C
+  });
+
+  it("lets plain Ctrl+C through to the PTY as SIGINT (^C byte)", async () => {
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+
+    // The cleanest way to assert the SIGINT path is untouched: xterm's own input
+    // path still produces the ^C byte. `input("\x03")` exercises onData → pty_write.
+    act(() => {
+      (term as unknown as XTerm).input("\x03", true);
+    });
+
+    await waitFor(() => {
+      const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+      expect(writes).toContain(0x03);
+    });
+  });
+
+  it("writes the Shift+Enter newline sequence to the PTY (ESC+CR, not a bare \\r)", async () => {
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+
+    const textarea = document.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement;
+    expect(textarea, "xterm helper textarea must exist").not.toBeNull();
+
+    const event = new KeyboardEvent("keydown", {
+      code: "Enter",
+      key: "Enter",
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+    await act(async () => {
+      textarea.dispatchEvent(event);
+      await Promise.resolve();
+    });
+
+    // The chord is "handled": xterm's default `\r` is suppressed and the ESC+CR
+    // newline sequence is written to the PTY instead.
+    await waitFor(() => {
+      const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+      expect(writes).toEqual([0x1b, 0x0d]); // ESC + CR
+    });
+    // The DOM event must be cancelled so xterm's native `\r` path can't also fire.
+    expect(event.defaultPrevented).toBe(true);
+    // Exactly the 2-byte sequence reached the PTY — no extra bare `\r` (0x0d alone)
+    // from a double-send, and no submit.
+    const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+    expect(writes).toEqual([0x1b, 0x0d]);
+  });
+
+  it("lets plain Enter (no Shift) through to the PTY as a submit (\\r)", async () => {
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+
+    // Plain Enter must be untouched: xterm's own input path produces the bare `\r`.
+    // `input("\r")` exercises onData → pty_write the same way a real Enter would,
+    // confirming the Shift+Enter intercept does NOT hijack a modifier-less Enter.
+    act(() => {
+      (term as unknown as XTerm).input("\r", true);
+    });
+
+    await waitFor(() => {
+      const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+      expect(writes).toContain(0x0d); // CR — the normal submit
+    });
+    // And no stray ESC (0x1b) sneaks in — plain Enter is NOT the newline chord.
+    const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+    expect(writes).not.toContain(0x1b);
+  });
+
+  it("pastes the clipboard into the terminal on Ctrl+Shift+V", async () => {
+    const readText = vi.fn().mockResolvedValue("pasted-2c3d");
+    vi.stubGlobal("navigator", { clipboard: { readText } });
+
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+
+    const t = term as unknown as XTerm;
+    const pasteSpy = vi.spyOn(t, "paste");
+
+    const textarea = document.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement;
+    await act(async () => {
+      textarea.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "KeyV",
+          key: "V",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(pasteSpy).toHaveBeenCalledWith("pasted-2c3d"));
+  });
+
+  it("gates the reveal on the first post-activation reconcile (#33 anti-flash)", async () => {
+    // The inner xterm container (the element xterm opens into) must be kept
+    // visually HIDDEN from the moment the pane is active until its first
+    // post-activation geometry reconcile has run — so the stale-metrics first
+    // frame ("t e s t" spacing) is never shown. It carries `transition-opacity`
+    // and toggles `opacity-0` → `opacity-100`.
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(480);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(300);
+
+    const { container } = render(<Terminal active />);
+
+    // SYNCHRONOUSLY after the first render — before any rAF has fired — the
+    // reveal-gated inner container is HIDDEN: it is active but not yet reconciled,
+    // so the stale-metrics first frame would be painted here, invisibly.
+    const innerBefore = container.querySelector(".transition-opacity");
+    expect(innerBefore, "reveal-gated inner xterm container must exist").not.toBeNull();
+    expect(innerBefore?.className).toContain("opacity-0");
+    expect(innerBefore?.className).not.toContain("opacity-100");
+
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+
+    // Flush the activation reconcile rAF (which sets reconciledSinceActivation).
+    await act(async () => {
+      await new Promise((r) => requestAnimationFrame(() => r(null)));
+      await new Promise((r) => requestAnimationFrame(() => r(null)));
+    });
+
+    // Once reconciled, the container is revealed — the user sees the correct frame.
+    await waitFor(() => {
+      const inner = container.querySelector(".transition-opacity");
+      expect(inner?.className).toContain("opacity-100");
+      expect(inner?.className).not.toContain("opacity-0");
+    });
   });
 
   it("handles pty://exit without crashing", async () => {

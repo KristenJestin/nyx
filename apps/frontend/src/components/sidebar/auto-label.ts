@@ -101,33 +101,76 @@ export function resolveDisplayName(
 const AUTO_LABEL_POLL_MS = 1000;
 
 /**
+ * Quiet-period (ms) after the last observed cwd CHANGE before we persist it into
+ * the terminal record (FEEDBACK #32). A trailing-edge debounce so a burst of
+ * rapid `cd`s collapses into a SINGLE write — mirroring the scrollback-persist
+ * debounce style. Comfortably longer than the poll cadence so a single `cd`
+ * still writes promptly while a `cd a && cd b && cd c` does not write thrice.
+ */
+const PERSIST_CWD_DEBOUNCE_MS = 1500;
+
+/**
  * Poll the backend `terminal_info(ptyId)` on a timer and return the live auto
  * label, recomputed only when the cwd/foreground actually changes (DEBOUNCED by
  * the backend cache + this fixed poll cadence — never per output byte). Returns
  * `null` until a reading is available or while there is no PTY id yet.
  *
- * `poll` is injectable so the hook is exercised in jsdom with a mocked
- * `terminal_info` and fake timers, independent of a real `/proc`.
+ * SIDE EFFECT — PERSIST THE LIVE CWD (FEEDBACK #32). This is the one path that
+ * already holds BOTH the live cwd (from `terminal_info` / `/proc`) AND the durable
+ * terminal `recordId`, so it is where we write the live cwd back into the record.
+ * On restart a resumed terminal re-spawns its shell at `record.cwd`
+ * (`use-pty.ts` → `pty_spawn({ cwd })`); without this the record kept the STALE
+ * spawn-time cwd (the workspace root) so the resumed shell ignored every `cd` the
+ * user had made. We persist on every cwd CHANGE (DEBOUNCED), which catches ALL
+ * changes including a `cd` into a SUBDIR of the SAME workspace — something
+ * `auto_attach_terminal` (which only fires on a workspace-BINDING change) misses.
+ * A subdir is still a descendant of the workspace path, so persisting it does NOT
+ * break the binding resolver. Best-effort: a failed write is swallowed (the next
+ * cwd change retries; the floor is the last persisted value).
+ *
+ * `poll`/`persistCwd` are injectable so the hook is exercised in jsdom with a
+ * mocked `terminal_info` + spy persist and fake timers, independent of a real
+ * `/proc` and IPC. `recordId` is the durable `terminals.id`; when absent (a
+ * record-less standalone terminal) no cwd is persisted.
  */
 export function useAutoLabel(
   ptyId: number | null,
   options: {
     poll?: (ptyId: number) => Promise<TerminalInfo>;
     pollMs?: number;
+    /** Durable terminal record id; cwd is persisted into this row (FEEDBACK #32). */
+    recordId?: string | null;
+    /** Sink for the debounced cwd persist (defaults to the `set_terminal_cwd` IPC). */
+    persistCwd?: (recordId: string, cwd: string) => void;
+    /** Quiet period before a changed cwd is persisted (debounce). */
+    persistDebounceMs?: number;
   } = {},
 ): string | null {
-  const { poll = defaultPoll, pollMs = AUTO_LABEL_POLL_MS } = options;
+  const {
+    poll = defaultPoll,
+    pollMs = AUTO_LABEL_POLL_MS,
+    recordId = null,
+    persistCwd = defaultPersistCwd,
+    persistDebounceMs = PERSIST_CWD_DEBOUNCE_MS,
+  } = options;
   const [auto, setAuto] = useState<string | null>(null);
   // Remember the last computed label so an unchanged reading does not churn state.
   const lastRef = useRef<string | null>(null);
+  // Remember the last cwd we OBSERVED so a persist only fires when it CHANGES
+  // (debounced) — never once per poll for a stationary terminal.
+  const lastCwdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (ptyId === null) {
       setAuto(null);
       lastRef.current = null;
+      lastCwdRef.current = null;
       return;
     }
     let cancelled = false;
+    // Trailing-edge debounce timer for the cwd persist. Each fresh cwd change
+    // resets it, so a burst of `cd`s collapses to a single write once quiet.
+    let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
     const tick = async () => {
       try {
@@ -138,6 +181,18 @@ export function useAutoLabel(
         if (next !== lastRef.current) {
           lastRef.current = next;
           setAuto(next);
+        }
+        // FEEDBACK #32: persist the live cwd into the record when it CHANGES and
+        // is non-empty, debounced. Catches same-workspace subdir `cd`s too.
+        const cwd = info.cwd;
+        if (recordId && cwd && cwd !== lastCwdRef.current) {
+          lastCwdRef.current = cwd;
+          if (persistTimer !== null) clearTimeout(persistTimer);
+          persistTimer = setTimeout(() => {
+            persistTimer = null;
+            if (cancelled) return;
+            persistCwd(recordId, cwd);
+          }, persistDebounceMs);
         }
       } catch {
         // terminal_info can fail (pty gone / non-Linux): keep the last label.
@@ -150,8 +205,9 @@ export function useAutoLabel(
     return () => {
       cancelled = true;
       clearInterval(timer);
+      if (persistTimer !== null) clearTimeout(persistTimer);
     };
-  }, [ptyId, poll, pollMs]);
+  }, [ptyId, poll, pollMs, recordId, persistCwd, persistDebounceMs]);
 
   return auto;
 }
@@ -159,6 +215,15 @@ export function useAutoLabel(
 /** Default poll: the backend `terminal_info` command keyed by live PTY id. */
 function defaultPoll(ptyId: number): Promise<TerminalInfo> {
   return nyxBridge.invoke<TerminalInfo>("terminal_info", { id: ptyId });
+}
+
+/**
+ * Default cwd sink (FEEDBACK #32): persist the live cwd into the terminal record
+ * over the bridge. Best-effort — a failed write is swallowed; the next cwd change
+ * retries and the last persisted value is the floor.
+ */
+function defaultPersistCwd(recordId: string, cwd: string): void {
+  void nyxBridge.invoke("set_terminal_cwd", { id: recordId, cwd }).catch(() => {});
 }
 
 /**

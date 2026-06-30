@@ -88,6 +88,44 @@ pub struct ExecStatePersist {
     pub updated_at: i64,
 }
 
+/// One terminal's RUNTIME agent activity, surfaced to the front (the live dot). Mirrors
+/// `nyx_core::agent_activity::ActivitySnapshot`, with the [`Activity`] enum flattened to
+/// a string the front maps to the dot: `"working"` (running blue) | `"waiting"`
+/// (attention) | `"idle"`. `ready_unread` is the focus-aware "response ready" green-dot
+/// notification (cleared on focus, exactly like `exec_state_unread`). Built off the
+/// in-memory store — NEVER persisted.
+#[napi(object)]
+pub struct AgentActivitySnapshot {
+    /// The terminal record id this activity belongs to.
+    pub terminal_id: String,
+    /// `working` | `waiting` | `idle` — the stored activity kind (no time-based expiry).
+    pub activity: String,
+    /// `true` when a turn finished and the user has not yet viewed the terminal.
+    pub ready_unread: bool,
+    /// The RED analogue of `ready_unread` — `true` when the last turn ended on an API error
+    /// (`StopFailure`) and the user has not yet viewed the terminal (#35). Cleared on focus
+    /// (mark-read), a new turn, and PTY death / SessionEnd / close. Exposed to JS as
+    /// `errorUnread`.
+    pub error_unread: bool,
+    /// `true` when the plugin THIS session loaded is OLDER/different than the version nyx
+    /// bundles (#18b) — the per-session "plugin périmé" badge inviting a session restart.
+    /// Set once at SessionStart, runtime-only (never persisted), cleared on PTY death /
+    /// SessionEnd / close (a restarted session starts not outdated).
+    pub plugin_outdated: bool,
+}
+
+/// Flatten the runtime [`nyx_core::agent_activity::Activity`] enum to the string the
+/// front maps to the dot. The enum carries no time stamp (the 0-stale decision): the
+/// stored kind IS the surfaced kind.
+fn activity_kind_str(activity: nyx_core::agent_activity::Activity) -> &'static str {
+    use nyx_core::agent_activity::Activity;
+    match activity {
+        Activity::Idle => "idle",
+        Activity::Working => "working",
+        Activity::Waiting => "waiting",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AsyncTask implementations — each runs `compute()` on a libuv worker thread.
 // ---------------------------------------------------------------------------
@@ -532,6 +570,16 @@ impl Task for DbCommandTask {
                     .map_err(db_err)?;
                 Ok("null".to_string())
             }
+            // Persist a new project ORDER (FEEDBACK #11): all project ids in their new
+            // order. Mirrors "reorder" (terminals). The host broadcasts workspaces://changed
+            // on success so every sidebar surface re-pulls the reordered tree.
+            "projects_reorder" => {
+                let ids = self.arg_str_vec("ids")?;
+                self.db
+                    .with_conn(|c| db::reorder_projects(c, &ids))
+                    .map_err(db_err)?;
+                Ok("null".to_string())
+            }
             "rename" => {
                 let id = self.arg_str("id")?;
                 let label = self.arg_opt_str("label");
@@ -552,6 +600,19 @@ impl Task for DbCommandTask {
                 let serialized = self.arg_str("serialized")?;
                 self.db
                     .with_conn(|c| db::persist_scrollback(c, &id, &serialized))
+                    .map_err(db_err)?;
+                Ok("null".to_string())
+            }
+            // FEEDBACK #32: persist the terminal's LIVE working directory into its
+            // record. The auto-naming poll reads the live cwd from `/proc` (for the
+            // sidebar label) and pushes it here on CHANGE (debounced) so a relaunch
+            // re-spawns the shell at the LAST dir the user `cd`'d into, not the stale
+            // spawn-time cwd. Mirrors "rename".
+            "set_terminal_cwd" => {
+                let id = self.arg_str("id")?;
+                let cwd = self.arg_str("cwd")?;
+                self.db
+                    .with_conn(|c| db::set_terminal_cwd(c, &id, &cwd))
                     .map_err(db_err)?;
                 Ok("null".to_string())
             }
@@ -642,6 +703,56 @@ impl Task for DbCommandTask {
                 self.db
                     .with_conn(|c| db::rename_workspace(c, &id, &name))
                     .map_err(db_err)?;
+                Ok("null".to_string())
+            }
+            // Delete a NON-ROOT workspace by id (cascade removes its command instances,
+            // SET NULL detaches its terminals → they survive loose). Mirrors the MCP
+            // `remove_workspace` guards exactly: REFUSE the project's root (removing it
+            // would leave a rootless husk — delete the whole project instead), and REFUSE
+            // while any of the workspace's instances is running. The host re-broadcasts
+            // `workspaces://changed` on success so every sidebar surface re-pulls.
+            "workspace_delete" => {
+                let id = self.arg_str("id")?;
+                let workspace = self
+                    .db
+                    .with_conn(|c| db::get_workspace(c, &id))
+                    .map_err(db_err)?;
+                match workspace {
+                    None => return Err(Error::from_reason(format!("unknown workspace {id}"))),
+                    Some(ws) if ws.is_root => {
+                        return Err(Error::from_reason(
+                            "this is the project's root workspace — it cannot be removed on its \
+                             own; delete the whole project instead"
+                                .to_string(),
+                        ))
+                    }
+                    Some(_) => {}
+                }
+                let instance_ids = self
+                    .db
+                    .with_conn(|c| db::instance_ids_for_workspace(c, &id))
+                    .map_err(db_err)?;
+                let running = {
+                    let guard = self.runner.lock().unwrap();
+                    guard
+                        .as_ref()
+                        .map(|r| r.any_running(&instance_ids))
+                        .unwrap_or(false)
+                };
+                if running {
+                    return Err(Error::from_reason(
+                        "this workspace has a running command — stop it before removing the \
+                         workspace"
+                            .to_string(),
+                    ));
+                }
+                let deleted = self
+                    .db
+                    .with_conn(|c| db::delete_workspace(c, &id))
+                    .map_err(db_err)?;
+                if deleted == 0 {
+                    return Err(Error::from_reason(format!("unknown workspace {id}")));
+                }
                 Ok("null".to_string())
             }
             "set_workspace_collapsed" => {
@@ -869,9 +980,8 @@ impl Task for DbCommandTask {
                                 // never warns; only a live (active/unknown) session in a
                                 // non-resuming project does. An unrecognized state string is
                                 // treated as not-warnable (defensive).
-                                SessionState::from_db(&w.session_state).is_some_and(|s| {
-                                    should_warn_on_close(s, w.project_resume_on)
-                                })
+                                SessionState::from_db(&w.session_state)
+                                    .is_some_and(|s| should_warn_on_close(s, w.project_resume_on))
                             })
                             .map(|w| CloseWarningEntry {
                                 message: close_warning_message(
@@ -986,6 +1096,14 @@ pub struct NyxCore {
     /// `list_terminals` reports the true `live` bit. `Arc` so the installed MCP dispatcher
     /// shares the SAME map (built before OR after `mcpStart`).
     pub(crate) live_terminals: Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    /// The RUNTIME agent-activity store (the live "what is Claude doing" dot) — EMPTY at
+    /// boot (the anti-phantom guarantee: nothing is read from the DB, so a resumed
+    /// session starts idle, never a phantom running). The MCP dispatcher WRITES it on a
+    /// Claude per-turn hook (`UserPromptSubmit`/`Stop`/`Notification`), the host READS it
+    /// for the front (`agentActivitySnapshot`), and the PTY/close lifecycle CLEARS it on
+    /// PTY death / terminal close. `Arc` so the dispatcher (built before OR after
+    /// `mcpStart`) shares the SAME store as the host's read/clear calls. NEVER persisted.
+    pub(crate) activity: Arc<nyx_core::agent_activity::AgentActivityStore>,
 }
 
 #[napi]
@@ -1009,6 +1127,7 @@ impl NyxCore {
             data_dir,
             resource_dir: std::sync::Mutex::new(None),
             live_terminals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            activity: Arc::new(nyx_core::agent_activity::AgentActivityStore::new()),
         })
     }
 
@@ -1060,6 +1179,47 @@ impl NyxCore {
     #[napi]
     pub fn unregister_terminal_pty(&self, record_id: String) {
         self.live_terminals.lock().unwrap().remove(&record_id);
+    }
+
+    // --- RUNTIME agent activity (the live dot; never persisted) ----------------
+
+    /// Snapshot the RUNTIME agent activity of every terminal with something LIVE to show
+    /// (working/waiting OR a pending "ready" notification). Synchronous — a cheap
+    /// in-memory map read, never the Node loop / never the DB. The host calls this on the
+    /// `agent-sessions` change tick and at mount to build the live-dot map for the
+    /// renderer. A terminal that is idle (or whose `working` has gone stale) with no
+    /// pending ready is omitted (the front treats absence as idle).
+    #[napi]
+    pub fn agent_activity_snapshot(&self) -> Vec<AgentActivitySnapshot> {
+        self.activity
+            .snapshot_all()
+            .into_iter()
+            .map(|(terminal_id, snap)| AgentActivitySnapshot {
+                terminal_id,
+                activity: activity_kind_str(snap.activity).to_string(),
+                ready_unread: snap.ready_unread,
+                error_unread: snap.error_unread,
+                plugin_outdated: snap.plugin_outdated,
+            })
+            .collect()
+    }
+
+    /// FORCE a terminal's runtime activity to idle and drop its "ready" notification — the
+    /// anti-phantom clear the host calls on PTY death / terminal close (the agent-activity
+    /// analogue of "emit busy=false on PTY death"). Synchronous, idempotent. A killed
+    /// Claude that never sent `Stop` cannot leave a phantom running dot after this.
+    #[napi]
+    pub fn clear_agent_activity(&self, terminal_id: String) {
+        self.activity.clear(&terminal_id);
+    }
+
+    /// Clear ONLY the focus-aware "response ready" notification for a terminal (the
+    /// activity mark-read), leaving any live `working` activity intact. Called when the
+    /// user VIEWS the terminal — the same focus-aware clear as `terminal_exec_mark_read`.
+    /// Synchronous, idempotent.
+    #[napi]
+    pub fn mark_agent_ready_read(&self, terminal_id: String) {
+        self.activity.mark_ready_read(&terminal_id);
     }
 
     /// Auto-attach a terminal RECORD to a workspace by its live `cwd`, off the Node loop
@@ -1369,10 +1529,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "nyx-napi-closewarn-{}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("nyx-napi-closewarn-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp db dir");
         Db::open(&dir.join("nyx.db")).expect("open file-backed db")
     }

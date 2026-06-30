@@ -3,7 +3,7 @@ import {
   ChevronRightIcon,
   FolderPlusIcon,
   MoreVerticalIcon,
-  PencilIcon,
+  SlidersHorizontalIcon,
   TerminalSquareIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -37,6 +37,12 @@ export interface ProjectItemProps {
   onEditProject?: (tree: ProjectTree) => void;
   /** Open the delete-confirm modal for THIS project. */
   onDeleteProject?: (tree: ProjectTree) => void;
+  /**
+   * Open the delete-confirm flow for a single (non-root) workspace of THIS
+   * project. Threaded to each `<WorkspaceItem>` as its `onRemove`; the root
+   * workspace never offers it (the backend rejects removing a root).
+   */
+  onDeleteWorkspace?: (workspace: WorkspaceRecord) => void;
   /** Open the "Manage commands" modal for THIS project (PRD-3 command templates). */
   onManageCommands?: (tree: ProjectTree) => void;
   /** Commands (PRD-3 instances) grouped by `workspace_id`, for this project's keys. */
@@ -54,6 +60,13 @@ export interface ProjectItemProps {
   onSetCollapsed?: (id: string, collapsed: boolean) => void;
   /** Persist a workspace band's open/closed state (threaded to `<WorkspaceItem>`). */
   onSetWorkspaceCollapsed?: (id: string, collapsed: boolean) => void;
+  /**
+   * Optional drag handle rendered at the LEFT edge of the band header (FEEDBACK
+   * #11). `<SortableProjectItem>` injects a grip wired to dnd-kit's `handleRef`
+   * here so dragging is scoped to the handle (the band's toggle/kebab keep their
+   * own clicks). Absent in isolation tests → no handle, no behaviour change.
+   */
+  dragHandle?: React.ReactNode;
 }
 
 /**
@@ -82,6 +95,7 @@ export function ProjectItem({
   onAddWorkspace,
   onEditProject,
   onDeleteProject,
+  onDeleteWorkspace,
   onManageCommands,
   commandsByWorkspace,
   activeCommandId,
@@ -89,6 +103,7 @@ export function ProjectItem({
   onReorderTerminals,
   onSetCollapsed,
   onSetWorkspaceCollapsed,
+  dragHandle,
 }: ProjectItemProps) {
   // Initialize the band's open state from the PERSISTED `collapsed` flag so the
   // disclosure is restored on reload (open = !collapsed). `defaultOpen` is the
@@ -131,11 +146,17 @@ export function ProjectItem({
     // A `layout` projection here would be a SECOND animator on top of that flow —
     // exactly the double-tp we removed. (Shared rail FLIP still works: it rides
     // the `layoutId` element + the surrounding `LayoutGroup`, not this band.)
-    <motion.li className="flex flex-col">
+    //
+    // A `motion.div` (NOT `motion.li`): the band is wrapped by
+    // `<SortableProjectItem>`'s sortable `<li>` (FEEDBACK #11), so dnd-kit owns the
+    // outer `<li>`'s `transform` while Motion here owns only the band's open/close —
+    // separate elements, nothing to fight (same split as the terminal rows).
+    <motion.div className="flex flex-col">
       {/* FULL-BLEED band header (proto's `.pband`): flat fill, hairline divider.
           The toggle and the kebab are SIBLINGS (a button cannot nest a button),
           so the toggle button itself carries `aria-expanded`. */}
       <div className="group flex items-center border-b border-sidebar-border bg-sidebar-accent/60 hover:bg-sidebar-accent">
+        {dragHandle}
         <button
           type="button"
           aria-expanded={open}
@@ -183,11 +204,11 @@ export function ProjectItem({
           >
             {onEditProject && (
               <MenuItem
-                icon={<PencilIcon className="size-4" />}
+                icon={<SlidersHorizontalIcon className="size-4" />}
                 onClick={() => onEditProject(tree)}
-                aria-label={`Rename project ${project.name}`}
+                aria-label={`Project settings for ${project.name}`}
               >
-                Rename
+                Project settings
               </MenuItem>
             )}
             <MenuItem
@@ -243,6 +264,7 @@ export function ProjectItem({
                 onNewTerminal={onNewTerminal}
                 onSelectCommand={onSelectCommand}
                 onManageCommands={onManageCommands ? () => onManageCommands(tree) : undefined}
+                onRemove={onDeleteWorkspace}
                 onReorderTerminals={onReorderTerminals}
                 onSetCollapsed={onSetWorkspaceCollapsed}
               />
@@ -272,6 +294,6 @@ export function ProjectItem({
           )
         )}
       </CollapsibleSection>
-    </motion.li>
+    </motion.div>
   );
 }

@@ -78,11 +78,7 @@ function windowApi(): NyxWindowApi {
 }
 
 /** Build a {@link BridgeError} from a caught IPC/command failure. */
-function toBridgeError(
-  kind: BridgeError["kind"],
-  cause: unknown,
-  source?: string,
-): BridgeError {
+function toBridgeError(kind: BridgeError["kind"], cause: unknown, source?: string): BridgeError {
   const message =
     cause instanceof Error
       ? cause.message
@@ -97,11 +93,7 @@ function toBridgeError(
  * abort signal (reject `canceled`). With neither, returns the promise unchanged.
  * Identical semantics to the Tauri adapter's `withRequestOptions`.
  */
-function withRequestOptions<R>(
-  p: Promise<R>,
-  source: string,
-  opts?: RequestOptions,
-): Promise<R> {
+function withRequestOptions<R>(p: Promise<R>, source: string, opts?: RequestOptions): Promise<R> {
   if (!opts || (!opts.timeoutMs && !opts.signal)) return p;
   return new Promise<R>((resolve, reject) => {
     let settled = false;
@@ -113,8 +105,7 @@ function withRequestOptions<R>(
       if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
       fn();
     };
-    const onAbort = () =>
-      done(() => reject(toBridgeError("canceled", "aborted", source)));
+    const onAbort = () => done(() => reject(toBridgeError("canceled", "aborted", source)));
     if (opts.signal) {
       if (opts.signal.aborted) return onAbort();
       opts.signal.addEventListener("abort", onAbort);
@@ -295,9 +286,8 @@ export const electronBridge: NyxBridge = {
     // Normalize bytes to Uint8Array and deliver. We do NOT ack here — the credit must
     // reflect what xterm actually CONSUMED, so the consumer (`use-pty`) acks from
     // `xterm.write`'s completion callback via `ackPtyOutput` below.
-    const un = demux.subscribe<{ id: number; bytes: number[] | Uint8Array }>(
-      "pty://output",
-      (w) => listener({ id: w.id, bytes: bytesIn(w.bytes) }),
+    const un = demux.subscribe<{ id: number; bytes: number[] | Uint8Array }>("pty://output", (w) =>
+      listener({ id: w.id, bytes: bytesIn(w.bytes) }),
     );
     return Promise.resolve(un);
   },
@@ -314,18 +304,16 @@ export const electronBridge: NyxBridge = {
   },
   subscribePtyExit(listener: Listener<PtyExit>): Promise<Unsubscribe> {
     return Promise.resolve(
-      demux.subscribe<{ id: number; code: number | null }>(
-        "pty://exit",
-        (w) => listener({ id: w.id, code: w.code }),
+      demux.subscribe<{ id: number; code: number | null }>("pty://exit", (w) =>
+        listener({ id: w.id, code: w.code }),
       ),
     );
   },
 
   subscribeCommandOutput(listener: Listener<CommandOutput>): Promise<Unsubscribe> {
     return Promise.resolve(
-      demux.subscribe<{ id: string; bytes: number[] | Uint8Array }>(
-        "command://output",
-        (w) => listener({ id: w.id, bytes: bytesIn(w.bytes) }),
+      demux.subscribe<{ id: string; bytes: number[] | Uint8Array }>("command://output", (w) =>
+        listener({ id: w.id, bytes: bytesIn(w.bytes) }),
       ),
     );
   },
@@ -345,9 +333,8 @@ export const electronBridge: NyxBridge = {
 
   subscribeTerminalBusyState(listener: Listener<TerminalBusyState>): Promise<Unsubscribe> {
     return Promise.resolve(
-      demux.subscribe<{ id: string; busy: boolean }>(
-        "terminal://busy-state",
-        (w) => listener({ id: w.id, busy: w.busy }),
+      demux.subscribe<{ id: string; busy: boolean }>("terminal://busy-state", (w) =>
+        listener({ id: w.id, busy: w.busy }),
       ),
     );
   },

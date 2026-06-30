@@ -74,12 +74,17 @@ pub struct McpChangedEvent {
 /// Delivered to Node fire-and-forget; the renderer-owned PTY reconciliation does the work.
 #[napi(object)]
 pub struct McpTerminalOp {
-    /// `park` (a `create_terminal` opening command) | `send` (a `send_to_terminal` write)
-    /// | `close` (kill the terminal's PTY).
+    /// `park` (a `create_terminal` opening command) | `send` (a `send_to_terminal` write,
+    /// the host appends `\r`) | `send_raw` (a `send_keys` write of RAW pre-resolved bytes,
+    /// the host appends NOTHING) | `close` (kill the terminal's PTY).
     pub op: String,
     /// The terminal RECORD id the op targets.
     pub terminal_id: String,
-    /// The command line for `park`/`send`; empty for `close`.
+    /// The payload: the command LINE for `park`/`send` (the host appends `\r`); the RAW
+    /// bytes HEX-ENCODED for `send_raw` (the host decodes `Buffer.from(command, "hex")` and
+    /// writes them verbatim, NO newline); empty for `close`. Hex keeps arbitrary control
+    /// bytes intact across the Node boundary without a base64 dependency or a lossy string
+    /// round-trip.
     pub command: String,
 }
 
@@ -162,6 +167,18 @@ impl TerminalHost for NodeTerminalHost {
         Ok(true)
     }
 
+    fn send_keys(&self, terminal_id: &str, bytes: &[u8]) -> std::result::Result<bool, String> {
+        // SAME liveness gate as send_to_terminal (Tauri parity): no live PTY → `false` so the
+        // caller surfaces `invalid_state`, never a mendacious `sent: true`. The ONLY difference
+        // from `send` is the verb (`send_raw`) and that the payload is the RAW bytes (HEX-
+        // encoded for the Node boundary) the host writes verbatim — NO appended `\r`.
+        if !self.is_live(terminal_id) {
+            return Ok(false);
+        }
+        self.dispatch("send_raw", terminal_id, &hex_encode(bytes));
+        Ok(true)
+    }
+
     fn close_terminal_pty(&self, terminal_id: &str) {
         self.dispatch("close", terminal_id, "");
     }
@@ -188,6 +205,11 @@ struct PoolBackedDispatcher {
     on_changed: Option<ThreadsafeFunction<McpChangedEvent, ErrorStrategy::Fatal>>,
     /// The host's Node PTY bridge for the live-PTY half of the terminal tools.
     terminal_host: NodeTerminalHost,
+    /// The SHARED runtime agent-activity store the `agent_session_event` per-turn hooks
+    /// write (the live dot). The SAME `NyxCore.activity` Arc the host reads/clears — so a
+    /// `UserPromptSubmit`/`Stop` arriving over the loopback MCP and the host's
+    /// `agentActivitySnapshot`/`clearAgentActivity` operate on one store. Never persisted.
+    activity: Arc<nyx_core::agent_activity::AgentActivityStore>,
 }
 
 impl PoolBackedDispatcher {
@@ -253,6 +275,7 @@ impl ToolDispatcher for PoolBackedDispatcher {
                 &self.db,
                 &runner,
                 &self.terminal_host,
+                &self.activity,
                 name,
                 arguments,
             ),
@@ -275,6 +298,7 @@ impl ToolDispatcher for PoolBackedDispatcher {
                     &self.db,
                     &throwaway,
                     &self.terminal_host,
+                    &self.activity,
                     name,
                     arguments,
                 )
@@ -294,6 +318,19 @@ impl ToolDispatcher for PoolBackedDispatcher {
             )),
         }
     }
+}
+
+/// Lowercase-hex encode `bytes` for the `send_raw` terminal-op payload. The Node host
+/// decodes it with `Buffer.from(command, "hex")` — a dependency-free, lossless round-trip
+/// for arbitrary control bytes (which a latin1/utf8 string field could mangle).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 /// A no-op [`nyx_core::command::RunnerSink`] for the pre-runtime throwaway runner: nothing
@@ -350,6 +387,8 @@ impl NyxCore {
                 // dispatcher's send/list see live PTYs the moment the front registers them.
                 live_terminals: Arc::clone(&self.live_terminals),
             },
+            // The SAME runtime activity store the host reads/clears (the live dot).
+            activity: Arc::clone(&self.activity),
         }));
         server
             .start()
@@ -513,6 +552,54 @@ mod tests {
             RpcCode::InvalidState,
             "after PTY exit → invalid_state again"
         );
+    }
+
+    /// FEEDBACK #31: `send_keys` on the REAL host gates on a live PTY EXACTLY like
+    /// `send_to_terminal` — `invalid_state` on an alive record with no live PTY, and a
+    /// truthful `sent: true` once a PTY is registered. The bytes the resolver produced reach
+    /// the Node bridge as the `send_raw` op (here the op bridge is `None`, so we exercise the
+    /// liveness contract — the same gate the wired host uses before queuing the raw write).
+    #[test]
+    fn send_keys_on_node_host_gates_on_live_pty() {
+        let db = fresh_db();
+        let (host, live) = host_with_registry();
+
+        let created = mcp_tools_core::create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        // No live PTY → invalid_state (parity with send_to_terminal), NOT a mendacious sent.
+        let err = mcp_tools_core::send_keys(
+            &db,
+            &host,
+            &json!({ "terminal_id": tid, "keys": ["up"] }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code,
+            RpcCode::InvalidState,
+            "alive record with no live PTY must be invalid_state for send_keys too"
+        );
+
+        // Register a live PTY → the raw write is accepted (sent:true is truthful), and the
+        // result reports the resolved byte count (\x1b[A = 3 bytes for "up").
+        live.lock().unwrap().insert(tid.clone(), 42);
+        let ok = mcp_tools_core::send_keys(
+            &db,
+            &host,
+            &json!({ "terminal_id": tid, "keys": ["up"] }),
+        )
+        .unwrap();
+        assert_eq!(ok.result["sent"], json!(true));
+        assert_eq!(ok.result["bytes"], json!(3), "\"up\" resolves to 3 raw bytes");
+    }
+
+    /// The hex codec the `send_raw` op uses must round-trip arbitrary control bytes
+    /// losslessly (the property the Node `Buffer.from(hex, \"hex\")` relies on).
+    #[test]
+    fn hex_encode_round_trips_control_bytes() {
+        assert_eq!(hex_encode(b"\x1b[A"), "1b5b41");
+        assert_eq!(hex_encode(&[0x00, 0x03, 0x7f, 0xff]), "00037fff");
+        assert_eq!(hex_encode(b""), "");
     }
 
     /// Finding A + C: `list_terminals` on the REAL host reports the true `live` bit from the

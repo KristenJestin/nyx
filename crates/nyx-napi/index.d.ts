@@ -100,6 +100,36 @@ export interface ExecStatePersist {
   updatedAt: number
 }
 /**
+ * One terminal's RUNTIME agent activity, surfaced to the front (the live dot). Mirrors
+ * `nyx_core::agent_activity::ActivitySnapshot`, with the [`Activity`] enum flattened to
+ * a string the front maps to the dot: `"working"` (running blue) | `"waiting"`
+ * (attention) | `"idle"`. `ready_unread` is the focus-aware "response ready" green-dot
+ * notification (cleared on focus, exactly like `exec_state_unread`). Built off the
+ * in-memory store — NEVER persisted.
+ */
+export interface AgentActivitySnapshot {
+  /** The terminal record id this activity belongs to. */
+  terminalId: string
+  /** `working` | `waiting` | `idle` — the stored activity kind (no time-based expiry). */
+  activity: string
+  /** `true` when a turn finished and the user has not yet viewed the terminal. */
+  readyUnread: boolean
+  /**
+   * The RED analogue of `ready_unread` — `true` when the last turn ended on an API error
+   * (`StopFailure`) and the user has not yet viewed the terminal (#35). Cleared on focus
+   * (mark-read), a new turn, and PTY death / SessionEnd / close. Exposed to JS as
+   * `errorUnread`.
+   */
+  errorUnread: boolean
+  /**
+   * `true` when the plugin THIS session loaded is OLDER/different than the version nyx
+   * bundles (#18b) — the per-session "plugin périmé" badge inviting a session restart.
+   * Set once at SessionStart, runtime-only (never persisted), cleared on PTY death /
+   * SessionEnd / close (a restarted session starts not outdated).
+   */
+  pluginOutdated: boolean
+}
+/**
  * The result of an auto-attach pass surfaced to Node (the `auto_attach_terminal` command
  * result) — mirrors `nyx_core::resolve::AutoAttachResult`. The front reflects the new
  * binding ONLY when `changed`, so it never silently un-pins a manual terminal.
@@ -141,13 +171,20 @@ export interface McpChangedEvent {
  */
 export interface McpTerminalOp {
   /**
-   * `park` (a `create_terminal` opening command) | `send` (a `send_to_terminal` write)
-   * | `close` (kill the terminal's PTY).
+   * `park` (a `create_terminal` opening command) | `send` (a `send_to_terminal` write,
+   * the host appends ``) | `send_raw` (a `send_keys` write of RAW pre-resolved bytes,
+   * the host appends NOTHING) | `close` (kill the terminal's PTY).
    */
   op: string
   /** The terminal RECORD id the op targets. */
   terminalId: string
-  /** The command line for `park`/`send`; empty for `close`. */
+  /**
+   * The payload: the command LINE for `park`/`send` (the host appends ``); the RAW
+   * bytes HEX-ENCODED for `send_raw` (the host decodes `Buffer.from(command, "hex")` and
+   * writes them verbatim, NO newline); empty for `close`. Hex keeps arbitrary control
+   * bytes intact across the Node boundary without a base64 dependency or a lossy string
+   * round-trip.
+   */
   command: string
 }
 /**
@@ -190,6 +227,23 @@ export interface TerminalInfo {
    * program runs, the shell name at an idle prompt, `null` when undeterminable.
    */
   foreground?: string
+}
+/**
+ * One terminal's process-tree resource usage (FEEDBACK #28), at the napi frontier:
+ * the summed CPU% + resident memory of the shell AND all its transitive descendants.
+ * Mirrors `nyx_core::proc_stats::TreeStats`.
+ */
+export interface TreeStats {
+  /**
+   * Summed CPU usage of the tree, in PERCENT (relative to a single core, so a tree
+   * busy on N cores can exceed 100 — e.g. a parallel build). The host/UI may clamp.
+   */
+  cpuPct: number
+  /**
+   * Summed resident memory of the tree, in BYTES (RSS). A JS `number` holds this
+   * exactly up to 2^53 bytes (8 PiB), far beyond any real terminal's footprint.
+   */
+  memBytes: number
 }
 /**
  * The managed-command runner the Electron core-host owns (parity with the Tauri
@@ -318,6 +372,29 @@ export declare class NyxCore {
    * for `list_terminals` — exactly the Tauri `TerminalPtyMap::clear` behaviour. Idempotent.
    */
   unregisterTerminalPty(recordId: string): void
+  /**
+   * Snapshot the RUNTIME agent activity of every terminal with something LIVE to show
+   * (working/waiting OR a pending "ready" notification). Synchronous — a cheap
+   * in-memory map read, never the Node loop / never the DB. The host calls this on the
+   * `agent-sessions` change tick and at mount to build the live-dot map for the
+   * renderer. A terminal that is idle (or whose `working` has gone stale) with no
+   * pending ready is omitted (the front treats absence as idle).
+   */
+  agentActivitySnapshot(): Array<AgentActivitySnapshot>
+  /**
+   * FORCE a terminal's runtime activity to idle and drop its "ready" notification — the
+   * anti-phantom clear the host calls on PTY death / terminal close (the agent-activity
+   * analogue of "emit busy=false on PTY death"). Synchronous, idempotent. A killed
+   * Claude that never sent `Stop` cannot leave a phantom running dot after this.
+   */
+  clearAgentActivity(terminalId: string): void
+  /**
+   * Clear ONLY the focus-aware "response ready" notification for a terminal (the
+   * activity mark-read), leaving any live `working` activity intact. Called when the
+   * user VIEWS the terminal — the same focus-aware clear as `terminal_exec_mark_read`.
+   * Synchronous, idempotent.
+   */
+  markAgentReadyRead(terminalId: string): void
   /**
    * Auto-attach a terminal RECORD to a workspace by its live `cwd`, off the Node loop
    * (the `auto_attach_terminal` command). Runs the SHARED nyx-core resolver body at
@@ -476,6 +553,14 @@ export declare class NyxPty {
    */
   busy(): boolean | null
   /**
+   * This terminal's ROOT pid — the shell process id, the anchor of its process tree
+   * (FEEDBACK #28). The host's per-terminal stats poll passes this to
+   * `NyxProcStats.treeStats` to sum the shell + all descendants' CPU%/RAM. `None`
+   * when the shell pid is unknown (a spawn that did not yield a pid). Portable: every
+   * OS exposes the child's pid.
+   */
+  shellPid(): number | null
+  /**
    * The LIVE auto-label introspection of this terminal (the `terminal_info` command's
    * backend — PRD-5 auto-label / auto-attach revival): a fresh `{ cwd, foreground }`
    * read straight from the kernel, NOT from OSC 7. Anchored on the live PTY:
@@ -492,4 +577,52 @@ export declare class NyxPty {
    * (the front debounces), so it is two cheap syscalls, never per output byte.
    */
   terminalInfo(): TerminalInfo
+}
+/**
+ * Cross-platform per-terminal CPU%/RAM introspector (FEEDBACK #28). Owns ONE live
+ * `sysinfo::System` kept ALIVE across calls so per-process CPU% deltas are meaningful
+ * (a fresh System per call would always read 0% — see `nyx_core::proc_stats`). The
+ * host builds exactly ONE of these at boot and calls [`tree_stats_batch`](Self::tree_stats_batch)
+ * ONCE per poll tick with EVERY live terminal's shell pid.
+ *
+ * ## Off the Node main thread (FEEDBACK #28 perf)
+ *
+ * The full `/proc` scan is EXPENSIVE; with N terminals the old `tree_stats`-per-terminal
+ * loop ran N full scans SYNCHRONOUSLY on the Node main thread, blocking the event loop for
+ * hundreds of ms and freezing keystroke IPC. So the live `ProcStats` (the one `System`) now
+ * lives behind an `Arc<Mutex<…>>`, and [`tree_stats_batch`](Self::tree_stats_batch) returns
+ * an [`AsyncTask`]: the scan runs in `compute()` on a libuv WORKER thread (mirroring the DB
+ * tasks in `core_db.rs`), never the main loop. The single `System` is preserved for CPU%
+ * deltas — it is just shared through the mutex now (only the poll touches it, so there is
+ * no contention).
+ *
+ * Cross-platform via `sysinfo` (Linux/macOS/Windows) — the descendant set is found by
+ * walking PARENT pids, the one portable signal, never `/proc` session ids.
+ */
+export declare class NyxProcStats {
+  /**
+   * Build the introspector. CPU% is meaningful from the SECOND `treeStats*` call for a
+   * given pid on (the first has no prior sample to diff — it reads ~0%).
+   */
+  constructor()
+  /**
+   * Refresh the process table and return the summed CPU%/RAM of the tree rooted at
+   * `root_pid` (a terminal's shell pid). A pid that is GONE (the shell exited) yields
+   * the all-zero reading — NEVER an error.
+   *
+   * SYNCHRONOUS, kept for parity/single-pid callers; the host's per-tick poll uses the
+   * ASYNC [`tree_stats_batch`](Self::tree_stats_batch) so the scan never blocks the loop.
+   */
+  treeStats(rootPid: number): TreeStats
+  /**
+   * Refresh the process table ONCE, then return the summed CPU%/RAM of the tree rooted
+   * at EACH pid in `roots`, one [`TreeStats`] per root IN THE SAME ORDER — OFF the Node
+   * main thread (FEEDBACK #28 perf).
+   *
+   * The host calls this ONCE per poll tick with every live terminal's shell pid. The
+   * expensive `/proc` scan happens EXACTLY ONCE per tick (not once per terminal) and on
+   * a libuv WORKER thread (the returned [`AsyncTask`] is a `Promise` in JS), so the Node
+   * event loop keeps servicing keystroke IPC + PTY output while the scan is in flight.
+   */
+  treeStatsBatch(roots: Array<number>): Promise<TreeStats[]>
 }

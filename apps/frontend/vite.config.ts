@@ -18,6 +18,13 @@ const nyxE2e = process.env.VITE_NYX_E2E === "1" ? "1" : "";
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
+  // Relative asset base so the Electron shell can load the build over `file://`
+  // (`loadFile`): with the Vite default `base: "/"`, `index.html` references
+  // `/assets/...`, which under `file://` resolves to the filesystem root and the
+  // bundle never loads → black window. Tauri tolerated absolute paths via its
+  // custom protocol; Electron does not. `"./"` makes every asset URL relative.
+  base: "./",
+
   plugins: [
     react(),
     tailwindcss(),

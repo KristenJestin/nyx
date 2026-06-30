@@ -38,6 +38,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub mod agent;
+pub mod agent_activity;
 pub mod agent_resume;
 pub mod ansi;
 pub mod command;
@@ -56,6 +57,9 @@ pub mod plugin;
 pub mod portless;
 #[cfg(target_os = "linux")]
 pub mod proc;
+/// Per-terminal CPU%/RAM over a process tree (FEEDBACK #28). Cross-platform via
+/// `sysinfo` (Linux/macOS/Windows) — NOT `/proc`, unlike [`proc`].
+pub mod proc_stats;
 pub mod proc_util;
 pub mod pty;
 pub mod resolve;

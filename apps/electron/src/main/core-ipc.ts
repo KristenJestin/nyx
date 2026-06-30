@@ -182,6 +182,18 @@ function toEnvelope(payload: HostEventPayload): CoreEventEnvelope | null {
         event: "terminal://busy-state",
         payload: { terminal_id: payload.terminalId, busy: payload.busy },
       };
+    case "pty-stats":
+      // Per-terminal CPU%/RAM (FEEDBACK #28), keyed by the PERSISTENT id. The renderer's
+      // raw subscriber reads the snake_case `terminal_id` + `cpu_pct` + `mem_bytes`
+      // (parity with the other terminal:// events' snake_case wire shape).
+      return {
+        event: "terminal://stats",
+        payload: {
+          terminal_id: payload.terminalId,
+          cpu_pct: payload.cpuPct,
+          mem_bytes: payload.memBytes,
+        },
+      };
     case "command-state":
       // A managed-command run-state / ack / output-cleared transition, mapped to the
       // matching Tauri event name. The renderer filters on `instanceId` (camelCase,

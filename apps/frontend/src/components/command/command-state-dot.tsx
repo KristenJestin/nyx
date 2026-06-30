@@ -1,6 +1,7 @@
 import { motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
+import { CrossfadeFill } from "@/components/sidebar/run-state";
 import type { ExecState } from "@/components/sidebar/use-terminals";
 
 /**
@@ -13,22 +14,11 @@ import type { ExecState } from "@/components/sidebar/use-terminals";
  *  - `success` → GREEN (`--success`),     STATIC.
  *  - `error`   → RED   (`--destructive`), STATIC.
  *
- * Colours are design-system tokens only (no raw hex). The pulse is the ONLY
- * motion, driven by Motion (`motion/react`) — chrome, never the xterm viewport.
+ * Colours are design-system tokens only (no raw hex), painted by the SHARED
+ * `<CrossfadeFill>` (the same colour layer the sidebar dots use), so a state SWAP
+ * cross-fades the token rather than hard-cutting it. The `running` breathing pulse
+ * is driven by Motion (`motion/react`) — chrome, never the xterm viewport.
  */
-function stateBgClass(state: ExecState): string {
-  switch (state) {
-    case "running":
-      return "bg-info";
-    case "success":
-      return "bg-success";
-    case "error":
-      return "bg-destructive";
-    case "idle":
-    default:
-      return "bg-muted-foreground/50";
-  }
-}
 
 export interface CommandStateDotProps {
   state: ExecState;
@@ -67,7 +57,11 @@ export function CommandStateDot({ state, className }: CommandStateDotProps) {
           ? { duration: 1.4, repeat: Infinity, ease: "easeInOut" }
           : { duration: 0 }
       }
-      className={cn("inline-block size-2.5 shrink-0 rounded-full", stateBgClass(state), className)}
-    />
+      // `relative` anchors the absolute colour layer; the host owns the SHAPE + a11y +
+      // the Motion-driven running pulse, `<CrossfadeFill>` owns the cross-fading colour.
+      className={cn("relative inline-block size-2.5 shrink-0 rounded-full", className)}
+    >
+      <CrossfadeFill state={state} />
+    </motion.span>
   );
 }

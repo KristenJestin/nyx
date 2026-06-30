@@ -24,6 +24,19 @@ function term(id: string, cwd: string): TerminalRecord {
 
 function noop() {}
 
+/**
+ * `<StatusDot>`'s colour token lives on its shared `<CrossfadeFill>` layer (an
+ * `aria-hidden` absolute child), not the `role="status"` host. Read the fill
+ * classes off that layer; `data-state` stays on the host.
+ */
+function fillClasses(host: HTMLElement): string {
+  // During a colour cross-fade two stacked layers briefly coexist (outgoing + incoming);
+  // aggregate them so a token assertion sees the layer it cares about regardless of order.
+  return Array.from(host.querySelectorAll("[aria-hidden]"))
+    .map((el) => el.className)
+    .join(" ");
+}
+
 describe("<WorkspaceSubsections>", () => {
   it("renders drag-reorderable terminal rows (whole-item drag = SortableTerminalItem/dnd-kit wired)", () => {
     render(
@@ -138,7 +151,7 @@ describe("<WorkspaceSubsections>", () => {
     expect(onSelectCommand).toHaveBeenCalledWith("c1");
   });
 
-  it("the settled badge follows `unread` while the row reflects the factual state (v4)", () => {
+  it("the settled badge follows `unread` while the row reflects the factual state (v4)", async () => {
     // An UNREAD error: the settled badge is visible (the dot fill is destructive),
     // and the factual state is reported on the dot.
     const { rerender } = render(
@@ -154,9 +167,10 @@ describe("<WorkspaceSubsections>", () => {
       />,
     );
     let dot = screen.getByRole("status", { name: /status: error/i });
-    // Factual state is observable, and the visible fill is the error badge.
+    // Factual state is observable, and the visible fill (on the cross-fade layer) is the
+    // error badge.
     expect(dot).toHaveAttribute("data-state", "error");
-    expect(dot.className).toContain("bg-destructive");
+    expect(fillClasses(dot)).toContain("bg-destructive");
 
     // After acknowledge (unread=false): the settled badge HIDES (fill reverts to the
     // neutral idle muted fill) while the row STILL reflects the factual error state.
@@ -174,8 +188,10 @@ describe("<WorkspaceSubsections>", () => {
     );
     dot = screen.getByRole("status", { name: /status: error/i });
     expect(dot).toHaveAttribute("data-state", "error"); // factual state preserved
-    expect(dot.className).toContain("bg-muted-foreground/50"); // badge hidden
-    expect(dot.className).not.toContain("bg-destructive");
+    // The visible fill reverts to the neutral idle muted fill (badge hidden). During the
+    // cross-fade the outgoing destructive layer may still be exiting, so assert the NEW
+    // muted layer is present rather than that destructive is fully gone.
+    await waitFor(() => expect(fillClasses(dot)).toContain("bg-muted-foreground/50"));
   });
 
   it("a command row shows start/stop/relaunch icons with the SAME gating as the view (finding 01KV63TEGB…)", () => {

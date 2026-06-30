@@ -1,5 +1,15 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// Mock the toast helper so the delete flows can be asserted to fire the right
+// variant with the REAL backend reason — without mounting the toast manager/viewport.
+const toastMock = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+  info: vi.fn(),
+  warning: vi.fn(),
+}));
+vi.mock("@/components/ui/toast", () => ({ toast: toastMock }));
 
 import { useManualAdd, type UseManualAddDeps } from "./use-manual-add";
 import { basename } from "./folder-picker";
@@ -21,7 +31,14 @@ function ws(id: string, name: string, path: string, isRoot: boolean): WorkspaceR
 
 function tree(id: string, name: string, workspaces: WorkspaceRecord[] = []): ProjectTree {
   return {
-    project: { id, name, collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false },
+    project: {
+      id,
+      name,
+      collapsed: false,
+      created_at: 0,
+      updated_at: 0,
+      resume_agent_sessions: false,
+    },
     workspaces,
   };
 }
@@ -30,14 +47,25 @@ function tree(id: string, name: string, workspaces: WorkspaceRecord[] = []): Pro
  * Tiny harness that mounts `useManualAdd` and exposes its triggers plus the
  * rendered dialogs, so the flows can be driven without the full manager.
  */
-function Harness({ deps, target }: { deps: UseManualAddDeps; target: ProjectTree }) {
-  const { addProject, addWorkspace, editProject, removeProject, dialog } = useManualAdd(deps);
+function Harness({
+  deps,
+  target,
+  targetWs,
+}: {
+  deps: UseManualAddDeps;
+  target: ProjectTree;
+  /** Workspace the `remove-workspace` trigger targets (omit → the button is inert). */
+  targetWs?: WorkspaceRecord;
+}) {
+  const { addProject, addWorkspace, editProject, removeProject, removeWorkspace, dialog } =
+    useManualAdd(deps);
   return (
     <div>
       <button onClick={() => void addProject()}>add-project</button>
       <button onClick={() => void addWorkspace(target)}>add-workspace</button>
       <button onClick={() => editProject(target)}>edit-project</button>
       <button onClick={() => removeProject(target)}>delete-project</button>
+      <button onClick={() => targetWs && removeWorkspace(targetWs)}>remove-workspace</button>
       {dialog}
     </div>
   );
@@ -141,6 +169,77 @@ describe("useManualAdd — delete project (confirm modal)", () => {
     const confirm = screen.getByRole("button", { name: /^delete$/i });
     fireEvent.click(confirm);
     await waitFor(() => expect(deleteProject).toHaveBeenCalledWith("p1"));
+  });
+});
+
+describe("useManualAdd — remove workspace (confirm modal, #19)", () => {
+  // The module-level `toastMock` persists across tests (this file doesn't enable
+  // global clearMocks), so reset call history before each so the success/error
+  // assertions only see THIS test's calls.
+  beforeEach(() => vi.clearAllMocks());
+
+  // The confirm button is labelled "Remove workspace" for the workspace variant
+  // (the project delete uses "Delete"), so its presence proves the dialog opened in
+  // the WORKSPACE shape — robust against the description text being split by a <span>.
+  function deps(deleteWorkspace: UseManualAddDeps["deleteWorkspace"]): UseManualAddDeps {
+    return { createProject: vi.fn(), createWorkspace: vi.fn(), deleteWorkspace, pick: vi.fn() };
+  }
+
+  it("opens a workspace-specific confirm and calls deleteWorkspace + toasts success on confirm", async () => {
+    const deleteWorkspace = vi.fn().mockResolvedValue(undefined);
+    const target = tree("p1", "Proj", [
+      ws("w-root", "main", "/p", true),
+      ws("w2", "feature", "/p/feat", false),
+    ]);
+    render(
+      <Harness deps={deps(deleteWorkspace)} target={target} targetWs={target.workspaces[1]} />,
+    );
+    fireEvent.click(screen.getByText("remove-workspace"));
+
+    const confirm = await screen.findByRole("button", { name: /^remove workspace$/i });
+    fireEvent.click(confirm);
+
+    await waitFor(() => expect(deleteWorkspace).toHaveBeenCalledWith("w2"));
+    expect(toastMock.success).toHaveBeenCalledWith(expect.stringContaining("feature"));
+    expect(toastMock.error).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a backend rejection (running command) as an error toast + inline alert, keeps the dialog open", async () => {
+    const deleteWorkspace = vi
+      .fn()
+      .mockRejectedValue(
+        "this workspace has a running command — stop it before removing the workspace",
+      );
+    const target = tree("p1", "Proj", [
+      ws("w-root", "main", "/p", true),
+      ws("w2", "feature", "/p/feat", false),
+    ]);
+    render(
+      <Harness deps={deps(deleteWorkspace)} target={target} targetWs={target.workspaces[1]} />,
+    );
+    fireEvent.click(screen.getByText("remove-workspace"));
+
+    fireEvent.click(await screen.findByRole("button", { name: /^remove workspace$/i }));
+
+    await waitFor(() =>
+      expect(toastMock.error).toHaveBeenCalledWith(expect.stringContaining("running command")),
+    );
+    // The rejection keeps the modal open with the real reason inline.
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(toastMock.success).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op for the ROOT workspace (no dialog, no backend call)", async () => {
+    const deleteWorkspace = vi.fn();
+    const target = tree("p1", "Proj", [ws("w-root", "main", "/p", true)]);
+    render(
+      <Harness deps={deps(deleteWorkspace)} target={target} targetWs={target.workspaces[0]} />,
+    );
+    fireEvent.click(screen.getByText("remove-workspace"));
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /^remove workspace$/i })).toBeNull();
   });
 });
 

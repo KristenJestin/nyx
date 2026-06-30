@@ -46,8 +46,8 @@ export function CloseWarningDialog({
             {count === 1 ? "An agent session is still active" : "Agent sessions are still active"}
           </Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-muted-foreground">
-            Closing now will drop {count === 1 ? "this session" : "these sessions"} — this
-            project doesn't resume agent sessions on relaunch.
+            Closing now will drop {count === 1 ? "this session" : "these sessions"} — this project
+            doesn't resume agent sessions on relaunch.
           </Dialog.Description>
 
           <ul className="mt-3 flex flex-col gap-1.5">

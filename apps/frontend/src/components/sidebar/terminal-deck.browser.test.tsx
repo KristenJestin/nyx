@@ -1,5 +1,5 @@
 ﻿import { render } from "@testing-library/react";
-import { mockIPC } from "@/bridge/test-harness";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, beforeEach, expect, it } from "vitest";
 
 import { TerminalDeck } from "./terminal-deck";

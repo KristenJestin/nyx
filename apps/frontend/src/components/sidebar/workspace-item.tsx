@@ -1,7 +1,9 @@
 import { useState } from "react";
-import { ChevronRightIcon } from "lucide-react";
+import { ChevronRightIcon, MoreVerticalIcon, Trash2Icon } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 
+import { Button } from "@/components/ui/button";
+import { Menu, MenuItem } from "@/components/ui/menu";
 import { CollapsibleSection } from "./collapsible-section";
 import { WorkspaceSubsections } from "./workspace-subsections";
 import { itemTransition } from "./item-motion";
@@ -37,6 +39,14 @@ export interface WorkspaceItemProps {
   onSelectCommand?: (id: string) => void;
   /** Open the manage-commands modal (the COMMANDS band's hover gear). */
   onManageCommands?: () => void;
+  /**
+   * Remove THIS workspace (opens the delete-confirm flow). When provided AND the
+   * workspace is NOT the project root, the header shows a hover-revealed kebab
+   * with a destructive "Remove workspace" action. The ROOT never offers it — the
+   * backend rejects removing a root (delete the whole project instead), so the
+   * action is hidden there to keep the UI honest.
+   */
+  onRemove?: (workspace: WorkspaceRecord) => void;
   /** Persist a new order for this workspace's terminals (within-workspace only). */
   onReorderTerminals?: (workspaceId: string, ids: string[]) => void;
   /**
@@ -76,6 +86,7 @@ export function WorkspaceItem({
   onNewTerminal,
   onSelectCommand,
   onManageCommands,
+  onRemove,
   onReorderTerminals,
   onSetCollapsed,
 }: WorkspaceItemProps) {
@@ -123,6 +134,12 @@ export function WorkspaceItem({
   // collapsed band so the user can see activity without expanding.
   const count = terminals.length;
 
+  // The destructive "Remove workspace" action is offered ONLY for a non-root
+  // workspace with a handler. The root can never be removed on its own (the
+  // backend rejects it — delete the whole project instead), so the action is
+  // simply absent there (root guard reflected in the UI).
+  const canRemove = onRemove != null && !workspace.is_root;
+
   return (
     // NO `layout` prop: the rows animate a REAL height collapse (see
     // `item-motion.ts`), so this band's size follows in NORMAL DOCUMENT FLOW and
@@ -130,31 +147,64 @@ export function WorkspaceItem({
     // animator over that flow — the double-tp we removed.
     <motion.li className="mt-0.5 flex flex-col">
       {/* Quiet WORKSPACE sub-band (proto's `.wband`): a faint fill + uppercase
-          micro-label, distinctly lighter than the project band. */}
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={toggleOpen}
-        aria-label={`Toggle workspace ${label}`}
-        className="group flex items-center gap-1.5 rounded-md bg-sidebar-foreground/3 px-1.5 py-1 text-left text-sidebar-foreground select-none hover:bg-sidebar-foreground/6"
-      >
-        <motion.span
-          aria-hidden
-          animate={{ rotate: open ? 90 : 0 }}
-          transition={itemTransition(reduced)}
-          className="flex shrink-0 items-center text-muted-foreground"
+          micro-label, distinctly lighter than the project band. The toggle and
+          the kebab are SIBLINGS (a button cannot nest a button), so the toggle
+          button itself carries `aria-expanded`. */}
+      <div className="group flex items-center rounded-md bg-sidebar-foreground/3 hover:bg-sidebar-foreground/6">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={toggleOpen}
+          aria-label={`Toggle workspace ${label}`}
+          className="flex min-w-0 flex-1 items-center gap-1.5 px-1.5 py-1 text-left text-sidebar-foreground select-none"
         >
-          <ChevronRightIcon className="size-3" />
-        </motion.span>
-        <span className="min-w-0 flex-1 truncate text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-          {label}
-        </span>
-        {!open && count > 0 && (
-          <span className="shrink-0 pr-1 text-xs text-muted-foreground/60 tabular-nums">
-            {count}
+          <motion.span
+            aria-hidden
+            animate={{ rotate: open ? 90 : 0 }}
+            transition={itemTransition(reduced)}
+            className="flex shrink-0 items-center text-muted-foreground"
+          >
+            <ChevronRightIcon className="size-3" />
+          </motion.span>
+          <span className="min-w-0 flex-1 truncate text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+            {label}
           </span>
+          {!open && count > 0 && (
+            <span className="shrink-0 pr-1 text-xs text-muted-foreground/60 tabular-nums">
+              {count}
+            </span>
+          )}
+        </button>
+
+        {/* Hover-revealed kebab carrying the destructive workspace action (mirrors
+            the project header's kebab). Absent for the root. */}
+        {canRemove && (
+          <div className="shrink-0 pr-1 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100 data-popup-open:opacity-100">
+            <Menu
+              tooltip="Workspace actions"
+              trigger={
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Workspace actions for ${label}`}
+                  className="size-5"
+                >
+                  <MoreVerticalIcon />
+                </Button>
+              }
+            >
+              <MenuItem
+                destructive
+                icon={<Trash2Icon className="size-4" />}
+                onClick={() => onRemove?.(workspace)}
+                aria-label={`Remove workspace ${label}`}
+              >
+                Remove workspace
+              </MenuItem>
+            </Menu>
+          </div>
         )}
-      </button>
+      </div>
       <CollapsibleSection open={open} className="pt-0.5">
         {subsections}
       </CollapsibleSection>

@@ -124,6 +124,14 @@ pub const CREATE_TERMINAL_TOOL: &str = "create_terminal";
 /// kept out of [`V1_TOOLS`].
 pub const SEND_TO_TERMINAL_TOOL: &str = "send_to_terminal";
 
+/// The `send_keys` tool name (FEEDBACK #31). Writes RAW keystrokes (named keys like the
+/// arrows / Esc / Ctrl+C, plus literal text) into an open terminal's PTY WITHOUT any forced
+/// newline — the raw-key counterpart to `send_to_terminal` (which always submits a shell
+/// command line). It lets an agent drive a raw-mode TUI (navigate, type without submitting,
+/// interrupt). Advertised in `tools/list`, kept OUT of [`V1_TOOLS`] (same pattern as the
+/// other interactive-terminal tools).
+pub const SEND_KEYS_TOOL: &str = "send_keys";
+
 /// The `list_terminals` tool name (PRD-4 review R-TERM). Lists the OPEN (alive) terminals with
 /// their terminal id, cwd, label, workspace and the live terminal↔PTY id mapping, so an agent
 /// knows what it can write to. Read-only. Advertised in `tools/list`, kept out of [`V1_TOOLS`].
@@ -156,6 +164,17 @@ pub const READ_TERMINAL_TOOL: &str = "read_terminal";
 /// clients onboard against). Like `probe` it answers even with no managed runtime —
 /// it just reports `mcp_unavailable` so the best-effort hook degrades cleanly.
 pub const AGENT_SESSION_EVENT_TOOL: &str = "agent_session_event";
+
+/// The `set_project_settings` tool name. Modifies a project's mutable SETTINGS — its
+/// display `name` (rename) and its `resume_agent_sessions` opt-in (PRD-5 #5) — via the
+/// SAME `db::update_project` / `db::set_project_resume_agent_sessions` path the UI's
+/// project-settings modal drives. Partial update: only the fields supplied change. It
+/// is the MCP mirror of the previously UI-only project config (the gap that forced a
+/// manual DB edit to flip `resume_agent_sessions`). Advertised in `tools/list`, kept
+/// OUT of [`V1_TOOLS`] (same pattern as the other extension tools — it layers over the
+/// existing DB, it is not part of the frozen onboarding contract). It does NOT create a
+/// project (that stays a UI gesture, per [`SERVER_INSTRUCTIONS`]).
+pub const SET_PROJECT_SETTINGS_TOOL: &str = "set_project_settings";
 
 /// The frozen MCP v1 tool surface (ADR-0003). Phase-1 advertises these names in
 /// the `tools/list` handshake; the call bodies are wired in phase 2 over the PRD-3
@@ -195,6 +214,8 @@ project, and the commands available in (or running for) a workspace.
 - Launch, stop, and relaunch a managed command, then read its captured output to see \
 what happened (startup logs, errors, a dev server's URL, test results).
 - Register or create a workspace folder when the user wants nyx to track a new one.
+- Adjust an EXISTING project's settings: rename it, or turn on/off whether nyx resumes \
+that project's active agent sessions at relaunch (`set_project_settings`).
 
 Reach for nyx whenever a request is about the user's local projects or about running, \
 inspecting, or controlling development commands on their machine. Commands are \
@@ -208,7 +229,8 @@ Do NOT use nyx when:
 directly in the shell instead.
 - The user wants to create a new project or add it to nyx for the first time — that \
 is a UI gesture done in the nyx application itself; nyx tools operate on projects that \
-already exist in nyx.";
+already exist in nyx (you CAN, however, rename an existing project or change its \
+settings with set_project_settings).";
 
 /// Resolve the MCP port (ADR-0003 D2): `NYX_MCP_PORT` when it parses to a non-zero
 /// `u16`, else [`DEFAULT_PORT`]. Port 0 ("any free port") is rejected so the port
@@ -837,7 +859,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "project_id": str_prop("project to create the command template in"),
                 "name": str_prop("command display name (must be unique within the project)"),
                 "command": str_prop("the command line to run"),
-                "subfolder": str_prop("optional run path relative to the workspace (default: workspace root)"),
+                "subfolder": str_prop("optional run path relative to EACH workspace (default: workspace root). A run-path, NOT a scope: the template is materialized into every workspace and this subfolder is appended even if it does not exist there"),
             },
             "required": ["project_id", "name", "command"],
         },
@@ -941,6 +963,36 @@ fn tool_descriptors() -> Vec<Value> {
                 "command_id": str_prop("TEMPLATE id to remove (from list_commands(project_id=…)), NOT an instance_id"),
             },
             "required": ["command_id"],
+        },
+    }));
+    // Append set_project_settings: modify an EXISTING project's mutable settings (rename +
+    // resume-agent-sessions opt-in), the MCP mirror of the UI's project-settings modal.
+    // Advertised alongside the v1 surface, kept OUT of V1_TOOLS like the other extension
+    // tools.
+    descriptors.push(json!({
+        "name": SET_PROJECT_SETTINGS_TOOL,
+        "description": "Change an EXISTING project's settings, via the SAME path as the \
+                        UI's project-settings modal. You can rename it (`name`) and/or \
+                        turn its agent-session resume on/off (`resume_agent_sessions`): \
+                        when on, nyx re-attaches that project's terminals' active agent \
+                        sessions at relaunch (exact --resume) instead of opening a bare \
+                        shell; when off (the default) it leaves a bare shell. Only the \
+                        fields you supply are changed; omitted fields keep their current \
+                        value. Returns the project's updated settings. Does NOT create a \
+                        project (that is a UI gesture). Unknown project id → invalid_id; \
+                        an empty/blank name → invalid_argument.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("project to modify (the project id from list_projects)"),
+                "name": str_prop("new display name (optional; unchanged if omitted; must be non-blank)"),
+                "resume_agent_sessions": json!({
+                    "type": "boolean",
+                    "description": "optional; when true, resume this project's active agent \
+                                   sessions at relaunch instead of a bare shell. Unchanged if omitted.",
+                }),
+            },
+            "required": ["project_id"],
         },
     }));
     // Append clear_command_output (review R-OUTPUT): reset a command instance's captured
@@ -1053,6 +1105,43 @@ fn tool_descriptors() -> Vec<Value> {
                 "command": str_prop("the command line to run (a newline is appended so the shell executes it)"),
             },
             "required": ["terminal_id", "command"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": SEND_KEYS_TOOL,
+        "description": "Send raw keystrokes to an open terminal to drive an interactive, \
+                        full-screen (raw-mode) program — a TUI menu, a pager, a prompt, an \
+                        editor — where send_to_terminal does not fit. Unlike send_to_terminal \
+                        (which types a shell COMMAND LINE and presses Enter for you), send_keys \
+                        writes EXACTLY the keys you list and adds NO newline, so you control \
+                        navigation, typing, and submitting yourself. Identify the terminal by \
+                        its `terminal_id` from list_terminals. Pass `keys`: an ARRAY processed \
+                        left to right where each element is EITHER literal text (typed verbatim, \
+                        no newline) OR a named key. Named keys (case-insensitive): \"enter\", \
+                        \"tab\", \"escape\"/\"esc\", \"backspace\", \"space\", \"up\", \"down\", \
+                        \"left\", \"right\", \"home\", \"end\", \"pageup\", \"pagedown\", \
+                        \"delete\", and control combos \"ctrl+c\", \"ctrl+d\", \"ctrl+u\", \
+                        \"ctrl+l\", \"ctrl+a\", \"ctrl+e\" (any \"ctrl+<letter>\" works). \
+                        Anything else is treated as literal text. Examples: [\"hello\", \
+                        \"enter\"] types \"hello\" then submits; [\"down\", \"down\", \"enter\"] \
+                        moves down a menu and selects; [\"ctrl+c\"] interrupts; [\"draft\"] types \
+                        without submitting. The result reports how many bytes were sent. Output \
+                        appears live in that terminal — read it with read_terminal.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "terminal_id": str_prop("id of the open terminal to send keys to (from list_terminals)"),
+                "keys": json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "ordered keystrokes: each element is literal text (typed \
+                                   verbatim, NO newline added) or a named key like \"enter\", \
+                                   \"up\", \"escape\", \"tab\", \"ctrl+c\" (case-insensitive). \
+                                   Include \"enter\" yourself to submit; omit it to type without \
+                                   submitting.",
+                }),
+            },
+            "required": ["terminal_id", "keys"],
         },
     }));
     descriptors.push(json!({
@@ -1331,6 +1420,17 @@ mod tests {
             "instructions cover nyx's core concepts (projects/workspaces/commands)"
         );
         assert_no_internal_jargon("instructions", instructions);
+        // GUARD (FEEDBACK #4): Claude Code TRUNCATES a server's `instructions` at ~2000
+        // chars when ingesting them into the agent's context. A prior over-long version
+        // (2610 chars) was cut mid-sentence, LOSING the tail — including this very "Do NOT
+        // use nyx" guidance. Keep the instructions comfortably under that budget; put
+        // detailed/edge-case guidance in the per-TOOL descriptions (which are NOT capped).
+        let chars = instructions.chars().count();
+        assert!(
+            chars <= 2000,
+            "instructions must stay under Claude Code's ~2000-char ingest cap (was {chars}); \
+             move detail into tool descriptions"
+        );
     }
 
     /// Internal/dev jargon markers that must never appear in agent-facing strings
@@ -1477,6 +1577,11 @@ mod tests {
             names.contains(&SEND_TO_TERMINAL_TOOL),
             "send_to_terminal tool must be listed"
         );
+        // FEEDBACK #31: the raw-key injection tool advertised alongside, kept OUT of V1_TOOLS.
+        assert!(
+            names.contains(&SEND_KEYS_TOOL),
+            "send_keys tool must be listed"
+        );
         assert!(
             names.contains(&LIST_TERMINALS_TOOL),
             "list_terminals tool must be listed"
@@ -1495,14 +1600,19 @@ mod tests {
             names.contains(&AGENT_SESSION_EVENT_TOOL),
             "agent_session_event tool must be listed"
         );
+        // The project-settings (rename + resume) tool advertised alongside, kept OUT of V1_TOOLS.
+        assert!(
+            names.contains(&SET_PROJECT_SETTINGS_TOOL),
+            "set_project_settings tool must be listed"
+        );
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 16,
+            V1_TOOLS.len() + 18,
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
-             create_terminal/send_to_terminal/list_terminals/close_terminal/read_terminal + \
-             agent_session_event extension tools"
+             create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
+             agent_session_event + set_project_settings extension tools"
         );
     }
 

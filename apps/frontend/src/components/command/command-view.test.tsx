@@ -150,7 +150,13 @@ describe("<CommandView> (composed: panel + dot + 3 buttons, no stdin)", () => {
   it("shows the last run's exit code in the info bar once a run ends", async () => {
     installIpc();
     render(
-      <CommandView instanceId="ib3" name="dev" initialState="idle" command="bun run dev" cwd="/p" />,
+      <CommandView
+        instanceId="ib3"
+        name="dev"
+        initialState="idle"
+        command="bun run dev"
+        cwd="/p"
+      />,
     );
     await waitFor(() => expect(screen.getByText("bun run dev")).toBeInTheDocument());
     // No exit code before any run ends this session.
@@ -171,7 +177,13 @@ describe("<CommandView> (composed: panel + dot + 3 buttons, no stdin)", () => {
     // must KEEP showing the prior run's "exit 1" while the dot goes back to idle.
     installIpc();
     render(
-      <CommandView instanceId="ib5" name="dev" initialState="idle" command="bun run dev" cwd="/p" />,
+      <CommandView
+        instanceId="ib5"
+        name="dev"
+        initialState="idle"
+        command="bun run dev"
+        cwd="/p"
+      />,
     );
     await waitFor(() => expect(screen.getByText("bun run dev")).toBeInTheDocument());
     await act(async () => {

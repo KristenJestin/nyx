@@ -27,9 +27,12 @@ describe("useRunningDebounce (running anti-flicker, finding #14)", () => {
 
   it("shows NOTHING when a command settles BEFORE the threshold (no flash, result suppressed too)", () => {
     vi.useFakeTimers();
-    const { result, rerender } = renderHook(({ raw }: { raw: ExecState }) => useRunningDebounce(raw), {
-      initialProps: { raw: "idle" as ExecState },
-    });
+    const { result, rerender } = renderHook(
+      ({ raw }: { raw: ExecState }) => useRunningDebounce(raw),
+      {
+        initialProps: { raw: "idle" as ExecState },
+      },
+    );
     expect(result.current).toBe("idle");
 
     // Command starts → running, but we are still BELOW the threshold so the dot
@@ -59,9 +62,12 @@ describe("useRunningDebounce (running anti-flicker, finding #14)", () => {
 
   it("SHOWS running once it has lasted past the threshold, then settles to the result", () => {
     vi.useFakeTimers();
-    const { result, rerender } = renderHook(({ raw }: { raw: ExecState }) => useRunningDebounce(raw), {
-      initialProps: { raw: "idle" as ExecState },
-    });
+    const { result, rerender } = renderHook(
+      ({ raw }: { raw: ExecState }) => useRunningDebounce(raw),
+      {
+        initialProps: { raw: "idle" as ExecState },
+      },
+    );
 
     rerender({ raw: "running" });
     expect(result.current).toBe("idle"); // below threshold: hidden
@@ -79,9 +85,12 @@ describe("useRunningDebounce (running anti-flicker, finding #14)", () => {
 
   it("settled and idle states are shown IMMEDIATELY (never delayed)", () => {
     vi.useFakeTimers();
-    const { result, rerender } = renderHook(({ raw }: { raw: ExecState }) => useRunningDebounce(raw), {
-      initialProps: { raw: "success" as ExecState },
-    });
+    const { result, rerender } = renderHook(
+      ({ raw }: { raw: ExecState }) => useRunningDebounce(raw),
+      {
+        initialProps: { raw: "success" as ExecState },
+      },
+    );
     // Seeded from raw → success is visible at once.
     expect(result.current).toBe("success");
 

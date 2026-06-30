@@ -105,6 +105,31 @@ export async function handleCoreCommand(
     }
     return null;
   }
+  if (command === "agent_activity_snapshot") {
+    // The RUNTIME agent-activity map (the live dot) — a synchronous in-memory read off
+    // the SAME store the MCP `agent_session_event` hooks write. NOT the DB (activity is
+    // never persisted). Mapped to the snake_case contract shape the renderer reads.
+    return services.core.agentActivitySnapshot().map((a) => ({
+      terminal_id: a.terminalId,
+      activity: a.activity,
+      ready_unread: a.readyUnread,
+      // #35 — the RED analogue: the last turn ended on an API error (StopFailure).
+      error_unread: a.errorUnread,
+      // #18b — the per-session stale-plugin badge flag (runtime, never persisted).
+      plugin_outdated: a.pluginOutdated,
+    }));
+  }
+  if (command === "agent_mark_ready_read") {
+    // `{ terminalId }` → clear the focus-aware "response ready" notification for a
+    // terminal the user just viewed (the activity analogue of `terminal_exec_mark_read`).
+    // Synchronous, idempotent. NEVER persisted. Nudge the renderer to re-pull the
+    // activity map so the cleared green dot disappears (and stays gone after re-deselect).
+    const args = parseArgs(command, argsJson);
+    const terminalId = requireString(command, args, "terminalId");
+    services.core.markAgentReadyRead(terminalId);
+    services.events.changed("agent-sessions");
+    return null;
+  }
   if (command === "auto_attach_terminal") {
     // `{ terminalId, cwd }` → run the shared nyx-core auto-attach resolver + persist the
     // decided binding (off the Node loop); `{ workspaceId, changed }` back to the front,
@@ -156,13 +181,15 @@ function mutatesCommandTemplates(command: string): boolean {
 
 /** The project/workspace TREE-MUTATING DB commands that broadcast `workspaces://changed`
  *  on success — parity with the Tauri commands that call `emit_workspaces_changed`
- *  (`create_project` / `delete_project` / `create_workspace`). The collapse/rename/resume
- *  toggles refresh locally and do NOT broadcast (matching Tauri). */
+ *  (`create_project` / `delete_project` / `create_workspace` / `remove_workspace`). The
+ *  collapse/rename/resume toggles refresh locally and do NOT broadcast (matching Tauri). */
 function mutatesWorkspaceTree(command: string): boolean {
   switch (command) {
     case "create_project":
     case "delete_project":
+    case "projects_reorder":
     case "create_workspace":
+    case "workspace_delete":
       return true;
     default:
       return false;

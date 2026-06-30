@@ -9,6 +9,19 @@ import type { ExecState } from "@/components/sidebar/use-terminals";
 
 const ALL_STATES: ExecState[] = ["idle", "running", "success", "error"];
 
+/**
+ * The colour token now lives on `<CommandStateDot>`'s shared `<CrossfadeFill>`
+ * layer (an `aria-hidden` absolute child), not the `role="status"` host. Read the
+ * fill classes off that layer; `data-state`/`data-animated` stay on the host.
+ */
+function fillClasses(host: HTMLElement): string {
+  // During a colour cross-fade two stacked layers briefly coexist; aggregate them so a
+  // token assertion sees the layer it cares about regardless of DOM order.
+  return Array.from(host.querySelectorAll("[aria-hidden]"))
+    .map((el) => el.className)
+    .join(" ");
+}
+
 interface IpcSpy {
   calls: { cmd: string; args: Record<string, unknown> }[];
   callsTo: (cmd: string) => { cmd: string; args: Record<string, unknown> }[];
@@ -45,7 +58,8 @@ describe("<CommandStateDot> (4 states: colour + motion)", () => {
     };
     for (const state of ALL_STATES) {
       const { unmount } = render(<CommandStateDot state={state} />);
-      expect(screen.getByRole("status")).toHaveClass(tokens[state]);
+      // The colour lives on the cross-fade layer, not the role="status" host.
+      expect(fillClasses(screen.getByRole("status"))).toContain(tokens[state]);
       unmount();
     }
   });
@@ -53,14 +67,14 @@ describe("<CommandStateDot> (4 states: colour + motion)", () => {
   it("running is BLUE + ANIMATED; success is GREEN + STATIC (distinct on BOTH axes)", () => {
     const { rerender } = render(<CommandStateDot state="running" />);
     const running = screen.getByRole("status");
-    // Blue token + a live Motion animation (data-animated marks the pulse loop).
-    expect(running).toHaveClass("bg-info");
+    // Blue token (on the fill layer) + a live Motion animation (data-animated marks the loop).
+    expect(fillClasses(running)).toContain("bg-info");
     expect(running).toHaveAttribute("data-animated");
 
     rerender(<CommandStateDot state="success" />);
     const success = screen.getByRole("status");
     // Green token + NO animation → never confusable with running.
-    expect(success).toHaveClass("bg-success");
+    expect(fillClasses(success)).toContain("bg-success");
     expect(success).not.toHaveAttribute("data-animated");
   });
 

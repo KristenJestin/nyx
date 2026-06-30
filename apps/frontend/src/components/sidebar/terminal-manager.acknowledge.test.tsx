@@ -86,7 +86,14 @@ interface Backend {
 function installBackend(instances: Inst[]): Backend {
   const backend: Backend = { calls: [], acknowledge: [] };
   const projects: ProjectRecord[] = [
-    { id: "p1", name: "P", collapsed: false, created_at: 0, updated_at: 0 , resume_agent_sessions: false },
+    {
+      id: "p1",
+      name: "P",
+      collapsed: false,
+      created_at: 0,
+      updated_at: 0,
+      resume_agent_sessions: false,
+    },
   ];
   // One alive terminal so `useTerminals` bootstrap adopts it instead of calling
   // `create_terminal` (which, unmocked, would push a null record and crash the
@@ -128,7 +135,8 @@ function installBackend(instances: Inst[]): Backend {
                 was_running_on_shutdown: false,
                 created_at: 0,
                 updated_at: 0,
-                last_exit_code: i.last_state === "error" ? 1 : i.last_state === "success" ? 0 : null,
+                last_exit_code:
+                  i.last_state === "error" ? 1 : i.last_state === "success" ? 0 : null,
                 ended_at: i.last_state === "success" || i.last_state === "error" ? 1 : null,
                 unread: i.unread ?? false,
                 name: i.id,

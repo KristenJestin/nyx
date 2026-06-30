@@ -268,6 +268,20 @@ export interface PtyBusyStateEvent {
 }
 
 /**
+ * A per-terminal process-tree resource reading for a terminal RECORD (FEEDBACK #28).
+ * Emitted by the host's stats poll loop on a visible CHANGE, keyed by the PERSISTENT
+ * `terminalId`. `cpuPct` is the summed CPU% of the shell + all descendants (per single
+ * core, so it can exceed 100); `memBytes` is the summed RSS in bytes. Cross-platform via
+ * `sysinfo` (Linux/macOS/Windows).
+ */
+export interface PtyStatsEvent {
+  kind: "pty-stats";
+  terminalId: string;
+  cpuPct: number;
+  memBytes: number;
+}
+
+/**
  * A managed-command run-state / ack / output-cleared transition (parity with the Tauri
  * `command://state` / `command://ack` / `command://output-cleared` events). The host
  * forwards the runner's `CommandStateEvent`; main maps `kind` to the matching renderer
@@ -313,6 +327,7 @@ export type HostEventPayload =
   | PtyCwdEvent
   | PtyExecStateEvent
   | PtyBusyStateEvent
+  | PtyStatsEvent
   | CommandStateHostEvent
   | CommandOutputHostEvent
   | ChangedEvent

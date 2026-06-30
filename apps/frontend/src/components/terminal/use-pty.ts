@@ -38,6 +38,16 @@ export interface UsePtyOptions {
    */
   onPtyId?: (id: number | null) => void;
   /**
+   * Called once for every `pty://output` chunk AFTER it has been parsed into the
+   * xterm buffer (fired from `term.write`'s completion callback, alongside the
+   * flow-control ack). Lets a consumer react to fresh buffer state — used by
+   * `<Terminal>` to schedule a debounced repaint that defeats the resume "stale
+   * canvas" race (FEEDBACK #25), where the renderer is paused (IntersectionObserver)
+   * while a resumed `claude --resume` streams its frame, so the final buffer never
+   * gets an un-paused repaint. Optional — the socle / tests don't need it.
+   */
+  onOutput?: () => void;
+  /**
    * Read-only DEAD HISTORY bytes (prior scrollback + separator) to write into the
    * terminal ONCE, as the VERY FIRST thing the session does — BEFORE the
    * `pty://output` listener is attached and BEFORE `pty_spawn` — so the restored
@@ -87,6 +97,8 @@ interface PtySession {
   disposables: IDisposable[];
   /** Notify the consumer when the live PTY id resolves / clears (auto-naming). */
   onPtyId?: (id: number | null) => void;
+  /** Notify the consumer after each output chunk is parsed into the buffer (#25). */
+  onOutput?: () => void;
 }
 
 /**
@@ -136,12 +148,16 @@ export function usePty(
   fitAddon: FitAddon,
   options: UsePtyOptions = {},
 ): () => void {
-  const { cwd, recordId, onPtyId, deadHistory } = options;
+  const { cwd, recordId, onPtyId, onOutput, deadHistory } = options;
   const sessionRef = useRef<PtySession | null>(null);
   // Keep the latest onPtyId on a ref so the session always calls the current one
   // without re-running the spawn effect when the callback identity changes.
   const onPtyIdRef = useRef(onPtyId);
   onPtyIdRef.current = onPtyId;
+  // Same ref pattern for onOutput: the session always invokes the CURRENT callback
+  // without re-running (and thus respawning) on a callback identity change.
+  const onOutputRef = useRef(onOutput);
+  onOutputRef.current = onOutput;
 
   // Stable across renders: reads the live session off the ref each call, so it
   // is safe to capture in another effect's deps without re-running it.
@@ -169,6 +185,7 @@ export function usePty(
         pendingOutput: [],
         disposables: [],
         onPtyId: (id) => onPtyIdRef.current?.(id),
+        onOutput: () => onOutputRef.current?.(),
       };
       sessionRef.current = session;
     } else {
@@ -210,6 +227,35 @@ export function usePty(
   return resyncSize;
 }
 
+/**
+ * Pick the cols/rows to spawn the PTY at — the fix for the "TUI wrapped to ~8
+ * columns" bug (FEEDBACK #24).
+ *
+ * The trap: a terminal mounted `display:none` (an INACTIVE/background pane at
+ * boot — every resumed `claude` that is not the active tab) has a 0×0 element.
+ * `FitAddon.proposeDimensions()` sizes from `parseInt(getComputedStyle(parent)
+ * .width)`, and for the pane's `width:100%` on a hidden element that parses to
+ * `100` (the literal "100%") → ~8 columns. Spawning the PTY there makes a resumed
+ * `claude` run its ENTIRE turn hard-wrapped (Ink) to 8 columns; those physical
+ * line breaks are then FROZEN in the scrollback — the later geometry reconcile
+ * (`reconcileTerminalGeometry`) resizes the LIVE area via SIGWINCH but cannot
+ * un-wrap history already committed at 8 cols.
+ *
+ * So we trust the fit ONLY when the element has a real box; otherwise we spawn at
+ * the sane FALLBACK (xterm's default 80×24) — a normal terminal width every TUI
+ * renders fine at — and let the reconcile push the real size once the pane is
+ * shown. Pure + total so it is unit-testable with fakes (no real layout needed).
+ */
+export function chooseSpawnDimensions(
+  element: { clientWidth: number; clientHeight: number } | null | undefined,
+  proposeDimensions: () => { cols?: number; rows?: number } | undefined,
+  fallback: { cols: number; rows: number },
+): { cols: number; rows: number } {
+  const hasBox = !!element && element.clientWidth > 0 && element.clientHeight > 0;
+  const dims = hasBox ? proposeDimensions() : undefined;
+  return { cols: dims?.cols ?? fallback.cols, rows: dims?.rows ?? fallback.rows };
+}
+
 /** Set up listeners and spawn the PTY for a fresh session. */
 async function start(
   session: PtySession,
@@ -237,15 +283,18 @@ async function start(
   // and let `start()` replay the matching chunks once the id is known (see the
   // drain after `pty_spawn`). Filtering on `id === null` alone would DROP output
   // that races ahead of the spawn round-trip (the first prompt under IPC load).
-  session.unlistenOutput = await nyxBridge.subscribe<PtyOutputPayload>("pty://output", (payload) => {
-    if (session.torndown) return;
-    if (session.id === null) {
-      session.pendingOutput.push(payload);
-      return;
-    }
-    if (payload.id !== session.id) return;
-    writeAndAck(payload);
-  });
+  session.unlistenOutput = await nyxBridge.subscribe<PtyOutputPayload>(
+    "pty://output",
+    (payload) => {
+      if (session.torndown) return;
+      if (session.id === null) {
+        session.pendingOutput.push(payload);
+        return;
+      }
+      if (payload.id !== session.id) return;
+      writeAndAck(payload);
+    },
+  );
 
   // Write a PTY chunk to xterm and ACK its bytes from xterm's COMPLETION callback —
   // the flow-control credit (Electron lossless backpressure, annexe §E). Acking from
@@ -257,6 +306,10 @@ async function start(
     const len = payload.bytes.length;
     term.write(decode(payload.bytes), () => {
       nyxBridge.ackPtyOutput(payload.id, len);
+      // Buffer is now parsed: notify the consumer so it can react to fresh state
+      // (the #25 debounced repaint-if-at-bottom). Fired from the SAME completion
+      // callback as the ack so it sees the post-write buffer, not the pre-write one.
+      session.onOutput?.();
     });
   }
 
@@ -285,10 +338,15 @@ async function start(
     return;
   }
 
-  // Size the PTY from the current fit (fall back to xterm's current dims).
-  const dims = fitAddon.proposeDimensions();
-  const cols = dims?.cols ?? term.cols;
-  const rows = dims?.rows ?? term.rows;
+  // Size the PTY from the current fit — but ONLY when the pane has a real layout
+  // box (see `chooseSpawnDimensions`). A terminal mounted `display:none` (an
+  // inactive/background pane at boot) would otherwise spawn at a DEGENERATE ~8-col
+  // size and a resumed `claude` would hard-wrap its whole turn to 8 columns,
+  // frozen forever in the scrollback (FEEDBACK #24).
+  const { cols, rows } = chooseSpawnDimensions(term.element, () => fitAddon.proposeDimensions(), {
+    cols: term.cols,
+    rows: term.rows,
+  });
 
   // Pass the persistent terminal record id (when bound) so the backend can map
   // the live pty_id → terminal record id for exec-state (PRD-2.1). `terminalId`
@@ -324,10 +382,12 @@ async function start(
   session.disposables.push(
     term.onData((data) => {
       if (session.id === null) return;
-      void nyxBridge.invoke("pty_write", {
-        id: session.id,
-        data: Array.from(encoder.encode(data)),
-      }).catch(() => {});
+      void nyxBridge
+        .invoke("pty_write", {
+          id: session.id,
+          data: Array.from(encoder.encode(data)),
+        })
+        .catch(() => {});
     }),
   );
 

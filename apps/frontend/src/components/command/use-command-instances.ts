@@ -101,9 +101,9 @@ export function useCommandInstances(projects: ProjectTree[]): UseCommandInstance
     }
     const lists = await Promise.all(
       workspaceIds.map((wsId) =>
-        nyxBridge.invoke<InstanceWithTemplate[]>("command_instance_list", { workspaceId: wsId }).catch(
-          () => [] as InstanceWithTemplate[],
-        ),
+        nyxBridge
+          .invoke<InstanceWithTemplate[]>("command_instance_list", { workspaceId: wsId })
+          .catch(() => [] as InstanceWithTemplate[]),
       ),
     );
     const flat: CommandInstance[] = [];
@@ -147,17 +147,19 @@ export function useCommandInstances(projects: ProjectTree[]): UseCommandInstance
   useEffect(() => {
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe(COMMANDS_CHANGED_EVENT, () => {
-      if (torndown) return;
-      // A transient load failure leaves the current list; the next event recovers.
-      void load().catch(() => {});
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    void nyxBridge
+      .subscribe(COMMANDS_CHANGED_EVENT, () => {
+        if (torndown) return;
+        // A transient load failure leaves the current list; the next event recovers.
+        void load().catch(() => {});
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
@@ -173,26 +175,32 @@ export function useCommandInstances(projects: ProjectTree[]): UseCommandInstance
   useEffect(() => {
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe<CommandStatePayload>("command://state", (payload) => {
-      if (torndown) return;
-      const { instanceId, state } = payload;
-      const next = asExecState(state);
-      const settled = next === "success" || next === "error";
-      setInstances((prev) =>
-        prev.map((i) =>
-          i.id === instanceId
-            ? // A settled run becomes unread; a fresh run clears it; idle leaves it.
-              { ...i, state: next, unread: settled ? true : next === "running" ? false : i.unread }
-            : i,
-        ),
-      );
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    void nyxBridge
+      .subscribe<CommandStatePayload>("command://state", (payload) => {
+        if (torndown) return;
+        const { instanceId, state } = payload;
+        const next = asExecState(state);
+        const settled = next === "success" || next === "error";
+        setInstances((prev) =>
+          prev.map((i) =>
+            i.id === instanceId
+              ? // A settled run becomes unread; a fresh run clears it; idle leaves it.
+                {
+                  ...i,
+                  state: next,
+                  unread: settled ? true : next === "running" ? false : i.unread,
+                }
+              : i,
+          ),
+        );
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});
@@ -206,19 +214,21 @@ export function useCommandInstances(projects: ProjectTree[]): UseCommandInstance
   useEffect(() => {
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe<{ instanceId: string }>("command://ack", (payload) => {
-      if (torndown) return;
-      const { instanceId } = payload;
-      setInstances((prev) =>
-        prev.map((i) => (i.id === instanceId ? { ...i, unread: false } : i)),
-      );
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    void nyxBridge
+      .subscribe<{ instanceId: string }>("command://ack", (payload) => {
+        if (torndown) return;
+        const { instanceId } = payload;
+        setInstances((prev) =>
+          prev.map((i) => (i.id === instanceId ? { ...i, unread: false } : i)),
+        );
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});

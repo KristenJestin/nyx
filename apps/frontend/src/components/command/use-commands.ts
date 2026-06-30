@@ -236,17 +236,19 @@ export function useCommands(projectId: string | null): UseCommands {
   useEffect(() => {
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe(COMMANDS_CHANGED_EVENT, () => {
-      if (torndown) return;
-      // A transient list failure leaves the current templates; the next event recovers.
-      void refresh().catch(() => {});
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    void nyxBridge
+      .subscribe(COMMANDS_CHANGED_EVENT, () => {
+        if (torndown) return;
+        // A transient list failure leaves the current templates; the next event recovers.
+        void refresh().catch(() => {});
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});

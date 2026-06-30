@@ -56,17 +56,19 @@ export function useCommandState(
     if (!instanceId) return;
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe<CommandStatePayload>("command://state", (payload) => {
-      if (torndown) return;
-      if (payload.instanceId !== instanceId) return;
-      setState(asExecState(payload.state));
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    void nyxBridge
+      .subscribe<CommandStatePayload>("command://state", (payload) => {
+        if (torndown) return;
+        if (payload.instanceId !== instanceId) return;
+        setState(asExecState(payload.state));
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});

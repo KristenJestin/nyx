@@ -33,10 +33,7 @@ export function FieldLabel({ className, emphasized = false, ...props }: FieldLab
  * design-system muted tone (coss.com/ui's `FieldDescription`). Used as the inline
  * switch's "Relaunch when the workspace opens" sublabel.
  */
-export function FieldDescription({
-  className,
-  ...props
-}: React.ComponentPropsWithoutRef<"span">) {
+export function FieldDescription({ className, ...props }: React.ComponentPropsWithoutRef<"span">) {
   return (
     <span
       data-slot="field-description"

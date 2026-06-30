@@ -67,6 +67,15 @@ export class ElectronEventSink {
   }
 
   /**
+   * A per-terminal process-tree resource reading for a terminal RECORD (FEEDBACK #28):
+   * the summed CPU% + RSS of the shell + all descendants. Emitted by the stats poll loop
+   * on a visible CHANGE, keyed by the PERSISTENT `terminalId`.
+   */
+  ptyStats(terminalId: string, cpuPct: number, memBytes: number): void {
+    this.emit({ kind: "pty-stats", terminalId, cpuPct, memBytes });
+  }
+
+  /**
    * A managed-command run-state / ack / output-cleared transition (parity with the
    * Tauri `command://state` / `command://ack` / `command://output-cleared`). Keyed by
    * the persistent `instanceId`; `event` is `"state" | "ack" | "output-cleared"`.

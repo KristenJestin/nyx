@@ -38,10 +38,29 @@
 //! in the bundled `hooks/hooks.json`, auto-loaded by Claude Code from the plugin's
 //! standard hooks path.
 //!
+//! ## Forcing a fresh re-cache on a content change (finding #47 / the stale-cache bug)
+//!
+//! Claude Code caches an INSTALLED plugin under a **per-version** directory
+//! (`~/.claude/plugins/cache/<mkt>/<plugin>/<version>/`). When nyx ships new plugin content
+//! (e.g. new activity hooks) but the bundled `plugin.json` `version` does not advance — or
+//! even when it does — a `claude plugin marketplace update` + `claude plugin update` is NOT
+//! enough: `plugin update` is a NO-OP whenever Claude considers the installed version already
+//! current, so the versioned cache dir is never rebuilt and live sessions keep loading STALE
+//! hooks (the exact bug observed: the `0.5.0` cache only had `SessionStart`/`SessionEnd`).
+//!
+//! The robust, version-independent fix is the **uninstall + reinstall** the manual workaround
+//! proves: `marketplace update` (re-reads the source dir into Claude's marketplace cache) →
+//! `uninstall` (drops the versioned cache dir) → `install` (recreates the cache dir FRESH from
+//! the refreshed marketplace). This forces a clean re-cache EVEN AT AN EQUAL VERSION, so a
+//! content change always reaches Claude — zero user action. It runs ONLY when the copied
+//! content actually changed (the [`copy_tree`] change signal), so an unchanged boot does
+//! nothing (idempotent — no churn).
+//!
 //! ## Properties
 //! - **Idempotent**: both CLI subcommands are no-ops when already current (they exit 0
 //!   with a friendly "already installed" message); a moved stable dir is repaired by a
-//!   re-`add` at the new path ([`PluginChange::Updated`]).
+//!   re-`add` at the new path ([`PluginChange::Updated`]). A boot with unchanged content
+//!   forces no re-cache (no `uninstall`/`install` churn).
 //! - **Self-healing**: a stale/dead-path nyx entry (the exact broken state a real user
 //!   hit) is repaired by re-copying the content + re-`add`ing at the live stable path —
 //!   `marketplace add` overwrites the stale `known_marketplaces.json` entry in place
@@ -229,16 +248,10 @@ pub trait PluginCli {
 
     /// `claude plugin marketplace update <marketplace>` — re-read the marketplace SOURCE
     /// dir into Claude's marketplace cache (finding #47). A plain `marketplace add` on an
-    /// already-registered entry does NOT re-read the directory, so without this a bundled
-    /// plugin version bump never reaches Claude's cache. Idempotent.
+    /// already-registered entry does NOT re-read the directory, so without this the
+    /// subsequent reinstall would pull STALE content from the old marketplace cache.
+    /// Idempotent.
     fn marketplace_update(&self, marketplace: &str) -> Result<(), PluginError>;
-
-    /// `claude plugin update <plugin>@<marketplace> --scope user` — move the INSTALLED
-    /// plugin to the version now in the (refreshed) marketplace cache (finding #47). The
-    /// installed plugin is pinned to a versioned cache dir; `marketplace update` alone does
-    /// not move it, so this completes the propagation. Idempotent (no-op when already at
-    /// the latest version).
-    fn plugin_update(&self, install_id: &str) -> Result<(), PluginError>;
 }
 
 /// Recursively copy `src` → `dst`, mirroring the tree (creating `dst`). Used to land the
@@ -345,14 +358,15 @@ pub fn install_with(
     cli.marketplace_add(&install.install_dir)?;
     cli.install(&install.install_id())?;
 
-    // When an ALREADY-current install's stable content changed (a bundled plugin version
-    // bump from an app update, or a port re-template), propagate it through Claude's caches
-    // (finding #47): refresh the marketplace cache + move the installed plugin to the new
-    // version. A plain `marketplace add` does NOT re-read the dir, so without this the bump
-    // never lands. A FRESH add needs no propagation — `install` already pulled the current
-    // version into the cache.
+    // When an ALREADY-current install's stable content changed (new bundled hooks, a plugin
+    // version bump from an app update, or a port re-template), FORCE a fresh re-cache through
+    // Claude's per-version cache (finding #47 / the stale-cache bug). A plain re-`install` is
+    // a no-op (already installed) and `plugin update` is a no-op at an equal version, so the
+    // versioned cache dir is never rebuilt — live sessions keep loading stale content. The
+    // uninstall+reinstall workaround rebuilds it FRESH regardless of version. A FRESH add
+    // needs no re-cache — `install` already pulled the current content into the cache.
     if already_current && content_changed {
-        propagate_update(install, cli)?;
+        force_recache(install, cli)?;
     }
 
     Ok(if already_current && !content_changed {
@@ -364,16 +378,26 @@ pub fn install_with(
     })
 }
 
-/// Propagate a bundled-plugin change through Claude's caches (finding #47), verified
-/// against Claude Code 2.1.170: `marketplace update <name>` re-reads the marketplace
-/// SOURCE dir into Claude's cache (a plain `marketplace add` on an existing entry does
-/// NOT), then `plugin update <plugin>@<marketplace>` moves the installed plugin off its
-/// pinned versioned cache dir onto the new version. Both are idempotent, so calling this
-/// when nothing actually changed is harmless — but callers gate it on a real content
-/// change to avoid needless CLI churn.
-fn propagate_update(install: &PluginInstall, cli: &dyn PluginCli) -> Result<(), PluginError> {
+/// FORCE a fresh re-cache of an already-installed plugin whose bundled content changed
+/// (finding #47 / the stale-cache bug), verified against Claude Code 2.1.170. Claude caches
+/// an installed plugin under a PER-VERSION dir; the manual workaround that actually rebuilds
+/// it (`uninstall` + `install`) is what this automates:
+/// 1. `marketplace update <name>` — re-read the marketplace SOURCE dir into Claude's
+///    marketplace cache (a plain `marketplace add` on an existing entry does NOT re-read it),
+///    so the reinstall pulls the NEW content, not the stale marketplace cache.
+/// 2. `uninstall <plugin>@<marketplace>` — drop the pinned versioned cache dir.
+/// 3. `install <plugin>@<marketplace>` — recreate the cache dir FRESH from the refreshed
+///    marketplace.
+///
+/// Chosen over `plugin update` because `plugin update` is a NO-OP whenever Claude considers
+/// the installed version already current — so it never rebuilds the cache at an EQUAL version
+/// (the exact reason the stale `0.5.0` hooks persisted). `uninstall` + `install` rebuilds it
+/// regardless of version. Callers gate this on a real content change ([`copy_tree`]'s change
+/// signal) so an unchanged boot does no re-cache churn.
+fn force_recache(install: &PluginInstall, cli: &dyn PluginCli) -> Result<(), PluginError> {
     cli.marketplace_update(&install.marketplace)?;
-    cli.plugin_update(&install.install_id())?;
+    cli.uninstall(&install.install_id())?;
+    cli.install(&install.install_id())?;
     Ok(())
 }
 
@@ -396,11 +420,13 @@ pub fn remove_with(install: &PluginInstall, cli: &dyn PluginCli) -> Result<bool,
 /// - plugin **absent** from the real registry → **no-op** (we never install on boot
 ///   without an explicit click).
 /// - plugin **present** → refresh: re-copy the bundled content (it may have changed
-///   across an app update — including a version bump or a port change) and re-register at
+///   across an app update — new hooks, a version bump or a port change) and re-register at
 ///   the stable path (healing a drifted / dead path — review #34). When the content
-///   changed, ALSO propagate the bump through Claude's caches (`marketplace update` +
-///   `plugin update`, finding #47) so a new bundled version actually reaches the installed
-///   plugin. Writes / runs the CLI only when something changed (idempotent otherwise).
+///   changed, FORCE a fresh re-cache through Claude's per-version cache (`marketplace
+///   update` + `uninstall` + `install`, finding #47 / the stale-cache bug) so the NEW
+///   content actually reaches live sessions EVEN AT AN EQUAL VERSION — `plugin update`
+///   would no-op there. Runs the CLI only when something changed (idempotent otherwise: a
+///   boot with unchanged content forces no re-cache).
 pub fn reconcile_with(
     install: &PluginInstall,
     cli: &dyn PluginCli,
@@ -416,14 +442,18 @@ pub fn reconcile_with(
     if path_ok && !content_changed {
         return Ok(ReconcileOutcome::Unchanged);
     }
-    // Re-register (heals a drifted path) and re-install (idempotent).
-    cli.marketplace_add(&install.install_dir)?;
-    cli.install(&install.install_id())?;
-    // A content change = a version bump or port re-template: propagate it through Claude's
-    // marketplace + installed-plugin caches (finding #47). A pure path-drift heal (content
-    // unchanged) skips this — nothing new to propagate.
     if content_changed {
-        propagate_update(install, cli)?;
+        // New content: re-register the stable path (heals a drift) then FORCE a fresh
+        // re-cache (`marketplace update` + `uninstall` + `install`) so Claude rebuilds its
+        // per-version cache dir from the new content — the only thing that reaches live
+        // sessions at an equal version (finding #47 / the stale-cache bug).
+        cli.marketplace_add(&install.install_dir)?;
+        force_recache(install, cli)?;
+    } else {
+        // Pure path-drift heal (content unchanged): re-register + a single idempotent
+        // re-install is enough — nothing new to re-cache.
+        cli.marketplace_add(&install.install_dir)?;
+        cli.install(&install.install_id())?;
     }
     Ok(ReconcileOutcome::Updated)
 }
@@ -698,15 +728,6 @@ mod tests {
                 .push(format!("mkt-update {marketplace}"));
             Ok(())
         }
-        fn plugin_update(&self, install_id: &str) -> Result<(), PluginError> {
-            if self.absent {
-                return Err(PluginError::CliNotFound);
-            }
-            self.calls
-                .borrow_mut()
-                .push(format!("plugin-update {install_id}"));
-            Ok(())
-        }
         fn marketplace_list(&self) -> Result<Vec<MarketplaceEntry>, PluginError> {
             if self.absent {
                 return Err(PluginError::CliNotFound);
@@ -831,8 +852,8 @@ mod tests {
     }
 
     /// Re-installing with the SAME port is idempotent (the templated descriptor matches),
-    /// while a PORT CHANGE re-templates the copied descriptor and reports Updated +
-    /// propagates the change through Claude's caches (finding #44/#47).
+    /// while a PORT CHANGE re-templates the copied descriptor and reports Updated + FORCES a
+    /// fresh re-cache (finding #44/#47).
     #[test]
     fn install_re_templates_descriptor_on_port_change() {
         let dir = temp_dir("mcp-port-change");
@@ -842,13 +863,13 @@ mod tests {
         let cli = FakeCli::default();
 
         install_with(&install_for_port(&source, &stable, &settings, 8765), &cli).unwrap();
-        // Same port → Unchanged, no re-write, no update propagation.
+        // Same port → Unchanged, no re-write, no re-cache.
         assert_eq!(
             install_with(&install_for_port(&source, &stable, &settings, 8765), &cli).unwrap(),
             PluginChange::Unchanged
         );
 
-        // Port changes (e.g. NYX_MCP_PORT override) → re-template + Updated + propagate.
+        // Port changes (e.g. NYX_MCP_PORT override) → re-template + Updated + re-cache.
         assert_eq!(
             install_with(&install_for_port(&source, &stable, &settings, 7000), &cli).unwrap(),
             PluginChange::Updated
@@ -861,13 +882,13 @@ mod tests {
         let calls = cli.calls.borrow().clone();
         assert!(
             calls.iter().any(|c| c == "mkt-update nyx"),
-            "propagated marketplace update: {calls:?}"
+            "refreshed marketplace cache: {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c == "plugin-update nyx-claude-integration@nyx"),
-            "propagated plugin update: {calls:?}"
+                .any(|c| c == "uninstall nyx-claude-integration@nyx"),
+            "forced re-cache uninstalls the plugin: {calls:?}"
         );
     }
 
@@ -885,22 +906,22 @@ mod tests {
         assert_eq!(template_mcp_port(&raw, 1), raw.to_vec());
     }
 
-    // --- update propagation through Claude's caches (finding #47) ----------
+    // --- forced re-cache on a content change (finding #47 / stale-cache bug) ----
 
-    /// A bundled-content change (a plugin VERSION bump from an app update) makes install
-    /// run the full propagation sequence — `marketplace update` THEN `plugin update` — so
-    /// Claude's marketplace cache is refreshed and the installed plugin moves to the new
-    /// version. Verified against 2.1.170: `marketplace add` alone does not re-read the dir.
+    /// A bundled-content change makes install FORCE a fresh re-cache — `marketplace update`
+    /// THEN `uninstall` THEN `install` — so Claude rebuilds its per-version cache dir from
+    /// the new content. This works EVEN AT AN EQUAL VERSION (the exact stale-cache bug: the
+    /// version stayed `0.5.0` while the hooks changed), which a `plugin update` would not.
     #[test]
-    fn install_propagates_version_bump_through_caches() {
-        let dir = temp_dir("propagate");
+    fn install_forces_recache_on_content_change() {
+        let dir = temp_dir("recache");
         let source = write_bundled(&dir);
         let stable = dir.join("stable");
         let settings = dir.join("settings.json");
         let inst = install_for(&source, &stable, &settings);
         let cli = FakeCli::default();
         install_with(&inst, &cli).unwrap();
-        // No propagation on the FIRST install (Added, not a refresh of an existing entry).
+        // No re-cache on the FIRST install (Added, not a refresh of an existing entry).
         assert!(
             !cli.calls
                 .borrow()
@@ -909,10 +930,11 @@ mod tests {
             "no churn on fresh add"
         );
 
-        // App update ships a new plugin.json version → content change → propagate.
+        // App update ships NEW hooks while the version is UNCHANGED (the stale-cache bug) →
+        // content change → force a fresh re-cache even at the equal version.
         std::fs::write(
-            source.join(".claude-plugin").join("plugin.json"),
-            r#"{"name":"nyx-claude-integration","version":"0.5.0"}"#,
+            source.join("hooks").join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[]}}"#,
         )
         .unwrap();
         assert_eq!(install_with(&inst, &cli).unwrap(), PluginChange::Updated);
@@ -921,22 +943,26 @@ mod tests {
             .iter()
             .position(|c| c == "mkt-update nyx")
             .expect("marketplace update ran");
-        let plug = calls
+        let uninstall = calls
             .iter()
-            .position(|c| c == "plugin-update nyx-claude-integration@nyx")
-            .expect("plugin update ran");
+            .rposition(|c| c == "uninstall nyx-claude-integration@nyx")
+            .expect("uninstall ran");
+        let reinstall = calls
+            .iter()
+            .rposition(|c| c == "install nyx-claude-integration@nyx")
+            .expect("reinstall ran");
         assert!(
-            mkt < plug,
-            "marketplace cache refreshed BEFORE the installed plugin is bumped: {calls:?}"
+            mkt < uninstall && uninstall < reinstall,
+            "force-recache order: marketplace refresh → uninstall → reinstall: {calls:?}"
         );
     }
 
-    /// Reconcile propagates a version bump too (an app update lands while the plugin is
-    /// already installed): present + content changed → re-register + propagate. Idempotent
-    /// when nothing changed (no propagation churn).
+    /// Reconcile forces a re-cache too (an app update lands while the plugin is already
+    /// installed): present + content changed → re-register + force a fresh re-cache.
+    /// Idempotent when nothing changed (no uninstall/install churn).
     #[test]
-    fn reconcile_propagates_version_bump_and_is_idempotent() {
-        let dir = temp_dir("recon-propagate");
+    fn reconcile_forces_recache_on_content_change_and_is_idempotent() {
+        let dir = temp_dir("recon-recache");
         let source = write_bundled(&dir);
         let stable = dir.join("stable");
         let settings = dir.join("settings.json");
@@ -944,14 +970,22 @@ mod tests {
         let cli = FakeCli::default();
         install_with(&inst, &cli).unwrap();
 
-        // Unchanged → reconcile is a no-op (no propagation churn).
+        // Unchanged → reconcile is a no-op (no re-cache churn).
         assert_eq!(
             reconcile_with(&inst, &cli).unwrap(),
             ReconcileOutcome::Unchanged
         );
         let before = cli.calls.borrow().len();
+        assert!(
+            !cli.calls.borrow()[..before]
+                .iter()
+                .skip_while(|c| !c.starts_with("install"))
+                .any(|c| c == "uninstall nyx-claude-integration@nyx"),
+            "idempotent reconcile must not uninstall on an unchanged boot"
+        );
 
-        // App update bumps the bundled version → reconcile re-copies + propagates.
+        // App update ships new content (here a version bump, but the mechanism is
+        // version-independent) → reconcile re-copies + forces a re-cache.
         std::fs::write(
             source.join(".claude-plugin").join("plugin.json"),
             r#"{"name":"nyx-claude-integration","version":"0.6.0"}"#,
@@ -962,16 +996,22 @@ mod tests {
             ReconcileOutcome::Updated
         );
         let calls = cli.calls.borrow().clone();
-        assert!(calls.len() > before, "reconcile drove CLI on the bump");
+        assert!(calls.len() > before, "reconcile drove CLI on the change");
+        let mkt = calls
+            .iter()
+            .rposition(|c| c == "mkt-update nyx")
+            .expect("marketplace cache refreshed");
+        let uninstall = calls
+            .iter()
+            .rposition(|c| c == "uninstall nyx-claude-integration@nyx")
+            .expect("forced re-cache uninstalls");
+        let reinstall = calls
+            .iter()
+            .rposition(|c| c == "install nyx-claude-integration@nyx")
+            .expect("forced re-cache reinstalls");
         assert!(
-            calls.iter().any(|c| c == "mkt-update nyx"),
-            "marketplace cache refreshed: {calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|c| c == "plugin-update nyx-claude-integration@nyx"),
-            "plugin bumped: {calls:?}"
+            mkt < uninstall && uninstall < reinstall,
+            "force-recache order on reconcile: {calls:?}"
         );
     }
 

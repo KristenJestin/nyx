@@ -17,6 +17,7 @@ import { ElectronEventSink, type EmitEvent } from "./event-sink";
 import { loadNapi } from "./napi";
 import { HostServices } from "./services";
 import { BusyStatePoller } from "./busy-state";
+import { StatsPoller } from "./stats-state";
 import type { HostBootConfig, HostEventPayload, PingResult } from "../shared/host-protocol";
 
 /** True iff this process is pure Node (no Chromium browser/renderer runtime). */
@@ -111,6 +112,15 @@ export function boot(config: HostBootConfig, emit: EmitEvent): {
   services.ptys.onPtyExit((terminalId) => busyPoller.forget(terminalId));
   busyPoller.start();
   services.busyPoller = busyPoller;
+  //   b2. Per-terminal CPU%/RAM loop (FEEDBACK #28): sample each live terminal's process
+  //      tree (shell + descendants) ~1.5s via the single host-owned `NyxProcStats` (one
+  //      live `sysinfo::System`, kept alive for CPU% deltas), emit `terminal://stats` on a
+  //      visible change. Cross-platform (Linux/macOS/Windows). Shares the PTY-exit forget
+  //      hook so a closed terminal's tracked reading is dropped (alongside busy-state).
+  const statsPoller = new StatsPoller(services.ptys, events, new napi.NyxProcStats());
+  services.ptys.onPtyExit((terminalId) => statsPoller.forget(terminalId));
+  statsPoller.start();
+  services.statsPoller = statsPoller;
   //   c. Local MCP server (PRD-5 #3): start on the SHARED pool. A bind failure (port
   //      taken) is a WARNING, never a hard boot failure — the UI must still come up
   //      (parity with the Tauri `setup` which logs and continues).
@@ -146,6 +156,12 @@ export function boot(config: HostBootConfig, emit: EmitEvent): {
             break;
           case "send":
             services.ptys.writeToTerminal(op.terminalId, Buffer.from(`${op.command ?? ""}\r`, "utf8"));
+            break;
+          case "send_raw":
+            // FEEDBACK #31 (send_keys): the payload is the RAW bytes hex-encoded by nyx-napi
+            // (named keys + literal text already resolved). Decode and write them VERBATIM —
+            // NO appended `\r` (unlike "send"), so the agent can drive a raw-mode TUI.
+            services.ptys.writeToTerminal(op.terminalId, Buffer.from(op.command ?? "", "hex"));
             break;
           case "close":
             services.ptys.closeTerminal(op.terminalId);
@@ -210,8 +226,12 @@ export function shutdown(
   if (services && emit) {
     emit({ kind: "changed", topic: "commands" });
   }
-  // 2. Stop the busy-state poll loop (PRD-5 #1) before tearing down the PTYs.
-  if (services) services.busyPoller?.stop();
+  // 2. Stop the busy-state (PRD-5 #1) + per-terminal stats (FEEDBACK #28) poll loops
+  //    before tearing down the PTYs.
+  if (services) {
+    services.busyPoller?.stop();
+    services.statsPoller?.stop();
+  }
   // 3. Stop the PTYs. The keyed manager kills every live `NyxPty` (each kill EOFs
   //    its Rust reader and reaps the child) in the same Tauri shutdown order. The MCP
   //    server + DB pool are owned by the core (NyxCore) and torn down with the process

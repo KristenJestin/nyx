@@ -242,6 +242,16 @@ impl NyxPty {
         self.pty.lock().unwrap().is_busy()
     }
 
+    /// This terminal's ROOT pid — the shell process id, the anchor of its process tree
+    /// (FEEDBACK #28). The host's per-terminal stats poll passes this to
+    /// `NyxProcStats.treeStats` to sum the shell + all descendants' CPU%/RAM. `None`
+    /// when the shell pid is unknown (a spawn that did not yield a pid). Portable: every
+    /// OS exposes the child's pid.
+    #[napi]
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.pty.lock().unwrap().shell_pid()
+    }
+
     /// The LIVE auto-label introspection of this terminal (the `terminal_info` command's
     /// backend — PRD-5 auto-label / auto-attach revival): a fresh `{ cwd, foreground }`
     /// read straight from the kernel, NOT from OSC 7. Anchored on the live PTY:
@@ -291,6 +301,123 @@ fn read_terminal_info(_shell_pid: Option<u32>, _fg_pgid: Option<i32>) -> Termina
     TerminalInfo {
         cwd: None,
         foreground: None,
+    }
+}
+
+/// One terminal's process-tree resource usage (FEEDBACK #28), at the napi frontier:
+/// the summed CPU% + resident memory of the shell AND all its transitive descendants.
+/// Mirrors `nyx_core::proc_stats::TreeStats`.
+#[napi(object)]
+pub struct TreeStats {
+    /// Summed CPU usage of the tree, in PERCENT (relative to a single core, so a tree
+    /// busy on N cores can exceed 100 — e.g. a parallel build). The host/UI may clamp.
+    pub cpu_pct: f64,
+    /// Summed resident memory of the tree, in BYTES (RSS). A JS `number` holds this
+    /// exactly up to 2^53 bytes (8 PiB), far beyond any real terminal's footprint.
+    pub mem_bytes: f64,
+}
+
+/// Cross-platform per-terminal CPU%/RAM introspector (FEEDBACK #28). Owns ONE live
+/// `sysinfo::System` kept ALIVE across calls so per-process CPU% deltas are meaningful
+/// (a fresh System per call would always read 0% — see `nyx_core::proc_stats`). The
+/// host builds exactly ONE of these at boot and calls [`tree_stats_batch`](Self::tree_stats_batch)
+/// ONCE per poll tick with EVERY live terminal's shell pid.
+///
+/// ## Off the Node main thread (FEEDBACK #28 perf)
+///
+/// The full `/proc` scan is EXPENSIVE; with N terminals the old `tree_stats`-per-terminal
+/// loop ran N full scans SYNCHRONOUSLY on the Node main thread, blocking the event loop for
+/// hundreds of ms and freezing keystroke IPC. So the live `ProcStats` (the one `System`) now
+/// lives behind an `Arc<Mutex<…>>`, and [`tree_stats_batch`](Self::tree_stats_batch) returns
+/// an [`AsyncTask`]: the scan runs in `compute()` on a libuv WORKER thread (mirroring the DB
+/// tasks in `core_db.rs`), never the main loop. The single `System` is preserved for CPU%
+/// deltas — it is just shared through the mutex now (only the poll touches it, so there is
+/// no contention).
+///
+/// Cross-platform via `sysinfo` (Linux/macOS/Windows) — the descendant set is found by
+/// walking PARENT pids, the one portable signal, never `/proc` session ids.
+#[napi]
+pub struct NyxProcStats {
+    /// The live `ProcStats` (the single reused `System`), behind a mutex so the libuv
+    /// worker thread running [`TreeStatsBatchTask`] can lock it for the scan. Cloning this
+    /// `Arc` into the task hands the worker the SAME `System` (the CPU%-delta authority).
+    inner: Arc<Mutex<nyx_core::proc_stats::ProcStats>>,
+}
+
+#[napi]
+impl NyxProcStats {
+    /// Build the introspector. CPU% is meaningful from the SECOND `treeStats*` call for a
+    /// given pid on (the first has no prior sample to diff — it reads ~0%).
+    #[napi(constructor)]
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        NyxProcStats {
+            inner: Arc::new(Mutex::new(nyx_core::proc_stats::ProcStats::new())),
+        }
+    }
+
+    /// Refresh the process table and return the summed CPU%/RAM of the tree rooted at
+    /// `root_pid` (a terminal's shell pid). A pid that is GONE (the shell exited) yields
+    /// the all-zero reading — NEVER an error.
+    ///
+    /// SYNCHRONOUS, kept for parity/single-pid callers; the host's per-tick poll uses the
+    /// ASYNC [`tree_stats_batch`](Self::tree_stats_batch) so the scan never blocks the loop.
+    #[napi]
+    pub fn tree_stats(&self, root_pid: u32) -> TreeStats {
+        let s = self.inner.lock().unwrap().tree_stats(root_pid);
+        TreeStats {
+            cpu_pct: s.cpu_pct as f64,
+            mem_bytes: s.mem_bytes as f64,
+        }
+    }
+
+    /// Refresh the process table ONCE, then return the summed CPU%/RAM of the tree rooted
+    /// at EACH pid in `roots`, one [`TreeStats`] per root IN THE SAME ORDER — OFF the Node
+    /// main thread (FEEDBACK #28 perf).
+    ///
+    /// The host calls this ONCE per poll tick with every live terminal's shell pid. The
+    /// expensive `/proc` scan happens EXACTLY ONCE per tick (not once per terminal) and on
+    /// a libuv WORKER thread (the returned [`AsyncTask`] is a `Promise` in JS), so the Node
+    /// event loop keeps servicing keystroke IPC + PTY output while the scan is in flight.
+    #[napi(ts_return_type = "Promise<TreeStats[]>")]
+    pub fn tree_stats_batch(&self, roots: Vec<u32>) -> AsyncTask<TreeStatsBatchTask> {
+        AsyncTask::new(TreeStatsBatchTask {
+            inner: Arc::clone(&self.inner),
+            roots,
+        })
+    }
+}
+
+/// The off-main-thread process-tree scan (FEEDBACK #28 perf). `compute()` locks the shared
+/// `ProcStats`, runs the SINGLE-refresh `tree_stats_batch` (so the whole `/proc` scan + the
+/// per-root summation happen HERE, on a libuv worker thread, NOT the Node main loop), and
+/// `resolve()` maps each `nyx_core::TreeStats` to the napi `TreeStats` — order preserved, so
+/// the host can zip the result back to its `roots` input. Mirrors the `Task` pattern in
+/// `core_db.rs`.
+pub struct TreeStatsBatchTask {
+    inner: Arc<Mutex<nyx_core::proc_stats::ProcStats>>,
+    roots: Vec<u32>,
+}
+
+impl Task for TreeStatsBatchTask {
+    type Output = Vec<nyx_core::proc_stats::TreeStats>;
+    type JsValue = Vec<TreeStats>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        // The blocking /proc scan happens HERE, on the libuv worker thread. The mutex is
+        // held only for the scan (the only contender is the poll itself, one tick at a
+        // time, so there is no real contention).
+        Ok(self.inner.lock().unwrap().tree_stats_batch(&self.roots))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output
+            .into_iter()
+            .map(|s| TreeStats {
+                cpu_pct: s.cpu_pct as f64,
+                mem_bytes: s.mem_bytes as f64,
+            })
+            .collect())
     }
 }
 

@@ -35,21 +35,23 @@ export function useCommandExitCode(instanceId: string | null): number | null {
     if (!instanceId) return;
     let torndown = false;
     let unlisten: (() => void) | undefined;
-    void nyxBridge.subscribe<CommandStatePayload>("command://state", (payload) => {
-      if (torndown) return;
-      const { instanceId: id, state, code } = payload;
-      if (id !== instanceId) return;
-      // A new run starting clears the previous code; a terminal transition records
-      // the natural exit code; `idle` leaves the last code in place to read.
-      if (state === "running") setCode(null);
-      else if (code !== null) setCode(code);
-    }).then((un) => {
-      if (torndown) {
-        void Promise.resolve(un()).catch(() => {});
-        return;
-      }
-      unlisten = un;
-    });
+    void nyxBridge
+      .subscribe<CommandStatePayload>("command://state", (payload) => {
+        if (torndown) return;
+        const { instanceId: id, state, code } = payload;
+        if (id !== instanceId) return;
+        // A new run starting clears the previous code; a terminal transition records
+        // the natural exit code; `idle` leaves the last code in place to read.
+        if (state === "running") setCode(null);
+        else if (code !== null) setCode(code);
+      })
+      .then((un) => {
+        if (torndown) {
+          void Promise.resolve(un()).catch(() => {});
+          return;
+        }
+        unlisten = un;
+      });
     return () => {
       torndown = true;
       if (unlisten) void Promise.resolve(unlisten()).catch(() => {});

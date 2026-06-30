@@ -1029,9 +1029,6 @@ mod tests {
         fn marketplace_update(&self, _m: &str) -> Result<(), crate::plugin::PluginError> {
             Ok(())
         }
-        fn plugin_update(&self, _id: &str) -> Result<(), crate::plugin::PluginError> {
-            Ok(())
-        }
         fn marketplace_list(
             &self,
         ) -> Result<Vec<crate::plugin::MarketplaceEntry>, crate::plugin::PluginError> {

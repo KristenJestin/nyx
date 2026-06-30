@@ -30,6 +30,11 @@ diesel_migrations = "2"
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 # Local MCP HTTP server: small synchronous loopback HTTP, bound to 127.0.0.1.
 tiny_http = "0.12"
+# Per-terminal CPU%/RAM (FEEDBACK #28): cross-platform process introspection
+# (Linux/macOS/Windows) WITHOUT touching `/proc` directly — sysinfo abstracts the
+# per-OS process table, CPU usage and RSS. `default-features = false` + only the
+# `system` feature: we never read disks/networks/components, just processes.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # Process-group (process-tree) kill for managed commands on Unix: SIGTERM/SIGKILL to
 # the child's process GROUP so stopping a service reaps the whole tree.

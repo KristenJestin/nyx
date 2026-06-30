@@ -15,6 +15,8 @@ interface FakeBackend {
   workspaces: Record<string, WorkspaceRecord[]>;
   setProjectCollapsed: { id: string; collapsed: boolean }[];
   setWorkspaceCollapsed: { id: string; collapsed: boolean }[];
+  /** Every `projects_reorder` call's id sequence, in order received. */
+  projectsReorder: string[][];
 }
 
 function project(id: string, collapsed = false): ProjectRecord {
@@ -53,6 +55,7 @@ function installBackend(
     ),
     setProjectCollapsed: [],
     setWorkspaceCollapsed: [],
+    projectsReorder: [],
   };
 
   // `shouldMockEvents: true` makes `emit`/`listen` work in tests, so a test can fire
@@ -81,6 +84,14 @@ function installBackend(
             const row = list.find((w) => w.id === id);
             if (row) row.collapsed = collapsed;
           }
+          return null;
+        }
+        case "projects_reorder": {
+          const ids = a.ids as string[];
+          backend.projectsReorder.push([...ids]);
+          // Reflect the new order so a re-list (e.g. `workspaces://changed`) is
+          // authoritative, as the real backend's `order` column would be.
+          backend.projects.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
           return null;
         }
         default:
@@ -140,6 +151,52 @@ describe("useProjects collapsed persistence", () => {
     expect(ws2?.collapsed).toBe(true);
     expect(ws1?.collapsed).toBe(false); // a sibling is untouched
     expect(backend.setWorkspaceCollapsed).toContainEqual({ id: "w2", collapsed: true });
+  });
+});
+
+describe("useProjects reorderProjects (FEEDBACK #11)", () => {
+  beforeEach(() => {
+    installBackend([], {});
+  });
+
+  it("optimistically reorders the tree AND invokes projects_reorder with the new ids", async () => {
+    const backend = installBackend([project("p1"), project("p2"), project("p3")], {
+      p1: [workspace("w1", "p1")],
+      p2: [workspace("w2", "p2")],
+      p3: [workspace("w3", "p3")],
+    });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.projects.map((t) => t.project.id)).toEqual(["p1", "p2", "p3"]);
+
+    // Drag p3 to the front.
+    await act(async () => {
+      await result.current.reorderProjects(["p3", "p1", "p2"]);
+    });
+
+    // Optimistic local reorder is reflected immediately on the tree...
+    expect(result.current.projects.map((t) => t.project.id)).toEqual(["p3", "p1", "p2"]);
+    // ...and the backend command was invoked with the new id order.
+    expect(backend.projectsReorder).toEqual([["p3", "p1", "p2"]]);
+  });
+
+  it("keeps each project's workspaces attached to it through the reorder", async () => {
+    installBackend([project("p1"), project("p2")], {
+      p1: [workspace("w1", "p1")],
+      p2: [workspace("w2", "p2")],
+    });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.reorderProjects(["p2", "p1"]);
+    });
+
+    const [first, second] = result.current.projects;
+    expect(first.project.id).toBe("p2");
+    expect(first.workspaces.map((w) => w.id)).toEqual(["w2"]);
+    expect(second.project.id).toBe("p1");
+    expect(second.workspaces.map((w) => w.id)).toEqual(["w1"]);
   });
 });
 
