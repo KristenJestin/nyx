@@ -1,0 +1,25 @@
+{
+  // Inherits the monorepo strictness floor from the root base (PDR-0006 wiring);
+  // overrides below are desktop-shell-specific.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Electron's main + preload run in Node (CommonJS), but the actual CJS output is
+    // produced by esbuild (`scripts/bundle.cjs`, `format: "cjs"`) — this tsconfig is
+    // TYPECHECK-ONLY (`tsc --noEmit`). Because every entry is BUNDLED, we use
+    // `moduleResolution: "bundler"` (from the base) so relative imports need NO `.js`
+    // extension (the bundler resolves the `.ts` source directly).
+    "lib": ["ES2023"],
+    "types": ["node", "electron"],
+    "outDir": "dist",
+    "rootDir": "src",
+    "sourceMap": true,
+    "declaration": false
+  },
+  "include": ["src/**/*.ts"],
+  // Main-process `*.test.ts` specs run under `bun test` (which supplies the `bun:test`
+  // types + transpiles them); they are NOT part of the `tsc --noEmit` typecheck of the
+  // shipped main/preload, and are never bundled into `dist/`. Excluding them keeps the
+  // typecheck on production code only (the bundler's entrypoints), without pulling in
+  // `bun-types`.
+  "exclude": ["src/**/*.test.ts"]
+}

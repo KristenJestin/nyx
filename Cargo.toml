@@ -1,0 +1,17 @@
+# Root Cargo workspace for the nyx v2 monorepo.
+#
+# One workspace, one `Cargo.lock` at the repo root, one shared `target/` dir.
+#
+# V2 topology (PDR-0006 / PDR-0007): a single Electron desktop shell supervising a
+# single Rust sidecar executable that wraps the shell-agnostic core. Tauri and the
+# transitional nyx-napi module are NOT part of the v2 Cargo workspace.
+#
+# Members:
+#   - crates/nyx-core      the shell-agnostic core (PTY, OSC, DB, MCP, agents, …)
+#   - crates/nyx-sidecar   the supervised sidecar binary wrapping nyx-core
+[workspace]
+resolver = "2"
+members = [
+    "crates/nyx-core",
+    "crates/nyx-sidecar",
+]

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the nyx macOS app (Phase 4 packaging —
+  01KWCJPFP9JSJMRDZGW2E0N904).
+
+  The hardened runtime (mac.hardenedRuntime: true) is required for notarization, but it
+  forbids by default the things the Electron/V8 runtime AND the nyx-sidecar child need:
+
+    * com.apple.security.cs.allow-jit
+      com.apple.security.cs.allow-unsigned-executable-memory
+      com.apple.security.cs.disable-library-validation
+        V8 JITs JavaScript; Electron 20+ on arm64 fails to launch under the hardened runtime
+        without these. disable-library-validation lets the app load the (separately-signed)
+        sidecar + any dynamically-loaded libs.
+
+    * com.apple.security.inherit
+        the spawned nyx-sidecar child inherits the app's sandbox/runtime so the supervised
+        binary launches under the same signed context.
+
+  These mirror the canonical electron-builder hardened-runtime entitlements
+  (electron.build/code-signing-mac → "hardenedRuntime"). Adjust per release if the app drops
+  a capability.
+-->
+<plist version="1.0">
+  <dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    <key>com.apple.security.inherit</key>
+    <true/>
+  </dict>
+</plist>

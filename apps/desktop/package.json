@@ -1,0 +1,41 @@
+{
+  "name": "nyx-v2",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron shell for nyx (Chromium + Wayland-native). Main process, frameless single-instance window, dev/prod wiring, allowlisted preload, and the supervised nyx-sidecar Rust binary (stdin/stdout MessagePack pipe).",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build:main": "node scripts/bundle.cjs",
+    "build:renderer": "bun run --filter nyx-v2-renderer build",
+    "build:renderer:e2e": "bun run --filter nyx-v2-renderer build:e2e",
+    "copy:renderer": "node scripts/copy-renderer.cjs",
+    "copy:sidecar": "node scripts/copy-sidecar.cjs",
+    "build:sidecar": "cargo build -p nyx-sidecar",
+    "copy:resources": "node scripts/copy-resources.cjs",
+    "build": "bun run build:main && bun run build:renderer && bun run copy:renderer && bun run build:sidecar && bun run copy:sidecar && bun run copy:resources",
+    "build:e2e": "bun run build:main && bun run build:renderer:e2e && bun run copy:renderer && bun run build:sidecar && bun run copy:sidecar && bun run copy:resources",
+    "dev": "node scripts/dev.cjs",
+    "start": "electron .",
+    "smoke:window": "electron scripts/smoke-window.cjs",
+    "smoke:single-instance": "node scripts/smoke-single-instance.cjs",
+    "smoke:wayland-flags": "electron scripts/smoke-wayland-flags.cjs",
+    "smoke:prod-load": "electron scripts/smoke-prod-load.cjs",
+    "smoke:sidecar-e2e": "electron scripts/smoke-sidecar-e2e.cjs",
+    "smoke:crash-recovery": "electron scripts/smoke-crash-recovery.cjs",
+    "smoke:sidecar-live": "electron scripts/smoke-sidecar-live-terminal.cjs",
+    "smoke:dev-launch": "node scripts/smoke-dev-launch.cjs",
+    "smoke:dev-launch:prod": "electron scripts/smoke-dev-launch.cjs --prod",
+    "package": "node scripts/package.cjs",
+    "smoke:package": "node scripts/smoke-package.cjs",
+    "smoke:data-dir": "bun test src/main/identity.test.ts",
+    "smoke:sidecar-derivation": "bun test src/main/sidecar.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "42.4.1",
+    "electron-builder": "^26.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "~5.8.3"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  // Inherits the monorepo strictness floor from the root base (PDR-0006 wiring);
+  // overrides below are renderer-specific (DOM libs, JSX, ES2020 target, alias).
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+
+    /* Bundler mode */
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Custom */
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

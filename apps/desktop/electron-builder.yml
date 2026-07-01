@@ -1,0 +1,135 @@
+# electron-builder configuration for the nyx Electron shell — PACKAGING MULTIPLATEFORME
+# (Phase 4 — `01KWCJPFP9JSJMRDZGW2E0N904`).
+#
+# Verified against the official electron-builder docs (Application Contents) and the
+# app-builder-lib 26.15.3 option schema vendored in node_modules:
+#   - `asar: true` bundles the app into `app.asar`; a NATIVE EXECUTABLE cannot be spawned
+#     from inside an asar, so `asarUnpack` extracts the matching files to
+#     `app.asar.unpacked/` (Electron resolves the unpacked path transparently). The
+#     `nyx-sidecar` Rust BINARY (the runtime authority — PDR-0007) is spawned as a real file
+#     over a stdin/stdout pipe, so it is unpacked on EVERY OS and launched from the Electron
+#     resources (`process.resourcesPath/app.asar.unpacked/dist/sidecar/…` — see
+#     `src/main/sidecar.ts → resolveSidecarBin`).
+#   - the bundled Claude plugin (read by the sidecar through `resourceDir`) is also unpacked:
+#     nyx-core's `resolve_bundled_plugin_dir` reads it from disk, impossible from inside asar.
+#
+# The Electron runtime version is PINNED to the POC's 42.4.1 — never "latest".
+#
+# PER-OS targets + signing:
+#   - Linux : AppImage; the staged sidecar gets the executable bit (copy-sidecar.cjs chmods
+#             0o755) + a documented glibc baseline (see PACKAGING.md). No signing on Linux.
+#   - macOS : DMG + zip; hardened-runtime sign + notarize wired via env-provided Apple
+#             Developer ID creds (CSC_LINK / CSC_KEY_PASSWORD + APPLE_ID /
+#             APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID). The unpacked sidecar binary is
+#             signed with the app so Gatekeeper admits it.
+#   - Windows: NSIS installer; Authenticode signing wired via env (CSC_LINK / WIN_CSC_LINK /
+#             certificate file). The sidecar binary sits INSIDE the signed package
+#             (app.asar.unpacked) and is reaped with the app via the sidecar's Job Object
+#             (kill-on-job-close — see crates/nyx-sidecar/src/lifecycle.rs).
+#
+# The early `--dir` SMOKE path still works: `scripts/package.cjs` passes `--dir` on the CLI,
+# which overrides the per-OS `target` below with a throwaway unpacked dir so the sidecar
+# embedding + resource-path resolution is smoke-tested fast on the host OS
+# (`scripts/smoke-package.cjs`).
+
+appId: com.netsirk.nyxv2
+productName: nyx-v2
+# Pin the runtime to the POC's Electron; do NOT float.
+electronVersion: 42.4.1
+
+directories:
+  output: release
+  # buildResources default (build/) — holds the macOS entitlements plist below.
+
+# The app is self-contained in apps/desktop: compiled main/preload, the copied renderer, the
+# staged nyx-sidecar binary, the bundled resources, and the runtime deps. We ship exactly the
+# built `dist/` + package.json (src/ + scripts excluded).
+files:
+  - "dist/**/*"
+  - "package.json"
+  - "!src/**"
+  - "!scripts/**"
+  - "!electron-builder.yml"
+  - "!tsconfig.json"
+
+# A native executable cannot be spawned from inside the asar → keep the staged nyx-sidecar
+# BINARY OUTSIDE the archive (in app.asar.unpacked), on EVERY OS. The bundled Claude plugin
+# (`dist/resources/**`) is unpacked too so the sidecar resolves it from a real on-disk path:
+# nyx-core's `resolve_bundled_plugin_dir` reads `<resource_dir>/resources/claude-plugin`,
+# where the main process resolves `<resource_dir> = <app>/resources/app.asar.unpacked/dist` —
+# so the unpacked layout becomes `…/app.asar.unpacked/dist/resources/claude-plugin`, exactly
+# what it expects.
+asar: true
+asarUnpack:
+  - "dist/sidecar/**"
+  - "dist/resources/**"
+
+# ----------------------------------------------------------------------------------------
+# Linux — AppImage (the single-file, no-install distribution the PRD mandates). Built on a
+# Linux host (electron-builder does NOT cross-compile the native sidecar; build it natively
+# first via `cargo build -p nyx-sidecar`, staged by copy-sidecar.cjs which sets the exec bit).
+# ----------------------------------------------------------------------------------------
+linux:
+  # Pin a clean, v1-DISTINCT executable name (the npm `name` is the unscoped `nyx-v2`, but
+  # we pin it here anyway so the AppImage binary is deterministically `nyx-v2` and never
+  # collides with v1's `nyx` binary).
+  executableName: nyx-v2
+  # Category is required by the AppImage desktop entry.
+  category: Development
+  target:
+    - AppImage
+
+# ----------------------------------------------------------------------------------------
+# macOS — DMG + zip, HARDENED-RUNTIME signed + NOTARIZED. Requires an Apple Developer ID
+# certificate (CSC_LINK + CSC_KEY_PASSWORD) and notarization creds (APPLE_ID +
+# APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID) provided via the environment at build time on a
+# macOS host. The unpacked sidecar binary is code-signed with the app (osx-sign walks
+# app.asar.unpacked), so Gatekeeper admits the spawned native binary.
+# ----------------------------------------------------------------------------------------
+mac:
+  category: public.app-category.developer-tools
+  # DMG + zip for the BUILD HOST's arch only — `universal` is intentionally NOT set, so this
+  # produces a single-arch artifact (Apple Silicon or Intel, whichever the macOS runner is).
+  # A true universal binary would require `universal: true` here AND a lipo'd fat sidecar (or a
+  # per-arch matrix) — both deferred to the CI macOS pipeline (documented in PACKAGING.md).
+  target:
+    - dmg
+    - zip
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  # The entitlements the hardened runtime needs to spawn the sidecar + let the JIT/unsigned-
+  # memory the Electron/V8 runtime uses. Lives in build/ (buildResources).
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Enable the @electron/notarize integration. Credentials come from the environment
+  # (APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID); with none set, electron-builder
+  # skips notarization with a warning rather than failing — so a dev build on macOS still
+  # produces a (un-notarized) app, and a release build with creds notarizes.
+  notarize: true
+
+# ----------------------------------------------------------------------------------------
+# Windows — NSIS installer, Authenticode-signed. Signing creds come from the environment
+# (CSC_LINK / WIN_CSC_LINK = the .pfx, CSC_KEY_PASSWORD / WIN_CSC_KEY_PASSWORD), provided on a
+# Windows host (or an EV/Azure Trusted Signing setup). The sidecar binary sits inside the
+# signed package (app.asar.unpacked) and is killed-with-parent by the sidecar's Job Object
+# (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — crates/nyx-sidecar/src/lifecycle.rs::setup_windows_job_object).
+# ----------------------------------------------------------------------------------------
+win:
+  target:
+    - nsis
+  # Authenticode: the publisher name verified at signature time (matches the cert subject).
+  # signtoolOptions.certificateFile / certificateSubjectName OR the CSC_LINK env var supply the
+  # cert; left to env so no secret lives in the repo.
+  signtoolOptions:
+    # Sign both the .exe and the bundled binaries (incl. the unpacked nyx-sidecar.exe).
+    signingHashAlgorithms:
+      - sha256
+
+# NSIS installer behavior — per-user install (no elevation), with the usual desktop/start-menu
+# shortcuts and the ability to choose the directory.
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true

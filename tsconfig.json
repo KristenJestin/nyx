@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "_comment": "Root TypeScript config for the nyx v2 monorepo (PDR-0006). It carries no files of its own. The two TS build units of the single desktop product extend tsconfig.base.json: the Electron shell (apps/desktop/tsconfig.json, typecheck-only via `tsc --noEmit`) and its co-located React renderer (apps/desktop/renderer/tsconfig.json, bundled by Vite). Typecheck the whole JS side with `bun run check`.",
+  "extends": "./tsconfig.base.json",
+  "files": [],
+  "include": []
+}

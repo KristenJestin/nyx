@@ -3,9 +3,11 @@ node_modules/
 dist/
 target/
 .tanstack/
+# electron-builder output (installers / unpacked packages)
+release/
 
-# prototype2 = repo de référence (design source), porté à la main, non suivi ici
-prototype2/
+# prototype = repo de référence (design source), porté à la main, non suivi ici
+prototype/
 
 # env / local
 .env

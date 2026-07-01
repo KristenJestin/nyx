@@ -1,0 +1,7 @@
+{
+  "name": "nyx-v2-claude-integration",
+  "version": "0.8.0",
+  "description": "nyx-v2 Claude integration: bundles the nyx-v2 MCP server AND SessionStart/SessionEnd hooks that report agent sessions to nyx-v2 and inject the nyx-v2 context (project/workspace/terminal) into a starting session.",
+  "author": { "name": "nyx-v2" },
+  "mcpServers": "./.mcp.json"
+}

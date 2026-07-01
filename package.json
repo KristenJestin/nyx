@@ -1,0 +1,28 @@
+{
+  "name": "nyx-v2-monorepo",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "nyx v2 monorepo — single Electron desktop shell (apps/desktop) supervising a single Rust sidecar (crates/nyx-sidecar) that wraps nyx-core. Tauri removed (PDR-0006).",
+  "workspaces": [
+    "apps/desktop",
+    "apps/desktop/renderer"
+  ],
+  "scripts": {
+    "dev": "bun run --filter nyx-v2-renderer dev",
+    "dev:desktop": "bun run --filter nyx-v2 dev",
+    "build": "bun run --filter nyx-v2-renderer build",
+    "build:desktop": "bun run --filter nyx-v2 build",
+    "test": "bun run --filter nyx-v2-renderer test && bun run test:core && bun run test:contract",
+    "test:frontend": "bun run --filter nyx-v2-renderer test",
+    "test:core": "cargo test --workspace --lib && cargo test -p nyx-sidecar --test contract",
+    "test:contract": "cargo test -p nyx-sidecar --test contract && cd contract && bun test",
+    "check": "bun run --filter nyx-v2-renderer check && bun run check:core",
+    "check:core": "cargo check --workspace",
+    "build:core": "cargo build -p nyx-core",
+    "build:sidecar": "cargo build -p nyx-sidecar"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.3"
+  }
+}

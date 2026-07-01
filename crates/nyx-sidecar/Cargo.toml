@@ -1,0 +1,70 @@
+# nyx-sidecar — the supervised Rust backend executable.
+#
+# A thin binary wrapping `nyx-core`. It is a CHILD of Electron main (never a
+# daemon, never survives the parent). Task 522 implements the supervised
+# lifecycle: handshake / ping / bounded shutdown, parent-death (Linux
+# PR_SET_PDEATHSIG + portable stdin-EOF watch) and descendant reaping (process
+# group). Task 523 swaps the line-based control protocol used here for the
+# versioned length-prefixed MessagePack pipe.
+[package]
+name = "nyx-sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "Supervised Rust sidecar executable wrapping nyx-core (handshake / ping / shutdown, parent-death, descendant reaping; length-prefixed MessagePack pipe to Electron main)."
+
+[lib]
+name = "nyx_sidecar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nyx-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+nyx-core = { path = "../nyx-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The query layer error type the generic db-command dispatcher (G0) maps to a readable
+# message (`db::list_terminals` & co. return `diesel::QueryResult<T>` =
+# `Result<T, diesel::result::Error>`). Same `diesel` version + features nyx-core pins, so
+# one resolved dependency — already in Cargo.lock via nyx-core, named directly here so the
+# dispatcher can reference the error type.
+diesel = { version = "2", features = ["sqlite", "returning_clauses_for_sqlite_3_35", "r2d2"] }
+# Boot/runtime errors from nyx-core (Db::open, etc.) are `anyhow::Result`; the
+# sidecar boot propagates them.
+anyhow = "1"
+# Interactive PTY sizing (HHC): the sidecar passes `PtySize` to `nyx_core::pty::Pty`.
+# Same version nyx-core pins, so one resolved dependency.
+portable-pty = "0.9"
+# Internal main <-> sidecar transport (PDR-0007): length-prefixed MessagePack
+# frames. rmp-serde encodes our positional (array) message envelopes; the bytes
+# match @msgpack/msgpack on the TS side byte-for-byte (verified by the contract
+# fixtures), so no struct-as-map key-order ambiguity.
+rmp-serde = "1.3"
+# Dynamic MessagePack values for the polymorphic message `body` field, so the
+# fixed 4-element envelope stays a deterministic MessagePack array. `with-serde`
+# makes `rmpv::Value` (de)serializable so it can sit inside the serde envelope.
+rmpv = { version = "1", features = ["with-serde"] }
+
+# Parent-death (PR_SET_PDEATHSIG), session/group leadership (setsid) and the
+# process-GROUP kill used to reap descendants on shutdown — same libc idiom the
+# core's managed-command runner already uses (crates/nyx-core/src/command.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows descendant-reaping (kill-with-parent): a JOB OBJECT with
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. The sidecar creates a job at startup and assigns
+# itself to it, so every process it later spawns is in the job; when the sidecar's last
+# job handle closes (the sidecar dies — incl. parent-death via stdin-EOF) Windows
+# terminates the WHOLE job, reaping the descendant tree. This is the Windows analog of the
+# Unix process-group reaping above (PDR-0007: the sidecar must not leave orphans). Already
+# resolved in Cargo.lock (pulled transitively by portable-pty), so it adds no new fetch.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    # The CreateJobObjectW binding's signature references SECURITY_ATTRIBUTES, which lives
+    # behind Win32_Security — enable it so the type resolves even though we pass null.
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

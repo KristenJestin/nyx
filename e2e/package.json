@@ -1,0 +1,16 @@
+{
+  "name": "nyx-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "End-to-end tests for nyx driving the real Electron app via wdio-electron-service + WebdriverIO (v9).",
+  "scripts": {
+    "test": "wdio run ./wdio.conf.cjs"
+  },
+  "devDependencies": {
+    "@wdio/cli": "^9.0.0",
+    "@wdio/local-runner": "^9.0.0",
+    "@wdio/mocha-framework": "^9.0.0",
+    "@wdio/spec-reporter": "^9.0.0",
+    "wdio-electron-service": "^8.0.0"
+  }
+}

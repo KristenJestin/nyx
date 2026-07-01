@@ -1,0 +1,12 @@
+{
+  "name": "nyx-v2",
+  "description": "nyx-v2 local marketplace: bundles the nyx-v2 Claude integration (MCP server + session-capture hooks) shipped on disk with the nyx-v2 app. Namespaced 'nyx-v2' so it coexists with a v1 'nyx' install in ~/.claude.",
+  "owner": { "name": "nyx-v2" },
+  "plugins": [
+    {
+      "name": "nyx-v2-claude-integration",
+      "source": "./",
+      "description": "nyx-v2 Claude integration: bundles the nyx-v2 MCP server AND SessionStart/SessionEnd hooks that report agent sessions to nyx-v2."
+    }
+  ]
+}
