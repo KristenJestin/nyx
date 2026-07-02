@@ -23,9 +23,9 @@ Tranché : `repositories` est une **entité persistée** (identité logique), av
 
 ## Q-004 - Stockage unique
 
-**Status: open**
+**Status: resolved (PDR-0024) - un seul fichier**
 
-Une seule base SQLite ou plusieurs bases internes par bounded context ? L'utilisateur doit voir une application et une autorité uniques, mais cela n'impose pas automatiquement un fichier physique unique.
+Tranchée : **un seul fichier SQLite** porte toute l'autorité métier (transactions atomiques cross-contexte, mono-writer local en WAL, backup/migration triviaux). Les bounded contexts restent une **séparation logique**, pas physique. Le seul gain de fichiers séparés (sync indépendante) = handoff multi-machine, différé (PDR-0016). Réversible. Voir PDR-0024.
 
 ## Q-005 - Terminologie de l'unité humaine
 
@@ -109,7 +109,9 @@ Tranchée : le fourre-tout « directives » de Depot est **décomposé en trois 
 
 ## Q-015 - Rafraîchissement temps réel des vues dérivées de Git
 
-**Status: open**
+**Status: open — différée en v2.3 (hors scope v2.1)**
+
+Décision de cadrage v2.1 : le temps réel de v2.1 couvre uniquement les mutations métier (`domain_events`). Les vues dérivées de Git appartiennent à la review → tranchée en v2.3.
 
 Les mutations métier passent par `domain_events` (push UI). Mais les **vues dérivées de Git** (diff de review, dirty, branche courante) ne sont pas des mutations métier : elles changent quand le code change sur le disque. À pincer : le sidecar **watch-t-il le fs/git** pour émettre un event (réactif), ou **re-lit-il sur déclencheur** (ouverture de la review, tick) ? Éviter de poller en continu ; éviter de rater un changement.
 

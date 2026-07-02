@@ -388,9 +388,10 @@ pub fn relaunch_command<S: RunnerSink>(
     Ok(result)
 }
 
-/// `get_command_output` — `{ instance_id | (name, workspace_id), tail_bytes?, since?,
-/// run? ("current"|"previous"), mark_read? }` → `{ instance_id, run, output,
-/// total_bytes, returned_bytes, truncated, reset, cursor, …status }`.
+/// `get_command_output` — `{ instance_id | (name, workspace_id), tail_bytes?, max_bytes?,
+/// since?, run? ("current"|"previous"), strip_ansi?, grep?, tail_lines?, mark_read? }` →
+/// `{ instance_id, run, output, total_bytes, returned_bytes, truncated, reset, cursor,
+/// …status }`.
 ///
 /// The source mirrors `bridge::command_output` + the Tauri `get_command_output`: the
 /// runner's LIVE in-memory tail while running, else the persisted scrollback rehydrated
@@ -399,19 +400,54 @@ pub fn relaunch_command<S: RunnerSink>(
 /// `mark_read:true` ALSO acknowledges the current run (clears `unread`) after the window
 /// is computed.
 ///
-/// NOTE on scope: the Tauri tool also offers `strip_ansi`/`grep`/`tail_lines`/`max_bytes`
-/// render knobs. Those are pure post-processing of the returned `output` string; this
-/// shared core returns the RAW bounded window (the byte cursor/round-trip is identical),
-/// which is the behavioral parity the runtime tools require. A shell that wants the
-/// render knobs can post-process `output`.
+/// RENDER KNOBS (v1 parity — the semantics are lifted from the Tauri
+/// `mcp_tools::render_output`): once the RAW bounded window is computed, the `output`
+/// string is reshaped by [`render_output`] — `strip_ansi` (default TRUE) cleans terminal
+/// control sequences, `grep` (a regex, matched per-line on the ANSI-stripped text) keeps
+/// only matching lines, and `tail_lines` keeps the last N lines (applied AFTER `grep`).
+/// `max_bytes` bounds the RAW window up front (`effective_tail = min(tail_bytes,
+/// max_bytes)`), the same ceiling guard as [`wait_for_command`].
+///
+/// INCREMENTAL INVARIANT: `total_bytes`/`returned_bytes`/`truncated`/`cursor` stay
+/// computed on the RAW [`bound_output`] window — the knobs only reshape the DISPLAYED
+/// `output` string. So a follow-up `get_command_output(since=cursor)` resumes on the raw
+/// byte stream with no gap/dup even when knobs are set. (`returned_bytes` therefore counts
+/// the RAW window bytes, NOT the rendered `output` length, matching v1.)
 pub fn get_command_output<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<Value, RpcError> {
     let instance_id = resolve_instance_id(db, args)?;
+    // Byte-window knobs. `max_bytes` is an alternative ceiling: the smaller of
+    // (tail_bytes, max_bytes) wins, and either above MAX_TAIL_BYTES is `output_too_large`
+    // — the SAME contract `wait_for_command` enforces (v1 `parse_window_knobs` parity).
     let tail_bytes = optional_usize(args, "tail_bytes")?.unwrap_or(DEFAULT_TAIL_BYTES);
+    let max_bytes = optional_usize(args, "max_bytes")?;
+    let ceiling = max_bytes.unwrap_or(crate::mcp_tools_core::MAX_TAIL_BYTES);
+    if tail_bytes > crate::mcp_tools_core::MAX_TAIL_BYTES
+        || ceiling > crate::mcp_tools_core::MAX_TAIL_BYTES
+    {
+        let requested = tail_bytes.max(ceiling);
+        return Err(RpcError::new(
+            RpcCode::OutputTooLarge,
+            format!(
+                "requested window exceeds max_bytes ({})",
+                crate::mcp_tools_core::MAX_TAIL_BYTES
+            ),
+        )
+        .with_data(
+            json!({ "requested": requested, "limit": crate::mcp_tools_core::MAX_TAIL_BYTES }),
+        ));
+    }
+    let effective_tail = tail_bytes.min(ceiling);
     let since = optional_usize(args, "since")?;
+    // Render knobs (v1 parity): strip_ansi defaults TRUE; grep is a per-line regex on the
+    // stripped text; tail_lines keeps the last N lines AFTER grep. These reshape only the
+    // displayed `output`, never the byte cursor (see the fn doc's INCREMENTAL INVARIANT).
+    let strip = optional_bool(args, "strip_ansi")?.unwrap_or(true);
+    let grep = optional_regex(args, "grep")?;
+    let tail_lines = optional_usize(args, "tail_lines")?;
     let mark_read = optional_bool(args, "mark_read")?.unwrap_or(false);
     let previous = matches!(optional_str(args, "run")?, Some("previous"));
 
@@ -454,11 +490,14 @@ pub fn get_command_output<S: RunnerSink>(
 
     // A current-run byte cursor is meaningless against the previous-run buffer.
     let effective_since = if previous { None } else { since };
-    let window = bound_output(&full, tail_bytes, effective_since);
+    let window = bound_output(&full, effective_tail, effective_since);
+    // Reshape ONLY the displayed `output` per the render knobs; every byte field below
+    // (total/returned/truncated/cursor) stays on the RAW window so `since=cursor` is exact.
+    let output = render_output(&window.output, strip, grep.as_ref(), tail_lines);
     let mut result = json!({
         "instance_id": instance_id,
         "run": if previous { "previous" } else { "current" },
-        "output": window.output,
+        "output": output,
         "total_bytes": window.total_bytes,
         "returned_bytes": window.returned_bytes,
         "truncated": window.truncated,
@@ -734,18 +773,33 @@ fn map_create_workspace_err(project_id: &str, e: diesel::result::Error) -> RpcEr
     }
 }
 
-/// Shared body of `workspace_add` / `create_workspace`: one `db::create_workspace` call,
-/// mapping its failure to the D8 vocabulary. The on-disk path handling (validate-existing
-/// vs mkdir-p) is done by the caller BEFORE this, so the two tools differ only in their
-/// filesystem precondition, not in the persistence path. Returns `{ workspace }`.
+/// Shared body of `workspace_add` / `create_workspace`: register the workspace through the
+/// SHARED use case [`crate::usecase::register_workspace`] — the ONE application service the
+/// UI bridge ALSO drives (PDR-0005, task #7). The use case composes
+/// [`crate::repository::register_workspace`] (insert + auto-detect Git repos under
+/// `root_path`, done_criterion #5) AND emits a `workspace.created` domain event through the
+/// injected [`crate::usecase::EventSink`] seam (task #8). Its failure is mapped to the D8
+/// vocabulary. The on-disk path handling (validate-existing vs mkdir-p) is done by the
+/// caller BEFORE this, so the two tools differ only in their filesystem precondition, not
+/// in the persistence path. Returns `{ workspace }`.
 fn create_workspace_inner(
     db: &Db,
+    events: &dyn crate::usecase::EventSink,
     project_id: &str,
     name: &str,
     path: &str,
 ) -> Result<Value, RpcError> {
     let workspace = db
-        .with_conn(|c| db::create_workspace(c, project_id, name, path))
+        .with_conn(|c| {
+            crate::usecase::register_workspace(
+                c,
+                events,
+                project_id,
+                name,
+                path,
+                crate::usecase::DomainEventSource::Mcp,
+            )
+        })
         .map_err(|e| map_create_workspace_err(project_id, e))?;
     Ok(json!({ "workspace": workspace }))
 }
@@ -753,9 +807,14 @@ fn create_workspace_inner(
 /// `workspace_add` — `{ project_id, path, name? }` → `{ workspace }`. Registers an EXISTING
 /// on-disk folder as a workspace (the *register an existing dir* tool — contrast
 /// `create_workspace`, which CREATES the folder first). The path is VALIDATED on disk
-/// BEFORE the DB write; `name` defaults to the path's last segment when omitted. Parity
-/// with the Tauri `workspace_add` (minus the shell sidebar-refresh event seam).
-pub fn workspace_add(db: &Db, args: &Value) -> Result<Value, RpcError> {
+/// BEFORE the shared-use-case write; `name` defaults to the path's last segment when
+/// omitted. Delegates the persistence + repo detection + domain-event emission to
+/// [`crate::usecase::register_workspace`] (the same use case the UI bridge calls).
+pub fn workspace_add(
+    db: &Db,
+    events: &dyn crate::usecase::EventSink,
+    args: &Value,
+) -> Result<Value, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let path = require_str(args, "path")?;
     let name = match optional_str(args, "name")? {
@@ -774,33 +833,42 @@ pub fn workspace_add(db: &Db, args: &Value) -> Result<Value, RpcError> {
         }
     };
     validate_existing_dir(path)?;
-    create_workspace_inner(db, project_id, &name, path)
+    create_workspace_inner(db, events, project_id, &name, path)
 }
 
 /// `create_workspace` — `{ project_id, name, path }` → `{ workspace }`. The *creating-intent*
 /// sibling of `workspace_add`: it `mkdir -p`s the folder BEFORE registering, so an agent can
 /// ask nyx to track a folder that does not exist on disk yet. Both then share the SAME
-/// `db::create_workspace` write. Parity with the Tauri `create_workspace`.
-pub fn create_workspace(db: &Db, args: &Value) -> Result<Value, RpcError> {
+/// [`crate::usecase::register_workspace`] use case (the same one the UI bridge drives).
+pub fn create_workspace(
+    db: &Db,
+    events: &dyn crate::usecase::EventSink,
+    args: &Value,
+) -> Result<Value, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let name = require_str(args, "name")?;
     let path = require_str(args, "path")?;
     ensure_dir_created(path)?;
-    create_workspace_inner(db, project_id, name, path)
+    create_workspace_inner(db, events, project_id, name, path)
 }
 
 /// The single entry point a shell's MCP dispatcher calls for the workspace registration
 /// tools (`workspace_add` / `create_workspace`): route `name` to the matching tool, or
 /// `None` if `name` is not one of them. A successful `Some(Ok(_))` signals a committed
 /// mutation, so a shell with a sidebar-refresh event seam can fire it after this returns.
+///
+/// `events` is the [`crate::usecase::EventSink`] the shell injects: a real shell passes its
+/// Phase-4 sink (a [`crate::usecase::NullEventSink`] in Phase 3, since no consumer exists
+/// yet); a test passes a recording sink to assert the emitted domain events (task #8).
 pub fn dispatch_workspace_tool(
     db: &Db,
+    events: &dyn crate::usecase::EventSink,
     name: &str,
     args: &Value,
 ) -> Option<Result<Value, RpcError>> {
     match name {
-        "workspace_add" => Some(workspace_add(db, args)),
-        "create_workspace" => Some(create_workspace(db, args)),
+        "workspace_add" => Some(workspace_add(db, events, args)),
+        "create_workspace" => Some(create_workspace(db, events, args)),
         _ => None,
     }
 }
@@ -870,6 +938,98 @@ fn ceil_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
+/// Read the OPTIONAL `grep` regex argument for `get_command_output` (v1
+/// `mcp_tools::optional_regex` parity). `None` when absent/null/empty; a present
+/// non-string or an invalid regex is an `invalid_argument` error naming the compile
+/// failure so the agent can fix the pattern. Matched per-line on the ANSI-stripped text.
+fn optional_regex(args: &Value, key: &str) -> Result<Option<regex::Regex>, RpcError> {
+    match optional_str(args, key)? {
+        None => Ok(None),
+        Some("") => Ok(None),
+        Some(pat) => regex::Regex::new(pat).map(Some).map_err(|e| {
+            RpcError::new(
+                RpcCode::InvalidArgument,
+                format!("argument '{key}' is not a valid regex: {e}"),
+            )
+        }),
+    }
+}
+
+/// Shape the `output` field of `get_command_output` from a RAW byte window, per the
+/// v1 `mcp_tools::render_output` contract. The byte cursor/total are computed by the
+/// caller on the RAW window, so reducing the rendered text here NEVER desyncs incremental
+/// polling.
+///
+/// - `strip` (default true at the call site): when set, the window is run through
+///   [`crate::ansi::strip_ansi`] and the cleaned text REPLACES `output` (one cleaned view,
+///   no parallel raw+text). When false the raw window is returned verbatim. The line modes
+///   below ALWAYS MATCH on the ANSI-stripped per-line text (regex anchors on readable
+///   text), but the EMITTED lines honor `strip` (stripped when true, raw when false).
+/// - `grep`: keep only the lines whose stripped form matches the regex. Applied BEFORE
+///   `tail_lines`.
+/// - `tail_lines`: keep at most the last N lines (after any `grep`). `n == 0` means "no
+///   line cap" (keep all), NOT "drop everything" — draining to zero would report empty
+///   output while `returned_bytes > 0`.
+fn render_output(
+    raw_window: &str,
+    strip: bool,
+    grep: Option<&regex::Regex>,
+    tail_lines: Option<usize>,
+) -> String {
+    let cleaned = crate::ansi::strip_ansi(raw_window);
+
+    // Fast path: no line modes → just honor `strip`.
+    if grep.is_none() && tail_lines.is_none() {
+        return if strip {
+            cleaned
+        } else {
+            raw_window.to_string()
+        };
+    }
+
+    // Line modes work line-by-line. We match on the cleaned per-line text but emit the
+    // stripped or raw line to honor `strip`. In RAW mode split on '\n' WITHOUT dropping a
+    // preceding '\r' (`str::lines` would rewrite CRLF→LF and break the raw-verbatim
+    // promise); a trailing '\n' yields a final empty element we drop.
+    let emit_source = if strip { cleaned.as_str() } else { raw_window };
+    let emit_lines: Vec<&str> = if strip {
+        emit_source.lines().collect()
+    } else {
+        let mut v: Vec<&str> = emit_source.split('\n').collect();
+        if emit_source.ends_with('\n') {
+            v.pop();
+        }
+        v
+    };
+    let mut kept: Vec<String> = Vec::new();
+    for line in &emit_lines {
+        // The haystack is the cleaned form: when strip=true the emitted line IS cleaned;
+        // when strip=false strip it so embedded escapes never foil the pattern.
+        let hay = if strip {
+            (*line).to_string()
+        } else {
+            crate::ansi::strip_ansi(line)
+        };
+        if let Some(re) = grep {
+            if !re.is_match(&hay) {
+                continue;
+            }
+        }
+        kept.push((*line).to_string());
+    }
+    if let Some(n) = tail_lines {
+        if n > 0 && kept.len() > n {
+            kept.drain(0..kept.len() - n);
+        }
+    }
+    let trailing_nl = emit_source.ends_with('\n');
+    let mut out = kept.join("\n");
+    if trailing_nl && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -915,6 +1075,138 @@ mod tests {
         assert!(w.reset);
         assert_eq!(w.output, "short");
         assert_eq!(w.cursor, 5);
+    }
+
+    // --- render knobs (v1 mcp_tools::render_output parity) ---------------------
+
+    #[test]
+    fn render_output_strips_ansi_by_default() {
+        // strip=true (the call-site default) → ANSI/control codes gone.
+        let raw = "\u{1b}[31merror: boom\u{1b}[0m\n";
+        assert_eq!(render_output(raw, true, None, None), "error: boom\n");
+    }
+
+    #[test]
+    fn render_output_strip_false_returns_raw_bytes() {
+        // strip=false → the window verbatim, escapes preserved.
+        let raw = "\u{1b}[31merror: boom\u{1b}[0m\n";
+        assert_eq!(render_output(raw, false, None, None), raw);
+    }
+
+    #[test]
+    fn render_output_grep_keeps_only_matching_lines() {
+        let raw = "start\nERROR: boom\ninfo: ok\nERROR: bang\n";
+        let re = optional_regex(&json!({ "grep": "ERROR" }), "grep")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            render_output(raw, true, Some(&re), None),
+            "ERROR: boom\nERROR: bang\n"
+        );
+    }
+
+    #[test]
+    fn render_output_grep_matches_on_stripped_text_even_when_strip_false() {
+        // The pattern anchors on the ANSI-stripped line, but strip=false emits the RAW
+        // line (escapes preserved) so the match works despite embedded color codes.
+        let raw = "info\n\u{1b}[31mERROR: boom\u{1b}[0m\n";
+        let re = optional_regex(&json!({ "grep": "ERROR" }), "grep")
+            .unwrap()
+            .unwrap();
+        // The emitted line is the RAW (colored) line; the trailing newline of the source
+        // is preserved. Only the non-matching "info" line was dropped.
+        assert_eq!(
+            render_output(raw, false, Some(&re), None),
+            "\u{1b}[31mERROR: boom\u{1b}[0m\n"
+        );
+    }
+
+    #[test]
+    fn render_output_tail_lines_keeps_last_n_of_fifteen() {
+        // 15 lines, tail_lines:5 → exactly the LAST 5 (the reported bug: 5 was ignored).
+        let raw: String = (1..=15).map(|n| format!("line{n}\n")).collect();
+        let out = render_output(&raw, true, None, Some(5));
+        assert_eq!(out, "line11\nline12\nline13\nline14\nline15\n");
+        assert_eq!(out.lines().count(), 5, "exactly 5 lines, not 15");
+    }
+
+    #[test]
+    fn render_output_grep_then_tail_lines_compose() {
+        // grep FIRST (keep ERROR lines), THEN tail_lines (last N of the matches).
+        let raw = "ERROR a\nok\nERROR b\nok\nERROR c\n";
+        let re = optional_regex(&json!({ "grep": "ERROR" }), "grep")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            render_output(raw, true, Some(&re), Some(2)),
+            "ERROR b\nERROR c\n"
+        );
+    }
+
+    #[test]
+    fn render_output_tail_lines_zero_keeps_all() {
+        // n==0 means "no cap" (keep all), NOT "drop everything".
+        let raw = "a\nb\nc\n";
+        assert_eq!(render_output(raw, true, None, Some(0)), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn optional_regex_absent_or_empty_is_none_invalid_is_error() {
+        assert!(optional_regex(&json!({}), "grep").unwrap().is_none());
+        assert!(optional_regex(&json!({ "grep": "" }), "grep")
+            .unwrap()
+            .is_none());
+        let err = optional_regex(&json!({ "grep": "(" }), "grep").unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+    }
+
+    /// max_bytes acts as an alternative byte ceiling: the effective window is
+    /// `min(tail_bytes, max_bytes)` computed on the RAW stream BEFORE rendering, so a
+    /// tight `max_bytes` caps `returned_bytes`/`output` the same way a tight `tail_bytes`
+    /// would (v1 `parse_window_knobs` parity).
+    #[test]
+    fn max_bytes_caps_the_raw_window() {
+        let full = "0123456789";
+        let effective_tail = 10usize.min(4); // tail_bytes=10, max_bytes=4 → 4 wins
+        let w = bound_output(full, effective_tail, None);
+        assert_eq!(w.returned_bytes, 4);
+        assert_eq!(render_output(&w.output, true, None, None), "6789");
+    }
+
+    /// THE INCREMENTAL INVARIANT: the render knobs reshape ONLY the displayed `output`;
+    /// `bound_output`'s `cursor`/`returned_bytes` are byte-exact on the RAW window, so a
+    /// follow-up read with `since=cursor` resumes with no gap/dup — regardless of knobs.
+    #[test]
+    fn knobs_never_move_the_raw_cursor_so_since_stays_contiguous() {
+        // A window carrying ANSI + many lines. First read: default knobs.
+        let full = "\u{1b}[32mline1\u{1b}[0m\nline2\nERROR3\nline4\n";
+        let w1 = bound_output(full, DEFAULT_TAIL_BYTES, None);
+        let rendered = render_output(&w1.output, true, None, Some(2));
+        // The rendered output is reshaped (stripped + last 2 lines)…
+        assert_eq!(rendered, "ERROR3\nline4\n");
+        // …but the cursor/returned_bytes still describe the RAW window byte-for-byte.
+        assert_eq!(w1.returned_bytes, full.len());
+        assert_eq!(w1.cursor, full.len());
+
+        // Same window, but with a grep knob instead: the RAW cursor is IDENTICAL.
+        let re = optional_regex(&json!({ "grep": "ERROR" }), "grep")
+            .unwrap()
+            .unwrap();
+        let w1b = bound_output(full, DEFAULT_TAIL_BYTES, None);
+        let rendered_b = render_output(&w1b.output, true, Some(&re), None);
+        assert_eq!(rendered_b, "ERROR3\n");
+        assert_eq!(w1b.cursor, w1.cursor, "grep does not move the raw cursor");
+
+        // New bytes arrive; a follow-up read with since=cursor resumes on the RAW stream
+        // with NO gap/dup, proving the knobs never desynced the incremental protocol.
+        let grown = format!("{full}line5\nline6\n");
+        let w2 = bound_output(&grown, DEFAULT_TAIL_BYTES, Some(w1.cursor));
+        assert!(!w2.reset);
+        assert_eq!(
+            w2.output, "line5\nline6\n",
+            "resumes exactly after the cursor"
+        );
+        assert_eq!(w2.cursor, grown.len());
     }
 
     #[test]
@@ -964,9 +1256,11 @@ mod tests {
             .with_conn(|c| db::create_project(c, "P", "/tmp/p", None))
             .unwrap();
         let existing = temp_subdir("add");
+        let sink = crate::usecase::test_support::RecordingEventSink::new();
 
         let res = dispatch_workspace_tool(
             &db,
+            &sink,
             "workspace_add",
             &json!({ "project_id": project.id, "path": existing.to_string_lossy() }),
         )
@@ -978,6 +1272,12 @@ mod tests {
         assert_eq!(
             ws["name"],
             json!(existing.file_name().unwrap().to_string_lossy())
+        );
+        // The MCP tool went through the shared use case, which emitted the domain event.
+        assert_eq!(
+            sink.kinds(),
+            vec![crate::usecase::DomainEventKind::WorkspaceCreated],
+            "workspace_add emitted a workspace.created domain event via the shared use case"
         );
 
         let _ = std::fs::remove_dir_all(&existing);
@@ -994,6 +1294,7 @@ mod tests {
             .unwrap();
         let err = dispatch_workspace_tool(
             &db,
+            &crate::usecase::NullEventSink,
             "workspace_add",
             &json!({ "project_id": project.id, "path": "/nyx/does/not/exist/zzz" }),
         )
@@ -1017,6 +1318,7 @@ mod tests {
 
         let res = dispatch_workspace_tool(
             &db,
+            &crate::usecase::NullEventSink,
             "create_workspace",
             &json!({ "project_id": project.id, "name": "WS", "path": fresh.to_string_lossy() }),
         )
@@ -1036,6 +1338,7 @@ mod tests {
         let base = temp_subdir("fk");
         let err = dispatch_workspace_tool(
             &db,
+            &crate::usecase::NullEventSink,
             "create_workspace",
             &json!({ "project_id": "nope", "name": "WS", "path": base.to_string_lossy() }),
         )
@@ -1051,6 +1354,72 @@ mod tests {
     fn dispatch_workspace_tool_ignores_unrelated_names() {
         let _g = db_guard();
         let db = Db::in_memory();
-        assert!(dispatch_workspace_tool(&db, "list_projects", &json!({})).is_none());
+        let sink = crate::usecase::NullEventSink;
+        assert!(dispatch_workspace_tool(&db, &sink, "list_projects", &json!({})).is_none());
+    }
+
+    /// CONVERGENCE (task #7, PDR-0005): the UI bridge and the MCP surface reach the SAME
+    /// `usecase::register_workspace` for "create a workspace". This test drives BOTH paths
+    /// against the SAME in-process authority and asserts they produce the SAME persisted
+    /// effect (a workspace row) AND the SAME domain event — proving neither path carries a
+    /// private business path.
+    ///
+    /// - MCP path: `dispatch_workspace_tool("create_workspace", …)` (the exact call the
+    ///   sidecar dispatcher makes).
+    /// - UI path: `usecase::register_workspace` (the exact call the UI bridge's
+    ///   `create_workspace` db-command makes — see `db_command.rs`).
+    #[test]
+    fn ui_and_mcp_create_workspace_share_one_use_case() {
+        use crate::usecase::{self, test_support::RecordingEventSink, DomainEventKind};
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/conv", None))
+            .unwrap();
+        let base = temp_subdir("conv");
+        let mcp_dir = base.join("mcp-ws");
+        let ui_dir = base.join("ui-ws");
+        std::fs::create_dir_all(&mcp_dir).unwrap();
+        std::fs::create_dir_all(&ui_dir).unwrap();
+
+        // MCP path — the dispatcher entry point, with a recording sink.
+        let mcp_sink = RecordingEventSink::new();
+        let mcp_res = dispatch_workspace_tool(
+            &db,
+            &mcp_sink,
+            "create_workspace",
+            &json!({ "project_id": project.id, "name": "mcp", "path": mcp_dir.to_string_lossy() }),
+        )
+        .expect("dispatched")
+        .expect("ok");
+        let mcp_ws_id = mcp_res["workspace"]["id"].as_str().unwrap().to_string();
+
+        // UI path — the SAME use case the db-command bridge calls, with its own sink.
+        let ui_sink = RecordingEventSink::new();
+        let ui_ws = db
+            .with_conn(|c| {
+                usecase::register_workspace(
+                    c,
+                    &ui_sink,
+                    &project.id,
+                    "ui",
+                    &ui_dir.to_string_lossy(),
+                    usecase::DomainEventSource::Ui,
+                )
+            })
+            .unwrap();
+
+        // Both persisted a real workspace under the SAME project.
+        let live = db
+            .with_conn(|c| db::list_workspaces(c, &project.id))
+            .unwrap();
+        assert!(live.iter().any(|w| w.id == mcp_ws_id));
+        assert!(live.iter().any(|w| w.id == ui_ws.id));
+
+        // Both emitted the SAME domain-event kind through the SAME use case's seam.
+        assert_eq!(mcp_sink.kinds(), vec![DomainEventKind::WorkspaceCreated]);
+        assert_eq!(ui_sink.kinds(), vec![DomainEventKind::WorkspaceCreated]);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

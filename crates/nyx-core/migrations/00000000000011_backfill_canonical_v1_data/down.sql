@@ -1,0 +1,12 @@
+-- Reverse schema v11. This migration is a DATA BACKFILL only (it added no columns,
+-- indexes, tables, or constraints — v10 owns the canonical STRUCTURE). A pure backfill
+-- has no schema to undo, and its data inverse is not cleanly recoverable (a re-run
+-- converges rather than tracking which rows it touched). The canonical
+-- `projects.primary_workspace_id` COLUMN itself is dropped by the v10 down migration, so
+-- reverting the whole chain still fully removes the backfilled data.
+--
+-- Therefore the reverse is an intentional NO-OP: reverting v11 leaves the (harmless,
+-- already-canonical) backfilled pointer in place; reverting further (v10 down) removes
+-- the column. A statement is required for a valid down.sql, so we run a no-op UPDATE
+-- that matches no rows.
+UPDATE projects SET primary_workspace_id = primary_workspace_id WHERE 1 = 0;

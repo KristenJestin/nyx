@@ -32,7 +32,7 @@ use nyx_core::mcp_tools_core::{self, ChangedTopic, TerminalHost};
 use serde_json::Value;
 
 use super::command::SidecarRunnerSink;
-use super::events::EventSink;
+use super::events::{EventSink, PushEventSink};
 use super::pty::PtyManager;
 use crate::pipe::wire::Event;
 
@@ -149,11 +149,18 @@ impl ToolDispatcher for SidecarDispatcher {
                 .expect("runtime command tool dispatch");
         }
 
-        // 2) Workspace registration tools (pure pool writes).
-        if let Some(res) = mcp_runtime::dispatch_workspace_tool(&self.db, name, arguments) {
-            let result = res?;
-            self.emit_effects(&[ChangedTopic::Workspaces]);
-            return Ok(result);
+        // 2) Workspace registration tools (pure pool writes). Both funnel through the
+        //    SHARED `usecase::register_workspace` (PDR-0005, the same use case the UI bridge
+        //    drives). The use case persists a `workspace.created` `domain_events` row IN its
+        //    transaction (task #9) and then emits the DOMAIN event through the injected sink
+        //    AFTER commit — here the real-time [`PushEventSink`] (task #10), which pushes the
+        //    v2.0 unsolicited `workspaces://changed` so the renderer re-pulls WITHOUT a reload
+        //    or a poll. The push is now driven by the committed DOMAIN event itself (not a
+        //    separate `emit_effects` string-match), so it covers this and every future
+        //    identity mutation uniformly.
+        let push = PushEventSink::new(self.events.clone());
+        if let Some(res) = mcp_runtime::dispatch_workspace_tool(&self.db, &push, name, arguments) {
+            return res;
         }
 
         // 3) Every other advertised tool (reads + CRUD + agent-session + terminals).

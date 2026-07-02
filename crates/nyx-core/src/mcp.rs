@@ -10,7 +10,10 @@
 //! - **D2 — port**: fixed & configurable, STABLE between launches. Default
 //!   [`DEFAULT_PORT`], overridable via `NYX_MCP_PORT`. Ephemeral / port 0 are
 //!   rejected — a stable port is what keeps an onboarded client's config valid
-//!   across restarts.
+//!   across restarts. v2 deliberately defaults to a DIFFERENT stable port than
+//!   the v1 cockpit (which owns 8765) so the two can run side by side during the
+//!   v1→v2 transition without an `AddrInUse` bind failure (still a fixed port,
+//!   NOT port 0 — the stability guarantee is unchanged).
 //! - **D3 — single-instance**: at most ONE server per machine. nyx is already
 //!   single-instance (`tauri-plugin-single-instance`), and [`McpServer::start`]
 //!   is itself start-once: a second call is a no-op, never a second listener.
@@ -32,7 +35,13 @@ use serde_json::{json, Value};
 /// Default fixed MCP port (ADR-0003 D2). Above the ephemeral range, low collision
 /// odds. Overridable via `NYX_MCP_PORT`, but STABLE between launches by default so
 /// an onboarded client's `http://127.0.0.1:<port>/mcp` config stays valid.
-pub const DEFAULT_PORT: u16 = 8765;
+///
+/// DISTINCT from the v1 cockpit's port (8765): the user's production v1 build runs
+/// permanently and holds 8765, and `McpServer::start` rejects port 0 / has no
+/// fallback (ADR-0003 D2 — a stable port), so sharing 8765 would make v2's bind
+/// fail with `AddrInUse` whenever v1 is up. v2 therefore takes 8766 so v1 and v2
+/// coexist on their own stable ports through the v1→v2 transition.
+pub const DEFAULT_PORT: u16 = 8766;
 
 /// Env var that overrides [`DEFAULT_PORT`] (ADR-0003 D2). Must parse to a valid
 /// non-zero `u16`; an invalid/zero value falls back to the default (port 0, i.e.
@@ -1361,6 +1370,13 @@ mod tests {
     #[test]
     fn resolve_port_defaults_and_honors_env() {
         let _g = ENV_LOCK.lock().unwrap();
+        // The v2 default is 8766 — a STABLE port DISTINCT from the v1 cockpit's 8765,
+        // so v1 and v2 coexist without an `AddrInUse` bind clash (ADR-0003 D2).
+        assert_eq!(
+            DEFAULT_PORT, 8766,
+            "v2 default port is 8766 (distinct from v1)"
+        );
+        assert_ne!(DEFAULT_PORT, 8765, "v2 must NOT share v1's port");
         std::env::remove_var(PORT_ENV);
         assert_eq!(resolve_port(), DEFAULT_PORT, "default when unset");
         std::env::set_var(PORT_ENV, "19001");

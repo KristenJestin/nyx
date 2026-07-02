@@ -46,7 +46,8 @@ const POOL_MAX_SIZE: u32 = 8;
 
 use crate::pathnorm;
 use crate::schema::{
-    agent_sessions, command_instances, managed_commands, projects, terminals, workspaces,
+    agent_sessions, command_instances, domain_events, managed_commands, projects, repositories,
+    terminals, workspaces,
 };
 
 /// The migrations baked into the binary at compile time from `migrations/`.
@@ -253,6 +254,18 @@ pub struct Project {
     /// ties broken by `created_at`/`id`. A v9 migration backfills it from the prior
     /// created-at order so existing projects keep their position.
     pub order_index: i32,
+    /// Canonical Linear prefix of the project (e.g. `NYX`) — NOT NULL, UNIQUE (v10).
+    /// A Spec's human key is `key || '-' || specs.number`. The v10 migration seeds a
+    /// deterministic unique stub for existing projects; the v11 data migration and the
+    /// use-case layer (later phases) own its curated value.
+    pub key: String,
+    /// The project's durable base workspace (v10): the canonical source of truth for
+    /// the primary role (`primary/worktree`), replacing reliance on `workspaces.is_root`.
+    /// `None` until backfilled (v11 points it at the current root workspace). FK to
+    /// `workspaces(id)` with ON DELETE SET NULL.
+    pub primary_workspace_id: Option<String>,
+    /// Soft-archive timestamp, epoch ms (v10). `None` while the project is active.
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -264,6 +277,10 @@ struct NewProject {
     updated_at: i64,
     /// Sidebar order; set to MAX(order)+1 at creation so a new project appends LAST.
     order_index: i32,
+    /// Canonical Linear prefix (v10): NOT NULL + UNIQUE. `create_project` derives a
+    /// deterministic, unique-by-construction stub so the UNIQUE constraint holds even
+    /// before the curated value is set by the use-case layer (later phases).
+    key: String,
 }
 
 /// A `workspaces` row. `path` is the canonical (normalized) absolute folder.
@@ -278,14 +295,27 @@ pub struct Workspace {
     pub id: String,
     pub project_id: String,
     pub name: String,
-    /// Canonical, normalized absolute path (see [`crate::pathnorm`]).
-    pub path: String,
+    /// Canonical, normalized absolute folder path (see [`crate::pathnorm`]). SQL column
+    /// is `root_path` (renamed from `path` in v10 to the data-model canonical name); the
+    /// value is unchanged. This is the workspace's identity within its project.
+    ///
+    /// The IPC/MCP wire field STAYS `path` (`#[serde(rename)]`): the UI/bridge contract
+    /// (owned by the use-case layer, later phases) is unchanged by this DB rename, so the
+    /// v2.1 schema task lands the canonical column without churning the renderer.
+    #[serde(rename = "path")]
+    pub root_path: String,
     pub branch: Option<String>,
     pub is_root: bool,
     /// Sidebar open/closed state, persisted across restarts (`false` = open).
     pub collapsed: bool,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Epoch ms the worktree folder was cleaned up at merge (v10). The workspace ROW is
+    /// PERMANENT — this marks the folder cleanup, never an auto-delete of the row.
+    /// `None` while the folder is live.
+    pub folder_removed_at: Option<i64>,
+    /// Soft-archive timestamp, epoch ms (v10). `None` while the workspace is active.
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -294,11 +324,128 @@ struct NewWorkspace {
     id: String,
     project_id: String,
     name: String,
-    path: String,
+    root_path: String,
     branch: Option<String>,
     is_root: bool,
     created_at: i64,
     updated_at: i64,
+}
+
+// --- Repository model (v2.1 canonical structure_locale, v10, PDR-0013) ----
+
+/// A `repositories` row: the LOGICAL identity of a repo within a project (e.g. `api`).
+/// `Serialize` for the IPC/MCP boundary. `relative_path` is the conventional path
+/// inside the project (`"."` in a mono-repo), constant across the project's workspaces.
+/// `optional` (SQLite 0/1 ↔ Rust `bool`) marks a repo NOT worktree'd by default at
+/// start (the structured, in-DB "nyxignore", per repo). There is deliberately NO
+/// checkout table: a workspace's repos are DERIVED (the non-optional ones) at
+/// `workspace.root_path || relative_path`, and Git state is re-read from Git (PDR-0013).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = repositories)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Repository {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    /// Conventional path within the project (`"."` in a mono-repo).
+    pub relative_path: String,
+    /// `true` = not worktree'd by default at start (in-DB "nyxignore").
+    pub optional: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Soft-archive timestamp, epoch ms. `None` while the repository is active.
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = repositories)]
+struct NewRepository {
+    id: String,
+    project_id: String,
+    name: String,
+    relative_path: String,
+    optional: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+// --- domain_events OUTBOX model (v2.1 Phase 4, v12) ----------------------
+
+/// A `domain_events` row: ONE persisted business mutation of a structuring identity
+/// (project / workspace / repository), written IN THE SAME TRANSACTION as the mutation
+/// it describes (the outbox pattern — see [`record_domain_event`]). `Serialize` for the
+/// IPC/observer boundary. `sequence` is the monotonic global ordering key (the rowid
+/// alias); `payload` is a JSON string (at least the concerned `identity_id`). The
+/// correlation ids are plain values (no FK) so the log survives a delete of the row it
+/// describes.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = domain_events)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct DomainEvent {
+    /// Monotonic, strictly-increasing global ordering key (the rowid alias).
+    pub sequence: i64,
+    /// The project the event is correlated to (always present).
+    pub project_id: String,
+    /// The workspace the event is correlated to, or `None` for a project- or
+    /// repository-scoped event that has no single workspace.
+    pub workspace_id: Option<String>,
+    /// The entity CLASS: `project` | `workspace` | `repository`.
+    pub aggregate: String,
+    /// The dotted `entity.action` wire string (`project.created`, …).
+    pub event_type: String,
+    /// WHERE the mutation originated: `ui` | `mcp`.
+    pub source: String,
+    /// WHO drove it (reserved — `None` today).
+    pub actor: Option<String>,
+    /// Event-specific JSON detail (at least the concerned identity id). Small by
+    /// design — never terminal bytes, never a Git-derived view.
+    pub payload: String,
+    /// Epoch ms the event was recorded.
+    pub created_at: i64,
+}
+
+/// A new `domain_events` row to insert. `sequence` is OMITTED — SQLite assigns the
+/// rowid (the monotonic ordering key) on insert. `created_at` is stamped explicitly by
+/// the backend (the julianday DEFAULT is only a raw-insert safety net).
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = domain_events)]
+pub struct NewDomainEvent {
+    pub project_id: String,
+    pub workspace_id: Option<String>,
+    pub aggregate: String,
+    pub event_type: String,
+    pub source: String,
+    pub actor: Option<String>,
+    pub payload: String,
+    pub created_at: i64,
+}
+
+/// Append ONE `domain_events` row to the outbox and return it (with its assigned
+/// `sequence`). Called by the mutating identity use cases INSIDE the same transaction as
+/// the mutation they describe (outbox pattern, task #9): if the surrounding transaction
+/// rolls back, this row is erased with it; if it commits, the event is durably present
+/// and ordered. `created_at` is stamped to now when the caller leaves it at 0.
+pub fn record_domain_event(
+    conn: &mut SqliteConnection,
+    mut event: NewDomainEvent,
+) -> QueryResult<DomainEvent> {
+    if event.created_at == 0 {
+        event.created_at = now_millis();
+    }
+    diesel::insert_into(domain_events::table)
+        .values(event)
+        .returning(DomainEvent::as_returning())
+        .get_result(conn)
+}
+
+/// List `domain_events` in emission order (`sequence` asc — the monotonic global
+/// order). The read companion to [`record_domain_event`], used by tests (and any future
+/// replay/audit surface) to assert the persisted, ordered outbox.
+pub fn list_domain_events(conn: &mut SqliteConnection) -> QueryResult<Vec<DomainEvent>> {
+    domain_events::table
+        .order(domain_events::sequence.asc())
+        .select(DomainEvent::as_select())
+        .load(conn)
 }
 
 // --- Managed command / instance models (PRD-3 v3) ------------------------
@@ -513,9 +660,18 @@ impl Db {
     /// closes; a one-connection pool keeps it alive and every checkout sees the same
     /// migrated schema). The customizer still applies foreign_keys + busy_timeout;
     /// WAL is a no-op on `:memory:` (it has no journal file), which is fine.
+    ///
+    /// The shared-cache DB is given a UNIQUE per-instance NAME
+    /// (`file:nyx-mem-<uuid>?mode=memory&cache=shared`). Without a unique name, every
+    /// `in_memory()` in the process would share ONE `:memory:` database (shared cache
+    /// keys on the name), so tests running in PARALLEL would migrate the same DB and
+    /// race the schema-migration write lock ("database schema is locked: main"). The
+    /// per-instance name isolates each test's DB while keeping the shared-cache +
+    /// one-connection-pool trick that keeps the memory DB alive.
     #[cfg(test)]
     pub fn in_memory() -> Self {
-        let manager = ConnectionManager::<SqliteConnection>::new("file::memory:?cache=shared");
+        let url = format!("file:nyx-mem-{}?mode=memory&cache=shared", Uuid::now_v7());
+        let manager = ConnectionManager::<SqliteConnection>::new(url);
         let pool = Pool::builder()
             .max_size(1)
             .connection_customizer(Box::new(PragmaCustomizer))
@@ -906,10 +1062,58 @@ pub fn detect_branch(path: &str) -> Option<String> {
 // normalized via `crate::pathnorm` BEFORE storage so UNIQUE(project_id, path)
 // and the auto-attach ancestor matching operate on canonical strings.
 
+/// Derive a canonical uppercase-alpha `key` STUB from a project name (v10). Keeps
+/// ASCII letters, uppercases them, and caps the length; empty input (or a name with no
+/// letters) falls back to `PRJ`. This is only the SHAPE — uniqueness is enforced by the
+/// caller (which disambiguates a collision) and by the `UNIQUE(projects.key)` index.
+fn derive_project_key_stub(name: &str) -> String {
+    let letters: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .take(8)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if letters.is_empty() {
+        "PRJ".to_string()
+    } else {
+        letters
+    }
+}
+
+/// Pick a UNIQUE `projects.key` for a new project, given the derived `stub`. Returns the
+/// stub if free, else `stub || N` for the smallest N making it unique. Runs inside the
+/// creating transaction so the read-then-insert is race-free under the single writer.
+fn unique_project_key(conn: &mut SqliteConnection, stub: &str) -> QueryResult<String> {
+    let exists = |conn: &mut SqliteConnection, candidate: &str| -> QueryResult<bool> {
+        projects::table
+            .filter(projects::key.eq(candidate))
+            .select(projects::id)
+            .first::<String>(conn)
+            .optional()
+            .map(|o| o.is_some())
+    };
+    if !exists(conn, stub)? {
+        return Ok(stub.to_string());
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{stub}{n}");
+        if !exists(conn, &candidate)? {
+            return Ok(candidate);
+        }
+        n += 1;
+    }
+}
+
 /// Create a project plus its single, explicitly-named ROOT workspace anchored at
 /// `root_path`, in one transaction. `root_name` names the root workspace
 /// (defaults to [`DEFAULT_ROOT_WORKSPACE_NAME`] when `None`/empty). The path is
 /// normalized before storage. Returns the new project and its root workspace.
+///
+/// The project's canonical `key` (v10, NOT NULL + UNIQUE) is derived from `name`
+/// ([`derive_project_key_stub`]) and disambiguated ([`unique_project_key`]) so the
+/// UNIQUE constraint always holds; the durable `primary_workspace_id` is then set to the
+/// freshly-created root workspace so the canonical primary role is anchored at creation.
 pub fn create_project(
     conn: &mut SqliteConnection,
     name: &str,
@@ -934,16 +1138,18 @@ pub fn create_project(
             .map(|m| m + 1)
             .unwrap_or(0);
 
-        let project = diesel::insert_into(projects::table)
+        let key = unique_project_key(conn, &derive_project_key_stub(name))?;
+
+        diesel::insert_into(projects::table)
             .values(NewProject {
                 id: project_id.clone(),
                 name: name.to_string(),
                 created_at: now,
                 updated_at: now,
                 order_index: next_order,
+                key,
             })
-            .returning(Project::as_returning())
-            .get_result(conn)?;
+            .execute(conn)?;
 
         let branch = gitbranch::detect(&normalized);
         let workspace = diesel::insert_into(workspaces::table)
@@ -951,13 +1157,22 @@ pub fn create_project(
                 id: Uuid::now_v7().to_string(),
                 project_id: project_id.clone(),
                 name: workspace_name,
-                path: normalized,
+                root_path: normalized,
                 branch,
                 is_root: true,
                 created_at: now,
                 updated_at: now,
             })
             .returning(Workspace::as_returning())
+            .get_result(conn)?;
+
+        // Anchor the canonical primary role (v10): the durable base workspace is the
+        // root we just created. `primary_workspace_id` is the source of truth for
+        // "the project's primary workspace" (the v11 data migration backfills it for
+        // pre-v10 projects; here it is set at creation).
+        let project = diesel::update(projects::table.find(&project_id))
+            .set(projects::primary_workspace_id.eq(&workspace.id))
+            .returning(Project::as_returning())
             .get_result(conn)?;
 
         // Materialize the project's templates as instances for the new root
@@ -1145,7 +1360,7 @@ pub fn create_workspace(
                 id: Uuid::now_v7().to_string(),
                 project_id: project_id.to_string(),
                 name: name.to_string(),
-                path: normalized,
+                root_path: normalized,
                 branch,
                 is_root: false,
                 created_at: now,
@@ -1183,9 +1398,379 @@ pub fn list_workspaces(
 /// the single best match). Ordered by path for deterministic iteration.
 pub fn all_workspaces(conn: &mut SqliteConnection) -> QueryResult<Vec<Workspace>> {
     workspaces::table
-        .order((workspaces::path.asc(), workspaces::id.asc()))
+        .order((workspaces::root_path.asc(), workspaces::id.asc()))
         .select(Workspace::as_select())
         .load(conn)
+}
+
+// --- Repository CRUD (v2.1 canonical structure_locale, v10, PDR-0013) -----
+//
+// A repository is the LOGICAL identity of a repo within a project. The path lives
+// HERE (`relative_path`), not per workspace — it is constant across the project's
+// workspaces. There is NO checkout table; a workspace's repos are derived and Git
+// state re-read from Git. These functions are the persistence socle; the detection
+// (auto-detect under root_path) + derived-membership logic land in Phase 2.
+
+/// Create a `repositories` row: a logical repo identity in `project_id`. `name` is the
+/// logical name (e.g. `api`), `relative_path` the conventional path within the project
+/// (`"."` in a mono-repo). `optional` marks a repo not worktree'd by default. The two
+/// UNIQUE constraints — (project_id, name) and (project_id, relative_path) — reject a
+/// duplicate name or path within the SAME project (a different project may reuse either).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_repository(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    name: &str,
+    relative_path: &str,
+    optional: bool,
+) -> QueryResult<Repository> {
+    let now = now_millis();
+    diesel::insert_into(repositories::table)
+        .values(NewRepository {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            name: name.to_string(),
+            relative_path: relative_path.to_string(),
+            optional,
+            created_at: now,
+            updated_at: now,
+        })
+        .returning(Repository::as_returning())
+        .get_result(conn)
+}
+
+/// List the repositories of `project_id`, ordered by `relative_path` (then id) for
+/// deterministic iteration. The read companion to [`create_repository`]. Excludes
+/// soft-archived rows (`archived_at IS NOT NULL`) so callers see only the LIVE
+/// logical repos; [`list_repositories_including_archived`] returns the full set.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_repositories(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Vec<Repository>> {
+    repositories::table
+        .filter(repositories::project_id.eq(project_id))
+        .filter(repositories::archived_at.is_null())
+        .order((repositories::relative_path.asc(), repositories::id.asc()))
+        .select(Repository::as_select())
+        .load(conn)
+}
+
+/// List EVERY repository of `project_id`, archived or not (ordered like
+/// [`list_repositories`]). Used where the caller needs the full logical set — e.g.
+/// re-detection reconciling against previously-archived identities.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_repositories_including_archived(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Vec<Repository>> {
+    repositories::table
+        .filter(repositories::project_id.eq(project_id))
+        .order((repositories::relative_path.asc(), repositories::id.asc()))
+        .select(Repository::as_select())
+        .load(conn)
+}
+
+// --- Identity authority: stable-id resolution + archive lifecycle (task #4) ---
+//
+// nyx is the SINGLE authority for the three structuring identities
+// (project / workspace / repository): there is no parallel Depot authority. The
+// FULL lifecycle — create (above), RESOLVE (by the stable internal id, which is
+// independent of any disk path), and ARCHIVE (soft, `archived_at`, never a hard
+// delete of the row) — passes through these nyx functions, with the canonical
+// invariants (unique project key, coherent `primary_workspace_id`, derived
+// membership) enforced here and by the schema.
+
+/// Resolve a repository by its STABLE internal id (UUIDv7), or `None` when unknown.
+/// The read companion to [`get_project`] / [`get_workspace`]: identity resolution
+/// keys on the id, NOT on a disk path — a repo keeps its identity when its
+/// `relative_path` or the workspace `root_path` moves. Returns archived rows too
+/// (the id still resolves; callers filter on `archived_at` when they want live-only).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_repository(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Repository>> {
+    repositories::table
+        .find(id)
+        .select(Repository::as_select())
+        .first::<Repository>(conn)
+        .optional()
+}
+
+/// Soft-ARCHIVE a project: stamp `archived_at` (epoch ms), leaving the row and all
+/// its children in place. nyx NEVER hard-deletes an identity as part of archiving —
+/// the row is permanent so history/references stay resolvable. Idempotent: an
+/// already-archived project keeps its original `archived_at` (the guard skips it).
+/// Returns rows updated (0 = unknown id, or already archived). [`unarchive_project`]
+/// reverses it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn archive_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(projects::table.find(id))
+        .filter(projects::archived_at.is_null())
+        .set((
+            projects::archived_at.eq(now_millis()),
+            projects::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Reverse [`archive_project`]: clear `archived_at` so the project is active again.
+/// Returns rows updated (0 = unknown id or not currently archived).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn unarchive_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(projects::table.find(id))
+        .filter(projects::archived_at.is_not_null())
+        .set((
+            projects::archived_at.eq(None::<i64>),
+            projects::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Soft-ARCHIVE a workspace: stamp `archived_at` (epoch ms). The workspace ROW is
+/// permanent (PDR-0008) — archiving marks it inactive without deleting it or its
+/// runtime, so `folder_removed_at` (worktree cleanup) and the identity both survive.
+/// Idempotent by the `archived_at IS NULL` guard. Returns rows updated.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn archive_workspace(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(workspaces::table.find(id))
+        .filter(workspaces::archived_at.is_null())
+        .set((
+            workspaces::archived_at.eq(now_millis()),
+            workspaces::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Reverse [`archive_workspace`]: clear `archived_at`. Returns rows updated.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn unarchive_workspace(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(workspaces::table.find(id))
+        .filter(workspaces::archived_at.is_not_null())
+        .set((
+            workspaces::archived_at.eq(None::<i64>),
+            workspaces::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Mark a workspace's worktree folder as CLEANED UP: stamp `folder_removed_at` (epoch
+/// ms). This is the workspace-as-pivot invariant (PDR-0008): the ROW is PERMANENT, so
+/// cleaning up a per-Spec worktree's folder at merge marks it here WITHOUT deleting the
+/// row — its runtime history (terminals / agent_sessions / command_instances still
+/// keyed on `workspace_id`) and its identity survive. There is deliberately NO
+/// auto-delete path: a folder disappearing NEVER removes the workspace row. Idempotent
+/// by the `folder_removed_at IS NULL` guard. Returns rows updated.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn mark_workspace_folder_removed(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(workspaces::table.find(id))
+        .filter(workspaces::folder_removed_at.is_null())
+        .set((
+            workspaces::folder_removed_at.eq(now_millis()),
+            workspaces::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Reverse [`mark_workspace_folder_removed`]: clear `folder_removed_at` (the folder was
+/// re-materialized). Returns rows updated (0 = unknown id or not currently marked).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn clear_workspace_folder_removed(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(workspaces::table.find(id))
+        .filter(workspaces::folder_removed_at.is_not_null())
+        .set((
+            workspaces::folder_removed_at.eq(None::<i64>),
+            workspaces::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Soft-ARCHIVE a repository identity: stamp `archived_at` (epoch ms). The logical
+/// identity is retired from active membership (auto-detection stops re-listing it)
+/// WITHOUT deleting the row, so any history keyed on the repo id stays resolvable.
+/// Idempotent by the `archived_at IS NULL` guard. Returns rows updated.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn archive_repository(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(repositories::table.find(id))
+        .filter(repositories::archived_at.is_null())
+        .set((
+            repositories::archived_at.eq(now_millis()),
+            repositories::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Reverse [`archive_repository`]: clear `archived_at`. Returns rows updated.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn unarchive_repository(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::update(repositories::table.find(id))
+        .filter(repositories::archived_at.is_not_null())
+        .set((
+            repositories::archived_at.eq(None::<i64>),
+            repositories::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Set (or move) a project's canonical `primary_workspace_id` to `workspace_id`,
+/// enforcing the invariant that the target workspace BELONGS to the same project.
+/// Returns `Ok(true)` when the pointer was set, `Ok(false)` when the invariant is
+/// violated (the workspace is unknown or belongs to another project) — in which case
+/// nothing is written, so `primary_workspace_id` never dangles at a foreign workspace.
+/// The schema's `ON DELETE SET NULL` FK guarantees the pointer can never reference a
+/// deleted workspace; this guard adds the cross-project coherence the FK alone cannot.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_primary_workspace(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    workspace_id: &str,
+) -> QueryResult<bool> {
+    conn.transaction(|conn| {
+        let belongs: Option<String> = workspaces::table
+            .find(workspace_id)
+            .filter(workspaces::project_id.eq(project_id))
+            .select(workspaces::id)
+            .first::<String>(conn)
+            .optional()?;
+        if belongs.is_none() {
+            return Ok(false);
+        }
+        diesel::update(projects::table.find(project_id))
+            .set((
+                projects::primary_workspace_id.eq(workspace_id),
+                projects::updated_at.eq(now_millis()),
+            ))
+            .execute(conn)?;
+        Ok(true)
+    })
+}
+
+// --- Repository manual override + detection upsert (task #5, PDR-0013) ------
+//
+// Auto-detection populates repositories under `workspace.root_path`; the user may
+// then MANUALLY override an identity — RENAME it, or mark it `optional` (the
+// in-DB "nyxignore" that excludes it from a workspace's DERIVED membership). These
+// are the persistence primitives the `crate::repository` detection/membership layer
+// drives; the Git state (branch/dirty/remotes) is NEVER written here — it is re-read
+// from Git on demand (PDR-0013).
+
+/// Rename a repository's logical `name` (a manual override), bumping `updated_at`.
+/// `relative_path` (the identity within the project) is untouched — a rename is a
+/// label change only. Returns rows updated (0 = unknown id). The UNIQUE(project_id,
+/// name) constraint rejects a collision with a sibling repo (surfaced as `Err`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn rename_repository(conn: &mut SqliteConnection, id: &str, name: &str) -> QueryResult<usize> {
+    diesel::update(repositories::table.find(id))
+        .set((
+            repositories::name.eq(name),
+            repositories::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Set a repository's `optional` flag (a manual override), bumping `updated_at`.
+/// `optional = true` is the in-DB "nyxignore": the repo is NOT worktree'd by default
+/// and DROPS OUT of a workspace's derived membership. Returns rows updated (0 =
+/// unknown id).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_repository_optional(
+    conn: &mut SqliteConnection,
+    id: &str,
+    optional: bool,
+) -> QueryResult<usize> {
+    diesel::update(repositories::table.find(id))
+        .set((
+            repositories::optional.eq(optional),
+            repositories::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Idempotently register a DETECTED repository at `relative_path` in `project_id`.
+///
+/// Detection re-runs whenever a workspace is (re)registered, so this MUST NOT clobber
+/// a user's manual overrides. Keyed on the stable identity `(project_id,
+/// relative_path)`:
+///   * ABSENT → insert a new logical identity with the detected `name` (active,
+///     non-optional by default).
+///   * PRESENT and ARCHIVED → un-archive it (the folder reappeared) but leave the
+///     user's `name`/`optional` overrides intact.
+///   * PRESENT and active → a no-op; the manual `name`/`optional` overrides win over
+///     the detected name (detection never renames or re-includes behind the user).
+///
+/// Returns the resolved [`Repository`] row (inserted or pre-existing). This is the
+/// single write path detection uses, so a re-scan converges instead of duplicating.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn upsert_detected_repository(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    detected_name: &str,
+    relative_path: &str,
+) -> QueryResult<Repository> {
+    conn.transaction(|conn| {
+        let existing: Option<Repository> = repositories::table
+            .filter(repositories::project_id.eq(project_id))
+            .filter(repositories::relative_path.eq(relative_path))
+            .select(Repository::as_select())
+            .first::<Repository>(conn)
+            .optional()?;
+
+        match existing {
+            Some(repo) if repo.archived_at.is_some() => {
+                // The folder reappeared: reactivate the SAME identity, keep overrides.
+                diesel::update(repositories::table.find(&repo.id))
+                    .set((
+                        repositories::archived_at.eq(None::<i64>),
+                        repositories::updated_at.eq(now_millis()),
+                    ))
+                    .execute(conn)?;
+                repositories::table
+                    .find(&repo.id)
+                    .select(Repository::as_select())
+                    .first::<Repository>(conn)
+            }
+            // Active identity already present → detection is a no-op (overrides win).
+            Some(repo) => Ok(repo),
+            None => {
+                // A brand-new detected identity. `name` may collide with a sibling's
+                // (two folders resolving to the same logical name); disambiguate so the
+                // UNIQUE(project_id, name) holds — the path is the identity, the name is
+                // a label.
+                let name = unique_repository_name(conn, project_id, detected_name)?;
+                create_repository(conn, project_id, &name, relative_path, false)
+            }
+        }
+    })
+}
+
+/// Pick a UNIQUE `repositories.name` within `project_id`, given a detected `stub`.
+/// Returns the stub if free, else `stub-N` for the smallest N making it unique. Runs
+/// inside the caller's transaction so the read-then-insert is race-free under the
+/// single writer. Mirrors [`unique_project_key`] for the per-project name axis.
+#[cfg_attr(not(test), allow(dead_code))]
+fn unique_repository_name(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    stub: &str,
+) -> QueryResult<String> {
+    let exists = |conn: &mut SqliteConnection, candidate: &str| -> QueryResult<bool> {
+        repositories::table
+            .filter(repositories::project_id.eq(project_id))
+            .filter(repositories::name.eq(candidate))
+            .select(repositories::id)
+            .first::<String>(conn)
+            .optional()
+            .map(|o| o.is_some())
+    };
+    if !exists(conn, stub)? {
+        return Ok(stub.to_string());
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{stub}-{n}");
+        if !exists(conn, &candidate)? {
+            return Ok(candidate);
+        }
+        n += 1;
+    }
 }
 
 /// Attach `terminal_id` to `workspace_id` with the given binding `mode`
@@ -1684,7 +2269,7 @@ pub fn instance_run_context(
         .select((
             managed_commands::command,
             managed_commands::subfolder,
-            workspaces::path,
+            workspaces::root_path,
             managed_commands::restart_on_startup,
         ))
         .first::<(String, Option<String>, String, bool)>(conn)
@@ -1707,7 +2292,7 @@ pub fn instance_run_context(
 pub fn workspace_path(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<String>> {
     workspaces::table
         .find(id)
-        .select(workspaces::path)
+        .select(workspaces::root_path)
         .first::<String>(conn)
         .optional()
 }
@@ -1767,12 +2352,56 @@ pub fn instance_ids_for_workspace(
         .load(conn)
 }
 
-/// Delete a workspace (ON DELETE CASCADE removes its command instances, SET NULL
-/// detaches its terminals). Returns rows deleted (0 = workspace not found).
-/// The caller is responsible for guarding against (a) live running instances (see
-/// `instance_ids_for_workspace` + runner's `any_running`) AND (b) deleting a project's
-/// ROOT workspace — removing the root would leave a rootless project (see the
-/// `remove_workspace` MCP handler, which refuses `is_root` rows).
+/// The RECORD ids of every terminal attached to `workspace_id`. Used by the
+/// destructive `remove_workspace` cascade: the sidecar adapter closes each of
+/// these terminals' LIVE PTYs (via its PTY manager / `TerminalHost`) before the
+/// use case deletes the rows, so no interactive shell is orphaned.
+pub fn terminal_ids_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<Vec<String>> {
+    terminals::table
+        .filter(terminals::workspace_id.eq(workspace_id))
+        .select(terminals::id)
+        .load(conn)
+}
+
+/// HARD-delete every `agent_sessions` row anchored to `workspace_id` (the workspace-scoped
+/// half of the destructive remove cascade). This covers sessions whose `workspace_id`
+/// points at the workspace even when their host terminal is loose (not attached to it);
+/// sessions on the workspace's OWN terminals are additionally cascaded by
+/// [`delete_terminals_for_workspace`] (agent_sessions → terminals is ON DELETE CASCADE).
+/// Returns rows deleted. MUST run inside the same transaction as the workspace delete.
+pub fn delete_agent_sessions_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<usize> {
+    diesel::delete(agent_sessions::table.filter(agent_sessions::workspace_id.eq(workspace_id)))
+        .execute(conn)
+}
+
+/// HARD-delete every `terminals` row attached to `workspace_id` (the workspace-scoped half
+/// of the destructive remove cascade). Deleting a terminal CASCADES its remaining
+/// `agent_sessions` (FK ON DELETE CASCADE), so this also reaps any session still hosted on
+/// one of the workspace's terminals. Returns rows deleted. MUST run inside the same
+/// transaction as the workspace delete.
+pub fn delete_terminals_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<usize> {
+    diesel::delete(terminals::table.filter(terminals::workspace_id.eq(workspace_id))).execute(conn)
+}
+
+/// Delete a workspace. ON DELETE CASCADE removes its command instances. Its terminals and
+/// agent sessions are NOT reaped by this call — the workspace FK on both is ON DELETE SET
+/// NULL, so the [`crate::usecase::remove_workspace`] use case deletes those rows EXPLICITLY
+/// (via [`delete_agent_sessions_for_workspace`] + [`delete_terminals_for_workspace`]) in the
+/// same transaction, BEFORE this call, to make workspace removal a full destructive cascade
+/// of its runtime (no orphaned "loose" terminals). Returns rows deleted (0 = workspace not
+/// found). The caller is responsible for guarding against deleting a project's ROOT
+/// workspace — removing the root would leave a rootless project (see the use case, which
+/// refuses `is_root` rows) — and for killing any LIVE process (see `instance_ids_for_workspace`
+/// + `terminal_ids_for_workspace`) from the adapter that owns the runner.
 pub fn delete_workspace(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
     diesel::delete(workspaces::table.find(id)).execute(conn)
 }
@@ -1807,7 +2436,7 @@ pub fn all_instances_for_restore(conn: &mut SqliteConnection) -> QueryResult<Vec
             managed_commands::restart_on_startup,
             managed_commands::command,
             managed_commands::subfolder,
-            workspaces::path,
+            workspaces::root_path,
         ))
         .load::<(String, String, bool, bool, String, Option<String>, String)>(conn)
         .map(|rows| {
@@ -2023,7 +2652,7 @@ pub fn list_instances_for_workspace(
             managed_commands::source_package_json_path,
             managed_commands::source_script_name,
             managed_commands::package_manager,
-            workspaces::path,
+            workspaces::root_path,
         ))
         .load::<(
             String,
@@ -2807,6 +3436,59 @@ mod tests {
         assert_eq!(rows[1].label, None);
     }
 
+    /// The `domain_events` model (v12) round-trips through the migrated DB, `sequence`
+    /// is strictly increasing (the monotonic global ordering key), and `list_domain_events`
+    /// returns them in emission order. Proves the v12 migration + `schema.rs` `domain_events`
+    /// table + the model columns are consistent (the outbox's persistence half).
+    #[test]
+    fn domain_events_round_trip_and_monotonic_sequence() {
+        let mut conn = open_in_memory();
+
+        let a = record_domain_event(
+            &mut conn,
+            NewDomainEvent {
+                project_id: "p1".into(),
+                workspace_id: Some("w1".into()),
+                aggregate: "workspace".into(),
+                event_type: "workspace.created".into(),
+                source: "ui".into(),
+                actor: None,
+                payload: "{\"identity_id\":\"w1\"}".into(),
+                created_at: 0,
+            },
+        )
+        .expect("record a");
+        let b = record_domain_event(
+            &mut conn,
+            NewDomainEvent {
+                project_id: "p1".into(),
+                workspace_id: None,
+                aggregate: "project".into(),
+                event_type: "project.archived".into(),
+                source: "mcp".into(),
+                actor: None,
+                payload: "{\"identity_id\":\"p1\"}".into(),
+                created_at: 0,
+            },
+        )
+        .expect("record b");
+
+        // Strictly increasing sequence (the monotonic global order).
+        assert!(b.sequence > a.sequence, "sequence is monotonic per insert");
+        // created_at was stamped (0 → now).
+        assert!(a.created_at > 0 && b.created_at > 0, "created_at stamped");
+        // Nullable workspace_id round-trips both ways.
+        assert_eq!(a.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(b.workspace_id, None);
+
+        let all = list_domain_events(&mut conn).expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].sequence, a.sequence, "listed in sequence order");
+        assert_eq!(all[1].sequence, b.sequence);
+        assert_eq!(all[0].event_type, "workspace.created");
+        assert_eq!(all[1].source, "mcp");
+    }
+
     /// The `status` CHECK constraint rejects anything but alive|closed — proves
     /// the migration's constraint reached the DB.
     #[test]
@@ -2892,10 +3574,10 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Step DOWN to the pre-v4 schema → the four exec-state columns are gone. The
-        // exec-state migration is dir #4; later PRDs stacked dirs #5..#9 on top, so
-        // reaching the pre-v4 schema peels all of them then dir #4 itself (6 reverts,
-        // reverse order).
-        for _ in 0..6 {
+        // exec-state migration is dir #4; later PRDs stacked dirs #5..#12 on top (v2.1
+        // Phase 4 added dir #12, the domain_events outbox), so reaching the pre-v4 schema
+        // peels all of them then dir #4 itself (9 reverts, reverse order).
+        for _ in 0..9 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -3547,6 +4229,798 @@ mod tests {
         );
     }
 
+    /// v2.1 STORAGE SEAL (task `01KWDCNDJRM6V0M5D01KRP4ENT`, done-criteria:
+    /// "Un seul fichier SQLite, WAL actif, migrations appliquées au boot" +
+    /// "La chaîne de migrations est versionnée et rejouable à blanc sans erreur").
+    ///
+    /// Opens a REAL, single file-backed `nyx.db` (the same path shape the sidecar
+    /// boots — one file for the whole authority, no second base), which runs the
+    /// FULL versioned migration chain once at open (`Db::open` → `run_migrations`).
+    /// Then it asserts the three sealed guarantees:
+    ///   1. WAL is active on that single on-disk file (`journal_mode = wal`), proving
+    ///      the boot pragmas hold on a persistent journal (not just `:memory:`).
+    ///   2. The chain is fully applied — ZERO pending migrations after boot
+    ///      ([`schema_health`] `up_to_date`), i.e. the whole versioned chain ran.
+    ///   3. Re-running the chain on the SAME already-migrated file is a clean no-op
+    ///      ("rejouable à blanc sans erreur"): `run_migrations` succeeds again and
+    ///      STILL reports zero pending — Diesel's `__diesel_schema_migrations` makes a
+    ///      replay idempotent, so a second boot never re-applies or errors.
+    #[test]
+    fn migration_chain_is_single_file_wal_and_replayable_from_scratch() {
+        let (db, path) = file_backed_db();
+
+        // Exactly ONE SQLite authority file at the sidecar's `<data_dir>/nyx.db` path
+        // (WAL adds transient -wal/-shm siblings, but the DB itself is a single file).
+        assert!(path.is_file(), "the DB is a single on-disk SQLite file");
+
+        db.with_conn(|conn| {
+            // (1) WAL is active on the real file-backed connection.
+            let journal: String = diesel::sql_query("PRAGMA journal_mode;")
+                .get_result::<PragmaText>(conn)
+                .expect("read journal_mode")
+                .value;
+            assert_eq!(
+                journal.to_lowercase(),
+                "wal",
+                "the single DB file must run in WAL mode after boot"
+            );
+
+            // (2) The versioned chain is fully applied at boot: nothing pending.
+            let health = schema_health(conn);
+            assert!(
+                health.up_to_date,
+                "boot must leave the schema fully migrated (chain applied)"
+            );
+            assert_eq!(
+                health.pending_count,
+                Some(0),
+                "zero migrations may remain pending after boot"
+            );
+
+            // (3) Replay the whole chain on the already-migrated file — idempotent,
+            // no error, still zero pending. This is "rejouable à blanc sans erreur":
+            // a second boot re-runs `run_migrations` and does nothing.
+            run_migrations(conn).expect("re-running the migration chain must be a clean no-op");
+            let health_after = schema_health(conn);
+            assert!(
+                health_after.up_to_date,
+                "a replay of the chain must not leave anything pending"
+            );
+            assert_eq!(
+                health_after.pending_count,
+                Some(0),
+                "replaying an already-applied chain adds no pending migrations"
+            );
+        });
+    }
+
+    // --- v2.1 canonical structure_locale (task 01KWDCNDJWP9SVFXFQXJCC85WD) ----
+
+    /// Helper: does a table exist in the migrated DB? Reads `sqlite_master`.
+    #[cfg(test)]
+    fn table_exists(conn: &mut SqliteConnection, table: &str) -> bool {
+        #[derive(diesel::QueryableByName)]
+        struct Cnt {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            #[diesel(column_name = "n")]
+            n: i64,
+        }
+        diesel::sql_query(format!(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='{table}'"
+        ))
+        .get_result::<Cnt>(conn)
+        .expect("query sqlite_master")
+        .n > 0
+    }
+
+    /// Helper: does an index exist in the migrated DB? Reads `sqlite_master`.
+    #[cfg(test)]
+    fn index_exists(conn: &mut SqliteConnection, index: &str) -> bool {
+        #[derive(diesel::QueryableByName)]
+        struct Cnt {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            #[diesel(column_name = "n")]
+            n: i64,
+        }
+        diesel::sql_query(format!(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='index' AND name='{index}'"
+        ))
+        .get_result::<Cnt>(conn)
+        .expect("query sqlite_master")
+        .n > 0
+    }
+
+    /// DONE-CRITERION (task #2): "Les 3 tables structure_locale existent à la forme du
+    /// data-model.dbml (colonnes, index, FKs)." Exercises EVERY canonical column of
+    /// `projects` / `workspaces` / `repositories` through a real typed insert+select
+    /// against the migrated DB. A drifted column name/type would fail to compile or run
+    /// here (`check_for_backend` also adds a compile-time column-type check). It also
+    /// asserts the canonical FKs: `projects.primary_workspace_id → workspaces.id` and
+    /// `repositories.project_id → projects.id` (a repo in a non-existent project is
+    /// rejected by the FK).
+    #[test]
+    fn canonical_structure_locale_tables_roundtrip_all_columns() {
+        let mut conn = open_in_memory();
+
+        // projects: key + primary_workspace_id + archived_at reach the model.
+        let (project, root) =
+            create_project(&mut conn, "sandbox", p("/p/pal", "C:\\p\\pal"), None).unwrap();
+        assert!(!project.key.is_empty(), "projects.key is NOT NULL, seeded");
+        assert_eq!(
+            project.primary_workspace_id.as_deref(),
+            Some(root.id.as_str()),
+            "primary_workspace_id (canonical primary role) points at the root workspace"
+        );
+        assert_eq!(project.archived_at, None, "a fresh project is not archived");
+
+        // workspaces: root_path (renamed) + folder_removed_at + archived_at reach the model.
+        assert_eq!(
+            root.root_path,
+            crate::pathnorm::normalize(p("/p/pal", "C:\\p\\pal")),
+            "root_path carries the canonical normalized folder"
+        );
+        assert_eq!(root.folder_removed_at, None, "a live folder is not removed");
+        assert_eq!(root.archived_at, None, "a fresh workspace is not archived");
+
+        // repositories: name + relative_path + optional + archived_at roundtrip; the
+        // (project_id) FK holds (this project exists).
+        let repo = create_repository(&mut conn, &project.id, "api", "api", false)
+            .expect("create a non-optional repo");
+        assert_eq!(repo.name, "api");
+        assert_eq!(repo.relative_path, "api");
+        assert!(
+            !repo.optional,
+            "optional defaults to false for a normal repo"
+        );
+        assert_eq!(repo.archived_at, None);
+        let mono = create_repository(&mut conn, &project.id, "root", ".", true)
+            .expect("create an optional mono-repo-style '.' repo");
+        assert!(mono.optional, "optional=true persists");
+        let listed = list_repositories(&mut conn, &project.id).unwrap();
+        assert_eq!(listed.len(), 2, "both repos are listed for the project");
+
+        // FK: primary_workspace_id references a REAL workspace (the root just created).
+        // Deleting the workspace SET NULLs the pointer rather than orphaning it — proves
+        // the FK is wired ON DELETE SET NULL as the canonical model specifies.
+        diesel::delete(workspaces::table.find(&root.id))
+            .execute(&mut conn)
+            .expect("delete the root workspace");
+        let after = get_project(&mut conn, &project.id).unwrap().unwrap();
+        assert_eq!(
+            after.primary_workspace_id, None,
+            "primary_workspace_id FK is ON DELETE SET NULL"
+        );
+
+        // FK: a repository in a NON-existent project is rejected (project_id FK).
+        let bad = create_repository(&mut conn, "no-such-project", "x", "x", false);
+        assert!(
+            bad.is_err(),
+            "repositories.project_id FK rejects a dangling project"
+        );
+    }
+
+    /// DONE-CRITERION (task #2): the canonical INDEXES exist at the dbml form —
+    /// UNIQUE(projects.key), UNIQUE(workspaces.project_id, root_path) (preserved across
+    /// the rename), the secondary (project_id, name) workspace index, and the two
+    /// repository UNIQUE indexes. Verified structurally via `sqlite_master` AND
+    /// behaviourally via constraint violations.
+    #[test]
+    fn canonical_structure_locale_indexes_and_uniques_are_enforced() {
+        let mut conn = open_in_memory();
+
+        // The named indexes the v10 migration creates exist.
+        assert!(
+            index_exists(&mut conn, "idx_projects_key"),
+            "UNIQUE projects.key index"
+        );
+        assert!(
+            index_exists(&mut conn, "idx_workspaces_project_name"),
+            "secondary (project_id, name) workspace index"
+        );
+        assert!(
+            index_exists(&mut conn, "idx_repositories_project"),
+            "repositories (project_id) index"
+        );
+
+        let (project, _root) = create_project(&mut conn, "Nyx", p("/n", "C:\\n"), None).unwrap();
+
+        // UNIQUE(projects.key): a second project sharing a key is rejected. We force a
+        // collision by updating a second project's key to the first's.
+        let (project2, _r2) = create_project(&mut conn, "Other", p("/o", "C:\\o"), None).unwrap();
+        let dup_key = diesel::update(projects::table.find(&project2.id))
+            .set(projects::key.eq(&project.key))
+            .execute(&mut conn);
+        assert!(
+            dup_key.is_err(),
+            "UNIQUE(projects.key) rejects a duplicate key"
+        );
+
+        // UNIQUE(repositories.project_id, name): same name in the same project is rejected.
+        create_repository(&mut conn, &project.id, "api", "api", false).unwrap();
+        let dup_name = create_repository(&mut conn, &project.id, "api", "different", false);
+        assert!(
+            dup_name.is_err(),
+            "UNIQUE(project_id, name) rejects a duplicate repo name"
+        );
+
+        // UNIQUE(repositories.project_id, relative_path): same path in the same project rejected.
+        let dup_path = create_repository(&mut conn, &project.id, "api2", "api", false);
+        assert!(
+            dup_path.is_err(),
+            "UNIQUE(project_id, relative_path) rejects a duplicate repo path"
+        );
+
+        // The SAME repo name/path in a DIFFERENT project is accepted (uniqueness is per project).
+        create_repository(&mut conn, &project2.id, "api", "api", false)
+            .expect("same repo identity in another project is allowed");
+    }
+
+    /// DONE-CRITERION (task #2): "workspace_repositories n'existe pas ; aucune table
+    /// specs créée." The PDR-0013 checkout table must NOT exist (membership is derived),
+    /// and the Spec domain (specs, reserved for v2.4) must NOT be built in v2.1. Asserts
+    /// their ABSENCE from the migrated schema, and that the 3 canonical tables DO exist.
+    #[test]
+    fn no_workspace_repositories_and_no_specs_table() {
+        let mut conn = open_in_memory();
+
+        assert!(table_exists(&mut conn, "projects"), "projects exists");
+        assert!(table_exists(&mut conn, "workspaces"), "workspaces exists");
+        assert!(
+            table_exists(&mut conn, "repositories"),
+            "repositories exists"
+        );
+
+        assert!(
+            !table_exists(&mut conn, "workspace_repositories"),
+            "the checkout table workspace_repositories must NOT exist (PDR-0013)"
+        );
+        assert!(
+            !table_exists(&mut conn, "specs"),
+            "the specs table must NOT exist in v2.1 (Spec domain reserved for v2.4)"
+        );
+    }
+
+    // --- v2.1 identity authority: create/resolve/archive (task #4) -----------
+
+    /// DONE-CRITERION (task #4): "Créer / résoudre / archiver un projet, un workspace
+    /// et un repository passe par nyx, invariants vérifiés." The FULL lifecycle of the
+    /// three identities goes through nyx functions. Create → resolve BY STABLE ID (not by
+    /// path) → archive (soft, `archived_at`, no row deleted) → the row still resolves by
+    /// id while dropping out of the LIVE listing → unarchive restores it.
+    #[test]
+    fn create_resolve_archive_lifecycle_for_the_three_identities() {
+        let mut conn = open_in_memory();
+
+        // CREATE — project (+ its root workspace) through nyx.
+        let (project, root) = create_project(&mut conn, "Nyx", p("/n", "C:\\n"), None).unwrap();
+        let repo = create_repository(&mut conn, &project.id, "api", "api", false).unwrap();
+
+        // RESOLVE by the STABLE internal id (independent of any disk path).
+        assert_eq!(
+            get_project(&mut conn, &project.id).unwrap().unwrap().id,
+            project.id,
+            "a project resolves by its stable id"
+        );
+        assert_eq!(
+            get_workspace(&mut conn, &root.id).unwrap().unwrap().id,
+            root.id,
+            "a workspace resolves by its stable id"
+        );
+        assert_eq!(
+            get_repository(&mut conn, &repo.id).unwrap().unwrap().id,
+            repo.id,
+            "a repository resolves by its stable id"
+        );
+
+        // ARCHIVE the repository: soft (archived_at set), NOT a delete.
+        assert_eq!(archive_repository(&mut conn, &repo.id).unwrap(), 1);
+        let archived = get_repository(&mut conn, &repo.id).unwrap().unwrap();
+        assert!(
+            archived.archived_at.is_some(),
+            "archive stamps archived_at, keeping the row resolvable by id"
+        );
+        assert!(
+            list_repositories(&mut conn, &project.id)
+                .unwrap()
+                .is_empty(),
+            "an archived repo drops out of the LIVE listing"
+        );
+        assert_eq!(
+            list_repositories_including_archived(&mut conn, &project.id)
+                .unwrap()
+                .len(),
+            1,
+            "…but is still present in the archive-inclusive listing (no delete)"
+        );
+
+        // Idempotent archive; then unarchive restores it to the live listing.
+        assert_eq!(
+            archive_repository(&mut conn, &repo.id).unwrap(),
+            0,
+            "re-archiving is a no-op (idempotent)"
+        );
+        assert_eq!(unarchive_repository(&mut conn, &repo.id).unwrap(), 1);
+        assert_eq!(
+            list_repositories(&mut conn, &project.id).unwrap().len(),
+            1,
+            "unarchive returns the repo to the live listing"
+        );
+
+        // Archive a project / workspace: soft, resolvable by id, no row deleted.
+        assert_eq!(archive_workspace(&mut conn, &root.id).unwrap(), 1);
+        assert!(get_workspace(&mut conn, &root.id)
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some());
+        assert_eq!(archive_project(&mut conn, &project.id).unwrap(), 1);
+        assert!(get_project(&mut conn, &project.id)
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some());
+    }
+
+    /// DONE-CRITERION (task #4): invariant — "clé projet unique". nyx derives a
+    /// deterministic, disambiguated key on create so the `UNIQUE(projects.key)` invariant
+    /// holds even for same-named projects; there is no second authority minting keys.
+    #[test]
+    fn project_key_is_unique_and_disambiguated_by_nyx() {
+        let mut conn = open_in_memory();
+        let (a, _) = create_project(&mut conn, "sandbox", p("/a", "C:\\a"), None).unwrap();
+        let (b, _) = create_project(&mut conn, "sandbox", p("/b", "C:\\b"), None).unwrap();
+        assert_ne!(a.key, b.key, "same-named projects get DISTINCT unique keys");
+        assert!(!a.key.is_empty() && !b.key.is_empty(), "keys are NOT NULL");
+    }
+
+    /// DONE-CRITERION (task #4): invariant — "primary_workspace_id cohérent". Creation
+    /// anchors it at the root workspace; [`set_primary_workspace`] moves it ONLY to a
+    /// workspace of the SAME project (a cross-project target is refused, leaving the
+    /// pointer coherent). This is the coherence the FK (ON DELETE SET NULL) alone cannot
+    /// give.
+    #[test]
+    fn primary_workspace_id_stays_coherent_through_nyx() {
+        let mut conn = open_in_memory();
+        let (proj, root) = create_project(&mut conn, "Nyx", p("/n", "C:\\n"), None).unwrap();
+        assert_eq!(
+            proj.primary_workspace_id.as_deref(),
+            Some(root.id.as_str()),
+            "creation anchors primary_workspace_id at the root workspace"
+        );
+
+        // Moving to another workspace of the SAME project succeeds and repoints.
+        let other =
+            create_workspace(&mut conn, &proj.id, "feat", p("/n/feat", "C:\\n\\feat")).unwrap();
+        assert!(set_primary_workspace(&mut conn, &proj.id, &other.id).unwrap());
+        assert_eq!(
+            get_project(&mut conn, &proj.id)
+                .unwrap()
+                .unwrap()
+                .primary_workspace_id
+                .as_deref(),
+            Some(other.id.as_str()),
+            "primary_workspace_id moved to the sibling workspace"
+        );
+
+        // A workspace of a DIFFERENT project is refused; the pointer is left untouched.
+        let (proj2, root2) = create_project(&mut conn, "Other", p("/o", "C:\\o"), None).unwrap();
+        assert!(
+            !set_primary_workspace(&mut conn, &proj.id, &root2.id).unwrap(),
+            "a foreign workspace is refused as primary (invariant guard)"
+        );
+        assert_eq!(
+            get_project(&mut conn, &proj.id)
+                .unwrap()
+                .unwrap()
+                .primary_workspace_id
+                .as_deref(),
+            Some(other.id.as_str()),
+            "the refused move left primary_workspace_id coherent (unchanged)"
+        );
+        // proj2's own pointer is unaffected.
+        assert_eq!(
+            proj2.primary_workspace_id.as_deref(),
+            Some(root2.id.as_str())
+        );
+    }
+
+    /// DONE-CRITERION (task #4): "Résolution d'identité stable (id interne) indépendante
+    /// des chemins disque." A workspace's `root_path` can change (folder moved/renamed on
+    /// disk) yet the SAME stable id keeps resolving the SAME identity — resolution never
+    /// keys on the path.
+    #[test]
+    fn identity_resolution_is_stable_across_a_disk_path_change() {
+        let mut conn = open_in_memory();
+        let (_proj, root) =
+            create_project(&mut conn, "Nyx", p("/old/loc", "C:\\old\\loc"), None).unwrap();
+        let id = root.id.clone();
+
+        // Simulate the folder moving on disk: the root_path changes, the id does not.
+        diesel::update(workspaces::table.find(&id))
+            .set(workspaces::root_path.eq(p("/new/loc", "C:\\new\\loc")))
+            .execute(&mut conn)
+            .unwrap();
+
+        let resolved = get_workspace(&mut conn, &id).unwrap().unwrap();
+        assert_eq!(
+            resolved.id, id,
+            "the same stable id resolves after a path move"
+        );
+        assert_eq!(
+            resolved.root_path,
+            pathnorm::normalize(p("/new/loc", "C:\\new\\loc")),
+            "resolution followed the identity, not the old path"
+        );
+    }
+
+    // --- v2.1 workspace = pivot intention/runtime, no Execution (task #6) -----
+
+    /// DONE-CRITERION (task #6): "Tout le runtime se rattache au workspace ; aucune
+    /// entité Execution." The three runtime kinds — a TERMINAL, an AGENT SESSION, and a
+    /// COMMAND INSTANCE — all key on `workspace_id` (the pivot), and NO `execution*`
+    /// table/column exists anywhere in the schema.
+    #[test]
+    fn all_runtime_attaches_to_workspace_and_no_execution_entity() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "Nyx", p("/n", "C:\\n"), None).unwrap();
+
+        // A terminal, attached to the workspace (the pivot).
+        let term = create_terminal(&mut conn, p("/n", "C:\\n"), None).unwrap();
+        attach_terminal(&mut conn, &term.id, &root.id, BINDING_MANUAL).unwrap();
+        assert_eq!(
+            get_terminal(&mut conn, &term.id)
+                .unwrap()
+                .unwrap()
+                .workspace_id
+                .as_deref(),
+            Some(root.id.as_str()),
+            "a terminal attaches to the workspace_id pivot"
+        );
+
+        // An agent session, keyed on the workspace.
+        let session = record_session_start(
+            &mut conn,
+            &term.id,
+            AGENT_KIND_CLAUDE_CODE,
+            SessionCapture {
+                workspace_id: Some(root.id.clone()),
+                external_session_id: "ext-1".to_string(),
+                cwd: p("/n", "C:\\n").to_string(),
+                transcript_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            session.workspace_id.as_deref(),
+            Some(root.id.as_str()),
+            "an agent session attaches to the workspace_id pivot"
+        );
+
+        // A command instance, materialized for the workspace.
+        let tmpl = create_template(
+            &mut conn,
+            &project.id,
+            "dev",
+            "echo hi",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        let insts = list_instances_for_workspace(&mut conn, &root.id).unwrap();
+        let inst = insts
+            .iter()
+            .find(|i| i.command_id == tmpl.id)
+            .expect("template materialized an instance for the workspace");
+        assert_eq!(
+            inst.workspace_id, root.id,
+            "a command instance attaches to the workspace_id pivot"
+        );
+
+        // NO Execution entity: no table nor column named after it exists in the schema.
+        assert!(
+            !table_exists(&mut conn, "executions"),
+            "there is NO executions table (PDR-0008)"
+        );
+        assert!(
+            !table_exists(&mut conn, "execution"),
+            "there is NO execution table (PDR-0008)"
+        );
+        #[derive(diesel::QueryableByName)]
+        struct Cnt {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            #[diesel(column_name = "n")]
+            n: i64,
+        }
+        let has_execution_col: i64 = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM pragma_table_info('command_instances') \
+             WHERE name LIKE '%execution%'",
+        )
+        .get_result::<Cnt>(&mut conn)
+        .unwrap()
+        .n;
+        assert_eq!(
+            has_execution_col, 0,
+            "no execution* column on the runtime tables (runtime keys on workspace_id)"
+        );
+    }
+
+    /// DONE-CRITERION (task #6): "folder_removed_at modélisé ; aucune suppression
+    /// automatique de ligne workspace." Marking the worktree folder cleaned up stamps
+    /// `folder_removed_at` and leaves the ROW (and its runtime) in place — it is NEVER an
+    /// auto-delete. The row still resolves by id; clearing the mark reverses it.
+    #[test]
+    fn folder_removed_at_marks_cleanup_without_deleting_the_row() {
+        let mut conn = open_in_memory();
+        let (_project, root) = create_project(&mut conn, "Nyx", p("/n", "C:\\n"), None).unwrap();
+
+        // A runtime terminal attached to the workspace, to prove it survives the mark.
+        let term = create_terminal(&mut conn, p("/n", "C:\\n"), None).unwrap();
+        attach_terminal(&mut conn, &term.id, &root.id, BINDING_MANUAL).unwrap();
+
+        assert!(
+            get_workspace(&mut conn, &root.id)
+                .unwrap()
+                .unwrap()
+                .folder_removed_at
+                .is_none(),
+            "a live workspace has no folder_removed_at"
+        );
+
+        // Mark the folder cleaned up.
+        assert_eq!(
+            mark_workspace_folder_removed(&mut conn, &root.id).unwrap(),
+            1
+        );
+        let after = get_workspace(&mut conn, &root.id).unwrap();
+        assert!(
+            after.is_some(),
+            "the workspace ROW is PERMANENT (not deleted)"
+        );
+        assert!(
+            after.unwrap().folder_removed_at.is_some(),
+            "folder_removed_at is stamped to mark the worktree cleanup"
+        );
+        // The runtime terminal is STILL attached — no auto-delete cascaded.
+        assert_eq!(
+            get_terminal(&mut conn, &term.id)
+                .unwrap()
+                .unwrap()
+                .workspace_id
+                .as_deref(),
+            Some(root.id.as_str()),
+            "marking the folder removed does NOT auto-delete the workspace or detach runtime"
+        );
+
+        // Idempotent; clearing the mark (folder re-materialized) reverses it.
+        assert_eq!(
+            mark_workspace_folder_removed(&mut conn, &root.id).unwrap(),
+            0,
+            "re-marking is a no-op (idempotent)"
+        );
+        assert_eq!(
+            clear_workspace_folder_removed(&mut conn, &root.id).unwrap(),
+            1
+        );
+        assert!(get_workspace(&mut conn, &root.id)
+            .unwrap()
+            .unwrap()
+            .folder_removed_at
+            .is_none());
+    }
+
+    // --- v2.1 v1→canonical DATA migration (task 01KWDCNDJX87BWJ6JMTRSETJYT) --
+
+    /// DONE-CRITERION (task #3): "Les projets/workspaces/runtime v1 existants sont
+    /// lisibles sous la forme canonique après migration." This is the GENUINE upgrade
+    /// path. We step DOWN to the PRE-canonical (pre-v10) schema — where `workspaces.path`
+    /// still exists, `projects` has no `key`/`primary_workspace_id`, and there is no
+    /// `repositories` table — insert v1-shaped rows (a project + its root workspace + a
+    /// runtime terminal ATTACHED to that workspace) with RAW SQL exactly as a v1 build
+    /// would, then run the v10+v11 UPGRADE and assert the rows are now readable through
+    /// the canonical model:
+    ///   * `workspaces.root_path` carries the OLD `path` value (no loss, canonical name);
+    ///   * `projects.key` is backfilled NOT-NULL + UNIQUE;
+    ///   * `projects.primary_workspace_id` points at the pre-existing root workspace
+    ///     (v11 backfill of the durable primary role);
+    ///   * the RUNTIME terminal is STILL attached to the SAME workspace (runtime
+    ///     preserved — the rename never moved a runtime row).
+    #[test]
+    fn v1_data_migrates_to_canonical_form_without_loss() {
+        use diesel::sql_query;
+        let mut conn = open_in_memory();
+
+        // Step DOWN to the pre-canonical schema: peel v12 (Phase 4 domain_events) then v11
+        // (data backfill) then v10 (canonical structure). After this, `workspaces.root_path`
+        // does NOT exist yet (`path` does), and `projects` has no `key`/`primary_workspace_id`.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v12 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v11 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v10 cleanly");
+        assert!(
+            !table_exists(&mut conn, "repositories"),
+            "pre-v10 schema has no repositories table"
+        );
+        let root_path_present: QueryResult<usize> =
+            sql_query("SELECT root_path FROM workspaces").execute(&mut conn);
+        assert!(
+            root_path_present.is_err(),
+            "pre-v10 schema still has `path`, not `root_path`"
+        );
+
+        // Insert v1-shaped rows via RAW SQL (the diesel models now know the canonical
+        // columns; raw SQL writes rows exactly as a pre-v10 build would). A project, its
+        // single ROOT workspace at a real path, and a terminal ATTACHED to that workspace.
+        let project_id = Uuid::now_v7().to_string();
+        let workspace_id = Uuid::now_v7().to_string();
+        let terminal_id = Uuid::now_v7().to_string();
+        let old_path = "/home/kris/legacy-project";
+        sql_query(format!(
+            "INSERT INTO projects (id, name) VALUES ('{project_id}', 'Legacy Project')"
+        ))
+        .execute(&mut conn)
+        .expect("insert a pre-v10 project");
+        sql_query(format!(
+            "INSERT INTO workspaces (id, project_id, name, path, is_root) \
+             VALUES ('{workspace_id}', '{project_id}', 'root', '{old_path}', 1)"
+        ))
+        .execute(&mut conn)
+        .expect("insert a pre-v10 root workspace");
+        sql_query(format!(
+            "INSERT INTO terminals (id, cwd, status, \"order\", workspace_id) \
+             VALUES ('{terminal_id}', '{old_path}', 'alive', 0, '{workspace_id}')"
+        ))
+        .execute(&mut conn)
+        .expect("insert a pre-v10 terminal attached to the workspace");
+
+        // UPGRADE: run v10 (structure + key seed + rename) then v11 (primary backfill).
+        run_migrations(&mut conn).expect("re-apply v10+v11 (the upgrade)");
+
+        // The project is now readable in canonical form.
+        let project = get_project(&mut conn, &project_id)
+            .expect("get_project after upgrade")
+            .expect("the pre-v10 project survived the upgrade");
+        assert!(
+            !project.key.is_empty(),
+            "key backfilled NOT NULL on upgrade"
+        );
+        assert_eq!(
+            project.primary_workspace_id.as_deref(),
+            Some(workspace_id.as_str()),
+            "primary_workspace_id backfilled to the pre-existing root workspace (v11)"
+        );
+
+        // The workspace's canonical `root_path` carries the OLD `path` value — no loss.
+        let ws = list_workspaces(&mut conn, &project_id).unwrap();
+        assert_eq!(
+            ws.len(),
+            1,
+            "the single workspace is preserved (no dup/loss)"
+        );
+        assert_eq!(
+            ws[0].root_path, old_path,
+            "root_path carries the pre-v10 path value verbatim"
+        );
+        assert!(ws[0].is_root, "the root role is preserved");
+
+        // The RUNTIME terminal is STILL attached to the SAME workspace (runtime preserved).
+        let term = get_terminal(&mut conn, &terminal_id)
+            .unwrap()
+            .expect("the runtime terminal survived the upgrade");
+        assert_eq!(
+            term.workspace_id.as_deref(),
+            Some(workspace_id.as_str()),
+            "the runtime stays attached to its workspace across the canonical migration"
+        );
+    }
+
+    /// DONE-CRITERION (task #3): "La migration est rejouable (idempotente) sans dupliquer
+    /// ni perdre de lignes." After the FULL canonical migration has run once, RE-RUNNING
+    /// the v11 backfill statements a second time must be a NO-OP: no row count changes,
+    /// no `primary_workspace_id` is repointed, no duplicate is created. We snapshot the
+    /// canonical state, replay the exact v11 backfill SQL, and assert the state is
+    /// IDENTICAL — the guards (`primary_workspace_id IS NULL`) make the replay converge.
+    #[test]
+    fn canonical_data_backfill_is_idempotent_on_replay() {
+        let mut conn = open_in_memory();
+
+        // A project (its create sets primary_workspace_id) + a second project whose
+        // pointer we clear to simulate a pre-v10 project the backfill must fix.
+        let (p1, root1) = create_project(&mut conn, "Alpha", p("/a", "C:\\a"), None).unwrap();
+        let (p2, root2) = create_project(&mut conn, "Beta", p("/b", "C:\\b"), None).unwrap();
+        // Simulate p2 as pre-v10 (pointer NULL) so the backfill has real work to do.
+        diesel::update(projects::table.find(&p2.id))
+            .set(projects::primary_workspace_id.eq::<Option<String>>(None))
+            .execute(&mut conn)
+            .unwrap();
+
+        // The v11 backfill SQL (verbatim shape from migrations/..._backfill_canonical_v1_data).
+        let backfill = "UPDATE projects \
+             SET primary_workspace_id = ( \
+                 SELECT w.id FROM workspaces AS w \
+                 WHERE w.project_id = projects.id AND w.is_root = 1 LIMIT 1) \
+             WHERE primary_workspace_id IS NULL \
+               AND EXISTS (SELECT 1 FROM workspaces AS w \
+                           WHERE w.project_id = projects.id AND w.is_root = 1)";
+
+        // First application: fixes p2, leaves p1 (already anchored at create) untouched.
+        diesel::sql_query(backfill)
+            .execute(&mut conn)
+            .expect("first backfill");
+        let after_first_p1 = get_project(&mut conn, &p1.id).unwrap().unwrap();
+        let after_first_p2 = get_project(&mut conn, &p2.id).unwrap().unwrap();
+        assert_eq!(
+            after_first_p1.primary_workspace_id.as_deref(),
+            Some(root1.id.as_str()),
+            "p1 stays anchored at its root (backfill skips already-set pointers)"
+        );
+        assert_eq!(
+            after_first_p2.primary_workspace_id.as_deref(),
+            Some(root2.id.as_str()),
+            "p2's NULL pointer is backfilled to its root workspace"
+        );
+
+        // Snapshot counts + pointers, REPLAY the backfill, assert nothing changed.
+        let projects_before: i64 = projects::table.count().get_result(&mut conn).unwrap();
+        let workspaces_before: i64 = workspaces::table.count().get_result(&mut conn).unwrap();
+
+        diesel::sql_query(backfill)
+            .execute(&mut conn)
+            .expect("replay backfill (idempotent)");
+
+        let projects_after: i64 = projects::table.count().get_result(&mut conn).unwrap();
+        let workspaces_after: i64 = workspaces::table.count().get_result(&mut conn).unwrap();
+        assert_eq!(
+            projects_before, projects_after,
+            "replay dups no project row"
+        );
+        assert_eq!(
+            workspaces_before, workspaces_after,
+            "replay dups no workspace row"
+        );
+
+        let replay_p1 = get_project(&mut conn, &p1.id).unwrap().unwrap();
+        let replay_p2 = get_project(&mut conn, &p2.id).unwrap().unwrap();
+        assert_eq!(
+            replay_p1.primary_workspace_id, after_first_p1.primary_workspace_id,
+            "replay does not repoint p1"
+        );
+        assert_eq!(
+            replay_p2.primary_workspace_id, after_first_p2.primary_workspace_id,
+            "replay does not repoint p2 (converges, no change)"
+        );
+    }
+
+    /// DONE-CRITERION (task #3, replay-safety at the CHAIN level): running the whole
+    /// embedded migration chain a SECOND time (a second boot) is a clean no-op that
+    /// neither errors nor loses the canonical data. Complements the task-#1 replay seal
+    /// by asserting the canonical rows survive a re-run unchanged.
+    #[test]
+    fn full_chain_replay_preserves_canonical_rows() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "Gamma", p("/g", "C:\\g"), None).unwrap();
+
+        // Re-run the entire chain (idempotent): a second boot must not error.
+        run_migrations(&mut conn).expect("replaying the whole chain is a clean no-op");
+
+        // The canonical rows are intact and still readable in canonical form.
+        let got = get_project(&mut conn, &project.id).unwrap().unwrap();
+        assert_eq!(got.key, project.key, "key unchanged by a chain replay");
+        assert_eq!(
+            got.primary_workspace_id.as_deref(),
+            Some(root.id.as_str()),
+            "primary_workspace_id unchanged by a chain replay"
+        );
+        let ws = list_workspaces(&mut conn, &project.id).unwrap();
+        assert_eq!(ws.len(), 1, "no workspace duplicated by a chain replay");
+        assert_eq!(
+            ws[0].root_path, root.root_path,
+            "root_path unchanged by a chain replay"
+        );
+    }
+
     /// `set_active` stamps `last_active_at` (greatest = most-recently-activated,
     /// the launcher's restore rule) WITHOUT bumping `updated_at`.
     #[test]
@@ -3693,9 +5167,12 @@ mod tests {
         let raw = p("/home//kris/./demo/", "C:/Home/Kris/Demo/");
         let (_, root) = create_project(&mut conn, "demo", raw, None).unwrap();
         let expected = crate::pathnorm::normalize(raw);
-        assert_eq!(root.path, expected, "stored path is the normalized form");
+        assert_eq!(
+            root.root_path, expected,
+            "stored path is the normalized form"
+        );
         // And the normalized form has no trailing separator / redundant pieces.
-        assert!(!root.path.ends_with('/') || root.path == "/");
+        assert!(!root.root_path.ends_with('/') || root.root_path == "/");
     }
 
     /// PURE branch parsing: a normal checkout reports a branch name; DETACHED HEAD
@@ -3828,7 +5305,10 @@ mod tests {
         // The SAME path in a DIFFERENT project is accepted.
         let w_other = create_workspace(&mut conn, &proj2.id, "feat", path_a)
             .expect("same path in another project must be accepted");
-        assert_eq!(w_other.path, w1.path, "both store the same canonical path");
+        assert_eq!(
+            w_other.root_path, w1.root_path,
+            "both store the same canonical path"
+        );
         assert_ne!(w_other.project_id, w1.project_id);
 
         // p1 still has exactly root + the one added workspace (no dup leaked in).
@@ -3852,7 +5332,7 @@ mod tests {
                 id: Uuid::now_v7().to_string(),
                 project_id: proj1.id.clone(),
                 name: "root2".into(),
-                path: pathnorm::normalize(p("/r1/extra", "C:\\r1\\extra")),
+                root_path: pathnorm::normalize(p("/r1/extra", "C:\\r1\\extra")),
                 branch: None,
                 is_root: true,
                 created_at: now,
@@ -3994,7 +5474,10 @@ mod tests {
         let ws = list_workspaces(&mut conn, &project.id).unwrap();
         assert_eq!(ws.len(), 1);
         assert_eq!(ws[0].id, root.id);
-        assert_eq!(ws[0].path, root.path, "rename does not touch the path");
+        assert_eq!(
+            ws[0].root_path, root.root_path,
+            "rename does not touch the path"
+        );
 
         // Renaming an unknown id is a no-op (0 rows), not an error.
         assert_eq!(update_project(&mut conn, "no-such-id", "x").unwrap(), 0);
@@ -4109,7 +5592,10 @@ mod tests {
         let listed = list_workspaces(&mut conn, &project.id).unwrap();
         let got = listed.iter().find(|w| w.id == feat.id).unwrap();
         assert_eq!(got.name, "frontend", "rename persists the new name");
-        assert_eq!(got.path, feat.path, "rename does not touch the path");
+        assert_eq!(
+            got.root_path, feat.root_path,
+            "rename does not touch the path"
+        );
 
         // Rename the root too (the editable "main" relabel).
         rename_workspace(&mut conn, &root.id, "primary").unwrap();
@@ -4174,7 +5660,7 @@ mod tests {
         );
         assert!(!got_root.collapsed, "a sibling workspace is left open");
         assert_eq!(
-            got_feat.path, feat.path,
+            got_feat.root_path, feat.root_path,
             "persisting collapse never touches the path"
         );
 
@@ -4231,10 +5717,11 @@ mod tests {
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the projects migration (dirs #9 → #3),
-        // then the projects migration (dir #2) itself — 8 reverts in reverse order.
-        // projects must then be absent.
-        for _ in 0..8 {
+        // Peel every migration stacked above the projects migration (dirs #12 → #3),
+        // then the projects migration (dir #2) itself — 11 reverts in reverse order
+        // (v2.1 Phase 4 added dir #12, the domain_events outbox). projects must then be
+        // absent.
+        for _ in 0..11 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -5079,9 +6566,10 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Peel every migration stacked above the managed_commands migration (dirs
-        // #9 → #4), then the managed_commands migration (dir #3) itself — 7 reverts in
-        // reverse order. managed_commands must then be absent.
-        for _ in 0..7 {
+        // #12 → #4), then the managed_commands migration (dir #3) itself — 10 reverts in
+        // reverse order (v2.1 Phase 4 added dir #12, the domain_events outbox).
+        // managed_commands must then be absent.
+        for _ in 0..10 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -5139,11 +6627,18 @@ mod tests {
         .unwrap();
         let inst = insert_instance(&mut conn, &dev.id, &root.id);
 
-        // Revert down to the v4-absent state. Migrations stack v9, v8, v7, v5 ON TOP of
-        // v4 (#11 added v9; PRD-5 added v7/v8; PRD-4 added v5), so reaching the v4-absent
-        // state peels v9, v8, v7, v5, then v4 (migrations revert in reverse order). The
-        // instance row + its v3 columns survive; the v4 columns are gone (a typed select
-        // of `unread` would now fail to run).
+        // Revert down to the v4-absent state. Migrations stack v12, v11, v10, v9, v8, v7, v5
+        // ON TOP of v4 (v2.1 Phase 4 added v12 domain_events; v2.1 added v10/v11; #11 added
+        // v9; PRD-5 added v7/v8; PRD-4 added v5), so reaching the v4-absent state peels v12,
+        // v11, v10, v9, v8, v7, v5, then v4 (migrations revert in reverse order). The instance
+        // row + its v3 columns survive; the v4 columns are gone (a typed select of `unread`
+        // would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v12 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v11 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v10 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v9 cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -5298,11 +6793,18 @@ mod tests {
         .unwrap();
         let inst = insert_instance(&mut conn, &dev.id, &root.id);
 
-        // Revert down to the v5-absent state. Migrations v9 (#11 project order), v8
-        // (project resume option) and v7 (agent_sessions) stack ON TOP of v5/prev_run,
-        // so reaching the v5-absent state now peels v9, v8, v7, then v5 (migrations
+        // Revert down to the v5-absent state. Migrations v12 (v2.1 Phase 4 domain_events),
+        // v11 (v2.1 data backfill), v10 (v2.1 canonical structure), v9 (#11 project order),
+        // v8 (project resume option) and v7 (agent_sessions) stack ON TOP of v5/prev_run, so
+        // reaching the v5-absent state now peels v12, v11, v10, v9, v8, v7, then v5 (migrations
         // revert in reverse order). The instance row + its v3/v4 columns survive; the v5
         // columns are gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v12 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v11 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v10 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v9 cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -6557,8 +8059,15 @@ mod tests {
         use diesel::sql_query;
         let mut conn = open_in_memory();
 
-        // Step DOWN past v9 (#11 project order) then v8 → the resume_agent_sessions
-        // column is gone.
+        // Step DOWN past v12 (v2.1 Phase 4 domain_events) then v11 (v2.1 data backfill) then
+        // v10 (v2.1 canonical structure) then v9 (#11 project order) then v8 → the
+        // resume_agent_sessions column is gone.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v12 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v11 cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v10 cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v9 cleanly");
         conn.revert_last_migration(MIGRATIONS)

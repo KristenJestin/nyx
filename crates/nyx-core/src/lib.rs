@@ -62,10 +62,12 @@ pub mod proc;
 pub mod proc_stats;
 pub mod proc_util;
 pub mod pty;
+pub mod repository;
 pub mod resolve;
 pub mod schema;
 pub mod shellinteg;
 pub mod subfolder;
+pub mod usecase;
 
 /// ONE process-global lock for every test that mutates a `NYX_CLAUDE_*` env seam
 /// (`NYX_CLAUDE_CONFIG` / `NYX_CLAUDE_SETTINGS` / `NYX_CLAUDE_BIN` /

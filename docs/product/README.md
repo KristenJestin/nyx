@@ -87,6 +87,7 @@ C-049 | Mode par spec (stepped / autopilot) | validated | PDR-0020
 C-050 | Human task surfacée dans l'onglet Tasks (badge, actionnable) ; Attention Inbox différée | validated | PDR-0021
 C-051 | Phases nommées (liste ordonnée sur la spec) ; pas de table, statut dérivé | validated | PDR-0022
 C-052 | Stockage = SQLite (statiquement liée au sidecar) ; couche requêtes = impl ; Turso différé | validated | PDR-0023
+C-053 | Stockage = un seul fichier SQLite ; séparation des bounded contexts logique, pas physique | validated | PDR-0024
 
 ## Décisions validées à ce jour
 
@@ -119,6 +120,7 @@ C-052 | Stockage = SQLite (statiquement liée au sidecar) ; couche requêtes = i
 27. **Surfaçage des human tasks** (PDR-0021) : une human task (`executor=human`) s'affiche dans l'**onglet Tasks** avec un badge « toi », **actionnable** par l'humain (`done`) — seule exception à la lecture seule des tasks ; l'agent l'annonce aussi en chat ; une task agent bloquée montre « bloquée par [human task] ». L'**Attention Inbox** (roll-up transverse de tous les signaux) n'est **pas un prérequis**, elle est différée (Q-007).
 28. **Phases nommées** (PDR-0022) : les phases gagnent un **nom** via une **liste ordonnée sur la spec** (`specs.phases` = `[{number,name}]`) que `tasks.phase` indexe. **Pas de table de phases** (respecte PDR-0014), **statut de phase toujours dérivé** des tasks. Le proto nommait déjà les phases ; c'est désormais backé.
 29. **Stockage** (PDR-0023) : moteur **SQLite** (SQLite-compatible), **compilé statiquement dans le sidecar** (pas de module natif per-OS — c'était un artefact Node/N-API, mort avec le sidecar Rust). La **couche requêtes/ORM** (Diesel/sqlx/…) est un **détail d'implémentation** (v2.0), pas une décision produit. **Turso (libsql/Turso DB) + Toasty = upgrade path différé** (sync = handoff différé), réversible. Ne résout pas Q-004 (fichier unique vs plusieurs).
+30. **Stockage : un seul fichier SQLite** (PDR-0024, ferme Q-004) : toute l'autorité métier dans une base unique (transactions atomiques cross-contexte, mono-writer local WAL, backup/migration triviaux). Les bounded contexts = séparation **logique** (modules/schéma), pas physique. Le seul gain de fichiers séparés (sync indépendante) = handoff multi-machine, différé (PDR-0016). Réversible. **Décisions de cadrage v2.1** liées : le lien Spec→runtime (`specs.workspace_id` + table `specs`) est **réservé en v2.1, réalisé en v2.4** ; le temps réel des **vues dérivées de Git** (diff/dirty/branche) est **différé en v2.3** (Q-015), v2.1 ne pousse que les `domain_events` métier.
 
 ## Discipline de mise à jour
 

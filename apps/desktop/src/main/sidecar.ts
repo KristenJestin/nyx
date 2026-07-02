@@ -342,6 +342,13 @@ export class Sidecar {
         ...process.env,
         NYX_DATA_DIR: dataDir,
         ...(resourceDir ? { NYX_RESOURCE_DIR: resourceDir } : {}),
+        // OPT IN the sidecar's boot-time Claude-plugin reconcile: when the MCP server binds
+        // (on `startMcp()` below), the sidecar re-templates the installed plugin's `.mcp.json`
+        // to the live MCP port + re-registers it via the `claude` CLI, so Claude Code connects
+        // the nyx MCP (finding #44/#45/#47). This is a REAL-`~/.claude` mutation, so it is
+        // opt-in — the app (which owns the integration) turns it on here; bare sidecar test
+        // spawns leave it off and stay hermetic. Honor an explicit user override if present.
+        NYX_RECONCILE_CLAUDE_PLUGIN: process.env.NYX_RECONCILE_CLAUDE_PLUGIN ?? "1",
       },
       // 0=stdin (frames in), 1=stdout (frames out), 2=stderr (logs to our stderr).
       stdio: ["pipe", "pipe", "inherit"],

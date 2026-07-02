@@ -59,6 +59,32 @@
 //   `claude --resume <id>` into the respawned shell). A SQLite INTEGER 0/1 boolean ↔
 //   Diesel `Bool`, appended LAST on `projects` (positional decoding) and back-filling
 //   safely (DEFAULT 0 → OFF for old projects — no surprise resume on upgrade).
+// - v10 (v2.1 — canonical Project/Workspace/Repository, data-model.dbml) ports the
+//   three `structure_locale` identities to their canonical form:
+//     * `projects` GAINS `key` (Text, NOT NULL, UNIQUE — the Linear prefix),
+//       `primary_workspace_id` (Nullable<Text> FK → workspaces.id, the durable base
+//       workspace), and `archived_at` (Nullable<BigInt>). Appended after
+//       `order_index` (positional decoding).
+//     * `workspaces` RENAMES `path` → `root_path` (Text — the canonical folder column;
+//       value unchanged) and GAINS `folder_removed_at` (Nullable<BigInt>, marks the
+//       worktree cleanup — the row is PERMANENT, never auto-deleted) and `archived_at`
+//       (Nullable<BigInt>). `is_root`/`collapsed`/`branch` remain as the backing
+//       mechanism; `primary_workspace_id` on `projects` is the canonical primary-role
+//       source of truth. Column ORDER must match the SQL migration.
+//     * `repositories` is the NEW logical-identity table (PDR-0013): `name`,
+//       `relative_path` ('.' in mono-repo), `optional` (SQLite 0/1 ↔ Diesel `Bool`),
+//       timestamps + `archived_at`, with UNIQUE(project_id,name) and
+//       UNIQUE(project_id,relative_path). There is NO `workspace_repositories` checkout
+//       table (membership is derived, Git state re-read from Git) and NO `specs` table
+//       (the Spec domain is reserved for v2.4).
+// - v12 (v2.1 Phase 4 — the `domain_events` OUTBOX, task 01KWDCNDJZ6KTVX36D4401KK89)
+//   adds the persistent, monotonically-ordered log of identity mutations. `sequence`
+//   is the `INTEGER PRIMARY KEY` rowid alias (strictly increasing per insert → the
+//   total emission order), mapped as Diesel `BigInt` (i64). `project_id` is NOT NULL;
+//   `workspace_id`/`actor` are `Nullable<Text>`; `aggregate`/`event_type`/`source` are
+//   NOT NULL TEXT; `payload` is a NOT NULL JSON TEXT bag (default '{}'); `created_at`
+//   is epoch-ms `BigInt`. The correlation ids are PLAIN values (no FK) so the audit log
+//   OUTLIVES a delete of the row it describes. Column ORDER must match the SQL migration.
 
 diesel::table! {
     terminals (id) {
@@ -92,6 +118,9 @@ diesel::table! {
         resume_agent_sessions -> Bool,
         #[sql_name = "order"]
         order_index -> Integer,
+        key -> Text,
+        primary_workspace_id -> Nullable<Text>,
+        archived_at -> Nullable<BigInt>,
     }
 }
 
@@ -100,12 +129,41 @@ diesel::table! {
         id -> Text,
         project_id -> Text,
         name -> Text,
-        path -> Text,
+        root_path -> Text,
         branch -> Nullable<Text>,
         is_root -> Bool,
         collapsed -> Bool,
         created_at -> BigInt,
         updated_at -> BigInt,
+        folder_removed_at -> Nullable<BigInt>,
+        archived_at -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    repositories (id) {
+        id -> Text,
+        project_id -> Text,
+        name -> Text,
+        relative_path -> Text,
+        optional -> Bool,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        archived_at -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    domain_events (sequence) {
+        sequence -> BigInt,
+        project_id -> Text,
+        workspace_id -> Nullable<Text>,
+        aggregate -> Text,
+        event_type -> Text,
+        source -> Text,
+        actor -> Nullable<Text>,
+        payload -> Text,
+        created_at -> BigInt,
     }
 }
 
@@ -173,12 +231,15 @@ diesel::joinable!(command_instances -> managed_commands (command_id));
 diesel::joinable!(command_instances -> workspaces (workspace_id));
 diesel::joinable!(agent_sessions -> terminals (terminal_id));
 diesel::joinable!(agent_sessions -> workspaces (workspace_id));
+diesel::joinable!(repositories -> projects (project_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     agent_sessions,
     command_instances,
+    domain_events,
     managed_commands,
     projects,
+    repositories,
     terminals,
     workspaces,
 );

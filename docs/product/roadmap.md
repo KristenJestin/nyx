@@ -33,10 +33,10 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 - figer le modèle Project/Workspace/Repository ;
 - faire de nyx l'autorité unique de ces identités ;
 - acter le workspace comme pivot intention/runtime (`Execution` rejetée, PDR-0008) ;
-- relier Spec/Task au runtime via `specs.workspace_id`, sans rendre le Spec obligatoire ;
+- acter le workspace comme point de rattachement du travail, **travail libre possible sans Spec** ; le lien Spec→runtime (`specs.workspace_id`) et la table `specs` sont **réservés ici mais réalisés en v2.4** (v2.1 ne construit pas le domaine Spec) ;
 - mettre en place les use cases communs UI/MCP ;
-- établir le flux d'événements temps réel ;
-- définir la stratégie de stockage et de migrations de la V2.
+- établir le flux d'événements temps réel des **mutations métier** (`domain_events` poussés, pas de polling) ; les **vues dérivées de Git** (diff/dirty/branche) sont **différées en v2.3** (Q-015) ;
+- définir la stratégie de stockage (**un seul fichier SQLite**, PDR-0024) et de migrations de la V2 (chaîne unique, reprise des données v1).
 
 **Gate :** le modèle relie clairement intention, dossiers, runtime et Git sans autorité Depot parallèle.
 
@@ -57,6 +57,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 ## v2.3 - Diff et review locale
 
 - moteur Git multi-repo ;
+- **rafraîchissement temps réel des vues dérivées de Git** (diff/dirty/branche) : watch fs/git ou re-read sur déclencheur — tranche **Q-015** (différée depuis v2.1) ;
 - working tree, staged, unstaged, untracked, commit, range et branches ;
 - gros diffs virtualisés ;
 - review générique, Spec facultatif ; review = vue dérivée (pas de table), modèle comment/task, finding = task (cf. PDR-0012, PDR-0015) ;
@@ -75,7 +76,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 - absorber Spec et révisions ;
 - absorber tâches, dépendances, actions humaines et findings de review ;
 - porter lifecycle, validations et garde-fous au backend nyx choisi ;
-- relier Spec/tâches au workspace de dev et aux reviews ;
+- relier Spec/tâches au workspace de dev et aux reviews (**réalise `specs.workspace_id`**, le seam réservé en v2.1) ;
 - fournir l'interface `Specs` native nyx ;
 - exposer les outils MCP nyx d'authoring et de transition ;
 - générer les contextes agents depuis l'état nyx ;

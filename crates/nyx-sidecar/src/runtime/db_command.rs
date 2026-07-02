@@ -34,7 +34,7 @@
 use nyx_core::db;
 use serde_json::Value;
 
-use super::events::EventSink;
+use super::events::{EventSink, PushEventSink};
 use super::Runtime;
 use crate::pipe::wire::Event;
 
@@ -83,6 +83,7 @@ pub fn dispatch(
         runtime,
         command,
         args,
+        events,
     };
     let result = ctx.run()?;
 
@@ -96,14 +97,22 @@ pub fn dispatch(
     }
 
     // Parity with the v1 `emit_commands_changed` / `emit_workspaces_changed`: a TEMPLATE
-    // mutation broadcasts `commands://changed`; a project/workspace TREE mutation
-    // broadcasts `workspaces://changed`, so every surface re-pulls. Emitted ONLY after a
-    // successful mutation (an `Err` above skips it).
+    // mutation broadcasts `commands://changed`; a project/workspace TREE mutation that runs
+    // OUTSIDE a use case (so no domain event drives its push) broadcasts `workspaces://changed`
+    // here, so every surface re-pulls. Emitted ONLY after a successful mutation (an `Err`
+    // above skips it).
+    //
+    // The IDENTITY mutations (`create_project`, `create_workspace`, `rename_workspace`,
+    // `workspace_delete`) are NOT broadcast here: each now runs through the shared
+    // `usecase::*` layer and pushes `workspaces://changed` via the domain-event-driven
+    // [`PushEventSink`] (task #10, same as the MCP path). Broadcasting them here too would
+    // DOUBLE-push. So the legacy list is trimmed to the genuine tree mutations that have no
+    // use case emitting a domain event (`projects_reorder`, `delete_project`).
     if mutates_command_templates(command) {
         events.emit(Event::Changed {
             topic: "commands".to_string(),
         });
-    } else if mutates_workspace_tree(command) {
+    } else if pushes_workspace_tree_legacy(command) {
         events.emit(Event::Changed {
             topic: "workspaces".to_string(),
         });
@@ -118,14 +127,26 @@ pub fn dispatch(
     Ok(result)
 }
 
-/// The per-call dispatch context: the runtime handle + the command name + its parsed args.
+/// The per-call dispatch context: the runtime handle + the command name + its parsed args +
+/// the pipe event sink (so an IDENTITY mutation can build a domain-event-driven
+/// [`PushEventSink`], the same real-time push the MCP path uses).
 struct Ctx<'a> {
     runtime: &'a Runtime,
     command: &'a str,
     args: Value,
+    events: &'a EventSink,
 }
 
 impl Ctx<'_> {
+    /// The domain-event-driven push sink for an IDENTITY mutation of the UI path, built from
+    /// the sidecar's pipe event sink — the SAME real-time push the MCP path wires (`mcp.rs`).
+    /// A use case emits its `DomainEvent` AFTER commit; this sink turns it into the coarse
+    /// `workspaces://changed` invalidation, so the push is driven by the committed DOMAIN
+    /// event (not by a string-matched command name in the legacy broadcast below).
+    fn push_sink(&self) -> PushEventSink {
+        PushEventSink::new(self.events.clone())
+    }
+
     /// Read a required string arg, or a readable error.
     fn arg_str(&self, name: &str) -> Result<String, String> {
         self.args
@@ -393,17 +414,40 @@ impl Ctx<'_> {
                 }))
             }
             // --- projects ------------------------------------------------------
+            // Every identity op below delegates to the SHARED `nyx_core::usecase` layer
+            // (PDR-0005, v2.1 task #7) — the SAME application service the MCP surface calls
+            // — so NO business logic lives in this UI bridge. The use cases emit domain
+            // events through the injected sink; in Phase 3 the UI bridge passes a
+            // `NullEventSink` (no consumer yet — the persistent `domain_events` table and
+            // the push pipeline are Phase 4), while still broadcasting the coarse
+            // `workspaces://changed` UI-refresh invalidation below as before.
             "list_projects" => self
                 .db()
-                .with_conn(db::list_projects)
+                .with_conn(nyx_core::usecase::list_projects)
                 .map_err(Self::db_err)
                 .and_then(|rows| Self::json(&rows)),
             "create_project" => {
                 let name = self.arg_str("name")?;
                 let root_path = self.arg_str("rootPath")?;
                 let root_name = self.arg_opt_str("rootName");
+                // Canonical registration flow via the SHARED use case: create the project +
+                // its root workspace, auto-detect the Git repos under the root
+                // (done_criterion #5), and emit `project.created` — the SAME use case the
+                // MCP surface reaches (no duplicated orchestration). The push is driven by
+                // that committed DOMAIN event through the [`PushEventSink`] (task #10), so
+                // this command is NOT in the legacy `pushes_workspace_tree_legacy` broadcast.
+                let push = self.push_sink();
                 self.db()
-                    .with_conn(|c| db::create_project(c, &name, &root_path, root_name.as_deref()))
+                    .with_conn(|c| {
+                        nyx_core::usecase::create_project(
+                            c,
+                            &push,
+                            &name,
+                            &root_path,
+                            root_name.as_deref(),
+                            nyx_core::usecase::DomainEventSource::Ui,
+                        )
+                    })
                     .map_err(Self::db_err)
                     .and_then(|(project, root)| {
                         Self::json(&serde_json::json!({ "project": project, "root": root }))
@@ -444,7 +488,7 @@ impl Ctx<'_> {
             "list_workspaces" => {
                 let project_id = self.arg_str("projectId")?;
                 self.db()
-                    .with_conn(|c| db::list_workspaces(c, &project_id))
+                    .with_conn(|c| nyx_core::usecase::list_workspaces(c, &project_id))
                     .map_err(Self::db_err)
                     .and_then(|rows| Self::json(&rows))
             }
@@ -452,53 +496,104 @@ impl Ctx<'_> {
                 let project_id = self.arg_str("projectId")?;
                 let name = self.arg_str("name")?;
                 let path = self.arg_str("path")?;
+                // Canonical registration flow via the SHARED use case: insert the workspace,
+                // auto-detect + persist the Git repos under its root_path (done_criterion
+                // #5), and emit `workspace.created` — the SAME `usecase::register_workspace`
+                // the MCP `workspace_add`/`create_workspace` tools reach. The push rides the
+                // committed DOMAIN event through the [`PushEventSink`] (task #10), so this
+                // command is NOT in the legacy broadcast.
+                let push = self.push_sink();
                 self.db()
-                    .with_conn(|c| db::create_workspace(c, &project_id, &name, &path))
+                    .with_conn(|c| {
+                        nyx_core::usecase::register_workspace(
+                            c,
+                            &push,
+                            &project_id,
+                            &name,
+                            &path,
+                            nyx_core::usecase::DomainEventSource::Ui,
+                        )
+                    })
                     .map_err(Self::db_err)
                     .and_then(|row| Self::json(&row))
             }
             "rename_workspace" => {
                 let id = self.arg_str("id")?;
                 let name = self.arg_str("name")?;
+                // Route through the SHARED use case (mirror of `rename_repository`): rename +
+                // emit a correlated `workspace.renamed` domain_event IN the same transaction
+                // (#9), then push via the committed DOMAIN event through the [`PushEventSink`]
+                // (#10) — the SAME real-time push the MCP path uses. This closes the prior gap
+                // where the UI rename went straight to `db::rename_workspace` (no event, no
+                // push). NOT in the legacy broadcast (the domain event drives the push).
+                let push = self.push_sink();
                 self.db()
-                    .with_conn(|c| db::rename_workspace(c, &id, &name))
+                    .with_conn(|c| {
+                        nyx_core::usecase::rename_workspace(
+                            c,
+                            &push,
+                            &id,
+                            &name,
+                            nyx_core::usecase::DomainEventSource::Ui,
+                        )
+                    })
                     .map_err(Self::db_err)?;
                 Ok("null".to_string())
             }
             "workspace_delete" => {
                 let id = self.arg_str("id")?;
-                let workspace = self
-                    .db()
-                    .with_conn(|c| db::get_workspace(c, &id))
-                    .map_err(Self::db_err)?;
-                match workspace {
-                    None => return Err(format!("unknown workspace {id}")),
-                    Some(ws) if ws.is_root => {
-                        return Err("this is the project's root workspace — it cannot be removed on its own; delete the whole project instead".to_string())
-                    }
-                    Some(_) => {}
-                }
+                // RUNTIME kill owned by the bridge: STOP every running command instance +
+                // CLOSE every interactive terminal PTY of the workspace BEFORE delegating.
+                // The live-process authorities (the runner + the PTY manager) are the
+                // sidecar's, not reachable from the nyx-core use case's `&mut SqliteConnection`,
+                // so the kill runs HERE — the same pattern as `create_workspace`'s FS
+                // precondition. This REPLACES the former "refuse while a command runs" guard
+                // (review 01KWEX11 — "Tout supprimer + tuer les vivants": the user wants the
+                // workspace's runtime cleared, not to be blocked). `stop`/`close_record` are
+                // idempotent, so passing the full membership lists (no live-filter) is safe.
                 let instance_ids = self
                     .db()
                     .with_conn(|c| db::instance_ids_for_workspace(c, &id))
                     .map_err(Self::db_err)?;
-                let running = {
-                    let guard = self.runtime.runner_cell().lock().unwrap();
-                    guard
-                        .as_ref()
-                        .map(|r| r.any_running(&instance_ids))
-                        .unwrap_or(false)
-                };
-                if running {
-                    return Err("this workspace has a running command — stop it before removing the workspace".to_string());
-                }
-                let deleted = self
+                let terminal_ids = self
                     .db()
-                    .with_conn(|c| db::delete_workspace(c, &id))
+                    .with_conn(|c| db::terminal_ids_for_workspace(c, &id))
                     .map_err(Self::db_err)?;
-                if deleted == 0 {
-                    return Err(format!("unknown workspace {id}"));
+                {
+                    let guard = self.runtime.runner_cell().lock().unwrap();
+                    if let Some(runner) = guard.as_ref() {
+                        for instance_id in &instance_ids {
+                            let _ = runner.stop(instance_id);
+                        }
+                    }
                 }
+                for terminal_id in &terminal_ids {
+                    self.runtime.pty().close_record(terminal_id);
+                }
+                // The DB-expressible business decision (root invariant + runtime-row delete +
+                // the `workspace.removed` domain event) is the SINGLE `usecase::remove_workspace`,
+                // shared with the MCP route — no invariant is duplicated in this bridge. The
+                // push rides the committed DOMAIN event through the [`PushEventSink`] (#10),
+                // so this command is NOT in the legacy broadcast.
+                let push = self.push_sink();
+                self.db()
+                    .with_conn(|c| {
+                        nyx_core::usecase::remove_workspace(
+                            c,
+                            &push,
+                            &id,
+                            nyx_core::usecase::DomainEventSource::Ui,
+                        )
+                    })
+                    .map_err(|e| match e {
+                        nyx_core::usecase::RemoveWorkspaceError::NotFound => {
+                            format!("unknown workspace {id}")
+                        }
+                        nyx_core::usecase::RemoveWorkspaceError::IsRoot => {
+                            "this is the project's root workspace — it cannot be removed on its own; delete the whole project instead".to_string()
+                        }
+                        nyx_core::usecase::RemoveWorkspaceError::Db(e) => Self::db_err(e),
+                    })?;
                 Ok("null".to_string())
             }
             "set_workspace_collapsed" => {
@@ -821,8 +916,17 @@ fn mutates_command_templates(command: &str) -> bool {
     )
 }
 
-/// The project/workspace TREE-MUTATING DB commands that broadcast `workspaces://changed`
-/// on success (parity with the v1 `emit_workspaces_changed`).
+/// The project/workspace TREE-MUTATING DB commands, for the IDEMPOTENCY guard (`dispatch`,
+/// the `idempotencyKey` at-most-once crash-recovery guard). This is the FULL set of tree
+/// mutations that must be recognised as duplicates on a post-crash retry — INCLUDING the
+/// identity mutations now routed through the shared use cases (`rename_workspace` is here so
+/// a retried rename carrying an `idempotencyKey` is a no-op success, not a second rename).
+///
+/// This is DELIBERATELY a SEPARATE predicate from [`pushes_workspace_tree_legacy`]: the
+/// idempotency question ("is this a tree mutation to guard?") is NOT the push question ("does
+/// the legacy broadcast own this command's push, or does a domain-event-driven `PushEventSink`
+/// own it?"). Trimming the legacy broadcast for the domain-event-driven commands must NOT
+/// weaken the idempotency guard, so the two concerns are two predicates.
 fn mutates_workspace_tree(command: &str) -> bool {
     matches!(
         command,
@@ -830,6 +934,238 @@ fn mutates_workspace_tree(command: &str) -> bool {
             | "delete_project"
             | "projects_reorder"
             | "create_workspace"
+            | "rename_workspace"
             | "workspace_delete"
     )
+}
+
+/// The project/workspace TREE-MUTATING DB commands whose `workspaces://changed` push is still
+/// owned by the LEGACY string-matched broadcast in [`dispatch`] — i.e. the genuine tree
+/// mutations that run OUTSIDE the shared use-case layer, so no committed DOMAIN event drives
+/// their push. The identity mutations (`create_project`, `create_workspace`,
+/// `rename_workspace`, `workspace_delete`) are ABSENT: each pushes exactly once via the
+/// domain-event-driven [`PushEventSink`] (task #10), so listing them here too would double-push.
+///
+/// `projects_reorder` is a pure ordering write (no use case, no domain event). `delete_project`
+/// likewise has NO use case emitting a domain event (it calls `db::delete_project` directly),
+/// so its push stays on this legacy broadcast until it is migrated to a use case.
+fn pushes_workspace_tree_legacy(command: &str) -> bool {
+    matches!(command, "delete_project" | "projects_reorder")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipe::codec::FrameDecoder;
+    use crate::pipe::wire::{decode_message, Message};
+    use nyx_core::db::Db;
+    use std::sync::{Arc, Mutex};
+
+    /// A fresh on-disk migrated `Db` under a unique temp dir (the sidecar cannot use
+    /// nyx-core's `#[cfg(test)]` in-memory db, which is not compiled into this crate). Returns
+    /// the temp DIR alongside the `Db` so the caller can pin it as the runtime's `data_dir` —
+    /// the sidecar persists `sidecar-recovery.json` (the idempotency journal) NEXT to `nyx.db`,
+    /// so a data dir of `PathBuf::new()` would write that file relative to the test binary's
+    /// CWD (the crate root), polluting the source tree. Pinning the temp dir keeps every
+    /// runtime artefact inside it.
+    fn temp_db() -> (std::path::PathBuf, Arc<Db>) {
+        let dir = std::env::temp_dir().join(format!(
+            "nyx-dbcmd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Arc::new(Db::open(&dir.join("nyx.db")).expect("open db"));
+        (dir, db)
+    }
+
+    /// A `Write` that appends to a shared buffer so a test can read back the frames the pipe
+    /// sink pushed.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Every `workspaces://changed` invalidation captured on the pipe.
+    fn workspaces_changed(buf: &Arc<Mutex<Vec<u8>>>) -> usize {
+        let bytes = buf.lock().unwrap().clone();
+        let mut dec = FrameDecoder::new();
+        dec.push(&bytes);
+        let mut count = 0;
+        while let Some(payload) = dec.next_frame().expect("decode frame") {
+            if let Ok(Message::Event(Event::Changed { topic })) = decode_message(&payload) {
+                if topic == "workspaces" {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// A dispatch harness: a `Runtime` over a temp DB + a capturing pipe sink. `run` drives the
+    /// REAL [`dispatch`] (idempotency guard + legacy broadcast reconciliation included), exactly
+    /// as the pipe run loop does, and returns the raw JSON result string.
+    struct Harness {
+        runtime: Runtime,
+        events: EventSink,
+        buf: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Harness {
+        fn new() -> Self {
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let events = EventSink::new(Box::new(SharedBuf(buf.clone())));
+            // Pin the runtime's `data_dir` to the DB's temp dir so any runtime artefact the
+            // dispatch persists (notably `sidecar-recovery.json`, the idempotency journal
+            // written by `idempotency_record`) lands INSIDE the temp dir — never relative to the
+            // test binary's CWD (the crate root), which would pollute the source tree.
+            let (data_dir, db) = temp_db();
+            Harness {
+                runtime: Runtime::with_db_and_paths(db, data_dir, None),
+                events,
+                buf,
+            }
+        }
+        fn run(&self, command: &str, args: serde_json::Value) -> Result<String, String> {
+            dispatch(&self.runtime, command, &args.to_string(), &self.events)
+        }
+        fn pushes(&self) -> usize {
+            workspaces_changed(&self.buf)
+        }
+    }
+
+    /// #10 — every IDENTITY mutation of the UI path (create_project, create_workspace,
+    /// rename_workspace, workspace_delete) pushes `workspaces://changed` EXACTLY ONCE, via the
+    /// domain-event-driven `PushEventSink` — NOT double-pushed by the trimmed legacy broadcast.
+    #[test]
+    fn ui_identity_mutations_each_push_workspaces_changed_exactly_once() {
+        let h = Harness::new();
+
+        // create_project → 1 push (project.created domain event).
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-p" }),
+            )
+            .unwrap();
+        assert_eq!(h.pushes(), 1, "create_project pushed exactly once");
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        // create_workspace → +1 push (workspace.created).
+        let ws = h
+            .run(
+                "create_workspace",
+                serde_json::json!({ "projectId": project_id, "name": "wt", "path": "/tmp/dbcmd-wt" }),
+            )
+            .unwrap();
+        assert_eq!(h.pushes(), 2, "create_workspace pushed exactly once more");
+        let ws: serde_json::Value = serde_json::from_str(&ws).unwrap();
+        let ws_id = ws["id"].as_str().unwrap().to_string();
+
+        // rename_workspace (the closed gap) → +1 push (workspace.renamed).
+        h.run(
+            "rename_workspace",
+            serde_json::json!({ "id": ws_id, "name": "renamed" }),
+        )
+        .unwrap();
+        assert_eq!(h.pushes(), 3, "rename_workspace pushed exactly once");
+
+        // workspace_delete → +1 push (workspace.removed).
+        h.run("workspace_delete", serde_json::json!({ "id": ws_id }))
+            .unwrap();
+        assert_eq!(h.pushes(), 4, "workspace_delete pushed exactly once");
+
+        // Four identity mutations, four pushes — no double-push from the legacy broadcast.
+        assert_eq!(h.pushes(), 4);
+
+        // #9 side: the UI rename persisted a correlated `workspace.renamed` domain_event.
+        let events = h
+            .runtime
+            .db()
+            .with_conn(nyx_core::db::list_domain_events)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "workspace.renamed" && e.source == "ui"),
+            "the UI rename emitted a workspace.renamed domain_event (source=ui)"
+        );
+    }
+
+    /// The IDEMPOTENCY guard is NOT weakened by trimming the legacy broadcast: a retried
+    /// mutation carrying the SAME `idempotencyKey` is a no-op success, and does NOT push a
+    /// second time. Covers a domain-event-driven command (`create_workspace`) whose push moved
+    /// off the legacy broadcast — the guard still recognises the duplicate via
+    /// `mutates_workspace_tree`.
+    #[test]
+    fn idempotency_guard_holds_for_domain_event_driven_commands() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-idem-p" }),
+            )
+            .unwrap();
+        let project_id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["project"]
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(h.pushes(), 1);
+
+        // First create_workspace with an idempotencyKey: applies, pushes once.
+        h.run(
+            "create_workspace",
+            serde_json::json!({
+                "projectId": project_id,
+                "name": "wt",
+                "path": "/tmp/dbcmd-idem-wt",
+                "idempotencyKey": "k-1",
+            }),
+        )
+        .unwrap();
+        assert_eq!(h.pushes(), 2, "first apply pushed once");
+        let workspaces = h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::usecase::list_workspaces(c, &project_id))
+            .unwrap();
+        let ws_count = workspaces.len();
+
+        // Retry with the SAME key: recognised as a duplicate → no-op success, NO second push,
+        // NO second workspace inserted.
+        let retry = h
+            .run(
+                "create_workspace",
+                serde_json::json!({
+                    "projectId": project_id,
+                    "name": "wt",
+                    "path": "/tmp/dbcmd-idem-wt",
+                    "idempotencyKey": "k-1",
+                }),
+            )
+            .unwrap();
+        assert_eq!(retry, "null", "the retry is a no-op success");
+        assert_eq!(h.pushes(), 2, "the guarded retry did NOT push again");
+        let after = h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::usecase::list_workspaces(c, &project_id))
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            ws_count,
+            "the guarded retry inserted no second workspace"
+        );
+    }
 }

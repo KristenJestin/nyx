@@ -217,7 +217,7 @@ pub fn auto_attach_terminal(
         .into_iter()
         .map(|w| WorkspaceMatch {
             id: w.id,
-            path: w.path,
+            path: w.root_path,
         })
         .collect();
 

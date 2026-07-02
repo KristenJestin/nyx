@@ -32,6 +32,7 @@ pub mod pty;
 pub mod recovery;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nyx_core::agent_activity::AgentActivityStore;
@@ -42,6 +43,29 @@ use crate::pipe::wire::{Request, Response};
 use command::{CommandRuntime, SidecarRunnerSink};
 use events::EventSink;
 use mcp::McpRuntime;
+
+/// The env flag that OPTS IN the boot-time Claude-plugin reconcile (`NYX_RECONCILE_CLAUDE_PLUGIN`).
+/// Set to a non-empty, non-`0` value by the app that OWNS the real Claude integration (the
+/// Electron main passes it when spawning the packaged/dev sidecar); UNSET everywhere else.
+///
+/// Why an explicit opt-in rather than "always on": the reconcile drives the REAL `claude plugin`
+/// CLI against the user's REAL `~/.claude` registry (re-copying + re-registering the nyx-v2
+/// marketplace). A bare sidecar test spawns with only `NYX_DATA_DIR` pointing at a TEMP dir — if
+/// the reconcile fired there and the dev's machine has nyx-v2 registered, it would re-register the
+/// marketplace at the temp path (deleted after the test), corrupting the user's real config. The
+/// flag keeps every existing test hermetic (they never set it) while production turns it on. The
+/// dedicated `integration_reconcile` test sets it AND the `NYX_CLAUDE_*` seams so it exercises the
+/// path against a FAKE claude + temp dirs, touching nothing real.
+const RECONCILE_PLUGIN_ENV: &str = "NYX_RECONCILE_CLAUDE_PLUGIN";
+
+/// Whether the boot-time Claude-plugin reconcile is opted in (see [`RECONCILE_PLUGIN_ENV`]). A
+/// value of `0`/empty reads as OFF so the flag can be unset by exporting `NYX_RECONCILE_CLAUDE_PLUGIN=0`.
+fn reconcile_claude_plugin_enabled() -> bool {
+    match std::env::var_os(RECONCILE_PLUGIN_ENV) {
+        Some(v) => !v.is_empty() && v != "0",
+        None => false,
+    }
+}
 
 /// The long-lived runtime state the sidecar owns (frontier 3 — the service/state
 /// container). Built ONCE at boot ([`Runtime::boot`]); cloned cheaply (every field is
@@ -86,6 +110,12 @@ pub struct Runtime {
     /// Behind a `Mutex` so the boot reconcile, the mutating db-commands' idempotency guard,
     /// and the ordered shutdown all serialize their reads/writes through one cell.
     recovery: Arc<Mutex<recovery::RecoveryState>>,
+    /// Latches `true` the first time the Claude-plugin boot reconcile runs (on the first
+    /// `McpStart`, once the MCP server has actually bound its port). A `Runtime` is cloned
+    /// cheaply and shared across the pipe dispatch, so this `Arc<AtomicBool>` guards against
+    /// re-reconciling on every subsequent `McpStart` (start-once returns the same bound port,
+    /// so a second reconcile would be redundant CLI churn). See [`Runtime::start_mcp`].
+    plugin_reconciled: Arc<AtomicBool>,
 }
 
 impl Runtime {
@@ -142,6 +172,7 @@ impl Runtime {
             data_dir,
             resource_dir,
             recovery: Arc::new(Mutex::new(recovery::RecoveryState::default())),
+            plugin_reconciled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -207,6 +238,96 @@ impl Runtime {
                 format!("restored {} managed command(s) on boot", restored.len()),
             );
         }
+    }
+
+    /// Start the MCP HTTP server (idempotent — start-once) and, on the FIRST successful
+    /// start of this process, RECONCILE the bundled Claude plugin against the port the server
+    /// actually bound. Returns that bound port (0 on a bind failure).
+    ///
+    /// This is the missing wiring the bug report describes. Production reaches it exactly once
+    /// at boot: the Electron main calls `sidecar.start()` then `sidecar.startMcp()`
+    /// (`apps/desktop/src/main/index.ts`), which sends `McpStart`. The plugin's bundled
+    /// `.mcp.json` declares `http://127.0.0.1:<port>/mcp`, so for Claude Code to CONNECT that
+    /// MCP the port written into the INSTALLED `.mcp.json` must be the port nyx is truly
+    /// listening on — which is only known once `McpServer::start` has bound. So we bind FIRST,
+    /// then reconcile with the bound port. Doing the reconcile HERE (rather than in
+    /// `attach_events`) also means it fires only when the MCP is actually started — never in a
+    /// bare test harness that opens no MCP surface, keeping those tests hermetic (no stray
+    /// shell-out to the real `claude`).
+    ///
+    /// The reconcile runs at most ONCE per process (the `plugin_reconciled` latch): a repeated
+    /// `McpStart` returns the same start-once port and must not re-drive the CLI.
+    fn start_mcp(&self) -> u16 {
+        let Some(mcp) = self.mcp() else {
+            return 0;
+        };
+        let port = mcp.start();
+        // Only reconcile once, and only when the server actually bound a live port.
+        if port != 0 && !self.plugin_reconciled.swap(true, Ordering::SeqCst) {
+            eprintln!("[nyx-sidecar] MCP HTTP server listening on 127.0.0.1:{port}/mcp");
+            if reconcile_claude_plugin_enabled() {
+                self.reconcile_claude_plugin(port);
+            }
+        }
+        port
+    }
+
+    /// RECONCILE the ONE bundled Claude Code plugin, keyed on the port the MCP server actually
+    /// bound (finding #44/#45/#47). This is the wiring the design intended ("Called from
+    /// lib.rs after the MCP server is bound") but that was never hooked up in the
+    /// Tauri→Electron move. Invoked once from [`Runtime::start_mcp`].
+    ///
+    /// It resolves the plugin descriptor the SAME way the Settings → Integrations install
+    /// does ([`nyx_core::agent::ClaudeCodeAdapter::plugin_install`] over the runtime's
+    /// `resource_dir` SOURCE + `data_dir` as the app-data dir → the stable
+    /// `<data_dir>/claude-plugin` install dir + the `claude` CLI driver), then delegates to
+    /// [`nyx_core::onboarding::reconcile_installed_providers`]. Because it reuses the EXACT
+    /// same descriptor builder as install, the stable dir it re-templates is the SAME dir the
+    /// marketplace was registered at (`known_marketplaces.json` → `<data_dir>/claude-plugin`),
+    /// so the re-template actually takes effect.
+    ///
+    /// CRUCIAL: the reconcile is given the REAL bound MCP port (not the default guess), so the
+    /// `__NYX_MCP_PORT__` placeholder in the installed `.mcp.json` is replaced with the port
+    /// nyx is truly listening on. A `mcp_port` of 0 (the MCP server failed to bind) skips the
+    /// reconcile — re-templating a `.mcp.json` to a dead port would only entrench the broken
+    /// state.
+    ///
+    /// Conservative + best-effort: a plugin the user removed in Claude Code is a no-op (never
+    /// re-installed at boot); an unresolvable descriptor / CLI or any CLI error is logged and
+    /// skipped, never a boot failure.
+    fn reconcile_claude_plugin(&self, mcp_port: u16) {
+        use nyx_core::agent::AgentAdapter;
+
+        if mcp_port == 0 {
+            eprintln!(
+                "[nyx-sidecar] skipping Claude plugin reconcile: MCP server is not bound (port 0)"
+            );
+            return;
+        }
+
+        // The descriptor carries the LIVE bound port so the copied `.mcp.json` is templated to
+        // the port nyx actually listens on — NOT `mcp::resolve_port()`'s guess (they normally
+        // match, but the bound port is the source of truth after `McpServer::start`).
+        let resource_dir = self.resource_dir.as_deref();
+        let app_data_dir = self.data_dir.clone();
+        let state_path = nyx_core::integrations::state_path_in(&self.data_dir);
+
+        // The per-provider resolver `reconcile_installed_providers` calls for each provider key.
+        // Only `claude_code` resolves to a descriptor; every other key → `None` (skipped). The
+        // descriptor's `mcp_port` is overridden to the REAL bound port so the re-template is
+        // correct even if `NYX_MCP_PORT` was unset and a non-default port was chosen at bind.
+        let resolve_plugin = |key: &str| -> nyx_core::onboarding::PluginReconcileEntry {
+            if key != "claude_code" {
+                return None;
+            }
+            let mut install = nyx_core::agent::ClaudeCodeAdapter
+                .plugin_install(resource_dir, Some(&app_data_dir))?;
+            install.mcp_port = mcp_port;
+            let cli = nyx_core::agent::ClaudeCodeAdapter.plugin_cli()?;
+            Some((install, cli))
+        };
+
+        nyx_core::onboarding::reconcile_installed_providers(mcp_port, &state_path, resolve_plugin);
     }
 
     /// The shared SQLite pool. The runtime's single connection authority.
@@ -394,10 +515,15 @@ impl Runtime {
                 None => err(*id, "managed-command runtime not started".into()),
             },
             // --- MCP HTTP server (HHD) -------------------------------------------
+            // Start-once + (on the first start of the process) reconcile the bundled Claude
+            // plugin against the bound port, so the installed `.mcp.json` is re-templated to
+            // the port nyx is actually listening on and Claude Code can CONNECT the MCP
+            // (finding #44/#45/#47). `start_mcp` returns 0 when the MCP runtime is not built
+            // yet, which the supervisor surfaces as a non-fatal "did not start".
             Request::McpStart { id } => match self.mcp() {
-                Some(mcp) => Response::McpStarted {
+                Some(_) => Response::McpStarted {
                     id: *id,
-                    port: mcp.start(),
+                    port: self.start_mcp(),
                 },
                 None => err(*id, "mcp runtime not started".into()),
             },

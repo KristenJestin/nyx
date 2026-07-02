@@ -407,27 +407,33 @@ pub fn probe(db: &Db) -> Result<Value, RpcError> {
     Ok(result)
 }
 
-/// `list_projects` — `{}` → `{ projects }`.
+/// `list_projects` — `{}` → `{ projects }`. Routes through the SHARED
+/// [`crate::usecase::list_projects`] (v2.1 task #8) — the SAME identity use case the UI
+/// bridge's `list_projects` db-command calls — so the read surface is aligned on the
+/// authority too, not just the mutations.
 pub fn list_projects(db: &Db) -> Result<Value, RpcError> {
-    let projects = db.with_conn(db::list_projects).map_err(internal_db)?;
+    let projects = db
+        .with_conn(crate::usecase::list_projects)
+        .map_err(internal_db)?;
     Ok(json!({ "projects": projects }))
 }
 
 /// `list_workspaces` — `{ project_id, cwd? }` → `{ workspaces }`. `cwd` is the OPTIONAL
-/// filter; each returned workspace's `branch` is resolved LIVE. Parity with the Tauri
-/// `list_workspaces`.
+/// filter; each returned workspace's `branch` is resolved LIVE. Routes the base list
+/// through the SHARED [`crate::usecase::list_workspaces`] (v2.1 task #8) — the SAME use
+/// case the UI bridge drives — then applies the MCP-only `cwd` filter + live-branch overlay.
 pub fn list_workspaces(db: &Db, args: &Value) -> Result<Value, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let cwd = optional_str(args, "cwd")?;
     let mut workspaces = db
-        .with_conn(|c| db::list_workspaces(c, project_id))
+        .with_conn(|c| crate::usecase::list_workspaces(c, project_id))
         .map_err(internal_db)?;
     if let Some(cwd) = cwd {
         let needle = crate::pathnorm::normalize(cwd);
-        workspaces.retain(|w| path_matches(&w.path, &needle));
+        workspaces.retain(|w| path_matches(&w.root_path, &needle));
     }
     for w in &mut workspaces {
-        w.branch = db::detect_branch(&w.path);
+        w.branch = db::detect_branch(&w.root_path);
     }
     Ok(json!({ "workspaces": workspaces }))
 }
@@ -689,7 +695,7 @@ fn discover_importable(
                         format!("unknown workspace {workspace_id}"),
                     )
                 })?;
-            (ws.project_id, vec![ws.path])
+            (ws.project_id, vec![ws.root_path])
         }
         (None, Some(project_id)) => {
             let workspaces = db
@@ -701,7 +707,7 @@ fn discover_importable(
                     format!("unknown project {project_id} (or it has no workspaces to scan)"),
                 ));
             }
-            let paths = workspaces.into_iter().map(|w| w.path).collect();
+            let paths = workspaces.into_iter().map(|w| w.root_path).collect();
             (project_id.to_string(), paths)
         }
         (None, None) => return Err(RpcError::new(
@@ -828,57 +834,83 @@ pub fn import_commands(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     })
 }
 
+/// Kill a workspace's LIVE runtime processes as part of the destructive `remove_workspace`
+/// cascade: STOP (tree-kill) every running managed-command instance, and CLOSE the live PTY
+/// (kill the interactive shell) of every terminal record. Both operations are IDEMPOTENT —
+/// a non-running instance / a terminal with no live PTY is a no-op — so this is safe to call
+/// with the full membership lists (the DB rows) without pre-filtering to only the live ones.
+/// SHARED by the UI bridge and the MCP route so the "kill the vivants" behaviour is defined
+/// once. Runs BEFORE the DB delete (the runner/host are the live-process authorities; the DB
+/// rows only record membership).
+pub fn kill_workspace_runtime<S: RunnerSink>(
+    runner: &CommandRunner<S>,
+    host: &dyn TerminalHost,
+    instance_ids: &[String],
+    terminal_ids: &[String],
+) {
+    for id in instance_ids {
+        // Best-effort tree-kill; a stop failure must not abort the removal (the user asked to
+        // clear everything). `stop` is a no-op on an already-idle instance.
+        let _ = runner.stop(id);
+    }
+    for id in terminal_ids {
+        // Kill the interactive shell if a PTY is live; no-op otherwise.
+        host.close_terminal_pty(id);
+    }
+}
+
 /// `remove_workspace` — `{ workspace_id }` → `{ removed, removed_instances }`. Refused on
-/// the root workspace, or while any instance runs. Parity with the Tauri `remove_workspace`.
+/// the root workspace. DESTRUCTIVE: any LIVE process in the workspace (running command PTY
+/// trees + interactive terminal shells) is KILLED, then the workspace and its full runtime
+/// (command instances + terminals + agent sessions) are deleted. Parity with the Tauri
+/// `remove_workspace`, updated for review 01KWEX11 ("Tout supprimer + tuer les vivants").
 pub fn remove_workspace<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
+    host: &dyn TerminalHost,
     args: &Value,
 ) -> Result<ToolOutcome, RpcError> {
     let workspace_id = require_str(args, "workspace_id")?;
-    let workspace = db
-        .with_conn(|c| db::get_workspace(c, workspace_id))
-        .map_err(internal_db)?;
-    match workspace {
-        None => {
-            return Err(RpcError::new(
-                RpcCode::InvalidId,
-                format!("unknown workspace {workspace_id}"),
-            ))
-        }
-        Some(ws) if ws.is_root => {
-            return Err(RpcError::new(
-                RpcCode::InvalidState,
-                format!(
-                    "workspace {workspace_id} is the project's root — it cannot be removed on \
-                     its own; delete the whole project instead"
-                ),
-            ))
-        }
-        Some(_) => {}
-    }
+    // RUNTIME kill owned by this adapter: STOP every running command instance + CLOSE every
+    // interactive terminal PTY of the workspace BEFORE the delete. The runner + PTY host are
+    // the live-process authorities (not the DB), unreachable from the nyx-core use case's
+    // `&mut SqliteConnection`, so the kill runs HERE — the same split as the FS precondition
+    // of `create_workspace`. This REPLACES the former "refuse while a command runs" guard
+    // (per the review decision, the user wants everything cleared, not to be blocked). The
+    // `instance_ids` len also feeds the `removed_instances` count the MCP contract returns.
     let instance_ids = db
         .with_conn(|c| db::instance_ids_for_workspace(c, workspace_id))
         .map_err(internal_db)?;
-    if runner.any_running(&instance_ids) {
-        return Err(RpcError::new(
-            RpcCode::InvalidState,
-            format!(
-                "workspace {workspace_id} has a running command — stop it before removing the \
-                 workspace"
-            ),
-        ));
-    }
-    let removed_instances = instance_ids.len();
-    let deleted = db
-        .with_conn(|c| db::delete_workspace(c, workspace_id))
+    let terminal_ids = db
+        .with_conn(|c| db::terminal_ids_for_workspace(c, workspace_id))
         .map_err(internal_db)?;
-    if deleted == 0 {
-        return Err(RpcError::new(
+    kill_workspace_runtime(runner, host, &instance_ids, &terminal_ids);
+    let removed_instances = instance_ids.len();
+    // The DB-expressible business decision (root invariant + delete + zero-row + the
+    // `workspace.removed` domain event) is the SINGLE `usecase::remove_workspace`, shared with
+    // the UI bridge — no invariant is duplicated here.
+    db.with_conn(|c| {
+        crate::usecase::remove_workspace(
+            c,
+            &crate::usecase::NullEventSink,
+            workspace_id,
+            crate::usecase::DomainEventSource::Mcp,
+        )
+    })
+    .map_err(|e| match e {
+        crate::usecase::RemoveWorkspaceError::NotFound => RpcError::new(
             RpcCode::InvalidId,
             format!("unknown workspace {workspace_id}"),
-        ));
-    }
+        ),
+        crate::usecase::RemoveWorkspaceError::IsRoot => RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "workspace {workspace_id} is the project's root — it cannot be removed on \
+                 its own; delete the whole project instead"
+            ),
+        ),
+        crate::usecase::RemoveWorkspaceError::Db(e) => internal_db(e),
+    })?;
     Ok(ToolOutcome::changed(
         json!({ "removed": true, "removed_instances": removed_instances }),
         ChangedTopic::Workspaces,
@@ -1382,7 +1414,7 @@ fn resolve_attach_for_new_terminal(
         .into_iter()
         .map(|w| WorkspaceMatch {
             id: w.id,
-            path: w.path,
+            path: w.root_path,
         })
         .collect();
     match decide_attachment(&current, Some(&normalized), &known) {
@@ -1658,7 +1690,7 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         crate::mcp::ADD_COMMAND_TOOL => Some(add_command(db, args)),
         crate::mcp::UPDATE_COMMAND_TOOL => Some(update_command(db, runner, args)),
         crate::mcp::IMPORT_COMMANDS_TOOL => Some(import_commands(db, args)),
-        crate::mcp::REMOVE_WORKSPACE_TOOL => Some(remove_workspace(db, runner, args)),
+        crate::mcp::REMOVE_WORKSPACE_TOOL => Some(remove_workspace(db, runner, host, args)),
         crate::mcp::REMOVE_COMMAND_TOOL => Some(remove_command(db, runner, args)),
         crate::mcp::REMOVE_COMMANDS_TOOL => Some(remove_commands(db, runner, args)),
         crate::mcp::CLEAR_COMMAND_OUTPUT_TOOL => Some(clear_command_output(db, runner, args)),
@@ -1736,6 +1768,68 @@ mod tests {
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0]["name"], json!("build"));
         assert!(res.get("terminals").is_none(), "must not return terminals");
+    }
+
+    /// DONE-CRITERION (task #8): the MCP identity READ tools (`list_projects` /
+    /// `list_workspaces`) pass through the SHARED `usecase` layer. Proof: a project +
+    /// workspace created via the SHARED `usecase::create_project` / `usecase::register_workspace`
+    /// (the exact use cases the UI bridge drives) surface through the MCP `list_projects` /
+    /// `list_workspaces` tools — same authority on both the read and the write side.
+    #[test]
+    fn mcp_list_identity_tools_go_through_the_shared_use_case() {
+        use crate::usecase::{
+            self, test_support::RecordingEventSink, DomainEventKind, DomainEventSource,
+        };
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let sink = RecordingEventSink::new();
+
+        // WRITE via the shared use cases (the UI-and-MCP authority).
+        let (project, _root) = db
+            .with_conn(|c| {
+                usecase::create_project(c, &sink, "P", "/tmp/uc-mcp", None, DomainEventSource::Mcp)
+            })
+            .unwrap();
+        let ws = db
+            .with_conn(|c| {
+                usecase::register_workspace(
+                    c,
+                    &sink,
+                    &project.id,
+                    "wt",
+                    "/tmp/uc-mcp-wt",
+                    DomainEventSource::Mcp,
+                )
+            })
+            .unwrap();
+
+        // READ via the MCP identity tools → the same authority surfaces them.
+        let projects = list_projects(&db).unwrap();
+        let ids: Vec<&str> = projects["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&project.id.as_str()));
+
+        let workspaces = list_workspaces(&db, &json!({ "project_id": project.id })).unwrap();
+        let ws_ids: Vec<&str> = workspaces["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap())
+            .collect();
+        assert!(ws_ids.contains(&ws.id.as_str()));
+
+        // The WRITE-side use cases emitted the expected domain events (task #8 seam).
+        assert_eq!(
+            sink.kinds(),
+            vec![
+                DomainEventKind::ProjectCreated,
+                DomainEventKind::WorkspaceCreated
+            ]
+        );
     }
 
     #[test]
@@ -2543,6 +2637,124 @@ mod tests {
             actives.iter().filter(|a| a.terminal_id == tid).count(),
             1,
             "still exactly one active session after the clear→start cycle"
+        );
+    }
+
+    /// A [`TerminalHost`] that RECORDS which terminal PTYs it was asked to close, so a test
+    /// can assert the destructive `remove_workspace` cascade killed the workspace's live
+    /// terminals via the host (review 01KWEX11, done_criterion #2).
+    #[derive(Default)]
+    struct RecordingHost {
+        closed: std::sync::Mutex<Vec<String>>,
+    }
+    impl TerminalHost for RecordingHost {
+        fn park_opening_command(&self, _: &str, _: &str) {}
+        fn send_to_terminal(&self, _: &str, _: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn send_keys(&self, _: &str, _: &[u8]) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn close_terminal_pty(&self, terminal_id: &str) {
+            self.closed.lock().unwrap().push(terminal_id.to_string());
+        }
+        fn terminal_liveness(&self, _: &str) -> (bool, Option<bool>) {
+            (false, None)
+        }
+    }
+
+    /// Review 01KWEX11 done_criterion #2 — the MCP `remove_workspace` DOES NOT refuse while a
+    /// command is live: it KILLS the workspace's running command (the runner stops it → idle)
+    /// AND closes its terminal PTYs (via the host), then removes the workspace + its full
+    /// runtime. Proves the "refuse if running" guard is REPLACED by "tuer puis supprimer".
+    #[test]
+    #[cfg(unix)]
+    fn remove_workspace_kills_live_runtime_instead_of_refusing() {
+        use std::time::{Duration, Instant};
+        let _g = db_guard();
+        let db = Db::in_memory();
+
+        // Project + a non-root workspace + a template → one materialized instance in the ws.
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/rmw-kill", None))
+            .unwrap();
+        let ws = db
+            .with_conn(|c| db::create_workspace(c, &project.id, "wt", "/tmp/rmw-kill-wt"))
+            .unwrap();
+        db.with_conn(|c| {
+            db::create_template(
+                c,
+                &project.id,
+                "dev",
+                "sleep 120",
+                None,
+                db::CommandSource::default(),
+            )
+        })
+        .unwrap();
+        let instance_ids = db
+            .with_conn(|c| db::instance_ids_for_workspace(c, &ws.id))
+            .unwrap();
+        let instance_id = instance_ids.first().expect("materialized instance").clone();
+
+        // A terminal attached to the workspace (its PTY must be closed by the host).
+        let terminal = db
+            .with_conn(|c| db::create_terminal(c, "/tmp/rmw-kill-wt", None))
+            .unwrap();
+        db.with_conn(|c| db::attach_terminal(c, &terminal.id, &ws.id, "auto"))
+            .unwrap();
+
+        // GENUINELY start the instance so it is LIVE in the runner.
+        let runner = noop_runner();
+        runner
+            .start(&instance_id, "sleep 120", None)
+            .expect("start");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runner.state_of(&instance_id) != RunState::Running && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            runner.state_of(&instance_id),
+            RunState::Running,
+            "the instance is live before removal"
+        );
+
+        // ACT: remove the workspace. The former guard would have REFUSED here.
+        let host = RecordingHost::default();
+        let outcome = remove_workspace(&db, &runner, &host, &json!({ "workspace_id": ws.id }))
+            .expect("remove_workspace must NOT refuse a workspace with a live command");
+        assert_eq!(outcome.result["removed"], json!(true));
+
+        // The live command was KILLED (runner stopped it → idle), not left running.
+        assert_eq!(
+            runner.state_of(&instance_id),
+            RunState::Idle,
+            "the live command was killed by the runner"
+        );
+        // The workspace's terminal PTY was asked to close (kill the interactive shell).
+        assert_eq!(
+            *host.closed.lock().unwrap(),
+            vec![terminal.id.clone()],
+            "the workspace's terminal PTY was closed via the host"
+        );
+        // The workspace + its runtime rows are gone.
+        assert!(
+            db.with_conn(|c| db::get_workspace(c, &ws.id))
+                .unwrap()
+                .is_none(),
+            "workspace row removed"
+        );
+        assert!(
+            db.with_conn(|c| db::instance_ids_for_workspace(c, &ws.id))
+                .unwrap()
+                .is_empty(),
+            "command instances cascaded"
+        );
+        assert!(
+            db.with_conn(|c| db::get_terminal(c, &terminal.id))
+                .unwrap()
+                .is_none(),
+            "the workspace's terminal row was deleted (not detached into the loose bucket)"
         );
     }
 
