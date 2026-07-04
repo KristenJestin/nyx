@@ -112,10 +112,7 @@ impl ResumeTarget {
     /// Unix/WSL and native Windows PowerShell/cmd alike (finding #83 — `claude --resume`
     /// is shell-agnostic and the CR injection from #76 makes it execute on PSReadLine).
     fn supports_resume(self) -> bool {
-        matches!(
-            self,
-            ResumeTarget::UnixOrWsl | ResumeTarget::WindowsNative
-        )
+        matches!(self, ResumeTarget::UnixOrWsl | ResumeTarget::WindowsNative)
     }
 }
 
@@ -305,10 +302,144 @@ pub fn close_warning_message(
     }
 }
 
+// --- Workspace context restore (v2.2 task 01KWHPV33M4H5YSMGYNW9TG6J0) --------
+//
+// The per-workspace RESTORE PLAN the cockpit reads after a restart to offer the user what
+// to resume. It REUSES the existing resume policy [`decide_resume`] verbatim — the SAME gates
+// (`resume_agent_sessions` project option, candidate state, transcript-on-disk, target) — so
+// there is NO third resume system (Q-011). It only aggregates the per-session decisions for
+// ONE workspace's candidate sessions into a plan the user acts on.
+
+/// The candidate inputs the caller gathers per session (from
+/// [`crate::db::resume_candidates_for_workspace`] + a transcript `stat`), plus the resolved
+/// shell — everything [`decide_resume`] needs, without this module touching the DB/FS. Plain
+/// borrowed values so the plan builder stays pure and exhaustively unit-testable.
+#[derive(Debug, Clone)]
+pub struct WorkspaceResumeCandidate<'a> {
+    /// The hosting terminal id (so the plan maps back to which pane resumes).
+    pub terminal_id: &'a str,
+    /// The `agent_sessions.id` this decision concerns.
+    pub session_id: &'a str,
+    /// The agent kind — used to resolve the adapter that builds the exact-resume command.
+    pub agent_kind: &'a str,
+    /// The agent's OWN session id (`external_session_id`) — the resume command's argument.
+    pub external_session_id: &'a str,
+    /// The candidate session's lifecycle state (`active`/`unknown`; `ended`/`resume_failed`
+    /// never reach here — the query filters to live candidates only).
+    pub session_state: SessionState,
+    /// Whether the project opts into `resume_agent_sessions` (OFF for a loose terminal).
+    pub project_resume_on: bool,
+    /// Whether the session's `transcript_path` EXISTS on disk (the caller `stat`s it; the
+    /// policy stays pure). `false` → the decision skips with `NoConversation`.
+    pub transcript_exists: bool,
+    /// The resolved execution target (native Unix/WSL vs. native Windows).
+    pub target: ResumeTarget,
+}
+
+/// One entry of the workspace restore plan: the [`decide_resume`] verdict for ONE candidate
+/// session, keyed to its terminal + session so the cockpit can present + act on it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkspaceResumeEntry {
+    /// The terminal hosting the candidate session.
+    pub terminal_id: String,
+    /// The `agent_sessions.id` this entry concerns.
+    pub session_id: String,
+    /// The agent kind (Claude / Codex / …).
+    pub agent_kind: String,
+    /// The exact resume command to inject when `resume` is true (`claude --resume <id>`),
+    /// else `None` (the session is not resumable — see `skip_reason`).
+    pub resume_command: Option<String>,
+    /// `true` when the policy decided to RESUME this session.
+    pub resume: bool,
+    /// `true` when the resumed candidate was `unknown` (stale / probable kill) — the resume
+    /// is still offered, but the doubt is surfaced (parity with `ResumeDecision::resume_uncertain`).
+    pub uncertain: bool,
+    /// When NOT resuming, the machine reason (e.g. `option_off`, `no_conversation`), so the
+    /// cockpit can explain WHY a live session is not offered for resume. `None` when resuming.
+    pub skip_reason: Option<&'static str>,
+}
+
+/// A stable, serialisable tag for a [`ResumeSkipReason`] (for the plan entry + the cockpit).
+fn skip_reason_tag(reason: ResumeSkipReason) -> &'static str {
+    match reason {
+        ResumeSkipReason::OptionOff => "option_off",
+        ResumeSkipReason::ClosedVoluntarily => "closed_voluntarily",
+        ResumeSkipReason::SessionEnded => "session_ended",
+        ResumeSkipReason::AlreadyResumeFailed => "already_resume_failed",
+        ResumeSkipReason::NoConversation => "no_conversation",
+        ResumeSkipReason::UnsupportedTarget => "unsupported_target",
+        ResumeSkipReason::NoResumeCommand => "no_resume_command",
+    }
+}
+
+/// Build the workspace RESTORE PLAN: run the EXISTING [`decide_resume`] policy over each of a
+/// workspace's candidate sessions and collect the per-session verdicts the cockpit offers to
+/// the user (task `01KWHPV33M4H5YSMGYNW9TG6J0` — "sessions agents reprenables"). `resolve` maps
+/// an `agent_kind` to its [`AgentAdapter`], and IS the single source of truth for that mapping:
+/// pass [`crate::agent::AgentRegistry::get`] directly (its borrowed-lifetime signature matches),
+/// so adding a resumable adapter to the registry is reflected here with no call-site edit.
+/// A kind with no adapter yields a non-resume entry (`no_resume_command`) rather than a panic.
+///
+/// This function makes NO decision of its own — it delegates every gate to `decide_resume`,
+/// so it introduces no new resume policy (Q-011). It is a PURE aggregation: the caller has
+/// already gathered the candidates (DB) and probed the transcripts (FS), and the USER chooses
+/// what to actually resume from the returned plan (nyx never blindly injects).
+///
+/// The `resolve` bound is borrowed (not `'static`): the resolved adapter only needs to outlive
+/// each per-candidate [`decide_resume`] call, so an `&AgentRegistry`-borrowed adapter is enough.
+pub fn workspace_resume_plan<'r>(
+    candidates: &[WorkspaceResumeCandidate<'_>],
+    resolve: &dyn Fn(&str) -> Option<&'r dyn AgentAdapter>,
+) -> Vec<WorkspaceResumeEntry> {
+    candidates
+        .iter()
+        .map(|c| {
+            let inputs = ResumeInputs {
+                project_resume_on: c.project_resume_on,
+                // A terminal reached by the restore scan is `alive` (a voluntary close leaves it
+                // `closed`, so it never reaches here) — the voluntary-close gate is structural.
+                closed_voluntarily: false,
+                session_state: c.session_state,
+                external_session_id: c.external_session_id,
+                transcript_exists: c.transcript_exists,
+                target: c.target,
+            };
+            let decision = match resolve(c.agent_kind) {
+                Some(adapter) => decide_resume(&inputs, adapter),
+                // No adapter for this kind → treat as "cannot build a resume command".
+                None => ResumeDecision::Skip(ResumeSkipReason::NoResumeCommand),
+            };
+            match decision {
+                ResumeDecision::Resume {
+                    command,
+                    resume_uncertain,
+                } => WorkspaceResumeEntry {
+                    terminal_id: c.terminal_id.to_string(),
+                    session_id: c.session_id.to_string(),
+                    agent_kind: c.agent_kind.to_string(),
+                    resume_command: Some(command),
+                    resume: true,
+                    uncertain: resume_uncertain,
+                    skip_reason: None,
+                },
+                ResumeDecision::Skip(reason) => WorkspaceResumeEntry {
+                    terminal_id: c.terminal_id.to_string(),
+                    session_id: c.session_id.to_string(),
+                    agent_kind: c.agent_kind.to_string(),
+                    resume_command: None,
+                    resume: false,
+                    uncertain: false,
+                    skip_reason: Some(skip_reason_tag(reason)),
+                },
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{ClaudeCodeAdapter, GenericAdapter};
+    use crate::agent::{AgentRegistry, ClaudeCodeAdapter, GenericAdapter};
     use crate::db;
 
     /// Baseline inputs that WOULD resume (option ON, not voluntarily closed, active
@@ -641,5 +772,171 @@ mod tests {
                 "{win} should classify as a Windows-native target"
             );
         }
+    }
+
+    // --- Workspace resume plan (task 01KWHPV33M4H5YSMGYNW9TG6J0) ----------
+
+    /// The plan tests resolve kind→adapter through the REAL [`AgentRegistry`] (the single
+    /// source of truth), not a hand-rolled `claude_code` branch: `claude_code` → the production
+    /// `ClaudeCodeAdapter`, every other kind → its placeholder (which builds no resume command),
+    /// an unknown kind → `None`. This proves the borrowed-lifetime `resolve` contract lets
+    /// `AgentRegistry::get` be passed straight in, so a future resumable adapter is picked up
+    /// with no call-site change.
+    fn plan_with_registry(
+        candidates: &[WorkspaceResumeCandidate<'_>],
+    ) -> Vec<WorkspaceResumeEntry> {
+        let registry = AgentRegistry::default();
+        workspace_resume_plan(candidates, &|kind| registry.get(kind))
+    }
+
+    fn candidate<'a>(
+        terminal: &'a str,
+        session: &'a str,
+        kind: &'a str,
+        ext: &'a str,
+        state: SessionState,
+        project_resume_on: bool,
+        transcript_exists: bool,
+    ) -> WorkspaceResumeCandidate<'a> {
+        WorkspaceResumeCandidate {
+            terminal_id: terminal,
+            session_id: session,
+            agent_kind: kind,
+            external_session_id: ext,
+            session_state: state,
+            project_resume_on,
+            transcript_exists,
+            target: ResumeTarget::UnixOrWsl,
+        }
+    }
+
+    /// The workspace restore plan DELEGATES to `decide_resume` per candidate — no new policy.
+    /// A resumable active session yields a resume entry with the exact command; an `unknown`
+    /// session resumes but is flagged uncertain; option-OFF and no-transcript yield precise
+    /// skip reasons. Covers done-criterion "sessions reprenables" + "états douteux".
+    #[test]
+    fn workspace_resume_plan_reuses_decide_resume_per_candidate() {
+        let candidates = vec![
+            // active + option ON + transcript → resume with exact id.
+            candidate(
+                "t1",
+                "s1",
+                db::AGENT_KIND_CLAUDE_CODE,
+                "ext-active",
+                SessionState::Active,
+                true,
+                true,
+            ),
+            // unknown (stale/probable kill) → still resumes, flagged uncertain.
+            candidate(
+                "t2",
+                "s2",
+                db::AGENT_KIND_CLAUDE_CODE,
+                "ext-unknown",
+                SessionState::Unknown,
+                true,
+                true,
+            ),
+            // option OFF → skip(option_off).
+            candidate(
+                "t3",
+                "s3",
+                db::AGENT_KIND_CLAUDE_CODE,
+                "ext-off",
+                SessionState::Active,
+                false,
+                true,
+            ),
+            // no transcript on disk → skip(no_conversation).
+            candidate(
+                "t4",
+                "s4",
+                db::AGENT_KIND_CLAUDE_CODE,
+                "ext-notx",
+                SessionState::Active,
+                true,
+                false,
+            ),
+        ];
+        let plan = plan_with_registry(&candidates);
+        assert_eq!(plan.len(), 4);
+
+        assert_eq!(
+            plan[0],
+            WorkspaceResumeEntry {
+                terminal_id: "t1".into(),
+                session_id: "s1".into(),
+                agent_kind: db::AGENT_KIND_CLAUDE_CODE.into(),
+                resume_command: Some("claude --resume ext-active".into()),
+                resume: true,
+                uncertain: false,
+                skip_reason: None,
+            },
+        );
+        // Unknown resumes but is flagged uncertain (the doubtful-state surfacing).
+        assert!(
+            plan[1].resume,
+            "an unknown session is still a resume candidate"
+        );
+        assert!(plan[1].uncertain, "the unknown state surfaces as uncertain");
+        assert_eq!(
+            plan[1].resume_command.as_deref(),
+            Some("claude --resume ext-unknown")
+        );
+        // Option OFF → skipped with the exact reason.
+        assert!(!plan[2].resume);
+        assert_eq!(plan[2].skip_reason, Some("option_off"));
+        assert!(plan[2].resume_command.is_none());
+        // No transcript → skipped with no_conversation (no doomed resume injected).
+        assert!(!plan[3].resume);
+        assert_eq!(plan[3].skip_reason, Some("no_conversation"));
+    }
+
+    /// A candidate whose `agent_kind` resolves to a NON-resumable adapter (`codex`'s registry
+    /// placeholder builds no command) yields a non-resume entry (`no_resume_command`) rather
+    /// than a panic — the plan is total. Routed through the real registry, so this also proves
+    /// a representable-but-not-resumable kind stays `no_resume_command` end to end.
+    #[test]
+    fn workspace_resume_plan_handles_non_resumable_agent_kind() {
+        let candidates = vec![candidate(
+            "t1",
+            "s1",
+            db::AGENT_KIND_CODEX,
+            "ext-1",
+            SessionState::Active,
+            true,
+            true,
+        )];
+        let plan = plan_with_registry(&candidates);
+        assert_eq!(plan.len(), 1);
+        assert!(!plan[0].resume);
+        assert_eq!(plan[0].skip_reason, Some("no_resume_command"));
+    }
+
+    /// A candidate whose `agent_kind` is NOT in the registry at all (an unknown/unrepresentable
+    /// kind → `AgentRegistry::get` returns `None`) still yields `no_resume_command`, never a
+    /// panic — the plan stays total whether the adapter is absent or merely non-resumable.
+    #[test]
+    fn workspace_resume_plan_handles_unresolvable_agent_kind() {
+        let candidates = vec![candidate(
+            "t1",
+            "s1",
+            "totally-unknown-kind",
+            "ext-1",
+            SessionState::Active,
+            true,
+            true,
+        )];
+        let plan = plan_with_registry(&candidates);
+        assert_eq!(plan.len(), 1);
+        assert!(!plan[0].resume);
+        assert_eq!(plan[0].skip_reason, Some("no_resume_command"));
+    }
+
+    /// An empty candidate set yields an empty plan (a workspace with no live sessions).
+    #[test]
+    fn workspace_resume_plan_empty_is_empty() {
+        let plan = plan_with_registry(&[]);
+        assert!(plan.is_empty());
     }
 }

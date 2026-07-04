@@ -152,6 +152,18 @@ describe("useTerminals", () => {
     expect(result.current.activeId).toBe(result.current.terminals[0].id);
   });
 
+  it("does NOT open a default terminal when autoOpenDefault is false (CRUD-only consumer)", async () => {
+    // The project→Terminals page borrows the CRUD verbs but renders its terminals from the
+    // runtime snapshot; visiting it must not spawn a phantom loose terminal.
+    const backend = installBackend([]);
+    const { result } = renderHook(() => useTerminals({ autoOpenDefault: false }));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(backend.createdCwds).toHaveLength(0);
+    expect(result.current.terminals).toHaveLength(0);
+    expect(result.current.activeId).toBeNull();
+  });
+
   it("adopts existing alive records on mount (no default created)", async () => {
     const backend = installBackend([aliveRow(10, "/a", 0), aliveRow(11, "/b", 1)]);
     const { result } = renderHook(() => useTerminals());

@@ -508,6 +508,90 @@ pub fn list_commands<S: RunnerSink>(
     ))
 }
 
+/// `workspace_runtime` — `{ workspace_id }` → `{ runtime }`. The v2.2 cockpit read model
+/// (task `01KWHPV32YVCRBNY1JW5CDY4AY`): the LIVE runtime aggregate of ONE workspace —
+/// its terminals (with the agent sessions on them), its cross-terminal agent sessions,
+/// and its managed-command SERVICES with their current run state. Routes through the
+/// SHARED [`crate::workspace_runtime::snapshot`] — the SAME read model the UI bridge's
+/// `workspace_runtime_snapshot` db-command calls (PDR-0005: one authority, UI + MCP) —
+/// overlaying each service's FACTUAL run state from THIS dispatcher's live `runner`
+/// (`runner.outcome`), exactly as `list_commands` does. An unknown workspace id is a
+/// D8 `invalid_id` error.
+pub fn workspace_runtime<S: RunnerSink>(
+    db: &Db,
+    runner: &CommandRunner<S>,
+    args: &Value,
+) -> Result<Value, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    let overlay = |instance_id: &str| runner.outcome(instance_id);
+    let snapshot = db
+        .with_conn(|c| crate::workspace_runtime::snapshot(c, workspace_id, &overlay))
+        .map_err(internal_db)?;
+    match snapshot {
+        Some(runtime) => Ok(json!({ "runtime": runtime })),
+        None => Err(RpcError::new(
+            RpcCode::InvalidId,
+            format!(
+                "unknown workspace {workspace_id} (use a workspace_id from \
+                 list_workspaces(project_id=…))"
+            ),
+        )),
+    }
+}
+
+/// `workspace_git` — `{ workspace_id }` → `{ git }`. The v2.2 Git CHANGES read model
+/// (task `01KWHPV33EGTB3Z41J0RQR1BAK`, PDR-0013): per NON-OPTIONAL repository of the
+/// workspace, the current branch, dirty flag, and changed-file SUMMARY — RE-READ from
+/// Git, never authoritative in the DB. Routes through the SHARED
+/// [`crate::workspace_git::summary`] — the SAME read model the UI bridge's
+/// `workspace_git_summary` db-command calls. NOT a line-level diff (v2.3). The only DB
+/// read resolves the workspace + derives its repos; every Git fact is transient. An
+/// unknown workspace id is a D8 `invalid_id` error.
+pub fn workspace_git(db: &Db, args: &Value) -> Result<Value, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    let summary = db
+        .with_conn(|c| crate::workspace_git::summary(c, workspace_id))
+        .map_err(internal_db)?;
+    match summary {
+        Some(git) => Ok(json!({ "git": git })),
+        None => Err(RpcError::new(
+            RpcCode::InvalidId,
+            format!(
+                "unknown workspace {workspace_id} (use a workspace_id from \
+                 list_workspaces(project_id=…))"
+            ),
+        )),
+    }
+}
+
+/// `workspace_timeline` — `{ workspace_id, limit? }` → `{ timeline }`. The v2.2 workspace
+/// TIMELINE read model (task `01KWHPV33SAV9NV1STSY403CF0`): the workspace's most recent
+/// `domain_events` (v2.1) as a BOUNDED, oldest-first activity fil — the business
+/// "changements notables" (workspace / repository / project lifecycle), NEVER a terminal
+/// byte (the outbox carries none by construction). Routes through the SHARED
+/// [`crate::workspace_timeline::timeline`] — the SAME read model the UI bridge's
+/// `workspace_timeline` db-command calls (PDR-0005). `limit` bounds the read (omitted / 0 →
+/// the default ceiling). NOT the full contextual activity timeline (v2.5). An unknown
+/// workspace id is a D8 `invalid_id` error.
+pub fn workspace_timeline(db: &Db, args: &Value) -> Result<Value, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    // Bound the read: an omitted / 0 limit lets the read model apply its default ceiling.
+    let limit = optional_usize(args, "limit")?.unwrap_or(0) as i64;
+    let timeline = db
+        .with_conn(|c| crate::workspace_timeline::timeline(c, workspace_id, limit))
+        .map_err(internal_db)?;
+    match timeline {
+        Some(timeline) => Ok(json!({ "timeline": timeline })),
+        None => Err(RpcError::new(
+            RpcCode::InvalidId,
+            format!(
+                "unknown workspace {workspace_id} (use a workspace_id from \
+                 list_workspaces(project_id=…))"
+            ),
+        )),
+    }
+}
+
 /// Whether a workspace `path` matches a normalized `cwd` filter (parity with the Tauri
 /// `path_matches`).
 fn path_matches(workspace_path: &str, cwd_normalized: &str) -> bool {
@@ -1064,15 +1148,13 @@ static EXPECTED_PLUGIN_VERSION: std::sync::LazyLock<Option<String>> =
     std::sync::LazyLock::new(|| {
         const MANIFEST: &str =
             include_str!("../resources/claude-plugin/.claude-plugin/plugin.json");
-        serde_json::from_str::<Value>(MANIFEST)
-            .ok()
-            .and_then(|v| {
-                v.get("version")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
+        serde_json::from_str::<Value>(MANIFEST).ok().and_then(|v| {
+            v.get("version")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
     });
 
 /// Decide, from the hook-reported `plugin_version`, whether the session's loaded plugin is
@@ -1136,9 +1218,15 @@ fn session_context_line(db: &Db, session: &db::AgentSession) -> String {
                 .ok()
                 .flatten()
             {
-                parts.push(format!("project \"{}\" (project_id={})", proj.name, proj.id));
+                parts.push(format!(
+                    "project \"{}\" (project_id={})",
+                    proj.name, proj.id
+                ));
             }
-            parts.push(format!("workspace \"{}\" (workspace_id={})", ws.name, ws.id));
+            parts.push(format!(
+                "workspace \"{}\" (workspace_id={})",
+                ws.name, ws.id
+            ));
         }
     }
     parts.push(format!("terminal_id={}", session.terminal_id));
@@ -1233,18 +1321,29 @@ pub fn agent_session_event(
             let session = db
                 .with_conn(
                     |c| -> Result<Option<db::AgentSession>, diesel::result::Error> {
-                        let Some(terminal) = db::get_terminal(c, terminal_id)? else {
-                            return Ok(None);
-                        };
-                        let capture = db::SessionCapture {
-                            workspace_id: terminal.workspace_id,
-                            external_session_id: start.external_session_id,
-                            cwd: start.cwd,
-                            transcript_path: start.transcript_path,
-                            metadata_json: start.metadata_json,
-                        };
-                        let row = db::record_session_start(c, terminal_id, agent_kind, capture)?;
-                        Ok(Some(row))
+                        // The session upsert AND its `agent_session.started` outbox event commit
+                        // ATOMICALLY (finding 01KWMCT58832JZW7M5GQDYZZ4B): `record_session_start`
+                        // nests as a savepoint, and `record_agent_session_event` writes the
+                        // correlated `domain_events` row in the SAME transaction — so the
+                        // workspace timeline surfaces the session start, and the timeline row can
+                        // never disagree with the session row (a rollback erases both).
+                        use diesel::Connection;
+                        c.transaction(|c| {
+                            let Some(terminal) = db::get_terminal(c, terminal_id)? else {
+                                return Ok(None);
+                            };
+                            let capture = db::SessionCapture {
+                                workspace_id: terminal.workspace_id,
+                                external_session_id: start.external_session_id,
+                                cwd: start.cwd,
+                                transcript_path: start.transcript_path,
+                                metadata_json: start.metadata_json,
+                            };
+                            let row =
+                                db::record_session_start(c, terminal_id, agent_kind, capture)?;
+                            crate::usecase::record_agent_session_event(c, &row, true)?;
+                            Ok(Some(row))
+                        })
                     },
                 )
                 .map_err(internal_db)?;
@@ -1308,15 +1407,27 @@ pub fn agent_session_event(
             let outcome = db
                 .with_conn(
                     |c| -> Result<Option<(String, bool)>, diesel::result::Error> {
-                        let Some(active) = db::active_session_for(c, terminal_id, agent_kind)?
-                        else {
-                            return Ok(None);
-                        };
-                        if active.external_session_id != end.external_session_id {
-                            return Ok(Some((active.id, false)));
-                        }
-                        db::mark_session_ended(c, &active.id)?;
-                        Ok(Some((active.id, true)))
+                        // The end mutation AND its `agent_session.ended` outbox event commit
+                        // ATOMICALLY (finding 01KWMCT58832JZW7M5GQDYZZ4B) so the workspace
+                        // timeline surfaces the session end and can never disagree with the row.
+                        use diesel::Connection;
+                        c.transaction(|c| {
+                            let Some(active) = db::active_session_for(c, terminal_id, agent_kind)?
+                            else {
+                                return Ok(None);
+                            };
+                            if active.external_session_id != end.external_session_id {
+                                return Ok(Some((active.id, false)));
+                            }
+                            db::mark_session_ended(c, &active.id)?;
+                            // Re-read the row so the outbox event carries the ENDED state
+                            // (its `ended_at` is now stamped); a missing re-read is impossible
+                            // right after the update, but guard defensively.
+                            if let Some(ended) = db::get_session(c, &active.id)? {
+                                crate::usecase::record_agent_session_event(c, &ended, false)?;
+                            }
+                            Ok(Some((active.id, true)))
+                        })
                     },
                 )
                 .map_err(internal_db)?;
@@ -1683,6 +1794,16 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         "list_projects" => read(list_projects(db)),
         "list_workspaces" => read(list_workspaces(db, args)),
         "list_commands" => read(list_commands(db, runner, args)),
+        // The v2.2 cockpit read model: a workspace's LIVE runtime aggregate (terminals +
+        // sessions + services), overlaying live run state from `runner` — the SAME
+        // `workspace_runtime::snapshot` the UI bridge drives (PDR-0005).
+        crate::mcp::WORKSPACE_RUNTIME_TOOL => read(workspace_runtime(db, runner, args)),
+        // The v2.2 Git CHANGES read model: branch/dirty/changed-files per non-optional
+        // repo, RE-READ from Git — the SAME `workspace_git::summary` the UI bridge drives.
+        crate::mcp::WORKSPACE_GIT_TOOL => read(workspace_git(db, args)),
+        // The v2.2 TIMELINE read model: a bounded, oldest-first fil of a workspace's recent
+        // domain_events — the SAME `workspace_timeline::timeline` the UI bridge drives.
+        crate::mcp::WORKSPACE_TIMELINE_TOOL => read(workspace_timeline(db, args)),
         crate::mcp::LIST_IMPORTABLE_SCRIPTS_TOOL => read(list_importable_scripts(db, args)),
         // Project settings (rename + resume opt-in) — mutating → workspaces changed.
         crate::mcp::SET_PROJECT_SETTINGS_TOOL => Some(set_project_settings(db, args)),
@@ -1830,6 +1951,237 @@ mod tests {
                 DomainEventKind::WorkspaceCreated
             ]
         );
+    }
+
+    /// DONE-CRITERION (task 01KWHPV32YVCRBNY1JW5CDY4AY, criterion #2): the MCP
+    /// `workspace_runtime` tool serves the SAME read model the UI bridge consumes — a
+    /// workspace's terminals + agent sessions + services, aggregated by the SHARED
+    /// `workspace_runtime::snapshot`. Proof: seed a workspace + a terminal with a live
+    /// session + a materialized command instance, then read via the MCP tool and assert
+    /// the aggregate shape, including the live-runner run-state overlay.
+    #[test]
+    fn mcp_workspace_runtime_tool_serves_the_shared_read_model() {
+        use crate::usecase::{self, test_support::RecordingEventSink, DomainEventSource};
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let sink = RecordingEventSink::new();
+
+        let (project, _root) = db
+            .with_conn(|c| {
+                usecase::create_project(c, &sink, "P", "/tmp/wr-mcp", None, DomainEventSource::Mcp)
+            })
+            .unwrap();
+        let ws = db
+            .with_conn(|c| {
+                usecase::register_workspace(
+                    c,
+                    &sink,
+                    &project.id,
+                    "wt",
+                    "/tmp/wr-mcp-wt",
+                    DomainEventSource::Mcp,
+                )
+            })
+            .unwrap();
+        // A command template → one instance in the workspace.
+        db.with_conn(|c| {
+            db::create_template(
+                c,
+                &project.id,
+                "dev",
+                "npm run dev",
+                None,
+                db::CommandSource::default(),
+            )
+        })
+        .unwrap();
+        // A terminal on the workspace, hosting a live agent session.
+        let term = db
+            .with_conn(|c| db::create_terminal(c, "/tmp/wr-mcp-wt", None))
+            .unwrap();
+        db.with_conn(|c| db::attach_terminal(c, &term.id, &ws.id, "auto"))
+            .unwrap();
+        db.with_conn(|c| {
+            db::record_session_start(
+                c,
+                &term.id,
+                "claude_code",
+                db::SessionCapture {
+                    workspace_id: Some(ws.id.clone()),
+                    external_session_id: "sess-mcp".to_string(),
+                    cwd: "/tmp/wr-mcp-wt".to_string(),
+                    transcript_path: None,
+                    metadata_json: None,
+                },
+            )
+        })
+        .unwrap();
+
+        // READ via the MCP tool (through the shared read model + the live runner overlay).
+        let runner = noop_runner();
+        let res = workspace_runtime(&db, &runner, &json!({ "workspace_id": ws.id })).unwrap();
+        let runtime = &res["runtime"];
+        assert_eq!(runtime["workspace"]["id"], json!(ws.id));
+        // Terminal + its session.
+        let terminals = runtime["terminals"].as_array().unwrap();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["id"], json!(term.id));
+        assert_eq!(
+            terminals[0]["sessions"][0]["external_session_id"],
+            json!("sess-mcp")
+        );
+        // Cross-terminal agent view.
+        let sessions = runtime["agent_sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        // Service with its (persisted-idle) run state.
+        let services = runtime["services"].as_array().unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0]["name"], json!("dev"));
+        assert_eq!(services[0]["run_state"], json!("idle"));
+
+        // An unknown workspace id is a D8 invalid_id error (not an empty snapshot).
+        let err = workspace_runtime(&db, &runner, &json!({ "workspace_id": "nope" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+    }
+
+    /// DONE-CRITERION (task 01KWHPV33EGTB3Z41J0RQR1BAK): the MCP `workspace_git` tool
+    /// serves the SAME Git CHANGES read model the UI bridge consumes — branch/dirty/
+    /// changed-files per non-optional repo, RE-READ from Git. Proof: register a real git
+    /// repo as a workspace, dirty it, and assert the MCP tool reports the change (with NO
+    /// DB write — Git is never authoritative in the DB). Git-guarded (skips if git absent).
+    #[test]
+    fn mcp_workspace_git_tool_serves_the_shared_git_read_model() {
+        use crate::repository::register_project;
+        let _g = db_guard();
+        if crate::proc_util::command("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping mcp workspace_git test: git unavailable");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("nyx-mcp-git-{}", uuid::Uuid::now_v7()));
+        let repo = root.join("api");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str], dir: &std::path::Path| {
+            let ok = crate::proc_util::command("git")
+                .args([
+                    "-c",
+                    "user.email=t@nyx",
+                    "-c",
+                    "user.name=nyx",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"], &repo);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"], &repo);
+        std::fs::write(repo.join("README.md"), b"nyx").unwrap();
+        git(&["add", "README.md"], &repo);
+        git(&["commit", "-q", "-m", "init"], &repo);
+
+        let db = Db::in_memory();
+        let (_project, root_ws) = db
+            .with_conn(|c| register_project(c, "Nyx", root.to_str().unwrap(), None))
+            .unwrap();
+
+        // Dirty the repo with an untracked file.
+        std::fs::write(repo.join("new.txt"), b"new").unwrap();
+
+        let res = workspace_git(&db, &json!({ "workspace_id": root_ws.id })).unwrap();
+        let repos = res["git"]["repos"].as_array().unwrap();
+        let api = repos
+            .iter()
+            .find(|r| r["relative_path"] == "api")
+            .expect("api repo summarized");
+        assert_eq!(api["branch"], json!("main"), "branch re-read from Git");
+        assert_eq!(api["dirty"], json!(true), "dirty re-read from Git");
+        let files: Vec<&str> = api["changed_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert!(files.contains(&"new.txt"), "changed files: {files:?}");
+
+        // Unknown workspace id is a D8 invalid_id error.
+        let err = workspace_git(&db, &json!({ "workspace_id": "nope" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DONE-CRITERION (task 01KWHPV33SAV9NV1STSY403CF0): the MCP `workspace_timeline` tool
+    /// serves the SAME bounded read model the UI bridge consumes — a workspace's recent
+    /// `domain_events` as an oldest-first, capped fil, with NO terminal byte. Proof: mutations
+    /// through the shared use cases land correlated `domain_events`; the tool returns them
+    /// bounded to `limit`, and every entry is a business event type (never terminal output).
+    #[test]
+    fn mcp_workspace_timeline_tool_serves_the_bounded_domain_events_read_model() {
+        use crate::usecase::{self, test_support::RecordingEventSink, DomainEventSource};
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let sink = RecordingEventSink::new();
+
+        let (project, _root) = db
+            .with_conn(|c| {
+                usecase::create_project(c, &sink, "P", "/tmp/tl-mcp", None, DomainEventSource::Mcp)
+            })
+            .unwrap();
+        let ws = db
+            .with_conn(|c| {
+                usecase::register_workspace(
+                    c,
+                    &sink,
+                    &project.id,
+                    "wt",
+                    "/tmp/tl-mcp-wt",
+                    DomainEventSource::Mcp,
+                )
+            })
+            .unwrap();
+        db.with_conn(|c| {
+            usecase::rename_workspace(c, &sink, &ws.id, "renamed", DomainEventSource::Ui)
+        })
+        .unwrap();
+
+        // READ via the MCP tool (bounded, oldest-first).
+        let res = workspace_timeline(&db, &json!({ "workspace_id": ws.id })).unwrap();
+        let timeline = &res["timeline"];
+        assert_eq!(timeline["workspace_id"], json!(ws.id));
+        let entries = timeline["entries"].as_array().unwrap();
+        // The workspace-scoped events surface, oldest-first, and every entry is a BUSINESS
+        // event with a small identity payload — NEVER a terminal byte.
+        let types: Vec<&str> = entries
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"workspace.created"));
+        assert!(types.contains(&"workspace.renamed"));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e["payload"].as_str().unwrap().contains("identity_id")),
+            "every timeline entry is a business event payload, no terminal bytes"
+        );
+
+        // The `limit` bounds the read.
+        let bounded =
+            workspace_timeline(&db, &json!({ "workspace_id": ws.id, "limit": 1 })).unwrap();
+        assert_eq!(bounded["timeline"]["limit"], json!(1));
+        assert_eq!(bounded["timeline"]["entries"].as_array().unwrap().len(), 1);
+
+        // Unknown workspace id is a D8 invalid_id error.
+        let err = workspace_timeline(&db, &json!({ "workspace_id": "nope" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
     }
 
     #[test]
@@ -2196,12 +2548,22 @@ mod tests {
             Activity::Working,
             "Stop with a background sub-agent in flight stays working — no premature green"
         );
-        assert!(!snap.ready_unread, "the green is deferred while the background runs");
+        assert!(
+            !snap.ready_unread,
+            "the green is deferred while the background runs"
+        );
         // The background sub-agent finishes → NOW idle + ready.
         send(json!({ "hook_event_name": "SubagentStop", "NYX_TERMINAL_ID": tid }));
         let snap = activity.snapshot(&tid).unwrap();
-        assert_eq!(snap.activity, Activity::Idle, "the last sub-agent settles the turn");
-        assert!(snap.ready_unread, "the green is raised on the trailing SubagentStop");
+        assert_eq!(
+            snap.activity,
+            Activity::Idle,
+            "the last sub-agent settles the turn"
+        );
+        assert!(
+            snap.ready_unread,
+            "the green is raised on the trailing SubagentStop"
+        );
 
         // --- SYNCHRONOUS: SubagentStart → SubagentStop → Stop (greens at the Stop) ---
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
@@ -2212,7 +2574,10 @@ mod tests {
         send(json!({ "hook_event_name": "Stop", "NYX_TERMINAL_ID": tid }));
         let snap = activity.snapshot(&tid).unwrap();
         assert_eq!(snap.activity, Activity::Idle);
-        assert!(snap.ready_unread, "a synchronous sub-agent greens at the Stop");
+        assert!(
+            snap.ready_unread,
+            "a synchronous sub-agent greens at the Stop"
+        );
     }
 
     /// A single long-running tool keeps the dot `working` between its `PreToolUse` and
@@ -2232,7 +2597,9 @@ mod tests {
 
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
         // A long tool: PreToolUse with no Post → stays working across reads.
-        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "NYX_TERMINAL_ID": tid }));
+        send(
+            json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "NYX_TERMINAL_ID": tid }),
+        );
         assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Working);
         send(
             json!({ "hook_event_name": "PostToolUse", "tool_name": "Bash", "NYX_TERMINAL_ID": tid }),
@@ -2240,20 +2607,31 @@ mod tests {
         assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Working);
 
         // AskUserQuestion → waiting (yellow), then its Post resumes working.
-        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }));
+        send(
+            json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }),
+        );
         assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Waiting);
-        send(json!({ "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }));
+        send(
+            json!({ "hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }),
+        );
         assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Working);
 
         // A permission prompt → waiting.
-        send(json!({ "hook_event_name": "Notification", "notification_type": "permission_prompt", "NYX_TERMINAL_ID": tid }));
+        send(
+            json!({ "hook_event_name": "Notification", "notification_type": "permission_prompt", "NYX_TERMINAL_ID": tid }),
+        );
         assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Waiting);
 
         // idle_prompt → idle + ready (a turn end via Notification).
-        send(json!({ "hook_event_name": "Notification", "notification_type": "idle_prompt", "NYX_TERMINAL_ID": tid }));
+        send(
+            json!({ "hook_event_name": "Notification", "notification_type": "idle_prompt", "NYX_TERMINAL_ID": tid }),
+        );
         let snap = activity.snapshot(&tid).unwrap();
         assert_eq!(snap.activity, Activity::Idle);
-        assert!(snap.ready_unread, "idle_prompt raises the ready notification");
+        assert!(
+            snap.ready_unread,
+            "idle_prompt raises the ready notification"
+        );
 
         // StopFailure also finishes the turn (a new prompt then a StopFailure).
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
@@ -2263,7 +2641,9 @@ mod tests {
 
         // A Notification of an unknown type is acknowledged as a no-op (no error, no
         // change), leaving the dot where it was.
-        let out = send(json!({ "hook_event_name": "Notification", "notification_type": "weird_unknown", "NYX_TERMINAL_ID": tid }));
+        let out = send(
+            json!({ "hook_event_name": "Notification", "notification_type": "weird_unknown", "NYX_TERMINAL_ID": tid }),
+        );
         assert!(out.effects.is_empty());
         assert_eq!(out.result["activity"], json!(false));
     }
@@ -2286,11 +2666,15 @@ mod tests {
 
         // A question blocks the agent → yellow.
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
-        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }));
+        send(
+            json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid }),
+        );
         assert_eq!(activity.snapshot(&tid).unwrap().activity, Activity::Waiting);
         // "chat about this": the agent resumes by running a tool — the dot must clear to blue
         // even though no AskUserQuestion PostToolUse arrived.
-        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "NYX_TERMINAL_ID": tid }));
+        send(
+            json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "NYX_TERMINAL_ID": tid }),
+        );
         assert_eq!(
             activity.snapshot(&tid).unwrap().activity,
             Activity::Working,
@@ -2301,8 +2685,13 @@ mod tests {
         let created2 = create_terminal(&db, &host, &json!({})).unwrap();
         let tid2 = created2.result["terminal_id"].as_str().unwrap().to_string();
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid2 }));
-        send(json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid2 }));
-        assert_eq!(activity.snapshot(&tid2).unwrap().activity, Activity::Waiting);
+        send(
+            json!({ "hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "NYX_TERMINAL_ID": tid2 }),
+        );
+        assert_eq!(
+            activity.snapshot(&tid2).unwrap().activity,
+            Activity::Waiting
+        );
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid2 }));
         assert_eq!(
             activity.snapshot(&tid2).unwrap().activity,
@@ -2358,6 +2747,75 @@ mod tests {
             activity.snapshot(&tid).is_none(),
             "SessionEnd clears the live dot"
         );
+    }
+
+    /// End-to-end (finding 01KWMCT58832JZW7M5GQDYZZ4B): the `agent_session_event` MCP tool
+    /// emits a correlated `agent_session.started` / `agent_session.ended` `domain_events` row
+    /// for a WORKSPACE-attached terminal — atomically with the `agent_sessions` mutation — so
+    /// the workspace timeline surfaces the session lifecycle. Payload carries the business
+    /// identity only, NEVER a terminal/transcript byte.
+    #[test]
+    fn agent_session_event_emits_timeline_domain_events_for_a_workspace_session() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+
+        // A project + workspace + a terminal ATTACHED to that workspace.
+        let (project, root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/tl-sess", None))
+            .unwrap();
+        let created = create_terminal(&db, &host, &json!({ "cwd": "/tmp/tl-sess" })).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        db.with_conn(|c| db::attach_terminal(c, &tid, &root.id, "auto"))
+            .unwrap();
+        let baseline = db.with_conn(db::list_domain_events).unwrap().len();
+
+        // SessionStart → `agent_session.started`.
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "ext-sid-1",
+                "cwd": "/tmp/tl-sess",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        // SessionEnd (a real end — logout) → `agent_session.ended`.
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "ext-sid-1",
+                "reason": "logout",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+
+        let events = db.with_conn(db::list_domain_events).unwrap();
+        let new: Vec<_> = events[baseline..].iter().collect();
+        let types: Vec<&str> = new.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(types.contains(&"agent_session.started"), "got {types:?}");
+        assert!(types.contains(&"agent_session.ended"), "got {types:?}");
+        for e in &new {
+            assert_eq!(e.workspace_id.as_deref(), Some(root.id.as_str()));
+            assert_eq!(e.project_id, project.id);
+            assert!(!e.payload.contains("\\x1b"), "no terminal escape bytes");
+            assert!(!e.payload.to_lowercase().contains("transcript"));
+        }
+
+        // The timeline read model surfaces both.
+        let tl = db
+            .with_conn(|c| crate::workspace_timeline::timeline(c, &root.id, 50))
+            .unwrap()
+            .unwrap();
+        let kinds: Vec<&str> = tl.entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(kinds.contains(&"agent_session.started"));
+        assert!(kinds.contains(&"agent_session.ended"));
     }
 
     /// SessionStart returns a MINIMAL nyx `context` line (#22) in `structuredContent` so the

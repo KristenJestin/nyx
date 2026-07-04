@@ -94,6 +94,22 @@ pub enum DomainEventKind {
     RepositoryUnarchived,
     RepositoryRenamed,
     RepositoryOptionalSet,
+    // --- Runtime activity (task 01KWHPV33SAV9NV1STSY403CF0 follow-up) ----------
+    // The BOUNDED runtime families the workspace timeline names as its content
+    // ("démarrages/arrêts de commandes, sessions agents"). Emitted through the SAME
+    // outbox (`persist_event`) IN the transaction that mutates `command_instances`
+    // (start/stop) / `agent_sessions` (start/end), correlated to the workspace so
+    // `recent_domain_events_for_workspace` surfaces them. Deliberately just these four
+    // (+ the identity families above) — NOT the full contextual activity timeline (v2.5).
+    /// A managed command instance transitioned to `running` (a start / relaunch spawn).
+    CommandStarted,
+    /// A managed command instance left `running` (a stop to idle, or a natural
+    /// success/error exit).
+    CommandStopped,
+    /// An agent session started on a terminal (`SessionStart`).
+    AgentSessionStarted,
+    /// An agent session ended cleanly (`SessionEnd`).
+    AgentSessionEnded,
 }
 
 impl DomainEventKind {
@@ -116,6 +132,10 @@ impl DomainEventKind {
             DomainEventKind::RepositoryUnarchived => "repository.unarchived",
             DomainEventKind::RepositoryRenamed => "repository.renamed",
             DomainEventKind::RepositoryOptionalSet => "repository.optional_set",
+            DomainEventKind::CommandStarted => "command.started",
+            DomainEventKind::CommandStopped => "command.stopped",
+            DomainEventKind::AgentSessionStarted => "agent_session.started",
+            DomainEventKind::AgentSessionEnded => "agent_session.ended",
         }
     }
 }
@@ -127,6 +147,12 @@ pub enum DomainEntity {
     Project,
     Workspace,
     Repository,
+    /// A managed command instance (`command_instances` row) — the entity a
+    /// `command.started` / `command.stopped` event concerns.
+    Command,
+    /// An agent session (`agent_sessions` row) — the entity an
+    /// `agent_session.started` / `agent_session.ended` event concerns.
+    AgentSession,
 }
 
 impl DomainEntity {
@@ -135,6 +161,8 @@ impl DomainEntity {
             DomainEntity::Project => "project",
             DomainEntity::Workspace => "workspace",
             DomainEntity::Repository => "repository",
+            DomainEntity::Command => "command",
+            DomainEntity::AgentSession => "agent_session",
         }
     }
 }
@@ -149,14 +177,21 @@ pub enum DomainEventSource {
     Ui,
     /// Driven by an MCP tool (an agent), through the MCP dispatcher.
     Mcp,
+    /// Driven by the runtime lifecycle itself, not clearly attributable to a single UI or
+    /// MCP call — a managed-command run-state transition (start / stop / natural exit) or an
+    /// agent-session lifecycle hook the runner/plugin channel drives. The runner sink and the
+    /// agent-session hook are shared by both surfaces, so a runtime event's origin is `system`.
+    System,
 }
 
 impl DomainEventSource {
-    /// The stable wire/DB string (`ui` | `mcp`).
+    /// The stable wire/DB string (`ui` | `mcp` | `system`). Free TEXT in `domain_events.source`
+    /// (no CHECK), so a new source needs no migration.
     pub fn as_str(self) -> &'static str {
         match self {
             DomainEventSource::Ui => "ui",
             DomainEventSource::Mcp => "mcp",
+            DomainEventSource::System => "system",
         }
     }
 }
@@ -236,12 +271,37 @@ fn build_payload(identity_id: &str) -> String {
 /// event is workspace-scoped) is passed by the caller, which resolved it from the mutated
 /// entity in the SAME transaction (captured BEFORE a delete). The persisted row's
 /// `sequence` is not needed by callers, so this returns `()` — the row's presence/atomicity
-/// is what matters. Kept crate-private: only the use cases below persist events.
+/// is what matters. Kept crate-private: only the use cases below persist events. The payload
+/// is the identity-only bag; a caller with a richer BUSINESS bag (a runtime event) uses
+/// [`persist_event_with_payload`].
 fn persist_event(
     conn: &mut SqliteConnection,
     kind: DomainEventKind,
     entity: DomainEntity,
     identity_id: &str,
+    correlation: &DomainEventCorrelation,
+    source: DomainEventSource,
+) -> QueryResult<()> {
+    persist_event_with_payload(
+        conn,
+        kind,
+        entity,
+        &build_payload(identity_id),
+        correlation,
+        source,
+    )
+}
+
+/// PERSIST one `domain_events` outbox row with a caller-provided BUSINESS `payload` (a small
+/// JSON bag — id/name/run-state/provider), INSIDE the caller's transaction. The generalization
+/// of [`persist_event`] for the runtime families (`command.*` / `agent_session.*`) whose payload
+/// carries more than the identity id. The `payload` MUST stay a small business bag — NEVER a
+/// terminal byte stream or scrollback (Q-008; the `domain_events` table forbids it by design).
+fn persist_event_with_payload(
+    conn: &mut SqliteConnection,
+    kind: DomainEventKind,
+    entity: DomainEntity,
+    payload: &str,
     correlation: &DomainEventCorrelation,
     source: DomainEventSource,
 ) -> QueryResult<()> {
@@ -254,7 +314,7 @@ fn persist_event(
             event_type: kind.as_str().to_string(),
             source: source.as_str().to_string(),
             actor: None,
-            payload: build_payload(identity_id),
+            payload: payload.to_string(),
             // 0 → `record_domain_event` stamps `now_millis()`.
             created_at: 0,
         },
@@ -550,6 +610,50 @@ pub fn list_workspaces(
 /// USE CASE — resolve ONE workspace by its stable id, or `None`. No event (a read).
 pub fn resolve_workspace(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Workspace>> {
     db::get_workspace(conn, id)
+}
+
+/// USE CASE — resolve a project's PRIMARY (free-work) workspace: the durable base workspace
+/// where the v2.2 cockpit opens FREE WORK (a workspace with NO Spec — there is no `specs`
+/// table in v2.2, so "sans Spec" is structural). This is the cockpit's default entry point
+/// for a project ("le primary workspace est l'espace de travail libre par défaut", task
+/// `01KWHPV33H0FX8NA4C94T5W46J`; glossary / domain-model.md §primary workspace).
+///
+/// Resolution keys on the CANONICAL source of truth first — `projects.primary_workspace_id`
+/// (v10; the durable primary role, replacing reliance on `workspaces.is_root`) — and, only if
+/// that pointer is absent or dangles (a project predating the v11 backfill, or a soft-archived
+/// target), FALLS BACK to the project's root workspace (`db::list_workspaces` orders `is_root`
+/// first). The pointer only wins when it resolves to a LIVE (non-archived) workspace of this
+/// project: an archived workspace is not a valid default FREE-WORK space, so a pointer at a
+/// soft-archived target is treated as dangling and the fallback prefers the first non-archived
+/// candidate. Returns `None` only for an unknown project with no workspaces at all. No event
+/// (a read); NEVER touches a Spec.
+pub fn resolve_primary_workspace(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Option<Workspace>> {
+    // The canonical pointer wins when it resolves to a LIVE workspace of THIS project. A
+    // soft-archived target (`archived_at` set) is NOT a valid free-work default, so it is
+    // treated as a dangling pointer and skipped in favour of the fallback below.
+    if let Some(project) = db::get_project(conn, project_id)? {
+        if let Some(primary_id) = project.primary_workspace_id.as_deref() {
+            if let Some(ws) = db::get_workspace(conn, primary_id)? {
+                if ws.project_id == project_id && ws.archived_at.is_none() {
+                    return Ok(Some(ws));
+                }
+            }
+        }
+    }
+    // Fallback for a project whose canonical pointer is absent, dangles, or points at an
+    // archived target: the first NON-ARCHIVED workspace (list_workspaces returns `is_root`
+    // first, so this is the live root when present). Only if every workspace is archived do
+    // we fall back to the first row overall, so an all-archived project still resolves rather
+    // than reporting `None` (which stays reserved for a project with no workspaces at all).
+    let workspaces = db::list_workspaces(conn, project_id)?;
+    Ok(workspaces
+        .iter()
+        .find(|ws| ws.archived_at.is_none())
+        .cloned()
+        .or_else(|| workspaces.into_iter().next()))
 }
 
 /// USE CASE — soft-archive a workspace (the ROW is permanent — PDR-0008 — archiving marks
@@ -930,6 +1034,126 @@ fn repository_flip(
     })
 }
 
+// --- Runtime lifecycle events (timeline follow-up 01KWMCT58832JZW7M5GQDYZZ4B) -----
+//
+// The workspace timeline (`workspace_timeline`) reads `domain_events` FAITHFULLY, but the
+// runtime families the timeline's scope names as its content — command start/stop and agent
+// sessions — never transited through the outbox before, so the fil was vide-en-pratique for
+// runtime activity. These two functions close that: each writes the STATE mutation
+// (`command_instances` / `agent_sessions`) AND its `domain_events` row IN ONE transaction (the
+// SAME outbox pattern as the identity use cases), correlated to the workspace so
+// `recent_domain_events_for_workspace` surfaces it. The payload is a SMALL business bag
+// (id/name/run-state/provider) — NEVER a terminal byte (Q-008; the outbox forbids it).
+
+/// A managed command instance's run-state transition PLUS its outbox event, atomic in one
+/// transaction — the runtime writer the production runner sink calls in place of a bare
+/// `db::set_run_state`.
+///
+/// In one transaction it: (1) writes the instance's run state (`db::set_run_state`, the SAME
+/// factual-outcome writer as before), then (2) — when the instance resolves — persists a
+/// correlated `command.started` (on `running`) or `command.stopped` (on `idle`/`success`/
+/// `error`) `domain_events` row so the workspace timeline surfaces the start/stop. The event's
+/// `workspace_id`/`project_id` come from the instance's workspace, resolved in the SAME
+/// transaction. A rollback erases both; a commit persists both. Unknown instance → the state
+/// write is a 0-row no-op and no event is emitted (nothing to correlate).
+///
+/// `state` is the [`crate::command::RunState`] the runner transitioned to; `exit_code` is the
+/// natural exit code for a success/error finish, else `None`. Payload = `{ instance_id,
+/// command_id, command_name, run_state, exit_code? }` — a small business bag, NEVER scrollback.
+pub fn record_command_run_state(
+    conn: &mut SqliteConnection,
+    instance_id: &str,
+    state: crate::command::RunState,
+    exit_code: Option<i32>,
+) -> QueryResult<()> {
+    use crate::command::RunState;
+    conn.transaction(|conn| {
+        // (1) The factual run-state write — the SAME single writer the sink used before.
+        db::set_run_state(conn, instance_id, state.as_db_str(), exit_code)?;
+
+        // (2) The outbox event, IN this transaction, correlated to the instance's workspace.
+        // A `running` transition is a START; leaving `running` (idle/success/error) is a STOP.
+        let kind = match state {
+            RunState::Running => DomainEventKind::CommandStarted,
+            RunState::Idle | RunState::Success | RunState::Error => DomainEventKind::CommandStopped,
+        };
+        // Resolve the instance → its workspace → correlation. An unknown instance yields no
+        // correlation, so no event is emitted (the state write above was a 0-row no-op).
+        if let Some(instance) = db::get_instance(conn, instance_id)? {
+            if let Some(correlation) = correlate_workspace(conn, &instance.workspace_id)? {
+                // The template name is a business label for the fil (best-effort — a missing
+                // template leaves it absent, never blocks the event).
+                let command_name = db::get_template(conn, &instance.command_id)?.map(|t| t.name);
+                let payload = serde_json::json!({
+                    "instance_id": instance_id,
+                    "command_id": instance.command_id,
+                    "command_name": command_name,
+                    "run_state": state.as_db_str(),
+                    "exit_code": exit_code,
+                })
+                .to_string();
+                persist_event_with_payload(
+                    conn,
+                    kind,
+                    DomainEntity::Command,
+                    &payload,
+                    &correlation,
+                    DomainEventSource::System,
+                )?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// An agent-session `SessionStart` / `SessionEnd` outbox event, persisted IN the same
+/// transaction as the `agent_sessions` mutation the caller just applied (or is applying) — so
+/// the workspace timeline surfaces the session start/end.
+///
+/// The caller (the shared `agent_session_event` MCP tool) has ALREADY resolved the session row
+/// (the upsert for a start, the `mark_session_ended` for an end) on THIS connection; this adds
+/// the correlated `agent_session.started` / `agent_session.ended` row so both commit together.
+/// The event is correlated to the session's `workspace_id` (an unattached session — no
+/// workspace — is skipped: it cannot appear on any workspace timeline). `provider` is the
+/// `agent_kind` (claude_code/codex/…). Payload = `{ session_id, agent_kind, external_session_id,
+/// run_state }` — a small business bag, NEVER a transcript / terminal byte.
+///
+/// Returns `Ok(())` and is a no-op (no event) when the session has no workspace anchor, so an
+/// unattached session never blocks the hook.
+pub fn record_agent_session_event(
+    conn: &mut SqliteConnection,
+    session: &crate::db::AgentSession,
+    started: bool,
+) -> QueryResult<()> {
+    // No workspace anchor → the session cannot be correlated to any workspace timeline; skip.
+    let Some(workspace_id) = session.workspace_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(correlation) = correlate_workspace(conn, workspace_id)? else {
+        return Ok(());
+    };
+    let (kind, run_state) = if started {
+        (DomainEventKind::AgentSessionStarted, "started")
+    } else {
+        (DomainEventKind::AgentSessionEnded, "ended")
+    };
+    let payload = serde_json::json!({
+        "session_id": session.id,
+        "agent_kind": session.agent_kind,
+        "external_session_id": session.external_session_id,
+        "run_state": run_state,
+    })
+    .to_string();
+    persist_event_with_payload(
+        conn,
+        kind,
+        DomainEntity::AgentSession,
+        &payload,
+        &correlation,
+        DomainEventSource::System,
+    )
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -1211,6 +1435,153 @@ mod tests {
                 DomainEventKind::PrimaryWorkspaceSet,
             ],
             "exactly one PrimaryWorkspaceSet — the cross-project violation emitted nothing"
+        );
+    }
+
+    /// FREE-WORK model (task `01KWHPV33H0FX8NA4C94T5W46J`): `resolve_primary_workspace`
+    /// returns the project's canonical `primary_workspace_id` (the default free-work
+    /// workspace), FOLLOWS the pointer when it is moved to a sibling, and NEVER depends on a
+    /// Spec (there is no `specs` table in v2.2). An unknown project resolves to `None`.
+    #[test]
+    fn resolve_primary_workspace_returns_the_canonical_free_work_workspace() {
+        let mut conn = open_in_memory();
+        let sink = RecordingEventSink::new();
+        let (project, root) = create_project(
+            &mut conn,
+            &sink,
+            "Nyx",
+            &root_path("prim"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+
+        // At creation the canonical pointer is anchored at the root: it IS the free-work default.
+        let primary = resolve_primary_workspace(&mut conn, &project.id)
+            .unwrap()
+            .expect("a project always has a primary workspace");
+        assert_eq!(
+            primary.id, root.id,
+            "the primary (free-work) workspace is the root at creation"
+        );
+
+        // Moving the canonical pointer to a sibling makes THAT the resolved free-work workspace.
+        let sibling = register_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            "wt",
+            &root_path("prim-wt"),
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        assert!(set_primary_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            &sibling.id,
+            DomainEventSource::Ui
+        )
+        .unwrap());
+        let moved = resolve_primary_workspace(&mut conn, &project.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            moved.id, sibling.id,
+            "resolve follows the canonical primary_workspace_id pointer"
+        );
+
+        // An unknown project resolves to None (no workspace at all).
+        assert!(resolve_primary_workspace(&mut conn, "nope")
+            .unwrap()
+            .is_none());
+    }
+
+    /// FALLBACK: a project whose canonical `primary_workspace_id` is NULL (predates the v11
+    /// backfill) still resolves its primary via the root workspace (`is_root` first). Proves
+    /// the free-work default is available even before the canonical pointer is set.
+    #[test]
+    fn resolve_primary_workspace_falls_back_to_root_when_pointer_is_null() {
+        use diesel::prelude::*;
+        let mut conn = open_in_memory();
+        let sink = RecordingEventSink::new();
+        let (project, root) = create_project(
+            &mut conn,
+            &sink,
+            "Nyx",
+            &root_path("fb"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        // Null out the canonical pointer to simulate a pre-backfill project.
+        {
+            use crate::schema::projects::dsl as p;
+            diesel::update(p::projects.filter(p::id.eq(&project.id)))
+                .set(p::primary_workspace_id.eq::<Option<String>>(None))
+                .execute(&mut conn)
+                .unwrap();
+        }
+        let primary = resolve_primary_workspace(&mut conn, &project.id)
+            .unwrap()
+            .expect("root fallback resolves the primary");
+        assert_eq!(
+            primary.id, root.id,
+            "with a NULL pointer, the root workspace is the free-work default"
+        );
+        assert!(primary.is_root, "the fallback is the root workspace");
+    }
+
+    /// ARCHIVED-TARGET GUARD (review #24): when the canonical `primary_workspace_id` points at a
+    /// SOFT-ARCHIVED workspace, that target is NOT a valid free-work default, so resolution treats
+    /// the pointer as dangling and falls back to the first non-archived candidate (the live root).
+    /// This keeps the doc-comment promise ("a soft-archived target FALLS BACK to the root") honest.
+    #[test]
+    fn resolve_primary_workspace_skips_an_archived_pointer_target() {
+        let mut conn = open_in_memory();
+        let sink = RecordingEventSink::new();
+        let (project, root) = create_project(
+            &mut conn,
+            &sink,
+            "Nyx",
+            &root_path("arch"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        // A live sibling that will become the primary, then get archived.
+        let sibling = register_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            "wt",
+            &root_path("arch-wt"),
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        assert!(set_primary_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            &sibling.id,
+            DomainEventSource::Ui
+        )
+        .unwrap());
+        // Soft-archive the pointed-at primary: it is no longer a valid free-work default.
+        assert!(
+            archive_workspace(&mut conn, &sink, &sibling.id, DomainEventSource::Ui).unwrap() > 0
+        );
+
+        let primary = resolve_primary_workspace(&mut conn, &project.id)
+            .unwrap()
+            .expect("an archived primary still resolves via the live fallback");
+        assert_eq!(
+            primary.id, root.id,
+            "an archived pointer target is skipped for the live root"
+        );
+        assert!(
+            primary.archived_at.is_none(),
+            "the resolved free-work default is never an archived workspace"
         );
     }
 
@@ -1851,5 +2222,213 @@ mod tests {
             "only the real flip persisted an event — no phantom for the no-ops"
         );
         assert_eq!(events.last().unwrap().event_type, "project.archived");
+    }
+
+    // --- Runtime lifecycle events (timeline follow-up 01KWMCT58832JZW7M5GQDYZZ4B) --------
+    //
+    // Prove the two runtime families now transit through the outbox, correlated to the
+    // workspace, with a small business payload and NEVER a terminal byte — so the timeline
+    // read model (which reads `domain_events` only) surfaces them.
+
+    /// Materialize a project + root workspace + one command instance in the root workspace.
+    fn seed_command_instance(conn: &mut SqliteConnection, tag: &str) -> (String, String, String) {
+        let (project, root) = create_project(
+            conn,
+            &NullEventSink,
+            "Nyx",
+            &root_path(tag),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        db::create_template(
+            conn,
+            &project.id,
+            "dev",
+            "npm run dev",
+            None,
+            db::CommandSource::default(),
+        )
+        .unwrap();
+        let instance_id = db::instance_ids_for_workspace(conn, &root.id)
+            .unwrap()
+            .pop()
+            .expect("the template materialized one instance in the root workspace");
+        (project.id, root.id, instance_id)
+    }
+
+    /// Starting a command emits a `command.started` outbox row correlated to the workspace,
+    /// with a business payload and no terminal byte; stopping emits `command.stopped`. The
+    /// timeline read model (reading `domain_events`) then surfaces both.
+    #[test]
+    fn command_start_and_stop_emit_correlated_domain_events() {
+        use crate::command::RunState;
+        let mut conn = open_in_memory();
+        let (project_id, ws_id, instance_id) = seed_command_instance(&mut conn, "cmd-ev");
+        let baseline = db::list_domain_events(&mut conn).unwrap().len();
+
+        // START → running.
+        record_command_run_state(&mut conn, &instance_id, RunState::Running, None).unwrap();
+        // STOP → idle (a plain stop, no exit code).
+        record_command_run_state(&mut conn, &instance_id, RunState::Idle, None).unwrap();
+
+        let events = db::list_domain_events(&mut conn).unwrap();
+        assert_eq!(
+            events.len(),
+            baseline + 2,
+            "exactly one event per transition (start + stop)"
+        );
+        let started = &events[baseline];
+        let stopped = &events[baseline + 1];
+        assert_eq!(started.event_type, "command.started");
+        assert_eq!(stopped.event_type, "command.stopped");
+        // Correlated to the workspace + project so the timeline read model surfaces them.
+        for e in [started, stopped] {
+            assert_eq!(e.workspace_id.as_deref(), Some(ws_id.as_str()));
+            assert_eq!(e.project_id, project_id);
+            assert_eq!(e.aggregate, "command");
+            assert_eq!(e.source, "system");
+            // Business payload — the instance/command identity + run state, NEVER scrollback.
+            assert!(e.payload.contains(&instance_id));
+            assert!(e.payload.contains("\"command_name\":\"dev\""));
+            assert!(!e.payload.to_lowercase().contains("scrollback"));
+            assert!(!e.payload.contains("\\x1b")); // no terminal escape bytes
+        }
+        assert!(started.payload.contains("\"run_state\":\"running\""));
+        assert!(stopped.payload.contains("\"run_state\":\"idle\""));
+
+        // The FACTUAL run-state write still happened atomically with the event.
+        let inst = db::get_instance(&mut conn, &instance_id).unwrap().unwrap();
+        assert_eq!(inst.last_state, "idle");
+
+        // And the timeline read model surfaces both, oldest-first (done_criterion: the fil is
+        // no longer vide-en-pratique for runtime activity).
+        let tl = crate::workspace_timeline::timeline(&mut conn, &ws_id, 50)
+            .unwrap()
+            .unwrap();
+        let kinds: Vec<&str> = tl.entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(kinds.contains(&"command.started"));
+        assert!(kinds.contains(&"command.stopped"));
+    }
+
+    /// A natural success/error exit is a STOP too (leaving `running`), carrying the exit code.
+    #[test]
+    fn command_natural_exit_emits_command_stopped_with_exit_code() {
+        use crate::command::RunState;
+        let mut conn = open_in_memory();
+        let (_project_id, ws_id, instance_id) = seed_command_instance(&mut conn, "cmd-exit");
+        record_command_run_state(&mut conn, &instance_id, RunState::Running, None).unwrap();
+        record_command_run_state(&mut conn, &instance_id, RunState::Error, Some(2)).unwrap();
+
+        let events = db::list_domain_events(&mut conn).unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.event_type, "command.stopped");
+        assert!(last.payload.contains("\"exit_code\":2"));
+        assert!(last.payload.contains("\"run_state\":\"error\""));
+        let _ = ws_id;
+    }
+
+    /// An unknown instance → the state write is a no-op and NO event is emitted (nothing to
+    /// correlate). No phantom timeline row.
+    #[test]
+    fn command_run_state_unknown_instance_emits_nothing() {
+        use crate::command::RunState;
+        let mut conn = open_in_memory();
+        let baseline = db::list_domain_events(&mut conn).unwrap().len();
+        record_command_run_state(&mut conn, "nope", RunState::Running, None).unwrap();
+        assert_eq!(db::list_domain_events(&mut conn).unwrap().len(), baseline);
+    }
+
+    /// An agent SessionStart / SessionEnd emits a correlated `agent_session.started` /
+    /// `agent_session.ended` outbox row (workspace-correlated, business payload, no transcript
+    /// byte) so the timeline surfaces the session lifecycle.
+    #[test]
+    fn agent_session_start_and_end_emit_correlated_domain_events() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(
+            &mut conn,
+            &NullEventSink,
+            "Nyx",
+            &root_path("agent-ev"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let term = db::create_terminal(&mut conn, &root_path("agent-ev"), None).unwrap();
+        db::attach_terminal(&mut conn, &term.id, &root.id, "auto").unwrap();
+        let baseline = db::list_domain_events(&mut conn).unwrap().len();
+
+        // Start: upsert the session row, then emit the correlated started event (as the tool
+        // does inside ONE transaction).
+        let session = db::record_session_start(
+            &mut conn,
+            &term.id,
+            "claude_code",
+            db::SessionCapture {
+                workspace_id: Some(root.id.clone()),
+                external_session_id: "ext-sess-1".to_string(),
+                cwd: root_path("agent-ev"),
+                transcript_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        record_agent_session_event(&mut conn, &session, true).unwrap();
+
+        // End: mark ended, re-read, emit the ended event.
+        db::mark_session_ended(&mut conn, &session.id).unwrap();
+        let ended = db::get_session(&mut conn, &session.id).unwrap().unwrap();
+        record_agent_session_event(&mut conn, &ended, false).unwrap();
+
+        let events = db::list_domain_events(&mut conn).unwrap();
+        assert_eq!(events.len(), baseline + 2);
+        let started = &events[baseline];
+        let ended_ev = &events[baseline + 1];
+        assert_eq!(started.event_type, "agent_session.started");
+        assert_eq!(ended_ev.event_type, "agent_session.ended");
+        for e in [started, ended_ev] {
+            assert_eq!(e.workspace_id.as_deref(), Some(root.id.as_str()));
+            assert_eq!(e.project_id, project.id);
+            assert_eq!(e.aggregate, "agent_session");
+            assert_eq!(e.source, "system");
+            assert!(e.payload.contains(&session.id));
+            assert!(e.payload.contains("\"agent_kind\":\"claude_code\""));
+            assert!(e.payload.contains("ext-sess-1"));
+            // No transcript / terminal byte in the business bag.
+            assert!(!e.payload.to_lowercase().contains("transcript"));
+            assert!(!e.payload.contains("\\x1b"));
+        }
+
+        // Timeline surfaces both.
+        let tl = crate::workspace_timeline::timeline(&mut conn, &root.id, 50)
+            .unwrap()
+            .unwrap();
+        let kinds: Vec<&str> = tl.entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(kinds.contains(&"agent_session.started"));
+        assert!(kinds.contains(&"agent_session.ended"));
+    }
+
+    /// An UNATTACHED session (no workspace anchor) emits nothing — it cannot appear on any
+    /// workspace timeline, and must never block the hook.
+    #[test]
+    fn agent_session_without_workspace_emits_nothing() {
+        let mut conn = open_in_memory();
+        let term = db::create_terminal(&mut conn, &root_path("agent-loose"), None).unwrap();
+        let session = db::record_session_start(
+            &mut conn,
+            &term.id,
+            "claude_code",
+            db::SessionCapture {
+                workspace_id: None,
+                external_session_id: "ext-loose".to_string(),
+                cwd: root_path("agent-loose"),
+                transcript_path: None,
+                metadata_json: None,
+            },
+        )
+        .unwrap();
+        let baseline = db::list_domain_events(&mut conn).unwrap().len();
+        record_agent_session_event(&mut conn, &session, true).unwrap();
+        assert_eq!(db::list_domain_events(&mut conn).unwrap().len(), baseline);
     }
 }

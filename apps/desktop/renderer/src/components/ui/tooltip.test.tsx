@@ -35,4 +35,26 @@ describe("<Tooltip> (Base UI tooltip wrapper)", () => {
       expect(labels.length).toBeGreaterThan(0);
     });
   });
+
+  it("renders the arrow OUT OF FLOW so it never overlaps the first letter of the label", async () => {
+    render(
+      <Tooltip label="Stop" delay={0}>
+        <Button aria-label="Stop">■</Button>
+      </Tooltip>,
+    );
+    const trigger = screen.getByRole("button", { name: /^stop$/i });
+    fireEvent.pointerEnter(trigger);
+    fireEvent.mouseEnter(trigger);
+
+    // The arrow wraps the triangle svg; it must be absolutely positioned (out of the
+    // label's text flow) so the label starts at the popup padding edge — the fix for the
+    // arrow-on-first-letter bug (`Stop` → dot on the `S`).
+    const arrow = await waitFor(() => {
+      const svg = document.querySelector("svg[aria-hidden]");
+      const host = svg?.parentElement as HTMLElement | null;
+      expect(host).not.toBeNull();
+      return host!;
+    });
+    expect(arrow.className).toContain("absolute");
+  });
 });

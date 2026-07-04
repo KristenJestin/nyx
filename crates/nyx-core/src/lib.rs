@@ -68,6 +68,9 @@ pub mod schema;
 pub mod shellinteg;
 pub mod subfolder;
 pub mod usecase;
+pub mod workspace_git;
+pub mod workspace_runtime;
+pub mod workspace_timeline;
 
 /// ONE process-global lock for every test that mutates a `NYX_CLAUDE_*` env seam
 /// (`NYX_CLAUDE_CONFIG` / `NYX_CLAUDE_SETTINGS` / `NYX_CLAUDE_BIN` /

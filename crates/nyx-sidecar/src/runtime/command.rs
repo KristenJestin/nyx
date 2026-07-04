@@ -64,16 +64,34 @@ pub struct SidecarRunnerSink {
 impl RunnerSink for SidecarRunnerSink {
     fn on_state(&self, instance_id: &str, state: RunState, exit_code: Option<i32>) {
         // Persist the FACTUAL outcome BEFORE emitting (a listener re-reading the row on
-        // the event sees the committed value) — the SAME order + helper as the v1 sink.
+        // the event sees the committed value) — the SAME order as the v1 sink, but now
+        // through the shared `usecase::record_command_run_state`, which writes the run state
+        // AND its `command.started`/`command.stopped` `domain_events` row IN ONE transaction
+        // (the outbox pattern, correlated to the instance's workspace). This is what makes a
+        // start/stop appear on the workspace timeline (finding 01KWMCT58832JZW7M5GQDYZZ4B);
+        // the atomicity means the timeline row can never disagree with the run-state row.
         let db_state = state.as_db_str();
-        let _ = self
-            .db
-            .with_conn(|c| db::set_run_state(c, instance_id, db_state, exit_code));
+        let _ = self.db.with_conn(|c| {
+            nyx_core::usecase::record_command_run_state(c, instance_id, state, exit_code)
+        });
+        // Fine-grained per-instance transition (the existing command-band consumers patch
+        // the matching dot in place from this).
         self.events.emit(Event::CommandState {
             event: "state".to_string(),
             instance_id: instance_id.to_string(),
             state: db_state.to_string(),
             exit_code,
+        });
+        // COARSE collection invalidation (v2.2 cockpit real-time wiring, task
+        // 01KWHPV33F3Y2X4YDFPXPKJE9V): a RUNTIME start/stop/exit changes a workspace's
+        // aggregate `services[].run_state`, so nudge `commands://changed` too. This is the
+        // SAME "X changed → re-fetch" channel the template mutations already use, so the
+        // cockpit read model (which re-pulls on the coarse topics, no polling) reflects a
+        // runtime transition live — whether it was driven by the UI, an MCP tool, or the
+        // boot/lifecycle. `on_state` fires only on a real transition (not on output), so
+        // this is one invalidation per start/stop/exit, not per output chunk.
+        self.events.emit(Event::Changed {
+            topic: "commands".to_string(),
         });
     }
 
@@ -269,5 +287,190 @@ impl CommandRuntime {
     /// (its shell + child dev server) is REAPED, never orphaned.
     pub fn kill_all_running(&self) {
         self.runner.kill_all_running();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipe::codec::FrameDecoder;
+    use crate::pipe::wire::{decode_message, Message};
+    use std::sync::Mutex;
+
+    /// A fresh on-disk migrated `Db` under a unique temp dir (the sidecar cannot use
+    /// nyx-core's `#[cfg(test)]` `Db::in_memory`, which is not compiled into this crate).
+    fn temp_db() -> Db {
+        let dir = std::env::temp_dir().join(format!(
+            "nyx-runner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Db::open(&dir.join("nyx.db")).expect("open db")
+    }
+
+    /// A `Write` that appends to a shared buffer, so a test can read back exactly the
+    /// frames the sink pushed onto the pipe.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Decode every complete `Event` frame the shared buffer captured.
+    fn captured_events(buf: &Arc<Mutex<Vec<u8>>>) -> Vec<Event> {
+        let bytes = buf.lock().unwrap().clone();
+        let mut dec = FrameDecoder::new();
+        dec.push(&bytes);
+        let mut events = Vec::new();
+        while let Some(payload) = dec.next_frame().expect("decode frame") {
+            if let Ok(Message::Event(e)) = decode_message(&payload) {
+                events.push(e);
+            }
+        }
+        events
+    }
+
+    /// done_criterion (task 01KWHPV33F3Y2X4YDFPXPKJE9V — "Une mutation runtime d'un
+    /// workspace met à jour le cockpit en live, sans rechargement ni polling."): a managed
+    /// command RUNTIME transition (start/stop/exit) — surfaced by the runner as
+    /// `RunnerSink::on_state` — pushes the v2.0 UNSOLICITED coarse `commands://changed`
+    /// invalidation on the pipe, the SAME channel the cockpit read model re-pulls on. That
+    /// is the runtime-mutation half of the "domain_events → live" wiring: the aggregate's
+    /// `services[].run_state` changes, so the sink nudges `commands` and the cockpit reflects
+    /// it live. Proof: drive `on_state` for a real transition and assert the pushed frames.
+    #[test]
+    fn on_state_pushes_a_commands_changed_invalidation_on_a_runtime_transition() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let events = EventSink::new(Box::new(SharedBuf(buf.clone())));
+        let db = temp_db();
+
+        // A real instance to mutate (so the persist half is a genuine write, not a no-op).
+        // `create_project` yields the root workspace; adding a template materializes one
+        // instance per existing workspace — so the root workspace gets one instance.
+        let (project, root_ws) = db
+            .with_conn(|c| db::create_project(c, "Nyx", "/tmp/runner-p", None))
+            .unwrap();
+        db.with_conn(|c| {
+            db::create_template(
+                c,
+                &project.id,
+                "dev",
+                "npm run dev",
+                None,
+                db::CommandSource::default(),
+            )
+        })
+        .unwrap();
+        let instance_id = db
+            .with_conn(|c| db::instance_ids_for_workspace(c, &root_ws.id))
+            .unwrap()
+            .pop()
+            .expect("the template materialized one instance in the root workspace");
+
+        let sink = SidecarRunnerSink {
+            db: Arc::new(db),
+            events,
+        };
+
+        // A RUNTIME start transition: running, no exit code yet.
+        sink.on_state(&instance_id, RunState::Running, None);
+        // A RUNTIME exit transition: success with an exit code.
+        sink.on_state(&instance_id, RunState::Success, Some(0));
+
+        let pushed = captured_events(&buf);
+        // Each transition pushes BOTH the fine-grained per-instance `command-state` AND the
+        // coarse `commands://changed` collection invalidation the cockpit re-pulls on.
+        let changed = pushed
+            .iter()
+            .filter(|e| matches!(e, Event::Changed { topic } if topic == "commands"))
+            .count();
+        assert_eq!(
+            changed, 2,
+            "each of the two runtime transitions pushed exactly one `commands://changed`"
+        );
+        // And no OTHER coarse topic was invalidated (this seam is scoped to `commands`).
+        assert!(
+            pushed
+                .iter()
+                .all(|e| !matches!(e, Event::Changed { topic } if topic != "commands")),
+            "on_state only invalidates the `commands` collection"
+        );
+    }
+
+    /// Finding 01KWMCT58832JZW7M5GQDYZZ4B: a runtime start/stop of a managed command now
+    /// persists a `command.started`/`command.stopped` `domain_events` row — correlated to the
+    /// instance's workspace — through the production sink's `on_state`, IN the same transaction
+    /// as the `command_instances` run-state write (via `usecase::record_command_run_state`). So
+    /// the workspace timeline (which reads `domain_events` only) surfaces the runtime activity,
+    /// and no terminal byte is persisted in the payload.
+    #[test]
+    fn on_state_persists_command_lifecycle_domain_events_for_the_timeline() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let events = EventSink::new(Box::new(SharedBuf(buf.clone())));
+        let db = Arc::new(temp_db());
+
+        let (project, root_ws) = db
+            .with_conn(|c| db::create_project(c, "Nyx", "/tmp/runner-tl", None))
+            .unwrap();
+        db.with_conn(|c| {
+            db::create_template(
+                c,
+                &project.id,
+                "dev",
+                "npm run dev",
+                None,
+                db::CommandSource::default(),
+            )
+        })
+        .unwrap();
+        let instance_id = db
+            .with_conn(|c| db::instance_ids_for_workspace(c, &root_ws.id))
+            .unwrap()
+            .pop()
+            .expect("the template materialized one instance in the root workspace");
+
+        let sink = SidecarRunnerSink {
+            db: Arc::clone(&db),
+            events,
+        };
+        // START then STOP.
+        sink.on_state(&instance_id, RunState::Running, None);
+        sink.on_state(&instance_id, RunState::Idle, None);
+
+        // The outbox now carries the two runtime events, correlated to the workspace.
+        let tl = db
+            .with_conn(|c| nyx_core::workspace_timeline::timeline(c, &root_ws.id, 50))
+            .unwrap()
+            .unwrap();
+        let kinds: Vec<&str> = tl.entries.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            kinds.contains(&"command.started"),
+            "timeline surfaces command.started — got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"command.stopped"),
+            "timeline surfaces command.stopped — got {kinds:?}"
+        );
+        // No terminal byte in any runtime payload.
+        for e in &tl.entries {
+            assert!(!e.payload.contains("\\x1b"), "no terminal escape bytes");
+            assert!(!e.payload.to_lowercase().contains("scrollback"));
+        }
+        // The factual run-state write happened atomically with the event.
+        let inst = db
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(inst.last_state, "idle");
     }
 }

@@ -247,9 +247,26 @@ function nextActiveIndex(removedIdx: number, newLength: number): number | null {
  * `deadHistory` (see `TerminalDeck` → `<Terminal deadHistory>`), which reinjects
  * it as read-only dead history (+ a visual separator) while a fresh shell spawns
  * at the record's `cwd`. If no `alive` record exists, one default terminal is
- * created so the app always opens with a usable shell.
+ * created so the app always opens with a usable shell — UNLESS the caller opts out
+ * via `{ autoOpenDefault: false }` (the project→Terminals page borrows the CRUD
+ * surface only and must NOT spawn a phantom loose terminal just by being visited;
+ * its terminal set is driven by the runtime snapshot, not this hook's bootstrap).
  */
-export function useTerminals(): UseTerminals {
+export interface UseTerminalsOptions {
+  /**
+   * Whether to auto-open one default terminal when `list_terminals` finds none
+   * alive (default `true` — the single-deck shell always wants a usable shell on
+   * open). A consumer that only needs the CRUD verbs (create/attach/close) and
+   * renders its terminals from another source passes `false` to suppress the
+   * bootstrap create.
+   */
+  autoOpenDefault?: boolean;
+}
+
+export function useTerminals(options: UseTerminalsOptions = {}): UseTerminals {
+  const { autoOpenDefault = true } = options;
+  const autoOpenDefaultRef = useRef(autoOpenDefault);
+  autoOpenDefaultRef.current = autoOpenDefault;
   const [terminals, setTerminals] = useState<TerminalRecord[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -363,15 +380,17 @@ export function useTerminals(): UseTerminals {
             alive[0],
           );
           setActiveId(restored.id);
-        } else {
+        } else if (autoOpenDefaultRef.current) {
+          // No alive record → open a default shell so the deck is never empty. Skipped
+          // when the caller opted out (a CRUD-only consumer with its own terminal source).
           await create();
         }
       } catch {
         // `list_terminals` failed (transient IPC/DB error). The bootstrap guard
         // (`bootstrapped`) prevents a retry, so without a fallback the app would
         // stay permanently empty — open a default terminal instead so there is
-        // always a usable shell.
-        await create().catch(() => {});
+        // always a usable shell (unless the caller opted out of the bootstrap open).
+        if (autoOpenDefaultRef.current) await create().catch(() => {});
       } finally {
         setLoading(false);
       }

@@ -1,0 +1,370 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  RouterProvider,
+} from "@tanstack/react-router";
+import { bridgeFake, mockIPC } from "@/bridge/test-harness";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-projects";
+import { ActiveProjectProvider } from "./active-project";
+import { BaseLayout } from "./base-layout";
+
+function project(id: string, name: string): ProjectRecord {
+  return { id, name, collapsed: false, created_at: 0, updated_at: 0, resume_agent_sessions: false };
+}
+
+function root(id: string, projectId: string): WorkspaceRecord {
+  return {
+    id,
+    project_id: projectId,
+    name: "root",
+    path: `/${id}`,
+    branch: null,
+    is_root: true,
+    collapsed: false,
+    created_at: 0,
+    updated_at: 0,
+  };
+}
+
+/**
+ * A workspace hosting a live agent session BLOCKED ON THE USER (`waiting`) — the terminal is
+ * present in the workspace snapshot (with a live, non-ended agent session) and its runtime
+ * activity is `waiting`, served by the agent-activity read model. Used to prove the yellow
+ * `waiting` dot is reachable on the rail end-to-end.
+ */
+interface WaitingAgent {
+  workspaceId: string;
+  terminalId: string;
+}
+
+/**
+ * Serve `list_projects` / `list_workspaces` from a fixed set of projects, plus a
+ * `workspace_runtime_snapshot` per workspace so the rail's aggregated project dot resolves.
+ * `runStateByWorkspace` maps a workspace id → the run_state of a single managed-command
+ * service in that workspace's runtime (absent ⇒ an empty, idle runtime). `waitingAgent`
+ * (optional) additionally seeds a terminal hosting a live agent session whose runtime
+ * activity is `waiting`, served via `agent_active_sessions` + `agent_activity_snapshot`.
+ */
+function installBackend(
+  projects: ProjectRecord[],
+  runStateByWorkspace: Record<string, string> = {},
+  waitingAgent?: WaitingAgent,
+): void {
+  mockIPC((cmd, args) => {
+    const a = (args ?? {}) as Record<string, unknown>;
+    switch (cmd) {
+      case "list_projects":
+        return projects;
+      case "list_workspaces":
+        return [root(`ws-${a.projectId as string}`, a.projectId as string)];
+      case "workspace_runtime_snapshot": {
+        const wsId = a.workspaceId as string;
+        const run = runStateByWorkspace[wsId];
+        const hostsAgent = waitingAgent?.workspaceId === wsId;
+        return {
+          workspace: { id: wsId, name: "root", path: `/${wsId}` },
+          terminals: hostsAgent
+            ? [
+                {
+                  id: waitingAgent!.terminalId,
+                  cwd: `/${wsId}`,
+                  label: null,
+                  workspace_id: wsId,
+                  status: "alive",
+                  exec_state: "idle",
+                  exec_state_unread: false,
+                  // A LIVE (non-ended) agent session so `activeAgentSession` sees it.
+                  sessions: [
+                    {
+                      id: `sess-${waitingAgent!.terminalId}`,
+                      terminal_id: waitingAgent!.terminalId,
+                      workspace_id: wsId,
+                      agent_kind: "claude_code",
+                      external_session_id: "ext-1",
+                      state: "active",
+                    },
+                  ],
+                },
+              ]
+            : [],
+          agent_sessions: [],
+          services: run
+            ? [
+                {
+                  id: `svc-${wsId}`,
+                  workspace_id: wsId,
+                  name: "dev",
+                  command: "npm run dev",
+                  run_state: run,
+                  exit_code: null,
+                  unread: false,
+                },
+              ]
+            : [],
+        };
+      }
+      // The agent-activity read model (`useAgentSessions`): the session-icon map + the
+      // runtime activity map. Only populated when a waiting agent is seeded.
+      case "agent_active_sessions":
+        return waitingAgent
+          ? [{ terminal_id: waitingAgent.terminalId, agent_kind: "claude_code" }]
+          : [];
+      case "agent_activity_snapshot":
+        return waitingAgent
+          ? [{ terminal_id: waitingAgent.terminalId, activity: "waiting", ready_unread: false }]
+          : [];
+      default:
+        return undefined;
+    }
+  });
+}
+
+/**
+ * Mount `<BaseLayout>` inside a real router (memory history) with stub pages for the 3
+ * routes, so the section-nav `<Link>`s and the `<Outlet/>` behave exactly as in the app.
+ */
+function renderLayout(initialEntry = "/") {
+  const rootRoute = createRootRoute({
+    component: () => (
+      <ActiveProjectProvider>
+        <BaseLayout />
+      </ActiveProjectProvider>
+    ),
+  });
+  const mk = (path: string, text: string) =>
+    createRoute({ getParentRoute: () => rootRoute, path, component: () => <div>{text}</div> });
+  const routeTree = rootRoute.addChildren([
+    mk("/", "TERMINALS PAGE"),
+    mk("/work", "WORK PAGE"),
+    mk("/knowledge", "KNOWLEDGE PAGE"),
+  ]);
+  const router = createRouter({
+    routeTree,
+    history: createMemoryHistory({ initialEntries: [initialEntry] }),
+  });
+  return render(<RouterProvider router={router} />);
+}
+
+describe("BaseLayout", () => {
+  beforeEach(() => {
+    installBackend([project("p1", "Alpha"), project("p2", "Beta")]);
+  });
+
+  it("renders the project rail from list_projects with a Project label (never Workspace)", async () => {
+    renderLayout();
+    // Each project appears as a tile labelled "Project <name>" — never "Workspace".
+    expect(await screen.findByRole("button", { name: "Project Alpha" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Project Beta" })).toBeTruthy();
+    expect(screen.queryByTitle("Workspace")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add workspace" })).toBeNull();
+    // The add affordance is a PROJECT add, not a workspace add.
+    expect(screen.getByRole("button", { name: "Add project" })).toBeTruthy();
+  });
+
+  it("marks the first project active once the list loads", async () => {
+    renderLayout();
+    const alpha = await screen.findByRole("button", { name: "Project Alpha" });
+    await waitFor(() => expect(alpha.getAttribute("aria-current")).toBe("true"));
+    expect(screen.getByRole("button", { name: "Project Beta" }).getAttribute("aria-current")).toBe(
+      "false",
+    );
+  });
+
+  it("enters a project on click (moves the active indicator)", async () => {
+    renderLayout();
+    const beta = await screen.findByRole("button", { name: "Project Beta" });
+    fireEvent.click(beta);
+    await waitFor(() => expect(beta.getAttribute("aria-current")).toBe("true"));
+    expect(screen.getByRole("button", { name: "Project Alpha" }).getAttribute("aria-current")).toBe(
+      "false",
+    );
+  });
+
+  it("renders the section-nav (Terminals / Work / Knowledge) and the index page in the Outlet", async () => {
+    renderLayout("/");
+    expect(await screen.findByRole("link", { name: "Terminals" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Work" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Knowledge" })).toBeTruthy();
+    expect(screen.getByText("TERMINALS PAGE")).toBeTruthy();
+  });
+
+  it("navigates between at least two pages via the section-nav", async () => {
+    renderLayout("/");
+    expect(await screen.findByText("TERMINALS PAGE")).toBeTruthy();
+    fireEvent.click(screen.getByRole("link", { name: "Work" }));
+    expect(await screen.findByText("WORK PAGE")).toBeTruthy();
+  });
+});
+
+describe("BaseLayout — + Add project (rail)", () => {
+  it("picks a folder, confirms the create modal, and the new project appears in the rail", async () => {
+    // Serve the base projects + capture the create_project call; the folder picker returns a
+    // path so the create modal opens seeded with the folder basename.
+    const createCalls: Record<string, unknown>[] = [];
+    mockIPC((cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      switch (cmd) {
+        case "list_projects":
+          return [project("p1", "Alpha")];
+        case "list_workspaces":
+          return [root(`ws-${a.projectId as string}`, a.projectId as string)];
+        case "workspace_runtime_snapshot":
+          return {
+            workspace: { id: a.workspaceId as string, name: "root", path: "/x" },
+            terminals: [],
+            agent_sessions: [],
+            services: [],
+          };
+        case "create_project": {
+          createCalls.push(a);
+          const created = project("p-new", (a.name as string) ?? "new-app");
+          return { project: created, root: root("ws-p-new", "p-new") };
+        }
+        default:
+          return undefined;
+      }
+    });
+    // The native folder picker resolves to this absolute path (basename → default name).
+    bridgeFake().pickedDirectory = "/home/kris/new-app";
+
+    renderLayout();
+    const addBtn = await screen.findByRole("button", { name: "Add project" });
+    fireEvent.click(addBtn);
+
+    // The create modal opens with the folder basename pre-filled; confirm it.
+    const nameField = await screen.findByRole("textbox", { name: /project name/i });
+    await waitFor(() => expect((nameField as HTMLInputElement).value).toBe("new-app"));
+    const confirm = screen.getByRole("button", { name: "Add project" });
+    // (two "Add project" buttons now exist — the rail one and the modal confirm; grab the last)
+    const confirmBtns = screen.getAllByRole("button", { name: "Add project" });
+    fireEvent.click(confirmBtns[confirmBtns.length - 1] ?? confirm);
+
+    // The backend create ran with the picked path, and the new project shows on the rail.
+    await waitFor(() => expect(createCalls.length).toBe(1));
+    expect(createCalls[0]!.rootPath).toBe("/home/kris/new-app");
+    expect(await screen.findByRole("button", { name: "Project new-app" })).toBeTruthy();
+  });
+
+  it("does nothing when the folder picker is cancelled (no modal, no create)", async () => {
+    const createCalls: unknown[] = [];
+    mockIPC((cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      switch (cmd) {
+        case "list_projects":
+          return [project("p1", "Alpha")];
+        case "list_workspaces":
+          return [root(`ws-${a.projectId as string}`, a.projectId as string)];
+        case "workspace_runtime_snapshot":
+          return {
+            workspace: { id: a.workspaceId as string, name: "root", path: "/x" },
+            terminals: [],
+            agent_sessions: [],
+            services: [],
+          };
+        case "create_project":
+          createCalls.push(a);
+          return undefined;
+        default:
+          return undefined;
+      }
+    });
+    bridgeFake().pickedDirectory = null; // cancelled
+
+    renderLayout();
+    const addBtn = await screen.findByRole("button", { name: "Add project" });
+    fireEvent.click(addBtn);
+    // A cancelled pick opens no modal → the name field never appears, no create fires.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByRole("textbox", { name: /project name/i })).toBeNull();
+    expect(createCalls.length).toBe(0);
+    vi.clearAllMocks();
+  });
+});
+
+describe("BaseLayout — aggregated project dot on the rail", () => {
+  it("shows an aggregated run-state dot on a non-entered project with live runtime", async () => {
+    // Beta (the non-entered tile — Alpha is auto-entered) has a running service in its
+    // workspace, so its rail tile carries a significant aggregated dot.
+    installBackend([project("p1", "Alpha"), project("p2", "Beta")], { "ws-p2": "running" });
+    renderLayout();
+    const beta = await screen.findByRole("button", { name: "Project Beta" });
+    const tile = beta.closest("li");
+    expect(tile).not.toBeNull();
+    await waitFor(() => {
+      expect(tile!.querySelector("[data-state]")?.getAttribute("data-state")).toBe("running");
+    });
+  });
+
+  it("renders NO dot on a non-entered project whose runtime is idle/empty", async () => {
+    // Beta has no running services → its aggregated state is idle → the shared quiet-state
+    // rule hides the dot (no `[data-state]` in the tile).
+    installBackend([project("p1", "Alpha"), project("p2", "Beta")]);
+    renderLayout();
+    const beta = await screen.findByRole("button", { name: "Project Beta" });
+    const tile = beta.closest("li");
+    expect(tile).not.toBeNull();
+    // Give the runtime hook a chance to resolve, then assert the dot stayed hidden.
+    await waitFor(() => expect(beta.getAttribute("aria-current")).toBe("false"));
+    expect(tile!.querySelector("[data-state]")).toBeNull();
+  });
+
+  it("MASKS the aggregated dot on the ACTIVE/entered project (detail already on screen)", async () => {
+    // Alpha is auto-entered (active) and HAS a running service — but because the user is
+    // INSIDE it (its workspaces + rows are on screen), the summary dot is masked on the active
+    // tile (finding: the dot only summarises the OTHER projects). Beta, non-active with a
+    // running service, still shows its dot — proving the mask is scoped to the active tile.
+    installBackend([project("p1", "Alpha"), project("p2", "Beta")], {
+      "ws-p1": "running",
+      "ws-p2": "running",
+    });
+    renderLayout();
+    const alpha = await screen.findByRole("button", { name: "Project Alpha" });
+    await waitFor(() => expect(alpha.getAttribute("aria-current")).toBe("true"));
+    const beta = screen.getByRole("button", { name: "Project Beta" });
+    // The non-active Beta tile shows its dot once the runtime resolves…
+    await waitFor(() => {
+      expect(beta.closest("li")!.querySelector("[data-state]")).not.toBeNull();
+    });
+    // …while the active Alpha tile masks its own (no dot despite a running service).
+    expect(alpha.closest("li")!.querySelector("[data-state]")).toBeNull();
+  });
+
+  it("surfaces a YELLOW (waiting) dot on the rail when a project hosts an agent blocked on the user", async () => {
+    // Beta hosts a terminal whose agent is `waiting` (blocked on the user), with NO other
+    // runnable state. The rail dot must roll up to `waiting` — the yellow "needs you" dot,
+    // reachable ONLY because the agent-activity axis is folded into the rollup.
+    installBackend([project("p1", "Alpha"), project("p2", "Beta")], undefined, {
+      workspaceId: "ws-p2",
+      terminalId: "t-agent",
+    });
+    renderLayout();
+    const beta = await screen.findByRole("button", { name: "Project Beta" });
+    const tile = beta.closest("li");
+    expect(tile).not.toBeNull();
+    await waitFor(() => {
+      expect(tile!.querySelector("[data-state]")?.getAttribute("data-state")).toBe("waiting");
+    });
+  });
+
+  it("pins the aggregated dot to the BOTTOM-RIGHT corner of the tile (badge placement)", async () => {
+    installBackend([project("p1", "Alpha"), project("p2", "Beta")], { "ws-p2": "running" });
+    renderLayout();
+    const beta = await screen.findByRole("button", { name: "Project Beta" });
+    const tile = beta.closest("li");
+    expect(tile).not.toBeNull();
+    await waitFor(() => expect(tile!.querySelector("[data-state]")).not.toBeNull());
+    // The dot's badge wrapper is absolutely pinned to the tile's bottom-right corner.
+    const dot = tile!.querySelector("[data-state]")!;
+    const badge = dot.closest("span.absolute");
+    expect(badge).not.toBeNull();
+    const cls = badge!.className;
+    expect(cls).toContain("absolute");
+    expect(cls).toContain("-right-0.5");
+    expect(cls).toContain("-bottom-0.5");
+  });
+});

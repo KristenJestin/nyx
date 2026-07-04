@@ -222,7 +222,6 @@ pub fn register_project(
 /// [`db::list_repositories`]) minus the `optional` ones (the in-DB "nyxignore").
 /// The path is COMPUTED per workspace, never stored — so the same logical repo lands
 /// at the right place in the primary workspace and in every worktree.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn workspace_members(
     conn: &mut SqliteConnection,
     workspace: &Workspace,
@@ -260,7 +259,6 @@ fn join_relative(root_path: &str, relative_path: &str) -> String {
 /// Git state, so a read is always fresh and can never diverge from the DB because the
 /// DB does not store it). A non-git path (or any git error) degrades to the default:
 /// `branch = None`, `dirty = false`, `remotes = []`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_git_state(path: &str) -> GitState {
     GitState {
         branch: db::detect_branch(path),
@@ -281,6 +279,63 @@ fn read_dirty(path: &str) -> bool {
         _ => return false,
     };
     !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
+/// One changed path in a work tree, as re-read from `git status --porcelain` — the
+/// SUMMARY view (PDR-0013), NOT a line-level diff (that engine is v2.3). `status` is
+/// the two-character porcelain XY code (e.g. ` M`, `??`, `A `, `R `); `path` is the
+/// changed path (the destination for a rename). Transient — NEVER persisted.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChangedFile {
+    /// The porcelain XY status code (two chars, e.g. ` M`, `??`, `MM`, `R `).
+    pub status: String,
+    /// The changed path (for a rename `R  old -> new`, this is the NEW path).
+    pub path: String,
+}
+
+/// The changed files of the work tree at `path`, re-read LIVE from `git status
+/// --porcelain -z` (SUMMARY only — file list + status code, NOT a line-level diff,
+/// which is v2.3). NOTHING is persisted (PDR-0013): the DB is not authoritative for
+/// Git state, so this read is always fresh and cannot diverge from a DB that does not
+/// store it. A non-git path / git error yields an empty vec. Paths are returned in
+/// Git's own order (sorted-ish by path); a rename entry keeps only its destination
+/// path (the summary's "what changed"), matching the `dirty` flag's granularity.
+///
+/// The `-z` form is used so a path with spaces or unusual characters is delimited by
+/// NUL (never quoted/escaped), making the parse unambiguous. Each record is
+/// `XY<space>PATH`; a rename/copy record (`R`/`C`) is followed by a SECOND NUL-delimited
+/// field (the origin path) which we skip — the destination is the changed path.
+pub fn read_changed_files(path: &str) -> Vec<ChangedFile> {
+    let output = match crate::proc_util::command("git")
+        .args(["-C", path, "status", "--porcelain", "-z"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut records = stdout.split('\0');
+    let mut changed = Vec::new();
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        // A porcelain record is `XY PATH` (X,Y then a space then the path). Guard a
+        // malformed short record defensively.
+        if record.len() < 3 {
+            continue;
+        }
+        let status = record[..2].to_string();
+        let file = record[3..].to_string();
+        // A rename (`R`) or copy (`C`) record is followed by a SECOND NUL-delimited
+        // field carrying the ORIGIN path; consume it so it is not parsed as a record.
+        let x = status.as_bytes()[0];
+        if x == b'R' || x == b'C' {
+            let _origin = records.next();
+        }
+        changed.push(ChangedFile { status, path: file });
+    }
+    changed
 }
 
 /// The configured remotes of the work tree at `path` (`git remote`), sorted and

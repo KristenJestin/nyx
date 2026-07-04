@@ -35,14 +35,23 @@ export function Tooltip({ label, children, delay = 350, side = "right" }: Toolti
         <BaseTooltip.Positioner side={side} sideOffset={6}>
           <BaseTooltip.Popup
             className={cn(
-              "z-50 max-w-56 rounded-md border border-border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md outline-none select-none",
+              // `relative` makes the popup the positioning context for the absolutely-
+              // positioned arrow below (so the arrow's Floating UI offsets anchor to the
+              // popup edge, not the viewport).
+              "relative z-50 max-w-56 rounded-md border border-border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md outline-none select-none",
               // Quick fade keyed on Base UI's open/closed transition hooks.
               "transition-opacity duration-150 ease-out",
               "data-[starting-style]:opacity-0 data-[ending-style]:opacity-0",
               "motion-reduce:transition-none",
             )}
           >
-            <BaseTooltip.Arrow className="text-popover">
+            {/* The arrow is taken OUT OF FLOW (`absolute`): Base UI's `TooltipArrow`
+                applies the Floating UI offset (`left`/`top`) via its own inline styles,
+                but only positions correctly when it is absolutely positioned — otherwise
+                it renders as the popup's FIRST in-flow child and its triangle sits on top
+                of the label's first letter (the bug: `Stop` → dot on the `S`). `absolute`
+                lifts it off the text flow so the label starts at the popup's padding edge. */}
+            <BaseTooltip.Arrow className="absolute text-popover">
               <svg width="10" height="5" viewBox="0 0 10 5" aria-hidden>
                 <path d="M0 0 L5 5 L10 0 Z" fill="currentColor" />
               </svg>

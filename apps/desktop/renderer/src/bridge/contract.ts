@@ -302,6 +302,35 @@ export type BackendCommand =
   | "rename_workspace"
   | "workspace_delete"
   | "set_workspace_collapsed"
+  // v2.2 runtime read model: a workspace's LIVE runtime aggregate (terminals + their
+  // agent sessions, cross-terminal agent sessions, and managed-command services with
+  // run state). Read-only; re-pulled (no polling) on any of the coarse invalidation
+  // topics `commands://changed`, `agent-sessions://changed`, `terminals://changed`,
+  // `workspaces://changed`, plus the fine `terminal://exec-state` event — see
+  // `RUNTIME_CHANGED_EVENTS` in `components/terminals/use-runtime-live.ts` for the
+  // source of truth (consumed by the project→workspaces Terminals page). `{ workspaceId }`.
+  | "workspace_runtime_snapshot"
+  // v2.2 FREE-WORK entry point (task 01KWHPV33H0FX8NA4C94T5W46J): the runtime aggregate of a
+  // project's PRIMARY workspace — the default "travail libre" cockpit when a project is opened
+  // WITHOUT a Spec. Same shape + same shared read model as `workspace_runtime_snapshot`, keyed
+  // on the project (resolves `primary_workspace_id`, root fallback). `{ projectId }`.
+  | "workspace_runtime_primary"
+  // v2.2 workspace CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a restart,
+  // WHAT a workspace offers to resume — computed by REUSING the existing resume policies (no
+  // 3rd system): per-session `decide_resume` verdicts (`resume_sessions`), the
+  // `restart_on_startup` services, and the crash-`interrupted` instances. The USER chooses
+  // what to resume; nyx never blind-resumes. Read-only, idempotent. `{ workspaceId }`.
+  | "workspace_restore_plan"
+  // v2.2 Git CHANGES read model: per non-optional repo of a workspace, its branch/dirty/
+  // changed-files SUMMARY, re-read from Git (never authoritative in the DB — PDR-0013).
+  // Read-only, on demand (no real-time refresh — Q-015, v2.3). `{ workspaceId }`.
+  | "workspace_git_summary"
+  // v2.2 workspace TIMELINE read model (task 01KWHPV33SAV9NV1STSY403CF0): a BOUNDED, oldest-
+  // first fil of a workspace's most recent `domain_events` (v2.1) — the business "changements
+  // notables" (workspace/repository/project lifecycle), NEVER a terminal byte. Read-only; re-
+  // pulled (no polling) on `workspaces://changed` (the topic identity mutations invalidate).
+  // NOT the full contextual activity timeline (v2.5). `{ workspaceId, limit? }`.
+  | "workspace_timeline"
   // managed commands
   | "command_list"
   | "command_create"

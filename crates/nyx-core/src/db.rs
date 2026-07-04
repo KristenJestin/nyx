@@ -448,6 +448,39 @@ pub fn list_domain_events(conn: &mut SqliteConnection) -> QueryResult<Vec<Domain
         .load(conn)
 }
 
+/// List the MOST RECENT `domain_events` correlated to a workspace, newest first, capped at
+/// `limit` rows — the BOUNDED slice the v2.2 cockpit timeline reads (task
+/// `01KWHPV33SAV9NV1STSY403CF0`). "Correlated to the workspace" is the union of:
+///   * the workspace-scoped events (`workspace_id = workspace_id`), and
+///   * the events of the workspace's PROJECT that carry no single workspace
+///     (`workspace_id IS NULL AND project_id = project_id`) — the project / repository
+///     "changements notables" that still belong to this workspace's context.
+///
+/// The result is ORDERED newest-first (`sequence` desc, the monotonic global order) and
+/// LIMITED to `limit`, so the timeline is bounded by construction — it never loads the whole
+/// unbounded log. The caller re-orders to oldest-first for display if it wants a chronology.
+/// This reads ONLY the small, business `domain_events` rows (each payload is a tiny JSON bag,
+/// never a terminal byte stream — see the v12 migration), so no terminal output can leak here.
+pub fn recent_domain_events_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+    project_id: &str,
+    limit: i64,
+) -> QueryResult<Vec<DomainEvent>> {
+    domain_events::table
+        .filter(
+            domain_events::workspace_id
+                .eq(Some(workspace_id))
+                .or(domain_events::workspace_id
+                    .is_null()
+                    .and(domain_events::project_id.eq(project_id))),
+        )
+        .order(domain_events::sequence.desc())
+        .limit(limit)
+        .select(DomainEvent::as_select())
+        .load(conn)
+}
+
 // --- Managed command / instance models (PRD-3 v3) ------------------------
 
 /// A `managed_commands` row: a per-project command TEMPLATE. `Serialize` for the
@@ -2976,6 +3009,23 @@ pub fn sessions_for_terminal(
         .load(conn)
 }
 
+/// All sessions ANCHORED to `workspace_id` (every state), across ALL their host
+/// terminals — the read counterpart of [`delete_agent_sessions_for_workspace`]. Used
+/// by the v2.2 workspace-runtime read model to surface the cross-terminal "Agents"
+/// view of a workspace, INCLUDING a session anchored to the workspace on a loose
+/// (unattached) host terminal. Oldest started first (`id` tiebreak).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sessions_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<Vec<AgentSession>> {
+    agent_sessions::table
+        .filter(agent_sessions::workspace_id.eq(workspace_id))
+        .order((agent_sessions::started_at.asc(), agent_sessions::id.asc()))
+        .select(AgentSession::as_select())
+        .load(conn)
+}
+
 /// Read back a single session by id.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn get_session(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<AgentSession>> {
@@ -3143,6 +3193,48 @@ pub fn resume_candidates_on_boot(conn: &mut SqliteConnection) -> QueryResult<Vec
         .load::<ResumeCandidate>(conn)
 }
 
+/// Gather the resume CANDIDATES anchored to ONE workspace (v2.2 task
+/// `01KWHPV33M4H5YSMGYNW9TG6J0`, workspace-scoped context restore): the SAME candidate shape
+/// and gates as [`resume_candidates_on_boot`] — every `active`/`unknown` session on an `alive`
+/// terminal, joined to the project's `resume_agent_sessions` flag — but FILTERED to sessions
+/// whose `workspace_id` is `workspace_id`. This is the per-workspace slice the cockpit reads
+/// to offer "resume these sessions" after a restart; it REUSES the existing resume policy
+/// (`crate::agent_resume::decide_resume`) unchanged — no new policy. Newest started last.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn resume_candidates_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<Vec<ResumeCandidate>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::Bool;
+    agent_sessions::table
+        .inner_join(terminals::table.on(terminals::id.eq(agent_sessions::terminal_id)))
+        .left_join(workspaces::table.on(workspaces::id.nullable().eq(agent_sessions::workspace_id)))
+        .left_join(
+            projects::table.on(projects::id
+                .nullable()
+                .eq(workspaces::project_id.nullable())),
+        )
+        .filter(terminals::status.eq(STATUS_ALIVE))
+        .filter(agent_sessions::workspace_id.eq(workspace_id))
+        .filter(
+            agent_sessions::state
+                .eq(SESSION_STATE_ACTIVE)
+                .or(agent_sessions::state.eq(SESSION_STATE_UNKNOWN)),
+        )
+        .order((agent_sessions::started_at.asc(), agent_sessions::id.asc()))
+        .select((
+            agent_sessions::terminal_id,
+            agent_sessions::id,
+            agent_sessions::agent_kind,
+            agent_sessions::external_session_id,
+            agent_sessions::state,
+            agent_sessions::transcript_path,
+            sql::<Bool>("COALESCE(projects.resume_agent_sessions, 0)"),
+        ))
+        .load::<ResumeCandidate>(conn)
+}
+
 /// One CLOSE-WARNING candidate (PRD-5 #6): an alive terminal hosting a LIVE
 /// (`active`/`unknown`) agent session, joined with its project's resume flag (loose
 /// terminal → `false`) and the fields the warning message needs (agent kind, terminal
@@ -3213,7 +3305,8 @@ pub fn close_warning_candidates(conn: &mut SqliteConnection) -> QueryResult<Vec<
     // `started_at asc, id asc` order, so a later insert into the map overwrites an older
     // one). Preserve first-seen terminal order for deterministic output.
     let mut order: Vec<String> = Vec::new();
-    let mut latest: std::collections::HashMap<String, CloseWarning> = std::collections::HashMap::new();
+    let mut latest: std::collections::HashMap<String, CloseWarning> =
+        std::collections::HashMap::new();
     for row in rows {
         if !latest.contains_key(&row.terminal_id) {
             order.push(row.terminal_id.clone());
@@ -3487,6 +3580,58 @@ mod tests {
         assert_eq!(all[1].sequence, b.sequence);
         assert_eq!(all[0].event_type, "workspace.created");
         assert_eq!(all[1].source, "mcp");
+    }
+
+    /// `recent_domain_events_for_workspace` (the v2.2 timeline query, task
+    /// `01KWHPV33SAV9NV1STSY403CF0`) returns the workspace-scoped events PLUS its project's
+    /// workspace-less events, newest-first, capped at `limit`. A row of ANOTHER project (even
+    /// workspace-less) is excluded, and a row of ANOTHER workspace in the SAME project is
+    /// excluded. The cap keeps the RECENT tail.
+    #[test]
+    fn recent_domain_events_for_workspace_scopes_and_bounds() {
+        let mut conn = open_in_memory();
+        let ev = |project: &str, workspace: Option<&str>, ty: &str| NewDomainEvent {
+            project_id: project.into(),
+            workspace_id: workspace.map(str::to_string),
+            aggregate: "workspace".into(),
+            event_type: ty.into(),
+            source: "ui".into(),
+            actor: None,
+            payload: "{\"identity_id\":\"x\"}".into(),
+            created_at: 0,
+        };
+        // p1: a project-scoped event, a w1-scoped event, a w2-scoped event.
+        record_domain_event(&mut conn, ev("p1", None, "project.created")).unwrap();
+        record_domain_event(&mut conn, ev("p1", Some("w1"), "workspace.created")).unwrap();
+        record_domain_event(&mut conn, ev("p1", Some("w2"), "workspace.created")).unwrap();
+        // p2: a project-scoped event of a DIFFERENT project (must not leak into w1's timeline).
+        record_domain_event(&mut conn, ev("p2", None, "project.archived")).unwrap();
+        // p1: a second w1-scoped event (the newest of w1's own events).
+        record_domain_event(&mut conn, ev("p1", Some("w1"), "workspace.renamed")).unwrap();
+
+        // The full (uncapped) correlated set for w1 of p1: its two workspace events + the ONE
+        // p1 project-scoped event = 3 rows; p2's project event and w2's event are excluded.
+        let got = recent_domain_events_for_workspace(&mut conn, "w1", "p1", 100).unwrap();
+        assert_eq!(
+            got.len(),
+            3,
+            "w1 events + p1 project-scoped event; no p2, no w2"
+        );
+        assert!(got.iter().all(|e| e.project_id == "p1"));
+        assert!(got.iter().all(|e| e.workspace_id.as_deref() != Some("w2")));
+        // Newest-first ordering.
+        assert!(
+            got.windows(2).all(|w| w[0].sequence > w[1].sequence),
+            "newest-first"
+        );
+
+        // Bounded: cap at 2 keeps the two NEWEST correlated rows.
+        let capped = recent_domain_events_for_workspace(&mut conn, "w1", "p1", 2).unwrap();
+        assert_eq!(capped.len(), 2, "bounded to the cap");
+        assert_eq!(
+            capped[0].event_type, "workspace.renamed",
+            "the newest correlated event is retained"
+        );
     }
 
     /// The `status` CHECK constraint rejects anything but alive|closed — proves
@@ -4019,9 +4164,18 @@ mod tests {
         );
 
         // The stored order_index values are 0,1,2 in the new sequence.
-        assert_eq!(get_project(&mut conn, &c.id).unwrap().unwrap().order_index, 0);
-        assert_eq!(get_project(&mut conn, &a.id).unwrap().unwrap().order_index, 1);
-        assert_eq!(get_project(&mut conn, &b.id).unwrap().unwrap().order_index, 2);
+        assert_eq!(
+            get_project(&mut conn, &c.id).unwrap().unwrap().order_index,
+            0
+        );
+        assert_eq!(
+            get_project(&mut conn, &a.id).unwrap().unwrap().order_index,
+            1
+        );
+        assert_eq!(
+            get_project(&mut conn, &b.id).unwrap().unwrap().order_index,
+            2
+        );
     }
 
     /// `rename` persists the label and clears it on `None` (criterion 3b).
@@ -4063,8 +4217,8 @@ mod tests {
         // A real `cd` clock would always be later; sleep so the bump is observable
         // even on a fast clock (mirrors set_active's timing assertion).
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let rows = set_terminal_cwd(&mut conn, &t.id, "/work/sandbox/sandbox-tests")
-            .expect("set cwd");
+        let rows =
+            set_terminal_cwd(&mut conn, &t.id, "/work/sandbox/sandbox-tests").expect("set cwd");
         assert_eq!(rows, 1, "the existing terminal row is updated");
 
         let after = get_terminal(&mut conn, &t.id).unwrap().unwrap();
@@ -8421,21 +8575,26 @@ mod tests {
 
         // A live session on t2 (other terminal) and a live Codex session on t1 (other
         // agent) — both must survive a new Claude session on t1.
-        let other_term = record_session_start(&mut conn, &t2.id, AGENT_KIND_CLAUDE_CODE, capture("t2"))
-            .unwrap();
-        let other_agent = record_session_start(&mut conn, &t1.id, AGENT_KIND_CODEX, capture("codex"))
-            .unwrap();
+        let other_term =
+            record_session_start(&mut conn, &t2.id, AGENT_KIND_CLAUDE_CODE, capture("t2")).unwrap();
+        let other_agent =
+            record_session_start(&mut conn, &t1.id, AGENT_KIND_CODEX, capture("codex")).unwrap();
 
-        record_session_start(&mut conn, &t1.id, AGENT_KIND_CLAUDE_CODE, capture("claude"))
-            .unwrap();
+        record_session_start(&mut conn, &t1.id, AGENT_KIND_CLAUDE_CODE, capture("claude")).unwrap();
 
         assert_eq!(
-            get_session(&mut conn, &other_term.id).unwrap().unwrap().state,
+            get_session(&mut conn, &other_term.id)
+                .unwrap()
+                .unwrap()
+                .state,
             SESSION_STATE_ACTIVE,
             "a session on another terminal is untouched"
         );
         assert_eq!(
-            get_session(&mut conn, &other_agent.id).unwrap().unwrap().state,
+            get_session(&mut conn, &other_agent.id)
+                .unwrap()
+                .unwrap()
+                .state,
             SESSION_STATE_ACTIVE,
             "a session of another agent on the same terminal is untouched"
         );
@@ -8449,12 +8608,12 @@ mod tests {
         let t1 = create_terminal(&mut conn, "/w1", None).unwrap();
         let t2 = create_terminal(&mut conn, "/w2", None).unwrap();
         let t3 = create_terminal(&mut conn, "/w3", None).unwrap();
-        let s1 = record_session_start(&mut conn, &t1.id, AGENT_KIND_CLAUDE_CODE, capture("s1"))
-            .unwrap();
-        let s2 = record_session_start(&mut conn, &t2.id, AGENT_KIND_CLAUDE_CODE, capture("s2"))
-            .unwrap();
-        let s3 = record_session_start(&mut conn, &t3.id, AGENT_KIND_CLAUDE_CODE, capture("s3"))
-            .unwrap();
+        let s1 =
+            record_session_start(&mut conn, &t1.id, AGENT_KIND_CLAUDE_CODE, capture("s1")).unwrap();
+        let s2 =
+            record_session_start(&mut conn, &t2.id, AGENT_KIND_CLAUDE_CODE, capture("s2")).unwrap();
+        let s3 =
+            record_session_start(&mut conn, &t3.id, AGENT_KIND_CLAUDE_CODE, capture("s3")).unwrap();
 
         // Empty slice → no-op.
         assert_eq!(mark_sessions_ended(&mut conn, &[]).unwrap(), 0);

@@ -185,6 +185,32 @@ pub const AGENT_SESSION_EVENT_TOOL: &str = "agent_session_event";
 /// project (that stays a UI gesture, per [`SERVER_INSTRUCTIONS`]).
 pub const SET_PROJECT_SETTINGS_TOOL: &str = "set_project_settings";
 
+/// The v2.2 cockpit read model tool (task `01KWHPV32YVCRBNY1JW5CDY4AY`): `{ workspace_id }`
+/// → the workspace's LIVE runtime aggregate (terminals + their agent sessions, the
+/// cross-terminal agent sessions, and the managed-command SERVICES with current run
+/// state). Read-only, no polling. Advertised in `tools/list`, kept OUT of [`V1_TOOLS`]
+/// (same pattern as the other extension tools — it layers a new read over the existing
+/// DB + runner authorities). Routes through the SHARED `workspace_runtime::snapshot`,
+/// the SAME read model the UI cockpit consumes (PDR-0005).
+pub const WORKSPACE_RUNTIME_TOOL: &str = "workspace_runtime";
+
+/// The v2.2 Git CHANGES read model tool (task `01KWHPV33EGTB3Z41J0RQR1BAK`, PDR-0013):
+/// `{ workspace_id }` → per non-optional repository, the current branch, dirty flag, and
+/// changed-file SUMMARY, RE-READ from Git and NEVER authoritative in the DB. NOT a
+/// line-level diff (the review engine is v2.3). Advertised in `tools/list`, kept OUT of
+/// [`V1_TOOLS`] (same pattern as the other extension tools). Routes through the SHARED
+/// `workspace_git::summary`, the SAME read model the UI cockpit consumes (PDR-0005).
+pub const WORKSPACE_GIT_TOOL: &str = "workspace_git";
+
+/// The v2.2 workspace TIMELINE read model tool (task `01KWHPV33SAV9NV1STSY403CF0`):
+/// `{ workspace_id, limit? }` → the workspace's most recent `domain_events` (v2.1) as a
+/// BOUNDED, oldest-first activity fil — the business "changements notables" (workspace /
+/// repository / project lifecycle), NEVER a terminal byte (the outbox carries none). NOT the
+/// full contextual activity timeline (v2.5). Advertised in `tools/list`, kept OUT of
+/// [`V1_TOOLS`] (same pattern as the other extension tools). Routes through the SHARED
+/// `workspace_timeline::timeline`, the SAME read model the UI cockpit consumes (PDR-0005).
+pub const WORKSPACE_TIMELINE_TOOL: &str = "workspace_timeline";
+
 /// The frozen MCP v1 tool surface (ADR-0003). Phase-1 advertises these names in
 /// the `tools/list` handshake; the call bodies are wired in phase 2 over the PRD-3
 /// runtime/DB layer (D6). Order is the ADR's listing order.
@@ -1282,6 +1308,60 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["hook_event_name", "session_id"],
         },
     }));
+    // Append the v2.2 cockpit read model tool: a workspace's LIVE runtime aggregate.
+    // Advertised alongside the v1 surface, kept OUT of V1_TOOLS (a new read over the
+    // existing authorities, not part of the frozen contract).
+    descriptors.push(json!({
+        "name": WORKSPACE_RUNTIME_TOOL,
+        "description": "Get a workspace's LIVE runtime at a glance: its interactive terminals \
+                        (with the agent sessions running on them), the agent sessions anchored \
+                        to the workspace across all its terminals, and its managed-command \
+                        services with each one's current run state (idle/running/success/error) \
+                        and last exit code. Use it to see everything happening in a workspace \
+                        in one call. Pass the `workspace_id` (from list_workspaces). Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace whose live runtime to aggregate (from list_workspaces(project_id=…))"),
+            },
+            "required": ["workspace_id"],
+        },
+    }));
+    // Append the v2.2 Git CHANGES read model tool: what changed in a workspace, per repo.
+    descriptors.push(json!({
+        "name": WORKSPACE_GIT_TOOL,
+        "description": "See what changed in a workspace, read live from Git: for each of the \
+                        workspace's repositories, its current branch, whether the work tree has \
+                        uncommitted changes, and the list of changed files (with their Git status \
+                        codes). This is a SUMMARY — file names and status, not a line-by-line \
+                        diff. Pass the `workspace_id` (from list_workspaces). Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace whose Git changes to summarize (from list_workspaces(project_id=…))"),
+            },
+            "required": ["workspace_id"],
+        },
+    }));
+    // Append the v2.2 workspace TIMELINE read model tool: the bounded activity fil of a
+    // workspace's recent business events (from the v2.1 domain_events outbox).
+    descriptors.push(json!({
+        "name": WORKSPACE_TIMELINE_TOOL,
+        "description": "See a workspace's recent activity as a BOUNDED, chronological timeline: \
+                        the business events recorded for it (its own and its project's/repos' \
+                        lifecycle — created, renamed, archived, primary-set, …), oldest first. \
+                        This is a short, capped fil of notable changes — NOT a full activity log \
+                        and NEVER terminal output. Pass the `workspace_id` (from list_workspaces) \
+                        and an optional `limit`. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace whose recent activity timeline to read (from list_workspaces(project_id=…))"),
+                "limit": int_prop("max number of most-recent events to return (bounded; defaults to a small ceiling when omitted or 0)"),
+            },
+            "required": ["workspace_id"],
+        },
+    }));
     descriptors
 }
 
@@ -1345,7 +1425,49 @@ mod tests {
         stream.read_to_string(&mut raw).unwrap();
         let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
         let status_line = head.lines().next().unwrap_or("").to_string();
-        (status_line, body.to_string())
+        // tiny_http streams a large response with `Transfer-Encoding: chunked` (no
+        // Content-Length) once the body exceeds its buffering threshold — which the full
+        // `tools/list` catalog now does. De-chunk here so this hand-rolled client returns
+        // the raw JSON body regardless of the framing (a Content-Length body has no
+        // chunk header and is returned verbatim).
+        let is_chunked = head.lines().any(|l| {
+            let l = l.to_ascii_lowercase();
+            l.starts_with("transfer-encoding:") && l.contains("chunked")
+        });
+        let body = if is_chunked {
+            dechunk(body)
+        } else {
+            body.to_string()
+        };
+        (status_line, body)
+    }
+
+    /// Decode an HTTP/1.1 `Transfer-Encoding: chunked` body into its payload: repeatedly
+    /// read a hex chunk-size line, then that many bytes, until the terminating `0` chunk.
+    /// A tiny decoder (the test bodies are small JSON) so the test HTTP client needs no
+    /// HTTP crate.
+    fn dechunk(mut s: &str) -> String {
+        let mut out = String::new();
+        // The loop ends the moment the remaining input no longer starts with a
+        // `size-line CRLF` header — the same exit the previous `let-else break`
+        // expressed — while the inner `break`s (terminating `0` chunk, truncated
+        // body) still short-circuit before the next iteration.
+        while let Some((size_line, rest)) = s.split_once("\r\n") {
+            // The chunk-size line may carry `;ext` extensions — take the hex prefix only.
+            let hex = size_line.split(';').next().unwrap_or("").trim();
+            let n = usize::from_str_radix(hex, 16).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            if rest.len() < n {
+                out.push_str(rest);
+                break;
+            }
+            out.push_str(&rest[..n]);
+            // Skip the chunk's trailing CRLF before the next size line.
+            s = rest[n..].strip_prefix("\r\n").unwrap_or(&rest[n..]);
+        }
+        out
     }
 
     /// Start a server on a deterministic free-but-fixed test port and wait until it
@@ -1623,14 +1745,31 @@ mod tests {
             names.contains(&SET_PROJECT_SETTINGS_TOOL),
             "set_project_settings tool must be listed"
         );
+        // v2.2 cockpit read model: the workspace-runtime aggregate tool advertised alongside,
+        // kept OUT of V1_TOOLS (a new read over the existing DB + runner authorities).
+        assert!(
+            names.contains(&WORKSPACE_RUNTIME_TOOL),
+            "workspace_runtime tool must be listed"
+        );
+        // v2.2 Git CHANGES read model: the workspace-git summary tool advertised alongside.
+        assert!(
+            names.contains(&WORKSPACE_GIT_TOOL),
+            "workspace_git tool must be listed"
+        );
+        // v2.2 TIMELINE read model: the bounded workspace activity fil tool advertised alongside.
+        assert!(
+            names.contains(&WORKSPACE_TIMELINE_TOOL),
+            "workspace_timeline tool must be listed"
+        );
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 18,
+            V1_TOOLS.len() + 21,
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
              create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
-             agent_session_event + set_project_settings extension tools"
+             agent_session_event + set_project_settings + workspace_runtime + workspace_git + \
+             workspace_timeline extension tools"
         );
     }
 

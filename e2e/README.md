@@ -44,6 +44,30 @@ the expected ids/markers/order via a small JSON in that dir; see `wdio.conf.cjs`
 every OS — so the scenario is deterministic on Windows too. Each non-restore spec gets
 its own isolated, temporary data dir.
 
+### v2.2 cockpit gate (`specs/cockpit-01-seed.e2e.cjs` → `cockpit-02-verify.e2e.cjs`)
+
+The v2.2 "travail actif" cockpit validation gate (PRD `01KWHPV32MD0JCGM4F71APNKQ0`, task
+`01KWHPV33TY0VM284TJEEBGP8K`), a seed→verify pair sharing one `NYX_DATA_DIR` (the `cockpit`
+key in `specDataDir`) like the restore pair:
+
+- **Seed (session 1)** drives a real free-work feature end-to-end **through the cockpit**:
+  opens a project whose root is a **real git repo** (so the Git-changes volet is non-empty),
+  runs a managed command (a **service**) + a **terminal** with observable output, and starts a
+  **real agent session** by POSTing the MCP `agent_session_event` tool over the sidecar's
+  loopback (`http://127.0.0.1:$NYX_MCP_PORT/mcp`) — the exact transport a Claude Code hook uses,
+  so it writes a genuine `agent_sessions` row + domain event with **zero test-only backend
+  plumbing**. It then navigates into the cockpit (`#/cockpit/project/<id>`, free-work) and
+  asserts the live runtime navigator, the live terminal pane (typed through the reused
+  `__nyxDeck`/`__nyxDeckInput` seams), and the Services / Changements / Timeline / Agents volets,
+  plus the **full v2.2 gate checklist** (workspace-centric, live-no-polling, no Execution entity,
+  agents without a 3rd tree category (Q-013), no Attention Inbox (Q-007), reserved review/Spec
+  seams).
+- **Verify (session 2)** relaunches on the same DB and asserts the workspace **context resumes**
+  (terminal restored + bound, service + agent session persisted) and re-renders in the cockpit.
+
+The seed uses two seams (no new production code): the shell `window.__nyx` seam to seed the
+runtime, and the **real MCP loopback** (fixed `NYX_MCP_PORT`) to seed the agent session.
+
 ### The other journeys
 
 `commands`, `workspace`, `typing`, `sidebar-redesign`, `rail-and-list`, `idle-replay`
@@ -94,6 +118,16 @@ Shared (both OSes):
 - A **display**: a real X/Wayland session (`$DISPLAY` / `$WAYLAND_DISPLAY`) or **`xvfb`**
   in CI. Unlike WebKitWebDriver, Electron's Chromium *can* run headless, but the PRD's
   Wayland-native surface is validated under a real Wayland session at the phase-7 gate.
+- `wdio.conf.cjs` reconciles three Linux launch realities so Chromedriver can attach:
+  - it **strips `ELECTRON_RUN_AS_NODE`** (a common dev-shell/Electron-CLI export) — otherwise
+    every `electron <entry>` runs as plain Node and the app crashes on boot;
+  - it passes `--no-sandbox --disable-dev-shm-usage --disable-gpu --ozone-platform=x11` so the
+    renderer child comes up and the DevTools port appears (X11 over XWayland; the Wayland-native
+    surface is the phase-7 gate);
+  - it aligns Chromium's `--user-data-dir` with the app's **pinned** Electron userData (the app
+    pins `<appData>/nyx-v2` in code as a v1-safety guard, ignoring `--user-data-dir`), by
+    steering `XDG_CONFIG_HOME`/`APPDATA` to a fixed e2e root so both agree and
+    `DevToolsActivePort` lands where Chromedriver reads it.
 
 ## Run locally
 

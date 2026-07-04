@@ -112,6 +112,21 @@ pub fn dispatch(
         events.emit(Event::Changed {
             topic: "commands".to_string(),
         });
+    } else if mutates_terminals(command) {
+        // A terminal RECORD mutation driven by the UI path (create/close/attach/auto-attach)
+        // broadcasts `terminals://changed`, SYMMETRIC to the MCP terminal tools (which emit
+        // the same topic via `emit_effects`, `mcp_tools_core.rs:1447/1664`). Without this the
+        // v2.2 cockpit read model (`useWorkspaceRuntime`, which re-pulls on `terminals://changed`)
+        // never refreshes for a UI-initiated terminal mutation — the case the MCP path already
+        // covered but the UI path did not (review 01KWKH7TE86AXS41Q4VS2CEXCW).
+        //
+        // NO reconciliation loop: the ONLY subscribers to `terminals://changed` are pure
+        // READERS — `useWorkspaceRuntime` re-pulls `workspace_runtime_snapshot` and
+        // `useTerminals` re-lists `list_terminals` (`use-terminals.ts:391`); neither issues a
+        // terminal-MUTATING db-command in response, so the emission cannot re-trigger itself.
+        events.emit(Event::Changed {
+            topic: "terminals".to_string(),
+        });
     } else if pushes_workspace_tree_legacy(command) {
         events.emit(Event::Changed {
             topic: "workspaces".to_string(),
@@ -224,6 +239,128 @@ impl Ctx<'_> {
             return Err("this command is running in at least one workspace — stop it before editing or deleting it".to_string());
         }
         Ok(())
+    }
+
+    /// Snapshot the live-runner run-state outcomes for `instance_ids` into a plain owned map,
+    /// taken UNDER the runner lock so the DB read that consumes it is not held under the lock.
+    /// The map backs the `RunStateOverlay` closure the workspace-runtime read model applies
+    /// (the SAME `runner.outcome` overlay as the MCP `list_commands` path). An un-built runner
+    /// yields an empty map (every service then reports its PERSISTED `last_state`).
+    fn run_state_outcomes(
+        &self,
+        instance_ids: &[String],
+    ) -> std::collections::HashMap<String, (nyx_core::command::RunState, Option<i32>, bool)> {
+        let guard = self.runtime.runner_cell().lock().unwrap();
+        match guard.as_ref() {
+            Some(runner) => instance_ids
+                .iter()
+                .filter_map(|id| runner.outcome(id).map(|o| (id.clone(), o)))
+                .collect(),
+            None => std::collections::HashMap::new(),
+        }
+    }
+
+    /// Build the WORKSPACE CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0) by REUSING
+    /// the existing resume policies — the resume decision (`agent_resume::workspace_resume_plan`
+    /// over `decide_resume`), the `restart_on_startup` restore rows, and the crash-reconcile
+    /// interrupted set. No new policy, no blind relaunch: the plan is what the cockpit offers so
+    /// the USER chooses what resumes. Pure read; idempotent.
+    fn workspace_restore_plan(&self, workspace_id: &str) -> Result<String, String> {
+        // The workspace must exist (a readable error, not an empty plan, for an unknown id).
+        if self
+            .db()
+            .with_conn(|c| nyx_core::db::get_workspace(c, workspace_id))
+            .map_err(Self::db_err)?
+            .is_none()
+        {
+            return Err(format!("unknown workspace {workspace_id}"));
+        }
+
+        // (1) Agent-session resume plan — REUSE `decide_resume` per candidate. Gather the
+        // workspace's `active`/`unknown` candidates, probe each transcript on disk (the pure
+        // policy needs the boolean), classify the target off the resolved shell, and resolve
+        // each kind's adapter via the production registry.
+        let candidates = self
+            .db()
+            .with_conn(|c| nyx_core::db::resume_candidates_for_workspace(c, workspace_id))
+            .map_err(Self::db_err)?;
+        let target =
+            nyx_core::agent_resume::ResumeTarget::classify_shell(&nyx_core::pty::resolve_shell());
+        // Resolve each kind to its adapter through the `AgentRegistry` — the SINGLE source of
+        // truth for kind→adapter (no inline `claude_code` branch duplicated here). Today only
+        // `claude_code` builds a resume command (the other kinds' `GenericAdapter` returns
+        // `None`), which `decide_resume` maps to `NoResumeCommand`; if a future resumable
+        // adapter is added to the registry, this restore plan reflects it with no edit here.
+        let registry = nyx_core::agent::AgentRegistry::default();
+        let resolve = |kind: &str| registry.get(kind);
+        let owned: Vec<nyx_core::agent_resume::WorkspaceResumeCandidate> = candidates
+            .iter()
+            .filter_map(|c| {
+                let session_state =
+                    nyx_core::agent_resume::SessionState::from_db(&c.session_state)?;
+                // `stat` the captured transcript path (finding #53): a missing file → skip.
+                let transcript_exists = c
+                    .transcript_path
+                    .as_deref()
+                    .map(|p| std::path::Path::new(p).exists())
+                    .unwrap_or(false);
+                Some(nyx_core::agent_resume::WorkspaceResumeCandidate {
+                    terminal_id: &c.terminal_id,
+                    session_id: &c.session_id,
+                    agent_kind: &c.agent_kind,
+                    external_session_id: &c.external_session_id,
+                    session_state,
+                    project_resume_on: c.project_resume_on,
+                    transcript_exists,
+                    target,
+                })
+            })
+            .collect();
+        let resume_sessions = nyx_core::agent_resume::workspace_resume_plan(&owned, &resolve);
+
+        // (2) restart_on_startup services of this workspace — the SAME restore rows the boot
+        // flow reads, filtered to this workspace's instances. Each carries whether it was
+        // running at the last shutdown (so the cockpit shows what WOULD relaunch).
+        let ws_instance_ids: std::collections::HashSet<String> = self
+            .db()
+            .with_conn(|c| nyx_core::db::instance_ids_for_workspace(c, workspace_id))
+            .map_err(Self::db_err)?
+            .into_iter()
+            .collect();
+        let restore_rows = self
+            .db()
+            .with_conn(nyx_core::db::all_instances_for_restore)
+            .map_err(Self::db_err)?;
+        #[derive(serde::Serialize)]
+        struct RestartService {
+            instance_id: String,
+            command: String,
+            was_running_on_shutdown: bool,
+        }
+        let restart_on_startup: Vec<RestartService> = restore_rows
+            .iter()
+            .filter(|r| r.restart_on_startup && ws_instance_ids.contains(&r.instance_id))
+            .map(|r| RestartService {
+                instance_id: r.instance_id.clone(),
+                command: r.command.clone(),
+                was_running_on_shutdown: r.was_running_on_shutdown,
+            })
+            .collect();
+
+        // (3) interrupted instances of this workspace (the crash reconcile's doubtful set).
+        let interrupted: Vec<String> = self
+            .runtime
+            .interrupted_instances()
+            .into_iter()
+            .filter(|id| ws_instance_ids.contains(id))
+            .collect();
+
+        Self::json(&serde_json::json!({
+            "workspace_id": workspace_id,
+            "resume_sessions": resume_sessions,
+            "restart_on_startup": restart_on_startup,
+            "interrupted": interrupted,
+        }))
     }
 
     /// Resolve the Claude plugin install descriptor + CLI driver from the runtime's
@@ -408,6 +545,17 @@ impl Ctx<'_> {
                         nyx_core::resolve::auto_attach_terminal(c, &terminal_id, cwd.as_deref())
                     })
                     .map_err(Self::db_err)?;
+                // Broadcast `terminals://changed` ONLY when the resolver actually re-bound the
+                // terminal (its workspace grouping changed) — symmetric to the other UI terminal
+                // mutations, but conditional here because a no-op resolve leaves the aggregate
+                // untouched. Handled at the call-site (not the name-matched `mutates_terminals`
+                // list) because the emission depends on `res.changed`, which the outer dispatch
+                // block cannot see (review 01KWKH7TE86AXS41Q4VS2CEXCW).
+                if res.changed {
+                    self.events.emit(Event::Changed {
+                        topic: "terminals".to_string(),
+                    });
+                }
                 Self::json(&serde_json::json!({
                     "workspace_id": res.workspace_id,
                     "changed": res.changed,
@@ -603,6 +751,113 @@ impl Ctx<'_> {
                     .with_conn(|c| db::set_workspace_collapsed(c, &id, collapsed))
                     .map_err(Self::db_err)?;
                 Ok("null".to_string())
+            }
+            // The v2.2 cockpit read model (task 01KWHPV32YVCRBNY1JW5CDY4AY): a workspace's
+            // LIVE runtime aggregate — terminals + their agent sessions, the cross-terminal
+            // agent sessions, and the managed-command services with their current run state.
+            // Routes through the SHARED `nyx_core::workspace_runtime::snapshot` — the EXACT
+            // same read model the MCP `workspace_runtime` tool serves (PDR-0005: one
+            // authority for UI + MCP) — overlaying each service's FACTUAL run state from the
+            // live runner (`runner.outcome`), exactly like the MCP `list_commands` path. A
+            // pure read: no mutation, no `changed` broadcast, no polling.
+            "workspace_runtime_snapshot" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                // Snapshot the live-runner outcomes UNDER the lock into a plain map, then
+                // build the overlay off that map — so the DB read below is not held under
+                // the runner lock (and the overlay closure is a simple owned lookup).
+                let instance_ids = self
+                    .db()
+                    .with_conn(|c| db::instance_ids_for_workspace(c, &workspace_id))
+                    .map_err(Self::db_err)?;
+                let outcomes = self.run_state_outcomes(&instance_ids);
+                let overlay = move |instance_id: &str| outcomes.get(instance_id).copied();
+                let snapshot = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::workspace_runtime::snapshot(c, &workspace_id, &overlay)
+                    })
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("unknown workspace {workspace_id}"))?;
+                Self::json(&snapshot)
+            }
+            // FREE-WORK entry point (task 01KWHPV33H0FX8NA4C94T5W46J): open the cockpit on a
+            // project's PRIMARY workspace WITHOUT requiring a Spec ("le primary workspace est
+            // l'espace de travail libre par défaut"). Resolves the primary/free-work workspace
+            // (`nyx_core::usecase::resolve_primary_workspace`) and serves its runtime through
+            // the SAME shared `snapshot` read model as `workspace_runtime_snapshot` — no Spec
+            // seam, no separate authority (there is no `specs` table in v2.2). Pure read.
+            "workspace_runtime_primary" => {
+                let project_id = self.arg_str("projectId")?;
+                // Resolve the primary workspace first so the overlay is scoped to ITS instances.
+                let primary = self
+                    .db()
+                    .with_conn(|c| nyx_core::usecase::resolve_primary_workspace(c, &project_id))
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("project {project_id} has no primary workspace"))?;
+                let instance_ids = self
+                    .db()
+                    .with_conn(|c| db::instance_ids_for_workspace(c, &primary.id))
+                    .map_err(Self::db_err)?;
+                let outcomes = self.run_state_outcomes(&instance_ids);
+                let overlay = move |instance_id: &str| outcomes.get(instance_id).copied();
+                let snapshot = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::workspace_runtime::snapshot_for_project(c, &project_id, &overlay)
+                    })
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("project {project_id} has no primary workspace"))?;
+                Self::json(&snapshot)
+            }
+            // v2.2 workspace CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a
+            // restart, WHAT this workspace offers to resume — computed by REUSING the existing
+            // resume policies (NO third system, Q-011). Three parts, all from live authorities:
+            //   * `resume_sessions` — the per-session `decide_resume` verdict for the
+            //     workspace's `active`/`unknown` sessions (via `resume_candidates_for_workspace`
+            //     + `agent_resume::workspace_resume_plan`), keyed on `resume_agent_sessions`,
+            //     the transcript-on-disk probe, and the target shell — the SAME policy the
+            //     close-warning uses. The USER chooses what to inject (nyx never blind-resumes).
+            //   * `restart_on_startup` — the workspace's services whose template opts into
+            //     `restart_on_startup` (from `all_instances_for_restore`, the SAME rows the boot
+            //     restore reads), each with whether it was running at the last shutdown.
+            //   * `interrupted` — this workspace's instances the crash reconcile flagged
+            //     `interrupted` (doubtful `running` it could not re-verify → NOT relaunched).
+            // A pure read: no mutation, no `changed` broadcast, no blind relaunch. Idempotent.
+            "workspace_restore_plan" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                self.workspace_restore_plan(&workspace_id)
+            }
+            // The v2.2 Git CHANGES read model (task 01KWHPV33EGTB3Z41J0RQR1BAK, PDR-0013): per
+            // non-optional repo of the workspace, its branch/dirty/changed-files RE-READ from
+            // Git — the EXACT same `nyx_core::workspace_git::summary` the MCP `workspace_git`
+            // tool serves (PDR-0005: one authority for UI + MCP). Git state is NEVER stored as
+            // truth in the DB: this arm issues only reads (no mutation, no `changed` broadcast).
+            "workspace_git_summary" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let summary = self
+                    .db()
+                    .with_conn(|c| nyx_core::workspace_git::summary(c, &workspace_id))
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("unknown workspace {workspace_id}"))?;
+                Self::json(&summary)
+            }
+            // The v2.2 workspace TIMELINE read model (task 01KWHPV33SAV9NV1STSY403CF0): a
+            // BOUNDED, oldest-first fil of the workspace's most recent `domain_events` (v2.1) —
+            // the business "changements notables" (workspace/repository/project lifecycle),
+            // NEVER a terminal byte (the outbox carries none). The EXACT same
+            // `nyx_core::workspace_timeline::timeline` the MCP `workspace_timeline` tool serves
+            // (PDR-0005: one authority for UI + MCP). `limit` bounds the read (omitted / 0 → the
+            // read model's default ceiling). A pure read: no mutation, no `changed` broadcast,
+            // no polling — the live refresh rides the existing unsolicited `*://changed` channel.
+            "workspace_timeline" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let limit = self.args.get("limit").and_then(|v| v.as_i64()).unwrap_or(0);
+                let timeline = self
+                    .db()
+                    .with_conn(|c| nyx_core::workspace_timeline::timeline(c, &workspace_id, limit))
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("unknown workspace {workspace_id}"))?;
+                Self::json(&timeline)
             }
             // --- managed-command templates / instances (read + CRUD + source/import).
             //     The RUNTIME start/stop/relaunch ride the typed pipe kinds; output +
@@ -916,6 +1171,26 @@ fn mutates_command_templates(command: &str) -> bool {
     )
 }
 
+/// The terminal RECORD-MUTATING DB commands whose UI path must broadcast `terminals://changed`
+/// — SYMMETRIC to the MCP terminal tools (`create_terminal`/`close_terminal`/`attach_terminal`
+/// emit `ChangedTopic::Terminals` via `emit_effects`). These flip a terminal record's existence
+/// or workspace binding, which the v2.2 cockpit runtime aggregate contains, so every surface
+/// that re-pulls on `terminals://changed` (`useWorkspaceRuntime`, `useTerminals`) reflects the
+/// mutation live — WITHOUT polling (review 01KWKH7TE86AXS41Q4VS2CEXCW).
+///
+/// EXCLUDED on purpose: the pure sidebar-local ops (`reorder`, `rename`, `set_active`,
+/// `persist_scrollback`, `set_terminal_cwd`, `terminal_exec_mark_read`) — they do not change the
+/// runtime aggregate's shape (which terminals exist / where they are bound), and the sidebar
+/// already folds them in optimistically. `auto_attach_terminal` is INCLUDED but emits only when
+/// it actually re-bound (`changed == true`); it is handled at its call-site, not by this list,
+/// because the emission is conditional on the resolver's decision.
+fn mutates_terminals(command: &str) -> bool {
+    matches!(
+        command,
+        "create_terminal" | "close_terminal" | "attach_terminal"
+    )
+}
+
 /// The project/workspace TREE-MUTATING DB commands, for the IDEMPOTENCY guard (`dispatch`,
 /// the `idempotencyKey` at-most-once crash-recovery guard). This is the FULL set of tree
 /// mutations that must be recognised as duplicates on a post-crash retry — INCLUDING the
@@ -996,20 +1271,25 @@ mod tests {
         }
     }
 
-    /// Every `workspaces://changed` invalidation captured on the pipe.
-    fn workspaces_changed(buf: &Arc<Mutex<Vec<u8>>>) -> usize {
+    /// Count the `Event::Changed { topic }` invalidations for `want_topic` captured on the pipe.
+    fn changed_count(buf: &Arc<Mutex<Vec<u8>>>, want_topic: &str) -> usize {
         let bytes = buf.lock().unwrap().clone();
         let mut dec = FrameDecoder::new();
         dec.push(&bytes);
         let mut count = 0;
         while let Some(payload) = dec.next_frame().expect("decode frame") {
             if let Ok(Message::Event(Event::Changed { topic })) = decode_message(&payload) {
-                if topic == "workspaces" {
+                if topic == want_topic {
                     count += 1;
                 }
             }
         }
         count
+    }
+
+    /// Every `workspaces://changed` invalidation captured on the pipe.
+    fn workspaces_changed(buf: &Arc<Mutex<Vec<u8>>>) -> usize {
+        changed_count(buf, "workspaces")
     }
 
     /// A dispatch harness: a `Runtime` over a temp DB + a capturing pipe sink. `run` drives the
@@ -1040,6 +1320,9 @@ mod tests {
         }
         fn pushes(&self) -> usize {
             workspaces_changed(&self.buf)
+        }
+        fn terminals_changed(&self) -> usize {
+            changed_count(&self.buf, "terminals")
         }
     }
 
@@ -1166,6 +1449,740 @@ mod tests {
             after.len(),
             ws_count,
             "the guarded retry inserted no second workspace"
+        );
+    }
+
+    /// DONE-CRITERION (task 01KWHPV32YVCRBNY1JW5CDY4AY, criterion #2): the UI bridge's
+    /// `workspace_runtime_snapshot` db-command serves the SAME shared read model the MCP
+    /// `workspace_runtime` tool serves — a workspace's terminals + agent sessions +
+    /// services. Proof: seed a workspace + a terminal with a live session + a command
+    /// instance via the shared authorities, dispatch the db-command, and assert the
+    /// aggregate shape. The read does NOT push a `changed` invalidation (it is a pure read).
+    #[test]
+    fn workspace_runtime_snapshot_serves_the_shared_read_model_over_the_ui_bridge() {
+        let h = Harness::new();
+
+        // Seed via the SAME db-commands the renderer uses (create_project/create_workspace).
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/wr-ui-p" }),
+            )
+            .unwrap();
+        let project_id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["project"]
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ws = h
+            .run(
+                "create_workspace",
+                serde_json::json!({ "projectId": project_id, "name": "wt", "path": "/tmp/wr-ui-wt" }),
+            )
+            .unwrap();
+        let ws_id = serde_json::from_str::<serde_json::Value>(&ws).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let pushes_before = h.pushes();
+
+        // A command template → one instance in the workspace, plus a terminal hosting a
+        // live agent session anchored to the workspace (seed directly on the shared DB).
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_template(
+                    c,
+                    &project_id,
+                    "dev",
+                    "npm run dev",
+                    None,
+                    nyx_core::db::CommandSource::default(),
+                )
+            })
+            .unwrap();
+        let term = h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::db::create_terminal(c, "/tmp/wr-ui-wt", None))
+            .unwrap();
+        h.runtime
+            .db()
+            .with_conn(|c| nyx_core::db::attach_terminal(c, &term.id, &ws_id, "auto"))
+            .unwrap();
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::record_session_start(
+                    c,
+                    &term.id,
+                    "claude_code",
+                    nyx_core::db::SessionCapture {
+                        workspace_id: Some(ws_id.clone()),
+                        external_session_id: "sess-ui".to_string(),
+                        cwd: "/tmp/wr-ui-wt".to_string(),
+                        transcript_path: None,
+                        metadata_json: None,
+                    },
+                )
+            })
+            .unwrap();
+
+        // READ via the UI bridge db-command.
+        let snap = h
+            .run(
+                "workspace_runtime_snapshot",
+                serde_json::json!({ "workspaceId": ws_id }),
+            )
+            .unwrap();
+        let runtime: serde_json::Value = serde_json::from_str(&snap).unwrap();
+        assert_eq!(runtime["workspace"]["id"], serde_json::json!(ws_id));
+        let terminals = runtime["terminals"].as_array().unwrap();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["id"], serde_json::json!(term.id));
+        assert_eq!(
+            terminals[0]["sessions"][0]["external_session_id"],
+            serde_json::json!("sess-ui")
+        );
+        assert_eq!(runtime["agent_sessions"].as_array().unwrap().len(), 1);
+        let services = runtime["services"].as_array().unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0]["name"], serde_json::json!("dev"));
+        assert_eq!(services[0]["run_state"], serde_json::json!("idle"));
+
+        // The read pushed NO `workspaces://changed` invalidation (a pure read).
+        assert_eq!(
+            h.pushes(),
+            pushes_before,
+            "workspace_runtime_snapshot is a pure read — no changed broadcast"
+        );
+
+        // An unknown workspace id is a readable error, not a panic.
+        let err = h
+            .run(
+                "workspace_runtime_snapshot",
+                serde_json::json!({ "workspaceId": "nope" }),
+            )
+            .unwrap_err();
+        assert!(err.contains("unknown workspace"), "got: {err}");
+    }
+
+    /// FREE-WORK entry point (task 01KWHPV33H0FX8NA4C94T5W46J): `workspace_runtime_primary`
+    /// opens the cockpit on a project's PRIMARY workspace WITHOUT a Spec, keyed on the PROJECT
+    /// id, and returns the SAME aggregate as `workspace_runtime_snapshot` for that primary
+    /// workspace. Proof: a fresh project (only its root/primary workspace — no worktree, no
+    /// Spec) resolves through `workspace_runtime_primary` to its primary workspace's runtime,
+    /// byte-identical to the by-workspace read. An unknown project is a readable error.
+    #[test]
+    fn workspace_runtime_primary_opens_the_free_work_workspace_over_the_ui_bridge() {
+        let h = Harness::new();
+
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/wr-free-p" }),
+            )
+            .unwrap();
+        let created_json: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let project_id = created_json["project"]["id"].as_str().unwrap().to_string();
+        // The project's primary (root) workspace id — the free-work default.
+        let primary_id = created_json["root"]["id"].as_str().unwrap().to_string();
+        let pushes_before = h.pushes();
+
+        // Open free work by PROJECT (no Spec anywhere).
+        let by_project = h
+            .run(
+                "workspace_runtime_primary",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap();
+        let primary_runtime: serde_json::Value = serde_json::from_str(&by_project).unwrap();
+        assert_eq!(
+            primary_runtime["workspace"]["id"],
+            serde_json::json!(primary_id),
+            "free-work opens the project's primary workspace"
+        );
+
+        // It is the SAME aggregate as the by-workspace read for that primary workspace.
+        let by_workspace = h
+            .run(
+                "workspace_runtime_snapshot",
+                serde_json::json!({ "workspaceId": primary_id }),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&by_workspace).unwrap(),
+            primary_runtime,
+            "free-work (by project) == the primary workspace's runtime (by id): no Spec seam"
+        );
+
+        // Pure read: no `changed` broadcast.
+        assert_eq!(
+            h.pushes(),
+            pushes_before,
+            "workspace_runtime_primary is a pure read — no changed broadcast"
+        );
+
+        // An unknown project is a readable error, not a panic.
+        let err = h
+            .run(
+                "workspace_runtime_primary",
+                serde_json::json!({ "projectId": "nope" }),
+            )
+            .unwrap_err();
+        assert!(err.contains("no primary workspace"), "got: {err}");
+    }
+
+    /// WORKSPACE CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a restart, the
+    /// `workspace_restore_plan` db-command REUSES the existing resume policies to report, for
+    /// ONE workspace: (a) the per-session `decide_resume` verdicts (resume the `resume_agent_
+    /// sessions`-ON candidate with a transcript, exact id); (b) the `restart_on_startup`
+    /// services (with their was-running snapshot); (c) the interrupted set. Proves "sessions
+    /// reprenables + restart_on_startup restaurés", scoped to the workspace, via the SAME
+    /// policies (no third system). Pure read — idempotent, no `changed` broadcast.
+    #[test]
+    fn workspace_restore_plan_reuses_existing_policies_scoped_to_workspace() {
+        let h = Harness::new();
+
+        // A project whose resume_agent_sessions is ON (so an active session is a resume candidate).
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/wr-restore-p" }),
+            )
+            .unwrap();
+        let created_json: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let project_id = created_json["project"]["id"].as_str().unwrap().to_string();
+        let ws_id = created_json["root"]["id"].as_str().unwrap().to_string();
+        h.run(
+            "set_project_resume_agent_sessions",
+            serde_json::json!({ "id": project_id, "resume": true }),
+        )
+        .unwrap();
+
+        // A template with restart_on_startup ON → its instance in the workspace, snapshotted
+        // running-at-shutdown so the plan shows it WOULD relaunch.
+        let restart_instance = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let tpl = nyx_core::db::create_template(
+                    c,
+                    &project_id,
+                    "dev",
+                    "npm run dev",
+                    None,
+                    nyx_core::db::CommandSource::default(),
+                )?;
+                nyx_core::db::set_restart_on_startup(c, &tpl.id, true)?;
+                let ids = nyx_core::db::instance_ids_for_template(c, &tpl.id)?;
+                let id = ids[0].clone();
+                nyx_core::db::set_was_running_on_shutdown(c, &id, true)?;
+                Ok::<_, diesel::result::Error>(id)
+            })
+            .unwrap();
+
+        // A terminal in the workspace hosting an ACTIVE Claude session WITH a real transcript
+        // on disk (so `decide_resume` resumes it — finding #53's present→resume half).
+        let transcript = h.runtime.data_dir().join("sess.jsonl");
+        std::fs::write(&transcript, b"{}\n").unwrap();
+        let term = h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::db::create_terminal(c, "/tmp/wr-restore-p", None))
+            .unwrap();
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::attach_terminal(c, &term.id, &ws_id, "auto")?;
+                nyx_core::db::record_session_start(
+                    c,
+                    &term.id,
+                    nyx_core::db::AGENT_KIND_CLAUDE_CODE,
+                    nyx_core::db::SessionCapture {
+                        workspace_id: Some(ws_id.clone()),
+                        external_session_id: "ext-restore".to_string(),
+                        cwd: "/tmp/wr-restore-p".to_string(),
+                        transcript_path: Some(transcript.to_string_lossy().to_string()),
+                        metadata_json: None,
+                    },
+                )?;
+                Ok::<_, diesel::result::Error>(())
+            })
+            .unwrap();
+        let pushes_before = h.pushes();
+
+        let plan_json = h
+            .run(
+                "workspace_restore_plan",
+                serde_json::json!({ "workspaceId": ws_id }),
+            )
+            .unwrap();
+        let plan: serde_json::Value = serde_json::from_str(&plan_json).unwrap();
+
+        // (a) The active session resumes with the EXACT id (policy reused verbatim).
+        let sessions = plan["resume_sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "one resume candidate in the workspace");
+        assert_eq!(sessions[0]["resume"], serde_json::json!(true));
+        assert_eq!(
+            sessions[0]["resume_command"],
+            serde_json::json!("claude --resume ext-restore")
+        );
+        assert_eq!(sessions[0]["uncertain"], serde_json::json!(false));
+
+        // (b) The restart_on_startup service is present with its was-running snapshot.
+        let services = plan["restart_on_startup"].as_array().unwrap();
+        assert_eq!(services.len(), 1);
+        assert_eq!(
+            services[0]["instance_id"],
+            serde_json::json!(restart_instance)
+        );
+        assert_eq!(
+            services[0]["was_running_on_shutdown"],
+            serde_json::json!(true)
+        );
+
+        // (c) No crash this run → interrupted is empty (nothing doubtful, no blind relaunch).
+        assert!(plan["interrupted"].as_array().unwrap().is_empty());
+
+        // Pure read + idempotent: no `changed` broadcast, and a second call is byte-identical.
+        assert_eq!(
+            h.pushes(),
+            pushes_before,
+            "workspace_restore_plan is a pure read — no changed broadcast"
+        );
+        let plan_again = h
+            .run(
+                "workspace_restore_plan",
+                serde_json::json!({ "workspaceId": ws_id }),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&plan_again).unwrap(),
+            plan,
+            "the restore plan is idempotent — a repeat call yields the same plan"
+        );
+
+        // An unknown workspace is a readable error.
+        let err = h
+            .run(
+                "workspace_restore_plan",
+                serde_json::json!({ "workspaceId": "nope" }),
+            )
+            .unwrap_err();
+        assert!(err.contains("unknown workspace"), "got: {err}");
+    }
+
+    /// WORKSPACE RESTORE — DOUBTFUL STATE: with `resume_agent_sessions` OFF, an `unknown`
+    /// (stale/probable-kill) session is reported as a NON-resume entry (`option_off`), never
+    /// blind-resumed; the plan surfaces the doubtful state for the user to choose. Covers the
+    /// done-criterion "états douteux marqués unknown/interrupted".
+    #[test]
+    fn workspace_restore_plan_surfaces_doubtful_state_without_blind_resume() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/wr-doubt-p" }),
+            )
+            .unwrap();
+        let created_json: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let ws_id = created_json["root"]["id"].as_str().unwrap().to_string();
+        // resume_agent_sessions stays OFF (the default) → no auto-resume offered.
+
+        // A terminal in the workspace hosting an UNKNOWN (doubtful) session.
+        let term = h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::db::create_terminal(c, "/tmp/wr-doubt-p", None))
+            .unwrap();
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::attach_terminal(c, &term.id, &ws_id, "auto")?;
+                nyx_core::db::record_session_start(
+                    c,
+                    &term.id,
+                    nyx_core::db::AGENT_KIND_CLAUDE_CODE,
+                    nyx_core::db::SessionCapture {
+                        workspace_id: Some(ws_id.clone()),
+                        external_session_id: "ext-doubt".to_string(),
+                        cwd: "/tmp/wr-doubt-p".to_string(),
+                        transcript_path: None,
+                        metadata_json: None,
+                    },
+                )?;
+                // Flip every still-`active` session to `unknown` (a stale active after a probable
+                // kill) via the SAME sweep the crash reconcile uses — the doubtful-state path.
+                nyx_core::db::sweep_stale_active_sessions(c, -1)?;
+                Ok::<_, diesel::result::Error>(())
+            })
+            .unwrap();
+
+        let plan_json = h
+            .run(
+                "workspace_restore_plan",
+                serde_json::json!({ "workspaceId": ws_id }),
+            )
+            .unwrap();
+        let plan: serde_json::Value = serde_json::from_str(&plan_json).unwrap();
+        let sessions = plan["resume_sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "the doubtful session is surfaced");
+        assert_eq!(
+            sessions[0]["resume"],
+            serde_json::json!(false),
+            "option OFF → not auto-resumed (no blind resume)"
+        );
+        assert_eq!(sessions[0]["skip_reason"], serde_json::json!("option_off"));
+    }
+
+    /// REVIEW 01KWKH7TE86AXS41Q4VS2CEXCW (+ 01KWKHC0FW9D2K69ATK4266H32): a terminal RECORD
+    /// mutation driven by the UI db-command path (create/close/attach/auto-attach) broadcasts
+    /// `terminals://changed`, SYMMETRIC to the MCP terminal tools — so the v2.2 cockpit
+    /// (`useWorkspaceRuntime`, which re-pulls on `terminals://changed`) refreshes live for a
+    /// UI-initiated terminal mutation. Before the fix these arms emitted NO invalidation, so a
+    /// UI create/close/attach left the cockpit aggregate stale.
+    #[test]
+    fn ui_terminal_mutations_broadcast_terminals_changed() {
+        let h = Harness::new();
+
+        // create_terminal → 1 `terminals://changed` (a new record enters the aggregate).
+        let created = h
+            .run(
+                "create_terminal",
+                serde_json::json!({ "cwd": "/tmp/tc-ui" }),
+            )
+            .unwrap();
+        assert_eq!(
+            h.terminals_changed(),
+            1,
+            "create_terminal broadcast terminals://changed once"
+        );
+        let term_id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // A workspace to attach the terminal to (its own identity pushes are on `workspaces`,
+        // NOT counted here).
+        let project = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/tc-ui-p" }),
+            )
+            .unwrap();
+        let project_id = serde_json::from_str::<serde_json::Value>(&project).unwrap()["project"]
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ws = h
+            .run(
+                "create_workspace",
+                serde_json::json!({ "projectId": project_id, "name": "wt", "path": "/tmp/tc-ui-wt" }),
+            )
+            .unwrap();
+        let ws_id = serde_json::from_str::<serde_json::Value>(&ws).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // attach_terminal → +1 `terminals://changed` (the terminal's workspace grouping changed).
+        h.run(
+            "attach_terminal",
+            serde_json::json!({ "terminalId": term_id, "workspaceId": ws_id, "mode": "manual" }),
+        )
+        .unwrap();
+        assert_eq!(
+            h.terminals_changed(),
+            2,
+            "attach_terminal broadcast terminals://changed once more"
+        );
+
+        // close_terminal → +1 `terminals://changed` (the record leaves the aggregate).
+        h.run("close_terminal", serde_json::json!({ "id": term_id }))
+            .unwrap();
+        assert_eq!(
+            h.terminals_changed(),
+            3,
+            "close_terminal broadcast terminals://changed once more"
+        );
+
+        // A NON-shape terminal op (rename) does NOT broadcast — it does not change which
+        // terminals exist / where they are bound, so the aggregate shape is untouched.
+        let before = h.terminals_changed();
+        let t2 = h
+            .run(
+                "create_terminal",
+                serde_json::json!({ "cwd": "/tmp/tc-ui-2" }),
+            )
+            .unwrap();
+        let t2_id = serde_json::from_str::<serde_json::Value>(&t2).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let after_create = h.terminals_changed();
+        assert_eq!(after_create, before + 1, "the second create broadcast once");
+        h.run("rename", serde_json::json!({ "id": t2_id, "label": "x" }))
+            .unwrap();
+        assert_eq!(
+            h.terminals_changed(),
+            after_create,
+            "rename does NOT broadcast terminals://changed (no aggregate-shape change)"
+        );
+    }
+
+    /// REVIEW 01KWKH7TE86AXS41Q4VS2CEXCW: `auto_attach_terminal` broadcasts `terminals://changed`
+    /// ONLY when it actually re-bound the terminal (`changed == true`) — a no-op resolve leaves
+    /// the aggregate untouched and emits nothing.
+    #[test]
+    fn ui_auto_attach_terminal_broadcasts_only_when_it_rebinds() {
+        let h = Harness::new();
+        // A terminal + a workspace whose root is the terminal's cwd, so the resolver binds it.
+        let created = h
+            .run(
+                "create_terminal",
+                serde_json::json!({ "cwd": "/tmp/tc-aa-wt" }),
+            )
+            .unwrap();
+        let term_id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let project = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/tc-aa-p" }),
+            )
+            .unwrap();
+        let project_id = serde_json::from_str::<serde_json::Value>(&project).unwrap()["project"]
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        h.run(
+            "create_workspace",
+            serde_json::json!({ "projectId": project_id, "name": "wt", "path": "/tmp/tc-aa-wt" }),
+        )
+        .unwrap();
+
+        let before = h.terminals_changed();
+        // First auto-attach: the cwd matches the workspace root → the resolver re-binds → emits.
+        let res = h
+            .run(
+                "auto_attach_terminal",
+                serde_json::json!({ "terminalId": term_id, "cwd": "/tmp/tc-aa-wt" }),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&res).unwrap()["changed"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            h.terminals_changed(),
+            before + 1,
+            "a re-binding auto-attach broadcast terminals://changed once"
+        );
+
+        // Second auto-attach with the SAME cwd: already bound → `changed == false` → NO emit.
+        let res2 = h
+            .run(
+                "auto_attach_terminal",
+                serde_json::json!({ "terminalId": term_id, "cwd": "/tmp/tc-aa-wt" }),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&res2).unwrap()["changed"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            h.terminals_changed(),
+            before + 1,
+            "a no-op auto-attach broadcast NOTHING"
+        );
+    }
+
+    /// DONE-CRITERION (task 01KWHPV33EGTB3Z41J0RQR1BAK): the UI bridge's
+    /// `workspace_git_summary` db-command serves the SAME Git CHANGES read model the MCP
+    /// `workspace_git` tool serves — branch/dirty/changed-files per non-optional repo,
+    /// RE-READ from Git. Proof: register a real git repo as a workspace, dirty it, read via
+    /// the db-command, and assert the change surfaces. The read pushes NO `changed`
+    /// invalidation and stores NOTHING (Git is never authoritative in the DB). Git-guarded.
+    #[test]
+    fn workspace_git_summary_serves_the_shared_git_read_model_over_the_ui_bridge() {
+        if nyx_core::proc_util::command("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping ui workspace_git_summary test: git unavailable");
+            return;
+        }
+        let h = Harness::new();
+
+        // A real git repo as the workspace's mono-repo tree. Uniqueness from pid + nanos
+        // (no uuid dep in this crate) so parallel test threads never collide on the path.
+        let root = std::env::temp_dir().join(format!(
+            "nyx-ui-git-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let ok = nyx_core::proc_util::command("git")
+                .args([
+                    "-c",
+                    "user.email=t@nyx",
+                    "-c",
+                    "user.name=nyx",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(root.join("README.md"), b"nyx").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        // Register via the shared registration flow (create_project auto-detects the repo).
+        let (_project, root_ws) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::repository::register_project(c, "Nyx", root.to_str().unwrap(), None)
+            })
+            .unwrap();
+        let pushes_before = h.pushes();
+
+        // Dirty the repo with an untracked file, then read the summary via the db-command.
+        std::fs::write(root.join("new.txt"), b"new").unwrap();
+        let out = h
+            .run(
+                "workspace_git_summary",
+                serde_json::json!({ "workspaceId": root_ws.id }),
+            )
+            .unwrap();
+        let git_summary: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(git_summary["workspace_id"], serde_json::json!(root_ws.id));
+        let repos = git_summary["repos"].as_array().unwrap();
+        assert_eq!(repos.len(), 1, "one mono-repo summarized");
+        assert_eq!(repos[0]["branch"], serde_json::json!("main"));
+        assert_eq!(repos[0]["dirty"], serde_json::json!(true));
+        let files: Vec<&str> = repos[0]["changed_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert!(files.contains(&"new.txt"), "changed files: {files:?}");
+
+        // A pure read: no `workspaces://changed` push.
+        assert_eq!(
+            h.pushes(),
+            pushes_before,
+            "workspace_git_summary is a pure read — no changed broadcast"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DONE-CRITERION (task 01KWHPV33SAV9NV1STSY403CF0): the UI bridge's `workspace_timeline`
+    /// db-command serves the SAME bounded read model the MCP `workspace_timeline` tool serves —
+    /// the workspace's recent `domain_events` as an oldest-first, capped fil, and NO terminal
+    /// byte. Proof: seeding a project + workspace via the SAME db-commands the renderer uses
+    /// lands correlated `domain_events`; the timeline db-command returns them bounded, and every
+    /// entry is a business event payload (never terminal output). The read pushes NO `changed`.
+    #[test]
+    fn workspace_timeline_serves_the_bounded_domain_events_read_model_over_the_ui_bridge() {
+        let h = Harness::new();
+
+        // Seed via the SAME db-commands the renderer uses — each mutation persists a
+        // correlated `domain_events` row (the outbox the timeline reads).
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/tl-ui-p" }),
+            )
+            .unwrap();
+        let project_id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["project"]
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ws = h
+            .run(
+                "create_workspace",
+                serde_json::json!({ "projectId": project_id, "name": "wt", "path": "/tmp/tl-ui-wt" }),
+            )
+            .unwrap();
+        let ws_id = serde_json::from_str::<serde_json::Value>(&ws).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let pushes_before = h.pushes();
+
+        // READ the timeline via the UI bridge db-command.
+        let out = h
+            .run(
+                "workspace_timeline",
+                serde_json::json!({ "workspaceId": ws_id }),
+            )
+            .unwrap();
+        let timeline: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(timeline["workspace_id"], serde_json::json!(ws_id));
+        let entries = timeline["entries"].as_array().unwrap();
+        // The workspace-scoped `workspace.created` event surfaces, oldest-first among a small
+        // chronology, and every entry is a business event payload — NEVER a terminal byte.
+        let types: Vec<&str> = entries
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect();
+        assert!(
+            types.contains(&"workspace.created"),
+            "the workspace.created event is in the timeline: {types:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| e["payload"].as_str().unwrap().contains("identity_id")),
+            "every timeline entry is a business event payload, no terminal bytes"
+        );
+        let seqs: Vec<i64> = entries
+            .iter()
+            .map(|e| e["sequence"].as_i64().unwrap())
+            .collect();
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "timeline is oldest-first (bounded chronology)"
+        );
+
+        // The `limit` bounds the read.
+        let bounded = h
+            .run(
+                "workspace_timeline",
+                serde_json::json!({ "workspaceId": ws_id, "limit": 1 }),
+            )
+            .unwrap();
+        let bounded: serde_json::Value = serde_json::from_str(&bounded).unwrap();
+        assert_eq!(bounded["limit"], serde_json::json!(1));
+        assert_eq!(bounded["entries"].as_array().unwrap().len(), 1);
+
+        // A pure read: no `changed` broadcast.
+        assert_eq!(
+            h.pushes(),
+            pushes_before,
+            "workspace_timeline is a pure read — no changed broadcast"
         );
     }
 }

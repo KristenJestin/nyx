@@ -9,9 +9,13 @@ const path = require("path");
 
 // Where the seed spec drops the expectations for the verify spec. Lives in the
 // shared data dir (NYX_E2E_DATA_DIR is injected per-session by wdio.conf.cjs).
-function handoffPath() {
+// The basename is PARAMETERIZED so each seed→verify pair keeps its OWN handoff
+// file (the two pairs run independently and MUST NOT share a filename). Restore
+// keeps its own "restore-handoff.json" via the default; other pairs (e.g. the
+// cockpit gate) build an isolated trio through makeHandoff() below.
+function handoffPath(basename) {
   const dir = process.env.NYX_E2E_DATA_DIR || require("os").tmpdir();
-  return path.join(dir, "restore-handoff.json");
+  return path.join(dir, basename || "restore-handoff.json");
 }
 
 function writeHandoff(data) {
@@ -20,6 +24,18 @@ function writeHandoff(data) {
 
 function readHandoff() {
   return JSON.parse(fs.readFileSync(handoffPath(), "utf8"));
+}
+
+// Build an isolated handoff trio bound to a DISTINCT `basename`, so another
+// seed→verify pair can reuse the shared write/read logic without colliding on
+// restore's file. Returns { handoffPath, writeHandoff, readHandoff }.
+function makeHandoff(basename) {
+  const pathFor = () => handoffPath(basename);
+  return {
+    handoffPath: pathFor,
+    writeHandoff: (data) => fs.writeFileSync(pathFor(), JSON.stringify(data, null, 2)),
+    readHandoff: () => JSON.parse(fs.readFileSync(pathFor(), "utf8")),
+  };
 }
 
 // Wait for the WebView to mount React + the control seam with an active term.
@@ -125,6 +141,7 @@ module.exports = {
   handoffPath,
   writeHandoff,
   readHandoff,
+  makeHandoff,
   waitForApp,
   listRecords,
   activeId,
