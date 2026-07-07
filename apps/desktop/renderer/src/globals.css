@@ -314,3 +314,32 @@
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
+
+/*
+ * NAVIGATION CROSS-FADE — the View Transitions API skin (v2.2.5 follow-up).
+ *
+ * `startNavTransition` (src/lib/nav-transition.ts) wraps the main-screen change
+ * (Terminals ↔ Work ↔ Knowledge) in `document.startViewTransition`. The API's
+ * default old→new cross-fade is a ~250ms ease; we pin it to ~200ms (inside the
+ * validated 150-250ms band) so the terminal fades in instead of snapping in.
+ * This is PURE CHROME over the DOM swap — the persistent terminal node is moved,
+ * not cloned/destroyed, so the lossless instance is untouched by the fade.
+ */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 200ms;
+  animation-timing-function: ease;
+}
+
+/*
+ * Reduced motion: belt-and-suspenders. `startNavTransition` already skips the VT
+ * entirely under `prefers-reduced-motion: reduce` (JS-side), but if a transition
+ * is ever started we also collapse the fade to nothing at the CSS layer so the
+ * screen change is instant.
+ */
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation: none;
+  }
+}

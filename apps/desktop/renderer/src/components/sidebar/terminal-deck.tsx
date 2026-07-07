@@ -1,11 +1,11 @@
-import { useEffect, useRef } from "react";
-import type { Terminal as XTerm } from "@xterm/xterm";
+import { useEffect } from "react";
 
 import { Terminal } from "@/components/terminal/terminal";
+import { getTerminal, reconcileTerminals } from "@/components/terminal/terminal-store";
 import type { TerminalRecord } from "./use-terminals";
 
 export interface TerminalDeckProps {
-  /** Records to mount, in order. Each gets exactly one mounted `<Terminal>`. */
+  /** Records to mount, in order. Each gets exactly one `<Terminal>` pane. */
   terminals: TerminalRecord[];
   /** Record id of the terminal to show; all others are mounted-but-hidden. */
   activeId: string | null;
@@ -17,112 +17,63 @@ export interface TerminalDeckProps {
 }
 
 /**
- * Read the whole xterm buffer (screen + scrollback) of an instance as a string.
- * The per-terminal test seam (`window.__nyxDeck[id]`) returns this so the unit
- * suite can prove an INACTIVE terminal still received its PTY output.
- */
-function readBuffer(term: XTerm | null): string {
-  if (!term) return "";
-  const buf = term.buffer.active;
-  let out = "";
-  for (let i = 0; i < buf.length; i++) {
-    const line = buf.getLine(i);
-    if (line) out += line.translateToString(true) + "\n";
-  }
-  return out;
-}
-
-/**
- * `<TerminalDeck>` — mounts ONE `<Terminal>` per record and shows only the
- * active one. The crucial property: inactive terminals stay MOUNTED (their
- * xterm instance + PTY listeners + buffer are all alive) — they are merely
- * hidden with `display:none`. So a background terminal keeps receiving its
- * `pty://output` (routed by its own PTY id inside `usePty`) and its scrollback
- * is intact when the user switches back. We do NOT unmount/remount on switch
- * (that would kill the buffer and respawn the shell).
+ * `<TerminalDeck>` — mounts ONE `<Terminal>` pane per record and shows only the
+ * active one. Post-v2.2.5 the live terminals live in the module-level
+ * {@link getTerminal store}, NOT in these components: each pane merely attaches
+ * its record's persistent DOM node into the visible container and detaches on
+ * unmount. So a terminal survives BOTH a selection switch (the pane stays mounted,
+ * hidden with `display:none`) AND a full navigation (the whole deck unmounts, each
+ * pane detaches — never destroys — and the instance stays in the store, reattached
+ * losslessly on return).
+ *
+ * The deck also RECONCILES the store against its live record set (see the effect):
+ * a record no longer present (closed by the user or by an agent over MCP) has its
+ * store instance disposed, so a churn of create/close never leaks a WASM core.
  *
  * Each pane carries `data-terminal-id` (the record id) and `data-active` so the
  * layer above (and the tests) can reason about visibility without inspecting
  * styles. The active pane is the only one without `display:none`.
  */
 export function TerminalDeck({ terminals, activeId, onPtyId }: TerminalDeckProps) {
-  // Per-record xterm instances, for the read seam. Lazy-init the Map once so we
-  // don't allocate (and throw away) a fresh Map on every render.
-  const instancesRef = useRef<Map<string, XTerm | null> | null>(null);
-  instancesRef.current ??= new Map();
-  const instances = instancesRef.current;
-
-  // Publish per-terminal test seams on window so tests (and the e2e suite) can
-  // act on any terminal by record id — including hidden ones. Both are INERT in
-  // production (nothing reads them):
-  //   - `__nyxDeck[id]()`       → read that terminal's xterm buffer (string);
-  //   - `__nyxDeckInput[id](s)` → type `s` into that terminal as keystrokes
-  //     (via xterm `input`, so the PTY echoes + runs it). The e2e suite needs
-  //     this because xterm paints to a WebGL canvas — there is no DOM text to
-  //     type into, so a WebDriver cannot enter input directly.
+  // Publish per-terminal test/e2e seams on window, backed by the STORE (so they
+  // address any terminal by record id, including hidden or navigated-away ones):
+  //   - `__nyxDeck[id]()`       → that terminal's screen text (from the ghostty core);
+  //   - `__nyxDeckInput[id](s)` → feed `s` as input (routes through the PTY).
+  // Both are inert in production (nothing reads them). Kept for the restore/e2e
+  // harness that already relies on this contract.
   useEffect(() => {
     const win = window as unknown as {
       __nyxDeck?: Record<string, () => string>;
       __nyxDeckInput?: Record<string, (data: string) => void>;
     };
-    win.__nyxDeck = win.__nyxDeck ?? {};
-    win.__nyxDeckInput = win.__nyxDeckInput ?? {};
+    win.__nyxDeck = new Proxy(
+      {},
+      { get: (_t, id: string) => () => getTerminal(id)?.readScreenText() ?? "" },
+    ) as Record<string, () => string>;
+    win.__nyxDeckInput = new Proxy(
+      {},
+      { get: (_t, id: string) => (data: string) => getTerminal(id)?.sendInput(data) },
+    ) as Record<string, (data: string) => void>;
     return () => {
       delete win.__nyxDeck;
       delete win.__nyxDeckInput;
     };
   }, []);
 
-  // Per-record callbacks are CACHED (keyed by record id) so each <Terminal> sees
-  // a STABLE onInstance/onPtyId identity across deck re-renders. Building a fresh
-  // closure each render (the prior `makeOnInstance(id)` call-in-render) re-ran
-  // <Terminal>'s onInstance effect on every switch/poll — pure churn — and
-  // defeated the documented "stable callback" intent. The closures capture only
-  // the id and read `window`/`onPtyIdRef.current` at call time, so no entry ever
-  // goes stale; entries for closed terminals are harmless (the seam is inert).
-  const onInstanceCbs = useRef(new Map<string, (term: XTerm | null) => void>());
-  const getOnInstance = (id: string) => {
-    let cb = onInstanceCbs.current.get(id);
-    if (!cb) {
-      cb = (term: XTerm | null) => {
-        instances.set(id, term);
-        const win = window as unknown as {
-          __nyxDeck?: Record<string, () => string>;
-          __nyxDeckInput?: Record<string, (data: string) => void>;
-        };
-        if (win.__nyxDeck) win.__nyxDeck[id] = () => readBuffer(term);
-        if (win.__nyxDeckInput) {
-          win.__nyxDeckInput[id] = (data: string) => term?.input(data, true);
-        }
-      };
-      onInstanceCbs.current.set(id, cb);
-    }
-    return cb;
-  };
+  // RECONCILE the store against the live record set: dispose (real close) any
+  // store instance whose record is no longer present. Runs after render so a
+  // freshly-added record's pane has mounted (created its instance) first.
+  const liveIds = terminals.map((t) => t.id).join(",");
+  useEffect(() => {
+    reconcileTerminals(terminals.map((t) => t.id));
+    // `liveIds` is the stable dep — the id SET, not the array identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveIds]);
 
-  // Read onPtyId off a ref so the per-record callbacks stay stable (no <Terminal>
-  // remount) even as the parent passes a fresh closure each render.
-  const onPtyIdRef = useRef(onPtyId);
-  onPtyIdRef.current = onPtyId;
-  const onPtyIdCbs = useRef(new Map<string, (ptyId: number | null) => void>());
-  const getOnPtyId = (recordId: string) => {
-    let cb = onPtyIdCbs.current.get(recordId);
-    if (!cb) {
-      cb = (ptyId: number | null) => onPtyIdRef.current?.(recordId, ptyId);
-      onPtyIdCbs.current.set(recordId, cb);
-    }
-    return cb;
-  };
-
-  // Render the panes in a STABLE order (by record id), INDEPENDENT of the sidebar
-  // order. The deck only ever SHOWS the active pane (the others are
-  // absolutely-positioned + `display:none`), so their DOM order is visually
-  // irrelevant — but it matters MECHANICALLY: if a sidebar drag-reorder changed
-  // this order, React would MOVE the active pane's DOM node among its siblings,
-  // detaching + reattaching its live xterm canvas and forcing a visible "refresh".
-  // The record id never changes on reorder, so sorting by it pins each pane's DOM
-  // slot; reordering the sidebar no longer disturbs the running terminal. Add/close
-  // still mount/unmount as expected.
+  // Render the panes in a STABLE order (by record id), independent of the sidebar
+  // order: the deck only ever SHOWS the active pane (others are `display:none`), so
+  // their DOM order is visually irrelevant, but sorting by id pins each pane's slot
+  // so a sidebar reorder never moves the active pane's DOM node.
   const ordered = [...terminals].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
   return (
@@ -134,9 +85,9 @@ export function TerminalDeck({ terminals, activeId, onPtyId }: TerminalDeckProps
             key={t.id}
             data-terminal-id={t.id}
             data-active={active ? "true" : "false"}
-            // Hidden panes stay mounted (buffer + PTY alive) but take no space.
-            // `display:none` is what keeps the inactive terminal's xterm alive
-            // while invisible — unmounting would destroy it.
+            // Hidden panes stay mounted; the store instance stays alive regardless.
+            // `display:none` gives the pane a 0×0 box — the instance's app-driven
+            // resize observer skips it (0×0 guard), so it never resizes to 1×1.
             style={active ? undefined : { display: "none" }}
             className="absolute inset-0 h-full w-full"
           >
@@ -145,8 +96,7 @@ export function TerminalDeck({ terminals, activeId, onPtyId }: TerminalDeckProps
               active={active}
               recordId={t.id}
               deadHistory={t.scrollback}
-              onInstance={getOnInstance(t.id)}
-              onPtyId={getOnPtyId(t.id)}
+              onPtyId={(ptyId) => onPtyId?.(t.id, ptyId)}
             />
           </div>
         );

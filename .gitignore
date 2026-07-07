@@ -14,3 +14,9 @@ prototype/
 .env.*
 .DS_Store
 .claude/settings.local.json
+
+# vitest browser-mode local artifacts (visual-regression baselines + failure
+# snapshots/attachments) — regenerated locally on first run, never committed.
+.vitest-screenshots/
+.vitest-attachments/
+**/__screenshots__/

@@ -30,6 +30,7 @@ pub mod events;
 pub mod mcp;
 pub mod pty;
 pub mod recovery;
+pub mod snapshot_store;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,6 +111,13 @@ pub struct Runtime {
     /// Behind a `Mutex` so the boot reconcile, the mutating db-commands' idempotency guard,
     /// and the ordered shutdown all serialize their reads/writes through one cell.
     recovery: Arc<Mutex<recovery::RecoveryState>>,
+    /// The sidecar-owned per-terminal VT SCREEN SNAPSHOT store (v2.2.5): the last serializable
+    /// screen (main + alt) of each terminal, persisted to `<data_dir>/terminal-snapshots.json`
+    /// on the ordered shutdown and read at boot. The `terminal_screen_rehydration` db-command
+    /// serves its ANSI re-hydration bytes so a restarted TUI is repainted faithfully — not just
+    /// its scrollback. Behind a `Mutex` so boot-load and shutdown-save serialize through one cell.
+    /// NOT in the frozen v1 DB (same precedent as [`recovery::RecoveryState`]).
+    snapshots: Arc<Mutex<snapshot_store::SnapshotStore>>,
     /// Latches `true` the first time the Claude-plugin boot reconcile runs (on the first
     /// `McpStart`, once the MCP server has actually bound its port). A `Runtime` is cloned
     /// cheaply and shared across the pipe dispatch, so this `Arc<AtomicBool>` guards against
@@ -172,6 +180,7 @@ impl Runtime {
             data_dir,
             resource_dir,
             recovery: Arc::new(Mutex::new(recovery::RecoveryState::default())),
+            snapshots: Arc::new(Mutex::new(snapshot_store::SnapshotStore::default())),
             plugin_reconciled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -215,6 +224,22 @@ impl Runtime {
         {
             let mut guard = self.recovery.lock().unwrap();
             *guard = recovery::RecoveryState::load(&self.data_dir);
+        }
+        // Load the per-terminal VT screen snapshots persisted at the last shutdown so the
+        // `terminal_screen_rehydration` db-command can hand the renderer each restarted
+        // terminal's re-hydration bytes (a TUI's alt-screen included, not just scrollback).
+        {
+            let mut guard = self.snapshots.lock().unwrap();
+            *guard = snapshot_store::SnapshotStore::load(&self.data_dir);
+            if !guard.is_empty() {
+                events.log(
+                    "info",
+                    format!(
+                        "loaded {} terminal screen snapshot(s) for restart re-hydration",
+                        guard.len()
+                    ),
+                );
+            }
         }
         if outcome.was_crash {
             events.log(
@@ -387,6 +412,15 @@ impl Runtime {
                 command.kill_all_running();
             }
         }
+        // Persist every live terminal's current VT screen (main + alt) BEFORE killing the PTYs,
+        // so the next boot can re-hydrate each terminal faithfully — a full-screen TUI included,
+        // not just its scrollback. Keyed by the persistent record id; record-less terminals are
+        // omitted (they cannot be correlated back at restart).
+        {
+            let live = self.pty.live_snapshots_by_record();
+            let mut store = self.snapshots.lock().unwrap();
+            store.save_live(&self.data_dir, live);
+        }
         self.pty.close_all();
         // Mark this an ORDERED (clean) shutdown so the next boot does NOT run the crash
         // reconcile. Best-effort persistence (the file is an optimization over the DB).
@@ -403,6 +437,28 @@ impl Runtime {
     /// the renderer badges them and the user chooses what to resume.
     pub fn interrupted_instances(&self) -> Vec<String> {
         self.recovery.lock().unwrap().interrupted.clone()
+    }
+
+    /// TEST-ONLY: load the persisted terminal-snapshot store from `data_dir` into this runtime,
+    /// mirroring what [`attach_events`](Runtime::attach_events) does at boot. Tests build a
+    /// runtime with [`with_db_and_paths`](Runtime::with_db_and_paths) (no full event-driven
+    /// boot), so this is the seam that populates the store for a restart-re-hydration assertion.
+    #[cfg(test)]
+    pub fn load_snapshots_for_test(&self, data_dir: &std::path::Path) {
+        *self.snapshots.lock().unwrap() = snapshot_store::SnapshotStore::load(data_dir);
+    }
+
+    /// The ANSI re-hydration byte stream for a terminal RECORD id, for restart re-hydration
+    /// (v2.2.5). Prefers a LIVE terminal's current screen (still-running after a hot reload of
+    /// the renderer) and falls back to the snapshot persisted at the last shutdown. `None` when
+    /// neither exists. The renderer writes these bytes verbatim into a fresh wterm/ghostty
+    /// terminal; ghostty reconstructs the exact grid (alt-screen included). Reading does not
+    /// consume the snapshot, and the byte stream is self-resetting, so re-hydration is idempotent.
+    pub fn terminal_rehydration_bytes(&self, record_id: &str) -> Option<Vec<u8>> {
+        if let Some(live) = self.pty.snapshot_by_record(record_id) {
+            return Some(live.to_rehydration_bytes());
+        }
+        self.snapshots.lock().unwrap().rehydration_bytes(record_id)
     }
 
     /// IDEMPOTENCY CHECK for a mutating operation: returns `true` if `key` was ALREADY

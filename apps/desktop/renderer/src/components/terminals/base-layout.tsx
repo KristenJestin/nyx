@@ -1,9 +1,10 @@
 import { useEffect, useMemo } from "react";
-import { Link, Outlet, useRouterState } from "@tanstack/react-router";
+import { Link, Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
 import { BookOpenIcon, BriefcaseIcon, PlusIcon, SquareTerminalIcon } from "lucide-react";
 import { motion } from "motion/react";
 
 import { cn } from "@/lib/utils";
+import { startNavTransition } from "@/lib/nav-transition";
 import { useProjects, type ProjectTree } from "@/components/sidebar/use-projects";
 import { useManualAdd } from "@/components/sidebar/use-manual-add";
 import { useAgentSessions } from "@/components/sidebar/use-agent-sessions";
@@ -118,6 +119,7 @@ export function BaseLayout() {
   const { projects, createProject, createWorkspace } = useProjects();
   const { activeProjectId, setActiveProjectId } = useActiveProject();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const navigate = useNavigate();
 
   // The rail's "+ Add project" flow — the SAME picker→create-modal→`create_project` path the
   // old sidebar head used, reused verbatim via `useManualAdd` (no new backend, no duplicated
@@ -193,6 +195,35 @@ export function BaseLayout() {
                   to={item.to}
                   title={item.label}
                   aria-label={item.label}
+                  // The MAIN-SCREEN change (Terminals ↔ Work ↔ Knowledge) is wrapped in a
+                  // View Transition cross-fade so the screen — terminal included — fades
+                  // instead of snapping in ("collé", user feedback). We intercept the click
+                  // and drive the navigation ourselves inside `startNavTransition`: it
+                  // snapshots the old DOM, cross-fades to the new, and only calls `navigate`
+                  // inside the callback. The persistent terminal instance is untouched (no
+                  // destroy/respawn) — the VT is pure chrome over the same detach→reattach.
+                  // `startNavTransition` no-ops the VT under `prefers-reduced-motion` and when
+                  // the API is absent (jsdom / old Chromium), so navigation always works.
+                  // We keep `<Link>` (real anchor, active state, a11y) but let a modified /
+                  // non-primary click fall through to the browser's default so it is not
+                  // hijacked.
+                  onClick={(e) => {
+                    if (
+                      e.defaultPrevented ||
+                      e.button !== 0 ||
+                      e.metaKey ||
+                      e.ctrlKey ||
+                      e.shiftKey ||
+                      e.altKey
+                    ) {
+                      return;
+                    }
+                    if (pathname === item.to) return; // already here — no transition
+                    e.preventDefault();
+                    startNavTransition(() => {
+                      void navigate({ to: item.to });
+                    });
+                  }}
                   className={cn(
                     "group flex size-9 items-center justify-center rounded-lg transition-colors",
                     active

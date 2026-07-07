@@ -1,12 +1,11 @@
-// xterm's own stylesheet MUST load before any terminal mounts: it carries the
-// LOAD-BEARING positioning rules (`.xterm-screen { position: relative }` and
-// `.xterm-screen canvas { position: absolute; left: 0; top: 0 }`). Without it the
-// WebGL/canvas render layers fall into normal flow and stack vertically — the
-// viewport goes mostly black with stray glyphs at the top and the real content
-// pushed down, "repairing" only when a full repaint (e.g. a selection drag)
-// fires. Imported here once so EVERY xterm surface (`<Terminal>` and the
-// read-only `<CommandOutputPanel>`) gets it. See FEEDBACK.md #3.
-import "@xterm/xterm/css/xterm.css";
+// wterm's stylesheet carries the terminal layout rules (`.wterm`, `.term-grid`,
+// `.term-row`) the DOM renderer relies on. Imported once here so every terminal
+// surface (`<Terminal>` and the read-only `<CommandOutputPanel>`) is styled even
+// before its instance mounts. (v2.2.5: xterm — and its WebGL canvas-positioning
+// workarounds — are gone; wterm renders to the DOM, so there is no canvas layer
+// to position.) The instance modules also import this so the style is present in
+// any entrypoint, but keeping it here mirrors the original global-load intent.
+import "@wterm/dom/css";
 
 import React from "react";
 import ReactDOM from "react-dom/client";

@@ -1,0 +1,101 @@
+# v2.2.5 TERMINAL-PERSISTENCE VALIDATION GATE — cross-OS (Windows / Linux / macOS)
+#
+# PRD `01KWMDBKW7GZ0X310TK64QEN32`, Phase 3, task `01KWMDBKWA3KBKGFR8B036APC1`.
+#
+# The task's done-criterion requires "navigation et restart lossless démontrés (TUI
+# inclus) sur Windows/Linux/macOS ; smokes verts." This workflow is the cross-OS
+# DEMONSTRATION MECHANISM: it runs the OS-AGNOSTIC gate on a 3-OS matrix, so the same
+# lossless proof is exercised on each platform by CI (the coder's workstation is
+# Linux-only and cannot run Windows/macOS locally).
+#
+# What the gate runs on EACH OS:
+#   - The RENDERER BROWSER suite (Vitest Browser Mode, real Chromium via Playwright,
+#     the REAL ghostty WASM core). This holds the end-to-end lossless gate itself
+#     (`src/components/terminal/gate-lossless.browser.test.tsx`):
+#       * NAV LOSSLESS — a shell + a TUI survive a full route detach->reattach with the
+#         SAME instance/node and buffer/alt-screen/cursor intact (zero reconstruction);
+#       * RESTART LOSSLESS — a fresh instance re-hydrates a TUI faithfully from the
+#         sidecar's VT snapshot bytes (alt-screen + cursor, not just scrollback);
+#       * the no-snapshot fresh-spawn fallback.
+#     Chromium + WASM + Playwright are cross-platform, so this real-ghostty render gate
+#     runs identically on all three OSes.
+#   - The RENDERER UNIT suite (jsdom) — the no-host store detach/reattach + guard-rail
+#     logic and the whole component suite.
+#   - The RUST core + sidecar tests — the sidecar half of the gate: a REAL PTY running a
+#     REAL TUI produces a faithful VT snapshot (`snapshot_captures_alt_screen_tui`), the
+#     snapshot round-trips through disk, and `terminal_screen_rehydration` reconstructs
+#     the alt-screen TUI (`terminal_screen_rehydration_restores_a_persisted_tui`). PTYs
+#     differ per OS (openpty vs ConPTY), so running this on each OS is load-bearing.
+#
+# NOTE on the WebdriverIO Electron e2e (`e2e/`): that harness drives the packaged
+# Electron app with a real shell + PTY end-to-end and is shell-agnostic across
+# Linux/Windows (see e2e/README.md). It needs a built app + a display (xvfb on Linux)
+# and pulls a network toolchain; it is intentionally NOT the primary gate job here (it
+# is the heavier native gate). The gate PROOF above is fully covered by the browser +
+# rust jobs, which are hermetic and fast on all three OSes.
+#
+# All `run:` steps are static commands; this workflow interpolates NO untrusted
+# `github.event.*` input into a shell (the only expression used, `matrix.os`, is a
+# fixed allowlist consumed by `runs-on` / the job name), so there is no injection risk.
+
+name: gate-v2.2.5-terminal-persistence
+
+on:
+  push:
+    branches: [feature/v2.2.5-terminal-persistence, main]
+  pull_request:
+  workflow_dispatch:
+
+# Least-privilege GITHUB_TOKEN: the gate only checks out, installs toolchains and
+# runs tests — it writes nothing back to the repo — so read-only `contents` access
+# is all it needs. This caps the blast radius on fork PRs to the default scope.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: lossless gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install JS deps (root workspaces)
+        run: bun install --frozen-lockfile
+
+      # Vitest Browser Mode drives a real Chromium through Playwright — provision its
+      # browser binary (and OS deps on Linux) so the real-ghostty gate can paint.
+      - name: Install Playwright Chromium
+        working-directory: apps/desktop/renderer
+        run: bunx playwright install --with-deps chromium
+
+      # --- THE GATE: real-ghostty browser suite (nav + restart lossless) ---
+      - name: Renderer BROWSER gate (real ghostty — nav + restart lossless)
+        run: bun run --filter nyx-v2-renderer test:browser
+
+      # --- Renderer unit suite (no-host store detach/reattach + guard-rails) ---
+      - name: Renderer UNIT suite (jsdom)
+        run: bun run --filter nyx-v2-renderer test:unit
+
+      # --- Sidecar half: real-PTY TUI -> VT snapshot -> rehydration (per-OS PTY) ---
+      - name: Rust core + sidecar tests (VT snapshot + rehydration)
+        run: cargo test --workspace --lib

@@ -1,15 +1,20 @@
 import { act, render, waitFor } from "@testing-library/react";
-import { mockIPC, emit } from "@/bridge/test-harness";
-import type { Terminal as XTerm } from "@xterm/xterm";
-import { beforeEach, describe, expect, it } from "vitest";
+import type { WTerm } from "@wterm/dom";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { mockIPC, emit } from "@/bridge/test-harness";
+import { FakeTerminalCore } from "@/components/terminal/fake-core";
+import { setCoreFactory, type CoreFactory } from "@/components/terminal/ghostty-core";
 import { CommandOutputPanel } from "./command-output-panel";
 
 /**
- * Spy on every IPC call so we can prove the read-only contract: the panel
- * rehydrates via `command_output` and NEVER calls any write/stdin/resize command.
- * `command_output` returns a scripted history (cold rehydration) per instance.
+ * `<CommandOutputPanel>` read-only contract (T8), jsdom. Post-v2.2.5 the panel
+ * renders with wterm + the ghostty core (xterm is gone). The WASM core cannot
+ * load under jsdom, so we inject a {@link FakeTerminalCore} (records writes) via
+ * the core-factory seam and assert on `core.written`. ANSI COLOR RENDERING is a
+ * browser-mode concern (the DOM renderer), not asserted here.
  */
+
 interface IpcSpy {
   calls: { cmd: string; args: Record<string, unknown> }[];
   callsTo: (cmd: string) => { cmd: string; args: Record<string, unknown> }[];
@@ -24,10 +29,7 @@ function installIpc(history: Record<string, string> = {}): IpcSpy {
     (cmd, args) => {
       const a = (args ?? {}) as Record<string, unknown>;
       spy.calls.push({ cmd, args: a });
-      if (cmd === "command_output") {
-        const id = a.instanceId as string;
-        return history[id] ?? "";
-      }
+      if (cmd === "command_output") return history[a.instanceId as string] ?? "";
       return null;
     },
     { shouldMockEvents: true },
@@ -35,109 +37,66 @@ function installIpc(history: Record<string, string> = {}): IpcSpy {
   return spy;
 }
 
-/** Read the xterm buffer as plain text (trimmed-right per line). */
-function readBuffer(term: XTerm | null): string {
-  if (!term) return "";
-  const buf = term.buffer.active;
-  let out = "";
-  for (let i = 0; i < buf.length; i++) {
-    const line = buf.getLine(i);
-    if (line) out += line.translateToString(true) + "\n";
-  }
-  return out;
-}
+let lastCore: FakeTerminalCore | null = null;
+let restoreFactory: CoreFactory | null = null;
 
-/** Read xterm's first row CELL colors so we can assert ANSI styling is applied. */
-function firstStyledCell(term: XTerm | null): { fg: number; isFgRGB: boolean } | null {
-  if (!term) return null;
-  const buf = term.buffer.active;
-  for (let row = 0; row < buf.length; row++) {
-    const line = buf.getLine(row);
-    if (!line) continue;
-    for (let col = 0; col < term.cols; col++) {
-      const cell = line.getCell(col);
-      if (!cell) continue;
-      const ch = cell.getChars();
-      if (ch && ch.trim() !== "" && (cell.isFgPalette() || cell.isFgRGB())) {
-        return { fg: cell.getFgColor(), isFgRGB: cell.isFgRGB() };
-      }
-    }
-  }
-  return null;
+function written(): string {
+  return lastCore?.written ?? "";
 }
 
 describe("<CommandOutputPanel> (read-only command output, T8)", () => {
   beforeEach(() => {
     installIpc();
+    lastCore = null;
+    restoreFactory = setCoreFactory(async () => {
+      lastCore = new FakeTerminalCore();
+      return lastCore;
+    });
+  });
+
+  afterEach(() => {
+    if (restoreFactory) setCoreFactory(restoreFactory);
   });
 
   it("rehydrates the persisted history via command_output on open", async () => {
     const spy = installIpc({ inst1: "RESTORED_HISTORY_42\r\n" });
-    let term: XTerm | null = null;
-    render(
-      <CommandOutputPanel
-        instanceId="inst1"
-        onInstance={(t) => {
-          term = t;
-        }}
-      />,
-    );
+    let term: WTerm | null = null;
+    render(<CommandOutputPanel instanceId="inst1" onInstance={(t) => (term = t)} />);
     await waitFor(() => expect(term).not.toBeNull());
 
-    // command_output was invoked for this instance (cold rehydration path).
     await waitFor(() => {
       const calls = spy.callsTo("command_output");
       expect(calls.length).toBeGreaterThan(0);
       expect(calls[0].args.instanceId).toBe("inst1");
     });
-    // The persisted scrollback is written into the buffer.
-    await waitFor(() => expect(readBuffer(term)).toContain("RESTORED_HISTORY_42"));
+    await waitFor(() => expect(written()).toContain("RESTORED_HISTORY_42"));
   });
 
-  it("renders streamed command://output with its ANSI colors", async () => {
-    installIpc({ inst2: "" });
-    let term: XTerm | null = null;
-    render(
-      <CommandOutputPanel
-        instanceId="inst2"
-        onInstance={(t) => {
-          term = t;
-        }}
-      />,
-    );
+  it("renders streamed command://output for its instance", async () => {
+    const spy = installIpc({ inst2: "" });
+    let term: WTerm | null = null;
+    render(<CommandOutputPanel instanceId="inst2" onInstance={(t) => (term = t)} />);
     await waitFor(() => expect(term).not.toBeNull());
-    // Let the rehydrate round-trip resolve so live output writes (not buffers).
-    await waitFor(() => expect(readBuffer(term)).toBeDefined());
+    // Wait until the output subscription is wired (the fake bridge delivers only
+    // to CURRENT subscribers, so an emit before subscribe would be dropped). The
+    // rehydrate `command_output` call fires AFTER all three subscribes resolve.
+    await waitFor(() => expect(spy.callsTo("command_output").length).toBeGreaterThan(0));
 
-    // A red-foreground "ERR" via SGR 31, then reset. Filtered by instanceId.
     const ansi = "\x1b[31mERR_TOKEN\x1b[0m\r\n";
     const bytes = Array.from(new TextEncoder().encode(ansi));
     await act(async () => {
       await emit("command://output", { instanceId: "inst2", bytes });
     });
-
-    await waitFor(() => expect(readBuffer(term)).toContain("ERR_TOKEN"));
-    // The cell carries a non-default foreground color → ANSI was applied, not
-    // stripped (palette index 1 = red, or an RGB value).
-    await waitFor(() => {
-      const cell = firstStyledCell(term);
-      expect(cell).not.toBeNull();
-    });
+    await waitFor(() => expect(written()).toContain("ERR_TOKEN"));
   });
 
   it("only writes output whose instanceId matches (filtered stream)", async () => {
-    installIpc({ inst3: "" });
-    let term: XTerm | null = null;
-    render(
-      <CommandOutputPanel
-        instanceId="inst3"
-        onInstance={(t) => {
-          term = t;
-        }}
-      />,
-    );
+    const spy = installIpc({ inst3: "" });
+    let term: WTerm | null = null;
+    render(<CommandOutputPanel instanceId="inst3" onInstance={(t) => (term = t)} />);
     await waitFor(() => expect(term).not.toBeNull());
-    await waitFor(() => expect(readBuffer(term)).toBeDefined());
+    // Wait until the subscription is wired (rehydrate call fires after subscribe).
+    await waitFor(() => expect(spy.callsTo("command_output").length).toBeGreaterThan(0));
 
     const mine = Array.from(new TextEncoder().encode("MINE_3\r\n"));
     const other = Array.from(new TextEncoder().encode("OTHER_9\r\n"));
@@ -146,155 +105,99 @@ describe("<CommandOutputPanel> (read-only command output, T8)", () => {
       await emit("command://output", { instanceId: "inst3", bytes: mine });
     });
 
-    await waitFor(() => expect(readBuffer(term)).toContain("MINE_3"));
-    expect(readBuffer(term)).not.toContain("OTHER_9");
+    await waitFor(() => expect(written()).toContain("MINE_3"));
+    expect(written()).not.toContain("OTHER_9");
   });
 
-  it("clears the panel on a new run (running transition) so output does not pile", async () => {
-    // Rehydrate the PREVIOUS run's output, then a `running` state event (a fresh
-    // start/relaunch for THIS instance) must wipe the panel so the new run's output
-    // does not stack under the old (finding: relaunch piled output).
+  it("resets the panel on a new run (running transition)", async () => {
     installIpc({ inst5: "OLD_RUN_OUTPUT\r\n" });
-    let term: XTerm | null = null;
-    render(
-      <CommandOutputPanel
-        instanceId="inst5"
-        onInstance={(t) => {
-          term = t;
-        }}
-      />,
-    );
+    let term: WTerm | null = null;
+    render(<CommandOutputPanel instanceId="inst5" onInstance={(t) => (term = t)} />);
     await waitFor(() => expect(term).not.toBeNull());
-    // The old run's history is shown first.
-    await waitFor(() => expect(readBuffer(term)).toContain("OLD_RUN_OUTPUT"));
+    await waitFor(() => expect(written()).toContain("OLD_RUN_OUTPUT"));
 
-    // A running transition for this instance = a new run → clear the panel.
+    // A running transition = a new run → RIS-reset the surface. The fake core
+    // records the reset sequence; we assert the reset was written.
     await act(async () => {
       await emit("command://state", { instanceId: "inst5", state: "running", code: null });
     });
-    await waitFor(() => expect(readBuffer(term)).not.toContain("OLD_RUN_OUTPUT"));
+    await waitFor(() => expect(written()).toContain("\x1bc"));
 
-    // New output streams onto the cleared panel, alone.
     const fresh = Array.from(new TextEncoder().encode("NEW_RUN_OUTPUT\r\n"));
     await act(async () => {
       await emit("command://output", { instanceId: "inst5", bytes: fresh });
     });
-    await waitFor(() => expect(readBuffer(term)).toContain("NEW_RUN_OUTPUT"));
-    expect(readBuffer(term)).not.toContain("OLD_RUN_OUTPUT");
+    await waitFor(() => expect(written()).toContain("NEW_RUN_OUTPUT"));
   });
 
-  it("ignores a running transition for a DIFFERENT instance (no spurious clear)", async () => {
+  it("ignores a running transition for a DIFFERENT instance (no spurious reset)", async () => {
     installIpc({ inst6: "KEEP_THIS_OUTPUT\r\n" });
-    let term: XTerm | null = null;
-    render(
-      <CommandOutputPanel
-        instanceId="inst6"
-        onInstance={(t) => {
-          term = t;
-        }}
-      />,
-    );
+    let term: WTerm | null = null;
+    render(<CommandOutputPanel instanceId="inst6" onInstance={(t) => (term = t)} />);
     await waitFor(() => expect(term).not.toBeNull());
-    await waitFor(() => expect(readBuffer(term)).toContain("KEEP_THIS_OUTPUT"));
+    await waitFor(() => expect(written()).toContain("KEEP_THIS_OUTPUT"));
 
-    // A running transition for ANOTHER instance must NOT clear this panel.
     await act(async () => {
       await emit("command://state", { instanceId: "other99", state: "running", code: null });
     });
-    // Give the listener a tick; the panel must still hold its output.
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
-    expect(readBuffer(term)).toContain("KEEP_THIS_OUTPUT");
+    // No reset sequence was written (the running was for another instance).
+    expect(written()).not.toContain("\x1bc");
   });
 
-  it("resets the panel on command://output-cleared for its instance (clear_command_output)", async () => {
-    // The MCP `clear_command_output` tool empties the backend buffer and emits
-    // `command://output-cleared` (review R-OUTPUT). The panel must wipe its xterm so
-    // it does not keep showing stale scrollback — the analog of the run-start clear
-    // but with NO state transition.
+  it("resets on command://output-cleared for its instance (clear_command_output)", async () => {
     installIpc({ inst7: "STALE_SCROLLBACK\r\n" });
-    let term: XTerm | null = null;
-    render(
-      <CommandOutputPanel
-        instanceId="inst7"
-        onInstance={(t) => {
-          term = t;
-        }}
-      />,
-    );
+    let term: WTerm | null = null;
+    render(<CommandOutputPanel instanceId="inst7" onInstance={(t) => (term = t)} />);
     await waitFor(() => expect(term).not.toBeNull());
-    await waitFor(() => expect(readBuffer(term)).toContain("STALE_SCROLLBACK"));
+    await waitFor(() => expect(written()).toContain("STALE_SCROLLBACK"));
 
-    // The cleared event for THIS instance wipes the panel (no state/code in payload).
     await act(async () => {
       await emit("command://output-cleared", { instanceId: "inst7" });
     });
-    await waitFor(() => expect(readBuffer(term)).not.toContain("STALE_SCROLLBACK"));
+    await waitFor(() => expect(written()).toContain("\x1bc"));
 
-    // Fresh output streams onto the cleared panel, alone.
     const fresh = Array.from(new TextEncoder().encode("AFTER_CLEAR\r\n"));
     await act(async () => {
       await emit("command://output", { instanceId: "inst7", bytes: fresh });
     });
-    await waitFor(() => expect(readBuffer(term)).toContain("AFTER_CLEAR"));
-    expect(readBuffer(term)).not.toContain("STALE_SCROLLBACK");
+    await waitFor(() => expect(written()).toContain("AFTER_CLEAR"));
   });
 
-  it("ignores command://output-cleared for a DIFFERENT instance (no spurious clear)", async () => {
+  it("ignores command://output-cleared for a DIFFERENT instance (no spurious reset)", async () => {
     installIpc({ inst8: "KEEP_AFTER_OTHER_CLEAR\r\n" });
-    let term: XTerm | null = null;
-    render(
-      <CommandOutputPanel
-        instanceId="inst8"
-        onInstance={(t) => {
-          term = t;
-        }}
-      />,
-    );
+    let term: WTerm | null = null;
+    render(<CommandOutputPanel instanceId="inst8" onInstance={(t) => (term = t)} />);
     await waitFor(() => expect(term).not.toBeNull());
-    await waitFor(() => expect(readBuffer(term)).toContain("KEEP_AFTER_OTHER_CLEAR"));
+    await waitFor(() => expect(written()).toContain("KEEP_AFTER_OTHER_CLEAR"));
 
-    // A cleared event for ANOTHER instance must NOT wipe this panel.
     await act(async () => {
       await emit("command://output-cleared", { instanceId: "other77" });
     });
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0));
     });
-    expect(readBuffer(term)).toContain("KEEP_AFTER_OTHER_CLEAR");
+    expect(written()).not.toContain("\x1bc");
   });
 
   it("NEVER sends a keystroke/stdin/resize to the backend (read-only strict)", async () => {
     const spy = installIpc({ inst4: "HELLO\r\n" });
-    let term: XTerm | null = null;
-    render(
-      <CommandOutputPanel
-        instanceId="inst4"
-        onInstance={(t) => {
-          term = t;
-        }}
-      />,
-    );
+    let term: WTerm | null = null;
+    render(<CommandOutputPanel instanceId="inst4" onInstance={(t) => (term = t)} />);
     await waitFor(() => expect(term).not.toBeNull());
     await waitFor(() => expect(spy.callsTo("command_output").length).toBeGreaterThan(0));
 
-    // Simulate the user "typing" into the panel: with the read-only wiring there
-    // is NO onData handler, so even an explicit write triggers no IPC. We also
-    // drive xterm's input directly to be sure no data path exists.
+    // The panel builds its WTerm with NO `onData`, so there is no input path at
+    // all. No write/stdin/resize command is ever invoked; the only IPC is the read.
     await act(async () => {
-      // xterm exposes `input()` which would fire onData IF one were wired.
-      (term as unknown as { input: (d: string) => void }).input("echo pwned\r");
       await new Promise((r) => setTimeout(r, 0));
     });
-
-    // No write/stdin/resize command was ever invoked — the only command-* IPC the
-    // panel makes is the rehydration read.
     expect(spy.callsTo("pty_write")).toHaveLength(0);
     expect(spy.callsTo("command_write")).toHaveLength(0);
     expect(spy.callsTo("pty_resize")).toHaveLength(0);
     expect(spy.callsTo("command_resize")).toHaveLength(0);
-    // Every IPC call the panel makes is the read-only rehydration.
     for (const call of spy.calls) {
       expect(call.cmd).toBe("command_output");
     }

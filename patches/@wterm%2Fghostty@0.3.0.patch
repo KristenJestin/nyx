@@ -1,0 +1,38 @@
+diff --git a/dist/ghostty-core.js b/dist/ghostty-core.js
+index d67f6034bf45572e90600566fa886a2d6f0b6f0d..4c5eeb0de0e5d83ea9439b30c9b7127e89ef4d02 100644
+--- a/dist/ghostty-core.js
++++ b/dist/ghostty-core.js
+@@ -104,7 +104,17 @@ export class GhosttyCore {
+         if (byteOffset + CELL_BYTES > this._viewportBufSize)
+             return BLANK_CELL;
+         const cell = parseCell(view, byteOffset);
+-        if (cell.codepoint === 0 && cell.flags === 0 && cell.colorFlags === 0)
++        // nyx patch (residual cells): a codepoint of 0 is an ERASED / never-written
++        // cell — it has NO glyph, so it must render as a truly BLANK cell even when the
++        // erase left residual per-cell SGR attributes behind (`flags` / `colorFlags` !=
++        // 0). Ghostty's ESC[2J / ESC[K / scroll blank the codepoint but can leave the
++        // pen's underline/color/… on the cell; unpatched, this branch only blanked when
++        // flags were ALSO 0, so those cells returned a STYLED SPACE (`char: 32` +
++        // residual flags) and the DOM painted a stray underline/color on an empty line
++        // (review 01KWY0KXSF0X8E6JDH2QVXTRRQ). Blanking on codepoint===0 alone fixes it.
++        // A background-color-erased region (BCE) is UNAFFECTED: ghostty stores those as a
++        // real space (codepoint===32), not 0, so their background still renders.
++        if (cell.codepoint === 0)
+             return BLANK_CELL;
+         const result = {
+             char: cell.codepoint || 32,
+@@ -191,6 +201,14 @@ export class GhosttyCore {
+         const view = new DataView(this.wasm.exports.memory.buffer, bufPtr, lineSize);
+         const cell = parseCell(view, col * CELL_BYTES);
+         freeBuffer(this.wasm, bufPtr, lineSize);
++        // nyx patch (residual cells): same rule as getCell — a codepoint of 0 is an
++        // erased/never-written scrollback cell with no glyph, so it must render blank
++        // even if residual SGR attributes (underline/color) were left on it. A line that
++        // scrolled off after an erase would otherwise carry a stray underline/color into
++        // the scrollback history (review 01KWY0KXSF0X8E6JDH2QVXTRRQ). A real written space
++        // (codepoint===32, incl. background-color-erase) is unaffected.
++        if (cell.codepoint === 0)
++            return BLANK_CELL;
+         return {
+             char: cell.codepoint || 32,
+             fg: DEFAULT_COLOR,

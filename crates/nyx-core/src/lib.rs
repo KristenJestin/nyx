@@ -68,6 +68,7 @@ pub mod schema;
 pub mod shellinteg;
 pub mod subfolder;
 pub mod usecase;
+pub mod vt_screen;
 pub mod workspace_git;
 pub mod workspace_runtime;
 pub mod workspace_timeline;

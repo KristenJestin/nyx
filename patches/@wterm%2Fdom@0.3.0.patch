@@ -1,0 +1,74 @@
+diff --git a/dist/input.js b/dist/input.js
+index 790c1e992d391054ae3d8306b914098852cad760..deee0e6048f441be70896a4a6a2a47e3299cbb02 100644
+--- a/dist/input.js
++++ b/dist/input.js
+@@ -39,6 +39,16 @@ const FIXED_KEYS = {
+ export class InputHandler {
+     constructor(element, onData, getBridge) {
+         this.composing = false;
++        // nyx patch (fcitx5 dedup): the exact text handleKeyDown just emitted for a
++        // plain printable key (null otherwise). Some IMEs (fcitx5) still deliver a
++        // browser `input` event AFTER a preventDefault()'d keydown, which would re-emit
++        // the same character (double input: "lslsls..."). handleInput drops an `input`
++        // whose value EXACTLY MATCHES this, then clears it. Reset at the top of every
++        // keydown so it is strictly turn-scoped (an `input` with no matching keydown, or
++        // a different value, is never dropped). NEVER set on the composition path
++        // (`composing` short-circuits keydown), so real IME compose (CJK / fcitx compose)
++        // is untouched.
++        this._keydownEmittedText = null;
+         this.element = element;
+         this.onData = onData;
+         this.getBridge = getBridge;
+@@ -98,6 +108,11 @@ export class InputHandler {
+         this.textarea.remove();
+     }
+     handleKeyDown(e) {
++        // nyx patch (fcitx5 dedup): start a fresh turn — forget any char a prior keydown
++        // emitted, so the dedup below only ever cancels the `input` that belongs to THIS
++        // keystroke. Left set from a previous turn it could otherwise drop an unrelated
++        // later `input`.
++        this._keydownEmittedText = null;
+         if (this.composing)
+             return;
+         if ((e.metaKey || e.ctrlKey) && e.key === "c") {
+@@ -128,8 +143,18 @@ export class InputHandler {
+         }
+         e.preventDefault();
+         const seq = this.keyToSequence(e);
+-        if (seq)
++        if (seq) {
++            // nyx patch (fcitx5 dedup): remember the emitted text for a PLAIN printable
++            // key only (`seq === e.key`, a single-char self-insert). For control/nav keys
++            // (Enter → "\r", arrows → "\x1b[...", ctrl combos, alt-prefixed) the browser
++            // emits no matching `input`, so we must NOT arm the guard — leaving it null
++            // means a following `input` is never wrongly dropped. A trailing IME-injected
++            // `input` (fcitx5) for a plain key carries the same character and is dropped
++            // by handleInput.
++            if (seq === e.key && e.key.length === 1)
++                this._keydownEmittedText = seq;
+             this.onData(seq);
++        }
+     }
+     handlePaste(e) {
+         e.preventDefault();
+@@ -160,6 +185,20 @@ export class InputHandler {
+         if (this.composing)
+             return;
+         const value = this.textarea.value;
++        // nyx patch (fcitx5 dedup): if the immediately-preceding keydown already
++        // preventDefault()'d and emitted EXACTLY this text, this `input` event is the
++        // IME's (fcitx5) duplicate for the SAME keystroke — consume the marker, clear the
++        // textarea and drop it so the character is not sent twice. Matching on the exact
++        // value (not just "a keydown happened") means a legitimate `input` that differs
++        // from what keydown emitted is still delivered. The marker is only ever set by
++        // handleKeyDown for a plain printable key; composition never reaches here (it
++        // short-circuits on `this.composing`), so real IME compose is unaffected.
++        if (this._keydownEmittedText !== null && value === this._keydownEmittedText) {
++            this._keydownEmittedText = null;
++            this.textarea.value = "";
++            return;
++        }
++        this._keydownEmittedText = null;
+         if (value) {
+             this.onData(value);
+             this.textarea.value = "";

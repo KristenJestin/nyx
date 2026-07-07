@@ -29,7 +29,7 @@
 //! gap avoids pause/resume thrash.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use nyx_core::osc133::{self, ExecOutcome};
 use nyx_core::osc7;
 use nyx_core::pty::{PauseGate, Pty};
+use nyx_core::vt_screen::{ScreenSnapshot, VtScreen};
 use portable_pty::PtySize;
 
 use super::events::EventSink;
@@ -83,9 +84,26 @@ struct LiveTerminal {
     flow: Arc<Mutex<FlowState>>,
     /// The pump thread handle, joined on close so the thread never leaks.
     pump: Option<JoinHandle<()>>,
+    /// The headless-VT feeder thread handle, joined on close so it never leaks.
+    feeder: Option<JoinHandle<()>>,
     /// The persistent terminal RECORD id this PTY was spawned for, if any (so close can
     /// retract the record -> live-pty join from `live_records`).
     record_id: Option<String>,
+    /// The HEADLESS VT screen model (v2.2.5): a dedicated FEEDER thread parses the SAME raw PTY
+    /// bytes the pump streams to the renderer into this grid (main + alt-screen), so
+    /// [`PtyManager::snapshot`] can capture a serializable [`ScreenSnapshot`] for lossless
+    /// re-hydration at restart — a full-screen TUI included, not just scrollback.
+    ///
+    /// CRITICAL: the parsing runs on the feeder thread, NOT on the pump's read→emit path. The
+    /// pump only does an O(1) channel send of each chunk to the feeder, so the (slow, byte-wise)
+    /// VT parse can never widen the pump's read-ahead window and thereby weaken the lossless
+    /// pause-gate backpressure. The correctness of live RENDERING stays with ghostty in the
+    /// renderer (this is a restore-time snapshot, per the PRD).
+    screen: Arc<Mutex<VtScreen>>,
+    /// The channel INTO the feeder thread. The pump sends each raw chunk here (O(1)); dropping
+    /// this sender (on close) disconnects the feeder so it drains and exits. `None` once close
+    /// has taken it to trigger that shutdown.
+    feed_tx: Option<Sender<Vec<u8>>>,
 }
 
 /// The live interactive-PTY registry + pump driver. The [`super::Runtime`] holds one;
@@ -149,16 +167,40 @@ impl PtyManager {
             seq: 0,
         }));
         let pty = Arc::new(Mutex::new(pty));
+        // Headless VT screen model (v2.2.5): sized to match the spawn geometry so its grid is
+        // the same shape the renderer paints.
+        let screen = Arc::new(Mutex::new(VtScreen::new(rows, cols)));
+
+        // FEEDER thread: owns the slow, byte-wise VT parse OFF the pump's read→emit path. The
+        // pump sends each raw chunk here (O(1)); this thread parses it into `screen`. Dropping
+        // the sender (on close) disconnects `feed_rx` so the feeder drains and exits.
+        let (feed_tx, feed_rx) = mpsc::channel::<Vec<u8>>();
+        let feeder_screen = Arc::clone(&screen);
+        let feeder = std::thread::Builder::new()
+            .name(format!("nyx-sidecar-pty-feeder-{terminal_id}"))
+            .spawn(move || {
+                run_screen_feeder(feed_rx, feeder_screen);
+            })?;
 
         // Spawn the pump thread: it OWNS the receiver and drives coalescing + OSC scan
-        // + flow control until the child exits (the receiver disconnects on EOF).
+        // + flow control until the child exits (the receiver disconnects on EOF). It also
+        // forwards each chunk to the feeder for the VT screen model.
         let pump_flow = Arc::clone(&flow);
         let pump_gate = pause_gate.clone();
         let pump_pty = Arc::clone(&pty);
+        let pump_feed_tx = feed_tx.clone();
         let pump = std::thread::Builder::new()
             .name(format!("nyx-sidecar-pty-pump-{terminal_id}"))
             .spawn(move || {
-                run_pump(terminal_id, rx, events, pump_flow, pump_gate, pump_pty);
+                run_pump(
+                    terminal_id,
+                    rx,
+                    events,
+                    pump_flow,
+                    pump_gate,
+                    pump_pty,
+                    pump_feed_tx,
+                );
             })?;
 
         self.terminals.lock().unwrap().insert(
@@ -168,7 +210,10 @@ impl PtyManager {
                 pause_gate,
                 flow,
                 pump: Some(pump),
+                feeder: Some(feeder),
                 record_id: (!record_id.is_empty()).then(|| record_id.to_string()),
+                screen,
+                feed_tx: Some(feed_tx),
             },
         );
         // Register the record -> live pty join so the MCP terminal tools resolve this
@@ -231,17 +276,55 @@ impl PtyManager {
 
     /// Resize a live PTY (SIGWINCH to the child). Unknown id -> error.
     pub fn resize(&self, terminal_id: u32, cols: u16, rows: u16) -> anyhow::Result<()> {
-        // Clone the pty `Arc` out from under the registry lock so the (potentially
+        // Clone the pty + screen `Arc`s out from under the registry lock so the (potentially
         // blocking) resize never holds the whole-registry lock.
-        let pty = {
+        let (pty, screen) = {
             let terms = self.terminals.lock().unwrap();
             let t = terms
                 .get(&terminal_id)
                 .ok_or_else(|| anyhow::anyhow!("unknown terminal {terminal_id}"))?;
-            Arc::clone(&t.pty)
+            (Arc::clone(&t.pty), Arc::clone(&t.screen))
         };
+        // Keep the headless VT grid the same shape as the PTY window so its snapshot matches
+        // what the renderer paints after a SIGWINCH.
+        screen.lock().unwrap().resize(rows, cols);
         let result = pty.lock().unwrap().resize(cols, rows, 0, 0);
         result
+    }
+
+    /// The serializable VT screen SNAPSHOT of a live terminal by its live pty id — the
+    /// current on-screen grid (main + alt-screen), for lossless re-hydration at restart
+    /// (v2.2.5). `None` for an unknown / already-closed terminal.
+    pub fn snapshot(&self, terminal_id: u32) -> Option<ScreenSnapshot> {
+        let screen = {
+            let terms = self.terminals.lock().unwrap();
+            Arc::clone(&terms.get(&terminal_id)?.screen)
+        };
+        let snap = screen.lock().unwrap().snapshot();
+        Some(snap)
+    }
+
+    /// The VT screen snapshot of a live terminal by its persistent RECORD id (the MCP / restore
+    /// path keys terminals by record id). `None` when no live PTY backs the record.
+    pub fn snapshot_by_record(&self, record_id: &str) -> Option<ScreenSnapshot> {
+        let pty_id = self.live_records.lock().unwrap().get(record_id).copied()?;
+        self.snapshot(pty_id)
+    }
+
+    /// Every live terminal that carries a persistent RECORD id, as `(record_id, snapshot)` of
+    /// its current VT screen. This is what the ordered shutdown persists so the next boot can
+    /// re-hydrate each terminal (a TUI on the alt-screen included). Record-less terminals are
+    /// omitted (they cannot be correlated back at restart).
+    pub fn live_snapshots_by_record(&self) -> Vec<(String, ScreenSnapshot)> {
+        let terms = self.terminals.lock().unwrap();
+        terms
+            .values()
+            .filter_map(|t| {
+                let rec = t.record_id.clone()?;
+                let snap = t.screen.lock().unwrap().snapshot();
+                Some((rec, snap))
+            })
+            .collect()
     }
 
     /// Close a live PTY: kill the interactive shell and join its pump. The pump
@@ -266,6 +349,13 @@ impl PtyManager {
             let _ = live.pty.lock().unwrap().kill();
             live.pause_gate.set_paused(false);
             if let Some(handle) = live.pump.take() {
+                let _ = handle.join();
+            }
+            // Drop the feeder's sender so its channel disconnects, then join it (the pump also
+            // held a sender clone, but it dropped when the pump thread exited above). The feeder
+            // drains any remaining chunks and exits — it never leaks past close.
+            drop(live.feed_tx.take());
+            if let Some(handle) = live.feeder.take() {
                 let _ = handle.join();
             }
         }
@@ -361,6 +451,7 @@ fn run_pump(
     flow: Arc<Mutex<FlowState>>,
     gate: PauseGate,
     pty: Arc<Mutex<Pty>>,
+    feed_tx: Sender<Vec<u8>>,
 ) {
     let mut pending: Vec<u8> = Vec::new();
     let mut last_flush = Instant::now();
@@ -380,6 +471,13 @@ fn run_pump(
         };
         match recv {
             Ok(chunk) => {
+                // Forward the SAME raw bytes to the headless VT feeder (v2.2.5) with an O(1)
+                // channel send — the slow byte-wise parse runs on the FEEDER thread, so it never
+                // slows this read→emit loop and can never widen the read-ahead window that the
+                // lossless pause-gate backpressure depends on. A `send` error means the feeder is
+                // gone (close); we simply stop forwarding then. Observational — the bytes still
+                // flow unchanged to TerminalOutput below.
+                let _ = feed_tx.send(chunk.clone());
                 // OSC 7 cwd (observational; bytes still flow to TerminalOutput below).
                 if let Some(cwd) = osc7::extract_last_cwd(&chunk) {
                     events.emit(Event::PtyCwd { terminal_id, cwd });
@@ -400,13 +498,38 @@ fn run_pump(
             }
             Err(RecvTimeoutError::Disconnected) => {
                 // Child exited / master closed: flush the tail, reap the code, emit
-                // `pty-exit`, exit the pump.
+                // `pty-exit`, exit the pump. The `feed_tx` clone drops here, so once close also
+                // drops the stored sender the feeder disconnects and exits.
                 flush(terminal_id, &mut pending, &events, &flow, &gate);
                 let code = pty.lock().unwrap().wait();
                 events.emit(Event::PtyExit { terminal_id, code });
                 break;
             }
         }
+    }
+}
+
+/// The headless-VT FEEDER loop (v2.2.5): drain raw output chunks off the pump and parse them
+/// into the [`VtScreen`], entirely OFF the pump's latency-critical read→emit path.
+///
+/// Why a separate thread: the VT parse is byte-wise and, under a pathological flood (`yes`),
+/// parsing megabytes is slow. If it ran inline on the pump, it would slow the pump's drain of
+/// the reader channel and let the core reader race ahead — widening the read-ahead window and
+/// weakening the lossless pause-gate backpressure (the unacked backlog would blow past the
+/// high-water mark). Here the pump only does an O(1) `send`, so backpressure is unaffected.
+///
+/// Coalescing: the screen is EVENTUALLY-CONSISTENT — only the *final* grid matters for a
+/// restart snapshot. So under a burst we drain everything currently queued and feed it in one
+/// batch, which lets the parser skip nothing but avoids per-chunk lock churn. Exits when the
+/// channel disconnects (the pump exited AND close dropped the stored sender).
+fn run_screen_feeder(rx: Receiver<Vec<u8>>, screen: Arc<Mutex<VtScreen>>) {
+    while let Ok(first) = rx.recv() {
+        // Coalesce whatever else is already queued so a flood is fed in one locked batch.
+        let mut batch = first;
+        while let Ok(more) = rx.try_recv() {
+            batch.extend_from_slice(&more);
+        }
+        screen.lock().unwrap().feed(&batch);
     }
 }
 
@@ -556,5 +679,127 @@ mod tests {
         assert!(has_terminator(b"abc\x1b\\"));
         assert!(!has_terminator(b"abc"));
         assert!(!has_terminator(b"abc\x1b"));
+    }
+
+    // --- per-terminal VT screen snapshot (v2.2.5, PRD 01KWMDBKW7GZ0X310TK64QEN32) ---------
+
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use crate::runtime::events::EventSink;
+
+    /// A discard sink: the pump's `TerminalOutput`/exit frames go nowhere in these tests — we
+    /// assert on the SNAPSHOT, not the wire, so the events are irrelevant here.
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn discard_sink() -> EventSink {
+        EventSink::new(Box::new(Sink(Arc::new(Mutex::new(Vec::new())))))
+    }
+
+    /// Poll the snapshot until `pred` holds or we time out, returning the last snapshot.
+    fn snapshot_until<F>(
+        mgr: &PtyManager,
+        id: u32,
+        timeout: Duration,
+        pred: F,
+    ) -> Option<ScreenSnapshot>
+    where
+        F: Fn(&ScreenSnapshot) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        let mut last = None;
+        while Instant::now() < deadline {
+            if let Some(s) = mgr.snapshot(id) {
+                let hit = pred(&s);
+                last = Some(s);
+                if hit {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        last
+    }
+
+    /// The pump feeds the per-terminal VT model, so a shell that prints text has a faithful
+    /// on-screen snapshot (the main-screen half of the done-criteria). We echo a marker via
+    /// `printf` (no trailing newline in the marker so the row text is exact) and read it back
+    /// off the snapshot grid — proving the sidecar EXPOSES a per-terminal screen snapshot.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_reflects_shell_output() {
+        let mgr = PtyManager::new();
+        let id = mgr
+            .spawn(80, 24, "", "", discard_sink())
+            .expect("spawn pty");
+        // Print a distinctive marker to the terminal's own stdout (flows through the pump).
+        mgr.write(id, b"printf 'NYX_SNAP_MARKER'\n").expect("write");
+        let snap = snapshot_until(&mgr, id, Duration::from_secs(5), |s| {
+            (0..s.main.rows).any(|r| s.main.row_text(r).contains("NYX_SNAP_MARKER"))
+        })
+        .expect("a snapshot");
+        assert!(
+            (0..snap.main.rows).any(|r| snap.main.row_text(r).contains("NYX_SNAP_MARKER")),
+            "the VT snapshot must contain the shell's printed marker; got rows: {:?}",
+            (0..snap.main.rows)
+                .map(|r| snap.main.row_text(r))
+                .collect::<Vec<_>>()
+        );
+        assert!(!snap.alt_active, "still on the main screen");
+        mgr.close(id);
+    }
+
+    /// The crux of the PRD: a TUI paints into the ALTERNATE screen, which is invisible to the
+    /// scrollback. Driving the alt-screen enter sequence + a painted line, the sidecar's
+    /// snapshot must show `alt_active` with the alt-grid content — the "restore a TUI, not just
+    /// the scrollback" capability. We emit the raw sequences via `printf` from the shell.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_captures_alt_screen_tui() {
+        let mgr = PtyManager::new();
+        let id = mgr
+            .spawn(80, 24, "", "", discard_sink())
+            .expect("spawn pty");
+        // Enter alt-screen (1049h), home, clear, paint a TUI line — all via one printf. Octal
+        // \033 is ESC in POSIX printf. No newline after the payload so the row is exact.
+        mgr.write(id, b"printf '\\033[?1049h\\033[H\\033[2JTUI_ALT_LINE'\n")
+            .expect("write");
+        let snap = snapshot_until(&mgr, id, Duration::from_secs(5), |s| {
+            s.alt_active
+                && s.alt
+                    .as_ref()
+                    .map(|a| (0..a.rows).any(|r| a.row_text(r).contains("TUI_ALT_LINE")))
+                    .unwrap_or(false)
+        })
+        .expect("a snapshot");
+        assert!(
+            snap.alt_active,
+            "the snapshot must show the alternate screen active"
+        );
+        let alt = snap.alt.expect("alt buffer present while in alt-screen");
+        assert!(
+            (0..alt.rows).any(|r| alt.row_text(r).contains("TUI_ALT_LINE")),
+            "the alt-screen grid must carry the TUI's painted line; got rows: {:?}",
+            (0..alt.rows).map(|r| alt.row_text(r)).collect::<Vec<_>>()
+        );
+        mgr.close(id);
+    }
+
+    /// An unknown / closed terminal has no snapshot.
+    #[test]
+    fn snapshot_none_for_unknown_terminal() {
+        let mgr = PtyManager::new();
+        assert!(mgr.snapshot(999_999).is_none());
     }
 }

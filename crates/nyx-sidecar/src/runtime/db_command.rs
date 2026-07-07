@@ -527,6 +527,22 @@ impl Ctx<'_> {
                 let (cwd, foreground) = self.runtime.pty().terminal_info(pty_id);
                 Self::json(&serde_json::json!({ "cwd": cwd, "foreground": foreground }))
             }
+            "terminal_screen_rehydration" => {
+                // `{ recordId }` -> `{ bytes: number[] }`: the ANSI re-hydration byte stream that
+                // repaints this terminal's screen (main + alt-screen) into a FRESH wterm/ghostty
+                // terminal at restart (v2.2.5 task #7). Prefers a still-live terminal's current
+                // screen, else the snapshot persisted at the last shutdown; `{ bytes: [] }` when
+                // there is nothing to restore. The renderer writes the bytes verbatim (ghostty is
+                // the VT authority) — no grid model crosses the wire, so the payload is
+                // front-lib independent. Reading is non-destructive and the stream self-resets, so
+                // repeated calls are idempotent.
+                let record_id = self.arg_str("recordId")?;
+                let bytes = self
+                    .runtime
+                    .terminal_rehydration_bytes(&record_id)
+                    .unwrap_or_default();
+                Self::json(&serde_json::json!({ "bytes": bytes }))
+            }
             "register_terminal_pty" => {
                 // The sidecar OWNS the PTY and auto-registers the record -> live-pty join on
                 // spawn (and retracts it on close), so the v1 explicit publish is a no-op
@@ -2184,5 +2200,131 @@ mod tests {
             pushes_before,
             "workspace_timeline is a pure read — no changed broadcast"
         );
+    }
+
+    // --- terminal re-hydration at restart (v2.2.5 task #7) -----------------------
+
+    use nyx_core::vt_screen::VtScreen;
+
+    /// Decode the `{ bytes: number[] }` result of `terminal_screen_rehydration` into raw bytes.
+    fn rehydration_bytes_from_result(json: &str) -> Vec<u8> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("json result");
+        v["bytes"]
+            .as_array()
+            .expect("bytes array")
+            .iter()
+            .map(|n| n.as_u64().expect("byte") as u8)
+            .collect()
+    }
+
+    /// The `terminal_screen_rehydration` db-command returns re-hydration bytes for a terminal
+    /// whose VT screen the sidecar persisted — and feeding those bytes into a fresh VT screen
+    /// restores a TUI on the ALT-SCREEN (not just the scrollback). This is the end-to-end
+    /// restart protocol at the sidecar seam: persist at shutdown → serve at restart.
+    #[test]
+    fn terminal_screen_rehydration_restores_a_persisted_tui() {
+        let h = Harness::new();
+        let data_dir = h.runtime.data_dir().to_path_buf();
+
+        // Simulate the pre-restart run: a terminal ended a session in a TUI on the alt-screen.
+        // We persist that screen through the sidecar's snapshot store keyed by the record id —
+        // exactly what `Runtime::shutdown` does with the live PtyManager snapshots.
+        let mut vt = VtScreen::new(6, 40);
+        vt.feed(b"$ vim notes.txt\r\n");
+        vt.feed(b"\x1b[?1049h\x1b[2J\x1b[H");
+        vt.feed(b"\x1b[1;1H  1 the quick brown fox");
+        vt.feed(b"\x1b[6;1H\x1b[7m-- INSERT --\x1b[0m");
+        let snap = vt.snapshot();
+        {
+            let mut store = super::super::snapshot_store::SnapshotStore::default();
+            store.save_live(&data_dir, [("rec-tui".to_string(), snap)]);
+        }
+
+        // RESTART: a fresh runtime over the SAME data dir loads the persisted store (exactly as
+        // `attach_events` does at boot).
+        let db2 = Arc::clone(h.runtime.db());
+        let runtime2 = Runtime::with_db_and_paths(db2, data_dir.clone(), None);
+        runtime2.load_snapshots_for_test(&data_dir);
+        let events = EventSink::new(Box::new(SharedBuf(Arc::new(Mutex::new(Vec::new())))));
+        let result = dispatch(
+            &runtime2,
+            "terminal_screen_rehydration",
+            &serde_json::json!({ "recordId": "rec-tui" }).to_string(),
+            &events,
+        )
+        .expect("rehydration command");
+        let bytes = rehydration_bytes_from_result(&result);
+        assert!(
+            !bytes.is_empty(),
+            "a persisted terminal yields re-hydration bytes"
+        );
+
+        // The renderer would write these into a fresh wterm/ghostty; we prove fidelity by
+        // feeding them into a fresh headless VT and asserting the alt-screen TUI is restored.
+        let mut fresh = VtScreen::new(6, 40);
+        fresh.feed(&bytes);
+        let restored = fresh.snapshot();
+        assert!(
+            restored.alt_active,
+            "restored terminal is back on the alt-screen (a TUI, not history)"
+        );
+        let alt = restored.alt.expect("alt buffer restored");
+        assert!(
+            (0..alt.rows).any(|r| alt.row_text(r).contains("the quick brown fox")),
+            "the TUI's alt-screen content is restored"
+        );
+        assert!(
+            (0..alt.rows).any(|r| alt.row_text(r).contains("-- INSERT --")),
+            "the TUI status line is restored"
+        );
+
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// The command is IDEMPOTENT: reading it twice returns the same bytes (a non-destructive
+    /// read of a self-resetting stream), and both restore the same screen.
+    #[test]
+    fn terminal_screen_rehydration_is_idempotent() {
+        let h = Harness::new();
+        let data_dir = h.runtime.data_dir().to_path_buf();
+        let mut vt = VtScreen::new(4, 30);
+        vt.feed(b"\x1b[?1049h\x1b[2J\x1b[HTUI STATE\r\nrow two");
+        {
+            let mut store = super::super::snapshot_store::SnapshotStore::default();
+            store.save_live(&data_dir, [("rec-1".to_string(), vt.snapshot())]);
+        }
+        h.runtime.load_snapshots_for_test(&data_dir);
+
+        let call = || {
+            rehydration_bytes_from_result(
+                &h.run(
+                    "terminal_screen_rehydration",
+                    serde_json::json!({ "recordId": "rec-1" }),
+                )
+                .unwrap(),
+            )
+        };
+        let first = call();
+        let second = call();
+        assert_eq!(
+            first, second,
+            "re-reading returns identical bytes (non-destructive)"
+        );
+        assert!(!first.is_empty());
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
+
+    /// An unknown record id (never persisted, not live) yields empty bytes — a benign
+    /// "nothing to restore", not an error.
+    #[test]
+    fn terminal_screen_rehydration_unknown_record_is_empty() {
+        let h = Harness::new();
+        let result = h
+            .run(
+                "terminal_screen_rehydration",
+                serde_json::json!({ "recordId": "does-not-exist" }),
+            )
+            .unwrap();
+        assert!(rehydration_bytes_from_result(&result).is_empty());
     }
 }

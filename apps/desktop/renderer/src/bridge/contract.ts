@@ -286,6 +286,10 @@ export type BackendCommand =
   | "reorder"
   | "terminal_exec_mark_read"
   | "persist_scrollback"
+  // v2.2.5 restart re-hydration: the sidecar's VT screen snapshot as an ANSI byte
+  // stream ({ recordId } -> { bytes: number[] }). Written into a fresh terminal to
+  // restore its screen (a TUI's alt-screen included), not just its scrollback.
+  | "terminal_screen_rehydration"
   // FEEDBACK #32: persist a terminal's live cwd into its record so a relaunch
   // re-spawns at the LAST directory, not the stale spawn-time cwd.
   | "set_terminal_cwd"

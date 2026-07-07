@@ -12,10 +12,10 @@ import type { WorkspaceRuntimeService, WorkspaceRuntimeTerminal } from "./use-wo
  * `<RuntimePaneHost>` — the Terminals page's MAIN surface, driven by the shared page runtime
  * selection:
  *
- *  - a selected TERMINAL shows its LIVE xterm pane. We reuse the real [`<TerminalDeck>`] — the
+ *  - a selected TERMINAL shows its LIVE wterm pane. We reuse the real [`<TerminalDeck>`] — the
  *    exact multi-terminal host the shell uses — so every live terminal in the ENTERED PROJECT
- *    (across all its workspaces) stays mounted (PTY + buffer + scrollback alive) and only the
- *    selected one is visible. No second terminal implementation, no duplicated xterm wiring.
+ *    (across all its workspaces) stays alive in the no-host store (PTY + wterm/ghostty screen
+ *    state) and only the selected one is visible. No second terminal implementation, one lib.
  *  - a selected SERVICE that is IDLE (no live run, nothing to stream) shows the MINIMAL empty
  *    state (`<CommandIdleEmpty>`: a discrete state label over the terminal surface) instead of a
  *    bare black pane — the validated empty state. Once it is running/settled its output streams

@@ -201,6 +201,55 @@ describe("BaseLayout", () => {
   });
 });
 
+/**
+ * The View Transitions API cross-fade on a main-screen change (finding
+ * 01KWV88BMDYXR8F0V6TSNFJSQQ). jsdom has NO `document.startViewTransition`, so:
+ *   - by DEFAULT (no spy) the section-nav still navigates — the fallback path;
+ *   - with a SPY installed, a section-nav click wraps the navigation in it.
+ */
+interface VTDoc {
+  startViewTransition?: (cb: () => void) => unknown;
+}
+const vtDoc = document as unknown as VTDoc;
+
+describe("BaseLayout — navigation cross-fade (View Transitions API)", () => {
+  beforeEach(() => {
+    installBackend([project("p1", "Alpha")]);
+  });
+
+  it("FALLBACK: navigates normally when startViewTransition is absent (jsdom default)", async () => {
+    // The API does not exist in jsdom — the fallback path. Navigation must still work.
+    expect(vtDoc.startViewTransition).toBeUndefined();
+    renderLayout("/");
+    expect(await screen.findByText("TERMINALS PAGE")).toBeTruthy();
+    fireEvent.click(screen.getByRole("link", { name: "Knowledge" }));
+    expect(await screen.findByText("KNOWLEDGE PAGE")).toBeTruthy();
+  });
+
+  it("wraps a section-nav navigation in document.startViewTransition when the API exists", async () => {
+    // Install a spy that runs its callback synchronously (like the real API's swap).
+    const vt = vi.fn((cb: () => void) => {
+      cb();
+      return {
+        finished: Promise.resolve(),
+        ready: Promise.resolve(),
+        updateCallbackDone: Promise.resolve(),
+      };
+    });
+    vtDoc.startViewTransition = vt as unknown as VTDoc["startViewTransition"];
+    try {
+      renderLayout("/");
+      expect(await screen.findByText("TERMINALS PAGE")).toBeTruthy();
+      fireEvent.click(screen.getByRole("link", { name: "Work" }));
+      // The transition wrapped the route change, and the new page rendered.
+      expect(vt).toHaveBeenCalledTimes(1);
+      expect(await screen.findByText("WORK PAGE")).toBeTruthy();
+    } finally {
+      delete vtDoc.startViewTransition;
+    }
+  });
+});
+
 describe("BaseLayout — + Add project (rail)", () => {
   it("picks a folder, confirms the create modal, and the new project appears in the rail", async () => {
     // Serve the base projects + capture the create_project call; the folder picker returns a
