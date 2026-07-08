@@ -109,9 +109,9 @@ Tranchée : le fourre-tout « directives » de Depot est **décomposé en trois 
 
 ## Q-015 - Rafraîchissement temps réel des vues dérivées de Git
 
-**Status: open — différée en v2.4 (hors scope v2.1)**
+**Status: open — différée en v2.5 (hors scope v2.1)**
 
-Décision de cadrage v2.1 : le temps réel de v2.1 couvre uniquement les mutations métier (`domain_events`). Les vues dérivées de Git appartiennent à la review → tranchée en v2.4.
+Décision de cadrage v2.1 : le temps réel de v2.1 couvre uniquement les mutations métier (`domain_events`). Les vues dérivées de Git appartiennent à la review → tranchée en v2.5.
 
 Les mutations métier passent par `domain_events` (push UI). Mais les **vues dérivées de Git** (diff de review, dirty, branche courante) ne sont pas des mutations métier : elles changent quand le code change sur le disque. À pincer : le sidecar **watch-t-il le fs/git** pour émettre un event (réactif), ou **re-lit-il sur déclencheur** (ouverture de la review, tick) ? Éviter de poller en continu ; éviter de rater un changement.
 

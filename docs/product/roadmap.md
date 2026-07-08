@@ -33,9 +33,9 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 - figer le modèle Project/Workspace/Repository ;
 - faire de nyx l'autorité unique de ces identités ;
 - acter le workspace comme pivot intention/runtime (`Execution` rejetée, PDR-0008) ;
-- acter le workspace comme point de rattachement du travail, **travail libre possible sans Spec** ; le lien Spec→runtime (`specs.workspace_id`) et la table `specs` sont **réservés ici mais réalisés en v2.5** (v2.1 ne construit pas le domaine Spec) ;
+- acter le workspace comme point de rattachement du travail, **travail libre possible sans Spec** ; le lien Spec→runtime (`specs.workspace_id`) et la table `specs` sont **réservés ici mais réalisés en v2.4** (v2.1 ne construit pas le domaine Spec) ;
 - mettre en place les use cases communs UI/MCP ;
-- établir le flux d'événements temps réel des **mutations métier** (`domain_events` poussés, pas de polling) ; les **vues dérivées de Git** (diff/dirty/branche) sont **différées en v2.4** (Q-015) ;
+- établir le flux d'événements temps réel des **mutations métier** (`domain_events` poussés, pas de polling) ; les **vues dérivées de Git** (diff/dirty/branche) sont **différées en v2.5** (Q-015) ;
 - définir la stratégie de stockage (**un seul fichier SQLite**, PDR-0024) et de migrations de la V2 (chaîne unique, reprise des données v1).
 
 **Gate :** le modèle relie clairement intention, dossiers, runtime et Git sans autorité Depot parallèle.
@@ -79,7 +79,24 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 
 **Gate :** travailler au shell en blocs (badges de statut, helpers natifs, TUI plein écran) sur **bash + starship**.
 
-## v2.4 - Diff et review locale
+## v2.4 - Specs : tâches et contextes agents
+
+**Status: draft** — PRD `01KX1C2CZ4D7PHT709N3Z92FR6`
+
+- absorber Spec et révisions ;
+- absorber tâches, dépendances, actions humaines et findings de review ;
+- porter lifecycle, validations et garde-fous au backend nyx choisi ;
+- relier Spec/tâches au workspace de dev et aux reviews (**réalise `specs.workspace_id`**, le seam réservé en v2.1) ; le **détail PRD avec onglets** construit ici est le **foyer** où la review se grafte (onglet « Review » du détail PRD, v2.5) ;
+- fournir l'interface `Specs` native nyx ;
+- exposer les outils MCP nyx d'authoring et de transition ;
+- générer les contextes agents depuis l'état nyx ;
+- actualiser immédiatement l'UI après toute mutation MCP.
+
+Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/workspaces dupliqués ou présentation historique devenue inutile.
+
+**Gate :** le workflow complet Spec -> tâches -> workspace de dev -> review -> done fonctionne dans nyx sans appeler Depot.
+
+## v2.5 - Diff et review locale
 
 - moteur Git multi-repo ;
 - **rafraîchissement temps réel des vues dérivées de Git** (diff/dirty/branche) : watch fs/git ou re-read sur déclencheur — tranche **Q-015** (différée depuis v2.1) ;
@@ -92,18 +109,20 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 - remapping des ancres et état outdated ;
 - pièces jointes utiles ;
 - résolution réservée à l'humain ;
-- compteurs non lus et temps réel UI/MCP.
+- compteurs non lus et temps réel UI/MCP ;
+- **présentation** : la review est un **onglet « Review » du détail PRD** construit en v2.4 (domaine Spec), ancré sur le **workspace du PRD**.
 
 **Gate :** reviewer un gros changement local multi-repo sans VS Code ni forge distante.
 
-### Note de session — v2.4-review (capacité développée, placement différé)
+### Note de session — capacité review (branche v2.4-review)
 
 > **Séquençage.** La capacité review a été **développée et validée en direct (pilotage
-> CDP, gate e2e 9/9)**, mais son **foyer de navigation** correct — un **onglet « Review »
-> dans le détail PRD** — appartient au **domaine Spec (v2.5)**, qui n'existe pas encore.
-> Le travail est donc **prêt en capacité, mais son câblage dans l'IA est différé** à v2.5.
+> CDP, gate e2e 9/9)** sur la branche **`v2.4-review`**, mais son **foyer de navigation**
+> correct — un **onglet « Review » dans le détail PRD** — appartient au **domaine Spec**,
+> construit en **v2.4**. Cette tranche **est** v2.5 : la review s'y **grafte en onglet du
+> détail PRD** une fois le domaine Spec disponible.
 
-**Développé cette session (host-agnostique, se garde tel quel) :**
+**Développé (host-agnostique, se garde tel quel) :**
 
 - moteur de diff sidecar (gix primaire + fallback git CLI) : 7 surfaces (working tree / staged / unstaged / untracked / commit / range / branches), modes living/pinned, multi-repo sans mélange des identités Git ; vues dérivées (dirty / branche / ahead-behind / résumé) UI + MCP ;
 - **rafraîchissement temps réel sans polling** (watch fs `notify` + debounce) sur le bus EventSink v2.1 (`repos://changed`) — tranche Q-015 ;
@@ -112,30 +131,15 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 - consigne dépendances : **PDR-0027** (gix + fallback CLI + `notify`) ;
 - **gate e2e** (pilotage réel CDP) : review living + pinned multi-repo, diff, annotations global/ligne/plage, re-mapping/outdated, réponse agent MCP, résolution humaine, promotion, temps réel — **9/9**.
 
-**Placement — à reprendre en v2.5 :**
+**Placement — la review se grafte ici (v2.5) sur le détail PRD (v2.4) :**
 
 - foyer correct = **onglet « Review » du détail PRD**, ancré sur le **workspace du PRD** (repos + projet **dérivés du workspace** — `schema.rs` : « the project is derived via the workspace ») ;
-- l'exposition actuelle via un **item de nav top-level + route `/review`** est **provisoire** (pas de détail PRD pour héberger l'onglet en v2.4) — **à retirer / recâbler** au retour ;
+- l'exposition actuelle via un **item de nav top-level + route `/review`** est **provisoire** (elle date d'avant l'existence du détail PRD) — **à retirer / recâbler** en onglet du détail PRD ;
 - le re-mapping des ancres (phase 4) a été **câblé sur une voie live** (commande `review_remap` déclenchée quand le HEAD living avance) pendant la gate — découverte du pilotage réel.
 
-**Où vit le travail :** branche **`v2.4-review`** (commit `61525ee`), **non mergée dans `v2`**, conservée pour reprise lors du dev v2.5 — les composants review s'y grafferont en onglet du détail PRD.
+**Où vit le travail :** branche **`v2.4-review`** (commit `61525ee`), **non mergée dans `v2`**, conservée pour la reprise en v2.5 — les composants review se grafferont en onglet du détail PRD (construit en v2.4). PRD diff/review : `01KX0EEP5H1MJW4T3QCZEWPHFK` (statut review).
 
-**Leçon.** La couche de présentation de la review dépend du **détail PRD (v2.5)** : la développer avant le domaine Spec livre la capacité mais laisse son point d'entrée sans foyer légitime. Ordre naturel : Spec/PRD (détail + onglets) → puis graft de l'onglet Review ancré workspace.
-
-## v2.5 - Specs : tâches et contextes agents
-
-- absorber Spec et révisions ;
-- absorber tâches, dépendances, actions humaines et findings de review ;
-- porter lifecycle, validations et garde-fous au backend nyx choisi ;
-- relier Spec/tâches au workspace de dev et aux reviews (**réalise `specs.workspace_id`**, le seam réservé en v2.1) ;
-- fournir l'interface `Specs` native nyx ;
-- exposer les outils MCP nyx d'authoring et de transition ;
-- générer les contextes agents depuis l'état nyx ;
-- actualiser immédiatement l'UI après toute mutation MCP.
-
-Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/workspaces dupliqués ou présentation historique devenue inutile.
-
-**Gate :** le workflow complet Spec -> tâches -> workspace de dev -> review -> done fonctionne dans nyx sans appeler Depot.
+**Leçon.** La couche de présentation de la review dépend du **détail PRD (domaine Spec, v2.4)** : la développer avant le domaine Spec livre la capacité mais laisse son point d'entrée sans foyer légitime. Ordre naturel : Spec/PRD (détail + onglets, v2.4) → puis graft de l'onglet Review ancré workspace (v2.5).
 
 ## v2.6 - Knowledge et mémoire projet
 
@@ -188,8 +192,8 @@ v2.0 consolidation Electron/Rust
 -> v2.2 travail actif (workspace) + attention
 -> v2.2.5 persistance terminal (livré)
 -> v2.3 terminal en blocs (honor-the-shell)
--> v2.4 diff/review
--> v2.5 Spec/tâches/contextes MCP
+-> v2.4 Spec/tâches/contextes MCP
+-> v2.5 diff/review
 -> v2.6 knowledge
 -> v2.7 capacités avancées retenues
 -> v2.8 migration et suppression Depot
@@ -201,8 +205,8 @@ Une tranche `v2.x` ne doit pas aspirer les suivantes. En particulier :
 
 - v2.1 ne construit pas toute l'UI Spec ;
 - v2.2 ne réimplémente pas la review ;
-- v2.4 ne copie pas le lifecycle Depot ;
-- v2.5 ne copie pas prototypes et documents ;
+- v2.5 ne copie pas le lifecycle Depot ;
+- v2.4 ne copie pas prototypes et documents ;
 - v2.7 ne devient pas un prétexte pour porter tout le legacy.
 
 La roadmap peut évoluer, mais **tout ce qui a été retenu pour la super-app appartient à la V2**, jamais à une hypothétique V3 utilisée comme parking.
