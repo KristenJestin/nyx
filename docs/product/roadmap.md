@@ -152,3 +152,46 @@ Une tranche `v2.x` ne doit pas aspirer les suivantes. En particulier :
 - v2.6 ne devient pas un prétexte pour porter tout le legacy.
 
 La roadmap peut évoluer, mais **tout ce qui a été retenu pour la super-app appartient à la V2**, jamais à une hypothétique V3 utilisée comme parking.
+
+## Terminal « blocks » — chantier PARKÉ (hors séquence v2.x)
+
+> **Note de version.** Ce chantier a été mené sous un PRD intitulé « v2.3 — Terminal blocks »,
+> mais la tranche roadmap **v2.3 ci-dessus reste « Diff et review locale »**. Le terminal blocks
+> est une amélioration UX du terminal (suite de v2.2.5), **à re-cadrer** dans la séquence (probable
+> v2.2.x). Ne pas confondre les deux « v2.3 ».
+
+Modèle « blocks » façon Warp, **honor-the-shell** : sortie shell (hors TUI) segmentée en blocs
+commande+résultat via **OSC 133**, historique rendu en blocs DOM, région active + TUI sur la grille
+wterm patchée (v2.2.5).
+
+- **Branche :** `feature/v2.3-terminal-blocks` — commit `255cdf1` (WIP, **non mergé**).
+- **PRD depot :** `01KWY7NFQJN068Q5ZSAJSSK2V2` · prototype validé : variante **« sobre »** élue.
+
+### Fait — validé en direct sur l'app réelle (pilotage CDP, bash+starship)
+
+- Segmentation OSC 133 → **blocs** : vrai prompt starship rejoué + commande + sortie + **code de sortie** (badges ✓/✗).
+- **Cause racine corrigée :** le `PROMPT_COMMAND` en **tableau bash 5.x** (omarchy+direnv+zoxide+starship)
+  faisait sauter le marqueur **OSC 133 `B`** → aucun bloc ne se formait. Fix : enregistrement *array-aware*
+  du hook (le `B` survit à la réécriture de PS1 par starship) + filet (bloc formé même si `B` manque).
+- Détection alt-screen (DECSET 1049/1047/47) + bascule blocs↔grille TUI plein écran.
+- Persistance des blocs (fichier JSON sidecar, **sans migration**) ; non-régression persistance v2.2.5 verte.
+- Renderer : liste de blocs (ANSI→tokens **design-system**), input épinglé bas, interactions (sélection/copie/repli).
+- Wire Rust↔TS `PtyBlock`/`PtyAltScreen` + fixtures de contrat byte-parity ; harness e2e Electron (bash+starship, CDP).
+
+### Reste à faire — défauts connus au parking
+
+1. **[bloquant visuel] La grille wterm duplique le scrollback complet SOUS les blocs.** Il faut **clipper la
+   grille à la seule région active** (prompt courant + sortie en cours) ; l'historique doit être **uniquement**
+   des blocs. C'est ce qui donne l'impression de « wterm à plat comme avant ».
+2. Conformité fine au **placement validé** (maquette « sobre » élue) — reproduire le placement via le
+   **design system**, jamais le CSS/px du mockup. Le placement n'a **jamais été distillé** (`depot prd prototype distill`) — à faire avant reprise.
+3. **Vérifier la saisie réelle** : un drop de caractères a été observé mais **confondu par l'injection CDP de
+   test** (frappes agent + utilisateur mélangées dans le même terminal). À re-tester sans injection.
+4. Sous-shell top-level `( … )` : header de commande corrompu (le fix propre `set -o functrace` **casse
+   starship**) — parké en idée de durcissement.
+
+### Leçon (à ne pas réoublier)
+
+Toute validation « blocs » **doit** passer par le **pilotage réel de l'app sur bash+starship réel (CDP)**,
+jamais un shell hermétique : les tests hermétiques émettaient un `B` que le vrai starship efface, ce qui a
+masqué pendant des heures que le produit ne marchait pas (gate e2e « vert » sur un faux positif).
