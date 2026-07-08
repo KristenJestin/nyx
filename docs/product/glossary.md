@@ -6,7 +6,7 @@ Lexique de référence des termes du produit nyx V2. Définitions courtes ; la v
 
 - **nyx** — le produit : gestionnaire de terminaux orienté travail agentique ; application desktop unique (Electron + sidecar Rust).
 - **Depot** — l'outil Spec/tâches/review existant (CLI Node) ; ses capacités utiles sont absorbées dans nyx, puis Depot est retiré.
-- **V2** — la totalité de la super-app cible ; `v2.0`…`v2.7` sont ses tranches livrables, pas des produits séparés.
+- **V2** — la totalité de la super-app cible ; `v2.0`…`v2.8` sont ses tranches livrables, pas des produits séparés.
 - **PDR** (Product Decision Record) — décision produit datée (`decisions/`) qui explique le pourquoi et ce qu'elle supersède.
 - **Statuts de décision** — `validated` / `proposed` / `investigating` / `rejected` / `superseded`.
 - **Grill** — motif fondateur : l'humain lâche du brut, l'agent le structure (clarifie, déduplique, ordonne), l'humain valide. Un comportement de playbook, pas un moteur.
@@ -60,7 +60,7 @@ Lexique de référence des termes du produit nyx V2. Définitions courtes ; la v
 
 ## Conception (prototype & design)
 
-- **Prototype** — annexe visuelle d'un Spec (scope projet, HTML en iframe, aucun runtime) ; un seul par Spec ; absorbé tard (v2.6, PDR-0009).
+- **Prototype** — annexe visuelle d'un Spec (scope projet, HTML en iframe, aucun runtime) ; un seul par Spec ; absorbé tard (v2.7, PDR-0009).
 - **Page / Version / Variant** — hiérarchie d'un prototype ; **Round** = snapshot nommé de tout le design (mécanisme de rollback) ; **Feedback** = commentaire piné (`open` / `ignored` ; `resolved` dérivé).
 - **Design-system** — knowledge projet (tables `design` au format DESIGN.md + `components`), **imposé** en contexte à l'agent (proto et dev) ; rendu Handlebars sidecar + Tailwind iframe (PDR-0010).
 
@@ -68,7 +68,7 @@ Lexique de référence des termes du produit nyx V2. Définitions courtes ; la v
 
 - **Harness** — pas un moteur de workflow : un **playbook** (texte/directives) que l'agent **exécute** via les **verbes observables** de nyx (PDR-0011).
 - **Verbes observables** — primitives v1 : lancer/observer une session avec un rôle, injecter du contexte, hooks start/close.
-- **Playbook** — le workflow lui-même, donnée éditable par projet (payoff v2.6).
+- **Playbook** — le workflow lui-même, donnée éditable par projet (payoff v2.7).
 - **Rôles par défaut** — orchestrateur (ne code pas, pilote), coder (ne fait que des tasks), auditeur (signale des findings, ne corrige pas), doc-sync (doc post-merge, reviewable).
 - **Aucun angle mort** — tout ce que fait l'agent passe par une surface observée : nyx possède le PTY et l'arbre de processus.
 

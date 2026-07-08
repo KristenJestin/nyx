@@ -101,7 +101,7 @@ Unité de décomposition issue d'un Spec (ou créée indépendamment pour du tra
 
 Annexe visuelle d'un Spec, au scope projet. Aucun workspace, aucun runtime : du HTML auto-contenu rendu dans une iframe. L'agent génère des variantes de pages ; l'utilisateur itère par rounds et commentaires pinés, puis élit une variante qui se distille en tâches.
 
-Décisions de forme (PDR-0009, par usage réel) : un seul prototype par Spec ; rounds conservés comme **mécanisme de rollback** quand l'agent dégrade le design ; pages, versions, variants, states, commentaires/résolution et élection conservés. Le schéma détaillé est figé à l'absorption (v2.6), pas ici. Le pont conception -> dev est l'élection d'une variante, porté par le Spec.
+Décisions de forme (PDR-0009, par usage réel) : un seul prototype par Spec ; rounds conservés comme **mécanisme de rollback** quand l'agent dégrade le design ; pages, versions, variants, states, commentaires/résolution et élection conservés. Le schéma détaillé est figé à l'absorption (v2.7), pas ici. Le pont conception -> dev est l'élection d'une variante, porté par le Spec.
 
 Le rendu et le vocabulaire visuel sont tranchés par PDR-0010 : design-system imposé (tables `design` au format DESIGN.md + `components`), composants Handlebars compilés dans le sidecar Rust, Tailwind exécuté localement dans l'iframe, sync incrémentale par md5 visuel. L'agent compose depuis ce vocabulaire imposé, pour le proto comme pour le dev.
 

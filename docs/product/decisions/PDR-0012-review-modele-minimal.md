@@ -1,6 +1,6 @@
 # PDR-0012 - Review : modèle minimal (review / comment / task)
 
-**Status: validated (modèle)** — le moteur de diff et l'UI sont spécifiés dans le Spec nyx « Viewer de gros diffs » (build v2.3).
+**Status: validated (modèle)** — le moteur de diff et l'UI sont spécifiés dans le Spec nyx « Viewer de gros diffs » (build v2.3 [maj roadmap : renuméroté v2.4]).
 
 **Superseded en partie par PDR-0015** : le concept `review` n'est **plus une entité stockée** (table `reviews` supprimée ; review = vue dérivée du diff Git + commentaires ancrés sur `(workspace, repository)` + `spec_id` optionnel). Les concepts `comment` et `task` ci-dessous restent canoniques.
 
@@ -25,4 +25,4 @@ Le domaine review avait accumulé des structures confuses (review niveau workspa
 - **threads + messages** → un seul `review_comments` (auto-threadé par `parent_id`).
 - les « 2 types de review » se dissolvent en deux attributs déjà présents : l'**auteur** du commentaire (humain/agent) et l'**existence d'une promotion** (une task existe, ou pas = « envoyé au coder, ou pas »).
 - le groupement cross-repo des tâches pour une passe coder (le `round`) est **différé** : utile seulement si le flux reboucle (coder -> audit -> re-coder). Ouvert tant que ce rebouclage n'est pas confirmé.
-- le moteur de diff (gix + fallback `git` CLI), le re-mapping des ancres et l'UI sont spécifiés dans le Spec nyx « Viewer de gros diffs » (build v2.3) ; la note d'archi de ce Spec (napi-rs / core-host) est **périmée** par PDR-0007 (sidecar).
+- le moteur de diff (gix + fallback `git` CLI), le re-mapping des ancres et l'UI sont spécifiés dans le Spec nyx « Viewer de gros diffs » (build v2.3 [maj roadmap : renuméroté v2.4]) ; la note d'archi de ce Spec (napi-rs / core-host) est **périmée** par PDR-0007 (sidecar).

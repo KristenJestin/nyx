@@ -37,31 +37,31 @@ CLI + web UI Node, ~39 tables. Le **domaine** est porté ; les **enveloppes** (w
 
 | Sous-système / table | Disposition | Tranche | Décision |
 | --- | --- | --- | --- |
-| Spec + révisions | porter (natif) | v2.4 | PDR-0014 |
-| Tasks (slice/human/review) + dépendances | porter | v2.4 | PDR-0014 |
-| Reviews / comments / anchors | **simplifier** (vue dérivée) | v2.3 | PDR-0012 / PDR-0015 |
-| `review_comment_tasks` (findings) | porter | v2.3 | PDR-0012 |
-| Prototypes (pages/versions/variants/rounds/feedback/design) | **différer** | v2.6 | PDR-0009 / PDR-0010 |
-| `spec_design_lock` / `round_page_design` | différer (sous prototype) | v2.6 | PDR-0010 |
-| Annexes (`spec_annexes`) | porter (concept **annexe**) | v2.4 / v2.5 | PDR-0016 |
-| Ideas | porter | v2.5 | proposed |
-| ADR | porter | v2.5 | proposed |
-| Directives | **décomposer** → rules (`directives`) + checks (`managed_commands.gate`) + agents | v2.4 / v2.6 | PDR-0011 / PDR-0020 |
-| Documents / `doc_profiles` / `doc_sync_runs` | porter (doc-sync = agent-job) | v2.5 / v2.6 | agent-harness |
-| Milestones | porter | v2.6 | proposed |
-| Tags | **remplacés** par catégorie unique (`categories`) | v2.4 | PDR-0017 |
-| Context commands (dev/coder/auditor) | porter : rendus **live par nyx-core**, injectés via **hooks** (zéro CLI) | v2.4 | PDR-0020 |
-| Stockage de fichiers (`attachments`) | porter (**interne**, dédup) | v2.4 | PDR-0016 |
-| Activity log → timeline | **simplifier** (`domain_events`) | v2.5 | PDR-0016 / Q-008 |
+| Spec + révisions | porter (natif) | v2.5 | PDR-0014 |
+| Tasks (slice/human/review) + dépendances | porter | v2.5 | PDR-0014 |
+| Reviews / comments / anchors | **simplifier** (vue dérivée) | v2.4 | PDR-0012 / PDR-0015 |
+| `review_comment_tasks` (findings) | porter | v2.4 | PDR-0012 |
+| Prototypes (pages/versions/variants/rounds/feedback/design) | **différer** | v2.7 | PDR-0009 / PDR-0010 |
+| `spec_design_lock` / `round_page_design` | différer (sous prototype) | v2.7 | PDR-0010 |
+| Annexes (`spec_annexes`) | porter (concept **annexe**) | v2.5 / v2.6 | PDR-0016 |
+| Ideas | porter | v2.6 | proposed |
+| ADR | porter | v2.6 | proposed |
+| Directives | **décomposer** → rules (`directives`) + checks (`managed_commands.gate`) + agents | v2.5 / v2.7 | PDR-0011 / PDR-0020 |
+| Documents / `doc_profiles` / `doc_sync_runs` | porter (doc-sync = agent-job) | v2.6 / v2.7 | agent-harness |
+| Milestones | porter | v2.7 | proposed |
+| Tags | **remplacés** par catégorie unique (`categories`) | v2.5 | PDR-0017 |
+| Context commands (dev/coder/auditor) | porter : rendus **live par nyx-core**, injectés via **hooks** (zéro CLI) | v2.5 | PDR-0020 |
+| Stockage de fichiers (`attachments`) | porter (**interne**, dédup) | v2.5 | PDR-0016 |
+| Activity log → timeline | **simplifier** (`domain_events`) | v2.6 | PDR-0016 / Q-008 |
 | `pending_actions` | **supprimer** | — | PDR-0016 |
 | `user_stories` | **supprimer** (dans le Spec) | — | PDR-0016 |
 | `out_of_scope_items` | **supprimer** (dans le Spec) | — | PDR-0016 |
 | `project_config` | **supprimer** (réglages typés) | — | PDR-0016 |
 | Handoff / lineage (sync cross-machine) | **différer** (tardif) | post-V2 | PDR-0016 |
-| Web UI (React/TanStack) | **supprimer** | v2.7 | validated |
-| CLI (citty) | **supprimer** | v2.7 | validated |
-| `serve` (Hono) / API HTTP | **supprimer** | v2.7 | validated |
-| `depot install` (slash-commands) | **remplacer** : plugin nyx (Settings→Integrations) — hooks + stubs `/n…` fixes, zéro CLI | v2.0 / v2.4 | PDR-0016 / PDR-0020 |
+| Web UI (React/TanStack) | **supprimer** | v2.8 | validated |
+| CLI (citty) | **supprimer** | v2.8 | validated |
+| `serve` (Hono) / API HTTP | **supprimer** | v2.8 | validated |
+| `depot install` (slash-commands) | **remplacer** : plugin nyx (Settings→Integrations) — hooks + stubs `/n…` fixes, zéro CLI | v2.0 / v2.5 | PDR-0016 / PDR-0020 |
 
 ## Familles d'événements (`domain_events.event_type`)
 

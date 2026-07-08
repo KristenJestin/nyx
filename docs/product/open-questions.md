@@ -59,7 +59,7 @@ Pour chaque sous-système : porter, simplifier, différer ou supprimer.
 
 **Méthode (apprise en session) :** la forme d'absorption se décide par **revue d'usage avec l'utilisateur**, feature par feature, jamais par un agent qui lit le schéma et tranche seul. Un schéma dit ce qui a été construit, pas ce qui est utilisé.
 
-À auditer : ~~prototypes, design rounds~~ (tranché par PDR-0009 : annexe du Spec, conservé, un seul par Spec, rounds = rollback, absorbé v2.6), catalogues UI, annexes, docs sync, milestones, tags, pending actions, reviews structurées, directives, contextes et activity log.
+À auditer : ~~prototypes, design rounds~~ (tranché par PDR-0009 : annexe du Spec, conservé, un seul par Spec, rounds = rollback, absorbé v2.7), catalogues UI, annexes, docs sync, milestones, tags, pending actions, reviews structurées, directives, contextes et activity log.
 
 ## Q-010 - Migration des données
 
@@ -109,9 +109,9 @@ Tranchée : le fourre-tout « directives » de Depot est **décomposé en trois 
 
 ## Q-015 - Rafraîchissement temps réel des vues dérivées de Git
 
-**Status: open — différée en v2.3 (hors scope v2.1)**
+**Status: open — différée en v2.4 (hors scope v2.1)**
 
-Décision de cadrage v2.1 : le temps réel de v2.1 couvre uniquement les mutations métier (`domain_events`). Les vues dérivées de Git appartiennent à la review → tranchée en v2.3.
+Décision de cadrage v2.1 : le temps réel de v2.1 couvre uniquement les mutations métier (`domain_events`). Les vues dérivées de Git appartiennent à la review → tranchée en v2.4.
 
 Les mutations métier passent par `domain_events` (push UI). Mais les **vues dérivées de Git** (diff de review, dirty, branche courante) ne sont pas des mutations métier : elles changent quand le code change sur le disque. À pincer : le sidecar **watch-t-il le fs/git** pour émettre un event (réactif), ou **re-lit-il sur déclencheur** (ouverture de la review, tick) ? Éviter de poller en continu ; éviter de rater un changement.
 
@@ -119,4 +119,4 @@ Les mutations métier passent par `domain_events` (push UI). Mais les **vues dé
 
 **Status: resolved (PDR-0010)**
 
-Tranchée. Le design-system est du knowledge projet stocké dans nyx (tables `design` au format DESIGN.md + `components`), imposé en contexte à l'agent. Templating Handlebars compilé dans le sidecar Rust, Tailwind exécuté localement dans l'iframe, sync incrémentale par md5 visuel, inventaire par glob, amorçage greenfield. Détail complet dans PDR-0010. Le câblage exact reste de l'implémentation v6.
+Tranchée. Le design-system est du knowledge projet stocké dans nyx (tables `design` au format DESIGN.md + `components`), imposé en contexte à l'agent. Templating Handlebars compilé dans le sidecar Rust, Tailwind exécuté localement dans l'iframe, sync incrémentale par md5 visuel, inventaire par glob, amorçage greenfield. Détail complet dans PDR-0010. Le câblage exact reste de l'implémentation v2.7.

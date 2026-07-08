@@ -86,7 +86,7 @@ Les politiques existantes restent canoniques : reprise des sessions agents confi
 
 ## Temps réel
 
-Les mutations métier (status, tâches, commentaires, runtime) sont **poussées** à l'UI via `domain_events` (events non sollicités du sidecar → main → renderer) ; **pas de polling**. Les **vues dérivées de Git** (diff de review, dirty, branche courante) ne sont **pas** des mutations métier : elles changent quand le code change sur le disque. Leur rafraîchissement (watch fs/git → event, ou re-read déclenché) est **différé en v2.3** (Q-015).
+Les mutations métier (status, tâches, commentaires, runtime) sont **poussées** à l'UI via `domain_events` (events non sollicités du sidecar → main → renderer) ; **pas de polling**. Les **vues dérivées de Git** (diff de review, dirty, branche courante) ne sont **pas** des mutations métier : elles changent quand le code change sur le disque. Leur rafraîchissement (watch fs/git → event, ou re-read déclenché) est **différé en v2.4** (Q-015).
 
 ## Interdictions
 

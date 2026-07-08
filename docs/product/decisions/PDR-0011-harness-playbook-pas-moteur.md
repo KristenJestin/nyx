@@ -1,6 +1,6 @@
 # PDR-0011 - Harness agent : playbook éditable, pas un moteur
 
-**Status: validated (direction)** — primitives en v1, harness en v2.6.
+**Status: validated (direction)** — primitives en v1, harness en v2.6 [maj roadmap : renuméroté v2.7].
 
 ## Context
 

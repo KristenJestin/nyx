@@ -12,7 +12,7 @@ Il fallait décider, pour la super-app nyx (Q-009), son placement, son timing et
 
 **Placement.** Le prototype est une **annexe du Spec**, au scope projet. Aucun workspace, aucun runtime : c'est de la donnée (HTML) rendue dans une iframe. Il ne touche pas le pivot workspace.
 
-**Timing.** Pas en v1. C'est de la phase conception ; il s'absorbe tard (roadmap v2.6). La v1 reste le runtime.
+**Timing.** Pas en v1. C'est de la phase conception ; il s'absorbe tard (roadmap v2.6 [maj roadmap : renuméroté v2.7]). La v1 reste le runtime.
 
 **Forme, décidée par l'usage réel (pas par le schéma) :**
 

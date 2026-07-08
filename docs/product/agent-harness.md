@@ -23,7 +23,7 @@ Bénéfice : friction minimale pour l'humain (il ne classifie jamais à la main)
 nyx ne construit **pas** de moteur de workflow. Le workflow est un **playbook éditable** (du texte/directive injecté comme instructions à l'agent). L'agent l'**exécute** en appelant les **verbes observables** de nyx. nyx fournit un playbook **par défaut**, forkable par projet.
 
 - **Verbes (primitives v1)** : lancer/observer une session avec un rôle, injecter du contexte, hooks de cycle de vie (start/close).
-- **Playbook (donnée, v2.6)** : le workflow lui-même, éditable.
+- **Playbook (donnée, v2.7)** : le workflow lui-même, éditable.
 - Frontière : *nyx possède les verbes, le projet possède le playbook.*
 
 ## Le playbook par défaut (dev) — proposé
@@ -46,7 +46,7 @@ Ce playbook par défaut est une conception **séparée et révisable** : sa form
 - **Design-system** (table `design`, format DESIGN.md) : vocabulaire visuel imposé, pour le proto **et** le dev (PDR-0010). L'agent compose depuis ce vocabulaire, il ne réinvente pas.
 - **Directives** (table `directives`) : fragments de contexte projet -> constituent le playbook (« directives v2 »).
 - **`agent_context_snapshots`** (table) : où les contextes générés sont tracés.
-- Le contenu réel est à **définir et valider par agent et sous-agent** (authoring v2.6), pas figé ici.
+- Le contenu réel est à **définir et valider par agent et sous-agent** (authoring v2.7), pas figé ici.
 
 ## Le modèle d'exécution : agents, workflows, déclenchement (PDR-0019 + PDR-0020)
 

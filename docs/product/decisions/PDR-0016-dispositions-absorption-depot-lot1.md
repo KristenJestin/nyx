@@ -11,7 +11,7 @@ Q-009 a fixé la **méthode** : la forme d'absorption se décide par **revue d'u
 ## Decision
 
 - **`pending_actions` → supprimer.** Le besoin (action en attente, gate de validation) est déjà couvert : `human_actions` (to-do humain), **Attention Inbox** (signal), verbes/managed commands (commande à lancer), et surtout la **résolution de commentaire de review** (le gate humain, humain-seul, PDR-0012/0015). Pas de file séparée.
-- **Handoff / sync cross-machine → différer.** Tranche tardive, hors périmètre v2.0–v2.7. nyx reste local-first mono-machine ; seul l'export/import de **migration** (`import_runs`) est conservé. À rouvrir si un usage réel l'exige.
+- **Handoff / sync cross-machine → différer.** Tranche tardive, hors périmètre v2.0–v2.7 [maj roadmap : dernière tranche désormais v2.8]. nyx reste local-first mono-machine ; seul l'export/import de **migration** (`import_runs`) est conservé. À rouvrir si un usage réel l'exige.
 - **`activity_log` → simplifier.** Capture **généreuse** d'événements **métier** via `domain_events` ; jamais le runtime octet par octet. Familles canoniques de `event_type` : Spec / Task / Review / Runtime / Knowledge / Human / Prototype / Migration (détail dans `absorption.md`), raffinable.
 - **`user_stories` → supprimer.** Vivent dans le corps du Spec (section de spec).
 - **`out_of_scope_items` → supprimer.** Vivent dans le corps du Spec (section « hors périmètre »).

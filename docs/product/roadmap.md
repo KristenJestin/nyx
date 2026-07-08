@@ -33,9 +33,9 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 - figer le modèle Project/Workspace/Repository ;
 - faire de nyx l'autorité unique de ces identités ;
 - acter le workspace comme pivot intention/runtime (`Execution` rejetée, PDR-0008) ;
-- acter le workspace comme point de rattachement du travail, **travail libre possible sans Spec** ; le lien Spec→runtime (`specs.workspace_id`) et la table `specs` sont **réservés ici mais réalisés en v2.4** (v2.1 ne construit pas le domaine Spec) ;
+- acter le workspace comme point de rattachement du travail, **travail libre possible sans Spec** ; le lien Spec→runtime (`specs.workspace_id`) et la table `specs` sont **réservés ici mais réalisés en v2.5** (v2.1 ne construit pas le domaine Spec) ;
 - mettre en place les use cases communs UI/MCP ;
-- établir le flux d'événements temps réel des **mutations métier** (`domain_events` poussés, pas de polling) ; les **vues dérivées de Git** (diff/dirty/branche) sont **différées en v2.3** (Q-015) ;
+- établir le flux d'événements temps réel des **mutations métier** (`domain_events` poussés, pas de polling) ; les **vues dérivées de Git** (diff/dirty/branche) sont **différées en v2.4** (Q-015) ;
 - définir la stratégie de stockage (**un seul fichier SQLite**, PDR-0024) et de migrations de la V2 (chaîne unique, reprise des données v1).
 
 **Gate :** le modèle relie clairement intention, dossiers, runtime et Git sans autorité Depot parallèle.
@@ -54,7 +54,32 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 
 **Gate :** exécuter et suivre une feature réelle sans autre outil d'exécution que nyx.
 
-## v2.3 - Diff et review locale
+## v2.2.5 - Persistance terminal (livré)
+
+**Status: livré**
+
+- bascule **xterm → wterm** (`@wterm/dom` + core **ghostty**, full VT), une seule lib terminal (PDR-0026) ;
+- **store d'instances no-host** (Map module-level hors React et hors cycle routeur) : detach/reattach du nœud DOM au fil de la navigation, **navigation lossless** (buffer, alt-screen, focus intacts) ;
+- **modèle d'écran VT headless** dans le sidecar + **re-hydratation au restart** : **restart lossless** (le TUI, hors scrollback, est restauré) ;
+- fondation **routeur** du shell de navigation multi-pages (PDR-0025) sur laquelle se branche le store terminal.
+
+**Gate :** naviguer et redémarrer l'app sans perdre le contexte terminal (buffer + TUI en alt-screen), sans host de terminaux persistant.
+
+## v2.3 - Terminal en blocs (honor-the-shell)
+
+**Status: en cours** — PRD `01KWY7NFQJN068Q5ZSAJSSK2V2`
+
+- **sortie shell en blocs** commande+résultat via **OSC 133** (bornes A/B/C/D, code de sortie) ;
+- **honor-the-shell** : le shell garde l'édition (Tab, Ctrl-R, historique, sudo, vim natifs) — nyx n'intercepte pas la saisie ;
+- **historique en blocs HTML statiques** (ANSI → style) ;
+- **région active + TUI** rendus via la grille **wterm** ;
+- **vrai prompt rejoué** (jamais synthétisé) ;
+- **bascule blocs ↔ grille plein écran** sur alt-screen ;
+- réutilise le **socle terminal v2.2.5** (wterm/ghostty, store no-host, routeur).
+
+**Gate :** travailler au shell en blocs (badges de statut, helpers natifs, TUI plein écran) sur **bash + starship**.
+
+## v2.4 - Diff et review locale
 
 - moteur Git multi-repo ;
 - **rafraîchissement temps réel des vues dérivées de Git** (diff/dirty/branche) : watch fs/git ou re-read sur déclencheur — tranche **Q-015** (différée depuis v2.1) ;
@@ -71,7 +96,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 
 **Gate :** reviewer un gros changement local multi-repo sans VS Code ni forge distante.
 
-## v2.4 - Specs : tâches et contextes agents
+## v2.5 - Specs : tâches et contextes agents
 
 - absorber Spec et révisions ;
 - absorber tâches, dépendances, actions humaines et findings de review ;
@@ -86,7 +111,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** le workflow complet Spec -> tâches -> workspace de dev -> review -> done fonctionne dans nyx sans appeler Depot.
 
-## v2.5 - Knowledge et mémoire projet
+## v2.6 - Knowledge et mémoire projet
 
 - idées et promotion vers Spec ;
 - ADR ;
@@ -99,9 +124,9 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** les informations durables nécessaires aux agents et à l'utilisateur sont consultables et modifiables dans nyx, sans second système de mémoire.
 
-## v2.6 - Capacités avancées de la V2
+## v2.7 - Capacités avancées de la V2
 
-Après validation des usages de v2.0 à v2.5 :
+Après validation des usages de v2.0 à v2.6 :
 
 - milestones, catégories et graphes de dépendances avancés ;
 - prototypes comme annexe du Spec (un seul par Spec ; rounds conservés comme rollback ; forme par revue d'usage, cf. PDR-0009) ;
@@ -110,13 +135,14 @@ Après validation des usages de v2.0 à v2.5 :
 - orchestration multi-agent via playbook éditable + verbes observables, pas un moteur (cf. PDR-0011) ;
 - automatisations ;
 - diagnostics et outils de réparation ;
+- gestion du cycle de vie / ressources des sessions agent : décharger (unload) les sessions Claude idle non visitées depuis un moment, resume au retour, et resume **paresseux** au démarrage (ne rien reprendre tant que le terminal n'a pas été ouvert) ; crux = détecter l'activité réelle d'un agent (busy/exec_state, agent_session_event, inactivité I/O) — à valider par un spike ; cf. idée depot `01KX0X3ZZQMEPKBQX30SX47HJF` ;
 - import/export et sauvegardes de longue durée.
 
 Chaque sous-système Depot doit recevoir une décision explicite : **porter, simplifier, remplacer ou supprimer**. Il n'est pas copié par défaut.
 
 **Gate :** chaque capacité avancée démontre un bénéfice sur la boucle travail -> agent -> review, sans transformer nyx en IDE ou gestionnaire de projet générique.
 
-## v2.7 - Migration finale et extinction de Depot
+## v2.8 - Migration finale et extinction de Depot
 
 - importer de façon idempotente projets liés, Spec, révisions, tâches, reviews, idées, ADR, directives, documents et pièces jointes retenues ;
 - gérer les chemins historiques WSL/Windows et les identités déjà présentes dans nyx ;
@@ -134,11 +160,13 @@ Chaque sous-système Depot doit recevoir une décision explicite : **porter, sim
 v2.0 consolidation Electron/Rust
 -> v2.1 modèle produit
 -> v2.2 travail actif (workspace) + attention
--> v2.3 diff/review
--> v2.4 Spec/tâches/contextes MCP
--> v2.5 knowledge
--> v2.6 capacités avancées retenues
--> v2.7 migration et suppression Depot
+-> v2.2.5 persistance terminal (livré)
+-> v2.3 terminal en blocs (honor-the-shell)
+-> v2.4 diff/review
+-> v2.5 Spec/tâches/contextes MCP
+-> v2.6 knowledge
+-> v2.7 capacités avancées retenues
+-> v2.8 migration et suppression Depot
 ```
 
 ## Règle de contrôle du scope
@@ -147,9 +175,9 @@ Une tranche `v2.x` ne doit pas aspirer les suivantes. En particulier :
 
 - v2.1 ne construit pas toute l'UI Spec ;
 - v2.2 ne réimplémente pas la review ;
-- v2.3 ne copie pas le lifecycle Depot ;
-- v2.4 ne copie pas prototypes et documents ;
-- v2.6 ne devient pas un prétexte pour porter tout le legacy.
+- v2.4 ne copie pas le lifecycle Depot ;
+- v2.5 ne copie pas prototypes et documents ;
+- v2.7 ne devient pas un prétexte pour porter tout le legacy.
 
 La roadmap peut évoluer, mais **tout ce qui a été retenu pour la super-app appartient à la V2**, jamais à une hypothétique V3 utilisée comme parking.
 
