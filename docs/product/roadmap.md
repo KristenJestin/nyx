@@ -96,6 +96,32 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 
 **Gate :** reviewer un gros changement local multi-repo sans VS Code ni forge distante.
 
+### Note de session — v2.4-review (capacité développée, placement différé)
+
+> **Séquençage.** La capacité review a été **développée et validée en direct (pilotage
+> CDP, gate e2e 9/9)**, mais son **foyer de navigation** correct — un **onglet « Review »
+> dans le détail PRD** — appartient au **domaine Spec (v2.5)**, qui n'existe pas encore.
+> Le travail est donc **prêt en capacité, mais son câblage dans l'IA est différé** à v2.5.
+
+**Développé cette session (host-agnostique, se garde tel quel) :**
+
+- moteur de diff sidecar (gix primaire + fallback git CLI) : 7 surfaces (working tree / staged / unstaged / untracked / commit / range / branches), modes living/pinned, multi-repo sans mélange des identités Git ; vues dérivées (dirty / branche / ahead-behind / résumé) UI + MCP ;
+- **rafraîchissement temps réel sans polling** (watch fs `notify` + debounce) sur le bus EventSink v2.1 (`repos://changed`) — tranche Q-015 ;
+- écran review (renderer) : arbre de fichiers, en-tête multi-repo, viewer de diff **virtualisé** maison, look via les tokens du design system ; composants **réutilisables** (`components/review/`) ;
+- modèle comment : `review_comments` auto-threadé, ancrage + **re-mapping** des ancres à travers les commits + état **outdated**, résolution **réservée à l'humain** (garde-fou vérifié adversarialement), réponses agent via **MCP** ; UI panneau + threads + ancres ; promotion comment→task (`review_tasks`, finding=task) via flux **grill** (humain valide ; l'agent ne valide jamais) ; compteurs non-lus temps réel ;
+- consigne dépendances : **PDR-0027** (gix + fallback CLI + `notify`) ;
+- **gate e2e** (pilotage réel CDP) : review living + pinned multi-repo, diff, annotations global/ligne/plage, re-mapping/outdated, réponse agent MCP, résolution humaine, promotion, temps réel — **9/9**.
+
+**Placement — à reprendre en v2.5 :**
+
+- foyer correct = **onglet « Review » du détail PRD**, ancré sur le **workspace du PRD** (repos + projet **dérivés du workspace** — `schema.rs` : « the project is derived via the workspace ») ;
+- l'exposition actuelle via un **item de nav top-level + route `/review`** est **provisoire** (pas de détail PRD pour héberger l'onglet en v2.4) — **à retirer / recâbler** au retour ;
+- le re-mapping des ancres (phase 4) a été **câblé sur une voie live** (commande `review_remap` déclenchée quand le HEAD living avance) pendant la gate — découverte du pilotage réel.
+
+**Où vit le travail :** branche **`v2.4-review`** (commit `61525ee`), **non mergée dans `v2`**, conservée pour reprise lors du dev v2.5 — les composants review s'y grafferont en onglet du détail PRD.
+
+**Leçon.** La couche de présentation de la review dépend du **détail PRD (v2.5)** : la développer avant le domaine Spec livre la capacité mais laisse son point d'entrée sans foyer légitime. Ordre naturel : Spec/PRD (détail + onglets) → puis graft de l'onglet Review ancré workspace.
+
 ## v2.5 - Specs : tâches et contextes agents
 
 - absorber Spec et révisions ;
