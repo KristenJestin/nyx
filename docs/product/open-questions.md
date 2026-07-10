@@ -35,9 +35,11 @@ Tranchée : l'unité humaine s'appelle **Spec** (renommée depuis « PRD » par 
 
 ## Q-006 - Navigation et place permanente du terminal
 
-**Status: prototype required**
+**Status: partiellement résolu (PDR-0025, PDR-0026)**
 
-Le terminal reste-t-il toujours monté pendant la navigation Specs/Runtime/Knowledge ? Le **workspace** (et non une Execution, supprimée) est-il une page, un tab, un split ou le mode principal de travail ?
+Le volet « terminal monté en permanence » est **tranché** : le shell multi-pages (routeur, PDR-0025) plus le **store d'instances no-host** (PDR-0026) gardent les terminaux vivants au fil de la navigation (detach/reattach du nœud DOM, buffer + alt-screen + focus intacts) sans host persistant. Le terminal survit donc à la navigation, lossless.
+
+**Reste ouvert :** le **workspace** (et non une Execution, supprimée) est-il une page, un tab, un split ou le mode principal de travail ? — à trancher au prototypage du workbench (v2.2+).
 
 ## Q-007 - Attention Inbox
 
@@ -59,7 +61,9 @@ Pour chaque sous-système : porter, simplifier, différer ou supprimer.
 
 **Méthode (apprise en session) :** la forme d'absorption se décide par **revue d'usage avec l'utilisateur**, feature par feature, jamais par un agent qui lit le schéma et tranche seul. Un schéma dit ce qui a été construit, pas ce qui est utilisé.
 
-À auditer : ~~prototypes, design rounds~~ (tranché par PDR-0009 : annexe du Spec, conservé, un seul par Spec, rounds = rollback, absorbé v2.7), catalogues UI, annexes, docs sync, milestones, tags, pending actions, reviews structurées, directives, contextes et activity log.
+Déjà tranchés (ne plus auditer) : ~~prototypes, design rounds~~ (PDR-0009), ~~tags~~ (PDR-0017 : catégorie unique), ~~pending actions~~ / ~~user_stories~~ / ~~out_of_scope_items~~ / ~~project_config~~ (PDR-0016 : supprimés), ~~reviews structurées~~ (PDR-0012/0015 : vue dérivée), ~~directives / contextes~~ (PDR-0020 : rules/checks/agents + hooks), ~~activity log~~ (PDR-0016 : `domain_events`), ~~annexes~~ (PDR-0016).
+
+Reste réellement à auditer (détail d'implémentation dans la tranche concernée) : **catalogues UI de composants** (v2.7), **docs sync / profiles** (v2.6/v2.7), **milestones** (v2.7), et le **mapping de champs** de chaque ligne « porter » de `absorption.md`.
 
 ## Q-010 - Migration des données
 
@@ -69,9 +73,11 @@ Mapping des identités, historique à conserver, pièces jointes, chemins WSL/Wi
 
 ## Q-011 - Politique de reprise des agents et services
 
-**Status: open**
+**Status: partiellement résolu — reste l'UX de reprise**
 
-Opt-in projet, opt-in workspace ou décision au redémarrage ? Définir clairement ce qui est repris, relancé, simplement affiché ou marqué inconnu.
+Le **socle** est posé et canonique (`technical-architecture.md`) : la reprise des sessions agents est un opt-in **projet** (`projects.resume_agent_sessions`), la relance des services un flag **par commande** (`managed_commands.restart_on_startup`) ; un `running` invérifiable au boot passe à `unknown`/`interrupted` et l'utilisateur choisit. Le sidecar ne crée pas de troisième système de reprise.
+
+**Reste ouvert :** l'**UX** de la reprise — granularité par workspace, écran de décision au redémarrage vs reprise silencieuse, et présentation des états `unknown`/`resume_failed`. Croise le resume paresseux/unload des sessions idle (idée v2.7, roadmap).
 
 ## Q-012 - Limite du produit
 
@@ -115,8 +121,10 @@ Décision de cadrage v2.1 : le temps réel de v2.1 couvre uniquement les mutatio
 
 Les mutations métier passent par `domain_events` (push UI). Mais les **vues dérivées de Git** (diff de review, dirty, branche courante) ne sont pas des mutations métier : elles changent quand le code change sur le disque. À pincer : le sidecar **watch-t-il le fs/git** pour émettre un event (réactif), ou **re-lit-il sur déclencheur** (ouverture de la review, tick) ? Éviter de poller en continu ; éviter de rater un changement.
 
-## Q-014 - Design-system comme contexte agent, et fidélité du prototype
+## Q-016 - Design-system comme contexte agent, et fidélité du prototype
 
 **Status: resolved (PDR-0010)**
+
+> Note : cette question portait par erreur le même id « Q-014 » que « Mécanisme des hooks projet » ; renumérotée **Q-016** pour lever la collision (l'id est un simple label, la question reste tranchée par PDR-0010).
 
 Tranchée. Le design-system est du knowledge projet stocké dans nyx (tables `design` au format DESIGN.md + `components`), imposé en contexte à l'agent. Templating Handlebars compilé dans le sidecar Rust, Tailwind exécuté localement dans l'iframe, sync incrémentale par md5 visuel, inventaire par glob, amorçage greenfield. Détail complet dans PDR-0010. Le câblage exact reste de l'implémentation v2.7.

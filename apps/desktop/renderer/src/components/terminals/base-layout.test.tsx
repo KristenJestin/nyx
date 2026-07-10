@@ -12,6 +12,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-projects";
 import { ActiveProjectProvider } from "./active-project";
 import { BaseLayout } from "./base-layout";
+import { saveLastProjectId } from "./ui-persistence";
 
 function project(id: string, name: string): ProjectRecord {
   return { id, name, collapsed: false, created_at: 0, updated_at: 0, resume_agent_sessions: false };
@@ -198,6 +199,29 @@ describe("BaseLayout", () => {
     expect(await screen.findByText("TERMINALS PAGE")).toBeTruthy();
     fireEvent.click(screen.getByRole("link", { name: "Work" }));
     expect(await screen.findByText("WORK PAGE")).toBeTruthy();
+  });
+});
+
+describe("BaseLayout — restores the last entered project", () => {
+  it("re-enters the LAST project (persisted) instead of the first on load", async () => {
+    installBackend([project("p1", "Alpha"), project("p2", "Beta")]);
+    // The user last entered Beta; a relaunch must reopen Beta, not snap to the first (Alpha).
+    saveLastProjectId("p2");
+    renderLayout();
+    const beta = await screen.findByRole("button", { name: "Project Beta" });
+    await waitFor(() => expect(beta.getAttribute("aria-current")).toBe("true"));
+    expect(screen.getByRole("button", { name: "Project Alpha" }).getAttribute("aria-current")).toBe(
+      "false",
+    );
+  });
+
+  it("falls back to the first project when the remembered project no longer exists", async () => {
+    installBackend([project("p1", "Alpha")]);
+    // A stale id (the remembered project was deleted while away) falls back cleanly to the first.
+    saveLastProjectId("p-deleted-while-away");
+    renderLayout();
+    const alpha = await screen.findByRole("button", { name: "Project Alpha" });
+    await waitFor(() => expect(alpha.getAttribute("aria-current")).toBe("true"));
   });
 });
 

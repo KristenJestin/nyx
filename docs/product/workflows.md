@@ -19,7 +19,7 @@ Ce workflow protège le caractère terminal-first : un Spec ne doit jamais être
 1. L'utilisateur sélectionne un Spec prêt.
 2. nyx crée le worktree de réalisation et pose `specs.workspace_id` vers lui.
 3. nyx associe branche et contexte agent au workspace.
-4. L'agent reçoit le contexte exact via MCP.
+4. L'agent reçoit son contexte (rôle + rules + Spec) rendu live par nyx-core et injecté via les **hooks** du plugin (SessionStart / UserPromptSubmit) ; le **MCP ne porte que les actions** (PDR-0020).
 5. Terminaux, services et sessions apparaissent sur le workspace.
 6. Les tâches progressent et l'UI se met à jour en temps réel.
 7. L'agent demande une review.

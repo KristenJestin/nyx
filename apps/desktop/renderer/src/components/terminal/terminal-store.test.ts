@@ -1,13 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { mockIPC } from "@/bridge/test-harness";
-import { FakeTerminalCore } from "./fake-core";
-import { setCoreFactory, type CoreFactory } from "./ghostty-core";
+import { emit, mockIPC } from "@/bridge/test-harness";
+import { chooseSpawnDimensions } from "./xterm-instance";
 import {
   __resetTerminalStore,
   attachTerminal,
-  destroyTerminal,
   detachTerminal,
+  disposeTerminal,
   ensureTerminal,
   getTerminal,
   reconcileTerminals,
@@ -15,47 +14,54 @@ import {
 } from "./terminal-store";
 
 /**
- * The NO-HOST STORE contract (jsdom): instances live in a module-level Map,
- * outside React/route lifecycle; navigation DETACHES their DOM node (never
- * destroys), and reattach is lossless. The ghostty WASM cannot load under jsdom,
- * so we inject a {@link FakeTerminalCore} via the core-factory seam.
+ * The MODULE-LEVEL STORE contract (jsdom): xterm instances live in a module-level
+ * Map, OUTSIDE React / the route lifecycle. Navigation DETACHES an instance's DOM
+ * node (never disposes), the PTY subscription lives IN the instance so output keeps
+ * flowing into the buffer while detached, and a reattach is lossless. The instance
+ * is DISPOSED (PTY closed) ONLY on a real close (dispose / reconcile).
+ *
+ * xterm renders to a canvas jsdom can't paint (getContext is stubbed to null in
+ * vitest.setup), so we assert the BUFFER (the source of truth), not pixels.
  */
 
-let cores: FakeTerminalCore[] = [];
-let restoreFactory: CoreFactory | null = null;
+const FIRST_PTY_ID = 100;
+let spawnedIds: number[] = [];
 let closes: number[] = [];
 
-async function waitForInstance(id: string): Promise<void> {
-  // `ensureTerminal` fires an async init; wait until the wterm host is built.
-  await new Promise((r) => setTimeout(r, 0));
-  await new Promise((r) => setTimeout(r, 0));
-  const inst = getTerminal(id);
-  if (!inst || !inst.el.querySelector(".term-grid")) {
+/** Poll until `pred()` holds or we time out; xterm parses writes asynchronously. */
+async function waitFor(pred: () => boolean, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pred()) return;
     await new Promise((r) => setTimeout(r, 5));
   }
+  expect(pred(), "waitFor predicate timed out").toBe(true);
 }
 
-describe("terminal-store (no-host detach/reattach)", () => {
+/** Wait until the instance's spawn has resolved (its PTY id is known). */
+async function waitForSpawn(id: string): Promise<void> {
+  await waitFor(() => getTerminal(id)?.pty != null);
+}
+
+describe("terminal-store (module-level keep-alive)", () => {
   beforeEach(() => {
-    cores = [];
+    spawnedIds = [];
     closes = [];
     mockIPC((cmd, args) => {
-      if (cmd === "pty_spawn") return 100 + cores.length;
+      if (cmd === "pty_spawn") {
+        const id = FIRST_PTY_ID + spawnedIds.length;
+        spawnedIds.push(id);
+        return id;
+      }
       if (cmd === "pty_close") {
         closes.push((args?.id as number) ?? -1);
       }
       return null;
     });
-    restoreFactory = setCoreFactory(async () => {
-      const core = new FakeTerminalCore();
-      cores.push(core);
-      return core;
-    });
   });
 
   afterEach(() => {
     __resetTerminalStore();
-    if (restoreFactory) setCoreFactory(restoreFactory);
   });
 
   it("holds instances in a module-level Map and publishes ids reactively", async () => {
@@ -64,29 +70,31 @@ describe("terminal-store (no-host detach/reattach)", () => {
     expect(getTerminal("a")).toBeDefined();
     expect(getTerminal("b")).toBeDefined();
     expect(terminalStore.state.ids).toEqual(["a", "b"]);
-    await waitForInstance("a");
+    await waitForSpawn("a");
   });
 
   it("ensureTerminal is idempotent — a second call never respawns", async () => {
     const first = ensureTerminal({ recordId: "a" });
-    await waitForInstance("a");
-    const spawnsAfterFirst = cores.length;
+    await waitForSpawn("a");
+    const spawnsAfterFirst = spawnedIds.length;
+
     const again = ensureTerminal({ recordId: "a" });
     expect(again).toBe(first);
-    await new Promise((r) => setTimeout(r, 10));
-    expect(cores.length).toBe(spawnsAfterFirst); // no second core built
+    // Give any (erroneous) second spawn a chance to fire, then assert none did.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(spawnedIds.length).toBe(spawnsAfterFirst);
   });
 
-  it("attach moves the SAME node; detach removes it WITHOUT destroying", async () => {
+  it("attach MOVES the same node; detach removes it WITHOUT disposing", async () => {
     const instance = ensureTerminal({ recordId: "a" });
-    await waitForInstance("a");
+    await waitForSpawn("a");
 
     const c1 = document.createElement("div");
     document.body.appendChild(c1);
     attachTerminal("a", c1);
     expect(instance.el.parentElement).toBe(c1);
-    // The focusable input lives INSIDE the node, so focus survives moves.
-    expect(instance.el.querySelector("textarea")).not.toBeNull();
+    // The focusable helper textarea lives INSIDE the node, so focus survives moves.
+    expect(instance.el.querySelector(".xterm-helper-textarea")).not.toBeNull();
 
     // DETACH (navigation): node removed, but the instance stays in the store and
     // the PTY is NOT closed.
@@ -95,25 +103,68 @@ describe("terminal-store (no-host detach/reattach)", () => {
     expect(getTerminal("a")).toBe(instance);
     expect(closes).toHaveLength(0);
 
-    // REATTACH into a DIFFERENT container (the return route's pane): same node.
+    // REATTACH into a DIFFERENT container (the return route's pane): SAME node.
     const c2 = document.createElement("div");
     document.body.appendChild(c2);
     attachTerminal("a", c2);
     expect(instance.el.parentElement).toBe(c2);
-    expect(instance.el.querySelector("textarea")).not.toBeNull();
+    expect(instance.el.querySelector(".xterm-helper-textarea")).not.toBeNull();
   });
 
-  it("survives repeated detach/reattach cycles losslessly (buffer + alt-screen intact)", async () => {
+  it("PTY output written WHILE DETACHED lands in the buffer, present on reattach", async () => {
     const instance = ensureTerminal({ recordId: "a" });
-    await waitForInstance("a");
+    await waitForSpawn("a");
+    const ptyId = instance.pty as number;
+
     const c1 = document.createElement("div");
     document.body.appendChild(c1);
     attachTerminal("a", c1);
 
-    // Enter alt-screen (a TUI) and write content.
-    const core = cores[0];
-    core.writeString("\x1b[?1049h"); // enter alt-screen
-    core.writeString("VIM-SESSION-CONTENT");
+    // Output while ATTACHED.
+    await emit("pty://output", {
+      id: ptyId,
+      bytes: Array.from(new TextEncoder().encode("BEFORE_NAV_7f3a\r\n")),
+    });
+    await waitFor(() => instance.readScreenText().includes("BEFORE_NAV_7f3a"));
+
+    // DETACH — as if the user navigated away from the Terminals page.
+    detachTerminal("a");
+    expect(instance.el.parentElement).toBeNull();
+
+    // Output arrives WHILE DETACHED — the subscription lives in the instance, not
+    // the (unmounted) React pane, so it must still reach the buffer.
+    await emit("pty://output", {
+      id: ptyId,
+      bytes: Array.from(new TextEncoder().encode("WHILE_DETACHED_zz9\r\n")),
+    });
+    await waitFor(() => instance.readScreenText().includes("WHILE_DETACHED_zz9"));
+    // Never closed the PTY across the navigation.
+    expect(closes).toHaveLength(0);
+
+    // REATTACH (return to the page): the SAME instance, buffer intact — both the
+    // pre-nav AND the while-detached output are present.
+    const c2 = document.createElement("div");
+    document.body.appendChild(c2);
+    attachTerminal("a", c2);
+    expect(getTerminal("a")).toBe(instance);
+    const text = instance.readScreenText();
+    expect(text).toContain("BEFORE_NAV_7f3a");
+    expect(text).toContain("WHILE_DETACHED_zz9");
+  });
+
+  it("survives repeated detach/reattach cycles losslessly (buffer intact, never respawned)", async () => {
+    const instance = ensureTerminal({ recordId: "a" });
+    await waitForSpawn("a");
+    const ptyId = instance.pty as number;
+
+    const c1 = document.createElement("div");
+    document.body.appendChild(c1);
+    attachTerminal("a", c1);
+    await emit("pty://output", {
+      id: ptyId,
+      bytes: Array.from(new TextEncoder().encode("SESSION_CONTENT_v1m\r\n")),
+    });
+    await waitFor(() => instance.readScreenText().includes("SESSION_CONTENT_v1m"));
 
     // 10 detach→reattach cycles (navigation churn).
     for (let i = 0; i < 10; i++) {
@@ -123,73 +174,19 @@ describe("terminal-store (no-host detach/reattach)", () => {
       attachTerminal("a", c);
     }
 
-    // The instance, its core state (alt-screen + content) and node all survived;
-    // never closed the PTY, never rebuilt the core.
+    // Same instance + buffer survived; never closed the PTY, never respawned.
     expect(getTerminal("a")).toBe(instance);
-    expect(instance.usingAltScreen()).toBe(true);
-    expect(core.written).toContain("VIM-SESSION-CONTENT");
+    expect(instance.readScreenText()).toContain("SESSION_CONTENT_v1m");
     expect(closes).toHaveLength(0);
-    expect(cores).toHaveLength(1); // core never rebuilt across cycles
+    expect(spawnedIds).toHaveLength(1);
   });
 
-  it("detach CUTS the app-driven ResizeObserver; reattach re-arms it losslessly", async () => {
-    // Track live (connected) ResizeObservers so we can prove detach disconnects
-    // the one `observeResize` armed — the JSDoc contract (#24). The vitest.setup
-    // stub is a no-op; here we count observe/disconnect on THIS test's instances.
-    let liveObservers = 0;
-    class TrackingResizeObserver {
-      observe(): void {
-        liveObservers++;
-      }
-      unobserve(): void {}
-      disconnect(): void {
-        if (liveObservers > 0) liveObservers--;
-      }
-    }
-    const prevRO = globalThis.ResizeObserver;
-    globalThis.ResizeObserver = TrackingResizeObserver as unknown as typeof ResizeObserver;
-    try {
-      const instance = ensureTerminal({ recordId: "a" });
-      await waitForInstance("a");
-
-      const c1 = document.createElement("div");
-      document.body.appendChild(c1);
-      attachTerminal("a", c1); // arms observeResize → one live observer
-      expect(liveObservers, "attach arms the app-driven observer").toBe(1);
-
-      // Enter alt-screen + write content so we can prove state survives the cut.
-      const core = cores[0];
-      core.writeString("\x1b[?1049h");
-      core.writeString("OBSERVER-CUT-CONTENT");
-
-      // DETACH: the observer is CUT (no stale observer lingers on the old parent),
-      // the node is removed, but the instance + its core state stay alive.
-      detachTerminal("a");
-      expect(liveObservers, "detach disconnects the observer (JSDoc #24)").toBe(0);
-      expect(instance.el.parentElement).toBeNull();
-      expect(getTerminal("a")).toBe(instance);
-      expect(closes).toHaveLength(0);
-
-      // REATTACH: the observer is RE-ARMED (exactly one live, not doubled) and the
-      // state is lossless (same instance, alt-screen + content intact).
-      const c2 = document.createElement("div");
-      document.body.appendChild(c2);
-      attachTerminal("a", c2);
-      expect(liveObservers, "reattach re-arms exactly one observer").toBe(1);
-      expect(getTerminal("a")).toBe(instance);
-      expect(instance.usingAltScreen()).toBe(true);
-      expect(core.written).toContain("OBSERVER-CUT-CONTENT");
-    } finally {
-      globalThis.ResizeObserver = prevRO;
-    }
-  });
-
-  it("destroyTerminal is the ONLY path that closes the PTY + drops the instance", async () => {
+  it("disposeTerminal is the ONLY path that closes the PTY + drops the instance", async () => {
     ensureTerminal({ recordId: "a" });
-    await waitForInstance("a");
+    await waitForSpawn("a");
     expect(closes).toHaveLength(0);
 
-    destroyTerminal("a");
+    disposeTerminal("a");
     expect(getTerminal("a")).toBeUndefined();
     expect(terminalStore.state.ids).not.toContain("a");
     expect(closes).toHaveLength(1);
@@ -199,14 +196,41 @@ describe("terminal-store (no-host detach/reattach)", () => {
     ensureTerminal({ recordId: "a" });
     ensureTerminal({ recordId: "b" });
     ensureTerminal({ recordId: "c" });
-    await waitForInstance("a");
+    await waitForSpawn("a");
+    await waitForSpawn("b");
+    await waitForSpawn("c");
 
-    // Only a + c remain live (b was closed elsewhere / by an agent).
+    // Only a + c remain live (b was closed elsewhere / by an agent over MCP).
     reconcileTerminals(["a", "c"]);
     expect(getTerminal("a")).toBeDefined();
     expect(getTerminal("b")).toBeUndefined();
     expect(getTerminal("c")).toBeDefined();
     // b's PTY was closed exactly once.
     expect(closes).toHaveLength(1);
+  });
+});
+
+describe("chooseSpawnDimensions (spawn-size gate)", () => {
+  it("uses the fit when the element has a real box", () => {
+    const el = { clientWidth: 640, clientHeight: 360 };
+    const dims = chooseSpawnDimensions(el, () => ({ cols: 200, rows: 50 }), { cols: 80, rows: 24 });
+    expect(dims).toEqual({ cols: 200, rows: 50 });
+  });
+
+  it("ignores the degenerate fit and falls back when the pane is hidden (0×0)", () => {
+    const el = { clientWidth: 0, clientHeight: 0 };
+    const dims = chooseSpawnDimensions(el, () => ({ cols: 8, rows: 24 }), { cols: 80, rows: 24 });
+    expect(dims).toEqual({ cols: 80, rows: 24 });
+  });
+
+  it("falls back when the element is absent (not yet opened)", () => {
+    const dims = chooseSpawnDimensions(null, () => ({ cols: 8, rows: 24 }), { cols: 80, rows: 24 });
+    expect(dims).toEqual({ cols: 80, rows: 24 });
+  });
+
+  it("falls back per-axis when a visible fit returns undefined", () => {
+    const el = { clientWidth: 100, clientHeight: 100 };
+    const dims = chooseSpawnDimensions(el, () => undefined, { cols: 80, rows: 24 });
+    expect(dims).toEqual({ cols: 80, rows: 24 });
   });
 });

@@ -18,17 +18,17 @@ export interface TerminalDeckProps {
 
 /**
  * `<TerminalDeck>` — mounts ONE `<Terminal>` pane per record and shows only the
- * active one. Post-v2.2.5 the live terminals live in the module-level
+ * active one. The live terminals live in the module-level
  * {@link getTerminal store}, NOT in these components: each pane merely attaches
  * its record's persistent DOM node into the visible container and detaches on
  * unmount. So a terminal survives BOTH a selection switch (the pane stays mounted,
  * hidden with `display:none`) AND a full navigation (the whole deck unmounts, each
- * pane detaches — never destroys — and the instance stays in the store, reattached
- * losslessly on return).
+ * pane detaches — never disposes — and the instance stays in the store, reattached
+ * losslessly on return with its buffer intact).
  *
  * The deck also RECONCILES the store against its live record set (see the effect):
  * a record no longer present (closed by the user or by an agent over MCP) has its
- * store instance disposed, so a churn of create/close never leaks a WASM core.
+ * store instance disposed, so a churn of create/close never leaks a PTY.
  *
  * Each pane carries `data-terminal-id` (the record id) and `data-active` so the
  * layer above (and the tests) can reason about visibility without inspecting
@@ -37,10 +37,9 @@ export interface TerminalDeckProps {
 export function TerminalDeck({ terminals, activeId, onPtyId }: TerminalDeckProps) {
   // Publish per-terminal test/e2e seams on window, backed by the STORE (so they
   // address any terminal by record id, including hidden or navigated-away ones):
-  //   - `__nyxDeck[id]()`       → that terminal's screen text (from the ghostty core);
+  //   - `__nyxDeck[id]()`       → that terminal's buffer text (screen + scrollback);
   //   - `__nyxDeckInput[id](s)` → feed `s` as input (routes through the PTY).
-  // Both are inert in production (nothing reads them). Kept for the restore/e2e
-  // harness that already relies on this contract.
+  // Both are inert in production (nothing reads them).
   useEffect(() => {
     const win = window as unknown as {
       __nyxDeck?: Record<string, () => string>;
@@ -60,13 +59,13 @@ export function TerminalDeck({ terminals, activeId, onPtyId }: TerminalDeckProps
     };
   }, []);
 
-  // RECONCILE the store against the live record set: dispose (real close) any
-  // store instance whose record is no longer present. Runs after render so a
-  // freshly-added record's pane has mounted (created its instance) first.
+  // RECONCILE the store against the live record set: dispose (real close) any store
+  // instance whose record is no longer present. Runs after render so a
+  // freshly-added record's pane has mounted (created its instance) first. Keyed on
+  // the id SET (not the array identity).
   const liveIds = terminals.map((t) => t.id).join(",");
   useEffect(() => {
     reconcileTerminals(terminals.map((t) => t.id));
-    // `liveIds` is the stable dep — the id SET, not the array identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIds]);
 

@@ -286,10 +286,6 @@ export type BackendCommand =
   | "reorder"
   | "terminal_exec_mark_read"
   | "persist_scrollback"
-  // v2.2.5 restart re-hydration: the sidecar's VT screen snapshot as an ANSI byte
-  // stream ({ recordId } -> { bytes: number[] }). Written into a fresh terminal to
-  // restore its screen (a TUI's alt-screen included), not just its scrollback.
-  | "terminal_screen_rehydration"
   // FEEDBACK #32: persist a terminal's live cwd into its record so a relaunch
   // re-spawns at the LAST directory, not the stale spawn-time cwd.
   | "set_terminal_cwd"
@@ -335,6 +331,21 @@ export type BackendCommand =
   // pulled (no polling) on `workspaces://changed` (the topic identity mutations invalidate).
   // NOT the full contextual activity timeline (v2.5). `{ workspaceId, limit? }`.
   | "workspace_timeline"
+  // v2.4 Spec domain READ models (Phase 4 — the native Specs UI). Pure reads over the
+  // `nyx_core::db` Spec/revision/task/workspace-context model (phases 1-3), served by the
+  // sidecar's `db_command` dispatch (the SAME authority the Phase-5 MCP tools will reuse).
+  // `spec_list` ({ projectId }) is the board read model: every LIVE Spec of a project +
+  // its per-Spec task tally (done/total) + the project's Linear key, for the board cards.
+  // `spec_detail` ({ specId }) is the PRD-detail read model: the Spec, its active revision
+  // (the six structured sections), its tasks + dependency edges, and the DERIVED workspace
+  // context (workspace → project → repos), consumed by the detail's tabs.
+  | "spec_list"
+  | "spec_detail"
+  // `spec_activity` ({ specId, limit? }) is the PRD-detail ACTIVITY read model: a BOUNDED,
+  // oldest-first fil of the Spec's most recent `spec`/`task` `domain_events` (its own lifecycle
+  // — creation, section edits, transitions — plus its tasks' add/transition/dependency events),
+  // NEVER a terminal byte. Mirrors `workspace_timeline`; consumed by the detail's Activity tab.
+  | "spec_activity"
   // managed commands
   | "command_list"
   | "command_create"
@@ -389,4 +400,8 @@ export type BackendEvent =
   | "commands://changed"
   | "workspaces://changed"
   | "terminals://changed"
-  | "agent-sessions://changed";
+  | "agent-sessions://changed"
+  // The Spec domain (Specs / revisions / tasks / dependencies) — the v2.4 authoring +
+  // transition MCP tools push this (`ChangedTopic::Specs` → `specs://changed`) so an open
+  // Specs board / PRD detail re-pulls after a mutation with NO reload or poll.
+  | "specs://changed";

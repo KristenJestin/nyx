@@ -1,0 +1,31 @@
+-- Schema v15: REALIZE the `specs.workspace_id` link (v2.4 Phase 3, task
+-- 01KX1DH6BB1QGMC0XBAQBRVZ5W — "Lien specs.workspace_id (repos + projet dérivés du
+-- workspace)"). A Spec is anchored on a dev WORKSPACE; the REPOS and the PROJECT of a
+-- review are DERIVED from that workspace (schema.rs / data-model.dbml: "the project is
+-- derived via the workspace"), NOT duplicated onto the Spec.
+--
+-- ## Why this migration is an INDEX only (no column change)
+--
+-- The `specs.workspace_id` COLUMN — the v2.1 reserved seam — already exists as a nullable
+-- FK `REFERENCES workspaces(id) ON DELETE SET NULL`, declared in v13 (Phase 1) and left
+-- NULL there ("realized/populated in Phase 3"). Phase 3 realizes the LINK, so:
+--   * The column and its FK constraint are ALREADY correct — this migration does NOT
+--     rewrite v13 (PDR-0024: ONE SQLite file, ONE append-only migration chain; the
+--     prior link stays untouched, this is just the next link).
+--   * The backend now SETS the pointer (see `set_spec_workspace` / `create_spec_with_workspace`
+--     in `db.rs`) and DERIVES the repos + project through the workspace (see
+--     `spec_workspace_context`).
+--
+-- What was MISSING for the reverse direction is an INDEX on `workspace_id`: the FK gives
+-- fast Spec→workspace resolution (the workspace PK), but the "which Specs are anchored on
+-- THIS workspace" reverse scan (the ON DELETE SET NULL housekeeping SQLite runs when a
+-- workspace is removed, and the coming review that resolves a Spec's workspace context)
+-- had no supporting index. This adds it, mirroring the FK-index convention v13 uses for
+-- the other Spec FKs (`idx_spec_revisions_spec`). Partial (WHERE NOT NULL): only anchored
+-- Specs participate, so a project's many workspace-less draft Specs cost nothing.
+--
+-- No canonical column is deferred here (the repos/project are DERIVED, never stored on the
+-- Spec — the whole point of PDR-0013's no-checkout-table design).
+
+CREATE INDEX idx_specs_workspace ON specs (workspace_id)
+    WHERE workspace_id IS NOT NULL;

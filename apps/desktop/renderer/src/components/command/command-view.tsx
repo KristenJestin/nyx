@@ -24,12 +24,7 @@ export interface CommandViewProps {
   sourceScriptName?: string | null;
   /** package.json path the source points at (the source field's title hint). */
   sourcePackageJsonPath?: string | null;
-  /**
-   * Whether this view is the active/visible one. Retained for the callers' API;
-   * the output panel no longer needs it (wterm renders to the DOM, and the
-   * app-driven sizing already skips a 0×0 hidden pane via its 0×0 guard — there
-   * is no WebGL context to gate on anymore).
-   */
+  /** Whether this view is the active/visible one (drives WebGL attach). */
   active?: boolean;
   className?: string;
 }
@@ -54,6 +49,7 @@ export function CommandView({
   cwd,
   sourceScriptName,
   sourcePackageJsonPath,
+  active = true,
   className,
 }: CommandViewProps) {
   const state = useCommandState(instanceId, initialState);
@@ -111,7 +107,7 @@ export function CommandView({
       {/* The read-only output panel fills the rest. Keyed by instance so a
           different command rebuilds a clean buffer + rehydrates its history. */}
       <div className="min-h-0 flex-1">
-        <CommandOutputPanel key={instanceId} instanceId={instanceId} />
+        <CommandOutputPanel key={instanceId} instanceId={instanceId} active={active} />
       </div>
     </div>
   );

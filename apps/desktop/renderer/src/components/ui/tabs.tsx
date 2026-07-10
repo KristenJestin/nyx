@@ -1,10 +1,23 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type * as React from "react";
 import { Tabs as BaseTabs } from "@base-ui/react/tabs";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
-import { tabHeightTransition, tabPanelTransition, tabPanelVariants } from "./tabs-motion";
+import {
+  tabHeightTransition,
+  tabIndicatorTransition,
+  tabPanelTransition,
+  tabPanelVariants,
+} from "./tabs-motion";
 
 /** `useLayoutEffect` on the client, `useEffect` on the server (no SSR warning). */
 const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
@@ -14,11 +27,17 @@ const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffec
  * (Root / List / Tab / Indicator / Panel), styled to the design system (a
  * bottom-border rail with muted-foreground triggers that brighten when active).
  *
- * The active-tab underline is Base UI's `Tabs.Indicator`, positioned from the
- * geometry CSS vars it publishes (`--active-tab-left` / `--active-tab-width`) and
- * SLID between tabs with a short transform/width transition. The transition has a
- * `motion-reduce:` escape hatch (mapped to `prefers-reduced-motion: reduce`) so
- * the project's reduced-motion rule holds.
+ * The active-tab underline is a **Motion shared-layout indicator**: a `motion.span`
+ * rendered INSIDE the active tab, sharing a per-list `layoutId` with every other
+ * tab's indicator slot. On a tab switch Motion FLIPs the underline from the old tab
+ * to the new one, so its POSITION and WIDTH interpolate TOGETHER — it SLIDES and
+ * RESIZES continuously across, instead of teleporting to the target then growing
+ * (the failing behaviour of the previous Base UI `--active-tab-left/-width` CSS-var
+ * transition, where transform and width animated out of sync). It reuses the SAME
+ * spring as the project rail's `ActiveRail` (`base-layout.tsx`) for a consistent
+ * feel, and honours `useReducedMotion` (the FLIP still lands correctly, just
+ * without the spring). Each `Tabs.List` mints its own `layoutId` (via `useId`) so
+ * two independent tab sets never share one underline.
  *
  * The PANEL SWITCH itself is **Motion-animated**: `Tabs.AnimatedPanel` wraps the
  * active panel's content in `AnimatePresence mode="wait"` + a `motion.div` that
@@ -42,25 +61,71 @@ const useIsomorphicLayoutEffect = typeof window !== "undefined" ? useLayoutEffec
  *   </Tabs.Root>
  */
 
-function TabsList({ className, children, ...props }: BaseTabs.List.Props) {
+/**
+ * Per-`Tabs.List` context: the shared-layout `layoutId` the active tab's underline
+ * uses (so two independent tab sets on screen never share one indicator) and the
+ * resolved reduced-motion flag (measured once at the list, not per tab). `null`
+ * outside a `Tabs.List` — a `Tabs.Tab` then renders no motion indicator.
+ */
+const TabsIndicatorContext = createContext<{
+  layoutId: string;
+  reduced: boolean | null;
+  fullWidth: boolean;
+} | null>(null);
+
+/** `<Tabs.List>` props: the Base UI list props + our opt-in `fullWidth` toggle. */
+export interface TabsListProps extends BaseTabs.List.Props {
+  /**
+   * OPT-IN full-width distribution: the triggers SPAN the whole rail, EVENLY
+   * (each `Tabs.Tab` becomes `flex-1`, its label centred). The Motion shared-layout
+   * underline still measures the ACTIVE trigger's own box, so it tracks the now-wider
+   * triggers correctly. Default (`false`) keeps the compact left-aligned rail every
+   * other consumer (e.g. the command-import modal) relies on — unchanged.
+   */
+  fullWidth?: boolean;
+}
+
+function TabsList({ className, children, fullWidth = false, ...props }: TabsListProps) {
+  // A stable, list-unique base for the indicator `layoutId`. `useId` gives one id
+  // per mounted list, so every tab in THIS list shares it (and only this list).
+  const layoutId = `tabs-indicator-${useId()}`;
+  const reduced = useReducedMotion();
   return (
     <BaseTabs.List
-      className={cn("relative flex gap-6 border-b border-border", className)}
+      className={cn("relative flex gap-6 border-b border-border", fullWidth && "w-full", className)}
       {...props}
     >
-      {children}
-      <BaseTabs.Indicator
-        className={cn(
-          "absolute bottom-[-1px] left-0 h-0.5 rounded-full bg-primary",
-          "translate-x-[var(--active-tab-left)] [width:var(--active-tab-width)]",
-          "transition-[transform,width] duration-200 ease-out motion-reduce:transition-none",
-        )}
-      />
+      <TabsIndicatorContext.Provider value={{ layoutId, reduced, fullWidth }}>
+        {children}
+      </TabsIndicatorContext.Provider>
     </BaseTabs.List>
   );
 }
 
+/**
+ * The active-tab underline: a `motion.span` sharing the list's `layoutId` so Motion
+ * FLIPs it between tabs (continuous slide + resize). Rendered only inside the ACTIVE
+ * tab — Base UI's `Tabs.Tab` passes its `state.active` to the `render` callback,
+ * which is how we know. Pinned to the tab's bottom edge with the same `bg-primary`
+ * pink underline as before; geometry follows the tab's own box, so its width tracks
+ * the tab label automatically.
+ */
+function TabIndicator() {
+  const ctx = useContext(TabsIndicatorContext);
+  if (ctx === null) return null;
+  return (
+    <motion.span
+      layoutId={ctx.layoutId}
+      transition={tabIndicatorTransition(ctx.reduced)}
+      className="absolute inset-x-0 bottom-[-1px] h-0.5 rounded-full bg-primary"
+    />
+  );
+}
+
 function TabsTab({ className, children, ...props }: BaseTabs.Tab.Props) {
+  // In a `fullWidth` list every trigger flexes to an equal share of the rail and
+  // centres its label; the shared-layout underline still follows this wider box.
+  const ctx = useContext(TabsIndicatorContext);
   return (
     <BaseTabs.Tab
       className={cn(
@@ -69,12 +134,20 @@ function TabsTab({ className, children, ...props }: BaseTabs.Tab.Props) {
         "hover:text-foreground/80 data-[selected]:text-foreground",
         "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
         "[&_svg]:size-3.5 [&_svg]:shrink-0 [&_svg]:opacity-80",
+        ctx?.fullWidth && "flex-1 justify-center",
         className,
       )}
+      // Base UI resolves the button props + exposes `state.active` here; we render
+      // the button ourselves so we can inject the shared-layout underline ONLY into
+      // the active tab. The Motion FLIP then slides it from the old tab to this one.
+      render={(renderProps, state) => (
+        <button {...renderProps}>
+          {children}
+          {state.active ? <TabIndicator /> : null}
+        </button>
+      )}
       {...props}
-    >
-      {children}
-    </BaseTabs.Tab>
+    />
   );
 }
 

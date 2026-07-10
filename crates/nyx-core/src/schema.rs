@@ -85,6 +85,48 @@
 //   NOT NULL TEXT; `payload` is a NOT NULL JSON TEXT bag (default '{}'); `created_at`
 //   is epoch-ms `BigInt`. The correlation ids are PLAIN values (no FK) so the audit log
 //   OUTLIVES a delete of the row it describes. Column ORDER must match the SQL migration.
+// - v13 (v2.4 Phase 1 — the Spec domain, task 01KX1DH4QC04C1FKHZT5ZF4BMS) adds `specs`
+//   and `spec_revisions`. `specs` is the durable Spec identity (PDR-0014): `project_id`
+//   (FK CASCADE) + `workspace_id` (Nullable FK SET NULL — the v2.1 seam, realized in
+//   Phase 3), `title`/`slug` (slug Nullable), `number` (per-project, UNIQUE),
+//   `priority`/`status`/`mode` (TEXT with CHECK vocabularies — the canonical
+//   `priority`/`spec_status`/`spec_mode` enums), `phases` (NOT NULL JSON TEXT, default
+//   '[]', PDR-0022), `current_revision_number`/`position` (Integer), epoch-ms
+//   timestamps + Nullable `completed_at`/`archived_at`. `spec_revisions` is the revision
+//   chain (FORK = new revision, previous `superseded`): `spec_id` (FK CASCADE),
+//   `revision_number` (UNIQUE per Spec), `revision_status` (TEXT CHECK active|superseded,
+//   exactly one active per Spec via a partial unique index), `title`, the six STRUCTURED
+//   section columns (`problem`/`solution`/`implementation_decisions`/`testing_decisions`/
+//   `user_stories`/`out_of_scope` — NOT NULL TEXT default ''), Nullable `change_reason`,
+//   and epoch-ms `created_at`. Column ORDER here must match the SQL migration exactly
+//   (Diesel positional decoding).
+// - v14 (v2.4 Phase 2 — the task domain, task 01KX1DH5TVVA2QJFKMXSWSR4DD) adds `tasks`
+//   and `task_dependencies`, the delegable unit of work of a Spec (PDR-0014). `tasks`:
+//   `project_id` (FK CASCADE) + `spec_id` (Nullable FK CASCADE — a task may exist without
+//   a Spec) + `parent_task_id` (Nullable self-FK CASCADE — the subtask tree). `kind`
+//   (TEXT CHECK slice|human|review — the PRD vocabulary), `executor` (TEXT CHECK
+//   agent|human, kept coherent with `kind` by a table CHECK), `type` (TEXT CHECK
+//   task_type), `status` (TEXT CHECK task_status), `priority` (TEXT CHECK priority),
+//   `severity` (Nullable TEXT CHECK severity — set = review FINDING, PDR-0016).
+//   `title` NOT NULL; `description`/`acceptance_criteria`/`verification_command` Nullable
+//   (verification_command = how a `kind=human` action is confirmed). `phase` Nullable
+//   Integer (indexes `specs.phases`, PDR-0022), `position` Integer, `blocked_reason`/
+//   `skip_reason` Nullable, epoch-ms timestamps + Nullable `completed_at`. `type` is a
+//   Rust keyword, so the column is exposed as `type_` via `#[sql_name = "type"]`.
+//   `task_dependencies`: the acyclic dependency graph — `task_id` + `depends_on_task_id`
+//   (both FK CASCADE, composite PRIMARY KEY), `type` (TEXT CHECK dependency_type, exposed
+//   as `type_`), epoch-ms `created_at`. Acyclicity is enforced in the backend (a
+//   reachability DFS before each insert), not in SQL. Column ORDER here must match the SQL
+//   migration exactly (Diesel positional decoding).
+// - v15 (v2.4 Phase 3 — REALIZE `specs.workspace_id`, task 01KX1DH6BB1QGMC0XBAQBRVZ5W) adds
+//   NO column: the `specs.workspace_id` nullable FK already exists (declared v13, the v2.1
+//   seam). Phase 3 realizes the LINK — the backend now SETS the pointer (`set_spec_workspace`
+//   / `create_spec_with_workspace`) and DERIVES the repos + project THROUGH the workspace
+//   (`spec_workspace_context`: Spec → workspace → project → its `repositories`), never
+//   duplicating them onto the Spec (PDR-0013: no checkout table). The migration only adds a
+//   PARTIAL INDEX `idx_specs_workspace ON specs(workspace_id) WHERE workspace_id IS NOT NULL`
+//   for the reverse "which Specs anchor on THIS workspace" scan. No `schema.rs` table change
+//   is needed (an index is not part of `diesel::table!`).
 
 diesel::table! {
     terminals (id) {
@@ -224,6 +266,82 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    specs (id) {
+        id -> Text,
+        project_id -> Text,
+        workspace_id -> Nullable<Text>,
+        title -> Text,
+        slug -> Nullable<Text>,
+        number -> Integer,
+        priority -> Text,
+        status -> Text,
+        mode -> Text,
+        phases -> Text,
+        current_revision_number -> Integer,
+        position -> Integer,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        completed_at -> Nullable<BigInt>,
+        archived_at -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    spec_revisions (id) {
+        id -> Text,
+        spec_id -> Text,
+        revision_number -> Integer,
+        revision_status -> Text,
+        title -> Text,
+        problem -> Text,
+        solution -> Text,
+        implementation_decisions -> Text,
+        testing_decisions -> Text,
+        user_stories -> Text,
+        out_of_scope -> Text,
+        change_reason -> Nullable<Text>,
+        created_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    tasks (id) {
+        id -> Text,
+        project_id -> Text,
+        spec_id -> Nullable<Text>,
+        parent_task_id -> Nullable<Text>,
+        kind -> Text,
+        executor -> Text,
+        #[sql_name = "type"]
+        type_ -> Text,
+        status -> Text,
+        priority -> Text,
+        severity -> Nullable<Text>,
+        title -> Text,
+        description -> Nullable<Text>,
+        acceptance_criteria -> Nullable<Text>,
+        verification_command -> Nullable<Text>,
+        phase -> Nullable<Integer>,
+        position -> Integer,
+        blocked_reason -> Nullable<Text>,
+        skip_reason -> Nullable<Text>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        completed_at -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    task_dependencies (task_id, depends_on_task_id) {
+        task_id -> Text,
+        depends_on_task_id -> Text,
+        #[sql_name = "type"]
+        type_ -> Text,
+        created_at -> BigInt,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
 diesel::joinable!(managed_commands -> projects (project_id));
@@ -232,6 +350,15 @@ diesel::joinable!(command_instances -> workspaces (workspace_id));
 diesel::joinable!(agent_sessions -> terminals (terminal_id));
 diesel::joinable!(agent_sessions -> workspaces (workspace_id));
 diesel::joinable!(repositories -> projects (project_id));
+diesel::joinable!(specs -> projects (project_id));
+diesel::joinable!(specs -> workspaces (workspace_id));
+diesel::joinable!(spec_revisions -> specs (spec_id));
+diesel::joinable!(tasks -> projects (project_id));
+diesel::joinable!(tasks -> specs (spec_id));
+// `task_dependencies` has TWO FKs into `tasks` (task_id + depends_on_task_id), and a
+// self-referential `parent_task_id` also joins `tasks -> tasks`; Diesel's `joinable!`
+// declares a single unambiguous join per table pair, so those ambiguous self-joins are
+// intentionally NOT declared (the CRUD queries them explicitly by column instead).
 
 diesel::allow_tables_to_appear_in_same_query!(
     agent_sessions,
@@ -240,6 +367,10 @@ diesel::allow_tables_to_appear_in_same_query!(
     managed_commands,
     projects,
     repositories,
+    spec_revisions,
+    specs,
+    task_dependencies,
+    tasks,
     terminals,
     workspaces,
 );

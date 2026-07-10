@@ -377,7 +377,7 @@ export function CommandsSection({
       </Tabs.Root>
 
       {/* === Inline footer (count + Import action) ========================= */}
-      <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3.5">
+      <div className="mt-3 flex items-center justify-between gap-2 border-t border-border py-3.5">
         <span className="text-xs text-muted-foreground">
           {tab === "commands"
             ? `${templates.length} command${templates.length === 1 ? "" : "s"}${

@@ -8,15 +8,14 @@
  * Transitions API (`document.startViewTransition`) so the old screen cross-fades
  * into the new one (the API's default ~150-250ms fade), terminal included.
  *
- * ## Why this is safe for the lossless terminal (the critical constraint)
+ * ## Why this is pure chrome (the critical constraint)
  * The View Transitions API captures a STATIC snapshot of the old DOM, then
  * animates that snapshot out while the new (live) DOM animates in. The callback
- * we pass ONLY runs the route change — it never touches the module-level
- * terminal store: no `destroy()`, no respawn, the same wterm/ghostty instance is
- * detached from the old pane and re-attached (node MOVED, never cloned) into the
- * new one exactly as before. The VT is pure chrome over that swap. The gate
- * (`gate-lossless.browser.test.tsx`) and `nav-transition.test.tsx` both assert
- * the instance identity + spawn count survive a transition.
+ * we pass ONLY runs the route change — it never spawns or destroys a terminal
+ * itself. Leaving the Terminals route unmounts the deck (each xterm instance is
+ * disposed) exactly as it would without a transition; scrollback is restored on
+ * return from the serialized snapshot. The VT is pure chrome over that swap.
+ * `nav-transition.test.ts` asserts the reduced-motion + no-API fallback paths.
  *
  * ## Reduced motion + fallback (done_criteria 3 + 4)
  * - `prefers-reduced-motion: reduce` → we run the change instantly, no VT.

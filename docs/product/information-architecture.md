@@ -2,9 +2,11 @@
 
 ## État
 
-**Status: proposed - prototype required**
+**Status: partiellement validé — shell de navigation posé (PDR-0025, PDR-0026), structure projet riche encore proposed**
 
-Cette structure organise les concepts sans prétendre que la navigation est validée. Elle doit être testée avec un prototype sur des projets mono-workspace et multi-repo.
+Le **shell multi-pages** est tranché et livré : rail de projets à gauche + section-nav + `<Outlet/>` (PDR-0025), terminaux montés en permanence via le store no-host (PDR-0026). Le shell **livré** expose trois pages — **Terminals** (`/`), **Work** (`/work`), **Knowledge** (`/knowledge`) — validées par le prototype de référence.
+
+**Écart à réconcilier :** la structure projet **plus riche** décrite ci-dessous (Overview / Specs / Runtime / Knowledge) reste **proposed**. Le shell livré la simplifie (Terminals = Runtime, Work = Specs+Overview) ; « Specs », « Runtime » et les onglets de détail Spec seront branchés à leur tranche (v2.4). Ce document décrit la cible ; le shell v2.2.5 en est la première itération, pas la forme finale.
 
 ## Navigation globale proposée
 
@@ -122,10 +124,10 @@ L'agent peut utiliser la structure complète via MCP sans imposer cette complexi
 
 ## Points à prototyper
 
-1. Rail global projets versus sidebar projet.
-2. Place permanente ou contextuelle des terminaux.
-3. Workspace comme page, tab, split ou mode principal de travail.
-4. Passage terminal -> diff -> commentaire sans perte de contexte.
-5. Inbox globale versus compteurs locaux.
-6. Navigation d'un faux workspace multi-repo.
-7. Comportement quand aucun Spec n'est associé à une session.
+1. ~~Rail global projets versus sidebar projet.~~ **Tranché** : rail de projets (PDR-0025).
+2. ~~Place permanente ou contextuelle des terminaux.~~ **Tranché** : montés en permanence, store no-host, survivent à la navigation (PDR-0026).
+3. Workspace comme page, tab, split ou mode principal de travail. *(ouvert, Q-006)*
+4. Passage terminal -> diff -> commentaire sans perte de contexte. *(partiellement : la navigation est lossless PDR-0026 ; le pont diff/commentaire arrive en v2.5)*
+5. Inbox globale versus compteurs locaux. *(ouvert, Q-007 — Attention Inbox différée)*
+6. Navigation d'un faux workspace multi-repo. *(ouvert)*
+7. Comportement quand aucun Spec n'est associé à une session. *(ouvert — travail libre, W-001)*

@@ -1,17 +1,19 @@
 import { Store } from "@tanstack/react-store";
 
-import { WtermInstance, type WtermInstanceOptions } from "./wterm-instance";
+import { XtermInstance, type XtermInstanceOptions } from "./xterm-instance";
 
 /**
- * THE NO-HOST TERMINAL STORE (v2.2.5).
+ * THE MODULE-LEVEL TERMINAL STORE.
  *
- * Live terminal instances are held in a FLAT, IMPERATIVE, MODULE-LEVEL `Map`,
+ * Live xterm instances are held in a FLAT, IMPERATIVE, MODULE-LEVEL `Map`,
  * OUTSIDE React and OUTSIDE the router's lifecycle. This is what makes terminals
- * survive navigation WITHOUT a persistent host mounted off the `<Outlet/>`: the
- * router mounts/unmounts routes freely, but the instances never live in that tree
- * — a route only ATTACHES an instance's persistent DOM node into its pane and
- * DETACHES it on unmount. The instance (and its ghostty WASM screen state) stays
- * put in this Map. A spike validated this holds losslessly across 50 cycles.
+ * survive NAVIGATION (not just a selection switch): the router mounts/unmounts
+ * the Terminals route freely, but the instances never live in that tree — a route
+ * only ATTACHES an instance's persistent DOM node into its pane and DETACHES it on
+ * unmount. The instance (and its xterm buffer / screen state) stays put in this
+ * Map, so a running command keeps streaming into the buffer and is reattached
+ * losslessly on return. The instance is DISPOSED (PTY closed, xterm freed) ONLY
+ * when the record is truly closed — never on navigation.
  *
  * Only METADATA is reactive: the ids of live instances and their titles live in a
  * `@tanstack/react-store` `Store`, so React views can subscribe to "which
@@ -28,7 +30,7 @@ export interface TerminalStoreState {
 }
 
 /** The imperative Map of instances — module-level, outside React. */
-const instances = new Map<string, WtermInstance>();
+const instances = new Map<string, XtermInstance>();
 
 /** The reactive metadata slice (ids + titles). */
 export const terminalStore = new Store<TerminalStoreState>({ ids: [], titles: {} });
@@ -42,17 +44,17 @@ function setTitle(recordId: string, title: string): void {
 }
 
 /**
- * Ensure a live instance exists for `recordId`, creating + `init()`-ing it once
- * if absent (idempotent — a second call with the same id returns the existing
+ * Ensure a live instance exists for `options.recordId`, creating it once if
+ * absent (idempotent — a second call with the same id returns the EXISTING
  * instance, so a remount/reattach never respawns the shell). The instance owns
- * its persistent DOM node from construction; the caller attaches it to a pane
- * with {@link attachTerminal}.
+ * its persistent DOM node + PTY wiring from construction; the caller attaches it
+ * to a pane with {@link attachTerminal}.
  */
-export function ensureTerminal(options: WtermInstanceOptions): WtermInstance {
+export function ensureTerminal(options: XtermInstanceOptions): XtermInstance {
   const existing = instances.get(options.recordId);
   if (existing) return existing;
 
-  const instance = new WtermInstance({
+  const instance = new XtermInstance({
     ...options,
     onTitle: (title) => {
       setTitle(options.recordId, title);
@@ -61,54 +63,44 @@ export function ensureTerminal(options: WtermInstanceOptions): WtermInstance {
   });
   instances.set(options.recordId, instance);
   publishIds();
-  // Fire the async init; the shell spawns once. Errors are swallowed so a WASM
-  // load failure never breaks the store (the pane just shows an empty terminal).
-  void instance.init().catch(() => {});
   return instance;
 }
 
 /** Read a live instance by id (or `undefined` if none). */
-export function getTerminal(recordId: string): WtermInstance | undefined {
+export function getTerminal(recordId: string): XtermInstance | undefined {
   return instances.get(recordId);
 }
 
 /**
- * ATTACH an instance's persistent DOM node into a pane container and start the
- * app-driven resize observer. If the node was previously attached elsewhere,
- * `appendChild` MOVES it (it is never cloned/rebuilt), so the wterm DOM — and the
- * focusable input that is its child — survives intact. Focus is restored on the
- * next frame (an element cannot take focus until it is laid out). Returns whether
- * an instance existed to attach.
+ * ATTACH an instance's persistent DOM node into a pane container (MOVES the node,
+ * never clones), then arm the app-driven resize/geometry pipeline. Returns
+ * whether an instance existed to attach.
  */
 export function attachTerminal(recordId: string, container: HTMLElement): boolean {
   const instance = instances.get(recordId);
   if (!instance) return false;
-  if (instance.el.parentElement !== container) container.appendChild(instance.el);
-  instance.observeResize();
+  instance.attach(container);
   return true;
 }
 
 /**
- * DETACH an instance's DOM node from its pane — the navigation path. We stop the
- * app-driven resize observer (so no stale observer lingers on the now-removed
- * parent) and remove the node from its parent; we DO NOT `destroy()`, so the
- * ghostty core keeps the full screen/alt-screen/cursor state. A later
- * {@link attachTerminal} re-arms the observer (via `observeResize`) and reattaches
- * the SAME node losslessly.
+ * DETACH an instance's DOM node from its pane — the navigation path. Removes the
+ * node and stops observing, but leaves the instance ALIVE in the Map (PTY open,
+ * buffer intact). A later {@link attachTerminal} reattaches the SAME node
+ * losslessly. NEVER disposes.
  */
 export function detachTerminal(recordId: string): void {
   const instance = instances.get(recordId);
   if (!instance) return;
-  instance.stopObserving(); // cut the observer before the node leaves its parent.
-  instance.el.remove(); // detach the node; the instance + its state stay in the Map.
+  instance.detach();
 }
 
 /**
- * REAL close of a terminal: dispose the instance (PTY closed, wterm destroyed,
- * node removed) and drop it from the store. This is the ONLY path that calls
- * `destroy()` — never navigation.
+ * REAL close of a terminal: dispose the instance (PTY closed, xterm freed, node
+ * removed) and drop it from the store. This is the ONLY path that calls
+ * `dispose()` — never navigation.
  */
-export function destroyTerminal(recordId: string): void {
+export function disposeTerminal(recordId: string): void {
   const instance = instances.get(recordId);
   if (!instance) return;
   instance.dispose();
@@ -123,17 +115,17 @@ export function destroyTerminal(recordId: string): void {
 /**
  * Prune instances whose record id is NO LONGER in the live set (e.g. a terminal
  * closed elsewhere / by an agent over MCP). Disposes each removed instance so a
- * churn of create/close never leaks. Called by the pane host with the current
- * live record ids.
+ * churn of create/close never leaks. Called by the deck with the current live
+ * record ids.
  */
 export function reconcileTerminals(liveIds: readonly string[]): void {
   const live = new Set(liveIds);
   for (const id of Array.from(instances.keys())) {
-    if (!live.has(id)) destroyTerminal(id);
+    if (!live.has(id)) disposeTerminal(id);
   }
 }
 
 /** TEST-ONLY: drop every instance (used by unit tests to reset module state). */
 export function __resetTerminalStore(): void {
-  for (const id of Array.from(instances.keys())) destroyTerminal(id);
+  for (const id of Array.from(instances.keys())) disposeTerminal(id);
 }

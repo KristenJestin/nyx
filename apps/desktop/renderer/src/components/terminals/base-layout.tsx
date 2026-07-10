@@ -13,6 +13,7 @@ import { projectRunState } from "./runtime-state";
 import { useConsumedNotifications } from "./use-consumed-notifications";
 import { useProjectRuntime } from "./use-project-runtime";
 import { useActiveProject } from "./active-project";
+import { loadLastProjectId } from "./ui-persistence";
 
 /**
  * The section-nav entries — the routed pages reachable from the rail. `Terminals` is
@@ -129,17 +130,53 @@ export function BaseLayout() {
   // mounted modal set, rendered once below.
   const { addProject, dialog: manualAddDialog } = useManualAdd({ createProject, createWorkspace });
 
-  // Default the entered project to the FIRST one once the list loads (and recover when
-  // the entered project disappears, e.g. it was deleted). A no-op while a valid project
-  // is already entered, so the user's own selection is never overridden.
+  // Enter a project once the list loads (and recover when the entered project disappears, e.g.
+  // it was deleted). RESTORE the LAST entered project (persisted, across relaunch) when it still
+  // exists, else fall back to the FIRST — so a relaunch reopens where the user left off rather
+  // than snapping to the first project. A no-op while a valid project is already entered, so the
+  // user's own selection is never overridden; and it never wipes the selection during the brief
+  // pre-load window (empty list + already-null id ⇒ nothing to do), which would otherwise drop
+  // the persisted id before the tree arrives.
   useEffect(() => {
     if (projects.length === 0) {
       if (activeProjectId !== null) setActiveProjectId(null);
       return;
     }
     const stillPresent = projects.some((p) => p.project.id === activeProjectId);
-    if (!stillPresent) setActiveProjectId(projects[0]!.project.id);
+    if (!stillPresent) {
+      const remembered = loadLastProjectId();
+      const restore =
+        remembered != null && projects.some((p) => p.project.id === remembered)
+          ? remembered
+          : projects[0]!.project.id;
+      setActiveProjectId(restore);
+    }
   }, [projects, activeProjectId, setActiveProjectId]);
+
+  // INERT e2e seam (`window.__nyxWork`), GATED behind the build-time `VITE_NYX_E2E=1` flag —
+  // published ONLY by the `build:e2e` renderer build, tree-shaken out of a real production
+  // build. It exposes the SAME v2.1 `create_project` the rail's "+ Add project" flow drives
+  // (a thin pass-through, no new backend), so the v2.4 spec-workflow e2e gate can seed the dev
+  // workspace the Spec anchors on WITHOUT driving the native folder-picker dialog. The shell
+  // rewrite (PDR-0025) unmounted the old `<TerminalManager>` `window.__nyx` seam; this restores
+  // a minimal project-seed seam on the ALWAYS-MOUNTED navigation shell. The Spec itself is
+  // authored/transitioned purely through the real MCP tools by the gate — never through here.
+  useEffect(() => {
+    if (import.meta.env.VITE_NYX_E2E !== "1") return;
+    const win = window as unknown as {
+      __nyxWork?: {
+        createProject: (name: string, rootPath: string, rootName?: string) => Promise<unknown>;
+        listProjects: () => ProjectTree[];
+      };
+    };
+    win.__nyxWork = {
+      createProject: (name, rootPath, rootName) => createProject(name, rootPath, rootName),
+      listProjects: () => projects,
+    };
+    return () => {
+      delete (window as unknown as { __nyxWork?: unknown }).__nyxWork;
+    };
+  }, [createProject, projects]);
 
   return (
     <div className="grid h-svh grid-cols-[60px_1fr] bg-background text-foreground">

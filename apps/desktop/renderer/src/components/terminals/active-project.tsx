@@ -1,4 +1,6 @@
-import { createContext, type ReactNode, useContext, useMemo, useState } from "react";
+import { createContext, type ReactNode, useCallback, useContext, useMemo, useState } from "react";
+
+import { saveLastProjectId } from "./ui-persistence";
 
 /**
  * The ACTIVE PROJECT — which project the user has entered from the left rail. It is a
@@ -25,10 +27,18 @@ export function ActiveProjectProvider({
   children: ReactNode;
   initialProjectId?: string | null;
 }) {
-  const [activeProjectId, setActiveProjectId] = useState<string | null>(initialProjectId);
+  const [activeProjectId, setActiveProjectIdState] = useState<string | null>(initialProjectId);
+  // Every entered-project change is REMEMBERED (renderer localStorage) so a relaunch — or a
+  // return to Terminals — restores the LAST project the user was in, not the first. The rail
+  // restore (`<BaseLayout>`) reads this hint back and honours it only when the project still
+  // exists (a deleted project's stale id falls back cleanly to the first).
+  const setActiveProjectId = useCallback((id: string | null) => {
+    setActiveProjectIdState(id);
+    saveLastProjectId(id);
+  }, []);
   const value = useMemo<ActiveProjectContextValue>(
     () => ({ activeProjectId, setActiveProjectId }),
-    [activeProjectId],
+    [activeProjectId, setActiveProjectId],
   );
   return <ActiveProjectContext.Provider value={value}>{children}</ActiveProjectContext.Provider>;
 }

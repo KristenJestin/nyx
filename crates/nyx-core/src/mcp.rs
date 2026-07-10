@@ -1362,6 +1362,189 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["workspace_id"],
         },
     }));
+    // Append the v2.4 Phase-5 Spec AUTHORING + TRANSITION tools (PDR-0020): an agent drives
+    // a Spec (PRD) end to end — create, author its sections, fork, transition its lifecycle,
+    // anchor it on a dev workspace, and add/transition/link its tasks — from nyx state, with
+    // ZERO depot CLI. Every one delegates to the SHARED nyx-core authority (the SAME lifecycle
+    // guards + validations + guard-rails the native Specs UI uses), so the MCP mutation is the
+    // single authority. Kept OUT of V1_TOOLS (a new surface, not the frozen v1 contract).
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_CREATE_TOOL,
+        "description": "Create a new Spec (a product design document) in nyx from its state — no \
+                        depot CLI. Starts a draft Spec with its first revision, optionally seeding \
+                        the structured \
+                        sections (problem / solution / implementation_decisions / \
+                        testing_decisions / user_stories / out_of_scope) and anchoring it on a \
+                        dev workspace (workspace_id, from list_workspaces). Returns the created \
+                        spec and revision. Use spec_update_section to fill sections later, and \
+                        spec_transition to move its lifecycle.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("project to create the Spec in (from list_projects)"),
+                "title": str_prop("the Spec's title"),
+                "workspace_id": str_prop("optional dev workspace to anchor the Spec on at birth (repos + project are derived from it); must exist"),
+                "problem": str_prop("optional 'problem' section (markdown)"),
+                "solution": str_prop("optional 'solution' section (markdown)"),
+                "implementation_decisions": str_prop("optional 'implementation decisions' section (markdown)"),
+                "testing_decisions": str_prop("optional 'testing decisions' section (markdown)"),
+                "user_stories": str_prop("optional 'user stories' section (markdown)"),
+                "out_of_scope": str_prop("optional 'out of scope' section (markdown)"),
+            },
+            "required": ["project_id", "title"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_UPDATE_SECTION_TOOL,
+        "description": "Edit ONE structured section of a Spec's active revision, in place (this is \
+                        NOT a fork). Pass the spec_id, the section name (problem, solution, \
+                        implementation_decisions, testing_decisions, user_stories, out_of_scope), \
+                        and the new markdown value (an empty string clears the section). Use \
+                        spec_fork instead when you want to snapshot the current design into a new \
+                        revision before diverging.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": str_prop("the Spec whose active revision to edit"),
+                "section": str_prop("which section: problem | solution | implementation_decisions | testing_decisions | user_stories | out_of_scope"),
+                "value": str_prop("the section's new markdown content (empty string clears it)"),
+            },
+            "required": ["spec_id", "section", "value"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_FORK_TOOL,
+        "description": "Fork a Spec into a NEW revision: the current revision is snapshotted and \
+                        marked superseded, and a fresh active revision (with the same sections) \
+                        becomes the editable one. Use this to keep history when the design \
+                        diverges. Pass the spec_id and an optional change_reason (why you forked). \
+                        Returns the new active revision.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": str_prop("the Spec to fork"),
+                "change_reason": str_prop("optional reason recorded on the new revision (why it supersedes the prior one)"),
+            },
+            "required": ["spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_TRANSITION_TOOL,
+        "description": "Move a Spec through its lifecycle: ready (draft→ready), start \
+                        (ready→in_progress), review (in_progress→in_review), done \
+                        (in_review→completed), or cancel. Transitions are guarded (the current \
+                        status must allow it) and the ready gate runs the pre-ready validations \
+                        (a problem + a solution must be present, the phase plan must be coherent). \
+                        The SENSITIVE transitions (ready, done, cancel) require a human's explicit \
+                        confirmation: pass user_confirmed=true only once the user has agreed — \
+                        otherwise the transition is refused. Returns the updated spec.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": str_prop("the Spec to transition"),
+                "transition": str_prop("ready | start | review | done | cancel"),
+                "user_confirmed": json!({ "type": "boolean", "description": "REQUIRED true for the sensitive transitions (ready/done/cancel): set it only after the user has explicitly confirmed. Ignored for start/review." }),
+            },
+            "required": ["spec_id", "transition"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_SET_WORKSPACE_TOOL,
+        "description": "Anchor a Spec on a dev workspace (its repos + project are derived through \
+                        that workspace), or detach it by omitting workspace_id. The workspace must \
+                        exist. Returns the updated spec.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": str_prop("the Spec to anchor/detach"),
+                "workspace_id": str_prop("the dev workspace to anchor on (from list_workspaces); omit or null to detach"),
+            },
+            "required": ["spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::TASK_ADD_TOOL,
+        "description": "Add a task to a Spec (or standalone). kind selects slice (agent \
+                        implementation work, the default), human (an action only the user can do — \
+                        give it a verification_command so it is verifiable), or review (a finding — \
+                        carry a severity). Link it to a Spec with spec_id, nest it under a parent \
+                        with parent_task_id, and group it with phase. Returns the created task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("project the task belongs to (from list_projects)"),
+                "title": str_prop("the task's title"),
+                "spec_id": str_prop("optional Spec to attach the task to"),
+                "kind": str_prop("slice (default) | human | review"),
+                "type": str_prop("optional task type (defaults to implementation)"),
+                "priority": str_prop("optional priority (urgent | high | med | low; defaults to med)"),
+                "severity": str_prop("optional finding severity (for kind=review)"),
+                "description": str_prop("optional long-form body"),
+                "acceptance_criteria": str_prop("optional acceptance/done criteria"),
+                "verification_command": str_prop("how a kind=human action is verified (required to close a human task)"),
+                "parent_task_id": str_prop("optional parent task (subtask decomposition)"),
+                "phase": int_prop("optional phase grouping (indexes the Spec's phase plan)"),
+            },
+            "required": ["project_id", "title"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::TASK_TRANSITION_TOOL,
+        "description": "Move a task through its lifecycle: start (→in_progress), done \
+                        (in_progress→done), block (carry a reason), skip (cancel, carry a reason), \
+                        or verify (the human-verified close for a kind=human task). Transitions are \
+                        guarded (the current status must allow it). A kind=human task cannot be \
+                        plain-done'd — use transition='verify' on a task that carries a \
+                        verification_command. Returns the updated task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": str_prop("the task to transition"),
+                "transition": str_prop("start | done | block | skip | verify"),
+                "reason": str_prop("the block/skip reason (stamped onto the task)"),
+            },
+            "required": ["task_id", "transition"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::TASK_ADD_DEPENDENCY_TOOL,
+        "description": "Add a dependency edge between two tasks: task_id depends on \
+                        depends_on_task_id (it needs the latter done first). The graph is kept \
+                        acyclic — an edge that would create a cycle, or a self-edge, is refused. \
+                        type is blocks (ordering, default) or relates_to (a soft link). A duplicate \
+                        edge is a no-op.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": str_prop("the dependent task (the one that needs the other first)"),
+                "depends_on_task_id": str_prop("the prerequisite task"),
+                "type": str_prop("blocks (default, ordering) | relates_to (soft link)"),
+            },
+            "required": ["task_id", "depends_on_task_id"],
+        },
+    }));
+    // Append the v2.4 Phase-5 agent-CONTEXT tool (PDR-0020): render a dev/coder/auditor
+    // manual live from nyx state (the native equivalent of `depot context …`).
+    descriptors.push(json!({
+        "name": crate::mcp_context::AGENT_CONTEXT_TOOL,
+        "description": "Render an agent context manual (dev, coder, or auditor) LIVE from nyx \
+                        state — the native equivalent of `depot context <role>`, with no depot CLI. \
+                        Given a role and a Spec (spec_id, or resolved from the current workspace via \
+                        cwd/workspace_id), returns the manual text: the role's preamble, the Spec's \
+                        structured sections, its current phase and that phase's tasks, and the \
+                        derived dev workspace + repos. Use it to load the working context for a \
+                        session before driving a Spec.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "role": str_prop("dev | coder | auditor — which manual to render"),
+                "spec_id": str_prop("the Spec to render the context for (preferred)"),
+                "workspace_id": str_prop("optional: resolve the Spec via its anchored dev workspace when spec_id is absent"),
+                "cwd": str_prop("optional: resolve the Spec via the workspace whose path matches this cwd when spec_id/workspace_id are absent"),
+            },
+            "required": ["role"],
+        },
+    }));
     descriptors
 }
 
@@ -1761,15 +1944,28 @@ mod tests {
             names.contains(&WORKSPACE_TIMELINE_TOOL),
             "workspace_timeline tool must be listed"
         );
+        // v2.4 Phase-5 (PDR-0020): the Spec AUTHORING + TRANSITION tools advertised alongside,
+        // kept OUT of V1_TOOLS (a new authoring surface, not the frozen v1 contract).
+        for expected in crate::mcp_tools_spec::SPEC_TOOLS {
+            assert!(
+                names.contains(&expected),
+                "phase-5 spec tool {expected} must be listed"
+            );
+        }
+        // v2.4 Phase-5: the agent-context render tool advertised alongside.
+        assert!(
+            names.contains(&crate::mcp_context::AGENT_CONTEXT_TOOL),
+            "agent_context tool must be listed"
+        );
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 21,
+            V1_TOOLS.len() + 21 + 9,
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
              create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
              agent_session_event + set_project_settings + workspace_runtime + workspace_git + \
-             workspace_timeline extension tools"
+             workspace_timeline + the 8 spec authoring/transition tools + agent_context extension tools"
         );
     }
 

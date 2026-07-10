@@ -17,6 +17,8 @@ function installBackend() {
         return [];
       case "list_workspaces":
         return [];
+      case "spec_list":
+        return [];
       default:
         return undefined;
     }
@@ -41,14 +43,34 @@ describe("app router", () => {
     expect(screen.getByRole("link", { name: "Terminals" })).toBeTruthy();
   });
 
-  it("mounts the Work route at `/work`", async () => {
+  it("mounts the Specs board at `/work`", async () => {
     renderAt("/work");
-    expect(await screen.findByRole("heading", { name: "Work" })).toBeTruthy();
+    // The board's own heading is "Specs"; the section-nav still carries a "Work" link.
+    expect(await screen.findByRole("heading", { name: "Specs" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Work" })).toBeTruthy();
   });
 
   it("mounts the Knowledge route at `/knowledge`", async () => {
     renderAt("/knowledge");
     expect(await screen.findByRole("heading", { name: "Knowledge" })).toBeTruthy();
+  });
+
+  it("accepts a `?terminal=<id>` deep-link on `/` (the Runtime-tab open-terminal seam)", async () => {
+    // The validated `terminal` search param is the way to open a PRECISE terminal by id.
+    const router = createAppRouter(["/?terminal=term-42"]);
+    render(<RouterProvider router={router} />);
+    // The index route still mounts (placeholder, empty backend) — the param did not break routing.
+    expect(await screen.findByText(/Enter a project/)).toBeTruthy();
+    // The param is parsed and narrowed onto the `/` route's search.
+    expect(router.state.location.search).toMatchObject({ terminal: "term-42" });
+  });
+
+  it("accepts a `?command=<id>` deep-link on `/` (the Runtime-tab open-command seam)", async () => {
+    // The validated `command` search param opens a PRECISE managed command's detail by id.
+    const router = createAppRouter(["/?command=svc-42"]);
+    render(<RouterProvider router={router} />);
+    expect(await screen.findByText(/Enter a project/)).toBeTruthy();
+    expect(router.state.location.search).toMatchObject({ command: "svc-42" });
   });
 
   it("keeps the shell rail + section-nav across every route", async () => {

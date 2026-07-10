@@ -1,11 +1,60 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { mockIPC } from "@/bridge/test-harness";
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRoute,
+  createRouter,
+  RouterProvider,
+} from "@tanstack/react-router";
+import { bridgeFake, mockIPC } from "@/bridge/test-harness";
 import { describe, expect, it } from "vitest";
 
 import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-projects";
 import { ActiveProjectProvider } from "./active-project";
 import { TerminalsPage } from "./terminals-page";
+import { loadLastTerminalId, saveLastTerminalId } from "./ui-persistence";
 import type { WorkspaceRuntimeSnapshot } from "./use-workspace-runtime";
+
+/**
+ * Mount `<TerminalsPage>` at `/` under a memory router so its `?terminal=<id>` deep-link search
+ * (read via `getRouteApi("/").useSearch()`) resolves. `initialProjectId` seeds the entered
+ * project; `terminal` seeds the deep-link param (the Runtime-tab open-terminal seam). The
+ * active-project provider wraps the router root so the page and rail share the selection.
+ */
+function mountTerminalsPage(opts: {
+  initialProjectId: string | null;
+  terminal?: string;
+  command?: string;
+}) {
+  const rootRoute = createRootRoute({
+    component: () => (
+      <ActiveProjectProvider initialProjectId={opts.initialProjectId}>
+        <TerminalsPage />
+      </ActiveProjectProvider>
+    ),
+  });
+  const indexRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/",
+    component: () => null,
+    validateSearch: (s: Record<string, unknown>): { terminal?: string; command?: string } => {
+      const out: { terminal?: string; command?: string } = {};
+      if (typeof s.terminal === "string") out.terminal = s.terminal;
+      if (typeof s.command === "string") out.command = s.command;
+      return out;
+    },
+  });
+  const search = opts.terminal
+    ? `?terminal=${opts.terminal}`
+    : opts.command
+      ? `?command=${opts.command}`
+      : "";
+  const router = createRouter({
+    routeTree: rootRoute.addChildren([indexRoute]),
+    history: createMemoryHistory({ initialEntries: [`/${search}`] }),
+  });
+  return render(<RouterProvider router={router} />);
+}
 
 function project(id: string, name: string): ProjectRecord {
   return { id, name, collapsed: false, created_at: 0, updated_at: 0, resume_agent_sessions: false };
@@ -111,11 +160,7 @@ function installBackend(calls: Array<{ cmd: string; args: Record<string, unknown
 }
 
 function renderPage() {
-  return render(
-    <ActiveProjectProvider initialProjectId="p1">
-      <TerminalsPage />
-    </ActiveProjectProvider>,
-  );
+  return mountTerminalsPage({ initialProjectId: "p1" });
 }
 
 describe("TerminalsPage", () => {
@@ -151,12 +196,68 @@ describe("TerminalsPage", () => {
 
   it("shows a placeholder when no project is entered", async () => {
     installBackend();
-    render(
-      <ActiveProjectProvider initialProjectId={null}>
-        <TerminalsPage />
-      </ActiveProjectProvider>,
-    );
+    mountTerminalsPage({ initialProjectId: null });
     expect(await screen.findByText(/Enter a project/)).toBeTruthy();
+  });
+
+  it("opens the terminal named by the `?terminal=<id>` deep-link (not the auto-first)", async () => {
+    installBackend();
+    // Deep-link to the SECOND workspace's terminal — the Runtime tab's open-terminal seam.
+    const { container } = mountTerminalsPage({ initialProjectId: "p1", terminal: "ws-feat-term" });
+    // The deep-linked terminal's deck pane is the ACTIVE one (not the auto-first ws-root-term).
+    await waitFor(() => {
+      const pane = container.querySelector('[data-terminal-id="ws-feat-term"]');
+      expect(pane?.getAttribute("data-active")).toBe("true");
+    });
+    const first = container.querySelector('[data-terminal-id="ws-root-term"]');
+    expect(first?.getAttribute("data-active")).toBe("false");
+  });
+
+  it("restores this project's LAST active terminal (persisted) instead of the first", async () => {
+    installBackend();
+    // The user last had the SECOND workspace's terminal focused in this project; a relaunch /
+    // return to Terminals must reopen it, not snap back to the first (ws-root-term).
+    saveLastTerminalId("p1", "ws-feat-term");
+    const { container } = renderPage();
+    await waitFor(() => {
+      const pane = container.querySelector('[data-terminal-id="ws-feat-term"]');
+      expect(pane?.getAttribute("data-active")).toBe("true");
+    });
+    const first = container.querySelector('[data-terminal-id="ws-root-term"]');
+    expect(first?.getAttribute("data-active")).toBe("false");
+  });
+
+  it("falls back to the first terminal when the persisted one no longer exists", async () => {
+    installBackend();
+    // A stale id (the remembered terminal was closed while away) must not pin the pane to
+    // something that is gone — the existence guard falls back cleanly to the first terminal.
+    saveLastTerminalId("p1", "ghost-term-that-is-gone");
+    const { container } = renderPage();
+    await waitFor(() => {
+      const pane = container.querySelector('[data-terminal-id="ws-root-term"]');
+      expect(pane?.getAttribute("data-active")).toBe("true");
+    });
+  });
+
+  it("remembers the selected terminal so a later entry can restore it", async () => {
+    installBackend();
+    renderPage();
+    // The auto-selected first terminal is persisted as this project's last active terminal — the
+    // write half of the restore round-trip (the read half is covered above).
+    await waitFor(() => expect(loadLastTerminalId("p1")).toBe("ws-root-term"));
+  });
+
+  it("opens the managed command named by the `?command=<id>` deep-link (its pane, deck hidden)", async () => {
+    installBackend();
+    // Deep-link to the SECOND workspace's service — the Runtime tab's open-command seam.
+    const { container } = mountTerminalsPage({ initialProjectId: "p1", command: "ws-feat-svc" });
+    // A selected SERVICE hides the terminal deck and shows the command's own pane, so the
+    // auto-first terminal is never the active surface (the deck region is hidden).
+    await waitFor(() => {
+      const pane = container.querySelector('[data-terminal-id="ws-root-term"]');
+      expect(pane).not.toBeNull();
+      expect(pane?.closest(".hidden")).not.toBeNull();
+    });
   });
 });
 
@@ -211,5 +312,103 @@ describe("TerminalsPage — restored terminal/command affordances (finding 50)",
       const close = calls.find((c) => c.cmd === "close_terminal");
       expect(close?.args.id).toBe("ws-root-term");
     });
+  });
+});
+
+describe("TerminalsPage — Add workspace (surfaced in the current shell)", () => {
+  it("adds a workspace via folder picker → name dialog → create_workspace, and it appears", async () => {
+    const created: Array<Record<string, unknown>> = [];
+    // Start with just the root workspace; the created one is appended so the authoritative
+    // re-list (`list_workspaces` after `create_workspace`) reflects it — proving the new
+    // workspace shows up in the sidebar list.
+    const workspaces: WorkspaceRecord[] = [workspace("ws-root", "p1", "root", true)];
+    mockIPC(
+      (cmd, args) => {
+        const a = (args ?? {}) as Record<string, unknown>;
+        switch (cmd) {
+          case "list_projects":
+            return [project("p1", "Alpha")];
+          case "list_workspaces":
+            return workspaces;
+          case "workspace_runtime_snapshot":
+            return snapshot(a.workspaceId as string);
+          case "pty_spawn":
+            return 100;
+          case "list_terminals":
+          case "command_list":
+          case "command_instance_list":
+          case "command_import_scripts":
+            return [];
+          case "create_workspace": {
+            created.push(a);
+            const ws = workspace("ws-new", "p1", (a.name as string) ?? "feature", false);
+            workspaces.push(ws);
+            return ws;
+          }
+          default:
+            return undefined;
+        }
+      },
+      { shouldMockEvents: true },
+    );
+    // The native folder picker resolves to this path (basename → the seeded default name).
+    bridgeFake().pickedDirectory = "/home/kris/feature";
+
+    mountTerminalsPage({ initialProjectId: "p1" });
+    // The Terminals sidebar header carries an "Add workspace" affordance (the current shell only
+    // surfaced "Add project" before — the capability existed but was unwired).
+    const addBtn = await screen.findByRole("button", { name: "Add workspace" });
+    fireEvent.click(addBtn);
+    // The name dialog opens seeded with the folder basename; confirm it.
+    const nameField = await screen.findByRole("textbox", { name: "Workspace name" });
+    await waitFor(() => expect((nameField as HTMLInputElement).value).toBe("feature"));
+    // Two "Add workspace" buttons now exist — the header trigger + the modal confirm; click the last.
+    const confirmBtns = screen.getAllByRole("button", { name: "Add workspace" });
+    fireEvent.click(confirmBtns[confirmBtns.length - 1]!);
+
+    // The backend create ran with the picked path + project, and the new workspace shows in the list.
+    await waitFor(() => expect(created.length).toBe(1));
+    expect(created[0]!.path).toBe("/home/kris/feature");
+    expect(created[0]!.projectId).toBe("p1");
+    expect(await screen.findByRole("button", { name: /feature/ })).toBeTruthy();
+  });
+
+  it("does nothing when the folder picker is cancelled (no dialog, no create)", async () => {
+    const created: unknown[] = [];
+    mockIPC(
+      (cmd, args) => {
+        const a = (args ?? {}) as Record<string, unknown>;
+        switch (cmd) {
+          case "list_projects":
+            return [project("p1", "Alpha")];
+          case "list_workspaces":
+            return [workspace("ws-root", "p1", "root", true)];
+          case "workspace_runtime_snapshot":
+            return snapshot(a.workspaceId as string);
+          case "pty_spawn":
+            return 100;
+          case "list_terminals":
+          case "command_list":
+          case "command_instance_list":
+          case "command_import_scripts":
+            return [];
+          case "create_workspace":
+            created.push(a);
+            return undefined;
+          default:
+            return undefined;
+        }
+      },
+      { shouldMockEvents: true },
+    );
+    bridgeFake().pickedDirectory = null; // cancelled
+
+    mountTerminalsPage({ initialProjectId: "p1" });
+    const addBtn = await screen.findByRole("button", { name: "Add workspace" });
+    fireEvent.click(addBtn);
+    // A cancelled pick opens no dialog → the name field never appears, no create fires.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByRole("textbox", { name: "Workspace name" })).toBeNull();
+    expect(created.length).toBe(0);
   });
 });

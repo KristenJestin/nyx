@@ -299,3 +299,112 @@ impl McpRuntime {
         self.server.is_started()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipe::codec::FrameDecoder;
+    use crate::pipe::wire::{decode_message, Message};
+    use nyx_core::db;
+
+    /// A `Write` that appends to a shared buffer, so a test reads back exactly the frames the
+    /// sink pushed onto the pipe (twin of the `events.rs` test helper).
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Decode every complete `Event` frame the shared buffer captured.
+    fn captured_events(buf: &Arc<Mutex<Vec<u8>>>) -> Vec<Event> {
+        let bytes = buf.lock().unwrap().clone();
+        let mut dec = FrameDecoder::new();
+        dec.push(&bytes);
+        let mut events = Vec::new();
+        while let Some(payload) = dec.next_frame().expect("decode frame") {
+            if let Ok(Message::Event(e)) = decode_message(&payload) {
+                events.push(e);
+            }
+        }
+        events
+    }
+
+    /// A fresh on-disk migrated `Db` under a unique temp dir (the sidecar cannot use
+    /// nyx-core's `#[cfg(test)]` `Db::in_memory`).
+    fn temp_db() -> Db {
+        let dir = std::env::temp_dir().join(format!(
+            "nyx-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Db::open(&dir.join("nyx.db")).expect("open db")
+    }
+
+    /// Build a `SidecarDispatcher` over the given `Db` + a pipe sink writing to `buf`, with NO
+    /// managed runner (the throwaway-runner path serves the extension tools). The SAME wiring
+    /// [`McpRuntime::start`] installs, minus the live-HTTP server.
+    fn dispatcher(db: Arc<Db>, buf: &Arc<Mutex<Vec<u8>>>) -> SidecarDispatcher {
+        let events = EventSink::new(Box::new(SharedBuf(buf.clone())));
+        let pty = Arc::new(PtyManager::new());
+        SidecarDispatcher {
+            db,
+            runner: Arc::new(Mutex::new(None)),
+            terminal_host: SidecarTerminalHost {
+                pty: Arc::clone(&pty),
+                live_records: pty.live_records(),
+                events: events.clone(),
+            },
+            activity: Arc::new(AgentActivityStore::new()),
+            events,
+        }
+    }
+
+    /// done_criterion (T9) — a Spec MUTATION via the MCP tools pushes a `specs://changed`
+    /// invalidation on the pipe. The FULL sidecar chain: `dispatch` → `spec_create` returns
+    /// `ToolOutcome{ effects: [ChangedTopic::Specs] }` → `emit_effects` → a PUSHED unsolicited
+    /// `Event::Changed { topic: "specs" }` (which the main process maps to `specs://changed`).
+    #[test]
+    fn a_spec_mutation_pushes_a_specs_changed_invalidation() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let db = Arc::new(temp_db());
+        let project_id = db
+            .with_conn(|c| db::create_project(c, "Proj", "/tmp/mcp-p", None))
+            .expect("project")
+            .0
+            .id;
+
+        let disp = dispatcher(Arc::clone(&db), &buf);
+        let out = disp
+            .call(
+                "spec_create",
+                &serde_json::json!({ "project_id": project_id, "title": "Live spec" }),
+            )
+            .expect("spec_create succeeds");
+        assert_eq!(out["spec"]["status"], "draft", "the spec was created");
+
+        let pushed = captured_events(&buf);
+        assert!(
+            pushed
+                .iter()
+                .any(|e| matches!(e, Event::Changed { topic } if topic == "specs")),
+            "the spec mutation pushed a `specs://changed` invalidation, got: {pushed:?}"
+        );
+        assert!(
+            pushed
+                .iter()
+                .filter(|e| matches!(e, Event::Changed { .. }))
+                .all(|e| matches!(e, Event::Changed { topic } if topic == "specs")),
+            "the only `changed` invalidation is on the `specs` topic"
+        );
+    }
+}

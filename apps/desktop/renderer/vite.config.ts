@@ -44,17 +44,6 @@ export default defineConfig(async () => ({
     "import.meta.env.VITE_NYX_E2E": JSON.stringify(nyxE2e),
   },
 
-  // Exclude the wterm packages from esbuild dep pre-bundling. `@wterm/ghostty`
-  // loads its WASM via `new URL("../wasm/ghostty-vt.wasm", import.meta.url)`;
-  // pre-bundling rewrites `import.meta.url` to the bundled chunk's location, so
-  // that relative asset URL breaks (the dev server then serves index.html for it
-  // — a `<!doctype html>` body that fails `WebAssembly.instantiate`). Serving the
-  // packages as source keeps `import.meta.url` pointing at the real module, so
-  // Vite resolves + emits the WASM correctly in BOTH dev and build.
-  optimizeDeps: {
-    exclude: ["@wterm/dom", "@wterm/core", "@wterm/ghostty"],
-  },
-
   // Dev-server options for the Electron dev run (`scripts/dev.cjs` waits on this fixed
   // port, then points the Electron main at it).
   //

@@ -875,6 +875,122 @@ impl Ctx<'_> {
                     .ok_or_else(|| format!("unknown workspace {workspace_id}"))?;
                 Self::json(&timeline)
             }
+            // --- Spec domain READ models (v2.4 Phase 4 — the native Specs UI) ----
+            // The board (`spec_list`) and the PRD detail (`spec_detail`) consume the Spec /
+            // revision / task / workspace-context model built in phases 1-3 (`nyx_core::db`).
+            // Pure reads over the SAME `nyx_core::db` accessors the MCP authoring tools of
+            // Phase 5 will reuse (one authority for UI + MCP, PDR-0005): no mutation, no
+            // `changed` broadcast. Mirrors the `workspace_runtime_snapshot` read pattern.
+            //
+            // `spec_list` — the board read model: every LIVE Spec of a project (via
+            // `db::list_specs`, archived excluded) with its per-Spec task tally (done/total
+            // over `db::list_tasks_for_spec`) so the card renders its progress bar, and the
+            // project's Linear `key` so the card shows the human key `KEY-number`. `{ projectId }`.
+            "spec_list" => {
+                let project_id = self.arg_str("projectId")?;
+                #[derive(serde::Serialize)]
+                struct SpecListEntry {
+                    #[serde(flatten)]
+                    spec: db::Spec,
+                    /// The project's Linear prefix (the card's human key is `key-number`).
+                    project_key: String,
+                    /// Tasks reaching `done` (the progress bar's numerator).
+                    tasks_done: i64,
+                    /// Total tasks of the Spec (the denominator).
+                    tasks_total: i64,
+                }
+                self.db()
+                    .with_conn(|c| {
+                        let project = db::get_project(c, &project_id)?;
+                        let project_key = project.map(|p| p.key).unwrap_or_default();
+                        let specs = db::list_specs(c, &project_id)?;
+                        let mut entries = Vec::with_capacity(specs.len());
+                        for spec in specs {
+                            let tasks = db::list_tasks_for_spec(c, &spec.id)?;
+                            let tasks_total = tasks.len() as i64;
+                            let tasks_done = tasks
+                                .iter()
+                                .filter(|t| t.status == db::TASK_STATUS_DONE)
+                                .count() as i64;
+                            entries.push(SpecListEntry {
+                                spec,
+                                project_key: project_key.clone(),
+                                tasks_done,
+                                tasks_total,
+                            });
+                        }
+                        Ok::<_, diesel::result::Error>(entries)
+                    })
+                    .map_err(Self::db_err)
+                    .and_then(|entries| Self::json(&entries))
+            }
+            // `spec_detail` — the PRD-detail read model: the Spec, its single ACTIVE revision
+            // (the six structured sections), its tasks + the dependency edges, and the DERIVED
+            // workspace context (workspace → project → repos, via
+            // `db::spec_workspace_context`, `None` until the Spec is anchored). This is what
+            // the detail's spec / tasks / activity / runtime tabs consume. `{ specId }`.
+            "spec_detail" => {
+                let spec_id = self.arg_str("specId")?;
+                #[derive(serde::Serialize)]
+                struct SpecDetail {
+                    spec: db::Spec,
+                    /// The single active revision (the editable one). Always present for a
+                    /// known Spec (the `create_spec` invariant); `None` only for an unknown id
+                    /// (handled by the `ok_or_else` below).
+                    revision: db::SpecRevision,
+                    tasks: Vec<db::Task>,
+                    dependencies: Vec<db::TaskDependency>,
+                    /// Workspace → project → repos, DERIVED from the anchor. `None` until the
+                    /// Spec is posed on a dev workspace (a sane state, not an error).
+                    workspace_context: Option<db::SpecWorkspaceContext>,
+                }
+                self.db()
+                    .with_conn(|c| {
+                        let Some(spec) = db::get_spec(c, &spec_id)? else {
+                            return Ok(None);
+                        };
+                        let Some(revision) = db::get_active_revision(c, &spec_id)? else {
+                            return Ok(None);
+                        };
+                        let tasks = db::list_tasks_for_spec(c, &spec_id)?;
+                        // The dependency EDGES of this Spec's tasks (forward direction), so
+                        // the tasks tab can render "blocked by" without N per-task round-trips.
+                        let mut dependencies = Vec::new();
+                        for task in &tasks {
+                            dependencies.extend(db::list_task_dependency_edges(c, &task.id)?);
+                        }
+                        let workspace_context = db::spec_workspace_context(c, &spec_id)?;
+                        Ok::<_, diesel::result::Error>(Some(SpecDetail {
+                            spec,
+                            revision,
+                            tasks,
+                            dependencies,
+                            workspace_context,
+                        }))
+                    })
+                    .map_err(Self::db_err)?
+                    .map_or_else(
+                        || Err(format!("unknown spec {spec_id}")),
+                        |detail| Self::json(&detail),
+                    )
+            }
+            // `spec_activity` — the PRD-detail ACTIVITY read model: a BOUNDED, oldest-first
+            // fil of the Spec's most recent `spec`/`task` `domain_events` (its own lifecycle:
+            // creation, section edits, transitions; plus its tasks' add/transition/dependency
+            // events). The SAME `nyx_core::spec_activity::activity` an MCP tool serves (PDR-0005:
+            // one authority for UI + MCP), mirroring `workspace_timeline`. `limit` bounds the
+            // read (omitted / 0 → the read model's default ceiling). A pure read: no mutation,
+            // no `changed` broadcast; the live refresh rides the existing unsolicited channel.
+            "spec_activity" => {
+                let spec_id = self.arg_str("specId")?;
+                let limit = self.args.get("limit").and_then(|v| v.as_i64()).unwrap_or(0);
+                let activity = self
+                    .db()
+                    .with_conn(|c| nyx_core::spec_activity::activity(c, &spec_id, limit))
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("unknown spec {spec_id}"))?;
+                Self::json(&activity)
+            }
             // --- managed-command templates / instances (read + CRUD + source/import).
             //     The RUNTIME start/stop/relaunch ride the typed pipe kinds; output +
             //     acknowledge route below to the live runner. ----------------------
@@ -2326,5 +2442,251 @@ mod tests {
             )
             .unwrap();
         assert!(rehydration_bytes_from_result(&result).is_empty());
+    }
+
+    // --- v2.4 Phase 4: the Spec-domain READ commands (`spec_list` / `spec_detail`) -------
+
+    /// Create a project through the dispatch and return its id (a helper for the Spec reads).
+    fn make_project(h: &Harness, name: &str, root: &str) -> String {
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": name, "rootPath": root }),
+            )
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        created["project"]["id"].as_str().unwrap().to_string()
+    }
+
+    /// `spec_list` returns the project's LIVE Specs with the per-Spec task tally + project key.
+    /// A pure READ — no `workspaces://changed` push.
+    #[test]
+    fn spec_list_returns_specs_with_task_tally() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-spec-list");
+        let pushes_before = h.pushes();
+
+        // Seed a Spec + two tasks (one done) directly through the shared `nyx_core::db`
+        // pool — the Spec authoring path is the Phase-5 MCP tools, out of THIS phase's scope.
+        let (spec_id, t1_id) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (spec, _rev) =
+                    nyx_core::db::create_spec(c, &project_id, "First spec", Default::default())?;
+                let slice_of = |sid: &str| nyx_core::db::NewTaskInput {
+                    spec_id: Some(sid.to_string()),
+                    ..nyx_core::db::NewTaskInput::slice()
+                };
+                let t1 = nyx_core::db::create_task(c, &project_id, "Task one", slice_of(&spec.id))?;
+                nyx_core::db::create_task(c, &project_id, "Task two", slice_of(&spec.id))?;
+                Ok::<_, diesel::result::Error>((spec.id, t1.id))
+            })
+            .unwrap();
+        // Mark task one done (start → done) so the tally is 1/2. The guarded transition owns
+        // its own transaction + error type, so it runs outside the seed closure above.
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::transition_task(c, &t1_id, nyx_core::db::TaskTransition::Start, None)
+            })
+            .unwrap();
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::transition_task(c, &t1_id, nyx_core::db::TaskTransition::Done, None)
+            })
+            .unwrap();
+
+        let result = h
+            .run("spec_list", serde_json::json!({ "projectId": project_id }))
+            .unwrap();
+        let entries: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let arr = entries.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "one Spec listed");
+        let entry = &arr[0];
+        assert_eq!(entry["id"].as_str().unwrap(), spec_id);
+        assert_eq!(entry["title"].as_str().unwrap(), "First spec");
+        assert_eq!(entry["tasks_total"].as_i64().unwrap(), 2);
+        assert_eq!(entry["tasks_done"].as_i64().unwrap(), 1);
+        assert!(
+            !entry["project_key"].as_str().unwrap().is_empty(),
+            "the project key is derived for the human key"
+        );
+        assert_eq!(
+            h.pushes(),
+            pushes_before,
+            "spec_list is a pure read (no push)"
+        );
+    }
+
+    /// `spec_detail` returns the Spec + its active revision + tasks + dependency edges. An
+    /// unknown spec id is a readable error, not a panic.
+    #[test]
+    fn spec_detail_returns_spec_revision_and_tasks() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-spec-detail");
+
+        let (spec_id, t2_id) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Detailed spec",
+                    nyx_core::db::SpecSections {
+                        problem: "the problem".to_string(),
+                        ..Default::default()
+                    },
+                )?;
+                let slice_of = |sid: &str| nyx_core::db::NewTaskInput {
+                    spec_id: Some(sid.to_string()),
+                    ..nyx_core::db::NewTaskInput::slice()
+                };
+                let t1 = nyx_core::db::create_task(c, &project_id, "First", slice_of(&spec.id))?;
+                let t2 = nyx_core::db::create_task(c, &project_id, "Second", slice_of(&spec.id))?;
+                // t2 depends on t1 (a `blocks` edge) — the detail must surface the edge.
+                nyx_core::db::add_task_dependency(
+                    c,
+                    &t2.id,
+                    &t1.id,
+                    nyx_core::db::DEPENDENCY_TYPE_BLOCKS,
+                )
+                .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                Ok::<_, diesel::result::Error>((spec.id, t2.id))
+            })
+            .unwrap();
+
+        let result = h
+            .run("spec_detail", serde_json::json!({ "specId": spec_id }))
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(detail["spec"]["id"].as_str().unwrap(), spec_id);
+        assert_eq!(
+            detail["revision"]["problem"].as_str().unwrap(),
+            "the problem"
+        );
+        assert_eq!(detail["tasks"].as_array().unwrap().len(), 2);
+        let deps = detail["dependencies"].as_array().unwrap();
+        assert_eq!(deps.len(), 1, "the one dependency edge is surfaced");
+        assert_eq!(deps[0]["task_id"].as_str().unwrap(), t2_id);
+        // No anchor posed → the derived workspace context is null (a sane state).
+        assert!(detail["workspace_context"].is_null());
+
+        // Unknown spec id → a readable error.
+        let err = h
+            .run("spec_detail", serde_json::json!({ "specId": "nope" }))
+            .unwrap_err();
+        assert!(err.contains("unknown spec"), "readable error: {err}");
+    }
+
+    /// `spec_activity` serves the SPEC-scoped, bounded, oldest-first `domain_events` fil over
+    /// the UI bridge: the Spec's own lifecycle (creation, section edit, transition) + its
+    /// tasks' events (add/transition), NEVER a terminal byte. A pure read (no push). An unknown
+    /// spec id is a readable error.
+    #[test]
+    fn spec_activity_serves_the_spec_scoped_domain_events_read_model_over_the_ui_bridge() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-spec-activity");
+        let pushes_before = h.pushes();
+
+        let spec_id = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Spec",
+                    nyx_core::db::SpecSections {
+                        problem: "p".to_string(),
+                        solution: "s".to_string(),
+                        ..Default::default()
+                    },
+                )?;
+                nyx_core::db::update_active_revision_section(
+                    c,
+                    &spec.id,
+                    nyx_core::db::SpecSection::Problem,
+                    "edited",
+                )?;
+                let task = nyx_core::db::create_task(
+                    c,
+                    &project_id,
+                    "T1",
+                    nyx_core::db::NewTaskInput {
+                        spec_id: Some(spec.id.clone()),
+                        ..nyx_core::db::NewTaskInput::slice()
+                    },
+                )?;
+                nyx_core::db::transition_task(
+                    c,
+                    &task.id,
+                    nyx_core::db::TaskTransition::Start,
+                    None,
+                )
+                .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                nyx_core::db::transition_spec(
+                    c,
+                    &spec.id,
+                    nyx_core::db::SpecTransition::Ready,
+                    true,
+                )
+                .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                Ok::<_, diesel::result::Error>(spec.id)
+            })
+            .unwrap();
+
+        let result = h
+            .run("spec_activity", serde_json::json!({ "specId": spec_id }))
+            .unwrap();
+        let activity: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(activity["spec_id"].as_str().unwrap(), spec_id);
+        let types: Vec<&str> = activity["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["event_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                "spec.created",
+                "spec.section_updated",
+                "task.added",
+                "task.transitioned",
+                "spec.transitioned",
+            ],
+            "the Spec's own + its task's events, oldest-first — not just project.created"
+        );
+        // Every entry carries the concerned spec_id in its small business payload.
+        assert!(activity["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["payload"].as_str().unwrap().contains(&spec_id)));
+        assert_eq!(
+            h.pushes(),
+            pushes_before,
+            "spec_activity is a pure read (no push)"
+        );
+
+        // The `limit` bounds the read.
+        let bounded = h
+            .run(
+                "spec_activity",
+                serde_json::json!({ "specId": spec_id, "limit": 2 }),
+            )
+            .unwrap();
+        let bounded: serde_json::Value = serde_json::from_str(&bounded).unwrap();
+        assert_eq!(bounded["limit"], serde_json::json!(2));
+        assert_eq!(bounded["entries"].as_array().unwrap().len(), 2);
+
+        // Unknown spec id → a readable error.
+        let err = h
+            .run("spec_activity", serde_json::json!({ "specId": "nope" }))
+            .unwrap_err();
+        assert!(err.contains("unknown spec"), "readable error: {err}");
     }
 }

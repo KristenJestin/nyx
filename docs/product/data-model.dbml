@@ -19,7 +19,7 @@
 // - Attention Inbox est une projection des etats/evenements, pas une table mutable universelle.
 // - Les remotes, branches courantes et dirty states sont detectes depuis Git, pas autoritaires en DB.
 // - Design-system projet en base (tables design + design_components, PDR-0010). Le sous-systeme
-//   prototype detaille (prototypes/pages/variants/rounds/feedback) s'absorbe a v2.6 (PDR-0009).
+//   prototype detaille (prototypes/pages/variants/rounds/feedback) s'absorbe a v2.7 (PDR-0009).
 
 // -----------------------------------------------------------------------------
 // ENUMS
@@ -348,7 +348,7 @@ Table tasks {
     (project_id, status)
   }
 
-  Note: 'Decomposition geree par l agent, pas administree a la main par l humain (PDR-0014) : pas de cle humaine (ULID). phase nullable = regroupement optionnel pose par l agent (pas de table de phases ; pas de phase = tasks a plat). priority = enum string. executor agent|human : une task executor=human = ex human_action (surfacee dans l Attention Inbox, pas geree a la main ; peut bloquer une task agent via task_dependencies). Une task peut exister sans Spec (travail leger). Une task promue depuis un commentaire de review (review_comment_tasks) est un finding ; severity optionnelle. Le coder ne travaille que sur des tasks.'
+  Note: 'Decomposition geree par l agent, pas administree a la main par l humain (PDR-0014) : pas de cle humaine (ULID). phase nullable = regroupement optionnel pose par l agent (pas de table de phases ; pas de phase = tasks a plat). priority = enum string. executor agent|human : une task executor=human = ex human_action (surfacee dans l onglet Tasks avec un badge « toi », actionnable par l humain, pas geree a la main ; peut bloquer une task agent via task_dependencies ; Attention Inbox differee PDR-0021). Une task peut exister sans Spec (travail leger). Une task promue depuis un commentaire de review (review_comment_tasks) est un finding ; severity optionnelle. Le coder ne travaille que sur des tasks.'
 }
 
 Table task_dependencies {
@@ -365,7 +365,8 @@ Table task_dependencies {
 // task_tags supprime : pas de classification sur les taches (territoire agent, PDR-0017).
 
 // human_actions supprimee (PDR-0014) : une action humaine = une task executor='human',
-// surfacee dans l'Attention Inbox. Les 3 saveurs (agent/human/finding) convergent dans tasks.
+// surfacee dans l'onglet Tasks (badge « toi », actionnable ; Attention Inbox differee, PDR-0021).
+// Les 3 saveurs (agent/human/finding) convergent dans tasks.
 
 // -----------------------------------------------------------------------------
 // RUNTIME : TERMINAUX, AGENTS, COMMANDES (rattaches au workspace)

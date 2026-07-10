@@ -1,23 +1,20 @@
 import { act, render, waitFor } from "@testing-library/react";
+import { mockIPC, emit } from "@/bridge/test-harness";
+import type { Terminal as XTerm } from "@xterm/xterm";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { mockIPC, emit } from "@/bridge/test-harness";
 import { Terminal } from "./terminal";
-import { FakeTerminalCore } from "./fake-core";
-import { setCoreFactory, type CoreFactory } from "./ghostty-core";
-import { __resetTerminalStore, getTerminal } from "./terminal-store";
+import { __resetTerminalStore } from "./terminal-store";
 
 /**
- * `<Terminal>` unit contract (jsdom). v2.2.5 decouples the live terminal from the
- * component: the instance lives in the module-level store; the component only
- * attaches its persistent DOM node into a container and detaches on unmount. The
- * ghostty WASM core cannot load under jsdom, so we inject a {@link FakeTerminalCore}
- * (which records writes) via the core-factory seam. Full VT RENDER (shell + TUI)
- * is a browser-mode / e2e concern — see the validation gate (Phase 3).
+ * Records every `invoke` the component makes and serves canned results so no
+ * real Tauri backend is touched. Event mocking is enabled so `listen`/`emit`
+ * round-trip in-process, letting us inject `pty://output` bytes.
  */
-
 interface IpcRecorder {
   calls: { cmd: string; args: Record<string, unknown> }[];
+  /** invoke calls for a given command name. */
   callsTo: (cmd: string) => { cmd: string; args: Record<string, unknown> }[];
 }
 
@@ -33,75 +30,128 @@ function installIpc(): IpcRecorder {
     },
     { shouldMockEvents: true },
   );
-  return { calls, callsTo: (cmd) => calls.filter((c) => c.cmd === cmd) };
+  return {
+    calls,
+    callsTo: (cmd) => calls.filter((c) => c.cmd === cmd),
+  };
 }
 
-/** The fake core the CURRENT test's instance is built with (captured per test). */
-let lastCore: FakeTerminalCore | null = null;
-let restoreFactory: CoreFactory | null = null;
+/** Read the whole xterm buffer (active screen + scrollback) as one string. */
+function bufferText(term: XTerm): string {
+  const buf = term.buffer.active;
+  let out = "";
+  for (let i = 0; i < buf.length; i++) {
+    const line = buf.getLine(i);
+    if (line) out += line.translateToString(true);
+  }
+  return out;
+}
 
-describe("<Terminal> (no-host store)", () => {
+describe("<Terminal>", () => {
   let ipc: IpcRecorder;
 
   beforeEach(() => {
     ipc = installIpc();
-    lastCore = null;
-    restoreFactory = setCoreFactory(async () => {
-      lastCore = new FakeTerminalCore();
-      return lastCore;
-    });
   });
 
   afterEach(() => {
+    // The live terminals live in a module-level store; drop them so instances
+    // (and their PTY subscriptions) never leak across tests.
     __resetTerminalStore();
-    if (restoreFactory) setCoreFactory(restoreFactory);
+    // clearMocks() runs in vitest.setup.ts afterEach.
     vi.useRealTimers();
+    // Drop any per-test navigator/clipboard stub so it never leaks across tests.
     vi.unstubAllGlobals();
   });
 
-  it("creates a store instance and spawns a PTY at mount", async () => {
-    render(<Terminal recordId="t1" />);
-    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
-    expect(getTerminal("t1")).toBeDefined();
-    // The spawn carries the record id so the backend maps pty_id → record.
-    expect(ipc.callsTo("pty_spawn")[0].args.terminalId).toBe("t1");
-  });
+  it("writes bytes received on pty://output into the xterm buffer", async () => {
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
 
-  it("writes bytes received on pty://output into the terminal core", async () => {
-    render(<Terminal recordId="t1" />);
+    // Wait until the component has spawned (so listen() is registered and the
+    // session id is set) before injecting output.
     await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+    expect(term).not.toBeNull();
 
     const text = "hello-from-pty-7f3a";
     const bytes = Array.from(new TextEncoder().encode(text));
+
     await act(async () => {
       await emit("pty://output", { id: SPAWNED_ID, bytes });
     });
 
-    await waitFor(() => expect(lastCore?.written).toContain(text));
+    // xterm parses writes asynchronously; wait for the buffer to reflect it.
+    await waitFor(() => {
+      expect(bufferText(term as unknown as XTerm)).toContain(text);
+    });
   });
 
   it("ignores pty://output for a different terminal id", async () => {
-    render(<Terminal recordId="t1" />);
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
     await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
 
     const bytes = Array.from(new TextEncoder().encode("not-mine"));
     await act(async () => {
       await emit("pty://output", { id: SPAWNED_ID + 999, bytes });
     });
+
+    // Give any (incorrect) write a chance to land, then assert it did NOT.
     await new Promise((r) => setTimeout(r, 20));
-    expect(lastCore?.written ?? "").not.toContain("not-mine");
+    expect(bufferText(term as unknown as XTerm)).not.toContain("not-mine");
+  });
+
+  it("spawns a PTY at mount and does NOT close it on unmount (keep-alive: detach ≠ dispose)", async () => {
+    const { unmount } = render(<Terminal />);
+
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+    expect(ipc.callsTo("pty_close")).toHaveLength(0);
+
+    await act(async () => {
+      unmount();
+      // Flush any deferred work so a buggy teardown-closes-PTY would have fired.
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // Navigation/unmount DETACHES the pane — it must NEVER close the PTY. The live
+    // instance stays in the module-level store (disposed only on a real close), so
+    // a running command survives navigating away and back.
+    expect(ipc.callsTo("pty_close")).toHaveLength(0);
+    expect(ipc.callsTo("pty_spawn")).toHaveLength(1);
+  });
+
+  it("spawns exactly one PTY under React.StrictMode (no double-spawn)", async () => {
+    render(
+      <StrictMode>
+        <Terminal />
+      </StrictMode>,
+    );
+
+    // StrictMode mounts → unmounts → remounts. Wait long enough that a buggy
+    // implementation's second spawn would have fired, then assert a single one.
+    await waitFor(() => expect(ipc.callsTo("pty_spawn").length).toBeGreaterThan(0));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+    });
+
+    expect(ipc.callsTo("pty_spawn")).toHaveLength(1);
+    // The StrictMode throwaway teardown must NOT close the surviving PTY.
+    expect(ipc.callsTo("pty_close")).toHaveLength(0);
   });
 
   it("forwards keystrokes (onData) to pty_write encoded as bytes", async () => {
-    render(<Terminal recordId="t1" />);
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
     await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
 
     act(() => {
-      // Drive the instance's input path directly (what the wterm input handler calls).
-      getTerminal("t1")?.sendInput("ls\n");
+      (term as unknown as XTerm).input("ls\n", true);
     });
 
-    await waitFor(() => expect(ipc.callsTo("pty_write").length).toBeGreaterThanOrEqual(1));
+    await waitFor(() => {
+      const writes = ipc.callsTo("pty_write");
+      expect(writes.length).toBeGreaterThanOrEqual(1);
+    });
     const writes = ipc.callsTo("pty_write");
     const joined = writes
       .flatMap((w) => w.args.data as number[])
@@ -111,65 +161,157 @@ describe("<Terminal> (no-host store)", () => {
     expect(writes[0].args.id).toBe(SPAWNED_ID);
   });
 
-  it("DETACHES on unmount without destroying — the instance survives (no pty_close)", async () => {
-    const { unmount } = render(<Terminal recordId="t1" />);
+  it("copies the selection on Ctrl+Shift+C without sending ^C to the PTY", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
     await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
-    const instance = getTerminal("t1");
-    expect(instance).toBeDefined();
+
+    // Seed a known selection. We stub hasSelection/getSelection on the live
+    // instance (xterm's selection model needs a painted viewport jsdom lacks),
+    // so the copy path reads a deterministic value.
+    const t = term as unknown as XTerm;
+    vi.spyOn(t, "hasSelection").mockReturnValue(true);
+    vi.spyOn(t, "getSelection").mockReturnValue("selected-text-1a2b");
+
+    const textarea = document.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement;
+    expect(textarea, "xterm helper textarea must exist").not.toBeNull();
 
     await act(async () => {
-      unmount();
-      await new Promise((r) => setTimeout(r, 0));
+      textarea.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "KeyC",
+          key: "C",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await Promise.resolve();
     });
 
-    // The instance is STILL in the store (navigation preserves it) and the PTY was
-    // NOT closed — detach, not destroy.
-    expect(getTerminal("t1")).toBe(instance);
-    expect(ipc.callsTo("pty_close")).toHaveLength(0);
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("selected-text-1a2b"));
+    // The chord must NOT reach the PTY (no ^C byte written for it).
+    const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+    expect(writes).not.toContain(0x03); // ETX / Ctrl+C
   });
 
-  it("REATTACHES the SAME instance on remount without respawning the shell", async () => {
-    const first = render(<Terminal recordId="t1" />);
+  it("lets plain Ctrl+C through to the PTY as SIGINT (^C byte)", async () => {
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
     await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
-    const instance = getTerminal("t1");
 
-    await act(async () => {
-      first.unmount();
-      await new Promise((r) => setTimeout(r, 0));
+    // The cleanest way to assert the SIGINT path is untouched: xterm's own input
+    // path still produces the ^C byte. `input("\x03")` exercises onData → pty_write.
+    act(() => {
+      (term as unknown as XTerm).input("\x03", true);
     });
 
-    // Navigate back: remount the same record. The node is reattached into the new
-    // container and NO second spawn occurs.
-    const second = render(<Terminal recordId="t1" />);
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 20));
+    await waitFor(() => {
+      const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+      expect(writes).toContain(0x03);
     });
-    expect(getTerminal("t1")).toBe(instance);
-    expect(ipc.callsTo("pty_spawn")).toHaveLength(1);
-    // The persistent node (with its input textarea child) is inside the new container.
-    const container = second.container.querySelector("[data-terminal-container='t1']");
-    expect(container?.querySelector("textarea")).not.toBeNull();
   });
 
-  it("gives the container inner padding (p-2.5) so the terminal is not glued to the edge", async () => {
-    // Regression guard (v2.2.5): the OUTER container must carry `p-2.5` like the
-    // pre-wterm xterm pane. The instance node (`el`, 100%×100%, in normal flow) is
-    // appended INTO this padded box, so its bounding rect is inset and the grid
-    // recomputes on the reduced content-box — the content is not flush to the edge.
-    const { container } = render(<Terminal recordId="t1" />);
+  it("writes the Shift+Enter newline sequence to the PTY (ESC+CR, not a bare \\r)", async () => {
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
     await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
-    const host = container.querySelector("[data-terminal-container='t1']");
-    expect(host).not.toBeNull();
-    expect(host?.className).toContain("p-2.5");
+
+    const textarea = document.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement;
+    expect(textarea, "xterm helper textarea must exist").not.toBeNull();
+
+    const event = new KeyboardEvent("keydown", {
+      code: "Enter",
+      key: "Enter",
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+    await act(async () => {
+      textarea.dispatchEvent(event);
+      await Promise.resolve();
+    });
+
+    // The chord is "handled": xterm's default `\r` is suppressed and the ESC+CR
+    // newline sequence is written to the PTY instead.
+    await waitFor(() => {
+      const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+      expect(writes).toEqual([0x1b, 0x0d]); // ESC + CR
+    });
+    // The DOM event must be cancelled so xterm's native `\r` path can't also fire.
+    expect(event.defaultPrevented).toBe(true);
+    // Exactly the 2-byte sequence reached the PTY — no extra bare `\r` (0x0d alone)
+    // from a double-send, and no submit.
+    const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+    expect(writes).toEqual([0x1b, 0x0d]);
+  });
+
+  it("lets plain Enter (no Shift) through to the PTY as a submit (\\r)", async () => {
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+
+    // Plain Enter must be untouched: xterm's own input path produces the bare `\r`.
+    // `input("\r")` exercises onData → pty_write the same way a real Enter would,
+    // confirming the Shift+Enter intercept does NOT hijack a modifier-less Enter.
+    act(() => {
+      (term as unknown as XTerm).input("\r", true);
+    });
+
+    await waitFor(() => {
+      const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+      expect(writes).toContain(0x0d); // CR — the normal submit
+    });
+    // And no stray ESC (0x1b) sneaks in — plain Enter is NOT the newline chord.
+    const writes = ipc.callsTo("pty_write").flatMap((w) => w.args.data as number[]);
+    expect(writes).not.toContain(0x1b);
+  });
+
+  it("pastes the clipboard into the terminal on Ctrl+Shift+V", async () => {
+    const readText = vi.fn().mockResolvedValue("pasted-2c3d");
+    vi.stubGlobal("navigator", { clipboard: { readText } });
+
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
+    await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
+
+    const t = term as unknown as XTerm;
+    const pasteSpy = vi.spyOn(t, "paste");
+
+    const textarea = document.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement;
+    await act(async () => {
+      textarea.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          code: "KeyV",
+          key: "V",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(pasteSpy).toHaveBeenCalledWith("pasted-2c3d"));
   });
 
   it("handles pty://exit without crashing", async () => {
-    render(<Terminal recordId="t1" />);
+    let term: XTerm | null = null;
+    render(<Terminal onInstance={(t) => (term = t ?? term)} />);
     await waitFor(() => expect(ipc.callsTo("pty_spawn")).toHaveLength(1));
 
     await act(async () => {
       await emit("pty://exit", { id: SPAWNED_ID, code: 0 });
     });
-    await waitFor(() => expect(lastCore?.written).toContain("process exited"));
+
+    await waitFor(() => {
+      expect(bufferText(term as unknown as XTerm)).toContain("process exited");
+    });
   });
 });

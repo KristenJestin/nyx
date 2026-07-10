@@ -1,125 +1,177 @@
-import { useEffect, useRef, useState } from "react";
-import { WTerm } from "@wterm/dom";
-import "@wterm/dom/css";
+import { useEffect, useMemo } from "react";
+import { FitAddon } from "@xterm/addon-fit";
+import type { ITerminalOptions, Terminal as XTerm } from "@xterm/xterm";
+import { useXTerm } from "react-xtermjs";
 
 import { cn } from "@/lib/utils";
-import { loadGhosttyCore } from "@/components/terminal/ghostty-core";
-import {
-  computeGrid,
-  hasUsableBox,
-  measureCell,
-  type CellMetrics,
-} from "@/components/terminal/measure-cell";
-import { applyWtermTheme, ensureTerminalFontLoaded } from "@/components/terminal/wterm-theme";
+import { useWebglAddon } from "@/components/terminal/use-webgl-addon";
+import { copySelection, isCopyChord } from "@/components/terminal/terminal-clipboard";
+import { ensureTerminalFontLoaded, resolveThemeFromCss } from "@/components/terminal/xterm-theme";
 import { useCommandOutput } from "./use-command-output";
+
+/**
+ * Default xterm options for the READ-ONLY command output panel. The key
+ * difference from the interactive `<Terminal>` is `disableStdin: true`: xterm
+ * routes no keystroke to a (non-existent) data path and shows no live cursor —
+ * the panel is watch-only. ANSI colour rendering is unchanged (the colours come
+ * over the wire and are drawn by xterm), so a command's coloured output renders
+ * with its colours. Selection + scroll remain available for reading.
+ */
+const READONLY_OPTIONS: ITerminalOptions = {
+  convertEol: false,
+  // No live shell here: hide the cursor and disable stdin so the panel reads as
+  // an output surface, not an editable terminal.
+  cursorBlink: false,
+  cursorStyle: "bar",
+  disableStdin: true,
+  fontFamily: '"Fira Code Variable", "Fira Code", ui-monospace, "Liberation Mono", monospace',
+  fontSize: 14,
+  letterSpacing: 0,
+  scrollback: 10_000,
+};
+
+// The xterm THEME + FONT helpers (resolveThemeFromCss, ensureTerminalFontLoaded,
+// and the FALLBACK_THEME floor they use) are shared with `<Terminal>` via
+// `@/components/terminal/xterm-theme` so both surfaces resolve their canvas
+// colours + font-load gate from a single implementation.
 
 export interface CommandOutputPanelProps {
   /**
-   * The `command_instances.id` whose output to show. On change the parent re-keys
-   * this component so a fresh wterm starts from a clean buffer and rehydrates that
-   * instance's history.
+   * The `command_instances.id` whose output to show. On change the panel rebuilds
+   * its xterm (keyed in the parent) so a fresh instance starts from a clean buffer
+   * and rehydrates that instance's history.
    */
   instanceId: string | null;
   /** Optional className for the full-bleed container (the parent gives it a size). */
   className?: string;
-  /** Surfaces the wterm instance to the parent / tests as it appears/disappears. */
-  onInstance?: (instance: WTerm | null) => void;
+  /**
+   * Surfaces the xterm instance to the parent / tests as it appears/disappears.
+   * The seam the unit tests use to read the buffer and assert on rendered output.
+   */
+  onInstance?: (instance: XTerm | null) => void;
+  /**
+   * Whether this panel is the active/visible one. WebGL is attached ONLY while
+   * active (disposed on blur), so many panels never exhaust the browser's WebGL
+   * context pool. Defaults to `true` for a standalone panel / the test harness.
+   */
+  active?: boolean;
 }
 
 /**
- * `<CommandOutputPanel>` — the READ-ONLY wterm surface that renders a managed
- * command instance's output (T8). Post-v2.2.5 it uses wterm + the ghostty core
- * (same lib as the interactive terminal — xterm is gone) but is wired to
- * `useCommandOutput` (rehydrate via `command_output`, stream `command://output`
- * filtered by `instanceId`) instead of a PTY.
+ * `<CommandOutputPanel>` — the READ-ONLY xterm surface that renders a managed
+ * command instance's output (T8). It reuses the terminal's xterm setup (WebGL via
+ * `useWebglAddon`, fit addon, design-system theme, font-load gating) but is wired
+ * to `useCommandOutput` — which rehydrates via `command_output` and streams
+ * `command://output` filtered by `instanceId` — instead of `usePty`.
  *
- * READ-ONLY STRICT (the T8 contract): the `WTerm` is built with NO `onData`
- * callback and `useCommandOutput` wires no input/resize→process backchannel, so
- * the panel never sends a byte to the process. Selection + scroll (DOM-local)
- * stay available for reading.
+ * READ-ONLY STRICT (the T8 contract): there is NO input path. `useCommandOutput`
+ * wires no `term.onData`/`pty_write` and no resize→stdin, and `disableStdin` is
+ * set on the xterm options, so the panel never sends a single byte to the process.
+ * Selection + scroll (xterm-local, no backend traffic) stay available for reading.
  *
- * Sizing is APP-DRIVEN with the 0×0 guard (`autoResize:false`), matching the
- * interactive terminal's guard-rails: wterm's own observer would resize a hidden
- * panel to 1×1 and destroy the grid, so we own sizing here.
+ * No animation anywhere in this viewport (the project directive): the xterm canvas
+ * is never wrapped in a Motion element and nothing here animates the surface.
  */
-export function CommandOutputPanel({ instanceId, className, onInstance }: CommandOutputPanelProps) {
-  const hostRef = useRef<HTMLDivElement | null>(null);
-  const [term, setTerm] = useState<WTerm | null>(null);
+export function CommandOutputPanel({
+  instanceId,
+  className,
+  onInstance,
+  active = true,
+}: CommandOutputPanelProps) {
+  // Stable across renders so `useXTerm`'s effect does not tear down + recreate the
+  // terminal every render.
+  const fitAddon = useMemo(() => new FitAddon(), []);
+  const addons = useMemo(() => [fitAddon], [fitAddon]);
+  const options = useMemo<ITerminalOptions>(() => ({ ...READONLY_OPTIONS }), []);
 
-  const onInstanceRef = useRef(onInstance);
-  onInstanceRef.current = onInstance;
+  const { ref, instance } = useXTerm({ options, addons });
 
-  // Build one read-only wterm (ghostty core) for this mount. Torn down on unmount
-  // (a real close of the panel — not a navigation-persisted terminal), so
-  // `destroy()` is correct here (this surface is per-selection, keyed by the parent).
+  // WebGL only while active (disposed on blur). Returns `clearAtlas()` so the
+  // post-font-load fit rebuilds the glyph atlas baked against fallback metrics.
+  const clearWebglAtlas = useWebglAddon(instance ?? null, active);
+
+  // The READ-ONLY output wiring: rehydrate via `command_output`, stream
+  // `command://output` filtered by `instanceId`. NO input path (see the hook).
+  useCommandOutput(instance ?? null, instanceId);
+
+  // Surface the instance to the parent / tests as it appears/disappears.
   useEffect(() => {
-    const host = hostRef.current;
-    if (!host) return;
-    let disposed = false;
-    let built: WTerm | null = null;
-    let observer: ResizeObserver | null = null;
-    let cell: CellMetrics | null = null;
-    let cols = 80;
-    let rows = 24;
+    onInstance?.(instance ?? null);
+    return () => onInstance?.(null);
+  }, [instance, onInstance]);
 
-    const reconcileSize = () => {
-      if (!built) return;
-      const rect = host.getBoundingClientRect();
-      if (!hasUsableBox({ width: rect.width, height: rect.height })) return; // 0×0 guard
-      const measured = measureCell(host) ?? cell;
-      if (!measured) return;
-      cell = measured;
-      const grid = computeGrid(rect.width, rect.height, measured);
-      if (grid.cols === cols && grid.rows === rows) return;
-      cols = grid.cols;
-      rows = grid.rows;
-      built.resize(cols, rows);
-    };
-
-    void (async () => {
-      const core = await loadGhosttyCore();
-      if (disposed) return;
-      applyWtermTheme(host);
-      await ensureTerminalFontLoaded();
-      if (disposed) return;
-      const wterm = new WTerm(host, {
-        core,
-        cols,
-        rows,
-        // Read-only: no `onData`, so nothing the user types reaches the process.
-        autoResize: false, // app-driven sizing with the 0×0 guard (see reconcileSize).
-      });
-      await wterm.init();
-      if (disposed) {
-        wterm.destroy();
-        return;
+  // COPY chord (Ctrl+Shift+C) on this READ-ONLY surface. There is no paste here
+  // (`disableStdin` — the panel never sends a byte to the process), so only copy
+  // is wired. Returning `false` keeps xterm from doing anything else with the
+  // chord. Every other key is left to xterm (which, being stdin-disabled, drops
+  // it). Shares the one clipboard implementation with `<Terminal>`.
+  useEffect(() => {
+    if (!instance) return;
+    instance.attachCustomKeyEventHandler((e) => {
+      if (e.type === "keydown" && isCopyChord(e)) {
+        void copySelection(instance);
+        return false;
       }
-      built = wterm;
-      cell = measureCell(host);
-      setTerm(wterm);
-      onInstanceRef.current?.(wterm);
-      if (typeof ResizeObserver !== "undefined") {
-        observer = new ResizeObserver(() => reconcileSize());
-        observer.observe(host);
-        reconcileSize();
-      }
-    })();
-
+      return true;
+    });
     return () => {
-      disposed = true;
-      observer?.disconnect();
-      onInstanceRef.current?.(null);
-      built?.destroy();
-      setTerm(null);
+      instance.attachCustomKeyEventHandler(() => true);
     };
-  }, []);
+  }, [instance]);
 
-  // The READ-ONLY output wiring: rehydrate + stream, no input path (see the hook).
-  useCommandOutput(term, instanceId);
+  // Derive the terminal theme from the design-system palette at mount (oklch
+  // tokens need the browser to convert; we resolve in an effect against the live
+  // DOM). Re-runs if the terminal is recreated.
+  useEffect(() => {
+    if (!instance) return;
+    const { background, foreground } = resolveThemeFromCss();
+    instance.options.theme = { ...instance.options.theme, background, foreground };
+  }, [instance]);
+
+  // Fit on open and keep fitting as the container resizes. The first authoritative
+  // fit runs AFTER the bundled monospace face loads so xterm measures the real
+  // glyph (the "t e s t" spacing fix); then rebuild the WebGL atlas. NOTE: unlike
+  // `<Terminal>` there is NO `resyncSize` — a command panel never informs the
+  // process of its size (read-only strict: no resize → stdin backchannel).
+  useEffect(() => {
+    if (!instance) return;
+    const el = ref.current;
+    if (!el) return;
+
+    const safeFit = () => {
+      try {
+        if (el.clientWidth > 0 && el.clientHeight > 0) fitAddon.fit();
+      } catch {
+        // ignore transient fit failures (no layout / detached)
+      }
+    };
+    safeFit();
+
+    let cancelled = false;
+    const fontFamily = options.fontFamily ?? (READONLY_OPTIONS.fontFamily as string);
+    const fontSize = options.fontSize ?? (READONLY_OPTIONS.fontSize as number);
+    void ensureTerminalFontLoaded(fontFamily, fontSize).then(() => {
+      if (cancelled) return;
+      safeFit();
+      clearWebglAtlas();
+      try {
+        instance.scrollToBottom();
+      } catch {
+        // ignore (detached / closing instance)
+      }
+    });
+
+    const observer = new ResizeObserver(() => safeFit());
+    observer.observe(el);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [instance, fitAddon, ref, options, clearWebglAtlas]);
 
   return (
     <div className={cn("h-full w-full overflow-hidden bg-background p-2.5", className)}>
-      <div ref={hostRef} className="h-full w-full overflow-hidden" />
+      <div ref={ref} className="h-full w-full overflow-hidden" />
     </div>
   );
 }

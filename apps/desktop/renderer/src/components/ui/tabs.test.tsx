@@ -3,7 +3,12 @@ import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import { Tabs, TabCount } from "./tabs";
-import { tabHeightTransition, tabPanelTransition, tabPanelVariants } from "./tabs-motion";
+import {
+  tabHeightTransition,
+  tabIndicatorTransition,
+  tabPanelTransition,
+  tabPanelVariants,
+} from "./tabs-motion";
 
 describe("tabPanelTransition (reduced-motion aware)", () => {
   it("returns a short eased tween when motion is allowed", () => {
@@ -40,6 +45,89 @@ describe("tabHeightTransition (reduced-motion aware modal-height animation)", ()
   it("treats null (unknown preference) as motion allowed", () => {
     const t = tabHeightTransition(null) as Record<string, unknown>;
     expect(t.type).toBe("spring");
+  });
+});
+
+describe("tabIndicatorTransition (reduced-motion aware active-underline slide)", () => {
+  it("returns the ActiveRail spring when motion is allowed", () => {
+    const t = tabIndicatorTransition(false) as Record<string, unknown>;
+    // Same spring shape as base-layout's ActiveRail: a duration-based bouncy spring.
+    expect(t.type).toBe("spring");
+    expect(t.duration).toBe(0.4);
+    expect(t.bounce).toBe(0.25);
+  });
+
+  it("returns an instant (duration 0) transition when reduced motion is set", () => {
+    const t = tabIndicatorTransition(true) as Record<string, unknown>;
+    expect(t.duration).toBe(0);
+    expect(t.type).toBeUndefined();
+  });
+
+  it("treats null (unknown preference) as motion allowed", () => {
+    const t = tabIndicatorTransition(null) as Record<string, unknown>;
+    expect(t.type).toBe("spring");
+  });
+});
+
+describe("<Tabs.List> active-tab underline (shared-layout indicator)", () => {
+  it("renders the pink underline inside the active tab only, and moves it on switch", async () => {
+    function Harness() {
+      const [tab, setTab] = useState("a");
+      return (
+        <Tabs.Root value={tab} onValueChange={(v) => setTab(v as string)}>
+          <Tabs.List>
+            <Tabs.Tab value="a">A</Tabs.Tab>
+            <Tabs.Tab value="b">B</Tabs.Tab>
+          </Tabs.List>
+        </Tabs.Root>
+      );
+    }
+    render(<Harness />);
+    const tabA = screen.getByRole("tab", { name: "A" });
+    const tabB = screen.getByRole("tab", { name: "B" });
+
+    // The underline (bg-primary bar) lives inside the ACTIVE tab (A), not the other.
+    expect(tabA.querySelector(".bg-primary")).not.toBeNull();
+    expect(tabB.querySelector(".bg-primary")).toBeNull();
+
+    // Switch to B → the underline is now inside B (Motion FLIPs it across).
+    fireEvent.click(tabB);
+    await waitFor(() => expect(tabB.querySelector(".bg-primary")).not.toBeNull());
+    expect(tabA.querySelector(".bg-primary")).toBeNull();
+  });
+});
+
+describe("<Tabs.List fullWidth> (opt-in even/justified distribution)", () => {
+  it("makes every trigger flex-1 and keeps the underline on the active tab", () => {
+    render(
+      <Tabs.Root value="a" onValueChange={() => {}}>
+        <Tabs.List fullWidth>
+          <Tabs.Tab value="a">A</Tabs.Tab>
+          <Tabs.Tab value="b">B</Tabs.Tab>
+        </Tabs.List>
+      </Tabs.Root>,
+    );
+    const tabA = screen.getByRole("tab", { name: "A" });
+    const tabB = screen.getByRole("tab", { name: "B" });
+    // Both triggers flex to an equal share of the rail (even distribution).
+    expect(tabA.className).toContain("flex-1");
+    expect(tabB.className).toContain("flex-1");
+    // The shared-layout underline still tracks the (now-wider) ACTIVE trigger only.
+    expect(tabA.querySelector(".bg-primary")).not.toBeNull();
+    expect(tabB.querySelector(".bg-primary")).toBeNull();
+  });
+
+  it("leaves triggers compact (no flex-1) by default — other consumers unchanged", () => {
+    render(
+      <Tabs.Root value="a" onValueChange={() => {}}>
+        <Tabs.List>
+          <Tabs.Tab value="a">A</Tabs.Tab>
+          <Tabs.Tab value="b">B</Tabs.Tab>
+        </Tabs.List>
+      </Tabs.Root>,
+    );
+    expect(screen.getByRole("tab", { name: "A" }).className).not.toContain("flex-1");
+    expect(screen.getByRole("tab", { name: "B" }).className).not.toContain("flex-1");
   });
 });
 

@@ -1,10 +1,18 @@
 # nyx e2e (wdio-electron-service + WebdriverIO)
 
+> **⚠️ Staleness — ce README précède plusieurs pivots plateforme, à re-porter.** Certaines descriptions ci-dessous
+> datent du portage Tauri et n'ont pas suivi la V2 : (1) le **`core-host` Node est supprimé** (PDR-0007) — c'est
+> désormais le **sidecar Rust** qui possède PTY/commandes ; (2) **xterm est remplacé par wterm (rendu DOM)**
+> (PDR-0026) — le texte du terminal est maintenant **dans le DOM** ; (3) l'**écran cockpit et la route `#/cockpit/…`
+> sont supprimés** (PDR-0025, shell multi-pages Terminals/Work/Knowledge) → les specs `cockpit-0*` visent un écran
+> disparu et sont **à re-câbler**. La section **Prerequisites** (sidecar) est, elle, à jour. Corrections partielles
+> appliquées ; le re-port complet des specs reste à faire.
+
 End-to-end tests that drive the **real** nyx **Electron** app through
 [`wdio-electron-service`](https://webdriver.io/docs/desktop-testing/electron) and
 WebdriverIO, on **Linux** and **Windows**. They cover what neither the jsdom unit
 suite nor the mock-runtime Rust tests can: the actual app process (Electron main +
-the dedicated core-host), a real Chromium WebGL render, and a real PTY/shell.
+the supervised **Rust sidecar**), a real Chromium render, and a real PTY/shell.
 
 > **Ported from the Tauri harness (task #27).** The previous harness drove the
 > WebKitGTK / WebView2 app via `tauri-driver`. This one launches the Electron app
@@ -31,7 +39,7 @@ The big PRD-1 scenario, split across **two app sessions** (a real close + reopen
 - **Seed (session 1)** opens **3 terminals at distinct cwds** each running a command
   with observable output, **reorders** them, and **closes the auto-created default**
   voluntarily. The session ends — `wdio-electron-service` closes the Electron app,
-  whose `before-quit` stops the core-host — simulating nyx quitting.
+  whose `before-quit` stops the Rust sidecar — simulating nyx quitting.
 - **Verify (session 2)** boots a fresh app on the **same SQLite DB** (same
   `NYX_DATA_DIR`) and asserts the restore contract: the **3 terminals are restored
   with their scrollback**, the voluntarily-closed default is **NOT re-spawned**, the
@@ -77,21 +85,24 @@ typing, and the sidebar/animation surfaces — all through the same seams.
 ### The test seam
 
 The app exposes an **inert** control seam on `window.__nyx`
-(`apps/frontend/src/components/sidebar/terminal-manager.tsx`) plus per-terminal
-read/input seams on `window.__nyxDeck` / `window.__nyxDeckInput`
-(`terminal-deck.tsx`), all keyed by record id. The e2e drives + reads terminals
-through these because xterm paints to a WebGL canvas — the text is not in the DOM and
-a WebDriver cannot type into or query it directly. The seams are **gated behind the
-build-time flag `VITE_NYX_E2E=1`**, so they never ship to real production; the
-Electron `bun run build:e2e` script builds the renderer with that flag.
+(under `apps/desktop/renderer/src/…` — the exact module may have moved with the
+navigation-shell rewrite) plus per-terminal read/input seams on `window.__nyxDeck` /
+`window.__nyxDeckInput`, all keyed by record id. **Historical rationale:** these seams
+date from **xterm**, which painted to a **WebGL canvas** — the text was not in the DOM,
+so a WebDriver could not type into or query it directly. Since the **wterm (DOM render)**
+switch (PDR-0026) the terminal text *is* in the DOM, but the seams are **retained** for
+**deterministic, id-keyed** driving (typing into a specific terminal without racing the
+DOM). They are **gated behind the build-time flag `VITE_NYX_E2E=1`**, so they never ship
+to real production; the Electron `bun run build:e2e` script builds the renderer with that
+flag.
 
 ## Isolation & cleanup (per the done-criteria)
 
 - Each spec runs against a **temporary `userData`** pinned via `NYX_DATA_DIR` (cleaned
   at `onPrepare`, swept at `onComplete`). The restore pair deliberately shares one dir.
 - When the electron service closes a session, the Electron app's `before-quit` runs the
-  ordered core-host shutdown (`coreHost.stop()`), which stops every PTY/managed command
-  — so no `core-host`/PTY leaks between sessions.
+  ordered **sidecar** shutdown, which stops every PTY/managed command — so no
+  sidecar/PTY leaks between sessions.
 
 ## Prerequisites
 
@@ -108,7 +119,7 @@ Shared (both OSes):
 
 ### Windows
 
-- A **POSIX shell** for the specs (`export` / `echo "$FOO"` / `printf`). The core-host
+- A **POSIX shell** for the specs (`export` / `echo "$FOO"` / `printf`). The sidecar
   PTY honors `$SHELL` first; `wdio.conf.cjs` auto-detects **Git Bash** when `$SHELL` is
   unset, so no WSL is required.
 - No display needed (Electron runs windowed; Chromedriver drives it).

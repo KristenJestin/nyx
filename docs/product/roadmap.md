@@ -10,7 +10,27 @@
 
 La V2 est complète uniquement lorsque les capacités utiles de Depot sont natives dans nyx, les données ont été migrées et Depot peut être retiré.
 
+## État d'avancement
+
+| Tranche | Intitulé | État |
+| --- | --- | --- |
+| v2.0 | Consolidation Electron/Rust | ✅ livré |
+| v2.1 | Noyau produit unifié | ✅ livré |
+| v2.2 | Workbench de travail actif | ✅ livré |
+| v2.2.5 | Persistance terminal | ✅ livré |
+| v2.3 | Terminal en blocs (honor-the-shell) | ⏸️ parké (WIP, branche non mergée) |
+| v2.4 | Specs : tâches et contextes agents | 🚧 en cours |
+| v2.5 | Diff et review locale | 🌿 développé sur `v2.4-review`, à greffer |
+| v2.6 | Knowledge et mémoire projet | ⬜ à venir |
+| v2.7 | Capacités avancées | ⬜ à venir |
+| v2.8 | Migration finale et extinction Depot | ⬜ à venir |
+
+> Le détail des chantiers menés hors de la ligne principale (review v2.4-review, terminal-blocks parké) vit dans
+> [`session-notes.md`](session-notes.md) ; les sections ci-dessous n'en gardent qu'un pointeur.
+
 ## v2.0 - Consolidation de la plateforme Electron/Rust
+
+**Status: livré**
 
 - terminer la migration Electron ;
 - retirer Tauri du build, des dépendances et de la maintenance active ;
@@ -30,6 +50,8 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 
 ## v2.1 - Noyau produit unifié
 
+**Status: livré**
+
 - figer le modèle Project/Workspace/Repository ;
 - faire de nyx l'autorité unique de ces identités ;
 - acter le workspace comme pivot intention/runtime (`Execution` rejetée, PDR-0008) ;
@@ -42,17 +64,25 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 
 ## v2.2 - Workbench de travail actif
 
-- workspace de travail (worktree per-Spec) comme unité, validé en v2.1 ;
-- association Spec/workspace/repositories/branches/sessions ;
-- écran de travail actif ;
-- terminaux, agents et services contextualisés ;
-- lien entre tâches, sessions, commandes et changements ;
-- Attention Inbox ;
-- timeline utile et bornée ;
-- reprise complète du contexte après redémarrage ;
-- travail libre possible sans Spec.
+**Status: livré** (périmètre **travail libre** ; les liens Spec/tâches sont réservés en seams, réalisés en v2.4)
 
-**Gate :** exécuter et suivre une feature réelle sans autre outil d'exécution que nyx.
+Livré (validé par la gate e2e cockpit, pilotage CDP) :
+
+- workspace de travail comme unité, écran de travail actif ;
+- terminaux, agents et services **contextualisés** au workspace, live sans polling (`domain_events`) ;
+- timeline utile et bornée ;
+- reprise complète du contexte runtime après redémarrage (terminal restauré + bindé, service + session agent
+  persistés) ;
+- **travail libre possible sans Spec** (W-001).
+
+Réservé / différé (pas construit ici, conforme aux décisions) :
+
+- **association Spec/tâches ↔ workspace** = **seams réservés**, réalisés en **v2.4** (domaine Spec) ;
+- **Attention Inbox** = **différée** (Q-007 / PDR-0021) — la gate a explicitement validé « no Attention Inbox » ;
+  les human tasks et le signal review passent par l'onglet Tasks / Overview ;
+- agents **sans 3ᵉ catégorie d'arbre** (Q-013), pas d'entité `Execution` (PDR-0008).
+
+**Gate (atteinte) :** exécuter et suivre une feature libre réelle sans autre outil d'exécution que nyx.
 
 ## v2.2.5 - Persistance terminal (livré)
 
@@ -67,7 +97,11 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 
 ## v2.3 - Terminal en blocs (honor-the-shell)
 
-**Status: en cours** — PRD `01KWY7NFQJN068Q5ZSAJSSK2V2`
+**Status: parké** (WIP validé en direct, branche `feature/v2.3-terminal-blocks` non mergée) — PRD `01KWY7NFQJN068Q5ZSAJSSK2V2`
+
+> Amélioration UX du terminal, suite de v2.2.5. Occupe le slot **v2.3** mais **parké** : la priorité est v2.4 (Specs),
+> une re-cadrage en v2.2.x reste possible. Le détail **fait / reste à faire / leçon** (dont le défaut visuel bloquant
+> de la grille wterm) est dans [`session-notes.md`](session-notes.md).
 
 - **sortie shell en blocs** commande+résultat via **OSC 133** (bornes A/B/C/D, code de sortie) ;
 - **honor-the-shell** : le shell garde l'édition (Tab, Ctrl-R, historique, sudo, vim natifs) — nyx n'intercepte pas la saisie ;
@@ -81,16 +115,31 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 
 ## v2.4 - Specs : tâches et contextes agents
 
-**Status: draft** — PRD `01KX1C2CZ4D7PHT709N3Z92FR6`
+**Status: en cours** — PRD `01KX1C2CZ4D7PHT709N3Z92FR6`
+
+Domaine Spec :
 
 - absorber Spec et révisions ;
-- absorber tâches, dépendances, actions humaines et findings de review ;
-- porter lifecycle, validations et garde-fous au backend nyx choisi ;
-- relier Spec/tâches au workspace de dev et aux reviews (**réalise `specs.workspace_id`**, le seam réservé en v2.1) ; le **détail PRD avec onglets** construit ici est le **foyer** où la review se grafte (onglet « Review » du détail PRD, v2.5) ;
+- absorber tâches, dépendances, actions humaines (`executor=human`) et findings de review ;
+- porter lifecycle, validations et garde-fous au backend nyx (Rust/SQLite) ;
+- relier Spec/tâches au workspace de dev (**réalise `specs.workspace_id`**, le seam réservé en v2.1) ; le
+  **détail Spec avec onglets** construit ici est le **foyer** où la review se grafte (onglet « Review » du détail
+  Spec, v2.5) ;
 - fournir l'interface `Specs` native nyx ;
 - exposer les outils MCP nyx d'authoring et de transition ;
-- générer les contextes agents depuis l'état nyx ;
 - actualiser immédiatement l'UI après toute mutation MCP.
+
+Fonctionnement agentique (PDR-0020) — câblé ici :
+
+- tables **`agents`** (4 types spec/dev/doc/subagent) + **`workflows`** / **`workflow_agents`** ; `projects.workflow_id`
+  assigne un workflow ; nyx livre les défauts forkables ;
+- **rules** (`directives`) + **checks** (`managed_commands.gate` / `blocking`) qui décomposent les « directives »
+  Depot ;
+- **contextes agents rendus live par nyx-core** et **injectés via les hooks du plugin** (SessionStart /
+  UserPromptSubmit), **zéro CLI, zéro fichier généré** ; déclencheurs = stubs fixes `/nspec` `/ndev` `/ndoc` ; MCP =
+  actions seules ;
+- **install via Settings → Integrations** (plugin bundlé `nyx-claude-integration`, par provider) ;
+- `specs.mode` = **stepped** | **autopilot**.
 
 Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/workspaces dupliqués ou présentation historique devenue inutile.
 
@@ -110,36 +159,18 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 - pièces jointes utiles ;
 - résolution réservée à l'humain ;
 - compteurs non lus et temps réel UI/MCP ;
-- **présentation** : la review est un **onglet « Review » du détail PRD** construit en v2.4 (domaine Spec), ancré sur le **workspace du PRD**.
+- **présentation** : la review est un **onglet « Review » du détail Spec** construit en v2.4 (domaine Spec), ancré sur le **workspace du Spec**.
 
 **Gate :** reviewer un gros changement local multi-repo sans VS Code ni forge distante.
 
 ### Note de session — capacité review (branche v2.4-review)
 
-> **Séquençage.** La capacité review a été **développée et validée en direct (pilotage
-> CDP, gate e2e 9/9)** sur la branche **`v2.4-review`**, mais son **foyer de navigation**
-> correct — un **onglet « Review » dans le détail PRD** — appartient au **domaine Spec**,
-> construit en **v2.4**. Cette tranche **est** v2.5 : la review s'y **grafte en onglet du
-> détail PRD** une fois le domaine Spec disponible.
-
-**Développé (host-agnostique, se garde tel quel) :**
-
-- moteur de diff sidecar (gix primaire + fallback git CLI) : 7 surfaces (working tree / staged / unstaged / untracked / commit / range / branches), modes living/pinned, multi-repo sans mélange des identités Git ; vues dérivées (dirty / branche / ahead-behind / résumé) UI + MCP ;
-- **rafraîchissement temps réel sans polling** (watch fs `notify` + debounce) sur le bus EventSink v2.1 (`repos://changed`) — tranche Q-015 ;
-- écran review (renderer) : arbre de fichiers, en-tête multi-repo, viewer de diff **virtualisé** maison, look via les tokens du design system ; composants **réutilisables** (`components/review/`) ;
-- modèle comment : `review_comments` auto-threadé, ancrage + **re-mapping** des ancres à travers les commits + état **outdated**, résolution **réservée à l'humain** (garde-fou vérifié adversarialement), réponses agent via **MCP** ; UI panneau + threads + ancres ; promotion comment→task (`review_tasks`, finding=task) via flux **grill** (humain valide ; l'agent ne valide jamais) ; compteurs non-lus temps réel ;
-- consigne dépendances : **PDR-0027** (gix + fallback CLI + `notify`) ;
-- **gate e2e** (pilotage réel CDP) : review living + pinned multi-repo, diff, annotations global/ligne/plage, re-mapping/outdated, réponse agent MCP, résolution humaine, promotion, temps réel — **9/9**.
-
-**Placement — la review se grafte ici (v2.5) sur le détail PRD (v2.4) :**
-
-- foyer correct = **onglet « Review » du détail PRD**, ancré sur le **workspace du PRD** (repos + projet **dérivés du workspace** — `schema.rs` : « the project is derived via the workspace ») ;
-- l'exposition actuelle via un **item de nav top-level + route `/review`** est **provisoire** (elle date d'avant l'existence du détail PRD) — **à retirer / recâbler** en onglet du détail PRD ;
-- le re-mapping des ancres (phase 4) a été **câblé sur une voie live** (commande `review_remap` déclenchée quand le HEAD living avance) pendant la gate — découverte du pilotage réel.
-
-**Où vit le travail :** branche **`v2.4-review`** (commit `61525ee`), **non mergée dans `v2`**, conservée pour la reprise en v2.5 — les composants review se grafferont en onglet du détail PRD (construit en v2.4). PRD diff/review : `01KX0EEP5H1MJW4T3QCZEWPHFK` (statut review).
-
-**Leçon.** La couche de présentation de la review dépend du **détail PRD (domaine Spec, v2.4)** : la développer avant le domaine Spec livre la capacité mais laisse son point d'entrée sans foyer légitime. Ordre naturel : Spec/PRD (détail + onglets, v2.4) → puis graft de l'onglet Review ancré workspace (v2.5).
+> La capacité review a été **développée et validée en direct (pilotage CDP, gate e2e 9/9)** sur la branche
+> **`v2.4-review`** (commit `61525ee`, non mergé), mais son **foyer de navigation** correct — un **onglet « Review »
+> dans le détail Spec** — appartient au **domaine Spec** (v2.4). Cette tranche **est** v2.5 : la review s'y **grafte**
+> une fois le domaine Spec disponible. Moteur de diff = **PDR-0027** (gix primaire + fallback git CLI + `notify`).
+>
+> **Détail complet** (ce qui est développé, le placement, la leçon de séquençage) → [`session-notes.md`](session-notes.md).
 
 ## v2.6 - Knowledge et mémoire projet
 
@@ -189,7 +220,7 @@ Chaque sous-système Depot doit recevoir une décision explicite : **porter, sim
 ```text
 v2.0 consolidation Electron/Rust
 -> v2.1 modèle produit
--> v2.2 travail actif (workspace) + attention
+-> v2.2 travail actif (workspace, travail libre ; Attention Inbox différée)
 -> v2.2.5 persistance terminal (livré)
 -> v2.3 terminal en blocs (honor-the-shell)
 -> v2.4 Spec/tâches/contextes MCP
@@ -211,45 +242,9 @@ Une tranche `v2.x` ne doit pas aspirer les suivantes. En particulier :
 
 La roadmap peut évoluer, mais **tout ce qui a été retenu pour la super-app appartient à la V2**, jamais à une hypothétique V3 utilisée comme parking.
 
-## Terminal « blocks » — chantier PARKÉ (hors séquence v2.x)
+## Terminal « blocks » — voir la tranche v2.3
 
-> **Note de version.** Ce chantier a été mené sous un PRD intitulé « v2.3 — Terminal blocks »,
-> mais la tranche roadmap **v2.3 ci-dessus reste « Diff et review locale »**. Le terminal blocks
-> est une amélioration UX du terminal (suite de v2.2.5), **à re-cadrer** dans la séquence (probable
-> v2.2.x). Ne pas confondre les deux « v2.3 ».
-
-Modèle « blocks » façon Warp, **honor-the-shell** : sortie shell (hors TUI) segmentée en blocs
-commande+résultat via **OSC 133**, historique rendu en blocs DOM, région active + TUI sur la grille
-wterm patchée (v2.2.5).
-
-- **Branche :** `feature/v2.3-terminal-blocks` — commit `255cdf1` (WIP, **non mergé**).
-- **PRD depot :** `01KWY7NFQJN068Q5ZSAJSSK2V2` · prototype validé : variante **« sobre »** élue.
-
-### Fait — validé en direct sur l'app réelle (pilotage CDP, bash+starship)
-
-- Segmentation OSC 133 → **blocs** : vrai prompt starship rejoué + commande + sortie + **code de sortie** (badges ✓/✗).
-- **Cause racine corrigée :** le `PROMPT_COMMAND` en **tableau bash 5.x** (omarchy+direnv+zoxide+starship)
-  faisait sauter le marqueur **OSC 133 `B`** → aucun bloc ne se formait. Fix : enregistrement *array-aware*
-  du hook (le `B` survit à la réécriture de PS1 par starship) + filet (bloc formé même si `B` manque).
-- Détection alt-screen (DECSET 1049/1047/47) + bascule blocs↔grille TUI plein écran.
-- Persistance des blocs (fichier JSON sidecar, **sans migration**) ; non-régression persistance v2.2.5 verte.
-- Renderer : liste de blocs (ANSI→tokens **design-system**), input épinglé bas, interactions (sélection/copie/repli).
-- Wire Rust↔TS `PtyBlock`/`PtyAltScreen` + fixtures de contrat byte-parity ; harness e2e Electron (bash+starship, CDP).
-
-### Reste à faire — défauts connus au parking
-
-1. **[bloquant visuel] La grille wterm duplique le scrollback complet SOUS les blocs.** Il faut **clipper la
-   grille à la seule région active** (prompt courant + sortie en cours) ; l'historique doit être **uniquement**
-   des blocs. C'est ce qui donne l'impression de « wterm à plat comme avant ».
-2. Conformité fine au **placement validé** (maquette « sobre » élue) — reproduire le placement via le
-   **design system**, jamais le CSS/px du mockup. Le placement n'a **jamais été distillé** (`depot prd prototype distill`) — à faire avant reprise.
-3. **Vérifier la saisie réelle** : un drop de caractères a été observé mais **confondu par l'injection CDP de
-   test** (frappes agent + utilisateur mélangées dans le même terminal). À re-tester sans injection.
-4. Sous-shell top-level `( … )` : header de commande corrompu (le fix propre `set -o functrace` **casse
-   starship**) — parké en idée de durcissement.
-
-### Leçon (à ne pas réoublier)
-
-Toute validation « blocs » **doit** passer par le **pilotage réel de l'app sur bash+starship réel (CDP)**,
-jamais un shell hermétique : les tests hermétiques émettaient un `B` que le vrai starship efface, ce qui a
-masqué pendant des heures que le produit ne marchait pas (gate e2e « vert » sur un faux positif).
+Le chantier « terminal en blocs » **est** la tranche **v2.3 ci-dessus** (parkée, branche
+`feature/v2.3-terminal-blocks` non mergée). Le détail **fait / reste à faire / leçon** est consolidé dans
+[`session-notes.md`](session-notes.md) — il n'existe **plus** deux « v2.3 » concurrents ni de note de version
+contradictoire.

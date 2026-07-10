@@ -9,7 +9,8 @@ import {
 import { ActiveProjectProvider } from "@/components/terminals/active-project";
 import { BaseLayout } from "@/components/terminals/base-layout";
 import { TerminalsPage } from "@/components/terminals/terminals-page";
-import { WorkPage } from "@/components/work/work-page";
+import { BoardPage } from "@/components/specs/board-page";
+import { SpecDetailPage } from "@/components/specs/spec-detail-page";
 import { KnowledgePage } from "@/components/knowledge/knowledge-page";
 
 /**
@@ -26,7 +27,7 @@ import { KnowledgePage } from "@/components/knowledge/knowledge-page";
  *
  * ## Code-based routes + memory history
  * - CODE-BASED routing (this module), not the prototype's file-based `routeTree.gen.ts`
- *   codegen: the 3-route tree is tiny, so a hand-written tree stays readable and testable
+ *   codegen: the route tree is tiny, so a hand-written tree stays readable and testable
  *   without the route-generation Vite plugin / generated artifact.
  * - `createMemoryHistory`: the app is loaded over `file://` under Electron, where mutating
  *   the URL path is fragile; a memory history keeps navigation entirely in RAM
@@ -46,18 +47,48 @@ const rootRoute = createRootRoute({
   ),
 });
 
+/**
+ * The `/` search params — OPTIONAL deep-links the Spec detail's Runtime tab navigates to when a
+ * runtime row is clicked (the only way to open a PRECISE runtime element by id):
+ *  - `terminal`: open (select) a specific terminal on entry.
+ *  - `command`: open (select) a specific managed command — its live output pane — on entry.
+ * Omitted → the page keeps its default "auto-select the first terminal" behaviour.
+ */
+interface TerminalsSearch {
+  readonly terminal?: string;
+  readonly command?: string;
+}
+
 /** Terminals — the index route (`/`): the entered project's workspaces + runtime. */
 const terminalsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   component: TerminalsPage,
+  // Validate (and narrow) the `?terminal=<id>` / `?command=<id>` deep-link params. Non-strings
+  // are dropped.
+  validateSearch: (search: Record<string, unknown>): TerminalsSearch => {
+    const out: { terminal?: string; command?: string } = {};
+    if (typeof search.terminal === "string") out.terminal = search.terminal;
+    if (typeof search.command === "string") out.command = search.command;
+    return out;
+  },
 });
 
-/** Work (`/work`) — routed stub for now (real board/specs ported later). */
+/** Work (`/work`) — the Specs BOARD (kanban / list of the entered project's Specs, v2.4). */
 const workRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/work",
-  component: WorkPage,
+  component: BoardPage,
+});
+
+/**
+ * Spec detail (`/work/$specId`) — the PRD detail with its tabs (spec / tasks / review-
+ * placeholder / annexes / activity / runtime, v2.4). Reached from a board card / row.
+ */
+const specDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/work/$specId",
+  component: SpecDetailPage,
 });
 
 /** Knowledge (`/knowledge`) — routed stub for now (real knowledge base ported later). */
@@ -67,10 +98,15 @@ const knowledgeRoute = createRoute({
   component: KnowledgePage,
 });
 
-const routeTree = rootRoute.addChildren([terminalsRoute, workRoute, knowledgeRoute]);
+const routeTree = rootRoute.addChildren([
+  terminalsRoute,
+  workRoute,
+  specDetailRoute,
+  knowledgeRoute,
+]);
 
 /**
- * Build a router over the 3-route tree. Exposed as a factory so tests can spin up an
+ * Build a router over the route tree. Exposed as a factory so tests can spin up an
  * isolated router (with their own memory history / initial entry) without the app's
  * module-level singleton. The default entry is the Terminals index (`/`).
  */

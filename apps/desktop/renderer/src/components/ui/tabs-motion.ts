@@ -66,3 +66,26 @@ const HEIGHT_TRANSITION: Transition = {
 export function tabHeightTransition(reduced: boolean | null): Transition {
   return reduced ? INSTANT_TRANSITION : HEIGHT_TRANSITION;
 }
+
+/**
+ * The spring for the active-tab UNDERLINE indicator's shared-layout move. The
+ * indicator is a Motion element rendered inside the ACTIVE tab, sharing a
+ * `layoutId` with every other tab's indicator slot; on a tab switch Motion FLIPs
+ * it from the old tab to the new one so its POSITION and WIDTH interpolate together
+ * — it SLIDES and RESIZES continuously instead of teleporting then growing (the
+ * Base UI `--active-tab-left/-width` CSS-var transition it replaces animated the
+ * two out of sync). This is the SAME spring as the rail's `ActiveRail`
+ * (`base-layout.tsx`), so the two sliding indicators feel consistent.
+ */
+const INDICATOR_TRANSITION: Transition = { type: "spring", duration: 0.4, bounce: 0.25 };
+
+/**
+ * Resolve the active-tab indicator's slide transition honouring reduced motion
+ * (instant when set, so the underline snaps to the new tab with no spring — the
+ * `layout` FLIP still keeps it correctly placed). Pure → unit-testable.
+ *
+ * @param reduced whether `prefers-reduced-motion` is set (from `useReducedMotion`).
+ */
+export function tabIndicatorTransition(reduced: boolean | null): Transition {
+  return reduced ? INSTANT_TRANSITION : INDICATOR_TRANSITION;
+}

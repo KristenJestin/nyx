@@ -67,12 +67,12 @@ CLI + web UI Node, ~39 tables. Le **domaine** est porté ; les **enveloppes** (w
 
 Capture **généreuse** d'événements métier (jamais le runtime octet par octet) :
 
-- **Spec** : `created`, `revision_published`, `status_changed`, `priority_changed`, `tag_changed`, `milestone_set`, `dependency_changed`, `workspace_assigned`, `completed`, `archived`
+- **Spec** : `created`, `revision_published`, `status_changed`, `priority_changed`, `category_changed`, `milestone_set`, `dependency_changed`, `workspace_assigned`, `completed`, `archived`
 - **Task** : `created`, `status_changed`, `phase_changed`, `priority_changed`, `agent_assigned`, `done`, `blocked`
 - **Review** : `comment_created`, `comment_replied`, `comment_resolved`, `comment_reopened`, `comment_outdated`, `comment_promoted`
 - **Runtime** : `workspace_created`, `workspace_folder_removed`, `terminal_opened`, `terminal_closed`, `command_started`, `command_succeeded`, `command_failed`, `agent_started`, `agent_waiting`, `agent_ended`, `agent_resumed`, `agent_resume_failed`
 - **Knowledge** : `idea_created`, `idea_promoted`, `adr_created`, `adr_accepted`, `document_created`, `document_revised`, `directive_changed`
-- **Human** : `human_action_created`, `human_action_completed`
+- **Human** (task `executor=human`, ex-`human_actions` foldé dans `tasks` — PDR-0021) : réutilise les événements **Task** (`created` / `done` / `blocked`) ; pas d'événement `human_action_*` séparé (plus d'entité dédiée)
 - **Prototype** : `round_presented`, `variant_elected`, `feedback_created`, `feedback_resolved`
 - **Migration** : `import_started`, `import_completed`
 

@@ -24,9 +24,5 @@
   },
   "devDependencies": {
     "typescript": "~5.8.3"
-  },
-  "patchedDependencies": {
-    "@wterm/dom@0.3.0": "patches/@wterm%2Fdom@0.3.0.patch",
-    "@wterm/ghostty@0.3.0": "patches/@wterm%2Fghostty@0.3.0.patch"
   }
 }

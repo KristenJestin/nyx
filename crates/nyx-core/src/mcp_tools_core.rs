@@ -64,17 +64,24 @@ pub enum ChangedTopic {
     Workspaces,
     Commands,
     AgentSessions,
+    /// The Spec domain (Specs / revisions / tasks / dependencies) — carried by the v2.4
+    /// authoring + transition MCP tools so any open Specs board / PRD detail re-pulls after
+    /// an agent mutation. The wire string is `specs`; the front's re-pull on it is wired in
+    /// phase 6 (real-time UI), but the mutation authority already NAMES the topic here so the
+    /// seam is single-authority end to end.
+    Specs,
 }
 
 impl ChangedTopic {
     /// The wire string the shell maps to its event (`terminals` / `workspaces` /
-    /// `commands` / `agent-sessions`).
+    /// `commands` / `agent-sessions` / `specs`).
     pub fn as_str(self) -> &'static str {
         match self {
             ChangedTopic::Terminals => "terminals",
             ChangedTopic::Workspaces => "workspaces",
             ChangedTopic::Commands => "commands",
             ChangedTopic::AgentSessions => "agent-sessions",
+            ChangedTopic::Specs => "specs",
         }
     }
 }
@@ -88,13 +95,13 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn read(result: Value) -> Self {
+    pub(crate) fn read(result: Value) -> Self {
         Self {
             result,
             effects: vec![],
         }
     }
-    fn changed(result: Value, topic: ChangedTopic) -> Self {
+    pub(crate) fn changed(result: Value, topic: ChangedTopic) -> Self {
         Self {
             result,
             effects: vec![topic],
@@ -1824,8 +1831,13 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         crate::mcp::LIST_TERMINALS_TOOL => read(list_terminals(db, host, args)),
         crate::mcp::CLOSE_TERMINAL_TOOL => Some(close_terminal(db, host, args)),
         crate::mcp::READ_TERMINAL_TOOL => read(read_terminal(db, args)),
-        // Not one of ours (runtime / workspace tools live in mcp_runtime).
-        _ => None,
+        // The v2.4 Phase-5 tools (routed by their own sub-dispatchers so a Spec/context tool
+        // is added in exactly one place): the Spec authoring + transition tools
+        // (create/update/fork/transition Spec, add/transition/depend tasks) and the
+        // agent-context render — each delegating to the SHARED `nyx_core::db` authority
+        // (single mutation path, no double implementation).
+        _ => crate::mcp_tools_spec::dispatch_spec_tool(db, name, args)
+            .or_else(|| crate::mcp_context::dispatch_context_tool(db, name, args)),
     }
 }
 

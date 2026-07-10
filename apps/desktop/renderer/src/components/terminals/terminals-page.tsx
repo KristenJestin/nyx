@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import { SquareTerminalIcon } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getRouteApi } from "@tanstack/react-router";
+import { FolderPlusIcon, SquareTerminalIcon } from "lucide-react";
 
 import { useProjects } from "@/components/sidebar/use-projects";
+import { useManualAdd } from "@/components/sidebar/use-manual-add";
+import { SidebarShell } from "@/components/ui/sidebar-shell";
 import { ProjectCommandsDialog } from "@/components/command/project-commands-dialog";
 import { PagePlaceholder } from "./page-placeholder";
 import { useActiveProject } from "./active-project";
@@ -11,7 +14,11 @@ import { ConsumedNotificationsProvider } from "./use-consumed-notifications";
 import { RuntimePaneHost } from "./runtime-pane-host";
 import { WorkspaceAccordion } from "./workspace-accordion";
 import { useTerminalActions } from "./use-terminal-actions";
+import { loadLastTerminalId, saveLastTerminalId } from "./ui-persistence";
 import type { WorkspaceRuntimeService, WorkspaceRuntimeTerminal } from "./use-workspace-runtime";
+
+/** The `/` route API, for reading the `?terminal=<id>` deep-link search param. */
+const terminalsRouteApi = getRouteApi("/");
 
 /**
  * `<TerminalsPage>` — the index route (`/`). One ENTERS a PROJECT (from the left rail); this
@@ -27,7 +34,22 @@ import type { WorkspaceRuntimeService, WorkspaceRuntimeTerminal } from "./use-wo
  */
 export function TerminalsPage() {
   const { activeProjectId } = useActiveProject();
-  const { projects } = useProjects();
+  const { projects, createProject, createWorkspace } = useProjects();
+  // The optional `?terminal=<id>` / `?command=<id>` deep-links (the Runtime tab opens a precise
+  // terminal or managed command here).
+  const { terminal: deepLinkTerminalId, command: deepLinkCommandId } =
+    terminalsRouteApi.useSearch();
+
+  // "Add workspace" for the entered project — the SAME folder-picker → name-dialog →
+  // `create_workspace` flow the old sidebar exposed, reused verbatim via `useManualAdd` (no new
+  // backend, no duplicated picker/dialog wiring), mirroring how `<BaseLayout>` reuses it for
+  // "Add project". PDR-0025's shell only surfaced project-add (the rail); this re-exposes the
+  // existing add-workspace capability where it belongs — the Terminals sidebar (its header, next
+  // to the entered project). `dialog` is the mounted modal set, rendered once below.
+  const { addWorkspace, dialog: manualAddDialog } = useManualAdd({
+    createProject,
+    createWorkspace,
+  });
 
   const activeTree = useMemo(
     () => projects.find((p) => p.project.id === activeProjectId) ?? null,
@@ -72,18 +94,29 @@ export function TerminalsPage() {
   }
 
   return (
-    <RuntimeSelectionProvider>
-      <ConsumedNotificationsProvider>
-        <TerminalsBody
-          projectId={activeTree.project.id}
-          projectName={activeTree.project.name}
-          workspaces={workspaces}
-          runtimeByWorkspace={runtimeByWorkspace}
-          allTerminals={allTerminals}
-          allServices={allServices}
-        />
-      </ConsumedNotificationsProvider>
-    </RuntimeSelectionProvider>
+    <>
+      {/* Keyed by project so ENTERING a different project (or returning to Terminals) gives a
+          fresh selection state — the auto-select effect then RESTORES that project's last active
+          terminal (persisted) rather than the previous project's selection leaking across the
+          switch. */}
+      <RuntimeSelectionProvider key={activeTree.project.id}>
+        <ConsumedNotificationsProvider>
+          <TerminalsBody
+            projectId={activeTree.project.id}
+            projectName={activeTree.project.name}
+            workspaces={workspaces}
+            runtimeByWorkspace={runtimeByWorkspace}
+            allTerminals={allTerminals}
+            allServices={allServices}
+            deepLinkTerminalId={deepLinkTerminalId ?? null}
+            deepLinkCommandId={deepLinkCommandId ?? null}
+            onAddWorkspace={() => void addWorkspace(activeTree)}
+          />
+        </ConsumedNotificationsProvider>
+      </RuntimeSelectionProvider>
+      {/* The add-workspace modal set (folder picker → name dialog). Mounted once, portalled. */}
+      {manualAddDialog}
+    </>
   );
 }
 
@@ -99,6 +132,9 @@ function TerminalsBody({
   runtimeByWorkspace,
   allTerminals,
   allServices,
+  deepLinkTerminalId,
+  deepLinkCommandId,
+  onAddWorkspace,
 }: {
   projectId: string;
   projectName: string;
@@ -106,6 +142,12 @@ function TerminalsBody({
   runtimeByWorkspace: ReturnType<typeof useProjectRuntime>["runtimeByWorkspace"];
   allTerminals: readonly WorkspaceRuntimeTerminal[];
   allServices: readonly WorkspaceRuntimeService[];
+  /** The `?terminal=<id>` deep-link target — select THIS terminal on entry (else null). */
+  deepLinkTerminalId: string | null;
+  /** The `?command=<id>` deep-link target — select THIS managed command on entry (else null). */
+  deepLinkCommandId: string | null;
+  /** Open the add-workspace flow (folder picker → name dialog) for the entered project. */
+  onAddWorkspace: () => void;
 }) {
   const { selected, select } = useRuntimeSelection();
 
@@ -120,26 +162,101 @@ function TerminalsBody({
   // tab + subfolder picker. `null` = closed.
   const [commandsFor, setCommandsFor] = useState<{ id: string; path: string } | null>(null);
 
-  // Auto-focus the FIRST terminal once one exists and nothing is selected yet, so a pane shows
-  // on entry without a click. A no-op once the user has selected anything, and re-runs only
-  // when the terminal set changes (never overriding a live selection).
-  const firstTerminalId = allTerminals[0]?.id ?? null;
+  // DEEP-LINK: when the URL carries `?terminal=<id>` (the Runtime tab opened a precise terminal),
+  // select THAT terminal as soon as it appears in the project's runtime — overriding the
+  // auto-select-first below. Applied ONCE per distinct target id (a ref guards it) so the user
+  // can freely select another terminal afterwards without being yanked back.
+  const appliedDeepLinkRef = useRef<string | null>(null);
+  const deepLinkExists =
+    deepLinkTerminalId != null && allTerminals.some((t) => t.id === deepLinkTerminalId);
   useEffect(() => {
-    if (selected == null && firstTerminalId != null) {
-      select({ kind: "terminal", id: firstTerminalId });
+    if (
+      deepLinkTerminalId != null &&
+      deepLinkExists &&
+      appliedDeepLinkRef.current !== deepLinkTerminalId
+    ) {
+      appliedDeepLinkRef.current = deepLinkTerminalId;
+      select({ kind: "terminal", id: deepLinkTerminalId });
     }
-  }, [selected, firstTerminalId, select]);
+  }, [deepLinkTerminalId, deepLinkExists, select]);
+
+  // The MIRROR of the terminal deep-link, for a managed COMMAND: when the URL carries
+  // `?command=<id>` (the Runtime tab opened a precise command's detail), select THAT service as
+  // soon as it appears in the project's runtime — so its live output pane shows. Applied ONCE per
+  // distinct id (a ref guards it) so the user can freely select elsewhere afterwards.
+  const appliedCommandDeepLinkRef = useRef<string | null>(null);
+  const commandDeepLinkExists =
+    deepLinkCommandId != null && allServices.some((s) => s.id === deepLinkCommandId);
+  useEffect(() => {
+    if (
+      deepLinkCommandId != null &&
+      commandDeepLinkExists &&
+      appliedCommandDeepLinkRef.current !== deepLinkCommandId
+    ) {
+      appliedCommandDeepLinkRef.current = deepLinkCommandId;
+      select({ kind: "service", id: deepLinkCommandId });
+    }
+  }, [deepLinkCommandId, commandDeepLinkExists, select]);
+
+  // Auto-focus a terminal on entry so a pane shows without a click: RESTORE this project's LAST
+  // active terminal (persisted, so a relaunch / return to Terminals reopens it) when it still
+  // exists in the live runtime, else the FIRST terminal — the guard against a stale id (a
+  // terminal closed while away) is the existence check, which falls back cleanly. A no-op once
+  // the user has selected anything (never overriding a live selection); re-runs only when the
+  // terminal set changes. SUPPRESSED while a deep-link is outstanding (present but not yet
+  // applied, or still pending its terminal) so it never races the deep-link onto the first
+  // terminal; once the deep-link has been applied it is allowed again (harmless — a selection
+  // already exists by then).
+  const firstTerminalId = allTerminals[0]?.id ?? null;
+  const deepLinkOutstanding =
+    (deepLinkTerminalId != null && appliedDeepLinkRef.current !== deepLinkTerminalId) ||
+    (deepLinkCommandId != null && appliedCommandDeepLinkRef.current !== deepLinkCommandId);
+  useEffect(() => {
+    if (selected != null || firstTerminalId == null || deepLinkOutstanding) return;
+    const remembered = loadLastTerminalId(projectId);
+    const restore =
+      remembered != null && allTerminals.some((t) => t.id === remembered)
+        ? remembered
+        : firstTerminalId;
+    select({ kind: "terminal", id: restore });
+  }, [selected, firstTerminalId, deepLinkOutstanding, projectId, allTerminals, select]);
+
+  // Remember the selected TERMINAL as this project's last active terminal, so the restore above
+  // reopens it after a relaunch or a return to the page. Only terminals are persisted (a selected
+  // service is a transient watch surface); the provider is keyed by project, so `projectId` is
+  // stable for this instance and the write always lands under the right project.
+  useEffect(() => {
+    if (selected?.kind === "terminal") saveLastTerminalId(projectId, selected.id);
+  }, [selected, projectId]);
 
   return (
-    <div className="grid h-svh grid-cols-[260px_1fr] bg-background text-foreground">
-      <aside className="flex h-svh flex-col border-r border-border/60 bg-muted/40">
-        <div className="border-b border-border/60 px-3 py-3">
-          <h1 className="truncate font-semibold text-sm text-foreground" title={projectName}>
-            {projectName}
-          </h1>
-          <p className="text-2xs uppercase tracking-wide text-muted-foreground">Terminals</p>
-        </div>
-        <nav className="min-h-0 flex-1 overflow-y-auto">
+    <div className="flex h-svh bg-background text-foreground">
+      <SidebarShell
+        aria-label="Workspaces"
+        header={
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <h1 className="truncate font-semibold text-sm text-foreground" title={projectName}>
+                {projectName}
+              </h1>
+              <p className="text-2xs uppercase tracking-wide text-muted-foreground">Terminals</p>
+            </div>
+            {/* Add a WORKSPACE (folder) to the entered project — the existing folder-picker →
+                name-dialog → create_workspace flow, surfaced here in the current shell (the
+                capability existed but was only wired into the removed sidebar). */}
+            <button
+              type="button"
+              onClick={onAddWorkspace}
+              className="flex size-7 shrink-0 items-center justify-center rounded-md border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+              aria-label="Add workspace"
+              title="Add workspace"
+            >
+              <FolderPlusIcon className="size-4" />
+            </button>
+          </div>
+        }
+      >
+        <nav>
           {workspaces.length === 0 ? (
             <p className="px-4 py-3 text-sm italic text-muted-foreground/70">
               No workspaces in this project.
@@ -157,9 +274,9 @@ function TerminalsBody({
             ))
           )}
         </nav>
-      </aside>
+      </SidebarShell>
 
-      <main className="min-w-0">
+      <main className="min-w-0 flex-1">
         <RuntimePaneHost terminals={allTerminals} services={allServices} />
       </main>
 

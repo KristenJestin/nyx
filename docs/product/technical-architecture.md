@@ -88,6 +88,23 @@ Les politiques existantes restent canoniques : reprise des sessions agents confi
 
 Les mutations métier (status, tâches, commentaires, runtime) sont **poussées** à l'UI via `domain_events` (events non sollicités du sidecar → main → renderer) ; **pas de polling**. Les **vues dérivées de Git** (diff de review, dirty, branche courante) ne sont **pas** des mutations métier : elles changent quand le code change sur le disque. Leur rafraîchissement (watch fs/git → event, ou re-read déclenché) est **différé en v2.5** (Q-015).
 
+## Sécurité de la surface MCP
+
+Le serveur MCP est une interface **externe** (agents) vers l'autorité Rust ; sa surface d'attaque doit être explicite, d'autant que le produit assume que **l'agent a autorité sur l'état**.
+
+- **Bind strictement loopback.** Le listener écoute sur `127.0.0.1` (`Ipv4Addr::LOCALHOST`), **jamais** `0.0.0.0` : la surface est **injoignable hors machine** (ADR-0003 D1). Port **fixe** (résolu à l'onboarding), endpoint `GET /health`, **start-once** (un seul listener par process, jamais un second).
+- **Anti-DNS-rebinding.** Le header `Host` de chaque requête doit être une **autorité loopback** ; une page malveillante qui « rebind » un hostname vers `127.0.0.1` porte le hostname de l'attaquant dans `Host` (pas un littéral loopback) → **rejetée** avant d'atteindre la surface MCP (ADR-0003 D9). Les clients légitimes (Claude Code) visent `127.0.0.1`/`localhost` et passent.
+- **Frontière de confiance = la machine locale.** Il n'y a **pas de token par requête** : la garde est loopback + Host. Conséquence assumée : **tout process local sur la machine** peut atteindre le MCP et muter l'état (même posture que nyx v1). C'est la surface à connaître — la frontière de sécurité est la machine, pas l'identité utilisateur. Un durcissement (token de session, allowlist de provider) est un upgrade path si un usage le justifie.
+- **`nyx.localhost` (portless)** est une surface **humaine/intégration séparée**, **pas** le transport MCP (qui reste `http://127.0.0.1:<port>/mcp` en direct).
+
+## Politique de validation : piloter l'app réelle
+
+**Toute capacité à surface runtime se valide par le pilotage réel de l'application** — Electron + sidecar + vrai PTY/shell, sur les shells cibles réels (ex. `bash + starship` sous omarchy/direnv/zoxide) —, **jamais** par un shell hermétique ni des mocks seuls.
+
+- **Pourquoi.** Un test hermétique peut être **vert sur un faux positif** : le cas fondateur est la segmentation OSC 133 où le marqueur `B` émis par le fixture était **effacé par le vrai starship**, masquant des heures durant que le produit ne marchait pas. Le monde réel diverge du fixture ; seul le pilotage réel le prouve.
+- **Comment.** Gate e2e Electron **pilotée** (CDP / WebDriver) contre l'app réelle, en plus des tests unitaires/contrat (nécessaires mais **non suffisants** pour déclarer une capacité livrée). Les gates de tranche l'appliquent (cockpit v2.2, review v2.5 9/9, terminal-blocks).
+- **Règle.** Une capacité n'est « livrée » que lorsqu'elle a été **observée fonctionner dans l'app réelle**, pas seulement lorsqu'une suite verte le suggère.
+
 ## Interdictions
 
 - pas de logique métier dans preload ou Electron main ;

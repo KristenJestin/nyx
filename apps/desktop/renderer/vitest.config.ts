@@ -34,13 +34,6 @@ export default defineConfig({
   // the app build does, so component tests importing a terminal row don't fail on the
   // unresolved virtual module. Same compiler/jsx as `vite.config.ts`.
   plugins: [react(), tsconfigPaths(), Icons({ compiler: "jsx", jsx: "react" })],
-  // Keep the wterm packages OUT of esbuild dep pre-bundling so `@wterm/ghostty`'s
-  // `new URL("../wasm/ghostty-vt.wasm", import.meta.url)` resolves to the real
-  // asset (not the dev server's index.html fallback) — see the note in
-  // `vite.config.ts`. Required for the browser suite to load the real ghostty WASM.
-  optimizeDeps: {
-    exclude: ["@wterm/dom", "@wterm/core", "@wterm/ghostty"],
-  },
   test: {
     projects: [
       {

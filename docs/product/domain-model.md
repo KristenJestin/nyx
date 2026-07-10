@@ -168,4 +168,4 @@ Spec -> dev            | colonne specs.workspace_id       | validated (PDR-0008)
 Spec/tasks             | domaine natif nyx issu de Depot | validated direction
 Review                | vue dérivée (Git + comments)    | validated (PDR-0015)
 UI et MCP             | mêmes use cases/état            | validated direction
-Fichier SQLite unique | non décidé                      | open
+Fichier SQLite unique | un seul fichier                 | validated (PDR-0024)
