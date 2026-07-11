@@ -4,7 +4,8 @@
   "private": true,
   "description": "End-to-end tests for nyx driving the real Electron app via wdio-electron-service + WebdriverIO (v9).",
   "scripts": {
-    "test": "wdio run ./wdio.conf.cjs"
+    "test": "wdio run ./wdio.conf.cjs",
+    "test:review": "wdio run ./wdio.conf.cjs --spec ./specs/review-gate-tab.e2e.cjs"
   },
   "devDependencies": {
     "@wdio/cli": "^9.0.0",

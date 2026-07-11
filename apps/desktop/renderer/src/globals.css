@@ -195,6 +195,24 @@
   --sidebar-ring: oklch(0.708 0 0);
 
   --product-claude: oklch(0.7576 0.159 55.93);
+
+  /* v2.4 review diff viewer — token-derived colours ONLY (no raw hex from the proto).
+     The added/removed line tints and gutter accents are color-mixes of the existing
+     semantic success/destructive tokens against the surface, so they follow the theme
+     (light/dark) automatically and never bake in a literal colour. Syntax token classes
+     reuse the same semantic palette the rest of the app uses. */
+  --diff-added-bg: color-mix(in oklch, var(--success) 14%, transparent);
+  --diff-added-fg: var(--foreground);
+  --diff-added-gutter: color-mix(in oklch, var(--success) 26%, transparent);
+  --diff-removed-bg: color-mix(in oklch, var(--destructive) 14%, transparent);
+  --diff-removed-fg: var(--foreground);
+  --diff-removed-gutter: color-mix(in oklch, var(--destructive) 26%, transparent);
+  --diff-syntax-keyword: var(--primary);
+  --diff-syntax-string: var(--success);
+  --diff-syntax-comment: var(--muted-foreground);
+  --diff-syntax-number: var(--warning);
+  --diff-syntax-type: var(--info);
+  --diff-syntax-punctuation: var(--muted-foreground);
 }
 
 .dark {

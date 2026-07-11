@@ -211,6 +211,72 @@ pub const WORKSPACE_GIT_TOOL: &str = "workspace_git";
 /// `workspace_timeline::timeline`, the SAME read model the UI cockpit consumes (PDR-0005).
 pub const WORKSPACE_TIMELINE_TOOL: &str = "workspace_timeline";
 
+/// The v2.4 GIT DIFF read model tool (task `01KX0F6FD836YASVYT17YV3FTW`, PDR-0007 /
+/// PDR-0015): `{ workspace_id, repository_id, kind, rev?, base?, target?, mode? }` → the
+/// line-level diff of ONE repository within a workspace, for a review surface
+/// (working_tree / staged / unstaged / untracked / commit / range / branches), LIVING or
+/// PINNED. gix primary, git CLI fallback; the diff never mixes Git identities across
+/// repos. NOT a stored review (the review is a vue dérivée, PDR-0015). Advertised in
+/// `tools/list`, kept OUT of [`V1_TOOLS`]. Routes through the SHARED
+/// `git_diff::diff_repo_with_mode`, the SAME engine the UI bridge's `repo_diff`
+/// db-command drives (PDR-0005).
+pub const REPO_DIFF_TOOL: &str = "repo_diff";
+
+/// The v2.4 DERIVED GIT VIEWS read model tool (task `01KX0F6FXE6AJ9BR4BYHRX6B1R`, Q-015 /
+/// PDR-0013): `{ workspace_id, repository_id, base?, target? }` → per-repo dirty state
+/// (staged / modified / untracked), current branch + base/target, ahead/behind, and a
+/// change summary — RE-READ from Git on demand, NEVER authoritative in the DB. Advertised
+/// in `tools/list`, kept OUT of [`V1_TOOLS`]. Routes through the SHARED
+/// `git_views::repo_view_with_target`, the SAME derivation the UI bridge's `repo_git_view`
+/// db-command drives (PDR-0005).
+pub const REPO_GIT_VIEW_TOOL: &str = "repo_git_view";
+
+/// The v2.4 REAL-TIME REFRESH registration tool (task `01KX0F6GDZEH3YN6QJDB7FC0WC`,
+/// Q-015): `{ workspace_id, repository_id, base?, target? }` → `{ watching: true }`. Begins
+/// a debounced fs-watch of the `(workspace, repository)` so an edit / commit / checkout
+/// recomputes the derived view and PUSHES `repos://changed` to BOTH the UI and MCP — the
+/// SAME watcher the UI `repo_watch` db-command drives (PDR-0005). Handled sidecar-side (the
+/// git-watch runtime is a shell-owned effect), advertised here, kept OUT of [`V1_TOOLS`].
+pub const REPO_WATCH_TOOL: &str = "repo_watch";
+
+/// The counterpart to [`REPO_WATCH_TOOL`]: `{ workspace_id, repository_id }` →
+/// `{ watching: false }`. Stops the real-time watch of a `(workspace, repository)`.
+pub const REPO_UNWATCH_TOOL: &str = "repo_unwatch";
+
+/// The v2.4 review COMMENT LIST tool (task `01KX0F6HEBPK34CV49EREHK3Y9`, PDR-0012/0015):
+/// `{ workspace_id, repository_id }` → `{ comments }`, the whole auto-threaded feed of a
+/// `(workspace, repository)` review (roots + replies, anchored + global, with `outdated`
+/// state). Routes through the SHARED `db::list_review_comments`, the SAME model the UI bridge's
+/// `review_comment_list` db-command reads (PDR-0005). Advertised in `tools/list`, kept OUT of
+/// [`V1_TOOLS`]. Read-only.
+pub const REVIEW_COMMENT_LIST_TOOL: &str = "review_comment_list";
+
+/// The v2.4 review COMMENT POST tool (task `01KX0F6HEBPK34CV49EREHK3Y9`):
+/// `{ workspace_id, repository_id, body, spec_id?, parent_id?, file_path?, side?, line_start?,
+/// line_end?, blob?, snippet?, context? }` → `{ comment }`. The AGENT façade to annotate a
+/// review — a global comment, an anchored comment, OR a REPLY (`parent_id`). The author is
+/// ALWAYS `agent` here (the human posts through the UI). The agent may reply but NEVER resolve:
+/// there is DELIBERATELY no `review_comment_resolve` MCP tool. Routes through the SHARED
+/// `db::insert_review_comment` (PDR-0005). Advertised in `tools/list`, kept OUT of [`V1_TOOLS`].
+pub const REVIEW_COMMENT_POST_TOOL: &str = "review_comment_post";
+
+/// The v2.4 review TASK LIST tool (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`, PDR-0012 — `finding =
+/// task`): `{ workspace_id, repository_id }` → `{ tasks }`, the promoted-task list of a
+/// `(workspace, repository)` review — each task's `from_comment_id`, `title`, optional
+/// `severity`, and `grill_state` (proposed | structured | validated). Routes through the SHARED
+/// `db::list_review_tasks`, the SAME model the UI bridge reads (PDR-0005). Advertised in
+/// `tools/list`, kept OUT of [`V1_TOOLS`]. Read-only.
+pub const REVIEW_TASK_LIST_TOOL: &str = "review_task_list";
+
+/// The v2.4 review TASK STRUCTURE tool (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`): the AGENT's step of
+/// the "grill". `{ id, title, details?, severity? }` → `{ task }`. Rewrites a PROPOSED (or
+/// still-structured) promotion into a clean task and moves it to `structured`. The agent may
+/// STRUCTURE but NEVER validate: there is DELIBERATELY no `review_task_validate` MCP tool
+/// (validation is human-only, the guard-rail symmetric to phase-4 human-only comment resolution).
+/// Routes through the SHARED `db::structure_task` (PDR-0005). Advertised in `tools/list`, kept
+/// OUT of [`V1_TOOLS`].
+pub const REVIEW_TASK_STRUCTURE_TOOL: &str = "review_task_structure";
+
 /// The frozen MCP v1 tool surface (ADR-0003). Phase-1 advertises these names in
 /// the `tools/list` handshake; the call bodies are wired in phase 2 over the PRD-3
 /// runtime/DB layer (D6). Order is the ADR's listing order.
@@ -1545,6 +1611,185 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["role"],
         },
     }));
+    // Append the v2.4 Git DIFF read model tool: the line-level diff of ONE repository in a
+    // workspace, for a review surface, in living or pinned mode (gix + git CLI fallback).
+    descriptors.push(json!({
+        "name": REPO_DIFF_TOOL,
+        "description": "Get the line-level Git diff of ONE repository within a workspace, \
+                        for local review. Choose a `kind`: working_tree (everything \
+                        uncommitted), staged, unstaged, untracked, commit (needs `rev`), \
+                        range or branches (need `base` and `target` rev-specs). Returns \
+                        per-file hunks with old/new sides and blob ids — one repo at a \
+                        time, so several repos' diffs never mix. Optional `mode` \
+                        (living|pinned) records whether the view follows the current state \
+                        or is frozen on the resolved SHA. gix-powered with a git CLI \
+                        fallback. Read-only; nothing is stored.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
+                "repository_id": str_prop("the repository to diff (from workspace_git(workspace_id=…))"),
+                "kind": str_prop("the diff surface: working_tree | staged | unstaged | untracked | commit | range | branches"),
+                "rev": str_prop("for kind=commit: the commit rev-spec to diff against its parent"),
+                "base": str_prop("for kind=range|branches: the BASE rev-spec (branch or SHA)"),
+                "target": str_prop("for kind=range|branches: the TARGET rev-spec (branch or SHA)"),
+                "mode": str_prop("optional: living (follows current state) | pinned (frozen on the resolved SHA)"),
+            },
+            "required": ["workspace_id", "repository_id", "kind"],
+        },
+    }));
+    // Append the v2.4 DERIVED GIT VIEWS tool: the per-repo dirty/branch/ahead-behind/summary
+    // state, on demand, in a stable shape (no line-level diff — that is repo_diff).
+    descriptors.push(json!({
+        "name": REPO_GIT_VIEW_TOOL,
+        "description": "Get the overall Git STATE of ONE repository within a workspace, on \
+                        demand: whether the work tree is dirty (with the staged / modified / \
+                        untracked file lists), the current branch and its base/target, how \
+                        many commits it is ahead/behind that base, and a compact change \
+                        summary. This is the repo's state at a glance — NOT the line-level \
+                        diff (use repo_diff for hunks). Pass an optional `base` (a local \
+                        branch or SHA — there is no remote) to get ahead/behind, and an \
+                        optional `target` to compare a specific endpoint instead of the \
+                        current branch. Read-only; nothing is stored.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
+                "repository_id": str_prop("the repository whose Git state to derive (from workspace_git(workspace_id=…))"),
+                "base": str_prop("optional review BASE endpoint (a local branch or SHA) to compute ahead/behind against"),
+                "target": str_prop("optional review TARGET endpoint (branch or SHA); defaults to the current branch"),
+            },
+            "required": ["workspace_id", "repository_id"],
+        },
+    }));
+    // Append the v2.4 REAL-TIME REFRESH tools (Q-015): begin/stop a debounced fs-watch of a
+    // repo so a change pushes `repos://changed` to both surfaces without polling.
+    descriptors.push(json!({
+        "name": REPO_WATCH_TOOL,
+        "description": "Start REAL-TIME watching of ONE repository within a workspace, so \
+                        that when the repo changes (a file edit, a commit, a checkout) nyx \
+                        recomputes its Git view and pushes the update live — no polling. Use \
+                        this when opening a review so the diff/branch/dirty state stays fresh; \
+                        pair with repo_unwatch when done. Idempotent per repository. Pass an \
+                        optional `base`/`target` (a local branch or SHA — no remote) so \
+                        ahead/behind stays correct across refreshes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
+                "repository_id": str_prop("the repository to watch in real time (from workspace_git(workspace_id=…))"),
+                "base": str_prop("optional review BASE endpoint (a local branch or SHA) kept for ahead/behind"),
+                "target": str_prop("optional review TARGET endpoint (branch or SHA); defaults to the current branch"),
+            },
+            "required": ["workspace_id", "repository_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": REPO_UNWATCH_TOOL,
+        "description": "Stop REAL-TIME watching of a repository previously registered with \
+                        repo_watch. A repository that was not being watched is a no-op.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace the repository belongs to"),
+                "repository_id": str_prop("the repository to stop watching"),
+            },
+            "required": ["workspace_id", "repository_id"],
+        },
+    }));
+    // Append the v2.4 review COMMENT tools: LIST the auto-threaded feed, and POST an
+    // agent comment/reply (NO resolve tool — the agent never resolves, only the human does).
+    // `int_prop` (with `minimum: 0`, defined above) stays in scope here and is reused for the
+    // 1-based `line_start`/`line_end` so their schema matches the file's other integer args.
+    descriptors.push(json!({
+        "name": REVIEW_COMMENT_LIST_TOOL,
+        "description": "List the review COMMENTS of ONE repository within a workspace — the whole \
+                        auto-threaded feed: thread roots and their replies, anchored comments \
+                        (on a file/side/line or range) and global ones, each with its author \
+                        (human or agent), status (open/resolved) and `outdated` flag (an anchor \
+                        the code moved out from under). Use this to read the current review \
+                        conversation before replying. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
+                "repository_id": str_prop("the repository whose review comments to list (from workspace_git(workspace_id=…))"),
+            },
+            "required": ["workspace_id", "repository_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": REVIEW_COMMENT_POST_TOOL,
+        "description": "Post a review COMMENT as the AGENT on ONE repository within a workspace. \
+                        Leave a GLOBAL comment (no anchor), an ANCHORED comment (pass `file_path` \
+                        + `side` old|new + `line_start` [+ `line_end` for a range], optionally \
+                        `blob`/`snippet`/`context` so it re-maps across commits), or a REPLY in a \
+                        thread (pass `parent_id`). The author is always the agent. You may reply \
+                        but you CANNOT resolve a comment — resolution is reserved to the human. \
+                        Returns the created comment.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
+                "repository_id": str_prop("the repository to comment on (from workspace_git(workspace_id=…))"),
+                "body": str_prop("the comment text"),
+                "spec_id": str_prop("optional spec the review is bound to (omit for a generic review)"),
+                "parent_id": str_prop("optional: the id of the comment to REPLY to (from review_comment_list) — omit for a new thread"),
+                "file_path": str_prop("optional: for an ANCHORED comment, the changed-file path to hang it on (omit for a global comment)"),
+                "side": str_prop("optional: the diff side the anchor is on: old | new"),
+                "line_start": int_prop("optional: the 1-based anchored line (or range start) on `side`"),
+                "line_end": int_prop("optional: the 1-based range end (defaults to line_start)"),
+                "blob": str_prop("optional: the blob SHA the anchor is captured on (helps re-mapping)"),
+                "snippet": str_prop("optional: the anchored line text (helps re-mapping)"),
+                "context": str_prop("optional: a few surrounding lines (helps disambiguate re-mapping)"),
+            },
+            "required": ["workspace_id", "repository_id", "body"],
+        },
+    }));
+    // Append the v2.4 review TASK tools (finding = task). LIST the promoted tasks, and
+    // STRUCTURE a proposed promotion (the agent's grill step — the agent may structure but NEVER
+    // validate; there is DELIBERATELY no validate tool, validation is human-only).
+    descriptors.push(json!({
+        "name": REVIEW_TASK_LIST_TOOL,
+        "description": "List the review TASKS (promoted coder tasks) of ONE repository within a \
+                        workspace. A task IS a coder task promoted from a review comment \
+                        (finding = task): each carries the source comment it came from \
+                        (`from_comment_id`), a `title`, an optional `severity`, and a \
+                        `grill_state` — `proposed` (a human initiated the promotion but did not \
+                        structure it yet), `structured` (you, the agent, gave it a clean \
+                        title/details), or `validated` (the human validated it — only THEN is it \
+                        ready for the coder). Use this to find the promotions waiting for you to \
+                        structure. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
+                "repository_id": str_prop("the repository whose tasks to list (from workspace_git(workspace_id=…))"),
+            },
+            "required": ["workspace_id", "repository_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": REVIEW_TASK_STRUCTURE_TOOL,
+        "description": "STRUCTURE a promoted review task (your step of the promotion \"grill\"). \
+                        The human lâche brut — initiates a promotion from a comment WITHOUT \
+                        structuring it; you turn it into a clean coder task: pass a sharp `title`, \
+                        actionable `details`, and an optional `severity` (info|low|medium|high|\
+                        critical). This moves the task to `structured`. You may structure but \
+                        you CANNOT validate a task — validation is reserved to the human (there \
+                        is no validate tool). A task the human already validated cannot be \
+                        re-structured. Returns the updated task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": str_prop("the task id to structure (from review_task_list)"),
+                "title": str_prop("a sharp task title for the coder"),
+                "details": str_prop("optional: actionable task details for the coder"),
+                "severity": str_prop("optional: info | low | medium | high | critical"),
+            },
+            "required": ["id", "title"],
+        },
+    }));
     descriptors
 }
 
@@ -1957,15 +2202,53 @@ mod tests {
             names.contains(&crate::mcp_context::AGENT_CONTEXT_TOOL),
             "agent_context tool must be listed"
         );
+        // v2.4 Git DIFF read model: the per-repo diff tool advertised alongside.
+        assert!(
+            names.contains(&REPO_DIFF_TOOL),
+            "repo_diff tool must be listed"
+        );
+        // v2.4 DERIVED GIT VIEWS read model: the per-repo state tool advertised alongside.
+        assert!(
+            names.contains(&REPO_GIT_VIEW_TOOL),
+            "repo_git_view tool must be listed"
+        );
+        // v2.4 REAL-TIME REFRESH (Q-015): the review watch/unwatch tools advertised alongside.
+        assert!(
+            names.contains(&REPO_WATCH_TOOL) && names.contains(&REPO_UNWATCH_TOOL),
+            "repo_watch + repo_unwatch tools must be listed"
+        );
+        // v2.4 review COMMENTS: the list + post tools advertised alongside (NO resolve tool —
+        // the agent never resolves).
+        assert!(
+            names.contains(&REVIEW_COMMENT_LIST_TOOL) && names.contains(&REVIEW_COMMENT_POST_TOOL),
+            "review_comment_list + review_comment_post tools must be listed"
+        );
+        assert!(
+            !names.contains(&"review_comment_resolve"),
+            "there is DELIBERATELY no resolve tool — the agent never resolves"
+        );
+        // v2.4 review TASKS (finding = task): the list + structure tools advertised (NO validate
+        // tool — the agent structures but the human validates; symmetric to the resolve guard-rail).
+        assert!(
+            names.contains(&REVIEW_TASK_LIST_TOOL) && names.contains(&REVIEW_TASK_STRUCTURE_TOOL),
+            "review_task_list + review_task_structure tools must be listed"
+        );
+        assert!(
+            !names.contains(&"review_task_validate"),
+            "there is DELIBERATELY no validate tool — the agent structures, the human validates"
+        );
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 21 + 9,
+            V1_TOOLS.len() + 21 + 9 + 8,
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
              create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
              agent_session_event + set_project_settings + workspace_runtime + workspace_git + \
-             workspace_timeline + the 8 spec authoring/transition tools + agent_context extension tools"
+             workspace_timeline + the 8 spec authoring/transition tools + agent_context + \
+             repo_diff + repo_git_view + repo_watch + repo_unwatch + \
+             review_comment_list + review_comment_post + review_task_list + \
+             review_task_structure extension tools"
         );
     }
 

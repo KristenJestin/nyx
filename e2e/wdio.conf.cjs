@@ -212,6 +212,18 @@ exports.config = {
     fs.rmSync(E2E_DATA_ROOT, { recursive: true, force: true });
     fs.mkdirSync(E2E_DATA_ROOT, { recursive: true });
 
+    // Stage the sidecar the build:e2e chain JUST built — never a stale one.
+    // `build:e2e` runs `build:sidecar` (= `cargo build -p nyx-sidecar`, which writes
+    // `target/DEBUG/nyx-sidecar`) and then `copy:sidecar`. But `copy-sidecar.cjs`, with no
+    // `NYX_SIDECAR_PROFILE`, prefers `target/release` when present — so a stale `target/release`
+    // binary left over from a prior packaged build gets staged INSTEAD of the fresh debug one,
+    // and the e2e app launches an out-of-date sidecar (e.g. missing the review commands
+    // `repo_diff`/`review_comment_*` → "not available over the sidecar transport"). Pin the
+    // profile to `debug` for the e2e build so `copy:sidecar` stages exactly what `build:sidecar`
+    // just produced. `spawnSync` below inherits `process.env`, so the child `copy:sidecar` sees
+    // it. This is scoped to the e2e path only — the packaged `build` keeps its own profile.
+    process.env.NYX_SIDECAR_PROFILE = "debug";
+
     if (process.env.NYX_E2E_SKIP_BUILD === "1") return;
     const res = spawnSync("bun", ["run", "build:e2e"], {
       cwd: ELECTRON_APP_DIR,

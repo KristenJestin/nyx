@@ -165,6 +165,325 @@ export interface TerminalExecState {
 }
 
 // ---------------------------------------------------------------------------
+// v2.4 review: the Git DIFF read model (the `repo_diff` / `repo_git_view` db-commands)
+// ---------------------------------------------------------------------------
+//
+// These mirror, on the wire, the `nyx_core::git_diff` / `nyx_core::git_views` serde
+// shapes (snake_case) the sidecar db-commands return. The review viewer (phase 3)
+// consumes them through `nyxBridge.invoke("repo_diff", …)` / `invoke("repo_git_view", …)`
+// — the SAME engine the MCP tools serve (PDR-0005: one authority for UI + MCP). No
+// review entity is stored: a `RepoDiff` is a transient VUE DÉRIVÉE of a `(workspace,
+// repository)` pair (PDR-0015), carrying that repo's OWN identity (`git_dir` + resolved
+// `base_sha`/`target_sha`) so the aggregating UI never mixes two repos' Git identities.
+
+/** Which backend produced a diff (gix primary, git CLI fallback). */
+export type DiffBackend = "gix" | "git_cli";
+
+/** LIVING (follows the current state) vs PINNED (frozen on a resolved SHA) — PDR-0015. */
+export type DiffMode = "living" | "pinned";
+
+/** How a file changed between the two diff sides. */
+export type ChangeKind = "added" | "deleted" | "modified";
+
+/** The role of a diff line within its hunk. */
+export type LineKind = "context" | "removed" | "added";
+
+/** One side of a file within a diff (its path + blob id, `null` when absent on that side). */
+export interface FileSide {
+  readonly path: string;
+  readonly blob: string | null;
+  readonly binary: boolean;
+}
+
+/** One line inside a {@link Hunk}, tagged by role. */
+export interface DiffLine {
+  readonly kind: LineKind;
+  readonly content: string;
+}
+
+/** A contiguous change region within a file, in unified-diff (1-based) coordinates. */
+export interface Hunk {
+  readonly old_start: number;
+  readonly old_lines: number;
+  readonly new_start: number;
+  readonly new_lines: number;
+  readonly lines: readonly DiffLine[];
+}
+
+/** The diff of ONE file: both sides' identity + its hunks. */
+export interface FileDiff {
+  readonly change: ChangeKind;
+  readonly old: FileSide | null;
+  readonly new: FileSide | null;
+  readonly binary: boolean;
+  readonly hunks: readonly Hunk[];
+}
+
+/**
+ * The full diff of ONE repository for one diff target — the unit the renderer draws as a
+ * single review pane. Carries the repo's own identity so several can be aggregated in one
+ * UI without mixing Git identities.
+ */
+export interface RepoDiff {
+  readonly repo_path: string;
+  readonly git_dir: string | null;
+  readonly mode: DiffMode;
+  readonly base_sha: string | null;
+  readonly target_sha: string | null;
+  readonly backend: DiffBackend;
+  readonly files: readonly FileDiff[];
+}
+
+/** WHAT to diff for a repository — mirrors the engine's `target_from_params` vocabulary. */
+export type DiffKind =
+  | "working_tree"
+  | "staged"
+  | "unstaged"
+  | "untracked"
+  | "commit"
+  | "range"
+  | "branches";
+
+/** Args for the `repo_diff` db-command. `rev` (commit) / `base`+`target` (range/branches)
+ *  are the rev-specs the chosen `kind` needs; `mode` overrides the target's default. */
+export interface RepoDiffArgs extends Record<string, unknown> {
+  readonly workspaceId: string;
+  readonly repositoryId: string;
+  readonly kind: DiffKind;
+  readonly rev?: string;
+  readonly base?: string;
+  readonly target?: string;
+  readonly mode?: DiffMode;
+}
+
+/** The dirty file partition of a repo (`repo_git_view.dirty`). */
+export interface DirtyState {
+  readonly clean: boolean;
+  readonly staged: readonly string[];
+  readonly modified: readonly string[];
+  readonly untracked: readonly string[];
+}
+
+/** The branch view of a repo (`repo_git_view.branch`): current + review base/target. */
+export interface BranchView {
+  readonly current: string | null;
+  readonly detached: boolean;
+  readonly base: string | null;
+  readonly target: string | null;
+}
+
+/** Ahead/behind counts of `target` relative to `base`. */
+export interface AheadBehind {
+  readonly ahead: number;
+  readonly behind: number;
+}
+
+/** The compact change summary of a repo view. */
+export interface ChangeSummary {
+  readonly changed_files: number;
+  readonly staged: number;
+  readonly modified: number;
+  readonly untracked: number;
+  readonly ahead: number;
+  readonly behind: number;
+}
+
+/** The derived Git VIEW of one repository (`repo_git_view`) — branch/dirty/summary. */
+export interface RepoGitView {
+  readonly repo_path: string;
+  readonly is_git: boolean;
+  readonly dirty: DirtyState;
+  readonly branch: BranchView;
+  readonly ahead_behind: AheadBehind | null;
+  readonly summary: ChangeSummary;
+}
+
+/** Args for `repo_git_view` / `repo_watch` (the review's optional base/target endpoints). */
+export interface RepoGitViewArgs extends Record<string, unknown> {
+  readonly workspaceId: string;
+  readonly repositoryId: string;
+  readonly base?: string;
+  readonly target?: string;
+}
+
+/** Args for `repo_unwatch` — release a `(workspace, repository)` living-refresh watch. */
+export interface RepoUnwatchArgs extends Record<string, unknown> {
+  readonly workspaceId: string;
+  readonly repositoryId: string;
+}
+
+// ---------------------------------------------------------------------------
+// v2.4 review: the COMMENT model (the `review_comment_*` db-commands)
+// ---------------------------------------------------------------------------
+//
+// These mirror, on the wire, the `nyx_core::db::ReviewComment` serde shape (snake_case) the
+// sidecar db-commands return. A review comment is the ONLY persisted review artifact
+// (PDR-0012/0015 — review is a vue dérivée): ONE auto-threaded table, keyed by
+// `(workspace, repository)`. A comment is ANCHORED (a `file_path` + `side` + `line_start`
+// [+ `line_end`] on the diff, with `blob`/`snippet`/`context` so it re-maps across commits)
+// or GLOBAL (`file_path` null). Resolution is HUMAN-ONLY: the UI façade resolves; the agent
+// (via MCP) only replies. `outdated` flags an anchor the code moved out from under.
+
+/** WHO authored a review comment: a human reviewer or an agent (replies via MCP). */
+export type CommentAuthorType = "human" | "agent";
+
+/** A review comment's lifecycle: open until a HUMAN resolves it. */
+export type ReviewCommentStatus = "open" | "resolved";
+
+/** Which diff side a comment anchor is on. */
+export type AnchorSide = "old" | "new";
+
+/**
+ * A `review_comments` row (mirror of `nyx_core::db::ReviewComment`). Auto-threaded by
+ * `parent_id` (null = a thread ROOT). Anchored (`file_path` present) or global. `outdated`
+ * flags an anchor the code moved out from under; `resolved_by_type` records WHO resolved it
+ * (only ever `human`).
+ */
+export interface ReviewComment {
+  readonly id: string;
+  readonly workspace_id: string;
+  readonly repository_id: string;
+  readonly spec_id: string | null;
+  readonly parent_id: string | null;
+  readonly author_type: CommentAuthorType;
+  readonly author_name: string;
+  readonly file_path: string | null;
+  readonly side: AnchorSide | null;
+  readonly line_start: number | null;
+  readonly line_end: number | null;
+  readonly blob: string | null;
+  readonly snippet: string | null;
+  readonly context: string | null;
+  readonly outdated: boolean;
+  readonly body: string;
+  readonly status: ReviewCommentStatus;
+  readonly resolved_by_type: CommentAuthorType | null;
+  readonly created_at: number;
+}
+
+/**
+ * Args for `review_comment_list` — the auto-threaded feed of a `(workspace, repository)`.
+ * `specId` SCOPES the feed to one Spec (Finding 41): the review is opened FROM a Spec, so its
+ * feed shows ONLY that Spec's comments — omit it for the unscoped whole-repo read.
+ */
+export interface ReviewCommentListArgs extends Record<string, unknown> {
+  readonly workspaceId: string;
+  readonly repositoryId: string;
+  readonly specId?: string;
+}
+
+/**
+ * Args for `review_comment_post` — the HUMAN façade to leave a comment. A global comment
+ * (no anchor), an ANCHORED comment (`filePath` + `side` + `lineStart` [+ `lineEnd`] with
+ * optional `blob`/`snippet`/`context` for re-mapping), or a REPLY (`parentId`).
+ */
+export interface ReviewCommentPostArgs extends Record<string, unknown> {
+  readonly workspaceId: string;
+  readonly repositoryId: string;
+  readonly body: string;
+  readonly specId?: string;
+  readonly parentId?: string;
+  readonly filePath?: string;
+  readonly side?: AnchorSide;
+  readonly lineStart?: number;
+  readonly lineEnd?: number;
+  readonly blob?: string;
+  readonly snippet?: string;
+  readonly context?: string;
+}
+
+/** Args for `review_comment_resolve` / `review_comment_reopen` — the HUMAN-only transitions. */
+export interface ReviewCommentIdArgs extends Record<string, unknown> {
+  readonly id: string;
+}
+
+// ---------------------------------------------------------------------------
+// v2.4 review: the TASK (finding = task) model + the UNREAD counter (Phase 5)
+// ---------------------------------------------------------------------------
+//
+// A task is a review COMMENT PROMOTED for the coder — `finding = task` (PDR-0012). These
+// mirror `nyx_core::db::ReviewTask` / `ReviewUnread` (snake_case on the wire). The promotion
+// is a "grill": the HUMAN lâche brut (`review_task_promote` → `proposed`), the AGENT
+// structures it (MCP `review_task_structure` → `structured`), the HUMAN validates it
+// (`review_task_validate` → `validated`). ONLY a `validated` task is ready for the coder.
+// The unread counter is a per-repo read watermark: `review_unread` reads the count, `review_mark_read`
+// zeroes it; both refresh live on `repos://changed`.
+
+/** A task's OPTIONAL severity (mirror of the `severity` CHECK vocabulary). */
+export type TaskSeverity = "info" | "low" | "medium" | "high" | "critical";
+
+/**
+ * The promotion "grill" state (mirror of `nyx_core::db` `grill_state`): `proposed` (human lâche
+ * brut) → `structured` (agent structured via MCP) → `validated` (human validated — ready for the
+ * coder).
+ */
+export type GrillState = "proposed" | "structured" | "validated";
+
+/**
+ * A `review_tasks` row (mirror of `nyx_core::db::ReviewTask`). `finding = task`: the promoted
+ * comment IS the coder task. `from_comment_id` is the trail back to its source comment; `severity`
+ * is optional; `grill_state` walks the grill.
+ */
+export interface ReviewTask {
+  readonly id: string;
+  readonly workspace_id: string;
+  readonly repository_id: string;
+  readonly from_comment_id: string;
+  readonly title: string;
+  readonly details: string | null;
+  readonly severity: TaskSeverity | null;
+  readonly grill_state: GrillState;
+  readonly created_at: number;
+  readonly updated_at: number;
+  /**
+   * The OPTIONAL Spec this task is scoped to (`null` = un-scoped), inherited from its source
+   * comment at promotion (Finding 53). Scopes `review_task_list` so a task promoted on one Spec
+   * never leaks onto another Spec sharing the same `(workspace, repository)` — the tasks
+   * counterpart of the comment scoping (Finding 41).
+   */
+  readonly spec_id: string | null;
+}
+
+/** The unread state of a `(workspace, repository)` review feed (mirror of `nyx_core::db::ReviewUnread`). */
+export interface ReviewUnread {
+  readonly workspace_id: string;
+  readonly repository_id: string;
+  /** Comments (roots + replies) created strictly after `last_read_at`. */
+  readonly unread: number;
+  /** Epoch-ms read watermark (0 = never read). */
+  readonly last_read_at: number;
+}
+
+/** Args for `review_task_promote` — the HUMAN lâche brut: promote a comment into a coder task. */
+export interface ReviewTaskPromoteArgs extends Record<string, unknown> {
+  readonly commentId: string;
+  /** Optional title (seeded from the comment body when absent). */
+  readonly title?: string;
+  /** Optional severity. */
+  readonly severity?: TaskSeverity;
+}
+
+/** Args for `review_task_validate` — the HUMAN validates a structured task. */
+export interface ReviewTaskIdArgs extends Record<string, unknown> {
+  readonly id: string;
+}
+
+/** Args for `review_task_list` / `review_unread` / `review_mark_read` / `review_remap`. */
+export interface ReviewRepoArgs extends Record<string, unknown> {
+  readonly workspaceId: string;
+  readonly repositoryId: string;
+}
+
+/**
+ * The result of `review_remap` — how many anchored comments were re-written (relocated OR flipped
+ * to `outdated`) by the re-mapping pass. `0` means every anchor still pointed at its captured blob
+ * (nothing to do). The re-mapped/outdated rows are read back through `review_comment_list`.
+ */
+export interface ReviewRemapResult {
+  readonly written: number;
+}
+
+// ---------------------------------------------------------------------------
 // The bridge surface, grouped by capability
 // ---------------------------------------------------------------------------
 
@@ -372,6 +691,51 @@ export type BackendCommand =
   // Clear the focus-aware "response ready" notification for a viewed terminal (the
   // activity analogue of `terminal_exec_mark_read`). `{ terminalId }`. Idempotent.
   | "agent_mark_ready_read"
+  // v2.4 review — the Git DIFF read model (task 01KX0F6GY96096AHWD8RZ2BMM0, PDR-0007/0015).
+  // `repo_diff` is the line-level diff of ONE `(workspace, repository)` for a review surface
+  // (working_tree/staged/unstaged/untracked/commit/range/branches), LIVING or PINNED — the
+  // EXACT same `nyx_core::git_diff` engine the MCP `repo_diff` tool serves (PDR-0005). A pure
+  // read: no mutation, nothing persisted (PDR-0013). Returns a `RepoDiff`.
+  | "repo_diff"
+  // `repo_git_view` — the derived Git view (branch/dirty/base/target/summary) of one
+  // `(workspace, repository)`, re-read from Git on demand (Q-015). Returns a `RepoGitView`.
+  | "repo_git_view"
+  // `repo_watch` — begin watching a `(workspace, repository)` so a work-tree/ref change pushes
+  // `repos://changed` (v2.1 pipe, debounced, no polling). A LIVING review calls it as it opens.
+  | "repo_watch"
+  // `repo_unwatch` — release a `repo_watch` as the review surface closes. Idempotent.
+  | "repo_unwatch"
+  // v2.4 review COMMENTS (task 01KX0F6HEBPK34CV49EREHK3Y9, PDR-0012/0015). The ONLY persisted
+  // review artifact: a single auto-threaded `review_comments` table (review = vue dérivée).
+  // `review_comment_list` reads the auto-threaded feed of a `(workspace, repository)`.
+  | "review_comment_list"
+  // `review_comment_post` leaves a HUMAN comment/reply (global/anchored/threaded). The MCP
+  // agent façade posts the SAME model as the agent. A mutation pushes `repos://changed`.
+  | "review_comment_post"
+  // `review_comment_resolve` / `review_comment_reopen` — the HUMAN-ONLY resolution transitions
+  // (there is DELIBERATELY no MCP resolve tool — the agent never resolves).
+  | "review_comment_resolve"
+  | "review_comment_reopen"
+  // v2.4 review TASKS (finding = task) + unread (task 01KX0F6JEKCEV2JCTMEBMM3P4Z, PDR-0012). The
+  // promotion "grill": `review_task_promote` is the HUMAN lâche brut (a `proposed` task
+  // from a comment); the agent structures it via the MCP `review_task_structure` tool; and
+  // `review_task_validate` is the HUMAN validation (there is DELIBERATELY no MCP validate tool
+  // — the agent never validates). `review_task_list` reads the promoted-task list. Each
+  // mutation pushes `repos://changed`.
+  | "review_task_promote"
+  | "review_task_validate"
+  | "review_task_list"
+  // `review_unread` reads the unread comment count of a `(workspace, repository)` feed;
+  // `review_mark_read` zeroes it (stamps the read watermark). A mark-read pushes `repos://changed`.
+  | "review_unread"
+  | "review_mark_read"
+  // `review_remap` re-anchors every open anchored comment of a `(workspace, repository)` against
+  // the repo's CURRENT HEAD (the phase-4 `remap_repo_comments` engine): an anchor whose snippet
+  // moved FOLLOWS the code, one whose snippet vanished flips `outdated`. Invoked by a LIVING
+  // review after a `repos://changed` push (a commit/checkout advanced the repo), so the anchors
+  // stay true to the moving diff. A mutation → pushes `repos://changed` (the feed re-pulls the
+  // re-mapped/outdated anchors live).
+  | "review_remap"
   // integrations
   | "integration_list"
   | "integration_install"
@@ -404,4 +768,8 @@ export type BackendEvent =
   // The Spec domain (Specs / revisions / tasks / dependencies) — the v2.4 authoring +
   // transition MCP tools push this (`ChangedTopic::Specs` → `specs://changed`) so an open
   // Specs board / PRD detail re-pulls after a mutation with NO reload or poll.
-  | "specs://changed";
+  | "specs://changed"
+  // v2.4 (task 01KX0F6GDZEH3YN6QJDB7FC0WC / 01KX0F6GY96096AHWD8RZ2BMM0): a WATCHED repo's
+  // work-tree/ref changed (edit / commit / checkout). The living review re-pulls the
+  // affected repo's `repo_diff` / `repo_git_view` — the "sans polling" refresh (Q-015).
+  | "repos://changed";

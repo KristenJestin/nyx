@@ -138,6 +138,15 @@ pub fn dispatch(
         events.emit(Event::Changed {
             topic: "agent-sessions".to_string(),
         });
+    } else if mutates_review_comments(command) {
+        // A review COMMENT mutation (post/reply/resolve/reopen) broadcasts `repos://changed`
+        // — the SAME topic the git-watch pushes and the MCP `review_comment_post` tool emits
+        // via its `Repos` effect — so an open review panel re-pulls `review_comment_list`
+        // live (a human post appears without a reload, symmetric to the agent's MCP reply).
+        // The only subscribers are pure readers (the comment list), so no reconcile loop.
+        events.emit(Event::Changed {
+            topic: "repos".to_string(),
+        });
     }
     Ok(result)
 }
@@ -991,6 +1000,357 @@ impl Ctx<'_> {
                     .ok_or_else(|| format!("unknown spec {spec_id}"))?;
                 Self::json(&activity)
             }
+            // The v2.4 Git DIFF read model (task 01KX0F6FD836YASVYT17YV3FTW, PDR-0007/0015): the
+            // line-level diff of ONE repository within a workspace for a review surface
+            // (working_tree/staged/unstaged/untracked/commit/range/branches), LIVING or PINNED —
+            // the EXACT same `nyx_core::git_diff` engine the MCP `repo_diff` tool serves (PDR-0005:
+            // one authority for UI + MCP). gix primary, git CLI fallback. The (workspace,repository)
+            // pair resolves to ONE repo's absolute path so the diff never mixes Git identities. A
+            // pure read: no mutation, no `changed` broadcast, nothing persisted (PDR-0013).
+            "repo_diff" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let kind = self.arg_str("kind")?;
+                let rev = self.arg_opt_str("rev");
+                let base = self.arg_opt_str("base");
+                let target = self.arg_opt_str("target");
+                let mode = self.arg_opt_str("mode");
+
+                let diff_target = nyx_core::git_diff::target_from_params(
+                    &kind,
+                    rev.as_deref(),
+                    base.as_deref(),
+                    target.as_deref(),
+                )?;
+                let mode_override = nyx_core::git_diff::mode_from_str(mode.as_deref())?;
+
+                let absolute_path = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::repository::member_absolute_path(c, &workspace_id, &repository_id)
+                    })
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| {
+                        format!("no repository {repository_id} in workspace {workspace_id}")
+                    })?;
+
+                let effective_mode = mode_override.unwrap_or_else(|| diff_target.default_mode());
+                let diff = nyx_core::git_diff::diff_repo_with_mode(
+                    &absolute_path,
+                    &diff_target,
+                    effective_mode,
+                )
+                .map_err(|e| e.to_string())?;
+                Self::json(&diff)
+            }
+            // The v2.4 DERIVED GIT VIEWS read model (task 01KX0F6FXE6AJ9BR4BYHRX6B1R, Q-015 /
+            // PDR-0013): the per-repo dirty state (staged/modified/untracked), current branch +
+            // base/target, ahead/behind, and change summary — RE-READ from Git on demand — the
+            // EXACT same `nyx_core::git_views::repo_view_with_target` the MCP `repo_git_view` tool
+            // serves (PDR-0005). The (workspace,repository) pair resolves to ONE repo's absolute
+            // path (no identity mixing). A pure read: no mutation, no broadcast, nothing persisted.
+            "repo_git_view" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let base = self.arg_opt_str("base");
+                let target = self.arg_opt_str("target");
+
+                let absolute_path = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::repository::member_absolute_path(c, &workspace_id, &repository_id)
+                    })
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| {
+                        format!("no repository {repository_id} in workspace {workspace_id}")
+                    })?;
+
+                let view = nyx_core::git_views::repo_view_with_target(
+                    &absolute_path,
+                    base.as_deref(),
+                    target.as_deref(),
+                );
+                Self::json(&view)
+            }
+            // The v2.4 REAL-TIME REFRESH registration (task 01KX0F6GDZEH3YN6QJDB7FC0WC, Q-015):
+            // begin watching a `(workspace, repository)` so a work-tree/ref change (edit /
+            // commit / checkout) recomputes the derived view and PUSHES `repos://changed` over
+            // the SAME v2.1 pipe the domain events ride — no polling, debounced. A review surface
+            // calls this as it opens; `repo_unwatch` releases it as it closes. The (workspace,
+            // repository) pair resolves to ONE repo's absolute path (no identity mixing). Returns
+            // null; the ongoing effect is the pushed refreshes, not this call's result. A missing
+            // git-watch runtime (a bare pre-`attach_events` state) or an unresolved repo is a
+            // readable error.
+            "repo_watch" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let base = self.arg_opt_str("base");
+                let target = self.arg_opt_str("target");
+
+                let absolute_path = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::repository::member_absolute_path(c, &workspace_id, &repository_id)
+                    })
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| {
+                        format!("no repository {repository_id} in workspace {workspace_id}")
+                    })?;
+
+                let git_watch = self
+                    .runtime
+                    .git_watch()
+                    .ok_or_else(|| "git-watch runtime not started".to_string())?;
+                git_watch.watch(&workspace_id, &repository_id, &absolute_path, base, target);
+                Ok("null".to_string())
+            }
+            // Stop the real-time watch of a `(workspace, repository)` (releases its OS watches).
+            // A pair that was never watched is a no-op success. Returns null.
+            "repo_unwatch" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let git_watch = self
+                    .runtime
+                    .git_watch()
+                    .ok_or_else(|| "git-watch runtime not started".to_string())?;
+                git_watch.unwatch(&workspace_id, &repository_id);
+                Ok("null".to_string())
+            }
+            // --- v2.4 review COMMENTS (task 01KX0F6HEBPK34CV49EREHK3Y9, PDR-0012/0015) ------
+            // The ONLY persisted review artifact: a single auto-threaded `review_comments`
+            // table (review = vue dérivée, no thread/message/finding entity). The UI façade
+            // owns list/post/reply/resolve; the MCP agent façade owns list + post/reply but
+            // NOT resolve (resolution is human-only). Both share `nyx_core::db` (PDR-0005). A
+            // mutation broadcasts `repos://changed` so an open review re-pulls the feed live.
+            //
+            // LIST the auto-threaded feed of a `(workspace, repository)` — roots + replies,
+            // anchored + global, with each comment's outdated/status. Read-only.
+            "review_comment_list" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                // SPEC SCOPING (Finding 41): the review is opened FROM a Spec, so the UI passes
+                // that Spec's id and the feed returns ONLY its comments — comments no longer leak
+                // onto other Specs sharing the `(workspace, repository)`. A missing `specId`
+                // (unscoped read) returns the whole repo feed.
+                let spec_id = self.arg_opt_str("specId");
+                let comments = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::db::list_review_comments(
+                            c,
+                            &workspace_id,
+                            &repository_id,
+                            spec_id.as_deref(),
+                        )
+                    })
+                    .map_err(Self::db_err)?;
+                Self::json(&comments)
+            }
+            // POST a HUMAN comment (a new thread root, an anchored comment, OR a reply). The
+            // UI is the human façade, so `authorType` defaults to `human` (an explicit
+            // `authorType` is honored for parity with the shared model). An anchor is captured
+            // when a `filePath` is given; `lineEnd` defaults to `lineStart`. Returns the row.
+            "review_comment_post" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let body = self.arg_str("body")?;
+                let spec_id = self.arg_opt_str("specId");
+                let parent_id = self.arg_opt_str("parentId");
+                let author_type = self
+                    .arg_opt_str("authorType")
+                    .unwrap_or_else(|| nyx_core::db::AUTHOR_HUMAN.to_string());
+                let author_name = self
+                    .arg_opt_str("authorName")
+                    .unwrap_or_else(|| "You".to_string());
+                let file_path = self.arg_opt_str("filePath");
+                let anchor = file_path.map(|fp| {
+                    let start = self
+                        .args
+                        .get("lineStart")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(1) as i32;
+                    let end = self
+                        .args
+                        .get("lineEnd")
+                        .and_then(|v| v.as_i64())
+                        .map(|e| e as i32)
+                        .unwrap_or(start)
+                        .max(start);
+                    nyx_core::db::CommentAnchor {
+                        file_path: fp,
+                        side: self
+                            .arg_opt_str("side")
+                            .unwrap_or_else(|| nyx_core::db::SIDE_NEW.to_string()),
+                        line_start: start,
+                        line_end: end,
+                        blob: self.arg_opt_str("blob"),
+                        snippet: self.arg_opt_str("snippet"),
+                        context: self.arg_opt_str("context"),
+                    }
+                });
+                let comment = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::db::insert_review_comment(
+                            c,
+                            nyx_core::db::NewComment {
+                                workspace_id: workspace_id.clone(),
+                                repository_id: repository_id.clone(),
+                                spec_id: spec_id.clone(),
+                                parent_id: parent_id.clone(),
+                                author_type: author_type.clone(),
+                                author_name: author_name.clone(),
+                                anchor: anchor.clone(),
+                                body: body.clone(),
+                            },
+                        )
+                    })
+                    .map_err(Self::db_err)?;
+                Self::json(&comment)
+            }
+            // RESOLVE a comment — the HUMAN-ONLY transition (stamps resolved_by_type=human).
+            // Reachable only from this UI façade; the MCP agent façade advertises no resolve
+            // tool, so the agent can never reach this path. Returns the updated row.
+            "review_comment_resolve" => {
+                let id = self.arg_str("id")?;
+                let comment = self
+                    .db()
+                    .with_conn(|c| nyx_core::db::resolve_review_comment(c, &id))
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("unknown review comment {id}"))?;
+                Self::json(&comment)
+            }
+            // RE-OPEN a resolved comment (the human's undo). Human-only, same façade.
+            "review_comment_reopen" => {
+                let id = self.arg_str("id")?;
+                let comment = self
+                    .db()
+                    .with_conn(|c| nyx_core::db::reopen_review_comment(c, &id))
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("unknown review comment {id}"))?;
+                Self::json(&comment)
+            }
+            // --- v2.4 review TASKS (= task) + unread (task 01KX0F6JEKCEV2JCTMEBMM3P4Z) --------
+            // The promotion "grill": the UI façade owns the human's steps (PROMOTE + VALIDATE)
+            // and the read (LIST); the MCP agent façade owns STRUCTURE + LIST but NOT validate
+            // (validation is human-only). A mutation broadcasts `repos://changed` so an open
+            // review re-pulls the task list + unread badge live.
+            //
+            // PROMOTE a comment into a coder task — the grill's FIRST step (the human lâche brut).
+            // Creates a `proposed` task linked to the comment; severity OPTIONAL. Returns it.
+            "review_task_promote" => {
+                let comment_id = self.arg_str("commentId")?;
+                let title = self.arg_opt_str("title");
+                let severity = self.arg_opt_str("severity");
+                let task = self
+                    .db()
+                    .with_conn(|c| {
+                        let comment = nyx_core::db::get_review_comment(c, &comment_id)?
+                            .ok_or(diesel::result::Error::NotFound)?;
+                        // Seed the title from the comment body when the human gave none.
+                        let seed = title.clone().unwrap_or_else(|| comment.body.clone());
+                        nyx_core::db::promote_comment_to_task(
+                            c,
+                            &comment,
+                            &seed,
+                            severity.as_deref(),
+                        )
+                    })
+                    .map_err(Self::db_err)?;
+                Self::json(&task)
+            }
+            // VALIDATE a structured task — the grill's THIRD step (HUMAN-only; the MCP façade
+            // has no validate tool). After this the task is "ready for the coder". Returns it.
+            "review_task_validate" => {
+                let id = self.arg_str("id")?;
+                let task = self
+                    .db()
+                    .with_conn(|c| nyx_core::db::validate_task(c, &id))
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("unknown review task {id}"))?;
+                Self::json(&task)
+            }
+            // LIST the tasks (promoted tasks) of a `(workspace, repository)`, SCOPED to the optional
+            // `specId` (finding #53). The UI façade always passes the Spec the review is opened from,
+            // so a task promoted on one Spec's comment never leaks onto another Spec sharing the same
+            // repo — the tasks counterpart of the comment scoping (#41). Omitting `specId` reads the
+            // whole repo's task list (unscoped). Read-only.
+            "review_task_list" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let spec_id = self.arg_opt_str("specId");
+                let tasks = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::db::list_review_tasks(
+                            c,
+                            &workspace_id,
+                            &repository_id,
+                            spec_id.as_deref(),
+                        )
+                    })
+                    .map_err(Self::db_err)?;
+                Self::json(&tasks)
+            }
+            // The UNREAD count of a `(workspace, repository)` review feed (comments created after
+            // the read watermark). Read-only. Backs the live non-lus badge (re-pulled on
+            // `repos://changed`).
+            "review_unread" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let unread = self
+                    .db()
+                    .with_conn(|c| nyx_core::db::review_unread(c, &workspace_id, &repository_id))
+                    .map_err(Self::db_err)?;
+                Self::json(&unread)
+            }
+            // MARK-READ the review feed of a `(workspace, repository)` — stamp the read watermark
+            // to now (unread → 0). Mutating → broadcasts `repos://changed`. Returns the zeroed
+            // unread state.
+            "review_mark_read" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let unread = self
+                    .db()
+                    .with_conn(|c| nyx_core::db::mark_review_read(c, &workspace_id, &repository_id))
+                    .map_err(Self::db_err)?;
+                Self::json(&unread)
+            }
+            // RE-MAP the anchored comments of a `(workspace, repository)` against the repo's
+            // CURRENT HEAD — the phase-4 `nyx_core::review_comment::remap_repo_comments` engine
+            // (task 01KX0F6HEBPK34CV49EREHK3Y9, PDR-0012). Each open anchored ROOT is re-anchored:
+            // one whose snippet MOVED follows the code (its `line_start`/`blob` refresh), one whose
+            // snippet VANISHED flips `outdated`. This is the LIVING review's "l'ancre suit après un
+            // nouveau commit" step: the review page invokes it after a `repos://changed` push (the
+            // repo advanced), so the moving diff and its anchors stay coherent. A mutation → the
+            // legacy broadcast below emits `repos://changed`, so the open feed re-pulls the
+            // re-mapped/outdated anchors live. The (workspace,repository) resolves to ONE repo's
+            // absolute path (no identity mixing). Returns `{ written }` (rows re-anchored/outdated).
+            "review_remap" => {
+                let workspace_id = self.arg_str("workspaceId")?;
+                let repository_id = self.arg_str("repositoryId")?;
+                let absolute_path = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::repository::member_absolute_path(c, &workspace_id, &repository_id)
+                    })
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| {
+                        format!("no repository {repository_id} in workspace {workspace_id}")
+                    })?;
+                let written = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::review_comment::remap_repo_comments(
+                            c,
+                            &absolute_path,
+                            &workspace_id,
+                            &repository_id,
+                        )
+                    })
+                    .map_err(Self::db_err)?;
+                Self::json(&serde_json::json!({ "written": written }))
+            }
             // --- managed-command templates / instances (read + CRUD + source/import).
             //     The RUNTIME start/stop/relaunch ride the typed pipe kinds; output +
             //     acknowledge route below to the live runner. ----------------------
@@ -1300,6 +1660,27 @@ fn mutates_command_templates(command: &str) -> bool {
             | "command_resync_source"
             | "command_unlink_source"
             | "command_import_create"
+    )
+}
+
+/// The review-MUTATING DB commands (v2.4) — each broadcasts `repos://changed` on success so an
+/// open review panel re-pulls its `review_comment_list` feed + `review_task_list` + `review_unread`
+/// badge live, symmetric to the MCP `review_comment_post` / `review_task_structure` tools'
+/// `Repos` effect. The COMMENT mutations (post/resolve/reopen) change the feed and the unread
+/// count; the TASK mutations (promote/validate) change the promoted-task list; `review_mark_read`
+/// zeroes the unread badge; `review_remap` re-anchors/outdates the anchored comments after the
+/// repo advanced — all push `repos://changed`. The pure reads (`review_comment_list`,
+/// `review_task_list`, `review_unread`) are deliberately absent.
+fn mutates_review_comments(command: &str) -> bool {
+    matches!(
+        command,
+        "review_comment_post"
+            | "review_comment_resolve"
+            | "review_comment_reopen"
+            | "review_task_promote"
+            | "review_task_validate"
+            | "review_mark_read"
+            | "review_remap"
     )
 }
 
@@ -2229,6 +2610,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// DONE-CRITERION (task 01KX0F6GDZEH3YN6QJDB7FC0WC, Q-015): a repo modification refreshes
+    /// the derived view and PUSHES the update to the UI + MCP over the v2.1 real-time bus,
+    /// without polling, with debounce. This drives the FULL sidecar chain end to end: the UI
+    /// `repo_watch` db-command registers a real repo on the git-watch runtime built by
+    /// `attach_events`, then an EDIT to the work tree causes a debounced `repos://changed`
+    /// invalidation to land on the SAME pipe the domain events ride (the channel the renderer
+    /// AND — via the shared authority — MCP re-pull on). NO poll loop: the pushes come from the
+    /// fs watch, and an idle repo stays silent.
+    #[test]
+    fn repo_watch_pushes_repos_changed_on_a_real_edit_over_the_v21_pipe() {
+        if nyx_core::proc_util::command("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping ui repo_watch real-time test: git unavailable");
+            return;
+        }
+        let h = Harness::new();
+        // Build the git-watch runtime (+ command/MCP runtimes) as the boot does, so the
+        // `repo_watch` db-command resolves a live runtime rather than erroring.
+        h.runtime.attach_events(&h.events);
+
+        let root = std::env::temp_dir().join(format!(
+            "nyx-ui-repowatch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let ok = nyx_core::proc_util::command("git")
+                .args([
+                    "-c",
+                    "user.email=t@nyx",
+                    "-c",
+                    "user.name=nyx",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        std::fs::write(root.join("README.md"), b"nyx").unwrap();
+        git(&["add", "README.md"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let (_project, root_ws) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::repository::register_project(c, "Nyx", root.to_str().unwrap(), None)
+            })
+            .unwrap();
+        // Resolve the repository id the way the renderer would (from the Git summary).
+        let repos = h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::workspace_git::summary(c, &root_ws.id))
+            .unwrap()
+            .unwrap()
+            .repos;
+        let repository_id = repos[0].repository_id.clone();
+
+        // Register the real-time watch via the UI db-command. The seed refresh pushes one
+        // `repos://changed` immediately (the surface starts from truth).
+        h.run(
+            "repo_watch",
+            serde_json::json!({ "workspaceId": root_ws.id, "repositoryId": repository_id }),
+        )
+        .unwrap();
+        let seeded = wait_until_repos_changed(&h.buf, 1, std::time::Duration::from_secs(3));
+        assert!(seeded, "repo_watch seeded one repos://changed");
+        let after_seed = changed_count(&h.buf, "repos");
+
+        // EDIT the work tree — the watcher must ring (no polling) and push a DEBOUNCED refresh.
+        std::fs::write(root.join("README.md"), b"changed by the user").unwrap();
+        let pushed =
+            wait_until_repos_changed(&h.buf, after_seed + 1, std::time::Duration::from_secs(5));
+        assert!(pushed, "the edit pushed a repos://changed over the pipe");
+
+        // NO POLLING: with the repo idle, the count stops climbing.
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        let quiescent = changed_count(&h.buf, "repos");
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        assert_eq!(
+            changed_count(&h.buf, "repos"),
+            quiescent,
+            "an idle watched repo pushes nothing further — event-driven, not polled"
+        );
+
+        // unwatch releases the watch: no further pushes after a subsequent edit.
+        h.run(
+            "repo_unwatch",
+            serde_json::json!({ "workspaceId": root_ws.id, "repositoryId": repository_id }),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let baseline = changed_count(&h.buf, "repos");
+        std::fs::write(root.join("README.md"), b"after unwatch").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert_eq!(
+            changed_count(&h.buf, "repos"),
+            baseline,
+            "no repos://changed after repo_unwatch — the OS watch was released"
+        );
+
+        h.runtime.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Poll the captured pipe buffer (a TEST aid, not the production mechanism) until at least
+    /// `want` `repos://changed` events have landed or `timeout` elapses.
+    fn wait_until_repos_changed(
+        buf: &Arc<Mutex<Vec<u8>>>,
+        want: usize,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if changed_count(buf, "repos") >= want {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        changed_count(buf, "repos") >= want
+    }
+
     /// DONE-CRITERION (task 01KWHPV33SAV9NV1STSY403CF0): the UI bridge's `workspace_timeline`
     /// db-command serves the SAME bounded read model the MCP `workspace_timeline` tool serves —
     /// the workspace's recent `domain_events` as an oldest-first, capped fil, and NO terminal
@@ -2688,5 +3206,179 @@ mod tests {
             .run("spec_activity", serde_json::json!({ "specId": "nope" }))
             .unwrap_err();
         assert!(err.contains("unknown spec"), "readable error: {err}");
+    }
+
+    /// DONE-CRITERION (task 01KX0F6HEBPK34CV49EREHK3Y9): the UI façade's review-comment
+    /// db-commands post/thread/list, RESOLUTION is human-only (a resolve stamps
+    /// resolved_by_type=human), and each mutation broadcasts `repos://changed` so an open
+    /// review re-pulls the feed live. Drives the REAL `dispatch` end-to-end.
+    #[test]
+    fn review_comment_db_commands_post_thread_list_resolve_human_only() {
+        let h = Harness::new();
+
+        // Post a HUMAN anchored root.
+        let root = h
+            .run(
+                "review_comment_post",
+                serde_json::json!({
+                    "workspaceId": "ws",
+                    "repositoryId": "repo",
+                    "body": "this is wrong",
+                    "filePath": "src/a.rs",
+                    "side": "new",
+                    "lineStart": 5,
+                    "lineEnd": 6,
+                }),
+            )
+            .unwrap();
+        let root: serde_json::Value = serde_json::from_str(&root).unwrap();
+        assert_eq!(
+            root["author_type"],
+            serde_json::json!("human"),
+            "UI posts as human"
+        );
+        assert_eq!(root["file_path"], serde_json::json!("src/a.rs"));
+        assert_eq!(root["line_start"], serde_json::json!(5));
+        let root_id = root["id"].as_str().unwrap().to_string();
+
+        // A comment mutation broadcasts repos://changed (the UI re-pulls the feed).
+        assert_eq!(
+            changed_count(&h.buf, "repos"),
+            1,
+            "post broadcasts repos://changed"
+        );
+
+        // Reply (thread under the root).
+        h.run(
+            "review_comment_post",
+            serde_json::json!({
+                "workspaceId": "ws",
+                "repositoryId": "repo",
+                "parentId": root_id,
+                "body": "agreed",
+            }),
+        )
+        .unwrap();
+        assert_eq!(changed_count(&h.buf, "repos"), 2, "reply broadcasts too");
+
+        // List: the auto-threaded feed (root + reply), oldest-first.
+        let listed = h
+            .run(
+                "review_comment_list",
+                serde_json::json!({ "workspaceId": "ws", "repositoryId": "repo" }),
+            )
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        let arr = listed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], serde_json::json!(root_id));
+        assert_eq!(arr[1]["parent_id"], serde_json::json!(root_id));
+
+        // RESOLVE — human-only: stamps resolved_by_type=human.
+        let resolved = h
+            .run(
+                "review_comment_resolve",
+                serde_json::json!({ "id": root_id }),
+            )
+            .unwrap();
+        let resolved: serde_json::Value = serde_json::from_str(&resolved).unwrap();
+        assert_eq!(resolved["status"], serde_json::json!("resolved"));
+        assert_eq!(resolved["resolved_by_type"], serde_json::json!("human"));
+        assert_eq!(changed_count(&h.buf, "repos"), 3, "resolve broadcasts too");
+
+        // Re-open clears it.
+        let reopened = h
+            .run(
+                "review_comment_reopen",
+                serde_json::json!({ "id": root_id }),
+            )
+            .unwrap();
+        let reopened: serde_json::Value = serde_json::from_str(&reopened).unwrap();
+        assert_eq!(reopened["status"], serde_json::json!("open"));
+        assert!(reopened["resolved_by_type"].is_null());
+    }
+
+    /// FINDING 41 (comments leak between Specs): `review_comment_post` carries the `specId` and
+    /// `review_comment_list` FILTERS by it, so a comment posted while reviewing Spec A appears on
+    /// Spec A ONLY — never on Spec B, even though both share the same `(workspace, repository)`.
+    /// A reply INHERITS its root's Spec, and an unscoped list (no `specId`) still sees everything.
+    #[test]
+    fn review_comment_db_commands_scope_by_spec() {
+        let h = Harness::new();
+
+        // A comment posted while reviewing Spec A.
+        let a = h
+            .run(
+                "review_comment_post",
+                serde_json::json!({
+                    "workspaceId": "ws",
+                    "repositoryId": "repo",
+                    "specId": "specA",
+                    "body": "A-scoped remark",
+                }),
+            )
+            .unwrap();
+        let a: serde_json::Value = serde_json::from_str(&a).unwrap();
+        assert_eq!(a["spec_id"], serde_json::json!("specA"));
+        let a_id = a["id"].as_str().unwrap().to_string();
+
+        // A reply WITHOUT an explicit specId inherits specA from its root.
+        let reply = h
+            .run(
+                "review_comment_post",
+                serde_json::json!({
+                    "workspaceId": "ws",
+                    "repositoryId": "repo",
+                    "parentId": a_id,
+                    "body": "inherits A",
+                }),
+            )
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["spec_id"], serde_json::json!("specA"), "reply inherits root spec");
+
+        // A comment posted while reviewing Spec B (same workspace+repo).
+        h.run(
+            "review_comment_post",
+            serde_json::json!({
+                "workspaceId": "ws",
+                "repositoryId": "repo",
+                "specId": "specB",
+                "body": "B-scoped remark",
+            }),
+        )
+        .unwrap();
+
+        // Spec A's scoped feed = its root + its inherited reply (NOT B's comment).
+        let list_a = h
+            .run(
+                "review_comment_list",
+                serde_json::json!({ "workspaceId": "ws", "repositoryId": "repo", "specId": "specA" }),
+            )
+            .unwrap();
+        let list_a: serde_json::Value = serde_json::from_str(&list_a).unwrap();
+        let arr_a = list_a.as_array().unwrap();
+        assert_eq!(arr_a.len(), 2, "Spec A sees only its own thread (no leak from B)");
+        assert!(arr_a.iter().all(|c| c["spec_id"] == serde_json::json!("specA")));
+
+        // Spec B's scoped feed = only B's comment.
+        let list_b = h
+            .run(
+                "review_comment_list",
+                serde_json::json!({ "workspaceId": "ws", "repositoryId": "repo", "specId": "specB" }),
+            )
+            .unwrap();
+        let list_b: serde_json::Value = serde_json::from_str(&list_b).unwrap();
+        assert_eq!(list_b.as_array().unwrap().len(), 1, "Spec B sees only its own comment");
+
+        // The UNSCOPED read (no specId) still returns the whole repo feed (agent façade / aggregate).
+        let list_all = h
+            .run(
+                "review_comment_list",
+                serde_json::json!({ "workspaceId": "ws", "repositoryId": "repo" }),
+            )
+            .unwrap();
+        let list_all: serde_json::Value = serde_json::from_str(&list_all).unwrap();
+        assert_eq!(list_all.as_array().unwrap().len(), 3, "unscoped read sees all three");
     }
 }

@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { LayoutGridIcon, ListIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { Breadcrumb, BreadcrumbCurrent } from "@/components/ui/breadcrumb";
 import { Spinner } from "@/components/ui/spinner";
 import { useActiveProject } from "@/components/terminals/active-project";
 
@@ -54,9 +55,14 @@ export function BoardPage() {
 
   return (
     <div className="flex h-svh flex-col bg-background px-6 pb-6 pt-10">
-      {/* Header — title + subtitle, and the kanban/list view toggle. */}
+      {/* Header — the SHARED breadcrumb (Finding 47: `Work` — the board IS the Work root), the
+          title + subtitle, and the kanban/list view toggle. The breadcrumb harmonises this header
+          with the Spec detail (`Work / <specKey>`) and the review (`Work / <specKey> / Review`). */}
       <header className="mb-5 flex items-start justify-between gap-4">
         <div className="min-w-0">
+          <Breadcrumb className="mb-2">
+            <BreadcrumbCurrent>Work</BreadcrumbCurrent>
+          </Breadcrumb>
           <h1 className="font-heading text-xl font-semibold tracking-tight text-foreground">
             Specs
           </h1>

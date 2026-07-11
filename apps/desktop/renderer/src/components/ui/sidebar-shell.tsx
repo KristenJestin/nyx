@@ -1,22 +1,33 @@
+import { motion, type Transition, useReducedMotion } from "motion/react";
 import type * as React from "react";
 
 import { cn } from "@/lib/utils";
 
 /**
- * `<SidebarShell>` — the SHARED left-hand sidebar CHASSIS used by both full-page rails:
- * the Terminals cockpit (`terminals-page`) and the PRD detail (`spec-detail-page`). It owns
- * only the SHELL — fixed width + LEFT position + right border + full height + the scrollable
- * content region + the surface tokens — matching the terminal sidebar exactly. The CONTENT is
- * injected per page (the terminals page injects its workspace nav; the PRD detail injects its
- * STATUS / MODE / REPOSITORIES / WORKSPACE sections), so the two rails stay one primitive with
- * one geometry and never drift apart again (review finding: two independent sidebars, no shared
- * primitive → extract a common shell, both pages to the LEFT).
+ * `<SidebarShell>` — the SHARED sidebar CHASSIS. It began as the fixed LEFT rail of both full-page
+ * cockpits (the Terminals page + the PRD detail) and now ALSO serves the review screen's two flanks
+ * (PDR-0028): a LEFT files rail and a RIGHT, closable comments rail — the SAME primitive placed in
+ * mirror.
  *
- * Layout contract: a `w-[260px] shrink-0` column so it holds its width whether it sits in a
- * flex row (the sibling main uses `flex-1 min-w-0`) or standalone. The optional `header` slot
- * renders in a bordered header block at the top (the terminals page's project title); the
- * `children` fill the SCROLLABLE region below it. Tokens only — no raw hex, no magic px beyond
- * the one shared width.
+ * ## Two shapes, one primitive
+ * - DEFAULT (`side="left"`, non-collapsible): the original geometry — a `w-[260px] shrink-0`, full-
+ *   height column with a RIGHT border and the muted surface. The existing rails (app-sidebar,
+ *   terminal, spec) render EXACTLY as before (their tests pin these classes), so nothing drifts.
+ * - `side="right"`: the mirror — the border moves to the LEFT edge, geometry otherwise identical.
+ * - `collapsible` + `open`: a closable rail whose WIDTH animates between its open width and `0`
+ *   (the prototype's `motion` width idiom), driven ENTIRELY by the parent (`open` is controlled).
+ *   Reduced-motion collapses instantly.
+ *
+ * ## One toggle per flank (Finding 46)
+ * A `collapsible` rail carries NO built-in close affordance: it is opened/closed SOLELY by its
+ * parent's control (in the review, the two ReviewHeader buttons — the panel-left button for the
+ * LEFT files rail, the comment button for the RIGHT comments rail). This removes the earlier
+ * asymmetry where the RIGHT rail had a redundant internal "Close panel" arrow (a second control for
+ * the same panel) while the LEFT had none — now both flanks behave identically, with the header
+ * buttons as the single source of truth.
+ *
+ * The `header` slot renders in a bordered, non-scrolling block at the top; `children` fill the
+ * scrollable region below. Tokens only — no raw hex, no magic px beyond the shared width.
  */
 export function SidebarShell({
   header,
@@ -24,29 +35,88 @@ export function SidebarShell({
   className,
   contentClassName,
   "aria-label": ariaLabel,
+  side = "left",
+  collapsible = false,
+  open = true,
+  width = 260,
 }: {
   /** Optional pinned header block (bordered, non-scrolling) at the top of the rail. */
   header?: React.ReactNode;
   /** The scrollable rail content (nav / sections). */
   children: React.ReactNode;
-  /** Extra classes on the `<aside>` shell (rarely needed — geometry is fixed). */
+  /** Extra classes on the shell (rarely needed — geometry is fixed). */
   className?: string;
   /** Extra classes on the scrollable content region. */
   contentClassName?: string;
   "aria-label"?: string;
+  /** Which flank the rail sits on: `left` (default, right border) or `right` (mirror, left border). */
+  side?: "left" | "right";
+  /** When true, the rail's width animates between `width` and `0` on `open` (a closable panel). */
+  collapsible?: boolean;
+  /** The open state of a `collapsible` rail — controlled ENTIRELY by the parent (Finding 46: the
+   *  rail has no internal toggle; its owning page's header button is the single open/close control).
+   *  Ignored when not collapsible. */
+  open?: boolean;
+  /** The rail's open width in px (collapsible mode). Defaults to the shared 260. */
+  width?: number;
 }) {
+  const reduce = useReducedMotion();
+  const borderClass = side === "right" ? "border-l" : "border-r";
+
+  const headerBlock =
+    header != null ? (
+      <div className="shrink-0 border-b border-border/60 px-3 py-3">{header}</div>
+    ) : null;
+  const body = (
+    <div className={cn("min-h-0 flex-1 overflow-y-auto", contentClassName)}>{children}</div>
+  );
+
+  // DEFAULT (non-collapsible): the original fixed-width rail geometry, mirrored by `side`. The
+  // existing left rails MUST keep these exact classes (their tests assert them).
+  if (!collapsible) {
+    return (
+      <aside
+        aria-label={ariaLabel}
+        // The default width lives in the `w-[260px]` class (existing rails pin it). A non-default
+        // `width` (e.g. the review's always-open 300px files rail, Finding 58) overrides it inline;
+        // the 260 default sets no inline style so those rails render byte-identically to before.
+        style={width === 260 ? undefined : { width }}
+        className={cn(
+          "flex h-svh w-[260px] shrink-0 flex-col bg-muted/40",
+          `${borderClass} border-border/60`,
+          className,
+        )}
+      >
+        {headerBlock}
+        {body}
+      </aside>
+    );
+  }
+
+  // COLLAPSIBLE: the width animates open↔0 (prototype idiom). Kept mounted (aria-hidden when
+  // closed) so re-opening animates back rather than remounting. The inner column holds a FIXED
+  // width so its content does not reflow while the outer width animates. No internal close control
+  // (Finding 46) — the parent's header button is the single open/close affordance for the rail.
+  const T: Transition = reduce ? { duration: 0 } : { type: "spring", duration: 0.4, bounce: 0.15 };
+
   return (
-    <aside
+    <motion.aside
       aria-label={ariaLabel}
+      aria-hidden={!open}
+      data-open={open}
+      initial={false}
+      animate={{ width: open ? width : 0 }}
+      transition={T}
       className={cn(
-        "flex h-svh w-[260px] shrink-0 flex-col border-r border-border/60 bg-muted/40",
+        "h-svh shrink-0 overflow-hidden bg-muted/40",
+        `${borderClass} border-border/60`,
         className,
       )}
     >
-      {header != null ? (
-        <div className="shrink-0 border-b border-border/60 px-3 py-3">{header}</div>
-      ) : null}
-      <div className={cn("min-h-0 flex-1 overflow-y-auto", contentClassName)}>{children}</div>
-    </aside>
+      <div style={{ width }} className="flex h-full flex-col">
+        {headerBlock}
+        {body}
+      </div>
+    </motion.aside>
   );
 }

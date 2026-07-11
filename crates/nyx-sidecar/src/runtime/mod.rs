@@ -27,6 +27,7 @@ pub mod command;
 pub mod db;
 pub mod db_command;
 pub mod events;
+pub mod git_watch;
 pub mod mcp;
 pub mod pty;
 pub mod recovery;
@@ -43,6 +44,7 @@ use nyx_core::db::Db;
 use crate::pipe::wire::{Request, Response};
 use command::{CommandRuntime, SidecarRunnerSink};
 use events::EventSink;
+use git_watch::GitWatchRuntime;
 use mcp::McpRuntime;
 
 /// The env flag that OPTS IN the boot-time Claude-plugin reconcile (`NYX_RECONCILE_CLAUDE_PLUGIN`).
@@ -87,6 +89,12 @@ pub struct Runtime {
     command: Arc<Mutex<Option<Arc<CommandRuntime>>>>,
     /// The MCP HTTP runtime (HHD), built with the command runtime.
     mcp: Arc<Mutex<Option<Arc<McpRuntime>>>>,
+    /// The v2.4 real-time GIT-WATCH runtime (Q-015): the fs-watch + debounce engine that
+    /// recomputes the derived Git views on a work-tree/ref change and PUSHES `repos://changed`
+    /// over the pipe. Built once the pipe [`EventSink`] exists ([`Runtime::attach_events`]);
+    /// `None` before then. The `repo_watch` / `repo_unwatch` db-commands (+ MCP tools)
+    /// register/unregister a `(workspace, repository)` as its review surface opens/closes.
+    git_watch: Arc<Mutex<Option<Arc<GitWatchRuntime>>>>,
     /// The shared runner cell the MCP dispatcher routes runtime command tools onto (the
     /// SAME cell the command runtime fills) — built before OR after the MCP server.
     runner_cell: Arc<Mutex<Option<Arc<CommandRunner<SidecarRunnerSink>>>>>,
@@ -175,6 +183,7 @@ impl Runtime {
             pty: Arc::new(pty::PtyManager::new()),
             command: Arc::new(Mutex::new(None)),
             mcp: Arc::new(Mutex::new(None)),
+            git_watch: Arc::new(Mutex::new(None)),
             runner_cell: Arc::new(Mutex::new(None)),
             activity: Arc::new(AgentActivityStore::new()),
             data_dir,
@@ -206,9 +215,20 @@ impl Runtime {
             // per-turn hooks write is the one the pipe `agent_activity_snapshot` reads.
             Arc::clone(&self.activity),
             events.clone(),
+            // Share the git-watch CELL (filled just below) so the MCP `repo_watch` /
+            // `repo_unwatch` tools drive the SAME watcher the UI db-commands do. The
+            // dispatcher reads the cell lazily on each call, so filling it after this is fine.
+            Arc::clone(&self.git_watch),
         ));
         *self.command.lock().unwrap() = Some(Arc::clone(&command));
         *self.mcp.lock().unwrap() = Some(mcp);
+
+        // Start the v2.4 real-time GIT-WATCH runtime (Q-015) over the SAME pipe `events`
+        // sink the domain events ride: an fs-watch + debounce engine that recomputes the
+        // derived Git views on a work-tree/ref change and pushes `repos://changed`. No repo
+        // is watched until a review surface registers one via `repo_watch` — so a bare boot
+        // starts zero watches (nothing to thrash on).
+        *self.git_watch.lock().unwrap() = Some(GitWatchRuntime::start(events.clone()));
 
         // CRASH RECONCILE (Phase 4 — `01KWCJPFP9JSJMRDZGW2E0N905`): BEFORE the boot restore,
         // detect whether the PREVIOUS run shut down cleanly. If it CRASHED, flag every
@@ -373,6 +393,13 @@ impl Runtime {
     /// The MCP runtime (once [`attach_events`](Runtime::attach_events) ran).
     pub fn mcp(&self) -> Option<Arc<McpRuntime>> {
         self.mcp.lock().unwrap().clone()
+    }
+
+    /// The v2.4 real-time git-watch runtime (once [`attach_events`](Runtime::attach_events)
+    /// ran). The `repo_watch` / `repo_unwatch` db-commands register a `(workspace,
+    /// repository)` with it as a review surface opens/closes.
+    pub fn git_watch(&self) -> Option<Arc<GitWatchRuntime>> {
+        self.git_watch.lock().unwrap().clone()
     }
 
     /// The SHARED runtime agent-activity store (the live dot the MCP hooks write + the

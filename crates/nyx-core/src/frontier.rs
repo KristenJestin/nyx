@@ -50,6 +50,11 @@ pub enum ChangedTopic {
     Workspaces,
     Commands,
     AgentSessions,
+    /// A watched repository's Git state changed (v2.4 Q-015): the real-time git
+    /// watcher ([`crate::git_watch`]) recomputed a derived view after a debounced
+    /// work-tree / ref change. The renderer (and MCP) re-pull the affected repo's
+    /// `repo_git_view` / `repo_diff`.
+    Repos,
 }
 
 /// Frontier 2 — **paths in**. The two filesystem locations the core needs, resolved

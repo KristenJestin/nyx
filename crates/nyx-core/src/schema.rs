@@ -342,6 +342,85 @@ diesel::table! {
     }
 }
 
+// - v16 (v2.4 Phase 4 — the `review_comments` table, task 01KX0F6HEBPK34CV49EREHK3Y9)
+//   is the ONLY persisted review artifact (PDR-0012/0015: review = vue dérivée, no
+//   review/thread/message/finding entity). ONE auto-threaded table: `parent_id`
+//   (Nullable<Text>, self-FK CASCADE) — NULL = a thread ROOT, non-NULL = a reply. Anchor
+//   columns (`file_path`/`side`/`line_start`/`line_end`/`blob`/`snippet`/`context`) are all
+//   Nullable (all NULL = a GLOBAL comment); `outdated` is a SQLite INTEGER 0/1 boolean ↔
+//   Diesel `Bool`. `author_type` (human|agent) / `status` (open|resolved) / `side`
+//   (old|new) / `resolved_by_type` (human|agent) are CHECK-enforced TEXT. Resolution is
+//   HUMAN-ONLY (enforced in the use-case layer + the MCP façade, which has no resolve). The
+//   correlation ids (`workspace_id`/`repository_id`/`spec_id`) are plain values (no FK to
+//   workspaces/repositories) so a comment survives Git churn / an archive, like
+//   `domain_events`. Column ORDER here must match the SQL migration exactly (Diesel
+//   positional decoding).
+diesel::table! {
+    review_comments (id) {
+        id -> Text,
+        workspace_id -> Text,
+        repository_id -> Text,
+        spec_id -> Nullable<Text>,
+        parent_id -> Nullable<Text>,
+        author_type -> Text,
+        author_name -> Text,
+        file_path -> Nullable<Text>,
+        side -> Nullable<Text>,
+        line_start -> Nullable<Integer>,
+        line_end -> Nullable<Integer>,
+        blob -> Nullable<Text>,
+        snippet -> Nullable<Text>,
+        context -> Nullable<Text>,
+        outdated -> Bool,
+        body -> Text,
+        status -> Text,
+        resolved_by_type -> Nullable<Text>,
+        created_at -> BigInt,
+    }
+}
+
+// - v17 (v2.4 Phase 5 — the `review_tasks` + `review_reads` tables, task
+//   01KX0F6JEKCEV2JCTMEBMM3P4Z) implement `finding = task`: a comment PROMOTED for the coder
+//   becomes a `review_tasks` row (the promoted comment IS the coder task, PDR-0012). It links
+//   its source comment via `from_comment_id` (NOT NULL Text, plain correlation, no FK CASCADE —
+//   a task is durable coder work that survives Git churn / an archive, like `review_comments`
+//   / `domain_events`). `title` (NOT NULL) / `details` (Nullable) carry the task text; `severity`
+//   (Nullable, CHECK info|low|medium|high|critical) is OPTIONAL; `grill_state` (NOT NULL, CHECK
+//   proposed|structured|validated) models the "grill" — proposed (human lâche brut) → structured
+//   (agent structures via MCP) → validated (human validates; only then ready for the coder). The
+//   human-only validate + agent-only structure are enforced at the use-case + MCP façade.
+//   `review_reads` is the UNREAD watermark (reuse of the runtime `unread` pattern): ONE row per
+//   (workspace, repository) whose `last_read_at` (NOT NULL BigInt epoch-ms) is the instant the
+//   human last saw the feed — the unread count is the comments created strictly after it, and
+//   mark-read stamps it `now`. Column ORDER here must match the SQL migration exactly (Diesel
+//   positional decoding).
+diesel::table! {
+    review_tasks (id) {
+        id -> Text,
+        workspace_id -> Text,
+        repository_id -> Text,
+        from_comment_id -> Text,
+        title -> Text,
+        details -> Nullable<Text>,
+        severity -> Nullable<Text>,
+        grill_state -> Text,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        // v18: appended LAST by `ALTER TABLE ADD COLUMN` — the physical column order this must
+        // mirror (Diesel positional decoding). The Spec a promoted task is scoped to (NULL =
+        // un-scoped), inherited from its source comment (finding #53).
+        spec_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    review_reads (workspace_id, repository_id) {
+        workspace_id -> Text,
+        repository_id -> Text,
+        last_read_at -> BigInt,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
 diesel::joinable!(managed_commands -> projects (project_id));
@@ -367,6 +446,9 @@ diesel::allow_tables_to_appear_in_same_query!(
     managed_commands,
     projects,
     repositories,
+    review_comments,
+    review_reads,
+    review_tasks,
     spec_revisions,
     specs,
     task_dependencies,

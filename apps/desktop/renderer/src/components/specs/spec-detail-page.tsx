@@ -10,6 +10,7 @@ import {
   TerminalIcon,
 } from "lucide-react";
 
+import { Breadcrumb, BreadcrumbCurrent, breadcrumbLinkClass } from "@/components/ui/breadcrumb";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs } from "@/components/ui/tabs";
 
@@ -59,7 +60,8 @@ function tabCount(key: SpecTabKey, detail: SpecDetail): number | null {
  * via `useSpecDetail`:
  *  - spec → the active revision; tasks → tasks + dependencies;
  *  - activity / runtime → the DERIVED workspace context (the phase-3 Spec→workspace link);
- *  - review → a PLACEHOLDER / anchor point (the review content grafts in v2.5).
+ *  - review → the Spec-scoped review comments + an "Open review" button onto the full-screen
+ *    review page (`/work/$specId/review`), PDR-0028.
  */
 export function SpecDetailPage() {
   const { specId } = routeApi.useParams();
@@ -94,17 +96,17 @@ export function SpecDetailPage() {
       <SpecSidebar detail={detail} />
 
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* Header — breadcrumb + title + human key. */}
+        {/* Header — breadcrumb + title + human key. Uses the SHARED `<Breadcrumb>` so the board,
+            this detail and the review page all render the same crumb chrome (Finding 47). */}
         <header className="shrink-0 px-8 pb-4 pt-7">
-          <nav className="mb-3 flex items-center gap-1.5 text-2xs text-muted-foreground">
-            <Link to="/work" className="hover:text-foreground">
+          <Breadcrumb className="mb-3">
+            <Link to="/work" className={breadcrumbLinkClass}>
               Work
             </Link>
-            <span aria-hidden>/</span>
-            <span className="font-mono text-foreground/80">
+            <BreadcrumbCurrent mono>
               {specKey(detail.workspace_context?.project.key ?? "", spec.number)}
-            </span>
-          </nav>
+            </BreadcrumbCurrent>
+          </Breadcrumb>
           <div className="flex items-start justify-between gap-4">
             <div className="flex min-w-0 items-center gap-2.5">
               <h1 className="min-w-0 truncate font-heading text-xl font-semibold tracking-tight text-foreground">
@@ -148,7 +150,7 @@ export function SpecDetailPage() {
             <Tabs.Panel value="tasks">
               <TasksTab detail={detail} />
             </Tabs.Panel>
-            <Tabs.Panel value="review">
+            <Tabs.Panel value="review" className="h-full">
               <ReviewTab detail={detail} />
             </Tabs.Panel>
             <Tabs.Panel value="annexes">

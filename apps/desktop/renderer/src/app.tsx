@@ -1,8 +1,11 @@
 import "@/globals.css";
 
+import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
 
+import { queryClient } from "@/lib/query";
 import { router } from "@/router";
+import { ReviewLiveSync } from "@/components/review/review-live-sync";
 import { Toaster } from "@/components/ui/toast";
 
 /**
@@ -16,6 +19,12 @@ import { Toaster } from "@/components/ui/toast";
  * workspace. The runtime backend it consumed is preserved and re-consumed by the
  * Terminals page under the shell.
  *
+ * `<QueryClientProvider>` wraps the whole app so the review data layer (and any future
+ * migrated surface) shares ONE TanStack Query cache (PDR-0029). The SAME `queryClient` is
+ * threaded into the router's context (`createRouter({ context: { queryClient } })`) so a
+ * route loader can `ensureQueryData`. `<ReviewLiveSync>` installs the single global
+ * `repos://changed` → `invalidateQueries` bridge (replacing the old per-hook subscriptions).
+ *
  * `<Toaster>` is mounted ONCE here — the single app-wide toast host (bottom-right,
  * above every modal). Mutations across the app push onto its global manager via the
  * `toast.*` helper, so the system has one stack regardless of which surface fired it.
@@ -26,10 +35,11 @@ import { Toaster } from "@/components/ui/toast";
  */
 function App() {
   return (
-    <>
+    <QueryClientProvider client={queryClient}>
+      <ReviewLiveSync />
       <RouterProvider router={router} />
       <Toaster />
-    </>
+    </QueryClientProvider>
   );
 }
 

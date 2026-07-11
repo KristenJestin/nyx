@@ -37,6 +37,14 @@ export default defineConfig(async () => ({
     Icons({ compiler: "jsx", jsx: "react" }),
   ],
 
+  // The @pierre/diffs syntax-highlight worker (the `?worker` import in
+  // `components/review/diffs-worker.ts`) code-splits its Shiki grammars + the inlined Oniguruma
+  // WASM into on-demand chunks, so it MUST be emitted as an ES-module worker: Vite's default
+  // `iife` worker format rejects code-splitting ("UMD and IIFE output formats are not supported
+  // for code-splitting builds"). Every chunk (grammars, wasm) is bundled LOCALLY — the review
+  // viewer stays fully offline at runtime (no CDN fetch), which the local app requires (PDR-0028).
+  worker: { format: "es" },
+
   // Statically replace the gate flag at build time so it tree-shakes cleanly:
   // in a production build this becomes `"" !== "1"` → always true → the seam's
   // entire `useEffect` body is dead code Vite/esbuild drops from the bundle.

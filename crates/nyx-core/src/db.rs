@@ -47,7 +47,8 @@ const POOL_MAX_SIZE: u32 = 8;
 use crate::pathnorm;
 use crate::schema::{
     agent_sessions, command_instances, domain_events, managed_commands, projects, repositories,
-    spec_revisions, specs, task_dependencies, tasks, terminals, workspaces,
+    review_comments, review_reads, review_tasks, spec_revisions, specs, task_dependencies, tasks,
+    terminals, workspaces,
 };
 
 /// The migrations baked into the binary at compile time from `migrations/`.
@@ -594,6 +595,560 @@ pub fn list_domain_events(conn: &mut SqliteConnection) -> QueryResult<Vec<Domain
         .order(domain_events::sequence.asc())
         .select(DomainEvent::as_select())
         .load(conn)
+}
+
+// --- review_comments model (v2.4 Phase 4, v16, PDR-0012/0015) --------------
+
+/// `review_comments.author_type` — a HUMAN reviewer.
+pub const AUTHOR_HUMAN: &str = "human";
+/// `review_comments.author_type` — an AGENT (writes via MCP; may reply, never resolve).
+pub const AUTHOR_AGENT: &str = "agent";
+/// `review_comments.side` — the OLD (removed / base) diff side.
+pub const SIDE_OLD: &str = "old";
+/// `review_comments.side` — the NEW (added / target) diff side.
+pub const SIDE_NEW: &str = "new";
+/// `review_comments.status` — open (not yet resolved).
+pub const COMMENT_STATUS_OPEN: &str = "open";
+/// `review_comments.status` — resolved (a HUMAN closed it).
+pub const COMMENT_STATUS_RESOLVED: &str = "resolved";
+
+/// A `review_comments` row: the ONLY persisted review artifact (PDR-0012/0015 — review is a
+/// vue dérivée). Auto-threaded by `parent_id` (`None` = a thread ROOT, `Some` = a reply).
+/// ANCHORED (`file_path` present, + `side`/`line_*`/`blob`/`snippet`/`context` for
+/// re-mapping) or GLOBAL (`file_path` `None`). `Serialize` for the IPC/MCP boundary. The
+/// `(workspace_id, repository_id, spec_id)` correlation is stored as plain values so a
+/// comment survives Git churn / an archive. Resolution is HUMAN-ONLY (the agent/MCP façade
+/// cannot set `status = resolved`).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = review_comments)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct ReviewComment {
+    pub id: String,
+    pub workspace_id: String,
+    pub repository_id: String,
+    /// The OPTIONAL spec the review is bound to (`None` = generic review, PDR-0004).
+    pub spec_id: Option<String>,
+    /// `None` = thread ROOT; `Some(root_id)` = a reply under that root.
+    pub parent_id: Option<String>,
+    /// `human` | `agent`.
+    pub author_type: String,
+    pub author_name: String,
+    /// The anchored changed-file path (`None` = a GLOBAL comment).
+    pub file_path: Option<String>,
+    /// `old` | `new` — which diff side the anchor is on (`None` for a global comment).
+    pub side: Option<String>,
+    /// 1-based anchored line (or range start) on `side`.
+    pub line_start: Option<i32>,
+    /// 1-based range end on `side` (equals `line_start` for a single-line anchor).
+    pub line_end: Option<i32>,
+    /// The blob SHA the anchor was captured on (the re-mapping's starting point).
+    pub blob: Option<String>,
+    /// The anchored line text — the primary snippet the re-mapping relocates.
+    pub snippet: Option<String>,
+    /// The surrounding lines — the re-mapping's disambiguation context.
+    pub context: Option<String>,
+    /// `true` when the anchor could no longer be relocated after the repo advanced.
+    pub outdated: bool,
+    pub body: String,
+    /// `open` | `resolved`.
+    pub status: String,
+    /// WHO resolved it (`None` while open; only ever `human` by policy).
+    pub resolved_by_type: Option<String>,
+    pub created_at: i64,
+}
+
+/// The anchor of a NEW review comment — the where-on-the-diff a comment hangs, plus the
+/// material the re-mapping needs to survive a commit. Absent (`None` on [`NewReviewComment`])
+/// = a GLOBAL comment. `line_end` defaults to `line_start` for a single-line anchor.
+#[derive(Debug, Clone, Default)]
+pub struct CommentAnchor {
+    pub file_path: String,
+    pub side: String,
+    pub line_start: i32,
+    pub line_end: i32,
+    pub blob: Option<String>,
+    pub snippet: Option<String>,
+    pub context: Option<String>,
+}
+
+/// The fields to POST a new review comment (root, reply, or global) — grouped so the
+/// call sites stay readable. `parent_id` `Some` = a reply; `anchor` `Some` = an anchored
+/// comment (a reply inherits its root's anchor at the read layer, so a reply usually
+/// carries no anchor of its own).
+#[derive(Debug, Clone, Default)]
+pub struct NewComment {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub spec_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub author_type: String,
+    pub author_name: String,
+    pub anchor: Option<CommentAnchor>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = review_comments)]
+struct NewReviewCommentRow {
+    id: String,
+    workspace_id: String,
+    repository_id: String,
+    spec_id: Option<String>,
+    parent_id: Option<String>,
+    author_type: String,
+    author_name: String,
+    file_path: Option<String>,
+    side: Option<String>,
+    line_start: Option<i32>,
+    line_end: Option<i32>,
+    blob: Option<String>,
+    snippet: Option<String>,
+    context: Option<String>,
+    outdated: bool,
+    body: String,
+    status: String,
+    resolved_by_type: Option<String>,
+    created_at: i64,
+}
+
+/// INSERT a review comment (a thread root, a reply, or a global comment) and return it.
+/// The author may be `human` OR `agent`; a reply carries a `parent_id`, an anchored comment
+/// carries an `anchor`. A fresh comment is always `open` and never `outdated` at creation
+/// (re-mapping only flips `outdated` later, when the repo advances). Called by BOTH façades
+/// (the UI db-command and the MCP tool), which is why author/anchor are parameters.
+pub fn insert_review_comment(
+    conn: &mut SqliteConnection,
+    new: NewComment,
+) -> QueryResult<ReviewComment> {
+    let anchor = new.anchor;
+    // A REPLY inherits its root's Spec binding: a reply posted without an explicit `spec_id`
+    // (typically an agent reply via MCP, which only knows the `parent_id`) resolves the parent's
+    // `spec_id` so the reply lands in the SAME spec-scoped feed as its root — never orphaned to
+    // the unscoped (`NULL`) bucket where it would drop out of the Spec's review. A ROOT (no
+    // parent), or a reply that was handed an explicit `spec_id`, keeps what it was given.
+    let spec_id = match (new.spec_id, &new.parent_id) {
+        (None, Some(parent_id)) => review_comments::table
+            .find(parent_id)
+            .select(review_comments::spec_id)
+            .first::<Option<String>>(conn)
+            .optional()?
+            .flatten(),
+        (spec_id, _) => spec_id,
+    };
+    let row = NewReviewCommentRow {
+        id: Uuid::now_v7().to_string(),
+        workspace_id: new.workspace_id,
+        repository_id: new.repository_id,
+        spec_id,
+        parent_id: new.parent_id,
+        author_type: new.author_type,
+        author_name: new.author_name,
+        file_path: anchor.as_ref().map(|a| a.file_path.clone()),
+        side: anchor.as_ref().map(|a| a.side.clone()),
+        line_start: anchor.as_ref().map(|a| a.line_start),
+        line_end: anchor.as_ref().map(|a| a.line_end),
+        blob: anchor.as_ref().and_then(|a| a.blob.clone()),
+        snippet: anchor.as_ref().and_then(|a| a.snippet.clone()),
+        context: anchor.as_ref().and_then(|a| a.context.clone()),
+        outdated: false,
+        body: new.body,
+        status: COMMENT_STATUS_OPEN.to_string(),
+        resolved_by_type: None,
+        created_at: now_millis(),
+    };
+    diesel::insert_into(review_comments::table)
+        .values(row)
+        .returning(ReviewComment::as_returning())
+        .get_result(conn)
+}
+
+/// List the review comments of a `(workspace, repository)`, oldest-first (`created_at`
+/// asc, ties broken by `id`) — the whole feed the review panel threads by `parent_id`.
+/// Includes both roots and replies, anchored and global, open and resolved.
+///
+/// `spec_id` SCOPES the feed to ONE Spec (PDR-0004/0028): a review is bound to the Spec it was
+/// opened from, so `Some(spec)` returns ONLY that Spec's comments — the fix for the leak where
+/// comments of one Spec surfaced on every Spec sharing the `(workspace, repository)` pair. A
+/// reply inherits its root's spec at INSERT time (see [`insert_review_comment`]), so scoping a
+/// root in scopes its whole thread. `None` is the UNSCOPED read (the whole repo feed, spec or
+/// not) the MCP agent façade and the repo-wide re-mapping still use.
+pub fn list_review_comments(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+    repository_id: &str,
+    spec_id: Option<&str>,
+) -> QueryResult<Vec<ReviewComment>> {
+    let mut query = review_comments::table
+        .filter(review_comments::workspace_id.eq(workspace_id))
+        .filter(review_comments::repository_id.eq(repository_id))
+        .into_boxed();
+    if let Some(spec_id) = spec_id {
+        query = query.filter(review_comments::spec_id.eq(spec_id.to_string()));
+    }
+    query
+        .order((review_comments::created_at.asc(), review_comments::id.asc()))
+        .select(ReviewComment::as_select())
+        .load(conn)
+}
+
+/// Resolve ONE comment by id, or `None` when unknown — used by the re-mapping and the
+/// resolve/reopen paths to load-then-mutate.
+pub fn get_review_comment(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> QueryResult<Option<ReviewComment>> {
+    review_comments::table
+        .find(id)
+        .select(ReviewComment::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// RESOLVE a comment — the HUMAN-ONLY state transition. `resolved_by_type` is always
+/// stamped `human`: this function is only reachable from the human-resolve write path (the
+/// UI db-command), NOT from the MCP agent façade, which advertises no resolve tool. Returns
+/// the updated row, or `None` when the id is unknown. Idempotent (resolving an already
+/// resolved comment is a no-op that returns it).
+pub fn resolve_review_comment(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> QueryResult<Option<ReviewComment>> {
+    let updated = diesel::update(review_comments::table.find(id))
+        .set((
+            review_comments::status.eq(COMMENT_STATUS_RESOLVED),
+            review_comments::resolved_by_type.eq(Some(AUTHOR_HUMAN)),
+        ))
+        .returning(ReviewComment::as_returning())
+        .get_result(conn)
+        .optional()?;
+    Ok(updated)
+}
+
+/// RE-OPEN a resolved comment (the human's undo of a resolve) — clears `status` back to
+/// `open` and drops `resolved_by_type`. Human-only, same as [`resolve_review_comment`].
+pub fn reopen_review_comment(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> QueryResult<Option<ReviewComment>> {
+    let updated = diesel::update(review_comments::table.find(id))
+        .set((
+            review_comments::status.eq(COMMENT_STATUS_OPEN),
+            review_comments::resolved_by_type.eq(None::<String>),
+        ))
+        .returning(ReviewComment::as_returning())
+        .get_result(conn)
+        .optional()?;
+    Ok(updated)
+}
+
+/// The re-mapped anchor to persist for ONE comment — the relocated line numbers + blob +
+/// snippet/context + the `outdated` verdict, grouped so [`update_review_comment_anchor`] takes
+/// one value. Produced by [`crate::review_comment::remap_repo_comments`].
+#[derive(Debug, Clone, Default)]
+pub struct AnchorUpdate {
+    pub line_start: Option<i32>,
+    pub line_end: Option<i32>,
+    pub blob: Option<String>,
+    pub snippet: Option<String>,
+    pub context: Option<String>,
+    pub outdated: bool,
+}
+
+/// Persist the outcome of a re-mapping for ONE anchored comment: its (possibly relocated)
+/// `line_start`/`line_end`/`blob`/`snippet`/`context` and its `outdated` flag. Called by
+/// [`crate::review_comment::remap_repo_comments`] after the repo advances; a global comment
+/// (no anchor) is never passed here. Returns the updated row, or `None` when unknown.
+pub fn update_review_comment_anchor(
+    conn: &mut SqliteConnection,
+    id: &str,
+    update: AnchorUpdate,
+) -> QueryResult<Option<ReviewComment>> {
+    let updated = diesel::update(review_comments::table.find(id))
+        .set((
+            review_comments::line_start.eq(update.line_start),
+            review_comments::line_end.eq(update.line_end),
+            review_comments::blob.eq(update.blob),
+            review_comments::snippet.eq(update.snippet),
+            review_comments::context.eq(update.context),
+            review_comments::outdated.eq(update.outdated),
+        ))
+        .returning(ReviewComment::as_returning())
+        .get_result(conn)
+        .optional()?;
+    Ok(updated)
+}
+
+// --- review_tasks (finding = task) + unread watermark (v2.4 Phase 5, v17, PDR-0012) ---------
+
+/// `review_tasks.grill_state` — PROPOSED: the human lâche brut (initiated the promotion from
+/// a comment, not yet structured). Never "ready for the coder".
+pub const GRILL_PROPOSED: &str = "proposed";
+/// `review_tasks.grill_state` — STRUCTURED: the agent gave it a clean title/details (via MCP)
+/// but the human has not validated it yet. Never "ready for the coder".
+pub const GRILL_STRUCTURED: &str = "structured";
+/// `review_tasks.grill_state` — VALIDATED: the human validated the structured task. ONLY a
+/// validated task is "ready for the coder" (the coder works on tasks, never raw comments).
+pub const GRILL_VALIDATED: &str = "validated";
+
+/// A `review_tasks` row: a comment PROMOTED for the coder — `finding = task` (PDR-0012). The
+/// promoted comment IS the coder task; `from_comment_id` is the trail back to its source comment.
+/// `severity` is OPTIONAL; `grill_state` walks proposed → structured → validated (the "grill":
+/// human lâche brut, agent structures via MCP, human validates). `Serialize` for the IPC/MCP
+/// boundary. Correlation ids are plain values (no FK) so a task survives Git churn / an
+/// archive, like `review_comments`.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = review_tasks)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct ReviewTask {
+    pub id: String,
+    pub workspace_id: String,
+    pub repository_id: String,
+    /// The comment this task was promoted from (finding = a promoted comment).
+    pub from_comment_id: String,
+    pub title: String,
+    /// The structured task detail (`None` until the agent structures it).
+    pub details: Option<String>,
+    /// OPTIONAL severity (`info` | `low` | `medium` | `high` | `critical`; `None` = unset).
+    pub severity: Option<String>,
+    /// `proposed` | `structured` | `validated` — the grill lifecycle.
+    pub grill_state: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// The OPTIONAL Spec this task is scoped to (`None` = un-scoped), INHERITED from its source
+    /// comment's `spec_id` at promotion (finding #53). Kept LAST to mirror the v18
+    /// `ALTER TABLE ADD COLUMN` physical column order (Diesel positional decoding). Scopes
+    /// [`list_review_tasks`] so a task promoted from one Spec's comment never leaks onto another
+    /// Spec sharing the same `(workspace, repository)` — the tasks counterpart of the comment fix
+    /// (#41).
+    pub spec_id: Option<String>,
+}
+
+impl ReviewTask {
+    /// Whether this task is READY FOR THE CODER: only a `validated` task is. The coder
+    /// works on tasks (validated promotions), never on raw comments or un-validated promotions.
+    pub fn is_ready_for_coder(&self) -> bool {
+        self.grill_state == GRILL_VALIDATED
+    }
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = review_tasks)]
+struct NewReviewTaskRow {
+    id: String,
+    workspace_id: String,
+    repository_id: String,
+    from_comment_id: String,
+    title: String,
+    details: Option<String>,
+    severity: Option<String>,
+    grill_state: String,
+    created_at: i64,
+    updated_at: i64,
+    spec_id: Option<String>,
+}
+
+/// PROMOTE a comment into a coder task (the grill's FIRST step — the human lâche brut). Creates a
+/// `review_tasks` row in state `proposed` linked to `from_comment_id`, seeding `title` from the
+/// comment body and anchoring on the SAME `(workspace, repository)` as the comment. `severity` is
+/// OPTIONAL. Human-initiated (the UI façade). Returns the created task.
+///
+/// The task INHERITS its source comment's `spec_id` (finding #53): a promotion from a Spec-scoped
+/// comment is itself Spec-scoped, so [`list_review_tasks`] can keep a Spec's task list its own — a
+/// task promoted on Spec A never surfaces on Spec B sharing the same `(workspace, repository)`, the
+/// tasks counterpart of the comment scoping (#41). A promotion from an un-scoped comment stays
+/// un-scoped (`None`).
+pub fn promote_comment_to_task(
+    conn: &mut SqliteConnection,
+    comment: &ReviewComment,
+    title: &str,
+    severity: Option<&str>,
+) -> QueryResult<ReviewTask> {
+    let now = now_millis();
+    let row = NewReviewTaskRow {
+        id: Uuid::now_v7().to_string(),
+        workspace_id: comment.workspace_id.clone(),
+        repository_id: comment.repository_id.clone(),
+        from_comment_id: comment.id.clone(),
+        title: title.to_string(),
+        details: None,
+        severity: severity.map(|s| s.to_string()),
+        grill_state: GRILL_PROPOSED.to_string(),
+        created_at: now,
+        updated_at: now,
+        spec_id: comment.spec_id.clone(),
+    };
+    diesel::insert_into(review_tasks::table)
+        .values(row)
+        .returning(ReviewTask::as_returning())
+        .get_result(conn)
+}
+
+/// STRUCTURE a proposed task (the grill's SECOND step — the AGENT structures it, via MCP).
+/// Rewrites `title`/`details` (+ optionally `severity`) and moves the state to `structured`. This
+/// is the AGENT capability; the agent NEVER validates (there is no validate path reachable from
+/// the MCP façade — the human-only guard-rail, symmetric to phase-4 human-only resolution). A
+/// task already `validated` is not re-openable to `structured` here (only a `proposed` OR
+/// `structured` task restructures); `None` on an unknown/validated id. Returns the updated row.
+pub fn structure_task(
+    conn: &mut SqliteConnection,
+    id: &str,
+    title: &str,
+    details: Option<&str>,
+    severity: Option<Option<&str>>,
+) -> QueryResult<Option<ReviewTask>> {
+    let Some(current) = get_review_task(conn, id)? else {
+        return Ok(None);
+    };
+    // The agent can only (re)structure a not-yet-validated task. A validated task is the
+    // human's committed decision; the agent cannot silently reopen it.
+    if current.grill_state == GRILL_VALIDATED {
+        return Ok(None);
+    }
+    let now = now_millis();
+    // `severity`: Some(v) sets it (v may be None to clear), None leaves it unchanged.
+    let sev = match severity {
+        Some(v) => v.map(|s| s.to_string()),
+        None => current.severity.clone(),
+    };
+    let updated = diesel::update(review_tasks::table.find(id))
+        .set((
+            review_tasks::title.eq(title.to_string()),
+            review_tasks::details.eq(details.map(|d| d.to_string())),
+            review_tasks::severity.eq(sev),
+            review_tasks::grill_state.eq(GRILL_STRUCTURED),
+            review_tasks::updated_at.eq(now),
+        ))
+        .returning(ReviewTask::as_returning())
+        .get_result(conn)
+        .optional()?;
+    Ok(updated)
+}
+
+/// VALIDATE a structured task (the grill's THIRD step — the HUMAN validates it). Moves the
+/// state to `validated`, after which the task is "ready for the coder". HUMAN-ONLY: this is
+/// only reachable from the UI façade (the MCP agent façade advertises no validate tool, so the
+/// agent can never reach it). Idempotent on an already-validated task. `None` on an unknown id.
+/// Returns the updated row.
+pub fn validate_task(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<ReviewTask>> {
+    let updated = diesel::update(review_tasks::table.find(id))
+        .set((
+            review_tasks::grill_state.eq(GRILL_VALIDATED),
+            review_tasks::updated_at.eq(now_millis()),
+        ))
+        .returning(ReviewTask::as_returning())
+        .get_result(conn)
+        .optional()?;
+    Ok(updated)
+}
+
+/// Read ONE task by id, or `None` when unknown.
+pub fn get_review_task(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<ReviewTask>> {
+    review_tasks::table
+        .find(id)
+        .select(ReviewTask::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// List the tasks (promoted tasks) of a `(workspace, repository)`, oldest-first — the review's
+/// promoted-task list. Includes every grill state (proposed / structured / validated).
+///
+/// `spec_id` SCOPES the list to ONE Spec (finding #53), mirroring [`list_review_comments`]: a review
+/// is bound to the Spec it was opened from, so `Some(spec)` returns ONLY that Spec's promoted tasks —
+/// the fix for the leak where a task promoted from one Spec's comment surfaced on every OTHER Spec
+/// sharing the `(workspace, repository)` pair. A task inherits its source comment's `spec_id` at
+/// promotion (see [`promote_comment_to_task`]). `None` is the UNSCOPED read (the whole repo's task
+/// list, scoped or not) the MCP agent façade still uses.
+pub fn list_review_tasks(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+    repository_id: &str,
+    spec_id: Option<&str>,
+) -> QueryResult<Vec<ReviewTask>> {
+    let mut query = review_tasks::table
+        .filter(review_tasks::workspace_id.eq(workspace_id))
+        .filter(review_tasks::repository_id.eq(repository_id))
+        .into_boxed();
+    if let Some(spec_id) = spec_id {
+        query = query.filter(review_tasks::spec_id.eq(spec_id.to_string()));
+    }
+    query
+        .order((review_tasks::created_at.asc(), review_tasks::id.asc()))
+        .select(ReviewTask::as_select())
+        .load(conn)
+}
+
+/// The unread state of a `(workspace, repository)` review feed — the COUNT of comments/replies
+/// not yet seen (created strictly after the read watermark) + the watermark itself. Reuses the
+/// runtime `unread` pattern as a per-repo READ WATERMARK. `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReviewUnread {
+    pub workspace_id: String,
+    pub repository_id: String,
+    /// The number of comments (roots + replies) created strictly after `last_read_at`.
+    pub unread: i64,
+    /// The epoch-ms watermark up to which the human has seen the feed (0 = never read).
+    pub last_read_at: i64,
+}
+
+/// The read watermark of a `(workspace, repository)`, or 0 when never read.
+fn read_watermark(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+    repository_id: &str,
+) -> QueryResult<i64> {
+    review_reads::table
+        .find((workspace_id, repository_id))
+        .select(review_reads::last_read_at)
+        .first::<i64>(conn)
+        .optional()
+        .map(|o| o.unwrap_or(0))
+}
+
+/// Compute the UNREAD count of a `(workspace, repository)` review feed: the number of comments
+/// (roots + replies, any author) whose `created_at` is STRICTLY AFTER the read watermark. A new
+/// comment/reply raises it; [`mark_review_read`] resets it to 0. Never-read = every comment is
+/// unread. This is the "compteur de non-lus" backing the live UI + MCP badge.
+pub fn review_unread(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+    repository_id: &str,
+) -> QueryResult<ReviewUnread> {
+    let last_read_at = read_watermark(conn, workspace_id, repository_id)?;
+    let unread: i64 = review_comments::table
+        .filter(review_comments::workspace_id.eq(workspace_id))
+        .filter(review_comments::repository_id.eq(repository_id))
+        .filter(review_comments::created_at.gt(last_read_at))
+        .count()
+        .get_result(conn)?;
+    Ok(ReviewUnread {
+        workspace_id: workspace_id.to_string(),
+        repository_id: repository_id.to_string(),
+        unread,
+        last_read_at,
+    })
+}
+
+/// MARK-READ the review feed of a `(workspace, repository)`: stamp the read watermark to `now`, so
+/// the unread count drops to 0 (mirrors the runtime `acknowledge`). Upserts the ONE
+/// `review_reads` row. Returns the fresh (zeroed) [`ReviewUnread`]. Idempotent.
+pub fn mark_review_read(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+    repository_id: &str,
+) -> QueryResult<ReviewUnread> {
+    let now = now_millis();
+    diesel::insert_into(review_reads::table)
+        .values((
+            review_reads::workspace_id.eq(workspace_id),
+            review_reads::repository_id.eq(repository_id),
+            review_reads::last_read_at.eq(now),
+        ))
+        .on_conflict((review_reads::workspace_id, review_reads::repository_id))
+        .do_update()
+        .set(review_reads::last_read_at.eq(now))
+        .execute(conn)?;
+    review_unread(conn, workspace_id, repository_id)
 }
 
 /// List the MOST RECENT `domain_events` correlated to a workspace, newest first, capped at
@@ -5517,6 +6072,354 @@ pub fn open_in_memory() -> SqliteConnection {
 mod tests {
     use super::*;
 
+    /// The `review_comments` model (v13) round-trips through the migrated DB: an anchored
+    /// comment (every anchor column populated), a reply (auto-threaded by `parent_id`), and a
+    /// global comment (all-NULL anchor) all persist and re-load, and `list_review_comments`
+    /// filters by `(workspace, repository)` oldest-first. Proves the v13 migration + `schema.rs`
+    /// `review_comments` table + the model columns are consistent (positional decoding of every
+    /// nullable/keyword column).
+    #[test]
+    fn review_comments_round_trip_and_scope() {
+        let mut conn = open_in_memory();
+
+        let root = insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                spec_id: Some("spec1".into()),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                anchor: Some(CommentAnchor {
+                    file_path: "api/src/a.rs".into(),
+                    side: SIDE_NEW.into(),
+                    line_start: 10,
+                    line_end: 12,
+                    blob: Some("deadbeef".into()),
+                    snippet: Some("let x = 1;".into()),
+                    context: Some("ctx above\nlet x = 1;\nctx below".into()),
+                }),
+                body: "anchored root".into(),
+                parent_id: None,
+            },
+        )
+        .expect("insert anchored root");
+        // Every anchor column round-trips (positional decoding sanity).
+        assert_eq!(root.spec_id.as_deref(), Some("spec1"));
+        assert_eq!(root.file_path.as_deref(), Some("api/src/a.rs"));
+        assert_eq!(root.side.as_deref(), Some(SIDE_NEW));
+        assert_eq!(root.line_start, Some(10));
+        assert_eq!(root.line_end, Some(12));
+        assert_eq!(root.blob.as_deref(), Some("deadbeef"));
+        assert_eq!(root.snippet.as_deref(), Some("let x = 1;"));
+        assert!(root.context.is_some());
+        assert!(!root.outdated);
+        assert_eq!(root.status, COMMENT_STATUS_OPEN);
+
+        // A reply auto-threads (parent_id), no separate table.
+        let reply = insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                parent_id: Some(root.id.clone()),
+                author_type: AUTHOR_AGENT.into(),
+                author_name: "nyx-agent".into(),
+                body: "agent reply".into(),
+                ..Default::default()
+            },
+        )
+        .expect("insert reply");
+        assert_eq!(reply.parent_id.as_deref(), Some(root.id.as_str()));
+        assert!(
+            reply.file_path.is_none(),
+            "a reply carries no anchor of its own"
+        );
+
+        // A GLOBAL comment (all-NULL anchor).
+        insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                body: "overall".into(),
+                ..Default::default()
+            },
+        )
+        .expect("insert global");
+
+        // A comment of ANOTHER repo is excluded by the scope filter.
+        insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "other-repo".into(),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                body: "elsewhere".into(),
+                ..Default::default()
+            },
+        )
+        .expect("insert other repo");
+
+        let listed = list_review_comments(&mut conn, "ws", "repo", None).expect("list");
+        assert_eq!(
+            listed.len(),
+            3,
+            "only this (workspace, repository)'s comments"
+        );
+        assert_eq!(listed[0].id, root.id, "oldest-first order");
+        assert_eq!(listed[1].id, reply.id);
+
+        // SPEC SCOPING (Finding 41): the anchored root was bound to `spec1`, and its reply INHERITS
+        // that binding at insert time, so a `spec1`-scoped read returns the pair — the `spec1`
+        // thread — while EXCLUDING the (unscoped) global comment. Proves comments no longer leak
+        // across Specs sharing a `(workspace, repository)`.
+        let spec1 = list_review_comments(&mut conn, "ws", "repo", Some("spec1")).expect("scoped");
+        assert_eq!(spec1.len(), 2, "only spec1's root + its (inherited) reply");
+        assert_eq!(spec1[0].id, root.id);
+        assert_eq!(spec1[1].id, reply.id, "the reply inherited spec1 from its root");
+        assert_eq!(reply.spec_id.as_deref(), Some("spec1"), "reply inherits root spec");
+        // A DIFFERENT Spec sharing the same (workspace, repository) sees NONE of spec1's comments.
+        let spec2 = list_review_comments(&mut conn, "ws", "repo", Some("spec2")).expect("scoped2");
+        assert!(spec2.is_empty(), "spec2 sees no spec1 comment (no cross-spec leak)");
+    }
+
+    /// A small helper: post a GLOBAL human comment in `(ws, repo)` and return it.
+    #[cfg(test)]
+    fn seed_comment(
+        conn: &mut SqliteConnection,
+        ws: &str,
+        repo: &str,
+        body: &str,
+    ) -> ReviewComment {
+        insert_review_comment(
+            conn,
+            NewComment {
+                workspace_id: ws.into(),
+                repository_id: repo.into(),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                body: body.into(),
+                ..Default::default()
+            },
+        )
+        .expect("seed comment")
+    }
+
+    /// The `review_tasks` GRILL flow (v14, `finding = task`): a comment PROMOTED becomes a
+    /// `proposed` task linked to its source comment, the AGENT structures it (→ `structured`),
+    /// and the HUMAN validates it (→ `validated`, ready for the coder). Severity is OPTIONAL, and
+    /// `list_review_tasks` scopes to the `(workspace, repository)`.
+    #[test]
+    fn review_tasks_grill_flow_and_severity_optional() {
+        let mut conn = open_in_memory();
+        let comment = seed_comment(&mut conn, "ws", "repo", "this login path looks fragile");
+
+        // PROMOTE — the human lâche brut: a `proposed` task, seeded title, NO severity, linked
+        // to the source comment. `finding = task`: this row IS the coder task.
+        let task = promote_comment_to_task(&mut conn, &comment, "fragile login path", None)
+            .expect("promote");
+        assert_eq!(task.grill_state, GRILL_PROPOSED);
+        assert_eq!(task.from_comment_id, comment.id, "linked to its comment");
+        assert_eq!(task.workspace_id, "ws");
+        assert_eq!(task.repository_id, "repo");
+        assert_eq!(
+            task.severity, None,
+            "severity is OPTIONAL — unset at promotion"
+        );
+        assert!(task.details.is_none());
+        assert!(
+            !task.is_ready_for_coder(),
+            "a proposed task is NOT ready for the coder"
+        );
+
+        // STRUCTURE — the agent gives it a clean title/details + an optional severity.
+        let structured = structure_task(
+            &mut conn,
+            &task.id,
+            "Harden the login path against empty credentials",
+            Some("Add validation + a test for the empty-password branch."),
+            Some(Some("high")),
+        )
+        .expect("structure ok")
+        .expect("task present");
+        assert_eq!(structured.grill_state, GRILL_STRUCTURED);
+        assert_eq!(structured.severity.as_deref(), Some("high"));
+        assert!(structured.details.is_some());
+        assert!(
+            !structured.is_ready_for_coder(),
+            "a structured-but-unvalidated task is NOT ready for the coder"
+        );
+
+        // VALIDATE — the human validates; ONLY now is it ready for the coder.
+        let validated = validate_task(&mut conn, &task.id)
+            .expect("validate ok")
+            .expect("task present");
+        assert_eq!(validated.grill_state, GRILL_VALIDATED);
+        assert!(
+            validated.is_ready_for_coder(),
+            "a validated task IS ready for the coder"
+        );
+
+        // A task of ANOTHER repo is excluded by the scope filter.
+        let other_comment = seed_comment(&mut conn, "ws", "other", "elsewhere");
+        promote_comment_to_task(&mut conn, &other_comment, "elsewhere task", None)
+            .expect("promote other");
+        let listed = list_review_tasks(&mut conn, "ws", "repo", None).expect("list");
+        assert_eq!(listed.len(), 1, "only this (workspace, repository)'s tasks");
+        assert_eq!(listed[0].id, task.id);
+    }
+
+    /// Finding #53 — a promoted task is SPEC-SCOPED (the tasks counterpart of the comment fix #41).
+    /// A task inherits its source comment's `spec_id` at promotion, and `list_review_tasks(spec)`
+    /// returns ONLY that Spec's tasks: a task promoted on Spec A never leaks onto Spec B sharing the
+    /// SAME `(workspace, repository)`. An un-scoped promotion stays in the `None` bucket.
+    #[test]
+    fn review_tasks_are_spec_scoped_no_cross_spec_leak() {
+        let mut conn = open_in_memory();
+        // TWO comments on the SAME (workspace, repo), each bound to a DIFFERENT Spec, plus one
+        // un-scoped comment (no Spec).
+        let seed_scoped = |conn: &mut SqliteConnection, spec: Option<&str>, body: &str| {
+            insert_review_comment(
+                conn,
+                NewComment {
+                    workspace_id: "ws".into(),
+                    repository_id: "repo".into(),
+                    spec_id: spec.map(|s| s.to_string()),
+                    author_type: AUTHOR_HUMAN.into(),
+                    author_name: "Kris".into(),
+                    body: body.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("seed scoped comment")
+        };
+        let comment_a = seed_scoped(&mut conn, Some("spec-A"), "A: fragile");
+        let comment_b = seed_scoped(&mut conn, Some("spec-B"), "B: also fragile");
+        let comment_none = seed_scoped(&mut conn, None, "generic");
+
+        let task_a = promote_comment_to_task(&mut conn, &comment_a, "fix A", None).expect("promote A");
+        let task_b = promote_comment_to_task(&mut conn, &comment_b, "fix B", None).expect("promote B");
+        let task_none =
+            promote_comment_to_task(&mut conn, &comment_none, "fix generic", None).expect("promote none");
+
+        // The task INHERITS its source comment's Spec.
+        assert_eq!(task_a.spec_id.as_deref(), Some("spec-A"));
+        assert_eq!(task_b.spec_id.as_deref(), Some("spec-B"));
+        assert_eq!(task_none.spec_id, None, "an un-scoped promotion stays un-scoped");
+
+        // Spec A's list shows ONLY task A — task B never leaks onto it (the #53 fix).
+        let list_a = list_review_tasks(&mut conn, "ws", "repo", Some("spec-A")).expect("list A");
+        assert_eq!(list_a.len(), 1, "Spec A sees only its own task");
+        assert_eq!(list_a[0].id, task_a.id);
+        assert!(
+            !list_a.iter().any(|t| t.id == task_b.id),
+            "Spec B's task must NOT leak onto Spec A"
+        );
+
+        // Spec B's list shows ONLY task B.
+        let list_b = list_review_tasks(&mut conn, "ws", "repo", Some("spec-B")).expect("list B");
+        assert_eq!(list_b.len(), 1, "Spec B sees only its own task");
+        assert_eq!(list_b[0].id, task_b.id);
+
+        // The UNSCOPED read (the MCP agent façade) still sees the whole repo's tasks.
+        let all = list_review_tasks(&mut conn, "ws", "repo", None).expect("list all");
+        assert_eq!(all.len(), 3, "the unscoped read sees every task of the repo");
+    }
+
+    /// The GRILL GUARD-RAIL: the agent's `structure` cannot touch a VALIDATED task (it cannot
+    /// silently reopen the human's committed decision), and there is no `structure`-to-`validated`
+    /// path — validation is human-only (`validate_task`, reachable only from the UI façade).
+    #[test]
+    fn structure_cannot_reopen_a_validated_task() {
+        let mut conn = open_in_memory();
+        let comment = seed_comment(&mut conn, "ws", "repo", "x");
+        let task = promote_comment_to_task(&mut conn, &comment, "t", None).expect("promote");
+        structure_task(&mut conn, &task.id, "structured", None, None)
+            .expect("structure")
+            .expect("present");
+        validate_task(&mut conn, &task.id)
+            .expect("validate")
+            .expect("present");
+
+        // The agent tries to re-structure the VALIDATED task → refused (no-op, None).
+        let reopened = structure_task(&mut conn, &task.id, "sneaky rewrite", None, None)
+            .expect("structure call ok");
+        assert!(
+            reopened.is_none(),
+            "structure must NOT reopen a validated task"
+        );
+        // The stored state is untouched — still validated with the human's title.
+        let stored = get_review_task(&mut conn, &task.id).unwrap().unwrap();
+        assert_eq!(stored.grill_state, GRILL_VALIDATED);
+        assert_eq!(stored.title, "structured");
+    }
+
+    /// The UNREAD watermark (v14): a fresh repo counts every comment as unread; a new
+    /// comment/reply raises the count; `mark_review_read` zeroes it; a comment posted AFTER a
+    /// mark-read is unread again. Reuses the runtime `unread` pattern as a per-repo read watermark.
+    #[test]
+    fn review_unread_counts_and_mark_read_resets() {
+        let mut conn = open_in_memory();
+
+        // Never-read: no comments → 0 unread, watermark 0.
+        let fresh = review_unread(&mut conn, "ws", "repo").expect("unread");
+        assert_eq!(fresh.unread, 0);
+        assert_eq!(fresh.last_read_at, 0);
+
+        // Two comments land — both unread (never read).
+        seed_comment(&mut conn, "ws", "repo", "one");
+        seed_comment(&mut conn, "ws", "repo", "two");
+        assert_eq!(review_unread(&mut conn, "ws", "repo").unwrap().unread, 2);
+
+        // Another repo's comment does NOT count here (scoped).
+        seed_comment(&mut conn, "ws", "other", "elsewhere");
+        assert_eq!(review_unread(&mut conn, "ws", "repo").unwrap().unread, 2);
+
+        // Mark-read → 0, watermark stamped.
+        let read = mark_review_read(&mut conn, "ws", "repo").expect("mark read");
+        assert_eq!(read.unread, 0);
+        assert!(read.last_read_at > 0, "watermark stamped to now");
+        assert_eq!(review_unread(&mut conn, "ws", "repo").unwrap().unread, 0);
+
+        // A comment created AFTER the mark-read is unread again (its created_at > watermark). The
+        // in-memory clock can share a millisecond with the watermark; force a strictly-later
+        // created_at so the STRICTLY-AFTER semantics are exercised deterministically.
+        let later = read.last_read_at + 1000;
+        diesel::insert_into(review_comments::table)
+            .values(NewReviewCommentRow {
+                id: Uuid::now_v7().to_string(),
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                spec_id: None,
+                parent_id: None,
+                author_type: AUTHOR_AGENT.into(),
+                author_name: "nyx-agent".into(),
+                file_path: None,
+                side: None,
+                line_start: None,
+                line_end: None,
+                blob: None,
+                snippet: None,
+                context: None,
+                outdated: false,
+                body: "agent replies later".into(),
+                status: COMMENT_STATUS_OPEN.into(),
+                resolved_by_type: None,
+                created_at: later,
+            })
+            .execute(&mut conn)
+            .expect("insert later comment");
+        assert_eq!(
+            review_unread(&mut conn, "ws", "repo").unwrap().unread,
+            1,
+            "a comment created after mark-read is unread again"
+        );
+    }
+
     /// A unique, file-backed `Db` in the OS temp dir (so WAL — which has no effect on
     /// `:memory:` — is observable on a real journal). Returns the `Db` and the path;
     /// the caller may inspect the on-disk pragmas. No `tempfile` dev-dep: uniqueness
@@ -6132,6 +7035,12 @@ mod tests {
         // Peel v15 (specs.workspace_id index), v14 (tasks/task_dependencies), then v13
         // (specs/spec_revisions); all must succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v18 (review_tasks.spec_id) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v17 (review_tasks/review_reads) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v16 (review_comments) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("v15 (specs.workspace_id index) reverts cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("v14 (tasks/task_dependencies) reverts cleanly");
@@ -6489,11 +7398,13 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Step DOWN to the pre-v4 schema → the four exec-state columns are gone. The
-        // exec-state migration is dir #4; later PRDs stacked dirs #5..#15 on top (v2.4
+        // exec-state migration is dir #4; later PRDs stacked dirs #5..#17 on top (v2.4
         // Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task domain;
-        // Phase 3 added dir #15 the specs.workspace_id index), so reaching the pre-v4 schema
-        // peels all of them then dir #4 itself (12 reverts, reverse order).
-        for _ in 0..12 {
+        // Phase 3 added dir #15 the specs.workspace_id index; Phase 4 added dir #16 the
+        // review_comments domain; Phase 5 added dir #17 the review_tasks domain), so
+        // reaching the pre-v4 schema peels all of them then dir #4 itself (14 reverts,
+        // reverse order).
+        for _ in 0..15 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -8295,6 +9206,12 @@ mod tests {
         // Peel v15 (specs.workspace_id index) then v14 (tasks/task_dependencies); both must
         // succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v18 (review_tasks.spec_id) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v17 (review_tasks/review_reads) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v16 (review_comments) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("v15 (specs.workspace_id index) reverts cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("v14 (tasks/task_dependencies) reverts cleanly");
@@ -8655,6 +9572,12 @@ mod tests {
         // domain_events) then v11 (data backfill) then v10 (canonical structure). After
         // this, `workspaces.root_path` does NOT exist yet (`path` does), and `projects` has
         // no `key`/`primary_workspace_id`.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v18 (review_tasks.spec_id) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v17 (review_tasks/review_reads) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v16 (review_comments) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v15 cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -9550,7 +10473,7 @@ mod tests {
         // (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task
         // domain; Phase 3 added dir #15 the specs.workspace_id index). projects must then
         // be absent.
-        for _ in 0..14 {
+        for _ in 0..17 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -10399,7 +11322,7 @@ mod tests {
         // reverse order (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14
         // the task domain; Phase 3 added dir #15 the specs.workspace_id index).
         // managed_commands must then be absent.
-        for _ in 0..13 {
+        for _ in 0..16 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -10465,6 +11388,12 @@ mod tests {
         // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row + its v3
         // columns survive; the v4 columns are gone (a typed select of `unread` would now fail
         // to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v18 (review_tasks.spec_id) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v17 (review_tasks/review_reads) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v16 (review_comments) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v15 cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -10639,6 +11568,12 @@ mod tests {
         // peels v15, v14, v13, v12, v11, v10, v9, v8, v7, then v5 (migrations revert in
         // reverse order). The instance row + its v3/v4 columns survive; the v5 columns are
         // gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v18 (review_tasks.spec_id) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v17 (review_tasks/review_reads) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v16 (review_comments) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v15 cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -11909,6 +12844,12 @@ mod tests {
         // task domain) then v13 (v2.4 Phase 1 Spec domain) then v12 (v2.1 Phase 4
         // domain_events) then v11 (v2.1 data backfill) then v10 (v2.1 canonical structure)
         // then v9 (#11 project order) then v8 → the resume_agent_sessions column is gone.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v18 (review_tasks.spec_id) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v17 (review_tasks/review_reads) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v16 (review_comments) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v15 cleanly");
         conn.revert_last_migration(MIGRATIONS)

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { emit, mockIPC } from "@/bridge/test-harness";
 import { createAppRouter } from "@/router";
+import { createQueryWrapper } from "@/lib/test-query";
 
 import type { SpecDetail } from "./types";
 
@@ -148,7 +149,9 @@ function installBackend(detail: SpecDetail = detailFixture()) {
 
 function renderDetail() {
   const router = createAppRouter(["/work/s1"]);
-  return render(<RouterProvider router={router} />);
+  // The Review tab's hooks are TanStack Query now (PDR-0029) — render under a fresh query client.
+  const { wrapper } = createQueryWrapper();
+  return render(<RouterProvider router={router} />, { wrapper });
 }
 
 describe("SpecDetailPage", () => {
@@ -189,12 +192,18 @@ describe("SpecDetailPage", () => {
     expect(screen.getAllByText(/Blocked by:/, { exact: false }).length).toBeGreaterThan(0);
   });
 
-  it("renders the Review tab as a placeholder / anchor (no review content)", async () => {
+  it("mounts the comments-only Review tab with an Open review button (no diff viewer, PDR-0028)", async () => {
     renderDetail();
     await screen.findByRole("heading", { name: "The detailed spec" });
     fireEvent.click(screen.getByRole("tab", { name: /Review/ }));
-    // The placeholder tells the user the review grafts here (v2.5). No diff/findings.
-    expect(await screen.findByText(/grafts here/)).toBeTruthy();
+    // The Review tab is now the COMMENTS surface + an "Open review" button that opens the
+    // full-screen review page (`/work/$specId/review`) — NOT the diff viewer, NOT the old
+    // "grafts here" placeholder. The heavy viewer (diff/tree) lives only on that page.
+    expect(screen.queryByText(/grafts here/)).toBeNull();
+    expect(await screen.findByTestId("open-review")).toBeTruthy();
+    // No diff viewer chrome mounts in the tab.
+    expect(screen.queryByTestId("diff-scroll")).toBeNull();
+    expect(screen.queryByRole("tablist", { name: "Repositories" })).toBeNull();
   });
 
   it("consumes the workspace link in the sidebar (repos + workspace derived from the anchor)", async () => {

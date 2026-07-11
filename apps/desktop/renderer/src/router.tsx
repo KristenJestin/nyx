@@ -1,16 +1,19 @@
+import type { QueryClient } from "@tanstack/react-query";
 import {
   createMemoryHistory,
-  createRootRoute,
+  createRootRouteWithContext,
   createRoute,
   createRouter,
   Outlet,
 } from "@tanstack/react-router";
 
+import { queryClient } from "@/lib/query";
 import { ActiveProjectProvider } from "@/components/terminals/active-project";
 import { BaseLayout } from "@/components/terminals/base-layout";
 import { TerminalsPage } from "@/components/terminals/terminals-page";
 import { BoardPage } from "@/components/specs/board-page";
 import { SpecDetailPage } from "@/components/specs/spec-detail-page";
+import { ReviewPage } from "@/components/review/review-page";
 import { KnowledgePage } from "@/components/knowledge/knowledge-page";
 
 /**
@@ -35,11 +38,23 @@ import { KnowledgePage } from "@/components/knowledge/knowledge-page";
  */
 
 /**
+ * The router CONTEXT — carries the app's TanStack Query client so a route loader can
+ * `context.queryClient.ensureQueryData(...)` to PRECHARGE a page's data (the official TanStack
+ * Query ↔ Router integration, PDR-0029). Threaded in at `createRouter({ context: { queryClient } })`
+ * below; the same client backs `<QueryClientProvider>` at the app root, so a loader-primed cache is
+ * the one the page's `useQuery` reads.
+ */
+export interface RouterContext {
+  readonly queryClient: QueryClient;
+}
+
+/**
  * The ROOT route: the navigation shell. The `<BaseLayout>` (rail + section-nav + its own
  * `<Outlet/>`) is wrapped in the `<ActiveProjectProvider>` so the entered-project
- * selection is shared between the rail and every routed page.
+ * selection is shared between the rail and every routed page. `createRootRouteWithContext`
+ * types the `queryClient` context every child route (and its loader) receives.
  */
-const rootRoute = createRootRoute({
+const rootRoute = createRootRouteWithContext<RouterContext>()({
   component: () => (
     <ActiveProjectProvider>
       <BaseLayout />
@@ -82,13 +97,27 @@ const workRoute = createRoute({
 });
 
 /**
- * Spec detail (`/work/$specId`) — the PRD detail with its tabs (spec / tasks / review-
- * placeholder / annexes / activity / runtime, v2.4). Reached from a board card / row.
+ * Spec detail (`/work/$specId`) — the PRD detail with its tabs (spec / tasks / review / annexes /
+ * activity / runtime). The Review tab shows the Spec-scoped comments + an "Open review" button onto
+ * the full-screen review page (`/work/$specId/review`, PDR-0028). Reached from a board card / row.
  */
 const specDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/work/$specId",
   component: SpecDetailPage,
+});
+
+/**
+ * Review (`/work/$specId/review`) — the FULL-SCREEN review page of a Spec (PDR-0028). Spec-scoped,
+ * NOT a top-level route: it is reached ONLY from the Spec detail's Review tab "Open review" button
+ * (no nav item, no `/review` top-level route — the "no provisional exposure" invariant). It re-
+ * derives the Spec's workspace context from `spec_detail` to scope the repos + comments, and links
+ * back to `/work/$specId`.
+ */
+const specReviewRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/work/$specId/review",
+  component: ReviewPage,
 });
 
 /** Knowledge (`/knowledge`) — routed stub for now (real knowledge base ported later). */
@@ -102,8 +131,27 @@ const routeTree = rootRoute.addChildren([
   terminalsRoute,
   workRoute,
   specDetailRoute,
+  specReviewRoute,
   knowledgeRoute,
 ]);
+
+/**
+ * The router-wide fallback for an UNCAUGHT throw inside a routed page. Setting it is what makes
+ * TanStack wrap each route in an error boundary at all (without a `defaultErrorComponent`/per-route
+ * `errorComponent`, `<Match>` uses a passthrough fragment and a page crash unmounts the whole app).
+ * It renders in the route's slot — i.e. inside `<BaseLayout>`'s `<Outlet/>` — so the navigation SHELL
+ * (rail + section-nav) SURVIVES a page crash and the user can navigate away, instead of a blank window.
+ */
+function RouteErrorFallback({ error }: { error: Error }) {
+  return (
+    <div className="flex h-svh flex-col items-center justify-center gap-3 bg-background p-6 text-center">
+      <p className="text-sm text-muted-foreground">Something went wrong on this screen.</p>
+      {error?.message ? (
+        <p className="max-w-md font-mono text-2xs text-muted-foreground/70">{error.message}</p>
+      ) : null}
+    </div>
+  );
+}
 
 /**
  * Build a router over the route tree. Exposed as a factory so tests can spin up an
@@ -114,6 +162,10 @@ export function createAppRouter(initialEntries: string[] = ["/"]) {
   return createRouter({
     routeTree,
     history: createMemoryHistory({ initialEntries }),
+    defaultErrorComponent: RouteErrorFallback,
+    // The review data layer's TanStack Query client, made available to every route's loader
+    // (PDR-0029). Tests pass the module singleton implicitly via this factory.
+    context: { queryClient },
   });
 }
 

@@ -29,10 +29,11 @@ use nyx_core::db::Db;
 use nyx_core::mcp::{McpServer, RpcCode, RpcError, ToolDispatcher};
 use nyx_core::mcp_runtime;
 use nyx_core::mcp_tools_core::{self, ChangedTopic, TerminalHost};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::command::SidecarRunnerSink;
 use super::events::{EventSink, PushEventSink};
+use super::git_watch::GitWatchRuntime;
 use super::pty::PtyManager;
 use crate::pipe::wire::Event;
 
@@ -113,6 +114,11 @@ pub struct SidecarDispatcher {
     /// The pipe event sink, used to push the `changed` invalidations a mutating tool
     /// produces (the front re-pulls).
     events: EventSink,
+    /// The shared cell holding the v2.4 real-time git-watch runtime (Q-015). Lets an MCP
+    /// client register/unregister a `(workspace, repository)` review watch via
+    /// `repo_watch` / `repo_unwatch` — the SAME watch the UI db-command drives (PDR-0005),
+    /// so a change pushes `repos://changed` to BOTH surfaces. `None` before the runtime is up.
+    git_watch: Arc<Mutex<Option<Arc<GitWatchRuntime>>>>,
 }
 
 impl SidecarDispatcher {
@@ -123,10 +129,80 @@ impl SidecarDispatcher {
             });
         }
     }
+
+    /// Handle the v2.4 `repo_watch` / `repo_unwatch` MCP tools (Q-015): register / release
+    /// a real-time watch of a `(workspace, repository)` review. Resolves the repo's absolute
+    /// path from the SHARED pool (identity isolation), then drives the SAME git-watch runtime
+    /// the UI `repo_watch` db-command drives. Returns `Some(result)` when `name` is one of
+    /// these tools, `None` otherwise (so the dispatcher falls through to the rest of the surface).
+    fn dispatch_repo_watch(&self, name: &str, args: &Value) -> Option<Result<Value, RpcError>> {
+        let unwatch = match name {
+            "repo_watch" => false,
+            "repo_unwatch" => true,
+            _ => return None,
+        };
+        Some((|| {
+            let workspace_id = require_str(args, "workspace_id")?;
+            let repository_id = require_str(args, "repository_id")?;
+            let git_watch = self.git_watch.lock().unwrap().clone().ok_or_else(|| {
+                RpcError::new(
+                    RpcCode::McpUnavailable,
+                    "the real-time git-watch runtime is not started".to_string(),
+                )
+            })?;
+            if unwatch {
+                git_watch.unwatch(workspace_id, repository_id);
+                return Ok(json!({ "watching": false }));
+            }
+            let base = args.get("base").and_then(Value::as_str).map(str::to_string);
+            let target = args
+                .get("target")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let absolute_path = self
+                .db
+                .with_conn(|c| {
+                    nyx_core::repository::member_absolute_path(c, workspace_id, repository_id)
+                })
+                .map_err(|e| RpcError::new(RpcCode::Internal, e.to_string()))?
+                .ok_or_else(|| {
+                    RpcError::new(
+                        RpcCode::InvalidId,
+                        format!("no repository {repository_id} in workspace {workspace_id}"),
+                    )
+                })?;
+            git_watch.watch(workspace_id, repository_id, &absolute_path, base, target);
+            Ok(json!({ "watching": true }))
+        })())
+    }
+}
+
+/// Require a non-empty string arg from an MCP tool's JSON object (the sidecar-side twin of
+/// the core `require_str`, kept local so this file does not reach into `mcp_tools_core`'s
+/// private helpers).
+fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidArgument,
+                format!("missing or empty string arg `{key}`"),
+            )
+        })
 }
 
 impl ToolDispatcher for SidecarDispatcher {
     fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError> {
+        // 0) The v2.4 real-time review WATCH tools (Q-015): `repo_watch` / `repo_unwatch`
+        //    register/release a `(workspace, repository)` on the git-watch runtime — a
+        //    sidecar-owned effect, so handled here (not in the shell-agnostic core) before
+        //    the rest of the surface. A change to a watched repo then pushes `repos://changed`
+        //    to BOTH the UI and MCP (the same channel the UI `repo_watch` db-command drives).
+        if let Some(res) = self.dispatch_repo_watch(name, arguments) {
+            return res;
+        }
+
         // 1) Runtime command tools (+ wait_for_command): route onto the shared runner.
         if matches!(
             name,
@@ -230,6 +306,9 @@ pub struct McpRuntime {
     activity: Arc<AgentActivityStore>,
     pty: Arc<PtyManager>,
     events: EventSink,
+    /// The shared cell holding the v2.4 real-time git-watch runtime (Q-015), so the MCP
+    /// `repo_watch` / `repo_unwatch` tools drive the SAME watcher the UI does.
+    git_watch: Arc<Mutex<Option<Arc<GitWatchRuntime>>>>,
 }
 
 impl McpRuntime {
@@ -244,6 +323,7 @@ impl McpRuntime {
         pty: Arc<PtyManager>,
         activity: Arc<AgentActivityStore>,
         events: EventSink,
+        git_watch: Arc<Mutex<Option<Arc<GitWatchRuntime>>>>,
     ) -> Self {
         McpRuntime {
             server: Arc::new(McpServer::default()),
@@ -252,6 +332,7 @@ impl McpRuntime {
             activity,
             pty,
             events,
+            git_watch,
         }
     }
 
@@ -278,6 +359,7 @@ impl McpRuntime {
             },
             activity: Arc::clone(&self.activity),
             events: self.events.clone(),
+            git_watch: Arc::clone(&self.git_watch),
         }));
         match self.server.start() {
             Ok(port) => port,
@@ -366,6 +448,10 @@ mod tests {
             },
             activity: Arc::new(AgentActivityStore::new()),
             events,
+            // No real-time git-watch runtime in the unit harness (the `repo_watch` /
+            // `repo_unwatch` tools report it as unavailable) — the extension-tool surface
+            // under test here does not need one.
+            git_watch: Arc::new(Mutex::new(None)),
         }
     }
 

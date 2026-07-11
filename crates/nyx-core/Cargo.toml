@@ -37,6 +37,31 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 # `get_command_output`'s `grep` render knob is a regex matched per-line on the
 # ANSI-stripped text (v1 parity: apps/tauri/src-tauri `optional_regex`/`render_output`).
 regex = "1"
+# Pure-Rust Git plumbing for the v2.4 diff/review engine (PDR-0007, sidecar-side):
+# gix is the PRIMARY diff/blob/ref/revwalk backend; a `git` CLI fallback
+# (crate::proc_util::command) covers anything gix cannot resolve so the engine is
+# always coherent. `default-features = false` keeps the surface tight and avoids the
+# heavy networking/transport stack (no remote — the review is 100% local):
+#   * `sha1`      — REQUIRED hash backend (gix-hash/sha1). Without a hash feature the
+#                   `Kind` enum is empty and gix-hash does not compile; gix's own
+#                   `default` pulls this in, so dropping default-features means we must
+#                   re-enable it explicitly.
+#   * `blob-diff` — line-level blob diff (hunks) — the core of the diff engine.
+#   * `revision`  — rev-spec parsing + revwalk (commit/range, ahead/behind).
+#   * `dirwalk`   — untracked-file walk (the `??` side of the working-tree diff).
+#   * `status`    — index-vs-worktree / index-vs-HEAD status (staged / unstaged).
+#   * `max-performance-safe` — the zlib-rs + prodash acceleration gix ships by default,
+#                   without the C zlib-ng dep (pure-Rust, no cmake).
+gix = { version = "0.85.0", default-features = false, features = ["sha1", "blob-diff", "revision", "dirwalk", "status", "max-performance-safe"] }
+
+# Filesystem/refs WATCHER for the v2.4 real-time refresh of the derived Git views
+# (task 01KX0F6GDZEH3YN6QJDB7FC0WC, Q-015). `notify` is the OS-native change source
+# (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows) — NO polling:
+# the kernel reports a work-tree edit / `.git` ref change and we recompute + push on that
+# event, coalesced by our own debounce. Used only by `crate::git_watch`; the shell
+# (sidecar) drives it against the v2.1 EventSink pipe. Default features keep the macOS
+# FSEvents backend; on Linux/Windows they are inert.
+notify = "7"
 
 # Process-group (process-tree) kill for managed commands on Unix: SIGTERM/SIGKILL to
 # the child's process GROUP so stopping a service reaps the whole tree.

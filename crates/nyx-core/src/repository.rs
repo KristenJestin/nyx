@@ -240,6 +240,27 @@ pub fn workspace_members(
         .collect())
 }
 
+/// Resolve ONE `(workspace, repository)` membership to its ABSOLUTE on-disk path in that
+/// workspace, or `None` when the pair does not resolve (unknown workspace, or the repo is
+/// not a non-optional member of the workspace's project). This is the multi-repo-safe
+/// path builder the v2.4 diff engine and derived-Git views key on: it never mixes two
+/// repositories' identities because it returns exactly ONE repo's path, computed the same
+/// way [`workspace_members`] does (`root_path` + `relative_path`, normalized).
+pub fn member_absolute_path(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+    repository_id: &str,
+) -> QueryResult<Option<String>> {
+    let Some(workspace) = db::get_workspace(conn, workspace_id)? else {
+        return Ok(None);
+    };
+    let members = workspace_members(conn, &workspace)?;
+    Ok(members
+        .into_iter()
+        .find(|m| m.repository.id == repository_id)
+        .map(|m| m.absolute_path))
+}
+
 /// Join a repo's `relative_path` onto a workspace `root_path`, normalized. A `"."`
 /// (mono-repo) resolves to the `root_path` itself; any other relative path is joined
 /// under it. The result is [`crate::pathnorm::normalize`]d so it matches the canonical

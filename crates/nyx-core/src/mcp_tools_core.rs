@@ -70,11 +70,14 @@ pub enum ChangedTopic {
     /// phase 6 (real-time UI), but the mutation authority already NAMES the topic here so the
     /// seam is single-authority end to end.
     Specs,
+    /// A watched repository's Git state changed (v2.4 Q-015 — the real-time git
+    /// watcher recomputed a derived view). Mirrors `frontier::ChangedTopic::Repos`.
+    Repos,
 }
 
 impl ChangedTopic {
     /// The wire string the shell maps to its event (`terminals` / `workspaces` /
-    /// `commands` / `agent-sessions` / `specs`).
+    /// `commands` / `agent-sessions` / `specs` / `repos`).
     pub fn as_str(self) -> &'static str {
         match self {
             ChangedTopic::Terminals => "terminals",
@@ -82,6 +85,7 @@ impl ChangedTopic {
             ChangedTopic::Commands => "commands",
             ChangedTopic::AgentSessions => "agent-sessions",
             ChangedTopic::Specs => "specs",
+            ChangedTopic::Repos => "repos",
         }
     }
 }
@@ -597,6 +601,213 @@ pub fn workspace_timeline(db: &Db, args: &Value) -> Result<Value, RpcError> {
             ),
         )),
     }
+}
+
+/// `repo_diff` — `{ workspace_id, repository_id, kind, rev?, base?, target?, mode? }` →
+/// `{ diff }`. The v2.4 GIT DIFF read model (task `01KX0F6FD836YASVYT17YV3FTW`, PDR-0007
+/// / PDR-0015): the line-level diff of ONE repository within a workspace, for one of the
+/// review surfaces (working_tree / staged / unstaged / untracked / commit / range /
+/// branches), in LIVING or PINNED mode. Routes through the SHARED
+/// [`crate::git_diff::diff_repo_with_mode`] — the SAME engine the UI bridge's `repo_diff`
+/// db-command drives (PDR-0005: one authority for UI + MCP). gix is the primary backend;
+/// the `git` CLI is a coherent fallback. The `(workspace_id, repository_id)` pair resolves
+/// to exactly ONE repo's absolute path via [`crate::repository::member_absolute_path`], so
+/// the diff never mixes Git identities across repos. Nothing is persisted (PDR-0013).
+pub fn repo_diff(db: &Db, args: &Value) -> Result<Value, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    let repository_id = require_str(args, "repository_id")?;
+    let kind = require_str(args, "kind")?;
+    let rev = optional_str(args, "rev")?;
+    let base = optional_str(args, "base")?;
+    let target = optional_str(args, "target")?;
+    let mode = optional_str(args, "mode")?;
+
+    let diff_target = crate::git_diff::target_from_params(kind, rev, base, target)
+        .map_err(|m| RpcError::new(RpcCode::InvalidArgument, m))?;
+    let mode_override = crate::git_diff::mode_from_str(mode)
+        .map_err(|m| RpcError::new(RpcCode::InvalidArgument, m))?;
+
+    // Resolve the ONE repository's absolute path (multi-repo identity isolation).
+    let absolute_path = db
+        .with_conn(|c| crate::repository::member_absolute_path(c, workspace_id, repository_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidId,
+                format!(
+                    "no repository {repository_id} in workspace {workspace_id} (use a \
+                     repository_id from workspace_git(workspace_id=…))"
+                ),
+            )
+        })?;
+
+    let effective_mode = mode_override.unwrap_or_else(|| diff_target.default_mode());
+    let diff = crate::git_diff::diff_repo_with_mode(&absolute_path, &diff_target, effective_mode)
+        .map_err(|e| RpcError::new(RpcCode::InvalidArgument, e.to_string()))?;
+    Ok(json!({ "diff": diff }))
+}
+
+/// `repo_git_view` — `{ workspace_id, repository_id, base?, target? }` → `{ view }`. The
+/// v2.4 DERIVED GIT VIEWS read model (task `01KX0F6FXE6AJ9BR4BYHRX6B1R`, Q-015 /
+/// PDR-0013): the per-repo dirty state (staged / modified / untracked), current branch +
+/// base/target, ahead/behind, and a change summary — RE-READ from Git on demand, NEVER
+/// persisted. Routes through the SHARED [`crate::git_views::repo_view_with_target`] — the
+/// SAME derivation the UI bridge's `repo_git_view` db-command drives (PDR-0005: one
+/// authority for UI + MCP). The `(workspace_id, repository_id)` pair resolves to exactly
+/// ONE repo's absolute path (multi-repo identity isolation). `base` is an OPTIONAL review
+/// endpoint (a local branch or SHA — no remote assumed); `target` optionally pins the
+/// compared endpoint (defaults to the current branch).
+pub fn repo_git_view(db: &Db, args: &Value) -> Result<Value, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    let repository_id = require_str(args, "repository_id")?;
+    let base = optional_str(args, "base")?;
+    let target = optional_str(args, "target")?;
+
+    let absolute_path = db
+        .with_conn(|c| crate::repository::member_absolute_path(c, workspace_id, repository_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidId,
+                format!(
+                    "no repository {repository_id} in workspace {workspace_id} (use a \
+                     repository_id from workspace_git(workspace_id=…))"
+                ),
+            )
+        })?;
+
+    let view = crate::git_views::repo_view_with_target(&absolute_path, base, target);
+    Ok(json!({ "view": view }))
+}
+
+/// `review_comment_list` — `{ workspace_id, repository_id, spec_id? }` → `{ comments }`. The v2.4
+/// review COMMENT feed read model (task `01KX0F6HEBPK34CV49EREHK3Y9`, PDR-0012/0015): the whole
+/// auto-threaded set of a `(workspace, repository)` review — roots + replies, anchored + global,
+/// with each comment's `outdated`/`status`. Routes through the SHARED
+/// [`crate::db::list_review_comments`] — the SAME model the UI bridge's `review_comment_list`
+/// db-command reads (PDR-0005). Optional `spec_id` SCOPES the feed to one Spec (Finding 41); the
+/// agent reviewing a Spec passes it, an unscoped call omits it and gets the whole repo feed.
+/// Read-only.
+pub fn review_comment_list(db: &Db, args: &Value) -> Result<Value, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    let repository_id = require_str(args, "repository_id")?;
+    let spec_id = optional_str(args, "spec_id")?;
+    let comments = db
+        .with_conn(|c| crate::db::list_review_comments(c, workspace_id, repository_id, spec_id))
+        .map_err(internal_db)?;
+    Ok(json!({ "comments": comments }))
+}
+
+/// `review_comment_post` — `{ workspace_id, repository_id, body, spec_id?, parent_id?,
+/// file_path?, side?, line_start?, line_end?, blob?, snippet?, context? }` → `{ comment }`. The
+/// v2.4 AGENT façade to annotate a review (task `01KX0F6HEBPK34CV49EREHK3Y9`). The author is
+/// ALWAYS `agent` — the human posts through the UI. The agent may leave a global/anchored
+/// comment OR a REPLY (`parent_id`), but there is DELIBERATELY no resolve tool: the agent NEVER
+/// resolves (resolution is human-only). Routes through the SHARED
+/// [`crate::db::insert_review_comment`] (PDR-0005). An anchor is captured when a `file_path` is
+/// given; `line_end` defaults to `line_start`. Carries a `Repos` changed effect so an open
+/// review UI re-pulls the comment feed live (the agent's reply appears without a reload).
+pub fn review_comment_post(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    let repository_id = require_str(args, "repository_id")?;
+    let body = require_str(args, "body")?;
+    let spec_id = optional_str(args, "spec_id")?;
+    let parent_id = optional_str(args, "parent_id")?;
+    let file_path = optional_str(args, "file_path")?;
+    let side = optional_str(args, "side")?;
+    let line_start = optional_usize(args, "line_start")?;
+    let line_end = optional_usize(args, "line_end")?;
+    let blob = optional_str(args, "blob")?;
+    let snippet = optional_str(args, "snippet")?;
+    let context = optional_str(args, "context")?;
+
+    // An anchor is present iff a file_path is given. Default side = new; line defaults to 1.
+    let anchor = file_path.map(|fp| {
+        let start = line_start.unwrap_or(1) as i32;
+        let end = line_end.map(|e| e as i32).unwrap_or(start).max(start);
+        crate::db::CommentAnchor {
+            file_path: fp.to_string(),
+            side: side.unwrap_or(crate::db::SIDE_NEW).to_string(),
+            line_start: start,
+            line_end: end,
+            blob: blob.map(|b| b.to_string()),
+            snippet: snippet.map(|s| s.to_string()),
+            context: context.map(|c| c.to_string()),
+        }
+    });
+
+    let comment = db
+        .with_conn(|c| {
+            crate::db::insert_review_comment(
+                c,
+                crate::db::NewComment {
+                    workspace_id: workspace_id.to_string(),
+                    repository_id: repository_id.to_string(),
+                    spec_id: spec_id.map(|s| s.to_string()),
+                    parent_id: parent_id.map(|p| p.to_string()),
+                    // The MCP façade ALWAYS writes as the agent (the human posts via the UI).
+                    author_type: crate::db::AUTHOR_AGENT.to_string(),
+                    author_name: "nyx-agent".to_string(),
+                    anchor,
+                    body: body.to_string(),
+                },
+            )
+        })
+        .map_err(internal_db)?;
+    Ok(ToolOutcome::changed(
+        json!({ "comment": comment }),
+        ChangedTopic::Repos,
+    ))
+}
+
+/// `review_task_list` — `{ workspace_id, repository_id }` → `{ tasks }`. The v2.4 review
+/// TASK (finding = task) read model (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`, PDR-0012 — finding = task):
+/// the promoted-task list of a `(workspace, repository)` review, each with its `from_comment_id`,
+/// `title`, optional `severity`, and `grill_state` (proposed/structured/validated). Routes through
+/// the SHARED [`crate::db::list_review_tasks`] — the SAME model the UI bridge reads (PDR-0005).
+/// Read-only. The agent façade reads the whole repo's task list UNSCOPED (`spec_id = None`), like
+/// its unscoped `review_comment_list` — the per-Spec scoping (finding #53) is the UI façade's read.
+pub fn review_task_list(db: &Db, args: &Value) -> Result<Value, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    let repository_id = require_str(args, "repository_id")?;
+    let tasks = db
+        .with_conn(|c| crate::db::list_review_tasks(c, workspace_id, repository_id, None))
+        .map_err(internal_db)?;
+    Ok(json!({ "tasks": tasks }))
+}
+
+/// `review_task_structure` — `{ id, title, details?, severity? }` → `{ task }`. The AGENT's
+/// step of the promotion "grill" (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`): the human lâche brut (a
+/// `proposed` task), the agent STRUCTURES it into a clean coder task (title + details + optional
+/// severity) and it moves to `structured`. The agent may structure but NEVER validate — there is
+/// DELIBERATELY no validate tool here (validation is human-only, symmetric to phase-4 human-only
+/// comment resolution). Routes through the SHARED [`crate::db::structure_task`] (PDR-0005),
+/// which also refuses to reopen an already-VALIDATED task. Carries a `Repos` changed effect so
+/// an open review UI re-pulls the task list + unread badge live. `invalid_id` when the task
+/// is unknown OR already validated (nothing to structure).
+pub fn review_task_structure(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let id = require_str(args, "id")?;
+    let title = require_str(args, "title")?;
+    let details = optional_str(args, "details")?;
+    // `severity` present (even null) → set it; absent → leave unchanged. The MCP arg carries a
+    // string when set, so a present key means "set to this severity".
+    let severity = match args.get("severity") {
+        Some(Value::Null) | None => None,
+        Some(_) => Some(optional_str(args, "severity")?),
+    };
+    let task = db
+        .with_conn(|c| crate::db::structure_task(c, id, title, details, severity))
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidId,
+                format!("no structurable task {id} (unknown or already validated)"),
+            )
+        })?;
+    Ok(ToolOutcome::changed(
+        json!({ "task": task }),
+        ChangedTopic::Repos,
+    ))
 }
 
 /// Whether a workspace `path` matches a normalized `cwd` filter (parity with the Tauri
@@ -1811,6 +2022,27 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         // The v2.2 TIMELINE read model: a bounded, oldest-first fil of a workspace's recent
         // domain_events — the SAME `workspace_timeline::timeline` the UI bridge drives.
         crate::mcp::WORKSPACE_TIMELINE_TOOL => read(workspace_timeline(db, args)),
+        // The v2.4 Git DIFF read model: the line-level diff of ONE repo in a workspace for a
+        // review surface (living/pinned) — the SAME `git_diff::diff_repo_with_mode` the UI
+        // bridge's `repo_diff` db-command drives (gix primary, git CLI fallback).
+        crate::mcp::REPO_DIFF_TOOL => read(repo_diff(db, args)),
+        // The v2.4 DERIVED GIT VIEWS read model: per-repo dirty/branch/ahead-behind/summary,
+        // on demand — the SAME `git_views::repo_view_with_target` the UI bridge drives.
+        crate::mcp::REPO_GIT_VIEW_TOOL => read(repo_git_view(db, args)),
+        // The v2.4 review COMMENT feed read model: the auto-threaded comments of a
+        // (workspace, repository) — the SAME `db::list_review_comments` the UI bridge drives.
+        crate::mcp::REVIEW_COMMENT_LIST_TOOL => read(review_comment_list(db, args)),
+        // The v2.4 review COMMENT post: the AGENT leaves a comment/reply (never resolves —
+        // there is no resolve tool). Mutating → carries a `Repos` changed effect so the UI
+        // re-pulls the feed. The SAME `db::insert_review_comment` the UI bridge drives.
+        crate::mcp::REVIEW_COMMENT_POST_TOOL => Some(review_comment_post(db, args)),
+        // The v2.4 review TASK (finding = task) list: the promoted-task list of a (workspace,
+        // repository) — the SAME `db::list_review_tasks` the UI bridge drives. Read-only.
+        crate::mcp::REVIEW_TASK_LIST_TOOL => read(review_task_list(db, args)),
+        // The v2.4 review TASK structure: the AGENT structures a proposed promotion (never
+        // validates — there is no validate tool). Mutating → carries a `Repos` changed effect so
+        // the UI re-pulls the task list + unread badge. The SAME `db::structure_task`.
+        crate::mcp::REVIEW_TASK_STRUCTURE_TOOL => Some(review_task_structure(db, args)),
         crate::mcp::LIST_IMPORTABLE_SCRIPTS_TOOL => read(list_importable_scripts(db, args)),
         // Project settings (rename + resume opt-in) — mutating → workspaces changed.
         crate::mcp::SET_PROJECT_SETTINGS_TOOL => Some(set_project_settings(db, args)),
@@ -2129,6 +2361,420 @@ mod tests {
         assert_eq!(err.code, RpcCode::InvalidId);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DONE-CRITERION (task 01KX0F6FD836YASVYT17YV3FTW): the MCP `repo_diff` tool exposes
+    /// the v2.4 diff engine to an agent — the line-level diff of ONE repository within a
+    /// workspace, resolved by `(workspace_id, repository_id)` so identities never mix.
+    /// Proof: register a git repo, modify a tracked file, then assert the tool returns a
+    /// modified FileDiff with hunks for THAT repo's file. Git-guarded (skips if absent).
+    #[test]
+    fn mcp_repo_diff_tool_serves_the_v24_diff_engine() {
+        use crate::repository::register_project;
+        let _g = db_guard();
+        if crate::proc_util::command("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping mcp repo_diff test: git unavailable");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("nyx-mcp-diff-{}", uuid::Uuid::now_v7()));
+        let repo = root.join("api");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str], dir: &std::path::Path| {
+            let ok = crate::proc_util::command("git")
+                .args([
+                    "-c",
+                    "user.email=t@nyx",
+                    "-c",
+                    "user.name=nyx",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"], &repo);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"], &repo);
+        std::fs::write(repo.join("README.md"), b"line1\nline2\nline3\n").unwrap();
+        git(&["add", "README.md"], &repo);
+        git(&["commit", "-q", "-m", "init"], &repo);
+
+        let db = Db::in_memory();
+        let (_project, root_ws) = db
+            .with_conn(|c| register_project(c, "Nyx", root.to_str().unwrap(), None))
+            .unwrap();
+
+        // The repository_id the tool needs comes from the workspace_git read model.
+        let git_summary = workspace_git(&db, &json!({ "workspace_id": root_ws.id })).unwrap();
+        let repository_id = git_summary["git"]["repos"][0]["repository_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Modify the tracked file → the working-tree diff shows a modification with hunks.
+        std::fs::write(repo.join("README.md"), b"line1\nCHANGED\nline3\n").unwrap();
+
+        let res = repo_diff(
+            &db,
+            &json!({
+                "workspace_id": root_ws.id,
+                "repository_id": repository_id,
+                "kind": "working_tree",
+            }),
+        )
+        .unwrap();
+        let files = res["diff"]["files"].as_array().unwrap();
+        let readme = files
+            .iter()
+            .find(|f| {
+                f["new"]["path"] == json!("README.md") || f["old"]["path"] == json!("README.md")
+            })
+            .expect("README diff present");
+        assert_eq!(readme["change"], json!("modified"));
+        assert!(
+            !readme["hunks"].as_array().unwrap().is_empty(),
+            "the modification has hunks"
+        );
+        assert_eq!(res["diff"]["backend"], json!("gix"), "gix primary backend");
+        assert_eq!(
+            res["diff"]["mode"],
+            json!("living"),
+            "working tree is living"
+        );
+
+        // An unknown repository_id is a D8 invalid_id error.
+        let err = repo_diff(
+            &db,
+            &json!({
+                "workspace_id": root_ws.id,
+                "repository_id": "nope",
+                "kind": "working_tree",
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+
+        // An unknown diff kind is an invalid_argument error.
+        let err = repo_diff(
+            &db,
+            &json!({
+                "workspace_id": root_ws.id,
+                "repository_id": "whatever",
+                "kind": "bogus",
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DONE-CRITERION (task 01KX0F6FXE6AJ9BR4BYHRX6B1R): the MCP `repo_git_view` tool serves
+    /// the v2.4 derived Git views — per-repo dirty/branch/ahead-behind/summary, on demand, in
+    /// the stable shape the renderer also consumes. Proof: register a git repo, dirty it, and
+    /// assert the tool reports the dirty partition + current branch. Git-guarded.
+    #[test]
+    fn mcp_repo_git_view_tool_serves_the_derived_views() {
+        use crate::repository::register_project;
+        let _g = db_guard();
+        if crate::proc_util::command("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping mcp repo_git_view test: git unavailable");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("nyx-mcp-view-{}", uuid::Uuid::now_v7()));
+        let repo = root.join("api");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str], dir: &std::path::Path| {
+            let ok = crate::proc_util::command("git")
+                .args([
+                    "-c",
+                    "user.email=t@nyx",
+                    "-c",
+                    "user.name=nyx",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"], &repo);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"], &repo);
+        std::fs::write(repo.join("README.md"), b"line1\nline2\n").unwrap();
+        git(&["add", "README.md"], &repo);
+        git(&["commit", "-q", "-m", "init"], &repo);
+
+        let db = Db::in_memory();
+        let (_project, root_ws) = db
+            .with_conn(|c| register_project(c, "Nyx", root.to_str().unwrap(), None))
+            .unwrap();
+        let git_summary = workspace_git(&db, &json!({ "workspace_id": root_ws.id })).unwrap();
+        let repository_id = git_summary["git"]["repos"][0]["repository_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Dirty it with an untracked file.
+        std::fs::write(repo.join("scratch.txt"), b"scratch\n").unwrap();
+
+        let res = repo_git_view(
+            &db,
+            &json!({
+                "workspace_id": root_ws.id,
+                "repository_id": repository_id,
+            }),
+        )
+        .unwrap();
+        assert_eq!(res["view"]["is_git"], json!(true));
+        assert_eq!(res["view"]["branch"]["current"], json!("main"));
+        assert_eq!(res["view"]["dirty"]["clean"], json!(false));
+        let untracked: Vec<&str> = res["view"]["dirty"]["untracked"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(untracked.contains(&"scratch.txt"));
+        assert_eq!(res["view"]["summary"]["untracked"], json!(1));
+
+        // An unknown repository_id is a D8 invalid_id error.
+        let err = repo_git_view(
+            &db,
+            &json!({
+                "workspace_id": root_ws.id,
+                "repository_id": "nope",
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DONE-CRITERION (task 01KX0F6HEBPK34CV49EREHK3Y9): the MCP review-comment tools let an
+    /// AGENT post a comment and REPLY into a thread — and the reply is authored `agent` and
+    /// appears in the list. Proof: post a root, reply to it via `review_comment_post`, and read
+    /// the feed back with `review_comment_list`. No git repo needed (comments key on the
+    /// (workspace, repository) strings).
+    #[test]
+    fn mcp_review_comment_tools_let_the_agent_post_and_reply() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+
+        // The agent posts an ANCHORED root comment.
+        let posted = review_comment_post(
+            &db,
+            &json!({
+                "workspace_id": "ws",
+                "repository_id": "repo",
+                "body": "this looks off",
+                "file_path": "src/a.rs",
+                "side": "new",
+                "line_start": 4,
+            }),
+        )
+        .expect("post root");
+        // A mutating tool → it carries the Repos changed effect (the UI re-pulls live).
+        assert_eq!(posted.effects, vec![ChangedTopic::Repos]);
+        let root = &posted.result["comment"];
+        assert_eq!(
+            root["author_type"],
+            json!("agent"),
+            "MCP posts as the agent"
+        );
+        assert_eq!(root["file_path"], json!("src/a.rs"));
+        assert_eq!(root["line_start"], json!(4));
+        let root_id = root["id"].as_str().unwrap().to_string();
+
+        // The agent REPLIES into the thread (parent_id).
+        let reply = review_comment_post(
+            &db,
+            &json!({
+                "workspace_id": "ws",
+                "repository_id": "repo",
+                "body": "on second thought it's fine",
+                "parent_id": root_id,
+            }),
+        )
+        .expect("post reply");
+        assert_eq!(reply.result["comment"]["parent_id"], json!(root_id));
+        assert_eq!(reply.result["comment"]["author_type"], json!("agent"));
+
+        // The list shows the auto-threaded feed (root + reply), authored agent.
+        let listed = review_comment_list(
+            &db,
+            &json!({ "workspace_id": "ws", "repository_id": "repo" }),
+        )
+        .expect("list");
+        let comments = listed["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 2, "root + reply");
+        assert_eq!(comments[0]["id"], json!(root_id), "oldest-first");
+        assert_eq!(comments[1]["parent_id"], json!(root_id));
+    }
+
+    /// DONE-CRITERION (task 01KX0F6HEBPK34CV49EREHK3Y9): the agent NEVER resolves. Proof: the
+    /// dispatcher exposes NO `review_comment_resolve` tool (and no resolve tool of any name) to
+    /// MCP — the agent has post/reply, and resolution is reachable ONLY from the UI façade. An
+    /// attempt to dispatch a resolve tool falls through as an unknown tool (`None`).
+    #[test]
+    fn mcp_agent_cannot_resolve_a_comment() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+
+        // No resolve tool of any name is dispatchable over MCP.
+        for name in ["review_comment_resolve", "review_comment_reopen"] {
+            let out = dispatch_extension_tool(
+                &db,
+                &runner,
+                &host,
+                &activity,
+                name,
+                &json!({ "id": "whatever" }),
+            );
+            assert!(
+                out.is_none(),
+                "{name} must NOT be an MCP tool — the agent never resolves"
+            );
+        }
+
+        // The agent CAN post/reply (sanity: the façade it IS allowed is dispatchable).
+        let out = dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            crate::mcp::REVIEW_COMMENT_POST_TOOL,
+            &json!({ "workspace_id": "ws", "repository_id": "repo", "body": "hi" }),
+        );
+        assert!(out.is_some(), "review_comment_post IS an MCP tool");
+    }
+
+    /// The GRILL over MCP (task 01KX0F6JEKCEV2JCTMEBMM3P4Z): the agent STRUCTURES a proposed
+    /// task via `review_task_structure` and lists it via `review_task_list`. Proof: a
+    /// human-promoted (proposed) task is structured to a clean task, moves to `structured`,
+    /// carries the `Repos` changed effect, and shows in the list.
+    #[test]
+    fn mcp_review_task_structure_and_list() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+
+        // A human-promoted task (the DB layer models the human's "lâche brut").
+        let task = db
+            .with_conn(|c| {
+                let comment = crate::db::insert_review_comment(
+                    c,
+                    crate::db::NewComment {
+                        workspace_id: "ws".into(),
+                        repository_id: "repo".into(),
+                        author_type: crate::db::AUTHOR_HUMAN.into(),
+                        author_name: "Kris".into(),
+                        body: "fragile".into(),
+                        ..Default::default()
+                    },
+                )?;
+                crate::db::promote_comment_to_task(c, &comment, "fragile", None)
+            })
+            .expect("promote");
+        assert_eq!(task.grill_state, crate::db::GRILL_PROPOSED);
+
+        // The AGENT structures it via MCP.
+        let structured = review_task_structure(
+            &db,
+            &json!({
+                "id": task.id,
+                "title": "Harden the fragile path",
+                "details": "Add validation + a test.",
+                "severity": "high",
+            }),
+        )
+        .expect("structure");
+        assert_eq!(structured.effects, vec![ChangedTopic::Repos]);
+        assert_eq!(
+            structured.result["task"]["grill_state"],
+            json!("structured")
+        );
+        assert_eq!(structured.result["task"]["severity"], json!("high"));
+
+        // It shows in the task list, still NOT validated (ready-for-coder is the human's call).
+        let listed = review_task_list(
+            &db,
+            &json!({ "workspace_id": "ws", "repository_id": "repo" }),
+        )
+        .expect("list");
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["grill_state"], json!("structured"));
+    }
+
+    /// DONE-CRITERION guard-rail (task 01KX0F6JEKCEV2JCTMEBMM3P4Z): the agent NEVER validates a
+    /// task. Proof: the dispatcher exposes NO validate/promote tool of any name to MCP — the
+    /// agent has ONLY `review_task_list` (read) + `review_task_structure` (structure).
+    /// Validation (making a task ready for the coder) is reachable ONLY from the UI façade. This
+    /// is the task-side twin of `mcp_agent_cannot_resolve_a_comment` (phase-4 human-only
+    /// resolution).
+    #[test]
+    fn mcp_agent_cannot_validate_or_promote_a_task() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+
+        // No validate/promote/mark-read tool of any name is dispatchable over MCP.
+        for name in [
+            "review_task_validate",
+            "review_task_promote",
+            "review_promote_comment",
+            "review_mark_read",
+        ] {
+            let out = dispatch_extension_tool(
+                &db,
+                &runner,
+                &host,
+                &activity,
+                name,
+                &json!({ "id": "whatever" }),
+            );
+            assert!(
+                out.is_none(),
+                "{name} must NOT be an MCP tool — the agent never validates/promotes"
+            );
+        }
+
+        // The agent CAN list + structure (the façade it IS allowed is dispatchable).
+        for name in [
+            crate::mcp::REVIEW_TASK_LIST_TOOL,
+            crate::mcp::REVIEW_TASK_STRUCTURE_TOOL,
+        ] {
+            let out = dispatch_extension_tool(
+                &db,
+                &runner,
+                &host,
+                &activity,
+                name,
+                &json!({ "workspace_id": "ws", "repository_id": "repo", "id": "x", "title": "t" }),
+            );
+            assert!(out.is_some(), "{name} IS an MCP tool");
+        }
     }
 
     /// DONE-CRITERION (task 01KWHPV33SAV9NV1STSY403CF0): the MCP `workspace_timeline` tool
