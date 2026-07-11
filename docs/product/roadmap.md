@@ -21,6 +21,8 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.3 | Terminal en blocs (honor-the-shell) | ⏸️ parké (WIP, branche non mergée) |
 | v2.4 | Specs : tâches et contextes agents | 🚧 en cours |
 | v2.5 | Diff et review locale | 🌿 développé sur `v2.4-review`, à greffer |
+| v2.5.5 | Reprise & cycle de vie des sessions agent | 📋 PRD prêt |
+| v2.5.6 | Cockpit de pilotage (chrome, CRUD, stats, reorder) | 📋 PRD prêt |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -172,6 +174,36 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 >
 > **Détail complet** (ce qui est développé, le placement, la leçon de séquençage) → [`session-notes.md`](session-notes.md).
 
+## v2.5.5 - Reprise & cycle de vie des sessions agent
+
+**Status: ready** — PRD `01KX8Z4E7B3PYW2DGCTTKXCHYC`
+
+> Point-release issue de l'audit v1→v2 : beaucoup de code de pilotage v1 a été recopié en v2 mais laissé
+> non-câblé ; la reprise des sessions avait le setting **et** la politique backend mais **aucune exécution**.
+> Comme v2.2.5, cette tranche **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
+
+- rebrancher l'**UI Integrations** (install du plugin Claude, dont dépendent détection d'agent + icône + statut) + le toggle `resume_agent_sessions` dans le shell actif ;
+- **EXÉCUTER la reprise en mode LAZY** (à l'ouverture d'un terminal, pas eager au boot) : consommer `workspace_restore_plan`, re-porter park+inject `claude --resume` (réutilise `decide_resume` / `workspace_resume_plan`) ;
+- afficher les états post-crash `interrupted` / `unknown` + une UI de restauration ;
+- **UNLOAD des sessions idle non visitées** + resume au retour (spike sur la détection d'activité réelle) — c'est ici que vit l'idée parquée `01KX0X3ZZQMEPKBQX30SX47HJF` (déplacée depuis v2.7).
+
+**Gate :** toggle ON → relance → reprise à l'ouverture ; crash → interrupted + restore ; idle → unload + resume ; plugin installable depuis l'UI.
+
+## v2.5.6 - Cockpit de pilotage : chrome, CRUD, stats, reorder
+
+**Status: ready** — PRD `01KX905WD4GSQBR5N66H0TJB3M`
+
+> Point-release qui rebranche le reste du cockpit v1 déjà recopié en v2 mais non-câblé.
+> Comme v2.2.5, elle **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
+
+- chrome fenêtre (min/max/close + drag) + **close-warning** avant de tuer des sessions live ;
+- **kebab projet** + CRUD (rename/delete projet + workspace) ;
+- **stats CPU/RAM par terminal** (ajoute le producteur sidecar `terminal://stats` manquant) ;
+- rename inline / bouton fermer par ligne / bande terminaux libres ;
+- **reorder** terminaux + projets (drag).
+
+**Gate :** parcourir le cockpit rebranché (chrome + close-warning, CRUD, stats, rename/close, terminaux libres, reorder), sans régression du workbench v2.2 ni de v2.5.5.
+
 ## v2.6 - Knowledge et mémoire projet
 
 - idées et promotion vers Spec ;
@@ -196,8 +228,10 @@ Après validation des usages de v2.0 à v2.6 :
 - orchestration multi-agent via playbook éditable + verbes observables, pas un moteur (cf. PDR-0011) ;
 - automatisations ;
 - diagnostics et outils de réparation ;
-- gestion du cycle de vie / ressources des sessions agent : décharger (unload) les sessions Claude idle non visitées depuis un moment, resume au retour, et resume **paresseux** au démarrage (ne rien reprendre tant que le terminal n'a pas été ouvert) ; crux = détecter l'activité réelle d'un agent (busy/exec_state, agent_session_event, inactivité I/O) — à valider par un spike ; cf. idée depot `01KX0X3ZZQMEPKBQX30SX47HJF` ;
 - import/export et sauvegardes de longue durée.
+
+> L'unload / lazy-resume des sessions agent idle (crux = détection d'activité réelle, idée depot
+> `01KX0X3ZZQMEPKBQX30SX47HJF`) est traité en **v2.5.5**.
 
 Chaque sous-système Depot doit recevoir une décision explicite : **porter, simplifier, remplacer ou supprimer**. Il n'est pas copié par défaut.
 
@@ -225,6 +259,8 @@ v2.0 consolidation Electron/Rust
 -> v2.3 terminal en blocs (honor-the-shell)
 -> v2.4 Spec/tâches/contextes MCP
 -> v2.5 diff/review
+-> v2.5.5 sessions agent (reprise/cycle de vie)
+-> v2.5.6 cockpit (chrome, CRUD, stats, reorder)
 -> v2.6 knowledge
 -> v2.7 capacités avancées retenues
 -> v2.8 migration et suppression Depot
