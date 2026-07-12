@@ -22,8 +22,9 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.4 | Specs : tâches et contextes agents | 🚧 en cours |
 | v2.5 | Diff et review locale | 🌿 développé sur `v2.4-review`, à greffer |
 | v2.5.5 | Reprise & cycle de vie des sessions agent | ✅ livré (mergé) |
-| v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 📋 PRD prêt |
+| v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 🚧 en cours |
 | v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📝 PRD rédigé (draft) |
+| v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📝 à concevoir |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -220,6 +221,21 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** forker un Spec à N tâches + M dépendances produit N tâches + M dépendances remappées, la révision précédente restant figée et en lecture seule ; zéro lien perdu ; sans régression du lifecycle Spec v2.4.
 
+## v2.5.8 - Contextes agents : livraison du harnais (injecté, générique multi-provider)
+
+**Status: à concevoir** — PRD à venir
+
+> Finit ce que v2.4 avait **promis mais pas livré**. Le RENDER des contextes existe (`agent_context`, en *pull*, rôles dev/coder/auditor) ; la **livraison** (hook push + stubs `/n…`) et les rôles **spec/doc** manquent → le Gate v2.4 « workflow complet **sans Depot** » n'est pas tenu. Point-release qui n'incrémente pas la suite.
+
+- ajouter les rôles **`spec`** (auteur-PRD qui grille) et **`doc`** au render live (aujourd'hui dev/coder/auditor seuls) ;
+- **livraison par hook** : `UserPromptSubmit` détecte le stub, appelle `agent_context` au sidecar (`127.0.0.1/mcp`) et injecte le manuel en `additionalContext` — **le patron SessionStart existe déjà** dans `nyx-session-hook.cjs` ;
+- **3 stubs fixes** `/nspec` `/ndev` `/ndoc` livrés avec le plugin bundlé (aujourd'hui : dossier `hooks/` seul, pas de `commands/`) ;
+- **contexte dynamique**, pas un template mort : rôle + rules (`directives`) + spec/phase/tâches + workspace/repos + design, rendus **live par nyx-core** ;
+- **sous-agents** (coder/auditor) : contexte transmis à leur lancement — mécanisme à arrêter dans le PRD (SubagentStart vs passé par l'orchestrateur) ;
+- **générique multi-provider** : Claude Code aujourd'hui, mais l'abstraction doit tenir pour **OpenCode / Codex / autres** — le harnais est de la **donnée** (rendue par nyx-core), le **transport** (hooks/stubs) est **par-provider**.
+
+**Gate :** taper `/nspec` (ou `/ndev`, `/ndoc`) injecte le harnais rendu **live** depuis nyx, MCP = actions seules ; la boucle create→dev→doc se pilote **sans Depot** — le vrai Gate v2.4 enfin tenu.
+
 ## v2.6 - Knowledge et mémoire projet
 
 - idées et promotion vers Spec ;
@@ -278,6 +294,7 @@ v2.0 consolidation Electron/Rust
 -> v2.5.5 sessions agent (reprise/cycle de vie)
 -> v2.5.6 cockpit (close-warning, CRUD, stats non-inline, reorder dnd-kit)
 -> v2.5.7 spec révisions (cliché complet, tâches versionnées)
+-> v2.5.8 contextes agents (livraison harnais, multi-provider)
 -> v2.6 knowledge
 -> v2.7 capacités avancées retenues
 -> v2.8 migration et suppression Depot
