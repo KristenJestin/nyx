@@ -22,7 +22,8 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.4 | Specs : tâches et contextes agents | 🚧 en cours |
 | v2.5 | Diff et review locale | 🌿 développé sur `v2.4-review`, à greffer |
 | v2.5.5 | Reprise & cycle de vie des sessions agent | 📋 PRD prêt |
-| v2.5.6 | Cockpit de pilotage (chrome, CRUD, stats, reorder) | 📋 PRD prêt |
+| v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 📋 PRD prêt |
+| v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📝 PRD rédigé (draft) |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -189,20 +190,35 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** toggle ON → relance → reprise à l'ouverture ; crash → interrupted + restore ; idle → unload + resume ; plugin installable depuis l'UI.
 
-## v2.5.6 - Cockpit de pilotage : chrome, CRUD, stats, reorder
+## v2.5.6 - Cockpit de pilotage : close-warning, CRUD, stats (non-inline), reorder (dnd-kit)
 
-**Status: ready** — PRD `01KX905WD4GSQBR5N66H0TJB3M`
+**Status: ready** — PRD `01KXBNX508EYHSQ1CW7RWYKV95` (rev 2 courante ; la rev 1 `01KX905W…3M` est superseded)
 
 > Point-release qui rebranche le reste du cockpit v1 déjà recopié en v2 mais non-câblé.
 > Comme v2.2.5, elle **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
 
-- chrome fenêtre (min/max/close + drag) + **close-warning** avant de tuer des sessions live ;
+- **close-warning** avant de tuer des sessions live (contrôles de fenêtre min/max/close = **hors scope**, fournis par le WM) ;
 - **kebab projet** + CRUD (rename/delete projet + workspace) ;
-- **stats CPU/RAM par terminal** (ajoute le producteur sidecar `terminal://stats` manquant) ;
+- **stats CPU/RAM par terminal** en affichage **non-inline** (survol/tooltip ou zone dédiée — ne pas cacher le nom comme en v1) ; ajoute le producteur sidecar `terminal://stats` manquant ;
 - rename inline / bouton fermer par ligne / bande terminaux libres ;
-- **reorder** terminaux + projets (drag).
+- **reorder** terminaux + projets (drag, **dnd-kit** comme les sortable-*-list de v1).
 
-**Gate :** parcourir le cockpit rebranché (chrome + close-warning, CRUD, stats, rename/close, terminaux libres, reorder), sans régression du workbench v2.2 ni de v2.5.5.
+**Gate :** parcourir le cockpit rebranché (close-warning, CRUD, stats non-inline, rename/close, terminaux libres, reorder dnd-kit), sans régression du workbench v2.2 ni de v2.5.5.
+
+## v2.5.7 - Spec révisions : cliché complet (tâches versionnées par révision)
+
+**Status: draft** — PRD `01KXBQ8QVYR887Y1C79V6EEQK4`
+
+> Suivi de v2.4 (Specs). Point-release qui **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
+> Déclencheur : en absorbant Depot, on a constaté que son fork ne clonait que le narratif + une partie des tâches et **perdait des liens** (vécu au fork rev 1→2 du PRD cockpit). Le natif ne doit **pas** reproduire ça.
+
+- une révision de Spec devient un **cliché immuable complet** : narratif **+ tâches + dépendances** (aujourd'hui seul le narratif est figé ; les tâches pendent du Spec via `tasks.spec_id` et traversent les forks) ;
+- `tasks` + `task_dependencies` **rattachées à une révision** + migration idempotente (backfill sur la révision active) ;
+- `fork_spec` **deep-clone atomique** des tâches + dépendances + sous-tâches (nouveaux ids, références de deps et de parent **remappées**, zéro lien perdu) ;
+- tâches d'une révision `superseded` en **lecture seule** (historique immuable) ;
+- lectures (task list, contexte agent, review) **scopées à une révision** (active par défaut ; historique consultable).
+
+**Gate :** forker un Spec à N tâches + M dépendances produit N tâches + M dépendances remappées, la révision précédente restant figée et en lecture seule ; zéro lien perdu ; sans régression du lifecycle Spec v2.4.
 
 ## v2.6 - Knowledge et mémoire projet
 
@@ -260,7 +276,8 @@ v2.0 consolidation Electron/Rust
 -> v2.4 Spec/tâches/contextes MCP
 -> v2.5 diff/review
 -> v2.5.5 sessions agent (reprise/cycle de vie)
--> v2.5.6 cockpit (chrome, CRUD, stats, reorder)
+-> v2.5.6 cockpit (close-warning, CRUD, stats non-inline, reorder dnd-kit)
+-> v2.5.7 spec révisions (cliché complet, tâches versionnées)
 -> v2.6 knowledge
 -> v2.7 capacités avancées retenues
 -> v2.8 migration et suppression Depot
