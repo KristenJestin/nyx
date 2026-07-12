@@ -21,7 +21,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.3 | Terminal en blocs (honor-the-shell) | ⏸️ parké (WIP, branche non mergée) |
 | v2.4 | Specs : tâches et contextes agents | 🚧 en cours |
 | v2.5 | Diff et review locale | 🌿 développé sur `v2.4-review`, à greffer |
-| v2.5.5 | Reprise & cycle de vie des sessions agent | 📋 PRD prêt |
+| v2.5.5 | Reprise & cycle de vie des sessions agent | ✅ livré (mergé) |
 | v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 📋 PRD prêt |
 | v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📝 PRD rédigé (draft) |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
@@ -177,7 +177,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 ## v2.5.5 - Reprise & cycle de vie des sessions agent
 
-**Status: ready** — PRD `01KX8Z4E7B3PYW2DGCTTKXCHYC`
+**Status: livré** — PRD `01KX8Z4E7B3PYW2DGCTTKXCHYC`
 
 > Point-release issue de l'audit v1→v2 : beaucoup de code de pilotage v1 a été recopié en v2 mais laissé
 > non-câblé ; la reprise des sessions avait le setting **et** la politique backend mais **aucune exécution**.
