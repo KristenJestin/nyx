@@ -282,8 +282,16 @@ fn branches_diff_in_subdirectory_omits_the_directory_entry() {
         !paths.contains(&"src") && !paths.contains(&"src/inner"),
         "the diff must not contain directory entries, got {paths:?}"
     );
-    assert!(paths.contains(&"src/a.rs") && paths.contains(&"src/b.rs") && paths.contains(&"src/inner/c.rs"));
-    assert_eq!(gix.files.len(), 3, "only the 3 changed files, got {paths:?}");
+    assert!(
+        paths.contains(&"src/a.rs")
+            && paths.contains(&"src/b.rs")
+            && paths.contains(&"src/inner/c.rs")
+    );
+    assert_eq!(
+        gix.files.len(),
+        3,
+        "only the 3 changed files, got {paths:?}"
+    );
     // Every entry is a real blob change with hunks (no binary/empty directory pseudo-file).
     for f in &gix.files {
         assert!(!f.hunks.is_empty(), "file {} has hunks", f.path());

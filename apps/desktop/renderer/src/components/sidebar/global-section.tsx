@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import { isBridgeError } from "@/bridge";
 import { XCircleIcon } from "lucide-react";
 
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -29,6 +30,13 @@ export interface GlobalSectionProps {
    * May return a promise so this section can toast the real reason on failure.
    */
   onResumeChange: (resume: boolean) => void | Promise<void>;
+  /**
+   * Whether to render the Name/rename field. Defaults to `true`. Set `false` at an
+   * entry point that must NOT expose project rename yet (phase-1 shell: rename/delete
+   * belong to the PRD-B kebab CRUD) — only the resume toggle is shown then. `onRename`
+   * is still required so the default (rename-enabled) callers stay unchanged.
+   */
+  showRename?: boolean;
 }
 
 /**
@@ -54,6 +62,7 @@ export function GlobalSection({
   resumeAgentSessions,
   onRename,
   onResumeChange,
+  showRename = true,
 }: GlobalSectionProps) {
   const [name, setName] = useState(projectName);
   const [saving, setSaving] = useState(false);
@@ -102,42 +111,45 @@ export function GlobalSection({
         Project-level settings. They apply to every workspace of this project.
       </p>
 
-      {/* Rename */}
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void save();
-        }}
-        className="flex flex-col gap-1.5"
-      >
-        <label htmlFor="project-name" className="text-xs font-medium text-muted-foreground">
-          Name
-        </label>
-        <div className="flex items-center gap-2">
-          <Input
-            id="project-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            aria-label="Project name"
-            disabled={!projectId}
-            className="flex-1"
-          />
-          <Button type="submit" size="sm" loading={saving} disabled={!canSave}>
-            Save
-          </Button>
-        </div>
-        {error && (
-          <p role="alert" className="mt-1 flex items-center gap-1 text-xs text-destructive">
-            <XCircleIcon className="size-3 shrink-0" />
-            {error}
-          </p>
-        )}
-      </form>
+      {/* Rename — hidden where the entry point must not expose project rename yet
+          (phase-1 shell; rename/delete = PRD-B kebab CRUD). */}
+      {showRename && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void save();
+          }}
+          className="flex flex-col gap-1.5"
+        >
+          <label htmlFor="project-name" className="text-xs font-medium text-muted-foreground">
+            Name
+          </label>
+          <div className="flex items-center gap-2">
+            <Input
+              id="project-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              aria-label="Project name"
+              disabled={!projectId}
+              className="flex-1"
+            />
+            <Button type="submit" size="sm" loading={saving} disabled={!canSave}>
+              Save
+            </Button>
+          </div>
+          {error && (
+            <p role="alert" className="mt-1 flex items-center gap-1 text-xs text-destructive">
+              <XCircleIcon className="size-3 shrink-0" />
+              {error}
+            </p>
+          )}
+        </form>
+      )}
 
       {/* Resume agent sessions */}
       <label
         htmlFor="resume-agent-sessions"
-        className="mt-5 flex items-start justify-between gap-3"
+        className={cn("flex items-start justify-between gap-3", showRename && "mt-5")}
       >
         <span className="flex flex-col gap-0.5">
           <span className="text-sm font-medium text-foreground">Resume agent sessions</span>

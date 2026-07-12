@@ -73,6 +73,78 @@ impl RunStateOverlay for NoRunStateOverlay {
     }
 }
 
+/// The LIVE per-terminal signals overlaid onto a runtime snapshot from the PTY layer —
+/// facts that are NOT in the DB and MUST NOT be persisted (the anti-phantom guarantee).
+/// Keyed by the persistent terminal RECORD id. v2.5.5 review:
+///   * `busy` — a command runs in the terminal's foreground process group (T1).
+///   * `detected_agent_kind` — the agent kind the FOREGROUND command resolves to via the
+///     provider-agnostic `AgentRegistry::detect` (T3), for PASSIVE adoption.
+///
+/// Kept a plain data struct (not per-field methods) so a future signal is one field, and
+/// so [`TerminalLiveOverlay`] resolves the whole set in one lookup per terminal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalLive {
+    /// The OS busy bit for this terminal (see [`WorkspaceTerminal::busy`]).
+    pub busy: bool,
+    /// The PASSIVELY-DETECTED agent kind for this terminal (see
+    /// [`WorkspaceTerminal::detected_agent_kind`]), or `None` when the foreground is not a
+    /// known agent. PROVIDER-AGNOSTIC: resolved through `AgentRegistry::detect`, never a
+    /// hardcoded `claude` — every registry adapter is eligible.
+    pub detected_agent_kind: Option<String>,
+}
+
+/// The live-terminal overlay seam: given a terminal RECORD id, return its live
+/// [`TerminalLive`] signals. The UI bridge passes an adapter over the live `PtyManager`
+/// (`is_busy`); a pure-DB caller (a test, the MCP tool, a cold read) passes
+/// [`NoTerminalLiveOverlay`] so every terminal reads its default (not busy). Modelling it
+/// as a trait keeps `nyx-core`'s read model decoupled from the sidecar's concrete PTY
+/// manager — exactly like [`RunStateOverlay`] does for the managed-command runner.
+pub trait TerminalLiveOverlay {
+    /// The live signals for the terminal RECORD `terminal_id` (default when unknown/dead).
+    fn live(&self, terminal_id: &str) -> TerminalLive;
+}
+
+/// The zero-overlay: no live PTY layer, so every terminal reports its default (idle/not
+/// busy). Used by the pure-DB callers — tests, the MCP `workspace_runtime` tool, and any
+/// cold read before the live overlay is applied.
+pub struct NoTerminalLiveOverlay;
+
+impl TerminalLiveOverlay for NoTerminalLiveOverlay {
+    fn live(&self, _terminal_id: &str) -> TerminalLive {
+        TerminalLive::default()
+    }
+}
+
+/// A blanket impl so any closure `Fn(&str) -> TerminalLive` is a [`TerminalLiveOverlay`] —
+/// the ergonomic form the sidecar db-command uses to adapt the live `PtyManager`
+/// (`|record_id| TerminalLive { busy: pty.is_busy_record(record_id) }`) without a named type.
+impl<F> TerminalLiveOverlay for F
+where
+    F: Fn(&str) -> TerminalLive,
+{
+    fn live(&self, terminal_id: &str) -> TerminalLive {
+        (self)(terminal_id)
+    }
+}
+
+/// Overlay the LIVE per-terminal PTY signals onto an already-built [`WorkspaceRuntimeSnapshot`],
+/// in place. This is deliberately a POST-processing step over the pure-DB [`snapshot`] (rather
+/// than a parameter of it) so `snapshot` stays a pure DB+runner projection with NO live-PTY
+/// dependency — the MCP tool and every test call it unchanged, and only the UI bridge (which
+/// holds the live `PtyManager`) applies this overlay. Each terminal's `busy` (T1) and
+/// `detected_agent_kind` (T3, passive adoption) are read from `overlay.live(record_id)`; a
+/// terminal the overlay does not know reads its default (not busy, no detected agent).
+pub fn apply_terminal_live_overlay(
+    snapshot: &mut WorkspaceRuntimeSnapshot,
+    overlay: &dyn TerminalLiveOverlay,
+) {
+    for wt in &mut snapshot.terminals {
+        let live = overlay.live(&wt.terminal.id);
+        wt.busy = live.busy;
+        wt.detected_agent_kind = live.detected_agent_kind;
+    }
+}
+
 /// A blanket impl so any closure `Fn(&str) -> Option<(RunState, Option<i32>, bool)>`
 /// is a [`RunStateOverlay`] — the ergonomic form a caller uses to adapt a
 /// `CommandRunner` (`|id| runner.outcome(id)`) without a named wrapper type.
@@ -95,6 +167,28 @@ pub struct WorkspaceTerminal {
     pub terminal: Terminal,
     /// The agent sessions anchored to this terminal (every state), oldest started first.
     pub sessions: Vec<AgentSession>,
+    /// The OS BUSY bit (v2.5.5 review T1): `true` while a command runs in this terminal's
+    /// FOREGROUND process group (the shell handed the terminal to a child), `false` at the
+    /// idle prompt. This is a LIVE signal from the PTY layer overlaid by
+    /// [`apply_terminal_live_overlay`] — NOT a DB column — so it is NEVER persisted (the
+    /// anti-phantom guarantee: a restored terminal with no foreground command reads idle by
+    /// construction). It restores the "un process foreground rallume un point running" mode
+    /// the OSC-133 `exec_state` cannot express (it never carries `running`). A pure-DB read
+    /// (tests, the MCP tool, a cold read before the overlay) leaves it `false`.
+    #[serde(default)]
+    pub busy: bool,
+    /// The PASSIVELY-DETECTED agent kind (v2.5.5 review T3): when the terminal's FOREGROUND
+    /// command resolves to a known agent via the provider-agnostic `AgentRegistry::detect`
+    /// (over the foreground `comm`), this is that adapter's `agent_kind` — else `None`. It is a
+    /// LIVE overlay (never persisted, distinct from `sessions[]`) so nyx can ADOPT an agent
+    /// launched by hand — show its provider icon + a busy-derived status — WITHOUT waiting for
+    /// the hook's `SessionStart`. It NEVER creates an `agent_sessions` row (that stays reserved
+    /// for the hook, which carries the resumable `external_session_id`); the renderer only shows
+    /// this passive kind WHEN there is no hook session for the terminal — the hook session, once
+    /// it fires, is the authoritative icon (no double icon, no flicker). `None` when the
+    /// foreground is a plain shell/command, so a stopped agent's passive icon disappears.
+    #[serde(default)]
+    pub detected_agent_kind: Option<String>,
 }
 
 /// One managed-command SERVICE of the workspace: the instance (joined to its template
@@ -193,7 +287,15 @@ pub fn snapshot(
                 anchored.push(s.clone());
             }
         }
-        terminals.push(WorkspaceTerminal { terminal, sessions });
+        // `busy` / `detected_agent_kind` default to their empty values here (a pure-DB
+        // projection knows no live foreground state); the UI bridge overlays the live PTY
+        // signals via `apply_terminal_live_overlay`.
+        terminals.push(WorkspaceTerminal {
+            terminal,
+            sessions,
+            busy: false,
+            detected_agent_kind: None,
+        });
     }
 
     // Sessions anchored to this workspace on a LOOSE (unattached) host terminal — the
@@ -522,6 +624,178 @@ mod tests {
             Some("persisted-branch"),
             "the runtime snapshot serves the PERSISTED branch verbatim (no live git detection)"
         );
+    }
+
+    /// v2.5.5 review T1 — the LIVE busy overlay surfaces on the terminal LINE. The pure-DB
+    /// snapshot reads every terminal `busy = false` (no live foreground knowledge); applying
+    /// [`apply_terminal_live_overlay`] with an overlay that reports one terminal busy flips
+    /// exactly that terminal's `busy` to `true`, leaving the others idle — the "un process
+    /// foreground rallume un point running sur la LIGNE" wiring, proven at the read-model.
+    #[test]
+    fn terminal_live_overlay_sets_busy_on_the_matching_terminal() {
+        let mut conn = open_in_memory();
+        let sink = NullEventSink;
+        let (project, _root) = usecase::create_project(
+            &mut conn,
+            &sink,
+            "Nyx",
+            &root_path("busy"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let ws = usecase::register_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            "wt",
+            &root_path("busy-wt"),
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let t1 = db::create_terminal(&mut conn, &root_path("busy-wt"), None).unwrap();
+        let t2 = db::create_terminal(&mut conn, &root_path("busy-wt"), None).unwrap();
+        db::attach_terminal(&mut conn, &t1.id, &ws.id, "auto").unwrap();
+        db::attach_terminal(&mut conn, &t2.id, &ws.id, "auto").unwrap();
+
+        let mut snap = snapshot(&mut conn, &ws.id, &NoRunStateOverlay)
+            .unwrap()
+            .expect("workspace resolves");
+        // Pure-DB: no terminal is busy (busy is never persisted — anti-phantom).
+        assert!(
+            snap.terminals.iter().all(|t| !t.busy),
+            "the pure-DB snapshot knows no live foreground state"
+        );
+
+        // Overlay reports t1 busy (a foreground command running), t2 idle.
+        let busy_id = t1.id.clone();
+        let overlay = move |id: &str| TerminalLive {
+            busy: id == busy_id,
+            ..Default::default()
+        };
+        apply_terminal_live_overlay(&mut snap, &overlay);
+
+        let t1_view = snap
+            .terminals
+            .iter()
+            .find(|t| t.terminal.id == t1.id)
+            .unwrap();
+        let t2_view = snap
+            .terminals
+            .iter()
+            .find(|t| t.terminal.id == t2.id)
+            .unwrap();
+        assert!(t1_view.busy, "the foreground-busy terminal lights running");
+        assert!(!t2_view.busy, "the idle-prompt terminal stays quiet");
+    }
+
+    /// v2.5.5 review T3 — the PASSIVE agent-adoption overlay surfaces the detected kind on the
+    /// terminal LINE, DISTINCT from `sessions[]` (it creates NO agent session). The pure-DB
+    /// snapshot has no detected kind; applying an overlay that reports one terminal's foreground
+    /// as a known agent sets exactly that terminal's `detected_agent_kind`, leaving `sessions`
+    /// untouched (no fake resumable session) — the read-model half of passive adoption.
+    #[test]
+    fn terminal_live_overlay_sets_detected_agent_kind_without_a_session() {
+        let mut conn = open_in_memory();
+        let sink = NullEventSink;
+        let (project, _root) = usecase::create_project(
+            &mut conn,
+            &sink,
+            "Nyx",
+            &root_path("passive"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let ws = usecase::register_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            "wt",
+            &root_path("passive-wt"),
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let t1 = db::create_terminal(&mut conn, &root_path("passive-wt"), None).unwrap();
+        let t2 = db::create_terminal(&mut conn, &root_path("passive-wt"), None).unwrap();
+        db::attach_terminal(&mut conn, &t1.id, &ws.id, "auto").unwrap();
+        db::attach_terminal(&mut conn, &t2.id, &ws.id, "auto").unwrap();
+
+        let mut snap = snapshot(&mut conn, &ws.id, &NoRunStateOverlay)
+            .unwrap()
+            .expect("workspace resolves");
+        assert!(
+            snap.terminals
+                .iter()
+                .all(|t| t.detected_agent_kind.is_none()),
+            "the pure-DB snapshot detects no passive agent"
+        );
+
+        // t1's foreground is a known agent (any registry kind), t2's is a plain shell.
+        let agent_id = t1.id.clone();
+        let overlay = move |id: &str| TerminalLive {
+            busy: true,
+            detected_agent_kind: (id == agent_id).then(|| "claude_code".to_string()),
+        };
+        apply_terminal_live_overlay(&mut snap, &overlay);
+
+        let t1_view = snap
+            .terminals
+            .iter()
+            .find(|t| t.terminal.id == t1.id)
+            .unwrap();
+        let t2_view = snap
+            .terminals
+            .iter()
+            .find(|t| t.terminal.id == t2.id)
+            .unwrap();
+        assert_eq!(
+            t1_view.detected_agent_kind.as_deref(),
+            Some("claude_code"),
+            "the foreground agent is adopted passively on its line"
+        );
+        assert!(
+            t1_view.sessions.is_empty(),
+            "passive adoption creates NO agent_sessions row (agent model not polluted)"
+        );
+        assert!(
+            t2_view.detected_agent_kind.is_none(),
+            "a plain shell adopts nothing"
+        );
+    }
+
+    /// The `NoTerminalLiveOverlay` is a no-op: applying it leaves every terminal at its
+    /// default (not busy) — the MCP tool / cold-read path never fabricates a running dot.
+    #[test]
+    fn no_terminal_live_overlay_leaves_busy_false() {
+        let mut conn = open_in_memory();
+        let sink = NullEventSink;
+        let (project, _root) = usecase::create_project(
+            &mut conn,
+            &sink,
+            "Nyx",
+            &root_path("nobusy"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let ws = usecase::register_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            "wt",
+            &root_path("nobusy-wt"),
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let t = db::create_terminal(&mut conn, &root_path("nobusy-wt"), None).unwrap();
+        db::attach_terminal(&mut conn, &t.id, &ws.id, "auto").unwrap();
+
+        let mut snap = snapshot(&mut conn, &ws.id, &NoRunStateOverlay)
+            .unwrap()
+            .unwrap();
+        apply_terminal_live_overlay(&mut snap, &NoTerminalLiveOverlay);
+        assert!(snap.terminals.iter().all(|t| !t.busy));
     }
 
     /// An unknown workspace id resolves to `None` (not an empty snapshot).

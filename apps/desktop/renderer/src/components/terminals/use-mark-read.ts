@@ -9,15 +9,21 @@ import { nyxBridge } from "@/bridge";
  *   - a TERMINAL clears via `terminal_exec_mark_read` (`{ id }`) — the SAME command the old
  *     sidebar's `markRead` used;
  *   - a SERVICE clears via `command_acknowledge` (`{ instanceId }`) — the SAME command the old
- *     command view used to acknowledge a finished one-shot.
- * Both are idempotent + best-effort. Those commands do NOT broadcast a runtime-collection
- * `*://changed` topic, so the page's snapshot is not re-pulled on a mark-read; `onConsume` records
- * the visit in the page-local consumed registry so the dot stays gone even before a fresh snapshot
- * (the persisted clear covers the next one). A `ref` guards against re-firing for the same row
- * while it stays active (the effect re-runs on unrelated snapshot churn); it re-arms on deselect.
+ *     command view used to acknowledge a finished one-shot;
+ *   - an AGENT clears its "response ready" / turn-error notification via `agent_mark_ready_read`
+ *     (`{ terminalId }`) — the SAME command the sidebar row fires on focus (review T2), so a
+ *     settled green/red on an agent LINE does not linger after the user views that terminal.
+ * All are idempotent + best-effort. The terminal/service commands do NOT broadcast a runtime-
+ * collection `*://changed` topic, so the page's snapshot is not re-pulled on their mark-read;
+ * `onConsume` records the visit in the page-local consumed registry so the dot stays gone even
+ * before a fresh snapshot (the persisted clear covers the next one). `agent_mark_ready_read` DOES
+ * push `agent-sessions://changed`, so the live activity map re-pulls and the settled dot clears
+ * from its source (no consumed registry needed for it). A `ref` guards against re-firing for the
+ * same row while it stays active (the effect re-runs on unrelated snapshot churn); it re-arms on
+ * deselect.
  */
 export function useMarkReadOnActive(
-  kind: "terminal" | "service",
+  kind: "terminal" | "service" | "agent",
   id: string,
   active: boolean,
   unread: boolean,
@@ -39,8 +45,14 @@ export function useMarkReadOnActive(
     clearedFor.current = id;
     // Record the visit locally FIRST (so the dot hides immediately + stays hidden), then persist.
     onConsumeRef.current?.();
-    const command = kind === "terminal" ? "terminal_exec_mark_read" : "command_acknowledge";
-    const args = kind === "terminal" ? { id } : { instanceId: id };
+    const command =
+      kind === "terminal"
+        ? "terminal_exec_mark_read"
+        : kind === "agent"
+          ? "agent_mark_ready_read"
+          : "command_acknowledge";
+    const args =
+      kind === "service" ? { instanceId: id } : kind === "agent" ? { terminalId: id } : { id };
     void nyxBridge.invoke(command, args).catch(() => {});
   }, [kind, id, active, unread]);
 }

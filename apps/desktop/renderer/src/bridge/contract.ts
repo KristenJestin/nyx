@@ -484,6 +484,47 @@ export interface ReviewRemapResult {
 }
 
 // ---------------------------------------------------------------------------
+// Agent-session lazy resume (v2.5.5) — the `workspace_restore_plan` read model
+// consumed to drive the LAZY `claude --resume` injection at terminal open.
+// ---------------------------------------------------------------------------
+
+/**
+ * One entry of `workspace_restore_plan.resume_sessions`: the `decide_resume` verdict for ONE of
+ * a workspace's candidate agent sessions (mirrors the Rust `WorkspaceResumeEntry`). When
+ * `resume` is true, `resume_command` is the exact `claude --resume <id>` line to inject;
+ * otherwise `skip_reason` records WHY (e.g. `option_off`, `no_conversation`). `uncertain` flags a
+ * resumed-but-doubtful (`unknown`/stale) session.
+ */
+export interface WorkspaceResumeEntry {
+  readonly terminal_id: string;
+  readonly session_id: string;
+  readonly agent_kind: string;
+  readonly resume_command: string | null;
+  readonly resume: boolean;
+  readonly uncertain: boolean;
+  readonly skip_reason: string | null;
+}
+
+/**
+ * The `workspace_restore_plan` read model: after a restart, WHAT a workspace offers to resume —
+ * REUSING the existing resume policy (no third system). Only `resume_sessions` is consumed by the
+ * lazy-resume driver here; `restart_on_startup` / `interrupted` back the (later) restore UI.
+ */
+export interface WorkspaceRestorePlan {
+  readonly workspace_id: string;
+  readonly resume_sessions: readonly WorkspaceResumeEntry[];
+  readonly restart_on_startup: readonly unknown[];
+  readonly interrupted: readonly string[];
+}
+
+/** One resume to PARK in the sidecar (the payload of `set_resume_parks`). */
+export interface ResumePark {
+  readonly terminalId: string;
+  readonly sessionId: string;
+  readonly command: string;
+}
+
+// ---------------------------------------------------------------------------
 // The bridge surface, grouped by capability
 // ---------------------------------------------------------------------------
 
@@ -691,6 +732,20 @@ export type BackendCommand =
   // Clear the focus-aware "response ready" notification for a viewed terminal (the
   // activity analogue of `terminal_exec_mark_read`). `{ terminalId }`. Idempotent.
   | "agent_mark_ready_read"
+  // v2.5.5 LAZY agent-session resume: push the resumable sessions the renderer read from
+  // `workspace_restore_plan` (each `{ terminalId, sessionId, command }`) so the sidecar parks
+  // each `claude --resume <id>` and injects it ONCE at that terminal's PTY spawn (or immediately
+  // if already live). `{ parks: ResumePark[] }`. Idempotent (a one-shot guard per record id);
+  // an injection whose write fails marks the session `resume_failed` (no retry loop).
+  | "set_resume_parks"
+  // v2.5.5 IDLE-SESSION UNLOAD: reclaim the resources of dormant agent sessions. The renderer
+  // sweeps on a timer, passing the currently-visited (focused) terminal record ids and an
+  // inactivity `thresholdSecs` (default 15 min). The sidecar closes the PTY of every agent-hosting
+  // terminal that is Idle (NEVER Working/Waiting — an ACTIVE session is never unloaded), unvisited,
+  // and idle beyond the threshold; the DB session stays `active` so a revisit RESUMES it via the
+  // same lazy park+inject (phase 2). `{ thresholdSecs?, visited: string[] }` → the unloaded record
+  // ids. Best-effort: a failed sweep just means no unload this tick.
+  | "unload_idle_sessions"
   // v2.4 review — the Git DIFF read model (task 01KX0F6GY96096AHWD8RZ2BMM0, PDR-0007/0015).
   // `repo_diff` is the line-level diff of ONE `(workspace, repository)` for a review surface
   // (working_tree/staged/unstaged/untracked/commit/range/branches), LIVING or PINNED — the

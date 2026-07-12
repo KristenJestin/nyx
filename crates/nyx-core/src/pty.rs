@@ -76,6 +76,20 @@ impl PauseGate {
 /// is exactly the `terminals.id` the bridge passed (see `pty_spawn`).
 pub const NYX_TERMINAL_ID_ENV: &str = "NYX_TERMINAL_ID";
 
+/// Env var carrying the MCP HTTP port THIS nyx instance's sidecar actually bound, into the
+/// spawned shell and everything it launches (review `01KXAXQN32GASMEB05PDW5BZSR`). The Claude
+/// plugin's `SessionStart` hook (`nyx-session-hook.cjs`) POSTs `agent_session_event` to
+/// `http://127.0.0.1:${NYX_MCP_PORT||8765}/mcp`; without this export the hook falls back to the
+/// default 8765, which is the v1 cockpit whenever v1 is up (v2 then binds 8766) — so a v2
+/// terminal's session events were silently delivered to v1, leaving v2's `agent_sessions` empty
+/// and the agent icon dark. Injected on the production interactive-shell spawn path
+/// ([`Pty::spawn`]) whenever the caller supplies the REAL bound port (`> 0`); it then propagates
+/// to child processes via normal env inheritance on every OS. A port of `0` means "not bound yet"
+/// (the MCP server has not started) — nothing is exported then, so the hook keeps its own fallback
+/// rather than being pointed at a misleading value. NEVER a hard-coded 8765/8766: the injected
+/// value is always the dynamically bound port, correct even under a v1/v2 port collision.
+pub const NYX_MCP_PORT_ENV: &str = "NYX_MCP_PORT";
+
 /// Monotonic source of PTY ids. Forward-compatible with PRD 1 multi-terminal:
 /// the bridge keys its managed state by this id.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -196,6 +210,12 @@ impl Pty {
     /// session events back to THIS terminal (PRD-5 task #3). `None` (the socle / a
     /// record-less spawn) exports nothing.
     ///
+    /// `mcp_port` is the MCP HTTP port THIS nyx instance's sidecar actually bound. When
+    /// `> 0` it is exported as [`NYX_MCP_PORT_ENV`] so the Claude plugin's `SessionStart`
+    /// hook POSTs `agent_session_event` to the RIGHT instance instead of the 8765 default
+    /// (the v1 cockpit under a port collision) — review `01KXAXQN32GASMEB05PDW5BZSR`. `0`
+    /// (the MCP server has not bound yet) exports nothing, so the hook keeps its own fallback.
+    ///
     /// Returns the [`Pty`] handle and a [`Receiver`] yielding chunks of output
     /// bytes as the reader thread reads them. The receiver completes (the
     /// sender is dropped) when the PTY reaches EOF — i.e. the child has exited.
@@ -203,6 +223,7 @@ impl Pty {
         size: PtySize,
         cwd: Option<&str>,
         terminal_id: Option<&str>,
+        mcp_port: u16,
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
         // Resolve the shell, then build its OSC 133 shell-integration plan
         // (PRD-2.1 task #5): a NON-DESTRUCTIVE per-spawn snippet that makes the
@@ -214,7 +235,7 @@ impl Pty {
         // command runner, which spawn arbitrary non-interactive programs).
         let shell = resolve_shell();
         let plan = crate::shellinteg::build(&shell);
-        Self::spawn_program_with_integration(&shell, size, cwd, &plan, terminal_id)
+        Self::spawn_program_with_integration(&shell, size, cwd, &plan, terminal_id, mcp_port)
     }
 
     /// Spawn an arbitrary program with NO shell integration (used by tests and the
@@ -228,7 +249,7 @@ impl Pty {
         size: PtySize,
         cwd: Option<&str>,
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
-        // No terminal-record id on the program path: tests / the managed-command
+        // No terminal-record id nor MCP port on the program path: tests / the managed-command
         // runner spawn arbitrary non-interactive programs that carry no agent session.
         Self::spawn_program_with_integration(
             program,
@@ -236,14 +257,16 @@ impl Pty {
             cwd,
             &crate::shellinteg::IntegrationPlan::default(),
             None,
+            0,
         )
     }
 
     /// TEST-ONLY: spawn `program` with the given `args`, exporting `terminal_id` as
-    /// [`NYX_TERMINAL_ID_ENV`], so the env-injection path (PRD-5 task #3) can be
+    /// [`NYX_TERMINAL_ID_ENV`] and (when `mcp_port > 0`) the MCP port as [`NYX_MCP_PORT_ENV`],
+    /// so both env-injection paths (PRD-5 task #3 + review `01KXAXQN32GASMEB05PDW5BZSR`) can be
     /// exercised on a controllable program per-OS (a POSIX `sh -c` on Unix, `cmd /C`
     /// on Windows) WITHOUT depending on which interactive shell `resolve_shell`
-    /// picks. Production code uses [`Pty::spawn`], which carries the id from the
+    /// picks. Production code uses [`Pty::spawn`], which carries the id + bound port from the
     /// bridge; this reuses the SAME single env-injection line via an
     /// [`crate::shellinteg::IntegrationPlan`] that only carries the args.
     #[cfg(test)]
@@ -253,12 +276,13 @@ impl Pty {
         size: PtySize,
         cwd: Option<&str>,
         terminal_id: Option<&str>,
+        mcp_port: u16,
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
         let plan = crate::shellinteg::IntegrationPlan {
             args: args.iter().map(std::ffi::OsString::from).collect(),
             ..Default::default()
         };
-        Self::spawn_program_with_integration(program, size, cwd, &plan, terminal_id)
+        Self::spawn_program_with_integration(program, size, cwd, &plan, terminal_id, mcp_port)
     }
 
     /// Spawn `program`, applying a shell-integration [`IntegrationPlan`]'s extra
@@ -267,13 +291,16 @@ impl Pty {
     ///
     /// `terminal_id`, when `Some`, is exported as [`NYX_TERMINAL_ID_ENV`] so the
     /// child shell (and everything it launches) carries nyx's persistent terminal
-    /// record id for agent-session correlation (PRD-5 task #3).
+    /// record id for agent-session correlation (PRD-5 task #3). `mcp_port`, when `> 0`,
+    /// is exported as [`NYX_MCP_PORT_ENV`] so the Claude plugin's hook reaches THIS
+    /// instance's MCP server (review `01KXAXQN32GASMEB05PDW5BZSR`).
     fn spawn_program_with_integration(
         program: &str,
         size: PtySize,
         cwd: Option<&str>,
         plan: &crate::shellinteg::IntegrationPlan,
         terminal_id: Option<&str>,
+        mcp_port: u16,
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size)?;
@@ -304,6 +331,29 @@ impl Pty {
         // the integration plan can shadow it.
         if let Some(tid) = terminal_id {
             cmd.env(NYX_TERMINAL_ID_ENV, tid);
+        }
+        // Agent-session ROUTING (review `01KXAXQN32GASMEB05PDW5BZSR`): export the MCP port THIS
+        // instance's sidecar actually bound so the Claude plugin's SessionStart hook POSTs
+        // `agent_session_event` to the RIGHT server. Without it the hook defaults to 8765 — the v1
+        // cockpit whenever v1 holds it and v2 fell back to 8766 — so v2's terminal session events
+        // landed in v1 and v2's `agent_sessions` stayed empty (no agent icon). Always the DYNAMIC
+        // bound port, never a hard-coded 8765/8766, so it is correct even under a v1/v2 collision.
+        //
+        // FIRST scrub any `NYX_MCP_PORT` this process INHERITED (`CommandBuilder::new` seeds every
+        // child from the sidecar's own `env::vars_os()`): the injected bound port below is the SINGLE
+        // source of truth, so a STALE inherited value must never leak to the child. This is a no-op in
+        // the nominal case (the sidecar's env carries none); when it does carry one (a user
+        // `NYX_MCP_PORT` override) the scrub+inject net-nets to the same authoritative value the bind
+        // produced (the inject already overrides). It also makes the port-0 contract hold
+        // UNCONDITIONALLY — no injection AND no inherited leak, so the hook keeps its own fallback —
+        // and it makes the `spawned_terminal_*` integration test a true guard: the child's ONLY source
+        // of the port is the injection line below, so deleting that line turns the assert red.
+        cmd.env_remove(NYX_MCP_PORT_ENV);
+        // A port of `0` means the MCP server has not bound yet; we inject nothing then (never a
+        // misleading default). Same OS-portable `CommandBuilder::env` as the terminal id, and set
+        // alongside it so both reach every shell.
+        if mcp_port != 0 {
+            cmd.env(NYX_MCP_PORT_ENV, mcp_port.to_string());
         }
 
         let child = pair.slave.spawn_command(cmd)?;
@@ -759,6 +809,7 @@ mod tests {
             small_size(),
             None,
             Some(tid),
+            0, // no MCP port for the NYX_TERMINAL_ID-focused assertion
         )
         .expect("spawn sh -c");
         let out = read_until(&rx, "NYXTID=[", Duration::from_secs(5));
@@ -782,6 +833,7 @@ mod tests {
             small_size(),
             None,
             Some(tid),
+            0, // no MCP port for the NYX_TERMINAL_ID-focused assertion
         )
         .expect("spawn cmd /C");
         let out = read_until(&rx, "NYXTID=[", Duration::from_secs(10));
@@ -807,6 +859,7 @@ mod tests {
             small_size(),
             None,
             None,
+            0,
         )
         .expect("spawn sh -c");
         let out = read_until(&rx, "NYXTID=[", Duration::from_secs(5));
@@ -831,12 +884,69 @@ mod tests {
             small_size(),
             None,
             Some(tid),
+            0, // no MCP port for the NYX_TERMINAL_ID inheritance assertion
         )
         .expect("spawn nested sh");
         let out = read_until(&rx, "NYXTID=[", Duration::from_secs(5));
         assert!(
             out.contains(&format!("NYXTID=[{tid}]")),
             "the var must inherit into a child process of the shell; got: {out:?}"
+        );
+        let _ = pty.kill();
+    }
+
+    // --- NYX_MCP_PORT injection (review 01KXAXQN32GASMEB05PDW5BZSR) -----------
+
+    /// done_criterion 1: a shell spawned with a KNOWN bound MCP port sees `NYX_MCP_PORT` set to
+    /// EXACTLY that port. Modelled on `nyx_terminal_id_is_exported_to_unix_shell`: we run
+    /// `sh -c 'echo $NYX_MCP_PORT'` so the value the child prints is the env the parent injected
+    /// — proving the port reaches the shell (and thus the Claude plugin's SessionStart hook, so it
+    /// POSTs `agent_session_event` to THIS instance rather than the 8765 default). The port here is
+    /// a non-default value (49234), so the assertion also proves it is the DYNAMIC bound port, not
+    /// a hard-coded 8765/8766 (done_criterion 2).
+    #[cfg(not(windows))]
+    #[test]
+    fn nyx_mcp_port_is_exported_to_unix_shell() {
+        let port: u16 = 49234;
+        let (mut pty, rx) = Pty::spawn_program_with_terminal_id(
+            "sh",
+            &["-c", "echo NYXPORT=[$NYX_MCP_PORT]"],
+            small_size(),
+            None,
+            Some("term-mcp-1"),
+            port,
+        )
+        .expect("spawn sh -c");
+        let out = read_until(&rx, "NYXPORT=[", Duration::from_secs(5));
+        assert!(
+            out.contains(&format!("NYXPORT=[{port}]")),
+            "child shell must see NYX_MCP_PORT == the bound port; got: {out:?}"
+        );
+        let _ = pty.kill();
+    }
+
+    /// A spawn whose MCP port is UNKNOWN (`0` — the MCP server has not bound yet) injects NOTHING:
+    /// `NYX_MCP_PORT` is UNSET in the child, so the Claude plugin's hook keeps its own fallback
+    /// rather than being pointed at a misleading value. This is the "port pas encore bindé au
+    /// spawn" case the fix must handle without corrupting routing. We remove the var from the
+    /// PARENT first so a `0` spawn genuinely shows it unset (the value can come ONLY from injection).
+    #[cfg(not(windows))]
+    #[test]
+    fn no_nyx_mcp_port_when_port_is_zero_unix() {
+        std::env::remove_var(NYX_MCP_PORT_ENV);
+        let (mut pty, rx) = Pty::spawn_program_with_terminal_id(
+            "sh",
+            &["-c", "echo NYXPORT=[${NYX_MCP_PORT:-UNSET}]"],
+            small_size(),
+            None,
+            Some("term-mcp-0"),
+            0,
+        )
+        .expect("spawn sh -c");
+        let out = read_until(&rx, "NYXPORT=[", Duration::from_secs(5));
+        assert!(
+            out.contains("NYXPORT=[UNSET]"),
+            "a port-0 (not-yet-bound) spawn must NOT export NYX_MCP_PORT; got: {out:?}"
         );
         let _ = pty.kill();
     }
@@ -886,6 +996,7 @@ mod tests {
             small_size(),
             None,
             None,
+            0,
         )
         .expect("spawn interactive bash");
 

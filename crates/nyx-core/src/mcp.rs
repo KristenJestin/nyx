@@ -364,6 +364,11 @@ pub struct McpServer {
     /// The accept-loop thread handle, kept so the server's lifetime is tied to the
     /// process and the thread can be joined on shutdown if needed.
     handle: Mutex<Option<JoinHandle<()>>>,
+    /// The live loopback listener, shared with the accept-loop thread. Held here so
+    /// [`McpServer::stop`] can `unblock` the accept loop AND, once the thread is joined
+    /// and this last clone is dropped, let `tiny_http::Server`'s `Drop` close the
+    /// listening socket (subsequent connects are then refused). `None` until started.
+    listener: Mutex<Option<Arc<tiny_http::Server>>>,
     /// The tool dispatcher invoked for `tools/call`. `None` until phase-2 wires the
     /// PRD-3-backed tools; the handshake (`initialize`/`tools/list`) works without it.
     dispatcher: Mutex<Option<Arc<dyn ToolDispatcher>>>,
@@ -375,6 +380,7 @@ impl Default for McpServer {
             started: AtomicBool::new(false),
             bound_port: AtomicU16::new(0),
             handle: Mutex::new(None),
+            listener: Mutex::new(None),
             dispatcher: Mutex::new(None),
         }
     }
@@ -529,6 +535,12 @@ impl McpServer {
             .unwrap_or(port);
         self.bound_port.store(real_port, Ordering::SeqCst);
 
+        // Share the listener with the accept-loop thread through an `Arc`: the thread reads
+        // requests off it, and [`McpServer::stop`] keeps a clone so it can `unblock` the
+        // loop and — once the thread is joined and both clones drop — close the socket.
+        let server = Arc::new(server);
+        *self.listener.lock().unwrap() = Some(Arc::clone(&server));
+
         let this = Arc::clone(self);
         let handle = std::thread::Builder::new()
             .name("nyx-mcp-http".into())
@@ -536,6 +548,33 @@ impl McpServer {
             .expect("spawn nyx-mcp-http thread");
         *self.handle.lock().unwrap() = Some(handle);
         Ok(real_port)
+    }
+
+    /// Gracefully STOP the HTTP listener: unblock the accept loop so its thread exits,
+    /// join it, then drop the last `Arc<tiny_http::Server>` so `tiny_http`'s `Drop`
+    /// closes the listening socket. After this returns, a new connection to the bound
+    /// port is REFUSED — nothing accepts it — so a late `POST /mcp` (e.g. the
+    /// `SessionEnd(reason=other)` hook of a Claude killed during shutdown) can no longer
+    /// reach the dispatcher. Bounded: `unblock` + a single `join` (the accept loop is
+    /// only ever inside a short synchronous request handler). Idempotent — a second call
+    /// (or a call before `start`) is a no-op.
+    pub fn stop(&self) {
+        // Take the listener clone FIRST so it is dropped at the end of this scope, AFTER
+        // the accept-loop thread has been joined (and thus dropped its own clone).
+        let listener = self.listener.lock().unwrap().take();
+        if let Some(server) = &listener {
+            // Break the blocking `incoming_requests()` so `accept_loop` returns.
+            server.unblock();
+        }
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        // The accept-loop thread has released its clone; dropping this last one here runs
+        // `tiny_http::Server::drop`, which closes the loopback listener socket.
+        drop(listener);
+        // Unlatch so a later `start` could rebind if ever needed (shutdown normally exits
+        // the process right after, but keep the flag honest).
+        self.started.store(false, Ordering::SeqCst);
     }
 
     /// Install the phase-2 tool dispatcher (ADR-0003 D6). Wired from the setup hook
@@ -559,7 +598,7 @@ impl McpServer {
     /// The blocking accept loop: serve each request on the calling thread. Requests
     /// are short synchronous JSON-RPC calls, so a single accept thread is adequate
     /// for the local cas nominal.
-    fn accept_loop(self: Arc<Self>, server: tiny_http::Server) {
+    fn accept_loop(self: Arc<Self>, server: Arc<tiny_http::Server>) {
         for request in server.incoming_requests() {
             self.handle_request(request);
         }

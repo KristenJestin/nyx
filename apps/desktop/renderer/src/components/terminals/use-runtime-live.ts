@@ -22,6 +22,11 @@ import type { BackendEvent } from "@/bridge";
  *                                 per-terminal event that also lives in the aggregate as
  *                                 `WorkspaceRuntimeTerminal.exec_state` (never on
  *                                 `terminals://changed`).
+ *   - `terminal://busy-state`   — a terminal's OS busy/idle TRANSITION (v2.5.5 review T1), the
+ *                                 FINE per-terminal signal the backend OVERLAYS onto the
+ *                                 aggregate as `WorkspaceRuntimeTerminal.busy`. Re-pulling on it
+ *                                 lights the LINE's `running` dot for a foreground command
+ *                                 (the OS-authoritative running source, independent of OSC 133).
  * Subscribing to those and re-pulling the snapshot on receipt is exactly the "sans polling"
  * contract: the page reflects a runtime mutation live because the backend TOLD it something
  * changed, not because it asked on a timer.
@@ -32,6 +37,7 @@ export const RUNTIME_CHANGED_EVENTS = [
   "terminals://changed",
   "workspaces://changed",
   "terminal://exec-state",
+  "terminal://busy-state",
 ] as const satisfies readonly BackendEvent[];
 
 /**

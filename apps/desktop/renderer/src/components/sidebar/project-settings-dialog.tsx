@@ -45,6 +45,12 @@ export interface ProjectSettingsDialogProps {
   workspacePath?: string | null;
   /** Which section to open on (defaults to Global). */
   initialSection?: ProjectSettingsSection;
+  /**
+   * Whether the Global pane exposes the project rename field. Defaults to `true`. The
+   * phase-1 shell entry point passes `false` so only the resume toggle is shown (rename/
+   * delete belong to the PRD-B kebab CRUD); other callers keep the field via the default.
+   */
+  showRename?: boolean;
   /** Persist a project rename (Global). */
   onRename: (name: string) => Promise<void>;
   /** Persist the resume-opt-in toggle (Global). May return a promise so the section
@@ -79,6 +85,7 @@ export function ProjectSettingsDialog({
   importWorkspaceId,
   workspacePath,
   initialSection = "global",
+  showRename = true,
   onRename,
   onResumeChange,
   onClose,
@@ -147,6 +154,7 @@ export function ProjectSettingsDialog({
                   resumeAgentSessions={resumeAgentSessions}
                   onRename={onRename}
                   onResumeChange={onResumeChange}
+                  showRename={showRename}
                 />
               ) : (
                 <CommandsSection

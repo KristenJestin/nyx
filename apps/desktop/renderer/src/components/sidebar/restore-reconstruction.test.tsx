@@ -1,8 +1,9 @@
 ﻿import { render, waitFor } from "@testing-library/react";
 import { mockIPC } from "@/bridge/test-harness";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { TerminalManager } from "./terminal-manager";
+import { __resetTerminalStore } from "@/components/terminal/terminal-store";
 import type { TerminalRecord } from "./use-terminals";
 
 /**
@@ -77,6 +78,15 @@ const SCROLLBACK_C = "C_HISTORY_marker";
 describe("restore reconstruction at launch", () => {
   beforeEach(() => {
     // installed per-test in each it() with the desired record set.
+  });
+
+  afterEach(() => {
+    // The manager's terminals live in a module-level store; drop them so instances (and their
+    // PTYs) never leak across tests. Without this, a later test's `ensureTerminal` for a re-used
+    // id would find the previous test's instance and skip the spawn we assert on. (Previously this
+    // reset was implicit — the deck's per-render reconcile disposed leftovers on the initial empty
+    // list — but reconciliation now lives app-wide in `base-layout`, so the test owns its cleanup.)
+    __resetTerminalStore();
   });
 
   it("re-mounts only ALIVE terminals, in order, never the closed one", async () => {

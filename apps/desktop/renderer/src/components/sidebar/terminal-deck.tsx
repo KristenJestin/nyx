@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 
 import { Terminal } from "@/components/terminal/terminal";
-import { getTerminal, reconcileTerminals } from "@/components/terminal/terminal-store";
+import { getTerminal } from "@/components/terminal/terminal-store";
 import type { TerminalRecord } from "./use-terminals";
 
 export interface TerminalDeckProps {
@@ -26,9 +26,11 @@ export interface TerminalDeckProps {
  * pane detaches — never disposes — and the instance stays in the store, reattached
  * losslessly on return with its buffer intact).
  *
- * The deck also RECONCILES the store against its live record set (see the effect):
- * a record no longer present (closed by the user or by an agent over MCP) has its
- * store instance disposed, so a churn of create/close never leaks a PTY.
+ * The deck NEVER disposes: it only ever sees the CURRENT project's terminals, so it must not
+ * decide which store instances are "gone" (a disposal keyed on the deck's per-project set killed
+ * the OTHER projects' terminals on a switch). The store reconciliation — disposing an instance
+ * whose backing record is truly gone (closed by the user or an agent over MCP) — lives ONCE at the
+ * app shell (`useReconcileTerminals` in `base-layout`), keyed on the GLOBAL `list_terminals` set.
  *
  * Each pane carries `data-terminal-id` (the record id) and `data-active` so the
  * layer above (and the tests) can reason about visibility without inspecting
@@ -59,15 +61,10 @@ export function TerminalDeck({ terminals, activeId, onPtyId }: TerminalDeckProps
     };
   }, []);
 
-  // RECONCILE the store against the live record set: dispose (real close) any store
-  // instance whose record is no longer present. Runs after render so a
-  // freshly-added record's pane has mounted (created its instance) first. Keyed on
-  // the id SET (not the array identity).
-  const liveIds = terminals.map((t) => t.id).join(",");
-  useEffect(() => {
-    reconcileTerminals(terminals.map((t) => t.id));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveIds]);
+  // NO reconciliation here: the deck only ever receives the CURRENT project's terminals, so it
+  // must never dispose store instances (that killed the other projects' terminals on a switch).
+  // The app-wide `useReconcileTerminals` (mounted in `base-layout`) purges truly-closed terminals
+  // against the GLOBAL `list_terminals` set instead.
 
   // Render the panes in a STABLE order (by record id), independent of the sidebar
   // order: the deck only ever SHOWS the active pane (others are `display:none`), so

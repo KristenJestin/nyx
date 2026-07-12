@@ -19,6 +19,7 @@ export function RuntimeRow({
   icon,
   label,
   state,
+  badge,
   actions,
 }: {
   /** The element this row selects (kind + id), matched against the shared selection. */
@@ -28,6 +29,12 @@ export function RuntimeRow({
   label: ReactNode;
   /** The row's run-state dot. */
   state: RunState;
+  /**
+   * An optional lifecycle badge shown INLINE after the label (a `<LifecycleBadge>`) — the SEPARATE
+   * post-crash doubt axis (`interrupted` / `unknown`), distinct from the run-state dot. `null` in
+   * the common (no-crash) case, so a healthy row stays name + dot only.
+   */
+  badge?: ReactNode;
   /** Optional trailing actions (revealed on hover / while selected). */
   actions?: ReactNode;
 }) {
@@ -56,6 +63,7 @@ export function RuntimeRow({
           />
         </span>
         <span className="min-w-0 flex-1 truncate text-foreground">{label}</span>
+        {badge != null ? <span className="shrink-0">{badge}</span> : null}
       </button>
       {actions != null ? (
         <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-data-[selected=true]:opacity-100">

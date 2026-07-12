@@ -60,11 +60,11 @@ fn main() {
 
 fn setup(db: &Db) {
     let demo_root = env_or("NYX_SEED_DEMO_ROOT", format!("{}/nyx-demo", home()));
-    let demo_root2 = env_or("NYX_SEED_DEMO_ROOT2", format!("{}/nyx-demo-feature", home()));
-    let nyx_v2 = env_or(
-        "NYX_SEED_NYX_V2",
-        "/home/kris/Projects/nyx-v2".to_string(),
+    let demo_root2 = env_or(
+        "NYX_SEED_DEMO_ROOT2",
+        format!("{}/nyx-demo-feature", home()),
     );
+    let nyx_v2 = env_or("NYX_SEED_NYX_V2", "/home/kris/Projects/nyx-v2".to_string());
 
     // --- Project A: "Nyx Demo" over the multi-repo tree (api + web) ------------------------
     let (proj_a, root_ws_a) = db
@@ -99,10 +99,7 @@ fn setup(db: &Db) {
     let repos_b = db
         .with_conn(|c| db::list_repositories(c, &proj_b.id))
         .expect("list repos B");
-    let nyxv2_repo = repos_b
-        .first()
-        .expect("nyx-v2 mono repo detected")
-        .clone();
+    let nyxv2_repo = repos_b.first().expect("nyx-v2 mono repo detected").clone();
     println!(
         "project B '{}' ws={} repo={} (rel='{}')",
         proj_b.name, root_ws_b.id, nyxv2_repo.name, nyxv2_repo.relative_path
@@ -120,8 +117,12 @@ fn setup(db: &Db) {
     );
     author_section(db, &s_done, SpecSection::UserStories,
         "- As a user I can sign in with email + password\n- As a user my session survives a reload\n- As a user I can sign out everywhere");
-    author_section(db, &s_done, SpecSection::OutOfScope,
-        "- SSO / OAuth providers (later)\n- Passwordless magic links\n- Hardware 2FA keys");
+    author_section(
+        db,
+        &s_done,
+        SpecSection::OutOfScope,
+        "- SSO / OAuth providers (later)\n- Passwordless magic links\n- Hardware 2FA keys",
+    );
     transition(db, &s_done, SpecTransition::Ready);
     transition(db, &s_done, SpecTransition::Start);
     transition(db, &s_done, SpecTransition::Review);
@@ -139,8 +140,12 @@ fn setup(db: &Db) {
     );
     author_section(db, &s_review, SpecSection::ImplementationDecisions,
         "- Gateway is a separate process behind the API\n- Redis pub/sub as the fan-out bus\n- Client reconnects with exponential backoff + resume token");
-    author_section(db, &s_review, SpecSection::OutOfScope,
-        "- Email/SMS fallback delivery\n- Notification preferences UI");
+    author_section(
+        db,
+        &s_review,
+        SpecSection::OutOfScope,
+        "- Email/SMS fallback delivery\n- Notification preferences UI",
+    );
     transition(db, &s_review, SpecTransition::Ready);
     transition(db, &s_review, SpecTransition::Start);
     transition(db, &s_review, SpecTransition::Review);
@@ -181,10 +186,20 @@ fn setup(db: &Db) {
         "The UI is light-only; users in low light have asked for a dark theme.",
         "", // solution still empty on purpose → legitimately a draft
     );
-    author_section(db, &s_draft, SpecSection::OutOfScope,
-        "- Per-component theme overrides\n- User-uploaded custom palettes");
-    db.with_conn(|c| db::fork_spec(c, &s_draft, Some("Split theming from the design-tokens work")))
-        .expect("fork draft spec");
+    author_section(
+        db,
+        &s_draft,
+        SpecSection::OutOfScope,
+        "- Per-component theme overrides\n- User-uploaded custom palettes",
+    );
+    db.with_conn(|c| {
+        db::fork_spec(
+            c,
+            &s_draft,
+            Some("Split theming from the design-tokens work"),
+        )
+    })
+    .expect("fork draft spec");
 
     // 6) Self-review spec on the REAL nyx-v2 diff (in_review), anchored on project B's workspace.
     let s_self = create_spec(
@@ -201,20 +216,55 @@ fn setup(db: &Db) {
 
     // --- Tasks: kinds (slice/human/review) × states (todo/in_progress/done/blocked/cancelled) --
     // COMPLETED spec — three done slice tasks across phases.
-    let t_schema = task(db, &proj_a.id, &s_done, "Design the sessions schema", TaskKind::Slice, Some(1));
+    let t_schema = task(
+        db,
+        &proj_a.id,
+        &s_done,
+        "Design the sessions schema",
+        TaskKind::Slice,
+        Some(1),
+    );
     start(db, &t_schema);
     done(db, &t_schema);
-    let t_cookie = task(db, &proj_a.id, &s_done, "Signed cookie middleware", TaskKind::Slice, Some(2));
+    let t_cookie = task(
+        db,
+        &proj_a.id,
+        &s_done,
+        "Signed cookie middleware",
+        TaskKind::Slice,
+        Some(2),
+    );
     start(db, &t_cookie);
     done(db, &t_cookie);
-    let t_signout = task(db, &proj_a.id, &s_done, "Global sign-out", TaskKind::Slice, Some(3));
+    let t_signout = task(
+        db,
+        &proj_a.id,
+        &s_done,
+        "Global sign-out",
+        TaskKind::Slice,
+        Some(3),
+    );
     start(db, &t_signout);
     done(db, &t_signout);
 
     // IN_PROGRESS spec — the variety pack + a dependency.
-    let t_provider = task(db, &proj_a.id, &s_prog, "Wire the payment provider SDK", TaskKind::Slice, Some(1));
+    let t_provider = task(
+        db,
+        &proj_a.id,
+        &s_prog,
+        "Wire the payment provider SDK",
+        TaskKind::Slice,
+        Some(1),
+    );
     start(db, &t_provider); // in_progress
-    let t_subs = task(db, &proj_a.id, &s_prog, "Model subscriptions & plans", TaskKind::Slice, Some(1));
+    let t_subs = task(
+        db,
+        &proj_a.id,
+        &s_prog,
+        "Model subscriptions & plans",
+        TaskKind::Slice,
+        Some(1),
+    );
     // t_subs depends on t_provider (blocks) — real acyclic edge.
     db.with_conn(|c| db::add_task_dependency(c, &t_subs, &t_provider, DEPENDENCY_TYPE_BLOCKS))
         .expect("dep subs->provider");
@@ -230,9 +280,23 @@ fn setup(db: &Db) {
         None,
     );
     block(db, &t_pdf); // blocked
-    let t_spike = task(db, &proj_a.id, &s_prog, "Spike: dunning emails (dropped)", TaskKind::Slice, None);
+    let t_spike = task(
+        db,
+        &proj_a.id,
+        &s_prog,
+        "Spike: dunning emails (dropped)",
+        TaskKind::Slice,
+        None,
+    );
     skip(db, &t_spike); // cancelled (skipped)
-    let t_todo = task(db, &proj_a.id, &s_prog, "Reconciliation nightly job", TaskKind::Slice, Some(2)); // stays todo
+    let t_todo = task(
+        db,
+        &proj_a.id,
+        &s_prog,
+        "Reconciliation nightly job",
+        TaskKind::Slice,
+        Some(2),
+    ); // stays todo
     let _ = t_todo;
     // A HUMAN task closed through the VERIFIED path (guard-rail).
     let t_human = task_full(
@@ -249,7 +313,7 @@ fn setup(db: &Db) {
     start(db, &t_human);
     db.with_conn(|c| db::verify_human_task(c, &t_human))
         .expect("verify human task"); // done via verify
-    // A REVIEW-kind finding task with a severity.
+                                      // A REVIEW-kind finding task with a severity.
     let t_finding = task_full(
         db,
         &proj_a.id,
@@ -297,7 +361,8 @@ fn setup(db: &Db) {
     );
 
     // LINE comment anchored on the KEEP line (line 4 of feature anchor.rs) — will RE-MAP.
-    let keep_anchor = review_comment::capture_anchor(anchor_file, SIDE_NEW, 4, 4, None, &anchor_src);
+    let keep_anchor =
+        review_comment::capture_anchor(anchor_file, SIDE_NEW, 4, 4, None, &anchor_src);
     let c_keep = post_anchored(
         db,
         &root_ws_a.id,
@@ -322,7 +387,8 @@ fn setup(db: &Db) {
     );
 
     // LINE comment anchored on the GONE line (line 5) — will go OUTDATED after the advance.
-    let gone_anchor = review_comment::capture_anchor(anchor_file, SIDE_NEW, 5, 5, None, &anchor_src);
+    let gone_anchor =
+        review_comment::capture_anchor(anchor_file, SIDE_NEW, 5, 5, None, &anchor_src);
     let _c_gone = post_anchored(
         db,
         &root_ws_a.id,
@@ -336,7 +402,8 @@ fn setup(db: &Db) {
 
     // RANGE comment anchored on a multi-line span in a bulk-rewritten module.
     let mod_src = std::fs::read_to_string(format!("{api_path}/src/mod_0.rs")).unwrap_or_default();
-    let range_anchor = review_comment::capture_anchor("src/mod_0.rs", SIDE_NEW, 3, 6, None, &mod_src);
+    let range_anchor =
+        review_comment::capture_anchor("src/mod_0.rs", SIDE_NEW, 3, 6, None, &mod_src);
     let c_range = post_anchored(
         db,
         &root_ws_a.id,
@@ -393,7 +460,12 @@ fn setup(db: &Db) {
         .expect("keep comment exists");
     let rt = db
         .with_conn(|c| {
-            db::promote_comment_to_task(c, &comment_keep, "Document discount handling in compute_total", None)
+            db::promote_comment_to_task(
+                c,
+                &comment_keep,
+                "Document discount handling in compute_total",
+                None,
+            )
         })
         .expect("promote keep");
     db.with_conn(|c| {
@@ -406,7 +478,8 @@ fn setup(db: &Db) {
         )
     })
     .expect("structure keep task");
-    db.with_conn(|c| db::validate_task(c, &rt.id)).expect("validate keep task");
+    db.with_conn(|c| db::validate_task(c, &rt.id))
+        .expect("validate keep task");
 
     // A second STRUCTURED-only task (from the global comment) — left un-validated.
     let comment_global = db
@@ -414,7 +487,14 @@ fn setup(db: &Db) {
         .expect("get global comment")
         .expect("global comment exists");
     let rt2 = db
-        .with_conn(|c| db::promote_comment_to_task(c, &comment_global, "Sweep the anchor module for the noted issues", None))
+        .with_conn(|c| {
+            db::promote_comment_to_task(
+                c,
+                &comment_global,
+                "Sweep the anchor module for the noted issues",
+                None,
+            )
+        })
         .expect("promote global");
     db.with_conn(|c| {
         db::structure_task(
@@ -482,13 +562,41 @@ fn setup(db: &Db) {
     // Managed COMMANDS (a fake dev server + friends) and TERMINALS in project A.
     // ------------------------------------------------------------------------------------
     let dev = db
-        .with_conn(|c| db::create_template(c, &proj_a.id, "dev server", "bun run dev", Some("api"), CommandSource::default()))
+        .with_conn(|c| {
+            db::create_template(
+                c,
+                &proj_a.id,
+                "dev server",
+                "bun run dev",
+                Some("api"),
+                CommandSource::default(),
+            )
+        })
         .expect("cmd dev");
-    db.with_conn(|c| db::set_restart_on_startup(c, &dev.id, true)).expect("restart-on-startup");
-    db.with_conn(|c| db::create_template(c, &proj_a.id, "typecheck (watch)", "bun run typecheck --watch", None, CommandSource::default()))
-        .expect("cmd typecheck");
-    db.with_conn(|c| db::create_template(c, &proj_a.id, "unit tests (watch)", "bun test --watch", Some("api"), CommandSource::default()))
-        .expect("cmd tests");
+    db.with_conn(|c| db::set_restart_on_startup(c, &dev.id, true))
+        .expect("restart-on-startup");
+    db.with_conn(|c| {
+        db::create_template(
+            c,
+            &proj_a.id,
+            "typecheck (watch)",
+            "bun run typecheck --watch",
+            None,
+            CommandSource::default(),
+        )
+    })
+    .expect("cmd typecheck");
+    db.with_conn(|c| {
+        db::create_template(
+            c,
+            &proj_a.id,
+            "unit tests (watch)",
+            "bun test --watch",
+            Some("api"),
+            CommandSource::default(),
+        )
+    })
+    .expect("cmd tests");
 
     for (cwd, label, ws) in [
         (api_path.as_str(), "api shell", &root_ws_a.id),
@@ -542,7 +650,10 @@ fn remap(db: &Db) {
     let comments = db
         .with_conn(|c| db::list_review_comments(c, &root_ws.id, &api.id, None))
         .expect("list comments");
-    for cm in comments.iter().filter(|c| c.file_path.as_deref() == Some("src/anchor.rs")) {
+    for cm in comments
+        .iter()
+        .filter(|c| c.file_path.as_deref() == Some("src/anchor.rs"))
+    {
         println!(
             "  anchor.rs comment {} → line_start={:?} outdated={} : {}",
             &cm.id[..8],
@@ -612,8 +723,17 @@ fn set_phases(db: &Db, spec_id: &str) {
         .expect("set phases");
 }
 
-fn task(db: &Db, project_id: &str, spec_id: &str, title: &str, kind: TaskKind, phase: Option<i32>) -> String {
-    task_full(db, project_id, spec_id, title, kind, phase, None, None, None)
+fn task(
+    db: &Db,
+    project_id: &str,
+    spec_id: &str,
+    title: &str,
+    kind: TaskKind,
+    phase: Option<i32>,
+) -> String {
+    task_full(
+        db, project_id, spec_id, title, kind, phase, None, None, None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -659,12 +779,21 @@ fn done(db: &Db, task_id: &str) {
         .expect("task done");
 }
 fn block(db: &Db, task_id: &str) {
-    db.with_conn(|c| db::transition_task(c, task_id, TaskTransition::Block, Some("blocked pending a decision")))
-        .expect("task block");
+    db.with_conn(|c| {
+        db::transition_task(
+            c,
+            task_id,
+            TaskTransition::Block,
+            Some("blocked pending a decision"),
+        )
+    })
+    .expect("task block");
 }
 fn skip(db: &Db, task_id: &str) {
-    db.with_conn(|c| db::transition_task(c, task_id, TaskTransition::Skip, Some("dropped from scope")))
-        .expect("task skip");
+    db.with_conn(|c| {
+        db::transition_task(c, task_id, TaskTransition::Skip, Some("dropped from scope"))
+    })
+    .expect("task skip");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,7 +839,17 @@ fn post_anchored(
     anchor: CommentAnchor,
     body: &str,
 ) -> String {
-    post(db, workspace_id, repository_id, spec_id, None, author_type, author_name, Some(anchor), body)
+    post(
+        db,
+        workspace_id,
+        repository_id,
+        spec_id,
+        None,
+        author_type,
+        author_name,
+        Some(anchor),
+        body,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -726,8 +865,18 @@ fn anchor_real_file(
     body: &str,
 ) {
     let content = std::fs::read_to_string(format!("{repo_abs}/{rel}")).unwrap_or_default();
-    let anchor = review_comment::capture_anchor(rel, SIDE_NEW, line_start, line_end, None, &content);
-    post_anchored(db, workspace_id, repository_id, Some(spec_id), AUTHOR_HUMAN, "Kris", anchor, body);
+    let anchor =
+        review_comment::capture_anchor(rel, SIDE_NEW, line_start, line_end, None, &content);
+    post_anchored(
+        db,
+        workspace_id,
+        repository_id,
+        Some(spec_id),
+        AUTHOR_HUMAN,
+        "Kris",
+        anchor,
+        body,
+    );
 }
 
 fn demo_member_path(db: &Db, workspace_id: &str, repository_id: &str) -> String {
@@ -737,8 +886,14 @@ fn demo_member_path(db: &Db, workspace_id: &str, repository_id: &str) -> String 
 }
 
 fn print_counts(db: &Db, proj_a: &str, proj_b: &str, ws_a: &str, api_repo: &str) {
-    let specs_a = db.with_conn(|c| db::list_specs(c, proj_a)).map(|v| v.len()).unwrap_or(0);
-    let specs_b = db.with_conn(|c| db::list_specs(c, proj_b)).map(|v| v.len()).unwrap_or(0);
+    let specs_a = db
+        .with_conn(|c| db::list_specs(c, proj_a))
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let specs_b = db
+        .with_conn(|c| db::list_specs(c, proj_b))
+        .map(|v| v.len())
+        .unwrap_or(0);
     let comments = db
         .with_conn(|c| db::list_review_comments(c, ws_a, api_repo, None))
         .map(|v| v.len())

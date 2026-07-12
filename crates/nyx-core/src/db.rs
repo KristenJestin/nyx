@@ -6180,11 +6180,21 @@ mod tests {
         let spec1 = list_review_comments(&mut conn, "ws", "repo", Some("spec1")).expect("scoped");
         assert_eq!(spec1.len(), 2, "only spec1's root + its (inherited) reply");
         assert_eq!(spec1[0].id, root.id);
-        assert_eq!(spec1[1].id, reply.id, "the reply inherited spec1 from its root");
-        assert_eq!(reply.spec_id.as_deref(), Some("spec1"), "reply inherits root spec");
+        assert_eq!(
+            spec1[1].id, reply.id,
+            "the reply inherited spec1 from its root"
+        );
+        assert_eq!(
+            reply.spec_id.as_deref(),
+            Some("spec1"),
+            "reply inherits root spec"
+        );
         // A DIFFERENT Spec sharing the same (workspace, repository) sees NONE of spec1's comments.
         let spec2 = list_review_comments(&mut conn, "ws", "repo", Some("spec2")).expect("scoped2");
-        assert!(spec2.is_empty(), "spec2 sees no spec1 comment (no cross-spec leak)");
+        assert!(
+            spec2.is_empty(),
+            "spec2 sees no spec1 comment (no cross-spec leak)"
+        );
     }
 
     /// A small helper: post a GLOBAL human comment in `(ws, repo)` and return it.
@@ -6301,15 +6311,20 @@ mod tests {
         let comment_b = seed_scoped(&mut conn, Some("spec-B"), "B: also fragile");
         let comment_none = seed_scoped(&mut conn, None, "generic");
 
-        let task_a = promote_comment_to_task(&mut conn, &comment_a, "fix A", None).expect("promote A");
-        let task_b = promote_comment_to_task(&mut conn, &comment_b, "fix B", None).expect("promote B");
-        let task_none =
-            promote_comment_to_task(&mut conn, &comment_none, "fix generic", None).expect("promote none");
+        let task_a =
+            promote_comment_to_task(&mut conn, &comment_a, "fix A", None).expect("promote A");
+        let task_b =
+            promote_comment_to_task(&mut conn, &comment_b, "fix B", None).expect("promote B");
+        let task_none = promote_comment_to_task(&mut conn, &comment_none, "fix generic", None)
+            .expect("promote none");
 
         // The task INHERITS its source comment's Spec.
         assert_eq!(task_a.spec_id.as_deref(), Some("spec-A"));
         assert_eq!(task_b.spec_id.as_deref(), Some("spec-B"));
-        assert_eq!(task_none.spec_id, None, "an un-scoped promotion stays un-scoped");
+        assert_eq!(
+            task_none.spec_id, None,
+            "an un-scoped promotion stays un-scoped"
+        );
 
         // Spec A's list shows ONLY task A — task B never leaks onto it (the #53 fix).
         let list_a = list_review_tasks(&mut conn, "ws", "repo", Some("spec-A")).expect("list A");
@@ -6327,7 +6342,11 @@ mod tests {
 
         // The UNSCOPED read (the MCP agent façade) still sees the whole repo's tasks.
         let all = list_review_tasks(&mut conn, "ws", "repo", None).expect("list all");
-        assert_eq!(all.len(), 3, "the unscoped read sees every task of the repo");
+        assert_eq!(
+            all.len(),
+            3,
+            "the unscoped read sees every task of the repo"
+        );
     }
 
     /// The GRILL GUARD-RAIL: the agent's `structure` cannot touch a VALIDATED task (it cannot

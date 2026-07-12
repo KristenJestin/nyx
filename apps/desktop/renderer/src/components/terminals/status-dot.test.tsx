@@ -71,6 +71,44 @@ describe("StatusDot", () => {
     rerender(<StatusDot state="idle" />);
     await waitFor(() => expect(container.querySelector("[data-state]")).toBeNull());
   });
+
+  it("keeps ONE dot on a visible→visible transition — the old one does NOT linger in exit", async () => {
+    // The reported bug: a running→success swap keyed the presence on `state`, so the OLD
+    // `running` dot stayed mounted fading in EXIT while the new `success` popped IN — two
+    // dots stacked. A STABLE key keeps the SAME node, so the fill glides in place
+    // (transition-colors) and there is ALWAYS exactly one dot.
+    const { container, rerender } = render(<StatusDot state="running" />);
+    expect(container.querySelectorAll("[data-state]")).toHaveLength(1);
+    rerender(<StatusDot state="success" />);
+    // Flush AnimatePresence's exit-injection tick. Under the buggy remount THIS is where a
+    // fading OLD `running` node would appear alongside the new one (two mounted dots).
+    await new Promise((r) => setTimeout(r, 0));
+    const dots = container.querySelectorAll("[data-state]");
+    expect(dots).toHaveLength(1);
+    expect(dots[0]!.getAttribute("data-state")).toBe("success");
+    // No stale `running` dot fading on top of the settled one.
+    expect(container.querySelector('[data-state="running"]')).toBeNull();
+  });
+
+  it("stays one dot across successive visible→visible swaps (running→waiting→error)", async () => {
+    const { container, rerender } = render(<StatusDot state="running" />);
+    for (const next of ["waiting", "error"] as const) {
+      rerender(<StatusDot state={next} />);
+      await new Promise((r) => setTimeout(r, 0));
+      const dots = container.querySelectorAll("[data-state]");
+      expect(dots).toHaveLength(1);
+      expect(dots[0]!.getAttribute("data-state")).toBe(next);
+    }
+  });
+
+  it("still MOUNTS a dot when a state leaves quiet (idle→running enter preserved)", () => {
+    // The presence pop on the quiet↔visible boundary must survive the stable-key fix: a
+    // quiet state renders nothing, so leaving quiet is a genuine mount (the enter animation).
+    const { container, rerender } = render(<StatusDot state="idle" />);
+    expect(container.querySelector("[data-state]")).toBeNull();
+    rerender(<StatusDot state="running" />);
+    expect(container.querySelector("[data-state]")).not.toBeNull();
+  });
 });
 
 describe("isQuietState", () => {

@@ -82,6 +82,8 @@ export const EVT_PTY_EXEC_STATE = 4;
 export const EVT_COMMAND_STATE = 5;
 export const EVT_COMMAND_OUTPUT = 6;
 export const EVT_CHANGED = 7;
+// OS busy-state transition for a terminal (v2.5.5 review T1), keyed by the RECORD id.
+export const EVT_PTY_BUSY_STATE = 8;
 
 /** Stable, machine-matchable error codes (mirror Rust `ErrorCode`). */
 export type ErrorCode =
@@ -200,6 +202,13 @@ export type Event =
       terminalId: number;
       state: string;
       exitCode: number | null;
+    }
+  | {
+      category: "event";
+      kind: "pty_busy_state";
+      /** The persistent terminal RECORD id (not the live pty id) — the renderer folds it directly. */
+      recordId: string;
+      busy: boolean;
     }
   | {
       category: "event";
@@ -389,6 +398,10 @@ export function encodeMessage(msg: Message): Uint8Array {
         case "pty_exec_state":
           kind = EVT_PTY_EXEC_STATE;
           body = [msg.terminalId, msg.state, msg.exitCode];
+          break;
+        case "pty_busy_state":
+          kind = EVT_PTY_BUSY_STATE;
+          body = [msg.recordId, msg.busy];
           break;
         case "command_state":
           kind = EVT_COMMAND_STATE;
@@ -612,6 +625,13 @@ export function decodeMessage(bytes: Uint8Array): Message {
         terminalId: asNumber(body[0]),
         state: body[1] as string,
         exitCode: body[2] == null ? null : asNumber(body[2]),
+      };
+    if (kind === EVT_PTY_BUSY_STATE)
+      return {
+        category: "event",
+        kind: "pty_busy_state",
+        recordId: body[0] as string,
+        busy: body[1] as boolean,
       };
     if (kind === EVT_COMMAND_STATE)
       return {

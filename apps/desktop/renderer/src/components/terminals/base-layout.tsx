@@ -1,13 +1,27 @@
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
-import { BookOpenIcon, BriefcaseIcon, PlusIcon, SquareTerminalIcon } from "lucide-react";
-import { motion } from "motion/react";
+import {
+  BookOpenIcon,
+  BriefcaseIcon,
+  PlusIcon,
+  SettingsIcon,
+  SlidersHorizontalIcon,
+  SquareTerminalIcon,
+} from "lucide-react";
+import { Menu as BaseMenu } from "@base-ui/react/menu";
+import { motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
 import { startNavTransition } from "@/lib/nav-transition";
+import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
+import { MenuItem } from "@/components/ui/menu";
 import { useProjects, type ProjectTree } from "@/components/sidebar/use-projects";
 import { useManualAdd } from "@/components/sidebar/use-manual-add";
 import { useAgentSessions } from "@/components/sidebar/use-agent-sessions";
+import { useReconcileTerminals } from "@/components/terminal/use-reconcile-terminals";
+import { SettingsDialog, type SettingsDialogHandle } from "@/components/sidebar/settings-dialog";
+import { ProjectSettingsDialog } from "@/components/sidebar/project-settings-dialog";
 import { isQuietState, StatusDot } from "./status-dot";
 import { projectRunState } from "./runtime-state";
 import { useConsumedNotifications } from "./use-consumed-notifications";
@@ -69,10 +83,12 @@ function ActiveRail({ layoutId }: { layoutId: string }) {
 function ProjectRailDot({ project, active }: { project: ProjectTree; active: boolean }) {
   const workspaceIds = useMemo(() => project.workspaces.map((w) => w.id), [project.workspaces]);
   const { runtimeByWorkspace } = useProjectRuntime(workspaceIds);
-  // The live agent-activity map (`terminal_id → activity`) from the SAME read model the
-  // sidebar rows use — the only source of the agent `waiting` (blocked-on-user) signal, which
-  // is neither an `exec_state` nor a DB session state. `useAgentSessions` owns its own
-  // subscription, so the rail dot gets it live without needing the sidebar's provider.
+  // The live agent-activity map (`terminal_id → AgentActivity`) from the SAME read model the
+  // sidebar rows + terminal LINES use — the source of every AGENT-AWARE signal a hosted agent
+  // contributes to the rollup (working→running, waiting→yellow, ready→green, error→red), none of
+  // which is an `exec_state` or a DB session state. The FULL activity is threaded so the project
+  // dot agregates exactly what each line shows. `useAgentSessions` owns its own subscription, so
+  // the rail dot gets it live without needing the sidebar's provider.
   const { byActivity } = useAgentSessions();
   // The consumed-notifications registry (the SAME one the rows use) makes the rollup
   // notification-aware: a settled success/error the user has already visited stops contributing
@@ -82,7 +98,7 @@ function ProjectRailDot({ project, active }: { project: ProjectTree; active: boo
     () =>
       projectRunState(
         [...runtimeByWorkspace.values()],
-        (terminalId) => byActivity.get(terminalId)?.activity,
+        (terminalId) => byActivity.get(terminalId),
         isConsumed,
       ),
     [runtimeByWorkspace, byActivity, isConsumed],
@@ -97,6 +113,89 @@ function ProjectRailDot({ project, active }: { project: ProjectTree; active: boo
     <span className="absolute -right-0.5 -bottom-0.5 rounded-full bg-background p-px ring-2 ring-muted/40">
       <StatusDot state={state} size="sm" />
     </span>
+  );
+}
+
+/**
+ * `<ProjectRailContextMenu>` — the per-project entry point on the rail: a RIGHT-CLICK
+ * context menu on a project tile exposing "Project settings" (the only project-level
+ * action rebranched here — the full kebab/rename/delete is PRD-B). It reuses the same
+ * Base UI `Menu` + virtual-cursor-anchor pattern as `<TerminalContextMenu>`: a controlled
+ * `Menu.Root` whose `Positioner` reads a zero-size box at the click point, so the popup
+ * lands at the cursor. Left-click is untouched (it still enters the project); we only
+ * intercept the secondary click and suppress the native OS menu.
+ */
+function ProjectRailContextMenu({
+  projectName,
+  onOpenSettings,
+  children,
+}: {
+  projectName: string;
+  onOpenSettings: () => void;
+  children: ReactNode;
+}) {
+  const reduced = useReducedMotion();
+  const [open, setOpen] = useState(false);
+  // The cursor point the menu anchors to, kept in a ref so the virtual anchor's
+  // getBoundingClientRect reads the latest value without re-creating the object.
+  const point = useRef({ x: 0, y: 0 });
+
+  const onContextMenu = useCallback((e: React.MouseEvent) => {
+    // Replace the native context menu with ours, anchored at the cursor.
+    e.preventDefault();
+    point.current = { x: e.clientX, y: e.clientY };
+    setOpen(true);
+  }, []);
+
+  // A zero-size virtual anchor at the cursor; Floating UI positions the popup against
+  // it exactly like a real element.
+  const anchor = useRef({
+    getBoundingClientRect: () =>
+      ({
+        x: point.current.x,
+        y: point.current.y,
+        width: 0,
+        height: 0,
+        top: point.current.y,
+        right: point.current.x,
+        bottom: point.current.y,
+        left: point.current.x,
+      }) as DOMRect,
+  });
+
+  return (
+    <BaseMenu.Root open={open} onOpenChange={setOpen} modal={false}>
+      {/* `display:contents` wrapper so the tile keeps its own box/layout; the wrapper
+          only captures the right-click. */}
+      <div className="contents" onContextMenu={onContextMenu}>
+        {children}
+      </div>
+      <BaseMenu.Portal>
+        <BaseMenu.Positioner anchor={anchor.current} side="right" align="start" sideOffset={2}>
+          <BaseMenu.Popup
+            aria-label={`Project ${projectName} settings`}
+            className={cn(
+              "z-50 min-w-44 origin-[var(--transform-origin)] rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg outline-none",
+            )}
+            render={
+              <motion.div
+                initial={{ opacity: 0, scale: 0.96, y: -4 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                transition={
+                  reduced
+                    ? { duration: 0 }
+                    : { type: "spring", stiffness: 520, damping: 38, mass: 0.7 }
+                }
+              />
+            }
+          >
+            <MenuItem icon={<SlidersHorizontalIcon />} onClick={onOpenSettings}>
+              Project settings
+            </MenuItem>
+          </BaseMenu.Popup>
+        </BaseMenu.Positioner>
+      </BaseMenu.Portal>
+    </BaseMenu.Root>
   );
 }
 
@@ -117,10 +216,18 @@ function ProjectRailDot({ project, active }: { project: ProjectTree; active: boo
  * project's runtime. No raw hex, no magic px — tokens and the token-backed scale only.
  */
 export function BaseLayout() {
-  const { projects, createProject, createWorkspace } = useProjects();
+  const { projects, createProject, createWorkspace, updateProject, setProjectResumeAgentSessions } =
+    useProjects();
   const { activeProjectId, setActiveProjectId } = useActiveProject();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navigate = useNavigate();
+
+  // APP-WIDE terminal-store reconciliation, mounted ONCE on the always-mounted shell. It disposes
+  // a live xterm instance ONLY when its backing record is truly gone from the GLOBAL `list_terminals`
+  // set (a real close, by the user or an agent over MCP) — NOT when the user switches project. This
+  // is deliberately NOT in the per-project deck: the deck only sees the current project's terminals,
+  // so reconciling there killed the previous project's terminals (and their agents) on every switch.
+  useReconcileTerminals();
 
   // The rail's "+ Add project" flow — the SAME picker→create-modal→`create_project` path the
   // old sidebar head used, reused verbatim via `useManualAdd` (no new backend, no duplicated
@@ -129,6 +236,34 @@ export function BaseLayout() {
   // the new project appears in the rail (the projects list re-lists on success). `dialog` is the
   // mounted modal set, rendered once below.
   const { addProject, dialog: manualAddDialog } = useManualAdd({ createProject, createWorkspace });
+
+  // The global Settings modal (gear at the foot of the rail → Integrations). The dialog
+  // stays mounted (Motion animates its exit); we pull a fresh provider list ON THE OPEN
+  // EVENT via its imperative handle — not from an effect watching `open` — exactly as the
+  // removed `<TerminalManager>` did. This restores the ONLY entry point that installs the
+  // Claude plugin (integration_list / install / remove), which the agent detection + session
+  // status depend on.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsDialogRef = useRef<SettingsDialogHandle>(null);
+  const openSettings = useCallback(() => {
+    setSettingsOpen(true);
+    settingsDialogRef.current?.reload();
+  }, []);
+
+  // The per-project settings modal (Global / Commands): which project's settings are open
+  // (`null` = closed). Reached from the rail tile's right-click "Project settings" — the
+  // project-level entry point rebranched into the active shell. Its Global pane finally
+  // exposes the `resume_agent_sessions` toggle (persisted via `set_project_resume_agent_
+  // sessions`), which was previously only mounted by the dead `<TerminalManager>`.
+  const [projectSettingsTree, setProjectSettingsTree] = useState<ProjectTree | null>(null);
+  // A per-open generation counter folded into the dialog `key` so each open REMOUNTS the
+  // dialog (its `initialSection` seed re-applies and the Global fields re-seed from the
+  // project's current name/toggle). Bumped on the closed→open edge.
+  const projectSettingsGen = useRef(0);
+  const projectSettingsWasOpen = useRef(false);
+  if (projectSettingsTree !== null && !projectSettingsWasOpen.current)
+    projectSettingsGen.current += 1;
+  projectSettingsWasOpen.current = projectSettingsTree !== null;
 
   // Enter a project once the list loads (and recover when the entered project disappears, e.g.
   // it was deleted). RESTORE the LAST entered project (persisted, across relaunch) when it still
@@ -186,19 +321,26 @@ export function BaseLayout() {
             const active = tree.project.id === activeProjectId;
             return (
               <li key={tree.project.id} className="relative">
-                <button
-                  type="button"
-                  onClick={() => setActiveProjectId(tree.project.id)}
-                  aria-current={active}
-                  aria-label={`Project ${tree.project.name}`}
-                  title={tree.project.name}
-                  className={cn(
-                    "flex size-9 items-center justify-center rounded-lg bg-muted font-medium text-xs text-foreground/85 transition-transform hover:scale-105",
-                    active && "ring-2 ring-primary/60",
-                  )}
+                {/* Right-click the tile → "Project settings" (the per-project entry point;
+                    left-click still enters the project). */}
+                <ProjectRailContextMenu
+                  projectName={tree.project.name}
+                  onOpenSettings={() => setProjectSettingsTree(tree)}
                 >
-                  {projectInitial(tree.project)}
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveProjectId(tree.project.id)}
+                    aria-current={active}
+                    aria-label={`Project ${tree.project.name}`}
+                    title={tree.project.name}
+                    className={cn(
+                      "flex size-9 items-center justify-center rounded-lg bg-muted font-medium text-xs text-foreground/85 transition-transform hover:scale-105",
+                      active && "ring-2 ring-primary/60",
+                    )}
+                  >
+                    {projectInitial(tree.project)}
+                  </button>
+                </ProjectRailContextMenu>
                 {/* The active-selection indicator shows ONLY on the entered tile; the
                     aggregated run-state dot shows on the OTHER (non-active) tiles — it is
                     masked on the active one (the detail is already on screen) and hides itself
@@ -275,6 +417,23 @@ export function BaseLayout() {
             );
           })}
         </ul>
+
+        {/* The global Settings entry point (rebranched from the removed sidebar head). It
+            sits at the FOOT of the rail — the section-nav `<ul>` above is `flex-1`, so this
+            is pushed to the bottom. Opening it pulls a fresh integration list (via the
+            dialog's imperative `reload`) so the Integrations tab can install/uninstall the
+            Claude plugin. */}
+        <Tooltip label="Settings">
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Settings"
+            onClick={openSettings}
+            className="mt-1"
+          >
+            <SettingsIcon />
+          </Button>
+        </Tooltip>
       </aside>
 
       {/* min-w-0 lets the 1fr cell follow the track, not its content (else a wide page
@@ -285,6 +444,54 @@ export function BaseLayout() {
 
       {/* The add-project modal set (folder picker → create modal). Mounted once, portalled. */}
       {manualAddDialog}
+
+      {/* Global Settings modal (rail gear → Integrations: install/uninstall the Claude
+          plugin). Stays mounted across open/close so its exit animation plays. */}
+      <SettingsDialog
+        ref={settingsDialogRef}
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+      />
+
+      {/* Project-settings modal (rail tile right-click → "Project settings"). In this
+          phase-1 shell entry point the Global pane exposes ONLY the `resume_agent_sessions`
+          toggle (persisted via `set_project_resume_agent_sessions`); the rename field is
+          hidden (`showRename={false}`) because project rename/delete belong to the PRD-B
+          kebab CRUD. `onRename` stays wired so PRD-B (and the default-`true` callers) are
+          unchanged. Resolve the LIVE tree from `projects` (not the captured snapshot) so the
+          toggle reflects optimistic tree updates immediately; fall back to the captured tree
+          until the live one is found. */}
+      {(() => {
+        const targetId = projectSettingsTree?.project.id ?? null;
+        const liveTree =
+          (targetId != null ? projects.find((t) => t.project.id === targetId) : null) ??
+          projectSettingsTree ??
+          null;
+        // The workspace the Commands pane is scoped to: the ROOT, else the first — so the
+        // pane is functional if navigated to (Commands itself is out of this task's scope).
+        const manageWorkspace =
+          liveTree?.workspaces.find((w) => w.is_root) ?? liveTree?.workspaces[0] ?? null;
+        return (
+          <ProjectSettingsDialog
+            // Remount per open so the Global fields re-seed (see `projectSettingsGen`).
+            key={`project-settings:${projectSettingsGen.current}`}
+            open={projectSettingsTree !== null}
+            projectId={liveTree?.project.id ?? null}
+            projectName={liveTree?.project.name ?? ""}
+            resumeAgentSessions={liveTree?.project.resume_agent_sessions ?? false}
+            importWorkspaceId={manageWorkspace?.id ?? null}
+            workspacePath={manageWorkspace?.path ?? null}
+            initialSection="global"
+            // Phase-1: expose only the resume toggle; rename/delete (kebab CRUD) = PRD-B.
+            showRename={false}
+            onRename={(name) => (targetId ? updateProject(targetId, name) : Promise.resolve())}
+            onResumeChange={(resume) =>
+              targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve()
+            }
+            onClose={() => setProjectSettingsTree(null)}
+          />
+        );
+      })()}
     </div>
   );
 }

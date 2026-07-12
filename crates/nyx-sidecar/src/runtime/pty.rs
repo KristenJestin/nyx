@@ -104,6 +104,12 @@ struct LiveTerminal {
     /// this sender (on close) disconnects the feeder so it drains and exits. `None` once close
     /// has taken it to trigger that shutdown.
     feed_tx: Option<Sender<Vec<u8>>>,
+    /// The instant of the LAST PTY I/O — updated on every output chunk (the pump) and on every
+    /// keystroke/write ([`PtyManager::write`]). Its elapsed time is the "inactivité I/O du PTY"
+    /// signal the idle-session UNLOAD (v2.5.5) uses as its inactivity THRESHOLD: a session with
+    /// no output nor keystroke for N minutes is a candidate to unload (gated first by the
+    /// `agent_activity == Idle` safety check). Shared with the pump thread by `Arc`.
+    last_io: Arc<Mutex<Instant>>,
 }
 
 /// The live interactive-PTY registry + pump driver. The [`super::Runtime`] holds one;
@@ -137,17 +143,28 @@ impl PtyManager {
         self.terminals.lock().unwrap().contains_key(&terminal_id)
     }
 
+    /// Whether a live PTY is currently registered for a terminal RECORD id (the persistent
+    /// `terminals.id`). Used by the lazy-resume park path to inject immediately into an
+    /// already-spawned terminal (vs. waiting for its next spawn).
+    pub fn is_live_record(&self, record_id: &str) -> bool {
+        self.live_records.lock().unwrap().contains_key(record_id)
+    }
+
     /// Spawn an interactive shell PTY of `cols`x`rows`, start its pump (binary output
     /// over `events` + OSC cwd/exec-state + exit), and return the live terminal id.
     ///
     /// `cwd` empty -> the sidecar's cwd; `record_id` empty -> no `NYX_TERMINAL_ID`
-    /// export. A spawn failure is a readable error (never a half-spawn).
+    /// export. `mcp_port` is the MCP HTTP port THIS instance's sidecar bound (`0` when the MCP
+    /// server has not started yet); `> 0` exports it as `NYX_MCP_PORT` so the Claude plugin's
+    /// SessionStart hook reaches THIS instance (review `01KXAXQN32GASMEB05PDW5BZSR`). A spawn
+    /// failure is a readable error (never a half-spawn).
     pub fn spawn(
         &self,
         cols: u16,
         rows: u16,
         cwd: &str,
         record_id: &str,
+        mcp_port: u16,
         events: EventSink,
     ) -> anyhow::Result<u32> {
         let size = PtySize {
@@ -158,7 +175,7 @@ impl PtyManager {
         };
         let cwd_opt = (!cwd.is_empty()).then_some(cwd);
         let record_opt = (!record_id.is_empty()).then_some(record_id);
-        let (pty, rx) = Pty::spawn(size, cwd_opt, record_opt)?;
+        let (pty, rx) = Pty::spawn(size, cwd_opt, record_opt, mcp_port)?;
         let terminal_id = pty.id() as u32;
         let pause_gate = pty.pause_gate();
         let flow = Arc::new(Mutex::new(FlowState {
@@ -170,6 +187,8 @@ impl PtyManager {
         // Headless VT screen model (v2.2.5): sized to match the spawn geometry so its grid is
         // the same shape the renderer paints.
         let screen = Arc::new(Mutex::new(VtScreen::new(rows, cols)));
+        // Last-I/O clock (v2.5.5 unload): starts "now" at spawn — a fresh terminal is not idle.
+        let last_io = Arc::new(Mutex::new(Instant::now()));
 
         // FEEDER thread: owns the slow, byte-wise VT parse OFF the pump's read→emit path. The
         // pump sends each raw chunk here (O(1)); this thread parses it into `screen`. Dropping
@@ -189,18 +208,20 @@ impl PtyManager {
         let pump_gate = pause_gate.clone();
         let pump_pty = Arc::clone(&pty);
         let pump_feed_tx = feed_tx.clone();
+        let pump_last_io = Arc::clone(&last_io);
         let pump = std::thread::Builder::new()
             .name(format!("nyx-sidecar-pty-pump-{terminal_id}"))
             .spawn(move || {
-                run_pump(
+                run_pump(PumpParams {
                     terminal_id,
                     rx,
                     events,
-                    pump_flow,
-                    pump_gate,
-                    pump_pty,
-                    pump_feed_tx,
-                );
+                    flow: pump_flow,
+                    gate: pump_gate,
+                    pty: pump_pty,
+                    feed_tx: pump_feed_tx,
+                    last_io: pump_last_io,
+                });
             })?;
 
         self.terminals.lock().unwrap().insert(
@@ -214,6 +235,7 @@ impl PtyManager {
                 record_id: (!record_id.is_empty()).then(|| record_id.to_string()),
                 screen,
                 feed_tx: Some(feed_tx),
+                last_io,
             },
         );
         // Register the record -> live pty join so the MCP terminal tools resolve this
@@ -257,21 +279,111 @@ impl PtyManager {
     /// under the registry lock then writes WITHOUT it, so a stuck child stalls only
     /// its own pty (parity with the v1 `PtyManager::write_to`). Unknown id -> error.
     pub fn write(&self, terminal_id: u32, data: &[u8]) -> anyhow::Result<()> {
-        // Clone the pty `Arc` out from under the registry lock, then grab the writer
+        // Clone the pty + last-I/O `Arc`s out from under the registry lock, then grab the writer
         // handle WITHOUT the registry lock so a stuck child stalls only its own pty.
-        let pty = {
+        let (pty, last_io) = {
             let terms = self.terminals.lock().unwrap();
-            terms
+            let t = terms
                 .get(&terminal_id)
-                .map(|t| Arc::clone(&t.pty))
-                .ok_or_else(|| anyhow::anyhow!("unknown terminal {terminal_id}"))?
+                .ok_or_else(|| anyhow::anyhow!("unknown terminal {terminal_id}"))?;
+            (Arc::clone(&t.pty), Arc::clone(&t.last_io))
         };
+        // A keystroke/paste/inject is I/O too — refresh the idle clock so a terminal the user is
+        // typing into (or one we just injected a resume line into) is never seen as idle.
+        *last_io.lock().unwrap() = Instant::now();
         let writer = pty.lock().unwrap().writer_handle();
         let mut w = writer.lock().unwrap();
         use std::io::Write as _;
         w.write_all(data)?;
         w.flush()?;
         Ok(())
+    }
+
+    /// The per-record PTY INACTIVITY durations (v2.5.5 unload): for every live terminal that
+    /// carries a persistent RECORD id, `(record_id, time since its last PTY I/O)`. The idle-
+    /// session unload sweep reads this as the "pas de frappe ni d'output depuis N min" threshold
+    /// signal (gated first by `agent_activity == Idle`). Record-less terminals are omitted (they
+    /// cannot be correlated back to a resumable session).
+    pub fn agent_idle_durations(&self) -> Vec<(String, Duration)> {
+        let terms = self.terminals.lock().unwrap();
+        terms
+            .values()
+            .filter_map(|t| {
+                let rec = t.record_id.clone()?;
+                let idle_for = t.last_io.lock().unwrap().elapsed();
+                Some((rec, idle_for))
+            })
+            .collect()
+    }
+
+    /// The OS BUSY bit of a live terminal by its persistent RECORD id (v2.5.5 review T1):
+    /// `true` while a command runs in its FOREGROUND process group, `false` at the idle
+    /// prompt. Resolves the record -> live pty -> [`nyx_core::pty::Pty::is_busy`]
+    /// (`foreground_pgid != shell_pid`). Returns `false` (not busy) when no live PTY backs
+    /// the record OR the OS signal is unavailable (non-Unix / master closed) — a terminal
+    /// with no derivable foreground group is not running anything (parity with the v1 poll's
+    /// null-is-idle treatment). This is the LIVE, non-persisted running source that
+    /// `apply_terminal_live_overlay` overlays onto the runtime snapshot's terminal LINE.
+    pub fn is_busy_record(&self, record_id: &str) -> bool {
+        let pty = {
+            let terms = self.terminals.lock().unwrap();
+            let Some(pty_id) = self.live_records.lock().unwrap().get(record_id).copied() else {
+                return false;
+            };
+            match terms.get(&pty_id) {
+                Some(t) => Arc::clone(&t.pty),
+                None => return false,
+            }
+        };
+        let busy = pty.lock().unwrap().is_busy();
+        busy.unwrap_or(false)
+    }
+
+    /// The OS busy bit of EVERY live terminal that carries a persistent RECORD id, as
+    /// `(record_id, busy)`. This is the per-tick sample the busy poll
+    /// ([`super::busy_poll`]) diffs to emit `terminal://busy-state` only on a TRANSITION
+    /// (parity with the v1 `BusyStatePoller` sweep). Record-less terminals are omitted (they
+    /// cannot be correlated back to a snapshot line). Never errors: a terminal whose busy bit
+    /// cannot be derived reports `false` (idle).
+    pub fn busy_by_record(&self) -> Vec<(String, bool)> {
+        // Snapshot the (record -> pty) joins first, then read each `is_busy` WITHOUT holding
+        // the registry lock across the (cheap) tcgetpgrp syscalls.
+        let joins: Vec<(String, Arc<Mutex<Pty>>)> = {
+            let terms = self.terminals.lock().unwrap();
+            self.live_records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(rec, pty_id)| {
+                    terms.get(pty_id).map(|t| (rec.clone(), Arc::clone(&t.pty)))
+                })
+                .collect()
+        };
+        joins
+            .into_iter()
+            .map(|(rec, pty)| {
+                let busy = pty.lock().unwrap().is_busy().unwrap_or(false);
+                (rec, busy)
+            })
+            .collect()
+    }
+
+    /// The FOREGROUND program name (`comm`) of a live terminal by its persistent RECORD id
+    /// (v2.5.5 review T3): `/proc/<foreground_pgid>/comm` — the running program the shell handed
+    /// the terminal to (`claude` while an agent runs, the shell name at the prompt). This is the
+    /// input the provider-agnostic `AgentRegistry::detect` resolves to an `agent_kind` for PASSIVE
+    /// agent adoption. `None` when no live PTY backs the record, on a non-Linux platform (no
+    /// `/proc`), or when the foreground cannot be read (e.g. the master already closed on exit) —
+    /// so the caller simply detects no agent. Reuses the SAME `read_terminal_info` foreground read
+    /// the auto-label path uses (its `.1` is the foreground `comm`).
+    pub fn foreground_comm_record(&self, record_id: &str) -> Option<String> {
+        let pty = {
+            let terms = self.terminals.lock().unwrap();
+            let pty_id = self.live_records.lock().unwrap().get(record_id).copied()?;
+            Arc::clone(&terms.get(&pty_id)?.pty)
+        };
+        let pty = pty.lock().unwrap();
+        read_terminal_info(pty.shell_pid(), foreground_pgid(&pty)).1
     }
 
     /// Resize a live PTY (SIGWINCH to the child). Unknown id -> error.
@@ -440,19 +552,44 @@ fn read_terminal_info(
     (None, None)
 }
 
+/// The channels + shared handles ONE pump thread drives, grouped into a single params struct so
+/// [`run_pump`] takes one argument instead of eight positional ones (`clippy::too_many_arguments`
+/// — the `last_io` idle clock added in v2.5.5 pushed the old flat signature to 8/7). Built at
+/// [`PtyManager::spawn`] and moved wholesale into the pump thread.
+struct PumpParams {
+    /// The live pty id (the wire terminal id all emitted frames carry).
+    terminal_id: u32,
+    /// The core reader channel: raw PTY chunks arrive here until the child exits / master closes.
+    rx: Receiver<Vec<u8>>,
+    /// The unsolicited-event sink the coalesced binary output / OSC state / exit ride.
+    events: EventSink,
+    /// The per-terminal flow-control accounting (in-flight bytes + pause state).
+    flow: Arc<Mutex<FlowState>>,
+    /// The lossless pause-gate the pump pauses/resumes for OS backpressure.
+    gate: PauseGate,
+    /// The live pty handle (reaped for the exit code on disconnect).
+    pty: Arc<Mutex<Pty>>,
+    /// The O(1) hand-off into the headless-VT feeder thread.
+    feed_tx: Sender<Vec<u8>>,
+    /// The last-PTY-I/O clock (v2.5.5 unload): refreshed on every output chunk.
+    last_io: Arc<Mutex<Instant>>,
+}
+
 /// The pump body (ported from the v1 napi `run_pump`): leading-edge coalescing, the
 /// OSC 7 / OSC 133 scan with a tail-carry across chunk boundaries, the flow-control
 /// reserve + pause-gate, and the exit reap. Runs until the reader channel disconnects
 /// (child exit / master close).
-fn run_pump(
-    terminal_id: u32,
-    rx: Receiver<Vec<u8>>,
-    events: EventSink,
-    flow: Arc<Mutex<FlowState>>,
-    gate: PauseGate,
-    pty: Arc<Mutex<Pty>>,
-    feed_tx: Sender<Vec<u8>>,
-) {
+fn run_pump(params: PumpParams) {
+    let PumpParams {
+        terminal_id,
+        rx,
+        events,
+        flow,
+        gate,
+        pty,
+        feed_tx,
+        last_io,
+    } = params;
     let mut pending: Vec<u8> = Vec::new();
     let mut last_flush = Instant::now();
     let mut osc133_tail: Vec<u8> = Vec::new();
@@ -471,6 +608,9 @@ fn run_pump(
         };
         match recv {
             Ok(chunk) => {
+                // OUTPUT is I/O: refresh the idle clock so a terminal actively printing (Claude
+                // streaming its answer, a build logging) is never seen as idle by the unload sweep.
+                *last_io.lock().unwrap() = Instant::now();
                 // Forward the SAME raw bytes to the headless VT feeder (v2.2.5) with an O(1)
                 // channel send — the slow byte-wise parse runs on the FEEDER thread, so it never
                 // slows this read→emit loop and can never widen the read-ahead window that the
@@ -741,7 +881,7 @@ mod tests {
     fn snapshot_reflects_shell_output() {
         let mgr = PtyManager::new();
         let id = mgr
-            .spawn(80, 24, "", "", discard_sink())
+            .spawn(80, 24, "", "", 0, discard_sink())
             .expect("spawn pty");
         // Print a distinctive marker to the terminal's own stdout (flows through the pump).
         mgr.write(id, b"printf 'NYX_SNAP_MARKER'\n").expect("write");
@@ -769,7 +909,7 @@ mod tests {
     fn snapshot_captures_alt_screen_tui() {
         let mgr = PtyManager::new();
         let id = mgr
-            .spawn(80, 24, "", "", discard_sink())
+            .spawn(80, 24, "", "", 0, discard_sink())
             .expect("spawn pty");
         // Enter alt-screen (1049h), home, clear, paint a TUI line — all via one printf. Octal
         // \033 is ESC in POSIX printf. No newline after the payload so the row is exact.
@@ -801,5 +941,110 @@ mod tests {
     fn snapshot_none_for_unknown_terminal() {
         let mgr = PtyManager::new();
         assert!(mgr.snapshot(999_999).is_none());
+    }
+
+    /// Poll `is_busy_record` until it equals `want` or we time out, returning whether it hit.
+    #[cfg(unix)]
+    fn busy_until(mgr: &PtyManager, record: &str, timeout: Duration, want: bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if mgr.is_busy_record(record) == want {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        mgr.is_busy_record(record) == want
+    }
+
+    /// v2.5.5 review T1 — the OS BUSY bit, end to end through a REAL PTY: a foreground command
+    /// (`sleep`) run in a record-backed terminal makes `is_busy_record` report `true` (its
+    /// foreground process group differs from the shell), and it returns to `false` once the
+    /// command hands the terminal back to the shell prompt. `busy_by_record` reports the SAME
+    /// record while busy. This is the "un process foreground rallume un point running, puis
+    /// s'éteint quand il rend la main au shell" criterion at the sidecar source (the poll's
+    /// sample). Reuses `nyx_core::pty::Pty::is_busy` (`foreground_pgid != shell_pid`).
+    #[cfg(unix)]
+    #[test]
+    fn busy_record_flips_true_while_a_foreground_command_runs() {
+        let mgr = PtyManager::new();
+        let record = "rec-busy";
+        let id = mgr
+            .spawn(80, 24, "", record, 0, discard_sink())
+            .expect("spawn pty");
+        // Run a foreground command for a moment; the shell puts it in its own process group and
+        // hands it the terminal → busy. `exec 2>/dev/null` keeps the row text irrelevant.
+        mgr.write(id, b"sleep 2\n").expect("write");
+        assert!(
+            busy_until(&mgr, record, Duration::from_secs(5), true),
+            "a foreground `sleep` must make the terminal report BUSY"
+        );
+        // While busy, the poll's sweep sample carries this record as busy.
+        assert!(
+            mgr.busy_by_record().iter().any(|(r, b)| r == record && *b),
+            "busy_by_record reports the busy record"
+        );
+        // Once `sleep` returns, the foreground group is the shell again → not busy.
+        assert!(
+            busy_until(&mgr, record, Duration::from_secs(6), false),
+            "the dot must clear when the command hands the terminal back to the shell"
+        );
+        // An unknown record is never busy (no live PTY backs it).
+        assert!(!mgr.is_busy_record("no-such-record"));
+        mgr.close(id);
+    }
+
+    /// v2.5.5 review T3 — the PASSIVE-adoption plumbing through a REAL PTY: while a foreground
+    /// command runs, `foreground_comm_record` returns its program name (`comm`), the input the
+    /// provider-agnostic `AgentRegistry::detect` resolves to an `agent_kind`. Here the foreground
+    /// is `sleep` (not an agent), so the read yields `"sleep"` and the default registry detects
+    /// nothing — proving the wire (foreground `comm` → registry) works and stays quiet for a
+    /// plain command. The POSITIVE, provider-agnostic detection is proven by the nyx-core
+    /// mock-adapter unit test; here we also pin that the SAME registry WOULD light for a real
+    /// agent name (`claude` → `claude_code`), so the only missing piece in production is the
+    /// process actually being that agent.
+    #[cfg(unix)]
+    #[test]
+    fn foreground_comm_feeds_provider_agnostic_detection() {
+        use nyx_core::agent::AgentRegistry;
+
+        let mgr = PtyManager::new();
+        let record = "rec-detect";
+        let id = mgr
+            .spawn(80, 24, "", record, 0, discard_sink())
+            .expect("spawn pty");
+        mgr.write(id, b"sleep 2\n").expect("write");
+        // Wait until the foreground is the `sleep` child (its comm becomes readable).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut comm = None;
+        while Instant::now() < deadline {
+            comm = mgr.foreground_comm_record(record);
+            if comm.as_deref() == Some("sleep") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(
+            comm.as_deref(),
+            Some("sleep"),
+            "the foreground program name is read from the live PTY"
+        );
+
+        // The provider-agnostic registry: a plain command is NOT an agent (no passive icon)...
+        let registry = AgentRegistry::default();
+        assert!(
+            registry.detect("sleep").is_none(),
+            "a plain foreground command adopts no agent"
+        );
+        // ...but the SAME registry path WOULD resolve a real agent's foreground name — the wire is
+        // keyed on the registry, not on any hardcoded provider.
+        assert_eq!(
+            registry.detect("claude").map(|a| a.kind()),
+            Some("claude_code"),
+            "the registry resolves a known agent's comm to its kind (no `if claude` in the wire)"
+        );
+
+        // An unknown record has no foreground comm (no live PTY).
+        assert!(mgr.foreground_comm_record("no-such-record").is_none());
+        mgr.close(id);
     }
 }

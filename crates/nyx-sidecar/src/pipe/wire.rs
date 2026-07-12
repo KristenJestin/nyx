@@ -104,6 +104,9 @@ pub const EVT_PTY_EXEC_STATE: u8 = 4;
 pub const EVT_COMMAND_STATE: u8 = 5;
 pub const EVT_COMMAND_OUTPUT: u8 = 6;
 pub const EVT_CHANGED: u8 = 7;
+// OS busy-state transition for a terminal (v2.5.5 review T1). Keyed by the persistent
+// RECORD id (NOT the live pty id) so the renderer folds it directly onto the record.
+pub const EVT_PTY_BUSY_STATE: u8 = 8;
 
 /// Stable, machine-matchable error codes (mirrored in TS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +324,13 @@ pub enum Event {
         state: String,
         exit_code: Option<i32>,
     },
+    /// An OS BUSY-STATE transition for a terminal (v2.5.5 review T1): the foreground process
+    /// group of the terminal RECORD `record_id` entered (`busy = true`) or left
+    /// (`busy = false`) a running command. Emitted by the busy poll ([`crate::runtime::busy_poll`])
+    /// ONLY on a transition, keyed by the persistent RECORD id (so the renderer folds it
+    /// directly onto its record, and the runtime tree re-pulls the snapshot whose overlaid
+    /// `busy` bit then lights the LINE's `running` dot). Independent of OSC 133 / exec-state.
+    PtyBusyState { record_id: String, busy: bool },
     /// A managed-command run-state / ack / output-cleared transition (the wire shape of
     /// the v1 `command://state` / `command://ack` / `command://output-cleared`).
     CommandState {
@@ -667,6 +677,14 @@ pub fn encode_message(msg: &Message) -> Vec<u8> {
                     opt_i32(*exit_code),
                 ]),
             ),
+            Event::PtyBusyState { record_id, busy } => (
+                CAT_EVENT,
+                EVT_PTY_BUSY_STATE,
+                rmpv::Value::Array(vec![
+                    rmpv::Value::String(record_id.clone().into()),
+                    rmpv::Value::Boolean(*busy),
+                ]),
+            ),
             Event::CommandState {
                 event,
                 instance_id,
@@ -890,6 +908,11 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, DecodeError> {
                 .ok_or_else(|| bad("pty_exec.state"))?,
             exit_code: fields.get(2).and_then(val_opt_i32),
         }),
+        (CAT_EVENT, EVT_PTY_BUSY_STATE) => Message::Event(Event::PtyBusyState {
+            record_id: val_str(&fields[0]).ok_or_else(|| bad("pty_busy.record"))?,
+            busy: val_bool(fields.get(1).ok_or_else(|| bad("pty_busy.busy"))?)
+                .ok_or_else(|| bad("pty_busy.busy"))?,
+        }),
         (CAT_EVENT, EVT_COMMAND_STATE) => Message::Event(Event::CommandState {
             event: val_str(&fields[0]).ok_or_else(|| bad("cmd_state.event"))?,
             instance_id: val_str(fields.get(1).ok_or_else(|| bad("cmd_state.iid"))?)
@@ -953,6 +976,15 @@ mod tests {
         roundtrip(Message::Event(Event::Log {
             level: "info".into(),
             message: "ready".into(),
+        }));
+        // v2.5.5 review T1: the OS busy-state transition, keyed by the record id.
+        roundtrip(Message::Event(Event::PtyBusyState {
+            record_id: "term-abc".into(),
+            busy: true,
+        }));
+        roundtrip(Message::Event(Event::PtyBusyState {
+            record_id: "term-xyz".into(),
+            busy: false,
         }));
     }
 

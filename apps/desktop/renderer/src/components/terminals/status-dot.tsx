@@ -118,9 +118,14 @@ export function StatusDot({ state, size, className }: StatusDotProps) {
     <AnimatePresence initial={false}>
       {visible ? (
         <motion.span
-          // Keyed on `state` so swapping a LIVE running↔waiting (or success↔error) dot
-          // re-runs the presence pop, paired with the inner `transition-colors` swap.
-          key={state}
+          // STABLE key (not `state`): a state→state swap (running→success, waiting→error,
+          // running→waiting…) must stay the SAME node so the fill glides in place via the
+          // inner `transition-colors` and the pulse/ping simply switches off for a settled
+          // state — ONE dot, no overlap. Keying on `state` remounted instead: the old dot
+          // lingered in EXIT (fading) while the new one popped IN, so both were briefly
+          // mounted → two dots stacked. AnimatePresence now only pops/fades on the
+          // quiet↔visible boundary (mount/unmount), where a single dot appears or leaves.
+          key="dot"
           data-state={state}
           initial={DOT_PRESENCE.initial}
           animate={{ ...DOT_PRESENCE.animate, transition: dotAppearTransition(reduced) }}

@@ -154,4 +154,17 @@ describe("<ProjectSettingsDialog> — Global pane", () => {
       "true",
     );
   });
+
+  it("hides the rename field when showRename=false but keeps the resume toggle", () => {
+    // The phase-1 shell entry point passes `showRename={false}` so only the resume toggle is
+    // exposed (rename/delete = PRD-B kebab CRUD). The Name field + Save must not render.
+    const props = baseProps();
+    render(<ProjectSettingsDialog {...props} showRename={false} />);
+    expect(screen.queryByLabelText("Project name")).toBeNull();
+    expect(screen.queryByRole("button", { name: /save/i })).toBeNull();
+    // The resume toggle stays present and functional.
+    const toggle = screen.getByRole("switch", { name: /resume agent sessions/i });
+    fireEvent.click(toggle);
+    expect(props.onResumeChange).toHaveBeenCalledWith(true);
+  });
 });

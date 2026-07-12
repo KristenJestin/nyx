@@ -441,3 +441,135 @@ describe("BaseLayout — aggregated project dot on the rail", () => {
     expect(cls).toContain("-bottom-0.5");
   });
 });
+
+/**
+ * The global Settings entry point rebranched into the active shell (base-layout). The
+ * removed `<TerminalManager>` owned the ONLY gear that opened the Integrations tab (where
+ * the Claude plugin is installed/uninstalled via `integration_list` / `integration_install`
+ * / `integration_remove`); this shell restores it. The gear opens the modal and pulls a
+ * fresh integration list on the OPEN EVENT (the dialog's imperative `reload`), exactly as
+ * the old wiring did.
+ */
+describe("BaseLayout — global Settings entry point (Integrations)", () => {
+  function installSettingsBackend(calls: string[]): void {
+    mockIPC((cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      calls.push(cmd);
+      switch (cmd) {
+        case "list_projects":
+          return [project("p1", "Alpha")];
+        case "list_workspaces":
+          return [root(`ws-${a.projectId as string}`, a.projectId as string)];
+        case "workspace_runtime_snapshot":
+          return {
+            workspace: { id: a.workspaceId as string, name: "root", path: "/x" },
+            terminals: [],
+            agent_sessions: [],
+            services: [],
+          };
+        case "agent_active_sessions":
+        case "agent_activity_snapshot":
+          return [];
+        // The Integrations pane's read model: the single bundled Claude plugin, not installed.
+        case "integration_list":
+          return [
+            { provider: "claude_code", label: "Claude Code", installed: false, available: true },
+          ];
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  it("exposes a Settings gear in the rail that opens the Integrations tab and lists the Claude plugin", async () => {
+    const calls: string[] = [];
+    installSettingsBackend(calls);
+    renderLayout();
+
+    // The entry point is present in the active shell — an accessible Settings gear.
+    const gear = await screen.findByRole("button", { name: "Settings" });
+    // Not yet loaded: the modal is closed, so no integration list was pulled.
+    expect(calls).not.toContain("integration_list");
+
+    fireEvent.click(gear);
+
+    // Opening pulls a fresh list (integration_list) and shows the Claude row with its
+    // single Install control — the install/uninstall surface (integration_install/remove).
+    expect(await screen.findByText("Claude Code")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Install" })).toBeTruthy();
+    await waitFor(() => expect(calls).toContain("integration_list"));
+  });
+});
+
+/**
+ * The per-project settings entry point rebranched into the active shell (base-layout). The
+ * removed `<TerminalManager>` owned the ONLY surface that mounted `<ProjectSettingsDialog>`;
+ * this shell restores it via a right-click "Project settings" on the rail tile. The Global
+ * pane's `resume_agent_sessions` toggle is wired to `set_project_resume_agent_sessions` — the
+ * setting that was previously reachable only through a manual database edit.
+ *
+ * Phase-1 SCOPE: this entry point exposes ONLY the resume toggle — the rename field is hidden
+ * (`showRename={false}`) because project rename/delete belong to the PRD-B kebab CRUD. The
+ * shell must not introduce a new, functional project-rename capability in phase 1.
+ */
+describe("BaseLayout — project settings entry point (resume toggle)", () => {
+  function installResumeBackend(calls: { cmd: string; args: Record<string, unknown> }[]): void {
+    mockIPC((cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      calls.push({ cmd, args: a });
+      switch (cmd) {
+        case "list_projects":
+          return [project("p1", "Alpha")];
+        case "list_workspaces":
+          return [root(`ws-${a.projectId as string}`, a.projectId as string)];
+        case "workspace_runtime_snapshot":
+          return {
+            workspace: { id: a.workspaceId as string, name: "root", path: "/x" },
+            terminals: [],
+            agent_sessions: [],
+            services: [],
+          };
+        case "agent_active_sessions":
+        case "agent_activity_snapshot":
+          return [];
+        // The resume opt-in persistence — the command the toggle drives.
+        case "set_project_resume_agent_sessions":
+          return undefined;
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  it("right-click a rail tile → Project settings, and the resume toggle persists via set_project_resume_agent_sessions", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    installResumeBackend(calls);
+    renderLayout();
+
+    // The per-project entry point: right-click the tile → a "Project settings" context menu.
+    const tile = await screen.findByRole("button", { name: "Project Alpha" });
+    fireEvent.contextMenu(tile);
+    const item = await screen.findByRole("menuitem", { name: "Project settings" });
+    fireEvent.click(item);
+
+    // The project-settings modal opens on Global, exposing the resume toggle (off by default).
+    const toggle = await screen.findByRole("switch", { name: /resume agent sessions/i });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+
+    // Phase-1 scope: this entry point does NOT expose a functional project-rename (rename/
+    // delete = PRD-B kebab CRUD). The Name field and its Save button must be absent.
+    expect(screen.queryByLabelText("Project name")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+
+    // Flipping it persists immediately via the backend command, scoped to THIS project id.
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(calls.some((c) => c.cmd === "set_project_resume_agent_sessions")).toBe(true),
+    );
+    const call = calls.find((c) => c.cmd === "set_project_resume_agent_sessions");
+    expect(call?.args.id).toBe("p1");
+    expect(call?.args.resume).toBe(true);
+    // And no rename ever reached the backend from this phase-1 entry point.
+    expect(calls.some((c) => c.cmd === "update_project")).toBe(false);
+  });
+});

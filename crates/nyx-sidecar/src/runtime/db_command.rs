@@ -214,6 +214,32 @@ impl Ctx<'_> {
             .ok_or_else(|| format!("{}: missing string[] arg '{name}'", self.command))
     }
 
+    /// Read the v2.5.5 resume-park batch (`[{ terminalId, sessionId, command }]`) as the
+    /// `(record_id, session_id, command)` tuples [`Runtime::park_resumes`](super::Runtime::park_resumes)
+    /// consumes. A missing array or a malformed entry is a readable error (never a silent drop —
+    /// a lost park is a lost resume). Mirrors the `ResumePark` contract shape.
+    fn arg_resume_parks(&self, name: &str) -> Result<Vec<(String, String, String)>, String> {
+        let arr = self
+            .args
+            .get(name)
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("{}: missing object[] arg '{name}'", self.command))?;
+        arr.iter()
+            .map(|entry| {
+                let field = |key: &str| {
+                    entry
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| {
+                            format!("{}: park entry missing string field '{key}'", self.command)
+                        })
+                };
+                Ok((field("terminalId")?, field("sessionId")?, field("command")?))
+            })
+            .collect()
+    }
+
     /// The shared DB pool.
     fn db(&self) -> &nyx_core::db::Db {
         self.runtime.db()
@@ -267,6 +293,36 @@ impl Ctx<'_> {
                 .collect(),
             None => std::collections::HashMap::new(),
         }
+    }
+
+    /// Overlay the LIVE per-terminal PTY signals onto a freshly-built runtime snapshot from the
+    /// sidecar's live [`PtyManager`] (v2.5.5 review):
+    ///   * T1 — each terminal's OS `busy` bit (`is_busy_record` — a foreground command running);
+    ///   * T3 — the PASSIVELY-DETECTED agent kind: the terminal's foreground `comm`
+    ///     (`foreground_comm_record`) resolved through the PROVIDER-AGNOSTIC
+    ///     [`nyx_core::agent::AgentRegistry::detect`] (no hardcoded `claude` — every adapter is
+    ///     eligible), so nyx can adopt a hand-launched agent's icon WITHOUT the hook. This never
+    ///     creates an `agent_sessions` row; it is display-only, distinct from `sessions[]`.
+    ///
+    /// Keeps `nyx_core::workspace_runtime`'s pure-DB `snapshot` free of any live-PTY dependency;
+    /// only this UI-bridge path, which HOLDS the manager, applies the overlay (the MCP tool serves
+    /// the DB-only snapshot).
+    fn apply_terminal_live(
+        &self,
+        snapshot: &mut nyx_core::workspace_runtime::WorkspaceRuntimeSnapshot,
+    ) {
+        let pty = self.runtime.pty();
+        // The provider-agnostic adapter registry, resolved ONCE for the whole overlay pass.
+        let registry = nyx_core::agent::AgentRegistry::default();
+        let overlay = |record_id: &str| nyx_core::workspace_runtime::TerminalLive {
+            busy: pty.is_busy_record(record_id),
+            // Resolve the foreground program to an agent kind via the registry — `None` for a
+            // plain shell/command, so a stopped agent's passive icon disappears on the next pull.
+            detected_agent_kind: pty
+                .foreground_comm_record(record_id)
+                .and_then(|comm| registry.detect(&comm).map(|a| a.kind().to_string())),
+        };
+        nyx_core::workspace_runtime::apply_terminal_live_overlay(snapshot, &overlay);
     }
 
     /// Build the WORKSPACE CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0) by REUSING
@@ -657,6 +713,49 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)?;
                 Ok("null".to_string())
             }
+            // v2.5.5 LAZY agent-session resume: PARK the `claude --resume <id>` commands the
+            // renderer read from `workspace_restore_plan` (`{ parks: [{ terminalId, sessionId,
+            // command }] }`) into the runtime's `ResumeParks`, keyed by terminal RECORD id. Each is
+            // injected ONCE at that terminal's PTY spawn — or IMMEDIATELY if the PTY is already live
+            // (`Runtime::park_resumes` checks liveness). This is the sidecar half the `NyxBridge`
+            // `set_resume_parks` invocation drives; without it the whole lazy-resume path is inert
+            // over the transport (the in-process `Runtime::park_resumes` was never reachable from the
+            // wire dispatch). Void result.
+            "set_resume_parks" => {
+                let parks = self.arg_resume_parks("parks")?;
+                self.runtime.park_resumes(&parks, self.events);
+                Ok("null".to_string())
+            }
+            // v2.5.5 IDLE-SESSION UNLOAD: the sidecar half of the renderer's timer sweep
+            // (`use-idle-unload.ts`). Reclaim the resources of DORMANT agent sessions by closing the
+            // PTY of every agent-hosting terminal that is Idle (NEVER Working/Waiting — an ACTIVE
+            // session is never unloaded), NOT currently `visited` (focused), idle beyond
+            // `thresholdSecs`, AND resume-eligible. The authoritative safety + eligibility decision
+            // lives in [`Runtime::unload_idle_sessions`](super::Runtime::unload_idle_sessions)
+            // (`decide_unload` gate + the `decide_resume` master switch); this arm ONLY maps the
+            // renderer's args to it. This is the transport half the `NyxBridge` `unload_idle_sessions`
+            // invocation drives — WITHOUT it the sweep fell into the fallback Error and NEVER ran over
+            // the wire (the in-process method was unreachable from the dispatch, exactly the class of
+            // bug fixed for `set_resume_parks`). `{ thresholdSecs?, visited: string[] }` → the unloaded
+            // terminal record ids (parity with the contract's documented return). The DB sessions stay
+            // `active`, so an in-run revisit RESUMES each via the phase-2 lazy park+inject.
+            "unload_idle_sessions" => {
+                // `thresholdSecs` is OPTIONAL (contract default = `DEFAULT_UNLOAD_THRESHOLD_SECS`,
+                // 15 min); `visited` is the REQUIRED list of focused terminal record ids (a readable
+                // error if missing — never a silent drop, as with `arg_resume_parks`).
+                let threshold = std::time::Duration::from_secs(
+                    self.args
+                        .get("thresholdSecs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(nyx_core::agent_unload::DEFAULT_UNLOAD_THRESHOLD_SECS),
+                );
+                let visited: std::collections::HashSet<String> =
+                    self.arg_str_vec("visited")?.into_iter().collect();
+                let unloaded = self
+                    .runtime
+                    .unload_idle_sessions(threshold, &visited, self.events);
+                Self::json(&unloaded)
+            }
             // --- workspaces ----------------------------------------------------
             "list_workspaces" => {
                 let project_id = self.arg_str("projectId")?;
@@ -796,13 +895,18 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)?;
                 let outcomes = self.run_state_outcomes(&instance_ids);
                 let overlay = move |instance_id: &str| outcomes.get(instance_id).copied();
-                let snapshot = self
+                let mut snapshot = self
                     .db()
                     .with_conn(|c| {
                         nyx_core::workspace_runtime::snapshot(c, &workspace_id, &overlay)
                     })
                     .map_err(Self::db_err)?
                     .ok_or_else(|| format!("unknown workspace {workspace_id}"))?;
+                // Overlay the LIVE per-terminal PTY signals (the OS `busy` bit, T1) onto the
+                // pure-DB snapshot so the runtime tree LINE lights a `running` dot for a
+                // foreground command. This is the ONE place with the live `PtyManager`; the
+                // MCP tool / tests read the DB-only snapshot unchanged.
+                self.apply_terminal_live(&mut snapshot);
                 Self::json(&snapshot)
             }
             // FREE-WORK entry point (task 01KWHPV33H0FX8NA4C94T5W46J): open the cockpit on a
@@ -825,13 +929,16 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)?;
                 let outcomes = self.run_state_outcomes(&instance_ids);
                 let overlay = move |instance_id: &str| outcomes.get(instance_id).copied();
-                let snapshot = self
+                let mut snapshot = self
                     .db()
                     .with_conn(|c| {
                         nyx_core::workspace_runtime::snapshot_for_project(c, &project_id, &overlay)
                     })
                     .map_err(Self::db_err)?
                     .ok_or_else(|| format!("project {project_id} has no primary workspace"))?;
+                // Overlay the LIVE per-terminal PTY signals (the OS `busy` bit, T1) — same as
+                // `workspace_runtime_snapshot` above (one authority, PDR-0005).
+                self.apply_terminal_live(&mut snapshot);
                 Self::json(&snapshot)
             }
             // v2.2 workspace CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a
@@ -3335,7 +3442,11 @@ mod tests {
             )
             .unwrap();
         let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(reply["spec_id"], serde_json::json!("specA"), "reply inherits root spec");
+        assert_eq!(
+            reply["spec_id"],
+            serde_json::json!("specA"),
+            "reply inherits root spec"
+        );
 
         // A comment posted while reviewing Spec B (same workspace+repo).
         h.run(
@@ -3358,8 +3469,14 @@ mod tests {
             .unwrap();
         let list_a: serde_json::Value = serde_json::from_str(&list_a).unwrap();
         let arr_a = list_a.as_array().unwrap();
-        assert_eq!(arr_a.len(), 2, "Spec A sees only its own thread (no leak from B)");
-        assert!(arr_a.iter().all(|c| c["spec_id"] == serde_json::json!("specA")));
+        assert_eq!(
+            arr_a.len(),
+            2,
+            "Spec A sees only its own thread (no leak from B)"
+        );
+        assert!(arr_a
+            .iter()
+            .all(|c| c["spec_id"] == serde_json::json!("specA")));
 
         // Spec B's scoped feed = only B's comment.
         let list_b = h
@@ -3369,7 +3486,11 @@ mod tests {
             )
             .unwrap();
         let list_b: serde_json::Value = serde_json::from_str(&list_b).unwrap();
-        assert_eq!(list_b.as_array().unwrap().len(), 1, "Spec B sees only its own comment");
+        assert_eq!(
+            list_b.as_array().unwrap().len(),
+            1,
+            "Spec B sees only its own comment"
+        );
 
         // The UNSCOPED read (no specId) still returns the whole repo feed (agent façade / aggregate).
         let list_all = h
@@ -3379,6 +3500,10 @@ mod tests {
             )
             .unwrap();
         let list_all: serde_json::Value = serde_json::from_str(&list_all).unwrap();
-        assert_eq!(list_all.as_array().unwrap().len(), 3, "unscoped read sees all three");
+        assert_eq!(
+            list_all.as_array().unwrap().len(),
+            3,
+            "unscoped read sees all three"
+        );
     }
 }

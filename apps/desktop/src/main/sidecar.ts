@@ -730,6 +730,14 @@ export function toEnvelope(event: PipeEvent): CoreEventEnvelope | null {
           exit_code: event.exitCode,
         },
       };
+    case "pty_busy_state":
+      // The OS busy-state transition (v2.5.5 review T1). The sidecar emits it keyed by the
+      // persistent RECORD id, so the renderer folds it straight onto the terminal record and
+      // the runtime tree re-pulls the snapshot (whose overlaid `busy` bit lights the line).
+      return {
+        event: "terminal://busy-state",
+        payload: { terminal_id: event.recordId, busy: event.busy },
+      };
     case "command_state":
       switch (event.event) {
         case "ack":

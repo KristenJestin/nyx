@@ -380,6 +380,21 @@ impl McpRuntime {
     pub fn is_started(&self) -> bool {
         self.server.is_started()
     }
+
+    /// STOP the MCP HTTP listener (close the loopback socket + join its accept thread).
+    ///
+    /// Called FIRST in [`Runtime::shutdown`](super::Runtime::shutdown), BEFORE the PTYs are
+    /// closed. That ordering is the whole fix: when the sidecar kills the interactive Claude
+    /// PTYs, each dying Claude fires a `SessionEnd(reason=other)` hook that `POST`s
+    /// `agent_session_event` to this server. In v1 the in-process MCP died WITH the host, so
+    /// that POST lost the race and the session stayed `active` (and was resumed next boot). In
+    /// v2 the sidecar outlives the PTYs, so the POST would land and `mark_session_ended` —
+    /// killing the resume forever. Closing the listener before `close_all` restores the v1 /
+    /// crash-reaper behaviour: the late POST hits a refused socket, the session stays `active`,
+    /// and lazy-resume reclaims it. Bounded + idempotent (delegates to [`McpServer::stop`]).
+    pub fn stop(&self) {
+        self.server.stop();
+    }
 }
 
 #[cfg(test)]

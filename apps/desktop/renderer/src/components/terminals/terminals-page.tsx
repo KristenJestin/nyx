@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getRouteApi } from "@tanstack/react-router";
-import { FolderPlusIcon, SquareTerminalIcon } from "lucide-react";
+import { FolderPlusIcon, SettingsIcon, SquareTerminalIcon } from "lucide-react";
 
 import { useProjects } from "@/components/sidebar/use-projects";
 import { useManualAdd } from "@/components/sidebar/use-manual-add";
 import { SidebarShell } from "@/components/ui/sidebar-shell";
 import { ProjectCommandsDialog } from "@/components/command/project-commands-dialog";
+import { ProjectSettingsDialog } from "@/components/sidebar/project-settings-dialog";
 import { PagePlaceholder } from "./page-placeholder";
 import { useActiveProject } from "./active-project";
 import { useProjectRuntime } from "./use-project-runtime";
@@ -14,6 +15,9 @@ import { ConsumedNotificationsProvider } from "./use-consumed-notifications";
 import { RuntimePaneHost } from "./runtime-pane-host";
 import { WorkspaceAccordion } from "./workspace-accordion";
 import { useTerminalActions } from "./use-terminal-actions";
+import { useLazyResume } from "./use-lazy-resume";
+import { useIdleUnload } from "./use-idle-unload";
+import { RestorePlanProvider } from "./use-restore-plan";
 import { loadLastTerminalId, saveLastTerminalId } from "./ui-persistence";
 import type { WorkspaceRuntimeService, WorkspaceRuntimeTerminal } from "./use-workspace-runtime";
 
@@ -34,7 +38,8 @@ const terminalsRouteApi = getRouteApi("/");
  */
 export function TerminalsPage() {
   const { activeProjectId } = useActiveProject();
-  const { projects, createProject, createWorkspace } = useProjects();
+  const { projects, createProject, createWorkspace, setProjectResumeAgentSessions, updateProject } =
+    useProjects();
   // The optional `?terminal=<id>` / `?command=<id>` deep-links (the Runtime tab opens a precise
   // terminal or managed command here).
   const { terminal: deepLinkTerminalId, command: deepLinkCommandId } =
@@ -51,6 +56,11 @@ export function TerminalsPage() {
     createWorkspace,
   });
 
+  // The per-project settings modal opened by the header's VISIBLE gear (the discoverable
+  // twin of the rail tile's right-click "Project settings"). Local open state, mirroring the
+  // `manualAddDialog` pattern: the dialog is mounted once below and driven by this boolean.
+  const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
+
   const activeTree = useMemo(
     () => projects.find((p) => p.project.id === activeProjectId) ?? null,
     [projects, activeProjectId],
@@ -59,6 +69,11 @@ export function TerminalsPage() {
   const workspaceIds = useMemo(() => workspaces.map((w) => w.id), [workspaces]);
 
   const { runtimeByWorkspace } = useProjectRuntime(workspaceIds);
+
+  // LAZY agent-session resume (v2.5.5): consume each workspace's `workspace_restore_plan` and hand
+  // the sidecar the resumable `claude --resume <id>` lines to inject once at each terminal's PTY
+  // open. Honours the project resume toggle (a toggle-OFF workspace yields no resumable entry).
+  useLazyResume(workspaceIds);
 
   // The FLAT list of every workspace's terminals — the deck spans the whole project so a
   // selection switch across workspaces never remounts a live terminal. Kept in workspace
@@ -101,21 +116,48 @@ export function TerminalsPage() {
           switch. */}
       <RuntimeSelectionProvider key={activeTree.project.id}>
         <ConsumedNotificationsProvider>
-          <TerminalsBody
-            projectId={activeTree.project.id}
-            projectName={activeTree.project.name}
-            workspaces={workspaces}
-            runtimeByWorkspace={runtimeByWorkspace}
-            allTerminals={allTerminals}
-            allServices={allServices}
-            deepLinkTerminalId={deepLinkTerminalId ?? null}
-            deepLinkCommandId={deepLinkCommandId ?? null}
-            onAddWorkspace={() => void addWorkspace(activeTree)}
-          />
+          {/* The post-crash RESTORE registry for this project's workspaces: reads each
+              `workspace_restore_plan` so service rows can badge crash-`interrupted` instances and
+              the restore panel can offer resume/ignore for the resumable interrupted sessions. */}
+          <RestorePlanProvider workspaceIds={workspaceIds}>
+            <TerminalsBody
+              projectId={activeTree.project.id}
+              projectName={activeTree.project.name}
+              workspaces={workspaces}
+              runtimeByWorkspace={runtimeByWorkspace}
+              allTerminals={allTerminals}
+              allServices={allServices}
+              deepLinkTerminalId={deepLinkTerminalId ?? null}
+              deepLinkCommandId={deepLinkCommandId ?? null}
+              onAddWorkspace={() => void addWorkspace(activeTree)}
+              onOpenProjectSettings={() => setProjectSettingsOpen(true)}
+            />
+          </RestorePlanProvider>
         </ConsumedNotificationsProvider>
       </RuntimeSelectionProvider>
       {/* The add-workspace modal set (folder picker → name dialog). Mounted once, portalled. */}
       {manualAddDialog}
+      {/* The project-settings modal, opened by the header's VISIBLE gear — the discoverable
+          entry point to the project's settings (the Global pane's `resume_agent_sessions`
+          toggle). Reuses the SHARED `<ProjectSettingsDialog>` and mirrors the rail tile's
+          right-click wiring in `base-layout` (initialSection="global", the resume toggle bound
+          to `setProjectResumeAgentSessions`), but self-contained here so the reglage is findable
+          from the active project's header. Rename stays hidden (`showRename={false}`): rename/
+          delete belong to the PRD-B kebab CRUD, so `onRename` is wired (required by the prop) but
+          unreachable. `activeTree` is non-null in this branch (the early return above guards it),
+          and it is derived live from `projects`, so the toggle reflects the optimistic tree
+          update immediately. */}
+      <ProjectSettingsDialog
+        open={projectSettingsOpen}
+        projectId={activeTree.project.id}
+        projectName={activeTree.project.name}
+        resumeAgentSessions={activeTree.project.resume_agent_sessions ?? false}
+        initialSection="global"
+        showRename={false}
+        onRename={(name) => updateProject(activeTree.project.id, name)}
+        onResumeChange={(resume) => setProjectResumeAgentSessions(activeTree.project.id, resume)}
+        onClose={() => setProjectSettingsOpen(false)}
+      />
     </>
   );
 }
@@ -135,6 +177,7 @@ function TerminalsBody({
   deepLinkTerminalId,
   deepLinkCommandId,
   onAddWorkspace,
+  onOpenProjectSettings,
 }: {
   projectId: string;
   projectName: string;
@@ -148,8 +191,16 @@ function TerminalsBody({
   deepLinkCommandId: string | null;
   /** Open the add-workspace flow (folder picker → name dialog) for the entered project. */
   onAddWorkspace: () => void;
+  /** Open the project-settings modal (Global pane → resume toggle) for the entered project. */
+  onOpenProjectSettings: () => void;
 }) {
   const { selected, select } = useRuntimeSelection();
+
+  // IDLE-SESSION UNLOAD (v2.5.5): on a timer, ask the sidecar to unload DORMANT agent sessions to
+  // free resources — never the VISITED (selected) terminal, and never an ACTIVE one (the sidecar
+  // enforces that). A revisit re-spawns + resumes via the phase-2 lazy park+inject. The visited set
+  // is the currently-selected terminal (the pane on screen); a selected service or nothing → none.
+  useIdleUnload(selected?.kind === "terminal" ? [selected.id] : []);
 
   // Restore the old shell's terminal management, recabled to the page selection: Ctrl+T (new
   // terminal in the SELECTED terminal's workspace, else loose), Ctrl+W (close selected), the
@@ -241,18 +292,34 @@ function TerminalsBody({
               </h1>
               <p className="text-2xs uppercase tracking-wide text-muted-foreground">Terminals</p>
             </div>
-            {/* Add a WORKSPACE (folder) to the entered project — the existing folder-picker →
-                name-dialog → create_workspace flow, surfaced here in the current shell (the
-                capability existed but was only wired into the removed sidebar). */}
-            <button
-              type="button"
-              onClick={onAddWorkspace}
-              className="flex size-7 shrink-0 items-center justify-center rounded-md border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-              aria-label="Add workspace"
-              title="Add workspace"
-            >
-              <FolderPlusIcon className="size-4" />
-            </button>
+            <div className="flex shrink-0 items-center gap-1.5">
+              {/* Project settings (gear) — the VISIBLE, discoverable entry point to the project's
+                  settings (the Global pane's `resume_agent_sessions` toggle). It surfaces in the
+                  active project's header the SAME `<ProjectSettingsDialog>` the rail tile's
+                  right-click "Project settings" opens (base-layout), so the reglage is findable
+                  instead of hidden behind a context menu. */}
+              <button
+                type="button"
+                onClick={onOpenProjectSettings}
+                className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                aria-label="Project settings"
+                title="Project settings"
+              >
+                <SettingsIcon className="size-4" />
+              </button>
+              {/* Add a WORKSPACE (folder) to the entered project — the existing folder-picker →
+                  name-dialog → create_workspace flow, surfaced here in the current shell (the
+                  capability existed but was only wired into the removed sidebar). */}
+              <button
+                type="button"
+                onClick={onAddWorkspace}
+                className="flex size-7 shrink-0 items-center justify-center rounded-md border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                aria-label="Add workspace"
+                title="Add workspace"
+              >
+                <FolderPlusIcon className="size-4" />
+              </button>
+            </div>
           </div>
         }
       >

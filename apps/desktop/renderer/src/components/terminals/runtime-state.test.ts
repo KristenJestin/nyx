@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 
+import type { AgentActivity } from "@/components/sidebar/use-agent-sessions";
 import {
   activeAgentSession,
   notifiedRunState,
   projectRunState,
   serviceRunState,
+  terminalLineState,
   terminalRunState,
   workspaceRunState,
 } from "./runtime-state";
@@ -65,15 +67,132 @@ function snapshot(
   };
 }
 
+/** A per-terminal live agent activity (the `byActivity.get(id)` shape). */
+function activity(overrides: Partial<AgentActivity> = {}): AgentActivity {
+  return {
+    activity: "idle",
+    readyUnread: false,
+    errorUnread: false,
+    pluginOutdated: false,
+    ...overrides,
+  };
+}
+
 describe("terminalRunState / serviceRunState", () => {
-  it("reads the terminal exec_state straight through", () => {
-    expect(terminalRunState(terminal({ exec_state: "running" }))).toBe("running");
+  it("falls back to exec_state when the terminal is not busy", () => {
     expect(terminalRunState(terminal({ exec_state: "error" }))).toBe("error");
+    expect(terminalRunState(terminal({ exec_state: "idle" }))).toBe("idle");
+    // `busy` absent (a pure-DB / MCP snapshot with no live overlay) reads as not busy.
+    expect(terminalRunState(terminal({ exec_state: "success", busy: undefined }))).toBe("success");
+    expect(terminalRunState(terminal({ exec_state: "idle", busy: false }))).toBe("idle");
+  });
+
+  it("review T1: the OS busy bit lights `running` on the LINE, over exec_state", () => {
+    // A foreground command (busy) reads `running` even though OSC 133 `exec_state` never
+    // carries `running` (it only settles to success/error). This is the restored terminal mode.
+    expect(terminalRunState(terminal({ busy: true, exec_state: "idle" }))).toBe("running");
+    // Busy takes priority over a stale settled exec_state (a new foreground command started).
+    expect(terminalRunState(terminal({ busy: true, exec_state: "success" }))).toBe("running");
+    expect(terminalRunState(terminal({ busy: true, exec_state: "error" }))).toBe("running");
   });
 
   it("reads the service factual run_state straight through", () => {
     expect(serviceRunState(service({ run_state: "success" }))).toBe("success");
     expect(serviceRunState(service({ run_state: "running" }))).toBe("running");
+  });
+});
+
+describe("terminalLineState (two-mode LINE dot — review T2)", () => {
+  const agentTerm = terminal({ sessions: [session("a1", "active")] });
+  const opts = { terminalUnread: false, selected: false };
+
+  it("AGENT MODE: working → running, waiting → waiting (live, always shown)", () => {
+    expect(terminalLineState(agentTerm, activity({ activity: "working" }), opts)).toBe("running");
+    expect(terminalLineState(agentTerm, activity({ activity: "waiting" }), opts)).toBe("waiting");
+    // A live agent state shows even on the selected/viewed row (never a consumable notification).
+    expect(
+      terminalLineState(agentTerm, activity({ activity: "waiting" }), {
+        terminalUnread: false,
+        selected: true,
+      }),
+    ).toBe("waiting");
+  });
+
+  it("AGENT MODE: idle agent shows the settled ready (green) / error (red, priority) notification", () => {
+    expect(terminalLineState(agentTerm, activity({ readyUnread: true }), opts)).toBe("success");
+    expect(
+      terminalLineState(agentTerm, activity({ readyUnread: true, errorUnread: true }), opts),
+    ).toBe("error");
+    // Suppressed while the agent line is the viewed row (seen), and when nothing is unread.
+    expect(
+      terminalLineState(agentTerm, activity({ readyUnread: true }), {
+        terminalUnread: false,
+        selected: true,
+      }),
+    ).toBe("idle");
+    expect(terminalLineState(agentTerm, activity({ activity: "idle" }), opts)).toBe("idle");
+  });
+
+  it("AGENT MODE PRIMES over the terminal mode (busy/exec_state ignored on an agent line)", () => {
+    const busyAgent = terminal({
+      busy: true,
+      exec_state: "success",
+      exec_state_unread: true,
+      sessions: [session("a1", "active")],
+    });
+    // Agent working → running (not from busy); agent waiting → waiting (over the success exec_state).
+    expect(terminalLineState(busyAgent, activity({ activity: "waiting" }), opts)).toBe("waiting");
+  });
+
+  it("TERMINAL MODE (no session): falls back to busy/exec_state (task T1)", () => {
+    expect(
+      terminalLineState(terminal({ busy: true }), activity({ activity: "working" }), opts),
+    ).toBe("running");
+    expect(
+      terminalLineState(terminal({ exec_state: "success" }), undefined, {
+        terminalUnread: true,
+        selected: false,
+      }),
+    ).toBe("success");
+  });
+
+  it("AGENT MODE with NO live activity entry (idle at the prompt) → idle, NOT running — busy IGNORED", () => {
+    // The BUG this fixes: a fresh/idle Claude session sits at the prompt with no activity entry
+    // (`byActivity.get(id) === undefined`) while it is the foreground process (OS `busy` ON). A
+    // line that CARRIES an agent stays in AGENT mode and shows an EMPTY dot — never the
+    // busy-derived `running`.
+    const busyIdleAgent = terminal({ busy: true, sessions: [session("a1", "active")] });
+    expect(terminalLineState(busyIdleAgent, undefined, opts)).toBe("idle");
+    // Same for a resumed agent with a stale settled exec_state and no activity entry: agent mode
+    // ignores exec_state too (no phantom green from a persisted result), so the dot is empty.
+    const resumed = terminal({
+      busy: true,
+      exec_state: "success",
+      exec_state_unread: true,
+      sessions: [session("a1", "active")],
+    });
+    expect(terminalLineState(resumed, undefined, { terminalUnread: true, selected: false })).toBe(
+      "idle",
+    );
+  });
+
+  it("AGENT MODE via PASSIVE detection (detected_agent_kind, no session) → busy IGNORED → idle", () => {
+    // A hand-launched agent adopted by passive foreground detection (review T3: no hook session
+    // yet) is STILL an agent line — its busy bit is ignored and, with no activity entry, the dot
+    // is empty (not the busy `running`).
+    const detected = terminal({ busy: true, detected_agent_kind: "claude_code", sessions: [] });
+    expect(terminalLineState(detected, undefined, opts)).toBe("idle");
+    // Its live activity still primes the dot when present.
+    expect(terminalLineState(detected, activity({ activity: "working" }), opts)).toBe("running");
+  });
+
+  it("NON-REGRESSION: a NON-agent terminal (no session, no detected agent) + busy → running (T1)", () => {
+    // A plain PTY with a foreground command must STILL light the busy `running` dot — only an
+    // agent line ignores busy. `activity` is irrelevant (there is no agent to own it).
+    expect(terminalLineState(terminal({ busy: true }), undefined, opts)).toBe("running");
+    expect(terminalLineState(terminal({ busy: true }), activity({ activity: "idle" }), opts)).toBe(
+      "running",
+    );
   });
 });
 
@@ -104,18 +223,24 @@ describe("workspaceRunState", () => {
     ).toBe("error");
   });
 
-  it("without an agent-activity lookup, folds terminals + services only (exec-state axis)", () => {
-    // A terminal hosting a live agent session but idle exec_state contributes only its
-    // exec_state when no activity lookup is supplied — the historical exec-state-only rollup.
+  it("without an agent-activity lookup, an agent terminal has no activity → idle (busy IGNORED)", () => {
+    // A terminal hosting a live agent session with NO activity lookup has no activity entry, so
+    // (exactly as on its line) it is in AGENT mode with an empty dot — the OS busy bit is IGNORED,
+    // it does NOT fall back to a busy-derived running. An idle-exec_state agent rolls up idle.
     const withAgent = terminal({ exec_state: "idle", sessions: [session("a1", "active")] });
     expect(workspaceRunState(snapshot([withAgent], []))).toBe("idle");
+    // Even busy, an agent with no activity entry contributes idle (the bug this fixes: the rollup
+    // used to read the busy bit and show running for a foreground agent).
+    const busyAgent = terminal({ busy: true, sessions: [session("a1", "active")] });
+    expect(workspaceRunState(snapshot([busyAgent], []))).toBe("idle");
   });
 
   it("folds an agent BLOCKED ON THE USER (waiting) into the rollup as yellow", () => {
     // A terminal hosting a live agent session whose runtime activity is `waiting` contributes
     // `waiting` (yellow) even though its own exec_state is idle — reached ONLY via the lookup.
     const t = terminal({ id: "t-wait", exec_state: "idle", sessions: [session("a1", "active")] });
-    const lookup = (id: string) => (id === "t-wait" ? ("waiting" as const) : undefined);
+    const lookup = (id: string) =>
+      id === "t-wait" ? activity({ activity: "waiting" }) : undefined;
     expect(workspaceRunState(snapshot([t], []), lookup)).toBe("waiting");
   });
 
@@ -123,7 +248,8 @@ describe("workspaceRunState", () => {
     // waiting > error > success > running — the reordered STATE_PRIORITY. An agent awaiting
     // input alongside a failed (unread) service still rolls up to yellow.
     const t = terminal({ id: "t-wait", exec_state: "idle", sessions: [session("a1", "active")] });
-    const lookup = (id: string) => (id === "t-wait" ? ("waiting" as const) : undefined);
+    const lookup = (id: string) =>
+      id === "t-wait" ? activity({ activity: "waiting" }) : undefined;
     expect(
       workspaceRunState(snapshot([t], [service({ run_state: "error", unread: true })]), lookup),
     ).toBe("waiting");
@@ -142,22 +268,24 @@ describe("workspaceRunState", () => {
   });
 
   it("a NON-agent terminal never contributes waiting, even if the lookup reports one", () => {
-    // No live agent session on this terminal → `activeAgentSession` is undefined → the waiting
-    // axis is skipped regardless of the activity lookup (never fabricate waiting for a PTY).
+    // No live agent session / detected agent on this terminal → it is in TERMINAL mode, so the
+    // agent activity is IGNORED (never fabricate an agent state for a plain PTY). Its exec_state
+    // (running) carries.
     const plain = terminal({ id: "t-plain", exec_state: "running", sessions: [] });
-    const lookup = () => "waiting" as const;
+    const lookup = () => activity({ activity: "waiting" });
     expect(workspaceRunState(snapshot([plain], []), lookup)).toBe("running");
   });
 
-  it("an agent that is WORKING (not waiting) contributes only its exec_state, not yellow", () => {
-    // A live agent whose activity is `working` is busy, not blocked — no yellow. Its terminal
-    // exec_state (running here) carries; waiting is reserved for blocked-on-user.
+  it("an agent that is WORKING contributes running (from its activity, NOT the busy bit)", () => {
+    // A live agent whose activity is `working` contributes `running` — the SAME dot its line
+    // shows — even when its own exec_state is idle (the running comes from the agent turn, not a
+    // busy/exec_state fallback). waiting is reserved for blocked-on-user.
     const t = terminal({
       id: "t-work",
-      exec_state: "running",
+      exec_state: "idle",
       sessions: [session("a1", "active")],
     });
-    const lookup = () => "working" as const;
+    const lookup = () => activity({ activity: "working" });
     expect(workspaceRunState(snapshot([t], []), lookup)).toBe("running");
   });
 
@@ -211,6 +339,97 @@ describe("workspaceRunState", () => {
   });
 });
 
+// ── AGENT-AWARE rollup (the fix: the rollup agregates the SAME agent-aware projection each LINE
+// shows — `terminalLineState`, selected:false — not the OS busy bit / raw exec_state. A single
+// terminal-agent that has REPLIED (ready/green) must roll up GREEN, not running/blue). ──
+describe("workspaceRunState — agent-aware rollup (rollup agrees with the line)", () => {
+  // A busy foreground agent terminal (claude in the foreground → OS `busy` ON) with a live session.
+  const busyAgent = (overrides: Partial<WorkspaceRuntimeTerminal> = {}) =>
+    terminal({ id: "t-agent", busy: true, sessions: [session("a1", "active")], ...overrides });
+  const agentActivity = (act: AgentActivity | undefined) => (id: string) =>
+    id === "t-agent" ? act : undefined;
+
+  it("(a) a SINGLE terminal-agent that REPLIED (ready, busy) → success, NOT running", () => {
+    // The user's exact bug: one terminal, agent responded (line dot green). readyUnread primes the
+    // rollup to `success`; the busy bit is IGNORED. Only success+idle present → success wins.
+    const t = busyAgent();
+    const lookup = agentActivity(activity({ activity: "idle", readyUnread: true }));
+    expect(workspaceRunState(snapshot([t], []), lookup)).toBe("success");
+  });
+
+  it("(b) a terminal-agent IDLE at the prompt (busy, no activity) → idle, NOT running", () => {
+    // A busy foreground agent with NO activity entry contributes idle (busy ignored), exactly as
+    // on its line — so a single idle agent rolls the whole workspace up to idle (no dot).
+    const t = busyAgent();
+    expect(workspaceRunState(snapshot([t], []), agentActivity(undefined))).toBe("idle");
+  });
+
+  it("(c) a terminal-agent WORKING → running", () => {
+    const t = busyAgent();
+    const lookup = agentActivity(activity({ activity: "working" }));
+    expect(workspaceRunState(snapshot([t], []), lookup)).toBe("running");
+  });
+
+  it("(d) a terminal-agent WAITING (blocked on user) → waiting", () => {
+    const t = busyAgent();
+    const lookup = agentActivity(activity({ activity: "waiting" }));
+    expect(workspaceRunState(snapshot([t], []), lookup)).toBe("waiting");
+  });
+
+  it("(e) a terminal-agent that ERRORED (errorUnread) → error", () => {
+    const t = busyAgent();
+    const lookup = agentActivity(activity({ activity: "idle", errorUnread: true }));
+    expect(workspaceRunState(snapshot([t], []), lookup)).toBe("error");
+  });
+
+  it("(f) MIX: agent READY + a NON-agent terminal BUSY → success (success > running)", () => {
+    // The agent's green outranks a plain busy terminal's blue via the shared STATE_PRIORITY.
+    const agent = busyAgent();
+    const plainBusy = terminal({ id: "t-plain", busy: true, sessions: [] });
+    const lookup = agentActivity(activity({ activity: "idle", readyUnread: true }));
+    expect(workspaceRunState(snapshot([agent, plainBusy], []), lookup)).toBe("success");
+  });
+
+  it("(g) MIX: agent WAITING + another agent ERROR → waiting (waiting > error)", () => {
+    const waiter = terminal({ id: "t-agent", busy: true, sessions: [session("a1", "active")] });
+    const errer = terminal({ id: "t-err", busy: true, sessions: [session("a2", "active")] });
+    const lookup = (id: string) =>
+      id === "t-agent"
+        ? activity({ activity: "waiting" })
+        : id === "t-err"
+          ? activity({ activity: "idle", errorUnread: true })
+          : undefined;
+    expect(workspaceRunState(snapshot([waiter, errer], []), lookup)).toBe("waiting");
+  });
+
+  it("(h) NON-REGRESSION: a NON-agent terminal BUSY (alone) → running", () => {
+    // A plain PTY with a foreground command still lights the busy `running` — only an agent line
+    // ignores busy. The activity lookup is irrelevant (no agent to own it).
+    const plain = terminal({ id: "t-plain", busy: true, sessions: [] });
+    expect(workspaceRunState(snapshot([plain], []), agentActivity(undefined))).toBe("running");
+  });
+
+  it("(i) a REPLIED agent whose ready has been READ (readyUnread false) → no longer contributes → idle", () => {
+    // Once the agent's ready notification is read (the source clears `readyUnread`, e.g. on focus
+    // via `agent_mark_ready_read`), the agent contributes idle — exactly as its line dot clears.
+    const t = busyAgent();
+    const lookup = agentActivity(activity({ activity: "idle", readyUnread: false }));
+    expect(workspaceRunState(snapshot([t], []), lookup)).toBe("idle");
+  });
+
+  it("projectRunState mirrors workspaceRunState for the agent-aware rollup (single workspace)", () => {
+    // The project dot agrees with the workspace dot by construction — a single-workspace project
+    // hosting a replied agent rolls up green on the rail too, and a working agent → running.
+    const ready = busyAgent();
+    const readyLookup = agentActivity(activity({ activity: "idle", readyUnread: true }));
+    const readyWs = snapshot([ready], []);
+    expect(projectRunState([readyWs], readyLookup)).toBe(workspaceRunState(readyWs, readyLookup));
+    expect(projectRunState([readyWs], readyLookup)).toBe("success");
+    const workingLookup = agentActivity(activity({ activity: "working" }));
+    expect(projectRunState([snapshot([busyAgent()], [])], workingLookup)).toBe("running");
+  });
+});
+
 describe("projectRunState", () => {
   it("is idle when the project has no loaded workspace runtime", () => {
     expect(projectRunState([])).toBe("idle");
@@ -242,7 +461,8 @@ describe("projectRunState", () => {
       sessions: [session("a1", "active")],
     });
     const wsB = snapshot([waitTerm], []);
-    const lookup = (id: string) => (id === "t-wait" ? ("waiting" as const) : undefined);
+    const lookup = (id: string) =>
+      id === "t-wait" ? activity({ activity: "waiting" }) : undefined;
     expect(projectRunState([wsA, wsB], lookup)).toBe("waiting");
   });
 

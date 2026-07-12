@@ -23,6 +23,7 @@
 //! the long-lived `nyx-core` state the sidecar owns and hands the protocol dispatch
 //! typed access. The TS `core-host` is no longer solicited for any of this.
 
+pub mod busy_poll;
 pub mod command;
 pub mod db;
 pub mod db_command;
@@ -31,11 +32,14 @@ pub mod git_watch;
 pub mod mcp;
 pub mod pty;
 pub mod recovery;
+pub mod resume_parks;
 pub mod snapshot_store;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nyx_core::agent_activity::AgentActivityStore;
 use nyx_core::command::CommandRunner;
@@ -132,6 +136,17 @@ pub struct Runtime {
     /// re-reconciling on every subsequent `McpStart` (start-once returns the same bound port,
     /// so a second reconcile would be redundant CLI churn). See [`Runtime::start_mcp`].
     plugin_reconciled: Arc<AtomicBool>,
+    /// The LAZY agent-session resume parks (v2.5.5): `claude --resume <id>` commands the renderer
+    /// pushed from the `workspace_restore_plan` read model, injected ONCE into a terminal's shell
+    /// at its PTY spawn (or immediately if already live). In-memory, per app run — a sidecar
+    /// restart re-evaluates the restore plan afresh. See [`Runtime::park_resumes`] /
+    /// [`Runtime::inject_resume_on_spawn`].
+    resume_parks: Arc<resume_parks::ResumeParks>,
+    /// The OS BUSY-STATE POLL (v2.5.5 review T1): the periodic `Pty::is_busy` sweep that pushes
+    /// `terminal://busy-state` transitions so a foreground command lights the runtime tree's
+    /// `running` dot (the v1 `BusyStatePoller` port). Started in [`Runtime::attach_events`] once
+    /// the pipe [`EventSink`] exists; `None` before then (a bare test build spawns no poll).
+    busy_poll: Arc<Mutex<Option<Arc<busy_poll::BusyPoll>>>>,
 }
 
 impl Runtime {
@@ -191,6 +206,8 @@ impl Runtime {
             recovery: Arc::new(Mutex::new(recovery::RecoveryState::default())),
             snapshots: Arc::new(Mutex::new(snapshot_store::SnapshotStore::default())),
             plugin_reconciled: Arc::new(AtomicBool::new(false)),
+            resume_parks: Arc::new(resume_parks::ResumeParks::new()),
+            busy_poll: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -229,6 +246,17 @@ impl Runtime {
         // is watched until a review surface registers one via `repo_watch` — so a bare boot
         // starts zero watches (nothing to thrash on).
         *self.git_watch.lock().unwrap() = Some(GitWatchRuntime::start(events.clone()));
+
+        // Start the OS BUSY-STATE POLL (v2.5.5 review T1): the periodic `Pty::is_busy` sweep over
+        // every record-backed live PTY, pushing `terminal://busy-state` on each foreground
+        // transition so the runtime tree lights a `running` dot for ANY foreground command (a
+        // build, a `sleep`, a hand-launched agent) WITHOUT a hook — the v1 `BusyStatePoller` port
+        // re-câbled onto the sidecar pipe. Independent of OSC 133; a restored idle terminal
+        // samples idle by construction (no phantom running).
+        *self.busy_poll.lock().unwrap() = Some(busy_poll::BusyPoll::start(
+            Arc::clone(&self.pty),
+            events.clone(),
+        ));
 
         // CRASH RECONCILE (Phase 4 — `01KWCJPFP9JSJMRDZGW2E0N905`): BEFORE the boot restore,
         // detect whether the PREVIOUS run shut down cleanly. If it CRASHED, flag every
@@ -385,6 +413,176 @@ impl Runtime {
         &self.pty
     }
 
+    /// PARK a batch of LAZY agent-session resumes (v2.5.5): the renderer pushes each resumable
+    /// session's `claude --resume <id>` (computed by the `workspace_restore_plan` read model,
+    /// which REUSES `agent_resume::decide_resume`) keyed by its terminal RECORD id. Each park is
+    /// stored one-shot; a resume whose terminal PTY is ALREADY live is injected IMMEDIATELY (the
+    /// deck eager-mounts every project terminal, so at relaunch the spawn usually precedes the
+    /// plan), otherwise it waits for [`inject_resume_on_spawn`](Runtime::inject_resume_on_spawn).
+    /// The `attempted` guard inside [`resume_parks::ResumeParks`] makes a re-pushed plan idempotent.
+    pub fn park_resumes(&self, parks: &[(String, String, String)], events: &EventSink) {
+        for (record_id, session_id, command) in parks {
+            self.resume_parks.park(
+                record_id,
+                resume_parks::ResumePark {
+                    session_id: session_id.clone(),
+                    command: command.clone(),
+                },
+            );
+            // If the terminal is already live (spawned before the plan arrived), inject now —
+            // the shell prompt is ready by this point, so the resume line runs cleanly.
+            if self.pty.is_live_record(record_id) {
+                self.inject_resume(record_id, events);
+            }
+        }
+    }
+
+    /// Drain and inject the parked resume for a terminal AT ITS PTY SPAWN (v2.5.5): the front
+    /// mounted/opened the terminal and its PTY is now live, so a parked `claude --resume <id>` is
+    /// written into the fresh shell EXACTLY ONCE. A no-op when nothing is parked for this record
+    /// (a bare terminal, or the plan has not arrived yet — then the `park_resumes` immediate path
+    /// covers it once it does).
+    pub fn inject_resume_on_spawn(&self, record_id: &str, events: &EventSink) {
+        if record_id.is_empty() {
+            return;
+        }
+        self.inject_resume(record_id, events);
+    }
+
+    /// Take the pending resume for `record_id` (one-shot) and INJECT it into the live shell — the
+    /// SAME write path as a keystroke, `command` + a trailing carriage return (`\r`) so the shell
+    /// executes it and stays interactive (parity with the v1 injection). A no-op when nothing is
+    /// pending. A failed write marks the session `resume_failed` (no retry loop) and nudges the
+    /// renderer to re-pull the agent sessions so the clean `resume-failed` state surfaces.
+    fn inject_resume(&self, record_id: &str, events: &EventSink) {
+        let Some(park) = self.resume_parks.take_for_inject(record_id) else {
+            return;
+        };
+        let mut bytes = park.command.into_bytes();
+        bytes.push(b'\r');
+        // `write_to_record` returns false when no live PTY backs the record OR the write errored.
+        // We only reach here for a live record (spawn just registered it, or `park_resumes`
+        // checked liveness), so a false is a genuine injection failure → mark the session failed.
+        if !self.pty.write_to_record(record_id, &bytes) {
+            let _ = self
+                .db
+                .with_conn(|c| nyx_core::db::mark_session_resume_failed(c, &park.session_id));
+            events.emit(crate::pipe::wire::Event::Changed {
+                topic: "agent-sessions".to_string(),
+            });
+        }
+    }
+
+    /// UNLOAD the idle agent sessions (v2.5.5 — task `01KX8Z6T1J2AC65DHHZTCQ26Z4`): close the PTY
+    /// of every agent-hosting terminal that is safe to unload, freeing its resources / dropping it
+    /// out of the TUI, and RETURN the record ids unloaded. The renderer drives this on a timer,
+    /// passing the currently-`visited` (focused) terminal record ids and an inactivity `threshold`.
+    ///
+    /// A terminal is unloaded ONLY when BOTH gates pass:
+    ///   1. [`nyx_core::agent_unload::decide_unload`] says so — its runtime activity is `Idle`
+    ///      (NEVER `Working`/`Waiting` — the central "une session ACTIVE n'est JAMAIS unloadée"
+    ///      invariant AND the "action en cours" exception, both enforced by the activity gate since
+    ///      a long in-flight action keeps `Working` 0-stale), it is NOT visited, and it has had NO
+    ///      PTY I/O for at least `threshold`; AND
+    ///   2. the session is RESUME-ELIGIBLE — the SAME `agent_resume::decide_resume` policy the
+    ///      restore plan uses would resume it (the project toggle is ON, the session is a live
+    ///      candidate with a transcript on disk, the shell/adapter can host the resume). This is the
+    ///      "toggle = interrupteur maître" decision extended to unload (review
+    ///      `01KX9CP96KVK6BTHY3ZSWY1E67`, finding 2): a session we could NOT bring back on revisit
+    ///      (e.g. a `resume_agent_sessions`-OFF project, the default) is NEVER unloaded — it stays
+    ///      loaded rather than being killed without recourse.
+    ///
+    /// Only ACTIVE/UNKNOWN agent sessions on `alive` terminals are candidates (a bare shell is not a
+    /// resumable session), read from `resume_candidates_on_boot` (which also carries the toggle +
+    /// transcript + external id gate 2 needs).
+    ///
+    /// The unload does NOT end the DB session (it stays `active`, exactly like a session left after
+    /// an app kill), so a revisit RESUMES it through the SAME phase-2 lazy path: closing the PTY +
+    /// [`resume_parks::ResumeParks::rearm`] RE-PARKS the exact `claude --resume <id>` (rebuilt HERE
+    /// via `decide_resume`), so on the terminal's next spawn — an IN-RUN revisit — the resume is
+    /// re-injected automatically, WITHOUT depending on the renderer re-pushing the plan (it pushes a
+    /// workspace's plan at most once per run — review finding 1). The runtime activity entry is
+    /// cleared (the anti-phantom reflex on unload).
+    pub fn unload_idle_sessions(
+        &self,
+        threshold: Duration,
+        visited: &HashSet<String>,
+        events: &EventSink,
+    ) -> Vec<String> {
+        // Only ACTIVE/UNKNOWN agent sessions on `alive` terminals are unload candidates — a plain
+        // shell with no session is not a resumable thing to unload. Read them via
+        // `resume_candidates_on_boot` (keyed by record id), which ALSO carries the resume-eligibility
+        // inputs (project toggle, transcript path, external id, agent kind) gate 2 below needs — so
+        // the unload never kills a session it could not bring back.
+        let candidates: std::collections::HashMap<String, nyx_core::db::ResumeCandidate> = self
+            .db
+            .with_conn(nyx_core::db::resume_candidates_on_boot)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|c| (c.terminal_id.clone(), c))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Resolve the run-constant resume inputs ONCE: the kind→adapter registry (the single source
+        // of truth) and the target shell classification. Reused per candidate by `decide_resume`.
+        let registry = nyx_core::agent::AgentRegistry::default();
+        let target =
+            nyx_core::agent_resume::ResumeTarget::classify_shell(&nyx_core::pty::resolve_shell());
+
+        let mut unloaded = Vec::new();
+        for (record_id, idle_for) in self.pty.agent_idle_durations() {
+            let Some(candidate) = candidates.get(&record_id) else {
+                continue; // a live terminal that does not host an active agent session — skip.
+            };
+            // GATE 1 — safety/focus/threshold. The authoritative live activity (missing entry ⇒
+            // Idle — the anti-phantom default). Never unload Working/Waiting, the visited terminal,
+            // or one still within the grace window.
+            let activity = self
+                .activity
+                .snapshot(&record_id)
+                .map(|s| s.activity)
+                .unwrap_or(nyx_core::agent_activity::Activity::Idle);
+            let unload_candidate = nyx_core::agent_unload::UnloadCandidate {
+                record_id: record_id.clone(),
+                activity,
+                visited: visited.contains(&record_id),
+                idle_for,
+            };
+            if !nyx_core::agent_unload::decide_unload(&unload_candidate, threshold).is_unload() {
+                continue;
+            }
+            // GATE 2 — resume-eligibility (master switch). Only unload a session the SAME
+            // `decide_resume` policy would resume on revisit; else keep it loaded (never kill
+            // without recourse — a toggle-OFF project is the common case).
+            let Some(command) = resume_command_for_candidate(candidate, target, &registry) else {
+                continue;
+            };
+            // Free the resources / take it out of the TUI. The DB session stays `active`.
+            self.pty.close_record(&record_id);
+            // Anti-phantom reflex: drop the (Idle) runtime activity entry for the gone PTY.
+            self.activity.clear(&record_id);
+            // RE-PARK the exact resume so an IN-RUN revisit re-injects `claude --resume <id>` via
+            // the phase-2 spawn-drain — no dependence on the renderer re-pushing the plan.
+            self.resume_parks.rearm(
+                &record_id,
+                resume_parks::ResumePark {
+                    session_id: candidate.session_id.clone(),
+                    command,
+                },
+            );
+            unloaded.push(record_id);
+        }
+        if !unloaded.is_empty() {
+            // Nudge the renderer to re-pull the agent sessions / terminals so the unloaded ones
+            // drop out of the deck (and can be re-mounted → resumed on revisit).
+            events.emit(crate::pipe::wire::Event::Changed {
+                topic: "agent-sessions".to_string(),
+            });
+        }
+        unloaded
+    }
+
     /// The managed-command runtime (once [`attach_events`](Runtime::attach_events) ran).
     pub fn command(&self) -> Option<Arc<CommandRuntime>> {
         self.command.lock().unwrap().clone()
@@ -433,6 +631,20 @@ impl Runtime {
     /// reconcile fires. We persist the clean marker WHILE keeping the idempotency journal, and
     /// clear the now-consumed interrupted set (the next clean run starts with nothing doubtful).
     pub fn shutdown(&self) {
+        // STOP THE MCP HTTP LISTENER FIRST — BEFORE any PTY is closed (`self.pty.close_all()`
+        // below). Closing the interactive Claude PTYs makes each dying Claude fire a
+        // `SessionEnd(reason=other)` hook that POSTs `agent_session_event` to our MCP server. If
+        // the server were still listening (as it was until this fix — it only died when the
+        // process exited), that POST would `mark_session_ended` and the session would NEVER be
+        // resumed. Tearing the listener down here means the late POST hits a refused socket
+        // (parity with v1, where the in-process MCP died WITH the host, and with the crash reaper,
+        // which SIGKILLs Claude+MCP together): the killed session stays `active` and lazy-resume
+        // reclaims it next boot. A Claude ended INTENTIONALLY while the app runs (logout /
+        // prompt_input_exit) still reaches the LIVE server before this shutdown, so it stays
+        // `ended` (v1 parity, untouched). Bounded (unblock + join), idempotent.
+        if let Some(mcp) = self.mcp() {
+            mcp.stop();
+        }
         if let Some(command) = self.command() {
             if command.begin_shutdown() {
                 command.snapshot_on_shutdown();
@@ -539,13 +751,33 @@ impl Runtime {
                 rows,
                 cwd,
                 record_id,
-            } => match self.pty.spawn(*cols, *rows, cwd, record_id, events.clone()) {
-                Ok(terminal_id) => Response::PtySpawned {
-                    id: *id,
-                    terminal_id,
-                },
-                Err(e) => err(*id, format!("pty spawn failed: {e}")),
-            },
+            } => {
+                // Route the Claude plugin's SessionStart hook to THIS instance (review
+                // `01KXAXQN32GASMEB05PDW5BZSR`): read the port the MCP server ACTUALLY bound and
+                // export it into the spawned shell as `NYX_MCP_PORT`. The bound port is the single
+                // source of truth (the same value `reconcile_claude_plugin` writes into the
+                // installed `.mcp.json`), read live so it is always the real, dynamically bound
+                // port — never a hard-coded 8765/8766, correct even under a v1/v2 collision.
+                // `0` (the MCP server has not started yet — a terminal racing the boot McpStart)
+                // exports nothing, so the hook keeps its own fallback rather than a wrong port.
+                let mcp_port = self.mcp().map(|m| m.bound_port()).unwrap_or(0);
+                match self
+                    .pty
+                    .spawn(*cols, *rows, cwd, record_id, mcp_port, events.clone())
+                {
+                    Ok(terminal_id) => {
+                        // LAZY agent-session resume (v2.5.5): the terminal's PTY is now live — drain
+                        // and inject a parked `claude --resume <id>` exactly once (a bare terminal
+                        // with no park is untouched). Mirrors the v1 injection at `register_terminal_pty`.
+                        self.inject_resume_on_spawn(record_id, events);
+                        Response::PtySpawned {
+                            id: *id,
+                            terminal_id,
+                        }
+                    }
+                    Err(e) => err(*id, format!("pty spawn failed: {e}")),
+                }
+            }
             Request::PtyWrite {
                 id,
                 terminal_id,
@@ -631,5 +863,46 @@ impl Runtime {
             // Stateless requests never reach here (routed by handle_request_stateless).
             _ => err(0, "stateless request routed to dispatch_runtime".into()),
         }
+    }
+}
+
+/// The exact resume command for a candidate IFF the SHARED `agent_resume::decide_resume` policy
+/// would resume it (project toggle ON, live candidate, transcript on disk, resumable target +
+/// adapter), else `None`. It REUSES `decide_resume` verbatim — the SAME gate the workspace restore
+/// plan applies (no new policy, no duplication) — so the idle-session UNLOAD (v2.5.5, review
+/// `01KX9CP96KVK6BTHY3ZSWY1E67`):
+///   * gates unloading on resume-eligibility (finding 2 — never kill a session it could not bring
+///     back: a `resume_agent_sessions`-OFF project yields `Skip(OptionOff)` → `None` → kept), and
+///   * rebuilds the `claude --resume <id>` to RE-PARK at unload (finding 1 — the in-run revisit
+///     re-injects it) from the SAME string `decide_resume` returns.
+///
+/// A free fn (not a method): it needs none of the runtime state, only the plain candidate + the
+/// run-constant target/registry the caller resolves once.
+fn resume_command_for_candidate(
+    candidate: &nyx_core::db::ResumeCandidate,
+    target: nyx_core::agent_resume::ResumeTarget,
+    registry: &nyx_core::agent::AgentRegistry,
+) -> Option<String> {
+    let session_state = nyx_core::agent_resume::SessionState::from_db(&candidate.session_state)?;
+    // `stat` the captured transcript (finding #53 parity): a missing file → not resumable.
+    let transcript_exists = candidate
+        .transcript_path
+        .as_deref()
+        .map(|p| std::path::Path::new(p).exists())
+        .unwrap_or(false);
+    let inputs = nyx_core::agent_resume::ResumeInputs {
+        project_resume_on: candidate.project_resume_on,
+        // A terminal reached by the sweep is `alive` (a voluntary close leaves it `closed`, so it
+        // never reaches here) — the voluntary-close gate is structural, exactly as the restore plan.
+        closed_voluntarily: false,
+        session_state,
+        external_session_id: &candidate.external_session_id,
+        transcript_exists,
+        target,
+    };
+    let adapter = registry.get(&candidate.agent_kind)?;
+    match nyx_core::agent_resume::decide_resume(&inputs, adapter) {
+        nyx_core::agent_resume::ResumeDecision::Resume { command, .. } => Some(command),
+        nyx_core::agent_resume::ResumeDecision::Skip(_) => None,
     }
 }

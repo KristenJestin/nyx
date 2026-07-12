@@ -42,16 +42,19 @@ export function WorkspaceAccordion({
   const [open, setOpen] = useState(defaultOpen);
   const reduced = useReducedMotion();
   const Icon = workspace.is_root ? FolderGit2Icon : GitBranchIcon;
-  // The agent `waiting` (blocked-on-user) axis comes from the SAME `agent_activity_snapshot`
-  // read model the sidebar rows use, folded into the workspace rollup so a hosted agent
-  // awaiting input turns this accordion's dot yellow (finding: workspace + project dots).
+  // The live per-terminal agent activity from the SAME `agent_activity_snapshot` read model the
+  // sidebar rows + the terminal LINES use, folded into the workspace rollup so a hosted agent
+  // contributes its AGENT-AWARE state (working→running, waiting→yellow, ready→green, error→red;
+  // busy ignored) — the SAME projection each line shows — not the OS busy bit (finding: the rollup
+  // must agree with the lines). The FULL activity is threaded (not just the kind) so the agent's
+  // settled ready/error notification remounts to this accordion's dot too.
   const { byActivity } = useAgentSessions();
   // The consumed-notifications registry (the SAME one the rows use) makes the rollup
   // notification-aware: a settled success/error the user has already visited stops contributing
   // to this accordion's dot, exactly as it stops contributing to its own row's dot.
   const { isConsumed } = useConsumedNotifications();
   const rollup = snapshot
-    ? workspaceRunState(snapshot, (terminalId) => byActivity.get(terminalId)?.activity, isConsumed)
+    ? workspaceRunState(snapshot, (terminalId) => byActivity.get(terminalId), isConsumed)
     : "idle";
 
   return (
@@ -85,6 +88,10 @@ export function WorkspaceAccordion({
             snapshot={snapshot}
             onNewTerminal={onNewTerminal}
             onNewCommand={onNewCommand}
+            // The live agent-activity lookup (review T2) — the SAME `byActivity` map that feeds
+            // this accordion's rollup dot, threaded to each terminal LINE so a hosted agent shows
+            // its working/waiting/ready dot on the line, not just at the rollup.
+            agentActivity={(terminalId) => byActivity.get(terminalId)}
           />
         ) : (
           <p className="px-4 py-2 text-sm italic text-muted-foreground/70">Loading runtime…</p>

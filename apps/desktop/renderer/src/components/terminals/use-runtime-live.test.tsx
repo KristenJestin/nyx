@@ -5,13 +5,14 @@ import { describe, expect, it, vi } from "vitest";
 import { RUNTIME_CHANGED_EVENTS, useRuntimeChangeSubscription } from "./use-runtime-live";
 
 describe("use-runtime-live (shared live engine)", () => {
-  it("declares the coarse invalidation topics + the fine exec-state event as the single source", () => {
+  it("declares the coarse invalidation topics + the fine exec-state/busy-state events as the single source", () => {
     expect([...RUNTIME_CHANGED_EVENTS]).toEqual([
       "commands://changed",
       "agent-sessions://changed",
       "terminals://changed",
       "workspaces://changed",
       "terminal://exec-state",
+      "terminal://busy-state",
     ]);
   });
 

@@ -166,8 +166,11 @@ const IDLE_NOTIFICATION_TYPE: &str = "idle_prompt";
 /// NEITHER `SubagentStop` NOR a string we match, a deferred background turn would keep the
 /// dot BLUE until the next `UserPromptSubmit` (which resets everything) — never a wrong
 /// green, but a possibly-stuck blue. THIS IS THE ONE THING TO VALIDATE IN THE GUI.
-const SUBAGENT_DONE_NOTIFICATION_TYPES: &[&str] =
-    &["background_subagent_complete", "subagent_complete", "agent_complete"];
+const SUBAGENT_DONE_NOTIFICATION_TYPES: &[&str] = &[
+    "background_subagent_complete",
+    "subagent_complete",
+    "agent_complete",
+];
 
 /// The live activity KIND of ONE agent-hosting terminal — the resolved dot color. There
 /// is NO `since` stamp and NO time-based expiry (the 0-stale decision): an entry holds
@@ -810,7 +813,10 @@ mod tests {
 
         let s = store.apply("t1", ActivityEvent::TurnFinished);
         assert_eq!(s.activity, Activity::Idle);
-        assert!(s.ready_unread, "a finished turn raises the ready notification");
+        assert!(
+            s.ready_unread,
+            "a finished turn raises the ready notification"
+        );
     }
 
     /// THE CORE FIX — a single tool that runs for "10 minutes": one `PreToolUse`, no
@@ -876,7 +882,11 @@ mod tests {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
         let s = store.apply("t1", ActivityEvent::AskStarted);
-        assert_eq!(s.activity, Activity::Waiting, "asking the user blocks → yellow");
+        assert_eq!(
+            s.activity,
+            Activity::Waiting,
+            "asking the user blocks → yellow"
+        );
         // The user answers.
         let s = store.apply("t1", ActivityEvent::AskFinished);
         assert_eq!(
@@ -912,7 +922,10 @@ mod tests {
         store.apply("t1", ActivityEvent::PromptSubmitted);
         let s = store.apply("t1", ActivityEvent::AttentionNeeded); // permission_prompt.
         assert_eq!(s.activity, Activity::Waiting);
-        assert!(!s.ready_unread, "a permission prompt is not a finished response");
+        assert!(
+            !s.ready_unread,
+            "a permission prompt is not a finished response"
+        );
 
         // idle_prompt behaves like Stop.
         let s = store.apply("t1", ActivityEvent::TurnFinished);
@@ -970,7 +983,11 @@ mod tests {
         store.apply("t4", ActivityEvent::PromptSubmitted);
         store.apply("t4", ActivityEvent::AttentionNeeded); // Waiting.
         let s = store.apply("t4", ActivityEvent::PromptSubmitted);
-        assert_eq!(s.activity, Activity::Working, "a new prompt resets the yellow");
+        assert_eq!(
+            s.activity,
+            Activity::Working,
+            "a new prompt resets the yellow"
+        );
     }
 
     /// #26 — `AskFinished` lifts the yellow UNCONDITIONALLY (the decline path), even though
@@ -1022,9 +1039,16 @@ mod tests {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
         let s = store.apply("t1", ActivityEvent::TurnFailed); // StopFailure.
-        assert_eq!(s.activity, Activity::Idle, "a failed turn ends the turn → Idle");
+        assert_eq!(
+            s.activity,
+            Activity::Idle,
+            "a failed turn ends the turn → Idle"
+        );
         assert!(s.error_unread, "an errored turn raises the red error dot");
-        assert!(!s.ready_unread, "an errored turn does NOT raise the green ready dot");
+        assert!(
+            !s.ready_unread,
+            "an errored turn does NOT raise the green ready dot"
+        );
     }
 
     /// (#35 regression) A normal `Stop` still raises ONLY the green `ready_unread`, never the
@@ -1036,7 +1060,10 @@ mod tests {
         let s = store.apply("t1", ActivityEvent::TurnFinished); // Stop.
         assert_eq!(s.activity, Activity::Idle);
         assert!(s.ready_unread, "a finished turn raises the green ready dot");
-        assert!(!s.error_unread, "a successful turn must NOT raise the red error dot");
+        assert!(
+            !s.error_unread,
+            "a successful turn must NOT raise the red error dot"
+        );
     }
 
     /// (#35) A `StopFailure` while a BACKGROUND sub-agent is still in flight DEFERS the RED
@@ -1047,20 +1074,33 @@ mod tests {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
         store.apply("t1", ActivityEvent::SubagentStarted); // a BACKGROUND sub-agent begins.
-        // The MAIN turn ERRORS while the background sub-agent is still running.
+                                                           // The MAIN turn ERRORS while the background sub-agent is still running.
         let s = store.apply("t1", ActivityEvent::TurnFailed); // StopFailure.
         assert_eq!(
             s.activity,
             Activity::Working,
             "a StopFailure with a sub-agent still in flight stays Working — defers the red"
         );
-        assert!(!s.error_unread, "the red is DEFERRED while a background sub-agent runs");
+        assert!(
+            !s.error_unread,
+            "the red is DEFERRED while a background sub-agent runs"
+        );
         assert!(!s.ready_unread);
         // The background sub-agent finishes → the deferred turn-end applies as RED, not green.
         let s = store.apply("t1", ActivityEvent::SubagentFinished);
-        assert_eq!(s.activity, Activity::Idle, "the last sub-agent settles the errored turn");
-        assert!(s.error_unread, "the deferred RED is raised when the last sub-agent finishes");
-        assert!(!s.ready_unread, "a deferred FAILED turn settles red, never green");
+        assert_eq!(
+            s.activity,
+            Activity::Idle,
+            "the last sub-agent settles the errored turn"
+        );
+        assert!(
+            s.error_unread,
+            "the deferred RED is raised when the last sub-agent finishes"
+        );
+        assert!(
+            !s.ready_unread,
+            "a deferred FAILED turn settles red, never green"
+        );
     }
 
     /// (#35) `mark_ready_read` (focus) clears the RED `error_unread` too — focus acknowledges
@@ -1073,7 +1113,10 @@ mod tests {
         assert!(store.snapshot("t1").unwrap().error_unread);
         store.mark_ready_read("t1");
         let snap = store.snapshot("t1").unwrap();
-        assert!(!snap.error_unread, "viewing the terminal clears the red error dot");
+        assert!(
+            !snap.error_unread,
+            "viewing the terminal clears the red error dot"
+        );
         assert_eq!(snap.activity, Activity::Idle);
     }
 
@@ -1141,7 +1184,11 @@ mod tests {
 
         // The background sub-agent finally finishes → NOW the deferred turn-end applies.
         let s = store.apply("t1", ActivityEvent::SubagentFinished);
-        assert_eq!(s.activity, Activity::Idle, "the last sub-agent settles the turn");
+        assert_eq!(
+            s.activity,
+            Activity::Idle,
+            "the last sub-agent settles the turn"
+        );
         assert!(
             s.ready_unread,
             "the green 'ready' is raised when the last sub-agent finishes"
@@ -1159,11 +1206,17 @@ mod tests {
         // The sub-agent finishes BEFORE the turn ends (synchronous): still Working, no green.
         let s = store.apply("t1", ActivityEvent::SubagentFinished);
         assert_eq!(s.activity, Activity::Working, "main turn still generating");
-        assert!(!s.ready_unread, "a sub-agent stop with no deferred Stop raises nothing");
+        assert!(
+            !s.ready_unread,
+            "a sub-agent stop with no deferred Stop raises nothing"
+        );
         // The main turn then ends with no sub-agent in flight → immediate Idle + green.
         let s = store.apply("t1", ActivityEvent::TurnFinished);
         assert_eq!(s.activity, Activity::Idle);
-        assert!(s.ready_unread, "a synchronous sub-agent greens at the Stop as before");
+        assert!(
+            s.ready_unread,
+            "a synchronous sub-agent greens at the Stop as before"
+        );
     }
 
     /// Sub-agents and TOOLS are counted SEPARATELY: a `Stop` resets the tool counter (a lost
@@ -1175,13 +1228,21 @@ mod tests {
         store.apply("t1", ActivityEvent::PromptSubmitted);
         store.apply("t1", ActivityEvent::SubagentStarted); // background sub-agent.
         store.apply("t1", ActivityEvent::ToolStarted); // a tool whose Post will be "lost".
-        // Stop: the tool bookkeeping is reset, but the sub-agent survives → still Working.
+                                                       // Stop: the tool bookkeeping is reset, but the sub-agent survives → still Working.
         let s = store.apply("t1", ActivityEvent::TurnFinished);
-        assert_eq!(s.activity, Activity::Working, "the sub-agent keeps it Working");
+        assert_eq!(
+            s.activity,
+            Activity::Working,
+            "the sub-agent keeps it Working"
+        );
         assert!(!s.ready_unread);
         // A stray late tool Post must not underflow nor settle the turn.
         let s = store.apply("t1", ActivityEvent::ToolFinished);
-        assert_eq!(s.activity, Activity::Working, "stray Post does not settle a deferred turn");
+        assert_eq!(
+            s.activity,
+            Activity::Working,
+            "stray Post does not settle a deferred turn"
+        );
         assert!(!s.ready_unread);
         // The sub-agent finishes → deferred green applies.
         let s = store.apply("t1", ActivityEvent::SubagentFinished);
@@ -1202,7 +1263,10 @@ mod tests {
         // First sub-agent finishes — one still in flight → stay Working, no green yet.
         let s = store.apply("t1", ActivityEvent::SubagentFinished);
         assert_eq!(s.activity, Activity::Working, "one sub-agent still running");
-        assert!(!s.ready_unread, "no green until the LAST sub-agent finishes");
+        assert!(
+            !s.ready_unread,
+            "no green until the LAST sub-agent finishes"
+        );
         // Last sub-agent finishes → deferred green.
         let s = store.apply("t1", ActivityEvent::SubagentFinished);
         assert_eq!(s.activity, Activity::Idle);
@@ -1240,13 +1304,24 @@ mod tests {
         apply_hook("UserPromptSubmit", None);
         apply_hook("SubagentStart", None);
         let s = apply_hook("Stop", None);
-        assert_eq!(s.activity, Activity::Working, "deferred while the background runs");
+        assert_eq!(
+            s.activity,
+            Activity::Working,
+            "deferred while the background runs"
+        );
         assert!(!s.ready_unread);
         // The background completes via a NOTIFICATION (not a SubagentStop) → counter drops,
         // deferred green lifts.
         let s = apply_hook("Notification", Some("background_subagent_complete"));
-        assert_eq!(s.activity, Activity::Idle, "notification completion settles the turn");
-        assert!(s.ready_unread, "the deferred green is raised via the completion notification");
+        assert_eq!(
+            s.activity,
+            Activity::Idle,
+            "notification completion settles the turn"
+        );
+        assert!(
+            s.ready_unread,
+            "the deferred green is raised via the completion notification"
+        );
     }
 
     /// A `clear` (PTY death / SessionEnd / close) during a deferred background turn drops
@@ -1278,7 +1353,11 @@ mod tests {
         // Simulate a bare-Esc-then-new-prompt: leave a tool "in flight" then prompt again.
         store.apply("t1", ActivityEvent::AskStarted); // Waiting + in_flight=1 dangling.
         let s = store.apply("t1", ActivityEvent::PromptSubmitted);
-        assert_eq!(s.activity, Activity::Working, "a new turn resets to Working");
+        assert_eq!(
+            s.activity,
+            Activity::Working,
+            "a new turn resets to Working"
+        );
         assert!(!s.ready_unread, "a new turn drops the stale 'ready'");
         // And the dangling in_flight is gone: a single Stop now idles cleanly.
         let s = store.apply("t1", ActivityEvent::TurnFinished);
@@ -1317,7 +1396,10 @@ mod tests {
         assert!(store.snapshot("t1").unwrap().ready_unread);
         store.mark_ready_read("t1");
         let snap = store.snapshot("t1").unwrap();
-        assert!(!snap.ready_unread, "viewing the terminal clears the green dot");
+        assert!(
+            !snap.ready_unread,
+            "viewing the terminal clears the green dot"
+        );
         assert_eq!(snap.activity, Activity::Idle);
         // If a new turn started, mark_ready_read must NOT touch the Working state.
         store.apply("t1", ActivityEvent::PromptSubmitted);
@@ -1365,7 +1447,11 @@ mod tests {
 
         let all = store.snapshot_all();
         let ids: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["t-a", "t-b", "t-d"], "ordered, only live terminals");
+        assert_eq!(
+            ids,
+            vec!["t-a", "t-b", "t-d"],
+            "ordered, only live terminals"
+        );
         // t-a is Idle but has a pending ready → still listed, with ready_unread.
         let a = all.iter().find(|(id, _)| id == "t-a").unwrap();
         assert_eq!(a.1.activity, Activity::Idle);
@@ -1395,13 +1481,20 @@ mod tests {
 
         // An OUTDATED verdict materializes an idle entry whose badge `snapshot_all` surfaces.
         store.set_plugin_outdated("t-stale", true);
-        let snap = store.snapshot("t-stale").expect("stale badge materializes an entry");
-        assert_eq!(snap.activity, Activity::Idle, "the badge does not imply working");
+        let snap = store
+            .snapshot("t-stale")
+            .expect("stale badge materializes an entry");
+        assert_eq!(
+            snap.activity,
+            Activity::Idle,
+            "the badge does not imply working"
+        );
         assert!(!snap.ready_unread);
         assert!(snap.plugin_outdated, "the stale-plugin badge is set");
         let all = store.snapshot_all();
         assert!(
-            all.iter().any(|(id, s)| id == "t-stale" && s.plugin_outdated),
+            all.iter()
+                .any(|(id, s)| id == "t-stale" && s.plugin_outdated),
             "an idle-but-stale terminal is surfaced by snapshot_all"
         );
 
@@ -1409,7 +1502,10 @@ mod tests {
         store.apply("t-stale", ActivityEvent::PromptSubmitted);
         let snap = store.snapshot("t-stale").unwrap();
         assert_eq!(snap.activity, Activity::Working);
-        assert!(snap.plugin_outdated, "a new turn carries the stale-plugin badge over");
+        assert!(
+            snap.plugin_outdated,
+            "a new turn carries the stale-plugin badge over"
+        );
 
         // A hard clear (PTY death / SessionEnd / restart) drops the badge with everything.
         store.clear("t-stale");

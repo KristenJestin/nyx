@@ -412,3 +412,45 @@ describe("TerminalsPage — Add workspace (surfaced in the current shell)", () =
     expect(created.length).toBe(0);
   });
 });
+
+describe("TerminalsPage — Project settings (visible gear entry point)", () => {
+  it("the header exposes a Project settings gear that opens the dialog on Global (resume toggle, rename hidden)", async () => {
+    installBackend();
+    renderPage();
+    // The active project's header carries a VISIBLE, discoverable "Project settings" gear — the
+    // twin of the rail tile's right-click entry point, surfaced so the reglage is FINDABLE (it
+    // was previously only reachable via a hidden context menu).
+    const gear = await screen.findByRole("button", { name: "Project settings" });
+    // Closed by default: the resume toggle is not mounted until the gear is clicked.
+    expect(screen.queryByRole("switch", { name: /resume agent sessions/i })).toBeNull();
+
+    fireEvent.click(gear);
+
+    // The shared ProjectSettingsDialog opens on the Global section: the resume toggle shows and,
+    // because rename/delete belong to the PRD-B kebab CRUD (showRename=false), the Project name
+    // field stays hidden.
+    const toggle = await screen.findByRole("switch", { name: /resume agent sessions/i });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(screen.queryByLabelText("Project name")).toBeNull();
+  });
+
+  it("flipping the resume toggle persists via set_project_resume_agent_sessions and reflects live", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    installBackend(calls);
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Project settings" }));
+    const toggle = await screen.findByRole("switch", { name: /resume agent sessions/i });
+
+    fireEvent.click(toggle);
+
+    // The flip calls the SAME backend command the rail right-click wiring uses; the project id +
+    // requested value are threaded through `setProjectResumeAgentSessions`.
+    await waitFor(() => {
+      const call = calls.find((c) => c.cmd === "set_project_resume_agent_sessions");
+      expect(call?.args).toEqual({ id: "p1", resume: true });
+    });
+    // The optimistic tree update flows back to the live `resumeAgentSessions` prop, so the toggle
+    // reflects the persisted ON state (proving the setting sticks, not just fires-and-forgets).
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+  });
+});

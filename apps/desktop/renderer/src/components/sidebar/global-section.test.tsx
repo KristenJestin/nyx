@@ -112,3 +112,39 @@ describe("<GlobalSection> toast wiring — resume toggle", () => {
     await waitFor(() => expect(toastMock.error).toHaveBeenCalledWith("backend said no"));
   });
 });
+
+describe("<GlobalSection> — showRename", () => {
+  it("renders the rename field by default (showRename defaults to true)", () => {
+    render(
+      <GlobalSection
+        projectId="p1"
+        projectName="P"
+        resumeAgentSessions={false}
+        onRename={vi.fn().mockResolvedValue(undefined)}
+        onResumeChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText("Project name")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
+  });
+
+  it("hides the rename field when showRename=false but keeps the resume toggle", () => {
+    const onResumeChange = vi.fn();
+    render(
+      <GlobalSection
+        projectId="p1"
+        projectName="P"
+        resumeAgentSessions={false}
+        onRename={vi.fn().mockResolvedValue(undefined)}
+        onResumeChange={onResumeChange}
+        showRename={false}
+      />,
+    );
+    // The Name/rename field is not mounted (phase-1: rename/delete = PRD-B kebab CRUD)…
+    expect(screen.queryByLabelText("Project name")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    // …while the resume toggle stays present and functional.
+    fireEvent.click(screen.getByRole("switch"));
+    expect(onResumeChange).toHaveBeenCalledWith(true);
+  });
+});

@@ -710,9 +710,12 @@ impl AgentRegistry {
         self.adapters.iter().map(|a| a.kind()).collect()
     }
 
-    /// Best-effort: the adapter whose [`AgentAdapter::detect`] matches `command_line`,
-    /// if any. The production tag-a-spawn path (`claude` → `claude_code`).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Best-effort: the adapter whose [`AgentAdapter::detect`] matches `command_line` (or a
+    /// foreground `comm`), if any — PROVIDER-AGNOSTIC (it asks every registered adapter, never
+    /// a hardcoded `claude`). This is the production PASSIVE-ADOPTION path (v2.5.5 review T3):
+    /// the sidecar resolves a terminal's foreground command to an `agent_kind` so nyx can show
+    /// that agent's icon + a busy-derived status WITHOUT waiting for the hook. RE-ACTIVATED (was
+    /// `#[cfg_attr(not(test), allow(dead_code))]`) now that it is wired into the runtime.
     pub fn detect(&self, command_line: &str) -> Option<&dyn AgentAdapter> {
         self.adapters
             .iter()
@@ -992,7 +995,12 @@ mod tests {
         };
         assert!(mk(Some("clear")).is_internal_transition());
         assert!(mk(Some("resume")).is_internal_transition());
-        for real in ["logout", "prompt_input_exit", "bypass_permissions_disabled", "other"] {
+        for real in [
+            "logout",
+            "prompt_input_exit",
+            "bypass_permissions_disabled",
+            "other",
+        ] {
             assert!(
                 !mk(Some(real)).is_internal_transition(),
                 "{real} is a real end"
@@ -1023,6 +1031,54 @@ mod tests {
             .is_none());
         // Not even an object with the keys.
         assert!(claude.parse_event(&serde_json::json!("nope")).is_none());
+    }
+
+    /// PROVIDER-AGNOSTIC detection (v2.5.5 review T3): `AgentRegistry::detect` routes to WHATEVER
+    /// adapter claims the command — it has ZERO knowledge of `claude`. A MOCK non-claude adapter
+    /// (an arbitrary `agent_kind`, detecting its own CLI name) is resolved by the SAME registry
+    /// path the production passive adoption uses, and a command it does not claim resolves to
+    /// `None`. This proves the passive-adoption detection works for an arbitrary provider — the
+    /// "anticiper d'autres agents (codex, opencode, custom)" guarantee, no `if claude` anywhere.
+    #[test]
+    fn detect_is_provider_agnostic_via_a_mock_adapter() {
+        /// A stand-in for a future/custom agent: an arbitrary kind that recognizes its own CLI.
+        struct MockAgent;
+        impl AgentAdapter for MockAgent {
+            fn kind(&self) -> &'static str {
+                "mock_agent"
+            }
+            fn detect(&self, command_line: &str) -> bool {
+                let first = command_line.split_whitespace().next().unwrap_or_default();
+                let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+                base == "mockcli"
+            }
+        }
+
+        // A registry that knows ONLY the mock adapter — no Claude in sight.
+        let reg = AgentRegistry {
+            adapters: vec![Box::new(MockAgent)],
+        };
+        let detected = reg.detect("mockcli --flag");
+        assert!(detected.is_some(), "the mock agent's CLI is detected");
+        assert_eq!(
+            detected.unwrap().kind(),
+            "mock_agent",
+            "detection resolves the arbitrary (non-claude) kind via the registry"
+        );
+        // A bare foreground `comm` (not just a full command line) resolves the same way.
+        assert_eq!(reg.detect("mockcli").unwrap().kind(), "mock_agent");
+        // A command the mock does not claim → None (the passive icon stays absent).
+        assert!(reg.detect("bash").is_none());
+        assert!(
+            reg.detect("claude").is_none(),
+            "no adapter here claims claude"
+        );
+
+        // And in the PRODUCTION default registry the SAME generic path routes a non-claude CLI
+        // to nothing today (codex/opencode/custom ship no `detect`) while remaining OPEN to it —
+        // i.e. detection is keyed on adapters, not on a hardcoded provider.
+        let prod = AgentRegistry::default();
+        assert!(prod.detect("mockcli").is_none());
     }
 
     /// `detect` tags a `claude` spawn to the claude_code adapter (via the registry),

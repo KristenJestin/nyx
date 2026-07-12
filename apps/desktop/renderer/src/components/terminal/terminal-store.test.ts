@@ -208,6 +208,30 @@ describe("terminal-store (module-level keep-alive)", () => {
     // b's PTY was closed exactly once.
     expect(closes).toHaveLength(1);
   });
+
+  it("reconcileTerminals against the GLOBAL set keeps a terminal absent from the current deck", async () => {
+    // Two terminals live in DIFFERENT projects: `pA` (project A, the deck on screen) and `pB`
+    // (project B, whose pane is not mounted right now). Both records are still ALIVE, so the
+    // GLOBAL live set is [pA, pB].
+    ensureTerminal({ recordId: "pA" });
+    ensureTerminal({ recordId: "pB" });
+    await waitForSpawn("pA");
+    await waitForSpawn("pB");
+
+    // Reconciling against the GLOBAL set (both projects) disposes NEITHER — the deck currently
+    // showing only pA (project A) must NOT cause pB (project B) to be closed. This is the fix: the
+    // reconciliation runs against `list_terminals` (all projects), never the per-project deck.
+    reconcileTerminals(["pA", "pB"]);
+    expect(getTerminal("pA")).toBeDefined();
+    expect(getTerminal("pB")).toBeDefined();
+    expect(closes).toHaveLength(0);
+
+    // Only once pB is REALLY closed (dropped from the global set) is it disposed.
+    reconcileTerminals(["pA"]);
+    expect(getTerminal("pA")).toBeDefined();
+    expect(getTerminal("pB")).toBeUndefined();
+    expect(closes).toHaveLength(1);
+  });
 });
 
 describe("chooseSpawnDimensions (spawn-size gate)", () => {

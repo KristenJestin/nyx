@@ -31,6 +31,27 @@ export interface WorkspaceRuntimeTerminal {
    * the terminal is not the one being viewed.
    */
   readonly exec_state_unread: boolean;
+  /**
+   * The OS BUSY bit (v2.5.5 review T1): `true` while a command runs in this terminal's
+   * FOREGROUND process group (a build, a `sleep`, a hand-launched agent), `false` at the idle
+   * prompt. It is a LIVE signal the backend OVERLAYS onto the snapshot from the PTY layer
+   * (`apply_terminal_live_overlay`), NEVER persisted — so a restored idle terminal reads
+   * `false` by construction (no phantom running). It is the running source OSC 133's
+   * `exec_state` cannot express (that never carries `running`); `terminalRunState` folds it in.
+   * Defaults to `false` when absent (a pure-DB / MCP snapshot with no live overlay).
+   */
+  readonly busy?: boolean;
+  /**
+   * The PASSIVELY-DETECTED agent kind (v2.5.5 review T3): when the terminal's FOREGROUND command
+   * is a known agent (resolved by the backend's provider-agnostic `AgentRegistry::detect` over the
+   * foreground `comm`), this is that agent's `agent_kind` (e.g. `"claude_code"`) — else `null`.
+   * It lets the tree ADOPT a hand-launched agent (show its provider icon + a busy-derived status)
+   * WITHOUT waiting for the hook's `SessionStart`. It is a LIVE overlay, DISTINCT from
+   * `sessions[]`, and creates NO agent session: the RECONCILIATION lives in the row — a real hook
+   * `sessions[]` entry (resumable) takes PRECEDENCE over this passive kind (no double icon), and
+   * when the agent stops (`null`) the passive icon disappears. Absent on a pure-DB / MCP snapshot.
+   */
+  readonly detected_agent_kind?: string | null;
   /** The agent sessions hosted on this terminal (every state, oldest first). */
   readonly sessions: readonly WorkspaceRuntimeSession[];
 }

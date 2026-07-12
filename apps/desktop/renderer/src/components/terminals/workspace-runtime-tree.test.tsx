@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { mockIPC } from "@/bridge/test-harness";
 import { describe, expect, it } from "vitest";
 
+import type { AgentActivity } from "@/components/sidebar/use-agent-sessions";
 import { RuntimeSelectionProvider, type RuntimeSelection } from "./runtime-selection";
 import { ConsumedNotificationsProvider } from "./use-consumed-notifications";
 import { WorkspaceRuntimeTree } from "./workspace-runtime-tree";
@@ -256,5 +257,138 @@ describe("WorkspaceRuntimeTree — notification dots (finding 53)", () => {
     // t1 is no longer selected, but its notification stays consumed (does not resurface).
     await waitFor(() => expect(dotStateFor("two")).toBeNull());
     expect(dotStateFor("one")).toBeNull();
+  });
+});
+
+describe("WorkspaceRuntimeTree — agent activity on the LINE (review T2)", () => {
+  function agent(overrides: Partial<AgentActivity> = {}): AgentActivity {
+    return {
+      activity: "idle",
+      readyUnread: false,
+      errorUnread: false,
+      pluginOutdated: false,
+      ...overrides,
+    };
+  }
+
+  function renderWithActivity(
+    snap: WorkspaceRuntimeSnapshot,
+    byId: Record<string, AgentActivity>,
+    selection: RuntimeSelection | null = null,
+  ) {
+    return render(
+      <RuntimeSelectionProvider initialSelection={selection}>
+        <ConsumedNotificationsProvider>
+          <WorkspaceRuntimeTree snapshot={snap} agentActivity={(id) => byId[id]} />
+        </ConsumedNotificationsProvider>
+      </RuntimeSelectionProvider>,
+    );
+  }
+
+  const agentTerminal = () =>
+    terminal({ id: "t1", label: "agent", exec_state: "idle", sessions: [session("active")] });
+
+  it("shows the agent WORKING dot (running/blue) on its host LINE", () => {
+    renderWithActivity(snapshot({ terminals: [agentTerminal()] }), {
+      t1: agent({ activity: "working" }),
+    });
+    expect(dotStateFor("agent")).toBe("running");
+  });
+
+  it("shows the agent WAITING dot (yellow) on its host LINE — not just the workspace rollup", () => {
+    renderWithActivity(snapshot({ terminals: [agentTerminal()] }), {
+      t1: agent({ activity: "waiting" }),
+    });
+    expect(dotStateFor("agent")).toBe("waiting");
+  });
+
+  it("shows the agent READY dot (success/green) on an UNREAD, unselected agent LINE", () => {
+    renderWithActivity(snapshot({ terminals: [agentTerminal()] }), {
+      t1: agent({ activity: "idle", readyUnread: true }),
+    });
+    expect(dotStateFor("agent")).toBe("success");
+  });
+
+  it("shows the agent turn-ERROR dot (red) with priority over ready", () => {
+    renderWithActivity(snapshot({ terminals: [agentTerminal()] }), {
+      t1: agent({ activity: "idle", readyUnread: true, errorUnread: true }),
+    });
+    expect(dotStateFor("agent")).toBe("error");
+  });
+
+  it("agent activity PRIMES over the terminal mode (busy/exec_state) on an agent line", () => {
+    // The host terminal has a settled unread SUCCESS exec_state AND is busy — but because it
+    // hosts an agent whose activity is `waiting`, the LINE shows `waiting`, not the terminal mode.
+    const t = terminal({
+      id: "t1",
+      label: "agent",
+      exec_state: "success",
+      exec_state_unread: true,
+      busy: true,
+      sessions: [session("active")],
+    });
+    renderWithActivity(snapshot({ terminals: [t] }), { t1: agent({ activity: "waiting" }) });
+    expect(dotStateFor("agent")).toBe("waiting");
+  });
+
+  it("falls back to TERMINAL mode when the line has NO agent session (busy → running, T1)", () => {
+    // No session on the terminal → terminal mode: the OS busy bit lights `running` even with an
+    // (irrelevant) activity entry present for its id.
+    const t = terminal({ id: "t1", label: "plain", exec_state: "idle", busy: true, sessions: [] });
+    renderWithActivity(snapshot({ terminals: [t] }), { t1: agent({ activity: "idle" }) });
+    expect(dotStateFor("plain")).toBe("running");
+  });
+
+  it("idle agent line (busy, NO live activity entry) shows NO dot — busy/exec_state IGNORED (bug fix)", () => {
+    // THE BUG: a fresh/idle Claude session sits at the prompt as the foreground process (OS `busy`
+    // ON) and may carry a stale settled exec_state, yet has NO activity entry. It must show an
+    // EMPTY dot — a line that carries an agent is in AGENT mode, which ignores the busy bit AND the
+    // exec_state — not the busy-derived `running` (nor a phantom green). This is v1 parity.
+    const t = terminal({
+      id: "t1",
+      label: "idle-agent",
+      exec_state: "success",
+      exec_state_unread: true,
+      busy: true,
+      sessions: [session("active")],
+    });
+    renderWithActivity(snapshot({ terminals: [t] }), {});
+    expect(dotStateFor("idle-agent")).toBeNull();
+  });
+
+  it("NON-REGRESSION: a NON-agent terminal that is busy STILL shows the running dot (T1)", () => {
+    // A plain PTY (no session, no detected agent) running a foreground command must still light the
+    // busy `running` dot — only an agent line ignores busy.
+    const t = terminal({
+      id: "t1",
+      label: "plain-busy",
+      exec_state: "idle",
+      busy: true,
+      sessions: [],
+    });
+    renderWithActivity(snapshot({ terminals: [t] }), {});
+    expect(dotStateFor("plain-busy")).toBe("running");
+  });
+
+  it("CONSUMES the agent ready notification on select via agent_mark_ready_read", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> });
+      return undefined;
+    });
+    renderWithActivity(snapshot({ terminals: [agentTerminal()] }), {
+      t1: agent({ activity: "idle", readyUnread: true }),
+    });
+    expect(dotStateFor("agent")).toBe("success");
+    // Selecting the agent line clears its ready dot via the agent seam (NOT terminal_exec_mark_read).
+    fireEvent.click(screen.getByText("agent"));
+    await waitFor(() => {
+      const markRead = calls.find((c) => c.cmd === "agent_mark_ready_read");
+      expect(markRead?.args.terminalId).toBe("t1");
+    });
+    // The viewed agent line suppresses its settled dot (you are on it → seen).
+    await waitFor(() => expect(dotStateFor("agent")).toBeNull());
+    // It did NOT fire the terminal exec mark-read (agent mode owns its own clear).
+    expect(calls.some((c) => c.cmd === "terminal_exec_mark_read")).toBe(false);
   });
 });

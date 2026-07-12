@@ -311,11 +311,21 @@ mod tests {
         let dead = u32::MAX;
         let out = stats.tree_stats_batch(&[me, dead, me]);
         assert_eq!(out.len(), 3, "one reading per root");
-        assert_eq!(out[1], TreeStats::ZERO, "the dead pid keeps its slot, zeroed");
+        assert_eq!(
+            out[1],
+            TreeStats::ZERO,
+            "the dead pid keeps its slot, zeroed"
+        );
         // The current process is alive → its tree has a real RSS.
-        assert!(out[0].mem_bytes > 0, "the test process's own tree consumes RAM");
+        assert!(
+            out[0].mem_bytes > 0,
+            "the test process's own tree consumes RAM"
+        );
         // Same root, same table → identical reading at both slots.
-        assert_eq!(out[0], out[2], "the same root sums identically within a batch");
+        assert_eq!(
+            out[0], out[2],
+            "the same root sums identically within a batch"
+        );
     }
 
     /// An empty batch refreshes nothing and returns an empty Vec (the host SKIPS the napi
