@@ -599,19 +599,29 @@ export interface NyxBridge {
 export interface WindowControls {
   minimize(): Promise<void>;
   toggleMaximize(): Promise<void>;
-  /** Close the window. The CLOSE-INTERCEPTION policy (agent-session warnings) is a
-   *  caller concern: the UI first asks the backend via `agent_close_warnings`
-   *  (see {@link NyxBridge.invoke}) and only calls `close()` when clear / confirmed. */
+  /** Close the window. The CLOSE-INTERCEPTION policy (agent-session warnings) is
+   *  centralized in the shell's main-process close guard, NOT a caller concern: under
+   *  the Electron shell `close()` re-enters that guard, which withholds the OS close and
+   *  relays it to the agent close-warning flow via {@link onCloseRequested} /
+   *  {@link confirmClose} (which run `agent_close_warnings`, see {@link NyxBridge.invoke}).
+   *  So `close()` is NOT an unconditional escape hatch — it proceeds only once the guard
+   *  clears (no live session) or the user confirms via {@link confirmClose}. */
   close(): Promise<void>;
   /** Props to spread on the draggable chrome element so the shell can move the
    *  window by it. The Tauri adapter returns `{ "data-tauri-drag-region": true }`;
    *  an Electron adapter returns the CSS `-webkit-app-region: drag` equivalent. */
   dragRegionProps(): Record<string, unknown>;
   /** Subscribe to the OS "window close requested" signal (the user clicked the OS
-   *  close button / Alt-F4). The handler runs BEFORE the window is destroyed — used
-   *  to flush pending scrollback. Returns an idempotent {@link Unsubscribe}. Resolves
+   *  close button / Alt-F4 / quit). The handler runs BEFORE the window is destroyed —
+   *  the shell WITHHOLDS the real close until the caller proceeds via {@link
+   *  confirmClose}. Used to flush pending scrollback AND to run the agent close-warning
+   *  guard (`agent_close_warnings`). Returns an idempotent {@link Unsubscribe}. Resolves
    *  with a no-op unsubscribe when the shell has no such hook (e.g. under tests). */
   onCloseRequested(handler: () => void): Promise<Unsubscribe>;
+  /** Proceed with the REAL close after an {@link onCloseRequested} guard cleared it (no
+   *  live agent session) or the user confirmed. Bypasses the shell's close guard so it
+   *  does not re-prompt. A no-op (resolved) on shells with no such hook (tests). */
+  confirmClose(): Promise<void>;
 }
 
 /** Filesystem paths the front asks the shell to resolve. */

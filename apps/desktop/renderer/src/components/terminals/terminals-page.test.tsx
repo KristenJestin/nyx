@@ -413,6 +413,60 @@ describe("TerminalsPage — Add workspace (surfaced in the current shell)", () =
   });
 });
 
+describe("TerminalsPage — no loose terminals band (v2.5.6 finding #26)", () => {
+  /** A backend whose `list_terminals` returns ONE unattached terminal (`workspace_id null`). */
+  function installBackendWithLooseTerminal() {
+    mockIPC(
+      (cmd, args) => {
+        const a = (args ?? {}) as Record<string, unknown>;
+        switch (cmd) {
+          case "list_projects":
+            return [project("p1", "Alpha")];
+          case "list_workspaces":
+            return [workspace("ws-root", "p1", "root", true)];
+          case "workspace_runtime_snapshot":
+            return snapshot(a.workspaceId as string);
+          case "pty_spawn":
+            return 100;
+          case "list_terminals":
+            return [
+              {
+                id: "loose-1",
+                cwd: "/tmp",
+                label: "loose-shell",
+                status: "alive",
+                order_index: 0,
+                created_at: 0,
+                updated_at: 0,
+                closed_at: null,
+                workspace_id: null,
+              },
+            ];
+          case "command_list":
+          case "command_instance_list":
+          case "command_import_scripts":
+            return [];
+          default:
+            return undefined;
+        }
+      },
+      { shouldMockEvents: true },
+    );
+  }
+
+  it("does NOT render a Loose terminals band, even when an unattached terminal exists", async () => {
+    installBackendWithLooseTerminal();
+    renderPage();
+    // The workspace tree must render (so we know the page mounted), but the removed band + its
+    // unattached terminal must be absent — the user cannot have a terminal attached to nothing.
+    expect(await screen.findByText("ws-root-shell")).toBeTruthy();
+    expect(screen.queryByText("Loose terminals")).toBeNull();
+    expect(screen.queryByText("loose-shell")).toBeNull();
+    // The band's "New unattached terminal" affordance is gone too.
+    expect(screen.queryByRole("button", { name: "New unattached terminal" })).toBeNull();
+  });
+});
+
 describe("TerminalsPage — Project settings (visible gear entry point)", () => {
   it("the header exposes a Project settings gear that opens the dialog on Global (resume toggle, rename hidden)", async () => {
     installBackend();

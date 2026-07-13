@@ -368,6 +368,36 @@ impl PtyManager {
             .collect()
     }
 
+    /// The SHELL (root) pid of every live terminal that carries a persistent RECORD id, as
+    /// `(record_id, shell_pid)` (FEEDBACK #28 / v2.5.6). This is the per-tick input the stats poll
+    /// ([`super::stats_poll`]) feeds to [`nyx_core::proc_stats::ProcStats::tree_stats_batch`] to
+    /// sum each terminal's PROCESS-TREE CPU%/RAM (the shell + every descendant). A terminal whose
+    /// shell pid is unavailable (already exited, or the platform did not report one) is omitted —
+    /// it consumes nothing to report. Mirrors the [`busy_by_record`](Self::busy_by_record) sample
+    /// shape (record id → live PTY), reading the shell pid instead of the busy bit.
+    pub fn shell_pids_by_record(&self) -> Vec<(String, u32)> {
+        // Snapshot the (record -> pty) joins first, then read each `shell_pid` WITHOUT holding the
+        // registry lock (parity with `busy_by_record`).
+        let joins: Vec<(String, Arc<Mutex<Pty>>)> = {
+            let terms = self.terminals.lock().unwrap();
+            self.live_records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(rec, pty_id)| {
+                    terms.get(pty_id).map(|t| (rec.clone(), Arc::clone(&t.pty)))
+                })
+                .collect()
+        };
+        joins
+            .into_iter()
+            .filter_map(|(rec, pty)| {
+                let pid = pty.lock().unwrap().shell_pid()?;
+                Some((rec, pid))
+            })
+            .collect()
+    }
+
     /// The FOREGROUND program name (`comm`) of a live terminal by its persistent RECORD id
     /// (v2.5.5 review T3): `/proc/<foreground_pgid>/comm` — the running program the shell handed
     /// the terminal to (`claude` while an agent runs, the shell name at the prompt). This is the
@@ -990,6 +1020,29 @@ mod tests {
         );
         // An unknown record is never busy (no live PTY backs it).
         assert!(!mgr.is_busy_record("no-such-record"));
+        mgr.close(id);
+    }
+
+    /// FEEDBACK #28 / v2.5.6 — the STATS sample through a REAL PTY: a record-backed live terminal
+    /// is reported by `shell_pids_by_record` with a REAL shell pid, so the stats poll can sum its
+    /// process tree. A record with no live PTY is absent from the sample.
+    #[cfg(unix)]
+    #[test]
+    fn shell_pids_by_record_reports_live_record_backed_terminals() {
+        let mgr = PtyManager::new();
+        let record = "rec-stats";
+        let id = mgr
+            .spawn(80, 24, "", record, 0, discard_sink())
+            .expect("spawn pty");
+        let sample = mgr.shell_pids_by_record();
+        let entry = sample.iter().find(|(r, _)| r == record);
+        let (_, pid) = entry.expect("the record-backed terminal appears in the stats sample");
+        assert!(
+            *pid > 0,
+            "a live shell has a real pid the tree walk can root at"
+        );
+        // A record with no live PTY contributes nothing to the sample.
+        assert!(!sample.iter().any(|(r, _)| r == "no-such-record"));
         mgr.close(id);
     }
 

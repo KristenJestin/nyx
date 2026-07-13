@@ -6,10 +6,13 @@
 // WebView2 app through `tauri-driver`; this one drives the Electron app directly:
 // `wdio-electron-service` discovers the Electron Chromium, spins up the matching
 // Chromedriver, launches our built app (`appBinaryPath`/`appEntryPoint`), and exposes
-// the standard `browser`. The SPEC FILES are unchanged: they drive + read terminals
-// through the inert `window.__nyx` / `window.__nyxDeck` seams (xterm paints to a WebGL
-// canvas, so the text is not in the DOM) — those seams are renderer-side React and
-// SHELL-AGNOSTIC, so nothing in the specs is Tauri- or Electron-specific.
+// the standard `browser`. The SPEC FILES are driver-agnostic: they drive + read the app
+// through inert renderer-side seams — on the current v2.5.6 shell these are
+// `window.__nyxWork` (base-layout: project seed/list) and the per-terminal
+// `window.__nyxDeck` / `window.__nyxDeckInput` (terminal-deck: read/input). The old v2.2
+// `window.__nyx` seam is GONE with `<TerminalManager>` (PDR-0025). Those seams are
+// renderer-side React and SHELL-AGNOSTIC, so nothing in the specs is Tauri- or
+// Electron-specific.
 //
 // Why WDIO v9 here (the Tauri harness pinned v7): `wdio-electron-service` targets the
 // modern WDIO (v8/v9) session stack. The Tauri pin existed because `tauri-driver`
@@ -120,6 +123,11 @@ function specDataDir(specPath) {
   const base = specPath ? path.basename(specPath) : "default";
   let key;
   if (/^restore-\d+/.test(base)) key = "restore";
+  // The v2.5.6 reorder gate is a seed→verify pair that MUST share ONE data dir so the verify half
+  // relaunches on the DB the seed persisted (proving the drag order + resume setting survive a
+  // real quit). Matched BEFORE the generic `cockpit-\d+` rule (which this basename never hits) and
+  // before the isolated per-basename fallback.
+  else if (/^cockpit-v256-reorder-\d+/.test(base)) key = "cockpit-v256-reorder";
   else if (/^cockpit-\d+/.test(base)) key = "cockpit";
   else key = base.replace(/\W+/g, "_");
   return path.join(E2E_DATA_ROOT, key);
@@ -196,8 +204,9 @@ exports.config = {
 
   // Build the Electron app (with the E2E seam) once before the run, so the suite is
   // self-contained. Set NYX_E2E_SKIP_BUILD=1 to reuse an existing build. The renderer
-  // MUST be built with `VITE_NYX_E2E=1` (the `build:e2e` script) so `window.__nyx` is
-  // exposed — the specs drive the app through it.
+  // MUST be built with `VITE_NYX_E2E=1` (the `build:e2e` script) so the live control seams
+  // (`window.__nyxWork` + the per-terminal `window.__nyxDeck` / `window.__nyxDeckInput`)
+  // are exposed — the specs drive the app through them.
   onPrepare: function () {
     // A shell profile / tool that exports `ELECTRON_RUN_AS_NODE=1` (common on dev boxes that
     // use Electron-based CLIs) makes EVERY `electron <entry>` run as PLAIN NODE — so the app's

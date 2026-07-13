@@ -738,6 +738,20 @@ export function toEnvelope(event: PipeEvent): CoreEventEnvelope | null {
         event: "terminal://busy-state",
         payload: { terminal_id: event.recordId, busy: event.busy },
       };
+    case "terminal_stats":
+      // The per-terminal CPU%/RAM reading (FEEDBACK #28 / v2.5.6). Keyed by the persistent RECORD
+      // id. The wire carries CPU as an integer `cpuMilli` (thousandths of a percent) to stay
+      // float-free; divide back to the float `cpu_pct` the renderer hook (`use-terminal-stats`)
+      // formats. The renderer shows it on hover of a terminal LINE — never inline (non-inline
+      // constraint: the CPU%/RAM must not mask/truncate the terminal name).
+      return {
+        event: "terminal://stats",
+        payload: {
+          terminal_id: event.recordId,
+          cpu_pct: event.cpuMilli / 1000,
+          mem_bytes: event.memBytes,
+        },
+      };
     case "command_state":
       switch (event.event) {
         case "ack":

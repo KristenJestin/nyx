@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 
 import { RuntimeRow } from "./runtime-row";
 import { RuntimeSelectionProvider } from "./runtime-selection";
@@ -35,5 +35,42 @@ describe("RuntimeRow", () => {
     // the dot in grey/empty). The row keeps its name + glyph.
     expect(container.querySelector("[data-state]")).toBeNull();
     expect(screen.getByText("build")).toBeTruthy();
+  });
+});
+
+describe("RuntimeRow — inline editing (v2.5.6)", () => {
+  it("swaps the label for the editor when editing (name no longer rendered as text)", () => {
+    render(
+      <RuntimeSelectionProvider>
+        <RuntimeRow
+          selection={{ kind: "terminal", id: "t1" }}
+          icon={<span data-testid="row-icon" />}
+          label="build"
+          state="idle"
+          editing
+          editor={<input aria-label="rename" defaultValue="build" />}
+        />
+      </RuntimeSelectionProvider>,
+    );
+    // The editor is shown in place of the label — the name is no longer a plain text node.
+    expect(screen.getByRole("textbox", { name: "rename" })).toBeTruthy();
+    expect(screen.queryByText("build")).toBeNull();
+  });
+
+  it("fires onLabelDoubleClick on a double-click of the name", () => {
+    const onLabelDoubleClick = vi.fn();
+    render(
+      <RuntimeSelectionProvider>
+        <RuntimeRow
+          selection={{ kind: "terminal", id: "t1" }}
+          icon={<span data-testid="row-icon" />}
+          label="build"
+          state="idle"
+          onLabelDoubleClick={onLabelDoubleClick}
+        />
+      </RuntimeSelectionProvider>,
+    );
+    fireEvent.doubleClick(screen.getByText("build"));
+    expect(onLabelDoubleClick).toHaveBeenCalledTimes(1);
   });
 });

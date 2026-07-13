@@ -34,6 +34,7 @@ pub mod pty;
 pub mod recovery;
 pub mod resume_parks;
 pub mod snapshot_store;
+pub mod stats_poll;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -147,6 +148,12 @@ pub struct Runtime {
     /// `running` dot (the v1 `BusyStatePoller` port). Started in [`Runtime::attach_events`] once
     /// the pipe [`EventSink`] exists; `None` before then (a bare test build spawns no poll).
     busy_poll: Arc<Mutex<Option<Arc<busy_poll::BusyPoll>>>>,
+    /// The per-terminal CPU%/RAM STATS POLL (FEEDBACK #28 / v2.5.6): the periodic process-tree
+    /// sweep that pushes `terminal://stats` readings so the runtime tree can show a terminal's
+    /// live CPU%/RAM on hover (NON-inline — never masking the name). The missing producer for the
+    /// already-ported [`nyx_core::proc_stats`]. Started in [`Runtime::attach_events`] once the
+    /// pipe [`EventSink`] exists; `None` before then (a bare test build spawns no poll).
+    stats_poll: Arc<Mutex<Option<Arc<stats_poll::StatsPoll>>>>,
 }
 
 impl Runtime {
@@ -208,6 +215,7 @@ impl Runtime {
             plugin_reconciled: Arc::new(AtomicBool::new(false)),
             resume_parks: Arc::new(resume_parks::ResumeParks::new()),
             busy_poll: Arc::new(Mutex::new(None)),
+            stats_poll: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -254,6 +262,18 @@ impl Runtime {
         // re-câbled onto the sidecar pipe. Independent of OSC 133; a restored idle terminal
         // samples idle by construction (no phantom running).
         *self.busy_poll.lock().unwrap() = Some(busy_poll::BusyPoll::start(
+            Arc::clone(&self.pty),
+            events.clone(),
+        ));
+
+        // Start the per-terminal CPU%/RAM STATS POLL (FEEDBACK #28 / v2.5.6): the periodic process-
+        // tree sweep (`ProcStats::tree_stats_batch` over each record-backed shell pid) that pushes
+        // `terminal://stats` readings — the MISSING producer for the already-ported
+        // `nyx_core::proc_stats`. The renderer shows the reading on hover of a terminal LINE
+        // (NON-inline — the CPU%/RAM never masks the terminal name). Independent of the busy poll:
+        // that diffs a boolean transition, this streams a fresh reading each tick (CPU% is
+        // continuous), over its OWN reused `ProcStats` so per-process CPU% deltas stay meaningful.
+        *self.stats_poll.lock().unwrap() = Some(stats_poll::StatsPoll::start(
             Arc::clone(&self.pty),
             events.clone(),
         ));

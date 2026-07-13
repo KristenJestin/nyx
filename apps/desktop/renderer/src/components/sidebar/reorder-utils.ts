@@ -58,3 +58,43 @@ export function spliceWorkspaceOrder(
   }
   return next;
 }
+
+/**
+ * Sort `items` to follow the id sequence `order`, keeping any item whose id is NOT in `order`
+ * in its original relative position at the END. Pure + stable → unit-testable.
+ *
+ * This is the v2.5.6 cockpit's LIVE-order overlay for the workspace runtime tree: the terminal
+ * rows render off the `workspace_runtime_snapshot` (which the pure sidebar `reorder` DB command
+ * does NOT re-push — `db_command.rs`), so after a drag we can't wait for a snapshot re-pull to
+ * reflect the new order. Instead we sort the snapshot's terminals by the OPTIMISTIC global order
+ * `useTerminals` already maintains (its `reorder` folds the new `order_index` in immediately) —
+ * so the tree repaints in the dragged order at once, and a later re-pull (which returns the same
+ * persisted `order_index` order) is a no-op, never a snap-back. Robust to membership drift: an
+ * id present in `order` but absent from `items` is skipped; an item absent from `order` (a fresh
+ * terminal, or a pre-load empty order) keeps its place rather than being dropped.
+ *
+ * @param items  the rows to order (a workspace's snapshot terminals, or the loose ones).
+ * @param order  the authoritative global id order (`useTerminals().terminals` ids).
+ * @param idOf   how to read an item's id.
+ */
+export function sortByOrder<T>(
+  items: readonly T[],
+  order: readonly string[],
+  idOf: (item: T) => string,
+): T[] {
+  const rank = new Map(order.map((id, index) => [id, index]));
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => {
+      const ra = rank.get(idOf(a.item));
+      const rb = rank.get(idOf(b.item));
+      // Both unranked (absent from `order`): preserve their original relative order.
+      if (ra === undefined && rb === undefined) return a.index - b.index;
+      // A ranked item always precedes an unranked one (unranked sink to the end).
+      if (ra === undefined) return 1;
+      if (rb === undefined) return -1;
+      // Both ranked: by rank, then original index as a stable tiebreak.
+      return ra - rb || a.index - b.index;
+    })
+    .map((entry) => entry.item);
+}

@@ -19,6 +19,7 @@ import { app, BrowserWindow, shell } from "electron";
 
 import { registerCoreIpc } from "./core-ipc";
 import { applyAppIdentity } from "./identity";
+import { handleBeforeQuit } from "./quit-guard";
 import { Sidecar } from "./sidecar";
 import { applyWaylandFlags } from "./wayland";
 import { createMainWindow } from "./window";
@@ -48,6 +49,12 @@ if (!gotTheLock) {
   app.quit();
 } else {
   let mainWindow: BrowserWindow | null = null;
+
+  // Latched once a QUIT gesture (menu `File>Quit`, `Ctrl+Q`/`Cmd+Q`, a programmatic
+  // `app.quit()`) is routed through the window close guard, so that after the guarded window
+  // actually closes the app COMPLETES the quit even on macOS (where `window-all-closed` would
+  // otherwise leave the app resident). Set by the `before-quit` router below.
+  let quitting = false;
 
   // The supervised `nyx-sidecar` Rust binary — the runtime authority (PDR-0006/0007). It
   // OWNS the SQLite DB + PTY + managed commands + MCP; main owns the local stdin/stdout
@@ -135,18 +142,35 @@ if (!gotTheLock) {
     });
   });
 
-  // Ensure the sidecar is torn down before the app fully exits, so no orphan sidecar /
-  // PTY survives (the ordered shutdown then forced kill).
+  // Route the QUIT gesture through the SAME agent close-warning as the WM close button, and
+  // tear the sidecar down before the app fully exits (finding 01KXBSWRCPAYR4VZY5DVTF0PCX).
+  //
+  // Menu `File>Quit`, the `Ctrl+Q` / `Cmd+Q` accelerator, and any programmatic `app.quit()` all
+  // reach `before-quit` with the window STILL OPEN. The old handler force-exited here
+  // (`app.exit(0)`), bypassing every window `close` and killing live agent sessions with no
+  // warning. Now, while a live window is open, we WITHHOLD the quit and `win.close()` it — which
+  // re-enters `window.ts`'s close guard (the renderer's `agent_close_warnings` flow), exactly
+  // like the WM close button. Only once the window is gone (guard cleared / user confirmed / no
+  // live sessions) does the SAME `before-quit` fire again with no window left and perform the
+  // ordered sidecar teardown, then the hard `app.exit(0)` (which does NOT re-enter `before-quit`).
   app.on("before-quit", (event) => {
-    if (!sidecar.alive) return;
-    event.preventDefault();
-    void sidecar.stop().finally(() => app.exit(0));
+    handleBeforeQuit({
+      getWindow: () => mainWindow,
+      sidecar,
+      preventDefault: () => event.preventDefault(),
+      exit: () => app.exit(0),
+      markQuitting: () => {
+        quitting = true;
+      },
+    });
   });
 
-  // Quit when all windows are closed, except on macOS where apps stay alive until
-  // the user quits explicitly (standard platform convention).
+  // Quit when all windows are closed, except on macOS where apps stay alive until the user
+  // quits explicitly (standard platform convention) — UNLESS a quit was explicitly requested
+  // (a `Cmd+Q` routed through the close guard), which must actually terminate the app once its
+  // guarded window has closed.
   app.on("window-all-closed", () => {
-    if (process.platform !== "darwin") {
+    if (process.platform !== "darwin" || quitting) {
       app.quit();
     }
   });

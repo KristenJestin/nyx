@@ -63,6 +63,10 @@ interface NyxWindowApi {
   minimize(): Promise<void>;
   toggleMaximize(): Promise<boolean>;
   close(): Promise<void>;
+  // Optional so a preload predating the close-guard (or a bare test double) type-checks;
+  // the adapter falls back to `pagehide` / no-ops when they are absent.
+  onCloseRequested?(handler: () => void): () => void;
+  confirmClose?(): Promise<void>;
   controlsVisible(): Promise<boolean>;
   pickDirectory(title?: string): Promise<string | null>;
   homeDir(): Promise<string | null>;
@@ -219,11 +223,22 @@ const windowControls: WindowControls = {
   // under Electron). Returning the same key keeps the chrome component shell-agnostic.
   dragRegionProps: () => ({ "data-tauri-drag-region": true }),
   async onCloseRequested(handler: () => void): Promise<Unsubscribe> {
-    // The OS close button routes through the main process, which (phase 3+) relays a
-    // close-requested signal. Until that channel exists, the renderer-side
-    // scrollback flush is driven by the standard `beforeunload`/`pagehide` lifecycle;
-    // we subscribe to `pagehide` so a window teardown still flushes. Idempotent.
+    // The OS close button / Alt-F4 / quit routes through the MAIN process, which
+    // WITHHOLDS the real close and relays the `nyx:window/close-requested` push. Prefer
+    // that real signal (fires BEFORE teardown, so the close-warning guard can actually
+    // show its dialog and the caller then proceeds via `confirmClose`). Fall back to the
+    // DOM `pagehide` only when the preload predates the channel (older shell / tests),
+    // where all a handler can do is a best-effort flush. Idempotent unsubscribe.
     let done = false;
+    const api = windowApi();
+    if (typeof api.onCloseRequested === "function") {
+      const un = api.onCloseRequested(() => handler());
+      return () => {
+        if (done) return;
+        done = true;
+        un();
+      };
+    }
     const onHide = () => handler();
     window.addEventListener("pagehide", onHide);
     return () => {
@@ -232,6 +247,10 @@ const windowControls: WindowControls = {
       window.removeEventListener("pagehide", onHide);
     };
   },
+  confirmClose: () =>
+    (windowApi().confirmClose?.() ?? Promise.resolve()).catch((e) => {
+      throw toBridgeError("ipc", e, "window.confirmClose");
+    }),
 };
 
 // ---------------------------------------------------------------------------

@@ -84,6 +84,10 @@ export const EVT_COMMAND_OUTPUT = 6;
 export const EVT_CHANGED = 7;
 // OS busy-state transition for a terminal (v2.5.5 review T1), keyed by the RECORD id.
 export const EVT_PTY_BUSY_STATE = 8;
+// Per-terminal CPU%/RAM reading (FEEDBACK #28 / v2.5.6), keyed by the RECORD id. CPU is carried
+// as an integer `cpuMilli` (thousandths of a percent) — the msgpack subset forbids floats; the
+// main process divides by 1000 to the float `cpu_pct` the renderer formats.
+export const EVT_TERMINAL_STATS = 9;
 
 /** Stable, machine-matchable error codes (mirror Rust `ErrorCode`). */
 export type ErrorCode =
@@ -209,6 +213,16 @@ export type Event =
       /** The persistent terminal RECORD id (not the live pty id) — the renderer folds it directly. */
       recordId: string;
       busy: boolean;
+    }
+  | {
+      category: "event";
+      kind: "terminal_stats";
+      /** The persistent terminal RECORD id the reading is keyed by. */
+      recordId: string;
+      /** Process-tree CPU% in THOUSANDTHS of a percent (an integer — no float on the wire). */
+      cpuMilli: number;
+      /** Process-tree resident memory (RSS) in bytes. */
+      memBytes: number;
     }
   | {
       category: "event";
@@ -402,6 +416,10 @@ export function encodeMessage(msg: Message): Uint8Array {
         case "pty_busy_state":
           kind = EVT_PTY_BUSY_STATE;
           body = [msg.recordId, msg.busy];
+          break;
+        case "terminal_stats":
+          kind = EVT_TERMINAL_STATS;
+          body = [msg.recordId, msg.cpuMilli, msg.memBytes];
           break;
         case "command_state":
           kind = EVT_COMMAND_STATE;
@@ -632,6 +650,14 @@ export function decodeMessage(bytes: Uint8Array): Message {
         kind: "pty_busy_state",
         recordId: body[0] as string,
         busy: body[1] as boolean,
+      };
+    if (kind === EVT_TERMINAL_STATS)
+      return {
+        category: "event",
+        kind: "terminal_stats",
+        recordId: body[0] as string,
+        cpuMilli: asNumber(body[1]),
+        memBytes: asNumber(body[2]),
       };
     if (kind === EVT_COMMAND_STATE)
       return {

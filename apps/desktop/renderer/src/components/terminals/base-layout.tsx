@@ -3,25 +3,36 @@ import { Link, Outlet, useNavigate, useRouterState } from "@tanstack/react-route
 import {
   BookOpenIcon,
   BriefcaseIcon,
+  FolderPlusIcon,
   PlusIcon,
   SettingsIcon,
   SlidersHorizontalIcon,
   SquareTerminalIcon,
+  Trash2Icon,
 } from "lucide-react";
 import { Menu as BaseMenu } from "@base-ui/react/menu";
 import { motion, useReducedMotion } from "motion/react";
+import { DragDropProvider } from "@dnd-kit/react";
+import { useSortable } from "@dnd-kit/react/sortable";
+import { move } from "@dnd-kit/helpers";
 
 import { cn } from "@/lib/utils";
+import { reorderSensors, sameOrder } from "./reorder-dnd";
 import { startNavTransition } from "@/lib/nav-transition";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
-import { MenuItem } from "@/components/ui/menu";
-import { useProjects, type ProjectTree } from "@/components/sidebar/use-projects";
+import { MenuItem, MenuSeparator } from "@/components/ui/menu";
+import {
+  useProjects,
+  type ProjectTree,
+  type WorkspaceRecord,
+} from "@/components/sidebar/use-projects";
 import { useManualAdd } from "@/components/sidebar/use-manual-add";
 import { useAgentSessions } from "@/components/sidebar/use-agent-sessions";
 import { useReconcileTerminals } from "@/components/terminal/use-reconcile-terminals";
 import { SettingsDialog, type SettingsDialogHandle } from "@/components/sidebar/settings-dialog";
 import { ProjectSettingsDialog } from "@/components/sidebar/project-settings-dialog";
+import { CloseGuard } from "@/components/chrome/close-guard";
 import { isQuietState, StatusDot } from "./status-dot";
 import { projectRunState } from "./runtime-state";
 import { useConsumedNotifications } from "./use-consumed-notifications";
@@ -116,24 +127,105 @@ function ProjectRailDot({ project, active }: { project: ProjectTree; active: boo
   );
 }
 
+/** The per-project rail actions, threaded into the right-click context menu. */
+interface ProjectRailActions {
+  /** Open the project-settings modal (Global pane — rename + resume). */
+  onOpenSettings: () => void;
+  /** Add a (non-root) workspace to the project (folder picker → name dialog). */
+  onAddWorkspace: () => void;
+  /** Open the destructive-confirm flow for a single (non-root) workspace. */
+  onRemoveWorkspace: (workspace: WorkspaceRecord) => void;
+  /** Open the destructive-confirm flow for the whole project. */
+  onDeleteProject: () => void;
+}
+
 /**
- * `<ProjectRailContextMenu>` — the per-project entry point on the rail: a RIGHT-CLICK
- * context menu on a project tile exposing "Project settings" (the only project-level
- * action rebranched here — the full kebab/rename/delete is PRD-B). It reuses the same
- * Base UI `Menu` + virtual-cursor-anchor pattern as `<TerminalContextMenu>`: a controlled
+ * `<ProjectRailMenuItems>` — the shared body of the project actions menu, rendered inside the
+ * right-click context menu (v2.5.6 finding #24: the ⋮ kebab trigger was removed — right-click is
+ * the sole entry point). It bundles the project-level CRUD the cockpit rebranches:
+ *
+ *  - **Project settings** → the modal whose Global pane owns the project RENAME
+ *    (`update_project`) + the resume toggle;
+ *  - **Add workspace** → the folder-picker/name flow (`create_workspace`);
+ *  - one **Remove <workspace>** per NON-root workspace (the backend rejects removing a
+ *    root; the whole-project delete removes it instead) → `workspace_delete`;
+ *  - **Delete project** → `delete_project`.
+ *
+ * The two DESTRUCTIVE actions (remove workspace, delete project) are tinted
+ * `destructive` and route through `useManualAdd`'s confirm dialogs, so nothing is
+ * dropped without an explicit confirmation step.
+ */
+function ProjectRailMenuItems({
+  tree,
+  onOpenSettings,
+  onAddWorkspace,
+  onRemoveWorkspace,
+  onDeleteProject,
+}: { tree: ProjectTree } & ProjectRailActions) {
+  const name = tree.project.name;
+  // Only NON-root workspaces can be removed on their own; the root leaves with the
+  // whole project. Filtering here keeps a mono-root project's menu clean (no stray
+  // "Remove root" that the backend would reject).
+  const removable = tree.workspaces.filter((w) => !w.is_root);
+  return (
+    <>
+      <MenuItem
+        icon={<SlidersHorizontalIcon className="size-4" />}
+        onClick={onOpenSettings}
+        aria-label={`Project settings for ${name}`}
+      >
+        Project settings
+      </MenuItem>
+      <MenuItem
+        icon={<FolderPlusIcon className="size-4" />}
+        onClick={onAddWorkspace}
+        aria-label={`Add workspace to ${name}`}
+      >
+        Add workspace
+      </MenuItem>
+      {removable.length > 0 && (
+        <>
+          <MenuSeparator />
+          {removable.map((ws) => (
+            <MenuItem
+              key={ws.id}
+              destructive
+              icon={<Trash2Icon className="size-4" />}
+              onClick={() => onRemoveWorkspace(ws)}
+              aria-label={`Remove workspace ${ws.name} from ${name}`}
+            >
+              Remove {ws.name}
+            </MenuItem>
+          ))}
+        </>
+      )}
+      <MenuSeparator />
+      <MenuItem
+        destructive
+        icon={<Trash2Icon className="size-4" />}
+        onClick={onDeleteProject}
+        aria-label={`Delete project ${name}`}
+      >
+        Delete project
+      </MenuItem>
+    </>
+  );
+}
+
+/**
+ * `<ProjectRailContextMenu>` — the RIGHT-CLICK entry point to a project tile's actions
+ * (v2.5.6 finding #24: the ⋮ kebab was removed, so this is the SOLE way to reach the project
+ * CRUD — rename / delete project · add / remove workspace). It reuses the Base UI
+ * `Menu` + virtual-cursor-anchor pattern as `<TerminalContextMenu>`: a controlled
  * `Menu.Root` whose `Positioner` reads a zero-size box at the click point, so the popup
  * lands at the cursor. Left-click is untouched (it still enters the project); we only
  * intercept the secondary click and suppress the native OS menu.
  */
 function ProjectRailContextMenu({
-  projectName,
-  onOpenSettings,
+  tree,
   children,
-}: {
-  projectName: string;
-  onOpenSettings: () => void;
-  children: ReactNode;
-}) {
+  ...actions
+}: { tree: ProjectTree; children: ReactNode } & ProjectRailActions) {
   const reduced = useReducedMotion();
   const [open, setOpen] = useState(false);
   // The cursor point the menu anchors to, kept in a ref so the virtual anchor's
@@ -173,7 +265,7 @@ function ProjectRailContextMenu({
       <BaseMenu.Portal>
         <BaseMenu.Positioner anchor={anchor.current} side="right" align="start" sideOffset={2}>
           <BaseMenu.Popup
-            aria-label={`Project ${projectName} settings`}
+            aria-label={`Project ${tree.project.name} actions`}
             className={cn(
               "z-50 min-w-44 origin-[var(--transform-origin)] rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg outline-none",
             )}
@@ -189,13 +281,65 @@ function ProjectRailContextMenu({
               />
             }
           >
-            <MenuItem icon={<SlidersHorizontalIcon />} onClick={onOpenSettings}>
-              Project settings
-            </MenuItem>
+            <ProjectRailMenuItems tree={tree} {...actions} />
           </BaseMenu.Popup>
         </BaseMenu.Positioner>
       </BaseMenu.Portal>
     </BaseMenu.Root>
+  );
+}
+
+/**
+ * `<SortableProjectTile>` — one drag-sortable project tile of the rail (v2.5.6, task
+ * `01KXBNX51EPQ69MVKYG4W960HD`). The rebranch of v1's `sortable-project-item.tsx` into the ACTIVE
+ * shell's rail: the OUTER `<li>` is the PLAIN element dnd-kit owns (`useSortable`'s `ref`), so it
+ * drives the tile's transform during a drag/reflow while Motion (the `<ActiveRail>` indicator)
+ * owns only its own animation — separate elements, nothing to fight (the same split v1 used).
+ *
+ * Whole-tile drag with the 5px pointer activation (`reorderSensors`): a plain click still ENTERS
+ * the project and the right-click context menu still fires (a click under 5px is never a drag), so
+ * the drag never breaks the phase-2/3 rail affordances. A drop hands the new project id order to
+ * `reorderProjects` (persisted via `projects_reorder`).
+ */
+function SortableProjectTile({
+  tree,
+  index,
+  active,
+  railActions,
+  onEnter,
+}: {
+  tree: ProjectTree;
+  index: number;
+  active: boolean;
+  railActions: ProjectRailActions;
+  onEnter: () => void;
+}) {
+  const { ref, isDragging } = useSortable({ id: tree.project.id, index });
+  return (
+    <li ref={ref} className={cn("group relative", isDragging && "opacity-60")}>
+      {/* Right-click the tile → the project actions (v2.5.6 finding #24: the RIGHT-CLICK menu is
+          the ONLY entry point — no visible 3-dot kebab trigger); left-click still enters. */}
+      <ProjectRailContextMenu tree={tree} {...railActions}>
+        <button
+          type="button"
+          onClick={onEnter}
+          aria-current={active}
+          aria-label={`Project ${tree.project.name}`}
+          title={tree.project.name}
+          className={cn(
+            "flex size-9 items-center justify-center rounded-lg bg-muted font-medium text-xs text-foreground/85 transition-transform hover:scale-105",
+            active && "ring-2 ring-primary/60",
+          )}
+        >
+          {projectInitial(tree.project)}
+        </button>
+      </ProjectRailContextMenu>
+      {/* The active-selection indicator shows ONLY on the entered tile; the aggregated run-state
+          dot shows on the OTHER (non-active) tiles — masked on the active one and hidden when the
+          aggregate is quiet. */}
+      {active ? <ActiveRail layoutId="rail-project" /> : null}
+      <ProjectRailDot project={tree} active={active} />
+    </li>
   );
 }
 
@@ -216,8 +360,16 @@ function ProjectRailContextMenu({
  * project's runtime. No raw hex, no magic px — tokens and the token-backed scale only.
  */
 export function BaseLayout() {
-  const { projects, createProject, createWorkspace, updateProject, setProjectResumeAgentSessions } =
-    useProjects();
+  const {
+    projects,
+    createProject,
+    createWorkspace,
+    updateProject,
+    deleteProject,
+    deleteWorkspace,
+    reorderProjects,
+    setProjectResumeAgentSessions,
+  } = useProjects();
   const { activeProjectId, setActiveProjectId } = useActiveProject();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navigate = useNavigate();
@@ -229,13 +381,25 @@ export function BaseLayout() {
   // so reconciling there killed the previous project's terminals (and their agents) on every switch.
   useReconcileTerminals();
 
-  // The rail's "+ Add project" flow — the SAME picker→create-modal→`create_project` path the
-  // old sidebar head used, reused verbatim via `useManualAdd` (no new backend, no duplicated
-  // folder-picker/dialog wiring). `addProject` opens the native folder picker then the create
-  // modal (folder read-only + editable name); on confirm it calls the v2.1 `create_project` and
-  // the new project appears in the rail (the projects list re-lists on success). `dialog` is the
-  // mounted modal set, rendered once below.
-  const { addProject, dialog: manualAddDialog } = useManualAdd({ createProject, createWorkspace });
+  // The rail's project/workspace CRUD flows — the SAME picker→modal→backend paths the old
+  // sidebar head + project kebab used, reused verbatim via `useManualAdd` (no new backend, no
+  // duplicated folder-picker/dialog wiring):
+  //   - `addProject` opens the native folder picker then the create modal (folder read-only +
+  //     editable name); on confirm it calls `create_project` and the new project appears in the
+  //     rail;
+  //   - `addWorkspace` opens the picker then the add-workspace name dialog (`create_workspace`);
+  //   - `removeProject` / `removeWorkspace` open the DESTRUCTIVE-confirm dialog before dropping a
+  //     project (`delete_project`) or a single non-root workspace (`workspace_delete`) — so the
+  //     kebab's destructive actions always route through an explicit confirmation.
+  // `dialog` is the mounted modal set (create/edit/delete project + add workspace), rendered once
+  // below. Rename is NOT taken from here — the kebab opens the project-settings modal for that.
+  const {
+    addProject,
+    addWorkspace,
+    removeProject,
+    removeWorkspace,
+    dialog: manualAddDialog,
+  } = useManualAdd({ createProject, createWorkspace, deleteProject, deleteWorkspace });
 
   // The global Settings modal (gear at the foot of the rail → Integrations). The dialog
   // stays mounted (Motion animates its exit); we pull a fresh provider list ON THE OPEN
@@ -302,66 +466,76 @@ export function BaseLayout() {
       __nyxWork?: {
         createProject: (name: string, rootPath: string, rootName?: string) => Promise<unknown>;
         listProjects: () => ProjectTree[];
+        reorderProjects: (ids: string[]) => void;
       };
     };
     win.__nyxWork = {
       createProject: (name, rootPath, rootName) => createProject(name, rootPath, rootName),
       listProjects: () => projects,
+      // Drive the SAME project reorder the rail drag commits (`projects_reorder` → persisted
+      // `order_index`). The WebDriver Actions pointer API is unusable in this Electron harness
+      // (`Browser.getWindowForTarget` unsupported), so the reorder gate drives this real callback
+      // and still asserts the DOM rail order changed + survived a relaunch (honest persistence).
+      reorderProjects: (ids) => reorderProjects(ids),
     };
     return () => {
       delete (window as unknown as { __nyxWork?: unknown }).__nyxWork;
     };
-  }, [createProject, projects]);
+  }, [createProject, projects, reorderProjects]);
 
   return (
     <div className="grid h-svh grid-cols-[60px_1fr] bg-background text-foreground">
       <aside className="flex h-svh flex-col items-center border-r border-border/60 bg-muted/40 py-3">
-        <ul className="flex flex-col items-center gap-1.5">
-          {projects.map((tree) => {
-            const active = tree.project.id === activeProjectId;
-            return (
-              <li key={tree.project.id} className="relative">
-                {/* Right-click the tile → "Project settings" (the per-project entry point;
-                    left-click still enters the project). */}
-                <ProjectRailContextMenu
-                  projectName={tree.project.name}
-                  onOpenSettings={() => setProjectSettingsTree(tree)}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setActiveProjectId(tree.project.id)}
-                    aria-current={active}
-                    aria-label={`Project ${tree.project.name}`}
-                    title={tree.project.name}
-                    className={cn(
-                      "flex size-9 items-center justify-center rounded-lg bg-muted font-medium text-xs text-foreground/85 transition-transform hover:scale-105",
-                      active && "ring-2 ring-primary/60",
-                    )}
-                  >
-                    {projectInitial(tree.project)}
-                  </button>
-                </ProjectRailContextMenu>
-                {/* The active-selection indicator shows ONLY on the entered tile; the
-                    aggregated run-state dot shows on the OTHER (non-active) tiles — it is
-                    masked on the active one (the detail is already on screen) and hides itself
-                    when the aggregate is quiet. */}
-                {active ? <ActiveRail layoutId="rail-project" /> : null}
-                <ProjectRailDot project={tree} active={active} />
-              </li>
-            );
-          })}
-          <li>
-            <button
-              type="button"
-              onClick={() => void addProject()}
-              className="flex size-9 items-center justify-center rounded-lg border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-              aria-label="Add project"
-              title="Add project"
-            >
-              <PlusIcon className="size-4" />
-            </button>
-          </li>
-        </ul>
+        {/* DRAG-REORDER the rail's PROJECTS (v2.5.6): one `DragDropProvider` around the project
+            tiles (the "+ add project" tile is not sortable). A drop reorders the tree
+            optimistically and persists via `projects_reorder` (`reorderProjects`), so the order
+            survives a reload. Reuses the SAME dnd-kit setup as the terminal rows. */}
+        <DragDropProvider
+          sensors={reorderSensors}
+          onDragEnd={(event) => {
+            if (event.canceled) return;
+            const ids = projects.map((p) => p.project.id);
+            const next = move(ids, event);
+            if (!sameOrder(next, ids)) void reorderProjects(next);
+          }}
+        >
+          <ul className="flex flex-col items-center gap-1.5">
+            {projects.map((tree, index) => {
+              const active = tree.project.id === activeProjectId;
+              // The project CRUD actions, threaded into the right-click context menu (the sole
+              // entry point — finding #24). Rename opens the project-settings modal (its Global
+              // pane owns `update_project`); the destructive actions route through `useManualAdd`'s
+              // confirm dialogs (`removeProject` / `removeWorkspace`).
+              const railActions = {
+                onOpenSettings: () => setProjectSettingsTree(tree),
+                onAddWorkspace: () => void addWorkspace(tree),
+                onRemoveWorkspace: (ws: WorkspaceRecord) => removeWorkspace(ws),
+                onDeleteProject: () => removeProject(tree),
+              };
+              return (
+                <SortableProjectTile
+                  key={tree.project.id}
+                  tree={tree}
+                  index={index}
+                  active={active}
+                  railActions={railActions}
+                  onEnter={() => setActiveProjectId(tree.project.id)}
+                />
+              );
+            })}
+            <li>
+              <button
+                type="button"
+                onClick={() => void addProject()}
+                className="flex size-9 items-center justify-center rounded-lg border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                aria-label="Add project"
+                title="Add project"
+              >
+                <PlusIcon className="size-4" />
+              </button>
+            </li>
+          </ul>
+        </DragDropProvider>
 
         <div className="my-4 h-px w-7 bg-border/60" />
 
@@ -442,6 +616,11 @@ export function BaseLayout() {
         <Outlet />
       </div>
 
+      {/* The OS close-warning guard: intercepts the WM close / quit and confirms before
+          dropping LIVE agent sessions. Mounted once on the always-mounted shell so the
+          guard is live on every screen; renders nothing until the OS asks to close. */}
+      <CloseGuard />
+
       {/* The add-project modal set (folder picker → create modal). Mounted once, portalled. */}
       {manualAddDialog}
 
@@ -453,14 +632,13 @@ export function BaseLayout() {
         onClose={() => setSettingsOpen(false)}
       />
 
-      {/* Project-settings modal (rail tile right-click → "Project settings"). In this
-          phase-1 shell entry point the Global pane exposes ONLY the `resume_agent_sessions`
-          toggle (persisted via `set_project_resume_agent_sessions`); the rename field is
-          hidden (`showRename={false}`) because project rename/delete belong to the PRD-B
-          kebab CRUD. `onRename` stays wired so PRD-B (and the default-`true` callers) are
-          unchanged. Resolve the LIVE tree from `projects` (not the captured snapshot) so the
-          toggle reflects optimistic tree updates immediately; fall back to the captured tree
-          until the live one is found. */}
+      {/* Project-settings modal (rail kebab / right-click → "Project settings"). Its Global
+          pane owns the project RENAME (`showRename` — `update_project`) alongside the
+          `resume_agent_sessions` toggle (`set_project_resume_agent_sessions`); this is the
+          rename half of the PRD-B kebab CRUD (the delete half + add/remove workspace live in
+          the kebab's `useManualAdd` confirm dialogs). Resolve the LIVE tree from `projects`
+          (not the captured snapshot) so the name + toggle reflect optimistic tree updates
+          immediately; fall back to the captured tree until the live one is found. */}
       {(() => {
         const targetId = projectSettingsTree?.project.id ?? null;
         const liveTree =
@@ -482,8 +660,9 @@ export function BaseLayout() {
             importWorkspaceId={manageWorkspace?.id ?? null}
             workspacePath={manageWorkspace?.path ?? null}
             initialSection="global"
-            // Phase-1: expose only the resume toggle; rename/delete (kebab CRUD) = PRD-B.
-            showRename={false}
+            // PRD-B: the Global pane now exposes the project rename (kebab CRUD) alongside
+            // the resume toggle. Rename persists via `update_project`.
+            showRename
             onRename={(name) => (targetId ? updateProject(targetId, name) : Promise.resolve())}
             onResumeChange={(resume) =>
               targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve()

@@ -504,13 +504,13 @@ describe("BaseLayout — global Settings entry point (Integrations)", () => {
 /**
  * The per-project settings entry point rebranched into the active shell (base-layout). The
  * removed `<TerminalManager>` owned the ONLY surface that mounted `<ProjectSettingsDialog>`;
- * this shell restores it via a right-click "Project settings" on the rail tile. The Global
- * pane's `resume_agent_sessions` toggle is wired to `set_project_resume_agent_sessions` — the
- * setting that was previously reachable only through a manual database edit.
+ * this shell restores it via a right-click / kebab "Project settings" on the rail tile. The
+ * Global pane's `resume_agent_sessions` toggle is wired to `set_project_resume_agent_sessions`
+ * — the setting that was previously reachable only through a manual database edit.
  *
- * Phase-1 SCOPE: this entry point exposes ONLY the resume toggle — the rename field is hidden
- * (`showRename={false}`) because project rename/delete belong to the PRD-B kebab CRUD. The
- * shell must not introduce a new, functional project-rename capability in phase 1.
+ * PRD-B SCOPE: the Global pane now ALSO exposes the project rename (`showRename` →
+ * `update_project`) as the rename half of the kebab CRUD — the resume toggle keeps working
+ * alongside it.
  */
 describe("BaseLayout — project settings entry point (resume toggle)", () => {
   function installResumeBackend(calls: { cmd: string; args: Record<string, unknown> }[]): void {
@@ -549,17 +549,17 @@ describe("BaseLayout — project settings entry point (resume toggle)", () => {
     // The per-project entry point: right-click the tile → a "Project settings" context menu.
     const tile = await screen.findByRole("button", { name: "Project Alpha" });
     fireEvent.contextMenu(tile);
-    const item = await screen.findByRole("menuitem", { name: "Project settings" });
+    const item = await screen.findByRole("menuitem", { name: "Project settings for Alpha" });
     fireEvent.click(item);
 
     // The project-settings modal opens on Global, exposing the resume toggle (off by default).
     const toggle = await screen.findByRole("switch", { name: /resume agent sessions/i });
     expect(toggle).toHaveAttribute("aria-checked", "false");
 
-    // Phase-1 scope: this entry point does NOT expose a functional project-rename (rename/
-    // delete = PRD-B kebab CRUD). The Name field and its Save button must be absent.
-    expect(screen.queryByLabelText("Project name")).toBeNull();
-    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+    // PRD-B: the Global pane now ALSO exposes the project rename (Name field + Save) — the
+    // rename half of the kebab CRUD, wired to `update_project`.
+    expect(screen.getByLabelText("Project name")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Save" })).toBeTruthy();
 
     // Flipping it persists immediately via the backend command, scoped to THIS project id.
     fireEvent.click(toggle);
@@ -569,7 +569,156 @@ describe("BaseLayout — project settings entry point (resume toggle)", () => {
     const call = calls.find((c) => c.cmd === "set_project_resume_agent_sessions");
     expect(call?.args.id).toBe("p1");
     expect(call?.args.resume).toBe(true);
-    // And no rename ever reached the backend from this phase-1 entry point.
+    // Toggling resume alone never fires a rename (the Name field was left untouched).
     expect(calls.some((c) => c.cmd === "update_project")).toBe(false);
+  });
+});
+
+/**
+ * The project CRUD rebranched onto the rail (PRD-B) — reached via the tile's RIGHT-CLICK context
+ * menu (v2.5.6 finding #24: the ⋮ kebab trigger was removed, right-click is the sole entry point).
+ * It drives project RENAME (via the project-settings modal → `update_project`), DELETE project
+ * (`delete_project`), and ADD / REMOVE workspace (`create_workspace` / `workspace_delete`). The two
+ * destructive actions sit behind an explicit CONFIRMATION step, and every action routes to the SAME
+ * backend command the old sidebar kebab used.
+ */
+describe("BaseLayout — project right-click CRUD", () => {
+  function ws(id: string, projectId: string, name: string, isRoot: boolean): WorkspaceRecord {
+    return {
+      id,
+      project_id: projectId,
+      name,
+      path: `/${id}`,
+      branch: null,
+      is_root: isRoot,
+      collapsed: false,
+      created_at: 0,
+      updated_at: 0,
+    };
+  }
+
+  // One project (Alpha) with a root workspace "main" + one NON-root workspace "api" (so the
+  // kebab offers a per-workspace remove). Captures every IPC call so a test can assert the
+  // exact command + args a kebab action fired.
+  function installCrudBackend(calls: { cmd: string; args: Record<string, unknown> }[]): void {
+    mockIPC((cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      calls.push({ cmd, args: a });
+      switch (cmd) {
+        case "list_projects":
+          return [project("p1", "Alpha")];
+        case "list_workspaces":
+          return [ws("root-p1", "p1", "main", true), ws("api-p1", "p1", "api", false)];
+        case "workspace_runtime_snapshot":
+          return {
+            workspace: { id: a.workspaceId as string, name: "root", path: "/x" },
+            terminals: [],
+            agent_sessions: [],
+            services: [],
+          };
+        case "agent_active_sessions":
+        case "agent_activity_snapshot":
+          return [];
+        // The kebab CRUD commands — all succeed (undefined = Ok).
+        case "update_project":
+        case "create_workspace":
+        case "delete_project":
+        case "workspace_delete":
+          return undefined;
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  // Open the project's actions via the tile's RIGHT-CLICK menu (no visible kebab — finding #24).
+  async function openActions(): Promise<void> {
+    const tile = await screen.findByRole("button", { name: "Project Alpha" });
+    fireEvent.contextMenu(tile);
+  }
+
+  it("shows NO visible kebab (⋮) trigger on a rail tile (right-click only)", async () => {
+    installCrudBackend([]);
+    renderLayout();
+    // The tile is present, but there is no visible 3-dot actions button anymore.
+    await screen.findByRole("button", { name: "Project Alpha" });
+    expect(screen.queryByRole("button", { name: "Project actions for Alpha" })).toBeNull();
+  });
+
+  it("right-click → Project settings renames the project via update_project", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    installCrudBackend(calls);
+    renderLayout();
+
+    await openActions();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Project settings for Alpha" }));
+
+    // Rename lives in the settings modal's Global pane (per the task's reuse of
+    // project-settings-dialog). Edit the Name and Save.
+    const nameField = await screen.findByLabelText("Project name");
+    fireEvent.change(nameField, { target: { value: "Alpha Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(calls.some((c) => c.cmd === "update_project")).toBe(true));
+    const call = calls.find((c) => c.cmd === "update_project");
+    expect(call?.args.id).toBe("p1");
+    expect(call?.args.name).toBe("Alpha Renamed");
+  });
+
+  it("right-click → Add workspace creates a workspace via create_workspace", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    installCrudBackend(calls);
+    // The folder picker resolves to this path; the add dialog then opens.
+    bridgeFake().pickedDirectory = "/home/kris/api";
+    renderLayout();
+
+    await openActions();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Add workspace to Alpha" }));
+
+    // The add-workspace name dialog opens (folder read-only + editable name); confirm it.
+    const nameField = await screen.findByRole("textbox", { name: /workspace name/i });
+    fireEvent.change(nameField, { target: { value: "api" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add workspace" }));
+
+    await waitFor(() => expect(calls.some((c) => c.cmd === "create_workspace")).toBe(true));
+    const call = calls.find((c) => c.cmd === "create_workspace");
+    expect(call?.args.projectId).toBe("p1");
+    expect(call?.args.path).toBe("/home/kris/api");
+  });
+
+  it("right-click → Delete project asks to confirm BEFORE deleting via delete_project", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    installCrudBackend(calls);
+    renderLayout();
+
+    await openActions();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete project Alpha" }));
+
+    // A destructive-confirm step appears — nothing is deleted until it is confirmed.
+    const confirm = await screen.findByRole("button", { name: "Delete" });
+    expect(calls.some((c) => c.cmd === "delete_project")).toBe(false);
+
+    fireEvent.click(confirm);
+    await waitFor(() => expect(calls.some((c) => c.cmd === "delete_project")).toBe(true));
+    expect(calls.find((c) => c.cmd === "delete_project")?.args.id).toBe("p1");
+  });
+
+  it("right-click → Remove <workspace> asks to confirm BEFORE deleting via workspace_delete", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    installCrudBackend(calls);
+    renderLayout();
+
+    await openActions();
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Remove workspace api from Alpha" }),
+    );
+
+    // The single-workspace destructive-confirm step; nothing is removed until confirmed.
+    const confirm = await screen.findByRole("button", { name: "Remove workspace" });
+    expect(calls.some((c) => c.cmd === "workspace_delete")).toBe(false);
+
+    fireEvent.click(confirm);
+    await waitFor(() => expect(calls.some((c) => c.cmd === "workspace_delete")).toBe(true));
+    expect(calls.find((c) => c.cmd === "workspace_delete")?.args.id).toBe("api-p1");
   });
 });

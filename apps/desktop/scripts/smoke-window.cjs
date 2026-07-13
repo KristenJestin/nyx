@@ -7,8 +7,10 @@
  *
  *   1. window is created and FRAMELESS (no native frame);
  *   2. renderer has NO Node integration (`require`/`process`/`module` undefined);
- *   3. the ONLY injected global is `window.nyxWindow`, exposing EXACTLY the four
- *      allowlisted methods (no `ipcRenderer`, no extra channels);
+ *   3. the ONLY injected global is `window.nyxWindow`, exposing EXACTLY the eight
+ *      allowlisted methods (close, confirmClose, controlsVisible, homeDir, minimize,
+ *      onCloseRequested, pickDirectory, toggleMaximize) — no `ipcRenderer`, no extra
+ *      channels;
  *   4. the allowlisted IPC actually round-trips (`controlsVisible()` returns a bool;
  *      `toggleMaximize()` flips `isMaximized()`).
  *
@@ -90,11 +92,14 @@ app.whenReady().then(async () => {
   // (3) only the allowlisted bridge, exact methods, no ipcRenderer
   if (report.hasIpcRenderer) return fail("ipcRenderer leaked into the renderer");
   if (report.bridge !== "object") return fail(`window.nyxWindow missing (typeof=${report.bridge})`);
-  // The allowlisted window-control surface: the frameless chrome controls plus the two
+  // The allowlisted window-control surface: the frameless chrome controls; the two
   // MAIN-process resolvers the contract routes through the window bridge (`pickDirectory`
-  // — the native folder picker — and `homeDir` — `AppPathsBridge.homeDir`), added when the
-  // nyxBridge Electron adapter landed. Sorted (Object.keys order) for a stable assertion.
-  const expected = "close,controlsVisible,homeDir,minimize,pickDirectory,toggleMaximize";
+  // — the native folder picker — and `homeDir` — `AppPathsBridge.homeDir`); and the
+  // close-guard pair (`onCloseRequested` — the OS close-requested push the agent
+  // close-warning subscribes to — and `confirmClose` — proceed with the real close).
+  // Sorted (Object.keys order) for a stable assertion.
+  const expected =
+    "close,confirmClose,controlsVisible,homeDir,minimize,onCloseRequested,pickDirectory,toggleMaximize";
   if (report.keys !== expected) return fail(`nyxWindow keys = "${report.keys}", expected "${expected}"`);
   console.log(`[smoke-window] allowlisted bridge exposes exactly [${expected}] ✓`);
 

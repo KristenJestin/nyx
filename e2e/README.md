@@ -76,6 +76,47 @@ key in `specDataDir`) like the restore pair:
 The seed uses two seams (no new production code): the shell `window.__nyx` seam to seed the
 runtime, and the **real MCP loopback** (fixed `NYX_MCP_PORT`) to seed the agent session.
 
+### v2.5.6 cockpit-rebranch gate (`specs/cockpit-v256-*.e2e.cjs`)
+
+The v2.5.6 "Cockpit de pilotage" gate (PRD `01KXBNX508EYHSQ1CW7RWYKV95`, task
+`01KXBNX51EPQ69MVKYG4W960HE`). The v2.2 cockpit screen + its `#/cockpit/…` route are **gone**
+(PDR-0025) and `<TerminalManager>`'s `window.__nyx` seam with them, so these specs drive the
+**current multi-page shell** (Terminals / Work / Knowledge) through the seams it actually
+publishes — `window.__nyxWork` (`{ createProject, listProjects }`, base-layout) and the
+per-terminal `window.__nyxDeck` / `window.__nyxDeckInput` (terminal-deck) — plus the real DOM
+(rail project tiles, the Terminals sidebar tree, `[data-terminal-id]` deck panes,
+`[data-terminal-row]` sortables). Shared drivers live in `specs/cockpit-v256-helpers.cjs`; the
+MCP-loopback + git-repo primitives are reused verbatim from `cockpit-helpers.cjs`, and the
+handoff primitive (`makeHandoff`) from `restore-helpers.cjs`.
+
+- **`cockpit-v256-close-warning`** — the CHROME leg: min/max/close+drag are the **WM's** (out of
+  scope), so it validates the one piece of chrome nyx owns — the **close-warning** guard. It
+  MCP-seeds a **live agent session** on a non-resuming project, fires the OS `close-requested`
+  push from the main process (`browser.electron.execute`), and asserts the guard withholds the
+  close and lists the session; **Keep open** leaves the window intact.
+- **`cockpit-v256-crud`** — the rail project **kebab CRUD**: rename project (settings → Save),
+  add workspace (folder picker patched in main), remove workspace, delete project; plus the
+  kebab⇄right-click parity and the section-nav (v2.2 non-regression).
+- **`cockpit-v256-terminals`** — per-terminal affordances: a **live** workspace terminal (typed
+  via `__nyxDeck`), **inline rename**, the **CPU/RAM hover tooltip**, **per-row close**, the
+  **loose ("libres")** band, and Ctrl+T / Ctrl+W (v2.2 non-regression).
+- **`cockpit-v256-reorder-01-seed` → `-02-verify`** — a seed→verify pair sharing the
+  `cockpit-v256-reorder` `NYX_DATA_DIR` key: **drag-reorder** terminal rows AND rail projects,
+  turn the **resume-agent-sessions** toggle on, then **relaunch** and assert both orders + the
+  restored terminals (live PTYs) + the persisted resume setting survive the quit (reorder-persist
+  + v2.2/v2.5.5 non-regression).
+
+Run just this gate (avoiding the stale `cockpit-0*` / pre-shell specs):
+
+```sh
+cd e2e && bun install
+bun run test -- --spec ./specs/cockpit-v256-close-warning.e2e.cjs \
+               --spec ./specs/cockpit-v256-crud.e2e.cjs \
+               --spec ./specs/cockpit-v256-terminals.e2e.cjs \
+               --spec ./specs/cockpit-v256-reorder-01-seed.e2e.cjs \
+               --spec ./specs/cockpit-v256-reorder-02-verify.e2e.cjs
+```
+
 ### The other journeys
 
 `commands`, `workspace`, `typing`, `sidebar-redesign`, `rail-and-list`, `idle-replay`

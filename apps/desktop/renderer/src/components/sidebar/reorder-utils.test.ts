@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { spliceWorkspaceOrder } from "./reorder-utils";
+import { sortByOrder, spliceWorkspaceOrder } from "./reorder-utils";
 import type { TerminalRecord } from "./use-terminals";
 
 function term(id: string, workspaceId: string | null): TerminalRecord {
@@ -76,5 +76,47 @@ describe("spliceWorkspaceOrder — LOOSE group (workspace_id == null, 01KV2V4AWT
     const next = spliceWorkspaceOrder(terminals, null, ["L2", "L1"]);
     // The workspace terminal A stays first; the two loose swap.
     expect(next).toEqual(["A", "L2", "L1"]);
+  });
+});
+
+describe("sortByOrder (live-order overlay for the cockpit runtime tree)", () => {
+  const idOf = (t: { id: string }) => t.id;
+
+  it("reorders items to follow the authoritative global order", () => {
+    // A workspace's snapshot rows (snapshot order A,B,C) sorted by the optimistic global order
+    // after a drag moved them to C,A,B.
+    const rows = [{ id: "A" }, { id: "B" }, { id: "C" }];
+    expect(sortByOrder(rows, ["X", "C", "Y", "A", "B"], idOf)).toEqual([
+      { id: "C" },
+      { id: "A" },
+      { id: "B" },
+    ]);
+  });
+
+  it("is a stable identity when the order already matches", () => {
+    const rows = [{ id: "A" }, { id: "B" }];
+    expect(sortByOrder(rows, ["A", "B"], idOf)).toEqual([{ id: "A" }, { id: "B" }]);
+  });
+
+  it("keeps ranked items first and sinks UNRANKED ones to the end in their original order", () => {
+    // `fresh` is absent from the global order (a terminal added since, or a pre-load empty order):
+    // it must NOT be dropped — it keeps its place at the end.
+    const rows = [{ id: "fresh" }, { id: "B" }, { id: "A" }];
+    expect(sortByOrder(rows, ["A", "B"], idOf)).toEqual([
+      { id: "A" },
+      { id: "B" },
+      { id: "fresh" },
+    ]);
+  });
+
+  it("returns the items unchanged when the order is empty (pre-load safety)", () => {
+    const rows = [{ id: "A" }, { id: "B" }, { id: "C" }];
+    expect(sortByOrder(rows, [], idOf)).toEqual(rows);
+  });
+
+  it("skips order ids absent from the items (a row closed since the reorder)", () => {
+    const rows = [{ id: "A" }, { id: "C" }];
+    // `B` is in the global order but no longer in this group's rows — it is simply not emitted.
+    expect(sortByOrder(rows, ["C", "B", "A"], idOf)).toEqual([{ id: "C" }, { id: "A" }]);
   });
 });

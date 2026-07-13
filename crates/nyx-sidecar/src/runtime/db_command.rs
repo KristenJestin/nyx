@@ -113,12 +113,14 @@ pub fn dispatch(
             topic: "commands".to_string(),
         });
     } else if mutates_terminals(command) {
-        // A terminal RECORD mutation driven by the UI path (create/close/attach/auto-attach)
-        // broadcasts `terminals://changed`, SYMMETRIC to the MCP terminal tools (which emit
-        // the same topic via `emit_effects`, `mcp_tools_core.rs:1447/1664`). Without this the
-        // v2.2 cockpit read model (`useWorkspaceRuntime`, which re-pulls on `terminals://changed`)
-        // never refreshes for a UI-initiated terminal mutation — the case the MCP path already
-        // covered but the UI path did not (review 01KWKH7TE86AXS41Q4VS2CEXCW).
+        // A terminal RECORD mutation driven by the UI path (create/close/attach/auto-attach, and
+        // the v2.5.6 label `rename`) broadcasts `terminals://changed`, SYMMETRIC to the MCP terminal
+        // tools (which emit the same topic via `emit_effects`, `mcp_tools_core.rs:1447/1664`).
+        // Without this the cockpit read model (`useWorkspaceRuntime`, which re-pulls on
+        // `terminals://changed`) never refreshes for a UI-initiated terminal mutation — the case the
+        // MCP path already covered but the UI path did not (review 01KWKH7TE86AXS41Q4VS2CEXCW). See
+        // `mutates_terminals` for why `rename` now belongs here (the tree row reads `label` from the
+        // snapshot).
         //
         // NO reconciliation loop: the ONLY subscribers to `terminals://changed` are pure
         // READERS — `useWorkspaceRuntime` re-pulls `workspace_runtime_snapshot` and
@@ -1794,20 +1796,29 @@ fn mutates_review_comments(command: &str) -> bool {
 /// The terminal RECORD-MUTATING DB commands whose UI path must broadcast `terminals://changed`
 /// — SYMMETRIC to the MCP terminal tools (`create_terminal`/`close_terminal`/`attach_terminal`
 /// emit `ChangedTopic::Terminals` via `emit_effects`). These flip a terminal record's existence
-/// or workspace binding, which the v2.2 cockpit runtime aggregate contains, so every surface
-/// that re-pulls on `terminals://changed` (`useWorkspaceRuntime`, `useTerminals`) reflects the
-/// mutation live — WITHOUT polling (review 01KWKH7TE86AXS41Q4VS2CEXCW).
+/// or workspace binding, which the runtime aggregate contains, so every surface that re-pulls on
+/// `terminals://changed` (`useWorkspaceRuntime`, `useTerminals`) reflects the mutation live —
+/// WITHOUT polling (review 01KWKH7TE86AXS41Q4VS2CEXCW).
 ///
-/// EXCLUDED on purpose: the pure sidebar-local ops (`reorder`, `rename`, `set_active`,
-/// `persist_scrollback`, `set_terminal_cwd`, `terminal_exec_mark_read`) — they do not change the
-/// runtime aggregate's shape (which terminals exist / where they are bound), and the sidebar
-/// already folds them in optimistically. `auto_attach_terminal` is INCLUDED but emits only when
-/// it actually re-bound (`changed == true`); it is handled at its call-site, not by this list,
-/// because the emission is conditional on the resolver's decision.
+/// `rename` is INCLUDED (v2.5.6 cockpit rebranch): the runtime tree ROW now renders the terminal's
+/// display name from `label` in the `workspace_runtime_snapshot` (`WorkspaceTerminal` flattens the
+/// persisted `Terminal`), NOT from the sidebar's optimistic `useTerminals` store. So a UI rename
+/// that only updated `terminals.label` (no push) left the tree row showing the OLD name until an
+/// unrelated `terminals://changed` or a relaunch — the inline rename looked broken. Broadcasting
+/// here re-pulls the snapshot so the row repaints with the new label at once. The label is aggregate
+/// CONTENT (what the row shows), even though it is not aggregate SHAPE — the old exclusion conflated
+/// the two. Still safe: the only `terminals://changed` subscribers are pure READERS (no re-mutation,
+/// no loop — see the emission note above).
+///
+/// EXCLUDED on purpose: the pure sidebar-local ops (`reorder`, `set_active`, `persist_scrollback`,
+/// `set_terminal_cwd`, `terminal_exec_mark_read`) — they carry their own optimistic renderer state
+/// (`reorder` drives the tree's optimistic order; a re-pull would clobber it). `auto_attach_terminal`
+/// is INCLUDED but emits only when it actually re-bound (`changed == true`); it is handled at its
+/// call-site, not by this list, because the emission is conditional on the resolver's decision.
 fn mutates_terminals(command: &str) -> bool {
     matches!(
         command,
-        "create_terminal" | "close_terminal" | "attach_terminal"
+        "create_terminal" | "close_terminal" | "attach_terminal" | "rename"
     )
 }
 
@@ -2528,8 +2539,10 @@ mod tests {
             "close_terminal broadcast terminals://changed once more"
         );
 
-        // A NON-shape terminal op (rename) does NOT broadcast — it does not change which
-        // terminals exist / where they are bound, so the aggregate shape is untouched.
+        // A label `rename` DOES broadcast (v2.5.6 cockpit): the runtime tree row renders the
+        // terminal's display name from `label` in `workspace_runtime_snapshot`, so the snapshot must
+        // re-pull for the row to repaint with the new name. It is aggregate CONTENT (not shape), but
+        // the row reads it, so the surface must refresh live.
         let before = h.terminals_changed();
         let t2 = h
             .run(
@@ -2547,8 +2560,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             h.terminals_changed(),
-            after_create,
-            "rename does NOT broadcast terminals://changed (no aggregate-shape change)"
+            after_create + 1,
+            "rename broadcasts terminals://changed so the tree row (which reads label from the \
+             snapshot) repaints with the new name"
         );
     }
 

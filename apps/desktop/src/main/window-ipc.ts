@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 
 import { WINDOW_CHANNELS } from "../shared/ipc";
 import { windowControlsVisible } from "./env";
+import { confirmWindowClose } from "./window";
 
 /** Resolve the BrowserWindow that sent an IPC message (or undefined if gone). */
 function senderWindow(event: IpcMainInvokeEvent): BrowserWindow | null {
@@ -44,6 +45,13 @@ export function registerWindowIpc(): void {
 
   ipcMain.handle(WINDOW_CHANNELS.close, (event) => {
     senderWindow(event)?.close();
+  });
+
+  // The renderer's close-guard says "go ahead" (no live agent session, or the user
+  // confirmed): proceed with the real close, bypassing the `close` withhold guard.
+  ipcMain.handle(WINDOW_CHANNELS.confirmClose, (event) => {
+    const win = senderWindow(event);
+    if (win) confirmWindowClose(win);
   });
 
   // Resolved from the OS env in the main process (the renderer can't read it).

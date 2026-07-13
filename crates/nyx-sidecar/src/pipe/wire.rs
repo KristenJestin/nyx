@@ -107,6 +107,11 @@ pub const EVT_CHANGED: u8 = 7;
 // OS busy-state transition for a terminal (v2.5.5 review T1). Keyed by the persistent
 // RECORD id (NOT the live pty id) so the renderer folds it directly onto the record.
 pub const EVT_PTY_BUSY_STATE: u8 = 8;
+// Per-terminal CPU%/RAM reading (FEEDBACK #28 / v2.5.6). Keyed by the persistent RECORD id.
+// CPU is carried as an INTEGER (`cpu_milli`, thousandths of a percent) so the whole envelope
+// stays MessagePack-int only — the TS `msgpack-mini` subset (and the `Event`/`Message` `Eq`
+// derive) reject floats; the supervisor divides by 1000 back to a float `cpu_pct` for the UI.
+pub const EVT_TERMINAL_STATS: u8 = 9;
 
 /// Stable, machine-matchable error codes (mirrored in TS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +336,21 @@ pub enum Event {
     /// directly onto its record, and the runtime tree re-pulls the snapshot whose overlaid
     /// `busy` bit then lights the LINE's `running` dot). Independent of OSC 133 / exec-state.
     PtyBusyState { record_id: String, busy: bool },
+    /// A per-terminal CPU%/RAM reading (FEEDBACK #28 / v2.5.6): the process-tree resource use of
+    /// the terminal RECORD `record_id` (its shell + every descendant), sampled by the stats poll
+    /// ([`crate::runtime::stats_poll`]) on a fixed cadence and pushed EVERY tick (a pure stream,
+    /// not transition-gated — CPU% moves constantly). Keyed by the persistent RECORD id so the
+    /// renderer reads it per terminal LINE without masking the name (non-inline: shown on hover).
+    ///
+    /// `cpu_milli` is the CPU percentage in THOUSANDTHS of a percent (`cpu_pct * 1000`, rounded)
+    /// — an integer so the envelope carries no float (the `Eq` derive + the TS msgpack subset
+    /// forbid one); the supervisor divides by 1000 to the float `cpu_pct` the UI formats.
+    /// `mem_bytes` is the summed resident memory (RSS) of the tree, in bytes.
+    TerminalStats {
+        record_id: String,
+        cpu_milli: u32,
+        mem_bytes: u64,
+    },
     /// A managed-command run-state / ack / output-cleared transition (the wire shape of
     /// the v1 `command://state` / `command://ack` / `command://output-cleared`).
     CommandState {
@@ -685,6 +705,19 @@ pub fn encode_message(msg: &Message) -> Vec<u8> {
                     rmpv::Value::Boolean(*busy),
                 ]),
             ),
+            Event::TerminalStats {
+                record_id,
+                cpu_milli,
+                mem_bytes,
+            } => (
+                CAT_EVENT,
+                EVT_TERMINAL_STATS,
+                rmpv::Value::Array(vec![
+                    rmpv::Value::String(record_id.clone().into()),
+                    (*cpu_milli as u64).into(),
+                    (*mem_bytes).into(),
+                ]),
+            ),
             Event::CommandState {
                 event,
                 instance_id,
@@ -913,6 +946,13 @@ pub fn decode_message(bytes: &[u8]) -> Result<Message, DecodeError> {
             busy: val_bool(fields.get(1).ok_or_else(|| bad("pty_busy.busy"))?)
                 .ok_or_else(|| bad("pty_busy.busy"))?,
         }),
+        (CAT_EVENT, EVT_TERMINAL_STATS) => Message::Event(Event::TerminalStats {
+            record_id: val_str(&fields[0]).ok_or_else(|| bad("terminal_stats.record"))?,
+            cpu_milli: val_u32(fields.get(1).ok_or_else(|| bad("terminal_stats.cpu"))?)
+                .ok_or_else(|| bad("terminal_stats.cpu"))?,
+            mem_bytes: val_u64(fields.get(2).ok_or_else(|| bad("terminal_stats.mem"))?)
+                .ok_or_else(|| bad("terminal_stats.mem"))?,
+        }),
         (CAT_EVENT, EVT_COMMAND_STATE) => Message::Event(Event::CommandState {
             event: val_str(&fields[0]).ok_or_else(|| bad("cmd_state.event"))?,
             instance_id: val_str(fields.get(1).ok_or_else(|| bad("cmd_state.iid"))?)
@@ -985,6 +1025,18 @@ mod tests {
         roundtrip(Message::Event(Event::PtyBusyState {
             record_id: "term-xyz".into(),
             busy: false,
+        }));
+        // v2.5.6 FEEDBACK #28: the per-terminal CPU%/RAM reading, keyed by the record id, CPU as
+        // integer milli-percent (no float on the wire) + RSS bytes.
+        roundtrip(Message::Event(Event::TerminalStats {
+            record_id: "term-abc".into(),
+            cpu_milli: 1_234,
+            mem_bytes: 356_515_840,
+        }));
+        roundtrip(Message::Event(Event::TerminalStats {
+            record_id: "term-idle".into(),
+            cpu_milli: 0,
+            mem_bytes: 0,
         }));
     }
 

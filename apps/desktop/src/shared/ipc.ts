@@ -30,6 +30,23 @@ export const WINDOW_CHANNELS = {
   /** Close the main window (honors the renderer-side close-warning flow upstream). */
   close: "nyx:window/close",
   /**
+   * MAIN → RENDERER push (`webContents.send` ↔ `ipcRenderer.on`, NOT an invoke): the
+   * OS asked to close the window (WM close button / Alt-F4 / a `app.quit`). Main
+   * WITHHOLDS the real close (`event.preventDefault`) and emits this so the renderer
+   * can run the agent close-warning guard; the renderer then either lets it close
+   * (`confirmClose`) or keeps the window open. This is the shell-side hook the
+   * contract's `window.onCloseRequested` subscribes to.
+   */
+  closeRequested: "nyx:window/close-requested",
+  /**
+   * RENDERER → MAIN invoke: PROCEED with the real close after the close-guard cleared
+   * or the user confirmed. It marks the window as confirmed (so the `close` guard no
+   * longer withholds) and closes it — the escape hatch out of the `closeRequested`
+   * withhold. Distinct from `close` so a plain programmatic close still routes through
+   * the guard, while this is the guard's own "go ahead" that bypasses it.
+   */
+  confirmClose: "nyx:window/confirm-close",
+  /**
    * Resolve whether the custom window controls should render, from the OS env
    * `NYX_WINDOW_CONTROLS` (`"0"` hides; unset/any other value = visible). The
    * renderer cannot read `process.env`, so the main process is the only place the
@@ -114,8 +131,20 @@ export interface NyxWindowApi {
   minimize(): Promise<void>;
   /** Toggle maximize ⇄ restore; resolves to the resulting maximized state. */
   toggleMaximize(): Promise<boolean>;
-  /** Close the window. */
+  /** Close the window (routes through the main-process close guard). */
   close(): Promise<void>;
+  /**
+   * Subscribe to the OS "window close requested" push (the WM close button / Alt-F4 /
+   * quit). Main withholds the real close and fires this so the renderer can run its
+   * agent close-warning guard. Returns an unsubscribe. The handler runs BEFORE the
+   * window is destroyed — the renderer proceeds via {@link confirmClose} or keeps it.
+   */
+  onCloseRequested(handler: () => void): () => void;
+  /**
+   * Proceed with the REAL close after the guard cleared / the user confirmed. Bypasses
+   * the main-process close guard so it does not re-prompt.
+   */
+  confirmClose(): Promise<void>;
   /** Whether the custom controls should be shown (see `NYX_WINDOW_CONTROLS`). */
   controlsVisible(): Promise<boolean>;
   /** Open the OS folder picker; resolve the chosen path, or `null` if cancelled. */

@@ -7,6 +7,8 @@ import { useManualAdd } from "@/components/sidebar/use-manual-add";
 import { SidebarShell } from "@/components/ui/sidebar-shell";
 import { ProjectCommandsDialog } from "@/components/command/project-commands-dialog";
 import { ProjectSettingsDialog } from "@/components/sidebar/project-settings-dialog";
+import { TerminalStatsProvider } from "@/components/sidebar/use-terminal-stats";
+import { TerminalRenameProvider } from "@/components/sidebar/use-terminal-rename";
 import { PagePlaceholder } from "./page-placeholder";
 import { useActiveProject } from "./active-project";
 import { useProjectRuntime } from "./use-project-runtime";
@@ -15,6 +17,8 @@ import { ConsumedNotificationsProvider } from "./use-consumed-notifications";
 import { RuntimePaneHost } from "./runtime-pane-host";
 import { WorkspaceAccordion } from "./workspace-accordion";
 import { useTerminalActions } from "./use-terminal-actions";
+import { TerminalCloseProvider } from "./use-terminal-close";
+import { TerminalReorderProvider } from "./use-terminal-reorder";
 import { useLazyResume } from "./use-lazy-resume";
 import { useIdleUnload } from "./use-idle-unload";
 import { RestorePlanProvider } from "./use-restore-plan";
@@ -109,7 +113,11 @@ export function TerminalsPage() {
   }
 
   return (
-    <>
+    // The ONE `terminal://stats` subscription for the whole page (FEEDBACK #28): mounted OUTSIDE
+    // the project-keyed selection provider so it persists across project switches (no churn), and
+    // as an ancestor of every terminal row so each reads its live CPU%/RAM (shown on hover only —
+    // non-inline). Cheap when nothing streams (an empty map).
+    <TerminalStatsProvider>
       {/* Keyed by project so ENTERING a different project (or returning to Terminals) gives a
           fresh selection state — the auto-select effect then RESTORES that project's last active
           terminal (persisted) rather than the previous project's selection leaking across the
@@ -158,7 +166,7 @@ export function TerminalsPage() {
         onResumeChange={(resume) => setProjectResumeAgentSessions(activeTree.project.id, resume)}
         onClose={() => setProjectSettingsOpen(false)}
       />
-    </>
+    </TerminalStatsProvider>
   );
 }
 
@@ -205,8 +213,44 @@ function TerminalsBody({
   // Restore the old shell's terminal management, recabled to the page selection: Ctrl+T (new
   // terminal in the SELECTED terminal's workspace, else loose), Ctrl+W (close selected), the
   // Ctrl+Tab / Ctrl+PageUp-Down cycle — all via the REUSED sidebar hooks (finding 50). The
-  // section "+" calls `newTerminalInWorkspace` for a specific workspace.
-  const { newTerminalInWorkspace } = useTerminalActions(allTerminals);
+  // section "+" calls `newTerminalInWorkspace` for a specific workspace. v2.5.6 also surfaces the
+  // per-row rename/close callbacks.
+  //
+  // The FALLBACK workspace for a Ctrl+T that cannot inherit a workspace from the selection: the
+  // active project's ROOT (else its first) workspace. v2.5.6 finding #26 forbids unattached
+  // terminals, so Ctrl+T attaches here instead of spawning a loose terminal (only a project with
+  // NO workspaces leaves this null → the hook's last-resort loose fallback).
+  const fallbackWorkspace = useMemo(() => {
+    const ws = workspaces.find((w) => w.is_root) ?? workspaces[0] ?? null;
+    return ws ? { id: ws.id, path: ws.path } : null;
+  }, [workspaces]);
+
+  const {
+    newTerminalInWorkspace,
+    closeTerminal,
+    renameTerminal,
+    reorderTerminals,
+    orderedTerminalIds,
+  } = useTerminalActions(allTerminals, fallbackWorkspace);
+
+  // INERT e2e seam (`window.__nyxReorderTerminals`), GATED behind VITE_NYX_E2E=1 (tree-shaken out
+  // of a production build). Exposes the SAME within-group terminal reorder the drag commits
+  // (`reorderTerminals` → `reorder` IPC → persisted `order_index`). The reorder gate drives it
+  // because the WebDriver Actions pointer API is unusable in this Electron harness
+  // (`Browser.getWindowForTarget` unsupported), so a simulated drag never fires the dnd-kit sensor;
+  // the spec still asserts the DOM row order actually changed AND survived a real relaunch (honest
+  // persistence), so it fails if the product reorder regresses.
+  useEffect(() => {
+    if (import.meta.env.VITE_NYX_E2E !== "1") return;
+    (
+      window as unknown as {
+        __nyxReorderTerminals?: (group: string | null, ids: string[]) => void;
+      }
+    ).__nyxReorderTerminals = (group, ids) => reorderTerminals(group, ids);
+    return () => {
+      delete (window as unknown as { __nyxReorderTerminals?: unknown }).__nyxReorderTerminals;
+    };
+  }, [reorderTerminals]);
 
   // The "new command" gear opens the SHARED project command manager (`<ProjectCommandsDialog>` —
   // the exact modal the old sidebar gear opened), scoped to the clicked workspace for the import
@@ -281,83 +325,113 @@ function TerminalsBody({
   }, [selected, projectId]);
 
   return (
-    <div className="flex h-svh bg-background text-foreground">
-      <SidebarShell
-        aria-label="Workspaces"
-        header={
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <h1 className="truncate font-semibold text-sm text-foreground" title={projectName}>
-                {projectName}
-              </h1>
-              <p className="text-2xs uppercase tracking-wide text-muted-foreground">Terminals</p>
-            </div>
-            <div className="flex shrink-0 items-center gap-1.5">
-              {/* Project settings (gear) — the VISIBLE, discoverable entry point to the project's
+    // Thread the per-row RENAME + CLOSE callbacks to every terminal row (in the workspace tree)
+    // via context — the reused `use-terminal-rename` provider + the sibling close provider — so a
+    // row's inline rename / "×" acts WITHOUT prop-drilling through the accordion/tree chain.
+    <TerminalRenameProvider rename={renameTerminal}>
+      <TerminalCloseProvider close={closeTerminal}>
+        {/* DRAG-REORDER wiring (v2.5.6): threads the group reorder callback + the live global
+            order to every terminal row (in the workspace tree) via context, so a drag persists
+            (backend `reorder` → `order_index`) and the tree repaints in the new order without
+            prop-drilling. */}
+        <TerminalReorderProvider
+          reorderTerminals={reorderTerminals}
+          orderedIds={orderedTerminalIds}
+        >
+          <div className="flex h-svh bg-background text-foreground">
+            <SidebarShell
+              aria-label="Workspaces"
+              header={
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <h1
+                      className="truncate font-semibold text-sm text-foreground"
+                      title={projectName}
+                    >
+                      {projectName}
+                    </h1>
+                    <p className="text-2xs uppercase tracking-wide text-muted-foreground">
+                      Terminals
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {/* Project settings (gear) — the VISIBLE, discoverable entry point to the project's
                   settings (the Global pane's `resume_agent_sessions` toggle). It surfaces in the
                   active project's header the SAME `<ProjectSettingsDialog>` the rail tile's
                   right-click "Project settings" opens (base-layout), so the reglage is findable
                   instead of hidden behind a context menu. */}
-              <button
-                type="button"
-                onClick={onOpenProjectSettings}
-                className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-                aria-label="Project settings"
-                title="Project settings"
-              >
-                <SettingsIcon className="size-4" />
-              </button>
-              {/* Add a WORKSPACE (folder) to the entered project — the existing folder-picker →
+                    <button
+                      type="button"
+                      onClick={onOpenProjectSettings}
+                      className="flex size-7 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                      aria-label="Project settings"
+                      title="Project settings"
+                    >
+                      <SettingsIcon className="size-4" />
+                    </button>
+                    {/* Add a WORKSPACE (folder) to the entered project — the existing folder-picker →
                   name-dialog → create_workspace flow, surfaced here in the current shell (the
                   capability existed but was only wired into the removed sidebar). */}
-              <button
-                type="button"
-                onClick={onAddWorkspace}
-                className="flex size-7 shrink-0 items-center justify-center rounded-md border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-                aria-label="Add workspace"
-                title="Add workspace"
-              >
-                <FolderPlusIcon className="size-4" />
-              </button>
-            </div>
+                    <button
+                      type="button"
+                      onClick={onAddWorkspace}
+                      className="flex size-7 shrink-0 items-center justify-center rounded-md border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                      aria-label="Add workspace"
+                      title="Add workspace"
+                    >
+                      <FolderPlusIcon className="size-4" />
+                    </button>
+                  </div>
+                </div>
+              }
+            >
+              {/* The workspace accordions fill the sidebar; they scroll when the content grows past
+                the viewport. (v2.5.6 finding #26 removed the "loose terminals" foot band — no
+                terminal is surfaced unattached to a workspace anymore.) */}
+              <div className="flex min-h-full flex-col">
+                <nav className="flex-1">
+                  {workspaces.length === 0 ? (
+                    <p className="px-4 py-3 text-sm italic text-muted-foreground/70">
+                      No workspaces in this project.
+                    </p>
+                  ) : (
+                    workspaces.map((workspace, index) => (
+                      <WorkspaceAccordion
+                        key={workspace.id}
+                        workspace={workspace}
+                        snapshot={runtimeByWorkspace.get(workspace.id) ?? null}
+                        defaultOpen={index === 0}
+                        onNewTerminal={() =>
+                          void newTerminalInWorkspace(workspace.id, workspace.path)
+                        }
+                        onNewCommand={() =>
+                          setCommandsFor({ id: workspace.id, path: workspace.path })
+                        }
+                      />
+                    ))
+                  )}
+                </nav>
+              </div>
+            </SidebarShell>
+
+            <main className="min-w-0 flex-1">
+              <RuntimePaneHost terminals={allTerminals} services={allServices} />
+            </main>
+
+            {/* The shared command manager modal (create/edit commands), opened by a Commands-section
+              gear. Reuses the old sidebar's `<ProjectCommandsDialog>` verbatim. */}
+            <ProjectCommandsDialog
+              open={commandsFor !== null}
+              projectId={projectId}
+              projectName={projectName}
+              importWorkspaceId={commandsFor?.id ?? null}
+              workspacePath={commandsFor?.path ?? null}
+              onClose={() => setCommandsFor(null)}
+            />
           </div>
-        }
-      >
-        <nav>
-          {workspaces.length === 0 ? (
-            <p className="px-4 py-3 text-sm italic text-muted-foreground/70">
-              No workspaces in this project.
-            </p>
-          ) : (
-            workspaces.map((workspace, index) => (
-              <WorkspaceAccordion
-                key={workspace.id}
-                workspace={workspace}
-                snapshot={runtimeByWorkspace.get(workspace.id) ?? null}
-                defaultOpen={index === 0}
-                onNewTerminal={() => void newTerminalInWorkspace(workspace.id, workspace.path)}
-                onNewCommand={() => setCommandsFor({ id: workspace.id, path: workspace.path })}
-              />
-            ))
-          )}
-        </nav>
-      </SidebarShell>
-
-      <main className="min-w-0 flex-1">
-        <RuntimePaneHost terminals={allTerminals} services={allServices} />
-      </main>
-
-      {/* The shared command manager modal (create/edit commands), opened by a Commands-section
-          gear. Reuses the old sidebar's `<ProjectCommandsDialog>` verbatim. */}
-      <ProjectCommandsDialog
-        open={commandsFor !== null}
-        projectId={projectId}
-        projectName={projectName}
-        importWorkspaceId={commandsFor?.id ?? null}
-        workspacePath={commandsFor?.path ?? null}
-        onClose={() => setCommandsFor(null)}
-      />
-    </div>
+        </TerminalReorderProvider>
+      </TerminalCloseProvider>
+    </TerminalRenameProvider>
   );
 }
 

@@ -27,6 +27,14 @@ const nyxWindow: NyxWindowApi = {
   toggleMaximize: () =>
     ipcRenderer.invoke(WINDOW_CHANNELS.toggleMaximize) as Promise<boolean>,
   close: () => ipcRenderer.invoke(WINDOW_CHANNELS.close) as Promise<void>,
+  onCloseRequested: (handler: () => void) => {
+    // Wrap so the page-supplied handler never sees the raw `IpcRendererEvent`; the
+    // close-requested push carries no payload — it's a bare "the OS wants to close".
+    const listener = (_e: IpcRendererEvent) => handler();
+    ipcRenderer.on(WINDOW_CHANNELS.closeRequested, listener);
+    return () => ipcRenderer.removeListener(WINDOW_CHANNELS.closeRequested, listener);
+  },
+  confirmClose: () => ipcRenderer.invoke(WINDOW_CHANNELS.confirmClose) as Promise<void>,
   controlsVisible: () =>
     ipcRenderer.invoke(WINDOW_CHANNELS.controlsVisible) as Promise<boolean>,
   pickDirectory: (title) =>

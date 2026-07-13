@@ -29,7 +29,8 @@
     "package": "node scripts/package.cjs",
     "smoke:package": "node scripts/smoke-package.cjs",
     "smoke:data-dir": "bun test src/main/identity.test.ts",
-    "smoke:sidecar-derivation": "bun test src/main/sidecar.test.ts"
+    "smoke:sidecar-derivation": "bun test src/main/sidecar.test.ts",
+    "smoke:quit-guard": "bun test src/main/quit-guard.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

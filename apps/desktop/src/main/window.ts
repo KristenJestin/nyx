@@ -19,7 +19,28 @@
 import { join } from "node:path";
 import { BrowserWindow, shell, type App } from "electron";
 
+import { WINDOW_CHANNELS } from "../shared/ipc";
 import { devServerUrl } from "./env";
+
+/**
+ * Windows whose close has been CONFIRMED by the renderer's close-guard (agent
+ * close-warning cleared / the user chose "Close anyway"). The `close` guard installed
+ * in {@link createMainWindow} withholds the real close and asks the renderer FIRST;
+ * once a window is in this set the guard steps aside and lets it close. A `WeakSet`
+ * so a destroyed window is collected without bookkeeping.
+ */
+const confirmedClose = new WeakSet<BrowserWindow>();
+
+/**
+ * PROCEED with the real close of `win` after the renderer's close-guard cleared it —
+ * the target of the `nyx:window/confirm-close` IPC. Marks the window confirmed so the
+ * `close` guard no longer withholds, then closes it (which re-fires `close`, now a
+ * no-op pass-through). Idempotent: a second call on an already-closing window is safe.
+ */
+export function confirmWindowClose(win: BrowserWindow): void {
+  confirmedClose.add(win);
+  if (!win.isDestroyed()) win.close();
+}
 
 /**
  * Build and show the main window. Returns the created `BrowserWindow` so the caller
@@ -56,6 +77,21 @@ export function createMainWindow(app: App): BrowserWindow {
   // Show only once the page is ready to paint (no incremental-render flash).
   win.once("ready-to-show", () => {
     win.show();
+  });
+
+  // --- Close guard: agent close-warning before the window is destroyed --------
+  // The frameless window is closed by the user's WM (its close button / Alt-F4 /
+  // quit) — nyx draws no close control of its own (they are the WM's job). WITHHOLD
+  // that OS close and ask the RENDERER first: it runs the agent close-warning flow
+  // (`agent_close_warnings`) and, only when clear or the user confirms, calls back
+  // `confirmWindowClose` (the `confirm-close` IPC) which re-enters here having set the
+  // confirmed flag, so the window actually closes. Fail-safe: if the webContents is
+  // already gone (no one to ask), let the close proceed so the window is never trapped.
+  win.on("close", (event) => {
+    if (confirmedClose.has(win)) return;
+    if (win.webContents.isDestroyed()) return;
+    event.preventDefault();
+    win.webContents.send(WINDOW_CHANNELS.closeRequested);
   });
 
   // --- Navigation lockdown (official security checklist 12 & 13) --------------

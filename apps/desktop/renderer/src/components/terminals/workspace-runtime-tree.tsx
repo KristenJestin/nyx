@@ -1,11 +1,28 @@
-import { PlusIcon, ServerCogIcon, Settings2Icon, SquareTerminalIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import {
+  PencilIcon,
+  PlusIcon,
+  ServerCogIcon,
+  Settings2Icon,
+  SquareTerminalIcon,
+  XIcon,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Tooltip } from "@/components/ui/tooltip";
 import { CommandControls } from "@/components/command/command-controls";
 import { agentProviderFor } from "@/components/sidebar/agent-providers";
 import type { AgentActivity } from "@/components/sidebar/use-agent-sessions";
+import { useRenameTerminal } from "@/components/sidebar/use-terminal-rename";
+import {
+  formatBytes,
+  formatCpuPct,
+  useTerminalStatsFor,
+} from "@/components/sidebar/use-terminal-stats";
 import { RuntimeRow } from "./runtime-row";
+import { useCloseTerminal } from "./use-terminal-close";
+import { SortableTerminalRows } from "./sortable-terminal-rows";
 import { RuntimeSection, RuntimeSectionList } from "./runtime-section";
 import {
   activeAgentSession,
@@ -88,15 +105,17 @@ export function WorkspaceRuntimeTree({
           ) : null
         }
       >
-        <RuntimeSectionList
+        {/* DRAG-REORDER (v2.5.6): the workspace's terminals are drag-sortable within this group
+            (never across workspaces). A drop persists via the reorder context (backend `reorder`
+            → each terminal's `order_index`); the 5px pointer activation keeps the row's click /
+            rename / close intact. */}
+        <SortableTerminalRows
+          terminals={terminals}
+          group={snapshot.workspace.id}
           empty="No open terminals."
-          rows={terminals.map((terminal) => (
-            <TerminalRow
-              key={terminal.id}
-              terminal={terminal}
-              activity={agentActivity?.(terminal.id)}
-            />
-          ))}
+          renderRow={(terminal) => (
+            <TerminalRow terminal={terminal} activity={agentActivity?.(terminal.id)} />
+          )}
         />
       </RuntimeSection>
 
@@ -138,8 +157,21 @@ export function WorkspaceRuntimeTree({
  * Its DOT is the TWO-MODE fold ({@link terminalLineState}, review T2): for an agent-hosting line
  * the live agent activity (working/waiting/ready) primes the dot; otherwise the OS busy/exec_state
  * terminal mode (task T1). `activity` is this terminal's live activity entry (`byActivity.get`).
+ *
+ * ## v2.5.6 cockpit affordances
+ *  - CPU%/RAM (FEEDBACK #28) show ONLY as a hover TOOLTIP (`RuntimeRow`'s `tooltip`) — NON-inline,
+ *    so the reading never masks/truncates the terminal name (the firm constraint). The stats come
+ *    from the shared `terminal://stats` map (one subscription for all rows).
+ *  - RENAME inline (`use-terminal-rename`): a hover pencil or a double-click on the name swaps it
+ *    for an `<Input>` (Enter/blur commit, Esc cancels), pinning a MANUAL label via the context
+ *    rename callback.
+ *  - CLOSE per row (`use-terminal-close`): a hover "×" closes THIS terminal by id (previously only
+ *    Ctrl+W, which targets the selected one).
+ *
+ * Exported so the Terminals page's LOOSE-terminals band (`workspace_id == null`) reuses the exact
+ * same row — those terminals get the identical icon/dot/stats/rename/close behaviour.
  */
-function TerminalRow({
+export function TerminalRow({
   terminal,
   activity,
 }: {
@@ -192,6 +224,47 @@ function TerminalRow({
   // liveness unconfirmed) badges the row so the doubt reads at a glance beside the run-state dot.
   const doubtful = liveSession?.state === "unknown";
 
+  // PER-TERMINAL CPU%/RAM (FEEDBACK #28) — NON-INLINE: the live process-tree reading for THIS
+  // terminal from the shared `terminal://stats` map (one subscription for all rows), shown ONLY as
+  // a hover TOOLTIP so it never masks/truncates the terminal name. `null` before the first tick →
+  // no tooltip (the row is unchanged until a reading arrives).
+  const stats = useTerminalStatsFor(terminal.id);
+  const statsTooltip = stats
+    ? `CPU ${formatCpuPct(stats.cpuPct)} · RAM ${formatBytes(stats.memBytes)}`
+    : undefined;
+
+  // RENAME inline (v2.5.6): the context rename callback pins a MANUAL label (wins over the auto
+  // name) or clears it back to auto-naming with `null`. `editing` toggles the inline `<Input>`
+  // (opened by the hover pencil or a double-click on the name); `draft` is its controlled value,
+  // seeded from the current displayed name so the user edits FROM what they see.
+  const rename = useRenameTerminal();
+  const close = useCloseTerminal();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const beginRename = () => {
+    setDraft(terminal.label?.trim() ? terminal.label : typeof label === "string" ? label : "");
+    setEditing(true);
+  };
+
+  // Commit the draft: a TRIMMED non-empty value pins a manual label; empty clears it back to
+  // auto-naming (`null`). Skip the round-trip when unchanged from the persisted label.
+  const commitRename = () => {
+    setEditing(false);
+    const trimmed = draft.trim();
+    const next = trimmed ? trimmed : null;
+    const current = terminal.label?.trim() ? terminal.label.trim() : null;
+    if (next !== current) rename(terminal.id, next);
+  };
+
+  // Focus + select-all once the input shows, so the user can immediately overwrite or tweak.
+  useEffect(() => {
+    if (editing) inputRef.current?.select();
+  }, [editing]);
+
+  const nameForLabels = typeof label === "string" ? label : terminal.id;
+
   return (
     <RuntimeRow
       selection={selection}
@@ -199,6 +272,80 @@ function TerminalRow({
       label={label}
       state={dotState}
       badge={doubtful ? <LifecycleBadge state="unknown" /> : undefined}
+      tooltip={statsTooltip}
+      editing={editing}
+      onLabelDoubleClick={beginRename}
+      editor={
+        <Input
+          ref={inputRef}
+          aria-label={`Rename terminal ${nameForLabels}`}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commitRename();
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              setEditing(false);
+            }
+          }}
+          // h-5 (20px) matches the label's line-box (text-sm ⇒ line-height 20px) so entering /
+          // leaving rename does NOT change the row height (v2.5.6 finding #25). The shared
+          // `py-1.5` wrapper (runtime-row) then yields the SAME 32px row in both states; a taller
+          // h-6 (24px) grew the row by +4px on edit.
+          className="h-5 w-full min-w-0 px-1.5 py-0 text-sm"
+        />
+      }
+      actions={
+        !editing ? (
+          <>
+            {/* RENAME (v2.5.6): a hover pencil opening the inline editor — the discoverable twin of
+                the double-click on the name. `stopPropagation` so it never also selects the row. */}
+            <Tooltip label="Rename terminal">
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Rename terminal ${nameForLabels}`}
+                // stopPropagation on BOTH pointerdown AND click: with the reorder sensor's
+                // `preventActivation: () => false` (reorder-dnd.ts:18-29), a pointerdown+drag that
+                // reached this button would otherwise START a row drag. Swallowing pointerdown here
+                // keeps the drag off this control (the click still fires → rename opens).
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  beginRename();
+                }}
+              >
+                <PencilIcon />
+              </Button>
+            </Tooltip>
+            {/* CLOSE (v2.5.6): a per-row "×" that closes THIS terminal (by id), so the user is no
+                longer limited to Ctrl+W on the selected one. `stopPropagation` so closing never
+                also selects the row. */}
+            <Tooltip label="Close terminal">
+              <Button
+                variant="ghost-destructive"
+                size="icon-xs"
+                aria-label={`Close terminal ${nameForLabels}`}
+                // stopPropagation on pointerdown too (same reason as the pencil above): the reorder
+                // sensor opts out of preventActivation, so without this a pointerdown+drag on the ×
+                // could start a row drag. The click still fires → the terminal closes.
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  close(terminal.id);
+                }}
+              >
+                <XIcon />
+              </Button>
+            </Tooltip>
+          </>
+        ) : undefined
+      }
     />
   );
 }

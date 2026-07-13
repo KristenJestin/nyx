@@ -82,17 +82,27 @@ contract wraps it in an `Unsubscribe` the caller MUST run on teardown.
 
 ## Window controls — `@tauri-apps/api/window` → `bridge.window`
 
-| Tauri API                             | Call-site                    | Contract method            |
-| ------------------------------------- | ---------------------------- | -------------------------- |
-| `getCurrentWindow().minimize()`       | `chrome/window-controls.tsx` | `window.minimize()`        |
-| `getCurrentWindow().toggleMaximize()` | `chrome/window-controls.tsx` | `window.toggleMaximize()`  |
-| `getCurrentWindow().close()`          | `chrome/window-controls.tsx` | `window.close()`           |
-| `data-tauri-drag-region` (DOM attr)   | `chrome/chrome-bar.tsx`      | `window.dragRegionProps()` |
+| Tauri API                             | Call-site                    | Contract method             |
+| ------------------------------------- | ---------------------------- | --------------------------- |
+| `getCurrentWindow().minimize()`       | `chrome/window-controls.tsx` | `window.minimize()`         |
+| `getCurrentWindow().toggleMaximize()` | `chrome/window-controls.tsx` | `window.toggleMaximize()`   |
+| `getCurrentWindow().close()`          | `chrome/window-controls.tsx` | `window.close()`            |
+| — (no Tauri-API equivalent)           | `chrome/close-guard.tsx`     | `window.onCloseRequested()` |
+| — (no Tauri-API equivalent)           | `chrome/close-guard.tsx`     | `window.confirmClose()`     |
+| `data-tauri-drag-region` (DOM attr)   | `chrome/chrome-bar.tsx`      | `window.dragRegionProps()`  |
 
-**Close interception**: `window-controls.tsx` first calls `agent_close_warnings`
-(via `chrome/close-warning.ts`) and only `window.close()`s when there are no live
-sessions to drop / the user confirms. The contract keeps the policy in the caller;
-`close()` is the unconditional action.
+**Close interception**: the agent close-warning is centralized in the MAIN process
+(no longer a caller concern). The Electron shell WITHHOLDS every OS window close (WM
+close button / Alt-F4 / quit — the quit gesture routes `win.close()` through the same
+guard) and pushes `nyx:window/close-requested`. `<CloseGuard>` (`chrome/close-guard.tsx`,
+mounted from `terminals/base-layout.tsx`) subscribes via `window.onCloseRequested()`,
+runs `agent_close_warnings` (via `chrome/close-warning.ts`), and proceeds with
+`window.confirmClose()` only when there are no live sessions to drop / the user confirms
+— which clears the guard so the real close goes through. Consequently `close()` is NO
+longer an unconditional action: under the Electron shell it re-enters this same
+main-process guard. (`window-controls.tsx`'s custom X button additionally runs a
+caller-side warning check before it calls `close()`.) The `onCloseRequested`/`confirmClose`
+pair are Electron-shell close-guard seams with no direct `@tauri-apps/api/window` mapping.
 
 ## Folder picker — `@tauri-apps/plugin-dialog` → `pickDirectory`
 
