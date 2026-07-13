@@ -24,7 +24,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5.5 | Reprise & cycle de vie des sessions agent | ✅ livré (mergé) |
 | v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 🚧 en cours |
 | v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📋 PRD prêt |
-| v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📝 PRD rédigé (draft) |
+| v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📋 PRD prêt |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -223,7 +223,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 ## v2.5.8 - Contextes agents : livraison du harnais (injecté, générique multi-provider)
 
-**Status: draft** — PRD `01KXC80E2CDSNN9PPMJFJFE3X7` (contexte `/nspec` rédigé ; dev/coder/auditor/doc à co-rédiger)
+**Status: ready** — PRD `01KXC80E2CDSNN9PPMJFJFE3X7` (6 contextes rédigés : spec/dev/coder/auditor/doc/prototype)
 
 > Finit ce que v2.4 avait **promis mais pas livré**. Le RENDER des contextes existe (`agent_context`, en *pull*, rôles dev/coder/auditor) ; la **livraison** (hook push + stubs `/n…`) et les rôles **spec/doc** manquent → le Gate v2.4 « workflow complet **sans Depot** » n'est pas tenu. Point-release qui n'incrémente pas la suite.
 
