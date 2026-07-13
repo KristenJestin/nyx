@@ -23,7 +23,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5 | Diff et review locale | 🌿 développé sur `v2.4-review`, à greffer |
 | v2.5.5 | Reprise & cycle de vie des sessions agent | ✅ livré (mergé) |
 | v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 🚧 en cours |
-| v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📝 PRD rédigé (draft) |
+| v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📋 PRD prêt |
 | v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📝 PRD rédigé (draft) |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
@@ -208,7 +208,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 ## v2.5.7 - Spec révisions : cliché complet (tâches versionnées par révision)
 
-**Status: draft** — PRD `01KXBQ8QVYR887Y1C79V6EEQK4`
+**Status: ready** — PRD `01KXBQ8QVYR887Y1C79V6EEQK4`
 
 > Suivi de v2.4 (Specs). Point-release qui **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
 > Déclencheur : en absorbant Depot, on a constaté que son fork ne clonait que le narratif + une partie des tâches et **perdait des liens** (vécu au fork rev 1→2 du PRD cockpit). Le natif ne doit **pas** reproduire ça.
