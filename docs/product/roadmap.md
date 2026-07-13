@@ -264,6 +264,8 @@ Après validation des usages de v2.0 à v2.6 :
 
 > L'unload / lazy-resume des sessions agent idle (crux = détection d'activité réelle, idée depot
 > `01KX0X3ZZQMEPKBQX30SX47HJF`) est traité en **v2.5.5**.
+>
+> La **machinerie prototype** (design-system rendu, composants mappés, **distill→dev fidèle** — la vraie douleur v1) est capturée en avance dans le PRD `01KXC8WVEYZM32Y1BAPWY3QJPS` (draft), pour ne pas perdre la conception faite en v2.5.8. Le **rôle prototype léger** + son entrée (`/nspec` propose un proto quand c'est graphique) sont livrés dès **v2.5.8**.
 
 Chaque sous-système Depot doit recevoir une décision explicite : **porter, simplifier, remplacer ou supprimer**. Il n'est pas copié par défaut.
 
