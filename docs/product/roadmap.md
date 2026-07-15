@@ -28,6 +28,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
+| tardif | Délégation & reprise cross-machine (handoff continuable) | 🔮 capturé — post-v2.8, position provisoire |
 
 > Le détail des chantiers menés hors de la ligne principale (review v2.4-review, terminal-blocks parké) vit dans
 > [`session-notes.md`](session-notes.md) ; les sections ci-dessous n'en gardent qu'un pointeur.
@@ -282,6 +283,20 @@ Chaque sous-système Depot doit recevoir une décision explicite : **porter, sim
 - archiver le repository Depot en lecture seule.
 
 **Gate final V2 :** nyx couvre les workflows retenus, les données sont migrées, Depot n'est plus requis et il n'existe qu'une seule application et une seule autorité métier.
+
+## Tardif — Délégation & reprise cross-machine (handoff continuable)
+
+**Status: capturé (draft)** — Spec `01KXJS1PMAXT989QGPN34TA8S8` · **position PROVISOIRE**
+
+> Direction validée avec l'utilisateur, figée pour ne pas la perdre. **Un des derniers chantiers** : dépend de tout le socle natif (Spec + knowledge + `domain_events` + harnais v2.5.8) **et** de l'extinction de Depot (v2.8). D'autres tranches non encore définies viendront probablement **avant** — d'où la position provisoire.
+
+- **Besoin** : déléguer un job de dev agent continuable à une machine toujours allumée (serveur maison h24), éteindre son PC, laisser avancer, rapatrier le résultat pour le tester. **Relais séquentiel**, pas de sync concurrente.
+- **nyx = primitives locales pures** (0 réseau/secret) : artefact **auto-contenu** (état Spec/tâches/events/ideas/docs **+** code delta = bundle git + dirty + untracked) · `export`/`import` · **bail** (X en lecture seule sur l'origine pendant la délégation) · **réconciliation pilotée par agent** (union additive + escalade humaine, pas de moteur de merge).
+- **Reprise** = un agent frais `ndev` reprend les tâches ouvertes depuis l'état importé (déjà v2.5.8 + `domain_events`).
+- **Transport = skill SÉPARÉ** (hors nyx) : bouge l'artefact (SSH au choix), déclenche import + `ndev`, rapatrie ; possède connexion + secrets. nyx ne touche jamais au réseau.
+- **Env** = parité **manuelle** sur serveur pré-configuré (nyx détecte/prévient le mismatch, ne provisionne pas).
+
+**Gate :** éteindre le PC en cours de Spec → le serveur reprend et avance seul → rapatriement absorbé par union sans conflit — sans que nyx ne fasse de réseau.
 
 ## Ordre strict
 
