@@ -1,4 +1,5 @@
-//! Integration test for SIDECAR CRASH RECOVERY (Phase 4 — `01KWCJPFP9JSJMRDZGW2E0N905`).
+//! Integration test for SIDECAR CRASH RECOVERY (Phase 4 — `01KWCJPFP9JSJMRDZGW2E0N905`;
+//! crash-UI reverted in v2.5.8 — `01KXJP5FZAXPTNQJBZY1EC0KWD`).
 //!
 //! Spawns the REAL `nyx-sidecar` binary against a fixed data dir, drives it to a serving
 //! state, seeds persisted runtime state that looks like work-in-progress (a managed-command
@@ -8,19 +9,18 @@
 //! asserts, over the pipe, that the relaunched sidecar:
 //!
 //!   * reopened SQLite and rebuilt the persisted state (the seeded rows are queryable again);
-//!   * flagged the previously-`running` instance `interrupted` (surfaced via the
-//!     `recovery_snapshot` db-command) — its liveness could not be confirmed and it was NOT
-//!     blindly relaunched;
-//!   * flipped the previously-`active` agent session to `unknown` (no session is `active`
-//!     after the crash reconcile, because the runtime cannot re-verify it).
+//!   * treated the crash as a CLEAN shutdown — the previously-`active` agent session STAYS
+//!     `active` (NOT flipped to `unknown`), so the normal silent, toggle-gated resume path
+//!     applies. There is NO `interrupted` set and NO crash-recovery card (the v2.5.5 crash-UI
+//!     was reverted): a crash no longer gets any special surfacing.
 //!
 //! The "exactly one relaunch" half of the done-criterion is the SUPERVISOR's single-relaunch
 //! latch, owned by the `Sidecar` manager (`apps/desktop/src/main/sidecar.ts`) and proven
 //! end-to-end by the Electron smoke `apps/desktop/scripts/smoke-crash-recovery.cjs` (steps 3
 //! and 5: a kill yields exactly one `recovering` transition, and a second crash settles
 //! `degraded` without looping). This integration test owns the sidecar-side half: a relaunch
-//! after a real `SIGKILL` reopens the DB, rebuilds state, and marks the doubtful `running`
-//! work interrupted/unknown.
+//! after a real `SIGKILL` reopens the DB, rebuilds state, and leaves the in-flight work as a
+//! silent resume candidate (no interrupted/unknown special handling).
 
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -204,11 +204,12 @@ fn kill_hard(child: &mut Child) {
     }
 }
 
-/// The end-to-end crash-recovery criterion: KILL the running sidecar, RELAUNCH it once
-/// against the same data dir, and assert the reopened+rebuilt state marks the doubtful
-/// `running` work interrupted and the active session unknown.
+/// The end-to-end crash-recovery criterion (v2.5.8 revert): KILL the running sidecar,
+/// RELAUNCH it once against the same data dir, and assert the reopened+rebuilt state treats
+/// the crash as a CLEAN shutdown — the previously-`active` session STAYS `active` (a silent
+/// resume candidate), with NO interrupted set and NO crash-recovery card.
 #[test]
-fn kill_then_relaunch_rebuilds_state_and_flags_interrupted_unknown() {
+fn kill_then_relaunch_rebuilds_state_and_keeps_session_active_no_interrupted() {
     let data_dir = temp_data_dir();
 
     // --- 1. First sidecar run: boot, then seed in-flight state, then CRASH it ---------
@@ -262,8 +263,9 @@ fn kill_then_relaunch_rebuilds_state_and_flags_interrupted_unknown() {
     handshake(&mut stdin2, &mut stdout2, &mut dec2, 1);
 
     // SQLite was reopened + the persisted state rebuilt: the seeded session row is queryable
-    // again (the DB survived the crash), but it is NO LONGER `active` — the crash reconcile
-    // flipped it to `unknown` (liveness unconfirmed).
+    // again (the DB survived the crash) AND it is STILL `active` — a crash is now treated as a
+    // clean shutdown, so the reconcile no longer flips `active -> unknown`. The session is a
+    // silent resume candidate handled by the normal toggle-gated path, not a crash card.
     let active_after = db_command(
         &mut stdin2,
         &mut stdout2,
@@ -275,33 +277,18 @@ fn kill_then_relaunch_rebuilds_state_and_flags_interrupted_unknown() {
     let after: serde_json::Value = serde_json::from_str(&active_after).unwrap();
     assert_eq!(
         after.as_array().map(|a| a.len()),
-        Some(0),
-        "NO session is `active` after the crash reconcile (the previously-active one was \
-         flipped to `unknown`): {active_after}"
+        Some(1),
+        "the previously-active session STAYS `active` after a crash relaunch (no forced \
+         active -> unknown): {active_after}"
     );
-
-    // The previously-`running` instance is flagged `interrupted` — surfaced for the user to
-    // choose, NOT blindly relaunched.
-    let recovery = db_command(
-        &mut stdin2,
-        &mut stdout2,
-        &mut dec2,
-        3,
-        "recovery_snapshot",
-        "{}",
-    );
-    let parsed: serde_json::Value = serde_json::from_str(&recovery).expect("parse recovery json");
-    let interrupted = parsed
-        .get("interrupted")
-        .and_then(|v| v.as_array())
-        .expect("interrupted array");
     assert!(
-        interrupted.iter().any(|v| v.as_str() == Some(&instance_id)),
-        "the previously-running instance {instance_id} is flagged interrupted: {recovery}"
+        active_after.contains("claude_code"),
+        "the still-active session is the seeded claude_code one: {active_after}"
     );
 
     // The instance row is rebuilt + queryable (proves SQLite was reopened and state rebuilt).
-    // We confirm via the DB directly that the snapshot was cleared (no blind relaunch).
+    // No blind relaunch happened: the seeded template does not opt into restart_on_startup, so
+    // the normal boot restore leaves it un-relaunched (and there is no interrupted surface).
     {
         use nyx_core::db::{self, Db};
         let db = Db::open(&data_dir.join("nyx.db")).expect("reopen db for assertion");
@@ -311,8 +298,7 @@ fn kill_then_relaunch_rebuilds_state_and_flags_interrupted_unknown() {
             .expect("the seeded instance row survived the crash + relaunch");
         assert!(
             !row.was_running_on_shutdown,
-            "the crash reconcile cleared the was_running snapshot so the boot restore cannot \
-             blindly relaunch the service"
+            "the normal boot restore reset the was_running snapshot (no blind relaunch)"
         );
     }
 

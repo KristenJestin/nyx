@@ -907,6 +907,90 @@ pub fn set_project_settings(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
     ))
 }
 
+/// Parse the REQUIRED `repos` argument of `project_set_repos`: an array of
+/// `{ relative_path, name? }` objects into [`db::RepoConfig`]s. Missing/not-an-array →
+/// `invalid_argument`; an element that is not an object, or lacks a non-empty
+/// `relative_path`, is rejected. An empty array is accepted (resets to the fallback).
+fn parse_repo_configs(args: &Value) -> Result<Vec<db::RepoConfig>, RpcError> {
+    let arr = match args.get("repos") {
+        Some(Value::Array(arr)) => arr,
+        _ => {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                "missing or invalid required array argument 'repos'",
+            ))
+        }
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let obj = v.as_object().ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidArgument,
+                format!("argument 'repos[{i}]' must be an object {{ relative_path, name? }}"),
+            )
+        })?;
+        let relative_path = obj
+            .get("relative_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                RpcError::new(
+                    RpcCode::InvalidArgument,
+                    format!("argument 'repos[{i}].relative_path' must be a non-empty string"),
+                )
+            })?
+            .to_string();
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        out.push(db::RepoConfig {
+            relative_path,
+            name,
+        });
+    }
+    Ok(out)
+}
+
+/// `project_set_repos` — `{ project_id, repos: [{ relative_path, name? }] }` → `{ repos }`.
+/// Finding #27 (PDR-0013): CONFIGURE a project's repositories EXPLICITLY — the association
+/// that replaces the removed disk auto-detection. A full RECONCILE: the listed repos become
+/// the project's active logical identities (keyed on `(project_id, relative_path)`), and a
+/// repo previously configured but no longer listed is archived. Every workspace/worktree of
+/// the project then DERIVES these repos at `root_path + relative_path` (so
+/// workspace_git/repo_diff/review see each sub-repo). Routes through the SHARED
+/// [`crate::db::set_project_repositories`] — the single write path (PDR-0005). Mutating → a
+/// `repos` changed effect so any open review/cockpit re-pulls. NEVER scans the disk. An
+/// unknown project id is a D8 `invalid_id` error.
+pub fn project_set_repos(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let project_id = require_str(args, "project_id")?;
+    let repos = parse_repo_configs(args)?;
+
+    // Validate the id up front so an unknown project yields a clean `invalid_id` rather than
+    // a silent config on nothing.
+    if db
+        .with_conn(|c| db::get_project(c, project_id))
+        .map_err(internal_db)?
+        .is_none()
+    {
+        return Err(RpcError::new(
+            RpcCode::InvalidId,
+            format!("unknown project {project_id}"),
+        ));
+    }
+
+    let configured = db
+        .with_conn(|c| db::set_project_repositories(c, project_id, &repos))
+        .map_err(internal_db)?;
+    Ok(ToolOutcome::changed(
+        json!({ "repos": configured }),
+        ChangedTopic::Repos,
+    ))
+}
+
 /// `update_command` — `{ command_id, name?, command?, subfolder? }` → `{ command }`.
 /// Partial update; the package.json source-detach rule runs; refused while any instance
 /// is running. Parity with the Tauri `update_command`.
@@ -2046,6 +2130,9 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         crate::mcp::LIST_IMPORTABLE_SCRIPTS_TOOL => read(list_importable_scripts(db, args)),
         // Project settings (rename + resume opt-in) — mutating → workspaces changed.
         crate::mcp::SET_PROJECT_SETTINGS_TOOL => Some(set_project_settings(db, args)),
+        // Explicit repository config (finding #27): SET a project's repos — mutating → repos
+        // changed so any open review/cockpit re-pulls. The SAME `db::set_project_repositories`.
+        crate::mcp::PROJECT_SET_REPOS_TOOL => Some(project_set_repos(db, args)),
         // Command-template CRUD (mutating → carry a `changed` effect).
         crate::mcp::ADD_COMMAND_TOOL => Some(add_command(db, args)),
         crate::mcp::UPDATE_COMMAND_TOOL => Some(update_command(db, runner, args)),
@@ -2333,9 +2420,21 @@ mod tests {
         git(&["commit", "-q", "-m", "init"], &repo);
 
         let db = Db::in_memory();
-        let (_project, root_ws) = db
+        let (project, root_ws) = db
             .with_conn(|c| register_project(c, "Nyx", root.to_str().unwrap(), None))
             .unwrap();
+        // Finding #27: no auto-detection — configure the `api` sub-repo EXPLICITLY.
+        db.with_conn(|c| {
+            db::set_project_repositories(
+                c,
+                &project.id,
+                &[db::RepoConfig {
+                    relative_path: "api".into(),
+                    name: Some("api".into()),
+                }],
+            )
+        })
+        .unwrap();
 
         // Dirty the repo with an untracked file.
         std::fs::write(repo.join("new.txt"), b"new").unwrap();
@@ -2408,9 +2507,21 @@ mod tests {
         git(&["commit", "-q", "-m", "init"], &repo);
 
         let db = Db::in_memory();
-        let (_project, root_ws) = db
+        let (project, root_ws) = db
             .with_conn(|c| register_project(c, "Nyx", root.to_str().unwrap(), None))
             .unwrap();
+        // Finding #27: configure the `api` sub-repo EXPLICITLY (no disk auto-detection).
+        db.with_conn(|c| {
+            db::set_project_repositories(
+                c,
+                &project.id,
+                &[db::RepoConfig {
+                    relative_path: "api".into(),
+                    name: Some("api".into()),
+                }],
+            )
+        })
+        .unwrap();
 
         // The repository_id the tool needs comes from the workspace_git read model.
         let git_summary = workspace_git(&db, &json!({ "workspace_id": root_ws.id })).unwrap();
@@ -2521,9 +2632,21 @@ mod tests {
         git(&["commit", "-q", "-m", "init"], &repo);
 
         let db = Db::in_memory();
-        let (_project, root_ws) = db
+        let (project, root_ws) = db
             .with_conn(|c| register_project(c, "Nyx", root.to_str().unwrap(), None))
             .unwrap();
+        // Finding #27: configure the `api` sub-repo EXPLICITLY (no disk auto-detection).
+        db.with_conn(|c| {
+            db::set_project_repositories(
+                c,
+                &project.id,
+                &[db::RepoConfig {
+                    relative_path: "api".into(),
+                    name: Some("api".into()),
+                }],
+            )
+        })
+        .unwrap();
         let git_summary = workspace_git(&db, &json!({ "workspace_id": root_ws.id })).unwrap();
         let repository_id = git_summary["git"]["repos"][0]["repository_id"]
             .as_str()
@@ -3062,6 +3185,111 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.name, "Keep");
+    }
+
+    /// FINDING #27: the `project_set_repos` tool configures a project's repos EXPLICITLY,
+    /// and the configured sub-repo is then SEEN by `workspace_git` (consequence #5 — the
+    /// review/diff surface no longer sees only the root). Also: unknown project → invalid_id.
+    #[test]
+    fn mcp_project_set_repos_configures_repos_seen_by_workspace_git() {
+        let _g = db_guard();
+        if crate::proc_util::command("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping mcp project_set_repos test: git unavailable");
+            return;
+        }
+        // A container root with a git sub-repo `api` (a multi-repo layout — the very case
+        // the removed auto-detection used to guess and now the user declares explicitly).
+        let root = std::env::temp_dir().join(format!("nyx-mcp-setrepos-{}", uuid::Uuid::now_v7()));
+        let repo = root.join("api");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str], dir: &std::path::Path| {
+            let ok = crate::proc_util::command("git")
+                .args([
+                    "-c",
+                    "user.email=t@nyx",
+                    "-c",
+                    "user.name=nyx",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"], &repo);
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"], &repo);
+        std::fs::write(repo.join("README.md"), b"nyx").unwrap();
+        git(&["add", "README.md"], &repo);
+        git(&["commit", "-q", "-m", "init"], &repo);
+
+        let db = Db::in_memory();
+        let (project, root_ws) = db
+            .with_conn(|c| {
+                crate::repository::register_project(c, "Nyx", root.to_str().unwrap(), None)
+            })
+            .unwrap();
+
+        // BEFORE config: workspace_git sees only the root fallback (non-git container).
+        let before = workspace_git(&db, &json!({ "workspace_id": root_ws.id })).unwrap();
+        let before_repos = before["git"]["repos"].as_array().unwrap();
+        assert_eq!(
+            before_repos.len(),
+            1,
+            "fallback = the single current folder"
+        );
+        assert_eq!(before_repos[0]["relative_path"], json!("."));
+
+        // Configure the `api` sub-repo via the TOOL.
+        let out = project_set_repos(
+            &db,
+            &json!({
+                "project_id": project.id,
+                "repos": [{ "relative_path": "api", "name": "api" }],
+            }),
+        )
+        .unwrap();
+        assert!(
+            out.effects.contains(&ChangedTopic::Repos),
+            "a config mutation broadcasts a repos changed effect"
+        );
+        let repos = out.result["repos"].as_array().unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0]["relative_path"], json!("api"));
+
+        // AFTER config: workspace_git now sees the `api` sub-repo with its REAL Git state.
+        std::fs::write(repo.join("new.txt"), b"new").unwrap();
+        let after = workspace_git(&db, &json!({ "workspace_id": root_ws.id })).unwrap();
+        let api = after["git"]["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["relative_path"] == json!("api"))
+            .expect("api sub-repo now visible");
+        assert_eq!(api["branch"], json!("main"), "the sub-repo's real branch");
+        assert_eq!(api["dirty"], json!(true), "the sub-repo's real dirty state");
+
+        // Unknown project id is a D8 invalid_id error.
+        let err =
+            project_set_repos(&db, &json!({ "project_id": "nope", "repos": [] })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+
+        // A repo entry missing relative_path is invalid_argument.
+        let err = project_set_repos(
+            &db,
+            &json!({ "project_id": project.id, "repos": [{ "name": "x" }] }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

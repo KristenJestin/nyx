@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { LockIcon, UserIcon } from "lucide-react";
+import { ChevronRightIcon, LockIcon, UserIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -8,13 +8,47 @@ import { priorityMeta, taskStatusMeta } from "../spec-meta";
 import { Dot, ProgressBar } from "../spec-primitives";
 import { parsePhases, type SpecDetail, type Task } from "../types";
 
-const DONE_STATUSES = new Set(["done", "cancelled"]);
+// A task `skip` stamps the terminal `cancelled` status (`nyx_core::db::TASK_STATUS_CANCELLED`,
+// the sole `cancelled` target for a task). So on this tab a "skipped" task is exactly
+// `status === "cancelled"` — segregated into the collapsed "Skipped" section below.
+const SKIPPED_STATUS = "cancelled";
+
+// A task is RESOLVED once it leaves the OPEN set — either `done` OR skipped (`cancelled`). This
+// is the same set the dependency-blocker logic already treats as "prerequisite satisfied", so
+// progress, row styling, and blocker-resolution all share ONE definition of "no longer open".
+const RESOLVED_STATUSES = new Set(["done", SKIPPED_STATUS]);
+
+const isSkipped = (t: Task) => t.status === SKIPPED_STATUS;
+const isResolved = (t: Task) => RESOLVED_STATUSES.has(t.status);
+const isDone = (t: Task) => t.status === "done";
+
+// PROGRESS FORMULA (finding #34, refine of #30) — the ONE source of truth shared by the phase
+// cards AND the roll-up header, so the two can never diverge. Skipped tasks are EXCLUDED from
+// BOTH the numerator AND the denominator: progress = done / (total − skipped) = done / active. A
+// skip no longer inflates progress (skips + 0 done reads 0%; all active done reads 100%). EDGE
+// CASE: a set whose tasks are ALL skipped has no active task (`active === 0`) — treated as
+// complete/100% via an explicit guard (never a divide-by-zero / NaN), rendered as a full bar
+// with the `complete ? 1 : x` ternary at the call site.
+function progressOf(tasks: readonly Task[]): {
+  done: number;
+  active: number;
+  complete: boolean;
+  pct: number;
+} {
+  const done = tasks.filter(isDone).length;
+  const active = tasks.filter((t) => !isSkipped(t)).length; // total − skipped
+  const complete = active === 0;
+  const pct = complete ? 100 : Math.round((done / active) * 100);
+  return { done, active, complete, pct };
+}
 
 /** One task row: status dot, title (+ "blocked by"), type/human marker, priority, executor. */
 function TaskRow({ task, blocker }: { task: Task; blocker: Task | null }) {
   const status = taskStatusMeta(task.status);
   const priority = priorityMeta(task.priority);
-  const done = task.status === "done";
+  // Mute + strike any RESOLVED task (done OR skipped). This is what stops a skipped task from
+  // reading as pending — combined with living in the "Skipped" section, it is unmistakable.
+  const resolved = isResolved(task);
   const human = task.executor === "human";
   return (
     <div className="group flex items-center gap-3 px-3 py-2.5 transition-colors hover:bg-muted/60">
@@ -23,7 +57,7 @@ function TaskRow({ task, blocker }: { task: Task; blocker: Task | null }) {
         <span
           className={cn(
             "block min-w-0 truncate text-sm",
-            done
+            resolved
               ? "text-muted-foreground line-through decoration-foreground/25"
               : "text-foreground",
           )}
@@ -74,8 +108,12 @@ function PhaseCard({
   tasks: Task[];
   blockerOf: (t: Task) => Task | null;
 }) {
-  const done = tasks.filter((t) => t.status === "done").length;
-  const total = tasks.length;
+  // Skipped tasks are SEGREGATED out of the phase's active list — the user has moved on from
+  // them (finding #30). They live in the collapsed "Skipped" sub-section below, never mixed in.
+  const activeTasks = tasks.filter((t) => !isSkipped(t));
+  const skippedTasks = tasks.filter(isSkipped);
+  // Progress via the shared `progressOf` helper — same formula as the roll-up header.
+  const { done: doneCount, active: activeCount, complete } = progressOf(tasks);
   return (
     <div className="overflow-hidden rounded-xl border border-border/60 bg-card">
       <div className="flex items-center gap-3 bg-muted/40 px-3 py-2.5">
@@ -86,17 +124,39 @@ function PhaseCard({
           {name}
         </span>
         <div className="flex shrink-0 items-center gap-2">
-          <ProgressBar done={done} total={total} className="w-16" />
+          <ProgressBar
+            done={complete ? 1 : doneCount}
+            total={complete ? 1 : activeCount}
+            className="w-16"
+          />
           <span className="font-mono text-2xs tabular-nums text-muted-foreground">
-            {done}/{total}
+            {doneCount}/{activeCount}
           </span>
         </div>
       </div>
-      <div className="divide-y divide-border/40 border-t border-border/50">
-        {tasks.map((t) => (
-          <TaskRow key={t.id} task={t} blocker={blockerOf(t)} />
-        ))}
-      </div>
+      {activeTasks.length > 0 ? (
+        <div className="divide-y divide-border/40 border-t border-border/50">
+          {activeTasks.map((t) => (
+            <TaskRow key={t.id} task={t} blocker={blockerOf(t)} />
+          ))}
+        </div>
+      ) : null}
+      {skippedTasks.length > 0 ? (
+        <details className="group/skipped border-t border-border/50 bg-muted/20">
+          <summary className="flex cursor-pointer list-none select-none items-center gap-2 px-3 py-2 text-2xs font-medium uppercase tracking-wide text-muted-foreground/80 transition-colors hover:text-muted-foreground marker:hidden [&::-webkit-details-marker]:hidden">
+            <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-open/skipped:rotate-90" />
+            <span>Skipped</span>
+            <span className="font-mono tabular-nums text-muted-foreground/60">
+              {skippedTasks.length}
+            </span>
+          </summary>
+          <div className="divide-y divide-border/40 border-t border-border/40">
+            {skippedTasks.map((t) => (
+              <TaskRow key={t.id} task={t} blocker={blockerOf(t)} />
+            ))}
+          </div>
+        </details>
+      ) : null}
     </div>
   );
 }
@@ -130,14 +190,15 @@ export function TasksTab({ detail }: { detail: SpecDetail }) {
       if (t.status !== "blocked") return null;
       for (const prereqId of blocks.get(t.id) ?? []) {
         const prereq = byId.get(prereqId);
-        if (prereq && !DONE_STATUSES.has(prereq.status)) return prereq;
+        if (prereq && !RESOLVED_STATUSES.has(prereq.status)) return prereq;
       }
       return null;
     };
   }, [dependencies, byId]);
 
-  // Group tasks by phase. A task's `phase` indexes `spec.phases`; unphased tasks (or a Spec
-  // with no phases) fall into a single flat group so nothing is hidden.
+  // Group tasks by phase. A task's `phase` indexes `spec.phases`; a task whose phase is null
+  // OR points at no plan entry (legacy/mal-phased data) falls into the "Unphased" group so
+  // nothing is ever hidden. A Spec with no phases renders a single flat group.
   const phases = parsePhases(spec.phases);
   const groups = useMemo(() => {
     if (phases.length === 0) {
@@ -147,14 +208,17 @@ export function TasksTab({ detail }: { detail: SpecDetail }) {
       name: p.name,
       tasks: tasks.filter((t) => t.phase === p.number),
     }));
-    const unphased = tasks.filter((t) => t.phase == null);
+    // Unphased = null OR a phase number absent from the plan (an orphan — never hidden).
+    const unphased = tasks.filter((t) => !phases.some((p) => p.number === t.phase));
     if (unphased.length > 0) byPhase.push({ name: "Unphased", tasks: unphased });
     return byPhase;
   }, [phases, tasks]);
 
-  const doneCount = tasks.filter((t) => t.status === "done").length;
+  // Spec-level roll-up via the same shared `progressOf` helper as the phase cards (finding #34):
+  // done / (total − skipped), skipped excluded from numerator AND denominator, fully-skipped
+  // (activeCount === 0) treated as complete/100% (no NaN).
+  const { done: doneCount, active: activeCount, complete, pct } = progressOf(tasks);
   const total = tasks.length;
-  const pct = total ? Math.round((doneCount / total) * 100) : 0;
 
   if (total === 0) {
     return (
@@ -169,7 +233,7 @@ export function TasksTab({ detail }: { detail: SpecDetail }) {
       <div className="mb-5 flex items-center gap-4 rounded-xl border border-border/70 bg-muted/40 px-4 py-3">
         <div className="font-heading text-2xl tabular-nums text-foreground">
           {doneCount}
-          <span className="text-lg text-muted-foreground/60">/{total}</span>
+          <span className="text-lg text-muted-foreground/60">/{activeCount}</span>
         </div>
         <div className="flex-1">
           <div className="mb-1.5 flex items-center justify-between text-xs text-muted-foreground">
@@ -178,7 +242,11 @@ export function TasksTab({ detail }: { detail: SpecDetail }) {
             </span>
             <span className="font-mono">{pct}%</span>
           </div>
-          <ProgressBar done={doneCount} total={total} tone="bg-success" />
+          <ProgressBar
+            done={complete ? 1 : doneCount}
+            total={complete ? 1 : activeCount}
+            tone="bg-success"
+          />
         </div>
       </div>
 

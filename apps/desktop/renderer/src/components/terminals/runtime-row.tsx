@@ -32,7 +32,6 @@ export function RuntimeRow({
   icon,
   label,
   state,
-  badge,
   actions,
   tooltip,
   editing = false,
@@ -46,12 +45,6 @@ export function RuntimeRow({
   label: ReactNode;
   /** The row's run-state dot. */
   state: RunState;
-  /**
-   * An optional lifecycle badge shown INLINE after the label (a `<LifecycleBadge>`) — the SEPARATE
-   * post-crash doubt axis (`interrupted` / `unknown`), distinct from the run-state dot. `null` in
-   * the common (no-crash) case, so a healthy row stays name + dot only.
-   */
-  badge?: ReactNode;
   /** Optional trailing actions (revealed on hover / while selected). */
   actions?: ReactNode;
   /**
@@ -94,7 +87,6 @@ export function RuntimeRow({
       <span className="min-w-0 flex-1 truncate text-foreground" onDoubleClick={onLabelDoubleClick}>
         {label}
       </span>
-      {badge != null ? <span className="shrink-0">{badge}</span> : null}
     </button>
   );
 

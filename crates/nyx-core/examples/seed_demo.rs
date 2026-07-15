@@ -3,7 +3,7 @@
 //! Opens the v2 `nyx_core::db::Db` on a target SQLite file (running migrations, so a
 //! fresh/empty file is created + brought fully up to schema) and populates a RICH, coherent
 //! dataset through the SAME shared authorities the UI/MCP use — `nyx_core::repository`
-//! (project/workspace/repo auto-detect), `nyx_core::db` (spec/task/review CRUD + the guarded
+//! (project/workspace + explicit per-project repo config), `nyx_core::db` (spec/task/review CRUD + the guarded
 //! lifecycle transitions) and `nyx_core::review_comment` (anchor capture + re-mapping) — so
 //! every invariant (state machines, human-verify guard, acyclic deps, anchor re-map/outdated)
 //! is enforced exactly as in the app. No raw INSERTs.
@@ -74,18 +74,35 @@ fn setup(db: &Db) {
     let feat_ws = db
         .with_conn(|c| repository::register_workspace(c, &proj_a.id, "feature/login", &demo_root2))
         .expect("register feature workspace");
+    // Finding #27: configure the project's repos EXPLICITLY (no disk auto-detection). Both
+    // workspaces then inherit them at their own root_path + relative_path.
     let repos_a = db
-        .with_conn(|c| db::list_repositories(c, &proj_a.id))
-        .expect("list repos A");
+        .with_conn(|c| {
+            db::set_project_repositories(
+                c,
+                &proj_a.id,
+                &[
+                    db::RepoConfig {
+                        relative_path: "api".into(),
+                        name: Some("api".into()),
+                    },
+                    db::RepoConfig {
+                        relative_path: "web".into(),
+                        name: Some("web".into()),
+                    },
+                ],
+            )
+        })
+        .expect("configure repos A");
     let api_repo = repos_a
         .iter()
         .find(|r| r.name == "api")
-        .expect("api repo detected")
+        .expect("api repo configured")
         .clone();
     let web_repo = repos_a
         .iter()
         .find(|r| r.name == "web")
-        .expect("web repo detected")
+        .expect("web repo configured")
         .clone();
     println!(
         "project A '{}' ws=[{}, {}] repos=[{}, {}]",
@@ -96,10 +113,23 @@ fn setup(db: &Db) {
     let (proj_b, root_ws_b) = db
         .with_conn(|c| repository::register_project(c, "nyx-v2 (self review)", &nyx_v2, None))
         .expect("register nyx-v2 self-review");
+    // Finding #27: a mono-repo is one explicit repo at relative_path ".".
     let repos_b = db
-        .with_conn(|c| db::list_repositories(c, &proj_b.id))
-        .expect("list repos B");
-    let nyxv2_repo = repos_b.first().expect("nyx-v2 mono repo detected").clone();
+        .with_conn(|c| {
+            db::set_project_repositories(
+                c,
+                &proj_b.id,
+                &[db::RepoConfig {
+                    relative_path: ".".into(),
+                    name: Some("nyx-v2".into()),
+                }],
+            )
+        })
+        .expect("configure repos B");
+    let nyxv2_repo = repos_b
+        .first()
+        .expect("nyx-v2 mono repo configured")
+        .clone();
     println!(
         "project B '{}' ws={} repo={} (rel='{}')",
         proj_b.name, root_ws_b.id, nyxv2_repo.name, nyxv2_repo.relative_path
@@ -752,6 +782,19 @@ fn task_full(
         TaskKind::Review => Some(db::TASK_SEVERITY_HIGH.to_string()),
         _ => None,
     };
+    // task_add now groups BY NAME (the plan materializes from the names, get-or-create). The
+    // multi-phase demo specs pre-seed their plan via `set_phases` with these exact names, so
+    // mapping the demo's phase number back to its name makes get-or-create REUSE the seeded
+    // number (the plan and the tasks stay coherent, numbers unchanged).
+    let phase_name = phase.map(|n| {
+        match n {
+            1 => "Foundations",
+            2 => "Delivery",
+            3 => "Hardening",
+            _ => "Extra",
+        }
+        .to_string()
+    });
     let input = NewTaskInput {
         kind: kind.as_str().to_string(),
         type_: db::TASK_TYPE_IMPLEMENTATION.to_string(),
@@ -762,7 +805,7 @@ fn task_full(
         verification_command: verification.map(str::to_string),
         spec_id: Some(spec_id.to_string()),
         parent_task_id: None,
-        phase,
+        phase_name,
     };
     let t = db
         .with_conn(|c| db::create_task(c, project_id, title, input.clone()))

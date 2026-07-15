@@ -11,7 +11,6 @@ function plan(workspaceId: string, resumeSessions: unknown[]) {
     workspace_id: workspaceId,
     resume_sessions: resumeSessions,
     restart_on_startup: [],
-    interrupted: [],
   };
 }
 
@@ -56,14 +55,15 @@ describe("use-lazy-resume (renderer half of the lazy resume)", () => {
     });
   });
 
-  it("does NOT auto-park a DOUBTFUL (uncertain) resumable session — that belongs to the panel", async () => {
-    // The partition with `use-restore-plan`: lazy auto-drains ONLY the confident sessions
-    // (`!uncertain`); a post-crash `unknown`/stale candidate (`uncertain: true`) is left for the
-    // restore panel so the user chooses (and an Ignore there truly blocks — no park is ever set).
+  it("auto-parks EVERY resumable session, including an `uncertain` one (crash-UI reverted)", async () => {
+    // v2.5.8 revert: there is no longer a confident/doubtful partition. A crash is a clean
+    // shutdown (no `unknown` sessions), and `uncertain` is informational only — lazy resumes
+    // EVERY `resume: true` session silently (gated by the toggle + the #28 inject gate). So an
+    // `uncertain: true` resumable session is now ALSO parked, not held back for a (removed) panel.
     const fake = bridgeFake();
     fake.on("workspace_restore_plan", () =>
       plan("ws-1", [
-        // Confident resumable → auto-parked by lazy.
+        // A plain (active) resumable session.
         {
           terminal_id: "t-1",
           session_id: "s-1",
@@ -73,7 +73,7 @@ describe("use-lazy-resume (renderer half of the lazy resume)", () => {
           uncertain: false,
           skip_reason: null,
         },
-        // DOUBTFUL resumable (post-crash unknown) → NOT auto-parked; the panel owns it.
+        // An `uncertain` resumable session → now ALSO auto-parked (no partition anymore).
         {
           terminal_id: "t-2",
           session_id: "s-2",
@@ -94,9 +94,12 @@ describe("use-lazy-resume (renderer half of the lazy resume)", () => {
     renderHook(() => useLazyResume(["ws-1"]));
 
     await waitFor(() => expect(parkArgs).toHaveBeenCalledTimes(1));
-    // ONLY the confident session is parked; the doubtful one is never pushed by lazy.
+    // BOTH resumable sessions are parked — the `uncertain` one is no longer excluded.
     expect(parkArgs).toHaveBeenCalledWith({
-      parks: [{ terminalId: "t-1", sessionId: "s-1", command: "claude --resume ext-1" }],
+      parks: [
+        { terminalId: "t-1", sessionId: "s-1", command: "claude --resume ext-1" },
+        { terminalId: "t-2", sessionId: "s-2", command: "claude --resume ext-2" },
+      ],
     });
   });
 

@@ -127,6 +127,24 @@ fn wait_for_marker(rt: &Runtime, record_id: &str, needle: &str) -> bool {
     false
 }
 
+/// Poll the terminal's VT SCREEN snapshot for a short window and return `true` iff `needle` NEVER
+/// appears — the NEGATIVE of [`wait_for_marker`], for proving a GATED inject did not run. A short
+/// window suffices: an injected `printf` paints within tens of ms (that is exactly what
+/// `wait_for_marker` relies on), so the marker's ABSENCE across this window means it was never
+/// written to the shell.
+fn marker_absent(rt: &Runtime, record_id: &str, needle: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(750);
+    while Instant::now() < deadline {
+        if let Some(snap) = rt.pty().snapshot_by_record(record_id) {
+            if (0..snap.main.rows).any(|r| snap.main.row_text(r).contains(needle)) {
+                return false;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    true
+}
+
 fn no_visits() -> HashSet<String> {
     HashSet::new()
 }
@@ -314,6 +332,89 @@ fn action_in_flight_is_never_unloaded() {
     rt.activity().apply(&record, ActivityEvent::TurnFinished);
     let u = rt.unload_idle_sessions(Duration::ZERO, &no_visits(), &events);
     assert_eq!(u, vec![record.clone()]);
+}
+
+/// #28 — the RESUME INJECTION is gated on the CURRENT activity (belt-and-suspenders that holds AT
+/// THE MOMENT OF INJECT). A parked resume is NEVER typed into a session that is right now `Working`.
+/// A LIVE, WORKING terminal that receives a `set_resume_parks` push (the immediate `park_resumes`
+/// inject path — the PTY is already live) must NOT get the resume line written into it — otherwise
+/// it would land as keystrokes inside the running agent (the dogfood bug "resume relancé sur une
+/// session vivante"). The park is left PENDING on the skip, so once the turn ends (Idle) it drains
+/// and injects exactly once.
+#[test]
+fn resume_is_not_injected_into_a_working_session() {
+    let (rt, events, dir) = runtime();
+    let record = seed_resumable_agent_terminal(&rt, &dir, true);
+    rt.pty()
+        .spawn(80, 24, "", &record, 0, events.clone())
+        .expect("spawn pty");
+
+    // The session is WORKING (a prompt was submitted → Claude is generating).
+    rt.activity().apply(&record, ActivityEvent::PromptSubmitted);
+
+    // The renderer pushes the restore plan; the PTY is already live, so `park_resumes` WOULD inject
+    // immediately — but the activity gate SKIPS it because the session is Working.
+    rt.park_resumes(
+        &[(
+            record.clone(),
+            "sess".into(),
+            "printf 'NYX_GATED_RESUME\\n'".into(),
+        )],
+        &events,
+    );
+    assert!(
+        marker_absent(&rt, &record, "NYX_GATED_RESUME"),
+        "a resume is NOT injected into a WORKING session (gated on the CURRENT activity at inject)"
+    );
+
+    // The turn ends → Idle. The park was LEFT PENDING (not consumed by the skip), so the spawn-drain
+    // path a revisit runs now injects it exactly once into the now-idle shell.
+    rt.activity().apply(&record, ActivityEvent::TurnFinished);
+    rt.inject_resume_on_spawn(&record, &events);
+    assert!(
+        wait_for_marker(&rt, &record, "NYX_GATED_RESUME"),
+        "once the session is Idle, the still-pending resume injects exactly once"
+    );
+}
+
+/// #28, item 3 — the idle-unload ↔ REACTIVATION race: a session UNLOADED (its resume re-armed) that
+/// becomes ACTIVE again BEFORE the re-injection must NOT get a `claude --resume` typed into it. After
+/// the unload re-parks the resume, we re-spawn the terminal and mark the session `Working` before the
+/// spawn-drain inject runs; the inject gate then SKIPS — no resume fires on the live, working session.
+/// (Contrast `unloaded_session_resumes_in_run_on_revisit`, where the revisit stays Idle and the
+/// resume DOES inject.) Once it goes Idle again, the still-pending re-armed resume injects cleanly.
+#[test]
+fn reactivated_session_after_unload_is_not_resumed() {
+    let (rt, events, dir) = runtime();
+    let record = seed_resumable_agent_terminal(&rt, &dir, true);
+    rt.pty()
+        .spawn(80, 24, "", &record, 0, events.clone())
+        .expect("spawn pty");
+
+    // Idle → unloaded (ZERO threshold): the PTY closes and the unload RE-PARKS `claude --resume`.
+    let unloaded = rt.unload_idle_sessions(Duration::ZERO, &no_visits(), &events);
+    assert_eq!(unloaded, vec![record.clone()]);
+    assert!(!rt.pty().is_live_record(&record), "unloaded → PTY closed");
+
+    // REVISIT, but the session REACTIVATES before the resume is injected (a hook / keystroke arrived
+    // between the unload and the drain): re-spawn, mark it Working, THEN attempt the spawn-drain.
+    rt.pty()
+        .spawn(80, 24, "", &record, 0, events.clone())
+        .expect("re-spawn pty");
+    rt.activity().apply(&record, ActivityEvent::PromptSubmitted); // reactivated → Working.
+    rt.inject_resume_on_spawn(&record, &events);
+    assert!(
+        marker_absent(&rt, &record, "claude --resume ext-"),
+        "a session that reactivated before the injection does NOT get a resume typed into it"
+    );
+
+    // When it later goes Idle, the still-pending (never consumed) re-armed resume injects once.
+    rt.activity().apply(&record, ActivityEvent::TurnFinished);
+    rt.inject_resume_on_spawn(&record, &events);
+    assert!(
+        wait_for_marker(&rt, &record, "claude --resume ext-"),
+        "once Idle again, the re-armed resume injects exactly once"
+    );
 }
 
 /// The currently-VISITED (focused) terminal is never unloaded (réveil sur ouverture) — even idle

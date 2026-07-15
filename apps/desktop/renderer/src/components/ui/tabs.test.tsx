@@ -95,6 +95,25 @@ describe("<Tabs.List> active-tab underline (shared-layout indicator)", () => {
     await waitFor(() => expect(tabB.querySelector(".bg-primary")).not.toBeNull());
     expect(tabA.querySelector(".bg-primary")).toBeNull();
   });
+
+  it("clips the horizontal overshoot of the indicator bounce (no transient scrollbar), keeping the underline visible below the rail", () => {
+    render(
+      <Tabs.Root value="a" onValueChange={() => {}}>
+        <Tabs.List>
+          <Tabs.Tab value="a">A</Tabs.Tab>
+          <Tabs.Tab value="b">B</Tabs.Tab>
+        </Tabs.List>
+      </Tabs.Root>,
+    );
+    const list = screen.getByRole("tablist");
+    // `overflow-x-clip` contains the spring's horizontal OVERSHOOT so it never widens the
+    // content box → no ~0.5s horizontal scrollbar when the underline slides to the last tab.
+    expect(list.className).toContain("overflow-x-clip");
+    // It clips ONLY the x-axis: y stays visible (implicit `overflow-y: visible`), so the
+    // underline pinned at `bottom-[-1px]` is not cut off — the fix does not hide the rail.
+    expect(list.className).not.toContain("overflow-hidden");
+    expect(screen.getByRole("tab", { name: "A" }).querySelector(".bottom-\\[-1px\\]")).not.toBeNull();
+  });
 });
 
 describe("<Tabs.List fullWidth> (opt-in even/justified distribution)", () => {

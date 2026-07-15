@@ -6,39 +6,36 @@
 //! (a panic, a SIGKILL, an OOM — anything that is NOT the ordered `shutdown` request),
 //! the supervisor relaunches it EXACTLY ONCE (see `apps/desktop/src/main/sidecar.ts`).
 //! On that relaunch the sidecar reopens SQLite and rebuilds the persisted state from the
-//! runtime tables — but a row persisted as `running` is now SUSPECT: the process that
-//! backed it died with the old sidecar, and its liveness CANNOT be re-verified (the fresh
-//! runner has no handle to it). The PRD is explicit: such doubtful `running` states must be
-//! marked **unknown / interrupted**, NOT blindly relaunched — the USER chooses what to
-//! resume.
+//! runtime tables.
+//!
+//! ## A crash is a CLEAN shutdown (v2.5.8 — revert of the v2.5.5 crash-UI)
+//!
+//! Earlier (v2.5.5) a crash got SPECIAL handling: every instance persisted as `running`
+//! was flagged `interrupted`, every still-`active` agent session was forced to `unknown`,
+//! and the renderer showed an orange "Interrupted after a crash — choose what to resume"
+//! card (Resume / Ignore). That special path is GONE. A crash is now treated as an ORDINARY
+//! (clean) shutdown: the boot reconcile marks NOTHING interrupted and flips NO session to
+//! `unknown`. The NORMAL resume path then applies — the SILENT lazy agent-session resume,
+//! gated by the project's `resume_agent_sessions` toggle AND the #28 activity gate (a resume
+//! is never injected into a live/working session). Toggle ON → the session resumes silently;
+//! toggle OFF → nothing resumes. No card, no `interrupted` set, no doubtful-session UI.
 //!
 //! ## Why a sidecar-owned state file (and not a new DB column)
 //!
 //! `command_instances.last_state` is CHECK-constrained to `idle|running|success|error`
 //! (migration 00000000000003) and `nyx-core` is the FROZEN v1 port — byte-unchanged. So we
-//! cannot persist a literal `interrupted` in that column nor add a migration. Instead the
+//! cannot persist recovery bookkeeping in that column nor add a migration. Instead the
 //! sidecar owns a tiny JSON state file next to `nyx.db`
 //! (`<data_dir>/sidecar-recovery.json`) that records:
 //!   * `clean_shutdown` — `false` while serving, flipped to `true` only by the ordered
 //!     [`crate::runtime::Runtime::shutdown`]. If the next boot reads it still `false`, the
-//!     previous run CRASHED.
-//!   * `interrupted` — the instance ids whose `running` could not be re-verified after that
-//!     crash. The renderer reads this (via the `recovery_snapshot` db-command) to badge them
-//!     `interrupted` and offer the user a resume choice. Reset once consumed.
+//!     previous run CRASHED (used ONLY for a diagnostic log now — the reconcile does the same
+//!     thing either way).
 //!   * `idempotency` — a journal of the idempotency keys of mutating operations already
 //!     applied, so a mutation retried after a crash is de-duplicated rather than re-run.
-//!
-//! Agent SESSIONS, by contrast, DO have an `unknown` state in the (frozen) schema
-//! (`agent_sessions.state IN ('active','ended','unknown','resume_failed')`), so a crash
-//! reconcile flips every still-`active` session to `unknown` through the existing
-//! [`nyx_core::db::sweep_stale_active_sessions`] — the exact "stale active ⇒ unknown,
-//! still a resume candidate but liveness unconfirmed" semantics the resume policy already
-//! understands.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use nyx_core::db::{self, Db};
 use serde::{Deserialize, Serialize};
 
 /// The file name of the sidecar-owned recovery state, next to `nyx.db` under the data dir.
@@ -57,11 +54,6 @@ pub struct RecoveryState {
     /// file at all) infers the previous run did NOT shut down cleanly — i.e. it crashed.
     #[serde(default)]
     pub clean_shutdown: bool,
-    /// The command-instance ids whose persisted `running` could not be re-verified after the
-    /// last crash. The renderer badges these `interrupted` and offers a resume choice; the
-    /// sidecar NEVER auto-relaunches them (no blind resume — the PRD non-goal).
-    #[serde(default)]
-    pub interrupted: Vec<String>,
     /// The idempotency keys of mutating operations already applied (a bounded FIFO journal),
     /// so a mutation retried after a crash is recognised and not re-applied.
     #[serde(default)]
@@ -125,113 +117,49 @@ impl RecoveryState {
     }
 }
 
-/// The outcome of a boot-time crash reconcile — what the previous run left doubtful.
+/// The outcome of a boot-time recovery reconcile.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconcileOutcome {
-    /// `true` when the previous run did NOT shut down cleanly (a crash): the reconcile ran.
+    /// `true` when the previous run did NOT shut down cleanly (a crash). Informational only:
+    /// a crash is now handled exactly like a clean shutdown (no interrupted set, no
+    /// `active -> unknown` sweep) — this flag just lets the boot log note it happened.
     pub was_crash: bool,
-    /// Command-instance ids whose persisted `running` was unverifiable and is now flagged
-    /// `interrupted` (NOT relaunched).
-    pub interrupted_instances: Vec<String>,
-    /// How many `active` agent sessions were flipped to `unknown` (liveness unconfirmed).
-    pub sessions_marked_unknown: usize,
 }
 
-/// Reconcile the persisted runtime state after a (possible) crash, BEFORE the boot restore
-/// runs. Reads the sidecar-owned recovery file:
+/// Reconcile the persisted runtime state at boot, BEFORE the boot restore runs. Reads the
+/// sidecar-owned recovery file only to (a) note whether the previous run crashed (for the
+/// boot log) and (b) re-arm the file to `clean_shutdown = false` for the run now starting,
+/// preserving the idempotency journal.
 ///
-///   * If the previous run shut down cleanly (`clean_shutdown == true`), this is a no-op
-///     reconcile — the ordered shutdown already snapshotted/normalised everything — and we
-///     simply re-arm the file to `clean_shutdown = false` for the run we are starting.
-///   * If it did NOT (a crash), every command instance persisted as `last_state = 'running'`
-///     is an ORPHAN whose liveness we cannot confirm: we record its id in `interrupted`
-///     (the renderer surfaces it; the user chooses) and we DO NOT relaunch it. We also flip
-///     every still-`active` agent session to `unknown` via
-///     [`nyx_core::db::sweep_stale_active_sessions`] with a zero threshold (every active row
-///     is stale relative to "right now"), the exact stale⇒unknown semantics the resume
-///     policy already understands. We also clear the `was_running_on_shutdown` snapshots so
-///     the normal boot restore — which keys off that snapshot — cannot blindly relaunch a
-///     service the crash left running (the PRD non-goal).
-///
-/// Returns the [`ReconcileOutcome`] (logged by the caller). Always re-arms the recovery file
-/// with `clean_shutdown = false` + the interrupted set for the run now starting.
-pub fn reconcile_after_crash(db: &Db, data_dir: &Path) -> ReconcileOutcome {
+/// A crash is treated as a CLEAN shutdown: this does NOT flag any instance `interrupted`, does
+/// NOT flip any `active` agent session to `unknown`, and does NOT touch the shutdown snapshots.
+/// The NORMAL resume path takes over — the silent lazy agent-session resume gated by the
+/// project `resume_agent_sessions` toggle and the #28 activity gate — so nothing surfaces a
+/// crash-recovery card and nothing is blindly relaunched.
+pub fn reconcile_after_crash(data_dir: &Path) -> ReconcileOutcome {
     let had_file = RecoveryState::exists(data_dir);
     let prior = RecoveryState::load(data_dir);
-    let mut outcome = ReconcileOutcome::default();
+    // A recovery file present but not-clean means the previous run crashed. Diagnostic only.
+    let was_crash = had_file && !prior.clean_shutdown;
 
-    if !had_file || prior.clean_shutdown {
-        // FIRST/FRESH boot (no recovery file yet) OR a clean prior shutdown: nothing doubtful.
-        // A missing file is "the sidecar has never run against this data dir" — not a crash.
-        // A clean prior shutdown already snapshotted/normalised everything. Re-arm the file to
-        // not-clean for the run we are starting, preserving the idempotency journal (so a key
-        // applied just before a clean shutdown still dedupes after a restart).
-        let next = RecoveryState {
-            clean_shutdown: false,
-            interrupted: Vec::new(),
-            idempotency: prior.idempotency,
-        };
-        next.save(data_dir);
-        return outcome;
-    }
-
-    // CRASH PATH. Gather every instance persisted as `running` — these are the doubtful
-    // ones (the process that backed them died with the old sidecar; the fresh runner cannot
-    // re-verify them). We mark them interrupted and refuse to blindly relaunch them.
-    outcome.was_crash = true;
-    let running = db
-        .with_conn(running_instance_ids)
-        .unwrap_or_else(|_| Vec::new());
-
-    // Clear the shutdown snapshots BEFORE the boot restore reads them, so the snapshot-keyed
-    // restore (restart_on_startup AND was_running_on_shutdown) cannot relaunch a crashed
-    // service blindly. The user resumes interrupted instances explicitly instead.
-    db.with_conn(|c| {
-        for id in &running {
-            let _ = db::set_was_running_on_shutdown(c, id, false);
-        }
-    });
-
-    // Flip every still-`active` agent session to `unknown` (liveness unconfirmed). The sweep
-    // cutoff is `now - threshold`; a threshold of -1 puts the cutoff one ms in the FUTURE so
-    // the strict `last_seen_at < cutoff` filter matches EVERY active row — including one
-    // recorded in the current millisecond (a zero threshold would miss those). The row stays
-    // a resume CANDIDATE (active OR unknown) but now carries the doubt the resume policy reads.
-    outcome.sessions_marked_unknown = db
-        .with_conn(|c| db::sweep_stale_active_sessions(c, -1))
-        .unwrap_or(0);
-
-    outcome.interrupted_instances = running;
-
-    // Persist the interrupted set + re-arm the clean-shutdown marker to false for THIS run.
+    // Re-arm the file to not-clean for the run we are starting, preserving the idempotency
+    // journal (so a key applied just before a clean shutdown still dedupes after a restart).
+    // Whether the prior run crashed or shut down cleanly, the reconcile does the SAME thing:
+    // no interrupted set, no session sweep, no snapshot clearing — the normal (silent) resume
+    // path handles everything downstream.
     let next = RecoveryState {
         clean_shutdown: false,
-        interrupted: outcome.interrupted_instances.clone(),
         idempotency: prior.idempotency,
     };
     next.save(data_dir);
 
-    outcome
-}
-
-/// Read the ids of every command instance whose persisted `last_state` is `running` (a
-/// connection-scoped helper so the reconcile checks out the SAME pool). Uses the existing
-/// frozen `nyx_core::db::all_instances_for_restore` view (which carries `last_state`), so it
-/// adds no nyx-core surface.
-fn running_instance_ids(conn: &mut diesel::SqliteConnection) -> diesel::QueryResult<Vec<String>> {
-    Ok(db::all_instances_for_restore(conn)?
-        .into_iter()
-        .filter(|row| row.last_state == db::STATE_RUNNING)
-        .map(|row| row.instance_id)
-        // Deterministic order for stable snapshots/tests.
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
+    ReconcileOutcome { was_crash }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nyx_core::db::{self, Db};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -271,23 +199,22 @@ mod tests {
         })
     }
 
-    /// CRASH PATH: no recovery file (or `clean_shutdown=false`) ⇒ the reconcile flags every
-    /// `running` instance interrupted, marks active sessions unknown, clears the snapshot,
-    /// and persists the interrupted set. The done-criterion's "doubtful running ⇒
-    /// unknown/interrupted".
+    /// CRASH PATH (v2.5.8 revert): a not-clean recovery file ⇒ the reconcile treats the crash
+    /// as a CLEAN shutdown. It flags NOTHING interrupted, leaves the running instance's
+    /// shutdown snapshot untouched, and — crucially — does NOT flip the still-`active` agent
+    /// session to `unknown`. The session stays `active`, so the NORMAL (silent, toggle-gated)
+    /// resume path applies. `was_crash` is still reported for the boot log.
     #[test]
-    fn reconcile_flags_running_as_interrupted_after_crash() {
+    fn reconcile_after_crash_treats_a_crash_as_clean_no_interrupted_no_sweep() {
         let dir = temp_dir("crash");
         let db = open_db(&dir);
         let id = seed_running_instance(&db);
 
         // Simulate a crash: a PRIOR run armed the recovery file `clean_shutdown=false` at boot
         // and then crashed (never flipping it to true). An active agent session lingers, and the
-        // running instance is still `running` + snapshotted was_running_on_shutdown (nothing
-        // reset them). The existing not-clean file is the crash signal.
+        // running instance is still `running` + snapshotted was_running_on_shutdown.
         RecoveryState {
             clean_shutdown: false,
-            interrupted: Vec::new(),
             idempotency: vec![],
         }
         .save(&dir);
@@ -316,43 +243,38 @@ mod tests {
             "an active session exists pre-reconcile"
         );
 
-        let outcome = reconcile_after_crash(&db, &dir);
+        let outcome = reconcile_after_crash(&dir);
 
-        assert!(outcome.was_crash, "no clean marker -> treated as a crash");
-        assert_eq!(
-            outcome.interrupted_instances,
-            vec![id.clone()],
-            "the running instance is flagged interrupted"
+        assert!(
+            outcome.was_crash,
+            "a not-clean recovery file is still recognised as a crash (for the boot log)"
         );
-        assert_eq!(
-            outcome.sessions_marked_unknown, 1,
-            "the active session was flipped to unknown"
-        );
-        // The active session is now `unknown` (liveness unconfirmed), no longer `active`.
+        // The active session is STILL `active` — the crash reconcile no longer flips it to
+        // `unknown`, so the silent normal-resume path (not a card) will pick it up.
         assert_eq!(
             db.with_conn(db::active_agent_sessions).unwrap().len(),
-            0,
-            "no session remains `active` after the reconcile"
+            1,
+            "the active session stays `active` after a crash (no forced active -> unknown)"
         );
-        // The snapshot was cleared so the boot restore cannot blindly relaunch it.
+        // The shutdown snapshot is untouched (a crash is treated as clean — no special clear).
         let row = db.with_conn(|c| db::get_instance(c, &id)).unwrap().unwrap();
         assert!(
-            !row.was_running_on_shutdown,
-            "the shutdown snapshot was cleared (no blind relaunch)"
+            row.was_running_on_shutdown,
+            "the shutdown snapshot is left as-is (crash handled like a clean shutdown)"
         );
-        // The interrupted set is persisted for the renderer to read.
+        // The recovery file is re-armed to not-clean for THIS run — and there is no interrupted
+        // bookkeeping anymore (the field is gone).
         let persisted = RecoveryState::load(&dir);
         assert!(
             !persisted.clean_shutdown,
             "re-armed to not-clean for this run"
         );
-        assert_eq!(persisted.interrupted, vec![id], "interrupted set persisted");
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// FRESH-BOOT PATH: NO recovery file yet (first run against this data dir) ⇒ no crash, no
-    /// instance flagged, sessions untouched; the file is armed to not-clean for the new run.
+    /// FRESH-BOOT PATH: NO recovery file yet (first run against this data dir) ⇒ not a crash;
+    /// sessions untouched; the file is armed to not-clean for the new run.
     #[test]
     fn reconcile_is_noop_on_first_boot_without_a_recovery_file() {
         let dir = temp_dir("fresh");
@@ -363,13 +285,11 @@ mod tests {
             "no recovery file exists before the very first reconcile"
         );
 
-        let outcome = reconcile_after_crash(&db, &dir);
+        let outcome = reconcile_after_crash(&dir);
         assert!(
             !outcome.was_crash,
             "a first boot with no recovery file is NOT a crash"
         );
-        assert!(outcome.interrupted_instances.is_empty());
-        assert_eq!(outcome.sessions_marked_unknown, 0);
 
         // The file is now armed for this run.
         assert!(
@@ -378,12 +298,11 @@ mod tests {
         );
         let persisted = RecoveryState::load(&dir);
         assert!(!persisted.clean_shutdown, "armed not-clean for this run");
-        assert!(persisted.interrupted.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// CLEAN PATH: a prior `clean_shutdown=true` ⇒ no instance is flagged, sessions are
-    /// untouched, and the file is re-armed to not-clean for the new run.
+    /// CLEAN PATH: a prior `clean_shutdown=true` ⇒ not a crash; the file is re-armed to
+    /// not-clean for the new run and the idempotency journal survives.
     #[test]
     fn reconcile_is_noop_after_clean_shutdown() {
         let dir = temp_dir("clean");
@@ -392,19 +311,15 @@ mod tests {
         // The ordered shutdown wrote clean_shutdown=true.
         RecoveryState {
             clean_shutdown: true,
-            interrupted: Vec::new(),
             idempotency: vec!["k-1".into()],
         }
         .save(&dir);
 
-        let outcome = reconcile_after_crash(&db, &dir);
+        let outcome = reconcile_after_crash(&dir);
         assert!(!outcome.was_crash, "a clean prior shutdown is not a crash");
-        assert!(outcome.interrupted_instances.is_empty());
-        assert_eq!(outcome.sessions_marked_unknown, 0);
 
         let persisted = RecoveryState::load(&dir);
         assert!(!persisted.clean_shutdown, "re-armed to not-clean");
-        assert!(persisted.interrupted.is_empty());
         assert_eq!(
             persisted.idempotency,
             vec!["k-1".to_string()],
@@ -449,7 +364,6 @@ mod tests {
         std::fs::write(RecoveryState::path_in(&dir), b"{not json").unwrap();
         let s = RecoveryState::load(&dir);
         assert!(!s.clean_shutdown);
-        assert!(s.interrupted.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

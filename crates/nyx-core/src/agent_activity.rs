@@ -499,7 +499,16 @@ impl AgentActivityStore {
                 entry.in_flight = entry.in_flight.saturating_add(1);
                 entry.clear_waiting_if_working();
                 if entry.base == Activity::Idle {
+                    // Work RESUMED after a turn-end (a tool started while the base was Idle — an
+                    // agentic continuation, or a turn whose `UserPromptSubmit` was reordered behind
+                    // this hook by the best-effort, UNORDERED hook-POST transport). Re-enter
+                    // `Working` AND drop the now-stale turn-end notifications (#28): a fresh work
+                    // signal supersedes the prior answer, exactly as `new_turn` does — so a
+                    // resumed-and-working session reads a clean blue, never a stale green while it
+                    // is demonstrably working again.
                     entry.base = Activity::Working;
+                    entry.ready_unread = false;
+                    entry.error_unread = false;
                 }
             }
             // AskUserQuestion in flight → explicit Waiting (yellow), remember it so the
@@ -535,7 +544,12 @@ impl AgentActivityStore {
                 // A sub-agent starting is a "working again" signal → lift a stale Waiting (#26).
                 entry.clear_waiting_if_working();
                 if entry.base == Activity::Idle {
+                    // Same as `ToolStarted` (#28): a sub-agent starting after a turn-end means work
+                    // resumed → re-enter `Working` and drop the stale turn-end green/red so the dot
+                    // is a clean blue while it is working again, never a stale ready.
                     entry.base = Activity::Working;
+                    entry.ready_unread = false;
+                    entry.error_unread = false;
                 }
             }
             // A sub-agent finished → one fewer sub-agent in flight. CRUCIALLY this does NOT
@@ -1430,6 +1444,50 @@ mod tests {
         assert_eq!(store.snapshot("t2").unwrap().activity, Activity::Waiting);
         store.clear("t2");
         assert!(store.snapshot("t2").is_none(), "only a hard clear drops it");
+    }
+
+    /// (#28) THE "Working tant que ça travaille" invariant ACROSS a turn boundary: after a `Stop`
+    /// (Idle + green ready) or a `StopFailure` (Idle + red error), WORK RESUMING — a tool starting or
+    /// a sub-agent starting — WITHOUT a fresh `UserPromptSubmit` (an agentic continuation, or a
+    /// `UserPromptSubmit` REORDERED behind the work hook by the best-effort, unordered hook-POST
+    /// transport) MUST re-enter `Working` and DROP the now-stale turn-end notification. A
+    /// resumed-and-working session must never read `Idle` (which would let the idle-unload / lazy
+    /// resume treat it as dormant and inject a `claude --resume` into a live agent — the #28 bug),
+    /// nor keep a stale green/red while it is demonstrably working again.
+    #[test]
+    fn work_resuming_after_a_turn_end_re_enters_working_and_drops_the_stale_notification() {
+        // A TOOL resuming work after a successful turn end (green ready pending).
+        let store = AgentActivityStore::new();
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        let s = store.apply("t1", ActivityEvent::TurnFinished); // Idle + green.
+        assert_eq!(s.activity, Activity::Idle);
+        assert!(s.ready_unread);
+        let s = store.apply("t1", ActivityEvent::ToolStarted); // work resumes, no new prompt.
+        assert_eq!(
+            s.activity,
+            Activity::Working,
+            "a tool starting after a Stop re-enters Working — never a faux-Idle on a working session"
+        );
+        assert!(
+            !s.ready_unread,
+            "the stale green is dropped once work demonstrably resumes"
+        );
+
+        // A SUB-AGENT resuming work after an ERRORED turn end (red error pending) behaves the same.
+        let store = AgentActivityStore::new();
+        store.apply("t2", ActivityEvent::PromptSubmitted);
+        store.apply("t2", ActivityEvent::TurnFailed); // Idle + red error.
+        assert!(store.snapshot("t2").unwrap().error_unread);
+        let s = store.apply("t2", ActivityEvent::SubagentStarted);
+        assert_eq!(
+            s.activity,
+            Activity::Working,
+            "a sub-agent starting after a turn-end re-enters Working"
+        );
+        assert!(
+            !s.error_unread,
+            "the stale red is dropped once work resumes"
+        );
     }
 
     /// `snapshot_all` returns only terminals with something LIVE to show (working/waiting

@@ -302,6 +302,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
             source_dir,
             install_dir,
             settings_path,
+            // Where the BARE `/nspec` `/ndev` `/ndoc` stubs are deployed user-scope
+            // (`~/.claude/commands/`, resolved as the parent of the settings path +
+            // `commands/`) so they are invocable un-namespaced (finding 01KXEJVZ).
+            commands_dir: crate::plugin::claude_commands_dir(),
             // The plugin now bundles the nyx MCP (finding #44); the live loopback port is
             // templated into the copied `.mcp.json` so the plugin-declared http MCP points
             // at nyx's actual port.
@@ -1186,6 +1190,14 @@ mod tests {
             "registered path is stable, not the source"
         );
         assert_eq!(desc.source_dir, plugin_dir);
+        // The BARE user-scope command dir resolves next to the settings file
+        // (`<~/.claude>/commands/`), where the `/nspec` `/ndev` `/ndoc` stubs are deployed
+        // un-namespaced (finding 01KXEJVZ).
+        assert_eq!(
+            desc.commands_dir.as_deref(),
+            Some(dir.join("commands").as_path()),
+            "commands dir = parent of settings.json + commands/",
+        );
         // The adapter ships a real CLI driver.
         assert!(adapter.plugin_cli().is_some());
 

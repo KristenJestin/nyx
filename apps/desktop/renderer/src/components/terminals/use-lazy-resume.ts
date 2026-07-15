@@ -5,20 +5,18 @@ import type { ResumePark, WorkspaceRestorePlan } from "@/bridge";
 
 /**
  * `use-lazy-resume` — the RENDERER half of the LAZY agent-session resume (v2.5.5). It CONSUMES the
- * `workspace_restore_plan` read model (declared in the contract but, until now, consumed by no
- * component) for each workspace of the ENTERED project and PUSHES the CONFIDENT resumable sessions
- * to the sidecar (`set_resume_parks`), which parks each `claude --resume <id>` and injects it
- * exactly once at that terminal's PTY spawn — or immediately if the terminal's PTY is already live.
+ * `workspace_restore_plan` read model for each workspace of the ENTERED project and PUSHES the
+ * resumable sessions to the sidecar (`set_resume_parks`), which parks each `claude --resume <id>`
+ * and injects it exactly once at that terminal's PTY spawn — or immediately if the terminal's PTY
+ * is already live (the sidecar gates that inject on the CURRENT activity, #28: never into a live
+ * working session).
  *
- * ## Confident vs doubtful — the PARTITION with the restore panel
- * This hook auto-drains ONLY the CONFIDENT resumable sessions (`resume === true` AND
- * `uncertain === false`): a session whose candidate state survived as `active` (a clean shutdown,
- * no crash reconcile). The DOUBTFUL resumable sessions (`uncertain === true` — a post-crash
- * `unknown`/stale candidate) are DELIBERATELY left untouched here and handed instead to the
- * `<WorkspaceRestorePanel>` (`use-restore-plan`), which surfaces them for the user to Resume or
- * Ignore. The two consumers thus partition `resume_sessions` on `uncertain` and never overlap: a
- * doubtful session is never auto-parked by lazy, so an Ignore in the panel is truly blocking (no
- * park is ever set for it → nothing is injected at PTY spawn).
+ * ## Silent resume of every resumable session (crash-UI reverted, v2.5.8)
+ * This hook auto-drains EVERY resumable session (`resume === true`), whether its candidate state
+ * is `active` or `unknown`. There is no longer a confident/doubtful partition: the v2.5.5
+ * post-crash restore panel (which used to own the `uncertain` sessions) was reverted, so a crash
+ * no longer produces `unknown` sessions and every resumable session simply resumes SILENTLY here,
+ * gated only by the project resume toggle (`decide_resume`) and the #28 inject-time activity gate.
  *
  * ## Why here (lazy, not eager-at-boot)
  * The posture is LAZY: resume happens when you OPEN a workspace's terminals, not blindly at boot.
@@ -62,11 +60,11 @@ export function useLazyResume(workspaceIds: readonly string[]): void {
             workspaceId,
           });
           const parks: ResumePark[] = (plan.resume_sessions ?? [])
-            // Auto-drain the CONFIDENT resumable sessions only: `resume === true` AND NOT
-            // `uncertain`. The doubtful (`uncertain`) ones belong to the restore panel
-            // (`use-restore-plan`), never to this silent auto-resume — the partition that makes
-            // the panel's Ignore actually block a post-crash session.
-            .filter((entry) => entry.resume && entry.resume_command != null && !entry.uncertain)
+            // Auto-drain EVERY resumable session (`resume === true` with a command). The
+            // v2.5.5 confident/doubtful partition is gone (crash-UI reverted, v2.5.8): a crash
+            // is a clean shutdown, so there are no doubtful (`uncertain`) sessions to hold back —
+            // everything resumable resumes silently (gated by the toggle + the #28 inject gate).
+            .filter((entry) => entry.resume && entry.resume_command != null)
             .map((entry) => ({
               terminalId: entry.terminal_id,
               sessionId: entry.session_id,

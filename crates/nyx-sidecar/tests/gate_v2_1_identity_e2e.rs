@@ -2,13 +2,13 @@
 //! (task `01KWDCNDK0S6NHWVPJBR1MTN9G`, Phase 5).
 //!
 //! This is the executable half of the gate: it drives the identity journeys the PRD
-//! calls out — **create a project/workspace, detect repos, see a pushed event** — through
+//! calls out — **create a project/workspace, configure repos, see a pushed event** — through
 //! the REAL `nyx-sidecar` binary over the REAL pipe, then re-reads the SAME on-disk
 //! `nyx.db` to prove the persisted, single-file authority state. It exercises, in ONE
 //! run, the five gate points that the checklist otherwise proves by `file:line`:
 //!
-//!   1. **nyx, autorité unique** — the parcours goes project → root workspace → detected
-//!      repositories → live Git state, all owned by nyx's single SQLite authority; there is
+//!   1. **nyx, autorité unique** — the parcours goes project → root workspace → explicitly
+//!      configured repositories → live Git state, all owned by nyx's single SQLite authority; there is
 //!      no parallel Depot base (the sidecar opens exactly one `<data_dir>/nyx.db`).
 //!   2. **Données migrées / un seul fichier** — the sidecar migrates that ONE file at boot
 //!      (`runtime_boot` proves boot-migration; here we re-open the same file post-run and
@@ -28,9 +28,10 @@
 //! "parcours identité vérifié sur les 3 OS" is a 3-OS CI matrix point, not a single-host
 //! run. This smoke covers the whole Rust chain up to the pushed event decoded off the pipe.
 //!
-//! The repo-detection + Git-state legs shell out to `git`; when `git` is absent (a CI image
-//! without it) those legs skip GRACEFULLY (detection is git-agnostic by contract) while the
-//! project/workspace/push/outbox legs still run — mirroring `repository.rs`'s own tests.
+//! The repo-config + Git-state legs shell out to `git`; when `git` is absent (a CI image
+//! without it) those legs skip GRACEFULLY (the config/state reads are git-agnostic by
+//! contract) while the project/workspace/push/outbox legs still run — mirroring
+//! `repository.rs`'s own tests.
 
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -61,8 +62,8 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Is `git` on PATH? The repo-detection + Git-state legs need a real repo; they skip
-/// gracefully when git is absent (detection is git-agnostic by contract).
+/// Is `git` on PATH? The repo-config + Git-state legs need a real repo; they skip
+/// gracefully when git is absent (the reads are git-agnostic by contract).
 fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
@@ -285,9 +286,9 @@ impl Harness {
 
 /// THE identity-parcours smoke: create project + workspace over the real pipe, observe the
 /// pushed events, then re-open the SAME `nyx.db` to prove the persisted single-file state
-/// (detected repositories + correlated domain_events).
+/// (EXPLICITLY-configured repositories + correlated domain_events).
 ///
-/// Windows is excluded only because the repo-detection leg drives `git`; the core
+/// Windows is excluded only because the repo leg drives `git`; the core
 /// project/workspace/push/outbox assertions are platform-agnostic (the multi-OS parity is a
 /// CI-matrix concern, per the doc comment above).
 #[cfg(not(windows))]
@@ -297,12 +298,13 @@ fn identity_parcours_end_to_end_over_the_real_sidecar() {
     let have_git = git_available();
 
     // A MULTI-REPO root tree: two git subfolders (api, web) + a non-git folder (docs).
-    // When git is present, creating the project on this root must auto-detect api + web.
+    // Finding #27: nyx does NOT scan this tree — the repos are configured EXPLICITLY below
+    // (creating the project must NOT auto-detect api/web).
     let root = temp_dir("root");
     if have_git {
         init_repo(&root.join("api"), "main");
         init_repo(&root.join("web"), "feat");
-        std::fs::create_dir_all(root.join("docs")).unwrap(); // non-git: ignored
+        std::fs::create_dir_all(root.join("docs")).unwrap(); // non-git: not scanned
     }
 
     let mut h = Harness::spawn(data_dir.clone());
@@ -315,8 +317,8 @@ fn identity_parcours_end_to_end_over_the_real_sidecar() {
 
     // --- LEG 1: create a PROJECT (UI bridge → shared use case) ------------------------
     // Drives `create_project` — the same `usecase::create_project` the MCP surface funnels
-    // into. It creates the project + its root workspace, auto-detects repos under the root,
-    // persists a `project.created` domain_event, and PUSHES `workspaces://changed`.
+    // into. It creates the project + its root workspace WITHOUT scanning the disk (finding
+    // #27), persists a `project.created` domain_event, and PUSHES `workspaces://changed`.
     let created = h.db_command(
         10,
         "create_project",
@@ -335,7 +337,8 @@ fn identity_parcours_end_to_end_over_the_real_sidecar() {
     h.wait_for_workspaces_pushes(1);
 
     // --- LEG 2: add a non-root WORKSPACE (the worktree pivot) -------------------------
-    // A second workspace rooted at the api repo (itself a git tree → a '.' mono identity).
+    // A second workspace rooted at the api repo. No scan happens here either — the workspace
+    // inherits the project's configured repos (PDR-0013, finding #27).
     let ws_root = root.join("api");
     let ws = h.db_command(
         11,
@@ -443,23 +446,68 @@ fn identity_parcours_end_to_end_over_the_real_sidecar() {
         "exactly one domain_event per driven mutation — no phantom, no loss"
     );
 
-    // (b) REPO DETECTION — when git is present, creating the project on the multi-repo root
-    // detected api + web as logical repositories in the project. This is the "détecter
-    // repos" leg of the parcours, read from the persisted authority.
+    // (b) EXPLICIT REPO CONFIG (finding #27) — nyx did NOT scan the disk: right after
+    // create_project the project has NO repositories. The user then configures them
+    // EXPLICITLY (the SAME `db::set_project_repositories` authority the `project_set_repos`
+    // MCP tool drives), and only then do api + web exist as logical identities.
     if have_git {
+        let auto = db
+            .with_conn(|c| nyx_core::db::list_repositories(c, &project_id))
+            .expect("list_repositories");
+        assert!(
+            auto.is_empty(),
+            "creating the project did NOT auto-detect/scan any repo (finding #27): {:?}",
+            auto.iter().map(|r| &r.relative_path).collect::<Vec<_>>()
+        );
+
+        // Configure the multi-repo layout explicitly, ONCE per project.
+        db.with_conn(|c| {
+            nyx_core::db::set_project_repositories(
+                c,
+                &project_id,
+                &[
+                    nyx_core::db::RepoConfig {
+                        relative_path: "api".into(),
+                        name: None,
+                    },
+                    nyx_core::db::RepoConfig {
+                        relative_path: "web".into(),
+                        name: None,
+                    },
+                ],
+            )
+        })
+        .expect("configure repos");
+
         let repos = db
             .with_conn(|c| nyx_core::db::list_repositories(c, &project_id))
             .expect("list_repositories");
         let rel: Vec<&str> = repos.iter().map(|r| r.relative_path.as_str()).collect();
-        // The root detection registered api + web; the added `api`-rooted workspace also
-        // triggered detection of a '.' mono identity in the same project.
         assert!(
             rel.contains(&"api") && rel.contains(&"web"),
-            "creating the project detected the multi-repo subfolders (api, web): {rel:?}"
+            "the explicitly-configured sub-repos (api, web) are the project's repositories: {rel:?}"
         );
+
+        // The added `api`-rooted worktree INHERITS the SAME project config (PDR-0013): its
+        // derived members are the configured repos at ws.root_path + relative_path (no
+        // per-workspace detection).
+        let member_paths = db
+            .with_conn(|c| {
+                let ws =
+                    nyx_core::db::get_workspace(c, &ws_id)?.expect("the added workspace resolves");
+                let members = nyx_core::repository::workspace_members(c, &ws)?;
+                Ok::<_, diesel::result::Error>(
+                    members
+                        .into_iter()
+                        .map(|m| m.repository.relative_path)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .expect("derive workspace members");
         assert!(
-            rel.contains(&"."),
-            "the api-rooted worktree detected a '.' mono identity in the same project: {rel:?}"
+            member_paths.contains(&"api".to_string())
+                && member_paths.contains(&"web".to_string()),
+            "the worktree inherits the ONE project config (api, web), no per-workspace scan: {member_paths:?}"
         );
 
         // (c) GIT STATE re-read LIVE from Git (never persisted) — the branch of the api repo
@@ -472,7 +520,7 @@ fn identity_parcours_end_to_end_over_the_real_sidecar() {
         );
     } else {
         eprintln!(
-            "git unavailable: skipped the repo-detection + Git-state legs (git-agnostic by contract)"
+            "git unavailable: skipped the repo-config + Git-state legs (git-agnostic by contract)"
         );
     }
 

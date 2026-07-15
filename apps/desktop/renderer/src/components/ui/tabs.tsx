@@ -92,7 +92,16 @@ function TabsList({ className, children, fullWidth = false, ...props }: TabsList
   const reduced = useReducedMotion();
   return (
     <BaseTabs.List
-      className={cn("relative flex gap-6 border-b border-border", fullWidth && "w-full", className)}
+      // `overflow-x-clip` contains the ACTIVE-indicator spring's horizontal OVERSHOOT (the
+      // bounce) so it never widens the content box → no transient horizontal scrollbar when the
+      // underline slides to the right-most tab. `overflow-x: clip` pairs with an implicit
+      // `overflow-y: visible` (a VALID pair — clip does NOT coerce the other axis to auto),
+      // so the underline pinned at `bottom-[-1px]` stays visible below the rail.
+      className={cn(
+        "relative flex gap-6 overflow-x-clip border-b border-border",
+        fullWidth && "w-full",
+        className,
+      )}
       {...props}
     >
       <TabsIndicatorContext.Provider value={{ layoutId, reduced, fullWidth }}>

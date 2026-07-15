@@ -1836,10 +1836,12 @@ pub fn fork_spec(
 //     an INCOMPLETE draft must NOT pass ready.
 //
 // GARDE-FOUS (guard-rails), in the spirit of depot's `--user-confirmed`: the SENSITIVE
-// transitions (`ready`, `done`, `cancel`) require an explicit user confirmation. The
-// backend refuses them with [`SpecTransitionError::ConfirmationRequired`] unless the
+// transitions (`ready`, `start`, `done`, `cancel`) require an explicit user confirmation.
+// `start` is sensitive because it POSES the workspace anchor (ready→in_progress binds the
+// Spec to a dev workspace and kicks off implementation — a consequential, human-owned move).
+// The backend refuses them with [`SpecTransitionError::ConfirmationRequired`] unless the
 // caller passes `user_confirmed = true`, so a UI/MCP mutation cannot silently mark a
-// Spec ready/done/cancelled without the human's go-ahead.
+// Spec ready/started/done/cancelled without the human's go-ahead.
 
 /// A Spec lifecycle transition (the conceptual move, independent of the stored status
 /// string). Each maps to a canonical target `spec_status`, declares its legal source
@@ -1848,7 +1850,8 @@ pub fn fork_spec(
 pub enum SpecTransition {
     /// draft → ready. Sensitive; runs the pre-ready VALIDATIONS.
     Ready,
-    /// ready → in_progress. Not sensitive.
+    /// ready → in_progress. Sensitive: it POSES the Spec's workspace anchor
+    /// ([`transition_spec_with_workspace`]) in the SAME operation.
     Start,
     /// in_progress → in_review ("review"). Not sensitive.
     Review,
@@ -1906,12 +1909,16 @@ impl SpecTransition {
     }
 
     /// Whether this transition is SENSITIVE and therefore requires an explicit user
-    /// confirmation (the guard-rail, à la depot `--user-confirmed`): `ready`, `done`,
-    /// `cancel`. `start` / `review` are routine and need no confirmation.
+    /// confirmation (the guard-rail, à la depot `--user-confirmed`): `ready`, `start`,
+    /// `done`, `cancel`. `start` is sensitive because it POSES the workspace anchor
+    /// (ready→in_progress). Only `review` is routine and needs no confirmation.
     pub fn is_sensitive(self) -> bool {
         matches!(
             self,
-            SpecTransition::Ready | SpecTransition::Done | SpecTransition::Cancel
+            SpecTransition::Ready
+                | SpecTransition::Start
+                | SpecTransition::Done
+                | SpecTransition::Cancel
         )
     }
 }
@@ -1936,10 +1943,11 @@ pub enum ReadyValidation {
     PhasePlanOrdering { reason: String },
 }
 
-/// One phase entry in `specs.phases` (`[{number,name}]`, PDR-0022). Parsed only to
-/// VALIDATE the plan's coherence for the pre-ready gate; the column stays the JSON source
-/// of truth.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+/// One phase entry in `specs.phases` (`[{number,name}]`, PDR-0022). Parsed to VALIDATE the
+/// plan's coherence for the pre-ready gate, and re-serialized (same shape) when
+/// [`resolve_or_create_phase`] GROWS the plan from a task's phase name; the column stays the
+/// JSON source of truth.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct PhaseEntry {
     number: i64,
     #[serde(default)]
@@ -2001,7 +2009,14 @@ pub fn validate_ready(
 /// Validate a `specs.phases` JSON string for coherence (the phase-plan / cycle gate).
 /// Pure (no DB): parses and checks the ordering. An empty list is coherent. Returns the
 /// list of [`ReadyValidation`] the plan trips (empty = coherent).
-fn validate_phase_plan(phases_json: &str) -> Vec<ReadyValidation> {
+///
+/// The SINGLE coherence authority for a phase plan (numbers a clean 1..N, names non-empty).
+/// The plan is never authored directly: it self-builds as tasks name their phase
+/// ([`create_task`] → [`resolve_or_create_phase`]), and this same check runs at the `ready`
+/// gate ([`validate_ready`], above) — so the authoring write and the lifecycle gate share
+/// ONE rule, with no drift between them. `pub(crate)`: every caller is in-crate (the gate
+/// plus same-crate tests asserting a self-built plan is coherent); no out-of-crate consumer.
+pub(crate) fn validate_phase_plan(phases_json: &str) -> Vec<ReadyValidation> {
     let trimmed = phases_json.trim();
     // An absent plan ('' or '[]') is coherent by construction (tasks flat).
     if trimmed.is_empty() || trimmed == "[]" {
@@ -2052,9 +2067,13 @@ pub enum SpecTransitionError {
     InvalidSource { from: String, to: &'static str },
     /// The VALIDATION failed: the pre-ready checks produced these failures (only ready).
     ValidationFailed(Vec<ReadyValidation>),
-    /// The GUARD-RAIL: a SENSITIVE transition (ready/done/cancel) was attempted without
-    /// the user's explicit confirmation (`user_confirmed = false`).
+    /// The GUARD-RAIL: a SENSITIVE transition (ready/start/done/cancel) was attempted
+    /// without the user's explicit confirmation (`user_confirmed = false`).
     ConfirmationRequired,
+    /// A `start` transition carried a `workspace_id` to anchor on, but no workspace resolves
+    /// to it (the anchor GUARD — a Spec never anchors on a dangling id, exactly as
+    /// [`SetSpecWorkspaceError::WorkspaceNotFound`] guards the standalone anchor).
+    WorkspaceNotFound,
     /// A DB error surfaced while resolving or updating.
     Db(diesel::result::Error),
 }
@@ -2066,27 +2085,48 @@ impl From<diesel::result::Error> for SpecTransitionError {
 }
 
 /// Perform a Spec lifecycle `transition`, GUARDED + VALIDATED + guard-railed, and return
-/// the updated [`Spec`]. This is the SINGLE nyx-core owner of a Spec status change (both
-/// the UI and the MCP transition tools of later phases route through it), so the lifecycle
-/// rules live in one place:
-///
-///   1. RESOLVE the Spec (unknown id → [`SpecTransitionError::NotFound`]).
-///   2. GUARD-RAIL: a SENSITIVE transition (ready/done/cancel) without `user_confirmed`
-///      is refused with [`SpecTransitionError::ConfirmationRequired`] — the human must
-///      confirm (à la depot `--user-confirmed`).
-///   3. GUARD: the current `status` must be a legal SOURCE ([`SpecTransition::source_allowed`]),
-///      else [`SpecTransitionError::InvalidSource`].
-///   4. VALIDATE: the `ready` transition runs [`validate_ready`]; any failure →
-///      [`SpecTransitionError::ValidationFailed`] (an incomplete draft does NOT pass ready).
-///   5. WRITE the new `status` (and stamp `completed_at` on `done`), bumping `updated_at`.
-///
-/// Everything runs in ONE transaction so a refusal writes nothing.
+/// the updated [`Spec`]. The no-anchor convenience over [`transition_spec_with_workspace`]
+/// (like [`create_spec`] over [`create_spec_with_workspace`]): every transition BUT `start`
+/// never touches the workspace anchor, so those callers need not thread a workspace id.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn transition_spec(
     conn: &mut SqliteConnection,
     spec_id: &str,
     transition: SpecTransition,
     user_confirmed: bool,
+) -> Result<Spec, SpecTransitionError> {
+    transition_spec_with_workspace(conn, spec_id, transition, user_confirmed, None)
+}
+
+/// Perform a Spec lifecycle `transition`, GUARDED + VALIDATED + guard-railed, and — on the
+/// `start` transition (ready→in_progress) — ANCHOR the Spec on `workspace_id` in the SAME
+/// transaction. This is the SINGLE nyx-core owner of a Spec status change (both the UI and
+/// the MCP transition tools route through it), so the lifecycle rules live in one place:
+///
+///   1. RESOLVE the Spec (unknown id → [`SpecTransitionError::NotFound`]).
+///   2. GUARD-RAIL: a SENSITIVE transition (ready/start/done/cancel) without `user_confirmed`
+///      is refused with [`SpecTransitionError::ConfirmationRequired`] — the human must
+///      confirm (à la depot `--user-confirmed`).
+///   3. GUARD: the current `status` must be a legal SOURCE ([`SpecTransition::source_allowed`]),
+///      else [`SpecTransitionError::InvalidSource`].
+///   4. VALIDATE: the `ready` transition runs [`validate_ready`]; any failure →
+///      [`SpecTransitionError::ValidationFailed`] (an incomplete draft does NOT pass ready).
+///   5. ANCHOR (start only): a non-null `workspace_id` MUST resolve to an existing workspace
+///      ([`SpecTransitionError::WorkspaceNotFound`]); it is then written onto `specs.workspace_id`
+///      TOGETHER with the status flip. So the anchor is posed EXACTLY at ready→in_progress, in
+///      one atomic move — never at authoring (the review finding fix). For every other
+///      transition `workspace_id` is ignored (the anchor is left untouched).
+///   6. WRITE the new `status` (and stamp `completed_at` on `done`, or the anchor on `start`),
+///      bumping `updated_at`.
+///
+/// Everything runs in ONE transaction so a refusal writes nothing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn transition_spec_with_workspace(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    transition: SpecTransition,
+    user_confirmed: bool,
+    workspace_id: Option<&str>,
 ) -> Result<Spec, SpecTransitionError> {
     conn.transaction(|conn| {
         let spec = match get_spec(conn, spec_id)? {
@@ -2115,7 +2155,29 @@ pub fn transition_spec(
             }
         }
 
-        // WRITE the new status (+ completed_at on done), bumping updated_at.
+        // ANCHOR (start only): the workspace to anchor on MUST exist. Resolved here so the
+        // anchor write and the status flip share the transaction (atomic transition + anchor).
+        let start_anchor: Option<&str> = if transition == SpecTransition::Start {
+            match workspace_id {
+                Some(ws) => {
+                    let exists = workspaces::table
+                        .find(ws)
+                        .select(workspaces::id)
+                        .first::<String>(conn)
+                        .optional()?;
+                    if exists.is_none() {
+                        return Err(SpecTransitionError::WorkspaceNotFound);
+                    }
+                    Some(ws)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        // WRITE the new status (+ completed_at on done, or the workspace anchor on start),
+        // bumping updated_at.
         let now = now_millis();
         let target = transition.target_status();
         if transition == SpecTransition::Done {
@@ -2123,6 +2185,14 @@ pub fn transition_spec(
                 .set((
                     specs::status.eq(target),
                     specs::completed_at.eq(now),
+                    specs::updated_at.eq(now),
+                ))
+                .execute(conn)?;
+        } else if let Some(ws) = start_anchor {
+            diesel::update(specs::table.find(spec_id))
+                .set((
+                    specs::status.eq(target),
+                    specs::workspace_id.eq(ws),
                     specs::updated_at.eq(now),
                 ))
                 .execute(conn)?;
@@ -2135,6 +2205,11 @@ pub fn transition_spec(
         // Outbox: the status flip AND its `spec.transitioned` event commit atomically. The
         // payload records the `from`/`to` status AND the requested `verb` (the conceptual
         // move) so the feed can distinguish moves onto the same target status (e.g. `cancel`).
+        // Correlate the event to the EFFECTIVE workspace — the freshly-posed anchor on a
+        // `start`, else the Spec's existing one — so the workspace timeline folds it in.
+        let effective_ws = start_anchor
+            .map(str::to_string)
+            .or_else(|| spec.workspace_id.clone());
         let payload = serde_json::json!({
             "spec_id": spec_id,
             "from": spec.status,
@@ -2146,7 +2221,7 @@ pub fn transition_spec(
             conn,
             NewDomainEvent {
                 project_id: spec.project_id.clone(),
-                workspace_id: spec.workspace_id.clone(),
+                workspace_id: effective_ws,
                 aggregate: AGGREGATE_SPEC.to_string(),
                 event_type: "spec.transitioned".to_string(),
                 source: "mcp".to_string(),
@@ -2180,6 +2255,51 @@ pub fn set_spec_phases(
         .execute(conn)
 }
 
+/// GET-OR-CREATE a phase by NAME in a Spec's `specs.phases` plan, returning its 1-based
+/// number (PDR-0022). If a phase whose (trimmed) name already matches `name` exists, its
+/// number is returned unchanged (reuse — so a name passed twice maps to the SAME phase);
+/// otherwise the name is APPENDED as a new phase with the next number (max existing + 1 —
+/// 1-based, in FIRST-SEEN order) and the grown plan is persisted through [`set_spec_phases`].
+///
+/// This is the authoring primitive behind `task_add(phase="Name")`: the plan MATERIALIZES
+/// incrementally from the names the tasks carry, so a task's phase can never point outside
+/// the plan (no orphan by construction). It runs on the CALLER's connection so it composes
+/// INTO the task-insert transaction ([`create_task`]) — the plan grow and the task write
+/// commit atomically. A plan the new flow builds is a clean 1..N (it starts empty and only
+/// ever appends); a legacy plan is read as-is and never renumbered.
+fn resolve_or_create_phase(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    name: &str,
+) -> QueryResult<i32> {
+    let target = name.trim();
+    let phases_json: String = specs::table
+        .find(spec_id)
+        .select(specs::phases)
+        .first::<String>(conn)?;
+    let trimmed = phases_json.trim();
+    let mut entries: Vec<PhaseEntry> = if trimmed.is_empty() || trimmed == "[]" {
+        Vec::new()
+    } else {
+        serde_json::from_str(trimmed)
+            .map_err(|e| diesel::result::Error::DeserializationError(Box::new(e)))?
+    };
+    // GET: an existing phase with the same (trimmed) name keeps its number.
+    if let Some(existing) = entries.iter().find(|e| e.name.trim() == target) {
+        return Ok(existing.number as i32);
+    }
+    // CREATE: append with the next number (max + 1 — 1-based, first-seen order).
+    let next = entries.iter().map(|e| e.number).max().unwrap_or(0) + 1;
+    entries.push(PhaseEntry {
+        number: next,
+        name: target.to_string(),
+    });
+    let grown = serde_json::to_string(&entries)
+        .map_err(|e| diesel::result::Error::SerializationError(Box::new(e)))?;
+    set_spec_phases(conn, spec_id, &grown)?;
+    Ok(next as i32)
+}
+
 // --- Spec ↔ workspace LINK + DERIVED repos/project (v2.4 Phase 3, v15) ------
 //
 // REALIZE `specs.workspace_id` — the v2.1 reserved seam (declared nullable in v13, left
@@ -2208,6 +2328,11 @@ pub enum SetSpecWorkspaceError {
     SpecNotFound,
     /// A non-null `workspace_id` was given but no workspace resolves to it (the GUARD).
     WorkspaceNotFound,
+    /// The STATE GUARD: the standalone anchor is only legal while the Spec is `in_progress`.
+    /// A Spec in `draft`/`ready` (or a terminal state) is refused — the anchor is posed at
+    /// the ready→in_progress transition (the review finding), never earlier. Carries the
+    /// current status so the caller can explain the refusal.
+    InvalidState { status: String },
     /// A DB error surfaced while resolving or updating.
     Db(diesel::result::Error),
 }
@@ -2219,12 +2344,16 @@ impl From<diesel::result::Error> for SetSpecWorkspaceError {
 }
 
 /// SET (or CLEAR) a Spec's `workspace_id` — the anchor on a dev workspace (the v2.1 seam,
-/// realized here). GUARDED: a non-null `workspace_id` MUST resolve to an existing workspace
-/// (else [`SetSpecWorkspaceError::WorkspaceNotFound`]), so a Spec never anchors on a
-/// dangling id; passing `None` DETACHES the Spec (a sane, allowed state — the pointer is
+/// realized here). STATE-GUARDED: only a Spec that is `in_progress` may (re)anchor or detach
+/// through this standalone path — a `draft`/`ready` (or terminal) Spec is refused with
+/// [`SetSpecWorkspaceError::InvalidState`], because the anchor is posed at the ready→in_progress
+/// transition ([`transition_spec_with_workspace`]), never at authoring (the review finding).
+/// Also GUARDED: a non-null `workspace_id` MUST resolve to an existing workspace (else
+/// [`SetSpecWorkspaceError::WorkspaceNotFound`]), so a Spec never anchors on a dangling id;
+/// passing `None` DETACHES the Spec (a sane, allowed state while in_progress — the pointer is
 /// "posé au lancement, écrasable, jamais perdu", data-model.dbml). Bumps `updated_at`.
 /// Returns the updated [`Spec`]. Runs in ONE transaction so a refusal writes nothing. This
-/// is the SINGLE nyx-core owner of the anchor write (UI + MCP of later phases route here).
+/// is the SINGLE nyx-core owner of the standalone anchor write (UI + MCP route here).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn set_spec_workspace(
     conn: &mut SqliteConnection,
@@ -2238,6 +2367,13 @@ pub fn set_spec_workspace(
             None => return Err(SetSpecWorkspaceError::SpecNotFound),
             Some(s) => s,
         };
+        // STATE GUARD: the standalone (re)anchor/detach is only legal while in_progress. In
+        // draft/ready the anchor must NOT be posed — it belongs to the start transition.
+        if existing.status != SPEC_STATUS_IN_PROGRESS {
+            return Err(SetSpecWorkspaceError::InvalidState {
+                status: existing.status.clone(),
+            });
+        }
         // GUARD: a non-null anchor must point at an existing workspace.
         if let Some(ws_id) = workspace_id {
             let ws_exists = workspaces::table
@@ -2291,6 +2427,12 @@ pub fn set_spec_workspace(
 /// to an existing workspace ([`SetSpecWorkspaceError::WorkspaceNotFound`]) — the Spec never
 /// starts anchored on a dangling id. Returns the created [`Spec`] and its first
 /// [`SpecRevision`]. (The no-workspace path stays [`create_spec`].)
+///
+/// NOTE (review finding — anchor at the transition, not at authoring): the PRODUCTION path
+/// no longer anchors at birth. `spec_create` (the MCP tool) creates a PROJECT-scoped draft
+/// via [`create_spec`]; the anchor is posed later, at the ready→in_progress `start`
+/// transition ([`transition_spec_with_workspace`]). This lower-level primitive remains as a
+/// test/seed helper to stand up an anchored Spec directly, bypassing the lifecycle walk.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn create_spec_with_workspace(
     conn: &mut SqliteConnection,
@@ -2562,8 +2704,11 @@ pub struct NewTaskInput {
     pub spec_id: Option<String>,
     /// Optional parent task (subtask).
     pub parent_task_id: Option<String>,
-    /// Optional phase grouping (indexes `specs.phases`).
-    pub phase: Option<i32>,
+    /// Optional phase grouping BY NAME (PDR-0022). `create_task` resolves it to a 1-based
+    /// number through [`resolve_or_create_phase`], MATERIALIZING the Spec's plan from the
+    /// names in first-seen order (get-or-create). `None` (or a blank name / no `spec_id`) =
+    /// flat.
+    pub phase_name: Option<String>,
 }
 
 impl Default for NewTaskInput {
@@ -2578,7 +2723,7 @@ impl Default for NewTaskInput {
             verification_command: None,
             spec_id: None,
             parent_task_id: None,
-            phase: None,
+            phase_name: None,
         }
     }
 }
@@ -2641,6 +2786,16 @@ pub fn create_task(
     let spec_id = input.spec_id.clone();
     // Outbox: the task insert AND its `task.added` event commit atomically.
     conn.transaction(|conn| {
+        // Resolve the phase NAME to its 1-based number (GET-OR-CREATE in the Spec's plan),
+        // INSIDE this transaction so the plan grow + the task insert commit atomically — a
+        // task can never carry a phase absent from the plan. A phase name needs a Spec to
+        // live in; without a `spec_id` (or with a blank name) the task is flat.
+        let phase = match (spec_id.as_deref(), input.phase_name.as_deref()) {
+            (Some(sid), Some(name)) if !name.trim().is_empty() => {
+                Some(resolve_or_create_phase(conn, sid, name)?)
+            }
+            _ => None,
+        };
         let task = diesel::insert_into(tasks::table)
             .values(NewTask {
                 id: task_id.clone(),
@@ -2656,7 +2811,7 @@ pub fn create_task(
                 description: input.description,
                 acceptance_criteria: input.acceptance_criteria,
                 verification_command: input.verification_command,
-                phase: input.phase,
+                phase,
                 position: 0,
                 created_at: now,
                 updated_at: now,
@@ -3215,6 +3370,114 @@ pub fn verify_human_task(
 
         let updated = get_task(conn, task_id)?.ok_or(TaskTransitionError::NotFound)?;
         Ok(updated)
+    })
+}
+
+// --- task DELETE: the draft-authoring hard removal (v2.5.8, finding #31) ----
+//
+// A DELETE (vs. `skip`, which cancels but keeps the ghost) is only legitimate while the
+// parent Spec is still being AUTHORED. In `draft` you are still shaping the plan, so a
+// mis-sliced task must disappear cleanly; once the Spec is ready/in_progress the only
+// legitimate move is `skip` (which preserves the audit trail — the "18 ghosts cancelled"
+// the redesign called out are the price of NOT having a delete during authoring). Hence the
+// STATE GUARD below: draft-only.
+
+/// Why deleting a task was refused (or the DB failed). Returned by [`delete_task`] so a
+/// UI/MCP caller can react precisely. The GUARD is "the parent Spec must be in `draft`".
+#[derive(Debug)]
+pub enum DeleteTaskError {
+    /// No task resolves to the given id (mapped to `invalid_id`).
+    NotFound,
+    /// The STATE GUARD: the task's parent Spec is not in `draft` — carries the current spec
+    /// status, or `"(none)"` when the task has NO parent Spec (the draft gate cannot be
+    /// satisfied). A real delete is legal ONLY while the parent Spec is a draft; otherwise
+    /// `skip` the task (which keeps the trace). Mapped to `invalid_state`.
+    NotDraft { status: String },
+    /// A DB error surfaced while resolving or deleting.
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for DeleteTaskError {
+    fn from(e: diesel::result::Error) -> Self {
+        DeleteTaskError::Db(e)
+    }
+}
+
+/// DELETE a task outright — the draft-authoring affordance that REMOVES an erroneous task
+/// (vs. [`transition_task`] `skip`, which only cancels it and leaves the ghost). GUARDED to
+/// a parent Spec still in `draft`. THE single nyx-core owner of a task deletion, so the guard
+/// lives in one place (the UI + the MCP tool route here). Steps (ONE transaction, so a
+/// refusal writes nothing):
+///
+///   1. RESOLVE the task (unknown id → [`DeleteTaskError::NotFound`] → `invalid_id`).
+///   2. STATE GUARD: the task's parent Spec must be in `draft`. Any other state — or NO
+///      parent Spec (the draft gate cannot be satisfied) — is refused with
+///      [`DeleteTaskError::NotDraft`] (→ `invalid_state`); the caller should `skip` instead.
+///   3. CLEAN the dependency graph EXPLICITLY: delete every `task_dependencies` row where the
+///      task is the SOURCE (`task_id`) or the TARGET (`depends_on_task_id`), so no dangling
+///      edge survives. (`foreign_keys = ON` would also cascade these on the row delete, but
+///      the explicit cleanup is the contract and holds regardless of the pragma.)
+///   4. DELETE the task row. Any SUBTASKS (`parent_task_id ON DELETE CASCADE`) are removed by
+///      the FK cascade, so no child is left pointing at a deleted parent.
+///
+/// PHASE PLAN: `specs.phases` is auto-built by NAME ([`resolve_or_create_phase`]) and is left
+/// UNTOUCHED here — even when the deleted task was the last one of its phase. Keeping the
+/// (now empty) phase entry preserves the clean `1..N` invariant that [`validate_phase_plan`]
+/// / the `ready` gate require: PRUNING a middle phase would open a gap (breaking that gate)
+/// and RENUMBERING would orphan the OTHER tasks' `phase` numbers. So the coherent choice is
+/// to leave the entry (the UI simply renders it empty). No orphan, no crash.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn delete_task(conn: &mut SqliteConnection, task_id: &str) -> Result<(), DeleteTaskError> {
+    conn.transaction(|conn| {
+        let task = match get_task(conn, task_id)? {
+            None => return Err(DeleteTaskError::NotFound),
+            Some(t) => t,
+        };
+
+        // STATE GUARD: the parent Spec must be in `draft`. Resolve its status (None = the task
+        // has no Spec, or the Spec vanished) — anything but `draft` is refused, draft-only.
+        let spec_status: Option<String> = match &task.spec_id {
+            Some(sid) => specs::table
+                .find(sid)
+                .select(specs::status)
+                .first::<String>(conn)
+                .optional()?,
+            None => None,
+        };
+        if spec_status.as_deref() != Some(SPEC_STATUS_DRAFT) {
+            return Err(DeleteTaskError::NotDraft {
+                status: spec_status.unwrap_or_else(|| "(none)".to_string()),
+            });
+        }
+
+        // CLEAN the dependency graph: drop every edge touching this task in EITHER direction
+        // (as source, then as target), so the delete never leaves a dangling edge.
+        diesel::delete(task_dependencies::table.filter(task_dependencies::task_id.eq(task_id)))
+            .execute(conn)?;
+        diesel::delete(
+            task_dependencies::table.filter(task_dependencies::depends_on_task_id.eq(task_id)),
+        )
+        .execute(conn)?;
+
+        // DELETE the task row (subtasks cascade via `parent_task_id ON DELETE CASCADE`).
+        diesel::delete(tasks::table.find(task_id)).execute(conn)?;
+
+        // Outbox: the deletion AND its `task.deleted` event commit atomically. Correlate to
+        // the task's project + its Spec's workspace anchor (captured before the row went).
+        let workspace_id = match &task.spec_id {
+            Some(sid) => spec_correlation(conn, sid)?.and_then(|(_, ws)| ws),
+            None => None,
+        };
+        record_task_event(
+            conn,
+            "task.deleted",
+            &task.project_id,
+            workspace_id.as_deref(),
+            task.spec_id.as_deref(),
+            task_id,
+        )?;
+
+        Ok(())
     })
 }
 
@@ -4413,14 +4676,14 @@ pub fn set_primary_workspace(
     })
 }
 
-// --- Repository manual override + detection upsert (task #5, PDR-0013) ------
+// --- Repository manual override + explicit config (task #5 / finding #27, PDR-0013) ---
 //
-// Auto-detection populates repositories under `workspace.root_path`; the user may
-// then MANUALLY override an identity — RENAME it, or mark it `optional` (the
-// in-DB "nyxignore" that excludes it from a workspace's DERIVED membership). These
-// are the persistence primitives the `crate::repository` detection/membership layer
-// drives; the Git state (branch/dirty/remotes) is NEVER written here — it is re-read
-// from Git on demand (PDR-0013).
+// Repositories are configured EXPLICITLY, once per PROJECT (finding #27): there is NO
+// disk auto-detection. Each repo is a `relative_path` (+ a logical `name`) stored on the
+// project; a workspace's repos are then DERIVED at `workspace.root_path || relative_path`
+// (PDR-0013). The user may additionally RENAME an identity, or mark it `optional` (the
+// in-DB "nyxignore" that excludes it from a workspace's DERIVED membership). The Git state
+// (branch/dirty/remotes) is NEVER written here — it is re-read from Git on demand.
 
 /// Rename a repository's logical `name` (a manual override), bumping `updated_at`.
 /// `relative_path` (the identity within the project) is untouched — a rename is a
@@ -4454,61 +4717,141 @@ pub fn set_repository_optional(
         .execute(conn)
 }
 
-/// Idempotently register a DETECTED repository at `relative_path` in `project_id`.
+/// One repository the user configures on a project (finding #27): a `relative_path`
+/// within the project (`"."` for a mono-repo at the workspace root) plus an optional
+/// logical `name` (defaults to the path's basename when absent/blank). This is the
+/// EXPLICIT association that replaces the removed disk auto-detection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoConfig {
+    /// Conventional path within the project (`"."` = the workspace root itself).
+    pub relative_path: String,
+    /// Optional logical name; `None`/blank derives it from `relative_path`.
+    pub name: Option<String>,
+}
+
+/// Normalize a user-supplied `relative_path` to the canonical conventional form:
+/// trimmed, without a leading `./` or a trailing `/`; an empty path or `.` collapses to
+/// [`crate::repository::MONO_REPO_RELATIVE_PATH`] (`"."`). Keeps the identity key
+/// `(project_id, relative_path)` stable regardless of how the caller spelled it.
+fn normalize_relative_path(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .trim();
+    if trimmed.is_empty() || trimmed == "." {
+        crate::repository::MONO_REPO_RELATIVE_PATH.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Derive a logical repo `name` from its `relative_path` (the basename), or `"repo"`
+/// when the path has no basename (e.g. `"."`). Used only when the caller supplies no
+/// explicit name.
+fn derive_repo_name(relative_path: &str) -> String {
+    std::path::Path::new(relative_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "repo".to_string())
+}
+
+/// SET the explicit repository configuration of `project_id` (finding #27): the given
+/// `repos` become the project's active logical identities, keyed on `(project_id,
+/// relative_path)`. This is a full RECONCILE — the single write path the explicit config
+/// tool uses:
+///   * each configured repo is UPSERTED (created if absent, reactivated + renamed if it
+///     had been archived or renamed) so re-running the config converges without
+///     duplicating an identity or losing its history;
+///   * any currently-active repo whose `relative_path` is NOT in the new set is
+///     soft-ARCHIVED (removed from the config) — its row/history survive.
 ///
-/// Detection re-runs whenever a workspace is (re)registered, so this MUST NOT clobber
-/// a user's manual overrides. Keyed on the stable identity `(project_id,
-/// relative_path)`:
-///   * ABSENT → insert a new logical identity with the detected `name` (active,
-///     non-optional by default).
-///   * PRESENT and ARCHIVED → un-archive it (the folder reappeared) but leave the
-///     user's `name`/`optional` overrides intact.
-///   * PRESENT and active → a no-op; the manual `name`/`optional` overrides win over
-///     the detected name (detection never renames or re-includes behind the user).
-///
-/// Returns the resolved [`Repository`] row (inserted or pre-existing). This is the
-/// single write path detection uses, so a re-scan converges instead of duplicating.
+/// NEVER scans the disk. A project left with NO configured repos falls back at
+/// derivation time to the workspace's current folder ([`crate::repository::workspace_members`]).
+/// Returns the project's post-reconcile live repositories (canonical order).
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn upsert_detected_repository(
+pub fn set_project_repositories(
     conn: &mut SqliteConnection,
     project_id: &str,
-    detected_name: &str,
-    relative_path: &str,
-) -> QueryResult<Repository> {
+    repos: &[RepoConfig],
+) -> QueryResult<Vec<Repository>> {
     conn.transaction(|conn| {
-        let existing: Option<Repository> = repositories::table
-            .filter(repositories::project_id.eq(project_id))
-            .filter(repositories::relative_path.eq(relative_path))
-            .select(Repository::as_select())
-            .first::<Repository>(conn)
-            .optional()?;
+        let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for repo in repos {
+            let relative_path = normalize_relative_path(&repo.relative_path);
+            upsert_configured_repository(conn, project_id, &relative_path, repo.name.as_deref())?;
+            kept.insert(relative_path);
+        }
+        // Reconcile: archive any ACTIVE identity no longer in the configured set.
+        let active = list_repositories(conn, project_id)?;
+        for repo in active {
+            if !kept.contains(&repo.relative_path) {
+                archive_repository(conn, &repo.id)?;
+            }
+        }
+        list_repositories(conn, project_id)
+    })
+}
 
-        match existing {
-            Some(repo) if repo.archived_at.is_some() => {
-                // The folder reappeared: reactivate the SAME identity, keep overrides.
+/// Upsert ONE explicitly-configured repository at `relative_path` in `project_id`, keyed
+/// on the stable identity `(project_id, relative_path)`:
+///   * ABSENT → insert a new logical identity (active, non-optional). Its `name` is the
+///     caller's (disambiguated against siblings via [`unique_repository_name`]) or the
+///     path's basename.
+///   * PRESENT → reactivate it if it was archived, and apply the caller's explicit
+///     `name` when provided (config is authoritative). A `None`/blank name keeps the
+///     current name (so re-running the same config, or a rename-only edit elsewhere, is
+///     preserved).
+///
+/// Returns the resolved [`Repository`] row.
+fn upsert_configured_repository(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    relative_path: &str,
+    name: Option<&str>,
+) -> QueryResult<Repository> {
+    let desired_name = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    let existing: Option<Repository> = repositories::table
+        .filter(repositories::project_id.eq(project_id))
+        .filter(repositories::relative_path.eq(relative_path))
+        .select(Repository::as_select())
+        .first::<Repository>(conn)
+        .optional()?;
+
+    match existing {
+        Some(repo) => {
+            let reactivate = repo.archived_at.is_some();
+            let rename = desired_name
+                .as_deref()
+                .map(|n| n != repo.name)
+                .unwrap_or(false);
+            if reactivate || rename {
+                let final_name = desired_name.unwrap_or_else(|| repo.name.clone());
                 diesel::update(repositories::table.find(&repo.id))
                     .set((
                         repositories::archived_at.eq(None::<i64>),
+                        repositories::name.eq(final_name),
                         repositories::updated_at.eq(now_millis()),
                     ))
                     .execute(conn)?;
-                repositories::table
-                    .find(&repo.id)
-                    .select(Repository::as_select())
-                    .first::<Repository>(conn)
             }
-            // Active identity already present → detection is a no-op (overrides win).
-            Some(repo) => Ok(repo),
-            None => {
-                // A brand-new detected identity. `name` may collide with a sibling's
-                // (two folders resolving to the same logical name); disambiguate so the
-                // UNIQUE(project_id, name) holds — the path is the identity, the name is
-                // a label.
-                let name = unique_repository_name(conn, project_id, detected_name)?;
-                create_repository(conn, project_id, &name, relative_path, false)
-            }
+            repositories::table
+                .find(&repo.id)
+                .select(Repository::as_select())
+                .first::<Repository>(conn)
         }
-    })
+        None => {
+            // A brand-new identity. The `name` may collide with a sibling's; disambiguate
+            // so UNIQUE(project_id, name) holds — the path is the identity, name a label.
+            let base = desired_name.unwrap_or_else(|| derive_repo_name(relative_path));
+            let name = unique_repository_name(conn, project_id, &base)?;
+            create_repository(conn, project_id, &name, relative_path, false)
+        }
+    }
 }
 
 /// Pick a UNIQUE `repositories.name` within `project_id`, given a detected `stub`.
@@ -5830,8 +6173,14 @@ pub const SESSION_STALE_AFTER_MS: i64 = 30 * 60 * 1000;
 /// `unknown`/`ended`/`resume_failed` is untouched (the filter is `state='active'`),
 /// and a still-fresh `active` row is left alone. An `unknown` row STAYS a resume
 /// candidate (the resume flow reads active OR unknown); this only records the doubt.
-/// Returns the number of rows flipped. Run on each boot/scan (the kill-then-relaunch
-/// path leaves a row `active`, and this rebascules it on the next scan).
+/// Returns the number of rows flipped.
+///
+/// WIRING: currently has NO production caller. The v2.5.8 crash-UI revert removed the
+/// boot crash-reconcile that used to run this on each boot/scan, so nothing in prod
+/// flips a killed-then-relaunched `active` row to `unknown` today (a "crash" here is a
+/// clean shutdown). Retained as the canonical active→unknown staleness authority (hence
+/// the `#[cfg_attr(not(test), allow(dead_code))]`) and reached only by tests; re-wire it
+/// into a periodic/boot scan if that reconcile is reinstated.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn sweep_stale_active_sessions(
     conn: &mut SqliteConnection,
@@ -7085,7 +7434,8 @@ mod tests {
     fn spec_ready_to_review(conn: &mut SqliteConnection, project_id: &str) -> String {
         let (spec, _) = create_spec(conn, project_id, "Spec", complete_sections()).unwrap();
         transition_spec(conn, &spec.id, SpecTransition::Ready, true).unwrap();
-        transition_spec(conn, &spec.id, SpecTransition::Start, false).unwrap();
+        // `start` is now sensitive (it poses the workspace anchor) → confirm it.
+        transition_spec(conn, &spec.id, SpecTransition::Start, true).unwrap();
         transition_spec(conn, &spec.id, SpecTransition::Review, false).unwrap();
         spec.id
     }
@@ -7104,8 +7454,8 @@ mod tests {
         // draft → ready (sensitive: confirmed).
         let s = transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
         assert_eq!(s.status, SPEC_STATUS_READY);
-        // ready → in_progress (routine).
-        let s = transition_spec(&mut conn, &spec.id, SpecTransition::Start, false).unwrap();
+        // ready → in_progress (sensitive: it poses the anchor — confirmed).
+        let s = transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap();
         assert_eq!(s.status, SPEC_STATUS_IN_PROGRESS);
         // in_progress → in_review ("review", routine).
         let s = transition_spec(&mut conn, &spec.id, SpecTransition::Review, false).unwrap();
@@ -7127,7 +7477,7 @@ mod tests {
         // Cancel from in_progress (a non-terminal state) — confirmed → cancelled.
         let (spec, _) = create_spec(&mut conn, &project.id, "A", complete_sections()).unwrap();
         transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
-        transition_spec(&mut conn, &spec.id, SpecTransition::Start, false).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap();
         let cancelled = transition_spec(&mut conn, &spec.id, SpecTransition::Cancel, true).unwrap();
         assert_eq!(cancelled.status, SPEC_STATUS_CANCELLED);
 
@@ -7149,8 +7499,9 @@ mod tests {
         let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
         let (spec, _) = create_spec(&mut conn, &project.id, "Spec", complete_sections()).unwrap();
 
-        // start requires source=ready; on a draft it is an invalid source.
-        let err = transition_spec(&mut conn, &spec.id, SpecTransition::Start, false).unwrap_err();
+        // start requires source=ready; on a draft it is an invalid source. `start` is now
+        // sensitive, so confirm it to reach the source guard (the guard-rail is checked first).
+        let err = transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap_err();
         match err {
             SpecTransitionError::InvalidSource { from, to } => {
                 assert_eq!(from, SPEC_STATUS_DRAFT);
@@ -7171,10 +7522,10 @@ mod tests {
         assert!(matches!(err, SpecTransitionError::InvalidSource { .. }));
     }
 
-    /// DONE-CRITERION: "garde-fous (confirmation) sur ready/done/cancel." A SENSITIVE
-    /// transition without user confirmation is refused with `ConfirmationRequired`,
-    /// writing nothing; WITH confirmation it proceeds. The routine transitions
-    /// (start/review) need no confirmation.
+    /// DONE-CRITERION: "garde-fous (confirmation) sur ready/start/done/cancel." A SENSITIVE
+    /// transition without user confirmation is refused with `ConfirmationRequired`, writing
+    /// nothing; WITH confirmation it proceeds. `start` is now sensitive (it poses the
+    /// workspace anchor); only `review` stays routine (no confirmation needed).
     #[test]
     fn sensitive_transitions_require_user_confirmation() {
         let mut conn = open_in_memory();
@@ -7190,10 +7541,23 @@ mod tests {
             "an unconfirmed sensitive transition writes nothing"
         );
 
-        // Confirmed ready proceeds; then start/review are routine (no confirmation needed).
+        // Confirmed ready proceeds. `start` is ALSO sensitive now: unconfirmed → refused,
+        // still `ready` (nothing written).
         transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
-        transition_spec(&mut conn, &spec.id, SpecTransition::Start, false)
-            .expect("start needs no confirmation");
+        let err = transition_spec(&mut conn, &spec.id, SpecTransition::Start, false).unwrap_err();
+        assert!(
+            matches!(err, SpecTransitionError::ConfirmationRequired),
+            "start is sensitive (it poses the anchor) — unconfirmed is refused"
+        );
+        assert_eq!(
+            get_spec(&mut conn, &spec.id).unwrap().unwrap().status,
+            SPEC_STATUS_READY,
+            "an unconfirmed start writes nothing"
+        );
+
+        // Confirmed start proceeds; review is routine (no confirmation needed).
+        transition_spec(&mut conn, &spec.id, SpecTransition::Start, true)
+            .expect("confirmed start proceeds");
         transition_spec(&mut conn, &spec.id, SpecTransition::Review, false)
             .expect("review needs no confirmation");
 
@@ -8356,16 +8720,26 @@ mod tests {
 
     // --- Spec ↔ workspace LINK + DERIVED repos/project (v2.4 Phase 3, v15) ----
 
+    /// Drive a Spec to `in_progress` (unanchored) so the standalone anchor tests can exercise
+    /// `set_spec_workspace` — which is now STATE-GUARDED to `in_progress`. Confirms the two
+    /// sensitive steps (ready, start) and leaves the anchor unset (start with no workspace).
+    fn spec_in_progress_unanchored(conn: &mut SqliteConnection, project_id: &str) -> Spec {
+        let (spec, _) = create_spec(conn, project_id, "S", complete_sections()).unwrap();
+        transition_spec(conn, &spec.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(conn, &spec.id, SpecTransition::Start, true).unwrap();
+        get_spec(conn, &spec.id).unwrap().unwrap()
+    }
+
     /// DONE-CRITERION (task 01KX1DH6BB1QGMC0XBAQBRVZ5W), clause 1: "une Spec est liée à un
-    /// workspace via specs.workspace_id". [`set_spec_workspace`] anchors a Spec on an
-    /// EXISTING workspace and the pointer persists (round-trips via [`get_spec`]); clearing
-    /// it (`None`) detaches sanely.
+    /// workspace via specs.workspace_id". [`set_spec_workspace`] (re)anchors an IN_PROGRESS
+    /// Spec on an EXISTING workspace and the pointer persists (round-trips via [`get_spec`]);
+    /// clearing it (`None`) detaches sanely.
     #[test]
     fn set_spec_workspace_links_and_persists() {
         let mut conn = open_in_memory();
         let (project, root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
-        let (spec, _) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
-        assert_eq!(spec.workspace_id, None, "a fresh Spec is not yet anchored");
+        let spec = spec_in_progress_unanchored(&mut conn, &project.id);
+        assert_eq!(spec.workspace_id, None, "in_progress but not yet anchored");
 
         let linked = set_spec_workspace(&mut conn, &spec.id, Some(&root.id)).unwrap();
         assert_eq!(
@@ -8393,7 +8767,7 @@ mod tests {
     fn set_spec_workspace_guards_missing_workspace_and_spec() {
         let mut conn = open_in_memory();
         let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
-        let (spec, _) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
+        let spec = spec_in_progress_unanchored(&mut conn, &project.id);
 
         let err = set_spec_workspace(&mut conn, &spec.id, Some("no-such-workspace")).unwrap_err();
         assert!(
@@ -8408,6 +8782,95 @@ mod tests {
         assert!(
             matches!(err2, SetSpecWorkspaceError::SpecNotFound),
             "an unknown Spec is SpecNotFound, got {err2:?}"
+        );
+    }
+
+    /// STATE GUARD (review finding): the standalone [`set_spec_workspace`] REFUSES to anchor a
+    /// Spec that is not `in_progress` — a `draft` and a `ready` Spec are both rejected with
+    /// [`SetSpecWorkspaceError::InvalidState`], writing NOTHING. The anchor is posed at the
+    /// ready→in_progress transition, never at authoring. Once in_progress it is allowed.
+    #[test]
+    fn set_spec_workspace_refused_outside_in_progress() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+
+        // draft → refused.
+        let (draft, _) = create_spec(&mut conn, &project.id, "S", complete_sections()).unwrap();
+        let err = set_spec_workspace(&mut conn, &draft.id, Some(&root.id)).unwrap_err();
+        assert!(
+            matches!(&err, SetSpecWorkspaceError::InvalidState { status } if status == SPEC_STATUS_DRAFT),
+            "anchoring a draft is refused as InvalidState, got {err:?}"
+        );
+        assert_eq!(
+            get_spec(&mut conn, &draft.id)
+                .unwrap()
+                .unwrap()
+                .workspace_id,
+            None,
+            "the refused anchor wrote nothing"
+        );
+
+        // ready → still refused.
+        transition_spec(&mut conn, &draft.id, SpecTransition::Ready, true).unwrap();
+        let err = set_spec_workspace(&mut conn, &draft.id, Some(&root.id)).unwrap_err();
+        assert!(
+            matches!(&err, SetSpecWorkspaceError::InvalidState { status } if status == SPEC_STATUS_READY),
+            "anchoring a ready Spec is refused as InvalidState, got {err:?}"
+        );
+
+        // in_progress → allowed.
+        transition_spec(&mut conn, &draft.id, SpecTransition::Start, true).unwrap();
+        let linked = set_spec_workspace(&mut conn, &draft.id, Some(&root.id)).unwrap();
+        assert_eq!(linked.workspace_id.as_deref(), Some(root.id.as_str()));
+    }
+
+    /// The `start` transition POSES the workspace anchor in the SAME operation
+    /// ([`transition_spec_with_workspace`]): ready→in_progress writes both the status and
+    /// `specs.workspace_id` atomically. A dangling workspace id is refused
+    /// ([`SpecTransitionError::WorkspaceNotFound`]) and writes nothing.
+    #[test]
+    fn start_transition_anchors_the_workspace_atomically() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "S", complete_sections()).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
+
+        // A dangling anchor is refused; the Spec stays `ready`, unanchored.
+        let err = transition_spec_with_workspace(
+            &mut conn,
+            &spec.id,
+            SpecTransition::Start,
+            true,
+            Some("no-such-workspace"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SpecTransitionError::WorkspaceNotFound));
+        let got = get_spec(&mut conn, &spec.id).unwrap().unwrap();
+        assert_eq!(got.status, SPEC_STATUS_READY, "the refusal wrote nothing");
+        assert_eq!(got.workspace_id, None);
+
+        // A real workspace: status + anchor flip together.
+        let started = transition_spec_with_workspace(
+            &mut conn,
+            &spec.id,
+            SpecTransition::Start,
+            true,
+            Some(&root.id),
+        )
+        .unwrap();
+        assert_eq!(started.status, SPEC_STATUS_IN_PROGRESS);
+        assert_eq!(
+            started.workspace_id.as_deref(),
+            Some(root.id.as_str()),
+            "start posed the anchor in the same operation"
+        );
+        // Persisted and resolvable through the workspace.
+        assert_eq!(
+            spec_for_workspace(&mut conn, &root.id)
+                .unwrap()
+                .map(|s| s.id),
+            Some(spec.id.clone()),
+            "the Spec resolves from its anchor after the start transition"
         );
     }
 
@@ -8585,7 +9048,7 @@ mod tests {
             verification_command: None,
             spec_id: Some(spec_id.to_string()),
             parent_task_id: None,
-            phase: Some(2),
+            phase_name: Some("Delivery".to_string()),
         }
     }
 
@@ -8624,7 +9087,9 @@ mod tests {
         assert_eq!(slice.description.as_deref(), Some("a body"));
         assert_eq!(slice.acceptance_criteria.as_deref(), Some("done when X"));
         assert_eq!(slice.verification_command, None);
-        assert_eq!(slice.phase, Some(2));
+        // The phase is resolved from the NAME "Delivery": the first phase seen on this Spec,
+        // so it materializes as number 1 (get-or-create, 1-based, first-seen order).
+        assert_eq!(slice.phase, Some(1));
         assert_eq!(slice.position, 0);
         assert_eq!(slice.blocked_reason, None);
         assert_eq!(slice.skip_reason, None);
@@ -8733,27 +9198,65 @@ mod tests {
         );
     }
 
-    /// DONE-CRITERION: "phases". A task carries its `phase` (indexes `specs.phases`,
-    /// PDR-0022); `None` = flat.
+    /// DONE-CRITERION: "phases" — task_add BY NAME materializes `specs.phases` (PDR-0022).
+    /// A task carries a phase NAME; `create_task` GET-OR-CREATEs it in the Spec's plan and
+    /// stores the resolved 1-based number on `task.phase`. The plan builds incrementally in
+    /// FIRST-SEEN order, a repeated name REUSES its number, and no task is ever orphaned
+    /// (its phase always exists in the plan). `None` (or no Spec) = flat.
     #[test]
-    fn task_carries_its_phase() {
+    fn task_add_by_name_materializes_the_plan_get_or_create() {
         let mut conn = open_in_memory();
         let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
         let (spec, _) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
-        let phased = create_task(
-            &mut conn,
-            &project.id,
-            "Phase 3 work",
-            NewTaskInput {
-                spec_id: Some(spec.id.clone()),
-                phase: Some(3),
-                ..NewTaskInput::slice()
-            },
-        )
-        .unwrap();
-        assert_eq!(phased.phase, Some(3), "the task is grouped in phase 3");
+        // A fresh Spec has no plan.
+        assert_eq!(get_spec(&mut conn, &spec.id).unwrap().unwrap().phases, "[]");
+
+        let phase_task = |conn: &mut SqliteConnection, title: &str, name: &str| {
+            create_task(
+                conn,
+                &project.id,
+                title,
+                NewTaskInput {
+                    spec_id: Some(spec.id.clone()),
+                    phase_name: Some(name.to_string()),
+                    ..NewTaskInput::slice()
+                },
+            )
+            .unwrap()
+        };
+
+        // First-seen "Foundation" → phase 1 (1-based), and the plan is auto-created.
+        let a = phase_task(&mut conn, "wire it", "Foundation");
+        assert_eq!(a.phase, Some(1), "first phase name seen is number 1");
+        // A NEW name "Delivery" → phase 2 (next number, first-seen order).
+        let b = phase_task(&mut conn, "ship it", "Delivery");
+        assert_eq!(b.phase, Some(2), "second distinct name is number 2");
+        // The SAME name "Foundation" again → REUSES number 1 (get-or-create, no new phase).
+        let c = phase_task(&mut conn, "more foundation", "Foundation");
+        assert_eq!(c.phase, Some(1), "a repeated name reuses its number");
+
+        // The plan MATERIALIZED from the names, 1-based, in first-seen order, no duplicates.
+        let phases = get_spec(&mut conn, &spec.id).unwrap().unwrap().phases;
+        assert_eq!(
+            phases, r#"[{"number":1,"name":"Foundation"},{"number":2,"name":"Delivery"}]"#,
+            "specs.phases self-builds from the task phase names (1-based, first-seen)",
+        );
+        // No orphan is possible: every task's phase exists in the plan by construction.
+        assert!(
+            validate_phase_plan(&phases).is_empty(),
+            "the built plan is coherent 1..N"
+        );
+
+        // A whitespace-only name, or no Spec, is flat (no phase, no plan growth).
+        let blank = phase_task(&mut conn, "blank phase", "   ");
+        assert_eq!(blank.phase, None, "a blank name = flat");
         let flat = create_task(&mut conn, &project.id, "Flat", NewTaskInput::slice()).unwrap();
-        assert_eq!(flat.phase, None, "no phase = flat");
+        assert_eq!(flat.phase, None, "no phase name = flat");
+        assert_eq!(
+            get_spec(&mut conn, &spec.id).unwrap().unwrap().phases,
+            r#"[{"number":1,"name":"Foundation"},{"number":2,"name":"Delivery"}]"#,
+            "a flat/blank task never grows the plan",
+        );
     }
 
     /// DONE-CRITERION: "dépendances sans cycle". An edge is added and read back; a
@@ -8827,6 +9330,93 @@ mod tests {
         assert_eq!(remove_task_dependency(&mut conn, &a.id, &b.id).unwrap(), 1);
         add_task_dependency(&mut conn, &b.id, &a.id, DEPENDENCY_TYPE_BLOCKS)
             .expect("with A→B removed, B→A is acyclic");
+    }
+
+    /// v2.5.8 finding #31: `delete_task` REALLY removes a task (+ every `task_dependencies`
+    /// edge touching it, in EITHER direction) but ONLY while its parent Spec is in `draft`.
+    /// In draft the row and its edges are gone, the OTHER tasks survive, and the auto-built
+    /// phase plan stays a coherent 1..N (the emptied phase entry is KEPT — no gap, no orphan).
+    /// Out of draft (in_progress) the delete is REFUSED (`NotDraft`) and removes nothing.
+    /// Unknown id → `NotFound`.
+    #[test]
+    fn delete_task_draft_only_removes_task_and_its_dependency_edges() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
+
+        // A phased task A (Foundation) plus B and C (both Delivery, so the plan is 1..2).
+        let mk = |conn: &mut SqliteConnection, title: &str, phase: &str| {
+            create_task(
+                conn,
+                &project.id,
+                title,
+                NewTaskInput {
+                    spec_id: Some(spec.id.clone()),
+                    phase_name: Some(phase.to_string()),
+                    ..NewTaskInput::slice()
+                },
+            )
+            .unwrap()
+        };
+        let a = mk(&mut conn, "A", "Foundation");
+        let b = mk(&mut conn, "B", "Delivery");
+        let c = mk(&mut conn, "C", "Delivery");
+        // A is the SOURCE of A→B and the TARGET of C→A — deleting A must drop BOTH edges.
+        add_task_dependency(&mut conn, &a.id, &b.id, DEPENDENCY_TYPE_BLOCKS).unwrap();
+        add_task_dependency(&mut conn, &c.id, &a.id, DEPENDENCY_TYPE_BLOCKS).unwrap();
+
+        // Unknown id → NotFound.
+        assert!(matches!(
+            delete_task(&mut conn, "no-such-task"),
+            Err(DeleteTaskError::NotFound)
+        ));
+
+        // In DRAFT: deleting A really removes the row AND both edges touching it.
+        delete_task(&mut conn, &a.id).expect("delete in draft");
+        assert!(
+            get_task(&mut conn, &a.id).unwrap().is_none(),
+            "the task row is gone"
+        );
+        let remaining_edges: i64 = task_dependencies::table
+            .count()
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(
+            remaining_edges, 0,
+            "every dependency edge touching the deleted task (source OR target) is gone"
+        );
+        // The OTHER tasks survive, and the phase plan stays a coherent 1..N — the now-empty
+        // "Foundation" entry is KEPT (pruning it would open a gap the ready gate rejects).
+        assert!(get_task(&mut conn, &b.id).unwrap().is_some(), "B survives");
+        assert!(get_task(&mut conn, &c.id).unwrap().is_some(), "C survives");
+        let phases = get_spec(&mut conn, &spec.id).unwrap().unwrap().phases;
+        assert_eq!(
+            phases, r#"[{"number":1,"name":"Foundation"},{"number":2,"name":"Delivery"}]"#,
+            "the emptied phase entry is kept — the plan stays a clean 1..N after delete",
+        );
+        assert!(
+            validate_phase_plan(&phases).is_empty(),
+            "the plan is still coherent after the delete (no gap, no orphan)"
+        );
+
+        // Move the Spec OUT of draft → the delete is now REFUSED (skip is the legit move).
+        diesel::update(specs::table.find(&spec.id))
+            .set(specs::status.eq(SPEC_STATUS_IN_PROGRESS))
+            .execute(&mut conn)
+            .unwrap();
+        match delete_task(&mut conn, &b.id) {
+            Err(DeleteTaskError::NotDraft { status }) => {
+                assert_eq!(
+                    status, SPEC_STATUS_IN_PROGRESS,
+                    "the refusal carries the status"
+                )
+            }
+            other => panic!("expected NotDraft out of draft, got {other:?}"),
+        }
+        assert!(
+            get_task(&mut conn, &b.id).unwrap().is_some(),
+            "a refused delete removed nothing"
+        );
     }
 
     /// DONE-CRITERION: "transitions de task portées" — each of start / done / block / skip
@@ -9005,7 +9595,8 @@ mod tests {
     fn set_spec_workspace_emits_workspace_changed_event() {
         let mut conn = open_in_memory();
         let (project, root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
-        let (spec, _) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
+        // The standalone anchor is state-guarded to in_progress — drive the Spec there first.
+        let spec = spec_in_progress_unanchored(&mut conn, &project.id);
 
         // ANCHOR: from null → to the workspace.
         set_spec_workspace(&mut conn, &spec.id, Some(&root.id)).unwrap();

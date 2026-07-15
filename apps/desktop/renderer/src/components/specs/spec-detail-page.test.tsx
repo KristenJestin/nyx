@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { RouterProvider } from "@tanstack/react-router";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -190,6 +190,151 @@ describe("SpecDetailPage", () => {
     // The blocked task shows what it is blocked by (from the dependency edge). The caption
     // text is split across nodes ("Blocked by: " + the title), so match with `exact: false`.
     expect(screen.getAllByText(/Blocked by:/, { exact: false }).length).toBeGreaterThan(0);
+  });
+
+  it("never hides a mal-phased task: a phase absent from the plan lands in Unphased", async () => {
+    // A task whose `phase` (99) matches NO plan entry — legacy/mal-phased data. The redesign
+    // makes orphans impossible for new Specs, but the UI guard must still surface such a task
+    // (never hidden) under the "Unphased" group.
+    const base = detailFixture();
+    const orphan = { ...base.tasks[0], id: "t99", title: "Orphaned legacy task", phase: 99 };
+    const detail: SpecDetail = { ...base, tasks: [...base.tasks, orphan] };
+    installBackend(detail);
+
+    renderDetail();
+    await screen.findByRole("heading", { name: "The detailed spec" });
+    fireEvent.click(screen.getByRole("tab", { name: /Tasks/ }));
+    // The orphan is visible, grouped under "Unphased" — not swallowed.
+    expect(await screen.findByText("Orphaned legacy task")).toBeTruthy();
+    expect(screen.getByText("Unphased")).toBeTruthy();
+  });
+
+  // A single-phase Spec fixture built from a status list, e.g. mkPhaseDetail(["done", "cancelled"]).
+  // Each entry becomes one task in phase 1; a "cancelled" status is what a `skip` stamps.
+  function mkPhaseDetail(statuses: string[]): SpecDetail {
+    const base = detailFixture();
+    const tasks = statuses.map((status, i) => ({
+      ...base.tasks[0],
+      id: `t${i}`,
+      title: `Task ${i} (${status})`,
+      phase: 1,
+      status,
+      skip_reason: status === "cancelled" ? "obsolete" : null,
+      blocked_reason: null,
+    }));
+    return {
+      ...base,
+      spec: { ...base.spec, phases: JSON.stringify([{ number: 1, name: "Foundation" }]) },
+      tasks,
+      dependencies: [],
+    };
+  }
+
+  async function openTasksTab() {
+    renderDetail();
+    await screen.findByRole("heading", { name: "The detailed spec" });
+    fireEvent.click(screen.getByRole("tab", { name: /Tasks/ }));
+  }
+
+  const hasBar = (done: number, total: number) =>
+    screen
+      .getAllByRole("progressbar")
+      .some(
+        (b) =>
+          b.getAttribute("aria-valuenow") === String(done) &&
+          b.getAttribute("aria-valuemax") === String(total),
+      );
+
+  // Finding #30 (dogfood): a skipped task (a `skip` stamps the terminal `cancelled` status) must
+  // NOT read like pending — it is segregated into a collapsed "Skipped" sub-section, and reads
+  // muted/struck just like `done`.
+  it("segregates skipped tasks into a collapsed 'Skipped' section", async () => {
+    installBackend(mkPhaseDetail(["done", "cancelled", "cancelled"]));
+    await openTasksTab();
+
+    // The done task renders in the phase's ACTIVE list (not inside any <details>).
+    const doneTitle = await screen.findByText("Task 0 (done)");
+    expect(doneTitle.closest("details")).toBeNull();
+
+    // The skipped tasks are SEGREGATED into the collapsed "Skipped" <details> — not the active list.
+    const skippedTitle = screen.getByText("Task 1 (cancelled)");
+    const skippedSection = skippedTitle.closest("details");
+    expect(skippedSection).not.toBeNull();
+    // Collapsed by default, labelled "Skipped", with a count of 2.
+    expect((skippedSection as HTMLDetailsElement).open).toBe(false);
+    expect(within(skippedSection as HTMLElement).getByText("Skipped")).toBeTruthy();
+    expect(within(skippedSection as HTMLElement).getByText("2")).toBeTruthy();
+
+    // A skipped task reads muted/struck (resolved style), the same treatment `done` gets — not
+    // the plain `text-foreground` of an open task.
+    expect(skippedTitle.className).toMatch(/line-through/);
+    expect(doneTitle.className).toMatch(/line-through/);
+  });
+
+  // Finding #34 (dogfood, refine of #30): PROGRESS excludes skipped tasks from BOTH numerator and
+  // denominator — progress = done / (total − skipped). A phase with 3 done + 3 skip reads 3/3
+  // (100%), NOT 6/6; the roll-up header follows the same formula.
+  it("progress excludes skipped tasks — all-active-done + skips reads done/active = 100%", async () => {
+    installBackend(mkPhaseDetail(["done", "done", "done", "cancelled", "cancelled", "cancelled"]));
+    await openTasksTab();
+    await screen.findByText("Task 0 (done)");
+
+    // Both the PhaseCard and the roll-up header bars read 3/3 (NOT 6/6) — skips are excluded.
+    expect(hasBar(3, 3)).toBe(true);
+    expect(hasBar(6, 6)).toBe(false);
+    // The counters read 3/3 (phase card) and the header shows 100%.
+    expect(screen.getAllByText("3/3").length).toBeGreaterThan(0);
+    expect(screen.getByText("100%")).toBeTruthy();
+  });
+
+  it("progress excludes skipped tasks — 0 done + pending + skips reads 0/active = 0%", async () => {
+    // 0 done + 3 open (todo) + 2 skip → active = 3, done = 0 → 0/3 (0%), NOT 2/5 (40%).
+    installBackend(mkPhaseDetail(["todo", "todo", "todo", "cancelled", "cancelled"]));
+    await openTasksTab();
+    await screen.findByText("Task 0 (todo)");
+
+    expect(hasBar(0, 3)).toBe(true);
+    expect(hasBar(2, 5)).toBe(false);
+    expect(screen.getAllByText("0/3").length).toBeGreaterThan(0);
+    expect(screen.getByText("0%")).toBeTruthy();
+  });
+
+  it("a fully-skipped phase reads complete/100% (no divide-by-zero / NaN)", async () => {
+    // EDGE CASE: every task skipped → active = 0 → treated as complete/100%, rendered as a full
+    // bar (done === total === 1), never NaN.
+    installBackend(mkPhaseDetail(["cancelled", "cancelled", "cancelled"]));
+    const { container } = renderDetail();
+    await screen.findByRole("heading", { name: "The detailed spec" });
+    fireEvent.click(screen.getByRole("tab", { name: /Tasks/ }));
+    await screen.findByText("Task 0 (cancelled)");
+
+    // The guard turns the empty active set into a full bar and 100% — no NaN anywhere.
+    expect(hasBar(1, 1)).toBe(true);
+    expect(screen.getByText("100%")).toBeTruthy();
+    expect(container.innerHTML).not.toMatch(/NaN/);
+  });
+
+  it("the roll-up header follows the same done/(total − skipped) formula across phases", async () => {
+    const base = detailFixture();
+    // Phase 1: 1 done + 1 skip → 1/1 (100%). Phase 2: 1 open + 1 skip → 0/1 (0%).
+    // Spec roll-up: done = 1, active = 2 (skips excluded) → 1/2 (50%), NOT 2/4.
+    const tasks = [
+      { ...base.tasks[0], id: "a1", title: "P1 done", phase: 1, status: "done" },
+      { ...base.tasks[0], id: "a2", title: "P1 skip", phase: 1, status: "cancelled" },
+      { ...base.tasks[0], id: "b1", title: "P2 open", phase: 2, status: "todo" },
+      { ...base.tasks[0], id: "b2", title: "P2 skip", phase: 2, status: "cancelled" },
+    ];
+    installBackend({ ...base, tasks, dependencies: [] });
+    await openTasksTab();
+    await screen.findByText("P1 done");
+
+    // Header roll-up: 1/2 → 50% (skips excluded from BOTH numerator and denominator).
+    expect(hasBar(1, 2)).toBe(true);
+    expect(hasBar(2, 4)).toBe(false);
+    expect(screen.getByText("50%")).toBeTruthy();
+    // Phase bars: phase 1 = 1/1, phase 2 = 0/1.
+    expect(hasBar(1, 1)).toBe(true);
+    expect(hasBar(0, 1)).toBe(true);
   });
 
   it("mounts the comments-only Review tab with an Open review button (no diff viewer, PDR-0028)", async () => {

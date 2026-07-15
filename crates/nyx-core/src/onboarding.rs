@@ -1077,6 +1077,7 @@ mod tests {
             source_dir: source.to_path_buf(),
             install_dir: stable.to_path_buf(),
             settings_path: settings.to_path_buf(),
+            commands_dir: settings.parent().map(|p| p.join("commands")),
             mcp_port: 8765,
         }
     }

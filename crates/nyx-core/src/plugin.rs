@@ -109,6 +109,14 @@ pub struct PluginInstall {
     /// Used ONLY to strip legacy hand-written nyx keys on uninstall; the CLI owns the
     /// install-time writes. Injectable for tests.
     pub settings_path: PathBuf,
+    /// The agent's user-scope slash-command directory (Claude Code: `~/.claude/commands/`),
+    /// resolved as the parent of [`Self::settings_path`] + `commands/`. nyx DEPLOYS the three
+    /// bare `/nspec` `/ndev` `/ndoc` stubs here at install/reconcile and REMOVES them at
+    /// uninstall (dogfood finding 01KXEJVZ: a plugin-bundled command is namespaced
+    /// `/<plugin>:<cmd>` by Claude Code, so the stubs MUST live user-scope to be invocable
+    /// BARE). `None` when no user-scope command dir is modeled for the provider — the deploy
+    /// is then a no-op (multi-provider: only Claude Code's `~/.claude/commands/` is modeled).
+    pub commands_dir: Option<PathBuf>,
     /// The loopback port the bundled MCP server runs on (`mcp::resolve_port()`). Templated
     /// into the COPIED `.mcp.json` at install/reconcile time (the bundled source keeps the
     /// [`MCP_PORT_PLACEHOLDER`] token instead of a hard-coded port — finding #44), so the
@@ -134,6 +142,38 @@ pub const MCP_PORT_PLACEHOLDER: &str = "__NYX_MCP_PORT__";
 /// from `plugin.json` (`"mcpServers": "./.mcp.json"`). This is the ONE file the port is
 /// templated into during the copy.
 pub const MCP_DESCRIPTOR_FILE: &str = ".mcp.json";
+
+/// The three nyx slash-command stubs, COMPILED IN from the canonical source
+/// (`resources/claude-commands/`, deliberately OUTSIDE the plugin bundle so Claude Code
+/// never namespaces them `/<plugin>:<cmd>` — dogfood finding 01KXEJVZ). Each is deployed
+/// VERBATIM into the user-scope command dir ([`PluginInstall::commands_dir`]) so the human
+/// invokes `/nspec` `/ndev` `/ndoc` BARE. The content is UNCHANGED from the former in-plugin
+/// stubs: it carries the `<!-- NYX-AGENT-CONTEXT role=… -->` sentinel + `$ARGUMENTS`, so the
+/// hook's `UserPromptSubmit` branch still fires and injects the live-rendered role manual.
+/// `(file_name, verbatim_content)` — the SAME bytes the byte-identity + push-injection tests
+/// read from the canonical source dir on disk.
+pub const USER_COMMAND_STUBS: [(&str, &str); 3] = [
+    (
+        "nspec.md",
+        include_str!("../resources/claude-commands/nspec.md"),
+    ),
+    (
+        "ndev.md",
+        include_str!("../resources/claude-commands/ndev.md"),
+    ),
+    (
+        "ndoc.md",
+        include_str!("../resources/claude-commands/ndoc.md"),
+    ),
+];
+
+/// Legacy command directories that OLDER nyx builds bundled INTO the plugin (`commands/`
+/// and `.agents/`). Claude Code namespaces a plugin's commands as `/<plugin>:<cmd>` — the
+/// exact dogfood bug (finding 01KXEJVZ). Now that the stubs ship user-scope instead, any
+/// such directory left inside a PRIOR install's STABLE copy is PRUNED so the reinstalled
+/// plugin (and Claude's re-read marketplace cache) carries NO namespaced command. Names are
+/// relative to [`PluginInstall::install_dir`].
+const LEGACY_PLUGIN_COMMAND_DIRS: [&str; 2] = ["commands", ".agents"];
 
 /// What an [`install`] / [`reconcile`] run changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +348,72 @@ fn template_mcp_port(raw: &[u8], port: u16) -> Vec<u8> {
     }
 }
 
+/// Deploy the three nyx slash-command stubs ([`USER_COMMAND_STUBS`]) into the user-scope
+/// command dir (Claude Code: `~/.claude/commands/`). Best-effort + IDEMPOTENT: creates the
+/// dir, then writes each stub ONLY when its bytes differ from what is already there (an
+/// unchanged deploy is a no-op → no churn), touching NOTHING else in the dir (v1-coexistence:
+/// only nspec/ndev/ndoc.md are ever written). Returns whether anything was written.
+fn deploy_command_stubs(commands_dir: &Path) -> std::io::Result<bool> {
+    std::fs::create_dir_all(commands_dir)?;
+    let mut changed = false;
+    for (name, content) in USER_COMMAND_STUBS {
+        let dest = commands_dir.join(name);
+        let same = std::fs::read(&dest)
+            .map(|old| old == content.as_bytes())
+            .unwrap_or(false);
+        if !same {
+            std::fs::write(&dest, content)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Deploy the user-scope command stubs for `install`, BEST-EFFORT: a `None` `commands_dir`
+/// (no user-scope command dir modeled for the provider) is a no-op, and an IO failure is
+/// logged but NEVER fails the install — the plugin (MCP + hooks) is the primary artifact and
+/// must land even if `~/.claude/commands/` is unwritable (mirrors the rest of the vehicle).
+fn deploy_command_stubs_best_effort(install: &PluginInstall) {
+    if let Some(dir) = install.commands_dir.as_deref() {
+        if let Err(e) = deploy_command_stubs(dir) {
+            eprintln!("nyx plugin: deploying user-scope command stubs failed (best-effort): {e}");
+        }
+    }
+}
+
+/// Remove ONLY the three nyx slash-command stubs from the user-scope command dir — the mirror
+/// of [`deploy_command_stubs`]. Best-effort: an already-absent stub is fine, and NO other file
+/// in the dir is touched (v1-coexistence: never removes a user's own `~/.claude/commands/`
+/// files). Returns whether anything was removed.
+fn remove_command_stubs(commands_dir: &Path) -> bool {
+    let mut removed = false;
+    for (name, _) in USER_COMMAND_STUBS {
+        let dest = commands_dir.join(name);
+        if dest.exists() && std::fs::remove_file(&dest).is_ok() {
+            removed = true;
+        }
+    }
+    removed
+}
+
+/// PRUNE any [`LEGACY_PLUGIN_COMMAND_DIRS`] left inside `install_dir` by a PRIOR install that
+/// bundled the command stubs into the plugin (dogfood finding 01KXEJVZ). [`copy_tree`] mirrors
+/// source→dest by ADD/overwrite only (never deletes), so a stable copy from an older build
+/// would keep its stale `commands/` — which Claude re-reads into its marketplace cache and
+/// namespaces `/<plugin>:<cmd>`. Removing them here guarantees the reinstalled plugin carries
+/// NO namespaced command. Best-effort; returns whether anything was pruned (the caller folds
+/// that into its change signal so a one-time prune forces a fresh re-cache).
+fn prune_legacy_plugin_commands(install_dir: &Path) -> bool {
+    let mut pruned = false;
+    for name in LEGACY_PLUGIN_COMMAND_DIRS {
+        let dir = install_dir.join(name);
+        if dir.exists() && std::fs::remove_dir_all(&dir).is_ok() {
+            pruned = true;
+        }
+    }
+    pruned
+}
+
 /// True when `marketplace` is registered (present in the CLI's marketplace list) AND its
 /// registered path equals `expected_dir` (no drift). Both conditions must hold for the
 /// install to be "current": a stale/dead path counts as NOT current so reconcile heals it.
@@ -352,11 +458,20 @@ pub fn install_with(
     // templating the live MCP port into the copied `.mcp.json` (finding #44). The copy
     // reports whether the content (or port) changed so we can return Updated vs Unchanged.
     let content_changed = copy_tree(&install.source_dir, &install.install_dir, install.mcp_port)?;
+    // Drop any command dir a PRIOR (in-plugin-commands) build left in the stable copy so the
+    // reinstalled plugin carries NO namespaced `/<plugin>:<cmd>` (finding 01KXEJVZ). Fold the
+    // prune into the change signal so a one-time cleanup forces a fresh re-cache below.
+    let content_changed = prune_legacy_plugin_commands(&install.install_dir) || content_changed;
 
     // Register the marketplace + install the plugin. Both are idempotent, so re-running
     // when already current is safe; re-adding at the stable path heals a drifted entry.
     cli.marketplace_add(&install.install_dir)?;
     cli.install(&install.install_id())?;
+
+    // Deploy the BARE user-scope `/nspec` `/ndev` `/ndoc` stubs (finding 01KXEJVZ) — the
+    // stubs are NOT in the plugin bundle, so this is what makes them invocable un-namespaced.
+    // Best-effort + idempotent; a `None` commands_dir is a no-op.
+    deploy_command_stubs_best_effort(install);
 
     // When an ALREADY-current install's stable content changed (new bundled hooks, a plugin
     // version bump from an app update, or a port re-template), FORCE a fresh re-cache through
@@ -410,9 +525,16 @@ pub fn remove_with(install: &PluginInstall, cli: &dyn PluginCli) -> Result<bool,
     // "not found" message, which our adapter maps to Ok).
     let _ = cli.uninstall(&install.install_id());
     let _ = cli.marketplace_remove(&install.marketplace);
+    // Remove the user-scope command stubs we deployed (finding 01KXEJVZ) — best-effort, and
+    // ONLY nspec/ndev/ndoc.md (never a user's own `~/.claude/commands/` files).
+    let stubs_removed = install
+        .commands_dir
+        .as_deref()
+        .map(remove_command_stubs)
+        .unwrap_or(false);
     // Strip legacy hand-written keys the OLD approach left in settings.json.
     let legacy_cleaned = strip_legacy_settings(install)?;
-    Ok(legacy_cleaned)
+    Ok(legacy_cleaned || stubs_removed)
 }
 
 /// Boot-time reconciliation for a single plugin, mirroring the conservative MCP-server
@@ -439,6 +561,13 @@ pub fn reconcile_with(
     let path_ok = is_registered_at(&entries, &install.marketplace, &install.install_dir);
     // Present → ensure the stable content is current and the registered path matches.
     let content_changed = copy_tree(&install.source_dir, &install.install_dir, install.mcp_port)?;
+    // Prune any stale in-plugin command dir left by an older build (finding 01KXEJVZ) and
+    // fold it into the change signal so the one-time cleanup forces a fresh re-cache.
+    let content_changed = prune_legacy_plugin_commands(&install.install_dir) || content_changed;
+    // Present → (re)deploy the user-scope command stubs, best-effort. This also SELF-HEALS a
+    // user-deleted stub on any boot where the plugin is installed (idempotent — a matching
+    // stub is not rewritten), independent of the plugin-change outcome below.
+    deploy_command_stubs_best_effort(install);
     if path_ok && !content_changed {
         return Ok(ReconcileOutcome::Unchanged);
     }
@@ -560,6 +689,16 @@ pub fn claude_settings_path() -> Option<PathBuf> {
     crate::onboarding::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
 
+/// Resolve the agent's user-scope **command** directory (Claude Code: `~/.claude/commands/`)
+/// — the parent of [`claude_settings_path`] joined with `commands/`. This is where nyx deploys
+/// the BARE `/nspec` `/ndev` `/ndoc` stubs (finding 01KXEJVZ): a user-scope command is
+/// invocable un-namespaced, unlike a plugin-bundled command (`/<plugin>:<cmd>`). Honors the
+/// `NYX_CLAUDE_SETTINGS` seam transitively (same resolution as the settings path). `None` when
+/// no settings path / home dir resolves, or the settings path has no parent.
+pub fn claude_commands_dir() -> Option<PathBuf> {
+    claude_settings_path().and_then(|p| p.parent().map(|d| d.join("commands")))
+}
+
 /// Build the Claude Code [`PluginInstall`] from a resolved bundled plugin dir + the
 /// resolved settings path. Centralizes the Claude-specific names (`nyx-v2` marketplace,
 /// `nyx-v2-claude-integration` plugin) in ONE place — the rest of this module is generic.
@@ -669,6 +808,9 @@ mod tests {
             source_dir: source.to_path_buf(),
             install_dir: stable.to_path_buf(),
             settings_path: settings.to_path_buf(),
+            // Command stubs land next to the (temp) settings file, mirroring the real
+            // `~/.claude/commands/` derivation (parent of settings.json + `commands/`).
+            commands_dir: settings.parent().map(|p| p.join("commands")),
             mcp_port,
         }
     }
@@ -1220,6 +1362,137 @@ mod tests {
             .any(|c| c == "uninstall nyx-v2-claude-integration@nyx-v2"));
     }
 
+    // --- BARE user-scope command stubs (finding 01KXEJVZ) -----------------
+
+    /// The lifecycle done-criterion: an install DEPLOYS the three BARE `/nspec` `/ndev`
+    /// `/ndoc` stubs into the commands dir RESOLVED from the `NYX_CLAUDE_SETTINGS` seam
+    /// (parent of settings.json + `commands/`) — each carrying its role sentinel +
+    /// `$ARGUMENTS` — and the uninstall REMOVES exactly those three, leaving a sibling
+    /// user file untouched (v1-coexistence). Never touches the real `~/.claude`.
+    #[test]
+    fn install_deploys_bare_user_scope_stubs_via_settings_seam_and_uninstall_removes_them() {
+        // Resolves the `NYX_CLAUDE_SETTINGS` seam, so it takes the ONE crate-wide seam lock
+        // every env-mutating test shares (review #42/#43). Prior value restored on exit.
+        let _g = crate::CLAUDE_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os("NYX_CLAUDE_SETTINGS");
+
+        let dir = temp_dir("userscope-stubs");
+        let source = write_bundled(&dir);
+        let stable = dir.join("stable");
+        let claude_home = dir.join("dot-claude");
+        std::fs::create_dir_all(&claude_home).unwrap();
+        let settings = claude_home.join("settings.json");
+        std::env::set_var("NYX_CLAUDE_SETTINGS", &settings);
+
+        // The commands dir is RESOLVED through the seam: <claude_home>/commands.
+        let commands_dir = claude_commands_dir().expect("commands dir resolves from the seam");
+        assert_eq!(commands_dir, claude_home.join("commands"));
+
+        let inst = PluginInstall {
+            commands_dir: Some(commands_dir.clone()),
+            ..install_for(&source, &stable, &settings)
+        };
+        let cli = FakeCli::default();
+
+        // A user's own pre-existing command file must survive the whole lifecycle.
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        let user_file = commands_dir.join("my-own.md");
+        std::fs::write(&user_file, "keep me").unwrap();
+
+        install_with(&inst, &cli).unwrap();
+        for ((name, _), role) in USER_COMMAND_STUBS.iter().zip(["spec", "dev", "doc"]) {
+            let deployed = commands_dir.join(name);
+            let body = std::fs::read_to_string(&deployed)
+                .unwrap_or_else(|e| panic!("stub {name} deployed: {e}"));
+            assert!(
+                body.contains(&format!("NYX-AGENT-CONTEXT role={role}")),
+                "deployed {name} carries the role={role} sentinel"
+            );
+            assert!(
+                body.contains("$ARGUMENTS"),
+                "deployed {name} forwards the human's free text"
+            );
+        }
+        // A second install is idempotent (bytes match → no re-write, no panic).
+        install_with(&inst, &cli).unwrap();
+
+        // Uninstall removes ONLY the three nyx stubs, never the user's own file.
+        remove_with(&inst, &cli).unwrap();
+        for (name, _) in USER_COMMAND_STUBS {
+            assert!(
+                !commands_dir.join(name).exists(),
+                "uninstall removed the nyx stub {name}"
+            );
+        }
+        assert!(
+            user_file.exists(),
+            "the user's own command file is preserved"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("NYX_CLAUDE_SETTINGS", v),
+            None => std::env::remove_var("NYX_CLAUDE_SETTINGS"),
+        }
+    }
+
+    /// A `None` commands_dir (no user-scope command dir modeled for the provider) makes the
+    /// deploy/remove a clean no-op — install still succeeds, the stubs are simply not written.
+    #[test]
+    fn install_with_no_commands_dir_is_a_clean_noop() {
+        let dir = temp_dir("no-cmddir");
+        let source = write_bundled(&dir);
+        let stable = dir.join("stable");
+        let settings = dir.join("settings.json");
+        let inst = PluginInstall {
+            commands_dir: None,
+            ..install_for(&source, &stable, &settings)
+        };
+        let cli = FakeCli::default();
+        assert_eq!(install_with(&inst, &cli).unwrap(), PluginChange::Added);
+        // remove is likewise a clean no-op for the stubs (no legacy settings either → false).
+        assert!(!remove_with(&inst, &cli).unwrap());
+    }
+
+    /// An UPGRADE over a stable copy left by an older (in-plugin-commands) build PRUNES the
+    /// stale `commands/` + `.agents/` from the stable dir — so the reinstalled plugin carries
+    /// NO namespaced `/<plugin>:<cmd>` — and the prune counts as a change that forces a fresh
+    /// re-cache (finding 01KXEJVZ).
+    #[test]
+    fn install_prunes_legacy_in_plugin_command_dirs_from_stable_copy() {
+        let dir = temp_dir("prune-legacy");
+        let source = write_bundled(&dir);
+        let stable = dir.join("stable");
+        let settings = dir.join("settings.json");
+        let inst = install_for(&source, &stable, &settings);
+        let cli = FakeCli::default();
+        // First install lands a clean stable copy (source has no commands dirs).
+        install_with(&inst, &cli).unwrap();
+
+        // Simulate the prior build's residue: stale namespaced command dirs in the stable copy.
+        std::fs::create_dir_all(stable.join("commands")).unwrap();
+        std::fs::write(stable.join("commands").join("nspec.md"), "stale").unwrap();
+        std::fs::create_dir_all(stable.join(".agents").join("commands")).unwrap();
+        std::fs::write(stable.join(".agents").join("commands").join("ndev.md"), "x").unwrap();
+
+        // A reinstall prunes them and reports Updated (the prune is a real change) + re-caches.
+        assert_eq!(install_with(&inst, &cli).unwrap(), PluginChange::Updated);
+        assert!(
+            !stable.join("commands").exists(),
+            "stale in-plugin commands/ pruned from the stable copy"
+        );
+        assert!(
+            !stable.join(".agents").exists(),
+            "stale in-plugin .agents/ pruned from the stable copy"
+        );
+        let calls = cli.calls.borrow().clone();
+        assert!(
+            calls.iter().any(|c| c == "mkt-update nyx-v2"),
+            "the prune forced a fresh re-cache: {calls:?}"
+        );
+    }
+
     // --- graceful when claude is absent (review #35) ----------------------
 
     #[test]
@@ -1357,6 +1630,48 @@ mod tests {
                 crate_root.join(f).exists(),
                 "nyx-core is missing the bundled plugin file `{f}` — every shell that \
                  bundles the plugin would ship it incomplete"
+            );
+        }
+        // GUARD (finding 01KXEJVZ): the slash-command stubs are NO LONGER in the plugin
+        // bundle — they are deployed USER-SCOPE (bare `/nspec`), so a plugin-bundled
+        // (namespaced `/<plugin>:<cmd>`) copy must NOT reappear.
+        for legacy in [
+            "resources/claude-plugin/commands",
+            "resources/claude-plugin/.agents",
+        ] {
+            assert!(
+                !crate_root.join(legacy).exists(),
+                "`{legacy}` must NOT exist — a plugin-bundled command is namespaced \
+                 `/<plugin>:<cmd>`; the stubs ship user-scope now (finding 01KXEJVZ)"
+            );
+        }
+    }
+
+    /// GUARD (finding 01KXEJVZ): the three BARE user-scope command stubs the install vehicle
+    /// deploys ([`USER_COMMAND_STUBS`]) must ship in nyx-core's canonical `resources/
+    /// claude-commands/` source (OUTSIDE the plugin bundle), and each must carry its role
+    /// sentinel + `$ARGUMENTS` so the hook's `UserPromptSubmit` injection still fires. The
+    /// compiled-in constant and the on-disk canonical file are asserted byte-identical (the
+    /// push-injection e2e reads the on-disk copy; the deploy writes the constant).
+    #[test]
+    fn nyx_core_ships_the_user_scope_command_stubs() {
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for ((name, content), role) in USER_COMMAND_STUBS.iter().zip(["spec", "dev", "doc"]) {
+            let on_disk = crate_root.join("resources/claude-commands").join(name);
+            let bytes = std::fs::read(&on_disk)
+                .unwrap_or_else(|e| panic!("canonical stub `{name}` must ship: {e}"));
+            assert_eq!(
+                bytes,
+                content.as_bytes(),
+                "the compiled-in `{name}` must match the on-disk canonical source byte-for-byte"
+            );
+            assert!(
+                content.contains(&format!("NYX-AGENT-CONTEXT role={role}")),
+                "`{name}` must carry the role={role} sentinel the hook keys on"
+            );
+            assert!(
+                content.contains("$ARGUMENTS"),
+                "`{name}` must forward the human's free text"
             );
         }
     }

@@ -493,7 +493,8 @@ export interface ReviewRemapResult {
  * a workspace's candidate agent sessions (mirrors the Rust `WorkspaceResumeEntry`). When
  * `resume` is true, `resume_command` is the exact `claude --resume <id>` line to inject;
  * otherwise `skip_reason` records WHY (e.g. `option_off`, `no_conversation`). `uncertain` flags a
- * resumed-but-doubtful (`unknown`/stale) session.
+ * resumed-but-doubtful (`unknown`/stale) session — informational only now (the v2.5.5 restore
+ * panel that used to route on it was reverted; `use-lazy-resume` resumes every resumable entry).
  */
 export interface WorkspaceResumeEntry {
   readonly terminal_id: string;
@@ -507,14 +508,14 @@ export interface WorkspaceResumeEntry {
 
 /**
  * The `workspace_restore_plan` read model: after a restart, WHAT a workspace offers to resume —
- * REUSING the existing resume policy (no third system). Only `resume_sessions` is consumed by the
- * lazy-resume driver here; `restart_on_startup` / `interrupted` back the (later) restore UI.
+ * REUSING the existing resume policy (no third system). `resume_sessions` is consumed by the
+ * `use-lazy-resume` driver (silent resume gated by the project toggle); `restart_on_startup`
+ * backs the service-restore read. (The v2.5.5 crash `interrupted` set was reverted in v2.5.8.)
  */
 export interface WorkspaceRestorePlan {
   readonly workspace_id: string;
   readonly resume_sessions: readonly WorkspaceResumeEntry[];
   readonly restart_on_startup: readonly unknown[];
-  readonly interrupted: readonly string[];
 }
 
 /** One resume to PARK in the sidecar (the payload of `set_resume_parks`). */
@@ -687,9 +688,10 @@ export type BackendCommand =
   | "workspace_runtime_primary"
   // v2.2 workspace CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a restart,
   // WHAT a workspace offers to resume — computed by REUSING the existing resume policies (no
-  // 3rd system): per-session `decide_resume` verdicts (`resume_sessions`), the
-  // `restart_on_startup` services, and the crash-`interrupted` instances. The USER chooses
-  // what to resume; nyx never blind-resumes. Read-only, idempotent. `{ workspaceId }`.
+  // 3rd system): per-session `decide_resume` verdicts (`resume_sessions`) + the
+  // `restart_on_startup` services. `use-lazy-resume` drains the resumable sessions SILENTLY
+  // (gated by the project toggle). Read-only, idempotent. `{ workspaceId }`. (The v2.5.5 crash
+  // `interrupted` set / restore card was reverted in v2.5.8.)
   | "workspace_restore_plan"
   // v2.2 Git CHANGES read model: per non-optional repo of a workspace, its branch/dirty/
   // changed-files SUMMARY, re-read from Git (never authoritative in the DB — PDR-0013).

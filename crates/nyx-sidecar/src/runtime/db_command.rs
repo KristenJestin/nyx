@@ -329,9 +329,10 @@ impl Ctx<'_> {
 
     /// Build the WORKSPACE CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0) by REUSING
     /// the existing resume policies — the resume decision (`agent_resume::workspace_resume_plan`
-    /// over `decide_resume`), the `restart_on_startup` restore rows, and the crash-reconcile
-    /// interrupted set. No new policy, no blind relaunch: the plan is what the cockpit offers so
-    /// the USER chooses what resumes. Pure read; idempotent.
+    /// over `decide_resume`) and the `restart_on_startup` restore rows. No new policy, no blind
+    /// relaunch. The renderer's `use-lazy-resume` drains the resumable sessions SILENTLY (gated
+    /// by the project toggle + the #28 activity gate); a crash carries no special surface (the
+    /// v2.5.5 interrupted/restore card was reverted in v2.5.8). Pure read; idempotent.
     fn workspace_restore_plan(&self, workspace_id: &str) -> Result<String, String> {
         // The workspace must exist (a readable error, not an empty plan, for an unknown id).
         if self
@@ -414,19 +415,13 @@ impl Ctx<'_> {
             })
             .collect();
 
-        // (3) interrupted instances of this workspace (the crash reconcile's doubtful set).
-        let interrupted: Vec<String> = self
-            .runtime
-            .interrupted_instances()
-            .into_iter()
-            .filter(|id| ws_instance_ids.contains(id))
-            .collect();
-
+        // (crash-UI reverted in v2.5.8: no `interrupted` set — a crash is treated as a clean
+        // shutdown, so the resume plan is exactly the normal toggle-gated resume verdicts +
+        // restart_on_startup services, with no doubtful/interrupted surface.)
         Self::json(&serde_json::json!({
             "workspace_id": workspace_id,
             "resume_sessions": resume_sessions,
             "restart_on_startup": restart_on_startup,
-            "interrupted": interrupted,
         }))
     }
 
@@ -945,17 +940,17 @@ impl Ctx<'_> {
             }
             // v2.2 workspace CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a
             // restart, WHAT this workspace offers to resume — computed by REUSING the existing
-            // resume policies (NO third system, Q-011). Three parts, all from live authorities:
+            // resume policies (NO third system, Q-011). Two parts, both from live authorities:
             //   * `resume_sessions` — the per-session `decide_resume` verdict for the
             //     workspace's `active`/`unknown` sessions (via `resume_candidates_for_workspace`
             //     + `agent_resume::workspace_resume_plan`), keyed on `resume_agent_sessions`,
             //     the transcript-on-disk probe, and the target shell — the SAME policy the
-            //     close-warning uses. The USER chooses what to inject (nyx never blind-resumes).
+            //     close-warning uses. The renderer drains these SILENTLY (lazy resume).
             //   * `restart_on_startup` — the workspace's services whose template opts into
             //     `restart_on_startup` (from `all_instances_for_restore`, the SAME rows the boot
             //     restore reads), each with whether it was running at the last shutdown.
-            //   * `interrupted` — this workspace's instances the crash reconcile flagged
-            //     `interrupted` (doubtful `running` it could not re-verify → NOT relaunched).
+            // (The v2.5.5 crash `interrupted` set was reverted in v2.5.8 — a crash is a clean
+            // shutdown, so there is no doubtful/interrupted surface here.)
             // A pure read: no mutation, no `changed` broadcast, no blind relaunch. Idempotent.
             "workspace_restore_plan" => {
                 let workspace_id = self.arg_str("workspaceId")?;
@@ -1721,14 +1716,8 @@ impl Ctx<'_> {
             //     MCP + session-capture hooks). Routed onto the SHARED nyx_core::integrations
             //     cores so the Install/Uninstall button drives the EXACT same `claude` plugin
             //     install/uninstall as v1, at parity. install/remove SHELL OUT to `claude`. --
-            // --- crash recovery (Phase 4) -------------------------------------
-            // The boot crash reconcile flags command instances persisted as `running` (whose
-            // liveness it could not re-verify) as `interrupted`. This read surfaces that set
-            // so the renderer badges them and the user chooses what to resume — NEVER an auto-
-            // relaunch (the PRD non-goal). `{ interrupted: string[] }`.
-            "recovery_snapshot" => Self::json(&serde_json::json!({
-                "interrupted": self.runtime.interrupted_instances(),
-            })),
+            // (crash-UI reverted in v2.5.8: the `recovery_snapshot` db-command is gone — a crash
+            // is treated as a clean shutdown, so there is no interrupted set to surface.)
             "integration_list" => Self::json(&nyx_core::integrations::status_list()),
             "integration_install" => {
                 let provider = self.arg_str("provider")?;
@@ -2268,9 +2257,9 @@ mod tests {
     /// `workspace_restore_plan` db-command REUSES the existing resume policies to report, for
     /// ONE workspace: (a) the per-session `decide_resume` verdicts (resume the `resume_agent_
     /// sessions`-ON candidate with a transcript, exact id); (b) the `restart_on_startup`
-    /// services (with their was-running snapshot); (c) the interrupted set. Proves "sessions
-    /// reprenables + restart_on_startup restaurés", scoped to the workspace, via the SAME
-    /// policies (no third system). Pure read — idempotent, no `changed` broadcast.
+    /// services (with their was-running snapshot). Proves "sessions reprenables + restart_on_
+    /// startup restaurés", scoped to the workspace, via the SAME policies (no third system).
+    /// Pure read — idempotent, no `changed` broadcast. (No `interrupted` set — reverted v2.5.8.)
     #[test]
     fn workspace_restore_plan_reuses_existing_policies_scoped_to_workspace() {
         let h = Harness::new();
@@ -2373,8 +2362,8 @@ mod tests {
             serde_json::json!(true)
         );
 
-        // (c) No crash this run → interrupted is empty (nothing doubtful, no blind relaunch).
-        assert!(plan["interrupted"].as_array().unwrap().is_empty());
+        // (crash-UI reverted in v2.5.8: the plan carries no `interrupted` field anymore.)
+        assert!(plan.get("interrupted").is_none());
 
         // Pure read + idempotent: no `changed` broadcast, and a second call is byte-identical.
         assert_eq!(
@@ -2404,10 +2393,10 @@ mod tests {
         assert!(err.contains("unknown workspace"), "got: {err}");
     }
 
-    /// WORKSPACE RESTORE — DOUBTFUL STATE: with `resume_agent_sessions` OFF, an `unknown`
+    /// WORKSPACE RESTORE — OPTION OFF: with `resume_agent_sessions` OFF, an `unknown`
     /// (stale/probable-kill) session is reported as a NON-resume entry (`option_off`), never
-    /// blind-resumed; the plan surfaces the doubtful state for the user to choose. Covers the
-    /// done-criterion "états douteux marqués unknown/interrupted".
+    /// blind-resumed. (The `unknown` state can still exist from `sweep_stale_active_sessions`
+    /// staleness; a crash no longer produces it — v2.5.8 revert. This pins the toggle gate.)
     #[test]
     fn workspace_restore_plan_surfaces_doubtful_state_without_blind_resume() {
         let h = Harness::new();
@@ -2444,7 +2433,8 @@ mod tests {
                     },
                 )?;
                 // Flip every still-`active` session to `unknown` (a stale active after a probable
-                // kill) via the SAME sweep the crash reconcile uses — the doubtful-state path.
+                // kill) via `sweep_stale_active_sessions` — a legit way to reach the `unknown`
+                // read path (the crash reconcile no longer calls it — v2.5.8 revert).
                 nyx_core::db::sweep_stale_active_sessions(c, -1)?;
                 Ok::<_, diesel::result::Error>(())
             })

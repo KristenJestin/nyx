@@ -2,8 +2,8 @@
 //! (task `01KX8Z6TH9RW19XYDK74CAD8BT`, PRD `01KX8Z4E7B3PYW2DGCTTKXCHYC`, Phase 5).
 //!
 //! This is the executable half of the gate: it drives the four v2.5.5 lifecycle journeys the
-//! PRD calls out — **lazy resume on relaunch, crash → interrupted + restore, idle unload +
-//! resume-on-revisit, plugin installable** — through the REAL `nyx-sidecar` binary over the
+//! PRD calls out — **lazy resume on relaunch, crash → SILENT resume (crash-UI reverted), idle
+//! unload + resume-on-revisit, plugin installable** — through the REAL `nyx-sidecar` binary over the
 //! REAL framed pipe, EXACTLY as Electron main speaks to it. It exercises, in real runs, the
 //! four done-criteria points the checklist (`apps/desktop/GATE-v2.5.5.md`) otherwise proves by
 //! `file:line`:
@@ -13,11 +13,12 @@
 //!      `claude --resume <id>`; parking it (`set_resume_parks`) then spawning the terminal's
 //!      PTY injects that exact line into the REAL shell (observed on the wire). A toggle-OFF
 //!      project's plan offers NO resume (`option_off`) and a spawn injects nothing.
-//!   2. **Crash → interrupted + restore** — a seeded persisted-`running` instance + a
-//!      not-clean recovery marker makes the sidecar's BOOT reconcile flag it `interrupted` and
-//!      flip the active session to `unknown`; `recovery_snapshot` + `workspace_restore_plan`
-//!      (both over the pipe) surface the interrupted set + the doubtful session for the user to
-//!      restore — with NO blind relaunch.
+//!   2. **Crash → SILENT resume (crash-UI reverted, v2.5.8)** — a seeded persisted-`running`
+//!      instance + a not-clean recovery marker (a CRASH) is treated by the BOOT reconcile as a
+//!      CLEAN shutdown: the active session STAYS `active` (not flipped to `unknown`) and
+//!      `workspace_restore_plan` (over the pipe) offers it as a CONFIDENT resume
+//!      (`resume=true, uncertain=false`) with NO `interrupted` set — parking + spawning then
+//!      injects `claude --resume <id>` SILENTLY, exactly like a clean relaunch. No card.
 //!   3. **Idle unload → resume-au-retour ; ACTIVE jamais unloadée** — `unload_idle_sessions`
 //!      (the db-command the renderer's sweep drives) KEEPS a session within its threshold and
 //!      the currently-visited one, UNLOADS an idle one past the threshold (its PTY closed →
@@ -106,13 +107,12 @@ fn seed_db<R>(data_dir: &std::path::Path, f: impl FnOnce(&Db) -> R) -> R {
 
 /// Write the sidecar-owned recovery marker (`<data_dir>/sidecar-recovery.json`, the format
 /// `runtime::recovery::RecoveryState` reads). `clean_shutdown=true` → the boot reconcile treats
-/// the prior run as a CLEAN shutdown (seeded `active` sessions stay `active`). `clean_shutdown
-/// =false` WITH the file present → a CRASH (running instances flagged `interrupted`, active
-/// sessions flipped `unknown`) — the exact signal `recovery.rs` keys on.
+/// the prior run as a CLEAN shutdown. `clean_shutdown=false` WITH the file present → a CRASH —
+/// which (since v2.5.8) is ALSO treated as clean: seeded `active` sessions stay `active`, with
+/// no interrupted set and no `active -> unknown` sweep. It is only the diagnostic crash signal.
 fn write_recovery_marker(data_dir: &std::path::Path, clean_shutdown: bool) {
     let json = serde_json::json!({
         "clean_shutdown": clean_shutdown,
-        "interrupted": [],
         "idempotency": [],
     });
     std::fs::write(
@@ -496,24 +496,26 @@ fn resume_toggle_off_injects_nothing_over_the_real_pipe() {
     h.shutdown();
 }
 
-/// DONE-CRITERION 2 — a CRASH surfaces `interrupted` instances + the doubtful session, offered
-/// for RESTORE, with NO blind relaunch. A persisted-`running` instance + a NOT-clean recovery
-/// marker makes the sidecar's BOOT reconcile flag it `interrupted` and flip the active session
-/// `unknown`; `recovery_snapshot` + `workspace_restore_plan` (over the pipe) surface both.
+/// DONE-CRITERION 2 (crash-UI reverted, v2.5.8) — a CRASH is treated as a CLEAN shutdown: the
+/// active session STAYS `active` and `workspace_restore_plan` offers it as a CONFIDENT resume
+/// (`resume=true, uncertain=false`) with NO `interrupted` set; parking + spawning then injects
+/// `claude --resume <id>` SILENTLY, exactly like a clean relaunch. No card, no doubtful state.
 #[test]
-fn crash_surfaces_interrupted_and_restore_plan_over_the_real_pipe() {
+fn crash_resumes_silently_no_interrupted_over_the_real_pipe() {
     let data_dir = temp_data_dir("crash");
     let ext = "ext-gate-crash";
 
-    // Seed a workspace with (a) a service instance persisted `running` + running-at-shutdown, and
-    // (b) an active Claude session — the two things a crash leaves doubtful.
+    // Seed a workspace with (a) a service instance persisted `running` + running-at-shutdown (the
+    // thing v2.5.5 used to flag `interrupted`), and (b) an active Claude session with a transcript
+    // on disk, project resume toggle ON — so the normal path resumes it silently.
     let transcript = data_dir.join("transcript-crash.jsonl");
     std::fs::write(&transcript, b"{}\n").unwrap();
-    let (workspace_id, running_instance) = seed_db(&data_dir, |db| {
+    let seed: Seed = seed_db(&data_dir, |db| {
         db.with_conn(|c| {
             let (project, root) =
                 db::create_project(c, "GateCrash", "/tmp/nyx-gate-crash", None).unwrap();
-            // A restart_on_startup-agnostic service persisted `running` (the crash orphan).
+            db::set_project_resume_agent_sessions(c, &project.id, true).unwrap();
+            // A service persisted `running` (the would-be crash orphan — now no special handling).
             let tmpl = db::create_template(
                 c,
                 &project.id,
@@ -542,7 +544,10 @@ fn crash_surfaces_interrupted_and_restore_plan_over_the_real_pipe() {
                 },
             )
             .unwrap();
-            (root.id, inst)
+            Seed {
+                workspace_id: root.id,
+                record_id: term.id,
+            }
         })
     });
     // A recovery file PRESENT but NOT clean → the prior run CRASHED (never flipped it to true).
@@ -550,34 +555,51 @@ fn crash_surfaces_interrupted_and_restore_plan_over_the_real_pipe() {
 
     let mut h = Harness::spawn(data_dir, &[]);
 
-    // `recovery_snapshot` (over the pipe) surfaces the interrupted set for the renderer to badge.
-    let recovery = h.db_command("recovery_snapshot", serde_json::json!({}));
-    let interrupted: Vec<String> = serde_json::from_value(recovery["interrupted"].clone()).unwrap();
-    assert!(
-        interrupted.contains(&running_instance),
-        "the crashed running instance is flagged interrupted: {interrupted:?}"
-    );
-
-    // `workspace_restore_plan` (over the pipe) offers the RESTORE UI's data: the interrupted set
-    // scoped to this workspace + the doubtful session, surfaced for the user to choose — NO blind
-    // relaunch (nothing was auto-started; the plan is a pure read of what COULD resume).
+    // `workspace_restore_plan` (over the pipe): the crash carries NO `interrupted` set (the field
+    // is gone), and the active session is a CONFIDENT resume — `resume=true, uncertain=false`,
+    // exactly as if the prior run had shut down cleanly (crash treated as clean).
     let plan = h.db_command(
         "workspace_restore_plan",
-        serde_json::json!({ "workspaceId": workspace_id }),
+        serde_json::json!({ "workspaceId": seed.workspace_id }),
     );
-    let plan_interrupted: Vec<String> =
-        serde_json::from_value(plan["interrupted"].clone()).unwrap();
     assert!(
-        plan_interrupted.contains(&running_instance),
-        "the restore plan surfaces the interrupted instance (user restores it explicitly)"
+        plan.get("interrupted").is_none(),
+        "a crash carries no interrupted set (crash-UI reverted): {plan}"
     );
-    // The active session was flipped `unknown` by the reconcile but is STILL a candidate the
-    // plan surfaces (a doubtful state offered for restore, never blind-resumed).
     let sessions = plan["resume_sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "the session is a resume candidate");
     assert_eq!(
-        sessions.len(),
-        1,
-        "the doubtful (now `unknown`) session is surfaced for restore"
+        sessions[0]["resume"],
+        serde_json::json!(true),
+        "crash + toggle ON → the session resumes (silent normal path)"
+    );
+    assert_eq!(
+        sessions[0]["uncertain"],
+        serde_json::json!(false),
+        "the session stays `active` (not flipped `unknown`) → confident, not doubtful"
+    );
+    assert_eq!(
+        sessions[0]["resume_command"],
+        serde_json::json!(format!("claude --resume {ext}")),
+    );
+
+    // PARK the plan's resume (the renderer's silent `use-lazy-resume` push) and OPEN the terminal:
+    // the parked `claude --resume <id>` injects at spawn — a SILENT resume after a crash, no card.
+    h.db_command(
+        "set_resume_parks",
+        serde_json::json!({
+            "parks": [ {
+                "terminalId": seed.record_id,
+                "sessionId": sessions[0]["session_id"],
+                "command": format!("claude --resume {ext}"),
+            } ]
+        }),
+    );
+    let _tid = h.spawn_pty_record(&seed.record_id);
+    let out = h.read_until_marker(&format!("claude --resume {ext}"));
+    assert!(
+        out.contains(&format!("claude --resume {ext}")),
+        "after a crash the session resumes SILENTLY on terminal open (no card): {out:?}"
     );
 
     h.shutdown();

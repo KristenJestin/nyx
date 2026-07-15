@@ -118,9 +118,10 @@ pub struct Runtime {
     /// build), or `None` in dev/bare — then the integrations core falls back to the source
     /// tree. From `NYX_RESOURCE_DIR` (the supervisor passes the unpacked resources path).
     resource_dir: Option<PathBuf>,
-    /// The sidecar-owned crash-recovery state (Phase 4): the clean-shutdown marker, the
-    /// instance ids flagged `interrupted` after a crash, and the idempotency-key journal for
-    /// mutating ops. Persisted to `<data_dir>/sidecar-recovery.json` (NOT the frozen v1 DB).
+    /// The sidecar-owned crash-recovery state (Phase 4): the clean-shutdown marker and the
+    /// idempotency-key journal for mutating ops. (The v2.5.5 crash `interrupted` set was
+    /// reverted in v2.5.8 — a crash is treated as a clean shutdown, so there is nothing to
+    /// flag.) Persisted to `<data_dir>/sidecar-recovery.json` (NOT the frozen v1 DB).
     /// Behind a `Mutex` so the boot reconcile, the mutating db-commands' idempotency guard,
     /// and the ordered shutdown all serialize their reads/writes through one cell.
     recovery: Arc<Mutex<recovery::RecoveryState>>,
@@ -278,17 +279,15 @@ impl Runtime {
             events.clone(),
         ));
 
-        // CRASH RECONCILE (Phase 4 — `01KWCJPFP9JSJMRDZGW2E0N905`): BEFORE the boot restore,
-        // detect whether the PREVIOUS run shut down cleanly. If it CRASHED, flag every
-        // instance persisted as `running` as `interrupted` (its liveness can't be
-        // re-verified), clear its shutdown snapshot so the snapshot-keyed restore below
-        // cannot blindly relaunch it, and flip every still-`active` agent session to
-        // `unknown`. The user resumes interrupted instances explicitly (no blind resume —
-        // the PRD non-goal). The reconcile re-arms the clean-shutdown marker to false for the
-        // run we are starting.
-        let outcome = recovery::reconcile_after_crash(&self.db, &self.data_dir);
-        // Latch the interrupted set into the runtime so the `recovery_snapshot` db-command
-        // surfaces it to the renderer and the idempotency journal is the loaded one.
+        // BOOT RECONCILE (Phase 4 — `01KWCJPFP9JSJMRDZGW2E0N905`; crash-UI reverted in v2.5.8):
+        // BEFORE the boot restore, re-arm the clean-shutdown marker to false for the run we are
+        // starting. A crash is now treated exactly like a CLEAN shutdown — the reconcile flags
+        // NOTHING interrupted and flips NO session to `unknown`; the normal SILENT resume path
+        // (lazy agent-session resume, gated by the project toggle + the #28 activity gate) takes
+        // over. `was_crash` is returned only so the boot can log that the previous run crashed.
+        let outcome = recovery::reconcile_after_crash(&self.data_dir);
+        // Reload the (re-armed) recovery state into the runtime so the idempotency journal is the
+        // loaded one.
         {
             let mut guard = self.recovery.lock().unwrap();
             *guard = recovery::RecoveryState::load(&self.data_dir);
@@ -311,12 +310,8 @@ impl Runtime {
         }
         if outcome.was_crash {
             events.log(
-                "warn",
-                format!(
-                    "crash recovery: previous run did not shut down cleanly — {} command(s) flagged interrupted, {} agent session(s) marked unknown (user chooses what to resume)",
-                    outcome.interrupted_instances.len(),
-                    outcome.sessions_marked_unknown
-                ),
+                "info",
+                "recovery: previous run did not shut down cleanly — treating it as a clean shutdown (silent resume via the normal toggle-gated path; no interrupted UI)".to_string(),
             );
         }
 
@@ -475,6 +470,29 @@ impl Runtime {
     /// pending. A failed write marks the session `resume_failed` (no retry loop) and nudges the
     /// renderer to re-pull the agent sessions so the clean `resume-failed` state surfaces.
     fn inject_resume(&self, record_id: &str, events: &EventSink) {
+        // GATE ON THE *CURRENT* ACTIVITY (finding `01KXJDKDCZFA7QB1QQTE91N4GG` / #28) — the
+        // belt-and-suspenders that holds AT THE MOMENT OF INJECT, not just at plan time. A parked
+        // `claude --resume <id>` must NEVER be typed into a session that is right now `Working`
+        // (Claude generating OR a tool/sub-agent in flight) or `Waiting` (blocked on the user):
+        // doing so injects the resume line as keystrokes INTO a live, active agent (the dogfood
+        // bug — "resume relancé sur une session vivante"). The park may have been set — or re-armed
+        // after an idle-unload — while the session was Idle, and the session can have become active
+        // again SINCE (an immediate inject via `park_resumes` racing a re-pushed restore plan, or a
+        // reactivation between an idle-unload and its re-injection). The unload path already refuses
+        // to unload a non-Idle session; this re-checks the LIVE activity here so a briefly-stale
+        // Idle can never turn into an inject either. Only a genuinely-Idle session (or one with no
+        // activity entry at all — a fresh/dead PTY ⇒ Idle) is injected into. On a skip we DELIBERATELY
+        // leave the park PENDING and un-attempted (we do not `take_for_inject`), so a later fresh,
+        // Idle spawn can still drain it — the resume is deferred, never lost.
+        if let Some(snap) = self.activity.snapshot(record_id) {
+            if matches!(
+                snap.activity,
+                nyx_core::agent_activity::Activity::Working
+                    | nyx_core::agent_activity::Activity::Waiting
+            ) {
+                return;
+            }
+        }
         let Some(park) = self.resume_parks.take_for_inject(record_id) else {
             return;
         };
@@ -578,6 +596,24 @@ impl Runtime {
             let Some(command) = resume_command_for_candidate(candidate, target, &registry) else {
                 continue;
             };
+            // GATE 1b — RE-CHECK the LIVE activity IMMEDIATELY before the irreversible close
+            // (finding #28, the idle-unload ↔ reactivation race). Gate 1's `decide_unload` ran on a
+            // snapshot taken BEFORE gate 2's command build — and gate 2 does real work (an FS `stat`
+            // of the transcript, an adapter lookup), so a concurrent MCP hook thread (a new
+            // `UserPromptSubmit`, a tool/sub-agent starting) could have flipped the session to
+            // `Working`/`Waiting` in that window. Re-read the activity as tightly as possible here so
+            // a session that reactivated mid-sweep is SPARED rather than killed — the "une session
+            // qui travaille n'est JAMAIS déchargée" invariant holds even under a race, not just for
+            // an in-order snapshot.
+            let still_idle = self
+                .activity
+                .snapshot(&record_id)
+                .map(|s| s.activity)
+                .unwrap_or(nyx_core::agent_activity::Activity::Idle)
+                == nyx_core::agent_activity::Activity::Idle;
+            if !still_idle {
+                continue;
+            }
             // Free the resources / take it out of the TUI. The DB session stays `active`.
             self.pty.close_record(&record_id);
             // Anti-phantom reflex: drop the (Idle) runtime activity entry for the gone PTY.
@@ -647,9 +683,9 @@ impl Runtime {
     /// every interactive PTY so nothing is orphaned past exit. Idempotent / latched.
     ///
     /// Phase 4: this is the ONLY path that marks the recovery file `clean_shutdown = true`.
-    /// A crash never runs `shutdown`, so the next boot reads it still `false` and the crash
-    /// reconcile fires. We persist the clean marker WHILE keeping the idempotency journal, and
-    /// clear the now-consumed interrupted set (the next clean run starts with nothing doubtful).
+    /// A crash never runs `shutdown`, so the next boot reads it still `false` and logs that the
+    /// previous run crashed (handled like a clean shutdown since v2.5.8). We persist the clean
+    /// marker WHILE keeping the idempotency journal.
     pub fn shutdown(&self) {
         // STOP THE MCP HTTP LISTENER FIRST — BEFORE any PTY is closed (`self.pty.close_all()`
         // below). Closing the interactive Claude PTYs makes each dying Claude fire a
@@ -686,16 +722,8 @@ impl Runtime {
         {
             let mut guard = self.recovery.lock().unwrap();
             guard.clean_shutdown = true;
-            guard.interrupted.clear();
             guard.save(&self.data_dir);
         }
-    }
-
-    /// The command-instance ids flagged `interrupted` by the boot crash reconcile (empty
-    /// after a clean prior shutdown). The `recovery_snapshot` db-command surfaces these so
-    /// the renderer badges them and the user chooses what to resume.
-    pub fn interrupted_instances(&self) -> Vec<String> {
-        self.recovery.lock().unwrap().interrupted.clone()
     }
 
     /// TEST-ONLY: load the persisted terminal-snapshot store from `data_dir` into this runtime,

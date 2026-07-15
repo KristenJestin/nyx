@@ -188,8 +188,24 @@ mod tests {
         init_repo(&root.join("web"), "feature");
 
         let mut conn = open_in_memory();
-        let (_project, root_ws) =
+        let (project, root_ws) =
             register_project(&mut conn, "Nyx", root.to_str().unwrap(), None).unwrap();
+        // Finding #27: configure the two sub-repos EXPLICITLY (no disk auto-detection).
+        db::set_project_repositories(
+            &mut conn,
+            &project.id,
+            &[
+                db::RepoConfig {
+                    relative_path: "api".into(),
+                    name: None,
+                },
+                db::RepoConfig {
+                    relative_path: "web".into(),
+                    name: None,
+                },
+            ],
+        )
+        .unwrap();
 
         // Baseline: both repos clean, on their branches, no changed files.
         let s0 = summary(&mut conn, &root_ws.id).unwrap().unwrap();
@@ -241,6 +257,22 @@ mod tests {
         let mut conn = open_in_memory();
         let (project, root_ws) =
             register_project(&mut conn, "Nyx", root.to_str().unwrap(), None).unwrap();
+        // Finding #27: configure the two sub-repos EXPLICITLY (no disk auto-detection).
+        db::set_project_repositories(
+            &mut conn,
+            &project.id,
+            &[
+                db::RepoConfig {
+                    relative_path: "api".into(),
+                    name: None,
+                },
+                db::RepoConfig {
+                    relative_path: "web".into(),
+                    name: None,
+                },
+            ],
+        )
+        .unwrap();
         // Mark `web` optional → it drops out of the derived membership.
         let repos = db::list_repositories(&mut conn, &project.id).unwrap();
         let web = repos.iter().find(|r| r.relative_path == "web").unwrap();

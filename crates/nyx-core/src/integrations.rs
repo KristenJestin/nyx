@@ -290,6 +290,8 @@ mod tests {
             source_dir,
             install_dir: root.join("stable"),
             settings_path: root.join("settings.json"),
+            // User-scope command dir under the temp root (parity with `~/.claude/commands/`).
+            commands_dir: Some(root.join("commands")),
             mcp_port: 4517,
         }
     }

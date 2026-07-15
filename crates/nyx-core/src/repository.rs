@@ -1,22 +1,26 @@
-//! Repository as a LOGICAL identity (PDR-0013, v2.1 task #5).
+//! Repository as a LOGICAL identity (PDR-0013, v2.1 task #5, finding #27).
 //!
 //! A repository is a logical Nyx identity within a project (e.g. `api`) — the SAME
 //! object across the project's primary workspace and every dev worktree, so
-//! review/history follow it. This module owns the three behaviours the canonical
-//! model demands on top of the `repositories` persistence socle in [`crate::db`]:
+//! review/history follow it. This module owns the behaviours the canonical model
+//! demands on top of the `repositories` persistence socle in [`crate::db`]:
 //!
-//! 1. **Auto-detection** ([`detect_under_root`] / [`detect_and_register`]). Scan a
-//!    workspace's `root_path` for Git work trees and register a logical identity per
-//!    detected repo. A MONO-REPO (a repo at the root itself) yields a single
-//!    identity with `relative_path = "."`; a MULTI-REPO layout (repos in immediate
-//!    subfolders) yields one identity per subfolder. Registration is idempotent and
-//!    NEVER clobbers a manual override (`crate::db::upsert_detected_repository`).
+//! 1. **Explicit configuration, NO disk scan** (finding #27). There is NO
+//!    auto-detection: nyx never scans a workspace's `root_path` to guess repos. The
+//!    repos of a project are configured EXPLICITLY, once per PROJECT, as a set of
+//!    `relative_path` (+ name) associations ([`crate::db::set_project_repositories`]).
+//!    A MONO-REPO is a single identity at `relative_path = "."`; a MULTI-REPO layout is
+//!    one identity per subfolder — but which is which is the user's declared config, not
+//!    a scan result.
 //!
-//! 2. **Derived membership** ([`workspace_members`]). A workspace does NOT store a
-//!    checkout list — there is no `workspace_repositories` table (PDR-0013).
-//!    A workspace's repos are DERIVED: the project's NON-OPTIONAL repositories,
-//!    each resolved at `workspace.root_path` joined with the repo's
-//!    `relative_path`. `optional` (the in-DB "nyxignore") excludes a repo.
+//! 2. **Derived membership + current-folder fallback** ([`workspace_members`]). A
+//!    workspace does NOT store a checkout list — there is no `workspace_repositories`
+//!    table (PDR-0013). A workspace's repos are DERIVED: the project's NON-OPTIONAL
+//!    repositories, each resolved at `workspace.root_path` joined with the repo's
+//!    `relative_path`. `optional` (the in-DB "nyxignore") excludes a repo. When a
+//!    project has NO configured repos at all, membership FALLS BACK to the workspace's
+//!    own folder as a single repo at `"."` (a synthetic, non-persisted identity),
+//!    handled gracefully even when that folder is not a Git work tree — never a scan.
 //!
 //! 3. **Git state re-read** ([`read_git_state`]). Branch, dirty flag, and remotes
 //!    are read from Git LIVE, on demand, and are NEVER written to the DB — the DB is
@@ -25,8 +29,8 @@
 //!
 //! Everything git-facing shells out through [`crate::proc_util::command`] (the
 //! hardened, console-flash-free spawn), stays fully git-agnostic (a non-git path
-//! simply yields no detection / an empty [`GitState`]), and never errors on a
-//! missing/So-so repo — detection and state reads are best-effort by contract.
+//! simply yields an empty [`GitState`]), and never errors on a missing/So-so repo —
+//! state reads are best-effort by contract.
 
 use std::path::Path;
 
@@ -36,21 +40,16 @@ use diesel::QueryResult;
 use crate::db::{self, Repository, Workspace};
 
 /// The conventional `relative_path` of a mono-repo: the repository lives at the
-/// workspace root itself. Kept as a shared const so detection and membership agree.
+/// workspace root itself. Kept as a shared const so config and membership agree.
 pub const MONO_REPO_RELATIVE_PATH: &str = ".";
 
-/// A repository detected under a workspace root, BEFORE it is registered: its
-/// conventional `relative_path` within the project and a derived logical `name`.
-/// `relative_path` is `"."` for a mono-repo, or the subfolder name for a repo found
-/// one level down.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DetectedRepo {
-    /// Derived logical name (the folder's basename, or the project folder name for a
-    /// mono-repo). Disambiguated for uniqueness only at registration time.
-    pub name: String,
-    /// Conventional path within the project (`"."` mono-repo, else the subfolder).
-    pub relative_path: String,
-}
+/// The stable-id PREFIX of the synthetic current-folder FALLBACK repository (finding
+/// #27). When a project has no configured repos, [`workspace_members`] yields one
+/// synthetic identity `"{FALLBACK_REPO_ID_PREFIX}{project_id}"` at `relative_path = "."`.
+/// The id is DETERMINISTIC per project so it round-trips through
+/// [`member_absolute_path`] (a `repo_diff`/`repo_git_view` call on it resolves back to
+/// the workspace root) — even though the identity is never persisted in `repositories`.
+pub const FALLBACK_REPO_ID_PREFIX: &str = "fallback:";
 
 /// A repository resolved for a specific workspace: its logical identity plus the
 /// ABSOLUTE on-disk path where it lives in THAT workspace (`root_path` joined with
@@ -79,154 +78,64 @@ pub struct GitState {
     pub remotes: Vec<String>,
 }
 
-/// Whether `dir` is the top of a Git work tree: it directly contains a `.git` entry
-/// (a directory in a normal clone, or a file in a linked worktree). Pure filesystem
-/// check, no subprocess — cheap enough to run per candidate folder during a scan.
-fn is_git_worktree(dir: &Path) -> bool {
-    dir.join(".git").exists()
-}
-
-/// Detect the Git repositories under a workspace `root_path`, returning one
-/// [`DetectedRepo`] per repo found, ordered by `relative_path` for determinism.
+/// REGISTER a non-root workspace at `path` under `project_id`. This is the canonical
+/// nyx-core entry point for "enregistrer un workspace" (done_criterion #5): it inserts
+/// the workspace row via [`db::create_workspace`]. It NO LONGER scans the disk for repos
+/// (finding #27): the project's repos are configured explicitly once, and this workspace
+/// INHERITS them (derived at `root_path || relative_path`, see [`workspace_members`]).
 ///
-/// Layouts handled (PDR-0013):
-///   * **mono-repo** — `root_path` is itself a Git work tree → a single detected repo
-///     at `relative_path = "."`, named after the root folder.
-///   * **multi-repo** — `root_path` is NOT a work tree but immediate subfolders are →
-///     one detected repo per such subfolder, `relative_path = <subfolder name>`.
-///
-/// Only the root and its IMMEDIATE children are scanned (a shallow, one-level walk):
-/// nested repos deeper down are out of scope for auto-detection (a manual override
-/// can still declare them). A non-existent or non-git `root_path` yields an empty
-/// vec — detection is best-effort and git-agnostic.
-pub fn detect_under_root(root_path: &str) -> Vec<DetectedRepo> {
-    let root = Path::new(root_path);
-    let mut found = Vec::new();
-
-    // Mono-repo: the root folder itself is a Git work tree.
-    if is_git_worktree(root) {
-        let name = root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("repo")
-            .to_string();
-        found.push(DetectedRepo {
-            name,
-            relative_path: MONO_REPO_RELATIVE_PATH.to_string(),
-        });
-        // A mono-repo IS the project's tree; do not also descend into its packages
-        // (those are subfolders of ONE repo, not separate repositories).
-        return found;
-    }
-
-    // Multi-repo: scan immediate subfolders for Git work trees.
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if is_git_worktree(&path) {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    found.push(DetectedRepo {
-                        name: name.to_string(),
-                        relative_path: name.to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    found.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    found
-}
-
-/// Auto-detect the repos under `workspace.root_path` and REGISTER each as a logical
-/// identity in the workspace's project, idempotently. Delegates each detected repo to
-/// [`db::upsert_detected_repository`], which keys on `(project_id, relative_path)` so a
-/// re-scan converges (no duplicates) and manual `name`/`optional` overrides are
-/// preserved. Returns the registered [`Repository`] rows in detection order.
-///
-/// This is the detection step that [`register_workspace`] / [`register_project`] run
-/// right after they insert the workspace — the real registration flow. It never deletes
-/// a previously-detected repo that vanished from disk (its identity + history are
-/// permanent — the user archives it explicitly if desired). It is also called directly
-/// on a RE-registration / re-scan of an existing workspace, where idempotence guarantees
-/// convergence.
-pub fn detect_and_register(
-    conn: &mut SqliteConnection,
-    workspace: &Workspace,
-) -> QueryResult<Vec<Repository>> {
-    let detected = detect_under_root(&workspace.root_path);
-    let mut registered = Vec::with_capacity(detected.len());
-    for d in detected {
-        let repo =
-            db::upsert_detected_repository(conn, &workspace.project_id, &d.name, &d.relative_path)?;
-        registered.push(repo);
-    }
-    Ok(registered)
-}
-
-/// REGISTER a non-root workspace at `path` under `project_id`, then auto-detect and
-/// persist the Git repositories under its `root_path`. This is the canonical
-/// nyx-core entry point for "enregistrer un workspace" (done_criterion #5): it composes
-/// the low-level [`db::create_workspace`] insert with [`detect_and_register`], so the
-/// act of registering a workspace populates the project's `repositories`.
-///
-/// The two steps are kept as a COMPOSITION here rather than folded into
-/// [`db::create_workspace`] on purpose: `db::create_workspace` is a pure persistence
-/// write that must stay disk-agnostic (a workspace may be registered before its folder
-/// exists — the MCP `create_workspace` tool `mkdir -p`s first, and detection then finds
-/// an empty tree and registers nothing, which is correct). Detection is the domain
-/// behaviour that reads the disk, so it lives in this `repository` layer that already
-/// owns the filesystem scan.
-///
-/// The insert failing is propagated as-is (the caller maps it to its error vocabulary);
-/// detection runs only after a successful insert. Returns the freshly-created
-/// [`Workspace`] — the detected repos are queryable via [`db::list_repositories`] /
-/// [`workspace_members`]. Detection is best-effort and NEVER clobbers a manual override,
-/// so a re-registration converges without losing user `name`/`optional` edits.
+/// Returns the freshly-created [`Workspace`]. The insert failing is propagated as-is (the
+/// caller maps it to its error vocabulary).
 pub fn register_workspace(
     conn: &mut SqliteConnection,
     project_id: &str,
     name: &str,
     path: &str,
 ) -> QueryResult<Workspace> {
-    let workspace = db::create_workspace(conn, project_id, name, path)?;
-    detect_and_register(conn, &workspace)?;
-    Ok(workspace)
+    db::create_workspace(conn, project_id, name, path)
 }
 
-/// REGISTER a project plus its root workspace at `root_path`, then auto-detect and
-/// persist the Git repositories under that root. The root-workspace analogue of
-/// [`register_workspace`]: it composes [`db::create_project`] (which creates the
-/// project and its single root workspace) with [`detect_and_register`] on that root
-/// workspace, so creating a project on a multi-repo tree populates its `repositories`
-/// in the same flow. Returns the new project and its root workspace.
+/// REGISTER a project plus its root workspace at `root_path`. The root-workspace analogue
+/// of [`register_workspace`]: it creates the project and its single root workspace via
+/// [`db::create_project`]. It does NOT scan the disk (finding #27) — the project's repos
+/// are configured explicitly afterwards ([`db::set_project_repositories`]), or a project
+/// left unconfigured falls back to the current folder at derivation time
+/// ([`workspace_members`]). Returns the new project and its root workspace.
 pub fn register_project(
     conn: &mut SqliteConnection,
     name: &str,
     root_path: &str,
     root_name: Option<&str>,
 ) -> QueryResult<(crate::db::Project, Workspace)> {
-    let (project, root) = db::create_project(conn, name, root_path, root_name)?;
-    detect_and_register(conn, &root)?;
-    Ok((project, root))
+    db::create_project(conn, name, root_path, root_name)
 }
 
-/// The DERIVED membership of `workspace`: the project's NON-OPTIONAL repositories,
-/// each resolved to its absolute path IN this workspace (`root_path` + `relative_path`).
+/// The DERIVED membership of `workspace`: the project's NON-OPTIONAL repositories, each
+/// resolved to its absolute path IN this workspace (`root_path` + `relative_path`).
 ///
-/// There is NO checkout table (PDR-0013): membership is computed here from the
-/// project's `repositories` (already filtered to the LIVE, non-archived set by
-/// [`db::list_repositories`]) minus the `optional` ones (the in-DB "nyxignore").
-/// The path is COMPUTED per workspace, never stored — so the same logical repo lands
-/// at the right place in the primary workspace and in every worktree.
+/// There is NO checkout table (PDR-0013): membership is computed here from the project's
+/// configured `repositories` (already filtered to the LIVE, non-archived set by
+/// [`db::list_repositories`]) minus the `optional` ones (the in-DB "nyxignore"). The path
+/// is COMPUTED per workspace, never stored — so the same logical repo lands at the right
+/// place in the primary workspace and in every worktree.
+///
+/// FALLBACK (finding #27): when the project has NO configured repositories at all,
+/// membership degrades to a SINGLE synthetic repo at `relative_path = "."` (the
+/// workspace's own folder). This is never a disk scan and never persisted — it just lets
+/// an unconfigured project's workspace still surface its current folder to
+/// `workspace_git`/`repo_diff`/review, gracefully even when that folder is not a Git work
+/// tree (the Git reads then degrade to an empty state). A project that HAS configured
+/// repos but marked them all `optional` is a deliberate config: its membership is
+/// legitimately empty (no fallback).
 pub fn workspace_members(
     conn: &mut SqliteConnection,
     workspace: &Workspace,
 ) -> QueryResult<Vec<WorkspaceRepo>> {
     let repos = db::list_repositories(conn, &workspace.project_id)?;
+    if repos.is_empty() {
+        // No repo configured on the project → the current folder as the sole repo.
+        return Ok(vec![fallback_member(workspace)]);
+    }
     Ok(repos
         .into_iter()
         .filter(|r| !r.optional)
@@ -238,6 +147,33 @@ pub fn workspace_members(
             }
         })
         .collect())
+}
+
+/// Build the synthetic current-folder FALLBACK member for `workspace` (finding #27): a
+/// single repo at `relative_path = "."` resolving to the workspace root, with a
+/// deterministic synthetic id (`"{FALLBACK_REPO_ID_PREFIX}{project_id}"`) so it
+/// round-trips through [`member_absolute_path`]. Never persisted, never a scan.
+fn fallback_member(workspace: &Workspace) -> WorkspaceRepo {
+    let now = crate::db::now_millis();
+    let name = Path::new(&workspace.root_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+    let repository = Repository {
+        id: format!("{FALLBACK_REPO_ID_PREFIX}{}", workspace.project_id),
+        project_id: workspace.project_id.clone(),
+        name,
+        relative_path: MONO_REPO_RELATIVE_PATH.to_string(),
+        optional: false,
+        created_at: now,
+        updated_at: now,
+        archived_at: None,
+    };
+    WorkspaceRepo {
+        absolute_path: join_relative(&workspace.root_path, MONO_REPO_RELATIVE_PATH),
+        repository,
+    }
 }
 
 /// Resolve ONE `(workspace, repository)` membership to its ABSOLUTE on-disk path in that
@@ -441,136 +377,225 @@ mod tests {
         git_in(dir, &["commit", "-q", "-m", "init"]);
     }
 
-    /// DONE-CRITERION (task #5): mono-repo detection. A `root_path` that is itself a
-    /// Git work tree detects ONE repository at `relative_path = "."`.
+    /// FINDING #27: explicit config → repos visible by the workspace. A project with NO
+    /// disk scan gets its repos declared via [`db::set_project_repositories`]; the
+    /// workspace then DERIVES them at `root_path + relative_path` (PDR-0013 preserved).
     #[test]
-    fn detects_mono_repo_at_dot() {
-        if !git_available() {
-            eprintln!("skipping mono-repo detection: git unavailable");
-            return;
-        }
-        let root = scratch_dir("mono");
-        init_repo(&root, "main");
+    fn set_project_repositories_configures_repos_visible_by_workspace() {
+        let mut conn = open_in_memory();
+        #[cfg(windows)]
+        let root = "C:\\proj";
+        #[cfg(not(windows))]
+        let root = "/proj";
+        let (project, ws) = create_project(&mut conn, "Nyx", root, None).unwrap();
 
-        let detected = detect_under_root(root.to_str().unwrap());
-        assert_eq!(detected.len(), 1, "one repo detected for a mono-repo");
+        // No repo configured yet → the workspace falls back to the current folder.
+        let members = workspace_members(&mut conn, &ws).unwrap();
+        assert_eq!(members.len(), 1, "unconfigured → single fallback member");
+        assert_eq!(members[0].repository.relative_path, MONO_REPO_RELATIVE_PATH);
+
+        // Explicitly configure two sub-repos by relative path (+ an explicit name for one).
+        let configured = db::set_project_repositories(
+            &mut conn,
+            &project.id,
+            &[
+                db::RepoConfig {
+                    relative_path: "api".into(),
+                    name: Some("backend".into()),
+                },
+                db::RepoConfig {
+                    relative_path: "web".into(),
+                    name: None,
+                },
+            ],
+        )
+        .unwrap();
+        let rels: Vec<&str> = configured
+            .iter()
+            .map(|r| r.relative_path.as_str())
+            .collect();
+        assert_eq!(rels, vec!["api", "web"], "both configured, canonical order");
         assert_eq!(
-            detected[0].relative_path, MONO_REPO_RELATIVE_PATH,
-            "mono-repo relative_path is '.'"
+            configured
+                .iter()
+                .find(|r| r.relative_path == "api")
+                .unwrap()
+                .name,
+            "backend",
+            "explicit name wins"
+        );
+        assert_eq!(
+            configured
+                .iter()
+                .find(|r| r.relative_path == "web")
+                .unwrap()
+                .name,
+            "web",
+            "name defaults to the path basename"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// DONE-CRITERION (task #5): multi-repo detection. A `root_path` that is NOT a work
-    /// tree but has Git subfolders detects one repo per subfolder, at its subfolder name.
-    #[test]
-    fn detects_multi_repo_per_subfolder() {
-        if !git_available() {
-            eprintln!("skipping multi-repo detection: git unavailable");
-            return;
-        }
-        let root = scratch_dir("multi");
-        init_repo(&root.join("api"), "main");
-        init_repo(&root.join("web"), "main");
-        // A plain (non-git) subfolder is IGNORED.
-        std::fs::create_dir_all(root.join("docs")).unwrap();
-
-        let detected = detect_under_root(root.to_str().unwrap());
-        let paths: Vec<&str> = detected.iter().map(|d| d.relative_path.as_str()).collect();
+        // The workspace now DERIVES both, each at root_path + relative_path.
+        let members = workspace_members(&mut conn, &ws).unwrap();
+        let paths: Vec<String> = members.iter().map(|m| m.absolute_path.clone()).collect();
         assert_eq!(
             paths,
-            vec!["api", "web"],
-            "one repo per Git subfolder, non-git subfolders ignored, sorted"
+            vec![
+                join_relative(&ws.root_path, "api"),
+                join_relative(&ws.root_path, "web"),
+            ],
+            "workspace inherits the project's configured repos (PDR-0013)"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A non-git (or absent) root yields NO detection — detection is git-agnostic.
+    /// FINDING #27: re-running the config RECONCILES — a repo dropped from the set is
+    /// archived (removed from membership) while the kept one survives with its history.
     #[test]
-    fn non_git_root_detects_nothing() {
-        let plain = scratch_dir("plain");
-        assert!(detect_under_root(plain.to_str().unwrap()).is_empty());
+    fn set_project_repositories_reconciles_removed_repos() {
+        let mut conn = open_in_memory();
+        #[cfg(windows)]
+        let root = "C:\\reconcile";
+        #[cfg(not(windows))]
+        let root = "/reconcile";
+        let (project, ws) = create_project(&mut conn, "Nyx", root, None).unwrap();
+
+        db::set_project_repositories(
+            &mut conn,
+            &project.id,
+            &[
+                db::RepoConfig {
+                    relative_path: "api".into(),
+                    name: None,
+                },
+                db::RepoConfig {
+                    relative_path: "web".into(),
+                    name: None,
+                },
+            ],
+        )
+        .unwrap();
+        let api_id = list_repositories(&mut conn, &project.id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.relative_path == "api")
+            .unwrap()
+            .id;
+
+        // Re-config with only `api` → `web` is archived, `api` keeps its identity.
+        let after = db::set_project_repositories(
+            &mut conn,
+            &project.id,
+            &[db::RepoConfig {
+                relative_path: "api".into(),
+                name: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(after.len(), 1, "only the kept repo remains active");
+        assert_eq!(
+            after[0].id, api_id,
+            "the kept repo keeps its stable identity"
+        );
+        assert_eq!(after[0].relative_path, "api");
+        let members = workspace_members(&mut conn, &ws).unwrap();
+        assert_eq!(members.len(), 1, "membership reflects the reconcile");
+        assert_eq!(members[0].repository.relative_path, "api");
+    }
+
+    /// FINDING #27: fallback to the CURRENT FOLDER when nothing is configured — the
+    /// derived membership is a single repo at `"."` resolving to the workspace root, with
+    /// a deterministic synthetic id (no disk scan, no persisted row).
+    #[test]
+    fn unconfigured_project_falls_back_to_current_folder() {
+        let mut conn = open_in_memory();
+        #[cfg(windows)]
+        let root = "C:\\fallback";
+        #[cfg(not(windows))]
+        let root = "/fallback";
+        let (project, ws) = create_project(&mut conn, "Nyx", root, None).unwrap();
+
         assert!(
-            detect_under_root("/no/such/path/nyx-absent").is_empty(),
-            "an absent root detects nothing"
+            list_repositories(&mut conn, &project.id)
+                .unwrap()
+                .is_empty(),
+            "no repo is persisted (fallback is derived, never a scan/write)"
         );
-        let _ = std::fs::remove_dir_all(&plain);
+        let members = workspace_members(&mut conn, &ws).unwrap();
+        assert_eq!(members.len(), 1, "one fallback member");
+        assert_eq!(members[0].repository.relative_path, MONO_REPO_RELATIVE_PATH);
+        assert_eq!(
+            members[0].absolute_path,
+            crate::pathnorm::normalize(&ws.root_path),
+            "the fallback repo resolves to the workspace root itself"
+        );
+        assert_eq!(
+            members[0].repository.id,
+            format!("{FALLBACK_REPO_ID_PREFIX}{}", project.id),
+            "the fallback id is deterministic per project"
+        );
+
+        // Deterministic id ROUND-TRIPS through member_absolute_path (repo_diff can resolve
+        // the fallback repo back to the workspace root).
+        let resolved = member_absolute_path(&mut conn, &ws.id, &members[0].repository.id)
+            .unwrap()
+            .expect("fallback id resolves");
+        assert_eq!(resolved, crate::pathnorm::normalize(&ws.root_path));
     }
 
-    /// DONE-CRITERION (task #5): "Enregistrer un workspace détecte ses repos ; override
-    /// manuel possible (optional)." Registration is idempotent (a re-scan does not
-    /// duplicate) and a manual `optional` override survives a re-scan.
+    /// FINDING #27: registering a project/workspace NEVER scans the disk — a multi-repo
+    /// tree on disk yields NO auto-detected repos; only the current-folder fallback until
+    /// the user configures explicitly.
     #[test]
-    fn register_is_idempotent_and_preserves_optional_override() {
+    fn register_does_not_scan_disk() {
         if !git_available() {
-            eprintln!("skipping register test: git unavailable");
+            eprintln!("skipping no-scan test: git unavailable");
             return;
         }
-        let root = scratch_dir("reg");
+        let root = scratch_dir("noscan");
         init_repo(&root.join("api"), "main");
         init_repo(&root.join("web"), "main");
 
         let mut conn = open_in_memory();
-        let (_p, ws) = create_project(&mut conn, "Nyx", root.to_str().unwrap(), None).unwrap();
+        let (project, ws) =
+            register_project(&mut conn, "Nyx", root.to_str().unwrap(), None).unwrap();
 
-        let first = detect_and_register(&mut conn, &ws).unwrap();
-        assert_eq!(first.len(), 2, "both subfolder repos registered");
-
-        // Manual override: mark `web` optional (the in-DB nyxignore).
-        let web = first.iter().find(|r| r.relative_path == "web").unwrap();
-        set_repository_optional(&mut conn, &web.id, true).unwrap();
-
-        // Re-scan: no duplicates, and the override is preserved.
-        let second = detect_and_register(&mut conn, &ws).unwrap();
-        assert_eq!(second.len(), 2, "re-scan does not duplicate");
-        let all = list_repositories(&mut conn, &ws.project_id).unwrap();
-        assert_eq!(all.len(), 2, "still exactly two repositories after re-scan");
-        let web_after = all.iter().find(|r| r.relative_path == "web").unwrap();
         assert!(
-            web_after.optional,
-            "the manual `optional` override survives a re-scan"
+            list_repositories(&mut conn, &project.id)
+                .unwrap()
+                .is_empty(),
+            "registering a project does NOT scan/persist the on-disk sub-repos"
         );
+        // Membership is the single current-folder fallback (root itself, non-git container).
+        let members = workspace_members(&mut conn, &ws).unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "only the fallback, never a scan of api/web"
+        );
+        assert_eq!(members[0].repository.relative_path, MONO_REPO_RELATIVE_PATH);
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// DONE-CRITERION (task #5): manual override — RENAME a detected repo. The rename
-    /// changes the logical `name` only (identity `relative_path` untouched), and a later
-    /// re-scan keeps the user's chosen name (detection is a no-op on an active identity).
+    /// FINDING #27: the fallback is GRACEFUL for a non-git folder — no crash, empty Git
+    /// state (branch=None, clean, no changed files).
     #[test]
-    fn manual_rename_override_survives_rescan() {
-        if !git_available() {
-            eprintln!("skipping rename test: git unavailable");
-            return;
-        }
-        let root = scratch_dir("rename");
-        init_repo(&root.join("api"), "main");
-
+    fn fallback_is_graceful_for_non_git_folder() {
+        let plain = scratch_dir("nongit");
         let mut conn = open_in_memory();
-        let (_p, ws) = create_project(&mut conn, "Nyx", root.to_str().unwrap(), None).unwrap();
-        let registered = detect_and_register(&mut conn, &ws).unwrap();
-        let api = &registered[0];
-        assert_eq!(api.name, "api", "detected name is the folder basename");
+        let (_p, ws) = create_project(&mut conn, "Nyx", plain.to_str().unwrap(), None).unwrap();
 
-        // Manual rename to a friendlier logical name.
-        db::rename_repository(&mut conn, &api.id, "backend").unwrap();
-
-        // Re-scan: the identity (relative_path 'api') is unchanged; the NAME override wins.
-        detect_and_register(&mut conn, &ws).unwrap();
-        let all = list_repositories(&mut conn, &ws.project_id).unwrap();
-        assert_eq!(all.len(), 1, "no duplicate identity after rename + rescan");
+        let members = workspace_members(&mut conn, &ws).unwrap();
         assert_eq!(
-            all[0].name, "backend",
-            "the manual rename survives a re-scan"
+            members.len(),
+            1,
+            "fallback member even for a non-git folder"
         );
-        assert_eq!(
-            all[0].relative_path, "api",
-            "the identity path is untouched"
-        );
+        // The Git re-read of a non-git path degrades to the default (no crash).
+        let state = read_git_state(&members[0].absolute_path);
+        assert_eq!(state, GitState::default());
+        assert!(read_changed_files(&members[0].absolute_path).is_empty());
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&plain);
     }
 
     /// DONE-CRITERION (task #5): derived membership. A workspace's repos = the
@@ -705,156 +730,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&plain);
     }
 
-    /// DONE-CRITERION (task #5, finding #13): "Enregistrer un workspace détecte ses
-    /// repos." END-TO-END proof through the REAL registration flow — `register_project`
-    /// (create_project + auto-detect on the root) and `register_workspace`
-    /// (create_workspace + auto-detect) — with NO direct `detect_and_register` call in
-    /// the test. After registering a MULTI-REPO tree, `list_repositories` returns the
-    /// detected repos.
+    /// FINDING #27 (done_criterion): a SINGLE project config is INHERITED by every
+    /// workspace/worktree — the repos of a workspace = the project's configured repos at
+    /// `workspace.root_path + relative_path` (PDR-0013 preserved, without any auto-detection
+    /// or per-workspace config). Proven through the real `register_project` /
+    /// `register_workspace` seam plus one `set_project_repositories` config call.
     #[test]
-    fn registering_a_multi_repo_workspace_detects_and_persists_repos() {
-        if !git_available() {
-            eprintln!("skipping multi-repo registration e2e: git unavailable");
-            return;
-        }
-        let root = scratch_dir("e2e-multi");
-        init_repo(&root.join("api"), "main");
-        init_repo(&root.join("web"), "main");
-        std::fs::create_dir_all(root.join("docs")).unwrap(); // non-git: ignored
-
+    fn project_config_is_inherited_by_every_workspace() {
         let mut conn = open_in_memory();
+        #[cfg(windows)]
+        let (root, wt) = ("C:\\proj", "C:\\proj-feat");
+        #[cfg(not(windows))]
+        let (root, wt) = ("/proj", "/proj-feat");
 
-        // Registering the PROJECT (its root workspace is the multi-repo tree) detects
-        // and persists both repos — via the real registration path, not a manual scan.
-        let (project, _root) =
-            register_project(&mut conn, "Nyx", root.to_str().unwrap(), None).unwrap();
-        let repos = list_repositories(&mut conn, &project.id).unwrap();
-        let paths: Vec<&str> = repos.iter().map(|r| r.relative_path.as_str()).collect();
-        assert_eq!(
-            paths,
-            vec!["api", "web"],
-            "registering the project detected and persisted both subfolder repos"
-        );
+        // Register a project (root workspace) and add a second worktree — NO disk scan.
+        let (project, root_ws) = register_project(&mut conn, "Nyx", root, None).unwrap();
+        let feat_ws = register_workspace(&mut conn, &project.id, "feat", wt).unwrap();
 
-        // Registering an ADDED workspace on the SAME tree re-detects idempotently
-        // (same identities, no duplicates) — the workspace-registration path also wires
-        // detection.
-        let ws2 = register_workspace(
+        // Configure the project's repos ONCE.
+        db::set_project_repositories(
             &mut conn,
             &project.id,
-            "worktree",
-            root.join("api").to_str().unwrap(),
-        )
-        .unwrap();
-        // `worktree` root_path is `.../api`, itself a git repo → detected as a mono-repo
-        // identity at `.` in the SAME project, added to the two subfolder repos.
-        assert_eq!(ws2.project_id, project.id);
-        let after = list_repositories(&mut conn, &project.id).unwrap();
-        let rels: Vec<&str> = after.iter().map(|r| r.relative_path.as_str()).collect();
-        assert_eq!(
-            rels,
-            vec![".", "api", "web"],
-            "registering a workspace also triggers detection (adds the '.' mono identity)"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// DONE-CRITERION (task #5, finding #13): a MONO-REPO tree — registering a workspace
-    /// whose root is itself a Git work tree detects one `.` repository, via the real
-    /// registration flow.
-    #[test]
-    fn registering_a_mono_repo_workspace_detects_the_dot_repo() {
-        if !git_available() {
-            eprintln!("skipping mono-repo registration e2e: git unavailable");
-            return;
-        }
-        let root = scratch_dir("e2e-mono");
-        init_repo(&root, "main");
-
-        let mut conn = open_in_memory();
-        let (project, _root) =
-            register_project(&mut conn, "Mono", root.to_str().unwrap(), None).unwrap();
-
-        let repos = list_repositories(&mut conn, &project.id).unwrap();
-        assert_eq!(repos.len(), 1, "one repo detected at registration");
-        assert_eq!(
-            repos[0].relative_path, MONO_REPO_RELATIVE_PATH,
-            "the mono-repo is registered at relative_path '.'"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// DONE-CRITERION (task #5, finding #13): a manual override (`optional` / rename)
-    /// SURVIVES a RE-registration through the real flow. A repository identity is keyed
-    /// on `(project_id, relative_path)`, so registering ANOTHER workspace in the SAME
-    /// project on a tree with the SAME subfolder layout re-runs detection over the same
-    /// identities (idempotently) — the user's `optional` and `name` edits must be
-    /// preserved. Proven entirely through `register_project` / `register_workspace`, the
-    /// real registration seam (no direct `detect_and_register` call in the test).
-    #[test]
-    fn manual_override_survives_reregistration_via_real_flow() {
-        if !git_available() {
-            eprintln!("skipping override-survival e2e: git unavailable");
-            return;
-        }
-        // Root workspace tree: repos `api` + `web`.
-        let root = scratch_dir("e2e-override-root");
-        init_repo(&root.join("api"), "main");
-        init_repo(&root.join("web"), "main");
-        // A SECOND worktree of the same project, same subfolder layout at a different
-        // absolute path (a real added worktree — the DB's UNIQUE(project_id, root_path)
-        // forbids reusing the root's path, but the derived identities coincide).
-        let worktree = scratch_dir("e2e-override-wt");
-        init_repo(&worktree.join("api"), "feat");
-        init_repo(&worktree.join("web"), "feat");
-
-        let mut conn = open_in_memory();
-        let (project, _root) =
-            register_project(&mut conn, "Nyx", root.to_str().unwrap(), None).unwrap();
-
-        // User overrides on the detected identities: mark `web` optional, rename `api`.
-        let registered = list_repositories(&mut conn, &project.id).unwrap();
-        let web = registered
-            .iter()
-            .find(|r| r.relative_path == "web")
-            .unwrap();
-        let api = registered
-            .iter()
-            .find(|r| r.relative_path == "api")
-            .unwrap();
-        set_repository_optional(&mut conn, &web.id, true).unwrap();
-        db::rename_repository(&mut conn, &api.id, "backend").unwrap();
-
-        // Register an ADDED workspace on the second tree → detection re-runs over the
-        // SAME `(project_id, relative_path)` identities via the real seam.
-        register_workspace(
-            &mut conn,
-            &project.id,
-            "worktree",
-            worktree.to_str().unwrap(),
+            &[
+                db::RepoConfig {
+                    relative_path: "api".into(),
+                    name: None,
+                },
+                db::RepoConfig {
+                    relative_path: "web".into(),
+                    name: None,
+                },
+            ],
         )
         .unwrap();
 
-        let after = list_repositories(&mut conn, &project.id).unwrap();
-        assert_eq!(
-            after.len(),
-            2,
-            "re-registration does not duplicate identities"
-        );
-        let web_after = after.iter().find(|r| r.relative_path == "web").unwrap();
-        let api_after = after.iter().find(|r| r.relative_path == "api").unwrap();
-        assert!(
-            web_after.optional,
-            "the manual `optional` override survives re-registration"
-        );
-        assert_eq!(
-            api_after.name, "backend",
-            "the manual rename survives re-registration"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&worktree);
+        // BOTH workspaces derive the SAME logical repos, each at their own root_path.
+        for ws in [&root_ws, &feat_ws] {
+            let members = workspace_members(&mut conn, ws).unwrap();
+            let paths: Vec<String> = members.iter().map(|m| m.absolute_path.clone()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    join_relative(&ws.root_path, "api"),
+                    join_relative(&ws.root_path, "web"),
+                ],
+                "the worktree inherits the ONE project config at its own root_path"
+            );
+        }
     }
 }

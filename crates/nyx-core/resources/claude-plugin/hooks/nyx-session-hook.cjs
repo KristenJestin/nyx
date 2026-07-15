@@ -37,6 +37,16 @@
  *   - POSTs the JSON-RPC `tools/call name=agent_session_event` to
  *     `http://127.0.0.1:${NYX_MCP_PORT||8765}/mcp` over native node `http`.
  *
+ * SLASH-COMMAND MANUAL INJECTION (v2.5.8 / PDR-0020): the bundled `/nspec` `/ndev` `/ndoc`
+ * command stubs each carry a sentinel marker (`NYX-AGENT-CONTEXT role=<role>`). When a
+ * `UserPromptSubmit` prompt carries that marker, this hook derives the role from it, POSTs a
+ * SECOND `tools/call name=agent_context` (`{ role, cwd }`) to the SAME sidecar, and relays the
+ * rendered role manual back to Claude as `UserPromptSubmit` `additionalContext` — the exact
+ * mirror of the SessionStart context relay below. ZERO argument parsing: the marker only names
+ * the role; the human's free text (id + instruction) stays untouched for the agent to read.
+ * `agent_context` resolves the Spec from `cwd`, so no id is needed. Fully best-effort — a
+ * missing marker, a sidecar that is down, or an unresolved Spec simply injects nothing.
+ *
  * GUARANTEES: best-effort, ~1s timeout, NEVER throws, ALWAYS exits 0. A hook that crashes
  * (or whose server is down) must not disturb the user's Claude Code session.
  */
@@ -50,6 +60,31 @@ const EVENT = process.argv[2] || ""; // hook name (informational; stdin is autho
 const PORT = process.env.NYX_MCP_PORT || "8765";
 const TERMINAL_ID = process.env.NYX_TERMINAL_ID || "";
 const TIMEOUT_MS = 1000;
+
+/**
+ * The sentinel a `/nspec` `/ndev` `/ndoc` command stub embeds in its expanded prompt body
+ * (`<!-- NYX-AGENT-CONTEXT role=<role> -->`). A `UserPromptSubmit` carrying it means the user
+ * ran a nyx slash command → we render that role's manual and inject it (see `roleFromPrompt`).
+ * Only the three TRIGGERABLE roles ship as stubs; coder/auditor/prototype are pull-only (the
+ * dev orchestrator fetches them via `agent_context`), so an unknown role in the marker is
+ * ignored rather than trusted.
+ */
+const AGENT_ROLE_MARKER = /NYX-AGENT-CONTEXT\s+role=([a-z][a-z-]*)/i;
+const TRIGGERABLE_ROLES = new Set(["spec", "dev", "doc"]);
+
+/**
+ * Derive the agent role from a submitted prompt, or "" when it carries no nyx sentinel (a
+ * normal prompt) or names a role we do not inject. Pure + defensive: a non-string / missing
+ * prompt yields "". ZERO argument parsing — only the marker's role token is read; the human's
+ * free text is never inspected.
+ */
+function roleFromPrompt(prompt) {
+  if (typeof prompt !== "string" || prompt.length === 0) return "";
+  const m = prompt.match(AGENT_ROLE_MARKER);
+  if (!m) return "";
+  const role = m[1].toLowerCase();
+  return TRIGGERABLE_ROLES.has(role) ? role : "";
+}
 
 /**
  * The version of the nyx plugin THIS session loaded (#18b — the stale-plugin badge). A
@@ -217,6 +252,42 @@ async function main() {
       }
     } catch (_e) {
       // No context injected on a parse/shape error — harmless.
+    }
+  }
+
+  // UserPromptSubmit — the `/nspec` `/ndev` `/ndoc` slash-command manual injection (v2.5.8 /
+  // PDR-0020). When the submitted prompt carries the stub's `NYX-AGENT-CONTEXT role=<role>`
+  // sentinel, POST a SECOND `agent_context` call ({ role, cwd }) and relay the rendered manual
+  // as `additionalContext` — the mirror of the SessionStart relay above. `agent_context`
+  // resolves the Spec from `cwd`, so no id is parsed here. Best-effort and NEVER throws: a
+  // sidecar that is down, an unresolved Spec, or a garbled response simply injects nothing (the
+  // agent still has the stub's own fallback instruction to pull the manual itself).
+  if (args.hook_event_name === "UserPromptSubmit") {
+    const role = roleFromPrompt(args.prompt);
+    if (role) {
+      try {
+        const cwd = typeof args.cwd === "string" ? args.cwd : "";
+        const ctxBody = JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: { name: "agent_context", arguments: { role, cwd } },
+        });
+        const ctxResp = await post(ctxBody);
+        const manual = JSON.parse(ctxResp)?.result?.structuredContent?.context;
+        if (manual && typeof manual === "string") {
+          process.stdout.write(
+            JSON.stringify({
+              hookSpecificOutput: {
+                hookEventName: "UserPromptSubmit",
+                additionalContext: manual,
+              },
+            }),
+          );
+        }
+      } catch (_e) {
+        // No manual injected on a parse/shape/network error — harmless (best-effort).
+      }
     }
   }
 }

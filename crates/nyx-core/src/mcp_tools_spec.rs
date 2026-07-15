@@ -44,10 +44,12 @@ pub const TASK_ADD_TOOL: &str = "task_add";
 pub const TASK_TRANSITION_TOOL: &str = "task_transition";
 /// `task_add_dependency` — add an acyclic `depends_on` edge between two tasks.
 pub const TASK_ADD_DEPENDENCY_TOOL: &str = "task_add_dependency";
+/// `task_delete` — DELETE a task outright (+ its dependency edges), GUARDED to a `draft` Spec.
+pub const TASK_DELETE_TOOL: &str = "task_delete";
 
 /// The Spec authoring + transition tool names — advertised in `tools/list` and routed by
 /// [`dispatch_spec_tool`]. A closed slice so a new tool is added in exactly one place.
-pub const SPEC_TOOLS: [&str; 8] = [
+pub const SPEC_TOOLS: [&str; 9] = [
     SPEC_CREATE_TOOL,
     SPEC_UPDATE_SECTION_TOOL,
     SPEC_FORK_TOOL,
@@ -56,6 +58,7 @@ pub const SPEC_TOOLS: [&str; 8] = [
     TASK_ADD_TOOL,
     TASK_TRANSITION_TOOL,
     TASK_ADD_DEPENDENCY_TOOL,
+    TASK_DELETE_TOOL,
 ];
 
 // --- Argument parsing helpers (the D8 vocabulary) --------------------------
@@ -151,9 +154,12 @@ fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
         }
         db::SpecTransitionError::ConfirmationRequired => RpcError::new(
             RpcCode::InvalidState,
-            "this is a sensitive transition (ready/done/cancel): pass user_confirmed=true \
+            "this is a sensitive transition (ready/start/done/cancel): pass user_confirmed=true \
              once the human has confirmed",
         ),
+        db::SpecTransitionError::WorkspaceNotFound => {
+            RpcError::new(RpcCode::InvalidId, "unknown workspace")
+        }
         db::SpecTransitionError::Db(e) => internal_db(e),
     }
 }
@@ -176,6 +182,24 @@ fn map_task_transition_err(e: db::TaskTransitionError) -> RpcError {
             format!("cannot verify a task in '{from}': it must be in progress (start it first)"),
         ),
         db::TaskTransitionError::Db(e) => internal_db(e),
+    }
+}
+
+/// Map a [`db::DeleteTaskError`] onto the D8 RPC vocabulary. The draft-only GUARD lives in
+/// `db.rs`; this only translates the typed refusal. Unknown task → `invalid_id`; a parent
+/// Spec that is not `draft` (or absent) → `invalid_state` (skip it instead).
+fn map_delete_task_err(e: db::DeleteTaskError) -> RpcError {
+    match e {
+        db::DeleteTaskError::NotFound => RpcError::new(RpcCode::InvalidId, "unknown task"),
+        db::DeleteTaskError::NotDraft { status } => RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "task_delete is only legal while the parent Spec is 'draft' (this task's Spec \
+                 is '{status}'): once ready/in_progress, skip the task instead \
+                 (task_transition transition=skip), which keeps the audit trail"
+            ),
+        ),
+        db::DeleteTaskError::Db(e) => internal_db(e),
     }
 }
 
@@ -211,32 +235,34 @@ fn map_set_workspace_err(e: db::SetSpecWorkspaceError) -> RpcError {
         db::SetSpecWorkspaceError::WorkspaceNotFound => {
             RpcError::new(RpcCode::InvalidId, "unknown workspace")
         }
+        db::SetSpecWorkspaceError::InvalidState { status } => RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "a Spec's workspace anchor can only be set while it is in_progress \
+                 (this Spec is '{status}'): the anchor is posed at the ready→in_progress \
+                 start transition (spec_transition transition=start, workspace_id=…)"
+            ),
+        ),
         db::SetSpecWorkspaceError::Db(e) => internal_db(e),
     }
 }
 
 // --- Tool handlers ---------------------------------------------------------
 
-/// `spec_create` — `{ project_id, title, workspace_id?, problem?, solution?,
-/// implementation_decisions?, testing_decisions?, user_stories?, out_of_scope? }` →
-/// `{ spec, revision }`. Creates a `draft` Spec (+ its first `active` revision) via the
-/// SHARED `db::create_spec` / `db::create_spec_with_workspace` authority. When
-/// `workspace_id` is given the Spec is anchored on that dev workspace at birth (the GUARD:
-/// the workspace must exist).
+/// `spec_create` — `{ project_id, title, problem?, solution?, implementation_decisions?,
+/// testing_decisions?, user_stories?, out_of_scope? }` → `{ spec, revision }`. Creates a
+/// `draft` Spec (+ its first `active` revision) via the SHARED `db::create_spec` authority.
+/// A Spec is authored PROJECT-scoped and UNANCHORED (review finding): there is NO
+/// `workspace_id` here — the dev workspace anchor is posed later, at the ready→in_progress
+/// `start` transition (`spec_transition`), never at authoring.
 pub fn spec_create(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let title = require_str(args, "title")?;
     let sections = sections_from_args(args)?;
-    let workspace_id = optional_str(args, "workspace_id")?;
 
-    let (spec, revision) = match workspace_id {
-        Some(ws) => db
-            .with_conn(|c| db::create_spec_with_workspace(c, project_id, ws, title, sections))
-            .map_err(map_set_workspace_err)?,
-        None => db
-            .with_conn(|c| db::create_spec(c, project_id, title, sections))
-            .map_err(internal_db)?,
-    };
+    let (spec, revision) = db
+        .with_conn(|c| db::create_spec(c, project_id, title, sections))
+        .map_err(internal_db)?;
     Ok(ToolOutcome::changed(
         json!({ "spec": spec, "revision": revision }),
         ChangedTopic::Specs,
@@ -300,17 +326,37 @@ pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     ))
 }
 
-/// `spec_transition` — `{ spec_id, transition, user_confirmed? }` → `{ spec }`. Performs a
-/// GUARDED + VALIDATED lifecycle transition via the SHARED `db::transition_spec`. The
-/// SENSITIVE transitions (ready/done/cancel) are refused unless `user_confirmed=true` — the
-/// guard-rail is enforced in `db.rs`, so it holds through the tool exactly as through the
-/// UI (à la depot `--user-confirmed`).
+/// `spec_transition` — `{ spec_id, transition, user_confirmed?, workspace_id?, cwd? }` →
+/// `{ spec }`. Performs a GUARDED + VALIDATED lifecycle transition via the SHARED
+/// `db::transition_spec_with_workspace`. The SENSITIVE transitions (ready/start/done/cancel)
+/// are refused unless `user_confirmed=true` — the guard-rail is enforced in `db.rs`, so it
+/// holds through the tool exactly as through the UI (à la depot `--user-confirmed`).
+///
+/// On `start` (ready→in_progress) the transition ALSO POSES the Spec's workspace anchor in
+/// the SAME operation: the dev workspace is resolved from an explicit `workspace_id`, else
+/// from `cwd` (the same cwd→workspace matcher `resolve_spec_id` uses). For every other
+/// transition no anchor is posed (`workspace_id`/`cwd` are ignored).
 pub fn spec_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id = require_str(args, "spec_id")?;
     let transition = parse_spec_transition(require_str(args, "transition")?)?;
     let user_confirmed = optional_bool(args, "user_confirmed")?.unwrap_or(false);
+    // Resolve the anchor ONLY for `start` — the one transition that binds the Spec to a dev
+    // workspace. Reuses the shared cwd→workspace resolution (no duplicated matcher).
+    let workspace_id = if transition == db::SpecTransition::Start {
+        crate::mcp_context::resolve_workspace_for_start(db, args)?
+    } else {
+        None
+    };
     let spec = db
-        .with_conn(|c| db::transition_spec(c, spec_id, transition, user_confirmed))
+        .with_conn(|c| {
+            db::transition_spec_with_workspace(
+                c,
+                spec_id,
+                transition,
+                user_confirmed,
+                workspace_id.as_deref(),
+            )
+        })
         .map_err(map_spec_transition_err)?;
     Ok(ToolOutcome::changed(
         json!({ "spec": spec }),
@@ -339,6 +385,12 @@ pub fn spec_set_workspace(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError
 /// `{ task }`. Creates a task (slice/human/review) via the SHARED `db::create_task` (which
 /// DERIVES `executor` from `kind`, keeping the pairing coherent). A `kind=human` task
 /// SHOULD carry a `verification_command` so it is verifiable at close time.
+///
+/// `phase` is a NAME (a string): nyx MATERIALIZES the Spec's plan from the names the tasks
+/// carry (get-or-create, 1-based, first-seen order — [`db::create_task`] →
+/// `resolve_or_create_phase`), so a task's phase always exists in the plan (no orphan). A
+/// phase name needs a `spec_id` (the plan lives on the Spec) — passing one without a Spec is
+/// refused.
 pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let title = require_str(args, "title")?;
@@ -359,15 +411,15 @@ pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     input.verification_command = optional_str(args, "verification_command")?.map(str::to_string);
     input.spec_id = optional_str(args, "spec_id")?.map(str::to_string);
     input.parent_task_id = optional_str(args, "parent_task_id")?.map(str::to_string);
-    input.phase = match args.get("phase") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(v.as_i64().ok_or_else(|| {
-            RpcError::new(
-                RpcCode::InvalidArgument,
-                "argument 'phase' must be an integer",
-            )
-        })? as i32),
-    };
+    // `phase` is a phase NAME: nyx materializes the plan from the names in first-seen order
+    // (get-or-create in `db::create_task`). It needs a Spec — the plan lives on the Spec.
+    input.phase_name = optional_str(args, "phase")?.map(str::to_string);
+    if input.phase_name.is_some() && input.spec_id.is_none() {
+        return Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            "argument 'phase' needs a 'spec_id' — the phase plan lives on the Spec",
+        ));
+    }
 
     let task = db
         .with_conn(|c| db::create_task(c, project_id, title, input.clone()))
@@ -431,6 +483,24 @@ pub fn task_add_dependency(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
     ))
 }
 
+/// `task_delete` — `{ task_id }` → `{ deleted: true, task_id }`. DELETES the task outright
+/// (+ its `task_dependencies` edges, in either direction) via the SHARED `db::delete_task`,
+/// GUARDED to a parent Spec still in `draft`. This is the draft-authoring hard removal — a
+/// mis-sliced task disappears cleanly while you are still shaping the plan — vs. `skip`
+/// (`task_transition`), which only cancels and keeps the ghost and is the legitimate move
+/// once the Spec is ready/in_progress. The draft GUARD lives in `db.rs`: an unknown task →
+/// `invalid_id`, a non-draft (or Spec-less) task → `invalid_state`. The Spec's auto-built
+/// phase plan is left intact (an emptied phase entry stays, keeping the plan a clean 1..N).
+pub fn task_delete(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let task_id = require_str(args, "task_id")?;
+    db.with_conn(|c| db::delete_task(c, task_id))
+        .map_err(map_delete_task_err)?;
+    Ok(ToolOutcome::changed(
+        json!({ "deleted": true, "task_id": task_id }),
+        ChangedTopic::Specs,
+    ))
+}
+
 // --- Dispatch --------------------------------------------------------------
 
 /// Route a Spec authoring/transition tool call, or `None` when `name` is not one of ours.
@@ -450,6 +520,7 @@ pub fn dispatch_spec_tool(
         TASK_ADD_TOOL => Some(task_add(db, args)),
         TASK_TRANSITION_TOOL => Some(task_transition(db, args)),
         TASK_ADD_DEPENDENCY_TOOL => Some(task_add_dependency(db, args)),
+        TASK_DELETE_TOOL => Some(task_delete(db, args)),
         _ => None,
     }
 }
@@ -498,23 +569,156 @@ mod tests {
         assert_eq!(out.result["revision"]["solution"], "the solution");
     }
 
+    /// A Spec is authored PROJECT-scoped and UNANCHORED (review finding #25): `spec_create`
+    /// does NOT anchor on a workspace — a `workspace_id` arg is IGNORED (never rejected, never
+    /// anchored). The dev anchor is posed later, at the `start` transition. The created Spec's
+    /// workspace_id is null.
     #[test]
-    fn spec_create_with_workspace_anchors_and_unknown_workspace_is_invalid_id() {
+    fn spec_create_is_project_scoped_and_unanchored() {
         let _g = db_guard();
         let (db, project_id, ws) = seeded_db();
+        // Even when a workspace_id is passed, the Spec is created unanchored.
         let out = spec_create(
             &db,
-            &json!({ "project_id": project_id, "title": "Anchored", "workspace_id": ws }),
+            &json!({ "project_id": project_id, "title": "Authored", "workspace_id": ws }),
         )
         .unwrap();
-        assert_eq!(out.result["spec"]["workspace_id"], ws);
+        assert!(
+            out.result["spec"]["workspace_id"].is_null(),
+            "an authored Spec is unanchored (workspace_id ignored at create)",
+        );
+        assert_eq!(out.result["spec"]["status"], "draft");
+    }
 
-        let err = spec_create(
+    /// The STATE GUARD through the tool (review finding #25): `spec_set_workspace` is REFUSED
+    /// (invalid_state) on a draft AND a ready Spec — the standalone anchor is only legal once
+    /// the Spec is in_progress. After the `start` transition it succeeds (a re-anchor/correction).
+    #[test]
+    fn spec_set_workspace_refused_before_in_progress() {
+        let _g = db_guard();
+        let (db, project_id, ws) = seeded_db();
+        let created = spec_create(
             &db,
-            &json!({ "project_id": project_id, "title": "Bad", "workspace_id": "nope" }),
+            &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+
+        // draft → refused.
+        let err =
+            spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidState);
+        assert!(
+            err.message.contains("in_progress"),
+            "the refusal cites in_progress"
+        );
+
+        // ready → still refused.
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+        let err =
+            spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidState);
+
+        // in_progress (via start, which itself anchors) → the standalone re-anchor is allowed.
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ws }),
+        )
+        .unwrap();
+        let ok = spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap();
+        assert_eq!(ok.result["spec"]["workspace_id"], ws);
+    }
+
+    /// `spec_transition` start is SENSITIVE and POSES the anchor in one op (review finding #25):
+    /// without user_confirmed it is refused; with confirmation + a workspace_id it moves the Spec
+    /// to in_progress AND anchors it. The anchor also resolves from `cwd` when workspace_id is
+    /// absent (the same cwd→workspace matcher the context render uses).
+    #[test]
+    fn spec_transition_start_requires_confirmation_and_poses_the_anchor() {
+        let _g = db_guard();
+        let (db, project_id, ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+
+        // Unconfirmed start → refused (sensitive), nothing anchored.
+        let err = spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "start", "workspace_id": ws }),
         )
         .unwrap_err();
-        assert_eq!(err.code, RpcCode::InvalidId);
+        assert_eq!(err.code, RpcCode::InvalidState);
+        assert!(err.message.contains("sensitive"));
+
+        // Confirmed start with an explicit workspace_id → in_progress + anchored.
+        let started = spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ws }),
+        )
+        .unwrap();
+        assert_eq!(started.result["spec"]["status"], "in_progress");
+        assert_eq!(
+            started.result["spec"]["workspace_id"], ws,
+            "start posed the anchor in the same operation",
+        );
+    }
+
+    /// The `start` anchor resolves from `cwd` when no workspace_id is given: the Spec anchors on
+    /// the workspace whose root path matches the cwd (review finding #25). agent_context(role=dev)
+    /// then resolves the Spec from that workspace — no regression of the project-scoped author.
+    #[test]
+    fn spec_transition_start_resolves_the_anchor_from_cwd_and_dev_context_follows() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project_id, workspace_id, cwd) = db.with_conn(|c| {
+            let (project, root) = db::create_project(c, "Proj", "/tmp/nyx-start", None).unwrap();
+            (project.id, root.id, root.root_path)
+        });
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+        // No workspace_id — resolve it from the cwd (nested under the workspace root).
+        let nested = format!("{cwd}/crates/api");
+        let started = spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "cwd": nested }),
+        )
+        .unwrap();
+        assert_eq!(
+            started.result["spec"]["workspace_id"], workspace_id,
+            "start resolved the anchor from the cwd → workspace",
+        );
+
+        // agent_context(role=dev) resolves the Spec from the workspace anchored at the transition.
+        let dev = crate::mcp_context::agent_context(
+            &db,
+            &json!({ "role": "dev", "workspace_id": workspace_id }),
+        )
+        .unwrap();
+        assert_eq!(
+            dev.result["spec_id"], sid,
+            "dev context resolves the anchored Spec"
+        );
     }
 
     #[test]
@@ -626,13 +830,17 @@ mod tests {
         let _g = db_guard();
         let (db, project_id, ws) = seeded_db();
 
-        // Create anchored on the workspace.
+        // Create PROJECT-scoped (unanchored) — the anchor is posed at the start transition.
         let created = spec_create(
             &db,
-            &json!({ "project_id": project_id, "title": "Feature", "workspace_id": ws }),
+            &json!({ "project_id": project_id, "title": "Feature" }),
         )
         .unwrap();
         let sid = spec_id_of(&created);
+        assert!(
+            created.result["spec"]["workspace_id"].is_null(),
+            "authored unanchored",
+        );
 
         // Author the two required sections.
         spec_update_section(
@@ -646,15 +854,22 @@ mod tests {
         )
         .unwrap();
 
-        // ready (confirmed) → start.
+        // ready (confirmed) → start (confirmed, anchoring on the dev workspace in one op).
         spec_transition(
             &db,
             &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
         )
         .unwrap();
-        let started =
-            spec_transition(&db, &json!({ "spec_id": sid, "transition": "start" })).unwrap();
+        let started = spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ws }),
+        )
+        .unwrap();
         assert_eq!(started.result["spec"]["status"], "in_progress");
+        assert_eq!(
+            started.result["spec"]["workspace_id"], ws,
+            "start posed the workspace anchor",
+        );
 
         // Add a slice task and drive it start → done.
         let task_out = task_add(
@@ -757,10 +972,144 @@ mod tests {
         assert_eq!(err.code, RpcCode::InvalidState);
     }
 
+    /// v2.5.8 finding #31 THROUGH the tool: `task_delete` REALLY removes a task (+ its
+    /// dependency edges) in a DRAFT Spec, is REFUSED (`invalid_state`) once the Spec is
+    /// in_progress (skip is the legit move there), and an unknown task is `invalid_id`.
+    #[test]
+    fn task_delete_is_draft_only_through_the_tool() {
+        let _g = db_guard();
+        let (db, project_id, ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+
+        // Two tasks + an edge, authored while the Spec is a draft.
+        let a = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "A", "spec_id": sid }),
+        )
+        .unwrap();
+        let b = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "B", "spec_id": sid }),
+        )
+        .unwrap();
+        let aid = a.result["task"]["id"].as_str().unwrap().to_string();
+        let bid = b.result["task"]["id"].as_str().unwrap().to_string();
+        task_add_dependency(&db, &json!({ "task_id": aid, "depends_on_task_id": bid })).unwrap();
+
+        // Unknown task → invalid_id.
+        let err = task_delete(&db, &json!({ "task_id": "nope" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+
+        // DRAFT: delete A really removes it (+ its edge) and reports the change on Specs.
+        let out = task_delete(&db, &json!({ "task_id": aid })).unwrap();
+        assert_eq!(out.effects, vec![ChangedTopic::Specs]);
+        assert_eq!(out.result["deleted"], true);
+        assert!(
+            db.with_conn(|c| db::get_task(c, &aid)).unwrap().is_none(),
+            "the task row is gone"
+        );
+        assert!(
+            db.with_conn(|c| db::list_task_dependency_edges(c, &aid))
+                .unwrap()
+                .is_empty(),
+            "the deleted task's dependency edge is gone"
+        );
+
+        // Move the Spec to in_progress (ready → start) → a delete is now REFUSED.
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ws }),
+        )
+        .unwrap();
+        let err = task_delete(&db, &json!({ "task_id": bid })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidState);
+        assert!(
+            db.with_conn(|c| db::get_task(c, &bid)).unwrap().is_some(),
+            "a refused delete removed nothing"
+        );
+    }
+
     #[test]
     fn dispatch_spec_tool_returns_none_for_a_foreign_tool() {
         let _g = db_guard();
         let (db, _p, _w) = seeded_db();
         assert!(dispatch_spec_tool(&db, "list_projects", &json!({})).is_none());
+    }
+
+    /// The REDESIGN (finding 01KXG68DN5DSCFDFA6C87NJHGV): `task_add` groups by phase NAME and
+    /// nyx MATERIALIZES the plan from the names, THROUGH the real dispatch. Adding tasks with
+    /// phase names auto-builds `specs.phases` (1-based, first-seen order, get-or-create), each
+    /// task's `phase` is the resolved number, a repeated name reuses its number, and no task
+    /// is orphaned. There is NO separate set-phases call.
+    #[test]
+    fn task_add_by_name_materializes_the_plan_through_dispatch() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let created = spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).unwrap();
+        let sid = spec_id_of(&created);
+
+        // A fresh Spec has no plan.
+        let before = db.with_conn(|c| db::get_spec(c, &sid)).unwrap().unwrap();
+        assert_eq!(before.phases, "[]", "no phase plan before any task");
+
+        // Add tasks by NAME through the exact MCP routing.
+        let add = |title: &str, phase: &str| {
+            dispatch_spec_tool(
+                &db,
+                TASK_ADD_TOOL,
+                &json!({ "project_id": project_id, "title": title, "spec_id": sid, "phase": phase }),
+            )
+            .expect("task_add is routed")
+            .expect("task_add ok")
+        };
+        let t1 = add("wire it", "Foundation");
+        assert_eq!(t1.effects, vec![ChangedTopic::Specs]);
+        assert_eq!(t1.result["task"]["phase"], 1, "first name seen → number 1");
+        let t2 = add("ship it", "Delivery");
+        assert_eq!(
+            t2.result["task"]["phase"], 2,
+            "second distinct name → number 2"
+        );
+        let t3 = add("more foundation", "Foundation");
+        assert_eq!(
+            t3.result["task"]["phase"], 1,
+            "a repeated name reuses its number"
+        );
+
+        // The plan self-built from the names (1-based, first-seen), coherent — no orphan.
+        let after = db.with_conn(|c| db::get_spec(c, &sid)).unwrap().unwrap();
+        assert_eq!(
+            after.phases, r#"[{"number":1,"name":"Foundation"},{"number":2,"name":"Delivery"}]"#,
+            "specs.phases materializes from the task phase names",
+        );
+        assert!(
+            db::validate_phase_plan(&after.phases).is_empty(),
+            "the auto-built plan is a coherent 1..N",
+        );
+    }
+
+    /// A phase name without a `spec_id` is refused (`invalid_argument`) — the plan lives on
+    /// the Spec, so a name has nowhere to materialize without one.
+    #[test]
+    fn task_add_phase_without_spec_is_invalid_argument() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let err = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "orphan", "phase": "Foundation" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(err.message.contains("spec_id"), "the refusal names spec_id");
     }
 }

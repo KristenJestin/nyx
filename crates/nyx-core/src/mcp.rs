@@ -185,6 +185,17 @@ pub const AGENT_SESSION_EVENT_TOOL: &str = "agent_session_event";
 /// project (that stays a UI gesture, per [`SERVER_INSTRUCTIONS`]).
 pub const SET_PROJECT_SETTINGS_TOOL: &str = "set_project_settings";
 
+/// The `project_set_repos` tool name (finding #27, PDR-0013). CONFIGURES the repositories
+/// of a project EXPLICITLY — the association that replaces the removed disk auto-detection.
+/// `{ project_id, repos: [{ relative_path, name? }] }` reconciles the project's logical
+/// repo set (each a `relative_path` within the project, `"."` for a mono-repo at the
+/// workspace root); a repo dropped from the list is archived. Every workspace/worktree of
+/// the project then DERIVES these repos at `workspace.root_path + relative_path`. A project
+/// left with NO configured repos falls back to the workspace's current folder. Routes
+/// through the SHARED `db::set_project_repositories` (PDR-0005). Advertised in `tools/list`,
+/// kept OUT of [`V1_TOOLS`] (same pattern as the other extension tools). NEVER scans disk.
+pub const PROJECT_SET_REPOS_TOOL: &str = "project_set_repos";
+
 /// The v2.2 cockpit read model tool (task `01KWHPV32YVCRBNY1JW5CDY4AY`): `{ workspace_id }`
 /// → the workspace's LIVE runtime aggregate (terminals + their agent sessions, the
 /// cross-terminal agent sessions, and the managed-command SERVICES with current run
@@ -1137,6 +1148,45 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["project_id"],
         },
     }));
+    // Append project_set_repos (finding #27): configure a project's repositories EXPLICITLY
+    // (the association that replaces disk auto-detection). Advertised alongside the v1
+    // surface, kept OUT of V1_TOOLS like the other extension tools.
+    descriptors.push(json!({
+        "name": PROJECT_SET_REPOS_TOOL,
+        "description": "Configure the repositories of a project EXPLICITLY (nyx does NOT \
+                        auto-detect repos from disk). Pass `project_id` and `repos`: the \
+                        FULL list of the project's repositories, each with a `relative_path` \
+                        within the project (use \".\" for a single repo at the workspace \
+                        root — a mono-repo) and an optional `name` (defaults to the path's \
+                        last segment). This is a full SET/reconcile: repos you list are \
+                        created or kept; a repo previously configured but NOT in the list is \
+                        removed (archived). Configure ONCE per project — every workspace and \
+                        dev worktree of the project then sees these repos at \
+                        `workspace_root + relative_path` (so workspace_git / repo_diff / the \
+                        review show each sub-repo's real changes). A project with NO \
+                        configured repos falls back to the workspace's current folder as a \
+                        single repo. Returns the project's configured repositories.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project whose repositories to configure (from list_projects)"),
+                "repos": json!({
+                    "type": "array",
+                    "description": "the FULL set of the project's repositories (a full replace). \
+                                   Empty array resets to the current-folder fallback.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "relative_path": str_prop("path of the repo within the project, e.g. \"api\" or \".\" for a repo at the workspace root"),
+                            "name": str_prop("optional logical name (defaults to the last path segment)"),
+                        },
+                        "required": ["relative_path"],
+                    },
+                }),
+            },
+            "required": ["project_id", "repos"],
+        },
+    }));
     // Append clear_command_output (review R-OUTPUT): reset a command instance's captured
     // output buffer. Advertised alongside the v1 surface, kept OUT of V1_TOOLS like the
     // other extension tools.
@@ -1479,16 +1529,16 @@ fn tool_descriptors() -> Vec<Value> {
                         depot CLI. Starts a draft Spec with its first revision, optionally seeding \
                         the structured \
                         sections (problem / solution / implementation_decisions / \
-                        testing_decisions / user_stories / out_of_scope) and anchoring it on a \
-                        dev workspace (workspace_id, from list_workspaces). Returns the created \
-                        spec and revision. Use spec_update_section to fill sections later, and \
-                        spec_transition to move its lifecycle.",
+                        testing_decisions / user_stories / out_of_scope). The Spec is authored \
+                        PROJECT-scoped and UNANCHORED — the dev workspace anchor is posed later, \
+                        at the ready→in_progress start transition (spec_transition), not here. \
+                        Returns the created spec and revision. Use spec_update_section to fill \
+                        sections later, and spec_transition to move its lifecycle.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": str_prop("project to create the Spec in (from list_projects)"),
                 "title": str_prop("the Spec's title"),
-                "workspace_id": str_prop("optional dev workspace to anchor the Spec on at birth (repos + project are derived from it); must exist"),
                 "problem": str_prop("optional 'problem' section (markdown)"),
                 "solution": str_prop("optional 'solution' section (markdown)"),
                 "implementation_decisions": str_prop("optional 'implementation decisions' section (markdown)"),
@@ -1540,7 +1590,10 @@ fn tool_descriptors() -> Vec<Value> {
                         (in_review→completed), or cancel. Transitions are guarded (the current \
                         status must allow it) and the ready gate runs the pre-ready validations \
                         (a problem + a solution must be present, the phase plan must be coherent). \
-                        The SENSITIVE transitions (ready, done, cancel) require a human's explicit \
+                        start ALSO POSES the Spec's dev workspace anchor in the same operation: \
+                        pass workspace_id (from list_workspaces) or a cwd to resolve it from — the \
+                        anchor is set atomically with the ready→in_progress flip. The SENSITIVE \
+                        transitions (ready, start, done, cancel) require a human's explicit \
                         confirmation: pass user_confirmed=true only once the user has agreed — \
                         otherwise the transition is refused. Returns the updated spec.",
         "inputSchema": {
@@ -1548,20 +1601,25 @@ fn tool_descriptors() -> Vec<Value> {
             "properties": {
                 "spec_id": str_prop("the Spec to transition"),
                 "transition": str_prop("ready | start | review | done | cancel"),
-                "user_confirmed": json!({ "type": "boolean", "description": "REQUIRED true for the sensitive transitions (ready/done/cancel): set it only after the user has explicitly confirmed. Ignored for start/review." }),
+                "user_confirmed": json!({ "type": "boolean", "description": "REQUIRED true for the sensitive transitions (ready/start/done/cancel): set it only after the user has explicitly confirmed. Ignored for review." }),
+                "workspace_id": str_prop("start only: the dev workspace to anchor the Spec on (from list_workspaces). Ignored for other transitions."),
+                "cwd": str_prop("start only: resolve the anchor workspace from the folder this runs in when workspace_id is absent (the workspace whose path matches). Ignored for other transitions."),
             },
             "required": ["spec_id", "transition"],
         },
     }));
     descriptors.push(json!({
         "name": crate::mcp_tools_spec::SPEC_SET_WORKSPACE_TOOL,
-        "description": "Anchor a Spec on a dev workspace (its repos + project are derived through \
-                        that workspace), or detach it by omitting workspace_id. The workspace must \
-                        exist. Returns the updated spec.",
+        "description": "RE-anchor a Spec on a dev workspace (its repos + project are derived \
+                        through that workspace), or detach it by omitting workspace_id. Only \
+                        allowed while the Spec is in_progress — a draft/ready Spec is refused: the \
+                        anchor is first posed at the ready→in_progress start transition \
+                        (spec_transition), and this tool only CORRECTS it afterwards. The \
+                        workspace must exist. Returns the updated spec.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the Spec to anchor/detach"),
+                "spec_id": str_prop("the in_progress Spec to re-anchor/detach"),
                 "workspace_id": str_prop("the dev workspace to anchor on (from list_workspaces); omit or null to detach"),
             },
             "required": ["spec_id"],
@@ -1588,7 +1646,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "acceptance_criteria": str_prop("optional acceptance/done criteria"),
                 "verification_command": str_prop("how a kind=human action is verified (required to close a human task)"),
                 "parent_task_id": str_prop("optional parent task (subtask decomposition)"),
-                "phase": int_prop("optional phase grouping (indexes the Spec's phase plan)"),
+                "phase": str_prop("optional phase NAME; nyx materializes the Spec's plan from the names, in first-seen order (needs spec_id)"),
             },
             "required": ["project_id", "title"],
         },
@@ -1628,24 +1686,46 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["task_id", "depends_on_task_id"],
         },
     }));
-    // Append the v2.4 Phase-5 agent-CONTEXT tool (PDR-0020): render a dev/coder/auditor
-    // manual live from nyx state (the native equivalent of `depot context …`).
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::TASK_DELETE_TOOL,
+        "description": "DELETE a task outright (and its dependency edges) — the draft-authoring \
+                        removal. Use it while the parent Spec is still in draft to make a \
+                        mis-sliced task disappear cleanly; it is REFUSED (invalid_state) once \
+                        the Spec is ready/in_progress — there, skip the task instead \
+                        (task_transition transition=skip), which keeps the audit trail. An \
+                        unknown task is invalid_id. The Spec's phase plan is left intact.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": str_prop("the task to delete (its parent Spec must be in draft)"),
+            },
+            "required": ["task_id"],
+        },
+    }));
+    // Append the v2.4 Phase-5 agent-CONTEXT tool (PDR-0020): render a
+    // spec/dev/coder/auditor/doc/prototype manual live from nyx state (the native
+    // equivalent of `depot context …`).
     descriptors.push(json!({
         "name": crate::mcp_context::AGENT_CONTEXT_TOOL,
-        "description": "Render an agent context manual (dev, coder, or auditor) LIVE from nyx \
+        "description": "Render an agent context manual (spec, dev, coder, auditor, doc, or prototype) LIVE from nyx \
                         state — the native equivalent of `depot context <role>`, with no depot CLI. \
                         Given a role and a Spec (spec_id, or resolved from the current workspace via \
                         cwd/workspace_id), returns the manual text: the role's preamble, the Spec's \
                         structured sections, its current phase and that phase's tasks, and the \
                         derived dev workspace + repos. Use it to load the working context for a \
-                        session before driving a Spec.",
+                        session before driving a Spec. For role=spec with NO Spec yet, it renders \
+                        the PROJECT-scoped authoring manual instead (a Spec is a project artifact \
+                        the author creates), resolving the project from project_id or the \
+                        cwd/workspace — never an error.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "role": str_prop("dev | coder | auditor — which manual to render"),
+                "role": str_prop("spec | dev | coder | auditor | doc | prototype — which manual to render"),
+                "axis": str_prop("for role=auditor: standards | spec — the review axis (the dev launches one auditor per axis at the end); ignored for other roles"),
                 "spec_id": str_prop("the Spec to render the context for (preferred)"),
                 "workspace_id": str_prop("optional: resolve the Spec via its anchored dev workspace when spec_id is absent"),
-                "cwd": str_prop("optional: resolve the Spec via the workspace whose path matches this cwd when spec_id/workspace_id are absent"),
+                "cwd": str_prop("optional: resolve the Spec (or, for role=spec authoring, the project) via the workspace whose path matches this cwd when spec_id/workspace_id are absent"),
+                "project_id": str_prop("optional: for role=spec authoring with no Spec yet, the project to author in (else resolved from cwd/workspace_id)"),
             },
             "required": ["role"],
         },
@@ -2212,6 +2292,11 @@ mod tests {
             names.contains(&SET_PROJECT_SETTINGS_TOOL),
             "set_project_settings tool must be listed"
         );
+        // finding #27: the explicit repository-config tool advertised alongside, kept OUT of V1_TOOLS.
+        assert!(
+            names.contains(&PROJECT_SET_REPOS_TOOL),
+            "project_set_repos tool must be listed"
+        );
         // v2.2 cockpit read model: the workspace-runtime aggregate tool advertised alongside,
         // kept OUT of V1_TOOLS (a new read over the existing DB + runner authorities).
         assert!(
@@ -2236,6 +2321,19 @@ mod tests {
                 "phase-5 spec tool {expected} must be listed"
             );
         }
+        // v2.5.8 finding #31: the draft-only task DELETE tool is advertised alongside (it is
+        // part of SPEC_TOOLS, so it also counts toward the total below).
+        assert!(
+            names.contains(&crate::mcp_tools_spec::TASK_DELETE_TOOL),
+            "task_delete tool must be listed"
+        );
+        // The phase plan is now MATERIALIZED from task_add(phase="Name") — the separate
+        // `spec_set_phases` tool was removed (finding 01KXG68DN5DSCFDFA6C87NJHGV), so it must
+        // NOT be advertised (symmetric to the no-resolve / no-validate guard-rails).
+        assert!(
+            !names.contains(&"spec_set_phases"),
+            "spec_set_phases was removed — the plan self-builds from task_add(phase name)",
+        );
         // v2.4 Phase-5: the agent-context render tool advertised alongside.
         assert!(
             names.contains(&crate::mcp_context::AGENT_CONTEXT_TOOL),
@@ -2278,14 +2376,15 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 21 + 9 + 8,
+            V1_TOOLS.len() + 22 + 9 + crate::mcp_tools_spec::SPEC_TOOLS.len(),
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
              create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
-             agent_session_event + set_project_settings + workspace_runtime + workspace_git + \
-             workspace_timeline + the 8 spec authoring/transition tools + agent_context + \
-             repo_diff + repo_git_view + repo_watch + repo_unwatch + \
+             agent_session_event + set_project_settings + project_set_repos + workspace_runtime + \
+             workspace_git + workspace_timeline + the 9 spec authoring/transition tools \
+             (incl. task_delete) + \
+             agent_context + repo_diff + repo_git_view + repo_watch + repo_unwatch + \
              review_comment_list + review_comment_post + review_task_list + \
              review_task_structure extension tools"
         );

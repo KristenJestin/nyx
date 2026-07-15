@@ -21,7 +21,6 @@ import { TerminalCloseProvider } from "./use-terminal-close";
 import { TerminalReorderProvider } from "./use-terminal-reorder";
 import { useLazyResume } from "./use-lazy-resume";
 import { useIdleUnload } from "./use-idle-unload";
-import { RestorePlanProvider } from "./use-restore-plan";
 import { loadLastTerminalId, saveLastTerminalId } from "./ui-persistence";
 import type { WorkspaceRuntimeService, WorkspaceRuntimeTerminal } from "./use-workspace-runtime";
 
@@ -124,23 +123,21 @@ export function TerminalsPage() {
           switch. */}
       <RuntimeSelectionProvider key={activeTree.project.id}>
         <ConsumedNotificationsProvider>
-          {/* The post-crash RESTORE registry for this project's workspaces: reads each
-              `workspace_restore_plan` so service rows can badge crash-`interrupted` instances and
-              the restore panel can offer resume/ignore for the resumable interrupted sessions. */}
-          <RestorePlanProvider workspaceIds={workspaceIds}>
-            <TerminalsBody
-              projectId={activeTree.project.id}
-              projectName={activeTree.project.name}
-              workspaces={workspaces}
-              runtimeByWorkspace={runtimeByWorkspace}
-              allTerminals={allTerminals}
-              allServices={allServices}
-              deepLinkTerminalId={deepLinkTerminalId ?? null}
-              deepLinkCommandId={deepLinkCommandId ?? null}
-              onAddWorkspace={() => void addWorkspace(activeTree)}
-              onOpenProjectSettings={() => setProjectSettingsOpen(true)}
-            />
-          </RestorePlanProvider>
+          {/* (v2.5.8: the post-crash RestorePlanProvider / "Interrupted — Resume/Ignore" registry
+              was reverted. A crash is treated as a clean shutdown → sessions resume SILENTLY via
+              `use-lazy-resume`, gated by the project resume toggle. No restore registry needed.) */}
+          <TerminalsBody
+            projectId={activeTree.project.id}
+            projectName={activeTree.project.name}
+            workspaces={workspaces}
+            runtimeByWorkspace={runtimeByWorkspace}
+            allTerminals={allTerminals}
+            allServices={allServices}
+            deepLinkTerminalId={deepLinkTerminalId ?? null}
+            deepLinkCommandId={deepLinkCommandId ?? null}
+            onAddWorkspace={() => void addWorkspace(activeTree)}
+            onOpenProjectSettings={() => setProjectSettingsOpen(true)}
+          />
         </ConsumedNotificationsProvider>
       </RuntimeSelectionProvider>
       {/* The add-workspace modal set (folder picker → name dialog). Mounted once, portalled. */}

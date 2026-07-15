@@ -30,11 +30,8 @@ import {
   serviceRunState,
   terminalLineState,
 } from "./runtime-state";
-import { LifecycleBadge } from "./lifecycle-badge";
-import { WorkspaceRestorePanel } from "./workspace-restore-panel";
 import { useRuntimeSelection } from "./runtime-selection";
 import { useConsumedNotifications } from "./use-consumed-notifications";
-import { useRestorePlan } from "./use-restore-plan";
 import { useMarkReadOnActive } from "./use-mark-read";
 import type {
   WorkspaceRuntimeService,
@@ -82,11 +79,9 @@ export function WorkspaceRuntimeTree({
   const { terminals, services } = snapshot;
   return (
     <div className="flex flex-col py-2">
-      {/* Post-crash RESTORATION UI: lists this workspace's resumable interrupted sessions with a
-          per-session Resume / Ignore choice (reads `workspace_restore_plan`). Renders nothing when
-          there is nothing to restore, so a healthy workspace shows no panel. */}
-      <WorkspaceRestorePanel workspaceId={snapshot.workspace.id} />
-
+      {/* (v2.5.8: the post-crash "Interrupted — Resume/Ignore" restore panel was reverted. A crash
+          is now treated as a clean shutdown → the session resumes SILENTLY via `use-lazy-resume`,
+          gated by the project resume toggle. No card, no per-workspace restore surface.) */}
       <RuntimeSection
         title="Terminals"
         count={terminals.length}
@@ -220,10 +215,6 @@ export function TerminalRow({
 
   const dotState = terminalLineState(terminal, activity, { terminalUnread, selected });
 
-  // A hosted agent session flipped to `unknown` by the crash reconcile (`active -> unknown`, its
-  // liveness unconfirmed) badges the row so the doubt reads at a glance beside the run-state dot.
-  const doubtful = liveSession?.state === "unknown";
-
   // PER-TERMINAL CPU%/RAM (FEEDBACK #28) — NON-INLINE: the live process-tree reading for THIS
   // terminal from the shared `terminal://stats` map (one subscription for all rows), shown ONLY as
   // a hover TOOLTIP so it never masks/truncates the terminal name. `null` before the first tick →
@@ -271,7 +262,6 @@ export function TerminalRow({
       icon={<Icon className="size-4" />}
       label={label}
       state={dotState}
-      badge={doubtful ? <LifecycleBadge state="unknown" /> : undefined}
       tooltip={statsTooltip}
       editing={editing}
       onLabelDoubleClick={beginRename}
@@ -354,15 +344,9 @@ export function TerminalRow({
 function ServiceRow({ service }: { service: WorkspaceRuntimeService }) {
   const { isSelected } = useRuntimeSelection();
   const { isConsumed, consume } = useConsumedNotifications();
-  const { isInterrupted } = useRestorePlan();
   const selection = { kind: "service", id: service.id } as const;
   const selected = isSelected(selection);
   const state = serviceRunState(service);
-
-  // A command instance the crash reconcile flagged `interrupted` (persisted `running` but its
-  // backing process died with the old sidecar — `running -> interrupted`, NOT auto-relaunched)
-  // badges the row so the doubt reads beside the run-state dot. Sourced from the restore plan.
-  const interrupted = isInterrupted(service.id);
 
   // Same Attention-Inbox semantics as terminals: the settled success/error dot shows only while
   // unread AND not viewed; selecting the service acknowledges it (`command_acknowledge`) + records
@@ -380,7 +364,6 @@ function ServiceRow({ service }: { service: WorkspaceRuntimeService }) {
       icon={<ServerCogIcon className="size-4" />}
       label={service.name}
       state={dotState}
-      badge={interrupted ? <LifecycleBadge state="interrupted" /> : undefined}
       actions={
         <CommandControls
           instanceId={service.id}

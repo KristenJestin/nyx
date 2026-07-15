@@ -4,24 +4,25 @@
  * AUTHORITATIVE coverage for the SUPERVISOR's single-relaunch latch (there is no separate TS
  * unit test for it); it proves that half of the done-criterion end-to-end against the REAL
  * `nyx-sidecar` binary driven by the REAL `Sidecar` manager: killing the sidecar triggers
- * EXACTLY ONE automatic relaunch (never a blind/looping restart), the relaunched sidecar
- * reopens SQLite + rebuilds the persisted state, and previously-`running` work whose liveness
- * can't be confirmed is flagged `interrupted`/`unknown` (the user chooses). The sidecar-side
+ * EXACTLY ONE automatic relaunch (never a blind/looping restart), and the relaunched sidecar
+ * reopens SQLite + rebuilds the persisted state. A crash is treated as a CLEAN shutdown (the
+ * v2.5.5 `interrupted`/restore-card handling was reverted in v2.5.8): there is NO interrupted
+ * flag and NO card — the normal silent, toggle-gated resume path applies. The sidecar-side
  * reconcile half is additionally covered by the Rust integration test
  * `crates/nyx-sidecar/tests/crash_recovery.rs`.
  *
  * What it drives (all through the REAL `Sidecar` manager + the REAL binary over the pipe):
  *   1. boot the sidecar against a pinned, empty data dir; seed in-flight state (a managed-
- *      command instance persisted `running` + an `active` agent session) by talking to the
- *      sidecar's OWN SQLite (the same `nyx.db`) — i.e. work that looks live at crash time;
+ *      command instance persisted `running`) by talking to the sidecar's OWN SQLite (the same
+ *      `nyx.db`) — i.e. work that looks live at crash time;
  *   2. CRASH it: `process.kill(pid, 'SIGKILL')` — NOT the ordered `stop()`, so the sidecar's
  *      clean-shutdown marker is never written;
  *   3. assert the manager relaunched EXACTLY ONCE: it returns to `ready`, the new pid differs
  *      from the dead one, and the relaunch count is exactly 1 (observed via the state stream:
  *      a single `recovering` transition);
- *   4. assert the relaunched sidecar rebuilt state + flagged the doubt: `recovery_snapshot`
- *      lists the previously-running instance as `interrupted`, and `agent_active_sessions` is
- *      now EMPTY (the active session was flipped to `unknown`);
+ *   4. assert the relaunched sidecar rebuilt state: the previously-seeded instance is still
+ *      queryable (SQLite reopened) and was NOT blindly relaunched, with NO interrupted surface
+ *      (crash treated as a clean shutdown — v2.5.8 revert);
  *   5. CRASH it a SECOND time and assert NO further relaunch (the single-relaunch latch holds:
  *      the manager goes `degraded`, never loops back to `recovering`/`ready`).
  *
@@ -102,6 +103,7 @@ app.whenReady().then(async () => {
   // + a managed command (which materializes one instance), then start that instance so it is
   // persisted `running`, and create a terminal that will host an agent session.
   let instanceId;
+  let rootWsId;
   try {
     const proj = await invoke(sidecar, "create_project", {
       name: "crash-proj",
@@ -118,7 +120,7 @@ app.whenReady().then(async () => {
       restartOnStartup: false,
     });
     // The template materialized one instance per workspace (root only here). Find it.
-    const rootWsId = proj.root && proj.root.id ? proj.root.id : null;
+    rootWsId = proj.root && proj.root.id ? proj.root.id : null;
     const instances = await invoke(sidecar, "command_instance_list", { workspaceId: rootWsId });
     if (!Array.isArray(instances) || instances.length === 0) {
       return fail(`no command instance materialized (got ${JSON.stringify(instances)})`);
@@ -154,31 +156,23 @@ app.whenReady().then(async () => {
     `[smoke-crash-recovery] EXACTLY ONE relaunch ✓ — pid ${firstPid} -> ${secondPid}, recovering x${recoveringCount}`,
   );
 
-  // --- 4. Assert state rebuilt + doubt flagged -------------------------------------------
-  // SQLite was reopened + state rebuilt: the recovery snapshot lists the previously-running
-  // instance as interrupted, and NO agent session is active (the active one became unknown).
-  let recovery;
-  let active;
+  // --- 4. Assert state rebuilt (crash treated as a clean shutdown — v2.5.8 revert) --------
+  // SQLite was reopened + state rebuilt: the previously-seeded instance is still queryable via
+  // command_instance_list. A crash carries NO interrupted surface anymore (the `recovery_snapshot`
+  // db-command was removed), and nothing is blindly relaunched: the fresh runner is empty on boot
+  // (restart_on_startup is OFF on the seeded template), so the instance is not live-running.
+  let instancesAfter;
   try {
-    recovery = await invoke(sidecar, "recovery_snapshot", {});
-    active = await invoke(sidecar, "agent_active_sessions", {});
+    instancesAfter = await invoke(sidecar, "command_instance_list", { workspaceId: rootWsId });
   } catch (e) {
-    return fail(`post-relaunch reads threw: ${e && e.message ? e.message : e}`);
+    return fail(`post-relaunch command_instance_list threw: ${e && e.message ? e.message : e}`);
   }
-  const interrupted = recovery && Array.isArray(recovery.interrupted) ? recovery.interrupted : null;
-  if (!interrupted) return fail(`recovery_snapshot did not return { interrupted: [] } (got ${JSON.stringify(recovery)})`);
-  if (!interrupted.includes(instanceId)) {
-    return fail(`the previously-running instance ${instanceId} is NOT flagged interrupted (got ${JSON.stringify(interrupted)})`);
+  const rebuilt =
+    Array.isArray(instancesAfter) && instancesAfter.find((i) => i && i.id === instanceId);
+  if (!rebuilt) {
+    return fail(`the seeded instance ${instanceId} was not rebuilt after the crash relaunch (got ${JSON.stringify(instancesAfter)})`);
   }
-  console.log(`[smoke-crash-recovery] previously-running instance flagged INTERRUPTED ✓ (${JSON.stringify(interrupted)})`);
-
-  // The instance must NOT have been blindly relaunched: it is not in the live runner's running
-  // set (command_instance_list reports its last_state — which the reconcile left as the stale
-  // 'running' string in the frozen column, but the runner has NO live process for it). We
-  // assert the stronger user-visible fact: it is surfaced as interrupted (above) and the
-  // recovery never auto-started it (no second `command://state running` was emitted by a
-  // relaunch — the runner is empty on boot after a crash). The interrupted flag is the
-  // contract the renderer reads; that is asserted.
+  console.log(`[smoke-crash-recovery] SQLite reopened + instance ${instanceId} rebuilt ✓ (crash treated as clean; no interrupted surface)`);
 
   // --- 5. CRASH again -> assert NO second relaunch (the latch holds) ---------------------
   console.log(`[smoke-crash-recovery] CRASHING again (SIGKILL pid=${secondPid}) to prove the single-relaunch latch …`);
@@ -196,7 +190,7 @@ app.whenReady().then(async () => {
 
   console.log(
     "[smoke-crash-recovery] OK — kill -> exactly one relaunch, SQLite reopened + state rebuilt, " +
-      "running command flagged interrupted, active session marked unknown; a second crash does NOT relaunch.",
+      "crash treated as a clean shutdown (no interrupted surface, silent resume); a second crash does NOT relaunch.",
   );
   cleanup();
   app.exit(0);
