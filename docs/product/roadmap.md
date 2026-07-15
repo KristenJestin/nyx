@@ -25,6 +25,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 🚧 en cours |
 | v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📋 PRD prêt |
 | v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📋 PRD prêt |
+| v2.5.9 | Reprise sessions : retrait de la carte Interrupted/Resume (crash = arrêt propre) | 📝 PRD rédigé (draft) — prochaine app-facing |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -237,6 +238,18 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** taper `/nspec` (ou `/ndev`, `/ndoc`) injecte le harnais rendu **live** depuis nyx, MCP = actions seules ; la boucle create→dev→doc se pilote **sans Depot** — le vrai Gate v2.4 enfin tenu.
 
+## v2.5.9 - Reprise sessions : crash = arrêt propre (retrait de la carte Interrupted/Resume)
+
+**Status: draft** — Spec `01KXJSTWB4E42FFQ4GVJMBMQMD` · **prochaine tranche app-facing** (après le cockpit v2.5.6)
+
+> Revert ciblé de la partie « interrupted + carte » de v2.5.5 : **pas de distinction crash**. Un arrêt de nyx (propre OU crash) est traité pareil ; le lazy-resume piloté par le toggle projet **reste**.
+
+- backend : `recovery.rs` (l.200-202) ne surface plus d'état `interrupted` — le redémarrage suit la seule resume policy (toggle projet) ;
+- UI : retirer la **carte orange Interrupted/Resume** + l'état `interrupted` (ambre) du `LifecycleBadge` ;
+- comportement : au redémarrage, toggle ON → reprise **silencieuse** ; OFF → rien.
+
+**Gate :** après un crash, plus aucune carte orange ; la reprise est pilotée par le seul toggle resume, sans régression du lazy-resume v2.5.5.
+
 ## v2.6 - Knowledge et mémoire projet
 
 - idées et promotion vers Spec ;
@@ -312,6 +325,7 @@ v2.0 consolidation Electron/Rust
 -> v2.5.6 cockpit (close-warning, CRUD, stats non-inline, reorder dnd-kit)
 -> v2.5.7 spec révisions (cliché complet, tâches versionnées)
 -> v2.5.8 contextes agents (livraison harnais, multi-provider)
+-> v2.5.9 reprise sessions (retrait carte Interrupted/Resume, crash = arrêt propre)
 -> v2.6 knowledge
 -> v2.7 capacités avancées retenues
 -> v2.8 migration et suppression Depot
