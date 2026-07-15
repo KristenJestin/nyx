@@ -25,7 +25,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 🚧 en cours |
 | v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📋 PRD prêt |
 | v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📋 PRD prêt |
-| v2.5.9 | Reprise sessions : retrait de la carte Interrupted/Resume (crash = arrêt propre) | 📝 PRD rédigé (draft) — prochaine app-facing |
+| v2.5.9 | Reprise sessions : retrait de la carte Interrupted/Resume (crash = arrêt propre) | 📋 PRD prêt — prochaine app-facing |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -240,7 +240,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 ## v2.5.9 - Reprise sessions : crash = arrêt propre (retrait de la carte Interrupted/Resume)
 
-**Status: draft** — Spec `01KXJSTWB4E42FFQ4GVJMBMQMD` · **prochaine tranche app-facing** (après le cockpit v2.5.6)
+**Status: ready** — Spec `01KXJSTWB4E42FFQ4GVJMBMQMD` · **prochaine tranche app-facing** (après le cockpit v2.5.6)
 
 > Revert ciblé de la partie « interrupted + carte » de v2.5.5 : **pas de distinction crash**. Un arrêt de nyx (propre OU crash) est traité pareil ; le lazy-resume piloté par le toggle projet **reste**.
 
