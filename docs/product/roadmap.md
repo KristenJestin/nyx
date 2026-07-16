@@ -26,6 +26,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📋 PRD prêt |
 | v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📋 PRD prêt |
 | v2.5.9 | Reprise sessions : retrait de la carte Interrupted/Resume (crash = arrêt propre) | 📋 PRD prêt — prochaine app-facing |
+| v2.5.10 | Surcouche terminal↔Spec : overlay live (avancement dev + création) | 📋 PRD prêt |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -250,6 +251,18 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** après un crash, plus aucune carte orange ; la reprise est pilotée par le seul toggle resume, sans régression du lazy-resume v2.5.5.
 
+## v2.5.10 - Surcouche terminal↔Spec : overlay live (avancement dev + création)
+
+**Status: ready** — Spec `01KXKM4X65P9CVQMX3ZBZY7H6H` (6 rounds de proto distillés)
+
+> Relier un terminal au(x) Spec(s) qu'y travaille une session agent, et afficher **en surcouche** : l'avancement des tâches (dev/review) ou la construction du Spec **en direct** (création). Mapping **automatique + éphémère** (démappe au `/clear`), **générique multi-provider**.
+
+- **DB** : `agent_session_specs` (many-to-many) ; **auto-map** par nyx-core (session ↔ Specs travaillés via MCP) ; **un-map** au reset de session (Claude = `SessionEnd reason=clear`, jamais compact/resume) ;
+- **résolution** : Specs de la **session active** du terminal, temps réel via `domain_events` + état de session ;
+- **UI** : rail « avancement dev » (fidèle `tasks-tab`) + tiroir « création live » (sections + tâches qui streament) ; onglet fermé cohérent ; **empilement multi-Spec sobre** (tiroir uniquement ; dev = un Spec).
+
+**Gate :** créer/dev un ou plusieurs Specs dans une session → overlay live + empilement sur le bon terminal ; `/clear` démappe (pas compact/resume) ; temps réel sans polling ; cœur générique multi-provider.
+
 ## v2.6 - Knowledge et mémoire projet
 
 - idées et promotion vers Spec ;
@@ -326,6 +339,7 @@ v2.0 consolidation Electron/Rust
 -> v2.5.7 spec révisions (cliché complet, tâches versionnées)
 -> v2.5.8 contextes agents (livraison harnais, multi-provider)
 -> v2.5.9 reprise sessions (retrait carte Interrupted/Resume, crash = arrêt propre)
+-> v2.5.10 surcouche terminal↔spec (overlay live dev + création)
 -> v2.6 knowledge
 -> v2.7 capacités avancées retenues
 -> v2.8 migration et suppression Depot
