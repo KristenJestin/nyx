@@ -27,7 +27,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📋 PRD prêt |
 | v2.5.9 | Reprise sessions : retrait de la carte Interrupted/Resume (crash = arrêt propre) | 📋 PRD prêt — prochaine app-facing |
 | v2.5.10 | Surcouche terminal↔Spec : overlay live (avancement dev + création) | 📋 PRD prêt |
-| v2.5.11 | Boucle review : findings review_tasks + rework en rounds + résolution + retour-chat | 📝 PRD rédigé (draft) |
+| v2.5.11 | Boucle review : findings (tasks kind=review) + rework en rounds + résolution + retour-chat | 📝 PRD rédigé (draft) |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -264,13 +264,13 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** créer/dev un ou plusieurs Specs dans une session → overlay live + empilement sur le bon terminal ; `/clear` démappe (pas compact/resume) ; temps réel sans polling ; cœur générique multi-provider.
 
-## v2.5.11 - Boucle review complète : findings (review_tasks) + rework en rounds + résolution + retour-chat
+## v2.5.11 - Boucle review complète : findings (tasks kind=review) + rework en rounds + résolution + retour-chat
 
 **Status: draft** — Spec `01KXR1AGWK08H9P800YHXPBCHS` · **couplé à v2.5.10** (l'overlay affiche ce modèle)
 
-> Corrige la boucle review de `/ndev` (v2.5.8), écarts révélés en test : findings dispersés (`tasks kind=review` vs `review_tasks`), retour‑chat sans chemin vers une review humaine, rework invisible.
+> Corrige la boucle review de `/ndev` (v2.5.8), écarts révélés en test + par l'overlay mergé : **deux modèles finding coexistent** (`tasks kind=review` que l'overlay affiche vs `review_tasks` du viewer) → on **unifie sur `tasks kind=review`** ; retour‑chat sans chemin vers une review humaine ; rework invisible.
 
-- **Findings = `review_tasks`** (canonique : commentaire source + grill + severity + **origine** auditeur/humain) ;
+- **Findings = `tasks kind=review`** (aligné overlay ; enrichi de `from_comment_id` + grill + **origine** auditeur/humain ; `review_tasks` déprécié) ;
 - **rework en ROUNDS** (sous‑phases 2.1, 4.1…) rattachés à la phase courante — chaque passage coder = un round → rework **visible** (= temps) ;
 - **grill** (proposed→structured→validated, validate human‑only) ; **comment↔task** (`from_comment_id`, 1→N) + **résolution** human‑only quand les tâches sont done ;
 - **retour‑chat = canal de review** (verbe MCP) — donner un retour dans la session, pas que le viewer ;
