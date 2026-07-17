@@ -46,9 +46,9 @@ const POOL_MAX_SIZE: u32 = 8;
 
 use crate::pathnorm;
 use crate::schema::{
-    agent_sessions, command_instances, domain_events, managed_commands, projects, repositories,
-    review_comments, review_reads, review_tasks, spec_revisions, specs, task_dependencies, tasks,
-    terminals, workspaces,
+    agent_session_specs, agent_sessions, command_instances, domain_events, managed_commands,
+    projects, repositories, review_comments, review_reads, review_tasks, spec_revisions, specs,
+    task_dependencies, tasks, terminals, workspaces,
 };
 
 /// The migrations baked into the binary at compile time from `migrations/`.
@@ -6215,6 +6215,133 @@ pub fn project_id_for_session(
         .optional()
 }
 
+// --- agent_session_specs: the ephemeral session↔Specs mapping (v20, v2.5.10) ------
+//
+// The MANY-TO-MANY link between an agent SESSION and the Specs it works (a session ↔ N
+// Specs). The auto-map ADDS a Spec to a session's set when the session works it via MCP
+// (`link_session_spec`), the un-map vacates the set on `/clear` (`clear_session_specs`), and
+// the overlay resolution reads "the Specs of a terminal" via its ACTIVE session
+// (`specs_for_terminal`). GENERIC over the provider — everything keys on the session id, the
+// common substrate (ADR-0010), never on a Claude specific.
+
+/// An `agent_session_specs` row: one (session, spec) membership of the ephemeral map.
+/// `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = agent_session_specs)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct AgentSessionSpec {
+    pub session_id: String,
+    pub spec_id: String,
+    pub created_at: i64,
+}
+
+/// ADD `spec_id` to `session_id`'s set (the auto-map's write). IDEMPOTENT: the (session,
+/// spec) pair is the PRIMARY KEY, so re-working an already-mapped Spec is a no-op (INSERT …
+/// ON CONFLICT DO NOTHING) — accumulation never duplicates. Returns `true` when the Spec was
+/// newly added, `false` when it was already in the set. Best-effort by the caller: it links
+/// only against a resolved ACTIVE session (see [`link_terminal_active_session_spec`]).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn link_session_spec(
+    conn: &mut SqliteConnection,
+    session_id: &str,
+    spec_id: &str,
+) -> QueryResult<bool> {
+    let inserted = diesel::insert_into(agent_session_specs::table)
+        .values((
+            agent_session_specs::session_id.eq(session_id),
+            agent_session_specs::spec_id.eq(spec_id),
+            agent_session_specs::created_at.eq(now_millis()),
+        ))
+        // A Spec already in this session's set is a no-op, not an error (idempotent accumulation).
+        .on_conflict((
+            agent_session_specs::session_id,
+            agent_session_specs::spec_id,
+        ))
+        .do_nothing()
+        .execute(conn)?;
+    Ok(inserted > 0)
+}
+
+/// VACATE `session_id`'s whole set (the un-map on `/clear`). The session ROW survives a
+/// `/clear` (it is refreshed in place, not ended — see the internal-transition guard in
+/// `agent_session_event`), so its set would otherwise persist across the reset; this empties
+/// it explicitly. Idempotent (an empty set → 0). Returns the number of rows deleted.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn clear_session_specs(conn: &mut SqliteConnection, session_id: &str) -> QueryResult<usize> {
+    diesel::delete(
+        agent_session_specs::table.filter(agent_session_specs::session_id.eq(session_id)),
+    )
+    .execute(conn)
+}
+
+/// The Specs in `session_id`'s set, as full [`Spec`] rows (join through the link table),
+/// newest-worked first (`created_at` desc, `spec_id` tiebreak). Empty when the session has
+/// no set. A Spec deleted meanwhile is gone from the join (the FK CASCADE drops the link).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn specs_for_session(conn: &mut SqliteConnection, session_id: &str) -> QueryResult<Vec<Spec>> {
+    agent_session_specs::table
+        .inner_join(specs::table.on(specs::id.eq(agent_session_specs::spec_id)))
+        .filter(agent_session_specs::session_id.eq(session_id))
+        .order((
+            agent_session_specs::created_at.desc(),
+            agent_session_specs::spec_id.asc(),
+        ))
+        .select(Spec::as_select())
+        .load(conn)
+}
+
+/// The single live (`active`) session hosted by `terminal_id`, of ANY agent kind — the
+/// GENERIC "which session is this terminal running" resolver (no provider named). At most one
+/// `active` row exists per (terminal, agent_kind); across kinds the MOST RECENTLY started wins
+/// (`started_at` desc). `None` when the terminal hosts no live session. This is the anchor of
+/// the terminal→Specs resolution and the auto-map's session lookup.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn active_session_for_terminal(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+) -> QueryResult<Option<AgentSession>> {
+    agent_sessions::table
+        .filter(agent_sessions::terminal_id.eq(terminal_id))
+        .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
+        .order(agent_sessions::started_at.desc())
+        .select(AgentSession::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// AUTO-MAP write: resolve `terminal_id`'s ACTIVE session and ADD `spec_id` to its set. The
+/// generic core of the auto-map — a spec-scoped MCP mutation, attributed to its calling
+/// terminal, lands here. Best-effort: a terminal with NO active session (a bare shell, or a
+/// call that could not be attributed) resolves to `None` and links nothing. Returns the
+/// session id the Spec was linked onto (`None` when there was no active session to link to).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn link_terminal_active_session_spec(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+    spec_id: &str,
+) -> QueryResult<Option<String>> {
+    let Some(session) = active_session_for_terminal(conn, terminal_id)? else {
+        return Ok(None);
+    };
+    link_session_spec(conn, &session.id, spec_id)?;
+    Ok(Some(session.id))
+}
+
+/// The overlay resolution: the Specs of `terminal_id` = the set of its ACTIVE session. No
+/// active session → an empty list (no session ⇒ no overlay). GENERIC — resolves through the
+/// session substrate, never a provider specific.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn specs_for_terminal(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+) -> QueryResult<Vec<Spec>> {
+    let Some(session) = active_session_for_terminal(conn, terminal_id)? else {
+        return Ok(Vec::new());
+    };
+    specs_for_session(conn, &session.id)
+}
+
 /// One resume CANDIDATE row for the boot resume scan (PRD-5 #5): a terminal that is
 /// still `alive`, has a resume-candidate session (`active` or `unknown`), and carries
 /// its project's `resume_agent_sessions` flag (derived via workspace → project). The
@@ -7403,6 +7530,8 @@ mod tests {
         // Peel v15 (specs.workspace_id index), v14 (tasks/task_dependencies), then v13
         // (specs/spec_revisions); all must succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v20 (agent_session_specs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v18 (review_tasks.spec_id) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v17 (review_tasks/review_reads) cleanly");
@@ -7781,13 +7910,13 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Step DOWN to the pre-v4 schema → the four exec-state columns are gone. The
-        // exec-state migration is dir #4; later PRDs stacked dirs #5..#17 on top (v2.4
+        // exec-state migration is dir #4; later PRDs stacked dirs #5..#20 on top (v2.4
         // Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task domain;
         // Phase 3 added dir #15 the specs.workspace_id index; Phase 4 added dir #16 the
-        // review_comments domain; Phase 5 added dir #17 the review_tasks domain), so
-        // reaching the pre-v4 schema peels all of them then dir #4 itself (14 reverts,
-        // reverse order).
-        for _ in 0..15 {
+        // review_comments domain; Phase 5 added dir #17 the review_tasks domain; v2.5.10
+        // added dir #20 the agent_session_specs link table), so reaching the pre-v4 schema
+        // peels all of them then dir #4 itself (15 reverts, reverse order).
+        for _ in 0..16 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -8067,6 +8196,99 @@ mod tests {
         assert!(
             candidates.iter().all(|c| c.terminal_id != t.id),
             "a closed terminal is never a boot resume candidate"
+        );
+    }
+
+    /// DONE-CRITERION (task 01KXN0HSQFP25TQVF61JHXKZAY): "Table + migration livrees ; une
+    /// session peut referencer plusieurs Specs ; contraintes/index poses." schema.rs ↔
+    /// migration v20 consistency + the many-to-many + the FK CASCADE constraints of
+    /// `agent_session_specs`, all through the migrated DB.
+    #[test]
+    fn agent_session_specs_many_to_many_and_cascade_constraints() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let t = create_terminal(&mut conn, "/work", None).unwrap();
+        let session =
+            record_session_start(&mut conn, &t.id, AGENT_KIND_CLAUDE_CODE, capture("ext-1"))
+                .expect("record_session_start");
+        let (a, _) = create_spec(&mut conn, &project.id, "A", SpecSections::empty()).unwrap();
+        let (b, _) = create_spec(&mut conn, &project.id, "B", SpecSections::empty()).unwrap();
+
+        // A fresh session starts with an EMPTY set.
+        assert!(
+            specs_for_session(&mut conn, &session.id)
+                .unwrap()
+                .is_empty(),
+            "a fresh session references no Specs"
+        );
+
+        // MANY-TO-MANY: one session references MULTIPLE Specs (N=2).
+        assert!(
+            link_session_spec(&mut conn, &session.id, &a.id).unwrap(),
+            "A is newly added"
+        );
+        assert!(
+            link_session_spec(&mut conn, &session.id, &b.id).unwrap(),
+            "B is newly added"
+        );
+        let set = specs_for_session(&mut conn, &session.id).unwrap();
+        assert_eq!(set.len(), 2, "the session's set holds N=2 Specs");
+        let ids: std::collections::HashSet<&str> = set.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(a.id.as_str()) && ids.contains(b.id.as_str()),
+            "both worked Specs are in the session's set"
+        );
+
+        // schema.rs ↔ migration: round-trip every `agent_session_specs` column via a typed
+        // select (a name/type/order drift would fail to compile or to load here).
+        let rows: Vec<AgentSessionSpec> = agent_session_specs::table
+            .filter(agent_session_specs::session_id.eq(&session.id))
+            .order(agent_session_specs::spec_id.asc())
+            .select(AgentSessionSpec::as_select())
+            .load(&mut conn)
+            .expect("load session specs");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| r.created_at > 0),
+            "created_at is stamped epoch-ms"
+        );
+        assert!(rows.iter().all(|r| r.session_id == session.id));
+
+        // CONSTRAINT — idempotent composite PRIMARY KEY: re-linking A is a no-op (no duplicate).
+        assert!(
+            !link_session_spec(&mut conn, &session.id, &a.id).unwrap(),
+            "re-linking an already-mapped Spec returns false (idempotent)"
+        );
+        assert_eq!(
+            specs_for_session(&mut conn, &session.id).unwrap().len(),
+            2,
+            "no duplicate row for the same (session, spec) pair"
+        );
+
+        // CONSTRAINT — FK CASCADE on Spec delete: a deleted Spec drops out of every set.
+        diesel::delete(specs::table.find(&a.id))
+            .execute(&mut conn)
+            .unwrap();
+        let after_spec_delete = specs_for_session(&mut conn, &session.id).unwrap();
+        assert_eq!(
+            after_spec_delete.len(),
+            1,
+            "deleting Spec A cascades its membership away"
+        );
+        assert_eq!(after_spec_delete[0].id, b.id);
+
+        // CONSTRAINT — FK CASCADE on session delete: removing the session empties its set.
+        diesel::delete(agent_sessions::table.find(&session.id))
+            .execute(&mut conn)
+            .unwrap();
+        let remaining: Vec<String> = agent_session_specs::table
+            .filter(agent_session_specs::session_id.eq(&session.id))
+            .select(agent_session_specs::spec_id)
+            .load(&mut conn)
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "deleting the session cascades away its whole set"
         );
     }
 
@@ -9816,6 +10038,8 @@ mod tests {
         // Peel v15 (specs.workspace_id index) then v14 (tasks/task_dependencies); both must
         // succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v20 (agent_session_specs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v18 (review_tasks.spec_id) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v17 (review_tasks/review_reads) cleanly");
@@ -10182,6 +10406,8 @@ mod tests {
         // domain_events) then v11 (data backfill) then v10 (canonical structure). After
         // this, `workspaces.root_path` does NOT exist yet (`path` does), and `projects` has
         // no `key`/`primary_workspace_id`.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v18 (review_tasks.spec_id) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -11078,12 +11304,12 @@ mod tests {
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the projects migration (dirs #15 → #3),
-        // then the projects migration (dir #2) itself — 14 reverts in reverse order
+        // Peel every migration stacked above the projects migration (dirs #20 → #3),
+        // then the projects migration (dir #2) itself — 17 reverts in reverse order
         // (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task
-        // domain; Phase 3 added dir #15 the specs.workspace_id index). projects must then
-        // be absent.
-        for _ in 0..17 {
+        // domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added dir #20
+        // the agent_session_specs link table). projects must then be absent.
+        for _ in 0..18 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -11928,11 +12154,11 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Peel every migration stacked above the managed_commands migration (dirs
-        // #15 → #4), then the managed_commands migration (dir #3) itself — 13 reverts in
+        // #20 → #4), then the managed_commands migration (dir #3) itself — 16 reverts in
         // reverse order (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14
-        // the task domain; Phase 3 added dir #15 the specs.workspace_id index).
-        // managed_commands must then be absent.
-        for _ in 0..16 {
+        // the task domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added
+        // dir #20 the agent_session_specs link table). managed_commands must then be absent.
+        for _ in 0..17 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -11998,6 +12224,8 @@ mod tests {
         // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row + its v3
         // columns survive; the v4 columns are gone (a typed select of `unread` would now fail
         // to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v18 (review_tasks.spec_id) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -12178,6 +12406,8 @@ mod tests {
         // peels v15, v14, v13, v12, v11, v10, v9, v8, v7, then v5 (migrations revert in
         // reverse order). The instance row + its v3/v4 columns survive; the v5 columns are
         // gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v18 (review_tasks.spec_id) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -13454,6 +13684,8 @@ mod tests {
         // task domain) then v13 (v2.4 Phase 1 Spec domain) then v12 (v2.1 Phase 4
         // domain_events) then v11 (v2.1 data backfill) then v10 (v2.1 canonical structure)
         // then v9 (#11 project order) then v8 → the resume_agent_sessions column is gone.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v18 (review_tasks.spec_id) cleanly");
         conn.revert_last_migration(MIGRATIONS)

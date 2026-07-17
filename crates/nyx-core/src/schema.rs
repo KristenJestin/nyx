@@ -421,6 +421,23 @@ diesel::table! {
     }
 }
 
+// - v20 (v2.5.10 Phase 1 — the `agent_session_specs` link table, task
+//   01KXN0HSQFP25TQVF61JHXKZAY) materializes the EPHEMERAL, MANY-TO-MANY mapping between an
+//   agent SESSION and the Specs it works (a session ↔ N Specs). It is a pure link table:
+//   `session_id` (FK → agent_sessions, CASCADE) + `spec_id` (FK → specs, CASCADE) form the
+//   composite PRIMARY KEY (a Spec is in a session's set at most once — accumulation is
+//   idempotent), plus an epoch-ms `created_at`. NO scalar `agent_sessions.spec_id`, NO
+//   terminal/workspace pin (rejected): the session is the unit of work, and "the Specs of a
+//   terminal" is the JOIN terminal → active session → this set. Column ORDER here must match
+//   the SQL migration exactly (Diesel positional decoding).
+diesel::table! {
+    agent_session_specs (session_id, spec_id) {
+        session_id -> Text,
+        spec_id -> Text,
+        created_at -> BigInt,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
 diesel::joinable!(managed_commands -> projects (project_id));
@@ -428,6 +445,8 @@ diesel::joinable!(command_instances -> managed_commands (command_id));
 diesel::joinable!(command_instances -> workspaces (workspace_id));
 diesel::joinable!(agent_sessions -> terminals (terminal_id));
 diesel::joinable!(agent_sessions -> workspaces (workspace_id));
+diesel::joinable!(agent_session_specs -> agent_sessions (session_id));
+diesel::joinable!(agent_session_specs -> specs (spec_id));
 diesel::joinable!(repositories -> projects (project_id));
 diesel::joinable!(specs -> projects (project_id));
 diesel::joinable!(specs -> workspaces (workspace_id));
@@ -440,6 +459,7 @@ diesel::joinable!(tasks -> specs (spec_id));
 // intentionally NOT declared (the CRUD queries them explicitly by column instead).
 
 diesel::allow_tables_to_appear_in_same_query!(
+    agent_session_specs,
     agent_sessions,
     command_instances,
     domain_events,

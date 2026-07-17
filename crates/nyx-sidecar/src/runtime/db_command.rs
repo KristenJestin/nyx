@@ -1643,6 +1643,54 @@ impl Ctx<'_> {
                 .with_conn(db::active_agent_sessions)
                 .map_err(Self::db_err)
                 .and_then(|rows| Self::json(&rows)),
+            // The v2.5.10 terminal↔Spec OVERLAY resolution (task 01KXN0HVF8T0CKB6C575RECTXG):
+            // `{ terminalId }` → the Specs a terminal's ACTIVE session is working (its
+            // `agent_session_specs` set) + a summary of that session for the overlay's liveness
+            // axis. NO active session → `{ session: null, specs: [] }` (no session ⇒ no overlay).
+            // Pure read over the SHARED `nyx_core::db` resolvers (`specs_for_terminal` = terminal
+            // → active session → its set). The live refresh rides the EXISTING unsolicited
+            // channels with NO polling: the auto-map/un-map + any spec/task mutation push
+            // `specs://changed`, and the session lifecycle pushes `agent-sessions://changed`, so
+            // an open overlay re-pulls this command on either topic. `{ terminalId }`.
+            "terminal_specs" => {
+                let terminal_id = self.arg_str("terminalId")?;
+                /// The overlay resolution result: the ACTIVE session's Spec set + a session
+                /// summary (its `state` is the liveness axis; `agent_kind` the provider).
+                #[derive(serde::Serialize)]
+                struct TerminalSpecs {
+                    /// The terminal's ACTIVE session, or `None` (no session ⇒ no overlay).
+                    session: Option<TerminalSpecsSession>,
+                    /// The Specs of that session's set (empty when no session / empty set).
+                    specs: Vec<db::Spec>,
+                }
+                #[derive(serde::Serialize)]
+                struct TerminalSpecsSession {
+                    id: String,
+                    agent_kind: String,
+                    state: String,
+                }
+                self.db()
+                    .with_conn(|c| {
+                        let Some(session) = db::active_session_for_terminal(c, &terminal_id)?
+                        else {
+                            return Ok::<_, diesel::result::Error>(TerminalSpecs {
+                                session: None,
+                                specs: Vec::new(),
+                            });
+                        };
+                        let specs = db::specs_for_session(c, &session.id)?;
+                        Ok(TerminalSpecs {
+                            session: Some(TerminalSpecsSession {
+                                id: session.id,
+                                agent_kind: session.agent_kind,
+                                state: session.state,
+                            }),
+                            specs,
+                        })
+                    })
+                    .map_err(Self::db_err)
+                    .and_then(|out| Self::json(&out))
+            }
             "agent_close_warnings" => {
                 use nyx_core::agent_resume::{
                     close_warning_message, should_warn_on_close, SessionState,
@@ -3146,6 +3194,80 @@ mod tests {
             h.pushes(),
             pushes_before,
             "spec_list is a pure read (no push)"
+        );
+    }
+
+    /// DONE-CRITERION (task 01KXN0HVF8T0CKB6C575RECTXG): "Le renderer obtient le set de Specs de
+    /// la session active d'un terminal." The `terminal_specs` command resolves a terminal → its
+    /// ACTIVE session → the session's Spec set (a pure read, no push). A terminal with NO active
+    /// session resolves to `{ session: null, specs: [] }` (no session ⇒ no overlay).
+    #[test]
+    fn terminal_specs_resolves_the_active_session_spec_set() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-terminal-specs");
+        let pushes_before = h.pushes();
+
+        // A terminal hosting a LIVE session that works ONE Spec.
+        let (terminal_id, spec_id) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let terminal = nyx_core::db::create_terminal(c, "/work", None)?;
+                let session = nyx_core::db::record_session_start(
+                    c,
+                    &terminal.id,
+                    nyx_core::db::AGENT_KIND_CLAUDE_CODE,
+                    nyx_core::db::SessionCapture {
+                        external_session_id: "ext-1".into(),
+                        cwd: "/work".into(),
+                        ..Default::default()
+                    },
+                )?;
+                let (spec, _rev) =
+                    nyx_core::db::create_spec(c, &project_id, "Worked spec", Default::default())?;
+                nyx_core::db::link_session_spec(c, &session.id, &spec.id)?;
+                Ok::<_, diesel::result::Error>((terminal.id, spec.id))
+            })
+            .unwrap();
+
+        let result = h
+            .run(
+                "terminal_specs",
+                serde_json::json!({ "terminalId": terminal_id }),
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            value["session"]["state"].as_str().unwrap(),
+            "active",
+            "the terminal's active session is surfaced (the overlay's liveness axis)"
+        );
+        let specs = value["specs"].as_array().unwrap();
+        assert_eq!(specs.len(), 1, "the active session's Spec set is returned");
+        assert_eq!(specs[0]["id"].as_str().unwrap(), spec_id);
+        assert_eq!(h.pushes(), pushes_before, "terminal_specs is a pure read");
+
+        // A terminal with NO active session → an EMPTY resolution (no session ⇒ no overlay).
+        let bare = h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::db::create_terminal(c, "/bare", None))
+            .unwrap();
+        let empty = h
+            .run(
+                "terminal_specs",
+                serde_json::json!({ "terminalId": bare.id }),
+            )
+            .unwrap();
+        let empty: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert!(
+            empty["session"].is_null(),
+            "no active session ⇒ session is null"
+        );
+        assert_eq!(
+            empty["specs"].as_array().unwrap().len(),
+            0,
+            "no session ⇒ an empty Spec set (no overlay)"
         );
     }
 

@@ -29,7 +29,7 @@ const isDone = (t: Task) => t.status === "done";
 // CASE: a set whose tasks are ALL skipped has no active task (`active === 0`) — treated as
 // complete/100% via an explicit guard (never a divide-by-zero / NaN), rendered as a full bar
 // with the `complete ? 1 : x` ternary at the call site.
-function progressOf(tasks: readonly Task[]): {
+export function progressOf(tasks: readonly Task[]): {
   done: number;
   active: number;
   complete: boolean;

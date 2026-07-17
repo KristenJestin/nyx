@@ -1696,6 +1696,40 @@ pub fn agent_session_event(
             // live activity is left untouched. A real end (logout, prompt_input_exit, …)
             // falls through to the normal end path below.
             if end.is_internal_transition() {
+                // UN-MAP (v2.5.10 Phase 1, task 01KXN0HTXFMZAJ0GTVWVBN2PGZ): a `/clear` RESETS
+                // the session's working context — vacate its Spec SET so the terminal overlay
+                // disappears — WITHOUT ending the row (the following SessionStart refreshes it
+                // in place, keeping the sidebar icon/dot steady). A `/resume` is also an
+                // internal transition but CONTINUES the same work, so it keeps the set; a
+                // `/compact` fires no SessionEnd at all, so it never reaches here. GENERIC: the
+                // reset DETECTION is per-provider (`end.resets_working_context()`), the CLEARING
+                // is provider-agnostic (`db::clear_session_specs`). Best-effort — a DB hiccup or
+                // no active session simply un-maps nothing.
+                if end.resets_working_context() {
+                    let cleared = db
+                        .with_conn(|c| -> Result<usize, diesel::result::Error> {
+                            let Some(session) = db::active_session_for(c, terminal_id, agent_kind)?
+                            else {
+                                return Ok(0);
+                            };
+                            db::clear_session_specs(c, &session.id)
+                        })
+                        .unwrap_or(0);
+                    if cleared > 0 {
+                        // The set actually changed → push `specs://changed` so the terminal
+                        // overlay re-pulls (and, now empty, disappears).
+                        return Ok(ToolOutcome::changed(
+                            json!({
+                                "event": "SessionEnd",
+                                "terminal_id": terminal_id,
+                                "ended": false,
+                                "reason": "clear — session Spec set vacated (overlay reset)",
+                                "specs_unmapped": cleared,
+                            }),
+                            ChangedTopic::Specs,
+                        ));
+                    }
+                }
                 return Ok(ToolOutcome::read(json!({
                     "event": "SessionEnd",
                     "terminal_id": terminal_id,
@@ -2087,10 +2121,11 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
     activity: &AgentActivityStore,
     name: &str,
     args: &Value,
+    caller_terminal_id: Option<&str>,
 ) -> Option<Result<ToolOutcome, RpcError>> {
     // Read tools wrap their plain JSON result into a no-effect `ToolOutcome`.
     let read = |r: Result<Value, RpcError>| Some(r.map(ToolOutcome::read));
-    match name {
+    let dispatched = match name {
         // Pure DB reads.
         crate::mcp::PROBE_TOOL => read(probe(db)),
         "list_projects" => read(list_projects(db)),
@@ -2157,7 +2192,24 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         // (single mutation path, no double implementation).
         _ => crate::mcp_tools_spec::dispatch_spec_tool(db, name, args)
             .or_else(|| crate::mcp_context::dispatch_context_tool(db, name, args)),
+    };
+
+    // AUTO-MAP (v2.5.10 Phase 1, task 01KXN0HTAXXMXF3GXF4ACM2970): when a spec-scoped MCP
+    // MUTATION succeeds, attribute it to the CALLING terminal's live session and ADD the
+    // worked Spec to that session's set. `caller_terminal_id` is the terminal the MCP
+    // connection is bound to (the `X-Nyx-Terminal-Id` header the plugin `.mcp.json` carries,
+    // resolved by `pty.rs`'s `NYX_TERMINAL_ID`); `None` for an un-attributable call (a bare
+    // client, a test). GENERIC + CIBLÉE: `worked_spec_id` returns `Some` ONLY for the mutating
+    // Spec authoring/transition tools (a READ returns `None`, so a read never maps), and the
+    // link resolves through the session substrate (no provider named). BEST-EFFORT: a terminal
+    // with no active session, or any DB hiccup, silently maps nothing — the tool result the
+    // agent sees is never affected.
+    if let (Some(caller), Some(Ok(outcome))) = (caller_terminal_id, dispatched.as_ref()) {
+        if let Some(spec_id) = crate::mcp_tools_spec::worked_spec_id(name, &outcome.result) {
+            let _ = db.with_conn(|c| db::link_terminal_active_session_spec(c, caller, &spec_id));
+        }
     }
+    dispatched
 }
 
 #[cfg(test)]
@@ -2772,6 +2824,7 @@ mod tests {
                 &activity,
                 name,
                 &json!({ "id": "whatever" }),
+                None,
             );
             assert!(
                 out.is_none(),
@@ -2787,6 +2840,7 @@ mod tests {
             &activity,
             crate::mcp::REVIEW_COMMENT_POST_TOOL,
             &json!({ "workspace_id": "ws", "repository_id": "repo", "body": "hi" }),
+            None,
         );
         assert!(out.is_some(), "review_comment_post IS an MCP tool");
     }
@@ -2876,6 +2930,7 @@ mod tests {
                 &activity,
                 name,
                 &json!({ "id": "whatever" }),
+                None,
             );
             assert!(
                 out.is_none(),
@@ -2895,9 +2950,229 @@ mod tests {
                 &activity,
                 name,
                 &json!({ "workspace_id": "ws", "repository_id": "repo", "id": "x", "title": "t" }),
+                None,
             );
             assert!(out.is_some(), "{name} IS an MCP tool");
         }
+    }
+
+    /// DONE-CRITERION (task 01KXN0HTAXXMXF3GXF4ACM2970): "Creer/editer un Spec via MCP l'ajoute
+    /// au set ; une lecture ne l'ajoute pas ; N Specs travailles = set de N". The auto-map:
+    /// `dispatch_extension_tool`, given the CALLER TERMINAL, attributes a spec-scoped mutation
+    /// to that terminal's live session and adds the worked Spec to its set — a read maps
+    /// nothing, and an un-attributable call (no caller) maps nothing.
+    #[test]
+    fn auto_map_adds_worked_specs_to_the_caller_session_not_reads() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+
+        // A project + a terminal hosting a LIVE agent session (the calling session).
+        let (project_id, terminal_id) = db.with_conn(|c| {
+            let (project, _root) = crate::db::create_project(c, "Proj", "/work", None).unwrap();
+            let terminal = crate::db::create_terminal(c, "/work", None).unwrap();
+            crate::db::record_session_start(
+                c,
+                &terminal.id,
+                crate::db::AGENT_KIND_CLAUDE_CODE,
+                crate::db::SessionCapture {
+                    external_session_id: "ext-1".into(),
+                    cwd: "/work".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (project.id, terminal.id)
+        });
+        let caller = Some(terminal_id.as_str());
+        let set = |db: &Db| {
+            db.with_conn(|c| crate::db::specs_for_terminal(c, &terminal_id))
+                .unwrap()
+        };
+
+        // 1) spec_create attributed to the caller terminal → the Spec joins the session's set.
+        let out = dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            crate::mcp_tools_spec::SPEC_CREATE_TOOL,
+            &json!({ "project_id": project_id, "title": "Spec A" }),
+            caller,
+        )
+        .expect("spec_create dispatched")
+        .expect("spec_create ok");
+        let spec_a = out.result["spec"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            set(&db).len(),
+            1,
+            "creating a Spec via MCP adds it to the set"
+        );
+        assert_eq!(set(&db)[0].id, spec_a);
+
+        // 2) A READ tool from the SAME caller → the set is UNCHANGED (a read never maps).
+        dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            "list_projects",
+            &json!({}),
+            caller,
+        )
+        .expect("list_projects dispatched")
+        .expect("ok");
+        assert_eq!(set(&db).len(), 1, "a read never adds a Spec to the set");
+
+        // 3) A SECOND Spec worked by the same session → the set is N=2.
+        let out2 = dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            crate::mcp_tools_spec::SPEC_CREATE_TOOL,
+            &json!({ "project_id": project_id, "title": "Spec B" }),
+            caller,
+        )
+        .unwrap()
+        .unwrap();
+        let spec_b = out2.result["spec"]["id"].as_str().unwrap().to_string();
+        let two = set(&db);
+        assert_eq!(two.len(), 2, "N worked Specs → a set of N");
+        let ids: std::collections::HashSet<&str> = two.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(spec_a.as_str()) && ids.contains(spec_b.as_str()));
+
+        // 4) An UN-ATTRIBUTABLE call (no caller terminal) still creates a Spec but maps nothing.
+        dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            crate::mcp_tools_spec::SPEC_CREATE_TOOL,
+            &json!({ "project_id": project_id, "title": "Spec C" }),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            set(&db).len(),
+            2,
+            "a call with no caller terminal maps nothing"
+        );
+    }
+
+    /// DONE-CRITERION (task 01KXN0HTXFMZAJ0GTVWVBN2PGZ): "clear vide le set (overlay disparait) ;
+    /// compact et resume ne demappent pas ; nouvelle session = set vide". The un-map: a
+    /// `SessionEnd reason=clear` vacates the calling session's Spec set (pushing `specs://changed`
+    /// so the overlay re-pulls empty) WITHOUT ending the session, while `reason=resume` keeps the
+    /// set. (`/compact` fires no `SessionEnd`, so it never reaches this path — no un-map by
+    /// construction.)
+    #[test]
+    fn un_map_clears_the_set_on_clear_but_not_on_resume() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+
+        // A project + a terminal hosting a LIVE session with TWO Specs in its set.
+        let (session_id, terminal_id) = db.with_conn(|c| {
+            let (project, _root) = crate::db::create_project(c, "Proj", "/work", None).unwrap();
+            let terminal = crate::db::create_terminal(c, "/work", None).unwrap();
+            let session = crate::db::record_session_start(
+                c,
+                &terminal.id,
+                crate::db::AGENT_KIND_CLAUDE_CODE,
+                crate::db::SessionCapture {
+                    external_session_id: "ext-1".into(),
+                    cwd: "/work".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let (a, _) =
+                crate::db::create_spec(c, &project.id, "A", crate::db::SpecSections::empty())
+                    .unwrap();
+            let (b, _) =
+                crate::db::create_spec(c, &project.id, "B", crate::db::SpecSections::empty())
+                    .unwrap();
+            crate::db::link_session_spec(c, &session.id, &a.id).unwrap();
+            crate::db::link_session_spec(c, &session.id, &b.id).unwrap();
+            (session.id, terminal.id)
+        });
+        let set = |db: &Db| {
+            db.with_conn(|c| crate::db::specs_for_terminal(c, &terminal_id))
+                .unwrap()
+        };
+        assert_eq!(
+            set(&db).len(),
+            2,
+            "the session starts with a set of 2 Specs"
+        );
+
+        // A `/clear` (SessionEnd reason=clear) VACATES the set and pushes `specs://changed`,
+        // but the session row stays ACTIVE (an internal transition — never ended).
+        let cleared = agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "ext-1",
+                "reason": "clear",
+                "NYX_TERMINAL_ID": terminal_id,
+            }),
+        )
+        .expect("clear handled");
+        assert_eq!(
+            cleared.effects,
+            vec![ChangedTopic::Specs],
+            "a real un-map pushes specs://changed so the overlay re-pulls empty"
+        );
+        assert!(
+            set(&db).is_empty(),
+            "clear vacated the session's Spec set (overlay disappears)"
+        );
+        let still_active = db
+            .with_conn(|c| crate::db::get_session(c, &session_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still_active.state,
+            crate::db::SESSION_STATE_ACTIVE,
+            "clear keeps the session active (only the Spec set is reset)"
+        );
+
+        // Re-populate the set, then a `/resume` (SessionEnd reason=resume) must NOT un-map.
+        let spec_c = db.with_conn(|c| {
+            let (project, _) = crate::db::create_project(c, "P2", "/work2", None).unwrap();
+            let (spec, _) =
+                crate::db::create_spec(c, &project.id, "C", crate::db::SpecSections::empty())
+                    .unwrap();
+            crate::db::link_session_spec(c, &session_id, &spec.id).unwrap();
+            spec.id
+        });
+        assert_eq!(set(&db).len(), 1, "the set has one Spec again");
+        let resumed = agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "ext-1",
+                "reason": "resume",
+                "NYX_TERMINAL_ID": terminal_id,
+            }),
+        )
+        .expect("resume handled");
+        assert!(
+            resumed.effects.is_empty(),
+            "resume is an internal transition that does NOT un-map (no change pushed)"
+        );
+        let after_resume = set(&db);
+        assert_eq!(after_resume.len(), 1, "resume keeps the Spec set intact");
+        assert_eq!(
+            after_resume[0].id, spec_c,
+            "the same Spec survives a resume"
+        );
     }
 
     /// DONE-CRITERION (task 01KWHPV33SAV9NV1STSY403CF0): the MCP `workspace_timeline` tool

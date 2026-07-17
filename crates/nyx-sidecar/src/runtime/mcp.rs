@@ -194,6 +194,33 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, RpcError> {
 
 impl ToolDispatcher for SidecarDispatcher {
     fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError> {
+        self.dispatch(name, arguments, None)
+    }
+
+    /// The MCP-server entry point: threads the CALLER TERMINAL (the `X-Nyx-Terminal-Id`
+    /// header nyx-core resolved) into the dispatch so a spec-scoped mutation is auto-mapped
+    /// onto that terminal's live session (v2.5.10 Phase 1).
+    fn call_with_caller(
+        &self,
+        name: &str,
+        arguments: &Value,
+        caller_terminal_id: Option<&str>,
+    ) -> Result<Value, RpcError> {
+        self.dispatch(name, arguments, caller_terminal_id)
+    }
+}
+
+impl SidecarDispatcher {
+    /// The shared dispatch body (parity with the v1 `PoolBackedDispatcher`). `caller_terminal_id`
+    /// is the terminal the MCP connection is bound to (`Some` on the live MCP path via
+    /// `call_with_caller`, `None` for a caller-agnostic invocation / a unit test) — passed
+    /// through to `dispatch_extension_tool` for the auto-map.
+    fn dispatch(
+        &self,
+        name: &str,
+        arguments: &Value,
+        caller_terminal_id: Option<&str>,
+    ) -> Result<Value, RpcError> {
         // 0) The v2.4 real-time review WATCH tools (Q-015): `repo_watch` / `repo_unwatch`
         //    register/release a `(workspace, repository)` on the git-watch runtime — a
         //    sidecar-owned effect, so handled here (not in the shell-agnostic core) before
@@ -249,6 +276,7 @@ impl ToolDispatcher for SidecarDispatcher {
                 &self.activity,
                 name,
                 arguments,
+                caller_terminal_id,
             ),
             None => {
                 // No managed runtime yet: a throwaway runner over a no-op sink so the
@@ -269,6 +297,7 @@ impl ToolDispatcher for SidecarDispatcher {
                     &self.activity,
                     name,
                     arguments,
+                    caller_terminal_id,
                 )
             }
         };

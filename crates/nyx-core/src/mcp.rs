@@ -48,6 +48,15 @@ pub const DEFAULT_PORT: u16 = 8766;
 /// "pick any free port", is explicitly rejected so the port stays stable).
 pub const PORT_ENV: &str = "NYX_MCP_PORT";
 
+/// The HTTP request header that binds an MCP connection to its ORIGIN TERMINAL (v2.5.10
+/// Phase 1 auto-map). The plugin `.mcp.json` sets it to `${NYX_TERMINAL_ID}` — the per-terminal
+/// id `pty.rs` exports into the shell — so every `tools/call` an agent makes carries the
+/// terminal it runs in. nyx reads it here and threads it into the dispatcher, which attributes a
+/// spec-scoped mutation to that terminal's live session (the session↔Specs auto-map). Absent (a
+/// bare MCP client, an un-templated config) → `None` → no attribution (best-effort). Matched
+/// case-INSENSITIVELY (HTTP header names are case-insensitive).
+pub const TERMINAL_ID_HEADER: &str = "X-Nyx-Terminal-Id";
+
 /// The `probe` spike tool name (PRD-4 #7, ADR-0004). A trivial no-op tool used to
 /// validate that a Claude Code `SessionStart` hook of type `mcp_tool` can reach
 /// nyx's MCP surface. It is NOT part of the frozen v1 surface ([`V1_TOOLS`]) — it is
@@ -404,6 +413,24 @@ pub trait ToolDispatcher: Send + Sync + 'static {
     /// Invoke tool `name` with JSON `arguments`; return the tool's JSON result, or a
     /// [`RpcError`] (ADR-0003 D8 error vocabulary) on failure.
     fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError>;
+
+    /// Invoke tool `name` KNOWING which terminal the MCP connection is bound to
+    /// (`caller_terminal_id` — the [`TERMINAL_ID_HEADER`] the request carried, `None` when
+    /// absent). This is the seam the v2.5.10 auto-map hangs on: a spec-scoped mutation is
+    /// attributed to its calling terminal's live session so the worked Spec joins that
+    /// session's set (see `mcp_tools_core::dispatch_extension_tool`). The DEFAULT ignores the
+    /// caller and delegates to [`ToolDispatcher::call`], so a dispatcher that does not care
+    /// (every test dispatcher, any non-terminal-aware host) is unchanged; the sidecar
+    /// dispatcher overrides it to thread the caller into its dispatch.
+    fn call_with_caller(
+        &self,
+        name: &str,
+        arguments: &Value,
+        caller_terminal_id: Option<&str>,
+    ) -> Result<Value, RpcError> {
+        let _ = caller_terminal_id;
+        self.call(name, arguments)
+    }
 }
 
 /// The ADR-0003 D8 error-code vocabulary, as a CLOSED enum. Modelling the code as a type
@@ -642,6 +669,15 @@ impl McpServer {
                 let _ = request.respond(json_response(200, &body));
             }
             (tiny_http::Method::Post, "/mcp") => {
+                // Bind this request to its ORIGIN TERMINAL (the auto-map seam): read the
+                // `X-Nyx-Terminal-Id` header the plugin `.mcp.json` carries (case-insensitive;
+                // an empty/absent value is `None`). Extracted BEFORE the body is drained.
+                let caller_terminal_id = request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv(TERMINAL_ID_HEADER))
+                    .map(|h| h.value.as_str().trim().to_string())
+                    .filter(|v| !v.is_empty());
                 let mut buf = String::new();
                 if request.as_reader().read_to_string(&mut buf).is_err() {
                     let _ = request.respond(json_response(
@@ -650,7 +686,7 @@ impl McpServer {
                     ));
                     return;
                 }
-                let response = self.handle_rpc(&buf);
+                let response = self.handle_rpc(&buf, caller_terminal_id.as_deref());
                 let _ = request.respond(json_response(200, &response));
             }
             _ => {
@@ -662,7 +698,7 @@ impl McpServer {
     /// Handle one JSON-RPC 2.0 request body and produce the response value. Supports
     /// the MCP handshake (`initialize`, `tools/list`) and dispatches `tools/call` to
     /// the phase-2 dispatcher when installed.
-    fn handle_rpc(&self, body: &str) -> Value {
+    fn handle_rpc(&self, body: &str, caller_terminal_id: Option<&str>) -> Value {
         let parsed: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => return rpc_error_envelope(Value::Null, -32700, "parse error"),
@@ -687,7 +723,7 @@ impl McpServer {
             "notifications/initialized" | "initialized" => rpc_result_envelope(id, json!({})),
             "ping" => rpc_result_envelope(id, json!({})),
             "tools/list" => rpc_result_envelope(id, json!({ "tools": tool_descriptors() })),
-            "tools/call" => self.handle_tools_call(id, &params),
+            "tools/call" => self.handle_tools_call(id, &params, caller_terminal_id),
             other => rpc_error_envelope(id, -32601, &format!("method not found: {other}")),
         }
     }
@@ -695,7 +731,12 @@ impl McpServer {
     /// Dispatch a `tools/call`. Phase-1 has no dispatcher installed, so this returns
     /// a `method_not_found` error rather than inventing a second command lifecycle
     /// (ADR-0003 D6). Phase-2 installs the PRD-3-backed dispatcher.
-    fn handle_tools_call(&self, id: Value, params: &Value) -> Value {
+    fn handle_tools_call(
+        &self,
+        id: Value,
+        params: &Value,
+        caller_terminal_id: Option<&str>,
+    ) -> Value {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         if name.is_empty() {
             return rpc_error_envelope(id, -32602, "invalid params: missing tool name");
@@ -708,7 +749,7 @@ impl McpServer {
                 -32601,
                 &format!("tool '{name}' not yet available (phase 2)"),
             ),
-            Some(d) => match d.call(name, &arguments) {
+            Some(d) => match d.call_with_caller(name, &arguments, caller_terminal_id) {
                 Ok(result) => rpc_result_envelope(
                     id,
                     json!({
@@ -2036,6 +2077,41 @@ mod tests {
         server
     }
 
+    /// POST a body to `/mcp`, OPTIONALLY carrying the `X-Nyx-Terminal-Id` header — the
+    /// production auto-map seam (`Some(id)` sends the header, `None` omits it entirely).
+    /// The `http_request` helper hard-codes only `Host`, so this variant is the only way a
+    /// test can drive the real header→caller extraction path in `handle_request`. Returns
+    /// `(status_line, body)`, de-chunking like `http_request`.
+    fn http_post_mcp(port: u16, body: &str, terminal_id: Option<&str>) -> (String, String) {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect loopback");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let terminal_header = terminal_id
+            .map(|t| format!("{TERMINAL_ID_HEADER}: {t}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n{terminal_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+        let status_line = head.lines().next().unwrap_or("").to_string();
+        let is_chunked = head.lines().any(|l| {
+            let l = l.to_ascii_lowercase();
+            l.starts_with("transfer-encoding:") && l.contains("chunked")
+        });
+        let body = if is_chunked {
+            dechunk(body)
+        } else {
+            body.to_string()
+        };
+        (status_line, body)
+    }
+
     #[test]
     fn resolve_port_defaults_and_honors_env() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -2420,6 +2496,154 @@ mod tests {
         assert_eq!(v["result"]["isError"], false);
         assert_eq!(v["result"]["structuredContent"]["tool"], "list_projects");
         assert_eq!(v["result"]["structuredContent"]["args"]["k"], 1);
+    }
+
+    #[test]
+    fn header_x_nyx_terminal_id_threads_the_caller_into_the_auto_map() {
+        // v2.5.10 Phase-1 review finding 01KXNC0KHS2YX3KHRMK9QW803P: the PRODUCTION seam
+        // — the `X-Nyx-Terminal-Id` header on a `POST /mcp` → `caller_terminal_id`
+        // extracted in `handle_request` → threaded `handle_rpc` → `handle_tools_call` →
+        // `ToolDispatcher::call_with_caller` → the auto-map — was proven only from
+        // `dispatch_extension_tool` INWARD (the caller injected directly in
+        // `mcp_tools_core::tests::auto_map_adds_worked_specs_to_the_caller_session_not_reads`).
+        // The test dispatchers never override `call_with_caller`, so a POST carrying the
+        // header was unobservable. This drives the WHOLE chain over the REAL loopback wire:
+        // a `spec_create` carrying the header lands the worked Spec in the header terminal's
+        // live-session set; the SAME call WITHOUT the header maps nothing.
+        //
+        // The dispatcher mirrors the real `SidecarDispatcher::call_with_caller`: it threads
+        // the caller into `dispatch_extension_tool` against a live in-memory `Db`, over a
+        // throwaway no-op runner + host (the sidecar's own pre-runtime path).
+        struct AutoMapDispatcher {
+            db: crate::db::Db,
+        }
+        impl AutoMapDispatcher {
+            fn dispatch(
+                &self,
+                name: &str,
+                args: &Value,
+                caller: Option<&str>,
+            ) -> Result<Value, RpcError> {
+                struct NoopSink;
+                impl crate::command::RunnerSink for NoopSink {
+                    fn on_state(&self, _: &str, _: crate::command::RunState, _: Option<i32>) {}
+                    fn on_acknowledge(&self, _: &str) {}
+                    fn on_output(&self, _: &str, _: &[u8]) {}
+                    fn persist_scrollback(&self, _: &str, _: &str) {}
+                    fn archive_previous_run(&self, _: &str) {}
+                    fn clear_output(&self, _: &str) {}
+                }
+                let runner = crate::command::CommandRunner::new(
+                    NoopSink,
+                    portable_pty::PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    },
+                );
+                let host = crate::mcp_tools_core::NoTerminalHost;
+                let activity = crate::agent_activity::AgentActivityStore::new();
+                match crate::mcp_tools_core::dispatch_extension_tool(
+                    &self.db, &runner, &host, &activity, name, args, caller,
+                ) {
+                    Some(res) => res.map(|o| o.result),
+                    None => Err(RpcError::new(
+                        RpcCode::MethodNotFound,
+                        format!("unknown tool '{name}'"),
+                    )),
+                }
+            }
+        }
+        impl ToolDispatcher for AutoMapDispatcher {
+            fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError> {
+                self.dispatch(name, arguments, None)
+            }
+            fn call_with_caller(
+                &self,
+                name: &str,
+                arguments: &Value,
+                caller_terminal_id: Option<&str>,
+            ) -> Result<Value, RpcError> {
+                self.dispatch(name, arguments, caller_terminal_id)
+            }
+        }
+
+        // Live substrate: a project + a terminal hosting a LIVE agent session (the caller).
+        let db = crate::db::Db::in_memory();
+        let (project_id, terminal_id) = db.with_conn(|c| {
+            let (project, _root) = crate::db::create_project(c, "Proj", "/work", None).unwrap();
+            let terminal = crate::db::create_terminal(c, "/work", None).unwrap();
+            crate::db::record_session_start(
+                c,
+                &terminal.id,
+                crate::db::AGENT_KIND_CLAUDE_CODE,
+                crate::db::SessionCapture {
+                    external_session_id: "ext-hdr-1".into(),
+                    cwd: "/work".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (project.id, terminal.id)
+        });
+        let set = |db: &crate::db::Db| {
+            db.with_conn(|c| crate::db::specs_for_terminal(c, &terminal_id))
+                .unwrap()
+        };
+
+        let server = start_on_port(19041);
+        server.set_dispatcher(Arc::new(AutoMapDispatcher { db: db.clone() }));
+
+        // 1) `spec_create` carrying the X-Nyx-Terminal-Id header → the worked Spec joins the
+        //    HEADER terminal's live-session set (header → caller → auto-map, over the wire).
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{{"project_id":"{}","title":"Spec via header"}}}}}}"#,
+            crate::mcp_tools_spec::SPEC_CREATE_TOOL,
+            project_id
+        );
+        let (status, body) = http_post_mcp(19041, &req, Some(&terminal_id));
+        assert!(status.contains("200"), "spec_create call 200, got {status}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["result"]["isError"], false,
+            "spec_create must succeed: {body}"
+        );
+        let mapped = set(&db);
+        assert_eq!(
+            mapped.len(),
+            1,
+            "the header terminal's session set gains the worked Spec (header→caller→auto-map)"
+        );
+        let spec_with_header = v["result"]["structuredContent"]["spec"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            mapped[0].id, spec_with_header,
+            "the auto-mapped Spec is exactly the one the header call created"
+        );
+
+        // 2) The SAME call WITHOUT the header → caller is `None` → the auto-map arms nothing.
+        //    (Guards the seam: if the header extraction/threading regressed to always-Some,
+        //    this would wrongly map a second Spec and the assert would fail.)
+        let req_no_hdr = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{}","arguments":{{"project_id":"{}","title":"Spec no header"}}}}}}"#,
+            crate::mcp_tools_spec::SPEC_CREATE_TOOL,
+            project_id
+        );
+        let (status2, body2) = http_post_mcp(19041, &req_no_hdr, None);
+        assert!(status2.contains("200"), "second call 200, got {status2}");
+        let v2: Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(
+            v2["result"]["isError"], false,
+            "spec_create still succeeds without the header: {body2}"
+        );
+        assert_eq!(
+            set(&db).len(),
+            1,
+            "no X-Nyx-Terminal-Id header → no caller → the set is unchanged (no auto-map)"
+        );
     }
 
     #[test]

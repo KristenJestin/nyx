@@ -3,6 +3,7 @@ import { useMemo } from "react";
 import { CommandOutputPanel } from "@/components/command/command-output-panel";
 import { TerminalDeck } from "@/components/sidebar/terminal-deck";
 import type { TerminalRecord } from "@/components/sidebar/use-terminals";
+import { SpecOverlay } from "@/components/terminal-spec-overlay/spec-overlay";
 import { CommandIdleEmpty } from "./command-idle-empty";
 import { EmptyHint } from "./tree-primitives";
 import { useRuntimeSelection } from "./runtime-selection";
@@ -88,6 +89,10 @@ export function RuntimePaneHost({
             <EmptyHint>No terminals to show.</EmptyHint>
           </div>
         )}
+        {/* The terminal↔Spec surcouche: anchored to the active terminal's right edge, over the
+            pane. It resolves its own Spec set and renders NOTHING when the terminal has no mapped
+            Spec (non-regression). Only mounted for the ACTIVE terminal (one live resolver). */}
+        {activeTerminalId != null ? <SpecOverlay terminalId={activeTerminalId} /> : null}
       </div>
       {activeServiceId != null ? (
         showIdleEmpty ? (

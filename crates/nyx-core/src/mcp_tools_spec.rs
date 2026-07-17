@@ -501,6 +501,52 @@ pub fn task_delete(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     ))
 }
 
+// --- Auto-map: the Spec a spec-scoped MUTATION worked on ---------------------
+
+/// The Spec id a successful spec-authoring tool call WORKED ON — the auto-map signal
+/// (v2.5.10 Phase 1, task 01KXN0HTAXXMXF3GXF4ACM2970). Given the tool `name` and its
+/// successful `result`, returns the Spec the call touched so the caller can ADD it to the
+/// calling session's set (`db::link_terminal_active_session_spec`). Returns `None` for:
+///   * a READ or non-Spec tool (never a work signal — a simple read must NOT map, so those
+///     names fall through to `None`);
+///   * a task tool whose task carries NO Spec (`spec_id` null — a project-scoped light task
+///     is not Spec work);
+///   * a result whose expected id is absent/malformed (defensive).
+///
+/// Pure + deterministic (reads ONLY the tool's own result JSON — the SAME `spec`/`task`
+/// object the tool already returns), so it is unit-testable in isolation and adds no DB
+/// round-trip. The ACCUMULATION is CIBLÉE: only the MUTATING Spec authoring/transition tools
+/// (`spec_create`, `spec_update_section`, `spec_fork`, `spec_transition`, `spec_set_workspace`,
+/// `task_add`, `task_transition`) are work signals — exactly the PRD's `spec_create /
+/// spec_update_section / task_add / task_transition / dev` set (a `spec_transition
+/// transition=start` is the "dev" launch). `task_add_dependency` / `task_delete` are
+/// deliberately NOT work signals (an edge tweak / a draft cleanup is not "working the Spec",
+/// and a deleted task's Spec is gone from the result).
+pub fn worked_spec_id(name: &str, result: &Value) -> Option<String> {
+    let str_at = |obj: &Value, path: &[&str]| -> Option<String> {
+        let mut cur = obj;
+        for key in path {
+            cur = cur.get(key)?;
+        }
+        cur.as_str().map(str::to_string)
+    };
+    match name {
+        // The Spec is returned directly as `result.spec`.
+        SPEC_CREATE_TOOL | SPEC_TRANSITION_TOOL | SPEC_SET_WORKSPACE_TOOL => {
+            str_at(result, &["spec", "id"])
+        }
+        // `spec_update_section` echoes the edited `result.spec_id`.
+        SPEC_UPDATE_SECTION_TOOL => str_at(result, &["spec_id"]),
+        // A fork returns the new `result.revision`, which carries its `spec_id`.
+        SPEC_FORK_TOOL => str_at(result, &["revision", "spec_id"]),
+        // A task tool returns `result.task`; its `spec_id` is the worked Spec (null = a
+        // project-scoped task with no Spec → `None`, no mapping).
+        TASK_ADD_TOOL | TASK_TRANSITION_TOOL => str_at(result, &["task", "spec_id"]),
+        // Reads, non-Spec tools, and the non-work Spec tools never map.
+        _ => None,
+    }
+}
+
 // --- Dispatch --------------------------------------------------------------
 
 /// Route a Spec authoring/transition tool call, or `None` when `name` is not one of ours.
@@ -547,6 +593,66 @@ mod tests {
 
     fn spec_id_of(out: &ToolOutcome) -> String {
         out.result["spec"]["id"].as_str().unwrap().to_string()
+    }
+
+    /// DONE-CRITERION (task 01KXN0HTAXXMXF3GXF4ACM2970): the auto-map's targeting is CIBLÉE —
+    /// a MUTATING Spec tool yields the worked Spec id, a READ (or a project-scoped task with no
+    /// Spec, or a non-work Spec tool) yields `None`. Pure over the tool result JSON.
+    #[test]
+    fn worked_spec_id_targets_mutations_and_ignores_reads() {
+        // Mutating Spec authoring/transition tools → the worked Spec id.
+        assert_eq!(
+            worked_spec_id(SPEC_CREATE_TOOL, &json!({ "spec": { "id": "S1" } })).as_deref(),
+            Some("S1")
+        );
+        assert_eq!(
+            worked_spec_id(SPEC_UPDATE_SECTION_TOOL, &json!({ "spec_id": "S2" })).as_deref(),
+            Some("S2")
+        );
+        assert_eq!(
+            worked_spec_id(SPEC_FORK_TOOL, &json!({ "revision": { "spec_id": "S3" } })).as_deref(),
+            Some("S3")
+        );
+        assert_eq!(
+            worked_spec_id(SPEC_TRANSITION_TOOL, &json!({ "spec": { "id": "S4" } })).as_deref(),
+            Some("S4")
+        );
+        assert_eq!(
+            worked_spec_id(TASK_ADD_TOOL, &json!({ "task": { "spec_id": "S5" } })).as_deref(),
+            Some("S5")
+        );
+        assert_eq!(
+            worked_spec_id(
+                TASK_TRANSITION_TOOL,
+                &json!({ "task": { "spec_id": "S6" } })
+            )
+            .as_deref(),
+            Some("S6")
+        );
+
+        // A task with NO Spec (project-scoped light work) is NOT Spec work.
+        assert_eq!(
+            worked_spec_id(TASK_ADD_TOOL, &json!({ "task": { "spec_id": null } })),
+            None
+        );
+        // Reads + non-Spec tools never map.
+        assert_eq!(
+            worked_spec_id("list_projects", &json!({ "projects": [] })),
+            None
+        );
+        assert_eq!(
+            worked_spec_id("agent_context", &json!({ "context": "…" })),
+            None
+        );
+        // The non-work Spec tools (an edge tweak / a draft cleanup) are deliberately no-ops.
+        assert_eq!(
+            worked_spec_id(TASK_ADD_DEPENDENCY_TOOL, &json!({ "added": true })),
+            None
+        );
+        assert_eq!(
+            worked_spec_id(TASK_DELETE_TOOL, &json!({ "deleted": true })),
+            None
+        );
     }
 
     #[test]

@@ -99,6 +99,20 @@ impl SessionEnd {
     pub fn is_internal_transition(&self) -> bool {
         matches!(self.reason.as_deref(), Some("clear") | Some("resume"))
     }
+
+    /// `true` when this end RESETS the session's working context — a `/clear` starts a FRESH
+    /// conversation on the SAME session row (v2.5.10 Phase 1). The session↔Specs auto-map keys
+    /// on this: a reset VACATES the session's Spec set (the terminal overlay disappears), while
+    /// `/resume` (and `/compact`, which fires NO `SessionEnd`) CONTINUES the same logical work
+    /// and keeps the set. It is a SUBSET of [`is_internal_transition`] (both keep the row
+    /// active); the split is what tells `clear` (un-map) apart from `resume` (no un-map).
+    ///
+    /// The "which reason means reset" decision lives HERE, in the per-provider adapter layer
+    /// (Claude's `clear`), so the generic core only calls this + `db::clear_session_specs` — the
+    /// PRD's "seul le détecteur de clear est par-provider, le cœur reste générique".
+    pub fn resets_working_context(&self) -> bool {
+        matches!(self.reason.as_deref(), Some("clear"))
+    }
 }
 
 /// Outcome of [`AgentAdapter::install_integration`]. The end-to-end install is
@@ -1013,6 +1027,36 @@ mod tests {
         assert!(
             !mk(None).is_internal_transition(),
             "an absent reason is treated as a real end (safe default)"
+        );
+    }
+
+    /// The RESET classifier (v2.5.10 un-map): ONLY `clear` resets the working context (vacates
+    /// the session's Spec set). `resume` is an internal transition but CONTINUES the work (keeps
+    /// the set); every real end and an absent reason are not resets either. This is the split
+    /// that tells `/clear` (un-map) apart from `/resume` (no un-map).
+    #[test]
+    fn session_end_reason_classifies_working_context_reset() {
+        let mk = |reason: Option<&str>| SessionEnd {
+            external_session_id: "x".to_string(),
+            reason: reason.map(str::to_string),
+        };
+        assert!(
+            mk(Some("clear")).resets_working_context(),
+            "clear resets the working context (un-map)"
+        );
+        assert!(
+            !mk(Some("resume")).resets_working_context(),
+            "resume continues the same work — no un-map"
+        );
+        for other in ["logout", "prompt_input_exit", "other"] {
+            assert!(
+                !mk(Some(other)).resets_working_context(),
+                "{other} is not a working-context reset"
+            );
+        }
+        assert!(
+            !mk(None).resets_working_context(),
+            "absent reason is no reset"
         );
     }
 

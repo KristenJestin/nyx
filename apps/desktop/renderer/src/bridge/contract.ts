@@ -526,6 +526,37 @@ export interface ResumePark {
 }
 
 // ---------------------------------------------------------------------------
+// v2.5.10 terminal↔Spec overlay — the `terminal_specs` resolution read model
+// (task 01KXN0HVF8T0CKB6C575RECTXG). Resolves a terminal to the Spec set of its
+// ACTIVE session; the overlay UI (Phase 2) consumes it and re-pulls it live on
+// `specs://changed` / `agent-sessions://changed` (no polling).
+// ---------------------------------------------------------------------------
+
+/**
+ * The ACTIVE session summary returned by `terminal_specs` — the overlay's LIVENESS axis. `state`
+ * is `agent_sessions.state` (`active` while the session lives); `agent_kind` names the provider
+ * (the overlay is GENERIC — Claude today, others tomorrow). `null` in {@link TerminalSpecs.session}
+ * means the terminal has no live session, so there is NO overlay.
+ */
+export interface TerminalSpecsSession {
+  readonly id: string;
+  readonly agent_kind: string;
+  readonly state: string;
+}
+
+/**
+ * The `terminal_specs` result: the Spec SET of a terminal's active session + that session's
+ * summary. `session === null` ⇒ no session ⇒ no overlay (and `specs` is empty). Each entry of
+ * `specs` is a Spec row shaped like the Specs board's `Spec` (id / title / status / priority /
+ * phases / …); the overlay maps them to its own view type — kept as `unknown` here so the bridge
+ * contract does not depend on the Specs UI layer.
+ */
+export interface TerminalSpecs {
+  readonly session: TerminalSpecsSession | null;
+  readonly specs: readonly unknown[];
+}
+
+// ---------------------------------------------------------------------------
 // The bridge surface, grouped by capability
 // ---------------------------------------------------------------------------
 
@@ -737,6 +768,15 @@ export type BackendCommand =
   // agents
   | "agent_active_sessions"
   | "agent_close_warnings"
+  // v2.5.10 terminal↔Spec OVERLAY resolution (task 01KXN0HVF8T0CKB6C575RECTXG): the Specs a
+  // terminal's ACTIVE session is working + a summary of that session (for the overlay's
+  // liveness axis). `{ terminalId }` → {@link TerminalSpecs}. NO active session → `{ session:
+  // null, specs: [] }` (no session ⇒ no overlay). Pure read over the SHARED `nyx_core::db`
+  // resolver (`specs_for_terminal`). The live refresh rides the EXISTING unsolicited channels
+  // with NO polling: the auto-map/un-map + any spec/task mutation push `specs://changed`, and
+  // the session lifecycle pushes `agent-sessions://changed` — an open overlay re-pulls this on
+  // either topic (the SAME re-pull pattern the runtime read model uses).
+  | "terminal_specs"
   // The RUNTIME agent-activity map (the live dot): which terminals are working/waiting
   // or carry a "response ready" notification. NEVER persisted — an in-memory read off the
   // same store the Claude per-turn hooks write. Re-pulled on `agent-sessions://changed`.
