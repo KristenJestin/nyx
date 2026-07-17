@@ -27,6 +27,7 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📋 PRD prêt |
 | v2.5.9 | Reprise sessions : retrait de la carte Interrupted/Resume (crash = arrêt propre) | 📋 PRD prêt — prochaine app-facing |
 | v2.5.10 | Surcouche terminal↔Spec : overlay live (avancement dev + création) | 📋 PRD prêt |
+| v2.5.11 | Boucle review : findings review_tasks + rework en rounds + résolution + retour-chat | 📝 PRD rédigé (draft) |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -263,6 +264,20 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** créer/dev un ou plusieurs Specs dans une session → overlay live + empilement sur le bon terminal ; `/clear` démappe (pas compact/resume) ; temps réel sans polling ; cœur générique multi-provider.
 
+## v2.5.11 - Boucle review complète : findings (review_tasks) + rework en rounds + résolution + retour-chat
+
+**Status: draft** — Spec `01KXR1AGWK08H9P800YHXPBCHS` · **couplé à v2.5.10** (l'overlay affiche ce modèle)
+
+> Corrige la boucle review de `/ndev` (v2.5.8), écarts révélés en test : findings dispersés (`tasks kind=review` vs `review_tasks`), retour‑chat sans chemin vers une review humaine, rework invisible.
+
+- **Findings = `review_tasks`** (canonique : commentaire source + grill + severity + **origine** auditeur/humain) ;
+- **rework en ROUNDS** (sous‑phases 2.1, 4.1…) rattachés à la phase courante — chaque passage coder = un round → rework **visible** (= temps) ;
+- **grill** (proposed→structured→validated, validate human‑only) ; **comment↔task** (`from_comment_id`, 1→N) + **résolution** human‑only quand les tâches sont done ;
+- **retour‑chat = canal de review** (verbe MCP) — donner un retour dans la session, pas que le viewer ;
+- **statut in‑place** : le Spec reste `in_review` pendant le rework (pas de bounce) ; corrige la state rule `/ndev`.
+
+**Gate :** retour (chat ET viewer) → grill → `review_tasks` → rounds par‑phase → coder → done → resolve (human‑only) ; findings auditeur en rounds aussi ; le Spec reste `in_review`.
+
 ## v2.6 - Knowledge et mémoire projet
 
 - idées et promotion vers Spec ;
@@ -340,6 +355,7 @@ v2.0 consolidation Electron/Rust
 -> v2.5.8 contextes agents (livraison harnais, multi-provider)
 -> v2.5.9 reprise sessions (retrait carte Interrupted/Resume, crash = arrêt propre)
 -> v2.5.10 surcouche terminal↔spec (overlay live dev + création)
+-> v2.5.11 boucle review (findings review_tasks + rework en rounds + retour-chat)
 -> v2.6 knowledge
 -> v2.7 capacités avancées retenues
 -> v2.8 migration et suppression Depot
