@@ -20,14 +20,14 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.2.5 | Persistance terminal | ✅ livré |
 | v2.3 | Terminal en blocs (honor-the-shell) | ⏸️ parké (WIP, branche non mergée) |
 | v2.4 | Specs : tâches et contextes agents | 🚧 en cours |
-| v2.5 | Diff et review locale | 🌿 développé sur `v2.4-review`, à greffer |
+| v2.5 | Diff et review locale | ✅ livré (clôturé ; greffe onglet Review = suivi) |
 | v2.5.5 | Reprise & cycle de vie des sessions agent | ✅ livré (mergé) |
 | v2.5.6 | Cockpit de pilotage (close-warning, CRUD, stats non-inline, reorder dnd-kit) | 🚧 en cours |
-| v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | 📋 PRD prêt |
+| v2.5.7 | Spec révisions : cliché complet (tâches versionnées par révision) | ✅ livré |
 | v2.5.8 | Contextes agents : livraison du harnais (stubs /n… + hook push + rôles spec/doc, multi-provider) | 📋 PRD prêt |
-| v2.5.9 | Reprise sessions : retrait de la carte Interrupted/Resume (crash = arrêt propre) | 📋 PRD prêt — prochaine app-facing |
+| v2.5.9 | Reprise sessions : retrait de la carte Interrupted/Resume (crash = arrêt propre) | 🚫 annulé |
 | v2.5.10 | Surcouche terminal↔Spec : overlay live (avancement dev + création) | 📋 PRD prêt |
-| v2.5.11 | Boucle review : findings (tasks kind=review) + rework en rounds + résolution + retour-chat | 📝 PRD rédigé (draft) |
+| v2.5.11 | Boucle review : findings (tasks kind=review) + rework en rounds + résolution + retour-chat | 📋 PRD prêt |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Capacités avancées | ⬜ à venir |
 | v2.8 | Migration finale et extinction Depot | ⬜ à venir |
@@ -212,7 +212,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 ## v2.5.7 - Spec révisions : cliché complet (tâches versionnées par révision)
 
-**Status: ready** — PRD `01KXBQ8QVYR887Y1C79V6EEQK4`
+**Status: livré** — PRD `01KXBQ8QVYR887Y1C79V6EEQK4`
 
 > Suivi de v2.4 (Specs). Point-release qui **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
 > Déclencheur : en absorbant Depot, on a constaté que son fork ne clonait que le narratif + une partie des tâches et **perdait des liens** (vécu au fork rev 1→2 du PRD cockpit). Le natif ne doit **pas** reproduire ça.
@@ -242,7 +242,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 ## v2.5.9 - Reprise sessions : crash = arrêt propre (retrait de la carte Interrupted/Resume)
 
-**Status: ready** — Spec `01KXJSTWB4E42FFQ4GVJMBMQMD` · **prochaine tranche app-facing** (après le cockpit v2.5.6)
+**Status: annulé** — Spec `01KXJSTWB4E42FFQ4GVJMBMQMD` (dev jamais réellement lancé)
 
 > Revert ciblé de la partie « interrupted + carte » de v2.5.5 : **pas de distinction crash**. Un arrêt de nyx (propre OU crash) est traité pareil ; le lazy-resume piloté par le toggle projet **reste**.
 
@@ -266,7 +266,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 ## v2.5.11 - Boucle review complète : findings (tasks kind=review) + rework en rounds + résolution + retour-chat
 
-**Status: draft** — Spec `01KXR1AGWK08H9P800YHXPBCHS` · **couplé à v2.5.10** (l'overlay affiche ce modèle)
+**Status: ready** — Spec `01KXR1AGWK08H9P800YHXPBCHS` · **couplé à v2.5.10** (l'overlay affiche ce modèle) · proto sous-phases `nested` distillé
 
 > Corrige la boucle review de `/ndev` (v2.5.8), écarts révélés en test + par l'overlay mergé : **deux modèles finding coexistent** (`tasks kind=review` que l'overlay affiche vs `review_tasks` du viewer) → on **unifie sur `tasks kind=review`** ; retour‑chat sans chemin vers une review humaine ; rework invisible.
 
