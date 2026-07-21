@@ -841,6 +841,55 @@ pub fn reopen_review_comment(
     Ok(updated)
 }
 
+/// Why an AGENT comment resolution was refused (or the DB failed). Returned by
+/// [`resolve_agent_comment`] so the MCP caller can react precisely.
+#[derive(Debug)]
+pub enum ResolveAgentCommentError {
+    /// No comment resolves to the given id.
+    NotFound,
+    /// The comment was authored by a HUMAN — its resolution is HUMAN-ONLY. The agent resolves only
+    /// its OWN (`author_type=agent`) comments; a human comment closes through the human/UI façade
+    /// ([`resolve_review_comment_when_findings_done`]).
+    HumanOnly,
+    /// A DB error surfaced while resolving or updating.
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for ResolveAgentCommentError {
+    fn from(e: diesel::result::Error) -> Self {
+        ResolveAgentCommentError::Db(e)
+    }
+}
+
+/// RESOLVE a review comment AS THE AGENT — the agent closes its OWN comment (v2.5.11 review
+/// follow-up, finding 01KXZYWGBQEJZ9BM39NYGFKHMJ). A comment is resolved BY ITS AUTHOR: the agent
+/// may resolve an `author_type=agent` comment (stamping `resolved_by_type=agent`), but an
+/// `author_type=human` comment is HUMAN-ONLY ([`ResolveAgentCommentError::HumanOnly`]) — it closes
+/// through the human/UI façade ([`resolve_review_comment_when_findings_done`], stamped `human`).
+/// This is the MCP-side counterpart of that human-only path (symmetric authorship guard). Idempotent
+/// on an already-resolved agent comment. Returns the updated row.
+pub fn resolve_agent_comment(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<ReviewComment, ResolveAgentCommentError> {
+    conn.transaction(|conn| {
+        let comment = get_review_comment(conn, id)?.ok_or(ResolveAgentCommentError::NotFound)?;
+        // AUTHORSHIP GUARD: only the agent's OWN comments are agent-resolvable; a human comment is
+        // human-only (the agent is refused — it closes through the human/UI façade).
+        if comment.author_type != AUTHOR_AGENT {
+            return Err(ResolveAgentCommentError::HumanOnly);
+        }
+        let updated = diesel::update(review_comments::table.find(id))
+            .set((
+                review_comments::status.eq(COMMENT_STATUS_RESOLVED),
+                review_comments::resolved_by_type.eq(Some(AUTHOR_AGENT)),
+            ))
+            .returning(ReviewComment::as_returning())
+            .get_result(conn)?;
+        Ok(updated)
+    })
+}
+
 /// The re-mapped anchor to persist for ONE comment — the relocated line numbers + blob +
 /// snippet/context + the `outdated` verdict, grouped so [`update_review_comment_anchor`] takes
 /// one value. Produced by [`crate::review_comment::remap_repo_comments`].
@@ -879,23 +928,42 @@ pub fn update_review_comment_anchor(
 }
 
 // --- review_tasks (finding = task) + unread watermark (v2.4 Phase 5, v17, PDR-0012) ---------
+//
+// ⚠️ DEPRECATED / SUPERSEDED (v2.5.11 "Boucle review complète", Phase 1, PDR-0016, PRD
+// 01KXR1AGWK08H9P800YHXPBCHS). The CANONICAL review finding is now a `tasks kind=review` row —
+// the SAME model the overlay reads via [`list_tasks_for_spec`] + `<TasksTab>` — carrying the
+// ported `from_comment_id` / `grill_state` columns (v21). There is ONE finding
+// representation; `review_tasks` is no longer a concurrent one. Read findings via
+// [`list_review_findings_for_spec`]; create them via [`create_task`] with `kind=review`.
+//
+// The `grill_state` vocabulary below is REUSED by the ported `tasks.grill_state` column — the
+// consts stay. COLLAPSED to TWO states in v25 (review follow-up #31): the human-only `validated`
+// third state was dropped (a finding is agent-owned; `structured` is now the coder-ready state).
+// The `review_tasks` TABLE and the [`ReviewTask`] struct + its promote/structure/list helpers
+// remain ONLY as the legacy PDR-0012 path until the promotion runtime cutover (v2.5.11 Phase 2,
+// task 01KXR1CYNX7X502QK6VVG6AEXX — "Comment↔task on tasks kind=review + résolution"); their grill
+// collapsed in lockstep with the shared consts. Do NOT build new finding features on `review_tasks`.
 
-/// `review_tasks.grill_state` — PROPOSED: the human lâche brut (initiated the promotion from
-/// a comment, not yet structured). Never "ready for the coder".
+/// `review_tasks.grill_state` / `tasks.grill_state` — PROPOSED: the agent captured the finding raw
+/// (promoted from a comment / chat retour, not yet structured). Never "ready for the coder".
 pub const GRILL_PROPOSED: &str = "proposed";
-/// `review_tasks.grill_state` — STRUCTURED: the agent gave it a clean title/details (via MCP)
-/// but the human has not validated it yet. Never "ready for the coder".
+/// `review_tasks.grill_state` / `tasks.grill_state` — STRUCTURED: the agent gave it a clean
+/// title/details (via MCP). Since v25 (grill collapse #31) this is the READY-FOR-CODER state — the
+/// grill has no human-only `validated` step; the agent's structured finding is the capture.
 pub const GRILL_STRUCTURED: &str = "structured";
-/// `review_tasks.grill_state` — VALIDATED: the human validated the structured task. ONLY a
-/// validated task is "ready for the coder" (the coder works on tasks, never raw comments).
-pub const GRILL_VALIDATED: &str = "validated";
 
 /// A `review_tasks` row: a comment PROMOTED for the coder — `finding = task` (PDR-0012). The
 /// promoted comment IS the coder task; `from_comment_id` is the trail back to its source comment.
-/// `severity` is OPTIONAL; `grill_state` walks proposed → structured → validated (the "grill":
-/// human lâche brut, agent structures via MCP, human validates). `Serialize` for the IPC/MCP
-/// boundary. Correlation ids are plain values (no FK) so a task survives Git churn / an
-/// archive, like `review_comments`.
+/// `severity` is OPTIONAL; `grill_state` walks proposed → structured (the "grill": the agent
+/// captures the retour raw, then structures it via MCP — `structured` is coder-ready). `Serialize`
+/// for the IPC/MCP boundary. Correlation ids are plain values (no FK) so a task survives Git churn /
+/// an archive, like `review_comments`.
+///
+/// ⚠️ DEPRECATED / SUPERSEDED (v2.5.11, PDR-0016): the canonical finding is a `tasks kind=review`
+/// row ([`Task`]) carrying the ported `from_comment_id` / `grill_state` columns — read
+/// via [`list_review_findings_for_spec`]. This struct + its promote/structure/list
+/// helpers remain ONLY as the legacy PDR-0012 path until the promotion runtime cutover (v2.5.11
+/// Phase 2). Do NOT build new finding features on it.
 #[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
 #[diesel(table_name = review_tasks)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
@@ -910,7 +978,8 @@ pub struct ReviewTask {
     pub details: Option<String>,
     /// OPTIONAL severity (`info` | `low` | `medium` | `high` | `critical`; `None` = unset).
     pub severity: Option<String>,
-    /// `proposed` | `structured` | `validated` — the grill lifecycle.
+    /// `proposed` | `structured` — the grill lifecycle (`structured` = coder-ready; the human-only
+    /// `validated` state was dropped in v25, review follow-up #31).
     pub grill_state: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -924,10 +993,11 @@ pub struct ReviewTask {
 }
 
 impl ReviewTask {
-    /// Whether this task is READY FOR THE CODER: only a `validated` task is. The coder
-    /// works on tasks (validated promotions), never on raw comments or un-validated promotions.
+    /// Whether this task is READY FOR THE CODER: a `structured` task is (the grill collapsed to two
+    /// states in v25 — the agent's structured finding IS the capture; there is no human-only
+    /// `validated` step). The coder works on tasks, never on raw comments or un-structured ones.
     pub fn is_ready_for_coder(&self) -> bool {
-        self.grill_state == GRILL_VALIDATED
+        self.grill_state == GRILL_STRUCTURED
     }
 }
 
@@ -984,11 +1054,10 @@ pub fn promote_comment_to_task(
 }
 
 /// STRUCTURE a proposed task (the grill's SECOND step — the AGENT structures it, via MCP).
-/// Rewrites `title`/`details` (+ optionally `severity`) and moves the state to `structured`. This
-/// is the AGENT capability; the agent NEVER validates (there is no validate path reachable from
-/// the MCP façade — the human-only guard-rail, symmetric to phase-4 human-only resolution). A
-/// task already `validated` is not re-openable to `structured` here (only a `proposed` OR
-/// `structured` task restructures); `None` on an unknown/validated id. Returns the updated row.
+/// Rewrites `title`/`details` (+ optionally `severity`) and moves the state to `structured` — the
+/// coder-ready state (the grill collapsed to two states in v25; there is no human-only `validated`
+/// step, so no state is locked against re-structuring). `None` on an unknown id. Returns the
+/// updated row.
 pub fn structure_task(
     conn: &mut SqliteConnection,
     id: &str,
@@ -999,11 +1068,6 @@ pub fn structure_task(
     let Some(current) = get_review_task(conn, id)? else {
         return Ok(None);
     };
-    // The agent can only (re)structure a not-yet-validated task. A validated task is the
-    // human's committed decision; the agent cannot silently reopen it.
-    if current.grill_state == GRILL_VALIDATED {
-        return Ok(None);
-    }
     let now = now_millis();
     // `severity`: Some(v) sets it (v may be None to clear), None leaves it unchanged.
     let sev = match severity {
@@ -1024,23 +1088,6 @@ pub fn structure_task(
     Ok(updated)
 }
 
-/// VALIDATE a structured task (the grill's THIRD step — the HUMAN validates it). Moves the
-/// state to `validated`, after which the task is "ready for the coder". HUMAN-ONLY: this is
-/// only reachable from the UI façade (the MCP agent façade advertises no validate tool, so the
-/// agent can never reach it). Idempotent on an already-validated task. `None` on an unknown id.
-/// Returns the updated row.
-pub fn validate_task(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<ReviewTask>> {
-    let updated = diesel::update(review_tasks::table.find(id))
-        .set((
-            review_tasks::grill_state.eq(GRILL_VALIDATED),
-            review_tasks::updated_at.eq(now_millis()),
-        ))
-        .returning(ReviewTask::as_returning())
-        .get_result(conn)
-        .optional()?;
-    Ok(updated)
-}
-
 /// Read ONE task by id, or `None` when unknown.
 pub fn get_review_task(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<ReviewTask>> {
     review_tasks::table
@@ -1051,7 +1098,7 @@ pub fn get_review_task(conn: &mut SqliteConnection, id: &str) -> QueryResult<Opt
 }
 
 /// List the tasks (promoted tasks) of a `(workspace, repository)`, oldest-first — the review's
-/// promoted-task list. Includes every grill state (proposed / structured / validated).
+/// promoted-task list. Includes every grill state (proposed / structured).
 ///
 /// `spec_id` SCOPES the list to ONE Spec (finding #53), mirroring [`list_review_comments`]: a review
 /// is bound to the Spec it was opened from, so `Some(spec)` returns ONLY that Spec's promoted tasks —
@@ -1372,6 +1419,11 @@ pub struct Spec {
     pub completed_at: Option<i64>,
     /// Soft-archive timestamp, epoch ms. `None` while the Spec is active.
     pub archived_at: Option<i64>,
+    /// The phase currently UNDER REVIEW (v2.5.11 review follow-up, F5). Posed at the entry into
+    /// `in_review` (= the last delivered phase, F1) and cleared on any transition leaving review.
+    /// `None` = not under a per-phase review. A stable anchor for the overlay badge + finding
+    /// attribution (the middle rung of the finding-phase precedence).
+    pub reviewing_phase: Option<i32>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -2176,8 +2228,18 @@ pub fn transition_spec_with_workspace(
             None
         };
 
-        // WRITE the new status (+ completed_at on done, or the workspace anchor on start),
-        // bumping updated_at.
+        // reviewing_phase (F5): POSE it at the entry into `in_review` (= the last delivered phase,
+        // F1 [`current_phase_for_spec`]) as the stable review anchor; CLEAR it (NULL) on every other
+        // transition — `done` (advance out of review) and `cancel` end the review episode. Written on
+        // EVERY branch below so the anchor is never left stale.
+        let reviewing_phase_value: Option<i32> = if transition == SpecTransition::Review {
+            current_phase_for_spec(conn, spec_id)?.map(|(number, _)| number)
+        } else {
+            None
+        };
+
+        // WRITE the new status (+ completed_at on done, or the workspace anchor on start), the
+        // reviewing_phase anchor, bumping updated_at.
         let now = now_millis();
         let target = transition.target_status();
         if transition == SpecTransition::Done {
@@ -2185,6 +2247,7 @@ pub fn transition_spec_with_workspace(
                 .set((
                     specs::status.eq(target),
                     specs::completed_at.eq(now),
+                    specs::reviewing_phase.eq(reviewing_phase_value),
                     specs::updated_at.eq(now),
                 ))
                 .execute(conn)?;
@@ -2193,12 +2256,17 @@ pub fn transition_spec_with_workspace(
                 .set((
                     specs::status.eq(target),
                     specs::workspace_id.eq(ws),
+                    specs::reviewing_phase.eq(reviewing_phase_value),
                     specs::updated_at.eq(now),
                 ))
                 .execute(conn)?;
         } else {
             diesel::update(specs::table.find(spec_id))
-                .set((specs::status.eq(target), specs::updated_at.eq(now)))
+                .set((
+                    specs::status.eq(target),
+                    specs::reviewing_phase.eq(reviewing_phase_value),
+                    specs::updated_at.eq(now),
+                ))
                 .execute(conn)?;
         }
 
@@ -2255,6 +2323,21 @@ pub fn set_spec_phases(
         .execute(conn)
 }
 
+/// Decode the BASIC named HTML entities in a plain-text label (v2.5.11 review follow-up, finding
+/// 01KXZP1RDSMWP7WYMV8FXQ9965) so an HTML-escaped input round-trips to its real characters. Handles
+/// the entities a label realistically carries — `&lt;`/`&gt;`/`&quot;`/`&#39;`/`&apos;` and, LAST,
+/// `&amp;` — decoding `&amp;` last so a genuine double-escape like `&amp;lt;` decodes to the literal
+/// `&lt;` (not `<`). Idempotent on text that carries no entities (a clean `&` / `<` is left as-is).
+fn decode_basic_html_entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        // `&amp;` LAST: decoding it first would over-decode `&amp;lt;` → `<`.
+        .replace("&amp;", "&")
+}
+
 /// GET-OR-CREATE a phase by NAME in a Spec's `specs.phases` plan, returning its 1-based
 /// number (PDR-0022). If a phase whose (trimmed) name already matches `name` exists, its
 /// number is returned unchanged (reuse — so a name passed twice maps to the SAME phase);
@@ -2272,7 +2355,16 @@ fn resolve_or_create_phase(
     spec_id: &str,
     name: &str,
 ) -> QueryResult<i32> {
-    let target = name.trim();
+    // NORMALIZE the incoming name (v2.5.11 review follow-up, finding 01KXZP1RDSMWP7WYMV8FXQ9965): a
+    // phase label is plain human text, never HTML. When it arrives HTML-ESCAPED (e.g. an authoring
+    // client that lifted "Column model & visibility" from an escaped source sends "Column model
+    // &amp; visibility"), storing it verbatim makes the plan carry `&amp;`, which the overlay then
+    // renders LITERALLY as "&amp;" (the double-escape). Decode the basic entities ONCE here — the
+    // single choke point every phase name flows through — so the plan holds the real character and a
+    // clean `&` round-trips unchanged (idempotent on already-decoded text; no legitimate `&`/`<`/`>`
+    // is mangled).
+    let decoded = decode_basic_html_entities(name);
+    let target = decoded.trim();
     let phases_json: String = specs::table
         .find(spec_id)
         .select(specs::phases)
@@ -2629,6 +2721,18 @@ pub struct Task {
     pub updated_at: i64,
     /// Epoch ms the task reached `done`. `None` while not done.
     pub completed_at: Option<i64>,
+    /// FINDING trail (v21, PDR-0016): the `review_comments` id this finding was PROMOTED from
+    /// (the comment↔task link, 1→N). `None` on a task not promoted from a comment. Ported from
+    /// the deprecated `review_tasks.from_comment_id`.
+    pub from_comment_id: Option<String>,
+    /// REWORK round (v22, PDR-0022): the sub-phase axis. `None` = the plan (round 0); `Some(n≥1)` =
+    /// a rework pass rattached to `phase` (rendered 2.1, 4.1… by the overlay). PER-PHASE numbering.
+    pub round: Option<i32>,
+    /// FINDING grill (v21; COLLAPSED to two states in v25): `proposed` | `structured` — the
+    /// promotion "grill" (`structured` = ready for the coder). `None` on a task that is not a
+    /// grilled review finding. Physically LAST after the v25 CHECK rebuild (Diesel positional
+    /// decoding mirrors the migration order).
+    pub grill_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -2652,6 +2756,13 @@ struct NewTask {
     position: i32,
     created_at: i64,
     updated_at: i64,
+    // v21 (v2.5.11) — the ported review-finding trail (findings = `tasks kind=review`).
+    from_comment_id: Option<String>,
+    // v22 (v2.5.11) — the rework round (sub-phase axis; None = plan/round 0).
+    round: Option<i32>,
+    // v25 (v2.5.11 review follow-up #31) — the finding grill state, physically LAST after the
+    // CHECK rebuild that dropped `validated` (proposed|structured only).
+    grill_state: Option<String>,
 }
 
 /// A `task_dependencies` row: one directed edge `task_id --depends_on--> depends_on_task_id`
@@ -2709,6 +2820,15 @@ pub struct NewTaskInput {
     /// names in first-seen order (get-or-create). `None` (or a blank name / no `spec_id`) =
     /// flat.
     pub phase_name: Option<String>,
+    /// FINDING trail (v21, `kind=review`): the `review_comments` id this finding was PROMOTED
+    /// from (the comment↔task link). `None` on a task not promoted from a comment.
+    pub from_comment_id: Option<String>,
+    /// FINDING grill (v21; collapsed to two states in v25): the initial `grill_state`
+    /// (`proposed`|`structured`). `None` on a task that is not a grilled review finding.
+    pub grill_state: Option<String>,
+    /// REWORK round (v22): `None` = the plan (round 0); `Some(n≥1)` = a rework pass rattached to
+    /// the task's phase. Use [`next_round_for_phase`] to open the next round of a phase.
+    pub round: Option<i32>,
 }
 
 impl Default for NewTaskInput {
@@ -2724,6 +2844,9 @@ impl Default for NewTaskInput {
             spec_id: None,
             parent_task_id: None,
             phase_name: None,
+            from_comment_id: None,
+            grill_state: None,
+            round: None,
         }
     }
 }
@@ -2746,7 +2869,9 @@ impl NewTaskInput {
         }
     }
 
-    /// A `review` finding (finding=task) carrying its `severity`.
+    /// A `review` finding (finding=task) carrying its `severity`. A finding is ALWAYS agent-created
+    /// (the auditor raises it, or the agent grills a retour into it) and closable by the agent coder
+    /// loop — there is no per-finding origin (v24; provenance lives on `review_comments.author_type`).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn review(severity: impl Into<String>) -> Self {
         Self {
@@ -2815,6 +2940,9 @@ pub fn create_task(
                 position: 0,
                 created_at: now,
                 updated_at: now,
+                from_comment_id: input.from_comment_id,
+                grill_state: input.grill_state,
+                round: input.round,
             })
             .returning(Task::as_returning())
             .get_result(conn)?;
@@ -2855,6 +2983,488 @@ pub fn list_tasks_for_spec(conn: &mut SqliteConnection, spec_id: &str) -> QueryR
         .order((tasks::position.asc(), tasks::created_at.asc()))
         .select(Task::as_select())
         .load(conn)
+}
+
+/// List the review FINDINGS of a Spec — the `tasks kind=review` rows (v2.5.11, PDR-0016). This
+/// is the CANONICAL finding read: a finding is a `tasks kind=review` row (carrying `severity` +
+/// the ported `from_comment_id` / `grill_state`), NOT a separate `review_tasks` row
+/// (that table is DEPRECATED — see [`ReviewTask`]). Both the overlay (via [`list_tasks_for_spec`] +
+/// `<TasksTab>`) and the review viewer read the SAME `tasks kind=review` representation. Ordered
+/// like [`list_tasks_for_spec`] (position, then created_at) for a deterministic list.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_review_findings_for_spec(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+) -> QueryResult<Vec<Task>> {
+    tasks::table
+        .filter(tasks::spec_id.eq(spec_id))
+        .filter(tasks::kind.eq(TASK_KIND_REVIEW))
+        .order((tasks::position.asc(), tasks::created_at.asc()))
+        .select(Task::as_select())
+        .load(conn)
+}
+
+/// The NEXT rework round to open for a Spec PHASE (v2.5.11, PDR-0022). Rounds are PER-PHASE: the
+/// max existing `round` among that phase's review findings + 1 (1-based; `1` when the phase has no
+/// rework yet — its first pass is round 1, rendered "N.1"). The review-loop orchestrator calls
+/// this ONCE when it opens a new rework pass, then tags that pass's findings with the returned
+/// round (so all findings of one pass share a round, and each coder pass increments it). Plan
+/// slices (round 0 / NULL) are ignored by the `max`. `None` phase = the flat/un-phased bucket.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn next_round_for_phase(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    phase: i32,
+) -> QueryResult<i32> {
+    let max_round: Option<i32> = tasks::table
+        .filter(tasks::spec_id.eq(spec_id))
+        .filter(tasks::phase.eq(phase))
+        .filter(tasks::kind.eq(TASK_KIND_REVIEW))
+        .select(diesel::dsl::max(tasks::round))
+        .first::<Option<i32>>(conn)?;
+    Ok(max_round.unwrap_or(0) + 1)
+}
+
+/// The OPEN rework round of a Spec PHASE — the round of the CURRENTLY-OPEN review pass (v2.5.11
+/// review follow-up, finding 01KXZP1PEAQ6V2R5DCQGMSY9MG). A round is OPEN while it still carries ≥1
+/// NON-terminal (`status` not `done`/`cancelled`) `kind=review` finding: all findings raised in the
+/// SAME pass share it, so ONE review pass = ONE round holding N findings — NOT one round per finding
+/// or per comment (the bug this fixes: 3 retours of one pass took rounds 1/2/3). Returns the MAX open
+/// round (there is normally a single one). `None` = no open round → the caller opens the phase's NEXT
+/// round via [`next_round_for_phase`], so a NEW pass raised only AFTER the prior round's findings are
+/// resolved increments (N.1 → N.2). Plan slices (round 0 / NULL) never qualify (they carry no
+/// `round`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn open_round_for_phase(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    phase: i32,
+) -> QueryResult<Option<i32>> {
+    tasks::table
+        .filter(tasks::spec_id.eq(spec_id))
+        .filter(tasks::phase.eq(phase))
+        .filter(tasks::kind.eq(TASK_KIND_REVIEW))
+        .filter(tasks::round.is_not_null())
+        .filter(tasks::status.ne(TASK_STATUS_DONE))
+        .filter(tasks::status.ne(TASK_STATUS_CANCELLED))
+        .select(diesel::dsl::max(tasks::round))
+        .first::<Option<i32>>(conn)
+}
+
+/// Resolve a phase NUMBER to its NAME in the Spec's `phases` plan (`[{number,name}]`, PDR-0022), or
+/// `None` when the number is not in the plan. Used to turn an explicit / stored phase number (F5's
+/// override + `reviewing_phase`) back into the name [`create_task`] stamps through
+/// [`resolve_or_create_phase`] (get-or-create is a no-op for a name already in the plan).
+fn phase_name_for_number(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    number: i32,
+) -> QueryResult<Option<String>> {
+    let phases_json: String = specs::table
+        .find(spec_id)
+        .select(specs::phases)
+        .first::<String>(conn)?;
+    let trimmed = phases_json.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(None);
+    }
+    let entries: Vec<PhaseEntry> = serde_json::from_str(trimmed)
+        .map_err(|e| diesel::result::Error::DeserializationError(Box::new(e)))?;
+    Ok(entries
+        .iter()
+        .find(|e| e.number as i32 == number)
+        .map(|e| e.name.clone()))
+}
+
+/// The Spec's LAST DELIVERED phase — the phase a retour/finding rattaches to (v2.5.11 Phase 3,
+/// PDR-0022; review follow-up finding 01KXZP1NYQ2T11Y9WPYC22C5VR) — returned as `(number, name)` so
+/// a caller both TAGS the finding (by name, through [`create_task`]) and OPENS its per-phase round
+/// (by number, through [`next_round_for_phase`]). Derived from the Spec's `phases` plan + its task
+/// statuses, looking BACKWARD:
+///
+///   the HIGHEST phase that is entirely DELIVERED = every non-`cancelled` task of that phase is
+///   `done`, AND it carries ≥1 delivered (done) task.
+///
+/// This is DELIBERATELY NOT the "next phase to code" — which is the LOWEST phase that still has open
+/// work, resolved separately by [`crate::mcp_context`]'s `resolve_current_phase` for the coder/agent
+/// context (and left unchanged). On a STEPPED Spec (phases 1&2 `done`, 3&4 `todo`, Spec `in_review`)
+/// a retour must land on the phase UNDER REVIEW — the last delivered, phase 2 — NOT phase 3 (future,
+/// un-coded): pointing forward was the bug this replaces. In AUTOPILOT (every phase `done`) every
+/// phase is delivered, so the last delivered is the LAST phase — the final phase under review.
+///
+/// A phase with no task, or only `cancelled` tasks, or still carrying open (non-terminal) work is
+/// NOT delivered, so a finding NEVER rattaches to a phase without delivered work. `None` when NO
+/// phase is delivered yet (incl. a FLAT Spec with no phase plan): with no delivered phase to hang on,
+/// its findings stay un-phased (round 0) by construction (an un-phased finding is excluded from the
+/// rail gauge, `overlay-status.ts`). In the real review flow this None case does not arise — a phase
+/// is reviewed only after it is delivered — and F5's stored `reviewing_phase` anchors it explicitly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn current_phase_for_spec(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+) -> QueryResult<Option<(i32, String)>> {
+    let phases_json: String = specs::table
+        .find(spec_id)
+        .select(specs::phases)
+        .first::<String>(conn)?;
+    let trimmed = phases_json.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(None);
+    }
+    let entries: Vec<PhaseEntry> = serde_json::from_str(trimmed)
+        .map_err(|e| diesel::result::Error::DeserializationError(Box::new(e)))?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    // Every phased PLAN task's (phase, status) for this Spec — the raw material for "which phases are
+    // fully delivered", computed in Rust (one scan; the plan is small). `kind=review` findings are
+    // EXCLUDED: they are the rework a review triggers ON TOP of a delivered phase (themselves
+    // non-terminal), not the phase's plan work — counting them would make a phase read "not
+    // delivered" the moment its first finding lands, breaking the anchor mid-review.
+    let rows: Vec<(Option<i32>, String)> = tasks::table
+        .filter(tasks::spec_id.eq(spec_id))
+        .filter(tasks::phase.is_not_null())
+        .filter(tasks::kind.ne(TASK_KIND_REVIEW))
+        .select((tasks::phase, tasks::status))
+        .load::<(Option<i32>, String)>(conn)?;
+    // The LAST DELIVERED phase = the HIGHEST phase whose non-`cancelled` tasks are ALL `done` and
+    // which carries ≥1 `done` task (a look BACKWARD — never a phase with open work or no delivered
+    // task).
+    let mut last_delivered: Option<i32> = None;
+    for entry in &entries {
+        let number = entry.number as i32;
+        let mut any_done = false;
+        let mut all_non_cancelled_done = true;
+        for (_p, status) in rows.iter().filter(|(p, _)| *p == Some(number)) {
+            match status.as_str() {
+                TASK_STATUS_DONE => any_done = true,
+                TASK_STATUS_CANCELLED => {}
+                _ => all_non_cancelled_done = false,
+            }
+        }
+        if any_done && all_non_cancelled_done {
+            last_delivered = Some(last_delivered.map_or(number, |cur| cur.max(number)));
+        }
+    }
+    let Some(number) = last_delivered else {
+        return Ok(None);
+    };
+    let name = entries
+        .iter()
+        .find(|e| e.number as i32 == number)
+        .map(|e| e.name.clone())
+        .unwrap_or_default();
+    Ok(Some((number, name)))
+}
+
+// --- review FINDING grill + comment↔task, on `tasks kind=review` (v2.5.11 Phase 2) ----------
+//
+// The RUNTIME CUTOVER off the deprecated `review_tasks` table (PDR-0016, PRD
+// 01KXR1AGWK08H9P800YHXPBCHS, Phase 2, tasks 01KXR1CY66H2ZJKH58K7KYM7DG "Grill des retours" +
+// 01KXR1CYNX7X502QK6VVG6AEXX "Comment↔task + résolution"). A review finding is CREATED, GRILLED,
+// LISTED, LINKED to its source comment, and RESOLVED entirely as a `tasks kind=review` row here —
+// the SAME model the overlay + viewer read via [`list_review_findings_for_spec`]. These functions
+// REPLACE the `review_tasks` promote/structure/validate/list helpers on the runtime paths (MCP +
+// UI bridge); `review_tasks` is no longer a concurrent representation at runtime.
+//
+// The grill vocabulary is the SAME [`GRILL_PROPOSED`]/[`GRILL_STRUCTURED`] (proposed = the agent
+// captured the retour raw, structured = the agent structured it via MCP = coder-ready), now carried
+// by `tasks.grill_state` instead of `review_tasks.grill_state`. COLLAPSED to two states in v25
+// (review follow-up #31): the human-only `validated` third state was dropped — a finding is
+// agent-owned, and the agent's structured finding IS the capture.
+
+impl Task {
+    /// Whether this finding is READY FOR THE CODER: a `kind=review` finding whose grill reached
+    /// `structured`. The coder consumes ONLY structured findings (a `proposed` one is still raw; a
+    /// non-review or non-grilled task is not a finding here). The tasks counterpart of the
+    /// deprecated [`ReviewTask::is_ready_for_coder`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_finding_ready_for_coder(&self) -> bool {
+        self.kind == TASK_KIND_REVIEW && self.grill_state.as_deref() == Some(GRILL_STRUCTURED)
+    }
+}
+
+/// A review FINDING projected into the review-viewer WIRE shape (v2.5.11 cutover, PDR-0016): the
+/// SAME `{ id, from_comment_id, title, details, severity, grill_state, spec_id, … }` the renderer's
+/// `ReviewTask` reads, now SOURCED from a `tasks kind=review` row instead of the deprecated
+/// `review_tasks` table. `workspace_id`/`repository_id` come from the read's `(workspace, repo)`
+/// CONTEXT (a [`Task`] carries `project_id`/`spec_id`, not the repo pair) so the viewer keeps its
+/// existing shape without a `review_tasks` read. Extra fields (`status`/`round`/`phase`) ride along
+/// for the overlay/rounds; the viewer ignores what it does not use.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReviewFinding {
+    pub id: String,
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub from_comment_id: String,
+    pub title: String,
+    pub details: Option<String>,
+    pub severity: Option<String>,
+    pub grill_state: String,
+    pub spec_id: Option<String>,
+    pub status: String,
+    pub round: Option<i32>,
+    pub phase: Option<i32>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl ReviewFinding {
+    /// Project a `tasks kind=review` finding into the viewer wire shape, injecting the
+    /// `(workspace, repository)` the read was scoped to. `grill_state` falls back to `proposed`
+    /// and `from_comment_id` to empty only defensively — the viewer list only ever carries grilled
+    /// findings promoted from a comment (both fields present).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn from_task(task: &Task, workspace_id: &str, repository_id: &str) -> Self {
+        Self {
+            id: task.id.clone(),
+            workspace_id: workspace_id.to_string(),
+            repository_id: repository_id.to_string(),
+            from_comment_id: task.from_comment_id.clone().unwrap_or_default(),
+            title: task.title.clone(),
+            details: task.description.clone(),
+            severity: task.severity.clone(),
+            grill_state: task
+                .grill_state
+                .clone()
+                .unwrap_or_else(|| GRILL_PROPOSED.to_string()),
+            spec_id: task.spec_id.clone(),
+            status: task.status.clone(),
+            round: task.round,
+            phase: task.phase,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+        }
+    }
+}
+
+/// STRUCTURE a review finding — the grill's SECOND (and FINAL) step, the AGENT's capability (via
+/// MCP). Rewrites `title`/`description` (+ optionally `severity`) of a `tasks kind=review` finding
+/// and moves its `grill_state` to `structured` — the coder-ready state (the grill collapsed to two
+/// states in v25; there is no human-only `validated` step, so the agent may freely (re)structure a
+/// `proposed` OR `structured` finding). `None` on an unknown id or a non-`review` task. The tasks
+/// counterpart of the deprecated [`structure_task`], now on the canonical finding model.
+/// `severity`: `Some(v)` sets it (v may be `None` to clear), `None` leaves it unchanged.
+pub fn structure_finding(
+    conn: &mut SqliteConnection,
+    id: &str,
+    title: &str,
+    details: Option<&str>,
+    severity: Option<Option<&str>>,
+) -> QueryResult<Option<Task>> {
+    let Some(current) = get_task(conn, id)? else {
+        return Ok(None);
+    };
+    // Only a review finding is grillable — a plain slice/human task is never a finding.
+    if current.kind != TASK_KIND_REVIEW {
+        return Ok(None);
+    }
+    let now = now_millis();
+    let sev = match severity {
+        Some(v) => v.map(|s| s.to_string()),
+        None => current.severity.clone(),
+    };
+    let updated = diesel::update(tasks::table.find(id))
+        .set((
+            tasks::title.eq(title.to_string()),
+            tasks::description.eq(details.map(|d| d.to_string())),
+            tasks::severity.eq(sev),
+            tasks::grill_state.eq(GRILL_STRUCTURED),
+            tasks::updated_at.eq(now),
+        ))
+        .returning(Task::as_returning())
+        .get_result(conn)
+        .optional()?;
+    Ok(updated)
+}
+
+/// PROMOTE a review comment into a FINDING — a `tasks kind=review` row (the grill's FIRST step:
+/// the human lâche brut → `grill_state=proposed`). The runtime CUTOVER of the deprecated
+/// [`promote_comment_to_task`] onto the canonical finding model (v2.5.11 Phase 2, task
+/// 01KXR1CYNX7X502QK6VVG6AEXX). The finding carries:
+///   * `from_comment_id` = the comment's id — the trail back to its source comment (1 comment → N
+///     findings; the comment↔task link is read both ways: [`findings_for_comment`] forward, and
+///     `task.from_comment_id` back);
+///   * `grill_state = proposed` — awaits the agent's [`structure_finding`] (which makes it
+///     coder-ready; the grill has no human-only validate step since v25, review follow-up #31);
+///   * the comment's `spec_id` — a finding lives on the Spec (like every task); its `project_id`
+///     is resolved from that Spec.
+///
+/// A comment with NO `spec_id` cannot be promoted — there is no Spec to hang the finding on
+/// (`diesel::result::Error::NotFound`). `severity` is OPTIONAL.
+///
+/// PHASE + ROUND (v2.5.11 Phase 3, PDR-0022 + the review follow-up F1/F2/F5): the finding is
+/// rattached to a Spec PHASE and to a per-phase rework ROUND, so the rework a retour triggers is
+/// VISIBLE in the rail gauge (an un-phased finding is EXCLUDED — `overlay-status.ts`).
+///
+///   * PHASE — resolved with [`promote_comment_to_finding_on_phase`]'s PRECEDENCE (F5): an explicit
+///     override > the Spec's stored `reviewing_phase` (while `in_review`) > the derived LAST
+///     DELIVERED phase (F1, [`current_phase_for_spec`] — the phase under review, never a future
+///     un-coded one). This 4-arg entry passes NO override, so it takes `reviewing_phase`-or-derived.
+///   * ROUND — the phase's OPEN pass ([`open_round_for_phase`]) so N findings of ONE review pass
+///     SHARE a round; a NEW pass (raised only after the prior round's findings are resolved) opens
+///     the phase's NEXT round (N.1 → N.2, [`next_round_for_phase`]).
+///
+/// A FLAT Spec (no phase plan / no delivered phase) has no phase to rattach to, so its findings stay
+/// un-phased / round 0 by construction. This is the SINGLE runtime point that phases+rounds a retour,
+/// so EVERY channel — the chat verb ([`crate::mcp_tools_core::review_submit_feedback`]) and the
+/// viewer bridge (`review_task_promote`) and the auditor — inherits it.
+pub fn promote_comment_to_finding(
+    conn: &mut SqliteConnection,
+    comment: &ReviewComment,
+    title: &str,
+    severity: Option<&str>,
+) -> QueryResult<Task> {
+    promote_comment_to_finding_on_phase(conn, comment, title, severity, None)
+}
+
+/// [`promote_comment_to_finding`] with an EXPLICIT phase override (F5, finding
+/// 01KXZP1PY71W5P4N3VYJBHP91G). `phase_override` attributes the finding to a specific phase number,
+/// taking PRECEDENCE over the stored `reviewing_phase` and the derived last-delivered phase; the
+/// chat verb `review_submit_feedback` threads its optional `phase` MCP param here. `None` = the
+/// default precedence (stored `reviewing_phase` while `in_review`, else the derived F1 phase). An
+/// override that names no plan phase degrades to un-phased rather than minting a phantom phase.
+pub fn promote_comment_to_finding_on_phase(
+    conn: &mut SqliteConnection,
+    comment: &ReviewComment,
+    title: &str,
+    severity: Option<&str>,
+    phase_override: Option<i32>,
+) -> QueryResult<Task> {
+    let Some(spec_id) = comment.spec_id.clone() else {
+        return Err(diesel::result::Error::NotFound);
+    };
+    let project_id: String = specs::table
+        .find(&spec_id)
+        .select(specs::project_id)
+        .first(conn)?;
+    // PHASE precedence (F5): explicit override > stored `reviewing_phase` (only while the Spec is
+    // `in_review`) > derived last-delivered phase (F1). An explicit/stored NUMBER is mapped back to
+    // its plan NAME so [`create_task`] stamps the SAME number (get-or-create is a no-op for a name
+    // already in the plan — no new phase is minted); a number outside the plan → un-phased.
+    let resolved_phase: Option<(i32, String)> = match phase_override {
+        Some(n) => phase_name_for_number(conn, &spec_id, n)?.map(|name| (n, name)),
+        None => {
+            let (status, reviewing_phase): (String, Option<i32>) = specs::table
+                .find(&spec_id)
+                .select((specs::status, specs::reviewing_phase))
+                .first::<(String, Option<i32>)>(conn)?;
+            let stored = if status == SPEC_STATUS_IN_REVIEW {
+                reviewing_phase
+            } else {
+                None
+            };
+            match stored {
+                Some(n) => phase_name_for_number(conn, &spec_id, n)?.map(|name| (n, name)),
+                None => current_phase_for_spec(conn, &spec_id)?,
+            }
+        }
+    };
+    // ROUND (F2): reuse the phase's OPEN pass so N findings of one pass share a round; else open the
+    // phase's next round.
+    let (phase_name, round) = match resolved_phase {
+        Some((number, name)) => {
+            let round = match open_round_for_phase(conn, &spec_id, number)? {
+                Some(r) => r,
+                None => next_round_for_phase(conn, &spec_id, number)?,
+            };
+            (Some(name), Some(round))
+        }
+        None => (None, None),
+    };
+    let input = NewTaskInput {
+        kind: TASK_KIND_REVIEW.to_string(),
+        severity: severity.map(|s| s.to_string()),
+        spec_id: Some(spec_id),
+        from_comment_id: Some(comment.id.clone()),
+        grill_state: Some(GRILL_PROPOSED.to_string()),
+        phase_name,
+        round,
+        ..NewTaskInput::default()
+    };
+    create_task(conn, &project_id, title, input)
+}
+
+/// The FINDINGS promoted from ONE comment — the forward side of the comment↔task link (1→N). Reads
+/// the `tasks kind=review` rows whose `from_comment_id` is this comment (the reverse side is a
+/// task's own `from_comment_id`). Ordered like [`list_tasks_for_spec`]. Used by the resolution
+/// guard ([`resolve_review_comment_when_findings_done`]) and the traceability read.
+pub fn findings_for_comment(
+    conn: &mut SqliteConnection,
+    comment_id: &str,
+) -> QueryResult<Vec<Task>> {
+    tasks::table
+        .filter(tasks::from_comment_id.eq(comment_id))
+        .filter(tasks::kind.eq(TASK_KIND_REVIEW))
+        .order((tasks::position.asc(), tasks::created_at.asc()))
+        .select(Task::as_select())
+        .load(conn)
+}
+
+/// List the GRILLED review findings of a Spec — the `tasks kind=review` rows that carry a
+/// `grill_state` (i.e. were promoted/grilled from a comment or a chat retour). This is the viewer's
+/// promotion-panel read after the v2.5.11 cutover: it replaces the deprecated
+/// [`list_review_tasks`], sourcing the same list from `tasks kind=review` instead of `review_tasks`.
+/// A directly-raised auditor finding (`task_add`, no `grill_state`) is NOT included here — it lives
+/// in the overlay's TasksTab, not the review grill panel. Ordered like [`list_tasks_for_spec`].
+pub fn list_grilled_findings_for_spec(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+) -> QueryResult<Vec<Task>> {
+    tasks::table
+        .filter(tasks::spec_id.eq(spec_id))
+        .filter(tasks::kind.eq(TASK_KIND_REVIEW))
+        .filter(tasks::grill_state.is_not_null())
+        .order((tasks::position.asc(), tasks::created_at.asc()))
+        .select(Task::as_select())
+        .load(conn)
+}
+
+/// Why a guarded comment resolution was refused (or the DB failed). Returned by
+/// [`resolve_review_comment_when_findings_done`].
+#[derive(Debug)]
+pub enum ResolveCommentError {
+    /// No comment resolves to the given id.
+    NotFound,
+    /// The GUARD failed: the comment still has `pending` linked findings that are neither `done`
+    /// nor `cancelled` — a comment is resolvable only once its findings are settled.
+    FindingsNotDone { pending: usize },
+    /// A DB error surfaced while resolving or updating.
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for ResolveCommentError {
+    fn from(e: diesel::result::Error) -> Self {
+        ResolveCommentError::Db(e)
+    }
+}
+
+/// RESOLVE a review comment — HUMAN-ONLY, and ONLY once its linked findings are done (v2.5.11
+/// Phase 2, task 01KXR1CYNX7X502QK6VVG6AEXX). Guards [`resolve_review_comment`]: a comment that
+/// promoted findings (`from_comment_id`) can be closed only when EVERY linked `tasks kind=review`
+/// finding is settled (`done` or `cancelled`) — you resolve in knowledge of the fix, not before it
+/// lands. A comment with NO linked findings (a plain human comment) resolves freely (backwards
+/// compatible). Reachable only from the human (UI) façade — the MCP agent tool set advertises no
+/// resolve, exactly like [`resolve_review_comment`]. Returns the resolved comment, or a typed
+/// refusal ([`ResolveCommentError::FindingsNotDone`]) naming how many findings are still pending.
+pub fn resolve_review_comment_when_findings_done(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<ReviewComment, ResolveCommentError> {
+    conn.transaction(|conn| {
+        if get_review_comment(conn, id)?.is_none() {
+            return Err(ResolveCommentError::NotFound);
+        }
+        let pending = findings_for_comment(conn, id)?
+            .into_iter()
+            .filter(|t| t.status != TASK_STATUS_DONE && t.status != TASK_STATUS_CANCELLED)
+            .count();
+        if pending > 0 {
+            return Err(ResolveCommentError::FindingsNotDone { pending });
+        }
+        let resolved = resolve_review_comment(conn, id)?.ok_or(ResolveCommentError::NotFound)?;
+        Ok(resolved)
+    })
 }
 
 // --- task DEPENDENCIES: the ACYCLIC graph (cycle detection) ---------------
@@ -3193,6 +3803,11 @@ pub fn transition_task(
         if transition == TaskTransition::Done && task.kind == TASK_KIND_HUMAN {
             return Err(TaskTransitionError::HumanRequiresVerification);
         }
+
+        // A `kind=review` FINDING is ALWAYS agent-created and agent-closable: the agent coder loop
+        // closes ANY finding through this plain `done` path (v24 — the old `origin=human`
+        // human-only-resolution guard was dropped with the `origin` column; provenance lives on
+        // `review_comments.author_type`, not on the finding).
 
         // GUARD: the current status must be a legal source.
         if !transition.source_allowed(&task.status) {
@@ -6696,16 +7311,16 @@ mod tests {
     }
 
     /// The `review_tasks` GRILL flow (v14, `finding = task`): a comment PROMOTED becomes a
-    /// `proposed` task linked to its source comment, the AGENT structures it (→ `structured`),
-    /// and the HUMAN validates it (→ `validated`, ready for the coder). Severity is OPTIONAL, and
-    /// `list_review_tasks` scopes to the `(workspace, repository)`.
+    /// `proposed` task linked to its source comment, then the AGENT structures it (→ `structured`,
+    /// which is coder-ready — the grill collapsed to two states in v25, no human-only `validated`
+    /// step). Severity is OPTIONAL, and `list_review_tasks` scopes to the `(workspace, repository)`.
     #[test]
     fn review_tasks_grill_flow_and_severity_optional() {
         let mut conn = open_in_memory();
         let comment = seed_comment(&mut conn, "ws", "repo", "this login path looks fragile");
 
-        // PROMOTE — the human lâche brut: a `proposed` task, seeded title, NO severity, linked
-        // to the source comment. `finding = task`: this row IS the coder task.
+        // PROMOTE — the agent captures the retour raw: a `proposed` task, seeded title, NO severity,
+        // linked to the source comment. `finding = task`: this row IS the coder task.
         let task = promote_comment_to_task(&mut conn, &comment, "fragile login path", None)
             .expect("promote");
         assert_eq!(task.grill_state, GRILL_PROPOSED);
@@ -6722,7 +7337,8 @@ mod tests {
             "a proposed task is NOT ready for the coder"
         );
 
-        // STRUCTURE — the agent gives it a clean title/details + an optional severity.
+        // STRUCTURE — the agent gives it a clean title/details + an optional severity. This is the
+        // FINAL grill step: a structured task IS ready for the coder (no validate step since v25).
         let structured = structure_task(
             &mut conn,
             &task.id,
@@ -6736,18 +7352,8 @@ mod tests {
         assert_eq!(structured.severity.as_deref(), Some("high"));
         assert!(structured.details.is_some());
         assert!(
-            !structured.is_ready_for_coder(),
-            "a structured-but-unvalidated task is NOT ready for the coder"
-        );
-
-        // VALIDATE — the human validates; ONLY now is it ready for the coder.
-        let validated = validate_task(&mut conn, &task.id)
-            .expect("validate ok")
-            .expect("task present");
-        assert_eq!(validated.grill_state, GRILL_VALIDATED);
-        assert!(
-            validated.is_ready_for_coder(),
-            "a validated task IS ready for the coder"
+            structured.is_ready_for_coder(),
+            "a structured task IS ready for the coder (the grill's final state)"
         );
 
         // A task of ANOTHER repo is excluded by the scope filter.
@@ -6825,32 +7431,28 @@ mod tests {
         );
     }
 
-    /// The GRILL GUARD-RAIL: the agent's `structure` cannot touch a VALIDATED task (it cannot
-    /// silently reopen the human's committed decision), and there is no `structure`-to-`validated`
-    /// path — validation is human-only (`validate_task`, reachable only from the UI façade).
+    /// The collapsed grill (v25, review follow-up #31): `structure` can RE-structure a `structured`
+    /// task — there is no human-only `validated` lock to reopen, so the agent can refine its own
+    /// structured finding. The task stays `structured` (the coder-ready state) with the new title.
     #[test]
-    fn structure_cannot_reopen_a_validated_task() {
+    fn structure_can_restructure_a_structured_task() {
         let mut conn = open_in_memory();
         let comment = seed_comment(&mut conn, "ws", "repo", "x");
         let task = promote_comment_to_task(&mut conn, &comment, "t", None).expect("promote");
         structure_task(&mut conn, &task.id, "structured", None, None)
             .expect("structure")
             .expect("present");
-        validate_task(&mut conn, &task.id)
-            .expect("validate")
-            .expect("present");
 
-        // The agent tries to re-structure the VALIDATED task → refused (no-op, None).
-        let reopened = structure_task(&mut conn, &task.id, "sneaky rewrite", None, None)
-            .expect("structure call ok");
-        assert!(
-            reopened.is_none(),
-            "structure must NOT reopen a validated task"
-        );
-        // The stored state is untouched — still validated with the human's title.
+        // The agent re-structures the (already structured) task → allowed, stays `structured`.
+        let refined = structure_task(&mut conn, &task.id, "sharper title", None, None)
+            .expect("structure call ok")
+            .expect("re-structure a structured task is allowed");
+        assert_eq!(refined.grill_state, GRILL_STRUCTURED);
+        assert_eq!(refined.title, "sharper title");
+
         let stored = get_review_task(&mut conn, &task.id).unwrap().unwrap();
-        assert_eq!(stored.grill_state, GRILL_VALIDATED);
-        assert_eq!(stored.title, "structured");
+        assert_eq!(stored.grill_state, GRILL_STRUCTURED);
+        assert_eq!(stored.title, "sharper title");
     }
 
     /// The UNREAD watermark (v14): a fresh repo counts every comment as unread; a new
@@ -7530,6 +8132,16 @@ mod tests {
         // Peel v15 (specs.workspace_id index), v14 (tasks/task_dependencies), then v13
         // (specs/spec_revisions); all must succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v25 (tasks grill drop validated) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v24 (tasks drop origin) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v23 (specs reviewing_phase) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v22 (tasks round) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v21 (tasks review-finding fields) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v18 (review_tasks.spec_id) cleanly");
@@ -7914,9 +8526,12 @@ mod tests {
         // Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task domain;
         // Phase 3 added dir #15 the specs.workspace_id index; Phase 4 added dir #16 the
         // review_comments domain; Phase 5 added dir #17 the review_tasks domain; v2.5.10
-        // added dir #20 the agent_session_specs link table), so reaching the pre-v4 schema
-        // peels all of them then dir #4 itself (15 reverts, reverse order).
-        for _ in 0..16 {
+        // added dir #20 the agent_session_specs link table; v2.5.11 added dir #21 the
+        // tasks review-finding fields + dir #22 the tasks round + dir #23 the specs
+        // reviewing_phase + dir #24 dropped the tasks.origin column + dir #25 dropped the
+        // `validated` grill state), so reaching the pre-v4 schema peels all of them then dir #4
+        // itself (21 reverts, reverse order).
+        for _ in 0..21 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -9271,6 +9886,9 @@ mod tests {
             spec_id: Some(spec_id.to_string()),
             parent_task_id: None,
             phase_name: Some("Delivery".to_string()),
+            from_comment_id: None,
+            grill_state: None,
+            round: None,
         }
     }
 
@@ -9369,6 +9987,83 @@ mod tests {
         // All three kinds are listed under the Spec (the task↔Spec link, ordered).
         let listed = list_tasks_for_spec(&mut conn, &spec.id).unwrap();
         assert_eq!(listed.len(), 3, "all three kinds link to the Spec");
+    }
+
+    /// DONE-CRITERION (v2.5.11 Phase 1, task 01KXR1CWP2FMB2DYJG467WAMYQ): "un finding = une
+    /// `tasks kind=review` avec from_comment_id/grill_state/severity". A review finding is a
+    /// `tasks kind=review` row carrying the ported `review_tasks` fields — ONE representation, read
+    /// back via the CANONICAL [`list_review_findings_for_spec`] (the SAME `tasks kind=review` model
+    /// the overlay reads via `list_tasks_for_spec`). `review_tasks` is no longer needed. (v24: a
+    /// finding carries NO `origin` — it is always agent-created; provenance is on the comment.)
+    #[test]
+    fn review_finding_is_a_task_carrying_ported_review_fields() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // A finding PROMOTED from a comment: kind=review, carrying from_comment_id + grill_state
+        // (proposed) + severity, all on the ONE `tasks` row.
+        let finding = create_task(
+            &mut conn,
+            &project.id,
+            "Login path is fragile",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                from_comment_id: Some("comment-42".to_string()),
+                grill_state: Some(GRILL_PROPOSED.to_string()),
+                ..NewTaskInput::review(TASK_SEVERITY_HIGH)
+            },
+        )
+        .expect("create promoted review finding");
+        assert_eq!(finding.kind, TASK_KIND_REVIEW);
+        assert_eq!(finding.from_comment_id.as_deref(), Some("comment-42"));
+        assert_eq!(finding.grill_state.as_deref(), Some(GRILL_PROPOSED));
+        assert_eq!(finding.severity.as_deref(), Some(TASK_SEVERITY_HIGH));
+
+        // Re-read identically (the ported columns persist positionally, v21 migration + schema).
+        let got = get_task(&mut conn, &finding.id).unwrap().unwrap();
+        assert_eq!(got, finding, "the ported finding fields round-trip");
+
+        // An auditor finding raised directly via `task_add` (no source comment):
+        // from_comment_id/grill_state stay NULL.
+        let auditor = create_task(
+            &mut conn,
+            &project.id,
+            "Off-by-one in the loop",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                ..NewTaskInput::review(TASK_SEVERITY_MEDIUM)
+            },
+        )
+        .expect("create auditor finding");
+        assert_eq!(auditor.from_comment_id, None);
+        assert_eq!(auditor.grill_state, None);
+
+        // A plain slice is NOT a finding: every ported column is NULL.
+        let slice = create_task(
+            &mut conn,
+            &project.id,
+            "Implement the thing",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                ..NewTaskInput::slice()
+            },
+        )
+        .expect("create slice");
+        assert_eq!(slice.from_comment_id, None);
+        assert_eq!(slice.grill_state, None);
+
+        // The CANONICAL finding read returns ONLY the two `kind=review` rows (not the slice) —
+        // the overlay + viewer both read this `tasks kind=review` representation.
+        let findings = list_review_findings_for_spec(&mut conn, &spec.id).unwrap();
+        assert_eq!(
+            findings.len(),
+            2,
+            "only the two review findings, not the slice"
+        );
+        assert!(findings.iter().all(|t| t.kind == TASK_KIND_REVIEW));
+        assert!(findings.iter().any(|t| t.id == finding.id));
+        assert!(findings.iter().any(|t| t.id == auditor.id));
     }
 
     /// A task can exist WITHOUT a Spec (light work): `spec_id` is nullable.
@@ -9772,6 +10467,924 @@ mod tests {
         assert_eq!(slice_done.status, TASK_STATUS_DONE);
     }
 
+    /// DONE-CRITERION (v2.5.11 review follow-up, finding 01KXZYWFARPQXA9FVBPEZ9QV3J): a `kind=review`
+    /// finding is ALWAYS agent-created and agent-closable — the agent coder loop closes ANY finding
+    /// through the plain `done` path (v24 dropped the old `origin=human` human-only-resolution guard
+    /// with the `origin` column). Both an auditor finding raised via `task_add` AND a
+    /// comment-promoted (retour) finding close the same way; there is no per-finding human-only gate.
+    #[test]
+    fn findings_are_agent_closable_via_the_plain_done_path() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // An AUDITOR finding (raised directly) — the agent coder loop closes it via the plain path.
+        let auditor = create_task(
+            &mut conn,
+            &project.id,
+            "Off-by-one",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                ..NewTaskInput::review(TASK_SEVERITY_MEDIUM)
+            },
+        )
+        .unwrap();
+        transition_task(&mut conn, &auditor.id, TaskTransition::Start, None).unwrap();
+        let closed = transition_task(&mut conn, &auditor.id, TaskTransition::Done, None).unwrap();
+        assert_eq!(
+            closed.status, TASK_STATUS_DONE,
+            "an auditor finding IS closable by the agent loop"
+        );
+
+        // A finding grilled from a HUMAN retour (the chat/viewer channel) closes the SAME way — no
+        // human-only refusal anymore: a finding is agent-owned whatever its source channel.
+        let comment = insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                spec_id: Some(spec.id.clone()),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                body: "this retour needs work".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let retour = promote_comment_to_finding(
+            &mut conn,
+            &comment,
+            "Work the retour",
+            Some(TASK_SEVERITY_HIGH),
+        )
+        .unwrap();
+        transition_task(&mut conn, &retour.id, TaskTransition::Start, None).unwrap();
+        let retour_closed =
+            transition_task(&mut conn, &retour.id, TaskTransition::Done, None).unwrap();
+        assert_eq!(
+            retour_closed.status, TASK_STATUS_DONE,
+            "a retour-grilled finding is ALSO agent-closable (no human-only gate on findings)"
+        );
+        assert!(retour_closed.completed_at.is_some());
+    }
+
+    /// DONE-CRITERION (v2.5.11 Phase 1, task 01KXR1CXPEJ6H1K8YTJNEBYF4S): `tasks` carries (phase,
+    /// round); a finding is rattached to a phase + a round (PER-PHASE, 2.1/4.1…), so it is PHASED
+    /// and enters the rail gauge (`tasksOfPhase`) instead of being excluded as Unphased.
+    /// [`next_round_for_phase`] opens the next per-phase round.
+    #[test]
+    fn tasks_carry_phase_and_round_findings_are_phased_per_phase() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // A plan slice: phase resolves from the NAME (materializes phase 1), round = NULL (plan).
+        let slice = create_task(
+            &mut conn,
+            &project.id,
+            "Build phase 2",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                phase_name: Some("Delivery".to_string()),
+                ..NewTaskInput::slice()
+            },
+        )
+        .unwrap();
+        assert_eq!(slice.phase, Some(1), "the slice is phased (phase 1)");
+        assert_eq!(slice.round, None, "a plan slice is round 0 (NULL)");
+
+        // The FIRST rework round of phase 1: next_round_for_phase returns 1 (no findings yet).
+        let round1 = next_round_for_phase(&mut conn, &spec.id, 1).unwrap();
+        assert_eq!(round1, 1, "phase 1's first rework is round 1 (→ 1.1)");
+
+        // A finding rattached to phase 1 + round 1 (rendered "1.1"). It is PHASED → it counts.
+        let finding = create_task(
+            &mut conn,
+            &project.id,
+            "Fix in delivery",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                phase_name: Some("Delivery".to_string()),
+                round: Some(round1),
+                ..NewTaskInput::review(TASK_SEVERITY_HIGH)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            finding.phase,
+            Some(1),
+            "the finding is rattached to the phase (not Unphased)"
+        );
+        assert_eq!(finding.round, Some(1));
+
+        // Re-read identically (the round column persists positionally, v22 migration + schema).
+        let got = get_task(&mut conn, &finding.id).unwrap().unwrap();
+        assert_eq!(got, finding, "the round column round-trips");
+
+        // Now phase 1 has a round-1 finding → the NEXT round is 2 (→ "1.2"), PER-PHASE.
+        assert_eq!(
+            next_round_for_phase(&mut conn, &spec.id, 1).unwrap(),
+            2,
+            "the next rework of phase 1 is round 2 (per-phase increment)"
+        );
+        // A DIFFERENT phase numbers its rounds independently (from 1).
+        assert_eq!(
+            next_round_for_phase(&mut conn, &spec.id, 4).unwrap(),
+            1,
+            "phase 4's rounds are independent (its first is round 1 → 4.1)"
+        );
+
+        // The finding is listed among the Spec's phased tasks (so the rail gauge counts it).
+        let phase1_tasks: Vec<_> = list_tasks_for_spec(&mut conn, &spec.id)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.phase == Some(1))
+            .collect();
+        assert!(
+            phase1_tasks.iter().any(|t| t.id == finding.id),
+            "the phased finding is part of phase 1's tasks → it enters the gauge"
+        );
+    }
+
+    /// DONE-CRITERION (v2.5.11 Phase 2, task 01KXR1CZPJY42PD91VRMPYSJJE "Statut in-place"): the Spec
+    /// STAYS `in_review` through review + rework — there is NO bounce back to `in_progress` (that
+    /// transition does not exist in the lifecycle), and the coder works the findings as a ROUND IN
+    /// PLACE (a task transition never touches the Spec's state). Non-goal: no new lifecycle edge.
+    #[test]
+    fn spec_stays_in_review_during_rework_no_bounce_rounds_carry_activity() {
+        // The lifecycle EDGES: `in_review` has NO edge back to `in_progress` — the "bounce" the old
+        // state rule described does not exist. `Start` (→ in_progress) is legal ONLY from `ready`;
+        // `in_review`'s only forward exit is `Done` (→ completed).
+        assert!(
+            !SpecTransition::Start.source_allowed(SPEC_STATUS_IN_REVIEW),
+            "there is NO in_review → in_progress transition (no bounce)"
+        );
+        assert!(
+            SpecTransition::Start.source_allowed(SPEC_STATUS_READY),
+            "in_progress is reached only from ready (start poses the anchor)"
+        );
+        assert!(
+            SpecTransition::Done.source_allowed(SPEC_STATUS_IN_REVIEW),
+            "the only forward exit from in_review is done (with the human's confirmation)"
+        );
+        assert!(
+            !SpecTransition::Review.source_allowed(SPEC_STATUS_IN_REVIEW),
+            "review is not re-enterable from in_review — it stays in_review, no self-churn"
+        );
+
+        // The coder works a REWORK ROUND finding start → done WITHOUT any Spec transition — the
+        // rounds carry the rework in place. A task transition never reads/writes the Spec status.
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // Seed the phase with a round-1 finding FIRST, so the next round is a REAL per-phase
+        // increment (2), not a coincidental 1 that two empty phases would both return. The name
+        // "Delivery" materializes as phase 1 on a fresh Spec (get-or-create; cf.
+        // tasks_carry_phase_and_round_findings_are_phased_per_phase). We open the next round for
+        // that SAME phase index (1) — index and materialized phase now agree, no ambiguity.
+        let first = create_task(
+            &mut conn,
+            &project.id,
+            "rework in round 1.1",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                phase_name: Some("Delivery".to_string()),
+                round: Some(1),
+                ..NewTaskInput::review(TASK_SEVERITY_MEDIUM)
+            },
+        )
+        .unwrap();
+        assert_eq!(first.phase, Some(1), "\"Delivery\" materializes as phase 1");
+
+        // next_round_for_phase(1) must INCREMENT over the existing round-1 finding → 2 (rendered
+        // "1.2"). The assert would FAIL (return 1) if the phase index were wrong or the increment
+        // broke — so it no longer passes by coincidence.
+        let round = next_round_for_phase(&mut conn, &spec.id, 1).unwrap();
+        assert_eq!(
+            round, 2,
+            "the next rework of phase 1 increments per-phase (1 → 2, rendered \"1.2\")"
+        );
+        let finding = create_task(
+            &mut conn,
+            &project.id,
+            "rework in round 1.2",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                phase_name: Some("Delivery".to_string()),
+                round: Some(round),
+                ..NewTaskInput::review(TASK_SEVERITY_MEDIUM)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            finding.phase,
+            Some(1),
+            "the rework finding is rattached to phase 1 (locks phase↔round: label \"1.2\")"
+        );
+        assert_eq!(
+            finding.round,
+            Some(2),
+            "the rework pass is round 2 of its phase (the per-phase increment, not a coincidental 1)"
+        );
+        transition_task(&mut conn, &finding.id, TaskTransition::Start, None).unwrap();
+        let done = transition_task(&mut conn, &finding.id, TaskTransition::Done, None).unwrap();
+        assert_eq!(
+            done.status, TASK_STATUS_DONE,
+            "the coder works the round to done in place — no Spec transition needed"
+        );
+    }
+
+    /// DONE-CRITERION (v2.5.11 Phase 2, task 01KXR1CY66H2ZJKH58K7KYM7DG "Grill des retours" +
+    /// review follow-up #31 "grill collapse"): a review finding walks proposed → structured ON
+    /// `tasks kind=review` (the cutover off the deprecated `review_tasks` grill). STRUCTURE is the
+    /// AGENT's step ([`structure_finding`], via MCP) and its FINAL step: a `structured` finding is
+    /// coder-ready ([`Task::is_finding_ready_for_coder`]) — the human-only `validated` state was
+    /// dropped (a finding is agent-owned; the agent's structured finding IS the capture).
+    #[test]
+    fn finding_grill_proposed_structured_on_tasks_kind_review() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // A finding captured raw: kind=review, grill_state=proposed (the grill's FIRST step).
+        let finding = create_task(
+            &mut conn,
+            &project.id,
+            "raw retour",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                from_comment_id: Some("c1".to_string()),
+                grill_state: Some(GRILL_PROPOSED.to_string()),
+                ..NewTaskInput::review(TASK_SEVERITY_LOW)
+            },
+        )
+        .unwrap();
+        assert_eq!(finding.grill_state.as_deref(), Some(GRILL_PROPOSED));
+        assert!(
+            !finding.is_finding_ready_for_coder(),
+            "a proposed finding is NOT ready for the coder"
+        );
+
+        // STRUCTURE (AGENT): proposed → structured, rewriting title/details/severity. This is the
+        // FINAL grill step — a structured finding is READY for the coder (no validate step).
+        let structured = structure_finding(
+            &mut conn,
+            &finding.id,
+            "Login path is fragile",
+            Some("harden the token refresh"),
+            Some(Some(TASK_SEVERITY_HIGH)),
+        )
+        .unwrap()
+        .expect("a proposed finding is structurable");
+        assert_eq!(structured.grill_state.as_deref(), Some(GRILL_STRUCTURED));
+        assert_eq!(structured.title, "Login path is fragile");
+        assert_eq!(
+            structured.description.as_deref(),
+            Some("harden the token refresh"),
+            "the agent's structured detail lands in `description`"
+        );
+        assert_eq!(structured.severity.as_deref(), Some(TASK_SEVERITY_HIGH));
+        assert!(
+            structured.is_finding_ready_for_coder(),
+            "a structured finding IS ready for the coder (the grill's final state)"
+        );
+
+        // The agent may RE-structure a structured finding (there is no `validated` lock to reopen);
+        // it stays `structured` with the refined title.
+        let refined = structure_finding(&mut conn, &finding.id, "Sharper title", None, None)
+            .unwrap()
+            .expect("re-structuring a structured finding is allowed");
+        assert_eq!(refined.grill_state.as_deref(), Some(GRILL_STRUCTURED));
+        assert_eq!(refined.title, "Sharper title");
+
+        // The grill step does not touch a NON-review task (a plain slice is never a finding).
+        let slice = create_task(
+            &mut conn,
+            &project.id,
+            "Slice",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                ..NewTaskInput::slice()
+            },
+        )
+        .unwrap();
+        assert!(
+            structure_finding(&mut conn, &slice.id, "x", None, None)
+                .unwrap()
+                .is_none(),
+            "structure_finding only grills a kind=review finding"
+        );
+        assert!(
+            !slice.is_finding_ready_for_coder(),
+            "a slice is never a coder-ready finding"
+        );
+    }
+
+    /// DONE-CRITERION (v2.5.11 Phase 2, task 01KXR1CYNX7X502QK6VVG6AEXX "Comment↔task 1→N +
+    /// résolution"): ONE comment promotes N `tasks kind=review` findings (the CUTOVER off
+    /// `review_tasks` — [`promote_comment_to_finding`] writes a `tasks` row, read via
+    /// [`list_grilled_findings_for_spec`], NOT [`list_review_tasks`]); the comment↔task link is
+    /// read BOTH ways (comment→findings via [`findings_for_comment`], finding→comment via
+    /// `task.from_comment_id`); and a comment RESOLVES (HUMAN-ONLY) only once its findings are done.
+    #[test]
+    fn comment_links_n_findings_both_ways_and_resolves_when_done() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // A spec-scoped HUMAN comment (a reviewer/chat retour).
+        let comment = insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                spec_id: Some(spec.id.clone()),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                body: "the login path is fragile".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // 1→N: the SAME comment promotes TWO findings, each a `tasks kind=review` row on the Spec.
+        let f1 = promote_comment_to_finding(&mut conn, &comment, "harden token refresh", None)
+            .expect("promote #1");
+        let f2 = promote_comment_to_finding(
+            &mut conn,
+            &comment,
+            "add a regression test",
+            Some(TASK_SEVERITY_MEDIUM),
+        )
+        .expect("promote #2");
+        assert_eq!(f1.kind, TASK_KIND_REVIEW);
+        assert_eq!(
+            f1.grill_state.as_deref(),
+            Some(GRILL_PROPOSED),
+            "a fresh promotion is proposed"
+        );
+
+        // Reverse side (finding → comment): each finding points back to its source comment.
+        assert_eq!(f1.from_comment_id.as_deref(), Some(comment.id.as_str()));
+        assert_eq!(f2.from_comment_id.as_deref(), Some(comment.id.as_str()));
+
+        // Forward side (comment → findings): both findings are read back from the comment (1→N).
+        let linked = findings_for_comment(&mut conn, &comment.id).unwrap();
+        assert_eq!(linked.len(), 2, "one comment → N findings");
+        let ids: std::collections::HashSet<&str> = linked.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(f1.id.as_str()) && ids.contains(f2.id.as_str()));
+
+        // The CUTOVER read: the grilled findings of the Spec are the two `tasks kind=review` rows
+        // (sourced from `tasks`, not `review_tasks`).
+        let grilled = list_grilled_findings_for_spec(&mut conn, &spec.id).unwrap();
+        assert_eq!(
+            grilled.len(),
+            2,
+            "grilled findings read off tasks kind=review"
+        );
+
+        // RESOLUTION guard: while a finding is still open, the comment CANNOT be resolved.
+        assert!(
+            matches!(
+                resolve_review_comment_when_findings_done(&mut conn, &comment.id),
+                Err(ResolveCommentError::FindingsNotDone { pending: 2 })
+            ),
+            "a comment with pending findings is refused (2 pending)"
+        );
+
+        // The agent closes the findings through the plain `done` path (a finding is agent-closable,
+        // v24 — no per-finding human-only gate). A finding must be started before it can be closed
+        // (done source = in_progress). One still open → still refused (1 pending).
+        transition_task(&mut conn, &f1.id, TaskTransition::Start, None).unwrap();
+        transition_task(&mut conn, &f1.id, TaskTransition::Done, None).unwrap();
+        assert!(
+            matches!(
+                resolve_review_comment_when_findings_done(&mut conn, &comment.id),
+                Err(ResolveCommentError::FindingsNotDone { pending: 1 })
+            ),
+            "one finding still open → still refused (1 pending)"
+        );
+
+        // Both findings done → the comment resolves, stamped HUMAN (comment resolution is human-only).
+        transition_task(&mut conn, &f2.id, TaskTransition::Start, None).unwrap();
+        transition_task(&mut conn, &f2.id, TaskTransition::Done, None).unwrap();
+        let resolved = resolve_review_comment_when_findings_done(&mut conn, &comment.id)
+            .expect("all findings done → the comment resolves");
+        assert_eq!(resolved.status, COMMENT_STATUS_RESOLVED);
+        assert_eq!(
+            resolved.resolved_by_type.as_deref(),
+            Some(AUTHOR_HUMAN),
+            "resolution is HUMAN-ONLY (stamped human)"
+        );
+
+        // A comment with NO linked findings resolves freely (backwards compatible).
+        let plain = insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                spec_id: Some(spec.id.clone()),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                body: "nit".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plain_resolved = resolve_review_comment_when_findings_done(&mut conn, &plain.id)
+            .expect("a comment with no findings resolves freely");
+        assert_eq!(plain_resolved.status, COMMENT_STATUS_RESOLVED);
+    }
+
+    /// DONE-CRITERION (v2.5.11 review follow-up, finding 01KXZYWGBQEJZ9BM39NYGFKHMJ): a comment is
+    /// resolved BY ITS AUTHOR — [`resolve_agent_comment`] closes an `author_type=agent` comment
+    /// (stamped `resolved_by_type=agent`) but REFUSES an `author_type=human` one
+    /// ([`ResolveAgentCommentError::HumanOnly`]), which stays human-only.
+    #[test]
+    fn agent_resolves_its_own_comment_and_is_refused_on_a_human_comment() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        let mk = |conn: &mut SqliteConnection, author: &str| {
+            insert_review_comment(
+                conn,
+                NewComment {
+                    workspace_id: "ws".into(),
+                    repository_id: "repo".into(),
+                    spec_id: Some(spec.id.clone()),
+                    author_type: author.into(),
+                    author_name: "who".into(),
+                    body: "note".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        // The agent resolves its OWN (author=agent) comment — stamped `resolved_by_type=agent`.
+        let agent_comment = mk(&mut conn, AUTHOR_AGENT);
+        let resolved = resolve_agent_comment(&mut conn, &agent_comment.id)
+            .expect("the agent resolves its own comment");
+        assert_eq!(resolved.status, COMMENT_STATUS_RESOLVED);
+        assert_eq!(resolved.resolved_by_type.as_deref(), Some(AUTHOR_AGENT));
+
+        // A HUMAN comment is refused (human-only): the agent cannot resolve it.
+        let human_comment = mk(&mut conn, AUTHOR_HUMAN);
+        assert!(
+            matches!(
+                resolve_agent_comment(&mut conn, &human_comment.id),
+                Err(ResolveAgentCommentError::HumanOnly)
+            ),
+            "a human comment is human-only — the agent's resolve is refused"
+        );
+        // …and it stays open (the refusal wrote nothing).
+        let still = get_review_comment(&mut conn, &human_comment.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still.status, COMMENT_STATUS_OPEN);
+
+        // An unknown id is a clean NotFound (not a panic).
+        assert!(matches!(
+            resolve_agent_comment(&mut conn, "nope"),
+            Err(ResolveAgentCommentError::NotFound)
+        ));
+    }
+
+    /// DONE-CRITERION (v2.5.11 review follow-up, F1 01KXZP1NYQ2T11Y9WPYC22C5VR + F2
+    /// 01KXZP1PEAQ6V2R5DCQGMSY9MG): a retour-finding is PHASED to the LAST DELIVERED phase (F1) and
+    /// ROUNDED to the phase's OPEN pass (F2), so the rework it triggers ENTERS the rail gauge (an
+    /// un-phased finding is EXCLUDED, `overlay-status.ts`). "ONE PASS = ONE round": every finding
+    /// raised in the SAME open pass — across comments — SHARES the round; a NEW pass, opened only
+    /// AFTER the prior round's findings are resolved, gets the phase's NEXT round (N.1 → N.2). A FLAT
+    /// Spec (no phase plan) has no delivered phase, so its findings stay un-phased / round 0.
+    #[test]
+    fn promote_phases_and_rounds_the_finding_one_pass_one_round() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // A plan slice materializes phase 1 ("Delivery") and is DELIVERED (done) — so phase 1 is the
+        // LAST DELIVERED phase (F1), the phase under review a retour rattaches to.
+        let slice = create_task(
+            &mut conn,
+            &project.id,
+            "Build delivery",
+            NewTaskInput {
+                spec_id: Some(spec.id.clone()),
+                phase_name: Some("Delivery".to_string()),
+                ..NewTaskInput::slice()
+            },
+        )
+        .unwrap();
+        transition_task(&mut conn, &slice.id, TaskTransition::Start, None).unwrap();
+        transition_task(&mut conn, &slice.id, TaskTransition::Done, None).unwrap();
+        assert_eq!(
+            current_phase_for_spec(&mut conn, &spec.id).unwrap(),
+            Some((1, "Delivery".to_string())),
+            "the last delivered phase is 1 (its slice is done)"
+        );
+
+        let human_comment = |conn: &mut SqliteConnection, body: &str| {
+            insert_review_comment(
+                conn,
+                NewComment {
+                    workspace_id: "ws".into(),
+                    repository_id: "repo".into(),
+                    spec_id: Some(spec.id.clone()),
+                    author_type: AUTHOR_HUMAN.into(),
+                    author_name: "Kris".into(),
+                    body: body.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        // ONE PASS, THREE findings across TWO comments — all SHARE round 1 ("1.1"). This reproduces
+        // the F2 bug scenario (3 retours took rounds 1/2/3) and asserts the FIX: they share a round.
+        let comment_a = human_comment(&mut conn, "retour A");
+        let a1 = promote_comment_to_finding(&mut conn, &comment_a, "A1", None).unwrap();
+        let a2 = promote_comment_to_finding(&mut conn, &comment_a, "A2", None).unwrap();
+        let comment_b = human_comment(&mut conn, "retour B");
+        let b1 = promote_comment_to_finding(&mut conn, &comment_b, "B1", None).unwrap();
+        assert_eq!(
+            [
+                (a1.phase, a1.round),
+                (a2.phase, a2.round),
+                (b1.phase, b1.round)
+            ],
+            [(Some(1), Some(1)); 3],
+            "3 findings of ONE open pass (even across comments) SHARE phase 1's round 1 (\"1.1\")"
+        );
+
+        // RESOLVE the whole pass (the round's findings become terminal) — the round is now CLOSED.
+        for id in [&a1.id, &a2.id, &b1.id] {
+            transition_task(&mut conn, id, TaskTransition::Start, None).unwrap();
+            transition_task(&mut conn, id, TaskTransition::Done, None).unwrap();
+        }
+
+        // A NEW pass AFTER the prior round resolved opens phase 1's NEXT round → "1.2" (round+1).
+        let comment_c = human_comment(&mut conn, "retour C");
+        let c1 = promote_comment_to_finding(&mut conn, &comment_c, "C1", None).unwrap();
+        assert_eq!(
+            (c1.phase, c1.round),
+            (Some(1), Some(2)),
+            "a NEW pass (prior round resolved) opens phase 1's next round → \"1.2\""
+        );
+
+        // FLAT Spec (no phase plan): a retour has no delivered phase to rattach to → un-phased.
+        let (flat, _) = create_spec(&mut conn, &project.id, "Flat", SpecSections::empty()).unwrap();
+        let flat_comment = insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                spec_id: Some(flat.id.clone()),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                body: "flat retour".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let flat_finding =
+            promote_comment_to_finding(&mut conn, &flat_comment, "flat", None).unwrap();
+        assert_eq!(
+            (flat_finding.phase, flat_finding.round),
+            (None, None),
+            "a flat Spec (no phase plan) keeps the finding un-phased / round 0"
+        );
+    }
+
+    /// The in_review FALLBACK (v2.5.11 Phase 3, finding 01KXZF3R620DNB7RBCJ8H38FWW): once every plan
+    /// slice is DONE (the usual in_review state), a retour STILL rattaches to a phase — the LAST
+    /// phase of the plan (the one just delivered / under review) — so it is NEVER Unphased (which the
+    /// rail gauge excludes). Without this the FIRST retour of an in_review Spec would be lost.
+    #[test]
+    fn promote_falls_back_to_last_phase_when_the_plan_is_all_done() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // A two-phase plan; drive EVERY slice to done (the in_review state — no open work left).
+        for (title, phase) in [("Deliver", "Delivery"), ("Harden", "Hardening")] {
+            let slice = create_task(
+                &mut conn,
+                &project.id,
+                title,
+                NewTaskInput {
+                    spec_id: Some(spec.id.clone()),
+                    phase_name: Some(phase.to_string()),
+                    ..NewTaskInput::slice()
+                },
+            )
+            .unwrap();
+            transition_task(&mut conn, &slice.id, TaskTransition::Start, None).unwrap();
+            transition_task(&mut conn, &slice.id, TaskTransition::Done, None).unwrap();
+        }
+        // No open work → the current phase FALLS BACK to the last phase of the plan (2 = Hardening).
+        assert_eq!(
+            current_phase_for_spec(&mut conn, &spec.id).unwrap(),
+            Some((2, "Hardening".to_string())),
+            "with the plan all done, the current phase is the LAST phase (under review)"
+        );
+        let comment = insert_review_comment(
+            &mut conn,
+            NewComment {
+                workspace_id: "ws".into(),
+                repository_id: "repo".into(),
+                spec_id: Some(spec.id.clone()),
+                author_type: AUTHOR_HUMAN.into(),
+                author_name: "Kris".into(),
+                body: "late retour".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let finding = promote_comment_to_finding(&mut conn, &comment, "late", None).unwrap();
+        assert_eq!(
+            (finding.phase, finding.round),
+            (Some(2), Some(1)),
+            "the retour is PHASED to the last phase and opens its first round (\"2.1\") — never Unphased"
+        );
+    }
+
+    /// F1 (finding 01KXZP1NYQ2T11Y9WPYC22C5VR): `current_phase_for_spec` resolves the LAST DELIVERED
+    /// phase (a look BACKWARD), NEVER the first phase with open work (a look forward). STEPPED (phases
+    /// 1 & 2 done, 3 & 4 todo) → phase 2 (the phase under review), NOT phase 3 (future / un-coded —
+    /// the bug). AUTOPILOT (every phase done) → the last phase.
+    #[test]
+    fn current_phase_is_the_last_delivered_stepped_then_autopilot() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        // Four-phase plan; phases 1 & 2 DELIVERED (done), 3 & 4 still TODO — the stepped shape.
+        let slices: Vec<(&str, Task)> = ["One", "Two", "Three", "Four"]
+            .iter()
+            .map(|phase| {
+                let t = create_task(
+                    &mut conn,
+                    &project.id,
+                    phase,
+                    NewTaskInput {
+                        spec_id: Some(spec.id.clone()),
+                        phase_name: Some(phase.to_string()),
+                        ..NewTaskInput::slice()
+                    },
+                )
+                .unwrap();
+                (*phase, t)
+            })
+            .collect();
+        let deliver = |conn: &mut SqliteConnection, id: &str| {
+            transition_task(conn, id, TaskTransition::Start, None).unwrap();
+            transition_task(conn, id, TaskTransition::Done, None).unwrap();
+        };
+        for (phase, t) in &slices {
+            if *phase == "One" || *phase == "Two" {
+                deliver(&mut conn, &t.id);
+            }
+        }
+        // STEPPED: last delivered = 2, NOT 3 (the first phase with open work — never point forward).
+        assert_eq!(
+            current_phase_for_spec(&mut conn, &spec.id).unwrap(),
+            Some((2, "Two".to_string())),
+            "stepped: the retour phase is the last DELIVERED (2), never the first OPEN (3)"
+        );
+
+        // AUTOPILOT: deliver the rest → every phase delivered → the LAST phase (4).
+        for (phase, t) in &slices {
+            if *phase == "Three" || *phase == "Four" {
+                deliver(&mut conn, &t.id);
+            }
+        }
+        assert_eq!(
+            current_phase_for_spec(&mut conn, &spec.id).unwrap(),
+            Some((4, "Four".to_string())),
+            "autopilot: all delivered → the last phase (4)"
+        );
+    }
+
+    /// F5 lifecycle (finding 01KXZP1PY71W5P4N3VYJBHP91G): `specs.reviewing_phase` is POSED at the
+    /// entry into `in_review` (= the last delivered phase, F1) and CLEARED when the review ends
+    /// (`done` — the advance out of review).
+    #[test]
+    fn reviewing_phase_posed_at_in_review_and_cleared_on_done() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", complete_sections()).unwrap();
+
+        // Two DELIVERED phases (1 & 2 done) → the last delivered phase is 2.
+        for phase in ["One", "Two"] {
+            let t = create_task(
+                &mut conn,
+                &project.id,
+                phase,
+                NewTaskInput {
+                    spec_id: Some(spec.id.clone()),
+                    phase_name: Some(phase.to_string()),
+                    ..NewTaskInput::slice()
+                },
+            )
+            .unwrap();
+            transition_task(&mut conn, &t.id, TaskTransition::Start, None).unwrap();
+            transition_task(&mut conn, &t.id, TaskTransition::Done, None).unwrap();
+        }
+        let reviewing_phase = |conn: &mut SqliteConnection| {
+            get_spec(conn, &spec.id).unwrap().unwrap().reviewing_phase
+        };
+
+        // Not under review yet → reviewing_phase is NULL.
+        assert_eq!(
+            reviewing_phase(&mut conn),
+            None,
+            "a draft carries no reviewing_phase"
+        );
+
+        // draft → ready → in_progress → in_review.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Review, false).unwrap();
+        assert_eq!(
+            reviewing_phase(&mut conn),
+            Some(2),
+            "reviewing_phase is posed to the last delivered phase (2) at in_review entry"
+        );
+
+        // done → the review episode ends → reviewing_phase cleared.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Done, true).unwrap();
+        assert_eq!(
+            reviewing_phase(&mut conn),
+            None,
+            "reviewing_phase is cleared when the review ends (done)"
+        );
+    }
+
+    /// F5 precedence (finding 01KXZP1PY71W5P4N3VYJBHP91G): the finding's phase is resolved by
+    /// PRECEDENCE — an explicit override > the stored `reviewing_phase` (while `in_review`) > the
+    /// derived last-delivered phase (F1). Proven by making each rung DIFFER from the next.
+    #[test]
+    fn finding_phase_precedence_explicit_then_stored_then_derived() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", complete_sections()).unwrap();
+
+        // Phases One(1) & Two(2) DELIVERED, Three(3) present-but-todo (a real plan phase to override
+        // onto). Derived last-delivered = 2.
+        for (phase, done) in [("One", true), ("Two", true), ("Three", false)] {
+            let t = create_task(
+                &mut conn,
+                &project.id,
+                phase,
+                NewTaskInput {
+                    spec_id: Some(spec.id.clone()),
+                    phase_name: Some(phase.to_string()),
+                    ..NewTaskInput::slice()
+                },
+            )
+            .unwrap();
+            if done {
+                transition_task(&mut conn, &t.id, TaskTransition::Start, None).unwrap();
+                transition_task(&mut conn, &t.id, TaskTransition::Done, None).unwrap();
+            }
+        }
+        assert_eq!(
+            current_phase_for_spec(&mut conn, &spec.id).unwrap(),
+            Some((2, "Two".to_string())),
+            "the derived last-delivered phase is 2"
+        );
+        let comment = |conn: &mut SqliteConnection, body: &str| {
+            insert_review_comment(
+                conn,
+                NewComment {
+                    workspace_id: "ws".into(),
+                    repository_id: "repo".into(),
+                    spec_id: Some(spec.id.clone()),
+                    author_type: AUTHOR_HUMAN.into(),
+                    author_name: "Kris".into(),
+                    body: body.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        // (a) DERIVED (F1): NOT in_review + no stored reviewing_phase → last-delivered = 2 (autopilot
+        // fallback: nothing anchors it per-phase, so it retombes on the derived F1).
+        let c0 = comment(&mut conn, "derived");
+        let f0 = promote_comment_to_finding(&mut conn, &c0, "F0", None).unwrap();
+        assert_eq!(
+            f0.phase,
+            Some(2),
+            "no in_review anchor → the finding falls back to the derived F1 phase (2)"
+        );
+
+        // Drive to in_review → reviewing_phase posed to 2 (last delivered).
+        transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Review, false).unwrap();
+        // Force the STORED anchor to DIFFER from the derived (set it to 1) to prove stored wins.
+        diesel::update(specs::table.find(&spec.id))
+            .set(specs::reviewing_phase.eq(Some(1)))
+            .execute(&mut conn)
+            .unwrap();
+
+        // (b) STORED: in_review → the stored reviewing_phase (1) wins over the derived (2).
+        let c1 = comment(&mut conn, "stored");
+        let f1 = promote_comment_to_finding(&mut conn, &c1, "F1", None).unwrap();
+        assert_eq!(
+            f1.phase,
+            Some(1),
+            "in_review → the stored reviewing_phase (1) wins over the derived (2)"
+        );
+
+        // (c) EXPLICIT: an override (3) beats BOTH the stored (1) and the derived (2).
+        let c2 = comment(&mut conn, "explicit");
+        let f2 = promote_comment_to_finding_on_phase(&mut conn, &c2, "F2", None, Some(3)).unwrap();
+        assert_eq!(
+            f2.phase,
+            Some(3),
+            "an explicit override (3) beats the stored (1) and the derived (2)"
+        );
+    }
+
+    /// F6 (finding 01KXZP1RDSMWP7WYMV8FXQ9965): a phase name arriving HTML-ESCAPED is stored with the
+    /// REAL characters (no `&amp;` double-escape the overlay would render literally), a clean name
+    /// round-trips unchanged (no regression on a legitimate `&`), and the decoded name maps to the
+    /// SAME phase (get-or-create — no phantom phase).
+    #[test]
+    fn phase_name_html_entities_are_decoded_no_double_escape() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty()).unwrap();
+
+        let slice = |conn: &mut SqliteConnection, title: &str, phase: &str| {
+            create_task(
+                conn,
+                &project.id,
+                title,
+                NewTaskInput {
+                    spec_id: Some(spec.id.clone()),
+                    phase_name: Some(phase.to_string()),
+                    ..NewTaskInput::slice()
+                },
+            )
+            .unwrap()
+        };
+        let phases =
+            |conn: &mut SqliteConnection| get_spec(conn, &spec.id).unwrap().unwrap().phases;
+
+        // An HTML-escaped phase name is stored DECODED (the real `&`), never `&amp;`.
+        let escaped = slice(&mut conn, "t1", "Column model &amp; visibility");
+        assert_eq!(escaped.phase, Some(1));
+        let p1 = phases(&mut conn);
+        assert!(
+            p1.contains("Column model & visibility"),
+            "the phase name is stored DECODED: {p1}"
+        );
+        assert!(
+            !p1.contains("&amp;"),
+            "no &amp; double-escape in storage: {p1}"
+        );
+
+        // The SAME phase passed CLEAN reuses phase 1 (get-or-create — the decode makes them match).
+        let clean = slice(&mut conn, "t2", "Column model & visibility");
+        assert_eq!(
+            clean.phase,
+            Some(1),
+            "the decoded name maps to the SAME phase (no phantom phase)"
+        );
+
+        // No regression: a legitimate `&` (not part of an entity) is preserved as-is.
+        let legit = slice(&mut conn, "t3", "R&D");
+        assert_eq!(legit.phase, Some(2));
+        let p2 = phases(&mut conn);
+        assert!(
+            p2.contains("R&D") && !p2.contains("R&amp;D"),
+            "a legitimate `&` is preserved (no over-escaping): {p2}"
+        );
+    }
+
+    /// F6 unit (finding 01KXZP1RDSMWP7WYMV8FXQ9965): `decode_basic_html_entities` decodes the basic
+    /// named entities, is idempotent on clean text, and decodes `&amp;` LAST so `&amp;lt;` (the
+    /// literal text `&lt;`) is not over-decoded to `<`.
+    #[test]
+    fn decode_basic_html_entities_decodes_and_orders_amp_last() {
+        assert_eq!(decode_basic_html_entities("clean text"), "clean text");
+        assert_eq!(decode_basic_html_entities("a & b"), "a & b");
+        assert_eq!(decode_basic_html_entities("a &amp; b"), "a & b");
+        assert_eq!(decode_basic_html_entities("&lt;tag&gt;"), "<tag>");
+        assert_eq!(
+            decode_basic_html_entities("q&quot;s&#39;t&apos;u"),
+            "q\"s't'u"
+        );
+        // `&amp;` decoded LAST: `&amp;lt;` is the literal `&lt;`, not `<`.
+        assert_eq!(decode_basic_html_entities("&amp;lt;"), "&lt;");
+    }
+
     /// H6: a FORK emits a `spec.forked` domain event carrying the base (`from`) and new
     /// (`to`) revision numbers, so a forked revision becomes VISIBLE in the Activity feed
     /// (`fork_spec` emitted no event before — the F4 coverage gap).
@@ -10037,6 +11650,16 @@ mod tests {
         let mut conn = open_in_memory();
         // Peel v15 (specs.workspace_id index) then v14 (tasks/task_dependencies); both must
         // succeed. Each revert drops the current last link.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v25 (tasks grill drop validated) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v24 (tasks drop origin) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v23 (specs reviewing_phase) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v22 (tasks round) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v21 (tasks review-finding fields) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -10406,6 +12029,16 @@ mod tests {
         // domain_events) then v11 (data backfill) then v10 (canonical structure). After
         // this, `workspaces.root_path` does NOT exist yet (`path` does), and `projects` has
         // no `key`/`primary_workspace_id`.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v25 (tasks grill drop validated) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v24 (tasks drop origin) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v23 (specs reviewing_phase) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v22 (tasks round) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v21 (tasks review-finding fields) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -11304,12 +12937,15 @@ mod tests {
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the projects migration (dirs #20 → #3),
-        // then the projects migration (dir #2) itself — 17 reverts in reverse order
+        // Peel every migration stacked above the projects migration (dirs #25 → #3),
+        // then the projects migration (dir #2) itself — 23 reverts in reverse order
         // (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task
         // domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added dir #20
-        // the agent_session_specs link table). projects must then be absent.
-        for _ in 0..18 {
+        // the agent_session_specs link table; v2.5.11 added dir #21 the tasks review-finding
+        // fields + dir #22 the tasks round + dir #23 the specs reviewing_phase + dir #24
+        // dropped the tasks.origin column + dir #25 dropped the `validated` grill state).
+        // projects must then be absent.
+        for _ in 0..23 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -12154,11 +13790,14 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Peel every migration stacked above the managed_commands migration (dirs
-        // #20 → #4), then the managed_commands migration (dir #3) itself — 16 reverts in
+        // #25 → #4), then the managed_commands migration (dir #3) itself — 22 reverts in
         // reverse order (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14
         // the task domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added
-        // dir #20 the agent_session_specs link table). managed_commands must then be absent.
-        for _ in 0..17 {
+        // dir #20 the agent_session_specs link table; v2.5.11 added dir #21 the tasks
+        // review-finding fields + dir #22 the tasks round + dir #23 the specs reviewing_phase
+        // + dir #24 dropped the tasks.origin column + dir #25 dropped the `validated` grill
+        // state). managed_commands must then be absent.
+        for _ in 0..22 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -12224,6 +13863,16 @@ mod tests {
         // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row + its v3
         // columns survive; the v4 columns are gone (a typed select of `unread` would now fail
         // to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v25 (tasks grill drop validated) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v24 (tasks drop origin) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v23 (specs reviewing_phase) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v22 (tasks round) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v21 (tasks review-finding fields) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -12406,6 +14055,16 @@ mod tests {
         // peels v15, v14, v13, v12, v11, v10, v9, v8, v7, then v5 (migrations revert in
         // reverse order). The instance row + its v3/v4 columns survive; the v5 columns are
         // gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v25 (tasks grill drop validated) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v24 (tasks drop origin) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v23 (specs reviewing_phase) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v22 (tasks round) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v21 (tasks review-finding fields) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -13684,6 +15343,16 @@ mod tests {
         // task domain) then v13 (v2.4 Phase 1 Spec domain) then v12 (v2.1 Phase 4
         // domain_events) then v11 (v2.1 data backfill) then v10 (v2.1 canonical structure)
         // then v9 (#11 project order) then v8 → the resume_agent_sessions column is gone.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v25 (tasks grill drop validated) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v24 (tasks drop origin) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v23 (specs reviewing_phase) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v22 (tasks round) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v21 (tasks review-finding fields) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v20 (agent_session_specs) cleanly");
         conn.revert_last_migration(MIGRATIONS)

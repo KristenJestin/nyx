@@ -413,14 +413,16 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
             )
         })
         .expect("human comment");
+    // Promote onto the CANONICAL finding model (`tasks kind=review`, the v2.5.11 cutover) so the
+    // MCP `review_task_structure` (which routes to `db::structure_finding` on `tasks`) can grill it.
     let promoted = db
         .with_conn(|c| {
-            db::promote_comment_to_task(c, &comment, "consumer hangs without a timeout", None)
+            db::promote_comment_to_finding(c, &comment, "consumer hangs without a timeout", None)
         })
-        .expect("promote to task");
-    assert_eq!(promoted.grill_state, db::GRILL_PROPOSED);
+        .expect("promote to finding");
+    assert_eq!(promoted.grill_state.as_deref(), Some(db::GRILL_PROPOSED));
 
-    // The agent STRUCTURES the proposed task (proposed → structured), never validates it.
+    // The agent STRUCTURES the proposed finding (proposed → structured = coder-ready, #31).
     let structured = review_task_structure(
         &db,
         &json!({
@@ -468,9 +470,10 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
         bodies.iter().any(|b| b.contains("bounded recv timeout")),
         "agent reply in feed",
     );
+    // Findings are Spec-scoped since the cutover, so the list is read by `spec_id`.
     let review_tasks = review_task_list(
         &db,
-        &json!({ "workspace_id": workspace_id, "repository_id": repository_id }),
+        &json!({ "workspace_id": workspace_id, "repository_id": repository_id, "spec_id": sid }),
     )
     .expect("task list");
     assert_eq!(

@@ -71,6 +71,9 @@ function task(overrides: Partial<Task>): Task {
     created_at: 0,
     updated_at: 0,
     completed_at: null,
+    from_comment_id: null,
+    grill_state: null,
+    round: null,
     ...overrides,
   };
 }

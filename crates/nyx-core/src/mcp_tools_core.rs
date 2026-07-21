@@ -111,6 +111,13 @@ impl ToolOutcome {
             effects: vec![topic],
         }
     }
+    /// A mutating tool that touches MORE THAN ONE domain names every topic it invalidated, so the
+    /// shell pushes each `*://changed` (`emit_effects` iterates them). Used by the review FINDING
+    /// mutations, which touch BOTH the review feed (`Repos`, the viewer) AND the Spec's task list
+    /// (`Specs`, the terminal-spec overlay: a finding is a `tasks kind=review` row).
+    pub(crate) fn changed_many(result: Value, effects: Vec<ChangedTopic>) -> Self {
+        Self { result, effects }
+    }
 }
 
 // --- The shell's live-PTY terminal capability ------------------------------
@@ -702,8 +709,8 @@ pub fn review_comment_list(db: &Db, args: &Value) -> Result<Value, RpcError> {
 /// file_path?, side?, line_start?, line_end?, blob?, snippet?, context? }` → `{ comment }`. The
 /// v2.4 AGENT façade to annotate a review (task `01KX0F6HEBPK34CV49EREHK3Y9`). The author is
 /// ALWAYS `agent` — the human posts through the UI. The agent may leave a global/anchored
-/// comment OR a REPLY (`parent_id`), but there is DELIBERATELY no resolve tool: the agent NEVER
-/// resolves (resolution is human-only). Routes through the SHARED
+/// comment OR a REPLY (`parent_id`), and may resolve ITS OWN (agent) comments via
+/// [`review_comment_resolve`]; a HUMAN comment stays human-only. Routes through the SHARED
 /// [`crate::db::insert_review_comment`] (PDR-0005). An anchor is captured when a `file_path` is
 /// given; `line_end` defaults to `line_start`. Carries a `Repos` changed effect so an open
 /// review UI re-pulls the comment feed live (the agent's reply appears without a reload).
@@ -760,31 +767,71 @@ pub fn review_comment_post(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
     ))
 }
 
-/// `review_task_list` — `{ workspace_id, repository_id }` → `{ tasks }`. The v2.4 review
-/// TASK (finding = task) read model (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`, PDR-0012 — finding = task):
-/// the promoted-task list of a `(workspace, repository)` review, each with its `from_comment_id`,
-/// `title`, optional `severity`, and `grill_state` (proposed/structured/validated). Routes through
-/// the SHARED [`crate::db::list_review_tasks`] — the SAME model the UI bridge reads (PDR-0005).
-/// Read-only. The agent façade reads the whole repo's task list UNSCOPED (`spec_id = None`), like
-/// its unscoped `review_comment_list` — the per-Spec scoping (finding #53) is the UI façade's read.
+/// `review_comment_resolve` — `{ id }` → `{ comment }`. The AGENT resolves ITS OWN
+/// (`author_type=agent`) comment (v2.5.11 review follow-up finding `01KXZYWGBQEJZ9BM39NYGFKHMJ`). A
+/// comment is resolved BY ITS AUTHOR: this closes an agent comment (stamped `resolved_by_type=agent`)
+/// and REFUSES a HUMAN comment (`invalid_state`) — a human comment is human-only, closed through the
+/// human/UI façade (`review_comment_resolve` db-command). Routes through the SHARED
+/// [`crate::db::resolve_agent_comment`]. Carries a `Repos` changed effect so an open review UI
+/// re-pulls the feed live.
+pub fn review_comment_resolve(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let id = require_str(args, "id")?;
+    let comment = db
+        .with_conn(|c| crate::db::resolve_agent_comment(c, id))
+        .map_err(|e| match e {
+            crate::db::ResolveAgentCommentError::NotFound => {
+                RpcError::new(RpcCode::InvalidId, format!("unknown review comment {id}"))
+            }
+            crate::db::ResolveAgentCommentError::HumanOnly => RpcError::new(
+                RpcCode::InvalidState,
+                "this comment is human-authored: its resolution is HUMAN-ONLY. You resolve only \
+                 your OWN (agent) comments; reply to a human comment instead — the human validates \
+                 and closes it.",
+            ),
+            crate::db::ResolveAgentCommentError::Db(e) => internal_db(e),
+        })?;
+    Ok(ToolOutcome::changed(
+        json!({ "comment": comment }),
+        ChangedTopic::Repos,
+    ))
+}
+
+/// `review_task_list` — `{ workspace_id, repository_id, spec_id? }` → `{ tasks }`. The review
+/// FINDING read model, cut over to the CANONICAL `tasks kind=review` model (v2.5.11 Phase 2,
+/// PDR-0016 — NOT the deprecated `review_tasks` table): the GRILLED findings of a Spec, each with
+/// its `from_comment_id`, `title`, optional `severity`, and `grill_state`
+/// (proposed/structured; `structured` = coder-ready). Routes through the SHARED
+/// [`crate::db::list_grilled_findings_for_spec`], projected into the viewer wire shape
+/// ([`crate::db::ReviewFinding`]) — the SAME list the UI bridge reads. Read-only. Findings are
+/// SPEC-scoped, so the agent passes the `spec_id` it is reviewing; an unscoped call (no `spec_id`)
+/// returns an empty list (there is no repo-wide finding bucket once findings are `tasks`).
 pub fn review_task_list(db: &Db, args: &Value) -> Result<Value, RpcError> {
     let workspace_id = require_str(args, "workspace_id")?;
     let repository_id = require_str(args, "repository_id")?;
-    let tasks = db
-        .with_conn(|c| crate::db::list_review_tasks(c, workspace_id, repository_id, None))
-        .map_err(internal_db)?;
+    let spec_id = optional_str(args, "spec_id")?;
+    let tasks: Vec<crate::db::ReviewFinding> = match spec_id {
+        Some(sid) => db
+            .with_conn(|c| crate::db::list_grilled_findings_for_spec(c, sid))
+            .map_err(internal_db)?
+            .iter()
+            .map(|t| crate::db::ReviewFinding::from_task(t, workspace_id, repository_id))
+            .collect(),
+        None => Vec::new(),
+    };
     Ok(json!({ "tasks": tasks }))
 }
 
 /// `review_task_structure` — `{ id, title, details?, severity? }` → `{ task }`. The AGENT's
-/// step of the promotion "grill" (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`): the human lâche brut (a
-/// `proposed` task), the agent STRUCTURES it into a clean coder task (title + details + optional
-/// severity) and it moves to `structured`. The agent may structure but NEVER validate — there is
-/// DELIBERATELY no validate tool here (validation is human-only, symmetric to phase-4 human-only
-/// comment resolution). Routes through the SHARED [`crate::db::structure_task`] (PDR-0005),
-/// which also refuses to reopen an already-VALIDATED task. Carries a `Repos` changed effect so
-/// an open review UI re-pulls the task list + unread badge live. `invalid_id` when the task
-/// is unknown OR already validated (nothing to structure).
+/// step of the promotion "grill" (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`) — and its FINAL step: the agent
+/// captured the retour raw (a `proposed` finding), STRUCTURES it into a clean coder task (title +
+/// details + optional severity) and it moves to `structured`, which is READY for the coder. The grill
+/// collapsed to two states (review follow-up #31): there is no `validated` state and DELIBERATELY no
+/// validate tool. Routes through the SHARED [`crate::db::structure_finding`] — the CANONICAL finding
+/// model (`tasks kind=review`, v2.5.11 cutover, PDR-0016; NOT the deprecated `review_tasks` table).
+/// Carries `Repos` + `Specs` changed effects so BOTH the open review UI (viewer, `repos://changed`)
+/// AND the terminal-spec OVERLAY (`specs://changed` — a finding is a `tasks kind=review` row the
+/// overlay renders) re-pull the updated finding WITHOUT a reload (review F3). `invalid_id` when the
+/// finding is unknown or not a `kind=review` finding.
 pub fn review_task_structure(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let id = require_str(args, "id")?;
     let title = require_str(args, "title")?;
@@ -796,17 +843,88 @@ pub fn review_task_structure(db: &Db, args: &Value) -> Result<ToolOutcome, RpcEr
         Some(_) => Some(optional_str(args, "severity")?),
     };
     let task = db
-        .with_conn(|c| crate::db::structure_task(c, id, title, details, severity))
+        .with_conn(|c| crate::db::structure_finding(c, id, title, details, severity))
         .map_err(internal_db)?
         .ok_or_else(|| {
             RpcError::new(
                 RpcCode::InvalidId,
-                format!("no structurable task {id} (unknown or already validated)"),
+                format!("no structurable finding {id} (unknown or not a review finding)"),
             )
         })?;
-    Ok(ToolOutcome::changed(
+    Ok(ToolOutcome::changed_many(
         json!({ "task": task }),
-        ChangedTopic::Repos,
+        vec![ChangedTopic::Repos, ChangedTopic::Specs],
+    ))
+}
+
+/// `review_submit_feedback` — `{ workspace_id, repository_id, spec_id, body, title?, severity? }` →
+/// `{ comment, finding }`. The v2.5.11 RETOUR-CHAT channel (task `01KXR1CZ68C5S9CY2KFB073KDM`): the
+/// agent RELAYS the human's chat feedback into the review. It writes a HUMAN, GLOBAL (non-anchored)
+/// `review_comments` row — the human instructed the agent directly, so presence = authorization, no
+/// diff anchor needed — then immediately GRILLS it into a `proposed` `tasks kind=review` finding
+/// (agent-owned, closable by the coder loop like any finding) linked back via `from_comment_id`.
+/// This gives a chat retour the SAME path to review as the diff viewer (which stays a valid channel
+/// in parallel).
+/// Routes through the SHARED [`crate::db::insert_review_comment`] + [`crate::db::promote_comment_to_finding`].
+/// The comment is `author_type=human` even though it comes through the MCP (agent) façade — that is
+/// the whole point: the human is the author, the agent is only the relay. Carries `Repos` + `Specs`
+/// changed effects so BOTH the open review UI (viewer, `repos://changed` — the comment feed) AND the
+/// terminal-spec OVERLAY (`specs://changed` — the new finding is a `tasks kind=review` row it renders)
+/// re-pull WITHOUT a reload (review F3: a chat retour appears in the overlay live). `title` defaults to
+/// the feedback `body`.
+pub fn review_submit_feedback(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let workspace_id = require_str(args, "workspace_id")?;
+    let repository_id = require_str(args, "repository_id")?;
+    let spec_id = require_str(args, "spec_id")?;
+    let body = require_str(args, "body")?;
+    let title = optional_str(args, "title")?;
+    let severity = optional_str(args, "severity")?;
+    // OPTIONAL explicit phase attribution (F5): a positive phase number that OVERRIDES the stored
+    // `reviewing_phase` / derived last-delivered phase when rattaching the finding. Omitted = the
+    // default precedence applies.
+    let phase_override = optional_usize(args, "phase")?.map(|n| n as i32);
+
+    let (comment, finding) = db
+        .with_conn(
+            |c| -> diesel::QueryResult<(crate::db::ReviewComment, crate::db::Task)> {
+                use diesel::Connection;
+                // The comment + its finding commit ATOMICALLY (the inner `create_task` transaction
+                // nests as a savepoint) — a chat retour never leaves an orphan comment on failure.
+                c.transaction(|c| {
+                    // 1. The human's chat feedback → a HUMAN, GLOBAL (no anchor) review comment.
+                    let comment = crate::db::insert_review_comment(
+                        c,
+                        crate::db::NewComment {
+                            workspace_id: workspace_id.to_string(),
+                            repository_id: repository_id.to_string(),
+                            spec_id: Some(spec_id.to_string()),
+                            parent_id: None,
+                            author_type: crate::db::AUTHOR_HUMAN.to_string(),
+                            author_name: "You".to_string(),
+                            // GLOBAL: no anchor (file_path/line null) — presence = authorization.
+                            anchor: None,
+                            body: body.to_string(),
+                        },
+                    )?;
+                    // 2. Grill it into a `proposed` finding (agent-owned; the human provenance is on
+                    //    the comment). The optional `phase` overrides the finding's phase attribution (F5).
+                    let seed = title.unwrap_or(body);
+                    let finding = crate::db::promote_comment_to_finding_on_phase(
+                        c,
+                        &comment,
+                        seed,
+                        severity,
+                        phase_override,
+                    )?;
+                    Ok((comment, finding))
+                })
+            },
+        )
+        .map_err(internal_db)?;
+
+    Ok(ToolOutcome::changed_many(
+        json!({ "comment": comment, "finding": finding }),
+        vec![ChangedTopic::Repos, ChangedTopic::Specs],
     ))
 }
 
@@ -2151,17 +2269,25 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         // The v2.4 review COMMENT feed read model: the auto-threaded comments of a
         // (workspace, repository) — the SAME `db::list_review_comments` the UI bridge drives.
         crate::mcp::REVIEW_COMMENT_LIST_TOOL => read(review_comment_list(db, args)),
-        // The v2.4 review COMMENT post: the AGENT leaves a comment/reply (never resolves —
-        // there is no resolve tool). Mutating → carries a `Repos` changed effect so the UI
-        // re-pulls the feed. The SAME `db::insert_review_comment` the UI bridge drives.
+        // The v2.4 review COMMENT post: the AGENT leaves a comment/reply. Mutating → carries a
+        // `Repos` changed effect so the UI re-pulls the feed. The SAME `db::insert_review_comment`
+        // the UI bridge drives.
         crate::mcp::REVIEW_COMMENT_POST_TOOL => Some(review_comment_post(db, args)),
-        // The v2.4 review TASK (finding = task) list: the promoted-task list of a (workspace,
-        // repository) — the SAME `db::list_review_tasks` the UI bridge drives. Read-only.
+        // The v2.5.11 review COMMENT resolve: the AGENT closes ITS OWN (agent) comment; a HUMAN
+        // comment is refused (human-only). Mutating → `Repos` changed. Routes through
+        // `db::resolve_agent_comment` (the MCP counterpart of the human-only UI resolve).
+        crate::mcp::REVIEW_COMMENT_RESOLVE_TOOL => Some(review_comment_resolve(db, args)),
+        // The review FINDING list (v2.5.11 cutover): the GRILLED findings of a Spec — the SAME
+        // `db::list_grilled_findings_for_spec` (`tasks kind=review`, NOT `review_tasks`) the UI
+        // bridge drives. Read-only.
         crate::mcp::REVIEW_TASK_LIST_TOOL => read(review_task_list(db, args)),
-        // The v2.4 review TASK structure: the AGENT structures a proposed promotion (never
-        // validates — there is no validate tool). Mutating → carries a `Repos` changed effect so
-        // the UI re-pulls the task list + unread badge. The SAME `db::structure_task`.
+        // The review FINDING structure: the AGENT structures a proposed finding (never validates —
+        // there is no validate tool). Mutating → carries a `Repos` changed effect so the UI
+        // re-pulls the task list + unread badge. The SAME `db::structure_finding` (`tasks kind=review`).
         crate::mcp::REVIEW_TASK_STRUCTURE_TOOL => Some(review_task_structure(db, args)),
+        // The v2.5.11 RETOUR-CHAT channel: the agent relays the human's chat feedback into the
+        // review — a HUMAN global comment + a proposed finding. Mutating → `Repos` changed.
+        crate::mcp::REVIEW_SUBMIT_FEEDBACK_TOOL => Some(review_submit_feedback(db, args)),
         crate::mcp::LIST_IMPORTABLE_SCRIPTS_TOOL => read(list_importable_scripts(db, args)),
         // Project settings (rename + resume opt-in) — mutating → workspaces changed.
         crate::mcp::SET_PROJECT_SETTINGS_TOOL => Some(set_project_settings(db, args)),
@@ -2803,120 +2929,201 @@ mod tests {
         assert_eq!(comments[1]["parent_id"], json!(root_id));
     }
 
-    /// DONE-CRITERION (task 01KX0F6HEBPK34CV49EREHK3Y9): the agent NEVER resolves. Proof: the
-    /// dispatcher exposes NO `review_comment_resolve` tool (and no resolve tool of any name) to
-    /// MCP — the agent has post/reply, and resolution is reachable ONLY from the UI façade. An
-    /// attempt to dispatch a resolve tool falls through as an unknown tool (`None`).
+    /// DONE-CRITERION (v2.5.11 review follow-up finding 01KXZYWGBQEJZ9BM39NYGFKHMJ): a comment is
+    /// resolved BY ITS AUTHOR. The agent's `review_comment_resolve` MCP tool closes the agent's OWN
+    /// (author=agent) comment (stamped `resolved_by_type=agent`) and REFUSES a HUMAN comment
+    /// (`invalid_state` — human-only, closed through the UI façade). `review_comment_reopen` stays
+    /// NOT an MCP tool (a human-only undo).
     #[test]
-    fn mcp_agent_cannot_resolve_a_comment() {
+    fn mcp_agent_resolves_its_own_comment_and_is_refused_on_a_human_comment() {
         let _g = db_guard();
         let db = Db::in_memory();
         let runner = noop_runner();
         let host = NoTerminalHost;
         let activity = AgentActivityStore::new();
 
-        // No resolve tool of any name is dispatchable over MCP.
-        for name in ["review_comment_resolve", "review_comment_reopen"] {
-            let out = dispatch_extension_tool(
-                &db,
-                &runner,
-                &host,
-                &activity,
-                name,
-                &json!({ "id": "whatever" }),
-                None,
-            );
-            assert!(
-                out.is_none(),
-                "{name} must NOT be an MCP tool — the agent never resolves"
-            );
-        }
-
-        // The agent CAN post/reply (sanity: the façade it IS allowed is dispatchable).
-        let out = dispatch_extension_tool(
+        // The agent posts its OWN comment (author=agent) …
+        let posted = dispatch_extension_tool(
             &db,
             &runner,
             &host,
             &activity,
             crate::mcp::REVIEW_COMMENT_POST_TOOL,
-            &json!({ "workspace_id": "ws", "repository_id": "repo", "body": "hi" }),
+            &json!({ "workspace_id": "ws", "repository_id": "repo", "body": "nit: rename this" }),
             None,
+        )
+        .expect("review_comment_post IS an MCP tool")
+        .expect("post ok")
+        .result;
+        let agent_comment_id = posted["comment"]["id"].as_str().unwrap().to_string();
+
+        // … and resolves it via the MCP tool (author-owned resolution → resolved_by_type=agent).
+        let resolved = dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            crate::mcp::REVIEW_COMMENT_RESOLVE_TOOL,
+            &json!({ "id": agent_comment_id }),
+            None,
+        )
+        .expect("review_comment_resolve IS an MCP tool")
+        .expect("resolve ok")
+        .result;
+        assert_eq!(resolved["comment"]["status"], json!("resolved"));
+        assert_eq!(resolved["comment"]["resolved_by_type"], json!("agent"));
+
+        // A HUMAN comment is REFUSED (human-only). Seed one as the human directly.
+        let human_id = db
+            .with_conn(|c| {
+                crate::db::insert_review_comment(
+                    c,
+                    crate::db::NewComment {
+                        workspace_id: "ws".into(),
+                        repository_id: "repo".into(),
+                        spec_id: None,
+                        parent_id: None,
+                        author_type: crate::db::AUTHOR_HUMAN.into(),
+                        author_name: "You".into(),
+                        anchor: None,
+                        body: "human note".into(),
+                    },
+                )
+            })
+            .unwrap()
+            .id;
+        let refused = dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            crate::mcp::REVIEW_COMMENT_RESOLVE_TOOL,
+            &json!({ "id": human_id }),
+            None,
+        )
+        .expect("review_comment_resolve IS an MCP tool")
+        .expect_err("a human comment refuses agent resolution");
+        assert_eq!(
+            refused.code,
+            RpcCode::InvalidState,
+            "a human comment is human-only (invalid_state)"
         );
-        assert!(out.is_some(), "review_comment_post IS an MCP tool");
+
+        // The human-only UNDO stays off the MCP façade (no reopen tool).
+        assert!(
+            dispatch_extension_tool(
+                &db,
+                &runner,
+                &host,
+                &activity,
+                "review_comment_reopen",
+                &json!({ "id": "whatever" }),
+                None,
+            )
+            .is_none(),
+            "review_comment_reopen must NOT be an MCP tool (human-only undo)"
+        );
     }
 
-    /// The GRILL over MCP (task 01KX0F6JEKCEV2JCTMEBMM3P4Z): the agent STRUCTURES a proposed
-    /// task via `review_task_structure` and lists it via `review_task_list`. Proof: a
-    /// human-promoted (proposed) task is structured to a clean task, moves to `structured`,
-    /// carries the `Repos` changed effect, and shows in the list.
+    /// The GRILL over MCP, cut over to `tasks kind=review` (v2.5.11 Phase 2, PDR-0016): the agent
+    /// STRUCTURES a proposed FINDING via `review_task_structure` and lists it via
+    /// `review_task_list` (spec-scoped). Proof: a human-promoted (proposed) finding is structured
+    /// to a clean task, moves to `structured`, carries the `Repos` changed effect, and shows in the
+    /// Spec's grilled-findings list — all on the CANONICAL finding model, no `review_tasks` row.
     #[test]
     fn mcp_review_task_structure_and_list() {
         let _g = db_guard();
         let db = Db::in_memory();
 
-        // A human-promoted task (the DB layer models the human's "lâche brut").
-        let task = db
-            .with_conn(|c| {
+        // A project + Spec + a spec-scoped human comment, promoted to a `proposed` finding (the
+        // human's "lâche brut" now creates a `tasks kind=review` row, not a `review_tasks` row).
+        let (spec_id, finding) = db
+            .with_conn(|c| -> diesel::QueryResult<(String, crate::db::Task)> {
+                let (project, root) = crate::db::create_project(c, "Proj", "/work", None)?;
+                let (spec, _) = crate::db::create_spec(
+                    c,
+                    &project.id,
+                    "Spec",
+                    crate::db::SpecSections::empty(),
+                )?;
                 let comment = crate::db::insert_review_comment(
                     c,
                     crate::db::NewComment {
-                        workspace_id: "ws".into(),
+                        workspace_id: root.id.clone(),
                         repository_id: "repo".into(),
+                        spec_id: Some(spec.id.clone()),
                         author_type: crate::db::AUTHOR_HUMAN.into(),
                         author_name: "Kris".into(),
                         body: "fragile".into(),
                         ..Default::default()
                     },
                 )?;
-                crate::db::promote_comment_to_task(c, &comment, "fragile", None)
+                let finding = crate::db::promote_comment_to_finding(c, &comment, "fragile", None)?;
+                Ok((spec.id, finding))
             })
-            .expect("promote");
-        assert_eq!(task.grill_state, crate::db::GRILL_PROPOSED);
+            .expect("promote to a finding");
+        assert_eq!(finding.kind, crate::db::TASK_KIND_REVIEW);
+        assert_eq!(
+            finding.grill_state.as_deref(),
+            Some(crate::db::GRILL_PROPOSED)
+        );
 
-        // The AGENT structures it via MCP.
+        // The AGENT structures it via MCP (proposed → structured).
         let structured = review_task_structure(
             &db,
             &json!({
-                "id": task.id,
+                "id": finding.id,
                 "title": "Harden the fragile path",
                 "details": "Add validation + a test.",
                 "severity": "high",
             }),
         )
         .expect("structure");
-        assert_eq!(structured.effects, vec![ChangedTopic::Repos]);
+        // Mutating a finding invalidates BOTH the review viewer (Repos) AND the terminal-spec
+        // overlay (Specs — the finding is a `tasks kind=review` row it renders) so both re-pull
+        // WITHOUT a reload (review F3).
+        assert_eq!(
+            structured.effects,
+            vec![ChangedTopic::Repos, ChangedTopic::Specs]
+        );
         assert_eq!(
             structured.result["task"]["grill_state"],
             json!("structured")
         );
         assert_eq!(structured.result["task"]["severity"], json!("high"));
 
-        // It shows in the task list, still NOT validated (ready-for-coder is the human's call).
+        // It shows in the Spec's grilled-findings list as `structured` — coder-ready (the grill has
+        // no separate validate step, #31). The list is SPEC-scoped now (findings are `tasks`).
         let listed = review_task_list(
             &db,
-            &json!({ "workspace_id": "ws", "repository_id": "repo" }),
+            &json!({ "workspace_id": "ws", "repository_id": "repo", "spec_id": spec_id }),
         )
         .expect("list");
         let tasks = listed["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0]["grill_state"], json!("structured"));
+        assert_eq!(
+            tasks[0]["from_comment_id"],
+            finding.from_comment_id.unwrap()
+        );
     }
 
-    /// DONE-CRITERION guard-rail (task 01KX0F6JEKCEV2JCTMEBMM3P4Z): the agent NEVER validates a
-    /// task. Proof: the dispatcher exposes NO validate/promote tool of any name to MCP — the
-    /// agent has ONLY `review_task_list` (read) + `review_task_structure` (structure).
-    /// Validation (making a task ready for the coder) is reachable ONLY from the UI façade. This
-    /// is the task-side twin of `mcp_agent_cannot_resolve_a_comment` (phase-4 human-only
-    /// resolution).
+    /// DONE-CRITERION guard-rail (task 01KX0F6JEKCEV2JCTMEBMM3P4Z; grill collapse #31): the agent's
+    /// MCP surface exposes NO promote/validate/mark-read tool of any name — the agent has ONLY
+    /// `review_task_list` (read) + `review_task_structure` (structure, which makes a finding
+    /// coder-ready; the grill has no separate validate step). Promotion + comment resolution stay on
+    /// the UI façade. This is the task-side twin of `mcp_agent_cannot_resolve_a_comment` (phase-4
+    /// human-only resolution).
     #[test]
-    fn mcp_agent_cannot_validate_or_promote_a_task() {
+    fn mcp_agent_cannot_promote_or_mark_read_a_task() {
         let _g = db_guard();
         let db = Db::in_memory();
         let runner = noop_runner();
         let host = NoTerminalHost;
         let activity = AgentActivityStore::new();
 
-        // No validate/promote/mark-read tool of any name is dispatchable over MCP.
+        // No promote/validate/mark-read tool of any name is dispatchable over MCP (the collapsed
+        // grill has no validate tool at all).
         for name in [
             "review_task_validate",
             "review_task_promote",
@@ -2954,6 +3161,189 @@ mod tests {
             );
             assert!(out.is_some(), "{name} IS an MCP tool");
         }
+    }
+
+    /// DONE-CRITERION (v2.5.11 Phase 2, task 01KXR1CZ68C5S9CY2KFB073KDM "Retour-chat = canal de
+    /// review"): the agent relays the human's chat feedback via `review_submit_feedback` — it
+    /// creates a HUMAN, GLOBAL (non-anchored) comment and GRILLS it into a `proposed`
+    /// `tasks kind=review` finding (agent-owned; provenance lives on the comment's `author_type`, not
+    /// on the finding). The finding shows in the Spec's grilled-findings list; the diff-viewer
+    /// channel (`review_comment_post`) stays valid in parallel.
+    #[test]
+    fn mcp_review_submit_feedback_creates_a_human_global_grilled_finding() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+
+        // A project + Spec on a workspace (the finding lives on the Spec).
+        let (spec_id, ws_id) = db
+            .with_conn(|c| -> diesel::QueryResult<(String, String)> {
+                let (project, root) = crate::db::create_project(c, "Proj", "/work", None)?;
+                let (spec, _) = crate::db::create_spec(
+                    c,
+                    &project.id,
+                    "Spec",
+                    crate::db::SpecSections::empty(),
+                )?;
+                Ok((spec.id, root.id))
+            })
+            .unwrap();
+
+        // The agent relays the human's chat feedback.
+        let out = review_submit_feedback(
+            &db,
+            &json!({
+                "workspace_id": ws_id,
+                "repository_id": "repo",
+                "spec_id": spec_id,
+                "body": "the empty state looks broken",
+                "severity": "medium",
+            }),
+        )
+        .expect("submit feedback");
+        // The retour writes a comment (viewer, Repos) AND a finding = `tasks kind=review` (overlay,
+        // Specs), so it names BOTH topics → both surfaces re-pull without a reload (review F3).
+        assert_eq!(
+            out.effects,
+            vec![ChangedTopic::Repos, ChangedTopic::Specs],
+            "mutating a finding → Repos (viewer) + Specs (overlay) changed"
+        );
+
+        // The COMMENT is HUMAN + GLOBAL (no anchor — presence = authorization).
+        let comment = &out.result["comment"];
+        assert_eq!(comment["author_type"], json!(crate::db::AUTHOR_HUMAN));
+        assert!(
+            comment["file_path"].is_null(),
+            "global comment — no file anchor"
+        );
+        assert!(
+            comment["line_start"].is_null(),
+            "global comment — no line anchor"
+        );
+        assert_eq!(comment["body"], json!("the empty state looks broken"));
+
+        // The FINDING is a `proposed` `tasks kind=review` linked to the comment (agent-owned — no
+        // `origin`; the human provenance is on the comment's author_type).
+        let finding = &out.result["finding"];
+        assert_eq!(finding["kind"], json!(crate::db::TASK_KIND_REVIEW));
+        assert_eq!(finding["grill_state"], json!(crate::db::GRILL_PROPOSED));
+        assert!(
+            finding.get("origin").is_none(),
+            "a finding carries NO origin (v24 — always agent-created)"
+        );
+        assert_eq!(finding["severity"], json!("medium"));
+        assert_eq!(finding["from_comment_id"], comment["id"]);
+        assert_eq!(finding["spec_id"], json!(spec_id));
+
+        // It shows in the Spec's grilled-findings list (the same list the viewer reads).
+        let listed = review_task_list(
+            &db,
+            &json!({ "workspace_id": ws_id, "repository_id": "repo", "spec_id": spec_id }),
+        )
+        .expect("list");
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["grill_state"], json!("proposed"));
+
+        // COEXISTENCE: the diff-viewer channel (agent anchored comment) still works in parallel.
+        let viewer = review_comment_post(
+            &db,
+            &json!({
+                "workspace_id": ws_id,
+                "repository_id": "repo",
+                "spec_id": spec_id,
+                "body": "nit on this line",
+                "file_path": "src/x.rs",
+                "line_start": 3,
+            }),
+        )
+        .expect("viewer channel still posts");
+        assert_eq!(
+            viewer.result["comment"]["file_path"],
+            json!("src/x.rs"),
+            "the viewer stays a valid (anchored) review channel alongside the chat retour"
+        );
+    }
+
+    /// DONE-CRITERION (v2.5.11 review follow-up, F5 01KXZP1PY71W5P4N3VYJBHP91G): the OPTIONAL `phase`
+    /// param on `review_submit_feedback` OVERRIDES the phase nyx would infer (the last delivered), so
+    /// a finding can be attributed to an explicit phase; omitting it falls back to the derived phase.
+    #[test]
+    fn mcp_review_submit_feedback_phase_param_overrides_the_derived_phase() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+
+        // A Spec with TWO plan phases: One(1) DELIVERED (done), Two(2) still open → the derived
+        // last-delivered phase is 1.
+        let (spec_id, ws_id) = db
+            .with_conn(|c| -> diesel::QueryResult<(String, String)> {
+                let (project, root) = crate::db::create_project(c, "Proj", "/work", None)?;
+                let (spec, _) = crate::db::create_spec(
+                    c,
+                    &project.id,
+                    "Spec",
+                    crate::db::SpecSections::empty(),
+                )?;
+                for (title, phase, done) in [("t1", "One", true), ("t2", "Two", false)] {
+                    let t = crate::db::create_task(
+                        c,
+                        &project.id,
+                        title,
+                        crate::db::NewTaskInput {
+                            spec_id: Some(spec.id.clone()),
+                            phase_name: Some(phase.to_string()),
+                            ..crate::db::NewTaskInput::slice()
+                        },
+                    )?;
+                    if done {
+                        crate::db::transition_task(
+                            c,
+                            &t.id,
+                            crate::db::TaskTransition::Start,
+                            None,
+                        )
+                        .expect("start");
+                        crate::db::transition_task(c, &t.id, crate::db::TaskTransition::Done, None)
+                            .expect("deliver");
+                    }
+                }
+                Ok((spec.id, root.id))
+            })
+            .unwrap();
+
+        // Without `phase`: the finding falls back to the DERIVED last-delivered phase (1).
+        let derived = review_submit_feedback(
+            &db,
+            &json!({
+                "workspace_id": ws_id,
+                "repository_id": "repo",
+                "spec_id": spec_id,
+                "body": "derived",
+            }),
+        )
+        .expect("submit");
+        assert_eq!(
+            derived.result["finding"]["phase"],
+            json!(1),
+            "no phase param → the finding falls back to the derived last-delivered phase (1)"
+        );
+
+        // With `phase=2`: the explicit param OVERRIDES the derived (1) → the finding lands on phase 2.
+        let overridden = review_submit_feedback(
+            &db,
+            &json!({
+                "workspace_id": ws_id,
+                "repository_id": "repo",
+                "spec_id": spec_id,
+                "body": "explicit",
+                "phase": 2,
+            }),
+        )
+        .expect("submit with phase");
+        assert_eq!(
+            overridden.result["finding"]["phase"],
+            json!(2),
+            "an explicit phase param overrides the derived phase → the finding lands on phase 2"
+        );
     }
 
     /// DONE-CRITERION (task 01KXN0HTAXXMXF3GXF4ACM2970): "Creer/editer un Spec via MCP l'ajoute

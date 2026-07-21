@@ -537,4 +537,60 @@ mod tests {
             "the only `changed` invalidation is on the `specs` topic"
         );
     }
+
+    /// done_criterion (review F3, 01KXZP1QDXCAQ54H1Z1QDGNY2C): a review-FINDING MUTATION via the MCP
+    /// tools pushes BOTH `repos://changed` (the review viewer feed) AND `specs://changed` (the
+    /// terminal-spec OVERLAY / Spec detail, where a finding shows as a `tasks kind=review` row that
+    /// `useSpecDetail` re-pulls on `specs`, NOT `repos`). Before the fix `review_submit_feedback`
+    /// named only `Repos`, so the overlay reflected a chat retour ONLY after a manual reload. Drives
+    /// the FULL sidecar chain: `dispatch` → `review_submit_feedback` returns
+    /// `ToolOutcome{ effects: [Repos, Specs] }` → `emit_effects` → two pushed invalidations.
+    #[test]
+    fn a_review_finding_mutation_pushes_repos_and_specs_changed_for_the_overlay() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let db = Arc::new(temp_db());
+        // A project (→ its root workspace) + a Spec to hang the finding on.
+        let (project, ws) = db
+            .with_conn(|c| db::create_project(c, "Proj", "/tmp/mcp-review", None))
+            .expect("project");
+        let spec_id = db
+            .with_conn(|c| {
+                db::create_spec(c, &project.id, "Spec", Default::default()).map(|(s, _)| s.id)
+            })
+            .expect("spec");
+
+        let disp = dispatcher(Arc::clone(&db), &buf);
+        let out = disp
+            .call(
+                "review_submit_feedback",
+                &serde_json::json!({
+                    "workspace_id": ws.id,
+                    "repository_id": "repo",
+                    "spec_id": spec_id,
+                    "body": "the empty state looks broken",
+                }),
+            )
+            .expect("review_submit_feedback succeeds");
+        assert_eq!(
+            out["finding"]["grill_state"], "proposed",
+            "the chat retour was grilled into a proposed finding"
+        );
+
+        let pushed = captured_events(&buf);
+        let changed: Vec<&str> = pushed
+            .iter()
+            .filter_map(|e| match e {
+                Event::Changed { topic } => Some(topic.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            changed.contains(&"repos"),
+            "the review mutation pushed `repos://changed` for the viewer, got: {changed:?}"
+        );
+        assert!(
+            changed.contains(&"specs"),
+            "the review mutation pushed `specs://changed` for the OVERLAY (finding = tasks kind=review), got: {changed:?}"
+        );
+    }
 }

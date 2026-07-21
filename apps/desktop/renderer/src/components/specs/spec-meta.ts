@@ -79,19 +79,38 @@ export function priorityMeta(priority: string): PriorityMeta {
   return PRIORITY_META[priority as SpecPriority] ?? PRIORITY_META.med;
 }
 
-/** The task-status dot colour — a design-system token, reused by the tasks tab. */
-export const TASK_STATUS_META: Record<TaskStatus, { label: string; dot: string }> = {
-  todo: { label: "To do", dot: "bg-muted-foreground/40" },
-  ready: { label: "Ready", dot: "bg-info" },
-  in_progress: { label: "In progress", dot: "bg-warning" },
-  blocked: { label: "Blocked", dot: "bg-destructive" },
-  in_review: { label: "In review", dot: "bg-info" },
-  done: { label: "Done", dot: "bg-success" },
-  cancelled: { label: "Cancelled", dot: "bg-muted-foreground/30" },
+/**
+ * The task-status DOT look — the ONE source of truth for the panel's dots (finding: complete
+ * status→colour model). Every colour is a design-system token; `struck` marks the statuses whose
+ * TITLE reads struck-through in the panel. The model, aligned on the validated `/tmp/colors.html`:
+ *   - `done`      = green (`success`), title struck.
+ *   - `in_progress` = amber (`warning`).
+ *   - `blocked`   = red (`destructive`).
+ *   - `todo`      = FULL grey (`muted-foreground/50`), not struck.
+ *   - `cancelled` (a skip stamps `cancelled`) = ATTENUATED grey (`muted-foreground/28`, weaker than
+ *     todo) + title struck ⇒ DISTINCT from todo (full grey, not struck) AND from done (green, struck).
+ *   - `ready` / `in_review` = info blue (transient authoring states, unchanged).
+ */
+export interface TaskStatusMeta {
+  readonly label: string;
+  /** A solid dot colour — a design-system token `bg-*` class. */
+  readonly dot: string;
+  /** Whether the task's TITLE renders struck-through (done OR cancelled/skipped). */
+  readonly struck: boolean;
+}
+
+export const TASK_STATUS_META: Record<TaskStatus, TaskStatusMeta> = {
+  todo: { label: "To do", dot: "bg-muted-foreground/50", struck: false },
+  ready: { label: "Ready", dot: "bg-info", struck: false },
+  in_progress: { label: "In progress", dot: "bg-warning", struck: false },
+  blocked: { label: "Blocked", dot: "bg-destructive", struck: false },
+  in_review: { label: "In review", dot: "bg-info", struck: false },
+  done: { label: "Done", dot: "bg-success", struck: true },
+  cancelled: { label: "Cancelled", dot: "bg-muted-foreground/28", struck: true },
 };
 
 /** Resolve a task-status meta from a raw wire string, defaulting to `todo`. */
-export function taskStatusMeta(status: string): { label: string; dot: string } {
+export function taskStatusMeta(status: string): TaskStatusMeta {
   return TASK_STATUS_META[status as TaskStatus] ?? TASK_STATUS_META.todo;
 }
 

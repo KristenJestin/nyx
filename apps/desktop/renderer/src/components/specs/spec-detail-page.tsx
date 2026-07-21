@@ -17,6 +17,7 @@ import { Tabs } from "@/components/ui/tabs";
 import { SpecSidebar } from "./spec-sidebar";
 import { specKey } from "./spec-meta";
 import { useSpecDetail } from "./use-spec-detail";
+import { useSpecReviewComments } from "./use-spec-review-comments";
 import { ActivityTab } from "./tabs/activity-tab";
 import { AnnexesTab } from "./tabs/annexes-tab";
 import { ReviewTab } from "./tabs/review-tab";
@@ -66,6 +67,10 @@ function tabCount(key: SpecTabKey, detail: SpecDetail): number | null {
 export function SpecDetailPage() {
   const { specId } = routeApi.useParams();
   const { detail, loading, error } = useSpecDetail(specId);
+  // The review comments' author map — the source a finding's provenance is derived from on the
+  // Tasks tab (an OPEN human comment also drives the panel's provenance). Called before the early
+  // returns (rules of hooks); a null workspace context fetches nothing.
+  const { authorByCommentId } = useSpecReviewComments(detail?.workspace_context ?? null, specId);
   const [tab, setTab] = useState<SpecTabKey>("spec");
 
   if (loading) {
@@ -148,7 +153,7 @@ export function SpecDetailPage() {
               <SpecTab detail={detail} />
             </Tabs.Panel>
             <Tabs.Panel value="tasks">
-              <TasksTab detail={detail} />
+              <TasksTab detail={detail} authorByCommentId={authorByCommentId} />
             </Tabs.Panel>
             <Tabs.Panel value="review" className="h-full">
               <ReviewTab detail={detail} />

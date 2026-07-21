@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
-use crate::mcp_runtime::{internal_db, optional_bool, optional_str, require_str};
+use crate::mcp_runtime::{internal_db, optional_bool, optional_str, optional_usize, require_str};
 use crate::mcp_tools_core::{ChangedTopic, ToolOutcome};
 
 // --- Tool name constants (advertised in `tools/list`, dispatched below) ------
@@ -411,6 +411,10 @@ pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     input.verification_command = optional_str(args, "verification_command")?.map(str::to_string);
     input.spec_id = optional_str(args, "spec_id")?.map(str::to_string);
     input.parent_task_id = optional_str(args, "parent_task_id")?.map(str::to_string);
+    // ROUND (v2.5.11): the rework sub-phase a finding is rattached to (PER-PHASE; the orchestrator
+    // opens it with `next_round_for_phase`). Omitted = the plan (round 0). A finding raised during
+    // rework carries its phase's current round so it reads "2.1", "4.1"…
+    input.round = optional_usize(args, "round")?.map(|r| r as i32);
     // `phase` is a phase NAME: nyx materializes the plan from the names in first-seen order
     // (get-or-create in `db::create_task`). It needs a Spec — the plan lives on the Spec.
     input.phase_name = optional_str(args, "phase")?.map(str::to_string);
@@ -542,6 +546,10 @@ pub fn worked_spec_id(name: &str, result: &Value) -> Option<String> {
         // A task tool returns `result.task`; its `spec_id` is the worked Spec (null = a
         // project-scoped task with no Spec → `None`, no mapping).
         TASK_ADD_TOOL | TASK_TRANSITION_TOOL => str_at(result, &["task", "spec_id"]),
+        // RETOUR-CHAT (v2.5.11): relaying the human's chat feedback CREATES a finding on the Spec —
+        // a work signal. It returns `result.finding`; its `spec_id` is the worked Spec. (This is the
+        // "extend the auto-map when a finding promotion verb is added" the PRD calls for.)
+        crate::mcp::REVIEW_SUBMIT_FEEDBACK_TOOL => str_at(result, &["finding", "spec_id"]),
         // Reads, non-Spec tools, and the non-work Spec tools never map.
         _ => None,
     }
@@ -634,6 +642,16 @@ mod tests {
         assert_eq!(
             worked_spec_id(TASK_ADD_TOOL, &json!({ "task": { "spec_id": null } })),
             None
+        );
+        // RETOUR-CHAT (v2.5.11): relaying the human's feedback CREATES a finding on the Spec — it
+        // maps the worked Spec via `result.finding.spec_id` (the extended auto-map).
+        assert_eq!(
+            worked_spec_id(
+                crate::mcp::REVIEW_SUBMIT_FEEDBACK_TOOL,
+                &json!({ "finding": { "spec_id": "S7" }, "comment": { "id": "c1" } })
+            )
+            .as_deref(),
+            Some("S7")
         );
         // Reads + non-Spec tools never map.
         assert_eq!(

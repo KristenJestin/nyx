@@ -1,198 +1,258 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
+import { taskStatusMeta } from "../specs/spec-meta";
 import {
-  BAR_TRACK,
-  POINT_TONE,
-  RAIL_BAR_HEIGHT_PX,
-  RAIL_DOT_SIZE_PX,
-  type BarSegment,
-  type RailRollup,
+  RAIL_DOT_TONE,
+  RAIL_NEEDS_TONE,
+  RAIL_TRACK_TONE,
+  type RailModel,
+  type RailPhase,
+  type RailSegment,
+  type RailUnit,
 } from "./overlay-status";
 import { RailTabContent } from "./spec-rail-overlay";
 
-/** Query a bar zone by its stable `data-rail-bar-zone` hook (done/active/blocked/skipped). */
-function zone(el: HTMLElement, key: BarSegment["key"]): HTMLElement | null {
-  return el.querySelector<HTMLElement>(`[data-rail-bar-zone="${key}"]`);
-}
-/** The continuous base-fill layer of a phase pill (`data-rail-fill`). */
-function fill(el: HTMLElement): HTMLElement | null {
-  return el.querySelector<HTMLElement>("[data-rail-fill]");
-}
-/** Every rendered phase pill (`data-rail-phase`), in order. */
+/** Every rendered phase (`data-rail-phase`), in order. */
 function phases(el: HTMLElement): HTMLElement[] {
   return [...el.querySelectorAll<HTMLElement>("[data-rail-phase]")];
 }
-/** A bar rollup wrapping a single current-phase bar carrying the given zone segments. */
-function barRollup(segments: BarSegment[]): RailRollup {
-  return { items: [{ kind: "bar", pct: 0, segments }] };
-}
-/** The ordered `kind` of every phase item the rail rendered (via the `data-rail-kind` hook). */
+/** The ordered `kind` of every rendered phase. */
 function railKinds(el: HTMLElement): string[] {
-  return [...el.querySelectorAll<HTMLElement>("[data-rail-phase]")].map(
-    (n) => n.dataset.railKind ?? "",
-  );
+  return phases(el).map((n) => n.dataset.railKind ?? "");
+}
+/** Every rendered plan/round unit (`data-rail-unit`), in order. */
+function units(el: HTMLElement): HTMLElement[] {
+  return [...el.querySelectorAll<HTMLElement>("[data-rail-unit]")];
+}
+/** The segment cells (`data-rail-seg`) of a unit, in order. */
+function segsOf(unitEl: HTMLElement): HTMLElement[] {
+  return [...unitEl.querySelectorAll<HTMLElement>("[data-rail-seg]")];
 }
 
-describe("<RailTabContent> — per-status stacked bar (done/active/blocked/skipped, todo empty)", () => {
-  it("stacks done → active → blocked → skipped top→down with cumulative `top`, global tones", () => {
-    // One task per status ⇒ 25% each ⇒ tops 0/25/50/75. Tones = the global task-status dot classes.
-    const rollup = barRollup([
-      { key: "done", tone: "bg-success", heightPct: 25, pulse: false },
-      { key: "active", tone: "bg-warning", heightPct: 25, pulse: true },
-      { key: "blocked", tone: "bg-destructive", heightPct: 25, pulse: false },
-      { key: "skipped", tone: "bg-muted-foreground/30", heightPct: 25, pulse: false },
-    ]);
-    const { container } = render(<RailTabContent rollup={rollup} reduced={false} />);
+// --- segment fixtures: one per status, mirroring `segmentOf` (dot ↔ segment coherence) ---
+const doneSeg: RailSegment = {
+  state: "done",
+  tone: taskStatusMeta("done").dot,
+  transparent: false,
+  pulse: false,
+};
+const progSeg: RailSegment = {
+  state: "in_progress",
+  tone: taskStatusMeta("in_progress").dot,
+  transparent: false,
+  pulse: true,
+};
+const blockedSeg: RailSegment = {
+  state: "blocked",
+  tone: taskStatusMeta("blocked").dot,
+  transparent: false,
+  pulse: true,
+};
+const needsSeg: RailSegment = {
+  state: "needs_you",
+  tone: RAIL_NEEDS_TONE,
+  transparent: false,
+  pulse: true,
+};
+const todoSeg: RailSegment = {
+  state: "todo",
+  tone: taskStatusMeta("todo").dot,
+  transparent: true,
+  pulse: false,
+};
 
-    // DONE zone: success, anchored at the TOP (top 0), height = 25%.
-    const done = zone(container, "done");
-    expect(done?.className).toMatch(/bg-success/);
-    expect(done?.style.top).toBe("0%");
-    expect(done?.style.height).toBe("25%");
+/** A current-phase bar with the given units. */
+function current(us: RailUnit[]): Extract<RailPhase, { kind: "current" }> {
+  return { kind: "current", units: us };
+}
+const unit = (over: Partial<RailUnit> = {}): RailUnit => ({
+  key: "plan",
+  rework: false,
+  segments: [],
+  ...over,
+});
+const model = (ps: RailPhase[]): RailModel => ({ phases: ps });
 
-    // ACTIVE zone: warning, PULSING, stacked directly below done (top = 25%).
-    const active = zone(container, "active");
-    expect(active?.className).toMatch(/bg-warning/);
-    expect(active?.className).toMatch(/animate-pulse/);
-    expect(active?.style.top).toBe("25%");
-    expect(active?.style.height).toBe("25%");
-
-    // BLOCKED zone: destructive (RED) — no longer invisible/grey — stacked below active (top = 50%).
-    const blocked = zone(container, "blocked");
-    expect(blocked?.className).toMatch(/bg-destructive/);
-    expect(blocked?.className).not.toMatch(/animate-pulse/);
-    expect(blocked?.style.top).toBe("50%");
-    expect(blocked?.style.height).toBe("25%");
-
-    // SKIPPED zone: neutral, stacked below blocked (top = 75%).
-    const skipped = zone(container, "skipped");
-    expect(skipped?.className).toMatch(/bg-muted-foreground\/30/);
-    expect(skipped?.style.top).toBe("75%");
-    expect(skipped?.style.height).toBe("25%");
+describe("<RailTabContent> — dots (past/future) are ALWAYS grey, never a status colour", () => {
+  it("renders one grey filled dot per past/future phase, and NEVER a success/green dot", () => {
+    const { container } = render(
+      <RailTabContent
+        model={model([
+          { kind: "past", rounds: 0 },
+          current([unit({ segments: [progSeg, todoSeg] })]),
+          { kind: "future", rounds: 0 },
+        ])}
+      />,
+    );
+    expect(railKinds(container)).toEqual(["past", "current", "future"]);
+    const dots = [...container.querySelectorAll<HTMLElement>("[data-rail-dot]")];
+    expect(dots).toHaveLength(2); // one per past + future phase
+    for (const dot of dots) {
+      expect(dot.className).toContain(RAIL_DOT_TONE); // grey neutral
+      expect(dot.className).not.toContain(taskStatusMeta("done").dot); // never green
+    }
   });
 
-  it("under reduced motion the ACTIVE zone is STATIC (rendered, but NO pulse)", () => {
-    const rollup = barRollup([{ key: "active", tone: "bg-warning", heightPct: 40, pulse: true }]);
-    const { container } = render(<RailTabContent rollup={rollup} reduced={true} />);
-
-    const active = zone(container, "active");
-    expect(active).not.toBeNull(); // the zone still shows
-    expect(active?.className).not.toMatch(/animate-pulse/); // …just not pulsing
+  it("a reworked past phase shows N hollow round RINGS tied by a vertical trait", () => {
+    const { container } = render(
+      <RailTabContent
+        model={model([{ kind: "past", rounds: 2 }, current([unit({ segments: [progSeg] })])])}
+      />,
+    );
+    const past = phases(container)[0];
+    expect(past.querySelectorAll("[data-rail-round-ring]")).toHaveLength(2);
+    // The trait (tie) is present only when the phase carries rounds.
+    expect(past.querySelector("[data-rail-tie]")).not.toBeNull();
   });
 
-  it("an absent status ⇒ NO segment ⇒ NO element for that zone", () => {
-    // Only a done zone present ⇒ active/blocked/skipped elements are absent.
-    const rollup = barRollup([{ key: "done", tone: "bg-success", heightPct: 100, pulse: false }]);
-    const { container } = render(<RailTabContent rollup={rollup} reduced={false} />);
-
-    expect(zone(container, "done")?.style.height).toBe("100%");
-    expect(zone(container, "active")).toBeNull();
-    expect(zone(container, "blocked")).toBeNull();
-    expect(zone(container, "skipped")).toBeNull();
-  });
-
-  it("NO tasks (no segments) ⇒ an EMPTY bar (the track only, no zone elements)", () => {
-    const { container } = render(<RailTabContent rollup={barRollup([])} reduced={false} />);
-
-    expect(container.querySelectorAll("[data-rail-bar-zone]")).toHaveLength(0);
-  });
-
-  it("renders phase DOTS (done + remaining) around the bar without any bar zones on them", () => {
-    const rollup: RailRollup = {
-      items: [
-        { kind: "done" },
-        { kind: "bar", pct: 50, segments: [{ key: "done", tone: "bg-success", heightPct: 50, pulse: false }] },
-        { kind: "remaining" },
-      ],
-    };
-    const { container } = render(<RailTabContent rollup={rollup} reduced={false} />);
-
-    // One bar (the current phase) with its done zone; the two dots carry no bar hooks.
-    expect(container.querySelectorAll("[data-rail-bar-zone]")).toHaveLength(1);
-    expect(zone(container, "done")?.style.height).toBe("50%");
+  it("a plain phase (0 rounds) has no rings and no tie", () => {
+    const { container } = render(
+      <RailTabContent
+        model={model([{ kind: "future", rounds: 0 }, current([unit({ segments: [progSeg] })])])}
+      />,
+    );
+    const future = phases(container).find((p) => p.dataset.railKind === "future")!;
+    expect(future.querySelectorAll("[data-rail-round-ring]")).toHaveLength(0);
+    expect(future.querySelector("[data-rail-tie]")).toBeNull();
   });
 });
 
-describe("<RailTabContent> — CONTINUOUS morph phase items (one element, height/radius, no crossfade)", () => {
-  // 5 phases, phase 3 current ⇒ [done, done, bar, remaining, remaining].
-  const timeline: RailRollup = {
-    items: [
-      { kind: "done" },
-      { kind: "done" },
-      { kind: "bar", pct: 50, segments: [{ key: "done", tone: "bg-success", heightPct: 50, pulse: false }] },
-      { kind: "remaining" },
-      { kind: "remaining" },
-    ],
-  };
-
-  it("renders EXACTLY ONE phase item per rollup item, in order, each tagged with its kind", () => {
-    const { container } = render(<RailTabContent rollup={timeline} reduced={false} />);
-    // One motion.div (the `data-rail-phase` hook) per phase — same count, same order as the rollup.
-    expect(container.querySelectorAll("[data-rail-phase]")).toHaveLength(timeline.items.length);
-    expect(railKinds(container)).toEqual(["done", "done", "bar", "remaining", "remaining"]);
+describe("<RailTabContent> — the CURRENT phase is a strip of per-task status segments", () => {
+  it("renders one glued unit per plan/round, hatched only on rework units", () => {
+    const { container } = render(
+      <RailTabContent
+        model={model([
+          current([
+            unit({ key: "plan", rework: false, segments: [doneSeg] }),
+            unit({ key: "round-1", rework: true, segments: [progSeg] }),
+          ]),
+        ])}
+      />,
+    );
+    const us = units(container);
+    expect(us.map((u) => u.dataset.railUnit)).toEqual(["plan", "round-1"]);
+    // Only the rework unit carries the hatched-bg marker.
+    expect(us[0].hasAttribute("data-rail-rework")).toBe(false);
+    expect(us[1].hasAttribute("data-rail-rework")).toBe(true);
   });
 
-  it("has NO dot/bar crossfade views — each phase is ONE continuous element with a single base fill", () => {
-    const { container } = render(<RailTabContent rollup={timeline} reduced={false} />);
-
-    // The old `<AnimatePresence mode="wait">` crossfade is GONE: no `data-rail-view` layers exist.
-    expect(container.querySelectorAll("[data-rail-view]")).toHaveLength(0);
-    // Every phase pill carries EXACTLY ONE always-mounted base-fill layer (the continuous content).
-    for (const phase of phases(container)) {
-      expect(phase.querySelectorAll("[data-rail-fill]")).toHaveLength(1);
+  it("segments of a unit are CONTIGUOUS — NO separator between adjacent task segments", () => {
+    const { container } = render(
+      // 2 done tasks in one unit: they merge into one block, no trait between them.
+      <RailTabContent model={model([current([unit({ segments: [doneSeg, doneSeg] })])])} />,
+    );
+    const cells = segsOf(units(container)[0]);
+    expect(cells).toHaveLength(2);
+    for (const cell of cells) {
+      // No border/trait on a segment — the split line only lives BETWEEN units, not tasks.
+      expect(cell.className).not.toMatch(/border/);
     }
-    // The current phase (`bar`) is the ONLY one carrying stacked zones; the dots carry none.
-    const bar = phases(container).find((p) => p.dataset.railKind === "bar");
-    expect(bar?.querySelector("[data-rail-bar-zone='done']")).not.toBeNull();
-    expect(container.querySelectorAll("[data-rail-bar-zone]")).toHaveLength(1);
   });
 
-  it("the SAME element animates HEIGHT + border-RADIUS by kind (dot 6px round ↔ bar 64px rect)", () => {
-    const { container } = render(<RailTabContent rollup={timeline} reduced={false} />);
-    const bar = phases(container).find((p) => p.dataset.railKind === "bar");
-    const dot = phases(container).find((p) => p.dataset.railKind === "done");
-
-    // The morph is a SIZE change of the SAME pill: the current-phase bar springs to the tall gauge
-    // height, the finished-phase dot to the small dot height — never a swap of two representations.
-    expect(bar?.style.height).toBe(`${RAIL_BAR_HEIGHT_PX}px`);
-    expect(dot?.style.height).toBe(`${RAIL_DOT_SIZE_PX}px`);
-    // The border-radius animates too: a fully-round dot (size ÷ 2) vs a softer rounded-rect bar.
-    expect(dot?.style.borderRadius).toBe(`${RAIL_DOT_SIZE_PX / 2}px`);
-    expect(bar?.style.borderRadius).not.toBe(dot?.style.borderRadius);
+  it("a thin trait separates the UNITS only (border-t on every unit but the first)", () => {
+    const { container } = render(
+      <RailTabContent
+        model={model([
+          current([
+            unit({ key: "plan", rework: false, segments: [doneSeg] }),
+            unit({ key: "round-1", rework: true, segments: [progSeg] }),
+          ]),
+        ])}
+      />,
+    );
+    const us = units(container);
+    // The first unit carries no top trait; the following unit draws the inter-unit separator.
+    expect(us[0].className).not.toMatch(/border-t/);
+    expect(us[1].className).toContain("border-t");
+    expect(us[1].className).toContain("border-background");
   });
 
-  it("the base fill paints the dominant tone by kind (done=green, remaining=neutral, bar=track)", () => {
-    const { container } = render(<RailTabContent rollup={timeline} reduced={false} />);
-    const fills = phases(container).map((phase) => fill(phase));
-    // Items 0,1 = done dots (green success); items 3,4 = remaining dots (visible neutral).
-    expect(fills[0]?.className).toContain(POINT_TONE.done);
-    expect(fills[1]?.className).toContain(POINT_TONE.done);
-    expect(fills[3]?.className).toContain("bg-muted-foreground/60");
-    expect(fills[4]?.className).toContain("bg-muted-foreground/60");
-    // The current phase (`bar`) base fill is the neutral TRACK behind its stacked zones.
-    expect(fills[2]?.className).toContain(BAR_TRACK);
+  it("renders ONE segment per task, coloured by its status; todo renders at opacity 0", () => {
+    const { container } = render(
+      <RailTabContent
+        model={model([current([unit({ segments: [doneSeg, progSeg, todoSeg] })])])}
+      />,
+    );
+    const cells = segsOf(units(container)[0]);
+    expect(cells.map((c) => c.dataset.railSeg)).toEqual(["done", "in_progress", "todo"]);
+    // done: green tone, static.
+    expect(cells[0].className).toContain(taskStatusMeta("done").dot);
+    expect(cells[0].className).not.toMatch(/animate-pulse/);
+    // in_progress: amber tone (same as the panel dot), pulses.
+    expect(cells[1].className).toContain(taskStatusMeta("in_progress").dot);
+    expect(cells[1].className).toMatch(/animate-pulse/);
+    // todo: opacity 0, no colour tone painted (the track shows through).
+    expect(cells[2].className).toContain("opacity-0");
+    expect(cells[2].className).not.toContain(taskStatusMeta("todo").dot);
   });
 
-  it("under reduced motion the phase items still render (bar + dots) and the active zone is STATIC", () => {
-    const rollup: RailRollup = {
-      items: [
-        { kind: "done" },
-        {
-          kind: "bar",
-          pct: 40,
-          segments: [{ key: "active", tone: "bg-warning", heightPct: 40, pulse: true }],
-        },
-        { kind: "remaining" },
-      ],
-    };
-    const { container } = render(<RailTabContent rollup={rollup} reduced={true} />);
+  it("in_progress at 0 done still shows the AMBER segment (the bug: a 0%-fill bar went fully grey)", () => {
+    const { container } = render(
+      <RailTabContent
+        model={model([current([unit({ segments: [progSeg, todoSeg, todoSeg] })])])}
+      />,
+    );
+    const cells = segsOf(units(container)[0]);
+    // The amber in_progress segment is painted (visible) even with nothing done.
+    expect(cells[0].dataset.railSeg).toBe("in_progress");
+    expect(cells[0].className).toContain(taskStatusMeta("in_progress").dot);
+    expect(cells[0].className).not.toContain("opacity-0");
+    // The two todo segments are the transparent ones.
+    expect(cells[1].className).toContain("opacity-0");
+    expect(cells[2].className).toContain("opacity-0");
+  });
 
-    // The morph still yields one item per phase (instant, but present).
-    expect(railKinds(container)).toEqual(["done", "bar", "remaining"]);
-    // The active zone shows but does NOT pulse under reduced motion.
-    const active = zone(container, "active");
-    expect(active).not.toBeNull();
-    expect(active?.className).not.toMatch(/animate-pulse/);
+  it("BLOQUÉ (blocked): the task's segment is red (destructive) and pulses; a done segment stays green/static", () => {
+    const { container } = render(
+      <RailTabContent model={model([current([unit({ segments: [doneSeg, blockedSeg] })])])} />,
+    );
+    const cells = segsOf(units(container)[0]);
+    expect(cells[1].dataset.railSeg).toBe("blocked");
+    expect(cells[1].className).toContain(taskStatusMeta("blocked").dot);
+    expect(cells[1].className).toMatch(/animate-pulse/);
+    expect(cells[0].className).toContain(taskStatusMeta("done").dot);
+    expect(cells[0].className).not.toMatch(/animate-pulse/);
+  });
+
+  it("BESOIN DE TOI (kind=human): a magenta (primary) segment that pulses", () => {
+    const { container } = render(
+      <RailTabContent model={model([current([unit({ segments: [needsSeg] })])])} />,
+    );
+    const cell = segsOf(units(container)[0])[0];
+    expect(cell.dataset.railSeg).toBe("needs_you");
+    expect(cell.className).toContain(RAIL_NEEDS_TONE);
+    expect(cell.className).toMatch(/animate-pulse/);
+  });
+
+  it("a rework unit HATCHES its coloured segments, but not the transparent (todo) ones", () => {
+    const { container } = render(
+      <RailTabContent
+        model={model([
+          current([unit({ key: "round-1", rework: true, segments: [doneSeg, todoSeg] })]),
+        ])}
+      />,
+    );
+    const cells = segsOf(units(container)[0]);
+    expect(cells[0].style.backgroundImage).toMatch(/repeating-linear-gradient/); // coloured ⇒ hatched
+    expect(cells[1].style.backgroundImage).toBe(""); // transparent todo ⇒ no hatch
+  });
+
+  it("an empty unit (all cancelled / no tasks) renders a bare track — no segments", () => {
+    const { container } = render(
+      <RailTabContent model={model([current([unit({ segments: [] })])])} />,
+    );
+    const u = units(container)[0];
+    expect(segsOf(u)).toHaveLength(0);
+    expect(u.className).toContain(RAIL_TRACK_TONE); // the neutral track shows through
+  });
+
+  it("under reduced motion an in_progress segment renders but does NOT pulse", () => {
+    const { container } = render(
+      <RailTabContent model={model([current([unit({ segments: [progSeg] })])])} reduced={true} />,
+    );
+    const cell = segsOf(units(container)[0])[0];
+    expect(cell).not.toBeNull();
+    expect(cell.className).not.toMatch(/animate-pulse/);
   });
 });

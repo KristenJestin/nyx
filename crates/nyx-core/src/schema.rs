@@ -284,6 +284,11 @@ diesel::table! {
         updated_at -> BigInt,
         completed_at -> Nullable<BigInt>,
         archived_at -> Nullable<BigInt>,
+        // v23 (v2.5.11 review follow-up) — the STORED phase under review (PDR-0022). NULL = not under
+        // a per-phase review; ≥1 = the phase number posed at `in_review` entry (last delivered, F1)
+        // and cleared on leaving review. Appended LAST by `ALTER TABLE ADD COLUMN` (Diesel positional
+        // decoding).
+        reviewing_phase -> Nullable<Integer>,
     }
 }
 
@@ -329,6 +334,22 @@ diesel::table! {
         created_at -> BigInt,
         updated_at -> BigInt,
         completed_at -> Nullable<BigInt>,
+        // v21 (v2.5.11 Phase 1) — the review-FINDING fields PORTED from the deprecated
+        // `review_tasks` (findings = `tasks kind=review`, PDR-0016). Appended by
+        // `ALTER TABLE ADD COLUMN` (Diesel positional decoding). `from_comment_id` = the
+        // trail back to the promoted `review_comments` row (1→N). Nullable = NULL on a non-finding
+        // task. (The v21 `origin` column was DROPPED in v24 — a finding is ALWAYS agent-created, so
+        // it carried no signal; provenance lives on `review_comments.author_type`.)
+        from_comment_id -> Nullable<Text>,
+        // v22 (v2.5.11 Phase 1) — the REWORK ROUND (sub-phase axis). NULL = the plan (round 0);
+        // ≥1 = a rework pass rattached to `phase` (2.1, 4.1…). Appended by `ALTER TABLE ADD COLUMN`
+        // (Diesel positional decoding).
+        round -> Nullable<Integer>,
+        // v25 (v2.5.11 review follow-up #31) — the FINDING grill state, REBUILT to drop `validated`:
+        // now `proposed|structured` only (`structured` = ready for the coder). The in-place CHECK
+        // rebuild re-appends the column, so it sits LAST physically — `schema.rs` mirrors that (as
+        // v21/v22/v24 did for their appended columns). Nullable = NULL on a non-grilled task.
+        grill_state -> Nullable<Text>,
     }
 }
 
@@ -380,15 +401,22 @@ diesel::table! {
 }
 
 // - v17 (v2.4 Phase 5 — the `review_tasks` + `review_reads` tables, task
-//   01KX0F6JEKCEV2JCTMEBMM3P4Z) implement `finding = task`: a comment PROMOTED for the coder
+//   01KX0F6JEKCEV2JCTMEBMM3P4Z). ⚠️ `review_tasks` is DEPRECATED/SUPERSEDED as of v21 (v2.5.11,
+//   PDR-0016): the canonical finding is a `tasks kind=review` row carrying the ported
+//   `from_comment_id`/`grill_state` columns — ONE finding representation, no longer a
+//   concurrent table. `review_reads` (the unread watermark) is unaffected. `review_tasks`
+//   implement `finding = task`: a comment PROMOTED for the coder
 //   becomes a `review_tasks` row (the promoted comment IS the coder task, PDR-0012). It links
 //   its source comment via `from_comment_id` (NOT NULL Text, plain correlation, no FK CASCADE —
 //   a task is durable coder work that survives Git churn / an archive, like `review_comments`
 //   / `domain_events`). `title` (NOT NULL) / `details` (Nullable) carry the task text; `severity`
-//   (Nullable, CHECK info|low|medium|high|critical) is OPTIONAL; `grill_state` (NOT NULL, CHECK
-//   proposed|structured|validated) models the "grill" — proposed (human lâche brut) → structured
-//   (agent structures via MCP) → validated (human validates; only then ready for the coder). The
-//   human-only validate + agent-only structure are enforced at the use-case + MCP façade.
+//   (Nullable, CHECK info|low|medium|high|critical) is OPTIONAL; `grill_state` (NOT NULL) models
+//   the "grill". This DEPRECATED v17 table keeps its ORIGINAL three-state CHECK
+//   (proposed|structured|validated), never rebuilt — but the CANONICAL grill now lives on
+//   `tasks.grill_state`, which v25 (v2.5.11 review follow-up #31) collapsed to TWO states: proposed
+//   (human lâche brut) → structured (agent structures via MCP; a structured finding is coder-ready).
+//   There is no human-only validate step and no MCP validate tool anymore — only the agent-only
+//   structure transition is enforced at the use-case + MCP façade.
 //   `review_reads` is the UNREAD watermark (reuse of the runtime `unread` pattern): ONE row per
 //   (workspace, repository) whose `last_read_at` (NOT NULL BigInt epoch-ms) is the instant the
 //   human last saw the feed — the unread count is the comments created strictly after it, and

@@ -149,6 +149,16 @@ pub fn dispatch(
         events.emit(Event::Changed {
             topic: "repos".to_string(),
         });
+        // A FINDING mutation (promote/validate/resolve) ALSO changes the Spec's task list — a
+        // finding is a `tasks kind=review` row — so it ALSO broadcasts `specs://changed` for the
+        // terminal-spec OVERLAY / Spec detail (`useSpecDetail` re-pulls on `specs`, not `repos`).
+        // Without it the overlay only reflected the mutation after a manual reload (review F3).
+        // Subscribers are pure readers (spec detail / board), so no reconcile loop.
+        if mutates_review_findings(command) {
+            events.emit(Event::Changed {
+                topic: "specs".to_string(),
+            });
+        }
     }
     Ok(result)
 }
@@ -1312,16 +1322,25 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)?;
                 Self::json(&comment)
             }
-            // RESOLVE a comment — the HUMAN-ONLY transition (stamps resolved_by_type=human).
-            // Reachable only from this UI façade; the MCP agent façade advertises no resolve
-            // tool, so the agent can never reach this path. Returns the updated row.
+            // RESOLVE a comment — the HUMAN-ONLY transition (stamps resolved_by_type=human),
+            // GUARDED to a comment whose linked findings are all settled (v2.5.11 Phase 2: you
+            // resolve in knowledge of the fix). A comment with pending `tasks kind=review` findings
+            // is refused; one with none resolves freely. Reachable only from this UI façade; the MCP
+            // agent façade advertises no resolve tool. Returns the updated row.
             "review_comment_resolve" => {
                 let id = self.arg_str("id")?;
                 let comment = self
                     .db()
-                    .with_conn(|c| nyx_core::db::resolve_review_comment(c, &id))
-                    .map_err(Self::db_err)?
-                    .ok_or_else(|| format!("unknown review comment {id}"))?;
+                    .with_conn(|c| nyx_core::db::resolve_review_comment_when_findings_done(c, &id))
+                    .map_err(|e| match e {
+                        nyx_core::db::ResolveCommentError::NotFound => {
+                            format!("unknown review comment {id}")
+                        }
+                        nyx_core::db::ResolveCommentError::FindingsNotDone { pending } => format!(
+                            "cannot resolve comment {id}: {pending} linked finding(s) still open"
+                        ),
+                        nyx_core::db::ResolveCommentError::Db(e) => Self::db_err(e),
+                    })?;
                 Self::json(&comment)
             }
             // RE-OPEN a resolved comment (the human's undo). Human-only, same façade.
@@ -1335,66 +1354,64 @@ impl Ctx<'_> {
                 Self::json(&comment)
             }
             // --- v2.4 review TASKS (= task) + unread (task 01KX0F6JEKCEV2JCTMEBMM3P4Z) --------
-            // The promotion "grill": the UI façade owns the human's steps (PROMOTE + VALIDATE)
-            // and the read (LIST); the MCP agent façade owns STRUCTURE + LIST but NOT validate
-            // (validation is human-only). A mutation broadcasts `repos://changed` so an open
-            // review re-pulls the task list + unread badge live.
+            // The promotion "grill" (collapsed to two states, review follow-up #31): the UI façade
+            // owns the human's PROMOTE step and the read (LIST); the MCP agent façade owns
+            // STRUCTURE + LIST — a structured finding is coder-ready, there is no `validated` step.
+            // A mutation broadcasts `repos://changed` so an open review re-pulls the task list +
+            // unread badge live.
             //
-            // PROMOTE a comment into a coder task — the grill's FIRST step (the human lâche brut).
-            // Creates a `proposed` task linked to the comment; severity OPTIONAL. Returns it.
+            // PROMOTE a comment into a FINDING — the grill's FIRST step (the human lâche brut).
+            // Creates a `proposed` `tasks kind=review` finding linked to the comment (v2.5.11
+            // cutover — NOT a `review_tasks` row); severity OPTIONAL. Returns it in the viewer wire
+            // shape. The finding lives on the comment's Spec (a comment with no Spec cannot promote).
             "review_task_promote" => {
                 let comment_id = self.arg_str("commentId")?;
                 let title = self.arg_opt_str("title");
                 let severity = self.arg_opt_str("severity");
-                let task = self
+                let finding = self
                     .db()
-                    .with_conn(|c| {
+                    .with_conn(|c| -> diesel::QueryResult<nyx_core::db::ReviewFinding> {
                         let comment = nyx_core::db::get_review_comment(c, &comment_id)?
                             .ok_or(diesel::result::Error::NotFound)?;
                         // Seed the title from the comment body when the human gave none.
                         let seed = title.clone().unwrap_or_else(|| comment.body.clone());
-                        nyx_core::db::promote_comment_to_task(
+                        let task = nyx_core::db::promote_comment_to_finding(
                             c,
                             &comment,
                             &seed,
                             severity.as_deref(),
-                        )
+                        )?;
+                        Ok(nyx_core::db::ReviewFinding::from_task(
+                            &task,
+                            &comment.workspace_id,
+                            &comment.repository_id,
+                        ))
                     })
                     .map_err(Self::db_err)?;
-                Self::json(&task)
+                Self::json(&finding)
             }
-            // VALIDATE a structured task — the grill's THIRD step (HUMAN-only; the MCP façade
-            // has no validate tool). After this the task is "ready for the coder". Returns it.
-            "review_task_validate" => {
-                let id = self.arg_str("id")?;
-                let task = self
-                    .db()
-                    .with_conn(|c| nyx_core::db::validate_task(c, &id))
-                    .map_err(Self::db_err)?
-                    .ok_or_else(|| format!("unknown review task {id}"))?;
-                Self::json(&task)
-            }
-            // LIST the tasks (promoted tasks) of a `(workspace, repository)`, SCOPED to the optional
-            // `specId` (finding #53). The UI façade always passes the Spec the review is opened from,
-            // so a task promoted on one Spec's comment never leaks onto another Spec sharing the same
-            // repo — the tasks counterpart of the comment scoping (#41). Omitting `specId` reads the
-            // whole repo's task list (unscoped). Read-only.
+            // LIST the GRILLED review findings of a Spec — the `tasks kind=review` rows carrying a
+            // `grill_state` (v2.5.11 cutover — NOT `review_tasks`). Findings are Spec-scoped, so the
+            // UI passes the Spec the review is opened from; each is projected into the viewer wire
+            // shape, injecting the read's `(workspace, repository)`. Omitting `specId` returns an
+            // empty list (there is no repo-wide finding bucket once findings are tasks). Read-only.
             "review_task_list" => {
                 let workspace_id = self.arg_str("workspaceId")?;
                 let repository_id = self.arg_str("repositoryId")?;
                 let spec_id = self.arg_opt_str("specId");
-                let tasks = self
-                    .db()
-                    .with_conn(|c| {
-                        nyx_core::db::list_review_tasks(
-                            c,
-                            &workspace_id,
-                            &repository_id,
-                            spec_id.as_deref(),
-                        )
-                    })
-                    .map_err(Self::db_err)?;
-                Self::json(&tasks)
+                let findings: Vec<nyx_core::db::ReviewFinding> = match spec_id {
+                    Some(sid) => self
+                        .db()
+                        .with_conn(|c| nyx_core::db::list_grilled_findings_for_spec(c, &sid))
+                        .map_err(Self::db_err)?
+                        .iter()
+                        .map(|t| {
+                            nyx_core::db::ReviewFinding::from_task(t, &workspace_id, &repository_id)
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                Self::json(&findings)
             }
             // The UNREAD count of a `(workspace, repository)` review feed (comments created after
             // the read watermark). Read-only. Backs the live non-lus badge (re-pulled on
@@ -1813,7 +1830,7 @@ fn mutates_command_templates(command: &str) -> bool {
 /// open review panel re-pulls its `review_comment_list` feed + `review_task_list` + `review_unread`
 /// badge live, symmetric to the MCP `review_comment_post` / `review_task_structure` tools'
 /// `Repos` effect. The COMMENT mutations (post/resolve/reopen) change the feed and the unread
-/// count; the TASK mutations (promote/validate) change the promoted-task list; `review_mark_read`
+/// count; the TASK mutation (promote) changes the promoted-task list; `review_mark_read`
 /// zeroes the unread badge; `review_remap` re-anchors/outdates the anchored comments after the
 /// repo advanced — all push `repos://changed`. The pure reads (`review_comment_list`,
 /// `review_task_list`, `review_unread`) are deliberately absent.
@@ -1824,10 +1841,21 @@ fn mutates_review_comments(command: &str) -> bool {
             | "review_comment_resolve"
             | "review_comment_reopen"
             | "review_task_promote"
-            | "review_task_validate"
             | "review_mark_read"
             | "review_remap"
     )
+}
+
+/// The review FINDING-mutating subset of [`mutates_review_comments`] — the command that creates a
+/// `tasks kind=review` row (`promote` a comment into a finding). Besides the `repos://changed` all
+/// review mutations push (the viewer), this ALSO pushes `specs://changed` because a finding IS a Spec
+/// task: the terminal-spec OVERLAY (and the Spec detail page) render findings from `useSpecDetail`,
+/// which re-pulls on `specs://changed`, NOT `repos://changed`. Without this the overlay only reflected
+/// a promote after a manual reload (review F3, symmetric to the MCP `review_submit_feedback` /
+/// `review_task_structure` tools now naming `ChangedTopic::Specs`). The pure COMMENT mutations
+/// (post/resolve/reopen/mark_read/remap) do NOT touch the task list, so they stay `repos`-only.
+fn mutates_review_findings(command: &str) -> bool {
+    command == "review_task_promote"
 }
 
 /// The terminal RECORD-MUTATING DB commands whose UI path must broadcast `terminals://changed`
@@ -3630,6 +3658,135 @@ mod tests {
             list_all.as_array().unwrap().len(),
             3,
             "unscoped read sees all three"
+        );
+    }
+
+    /// v2.5.11 review follow-up (findings 01KXZYWEAMCVY9ASHRHTFX4FZA + 01KXZYWFARPQXA9FVBPEZ9QV3J +
+    /// #31 grill collapse): a finding is AGENT-OWNED and AGENT-CLOSABLE at the bridge. A human posts
+    /// an ANCHORED comment (`review_comment_post`, author=human), the agent grills it into a finding
+    /// (`review_task_promote` — the finding carries NO `origin`), STRUCTURES it (coder-ready — the
+    /// grill has no human-only validate step), and CLOSES it through the plain `db::transition_task`
+    /// done path WITHOUT any human-only refusal. With the finding done, its source comment resolves
+    /// (human-only, guarded on findings). Drives the REAL `dispatch` end-to-end.
+    #[test]
+    fn human_comment_promotes_finding_agent_closes_then_comment_resolves() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-finding-resolve");
+        // A Spec to hang the finding on — promotion needs the comment's Spec (a comment with no
+        // Spec cannot promote). Seed it through the shared pool (authoring is out of scope here).
+        let spec_id = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_spec(c, &project_id, "Spec", Default::default())
+                    .map(|(s, _)| s.id)
+            })
+            .unwrap();
+
+        // 1. VIEWER channel: a HUMAN ANCHORED comment (file/line) through the UI façade.
+        let comment = h
+            .run(
+                "review_comment_post",
+                serde_json::json!({
+                    "workspaceId": "ws",
+                    "repositoryId": "repo",
+                    "specId": spec_id,
+                    "body": "this branch is wrong",
+                    "filePath": "src/loop.rs",
+                    "side": "new",
+                    "lineStart": 12,
+                    "lineEnd": 14,
+                }),
+            )
+            .unwrap();
+        let comment: serde_json::Value = serde_json::from_str(&comment).unwrap();
+        assert_eq!(comment["author_type"], serde_json::json!("human"));
+        assert_eq!(comment["file_path"], serde_json::json!("src/loop.rs"));
+        let comment_id = comment["id"].as_str().unwrap().to_string();
+
+        // 2. GRILL: the agent promotes the comment into a finding (agent-owned — NO origin; the human
+        //    provenance stays on the comment's author_type).
+        let finding = h
+            .run(
+                "review_task_promote",
+                serde_json::json!({ "commentId": comment_id, "severity": "high" }),
+            )
+            .unwrap();
+        let finding: serde_json::Value = serde_json::from_str(&finding).unwrap();
+        assert!(
+            finding.get("origin").is_none(),
+            "a finding carries NO origin (v24 — always agent-created)"
+        );
+        assert_eq!(
+            finding["from_comment_id"],
+            serde_json::json!(comment_id),
+            "finding trails its comment"
+        );
+        let finding_id = finding["id"].as_str().unwrap().to_string();
+        // The promotion CREATED a `tasks kind=review` finding, so besides `repos` it ALSO pushed
+        // `specs://changed` for the overlay / Spec detail (review F3). The prior comment_post was a
+        // pure comment (repos only), so this is the FIRST `specs` push.
+        assert_eq!(
+            changed_count(&h.buf, "specs"),
+            1,
+            "review_task_promote broadcasts specs://changed (overlay live)"
+        );
+
+        // 3. STRUCTURE (agent): the grill's final step — a structured finding is coder-ready (#31;
+        //    no human-only validate step). Driven through the shared engine the MCP tool wraps.
+        let structured = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::structure_finding(c, &finding_id, "Fix the wrong branch", None, None)
+            })
+            .expect("structure ok")
+            .expect("a proposed finding is structurable");
+        assert!(
+            structured.is_finding_ready_for_coder(),
+            "a structured finding is ready for the coder (the grill's final state, #31)"
+        );
+
+        // 4. The AGENT coder loop CLOSES the finding through the plain `done` path — no human-only
+        //    refusal anymore (v24 dropped the guard). Start then Done, both succeed.
+        let closed = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::transition_task(
+                    c,
+                    &finding_id,
+                    nyx_core::db::TaskTransition::Start,
+                    None,
+                )?;
+                nyx_core::db::transition_task(
+                    c,
+                    &finding_id,
+                    nyx_core::db::TaskTransition::Done,
+                    None,
+                )
+            })
+            .expect("the agent closes the finding via the plain done path");
+        assert_eq!(
+            closed.status,
+            nyx_core::db::TASK_STATUS_DONE,
+            "the finding is agent-closable (no human-only gate)"
+        );
+        assert!(closed.completed_at.is_some(), "completion is stamped");
+
+        // 5. With its finding done, the source comment now resolves (comment resolution is
+        //    human-only, guarded on findings).
+        let comment_resolved = h
+            .run(
+                "review_comment_resolve",
+                serde_json::json!({ "id": comment_id }),
+            )
+            .unwrap();
+        let comment_resolved: serde_json::Value = serde_json::from_str(&comment_resolved).unwrap();
+        assert_eq!(comment_resolved["status"], serde_json::json!("resolved"));
+        assert_eq!(
+            comment_resolved["resolved_by_type"],
+            serde_json::json!("human")
         );
     }
 }

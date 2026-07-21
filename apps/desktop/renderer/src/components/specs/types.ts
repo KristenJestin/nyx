@@ -106,6 +106,19 @@ export interface Task {
   readonly created_at: number;
   readonly updated_at: number;
   readonly completed_at: number | null;
+  /**
+   * Review-FINDING fields (v21, PDR-0016) — a finding is a `tasks kind=review` row carrying
+   * these ported columns (the `review_tasks` table is deprecated). `null` on a non-finding task.
+   * `from_comment_id` = the comment a finding was promoted from; `grill_state` =
+   * `proposed`|`structured`|`validated`.
+   */
+  readonly from_comment_id: string | null;
+  readonly grill_state: string | null;
+  /**
+   * Rework ROUND (v22, PDR-0022) — the sub-phase axis. `null` = the plan (round 0); `n≥1` = a
+   * rework pass rattached to `phase` (rendered 2.1, 4.1… in the rail). PER-PHASE numbering.
+   */
+  readonly round: number | null;
 }
 
 /** A `task_dependencies` edge (the wire shape of `nyx_core::db::TaskDependency`). */

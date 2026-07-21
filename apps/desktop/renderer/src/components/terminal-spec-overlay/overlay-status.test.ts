@@ -3,25 +3,23 @@ import { describe, expect, it } from "vitest";
 import { taskStatusMeta } from "../specs/spec-meta";
 import type { SpecDetail, Task } from "../specs/types";
 import {
-  BAR_TRACK,
-  barZonesOf,
   currentPhaseIndex,
-  POINT_TONE,
-  RAIL_BAR_HEIGHT_PX,
-  RAIL_DOT_SIZE_PX,
-  RAIL_ITEM_WIDTH_PX,
-  railItemMorph,
-  railRollup,
+  phaseUnits,
+  RAIL_DOT_TONE,
+  RAIL_NEEDS_TONE,
+  RAIL_TRACK_TONE,
+  railModel,
+  roundCount,
+  segmentOf,
   tasksOfPhase,
-  type BarZoneKey,
-  type RailItem,
-  type RailRollup,
+  type RailPhase,
+  type RailUnit,
 } from "./overlay-status";
 
-/** A minimal `tasks` row — only `phase`/`status` matter to the rail roll-up (id is irrelevant). */
-function task(phase: number | null, status: string): Task {
+/** A minimal `tasks` row — the rail reads `phase`/`status`/`kind`/`round`. */
+function task(phase: number | null, status: string, extra: Partial<Task> = {}): Task {
   return {
-    id: `t-${phase}-${status}`,
+    id: `t-${phase}-${status}-${extra.round ?? 0}-${Math.random().toString(36).slice(2, 6)}`,
     project_id: "p",
     spec_id: "s",
     parent_task_id: null,
@@ -42,10 +40,19 @@ function task(phase: number | null, status: string): Task {
     created_at: 0,
     updated_at: 0,
     completed_at: null,
+    from_comment_id: null,
+    grill_state: null,
+    round: null,
+    ...extra,
   };
 }
 
-/** A minimal `spec_detail` — the roll-up reads only `spec.phases` (JSON) + `tasks`. */
+/** A review FINDING (kind=review) rattached to `phase` + `round`. */
+function finding(phase: number, status: string, round: number): Task {
+  return task(phase, status, { kind: "review", severity: "high", round });
+}
+
+/** A minimal `spec_detail` — the rail reads only `spec.phases` (JSON) + `tasks`. */
 function detail(phasesJson: string, tasks: Task[]): SpecDetail {
   return {
     spec: {
@@ -92,369 +99,231 @@ const THREE_PHASES = JSON.stringify([
   { number: 2, name: "P2" },
   { number: 3, name: "P3" },
 ]);
-
-/** The ordered `kind` sequence — the shape the rail renders top→bottom. */
-function kinds(rollup: RailRollup): string[] {
-  return rollup.items.map((it) => it.kind);
-}
-/** The single `bar` item's %, or `undefined` when there is no bar (all phases done). */
-function barPct(rollup: RailRollup): number | undefined {
-  return rollup.items.find((it) => it.kind === "bar")?.pct;
-}
-/** The `bar` item itself, or `undefined` when there is no bar (all phases done). */
-function bar(rollup: RailRollup): RailItem | undefined {
-  return rollup.items.find((it) => it.kind === "bar");
-}
-/** The height % of a given zone on a bar item, or 0 when that zone is absent (no segment). */
-function zoneH(item: RailItem | undefined, key: BarZoneKey): number {
-  return item?.segments?.find((s) => s.key === key)?.heightPct ?? 0;
-}
-/** The tone class of a given zone on a bar item, or `undefined` when the zone is absent. */
-function zoneTone(item: RailItem | undefined, key: BarZoneKey): string | undefined {
-  return item?.segments?.find((s) => s.key === key)?.tone;
-}
-/** The ordered zone keys of a bar item's segments (stack order top→bottom). */
-function zoneKeys(item: RailItem | undefined): BarZoneKey[] {
-  return (item?.segments ?? []).map((s) => s.key);
-}
-
-const FIVE_PHASES = JSON.stringify([
-  { number: 1, name: "P1" },
-  { number: 2, name: "P2" },
-  { number: 3, name: "P3" },
-  { number: 4, name: "P4" },
-  { number: 5, name: "P5" },
-]);
 const ONE_PHASE = JSON.stringify([{ number: 1, name: "P1" }]);
 
-describe("railRollup — ordered sequence (bar INLINE at the current phase)", () => {
-  it("CURRENT PHASE = the first phase NOT entirely done; the bar tracks THAT phase's % only, inline", () => {
-    // Phase 1 done, phase 2 half-done (the current phase), phase 3 untouched.
+/** The ordered `kind` sequence of the rail — one per phase, top→bottom. */
+function kinds(model: { phases: RailPhase[] }): string[] {
+  return model.phases.map((p) => p.kind);
+}
+/** The single CURRENT phase (the coloured bar), or `undefined`. */
+function currentPhase(model: {
+  phases: RailPhase[];
+}): Extract<RailPhase, { kind: "current" }> | undefined {
+  return model.phases.find(
+    (p): p is Extract<RailPhase, { kind: "current" }> => p.kind === "current",
+  );
+}
+/** The ordered segment STATES of a unit (one per non-cancelled task, top→bottom). */
+function segStates(u: RailUnit | undefined): string[] {
+  return (u?.segments ?? []).map((s) => s.state);
+}
+
+describe("railModel — one entry per phase, the current phase is the ONLY coloured bar", () => {
+  it("PAST = grey dot before the current phase, CURRENT = the bar, FUTURE = grey dot after", () => {
+    // Phase 1 done, phase 2 half-done (current), phase 3 untouched.
     const d = detail(THREE_PHASES, [
-      task(1, "done"),
       task(1, "done"),
       task(2, "done"),
       task(2, "todo"),
       task(3, "todo"),
     ]);
-    const rollup: RailRollup = railRollup(d);
-    // ORDERED: phase 1 = done dot, phase 2 (current) = the BAR inline, phase 3 = remaining dot.
-    expect(kinds(rollup)).toEqual(["done", "bar", "remaining"]);
-    // Total items = number of phases (the bar counts as the current phase).
-    expect(rollup.items).toHaveLength(3);
-    // The bar follows the CURRENT phase (phase 2 = 1 done / 2 active = 50%), NOT the global % (3/5 = 60%).
-    expect(barPct(rollup)).toBe(50);
+    const model = railModel(d);
+    expect(kinds(model)).toEqual(["past", "current", "future"]);
+    expect(model.phases).toHaveLength(3); // one entry per phase, never overflows
+    // The current phase (phase 2) is a single plan unit = a strip of one segment per task.
+    const cur = currentPhase(model);
+    expect(cur?.units).toHaveLength(1);
+    expect(cur?.units[0].key).toBe("plan");
+    expect(segStates(cur?.units[0])).toEqual(["done", "todo"]);
   });
 
-  it("bar is INLINE at the current phase's index — 5 phases / phase 3 current ⇒ [dot,dot,BAR,dot,dot]", () => {
-    // Phases 1 & 2 done, phase 3 in progress (current), phases 4 & 5 untouched.
-    const d = detail(FIVE_PHASES, [
-      task(1, "done"),
-      task(2, "done"),
-      task(3, "done"),
-      task(3, "todo"),
-      task(4, "todo"),
-      task(5, "todo"),
-    ]);
-    const rollup = railRollup(d);
-    expect(kinds(rollup)).toEqual(["done", "done", "bar", "remaining", "remaining"]);
-    expect(rollup.items).toHaveLength(5); // total = nb phases
-    expect(barPct(rollup)).toBe(50); // phase 3 = 1 done / 2 active
-  });
-
-  it("current phase = the FIRST phase ⇒ the BAR is the FIRST item (top)", () => {
-    // Phase 1 in progress (current), phase 2 untouched ⇒ [BAR, dot].
-    const d = detail(
-      JSON.stringify([
-        { number: 1, name: "P1" },
-        { number: 2, name: "P2" },
-      ]),
-      [task(1, "done"), task(1, "todo"), task(2, "todo")],
-    );
-    const rollup = railRollup(d);
-    expect(kinds(rollup)).toEqual(["bar", "remaining"]);
-    expect(barPct(rollup)).toBe(50); // phase 1 = 1 done / 2 active
-  });
-
-  it("ONE phase (current) ⇒ a single BAR item", () => {
-    const d = detail(ONE_PHASE, [task(1, "done"), task(1, "todo")]);
-    const rollup = railRollup(d);
-    expect(kinds(rollup)).toEqual(["bar"]);
-    expect(barPct(rollup)).toBe(50);
-  });
-
-  it("EVERY phase done ⇒ a done dot per phase and NO bar (no current phase)", () => {
+  it("EVERY phase done (Spec finished) ⇒ the LAST phase is an all-GREEN current bar, rest are grey dots", () => {
     const d = detail(THREE_PHASES, [task(1, "done"), task(2, "done"), task(3, "done")]);
-    const rollup = railRollup(d);
-    expect(kinds(rollup)).toEqual(["done", "done", "done"]);
-    // No current phase ⇒ NO bar item at all.
-    expect(rollup.items.some((it) => it.kind === "bar")).toBe(false);
-    expect(barPct(rollup)).toBeUndefined();
+    const model = railModel(d);
+    // dots stay grey (past) except the last phase, which reads as the green "done" bar (tout vert).
+    expect(kinds(model)).toEqual(["past", "past", "current"]);
+    expect(segStates(currentPhase(model)?.units[0])).toEqual(["done"]);
   });
 
-  it("FLAT spec (no phases) ⇒ a SINGLE bar = the GLOBAL task %", () => {
-    const d = detail("[]", [
-      task(null, "done"),
-      task(null, "todo"),
-      task(null, "todo"),
-      task(null, "todo"),
-    ]);
-    const rollup = railRollup(d);
-    expect(kinds(rollup)).toEqual(["bar"]);
-    expect(barPct(rollup)).toBe(25); // 1 done / 4 active
+  it("FLAT spec (no phases) ⇒ a SINGLE current bar over the whole task set", () => {
+    const d = detail("[]", [task(null, "done"), task(null, "todo"), task(null, "todo")]);
+    const model = railModel(d);
+    expect(kinds(model)).toEqual(["current"]);
+    // One segment per task, in task order.
+    expect(segStates(currentPhase(model)?.units[0])).toEqual(["done", "todo", "todo"]);
   });
 
-  it("NO tasks ⇒ current = phase 1, so the BAR is FIRST at 0% (never NaN), then remaining dots", () => {
-    const d = detail(THREE_PHASES, []);
-    const rollup = railRollup(d);
-    // Current = phase 1 (first not-done) ⇒ bar in first position; phases 2 & 3 remain.
-    expect(kinds(rollup)).toEqual(["bar", "remaining", "remaining"]);
-    expect(rollup.items).toHaveLength(3);
-    expect(barPct(rollup)).toBe(0);
-    expect(Number.isNaN(barPct(rollup))).toBe(false);
+  it("NO tasks ⇒ phase 1 is the current bar (empty, no segments), later phases are future dots", () => {
+    const model = railModel(detail(THREE_PHASES, []));
+    expect(kinds(model)).toEqual(["current", "future", "future"]);
+    // An empty unit has no segments — it renders as a bare track.
+    expect(currentPhase(model)?.units[0].segments).toEqual([]);
   });
 
-  it("FLAT spec with NO tasks ⇒ a single empty bar (0%, no divide-by-zero)", () => {
-    const rollup = railRollup(detail("[]", []));
-    expect(kinds(rollup)).toEqual(["bar"]);
-    expect(barPct(rollup)).toBe(0);
-  });
-
-  it("treats all-skipped (cancelled) phases as done and puts the bar at the current phase", () => {
-    // Phase 1 all skipped ⇒ reads as resolved/done; phase 2 is the current (todo) phase.
-    const d = detail(THREE_PHASES, [task(1, "cancelled"), task(2, "todo"), task(3, "todo")]);
-    const rollup = railRollup(d);
-    expect(kinds(rollup)).toEqual(["done", "bar", "remaining"]);
-    expect(barPct(rollup)).toBe(0); // phase 2 has 1 active todo, 0 done
-  });
-});
-
-describe("railRollup — per-status bar zones (done/active/blocked/skipped, todo empty)", () => {
-  it("the current-phase bar exposes done + active zones from the phase counts (count/total)", () => {
-    // Current phase = phase 1: 2 done, 1 in_progress, 1 todo ⇒ total 4 ⇒ done 50, active 25.
+  it("a PAST/FUTURE phase carries its rework-ROUND count as hollow rings; a plain phase carries 0", () => {
+    // Phase 1 fully done WITH one rework round (also done) ⇒ a past dot with 1 ring. Phase 2 current.
     const d = detail(THREE_PHASES, [
       task(1, "done"),
-      task(1, "done"),
-      task(1, "in_progress"),
-      task(1, "todo"),
+      finding(1, "done", 1),
+      task(2, "todo"),
+      task(3, "todo"),
     ]);
-    const b = bar(railRollup(d));
-    expect(zoneH(b, "done")).toBe(50);
-    expect(zoneH(b, "active")).toBe(25);
-    // Remainder (100 − 50 − 25 = 25%) is the empty TODO track — the zones never overflow.
-    expect(zoneH(b, "done") + zoneH(b, "active")).toBeLessThanOrEqual(100);
+    const model = railModel(d);
+    expect(model.phases[0]).toEqual({ kind: "past", rounds: 1 });
+    expect(model.phases[2]).toEqual({ kind: "future", rounds: 0 });
   });
 
-  it("counts BOTH in_progress AND in_review as the EN-COURS (active) zone", () => {
-    // 1 in_progress + 1 in_review + 2 todo ⇒ done 0, active 2 / total 4 ⇒ done 0, active 50.
-    const d = detail(ONE_PHASE, [
-      task(1, "in_progress"),
-      task(1, "in_review"),
-      task(1, "todo"),
-      task(1, "todo"),
-    ]);
-    const b = bar(railRollup(d));
-    expect(zoneH(b, "done")).toBe(0);
-    expect(zoneH(b, "active")).toBe(50);
-  });
-
-  it("a BLOCKED task yields a blocked zone in DESTRUCTIVE (red) — the global task-status dot colour", () => {
-    // Phase 1: 1 done, 1 blocked, 2 todo ⇒ total 4 ⇒ done 25, blocked 25 (no longer invisible).
+  it("the current phase's UNITS = plan then one per rework round, ascending", () => {
+    // Phase 1 current: a plan slice (done) + round 1 (done) + round 2 (in progress).
     const d = detail(ONE_PHASE, [
       task(1, "done"),
-      task(1, "blocked"),
-      task(1, "todo"),
-      task(1, "todo"),
+      finding(1, "done", 1),
+      finding(1, "in_progress", 2),
     ]);
-    const b = bar(railRollup(d));
-    expect(zoneH(b, "blocked")).toBe(25);
-    // Same colour as the panel's blocked task dot (taskStatusMeta) — destructive/red, not grey.
-    expect(zoneTone(b, "blocked")).toBe(taskStatusMeta("blocked").dot);
-    expect(zoneTone(b, "blocked")).toBe("bg-destructive");
+    const cur = currentPhase(railModel(d));
+    expect(cur?.units.map((u) => u.key)).toEqual(["plan", "round-1", "round-2"]);
+    // Each unit is a one-segment strip coloured by its task's status.
+    expect(segStates(cur?.units[0])).toEqual(["done"]);
+    expect(segStates(cur?.units[1])).toEqual(["done"]);
+    expect(segStates(cur?.units[2])).toEqual(["in_progress"]);
+    // The plan unit is NOT hatched; the round units ARE (rework bg).
+    expect(cur?.units[0].rework).toBe(false);
+    expect(cur?.units[1].rework).toBe(true);
+    expect(cur?.units[2].rework).toBe(true);
   });
 
-  it("a SKIPPED (cancelled) task yields the neutral skipped zone (global cancelled dot tone)", () => {
-    // Phase 1: 1 done, 1 cancelled(skip), 2 todo ⇒ total 4 ⇒ done 25, skipped 25.
-    const d = detail(ONE_PHASE, [
-      task(1, "done"),
-      task(1, "cancelled"),
-      task(1, "todo"),
-      task(1, "todo"),
-    ]);
-    const b = bar(railRollup(d));
-    expect(zoneH(b, "skipped")).toBe(25);
-    expect(zoneTone(b, "skipped")).toBe(taskStatusMeta("cancelled").dot);
-  });
-
-  it("every zone's tone = the GLOBAL task-status dot mapping (done=success, active=warning)", () => {
-    const d = detail(ONE_PHASE, [task(1, "done"), task(1, "in_progress")]);
-    const b = bar(railRollup(d));
-    expect(zoneTone(b, "done")).toBe(taskStatusMeta("done").dot);
-    expect(zoneTone(b, "done")).toBe("bg-success");
-    expect(zoneTone(b, "active")).toBe(taskStatusMeta("in_progress").dot);
-    expect(zoneTone(b, "active")).toBe("bg-warning");
-  });
-
-  it("stacks the zones top→down in progression order: done → active → blocked → skipped", () => {
-    // One task per status ⇒ every zone present ⇒ the full ordered stack.
-    const d = detail(ONE_PHASE, [
-      task(1, "done"),
-      task(1, "in_progress"),
-      task(1, "blocked"),
-      task(1, "cancelled"),
-      task(1, "todo"),
-    ]);
-    const b = bar(railRollup(d));
-    expect(zoneKeys(b)).toEqual(["done", "active", "blocked", "skipped"]);
-    // 5 tasks, one each of done/active/blocked/skipped ⇒ 20% per zone; the 5th (todo) is empty track.
-    expect(zoneH(b, "done")).toBe(20);
-    expect(zoneH(b, "active")).toBe(20);
-    expect(zoneH(b, "blocked")).toBe(20);
-    expect(zoneH(b, "skipped")).toBe(20);
-    // Disjoint statuses ⇒ the zones' heights sum to ≤ 100 (todo remainder is the empty track).
-    const sum = b?.segments?.reduce((a, s) => a + s.heightPct, 0) ?? 0;
-    expect(sum).toBeLessThanOrEqual(100);
-  });
-
-  it("only the ACTIVE zone pulses; done/blocked/skipped do not", () => {
-    const d = detail(ONE_PHASE, [
-      task(1, "done"),
-      task(1, "in_progress"),
-      task(1, "blocked"),
-      task(1, "cancelled"),
-    ]);
-    const b = bar(railRollup(d));
-    expect(b?.segments?.find((s) => s.key === "active")?.pulse).toBe(true);
-    for (const key of ["done", "blocked", "skipped"] as const) {
-      expect(b?.segments?.find((s) => s.key === key)?.pulse).toBe(false);
-    }
-  });
-
-  it("an ABSENT status yields NO segment (todo-only ⇒ no zones at all, empty bar)", () => {
-    const d = detail(ONE_PHASE, [task(1, "todo"), task(1, "todo")]);
-    const b = bar(railRollup(d));
-    expect(b?.segments).toEqual([]);
-  });
-
-  it("NO in_progress/in_review ⇒ no active zone (just the solid done zone, no pulse)", () => {
-    // Phase 1: 1 done, 1 todo ⇒ done 50, no active segment.
-    const d = detail(ONE_PHASE, [task(1, "done"), task(1, "todo")]);
-    const b = bar(railRollup(d));
-    expect(zoneH(b, "done")).toBe(50);
-    expect(zoneH(b, "active")).toBe(0);
-    expect(b?.segments?.some((s) => s.key === "active")).toBe(false);
-  });
-
-  it("NO tasks ⇒ no zones (empty bar, never NaN)", () => {
-    const b = bar(railRollup(detail(THREE_PHASES, [])));
-    expect(b?.segments).toEqual([]);
-    expect(zoneH(b, "done")).toBe(0);
-    expect(zoneH(b, "active")).toBe(0);
-    expect(Number.isNaN(zoneH(b, "done"))).toBe(false);
-  });
-
-  it("FLAT spec ⇒ the single bar carries zones for the WHOLE task set", () => {
-    // 1 done, 1 in_progress, 2 todo ⇒ total 4 ⇒ done 25, active 25.
-    const d = detail("[]", [
-      task(null, "done"),
-      task(null, "in_progress"),
-      task(null, "todo"),
-      task(null, "todo"),
-    ]);
-    const b = bar(railRollup(d));
-    expect(zoneH(b, "done")).toBe(25);
-    expect(zoneH(b, "active")).toBe(25);
-  });
-
-  it("barZonesOf: empty set ⇒ []; disjoint zones never exceed total", () => {
-    expect(barZonesOf([])).toEqual([]);
-    // 1 done, 2 in_progress, 1 in_review ⇒ done 1, active 3 / total 4 ⇒ 25 + 75 = 100.
-    const z = barZonesOf([
-      task(1, "done"),
-      task(1, "in_progress"),
-      task(1, "in_progress"),
-      task(1, "in_review"),
-    ]);
-    expect(z.find((s) => s.key === "done")?.heightPct).toBe(25);
-    expect(z.find((s) => s.key === "active")?.heightPct).toBe(75);
-    expect(z.reduce((a, s) => a + s.heightPct, 0)).toBeLessThanOrEqual(100);
-  });
-
-  it("all-done phases (done dots) carry NO segments", () => {
-    const rollup = railRollup(detail(THREE_PHASES, [task(1, "done"), task(2, "done"), task(3, "done")]));
-    expect(rollup.items.every((it) => it.segments === undefined)).toBe(true);
+  it("a blocked task surfaces as a RED segment; an in_progress task at 0 done still shows AMBER (the bug)", () => {
+    // blocked among done ⇒ its own red segment (no aggregate phase hue).
+    const blocked = currentPhase(
+      railModel(detail(ONE_PHASE, [task(1, "done"), task(1, "blocked")])),
+    );
+    expect(segStates(blocked?.units[0])).toEqual(["done", "blocked"]);
+    // 1 in_progress + 2 todo, 0 done: the amber segment is visible (not a fully-grey bar).
+    const active = currentPhase(
+      railModel(detail(ONE_PHASE, [task(1, "in_progress"), task(1, "todo"), task(1, "todo")])),
+    );
+    const segs = active?.units[0].segments ?? [];
+    expect(segs.map((s) => s.state)).toEqual(["in_progress", "todo", "todo"]);
+    expect(segs[0].transparent).toBe(false); // amber painted
+    expect(segs[0].tone).toBe(taskStatusMeta("in_progress").dot);
+    expect(segs[1].transparent).toBe(true); // todo = opacity 0
+    expect(segs[2].transparent).toBe(true);
   });
 });
 
-describe("railItemMorph — the dot↔bar morph geometry (purely vertical)", () => {
-  it("BAR target is the tall h-16 gauge; DOT target is the tiny round pastille — heights differ", () => {
-    expect(railItemMorph("bar").height).toBe(RAIL_BAR_HEIGHT_PX);
-    expect(RAIL_BAR_HEIGHT_PX).toBe(64);
-    expect(railItemMorph("done").height).toBe(RAIL_DOT_SIZE_PX);
-    expect(railItemMorph("remaining").height).toBe(RAIL_DOT_SIZE_PX);
-    expect(RAIL_DOT_SIZE_PX).toBe(6);
-    // The morph animates a REAL height change between the two states.
-    expect(railItemMorph("bar").height).not.toBe(railItemMorph("done").height);
+describe("segmentOf — one segment per task, coloured by its STATUS via the SAME taskStatusMeta as the dots", () => {
+  it("done/in_progress/blocked use the panel dot tone (dot ↔ segment coherence); todo is transparent", () => {
+    const done = segmentOf(task(1, "done"));
+    expect(done).toMatchObject({
+      state: "done",
+      tone: taskStatusMeta("done").dot,
+      transparent: false,
+      pulse: false,
+    });
+
+    const prog = segmentOf(task(1, "in_progress"));
+    expect(prog).toMatchObject({
+      state: "in_progress",
+      tone: taskStatusMeta("in_progress").dot,
+      transparent: false,
+      pulse: true, // in_progress breathes
+    });
+
+    const blocked = segmentOf(task(1, "blocked"));
+    expect(blocked).toMatchObject({
+      state: "blocked",
+      tone: taskStatusMeta("blocked").dot,
+      transparent: false,
+      pulse: true, // blocked breathes
+    });
+
+    const todo = segmentOf(task(1, "todo"));
+    expect(todo).toMatchObject({ state: "todo", transparent: true, pulse: false });
   });
 
-  it("RADIUS differs by kind: the DOT is fully ROUND (size ÷ 2), the BAR is a rounded-RECT", () => {
-    // DOT radius = half its size ⇒ a circle; BAR radius is a small rounded-rect, not a pill.
-    expect(railItemMorph("done").borderRadius).toBe(RAIL_DOT_SIZE_PX / 2);
-    expect(railItemMorph("remaining").borderRadius).toBe(RAIL_DOT_SIZE_PX / 2);
-    expect(railItemMorph("bar").borderRadius).not.toBe(railItemMorph("done").borderRadius);
-    // The DOT's radius (3) rounds a 6px box to a circle; the BAR keeps square-ish corners.
-    expect(railItemMorph("bar").borderRadius).toBeLessThan(RAIL_BAR_HEIGHT_PX / 2);
+  it("a pending kind=human task ⇒ a magenta needs_you segment that pulses", () => {
+    const seg = segmentOf(task(1, "todo", { kind: "human" }));
+    expect(seg).toMatchObject({
+      state: "needs_you",
+      tone: RAIL_NEEDS_TONE,
+      transparent: false,
+      pulse: true,
+    });
+    expect(RAIL_NEEDS_TONE).toBe("bg-primary"); // magenta in dark
   });
 
-  it("the WIDTH is CONSTANT across dot and bar ⇒ the morph is purely VERTICAL", () => {
-    // A single shared width token (w-1.5) is used for both states — no horizontal morph.
-    expect(RAIL_ITEM_WIDTH_PX).toBe(6);
-    expect(RAIL_ITEM_WIDTH_PX).toBe(RAIL_DOT_SIZE_PX);
+  it("a RESOLVED kind=human task falls back to its status colour (done = green, not magenta)", () => {
+    const seg = segmentOf(task(1, "done", { kind: "human" }));
+    expect(seg.state).toBe("done");
+    expect(seg.tone).toBe(taskStatusMeta("done").dot);
   });
 });
 
-describe("currentPhaseIndex", () => {
-  it("returns the first not-fully-done phase, or -1 when all are done", () => {
+describe("phaseUnits — the segment strip of each unit (cancelled excluded)", () => {
+  it("always yields at least one unit (an empty phase ⇒ a single empty plan unit, no segments)", () => {
+    expect(phaseUnits([])).toEqual([{ key: "plan", rework: false, segments: [] }]);
+  });
+
+  it("one segment per task, in task order, split across plan/round units", () => {
+    const units = phaseUnits([
+      task(1, "done"),
+      task(1, "in_progress"),
+      finding(1, "todo", 1),
+      finding(1, "done", 1),
+    ]);
+    expect(units[0].key).toBe("plan");
+    expect(units[0].rework).toBe(false);
+    expect(segStates(units[0])).toEqual(["done", "in_progress"]);
+    expect(units[1].key).toBe("round-1");
+    expect(units[1].rework).toBe(true);
+    expect(segStates(units[1])).toEqual(["todo", "done"]);
+  });
+
+  it("1 in_progress + 2 todo ⇒ 1 amber segment + 2 transparent (the 0-done visibility fix)", () => {
+    const units = phaseUnits([task(1, "in_progress"), task(1, "todo"), task(1, "todo")]);
+    const segs = units[0].segments;
+    expect(segs.map((s) => s.state)).toEqual(["in_progress", "todo", "todo"]);
+    expect(segs.filter((s) => s.transparent)).toHaveLength(2); // the two todo segments
+    expect(segs.filter((s) => !s.transparent)).toHaveLength(1); // the amber in_progress segment
+  });
+
+  it("EXCLUDES cancelled tasks (2 done + 1 cancelled ⇒ 2 green segments, NO cancelled segment)", () => {
+    const units = phaseUnits([task(1, "done"), task(1, "done"), task(1, "cancelled")]);
+    expect(segStates(units[0])).toEqual(["done", "done"]); // exactly 2 — the cancelled one has no segment
+    // Mixed: 1 done + 1 todo + 1 cancelled ⇒ 2 segments (done, todo), cancelled dropped.
+    const mixed = phaseUnits([task(1, "done"), task(1, "todo"), task(1, "cancelled")]);
+    expect(segStates(mixed[0])).toEqual(["done", "todo"]);
+  });
+});
+
+describe("roundCount / currentPhaseIndex / tasksOfPhase", () => {
+  it("roundCount counts DISTINCT rework rounds (round ≥ 1) only", () => {
+    expect(roundCount([task(1, "done"), finding(1, "done", 1), finding(1, "todo", 1)])).toBe(1);
+    expect(roundCount([finding(1, "done", 1), finding(1, "todo", 2)])).toBe(2);
+    expect(roundCount([task(1, "done")])).toBe(0);
+  });
+
+  it("currentPhaseIndex = first not-fully-done phase, or -1 when all done", () => {
     expect(currentPhaseIndex([[task(1, "done")], [task(2, "todo")]])).toBe(1);
     expect(currentPhaseIndex([[task(1, "done")], [task(2, "done")]])).toBe(-1);
-    // An EMPTY phase is not done (nothing completed) ⇒ it is the current phase.
-    expect(currentPhaseIndex([[], [task(2, "todo")]])).toBe(0);
+    expect(currentPhaseIndex([[], [task(2, "todo")]])).toBe(0); // an empty phase is not done
   });
-});
 
-describe("tasksOfPhase", () => {
-  it("filters tasks by their phase index", () => {
+  it("tasksOfPhase filters by the task's phase index", () => {
     const tasks = [task(1, "done"), task(2, "todo"), task(1, "todo")];
     expect(tasksOfPhase(tasks, 1)).toHaveLength(2);
-    expect(tasksOfPhase(tasks, 2)).toHaveLength(1);
     expect(tasksOfPhase(tasks, 3)).toHaveLength(0);
   });
 });
 
-describe("rail colour tokens — contrast vs the languette AND the scrollbar", () => {
-  it("done point = success (green); remaining point is a VISIBLE neutral, NOT the old blending /35", () => {
-    expect(POINT_TONE.done).toBe("bg-success");
-    // The old invisible pip was `bg-muted-foreground/35` (~the 45%-opacity scrollbar thumb).
-    expect(POINT_TONE.remaining).not.toMatch(/bg-muted-foreground\/35\b/);
-    // A more opaque neutral (/60) + a crisp ring so it reads against the languette AND scrollbar.
-    expect(POINT_TONE.remaining).toMatch(/bg-muted-foreground\/60/);
-    expect(POINT_TONE.remaining).toMatch(/ring/);
+describe("rail colour tokens — dots grey, needs magenta, track neutral", () => {
+  it("the phase dot is a neutral GREY, NEVER a status colour (never the green done token)", () => {
+    expect(RAIL_DOT_TONE).toMatch(/muted-foreground/);
+    expect(RAIL_DOT_TONE).not.toBe(taskStatusMeta("done").dot);
   });
 
-  it("the bar zone tones come from the GLOBAL task-status dot mapping and the TRACK contrasts", () => {
-    // The active/en-cours zone is the in_progress task-status dot colour (bg-warning), not bespoke.
-    const b = bar(railRollup(detail(ONE_PHASE, [task(1, "done"), task(1, "in_progress")])));
-    expect(zoneTone(b, "active")).toBe(taskStatusMeta("in_progress").dot);
-    expect(zoneTone(b, "active")).toBe("bg-warning");
-    // The track is a distinct neutral (not the fill), so the empty portion stays visible.
-    expect(BAR_TRACK).not.toBe(zoneTone(b, "active"));
-    expect(BAR_TRACK).toMatch(/muted-foreground/);
-  });
-
-  it("the DONE zone tone is solid success (green) — the SAME token as the done phase dot", () => {
-    const b = bar(railRollup(detail(ONE_PHASE, [task(1, "done"), task(1, "todo")])));
-    expect(zoneTone(b, "done")).toBe(taskStatusMeta("done").dot);
-    expect(zoneTone(b, "done")).toBe("bg-success");
-    expect(zoneTone(b, "done")).toBe(POINT_TONE.done);
+  it("the needs tone is magenta (primary); the unit track is neutral grey", () => {
+    expect(RAIL_NEEDS_TONE).toBe("bg-primary");
+    expect(RAIL_TRACK_TONE).toMatch(/muted-foreground/);
   });
 });

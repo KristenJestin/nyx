@@ -81,6 +81,11 @@ pub mod workspace_git;
 pub mod workspace_runtime;
 pub mod workspace_timeline;
 
+/// GATE e2e (v2.5.11 Phase 3, PRD 01KXR1AGWK08H9P800YHXPBCHS) — the full review LOOP, in
+/// process, over the real nyx-core surface. Test-only, so it compiles solely under `--lib`.
+#[cfg(test)]
+mod review_loop_gate;
+
 /// ONE process-global lock for every test that mutates a `NYX_CLAUDE_*` env seam
 /// (`NYX_CLAUDE_CONFIG` / `NYX_CLAUDE_SETTINGS` / `NYX_CLAUDE_BIN` /
 /// `NYX_CLAUDE_PLUGIN_DIR` / `NYX_CLAUDE_STABLE_PLUGIN_DIR`). These vars are

@@ -182,8 +182,9 @@ You may:
 - launch fresh coder and auditor sub-agents (forwarding each its own context)
 - run the checks
 - move the state forward (spec_transition, task_transition)
-- read the review feed (review_comment_list), structure the findings (review_task_structure), and
-  reply to the comments (review_comment_post)
+- read the review feed (review_comment_list), structure the findings (review_task_structure),
+  reply to the comments (review_comment_post), and relay the human's CHAT feedback into the review
+  (review_submit_feedback)
 
 You may not:
 
@@ -191,7 +192,8 @@ You may not:
 - bypass the coder or auditor sub-agents
 - mark the Spec done/cancel without the user's explicit confirmation
 - redefine or re-slice the Spec (that is already done — you work the existing tasks)
-- validate a finding or resolve a comment (validated/resolved are HUMAN-ONLY — no such MCP tool)
+- resolve a HUMAN comment in the human's place (human-comment resolution is HUMAN-ONLY — no MCP
+  tool for it; you may resolve your OWN agent comments with review_comment_resolve)
 
 ## Forwarding a sub-agent (generic — any provider, NO hook)
 
@@ -213,7 +215,11 @@ nyx never flips the Spec's state for you; you do, with spec_transition:
 - You are working a phase -> the Spec is in_progress.
 - AUTOPILOT + every phase finished -> review.
 - STEPPED + the current phase finished -> review (you wait for the human).
-- The human gave feedback and it resumes -> in_progress.
+- In review, the human comes back with feedback (or the auditor raises findings) -> you STAY
+  in_review and work it as a new ROUND. The Spec stays in_review through review AND rework: the
+  ROUNDS carry the activity (each coder pass = a round = time), NOT a state change. There is NO
+  bounce back to in_progress — that transition does not exist here, and it is what got the agent
+  stuck before. `done` (with the human's confirmation) is the only way OUT of in_review.
 - In a loop. NEVER get stuck on the wrong state.
 
 ## Running a phase (coder + deterministic checks)
@@ -239,24 +245,37 @@ When the Spec is in review and the human comes back to talk to you, their return
 not want to merge the current state" — even out of the Spec's scope. You work the feedback: you
 NEVER answer "recreate a PRD?" nor "I cannot create an agent review".
 
+The Spec STAYS in_review the whole time. Feedback (human or auditor) is worked IN PLACE as a new
+ROUND — the rounds carry the rework — you NEVER bounce the Spec back to in_progress (see the state
+rule). Feedback arrives by TWO channels, which coexist:
+  - the diff VIEWER — the human posts/promotes a comment on the diff;
+  - the CHAT — the human just tells you. Relay a chat retour with review_submit_feedback: it becomes
+    a HUMAN, GLOBAL review comment + a proposed finding — the SAME review path as the viewer (the
+    human instructed you directly, so no diff anchor is needed).
+
 1. READ the review feed (review_comment_list) — always, even if the human just says "have a look".
+   Capture any CHAT feedback into the feed first with review_submit_feedback.
 2. If a comment is ambiguous, GRILL the human IN THE CHAT to capture what they want — NOT in the
    comments. The viewer is for findings and result replies, not for the clarification dialogue.
-3. GRILL each human comment into a task. A comment the human promoted is a review task in
-   grill_state=proposed (list them with review_task_list); YOU rewrite it into a clean, actionable
-   task with review_task_structure (proposed -> structured). You NEVER validate it: structured ->
-   validated is HUMAN-ONLY (there is no validate MCP tool).
+3. GRILL each human comment into a finding. A promoted comment is a review finding in
+   grill_state=proposed (list them with review_task_list, passing the spec_id you are reviewing —
+   an UNSCOPED call returns an empty list); YOU rewrite it into a clean, actionable task with
+   review_task_structure (proposed -> structured). That is the WHOLE grill: a structured finding is
+   READY for the coder — there is no separate validation step (the grill has two states).
 4. VERIFY at least what each comment claims — not at face value, look at the facts — then fix it via
-   the coder (forward its context as usual).
+   the coder, working the findings as the current ROUND (forward its context as usual). The Spec
+   stays in_review throughout.
 5. When the fix is done, REPLY in the comment (review_comment_post, parent_id = the comment) stating
    WHAT WAS DONE: how it was implemented — or, if no change was needed, why ("not needed, because…").
-6. You NEVER resolve a human comment — HUMAN-ONLY (there is no resolve MCP tool). You reply (the
-   result); the human validates and closes.
+6. You NEVER resolve a human comment — HUMAN-ONLY (you resolve only YOUR OWN agent comments, via
+   review_comment_resolve). You reply (the result); the human validates and closes the human comment
+   (a comment resolves only once its findings are done).
 
 ## Guard-rails
 
 - done/cancel are sensitive: never without the human's explicit confirmation.
-- You never validate a finding nor resolve a comment in the human's place (both are human-only).
+- You never resolve a HUMAN comment in the human's place (human-only; you resolve only your OWN
+  agent comments). You reply with the result; the human validates and closes their comment.
 - No hidden sub-agent: everything goes through the nyx tools (nyx observes everything)."#
             }
             AgentRole::Coder => {
@@ -1114,6 +1133,22 @@ mod tests {
             text.contains("NEVER get stuck on the wrong state"),
             "never stuck on the wrong state",
         );
+        // Brick 2b — STATUT IN-PLACE (v2.5.11): the Spec STAYS in_review during rework; the rounds
+        // carry the activity; NO bounce back to in_progress (the fix for the stuck state).
+        assert!(
+            text.contains("The Spec stays in_review through review AND rework"),
+            "the Spec stays in_review during review + rework (no bounce)",
+        );
+        assert!(
+            text.contains("bounce back to in_progress"),
+            "the rework is worked in place as rounds — never bouncing to in_progress",
+        );
+        // Brick 2c — the CHAT is a review channel too (retour-chat, v2.5.11): relay chat feedback
+        // via review_submit_feedback (the same review path as the viewer).
+        assert!(
+            text.contains("review_submit_feedback"),
+            "the chat retour is a review channel (review_submit_feedback)",
+        );
 
         // Brick 3 — cadence: deterministic checks per phase, the 2-axis LLM auditor ONCE at the end.
         assert!(
@@ -1138,8 +1173,8 @@ mod tests {
             "grills each comment through the grill lifecycle (proposed -> structured)",
         );
         assert!(
-            text.contains("validated is HUMAN-ONLY"),
-            "the agent structures but never validates (human-only)",
+            text.contains("no separate validation step"),
+            "the grill has two states — a structured finding is coder-ready (no validate step, #31)",
         );
         assert!(
             text.contains("review_comment_post"),

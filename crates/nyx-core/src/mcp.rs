@@ -275,27 +275,49 @@ pub const REVIEW_COMMENT_LIST_TOOL: &str = "review_comment_list";
 /// `{ workspace_id, repository_id, body, spec_id?, parent_id?, file_path?, side?, line_start?,
 /// line_end?, blob?, snippet?, context? }` → `{ comment }`. The AGENT façade to annotate a
 /// review — a global comment, an anchored comment, OR a REPLY (`parent_id`). The author is
-/// ALWAYS `agent` here (the human posts through the UI). The agent may reply but NEVER resolve:
-/// there is DELIBERATELY no `review_comment_resolve` MCP tool. Routes through the SHARED
-/// `db::insert_review_comment` (PDR-0005). Advertised in `tools/list`, kept OUT of [`V1_TOOLS`].
+/// ALWAYS `agent` here (the human posts through the UI). The agent may reply and resolve ITS OWN
+/// (`author_type=agent`) comments ([`REVIEW_COMMENT_RESOLVE_TOOL`]); a HUMAN comment stays
+/// human-only. Routes through the SHARED `db::insert_review_comment` (PDR-0005). Advertised in
+/// `tools/list`, kept OUT of [`V1_TOOLS`].
 pub const REVIEW_COMMENT_POST_TOOL: &str = "review_comment_post";
 
-/// The v2.4 review TASK LIST tool (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`, PDR-0012 — `finding =
-/// task`): `{ workspace_id, repository_id }` → `{ tasks }`, the promoted-task list of a
-/// `(workspace, repository)` review — each task's `from_comment_id`, `title`, optional
-/// `severity`, and `grill_state` (proposed | structured | validated). Routes through the SHARED
-/// `db::list_review_tasks`, the SAME model the UI bridge reads (PDR-0005). Advertised in
-/// `tools/list`, kept OUT of [`V1_TOOLS`]. Read-only.
+/// The v2.5.11 review COMMENT RESOLVE tool (review follow-up finding `01KXZYWGBQEJZ9BM39NYGFKHMJ`):
+/// `{ id }` → `{ comment }`. A comment is resolved BY ITS AUTHOR — this AGENT façade closes an
+/// `author_type=agent` comment (the agent's own), and REFUSES an `author_type=human` one
+/// (`invalid_state`): a human comment stays human-only, closed through the human/UI façade
+/// (`review_comment_resolve` db-command). Routes through the SHARED `db::resolve_agent_comment`.
+/// Advertised in `tools/list`, kept OUT of [`V1_TOOLS`]. Mutating (`Repos` changed).
+pub const REVIEW_COMMENT_RESOLVE_TOOL: &str = "review_comment_resolve";
+
+/// The review FINDING LIST tool (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`; v2.5.11 cutover, PDR-0016):
+/// `{ workspace_id, repository_id, spec_id? }` → `{ tasks }`, the GRILLED findings of a Spec — each
+/// finding's `from_comment_id`, `title`, optional `severity`, and `grill_state` (proposed |
+/// structured; `structured` = coder-ready). Routes through the SHARED `db::list_grilled_findings_for_spec` — the
+/// CANONICAL `tasks kind=review` model (NOT the deprecated `review_tasks` table), the SAME model the
+/// UI bridge reads. Findings are Spec-scoped. Advertised in `tools/list`, kept OUT of [`V1_TOOLS`].
+/// Read-only.
 pub const REVIEW_TASK_LIST_TOOL: &str = "review_task_list";
 
-/// The v2.4 review TASK STRUCTURE tool (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`): the AGENT's step of
-/// the "grill". `{ id, title, details?, severity? }` → `{ task }`. Rewrites a PROPOSED (or
-/// still-structured) promotion into a clean task and moves it to `structured`. The agent may
-/// STRUCTURE but NEVER validate: there is DELIBERATELY no `review_task_validate` MCP tool
-/// (validation is human-only, the guard-rail symmetric to phase-4 human-only comment resolution).
-/// Routes through the SHARED `db::structure_task` (PDR-0005). Advertised in `tools/list`, kept
-/// OUT of [`V1_TOOLS`].
+/// The review FINDING STRUCTURE tool (task `01KX0F6JEKCEV2JCTMEBMM3P4Z`): the AGENT's step of the
+/// "grill" — and its FINAL step. `{ id, title, details?, severity? }` → `{ task }`. Rewrites a
+/// PROPOSED (or still-structured) finding into a clean task and moves it to `structured` — the
+/// coder-ready state. The grill collapsed to two states (review follow-up #31): there is NO
+/// `validated` step and DELIBERATELY no `review_task_validate` tool of any façade. Routes through the
+/// SHARED `db::structure_finding` — the CANONICAL `tasks kind=review` finding model (v2.5.11 cutover,
+/// PDR-0016; NOT `review_tasks`). Advertised in `tools/list`, kept OUT of [`V1_TOOLS`].
 pub const REVIEW_TASK_STRUCTURE_TOOL: &str = "review_task_structure";
+
+/// The v2.5.11 RETOUR-CHAT tool (task `01KXR1CZ68C5S9CY2KFB073KDM` — "Retour-chat = canal de
+/// review"): `{ workspace_id, repository_id, spec_id, body, severity?, title? }` →
+/// `{ comment, finding }`. The agent RELAYS the human's chat feedback as a review channel — it
+/// creates a HUMAN, GLOBAL (non-anchored) `review_comments` row (the human instructed directly, so
+/// presence = authorization — no anchor needed) and immediately GRILLS it into a `proposed`
+/// `tasks kind=review` finding (agent-owned, closable by the coder loop like any finding). This
+/// gives a chat retour the SAME path to review as the viewer, which stays a valid channel in
+/// parallel. Routes through the
+/// SHARED `db::insert_review_comment` + `db::promote_comment_to_finding`. Advertised in `tools/list`,
+/// kept OUT of [`V1_TOOLS`]. Mutating (`Repos` changed).
+pub const REVIEW_SUBMIT_FEEDBACK_TOOL: &str = "review_submit_feedback";
 
 /// The frozen MCP v1 tool surface (ADR-0003). Phase-1 advertises these names in
 /// the `tools/list` handshake; the call bodies are wired in phase 2 over the PRD-3
@@ -1688,6 +1710,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "verification_command": str_prop("how a kind=human action is verified (required to close a human task)"),
                 "parent_task_id": str_prop("optional parent task (subtask decomposition)"),
                 "phase": str_prop("optional phase NAME; nyx materializes the Spec's plan from the names, in first-seen order (needs spec_id)"),
+                "round": int_prop("optional rework round (sub-phase) for a kind=review finding; omit for the plan (round 0). PER-PHASE (2.1, 4.1…)"),
             },
             "required": ["project_id", "title"],
         },
@@ -1884,9 +1907,10 @@ fn tool_descriptors() -> Vec<Value> {
                         Leave a GLOBAL comment (no anchor), an ANCHORED comment (pass `file_path` \
                         + `side` old|new + `line_start` [+ `line_end` for a range], optionally \
                         `blob`/`snippet`/`context` so it re-maps across commits), or a REPLY in a \
-                        thread (pass `parent_id`). The author is always the agent. You may reply \
-                        but you CANNOT resolve a comment — resolution is reserved to the human. \
-                        Returns the created comment.",
+                        thread (pass `parent_id`). The author is always the agent. You may reply, \
+                        and you may resolve YOUR OWN (agent) comments with review_comment_resolve; \
+                        a HUMAN comment stays human-only (you cannot resolve it). Returns the \
+                        created comment.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1906,39 +1930,52 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["workspace_id", "repository_id", "body"],
         },
     }));
+    descriptors.push(json!({
+        "name": REVIEW_COMMENT_RESOLVE_TOOL,
+        "description": "Resolve one of YOUR OWN review comments (author = agent). A comment is \
+                        resolved by its author: you close the agent comments you left; a HUMAN \
+                        comment is human-only and refuses this call (reply to it instead — the \
+                        human validates and closes it). Returns the resolved comment.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": str_prop("the id of YOUR (agent) comment to resolve (from review_comment_list)"),
+            },
+            "required": ["id"],
+        },
+    }));
     // Append the v2.4 review TASK tools (finding = task). LIST the promoted tasks, and
-    // STRUCTURE a proposed promotion (the agent's grill step — the agent may structure but NEVER
-    // validate; there is DELIBERATELY no validate tool, validation is human-only).
+    // STRUCTURE a proposed promotion (the agent's grill step — and its final step; a structured
+    // finding is coder-ready, the grill has no `validated` state, review follow-up #31).
     descriptors.push(json!({
         "name": REVIEW_TASK_LIST_TOOL,
         "description": "List the review TASKS (promoted coder tasks) of ONE repository within a \
                         workspace. A task IS a coder task promoted from a review comment \
                         (finding = task): each carries the source comment it came from \
                         (`from_comment_id`), a `title`, an optional `severity`, and a \
-                        `grill_state` — `proposed` (a human initiated the promotion but did not \
-                        structure it yet), `structured` (you, the agent, gave it a clean \
-                        title/details), or `validated` (the human validated it — only THEN is it \
-                        ready for the coder). Use this to find the promotions waiting for you to \
-                        structure. Read-only.",
+                        `grill_state` — `proposed` (you, the agent, captured the finding from the \
+                        human's retour but have not structured it yet) or `structured` (you gave it \
+                        a clean title/details — it is now ready for the coder). Use this to find the \
+                        findings waiting for you to structure. Read-only.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
                 "repository_id": str_prop("the repository whose tasks to list (from workspace_git(workspace_id=…))"),
+                "spec_id": str_prop("the Spec whose findings to list (findings are Spec-scoped; omit for none)"),
             },
             "required": ["workspace_id", "repository_id"],
         },
     }));
     descriptors.push(json!({
         "name": REVIEW_TASK_STRUCTURE_TOOL,
-        "description": "STRUCTURE a promoted review task (your step of the promotion \"grill\"). \
-                        The human lâche brut — initiates a promotion from a comment WITHOUT \
-                        structuring it; you turn it into a clean coder task: pass a sharp `title`, \
-                        actionable `details`, and an optional `severity` (info|low|medium|high|\
-                        critical). This moves the task to `structured`. You may structure but \
-                        you CANNOT validate a task — validation is reserved to the human (there \
-                        is no validate tool). A task the human already validated cannot be \
-                        re-structured. Returns the updated task.",
+        "description": "STRUCTURE a promoted review task (your step of the promotion \"grill\" — \
+                        and its FINAL step). The human lâche brut (raw feedback); you, the agent, \
+                        captured it as a `proposed` finding — now turn it into a clean coder task: \
+                        pass a sharp `title`, actionable `details`, and an optional `severity` \
+                        (info|low|medium|high|critical). This moves the task to `structured`, which \
+                        is READY for the coder — the grill has just two states, there is no separate \
+                        validate step. You may re-structure to refine it. Returns the updated task.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1948,6 +1985,33 @@ fn tool_descriptors() -> Vec<Value> {
                 "severity": str_prop("optional: info | low | medium | high | critical"),
             },
             "required": ["id", "title"],
+        },
+    }));
+    // Append the v2.5.11 RETOUR-CHAT tool: relay the human's chat feedback into the review as a
+    // HUMAN, GLOBAL comment + a `proposed` finding (the viewer stays a valid channel in parallel).
+    descriptors.push(json!({
+        "name": REVIEW_SUBMIT_FEEDBACK_TOOL,
+        "description": "Submit the HUMAN's chat feedback as a review retour. When the user gives \
+                        you feedback IN THE CHAT while a Spec is in review, relay it here: it \
+                        creates a HUMAN, GLOBAL (non-anchored) review comment — the human \
+                        instructed you directly, so no diff anchor is needed — and immediately \
+                        grills it into a `proposed` review finding (a `tasks kind=review` you then \
+                        STRUCTURE, and the human VALIDATES). This gives a chat retour the SAME path \
+                        to review as the diff viewer, which stays a valid channel in parallel. The \
+                        user's return always means 'work this feedback' — capture it here rather \
+                        than brushing it off. Returns the created comment and finding.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
+                "repository_id": str_prop("the repository under review (from workspace_git(workspace_id=…))"),
+                "spec_id": str_prop("the Spec under review — the finding lives on it (required)"),
+                "body": str_prop("the human's feedback, verbatim from the chat"),
+                "title": str_prop("optional: a short title for the finding (defaults to the feedback body)"),
+                "severity": str_prop("optional: info | low | medium | high | critical"),
+                "phase": json!({ "type": "integer", "minimum": 1, "description": "optional: the phase NUMBER (1-based) this finding belongs to. Overrides the phase nyx would infer (the phase under review). Use it to attribute a finding to a specific phase — e.g. in an autopilot final review where several phases were delivered." }),
+            },
+            "required": ["workspace_id", "repository_id", "spec_id", "body"],
         },
     }));
     descriptors
@@ -2430,29 +2494,36 @@ mod tests {
             names.contains(&REPO_WATCH_TOOL) && names.contains(&REPO_UNWATCH_TOOL),
             "repo_watch + repo_unwatch tools must be listed"
         );
-        // v2.4 review COMMENTS: the list + post tools advertised alongside (NO resolve tool —
-        // the agent never resolves).
+        // v2.4 review COMMENTS: the list + post tools advertised alongside. v2.5.11: the agent
+        // resolves ITS OWN comments too (review_comment_resolve) — a HUMAN comment stays human-only.
         assert!(
             names.contains(&REVIEW_COMMENT_LIST_TOOL) && names.contains(&REVIEW_COMMENT_POST_TOOL),
             "review_comment_list + review_comment_post tools must be listed"
         );
         assert!(
-            !names.contains(&"review_comment_resolve"),
-            "there is DELIBERATELY no resolve tool — the agent never resolves"
+            names.contains(&REVIEW_COMMENT_RESOLVE_TOOL),
+            "review_comment_resolve is listed — the agent resolves its own (agent) comments"
         );
-        // v2.4 review TASKS (finding = task): the list + structure tools advertised (NO validate
-        // tool — the agent structures but the human validates; symmetric to the resolve guard-rail).
+        // v2.4 review TASKS (finding = task): the list + structure tools advertised. The grill has
+        // just two states (review follow-up #31) — a structured finding is coder-ready, so there is
+        // DELIBERATELY no validate tool of any name.
         assert!(
             names.contains(&REVIEW_TASK_LIST_TOOL) && names.contains(&REVIEW_TASK_STRUCTURE_TOOL),
             "review_task_list + review_task_structure tools must be listed"
         );
         assert!(
             !names.contains(&"review_task_validate"),
-            "there is DELIBERATELY no validate tool — the agent structures, the human validates"
+            "there is DELIBERATELY no validate tool — a structured finding is already coder-ready"
+        );
+        // v2.5.11 RETOUR-CHAT: the agent relays the human's chat feedback into the review (a HUMAN
+        // global comment + a proposed finding); the viewer stays a valid channel in parallel.
+        assert!(
+            names.contains(&REVIEW_SUBMIT_FEEDBACK_TOOL),
+            "review_submit_feedback tool must be listed (chat is a review channel)"
         );
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 22 + 9 + crate::mcp_tools_spec::SPEC_TOOLS.len(),
+            V1_TOOLS.len() + 24 + 9 + crate::mcp_tools_spec::SPEC_TOOLS.len(),
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
@@ -2461,8 +2532,8 @@ mod tests {
              workspace_git + workspace_timeline + the 9 spec authoring/transition tools \
              (incl. task_delete) + \
              agent_context + repo_diff + repo_git_view + repo_watch + repo_unwatch + \
-             review_comment_list + review_comment_post + review_task_list + \
-             review_task_structure extension tools"
+             review_comment_list + review_comment_post + review_comment_resolve + review_task_list + \
+             review_task_structure + review_submit_feedback extension tools"
         );
     }
 

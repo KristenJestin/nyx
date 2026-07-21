@@ -21,6 +21,7 @@ export const badgeVariants = cva(
         info: "border-info/40 bg-info/10 text-info",
         warning: "border-warning/40 bg-warning/10 text-warning",
         success: "border-success/40 bg-success/10 text-success",
+        destructive: "border-destructive/40 bg-destructive/10 text-destructive",
       },
     },
   },

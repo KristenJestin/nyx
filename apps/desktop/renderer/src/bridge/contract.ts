@@ -420,9 +420,11 @@ export type TaskSeverity = "info" | "low" | "medium" | "high" | "critical";
 export type GrillState = "proposed" | "structured" | "validated";
 
 /**
- * A `review_tasks` row (mirror of `nyx_core::db::ReviewTask`). `finding = task`: the promoted
- * comment IS the coder task. `from_comment_id` is the trail back to its source comment; `severity`
- * is optional; `grill_state` walks the grill.
+ * A review FINDING in the grill panel (mirror of `nyx_core::db::ReviewFinding`). `finding = task`:
+ * the promoted comment IS the coder task. As of v2.5.11 (PDR-0016) a finding is a `tasks kind=review`
+ * row — the CANONICAL model the overlay reads — projected here into this wire shape; the deprecated
+ * `review_tasks` table is no longer read at runtime. `from_comment_id` is the trail back to its
+ * source comment (1 comment → N findings); `severity` is optional; `grill_state` walks the grill.
  */
 export interface ReviewTask {
   readonly id: string;

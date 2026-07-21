@@ -465,7 +465,7 @@ fn setup(db: &Db) {
     db.with_conn(|c| db::resolve_review_comment(c, &c_resolved))
         .expect("resolve web comment");
 
-    // --- The GRILL: promote comments → tasks in proposed / structured / validated ---------
+    // --- The GRILL: promote comments → tasks in proposed / structured ---------
     // proposed (human lâche brut).
     let comment_range = db
         .with_conn(|c| db::get_review_comment(c, &c_range))
@@ -483,7 +483,8 @@ fn setup(db: &Db) {
         .expect("promote range");
     let _ = rt_proposed;
 
-    // structured (agent structures via MCP) then VALIDATED (human validates → ready for coder).
+    // structured (agent structures via MCP) — a structured task is coder-ready (the grill collapsed
+    // to two states in v25, review follow-up #31; there is no human-only validate step).
     let comment_keep = db
         .with_conn(|c| db::get_review_comment(c, &c_keep))
         .expect("get keep comment")
@@ -508,10 +509,8 @@ fn setup(db: &Db) {
         )
     })
     .expect("structure keep task");
-    db.with_conn(|c| db::validate_task(c, &rt.id))
-        .expect("validate keep task");
 
-    // A second STRUCTURED-only task (from the global comment) — left un-validated.
+    // A second structured task (from the global comment).
     let comment_global = db
         .with_conn(|c| db::get_review_comment(c, &c_global))
         .expect("get global comment")
@@ -806,6 +805,9 @@ fn task_full(
         spec_id: Some(spec_id.to_string()),
         parent_task_id: None,
         phase_name,
+        from_comment_id: None,
+        grill_state: None,
+        round: None,
     };
     let t = db
         .with_conn(|c| db::create_task(c, project_id, title, input.clone()))

@@ -10,6 +10,7 @@ import { specKey, statusMeta } from "../specs/spec-meta";
 import { TasksTab } from "../specs/tabs/tasks-tab";
 import type { Spec } from "../specs/types";
 import { useSpecDetail } from "../specs/use-spec-detail";
+import { useSpecReviewComments } from "../specs/use-spec-review-comments";
 import { OverlayPanelActions } from "./overlay-panel-actions";
 import { OverlayTab } from "./overlay-tab";
 import {
@@ -19,154 +20,176 @@ import {
   overlaySurfaceVariants,
 } from "./overlay-motion";
 import {
-  RAIL_ITEM_WIDTH_PX,
-  railFillTone,
-  railItemMorph,
-  railRollup,
-  type RailItem,
-  type RailRollup,
+  RAIL_DOT_TONE,
+  RAIL_HATCH_STYLE,
+  RAIL_RING_TONE,
+  RAIL_TIE_TONE,
+  RAIL_TRACK_TONE,
+  railModel,
+  type RailModel,
+  type RailPhase,
+  type RailSegment,
+  type RailUnit,
 } from "./overlay-status";
 
+/** Fixed geometry of the frozen rail (px) — a dot pastille, a hollow round ring, a glued bar unit. */
+const RAIL_DOT_PX = 8;
+const RAIL_RING_PX = 6;
+const RAIL_UNIT_HEIGHT_PX = 40;
+const RAIL_UNIT_WIDTH_PX = 10;
+
 /**
- * The closed rail tab's CONTENT (Option B sequence + per-status bar). NO Spec name, NO stacking (dev =
- * a single Spec). It renders the rail's ORDERED SEQUENCE (one item per phase, top→bottom in phase
- * order), with the PROGRESS BAR sitting INLINE at the CURRENT phase's position — NOT pinned to the
- * bottom. Each phase is a {@link RailPhaseItem} keyed by its PHASE INDEX (a STABLE key — NOT the
- * `kind`), so when `currentPhaseIndex` moves the SAME element MORPHS in place rather than remounting:
- *  - `done`      → a green (success) DOT for a phase already finished (before the current one).
- *  - `bar`       → the CURRENT phase's PROGRESS BAR (the stretched state) — see {@link RailPhaseItem}.
- *  - `remaining` → a neutral (visible) DOT for a phase still to do (after the current one).
- * As the current phase advances, the finished phase's `kind` flips `bar → done` (its element RETRACTS
- * from bar to dot) while the next phase flips `remaining → bar` (its element STRETCHES from dot to
- * bar) — "the bar descends the timeline". The items stack naturally and the languette's height
- * FOLLOWS their count (content-driven); the list can shrink + scroll (`min-h-0` + `overflow-y-auto`)
- * so a large phase count never squeezes the bar. Colours (see `overlay-status`) stay VISIBLE against
- * the languette AND the scrollbar behind it. `reduced` (from `useReducedMotion`) makes the active
- * zone STATIC (no pulse) AND collapses every animation (morph, zones, dot enter/leave) to INSTANT —
- * honouring reduced-motion.
- *
- * The phase items are wrapped in an `<AnimatePresence initial={false}>` so that when the PHASE COUNT
- * changes (a phase added/removed ⇒ a dot appears/disappears) the item ENTERS (grows in) / EXITS
- * (collapses out) on the shared spring instead of popping, and the neighbours reflow via each item's
- * `layout`. `initial={false}` keeps the FIRST paint instant (no arrival cascade); only phases added
- * AFTER mount animate in. This AnimatePresence is INDEPENDENT of the active languette's accent bar
- * (`layoutId` in `<OverlayTab>`): the items use local `layout` (no shared id), so the two never
- * collide.
+ * The closed rail tab's CONTENT — the FROZEN languette design (review #32). ONE entry per phase,
+ * top→bottom in phase order:
+ *  - PAST / FUTURE → a GREY dot (always neutral, never green); a reworked phase adds N hollow RING
+ *    dots tied to it by a vertical trait ({@link RailDotPhase}).
+ *  - CURRENT → the glued segment BARS (plan then rework rounds), the ONLY coloured element, each bar
+ *    a strip of per-task status segments ({@link RailCurrentPhase}).
+ * `reduced` (from `useReducedMotion`) drops the segments' pulse.
  */
-export function RailTabContent({
-  rollup,
-  reduced,
-}: {
-  rollup: RailRollup;
-  reduced?: boolean | null;
-}) {
+export function RailTabContent({ model, reduced }: { model: RailModel; reduced?: boolean | null }) {
   return (
-    <div className="flex min-h-0 flex-col items-center gap-1 overflow-y-auto">
-      <AnimatePresence initial={false}>
-        {rollup.items.map((item, i) => (
-          // KEY = the phase INDEX (STABLE) — NOT the `kind`. Keying by index means a `kind` flip
-          // (bar→done / remaining→bar) MORPHS the SAME element in place (height + radius animate)
-          // instead of remounting a fresh node (which would "jump"/reorder rather than morph); a
-          // phase COUNT change adds/removes a trailing index ⇒ AnimatePresence animates that dot's
-          // enter/leave.
-          <RailPhaseItem key={i} item={item} reduced={reduced} />
-        ))}
-      </AnimatePresence>
+    <div className="flex min-h-0 flex-col items-center gap-2.5 overflow-y-auto py-1">
+      {model.phases.map((phase, i) =>
+        phase.kind === "current" ? (
+          <RailCurrentPhase key={i} phase={phase} reduced={reduced} />
+        ) : (
+          <RailDotPhase key={i} phase={phase} />
+        ),
+      )}
     </div>
   );
 }
 
 /**
- * ONE phase of the rail as a SINGLE CONTINUOUS `motion.div` that MORPHS between a dot and the bar by
- * animating its SIZE — there is NO crossfade of two views (the old `<AnimatePresence mode="wait">`
- * dot↔bar swap is gone). It animates a purely VERTICAL morph — HEIGHT + border-RADIUS between the DOT
- * and BAR targets ({@link railItemMorph}), the WIDTH held CONSTANT ({@link RAIL_ITEM_WIDTH_PX}) — with
- * the spring shared by the rest of the overlay (`overlayMotionTransition`; `reduced` ⇒ INSTANT, no
- * morph). `layout` lets the NEIGHBOURS reflow fluidly as this item grows/shrinks. This is INDEPENDENT
- * of the active languette's accent bar (which travels via a `layoutId` in `<OverlayTab>`): these items
- * use local `layout` (no shared id), so the accent bar still GLIDES on a Spec switch and never
- * collides with the item morphs.
- *
- * The whole item ENTERS/EXITS through the parent `<AnimatePresence>` (a phase added/removed): it
- * grows in / collapses out (`opacity` + `height`) on the shared spring rather than popping.
- *
- * The CONTENT is CONTINUOUS — the SAME two layers stay mounted across every `kind`, so a `bar → done`
- * (or `remaining → bar`) flip is a pure SIZE change of one element, never a swap:
- *  - the BASE FILL (`data-rail-fill`) — an always-mounted full-bleed layer painted in the phase's
- *    dominant colour ({@link railFillTone}: `bar` = the neutral track, `done` = success green,
- *    `remaining` = the visible neutral). When the pill shrinks 64→6 this same layer scales down, so a
- *    finished phase reads as its dominant colour condensed into a dot (and the reverse on grow).
- *  - the per-status ZONES (`item.segments`, only ever present on the CURRENT phase's `bar`) stacked
- *    top→bottom OVER the base track so the gauge FLOWS DOWN like the timeline (done → active/pulse →
- *    blocked → skipped; the leftover track at the BOTTOM is the empty todo zone). Each zone is its OWN
- *    `motion.div`, wrapped in a nested `<AnimatePresence initial={false}>`, ANIMATING its cumulative
- *    `top` + `height` on the same spring: when a status COUNT changes (a task moves
- *    todo→in_progress→done→blocked…) the SAME zone element (keyed by `seg.key`) TRANSITIONS its
- *    height/top instead of jumping; a zone that first APPEARS (e.g. the first `blocked`) grows from
- *    height 0; one that DISAPPEARS shrinks to 0 before unmounting. Tones come from the GLOBAL
- *    task-status dot mapping (`segment.tone`); the active zone still PULSES (a className, left off the
- *    motion-animated `top`/`height` so it never fights the opacity keyframes) unless `reduced`.
- * As a phase FINISHES its zones naturally CONVERGE to a single 100% `done` (green) zone while the
- * `kind` flips `bar → done` and the height shrinks to a dot — the zones melt into the green base fill,
- * so the bar CONDENSES into a green dot with no crossfade; the next phase's dot GROWS the reverse way.
+ * A PAST or FUTURE phase — a grey filled DOT (done reads grey, never green). A phase that carried
+ * rework rounds shows `rounds` hollow RING dots below it, tied to the phase dot by a vertical trait
+ * (the "round rattaché à sa phase" grouping).
  */
-function RailPhaseItem({ item, reduced }: { item: RailItem; reduced?: boolean | null }) {
-  const morph = railItemMorph(item.kind);
-  const transition = overlayMotionTransition(reduced ?? null);
+function RailDotPhase({ phase }: { phase: Extract<RailPhase, { kind: "past" | "future" }> }) {
+  const tied = phase.rounds > 0;
   return (
-    <motion.div
-      layout
+    <div
       data-rail-phase=""
-      data-rail-kind={item.kind}
-      className="relative shrink-0 overflow-hidden"
-      style={{ width: RAIL_ITEM_WIDTH_PX }}
-      // ENTER/EXIT for the parent AnimatePresence (phase added/removed). `initial={false}` on that
-      // parent skips this on the FIRST paint, so mount is instant and only LATER add/remove animates.
-      // The `height` + `borderRadius` in `animate` ARE the dot↔bar morph: on a `kind` flip the SAME
-      // element springs between the DOT (6px, round) and BAR (64px, rounded-rect) targets.
-      initial={{ opacity: 0, height: 0 }}
-      animate={{ opacity: 1, height: morph.height, borderRadius: morph.borderRadius }}
-      exit={{ opacity: 0, height: 0 }}
-      transition={transition}
+      data-rail-kind={phase.kind}
+      className="relative flex flex-col items-center gap-1"
     >
-      {/* CONTINUOUS base fill — the ALWAYS-mounted dominant-colour layer that carries the morph's
-          continuity: the bar's neutral track, or a dot's status colour (done green / remaining
-          neutral). It never enters/exits on a `kind` flip, so the pill is one element that only
-          changes SIZE. The animated radius (round at the dot height) + `overflow-hidden` make the
-          retracted state read as a round dot. */}
-      <div data-rail-fill="" className={cn("absolute inset-0", railFillTone(item.kind))} />
-      {/* The per-status ZONES stacked from the TOP over the track so the gauge FLOWS DOWN (done →
-          active → blocked → skipped; the leftover track at the BOTTOM is the empty TODO zone). Only
-          the CURRENT phase's `bar` carries `segments`; the dots have none, so this renders nothing for
-          them (the base fill is the whole dot). Each zone is a motion.div in a nested AnimatePresence
-          so height/top TRANSITION on a status-count change and a zone grows-in / shrinks-out on appear
-          / disappear. `initial={false}` ⇒ the zones present on first paint settle at their resting
-          height (no cascade); a zone added LATER animates from height 0. */}
-      <AnimatePresence initial={false}>
-        {(() => {
-          let top = 0;
-          return (item.segments ?? []).map((seg) => {
-            const zoneTop = top;
-            top += seg.heightPct;
-            return (
-              <motion.div
-                key={seg.key}
-                data-rail-bar-zone={seg.key}
-                className={cn(
-                  "absolute inset-x-0",
-                  seg.tone,
-                  seg.pulse && !reduced && "motion-safe:animate-pulse",
-                )}
-                initial={{ top: `${zoneTop}%`, height: 0 }}
-                animate={{ top: `${zoneTop}%`, height: `${seg.heightPct}%` }}
-                exit={{ height: 0 }}
-                transition={transition}
-              />
-            );
-          });
-        })()}
-      </AnimatePresence>
-    </motion.div>
+      {tied ? (
+        <span
+          data-rail-tie=""
+          aria-hidden
+          className={cn("absolute left-1/2 top-2 bottom-1 w-px -translate-x-1/2", RAIL_TIE_TONE)}
+        />
+      ) : null}
+      <span
+        data-rail-dot=""
+        className={cn("relative z-[1] rounded-full", RAIL_DOT_TONE)}
+        style={{ width: RAIL_DOT_PX, height: RAIL_DOT_PX }}
+      />
+      {phase.rounds > 0
+        ? Array.from({ length: phase.rounds }).map((_, r) => (
+            <span
+              key={r}
+              data-rail-round-ring=""
+              className={cn("relative z-[1] rounded-full", RAIL_RING_TONE)}
+              style={{ width: RAIL_RING_PX, height: RAIL_RING_PX }}
+            />
+          ))
+        : null}
+    </div>
+  );
+}
+
+/**
+ * The CURRENT phase — the glued BARS: the plan (unit 0) then one bar per rework round, each a
+ * fixed-height STRIP of SEGMENTS (one per non-cancelled task, self-coloured by task status). This is
+ * the ONLY coloured element of the rail. Rework units are hatched.
+ */
+function RailCurrentPhase({
+  phase,
+  reduced,
+}: {
+  phase: Extract<RailPhase, { kind: "current" }>;
+  reduced?: boolean | null;
+}) {
+  return (
+    <div
+      data-rail-phase=""
+      data-rail-kind="current"
+      className="flex flex-col items-center overflow-hidden rounded-sm"
+    >
+      {phase.units.map((unit, i) => (
+        <RailUnitBar key={unit.key} unit={unit} first={i === 0} reduced={reduced} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * ONE glued unit of the current phase's bar — a fixed-height STRIP of SEGMENTS, one per non-cancelled
+ * task in task order (top→bottom), each `flex-1` so they split the height evenly. Each segment carries
+ * ITS task's status colour ({@link RailSegmentCell}), so an in_progress task reads amber even with 0
+ * done (the bug: a single-fill bar went fully grey at 0%). The unit's background is the neutral TRACK,
+ * shown through `todo` (transparent) segments and behind an empty (no-task) unit. A rework unit hatches
+ * its segments. No provenance tint ever leaks into the rail — task status only.
+ */
+function RailUnitBar({
+  unit,
+  first,
+  reduced,
+}: {
+  unit: RailUnit;
+  first: boolean;
+  reduced?: boolean | null;
+}) {
+  return (
+    <div
+      data-rail-unit={unit.key}
+      data-rail-rework={unit.rework ? "" : undefined}
+      className={cn(
+        "flex flex-col overflow-hidden",
+        RAIL_TRACK_TONE,
+        !first && "border-t border-background",
+      )}
+      style={{ width: RAIL_UNIT_WIDTH_PX, height: RAIL_UNIT_HEIGHT_PX }}
+    >
+      {unit.segments.map((segment, i) => (
+        <RailSegmentCell key={i} segment={segment} rework={unit.rework} reduced={reduced} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * ONE segment of a unit's strip = ONE non-cancelled task, painted in its STATUS colour (the SAME
+ * `taskStatusMeta` tone as the panel dot ⇒ dot ↔ segment coherence). `todo` renders at opacity 0 (the
+ * track shows through); in_progress/blocked/needs (kind=human) pulse (unless reduced motion). A rework
+ * unit hatches each coloured segment. Segments within a unit are CONTIGUOUS — NO split line between
+ * adjacent tasks (two same-status tasks merge into one block); the only trait is BETWEEN units
+ * ({@link RailUnitBar}).
+ */
+function RailSegmentCell({
+  segment,
+  rework,
+  reduced,
+}: {
+  segment: RailSegment;
+  rework: boolean;
+  reduced?: boolean | null;
+}) {
+  const pulse = segment.pulse && !reduced ? "motion-safe:animate-pulse" : undefined;
+  return (
+    <span
+      data-rail-seg={segment.state}
+      className={cn(
+        "min-h-0 flex-1",
+        // `todo` = opacity 0 (no colour, the track shows through); otherwise the status tone.
+        segment.transparent ? "opacity-0" : segment.tone,
+        pulse,
+      )}
+      // A rework round hatches its coloured segments (skip the invisible `todo` ones).
+      style={rework && !segment.transparent ? RAIL_HATCH_STYLE : undefined}
+    />
   );
 }
 
@@ -175,21 +198,24 @@ function RailPhaseItem({ item, reduced }: { item: RailItem; reduced?: boolean | 
  * terminal's right edge and pointer-transparent except for its own chrome, so the terminal stays
  * interactive underneath.
  *
- *  - CLOSED: a SIMPLE thin tab (vertical gauge + phase pips), no name/stacking (one Spec in dev).
+ *  - CLOSED: the FROZEN languette ({@link RailTabContent}) — grey dots for past/future phases (with
+ *    rework rings), a coloured glued bar for the current phase. No name/stacking (one Spec in dev).
  *  - OPEN: a fixed-width right panel — a header (human key + title + status badge) then the task
- *    decomposition rendered FIDÈLE to the real Spec detail by REUSING `<TasksTab>` wholesale
- *    (roll-up, phase cards, status dots, priority badges, blocked-by, finding/human, skipped).
+ *    decomposition rendered FIDÈLE by REUSING `<TasksTab>` (roll-up + reprises, nested rounds with
+ *    provenance/severity).
  *
- * Placement = prototype `hud-progression` round v6 (the retained SIMPLE rail). The Spec detail
- * (tasks + dependencies + workspace context) is pulled live via `useSpecDetail`, which re-fetches
- * on `specs://changed` — so the gauge, pips and open panel all track dev progress with NO polling.
+ * The Spec detail (tasks + dependencies + workspace context) is pulled live via `useSpecDetail`
+ * (`specs://changed`); the review comments — the source of the panel's provenance — via
+ * `useSpecReviewComments` (`repos://changed`). No polling. The rail's "besoin de toi" (magenta) now
+ * rides a pending `kind=human` task's own segment (per-task status colour), not a phase-level signal.
  */
 export function SpecRailOverlay({ spec }: { spec: Spec }) {
   const [open, setOpen] = useState(false);
   const { detail, loading } = useSpecDetail(spec.id);
+  const { authorByCommentId } = useSpecReviewComments(detail?.workspace_context ?? null, spec.id);
   const reduced = useReducedMotion();
 
-  const rollup: RailRollup = detail ? railRollup(detail) : { items: [] };
+  const model: RailModel = detail ? railModel(detail) : { phases: [] };
   const title = spec.title || `#${spec.number}`;
 
   return (
@@ -202,30 +228,26 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
       transition={overlayMotionTransition(reduced)}
       className="pointer-events-none absolute inset-y-0 right-0 z-20 flex items-stretch justify-end"
     >
-      {/* The closed languette (gauge) sits to the LEFT of the panel and STAYS mounted when open — it
-          FUSES with the panel (shared surface, no shared border) and becomes its close HANDLE. This
-          is the SAME chrome as the tiroir (shared `<OverlayTab>`, model A). Keeping the tab mounted
-          means its one-shot arrival ring is NOT re-triggered when the panel closes. */}
+      {/* The closed languette sits to the LEFT of the panel and STAYS mounted when open — it FUSES
+          with the panel (shared surface, no shared border) and becomes its close HANDLE. */}
       <div className="pointer-events-auto flex max-h-full min-h-0 flex-col justify-center">
         <OverlayTab
           label={`Open ${title} progress`}
           active={open}
           onClick={() => setOpen(!open)}
-          // Content-driven height: the languette grows with the phase-point count (the bar stays
-          // fixed), capped to the pane so a very large count scrolls instead of overflowing.
+          // Content-driven height: the languette grows with the phase count, capped to the pane so a
+          // very large count scrolls instead of overflowing.
           className="max-h-full min-h-0"
         >
           {loading && !detail ? (
             <Spinner className="size-3.5 text-muted-foreground" />
           ) : (
-            <RailTabContent rollup={rollup} reduced={reduced} />
+            <RailTabContent model={model} reduced={reduced} />
           )}
         </OverlayTab>
       </div>
       {/* WIDTH-ANIMATED SHELL (sidebar-shell idiom, same as the tiroir): outer width springs 0↔380 so
-          the languette "suit" the panel; `overflow-hidden` over a FIXED-width inner ⇒ no reflow / no
-          horizontal overflow. `shadow-xl` (only when open) defines the left edge in the gaps around
-          the languette — the panel has NO left border so the fused languette reads seamless. */}
+          the languette "suit" the panel; `overflow-hidden` over a FIXED-width inner ⇒ no reflow. */}
       <motion.div
         initial={false}
         animate={{ width: open && detail ? OVERLAY_PANEL_WIDTH : 0 }}
@@ -273,10 +295,11 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
                     <ChevronRightIcon className="size-4" />
                   </button>
                 </header>
-                {/* FIDÈLE task rendering — the real `<TasksTab>` component. `overflow-x-hidden` clamps
-                    the reused content to the 380px panel (no horizontal scrollbar / clipped text). */}
+                {/* FIDÈLE task rendering — the real `<TasksTab>` component, fed the review comments'
+                    author map so its nested rounds derive provenance. `overflow-x-hidden` clamps the
+                    reused content to the 380px panel (no horizontal scrollbar / clipped text). */}
                 <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-4">
-                  <TasksTab detail={detail} />
+                  <TasksTab detail={detail} authorByCommentId={authorByCommentId} />
                 </div>
               </motion.section>
             ) : null}

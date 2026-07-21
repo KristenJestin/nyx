@@ -1,0 +1,21 @@
+-- Schema v24: DROP the `tasks.origin` column — a review FINDING is ALWAYS raised by the agent
+-- (v2.5.11 "Boucle review complète", review follow-up finding 01KXZYWEAMCVY9ASHRHTFX4FZA —
+-- "Retirer origin de kind=review — une finding est TOUJOURS créée par l'agent").
+--
+-- ## Why (review follow-up: the origin model was wrong)
+--
+-- `tasks.origin` (v21) tagged a `kind=review` finding as `agent` (auditor) vs `human` (a retour) to
+-- drive a HUMAN-ONLY resolution guard. That distinction is INCORRECT: a finding is ALWAYS created by
+-- the agent (the auditor raises it, or the agent grills a retour into it) — whatever the channel. So
+-- `origin` carries no real signal on a finding, and the human-only guard it fed (finding 2,
+-- 01KXZYWFARPQXA9FVBPEZ9QV3J) is dropped with it: the agent closes ANY `kind=review` finding via the
+-- plain `done` path.
+--
+-- PROVENANCE is NOT lost: `review_comments.author_type` (human | agent) stays — THAT is the source of
+-- who spoke, and it is untouched here. Only the redundant `tasks.origin` goes.
+--
+-- SQLite has supported `ALTER TABLE ... DROP COLUMN` since 3.35 (2021); the bundled SQLite is well
+-- past that. Dropping `origin` (physically between `grill_state` and the v22 `round`) leaves the
+-- remaining ported columns in order — `schema.rs` mirrors that (Diesel positional decoding): the
+-- `tasks` table no longer lists `origin`.
+ALTER TABLE tasks DROP COLUMN origin;
