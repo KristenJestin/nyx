@@ -64,6 +64,10 @@ export interface SpecListEntry extends Spec {
   readonly tasks_done: number;
   /** Total tasks of the Spec (the denominator). */
   readonly tasks_total: number;
+  /** v2.6 — the "blocked by N" badge count (directional prerequisites), surfaced on the card. */
+  readonly blocked_by_count: number;
+  /** v2.6 — the "unblocks M" badge count (directional dependents), surfaced on the card. */
+  readonly unblocks_count: number;
 }
 
 /** A `spec_revisions` row (the wire shape of `nyx_core::db::SpecRevision`). */
@@ -175,6 +179,49 @@ export interface SpecDetail {
   readonly tasks: readonly Task[];
   readonly dependencies: readonly TaskDependency[];
   readonly workspace_context: SpecWorkspaceContext | null;
+}
+
+/**
+ * A `annexes` LIST row (the wire shape of `nyx_core::db::AnnexListItem`, v2.6): a Spec attachment
+ * (kind/title) + its content-addressed blob's `byte_len` (a size hint) + the dedup `content_hash`,
+ * WITHOUT the blob content. Rendered in the Spec-detail "Annexes" block (`annexe_list` db-command).
+ */
+export interface AnnexListItem {
+  readonly id: string;
+  readonly spec_id: string;
+  /** `doc` | `artefact` | `url` | `prototype`. */
+  readonly kind: string;
+  readonly title: string;
+  /** The dedup key / pointer into the content-addressed blob store. */
+  readonly content_hash: string;
+  readonly byte_len: number;
+  readonly created_at: number;
+}
+
+/**
+ * One edge of a Spec's dependency view (the wire shape of `nyx_core::db::SpecDepEdge`, v2.6): the
+ * OTHER Spec (id + `title`/`number`/`status`) + the link `kind` (`blocks`/`after`/`related`) + `note`.
+ */
+export interface SpecDepEdge {
+  readonly spec_id: string;
+  readonly kind: string;
+  readonly note: string | null;
+  readonly title: string;
+  readonly number: number;
+  readonly status: string;
+}
+
+/**
+ * A Spec's full dependency VIEW (the wire shape of `nyx_core::db::SpecDependencyView`, v2.6): the
+ * directional `blocked_by` / `unblocks` edges (their `_count` are the badge numbers) + the `related`
+ * context links. Consumed by the Spec-detail dependency badges (`spec_dependency_view` db-command).
+ */
+export interface SpecDependencyView {
+  readonly blocked_by: readonly SpecDepEdge[];
+  readonly unblocks: readonly SpecDepEdge[];
+  readonly related: readonly SpecDepEdge[];
+  readonly blocked_by_count: number;
+  readonly unblocks_count: number;
 }
 
 /** A phase entry parsed from `Spec.phases` (the JSON `[{number,name}]`, PDR-0022). */

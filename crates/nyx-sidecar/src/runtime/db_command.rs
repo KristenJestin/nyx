@@ -1021,6 +1021,11 @@ impl Ctx<'_> {
                     tasks_done: i64,
                     /// Total tasks of the Spec (the denominator).
                     tasks_total: i64,
+                    /// v2.6 — the "bloquée par N" badge count (directional prerequisites of this
+                    /// Spec). Surfaced on the board card (PRD "dépendances surfacées sur le board").
+                    blocked_by_count: i64,
+                    /// v2.6 — the "débloque M" badge count (directional dependents of this Spec).
+                    unblocks_count: i64,
                 }
                 self.db()
                     .with_conn(|c| {
@@ -1035,11 +1040,17 @@ impl Ctx<'_> {
                                 .iter()
                                 .filter(|t| t.status == db::TASK_STATUS_DONE)
                                 .count() as i64;
+                            // The Spec↔Spec dependency badge counts (SAME authority as the detail's
+                            // `spec_dependency_view`, so board + detail agree). One extra bounded
+                            // read per Spec — parity with the per-Spec task tally above.
+                            let deps = db::spec_dependency_view(c, &spec.id)?;
                             entries.push(SpecListEntry {
                                 spec,
                                 project_key: project_key.clone(),
                                 tasks_done,
                                 tasks_total,
+                                blocked_by_count: deps.blocked_by_count,
+                                unblocks_count: deps.unblocks_count,
                             });
                         }
                         Ok::<_, diesel::result::Error>(entries)
@@ -1793,6 +1804,126 @@ impl Ctx<'_> {
                 let provider = self.arg_str("provider")?;
                 self.integration_remove(&provider)
                     .and_then(|s| Self::json(&s))
+            }
+            // --- v2.6 KNOWLEDGE READ models (Phase 4 — the Idées view + the Spec-detail
+            //     annexes/dependency badges). Pure reads over the SAME `nyx_core::db` / `nyx_core::idea`
+            //     accessors the Phase-1/3 MCP tools call (one authority for UI + MCP, PDR-0005): no
+            //     mutation, no `changed` broadcast. Mirror the `spec_list`/`spec_detail` read pattern.
+            //
+            // `idea_themes` — the by-THEME grouping of a project's backlog: one row per theme
+            // (ungrouped ideas fold into a single `theme = null` group), each with the total count
+            // and the per-status breakdown (`open`/`planned`/`implemented`/`dropped`), biggest group
+            // first. Backs the Idées group headers (counter + status mini-dots) + the theme facet.
+            // `{ projectId }`.
+            "idea_themes" => {
+                let project_id = self.arg_str("projectId")?;
+                // The renderer paints the FULL per-status breakdown (mini-dots) + filters
+                // client-side, so the UI read spans EVERY status (`include_terminal = true`). The
+                // active-only default is the MCP `idea_themes` tool's, not this UI read.
+                self.db()
+                    .with_conn(|c| db::list_idea_themes(c, &project_id, true))
+                    .map_err(Self::db_err)
+                    .and_then(|themes| Self::json(&themes))
+            }
+            // `idea_list` — the BOUNDED backlog rows for the Idées table, newest-first, each ENRICHED
+            // with its linked Specs (so a row shows its Spec badges AND the detail drawer renders
+            // "corps + Specs liées + motif de fermeture" from the same item, no second round-trip).
+            // Composes `db::list_ideas` + `db::linked_specs_for_idea` per row — the SAME composition
+            // pattern as `spec_list` (list + per-item tally). Always capped (never Depot's unbounded
+            // dump). `{ projectId, status?, theme? }`.
+            "idea_list" => {
+                let project_id = self.arg_str("projectId")?;
+                let status = self.arg_opt_str("status");
+                let theme = self.arg_opt_str("theme");
+                /// The BOUNDED cap on the browse list — generous for a real backlog while it can
+                /// never re-create the flat unbounded list Depot drowned in (parity with the MCP
+                /// `idea_list` LIST_MAX_LIMIT).
+                const IDEA_LIST_CAP: i64 = 200;
+                #[derive(serde::Serialize)]
+                struct IdeaListItem {
+                    #[serde(flatten)]
+                    idea: db::Idea,
+                    /// The idée↔Spec links, each with the Spec's title/status/number.
+                    linked_specs: Vec<db::LinkedSpec>,
+                }
+                // The renderer paints its own status filter client-side (default "Active" =
+                // open+planned), so the UI list fetches EVERY status by default (`All`) and narrows
+                // only when a specific `status` arg is passed. The active-only default lives in the
+                // MCP `idea_list` tool, not this UI read.
+                let status_filter = match status.as_deref() {
+                    Some(s) => db::IdeaStatusFilter::One(s),
+                    None => db::IdeaStatusFilter::All,
+                };
+                self.db()
+                    .with_conn(|c| {
+                        let ideas = db::list_ideas(
+                            c,
+                            &project_id,
+                            status_filter,
+                            theme.as_deref(),
+                            IDEA_LIST_CAP,
+                            0,
+                        )?;
+                        let mut items = Vec::with_capacity(ideas.len());
+                        for idea in ideas {
+                            let linked_specs = db::linked_specs_for_idea(c, &idea.id)?;
+                            items.push(IdeaListItem { idea, linked_specs });
+                        }
+                        Ok::<_, diesel::result::Error>(items)
+                    })
+                    .map_err(Self::db_err)
+                    .and_then(|items| Self::json(&items))
+            }
+            // `idea_search` — the FTS5 + fuzzy scored search over a project's ideas (the SAME
+            // `nyx_core::idea::search_ideas` the MCP `idea_search` tool serves). Each hit carries a
+            // match extract, the blended score, and the idea's linked Specs. `theme`/`status` narrow
+            // the candidate set; `limit` is clamped by the engine. `{ projectId, query, theme?,
+            // status?, limit? }`.
+            "idea_search" => {
+                let project_id = self.arg_str("projectId")?;
+                let query = self.arg_str("query")?;
+                let theme = self.arg_opt_str("theme");
+                let status = self.arg_opt_str("status");
+                let limit = self
+                    .args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(nyx_core::idea::DEFAULT_SEARCH_LIMIT);
+                self.db()
+                    .with_conn(|c| {
+                        nyx_core::idea::search_ideas(
+                            c,
+                            &project_id,
+                            &query,
+                            theme.as_deref(),
+                            status.as_deref(),
+                            limit,
+                        )
+                    })
+                    .map_err(Self::db_err)
+                    .and_then(|results| Self::json(&results))
+            }
+            // `annexe_list` — the annexes attached to a Spec (the Spec-detail "Annexes" block),
+            // newest-first, each with its blob `byte_len` (no content shipped in the list). The SAME
+            // `db::list_annexes` the MCP `annexe_list` tool serves. `{ specId }`.
+            "annexe_list" => {
+                let spec_id = self.arg_str("specId")?;
+                self.db()
+                    .with_conn(|c| db::list_annexes(c, &spec_id))
+                    .map_err(Self::db_err)
+                    .and_then(|annexes| Self::json(&annexes))
+            }
+            // `spec_dependency_view` — a Spec's full dependency view: the directional `blocked_by` /
+            // `unblocks` edges (with their computable badge counts) + the `related` context links.
+            // Backs the Spec-detail dependency badges ("bloquée par N" / "débloque M"). The SAME
+            // `db::spec_dependency_view` the MCP `spec_link`/state read serves. `{ specId }`.
+            "spec_dependency_view" => {
+                let spec_id = self.arg_str("specId")?;
+                self.db()
+                    .with_conn(|c| db::spec_dependency_view(c, &spec_id))
+                    .map_err(Self::db_err)
+                    .and_then(|view| Self::json(&view))
             }
             other => Err(format!(
                 "db command '{other}' is not available over the sidecar transport"
@@ -3788,5 +3919,269 @@ mod tests {
             comment_resolved["resolved_by_type"],
             serde_json::json!("human")
         );
+    }
+
+    // --- v2.6 Phase 4: the KNOWLEDGE READ commands (Idées view + Spec-detail annexes/deps) ----
+
+    /// `idea_themes` groups a project's backlog by theme with the total + per-status breakdown
+    /// (biggest group first, ungrouped folded into a `theme = null` row). Backs the Idées group
+    /// headers (counter + status mini-dots) + the theme facet. A pure READ — no push.
+    #[test]
+    fn idea_themes_groups_backlog_by_theme_with_status_breakdown() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-idea-themes");
+        let pushes_before = h.pushes();
+
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_idea(c, &project_id, "RBAC one", "b", Some("RBAC"), "manual")?;
+                nyx_core::db::create_idea(c, &project_id, "RBAC two", "b", Some("RBAC"), "manual")?;
+                let ot =
+                    nyx_core::db::create_idea(c, &project_id, "OT", "b", Some("OT"), "manual")?;
+                // Close the OT idea so its theme's breakdown shows a non-open bucket.
+                nyx_core::db::close_idea(
+                    c,
+                    &ot.id,
+                    nyx_core::db::IDEA_STATUS_IMPLEMENTED,
+                    Some("done"),
+                )?;
+                Ok::<_, diesel::result::Error>(())
+            })
+            .unwrap();
+
+        let result = h
+            .run(
+                "idea_themes",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap();
+        let themes: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let themes = themes.as_array().unwrap();
+        // Biggest group first: RBAC (2) before OT (1).
+        assert_eq!(themes[0]["theme"].as_str().unwrap(), "RBAC");
+        assert_eq!(themes[0]["total"].as_i64().unwrap(), 2);
+        assert_eq!(themes[0]["open"].as_i64().unwrap(), 2);
+        assert_eq!(themes[1]["theme"].as_str().unwrap(), "OT");
+        assert_eq!(themes[1]["implemented"].as_i64().unwrap(), 1);
+        // A pure read pushed nothing.
+        assert_eq!(h.pushes(), pushes_before);
+    }
+
+    /// `idea_list` returns the bounded backlog rows ENRICHED with each idea's linked Specs (so a
+    /// row shows its Spec badges and the drawer renders detail from the same item), and honours the
+    /// `status`/`theme` filters. A pure READ — no push.
+    #[test]
+    fn idea_list_returns_bounded_rows_with_linked_specs() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-idea-list");
+
+        let (idea_id, spec_id) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (spec, _rev) =
+                    nyx_core::db::create_spec(c, &project_id, "Linked spec", Default::default())?;
+                let idea = nyx_core::db::create_idea(
+                    c,
+                    &project_id,
+                    "Idea A",
+                    "body",
+                    Some("RBAC"),
+                    "manual",
+                )?;
+                nyx_core::db::create_idea(c, &project_id, "Idea B", "b", Some("OT"), "manual")?;
+                nyx_core::db::link_idea_spec(
+                    c,
+                    &idea.id,
+                    &spec.id,
+                    nyx_core::db::IDEA_KIND_ADDRESSES,
+                )?;
+                Ok::<_, diesel::result::Error>((idea.id, spec.id))
+            })
+            .unwrap();
+
+        // Unfiltered — both ideas.
+        let all = h
+            .run("idea_list", serde_json::json!({ "projectId": project_id }))
+            .unwrap();
+        let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2);
+
+        // Filter by theme RBAC — one idea, ENRICHED with its linked Spec.
+        let rbac = h
+            .run(
+                "idea_list",
+                serde_json::json!({ "projectId": project_id, "theme": "RBAC" }),
+            )
+            .unwrap();
+        let rbac: serde_json::Value = serde_json::from_str(&rbac).unwrap();
+        let rbac = rbac.as_array().unwrap();
+        assert_eq!(rbac.len(), 1);
+        assert_eq!(rbac[0]["id"].as_str().unwrap(), idea_id);
+        let linked = rbac[0]["linked_specs"].as_array().unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0]["spec_id"].as_str().unwrap(), spec_id);
+        assert_eq!(linked[0]["kind"].as_str().unwrap(), "addresses");
+    }
+
+    /// `idea_search` serves the FTS5 + fuzzy scored search (the SAME engine the MCP tool serves):
+    /// a query surfaces the matching idea with a score + its linked Specs. A pure READ — no push.
+    #[test]
+    fn idea_search_returns_scored_hits() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-idea-search");
+
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_idea(
+                    c,
+                    &project_id,
+                    "Cache permission resolution",
+                    "the guard re-resolves permissions each request",
+                    Some("Perf"),
+                    "manual",
+                )?;
+                nyx_core::db::create_idea(
+                    c,
+                    &project_id,
+                    "Unify opening days",
+                    "luxon 1-7",
+                    Some("Sites"),
+                    "manual",
+                )?;
+                Ok::<_, diesel::result::Error>(())
+            })
+            .unwrap();
+
+        let result = h
+            .run(
+                "idea_search",
+                serde_json::json!({ "projectId": project_id, "query": "permission cache" }),
+            )
+            .unwrap();
+        let hits: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let hits = hits.as_array().unwrap();
+        assert!(!hits.is_empty(), "the permission-cache idea is surfaced");
+        assert_eq!(
+            hits[0]["title"].as_str().unwrap(),
+            "Cache permission resolution"
+        );
+        assert!(hits[0]["score"].as_f64().unwrap() > 0.0);
+    }
+
+    /// `annexe_list` returns a Spec's annexes newest-first, each with its blob `byte_len` (no
+    /// content in the list). Backs the Spec-detail "Annexes" block. A pure READ — no push.
+    #[test]
+    fn annexe_list_returns_spec_annexes() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-annexe-list");
+
+        let spec_id = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Spec with annexes",
+                    Default::default(),
+                )?;
+                nyx_core::db::add_annexe(
+                    c,
+                    &spec.id,
+                    nyx_core::db::ANNEX_KIND_PROTOTYPE,
+                    "Mockup L1",
+                    "<html>mockup</html>",
+                )?;
+                nyx_core::db::add_annexe(
+                    c,
+                    &spec.id,
+                    nyx_core::db::ANNEX_KIND_URL,
+                    "Design ref",
+                    "https://example.test/design",
+                )?;
+                Ok::<_, diesel::result::Error>(spec.id)
+            })
+            .unwrap();
+
+        let result = h
+            .run("annexe_list", serde_json::json!({ "specId": spec_id }))
+            .unwrap();
+        let annexes: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let annexes = annexes.as_array().unwrap();
+        assert_eq!(annexes.len(), 2);
+        // Newest-first: the URL annexe was added last.
+        assert_eq!(annexes[0]["kind"].as_str().unwrap(), "url");
+        assert_eq!(annexes[0]["title"].as_str().unwrap(), "Design ref");
+        assert!(annexes[0]["byte_len"].as_i64().unwrap() > 0);
+        assert!(
+            annexes[0].get("content").is_none(),
+            "the list never ships the blob content"
+        );
+    }
+
+    /// `spec_dependency_view` returns the directional `blocked_by`/`unblocks` edges + the badge
+    /// counts; `spec_list` surfaces the SAME counts per card. Backs the Spec-detail + board badges.
+    /// A pure READ — no push.
+    #[test]
+    fn spec_dependency_view_and_list_surface_badge_counts() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-spec-deps");
+
+        // B depends on A (A blocks B): A "débloque" B, B "bloquée par" A.
+        let (a_id, b_id) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (a, _) =
+                    nyx_core::db::create_spec(c, &project_id, "Spec A", Default::default())?;
+                let (b, _) =
+                    nyx_core::db::create_spec(c, &project_id, "Spec B", Default::default())?;
+                Ok::<_, diesel::result::Error>((a.id, b.id))
+            })
+            .unwrap();
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::add_spec_dependency(
+                    c,
+                    &b_id,
+                    &a_id,
+                    nyx_core::db::SPEC_DEP_KIND_BLOCKS,
+                    None,
+                )
+                .map_err(|_| diesel::result::Error::RollbackTransaction)
+            })
+            .unwrap();
+
+        // B's view: bloquée par 1 (A), débloque 0.
+        let view_b = h
+            .run(
+                "spec_dependency_view",
+                serde_json::json!({ "specId": b_id }),
+            )
+            .unwrap();
+        let view_b: serde_json::Value = serde_json::from_str(&view_b).unwrap();
+        assert_eq!(view_b["blocked_by_count"].as_i64().unwrap(), 1);
+        assert_eq!(view_b["unblocks_count"].as_i64().unwrap(), 0);
+        assert_eq!(view_b["blocked_by"][0]["spec_id"].as_str().unwrap(), a_id);
+
+        // The board `spec_list` carries the same counts per card.
+        let list = h
+            .run("spec_list", serde_json::json!({ "projectId": project_id }))
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+        let entries = list.as_array().unwrap();
+        let by_id = |id: &str| {
+            entries
+                .iter()
+                .find(|e| e["id"].as_str() == Some(id))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(&b_id)["blocked_by_count"].as_i64().unwrap(), 1);
+        assert_eq!(by_id(&a_id)["unblocks_count"].as_i64().unwrap(), 1);
     }
 }

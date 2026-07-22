@@ -73,6 +73,11 @@ pub enum ChangedTopic {
     /// A watched repository's Git state changed (v2.4 Q-015 — the real-time git
     /// watcher recomputed a derived view). Mirrors `frontier::ChangedTopic::Repos`.
     Repos,
+    /// The IDEAS backlog changed (v2.6 — carried by the `idea_*` MCP tools so any open
+    /// Idées view re-pulls after an agent capture / maintenance mutation). The wire string
+    /// is `ideas`; the front's re-pull on it is wired in Phase 4 (the Knowledge UI), but the
+    /// mutation authority NAMES the topic here so the seam is single-authority end to end.
+    Ideas,
 }
 
 impl ChangedTopic {
@@ -86,6 +91,7 @@ impl ChangedTopic {
             ChangedTopic::AgentSessions => "agent-sessions",
             ChangedTopic::Specs => "specs",
             ChangedTopic::Repos => "repos",
+            ChangedTopic::Ideas => "ideas",
         }
     }
 }
@@ -2317,7 +2323,15 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         // agent-context render — each delegating to the SHARED `nyx_core::db` authority
         // (single mutation path, no double implementation).
         _ => crate::mcp_tools_spec::dispatch_spec_tool(db, name, args)
-            .or_else(|| crate::mcp_context::dispatch_context_tool(db, name, args)),
+            .or_else(|| crate::mcp_context::dispatch_context_tool(db, name, args))
+            // The v2.6 IDEAS tools (capture + search + maintenance + Spec links) — routed by
+            // their own sub-dispatcher so an idea tool is added in exactly one place, each
+            // delegating to the SHARED `nyx_core::db` idea authority (single mutation path).
+            .or_else(|| crate::mcp_tools_idea::dispatch_idea_tool(db, name, args))
+            // The v2.6 ANNEXE tools (attach doc/artefact/url/prototype to a Spec, dedup by
+            // content_hash) — same one-place sub-dispatcher, delegating to the SHARED
+            // `nyx_core::db` annexe authority.
+            .or_else(|| crate::mcp_tools_annexe::dispatch_annexe_tool(db, name, args)),
     };
 
     // AUTO-MAP (v2.5.10 Phase 1, task 01KXN0HTAXXMXF3GXF4ACM2970): when a spec-scoped MCP

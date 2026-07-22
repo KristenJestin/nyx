@@ -878,6 +878,7 @@ fn tool_descriptors() -> Vec<Value> {
     // Reusable JSON-Schema fragments for the common id/string arguments.
     let str_prop = |desc: &str| json!({ "type": "string", "description": desc });
     let int_prop = |desc: &str| json!({ "type": "integer", "minimum": 0, "description": desc });
+    let bool_prop = |desc: &str| json!({ "type": "boolean", "description": desc });
     // The per-run `env` map (R-WSCMD #7): an object of KEY→VALUE strings merged onto the
     // inherited environment for the launched process. Values are strings (env values).
     let env_prop = || {
@@ -1766,6 +1767,57 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["task_id"],
         },
     }));
+    // Append the v2.6 Phase-3 Spec↔Spec DEPENDENCY tools: express structural constraints between
+    // Specs ("don't merge A before B", "when X lands, do Y") as a cycle-checked directed graph,
+    // and read the computable "bloquée par / débloque" badges. Delegating to the SHARED nyx-core
+    // spec-dependency authority. Part of SPEC_TOOLS (kept OUT of V1_TOOLS).
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_LINK_TOOL,
+        "description": "Link one Spec to another as a DEPENDENCY: from_spec_id depends on / comes \
+                        after to_spec_id (to must land first; from is 'blocked by' to, to \
+                        'unblocks' from). kind is 'blocks' (default, a hard merge gate) or 'after' \
+                        (sequencing) — both directional and cycle-checked — or 'related' (context \
+                        only, never gates and never cycles). An optional note records the rationale. \
+                        A link that would create a cycle in the dependency graph is REFUSED \
+                        (invalid_state); a self-link or an unknown Spec is refused too. Re-linking \
+                        the same pair updates the kind/note.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_spec_id": str_prop("the dependent Spec (the one that comes after / is blocked)"),
+                "to_spec_id": str_prop("the prerequisite Spec (the one that must land first)"),
+                "kind": str_prop("blocks (default) | after (both directional) | related (context only)"),
+                "note": str_prop("optional rationale for the constraint"),
+            },
+            "required": ["from_spec_id", "to_spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_UNLINK_TOOL,
+        "description": "Remove a Spec↔Spec dependency edge (from_spec_id → to_spec_id). Idempotent \
+                        (unlinking a pair that is not linked reports unlinked:false).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "from_spec_id": str_prop("the dependent Spec of the edge to remove"),
+                "to_spec_id": str_prop("the prerequisite Spec of the edge to remove"),
+            },
+            "required": ["from_spec_id", "to_spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_DEPS_TOOL,
+        "description": "Read a Spec's dependency view + computable badges: blocked_by (the Specs it \
+                        depends on / comes after — the 'bloquée par N' badge) and unblocks (the \
+                        Specs that depend on it — the 'débloque M' badge), each with the other \
+                        Spec's title/number/status, plus related context links and the counts \
+                        blocked_by_count / unblocks_count. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "spec_id": str_prop("the Spec whose dependencies + badges to read") },
+            "required": ["spec_id"],
+        },
+    }));
     // Append the v2.4 Phase-5 agent-CONTEXT tool (PDR-0020): render a
     // spec/dev/coder/auditor/doc/prototype manual live from nyx state (the native
     // equivalent of `depot context …`).
@@ -2012,6 +2064,273 @@ fn tool_descriptors() -> Vec<Value> {
                 "phase": json!({ "type": "integer", "minimum": 1, "description": "optional: the phase NUMBER (1-based) this finding belongs to. Overrides the phase nyx would infer (the phase under review). Use it to attribute a finding to a specific phase — e.g. in an autopilot final review where several phases were delivered." }),
             },
             "required": ["workspace_id", "repository_id", "spec_id", "body"],
+        },
+    }));
+    // Append the v2.6 IDEAS tools: the MAINTAINED backlog (capture + scored search + close/
+    // drop/merge maintenance + Spec links). Every mutating tool delegates to the SHARED
+    // nyx-core idea authority; idea_search is the scored top-N surfacing (FTS5 + fuzzy) that
+    // replaces a flat dump. Kept OUT of V1_TOOLS (a new surface, not the frozen v1 contract).
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_ADD_TOOL,
+        "description": "Capture a project IDEA (a follow-up / improvement raised during dev, \
+                        review, or spec work) into nyx's maintained backlog — the durable place \
+                        these go instead of being lost. Give a title and an optional body; group \
+                        it with an optional theme; optionally link it to one or more Specs (spec_ids, \
+                        linked as 'addresses'). Before adding, prefer idea_search to avoid a \
+                        duplicate. Returns the created idea and its linked Specs. \
+                        \n\nIDEA LIFECYCLE (ideas.status): `open` (fresh backlog) and `planned` (a \
+                        linked Spec is in dev) are LIVE; `implemented`, `closed` and `dropped` are \
+                        TERMINAL. `planned`/`implemented` are SPEC-DRIVEN (AUTOMATIC): they follow \
+                        the state of a Spec linked as kind='addresses' — the Spec going in_progress \
+                        moves the idea open→planned, the Spec completing moves it →implemented. \
+                        `closed` is the MANUAL fermeture-par-constat (idea_close, with a motif); \
+                        `dropped` is a manual abandon. A terminal idea does not move again except \
+                        via idea_reopen. Linking (here or idea_link) an idea to an already-active \
+                        Spec reconciles its status immediately (in_progress⇒planned, \
+                        completed⇒implemented).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("project to capture the idea in (from list_projects)"),
+                "title": str_prop("the idea's short title"),
+                "body": str_prop("optional longer description (markdown)"),
+                "theme": str_prop("optional grouping theme (e.g. 'auth', 'perf')"),
+                "source": str_prop("optional capture source: session (default) | spec | manual"),
+                "spec_ids": json!({ "type": "array", "items": { "type": "string" }, "description": "optional Spec ids to link the idea to (each as kind='addresses')" }),
+            },
+            "required": ["project_id", "title"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_SEARCH_TOOL,
+        "description": "Search a project's idea backlog and get a SCORED top-N — NOT a flat dump. \
+                        Combines full-text (FTS5) with a fuzzy/trigram pass so typos and spelling \
+                        variants still surface. Use it at the start of spec/dev work to find ideas \
+                        on a topic (to avoid re-creating a Spec for a need already tracked, and to \
+                        link the relevant ones). Each result carries the idea's title, a match \
+                        extract, a relevance score, and its linked Specs. Narrow with theme/status; \
+                        cap with limit. Search spans EVERY status by default (a resolved idea is \
+                        still findable) — pass status to restrict. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("project whose ideas to search (from list_projects)"),
+                "query": str_prop("the search text (words; typos tolerated)"),
+                "theme": str_prop("optional: restrict to this theme"),
+                "status": str_prop("optional: restrict to one status (open | planned | implemented | closed | dropped)"),
+                "limit": int_prop("optional: max results to return (default 10, capped at 50)"),
+            },
+            "required": ["project_id", "query"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_GET_TOOL,
+        "description": "Read ONE idea by id, with its linked Specs (each with the link kind and \
+                        the Spec's title/status/number). Unknown id → invalid_id. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "id": str_prop("the idea id (from idea_search / idea_list)") },
+            "required": ["id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_IMPLEMENT_TOOL,
+        "description": "Mark an idea IMPLEMENTED (resolved) — the terminal a completed linked Spec \
+                        also drives automatically; call this to record the resolution by hand. No \
+                        motif (use idea_close for a manual fermeture-with-reason). REFUSED \
+                        (invalid_state) if the idea is already terminal \
+                        (implemented/closed/dropped) — use idea_reopen first. Unknown id → \
+                        invalid_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "id": str_prop("the idea id to mark implemented") },
+            "required": ["id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_CLOSE_TOOL,
+        "description": "MANUALLY close an idea as `closed` with a motif (the 'fermeture par \
+                        constat' — you found it was already covered / no longer relevant). This is \
+                        the MANUAL closure, a status DISTINCT from `implemented` (which is the \
+                        Spec-driven, automatic resolution). Records the reason. REFUSED \
+                        (invalid_state) if the idea is already terminal — the existing motif is \
+                        never overwritten; reopen it first if you must re-close it. Unknown id → \
+                        invalid_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": str_prop("the idea id to close"),
+                "reason": str_prop("why it is closed (the motif)"),
+            },
+            "required": ["id", "reason"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_DROP_TOOL,
+        "description": "ABANDON an idea (mark it dropped) — it is no longer worth pursuing. \
+                        Terminal state. REFUSED (invalid_state) if the idea is already terminal \
+                        (implemented/closed/dropped). Unknown id → invalid_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "id": str_prop("the idea id to drop") },
+            "required": ["id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_REOPEN_TOOL,
+        "description": "REOPEN a terminal idea (implemented / closed / dropped) back to `open`, \
+                        clearing its fermeture trail (closed_at / closed_reason). This is the ONE \
+                        explicit way out of a terminal state — implement/close/drop deliberately \
+                        refuse to resurrect a terminal idea, so use idea_reopen when a dropped or \
+                        resolved idea is relevant again. A live idea is returned unchanged. Unknown \
+                        id → invalid_id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "id": str_prop("the idea id to reopen") },
+            "required": ["id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_MERGE_TOOL,
+        "description": "MERGE duplicate ideas into one: the target absorbs each source's points \
+                        (bodies appended) and Spec links, and each source is retired (dropped) with \
+                        a 'merged into' trail. Use it to de-duplicate the backlog. Pass the source \
+                        ids and the target id. Unknown target → invalid_id. Returns the updated \
+                        target and its linked Specs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_ids": json!({ "type": "array", "items": { "type": "string" }, "description": "the idea ids to fold into the target (non-empty)" }),
+                "target_id": str_prop("the idea that absorbs the sources"),
+            },
+            "required": ["source_ids", "target_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_LINK_TOOL,
+        "description": "Link an idea to a Spec with a kind: 'addresses' (the Spec handles the idea — \
+                        the resolution/promotion link that DRIVES the idea's lifecycle) or 'related' \
+                        (context only, drives nothing). An 'addresses' link reconciles the idea's \
+                        status to the Spec's CURRENT state right away: a Spec already in_progress \
+                        moves the idea open→planned, a Spec already completed →implemented (+motif). \
+                        Re-linking the same pair updates the kind. Both ids are validated (unknown → \
+                        invalid_id). Returns the link.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "idea_id": str_prop("the idea to link"),
+                "spec_id": str_prop("the Spec to link it to"),
+                "kind": str_prop("addresses (default) | related"),
+            },
+            "required": ["idea_id", "spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_UNLINK_TOOL,
+        "description": "Remove an idée↔Spec link. Idempotent (unlinking a pair that is not linked \
+                        is a no-op that reports unlinked:false).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "idea_id": str_prop("the idea"),
+                "spec_id": str_prop("the Spec to unlink from it"),
+            },
+            "required": ["idea_id", "spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_LIST_TOOL,
+        "description": "List a project's ideas as a BOUNDED, paginated dump — the fallback when you \
+                        want to browse rather than search. Prefer idea_search for finding ideas on a \
+                        topic. By DEFAULT lists only the ACTIVE backlog (open + planned) so the \
+                        actionable ideas are not buried under the resolved/abandoned tail; pass \
+                        include_terminal:true (or status:\"all\") to include \
+                        implemented/closed/dropped, or a concrete status to narrow to exactly one. \
+                        Page with limit (capped at 200) and offset. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("project whose ideas to list (from list_projects)"),
+                "status": str_prop("optional: one status (open | planned | implemented | closed | dropped), or \"active\" (open+planned, the default) / \"all\""),
+                "include_terminal": bool_prop("optional: include terminal ideas (implemented/closed/dropped) — default false (active only)"),
+                "theme": str_prop("optional: filter by theme"),
+                "limit": int_prop("optional: page size (default 50, capped at 200)"),
+                "offset": int_prop("optional: page offset (default 0)"),
+            },
+            "required": ["project_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_idea::IDEA_THEMES_TOOL,
+        "description": "Group a project's idea backlog BY THEME with counts — the maintenance view \
+                        that keeps the backlog navigable. Returns one entry per theme (ungrouped \
+                        ideas fold into a single theme=null group), each with a total and a \
+                        per-status breakdown (open / planned / implemented / closed / dropped), \
+                        biggest group first. By DEFAULT the counts reflect only the ACTIVE backlog \
+                        (open + planned) — a theme's total matches its actionable ideas and a \
+                        wholly-terminal theme drops out; pass include_terminal:true for the full \
+                        counts across every status. Use it to see the shape of the backlog and \
+                        where to dedup/merge. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("project whose ideas to group by theme (from list_projects)"),
+                "include_terminal": bool_prop("optional: count terminal ideas (implemented/closed/dropped) too — default false (active only)"),
+            },
+            "required": ["project_id"],
+        },
+    }));
+    // Append the v2.6 ANNEXE tools: attach a doc/artefact/url/prototype to a Spec with INTERNAL
+    // storage + DEDUP by content_hash (the same artefact attached twice stores one copy). Every
+    // tool delegates to the SHARED nyx-core annexe authority. Kept OUT of V1_TOOLS (a new surface).
+    descriptors.push(json!({
+        "name": crate::mcp_tools_annexe::ANNEXE_ADD_TOOL,
+        "description": "Attach an ANNEXE (a doc, artefact, URL, or prototype) to a Spec — stored \
+                        INTERNALLY in nyx (not a fragile link to a repo file that will move). The \
+                        content is content-addressed and DEDUPED: attaching the same content twice \
+                        (to this Spec or another) stores ONE physical copy. For a 'url' annexe the \
+                        content IS the URL string. Returns the created annexe.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": str_prop("the Spec to attach the annexe to"),
+                "kind": str_prop("annexe type: doc | artefact | url | prototype"),
+                "title": str_prop("the annexe's title"),
+                "content": str_prop("the annexe's content (the document/artefact text, or the URL string for kind=url) — stored internally"),
+            },
+            "required": ["spec_id", "kind", "title", "content"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_annexe::ANNEXE_LIST_TOOL,
+        "description": "List a Spec's annexes, newest-first — each with its kind, title, \
+                        content_hash and byte size (NOT the content; use annexe_get for the bytes). \
+                        Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "spec_id": str_prop("the Spec whose annexes to list") },
+            "required": ["spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_annexe::ANNEXE_GET_TOOL,
+        "description": "Read ONE annexe by id WITH its stored content (and byte size). Unknown id → \
+                        invalid_id. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "id": str_prop("the annexe id (from annexe_list)") },
+            "required": ["id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_annexe::ANNEXE_REMOVE_TOOL,
+        "description": "Detach an annexe from its Spec by id. Idempotent (removing an unknown id is \
+                        a no-op that reports removed:false). The internal content copy is garbage-\
+                        collected once no annexe references it any more.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "id": str_prop("the annexe id to remove") },
+            "required": ["id"],
         },
     }));
     descriptors
@@ -2521,19 +2840,43 @@ mod tests {
             names.contains(&REVIEW_SUBMIT_FEEDBACK_TOOL),
             "review_submit_feedback tool must be listed (chat is a review channel)"
         );
+        // v2.6 Phase 1: the IDEAS tools (capture + scored search + close/drop/merge + Spec
+        // links) advertised alongside, kept OUT of V1_TOOLS (a new surface).
+        for expected in crate::mcp_tools_idea::IDEA_TOOLS {
+            assert!(
+                names.contains(&expected),
+                "v2.6 idea tool {expected} must be listed"
+            );
+        }
+        // v2.6 Phase 3: the ANNEXE tools (attach doc/artefact/url/prototype to a Spec, dedup by
+        // content_hash) advertised alongside, kept OUT of V1_TOOLS (a new surface). The v2.6
+        // Phase-3 Spec-dependency tools (spec_link / spec_unlink / spec_deps) live IN SPEC_TOOLS,
+        // so they are covered by the SPEC_TOOLS loop above and counted via SPEC_TOOLS.len().
+        for expected in crate::mcp_tools_annexe::ANNEXE_TOOLS {
+            assert!(
+                names.contains(&expected),
+                "v2.6 annexe tool {expected} must be listed"
+            );
+        }
         assert_eq!(
             names.len(),
-            V1_TOOLS.len() + 24 + 9 + crate::mcp_tools_spec::SPEC_TOOLS.len(),
+            V1_TOOLS.len()
+                + 24
+                + 9
+                + crate::mcp_tools_spec::SPEC_TOOLS.len()
+                + crate::mcp_tools_idea::IDEA_TOOLS.len()
+                + crate::mcp_tools_annexe::ANNEXE_TOOLS.len(),
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
              create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
              agent_session_event + set_project_settings + project_set_repos + workspace_runtime + \
-             workspace_git + workspace_timeline + the 9 spec authoring/transition tools \
-             (incl. task_delete) + \
+             workspace_git + workspace_timeline + the spec authoring/transition tools \
+             (incl. task_delete + the v2.6 spec_link/spec_unlink/spec_deps) + \
              agent_context + repo_diff + repo_git_view + repo_watch + repo_unwatch + \
              review_comment_list + review_comment_post + review_comment_resolve + review_task_list + \
-             review_task_structure + review_submit_feedback extension tools"
+             review_task_structure + review_submit_feedback + the 12 v2.6 idea tools + \
+             the 4 v2.6 annexe tools extension tools"
         );
     }
 

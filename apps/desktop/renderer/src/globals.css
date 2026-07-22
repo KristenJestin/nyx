@@ -274,6 +274,22 @@
     @apply font-sans;
   }
 
+  /* DEFINITIVE horizontal-overflow guard for the whole cockpit window (v2.6).
+     nyx is a fixed desktop shell (`h-svh`, internal scroll surfaces): the DOCUMENT must
+     NEVER scroll horizontally. A stray page/drawer overflow used to escape all the way up
+     and scroll the WHOLE window — the LEFT RAIL included (user-confirmed). This clips the
+     X axis at the document root (and `#root`, the app mount) so no descendant — including
+     ABSOLUTELY-positioned ones that escape intermediate clips (their containing block is
+     the viewport) — can ever grow the document horizontally.
+     `clip`, not `hidden`: it clips without turning these into scroll containers, so the
+     Y axis stays a normal `visible` flow and the terminal / sidebar / list surfaces keep
+     their own vertical scroll untouched. */
+  html,
+  body,
+  #root {
+    overflow-x: clip;
+  }
+
   /* Global thin, themed, overlay-like scrollbars so the terminal scrollback
      pane AND the sidebar both drop the ugly native OS bar (dogfood Image 7).
      Defined ONCE here so every scrollable surface inherits it; colours derive

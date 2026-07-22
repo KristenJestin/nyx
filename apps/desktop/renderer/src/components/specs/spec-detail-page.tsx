@@ -14,8 +14,10 @@ import { Breadcrumb, BreadcrumbCurrent, breadcrumbLinkClass } from "@/components
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs } from "@/components/ui/tabs";
 
+import { DependencyBadges } from "./dependency-badges";
 import { SpecSidebar } from "./spec-sidebar";
 import { specKey } from "./spec-meta";
+import { useSpecDependencies } from "./use-spec-dependencies";
 import { useSpecDetail } from "./use-spec-detail";
 import { useSpecReviewComments } from "./use-spec-review-comments";
 import { ActivityTab } from "./tabs/activity-tab";
@@ -71,6 +73,7 @@ export function SpecDetailPage() {
   // Tasks tab (an OPEN human comment also drives the panel's provenance). Called before the early
   // returns (rules of hooks); a null workspace context fetches nothing.
   const { authorByCommentId } = useSpecReviewComments(detail?.workspace_context ?? null, specId);
+  const deps = useSpecDependencies(specId);
   const [tab, setTab] = useState<SpecTabKey>("spec");
 
   if (loading) {
@@ -118,6 +121,13 @@ export function SpecDetailPage() {
                 {spec.title}
               </h1>
             </div>
+            {/* Spec↔Spec dependency badges (PRD "badges dépendances sur le détail Spec"). Present
+                only when non-zero; the same `<DependencyBadges>` the board card surfaces. */}
+            <DependencyBadges
+              blockedBy={deps.blocked_by_count}
+              unblocks={deps.unblocks_count}
+              className="shrink-0 pt-1"
+            />
           </div>
         </header>
 

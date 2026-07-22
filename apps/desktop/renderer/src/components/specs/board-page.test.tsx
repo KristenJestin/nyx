@@ -29,6 +29,8 @@ function specEntry(overrides: Partial<SpecListEntry>): SpecListEntry {
     project_key: "NYX",
     tasks_done: 0,
     tasks_total: 0,
+    blocked_by_count: 0,
+    unblocks_count: 0,
     ...overrides,
   };
 }

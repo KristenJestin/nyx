@@ -466,6 +466,93 @@ diesel::table! {
     }
 }
 
+// - v26 (v2.6 Phase 1 — the IDEAS domain, task 01KXZ9K1ETEBFTR9NNYZVKHCE9) adds `ideas` and
+//   `idea_specs`, the MAINTAINED backlog (the missing piece of Depot's write-only cimetière).
+//   `ideas`: `project_id` (FK CASCADE), `title`/`body` (NOT NULL TEXT, body default '' — both
+//   FTS5-indexed), `status` (TEXT CHECK open|planned|implemented|dropped, default 'open' — the
+//   maintained lifecycle), `theme` (Nullable — the by-theme grouping axis), `source` (TEXT CHECK
+//   session|spec|manual, default 'session'), epoch-ms `created_at`/`updated_at`, and the
+//   fermeture trail `closed_at` (Nullable BigInt) / `closed_reason` (Nullable). `idea_specs`: the
+//   many-to-many idée↔Spec link — `idea_id` + `spec_id` (both FK CASCADE, composite PRIMARY KEY —
+//   a pair links at most once, re-link upserts the kind), `kind` (TEXT CHECK addresses|related,
+//   default 'addresses' — only `addresses` drives the auto lifecycle), epoch-ms `created_at`.
+//   The FTS5 index (`ideas_fts`, external-content on `ideas.rowid`) + its sync triggers are raw
+//   SQL in the migration (not a `diesel::table!`), queried through `sql_query`. Column ORDER here
+//   must match the SQL migration exactly (Diesel positional decoding).
+diesel::table! {
+    ideas (id) {
+        id -> Text,
+        project_id -> Text,
+        title -> Text,
+        body -> Text,
+        status -> Text,
+        theme -> Nullable<Text>,
+        source -> Text,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        closed_at -> Nullable<BigInt>,
+        closed_reason -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    idea_specs (idea_id, spec_id) {
+        idea_id -> Text,
+        spec_id -> Text,
+        kind -> Text,
+        created_at -> BigInt,
+    }
+}
+
+// - v27 (v2.6 Phase 3 — ANNEXES, task 01KXZ9K43C9ZMQ3M5JR07M78HV) adds `annex_blobs` (the
+//   content-addressed internal store: `content_hash` TEXT PRIMARY KEY = the SHA-1 hex the
+//   backend computes over `content`, plus `byte_len` + epoch-ms `created_at` — ONE row per
+//   distinct content, GLOBAL dedup scope) and `annexes` (the per-Spec attachment rows:
+//   `id` UUIDv7 PK, `spec_id` FK CASCADE, `kind` TEXT CHECK doc|artefact|url|prototype,
+//   `title`, `content_hash` FK → annex_blobs (the internal pointer), epoch-ms `created_at`).
+//   N attachments share one blob (dedup); the backend GC-drops a blob on its last-reference
+//   removal. Column ORDER here must match the SQL migration exactly (Diesel positional
+//   decoding).
+diesel::table! {
+    annex_blobs (content_hash) {
+        content_hash -> Text,
+        content -> Text,
+        byte_len -> BigInt,
+        created_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    annexes (id) {
+        id -> Text,
+        spec_id -> Text,
+        kind -> Text,
+        title -> Text,
+        content_hash -> Text,
+        created_at -> BigInt,
+    }
+}
+
+// - v28 (v2.6 Phase 3 — DÉPENDANCES Spec↔Spec, task 01KXZ9K4MBCXQP137ZD6CKJAJE) adds
+//   `spec_depends_on`, the DIRECTED dependency graph between Specs. An edge
+//   `(from_spec_id, to_spec_id)` means "from depends on / comes after to" (same orientation as
+//   `task_dependencies`): `from`/`to` are both FK CASCADE and form the composite PRIMARY KEY (a
+//   pair links at most once, re-link upserts). `kind` (TEXT CHECK blocks|after|related, default
+//   'blocks') — blocks/after are directional (feed cycle detection + badges), related is
+//   context-only (excluded from both). `note` (Nullable) is the rationale; epoch-ms `created_at`.
+//   Acyclicity + the self-edge refusal live in the backend (a reachability DFS), like
+//   `task_dependencies`. Column ORDER here must match the SQL migration exactly (Diesel
+//   positional decoding).
+diesel::table! {
+    spec_depends_on (from_spec_id, to_spec_id) {
+        from_spec_id -> Text,
+        to_spec_id -> Text,
+        kind -> Text,
+        note -> Nullable<Text>,
+        created_at -> BigInt,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
 diesel::joinable!(managed_commands -> projects (project_id));
@@ -479,24 +566,37 @@ diesel::joinable!(repositories -> projects (project_id));
 diesel::joinable!(specs -> projects (project_id));
 diesel::joinable!(specs -> workspaces (workspace_id));
 diesel::joinable!(spec_revisions -> specs (spec_id));
+diesel::joinable!(ideas -> projects (project_id));
+diesel::joinable!(idea_specs -> ideas (idea_id));
+diesel::joinable!(idea_specs -> specs (spec_id));
+diesel::joinable!(annexes -> specs (spec_id));
+diesel::joinable!(annexes -> annex_blobs (content_hash));
 diesel::joinable!(tasks -> projects (project_id));
 diesel::joinable!(tasks -> specs (spec_id));
 // `task_dependencies` has TWO FKs into `tasks` (task_id + depends_on_task_id), and a
 // self-referential `parent_task_id` also joins `tasks -> tasks`; Diesel's `joinable!`
 // declares a single unambiguous join per table pair, so those ambiguous self-joins are
 // intentionally NOT declared (the CRUD queries them explicitly by column instead).
+// `spec_depends_on` has TWO FKs into `specs` (from_spec_id + to_spec_id) — an ambiguous
+// self-join Diesel cannot declare a single `joinable!` for, so it is intentionally NOT
+// declared (the CRUD queries the two directions explicitly by column instead).
 
 diesel::allow_tables_to_appear_in_same_query!(
     agent_session_specs,
     agent_sessions,
+    annex_blobs,
+    annexes,
     command_instances,
     domain_events,
+    idea_specs,
+    ideas,
     managed_commands,
     projects,
     repositories,
     review_comments,
     review_reads,
     review_tasks,
+    spec_depends_on,
     spec_revisions,
     specs,
     task_dependencies,

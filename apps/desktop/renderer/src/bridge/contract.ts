@@ -845,6 +845,31 @@ export type BackendCommand =
   // stay true to the moving diff. A mutation → pushes `repos://changed` (the feed re-pulls the
   // re-mapped/outdated anchors live).
   | "review_remap"
+  // v2.6 KNOWLEDGE READ models (Phase 4 — the native Idées view + the Spec-detail annexes/deps).
+  // Pure reads over the SAME `nyx_core::db` / `nyx_core::idea` accessors the Phase-1/3 MCP tools
+  // call (one authority for UI + MCP, PDR-0005): no mutation, no `changed` broadcast — the Idées
+  // surface re-pulls off the coarse `ideas://changed` push a MCP idea mutation emits.
+  //
+  // `idea_themes` ({ projectId }) — the by-THEME grouping of a project's backlog (one row per
+  // theme, `theme=null` folds the ungrouped; each with `total` + per-status breakdown), biggest
+  // group first. Backs the Idées group headers (counter + status mini-dots) + the theme facet.
+  | "idea_themes"
+  // `idea_list` ({ projectId, status?, theme? }) — the BOUNDED backlog rows, newest-first, each
+  // ENRICHED with its linked Specs (rows show Spec badges; the drawer renders detail from the same
+  // item). Composes `db::list_ideas` + `db::linked_specs_for_idea` (parity with `spec_list`).
+  | "idea_list"
+  // `idea_search` ({ projectId, query, theme?, status?, limit? }) — the FTS5 + fuzzy scored search
+  // (the SAME `nyx_core::idea::search_ideas` the MCP tool serves): each hit carries an extract, the
+  // blended score, and the idea's linked Specs.
+  | "idea_search"
+  // `annexe_list` ({ specId }) — a Spec's annexes newest-first, each with its blob `byte_len` (no
+  // content in the list). Backs the Spec-detail "Annexes" block.
+  | "annexe_list"
+  // `spec_dependency_view` ({ specId }) — a Spec's dependency view: the directional `blocked_by` /
+  // `unblocks` edges + their computable badge counts + the `related` context links. Backs the
+  // Spec-detail dependency badges ("bloquée par N" / "débloque M"); the board reads the counts off
+  // the enriched `spec_list`.
+  | "spec_dependency_view"
   // integrations
   | "integration_list"
   | "integration_install"
@@ -878,6 +903,10 @@ export type BackendEvent =
   // transition MCP tools push this (`ChangedTopic::Specs` → `specs://changed`) so an open
   // Specs board / PRD detail re-pulls after a mutation with NO reload or poll.
   | "specs://changed"
+  // v2.6 (Phase 1/4): the IDEAS domain (ideas / idea_specs) — every idea authoring/maintenance
+  // MCP tool pushes `ChangedTopic::Ideas` → `ideas://changed`, so an open Idées view re-pulls its
+  // themes/rows after an agent mutation with NO reload or poll (mirror of `specs://changed`).
+  | "ideas://changed"
   // v2.4 (task 01KX0F6GDZEH3YN6QJDB7FC0WC / 01KX0F6GY96096AHWD8RZ2BMM0): a WATCHED repo's
   // work-tree/ref changed (edit / commit / checkout). The living review re-pulls the
   // affected repo's `repo_diff` / `repo_git_view` — the "sans polling" refresh (Q-015).

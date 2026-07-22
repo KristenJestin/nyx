@@ -46,10 +46,16 @@ pub const TASK_TRANSITION_TOOL: &str = "task_transition";
 pub const TASK_ADD_DEPENDENCY_TOOL: &str = "task_add_dependency";
 /// `task_delete` — DELETE a task outright (+ its dependency edges), GUARDED to a `draft` Spec.
 pub const TASK_DELETE_TOOL: &str = "task_delete";
+/// `spec_link` — add a Spec↔Spec dependency edge (blocks/after/related + note), cycle-checked.
+pub const SPEC_LINK_TOOL: &str = "spec_link";
+/// `spec_unlink` — remove a Spec↔Spec dependency edge.
+pub const SPEC_UNLINK_TOOL: &str = "spec_unlink";
+/// `spec_deps` — read a Spec's dependency view + the computable "bloquée par / débloque" badges.
+pub const SPEC_DEPS_TOOL: &str = "spec_deps";
 
 /// The Spec authoring + transition tool names — advertised in `tools/list` and routed by
 /// [`dispatch_spec_tool`]. A closed slice so a new tool is added in exactly one place.
-pub const SPEC_TOOLS: [&str; 9] = [
+pub const SPEC_TOOLS: [&str; 12] = [
     SPEC_CREATE_TOOL,
     SPEC_UPDATE_SECTION_TOOL,
     SPEC_FORK_TOOL,
@@ -59,6 +65,9 @@ pub const SPEC_TOOLS: [&str; 9] = [
     TASK_TRANSITION_TOOL,
     TASK_ADD_DEPENDENCY_TOOL,
     TASK_DELETE_TOOL,
+    SPEC_LINK_TOOL,
+    SPEC_UNLINK_TOOL,
+    SPEC_DEPS_TOOL,
 ];
 
 // --- Argument parsing helpers (the D8 vocabulary) --------------------------
@@ -223,6 +232,46 @@ fn map_dependency_err(e: db::DependencyError) -> RpcError {
             ),
         ),
         db::DependencyError::Db(e) => internal_db(e),
+    }
+}
+
+/// Map a [`db::SpecDependencyError`] onto the D8 RPC vocabulary (mirrors [`map_dependency_err`]
+/// for the Spec↔Spec graph).
+fn map_spec_dependency_err(e: db::SpecDependencyError) -> RpcError {
+    match e {
+        db::SpecDependencyError::SpecNotFound { id } => {
+            RpcError::new(RpcCode::InvalidId, format!("unknown spec {id}"))
+        }
+        db::SpecDependencyError::SelfDependency => {
+            RpcError::new(RpcCode::InvalidArgument, "a Spec cannot depend on itself")
+        }
+        db::SpecDependencyError::WouldCreateCycle {
+            from_spec_id,
+            to_spec_id,
+        } => RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "linking {from_spec_id} --depends_on--> {to_spec_id} would create a \
+                 Spec dependency cycle; refused"
+            ),
+        ),
+        db::SpecDependencyError::Db(e) => internal_db(e),
+    }
+}
+
+/// Resolve the Spec-dependency `kind` arg to the vocabulary (`blocks` | `after` | `related`),
+/// defaulting to `blocks` (a hard directional gate) when absent. An unknown value →
+/// `invalid_argument`.
+fn parse_spec_dep_kind(args: &Value) -> Result<&'static str, RpcError> {
+    match optional_str(args, "kind")? {
+        None => Ok(db::SPEC_DEP_KIND_BLOCKS),
+        Some("blocks") => Ok(db::SPEC_DEP_KIND_BLOCKS),
+        Some("after") => Ok(db::SPEC_DEP_KIND_AFTER),
+        Some("related") => Ok(db::SPEC_DEP_KIND_RELATED),
+        Some(other) => Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!("unknown kind '{other}' (accepted: blocks, after, related)"),
+        )),
     }
 }
 
@@ -505,6 +554,53 @@ pub fn task_delete(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     ))
 }
 
+/// `spec_link` — `{ from_spec_id, to_spec_id, kind?, note? }` → `{ dependency }`. Adds a directed
+/// Spec↔Spec dependency edge (from depends on / comes after to) via the SHARED
+/// `db::add_spec_dependency`. The CYCLE CHECK (directional kinds only — `related` is context and
+/// never cycles), the self-edge refusal and the endpoint resolution live in `db.rs`. `kind` is
+/// `blocks` (default) / `after` (directional) or `related` (context only); `note` is an optional
+/// rationale. Re-linking a pair UPSERTS the kind/note. A cycle → `invalid_state`.
+pub fn spec_link(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let from_spec_id = require_str(args, "from_spec_id")?;
+    let to_spec_id = require_str(args, "to_spec_id")?;
+    let kind = parse_spec_dep_kind(args)?;
+    let note = optional_str(args, "note")?;
+    let dependency = db
+        .with_conn(|c| db::add_spec_dependency(c, from_spec_id, to_spec_id, kind, note))
+        .map_err(map_spec_dependency_err)?;
+    Ok(ToolOutcome::changed(
+        json!({ "dependency": dependency }),
+        ChangedTopic::Specs,
+    ))
+}
+
+/// `spec_unlink` — `{ from_spec_id, to_spec_id }` → `{ unlinked }`. Removes a Spec↔Spec dependency
+/// edge via the SHARED `db::remove_spec_dependency`. Idempotent (`unlinked` is `false` when the
+/// pair was not linked).
+pub fn spec_unlink(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let from_spec_id = require_str(args, "from_spec_id")?;
+    let to_spec_id = require_str(args, "to_spec_id")?;
+    let removed = db
+        .with_conn(|c| db::remove_spec_dependency(c, from_spec_id, to_spec_id))
+        .map_err(internal_db)?;
+    Ok(ToolOutcome::changed(
+        json!({ "unlinked": removed > 0, "from_spec_id": from_spec_id, "to_spec_id": to_spec_id }),
+        ChangedTopic::Specs,
+    ))
+}
+
+/// `spec_deps` — `{ spec_id }` → the Spec's dependency VIEW: `blocked_by` / `unblocks` (the
+/// directional edges, each with the other Spec's title/number/status) + `related` context links,
+/// plus the COMPUTABLE badge counts `blocked_by_count` ("bloquée par N") and `unblocks_count`
+/// ("débloque M"). The read behind the board / Spec-detail badges (the UI is Phase 4). Read-only.
+pub fn spec_deps(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let spec_id = require_str(args, "spec_id")?;
+    let view = db
+        .with_conn(|c| db::spec_dependency_view(c, spec_id))
+        .map_err(internal_db)?;
+    Ok(ToolOutcome::read(json!(view)))
+}
+
 // --- Auto-map: the Spec a spec-scoped MUTATION worked on ---------------------
 
 /// The Spec id a successful spec-authoring tool call WORKED ON — the auto-map signal
@@ -523,9 +619,10 @@ pub fn task_delete(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// (`spec_create`, `spec_update_section`, `spec_fork`, `spec_transition`, `spec_set_workspace`,
 /// `task_add`, `task_transition`) are work signals — exactly the PRD's `spec_create /
 /// spec_update_section / task_add / task_transition / dev` set (a `spec_transition
-/// transition=start` is the "dev" launch). `task_add_dependency` / `task_delete` are
-/// deliberately NOT work signals (an edge tweak / a draft cleanup is not "working the Spec",
-/// and a deleted task's Spec is gone from the result).
+/// transition=start` is the "dev" launch). `task_add_dependency` / `task_delete` and the v2.6
+/// Spec-dependency tools (`spec_link` / `spec_unlink` / `spec_deps`) are deliberately NOT work
+/// signals (a structural edge tweak / a badge read / a draft cleanup is not "working the Spec",
+/// and a deleted task's Spec is gone from the result) — they fall through to `None`.
 pub fn worked_spec_id(name: &str, result: &Value) -> Option<String> {
     let str_at = |obj: &Value, path: &[&str]| -> Option<String> {
         let mut cur = obj;
@@ -575,6 +672,9 @@ pub fn dispatch_spec_tool(
         TASK_TRANSITION_TOOL => Some(task_transition(db, args)),
         TASK_ADD_DEPENDENCY_TOOL => Some(task_add_dependency(db, args)),
         TASK_DELETE_TOOL => Some(task_delete(db, args)),
+        SPEC_LINK_TOOL => Some(spec_link(db, args)),
+        SPEC_UNLINK_TOOL => Some(spec_unlink(db, args)),
+        SPEC_DEPS_TOOL => Some(spec_deps(db, args)),
         _ => None,
     }
 }
@@ -669,6 +769,22 @@ mod tests {
         );
         assert_eq!(
             worked_spec_id(TASK_DELETE_TOOL, &json!({ "deleted": true })),
+            None
+        );
+        // The v2.6 Spec-dependency tools (a structural edge tweak / a badge read) never map.
+        assert_eq!(
+            worked_spec_id(
+                SPEC_LINK_TOOL,
+                &json!({ "dependency": { "from_spec_id": "S" } })
+            ),
+            None
+        );
+        assert_eq!(
+            worked_spec_id(SPEC_UNLINK_TOOL, &json!({ "unlinked": true })),
+            None
+        );
+        assert_eq!(
+            worked_spec_id(SPEC_DEPS_TOOL, &json!({ "blocked_by": [] })),
             None
         );
     }
@@ -1160,6 +1276,103 @@ mod tests {
         assert!(
             db.with_conn(|c| db::get_task(c, &bid)).unwrap().is_some(),
             "a refused delete removed nothing"
+        );
+    }
+
+    /// DONE-CRITERION (v2.6 spec deps): `spec_link` refuses a cycle, `related` is context-only
+    /// (never cycles), `spec_deps` returns correct "bloquée par / débloque" badges, and
+    /// `spec_unlink` is idempotent — all THROUGH the real dispatch.
+    #[test]
+    fn spec_link_cycle_refused_badges_and_unlink_through_dispatch() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let mk = |title: &str| -> String {
+            spec_id_of(
+                &spec_create(&db, &json!({ "project_id": project_id, "title": title })).unwrap(),
+            )
+        };
+        let a = mk("A");
+        let b = mk("B");
+        let c = mk("C");
+
+        // A depends on B (blocks), B depends on C (after) — through the real dispatch.
+        let linked = dispatch_spec_tool(
+            &db,
+            SPEC_LINK_TOOL,
+            &json!({ "from_spec_id": a, "to_spec_id": b, "kind": "blocks", "note": "no merge" }),
+        )
+        .expect("spec_link routed")
+        .expect("spec_link ok");
+        assert_eq!(linked.effects, vec![ChangedTopic::Specs]);
+        assert_eq!(linked.result["dependency"]["kind"], "blocks");
+        spec_link(
+            &db,
+            &json!({ "from_spec_id": b, "to_spec_id": c, "kind": "after" }),
+        )
+        .unwrap();
+
+        // C → A would close the cycle A→B→C→A: REFUSED (invalid_state).
+        assert_eq!(
+            spec_link(&db, &json!({ "from_spec_id": c, "to_spec_id": a }))
+                .unwrap_err()
+                .code,
+            RpcCode::InvalidState
+        );
+        // Self-link → invalid_argument; unknown Spec → invalid_id; bad kind → invalid_argument.
+        assert_eq!(
+            spec_link(&db, &json!({ "from_spec_id": a, "to_spec_id": a }))
+                .unwrap_err()
+                .code,
+            RpcCode::InvalidArgument
+        );
+        assert_eq!(
+            spec_link(&db, &json!({ "from_spec_id": a, "to_spec_id": "nope" }))
+                .unwrap_err()
+                .code,
+            RpcCode::InvalidId
+        );
+        assert_eq!(
+            spec_link(
+                &db,
+                &json!({ "from_spec_id": a, "to_spec_id": b, "kind": "bogus" })
+            )
+            .unwrap_err()
+            .code,
+            RpcCode::InvalidArgument
+        );
+
+        // A `related` C→A link is context-only — it does NOT cycle even though A→B→C exists.
+        spec_link(
+            &db,
+            &json!({ "from_spec_id": c, "to_spec_id": a, "kind": "related", "note": "ctx" }),
+        )
+        .unwrap();
+
+        // Badges: B is blocked-by C (1) and unblocks A (1).
+        let deps_b = dispatch_spec_tool(&db, SPEC_DEPS_TOOL, &json!({ "spec_id": b }))
+            .expect("spec_deps routed")
+            .expect("spec_deps ok");
+        assert!(deps_b.effects.is_empty(), "spec_deps is a read");
+        assert_eq!(deps_b.result["blocked_by_count"], 1);
+        assert_eq!(deps_b.result["blocked_by"][0]["spec_id"], c);
+        assert_eq!(deps_b.result["unblocks_count"], 1);
+        assert_eq!(deps_b.result["unblocks"][0]["spec_id"], a);
+
+        // A: blocked-by B (1), unblocks 0 (the C→A link is related, not counted), 1 related link.
+        let deps_a = spec_deps(&db, &json!({ "spec_id": a })).unwrap();
+        assert_eq!(deps_a.result["blocked_by_count"], 1);
+        assert_eq!(deps_a.result["blocked_by"][0]["note"], "no merge");
+        assert_eq!(deps_a.result["unblocks_count"], 0);
+        assert_eq!(deps_a.result["related"].as_array().unwrap().len(), 1);
+
+        // Unlink A→B is idempotent and clears the badge.
+        let un = spec_unlink(&db, &json!({ "from_spec_id": a, "to_spec_id": b })).unwrap();
+        assert_eq!(un.result["unlinked"], true);
+        let un2 = spec_unlink(&db, &json!({ "from_spec_id": a, "to_spec_id": b })).unwrap();
+        assert_eq!(un2.result["unlinked"], false, "already unlinked → no-op");
+        assert_eq!(
+            spec_deps(&db, &json!({ "spec_id": a })).unwrap().result["blocked_by_count"],
+            0
         );
     }
 

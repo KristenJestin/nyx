@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { platform } from "node:process";
 
+import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import Icons from "unplugin-icons/vite";
 import tsconfigPaths from "vite-tsconfig-paths";
@@ -33,7 +34,13 @@ export default defineConfig({
   // `Icons` resolves `~icons/<set>/<slug>` brand-logo imports (finding #55) the same way
   // the app build does, so component tests importing a terminal row don't fail on the
   // unresolved virtual module. Same compiler/jsx as `vite.config.ts`.
-  plugins: [react(), tsconfigPaths(), Icons({ compiler: "jsx", jsx: "react" })],
+  // `tailwindcss()` compiles the REAL utility CSS from `globals.css` — matching the app build —
+  // so a BROWSER-mode spec that imports `@/globals.css` gets the true Tailwind layout (grid
+  // tracks, `min-w-[clamp(...)]`, `overflow-*`, `h-svh`). Without it the utilities never emit and
+  // a layout/overflow regression cannot be reproduced in the real browser. Only CSS that pulls in
+  // `@import "tailwindcss"` (i.e. `globals.css`) is affected, so the other browser specs (which
+  // never import it) render exactly as before.
+  plugins: [react(), tailwindcss(), tsconfigPaths(), Icons({ compiler: "jsx", jsx: "react" })],
   test: {
     projects: [
       {

@@ -46,9 +46,10 @@ const POOL_MAX_SIZE: u32 = 8;
 
 use crate::pathnorm;
 use crate::schema::{
-    agent_session_specs, agent_sessions, command_instances, domain_events, managed_commands,
-    projects, repositories, review_comments, review_reads, review_tasks, spec_revisions, specs,
-    task_dependencies, tasks, terminals, workspaces,
+    agent_session_specs, agent_sessions, annex_blobs, annexes, command_instances, domain_events,
+    idea_specs, ideas, managed_commands, projects, repositories, review_comments, review_reads,
+    review_tasks, spec_depends_on, spec_revisions, specs, task_dependencies, tasks, terminals,
+    workspaces,
 };
 
 /// The migrations baked into the binary at compile time from `migrations/`.
@@ -2269,6 +2270,13 @@ pub fn transition_spec_with_workspace(
                 ))
                 .execute(conn)?;
         }
+
+        // AUTO IDEA LIFECYCLE (v2.6, task 01KXZ9K2GSB8V8R390BR0NKQSM): a Spec transition drives
+        // the status of the ideas it ADDRESSES (kind=addresses) — start → planned, done →
+        // implemented (+ motif), cancel → reopen(open). In the SAME transaction, so the Spec flip
+        // and the idea propagation commit atomically. `related` links and the ready/review
+        // transitions change nothing (the helper returns early / excludes them).
+        propagate_idea_lifecycle_for_transition(conn, spec_id, spec.number, transition)?;
 
         // Outbox: the status flip AND its `spec.transitioned` event commit atomically. The
         // payload records the `from`/`to` status AND the requested `verb` (the conceptual
@@ -7147,6 +7155,1279 @@ pub fn close_warning_candidates(conn: &mut SqliteConnection) -> QueryResult<Vec<
         .collect())
 }
 
+// --- IDEAS domain (v2.6 Phase 1, v26) --------------------------------------
+//
+// The MAINTAINED backlog (the missing piece of Depot's write-only cimetière): pure DB
+// functions over `ideas` + `idea_specs`, plus the FTS5 raw-SQL match the `idea_search` tool
+// scores over. The maintenance semantics (search/fuzzy scoring, the auto lifecycle) live
+// ABOVE this floor — the search+scoring in `crate::idea`, the MCP tools in
+// `crate::mcp_tools_idea` — so this module stays the single persistence authority.
+
+/// `ideas.status` — a FRESH idea in the open backlog (the default at capture).
+pub const IDEA_STATUS_OPEN: &str = "open";
+/// `ideas.status` — a linked Spec (kind=addresses) went in_progress: the idea is being worked
+/// (Phase 2 auto transition). It has left the "open" backlog but is not yet resolved. AUTOMATIC —
+/// driven by the linked Spec's lifecycle, never a manual tool.
+pub const IDEA_STATUS_PLANNED: &str = "planned";
+/// `ideas.status` — AUTOMATICALLY resolved: a linked Spec reached `completed`, or an explicit
+/// `idea_implement`. A terminal state; `closed_at`/`closed_reason` are stamped. Distinct from
+/// [`IDEA_STATUS_CLOSED`], which is the MANUAL fermeture-par-constat.
+pub const IDEA_STATUS_IMPLEMENTED: &str = "implemented";
+/// `ideas.status` — MANUALLY closed by constat (`idea_close(reason)`): a human found the idea was
+/// already covered / no longer relevant and closed it with a motif. A terminal state distinct from
+/// [`IDEA_STATUS_IMPLEMENTED`] (which is the Spec-driven, automatic resolution). Added in v29.
+pub const IDEA_STATUS_CLOSED: &str = "closed";
+/// `ideas.status` — ABANDONED (manual drop, or a merge tombstone). Terminal.
+pub const IDEA_STATUS_DROPPED: &str = "dropped";
+
+/// Whether an `ideas.status` is TERMINAL — a resolved/abandoned end state that no automatic path
+/// and no `idea_implement`/`idea_close`/`idea_drop` may transition OUT of (only the explicit
+/// `idea_reopen` returns it to `open`). The three terminals are `implemented` (auto/`idea_implement`),
+/// `closed` (manual `idea_close`) and `dropped` (`idea_drop`/merge). `open`/`planned` are LIVE.
+pub fn is_terminal_idea_status(status: &str) -> bool {
+    matches!(
+        status,
+        IDEA_STATUS_IMPLEMENTED | IDEA_STATUS_CLOSED | IDEA_STATUS_DROPPED
+    )
+}
+
+/// `idea_specs.kind` — the Spec TRAITE the idea: the resolution/promotion link the auto
+/// lifecycle (Phase 2) keys on (a linked `addresses` Spec drives the idea's status).
+pub const IDEA_KIND_ADDRESSES: &str = "addresses";
+/// `idea_specs.kind` — CONTEXTE seul: a soft link that NEVER drives a status change.
+pub const IDEA_KIND_RELATED: &str = "related";
+
+/// `ideas.source` — an agent raised the idea during a work session (dev / review / nspec) —
+/// the common case and the `idea_add` capture default.
+pub const IDEA_SOURCE_SESSION: &str = "session";
+/// `ideas.source` — derived from a Spec.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const IDEA_SOURCE_SPEC: &str = "spec";
+/// `ideas.source` — a human typed it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const IDEA_SOURCE_MANUAL: &str = "manual";
+
+/// An `ideas` row: one MAINTAINED backlog idea. `Serialize` for the IPC/MCP boundary.
+/// `status` walks open → planned → implemented/closed (or dropped); `theme` is the grouping axis
+/// (`None` = ungrouped); `closed_at`/`closed_reason` are the fermeture trail (both `None`
+/// while live). The `title`/`body` are the FTS5-indexed text the `idea_search` scores over.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = ideas)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Idea {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub body: String,
+    /// `open` | `planned` | `implemented` | `closed` | `dropped`.
+    pub status: String,
+    /// The by-theme grouping axis (`None` = ungrouped).
+    pub theme: Option<String>,
+    /// `session` | `spec` | `manual` — how the idea was captured.
+    pub source: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Epoch ms the idea reached a terminal state (`None` while live).
+    pub closed_at: Option<i64>,
+    /// The fermeture motif (`None` while live).
+    pub closed_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = ideas)]
+struct NewIdeaRow {
+    id: String,
+    project_id: String,
+    title: String,
+    body: String,
+    status: String,
+    theme: Option<String>,
+    source: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+/// An `idea_specs` row: one idée↔Spec link with its `kind` (`addresses` | `related`).
+/// `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = idea_specs)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct IdeaSpecLink {
+    pub idea_id: String,
+    pub spec_id: String,
+    /// `addresses` (the Spec traite l'idée) | `related` (contexte seul).
+    pub kind: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = idea_specs)]
+struct NewIdeaSpecRow {
+    idea_id: String,
+    spec_id: String,
+    kind: String,
+    created_at: i64,
+}
+
+/// A Spec LINKED to an idea, enriched for surfacing (the `idea_search` / detail view): the
+/// link `kind` plus the Spec's human-facing `title`/`status`/`number`. Produced by
+/// [`linked_specs_for_idea`] via a join. `Serialize` for the MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Queryable)]
+pub struct LinkedSpec {
+    pub spec_id: String,
+    /// `addresses` | `related`.
+    pub kind: String,
+    pub title: String,
+    pub status: String,
+    pub number: i32,
+}
+
+/// One FTS5 hit: an idea `id` and its `bm25` relevance `score` (smaller = better match).
+/// Read via [`fts_match_ideas`] over the external-content `ideas_fts` index.
+#[derive(Debug, Clone, PartialEq, diesel::QueryableByName)]
+pub struct IdeaFtsHit {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub id: String,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    pub score: f64,
+}
+
+/// CREATE an idea in `project_id` (status `open`, no fermeture trail). `theme` is the optional
+/// grouping axis; `source` is how it was captured (`session`/`spec`/`manual`). Timestamps are
+/// stamped by the backend; the FTS5 index is fed by the migration's AFTER INSERT trigger.
+/// Returns the created [`Idea`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_idea(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    title: &str,
+    body: &str,
+    theme: Option<&str>,
+    source: &str,
+) -> QueryResult<Idea> {
+    let now = now_millis();
+    diesel::insert_into(ideas::table)
+        .values(NewIdeaRow {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            status: IDEA_STATUS_OPEN.to_string(),
+            theme: theme.map(|t| t.to_string()),
+            source: source.to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+        .returning(Idea::as_returning())
+        .get_result(conn)
+}
+
+/// Fetch ONE idea by id, or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_idea(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Idea>> {
+    ideas::table
+        .find(id)
+        .select(Idea::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// The status SCOPE of a backlog listing ([`list_ideas`] / [`list_idea_themes`]): the whole
+/// backlog, a single status, or the ACTIVE set (`open` + `planned`). `Active` is the maintained
+/// default the MCP `idea_list` / `idea_themes` tools apply so a listing surfaces the ACTIONABLE
+/// backlog, not the resolved/abandoned tail — the terminal ideas are opt-in (review finding
+/// 01KY4S0JCT7E7MMVT80Q1BSKE1). The renderer (which paints its own status filter client-side)
+/// still asks for `All` / `One`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdeaStatusFilter<'a> {
+    /// Every status (`open`/`planned`/`implemented`/`closed`/`dropped`).
+    All,
+    /// Only the LIVE backlog: `open` + `planned` (the maintained default).
+    Active,
+    /// Exactly one status (an explicit narrow — honoured even for a terminal status).
+    One(&'a str),
+}
+
+/// LIST the ideas of `project_id`, newest-first, filtered by `status` scope and/or `theme`, and
+/// BOUNDED by `limit`/`offset`. This is the paginated fetch-all fallback (the "secours" of PRD
+/// Impl Decisions): the primary read is `idea_search`; this is the raw dump, always capped so it
+/// can never re-create the flat unbounded list Depot drowned in. The `status` scope is
+/// [`IdeaStatusFilter`] — `Active` (open+planned) is the maintained default the MCP tool applies.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_ideas(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    status: IdeaStatusFilter,
+    theme: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> QueryResult<Vec<Idea>> {
+    let mut query = ideas::table
+        .filter(ideas::project_id.eq(project_id))
+        .into_boxed();
+    match status {
+        IdeaStatusFilter::All => {}
+        IdeaStatusFilter::Active => {
+            query = query.filter(ideas::status.eq_any(vec![
+                IDEA_STATUS_OPEN.to_string(),
+                IDEA_STATUS_PLANNED.to_string(),
+            ]));
+        }
+        IdeaStatusFilter::One(status) => {
+            query = query.filter(ideas::status.eq(status.to_string()));
+        }
+    }
+    if let Some(theme) = theme {
+        query = query.filter(ideas::theme.eq(theme.to_string()));
+    }
+    query
+        .order((ideas::created_at.desc(), ideas::id.desc()))
+        .limit(limit)
+        .offset(offset)
+        .select(Idea::as_select())
+        .load(conn)
+}
+
+/// CLOSE an idea into a terminal state (`implemented` or `dropped`): sets `status`, stamps
+/// `closed_at = now` and the `closed_reason` motif (`None` leaves it unset), and bumps
+/// `updated_at`. Returns the updated row, or `None` when the id is unknown. The single
+/// terminal-transition authority the `idea_implement` / `idea_close` / `idea_drop` tools call.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn close_idea(
+    conn: &mut SqliteConnection,
+    id: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> QueryResult<Option<Idea>> {
+    let now = now_millis();
+    diesel::update(ideas::table.find(id))
+        .set((
+            ideas::status.eq(status.to_string()),
+            ideas::closed_at.eq(Some(now)),
+            ideas::closed_reason.eq(reason.map(|r| r.to_string())),
+            ideas::updated_at.eq(now),
+        ))
+        .returning(Idea::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// Set an idea to a LIVE (non-terminal) status — `open` or `planned` — CLEARING the fermeture
+/// trail (`closed_at`/`closed_reason` → NULL) and bumping `updated_at`. This is the DISTINCT
+/// transition path the auto lifecycle uses for the moves that are NOT a closure:
+///   * `open → planned` when a linked Spec starts (there is no closure to stamp);
+///   * `… → open` REOPEN when a linked Spec is cancelled (any fermeture trail is cleared, so a
+///     reopened idea carries no stale "closed" trace).
+///
+/// Deliberately NOT [`close_idea`], which stamps `closed_at`/`closed_reason` UNCONDITIONALLY —
+/// a live idea must never carry a fermeture trail. Returns the updated row, or `None` when the
+/// id is unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_idea_live_status(
+    conn: &mut SqliteConnection,
+    id: &str,
+    status: &str,
+) -> QueryResult<Option<Idea>> {
+    let now = now_millis();
+    diesel::update(ideas::table.find(id))
+        .set((
+            ideas::status.eq(status.to_string()),
+            ideas::closed_at.eq(None::<i64>),
+            ideas::closed_reason.eq(None::<String>),
+            ideas::updated_at.eq(now),
+        ))
+        .returning(Idea::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// The ideas a Spec ADDRESSES — the ideas linked to `spec_id` with `kind = 'addresses'` (the
+/// resolution/promotion links the auto lifecycle keys on; `related` links are EXCLUDED so they
+/// drive nothing). The candidate set of [`propagate_idea_lifecycle_for_transition`].
+fn ideas_addressed_by_spec(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Vec<Idea>> {
+    idea_specs::table
+        .inner_join(ideas::table)
+        .filter(idea_specs::spec_id.eq(spec_id))
+        .filter(idea_specs::kind.eq(IDEA_KIND_ADDRESSES))
+        .select(Idea::as_select())
+        .load(conn)
+}
+
+/// Which idea move a Spec's state drives — the SHARED vocabulary of the Spec-transition
+/// propagation ([`propagate_idea_lifecycle_for_transition`]) AND the link-time reconciliation
+/// ([`reconcile_idea_status_to_spec`]), so both apply the SAME rules (no duplicated lifecycle).
+#[derive(Clone, Copy)]
+enum IdeaLifecycleAction {
+    /// `open → planned` (the Spec is/started in_progress).
+    Plan,
+    /// `open|planned → implemented` (the Spec is/reached completed).
+    Implement,
+    /// `planned → open` (the Spec was CANCELLED — reopen, not dropped).
+    Reopen,
+}
+
+/// Apply ONE [`IdeaLifecycleAction`] to ONE idea, per the auto-lifecycle rules — the single place
+/// the move is decided, shared by the Spec-transition propagation and the link-time reconcile.
+/// Returns whether the idea's status changed. TERMINAL ideas (`implemented`/`closed`/`dropped`) are
+/// left as-is by every branch: a genuinely resolved, manually-closed or abandoned idea is never
+/// disturbed by a Spec's state (no silent resurrection). `Plan` only touches `open`; `Implement`
+/// only `open`/`planned` (stamping the "implémentée via Spec #N" motif); `Reopen` only `planned`.
+fn apply_idea_lifecycle_action(
+    conn: &mut SqliteConnection,
+    idea: &Idea,
+    action: IdeaLifecycleAction,
+    spec_number: i32,
+) -> QueryResult<bool> {
+    let moved = match action {
+        // open → planned (a live move; no closure). Other statuses left as-is.
+        IdeaLifecycleAction::Plan if idea.status == IDEA_STATUS_OPEN => {
+            set_idea_live_status(conn, &idea.id, IDEA_STATUS_PLANNED)?;
+            true
+        }
+        // open|planned → implemented (+ motif). Terminal ideas left as-is.
+        IdeaLifecycleAction::Implement
+            if idea.status == IDEA_STATUS_OPEN || idea.status == IDEA_STATUS_PLANNED =>
+        {
+            close_idea(
+                conn,
+                &idea.id,
+                IDEA_STATUS_IMPLEMENTED,
+                Some(&format!("implémentée via Spec #{spec_number}")),
+            )?;
+            true
+        }
+        // planned → open (Spec cancelled — reopen, fermeture trail cleared). Others left as-is.
+        IdeaLifecycleAction::Reopen if idea.status == IDEA_STATUS_PLANNED => {
+            set_idea_live_status(conn, &idea.id, IDEA_STATUS_OPEN)?;
+            true
+        }
+        _ => false,
+    };
+    Ok(moved)
+}
+
+/// PROPAGATE a Spec lifecycle transition onto the ideas the Spec ADDRESSES (`kind=addresses`),
+/// per the PRD's auto lifecycle ("Cycle de vie (auto, piloté par la Spec liée en kind=addresses)"):
+///   * `start` (→ in_progress): each addressed idea still `open` becomes `planned` — it leaves the
+///     open backlog ("en cours via Spec X"). NO closure is stamped (planned is a LIVE state).
+///   * `done` (→ completed): each addressed idea still `open`/`planned` is closed as `implemented`,
+///     with the motif "implémentée via Spec #N".
+///   * `cancel` (→ cancelled): each addressed idea in `planned` (put there by this lifecycle)
+///     REOPENS to `open` (via [`set_idea_live_status`], clearing any fermeture trail) — the Spec
+///     did not ship it, so it returns to the backlog (NOT `dropped`).
+///
+/// `ready` / `review` drive NOTHING (they return early). `related` links are never in the
+/// candidate set, so they trigger no change. TERMINAL ideas (`implemented` / `dropped`) are left
+/// as-is by every branch — a genuinely resolved or manually abandoned idea is not disturbed by
+/// another Spec's transition.
+///
+/// Runs on the CALLER's connection so it composes INTO the Spec-transition transaction
+/// ([`transition_spec_with_workspace`]): the status flip and the idea propagation commit
+/// atomically. Returns the number of ideas whose status changed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn propagate_idea_lifecycle_for_transition(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    spec_number: i32,
+    transition: SpecTransition,
+) -> QueryResult<usize> {
+    // Only start/done/cancel drive an idea move; ready/review are inert.
+    let action = match transition {
+        SpecTransition::Start => IdeaLifecycleAction::Plan,
+        SpecTransition::Done => IdeaLifecycleAction::Implement,
+        SpecTransition::Cancel => IdeaLifecycleAction::Reopen,
+        SpecTransition::Ready | SpecTransition::Review => return Ok(0),
+    };
+    let mut changed = 0usize;
+    for idea in ideas_addressed_by_spec(conn, spec_id)? {
+        if apply_idea_lifecycle_action(conn, &idea, action, spec_number)? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+/// Map a Spec's CURRENT `status` to the idea lifecycle move a fresh `addresses` link should apply,
+/// or `None` for a state that drives nothing. The link-time analogue of the transition mapping:
+/// a Spec already `in_progress` ⇒ `Plan` (open→planned), already `completed` ⇒ `Implement`
+/// (open|planned→implemented+motif); every other state (draft/ready/in_review/blocked/cancelled/
+/// archived) leaves the idea unchanged.
+fn link_reconcile_action(spec_status: &str) -> Option<IdeaLifecycleAction> {
+    match spec_status {
+        SPEC_STATUS_IN_PROGRESS => Some(IdeaLifecycleAction::Plan),
+        SPEC_STATUS_COMPLETED => Some(IdeaLifecycleAction::Implement),
+        _ => None,
+    }
+}
+
+/// RECONCILE an idea's status with the CURRENT state of a Spec it was just linked to as
+/// `addresses` — the fix for "planned is unreachable" (review finding 01KY4S0FM3EFQNX0V0NHEPGPRR).
+///
+/// The Phase-2 auto lifecycle only fires at the INSTANT a Spec TRANSITIONS; linking an idea to a
+/// Spec that is ALREADY `in_progress` (or already `completed`) used to leave the idea `open`. This
+/// closes that gap: at link time, if the linked Spec is already in a state that drives a move, we
+/// apply the SAME move via the SAME [`apply_idea_lifecycle_action`] the transition path uses — Spec
+/// `in_progress` ⇒ open→planned, Spec `completed` ⇒ implemented(+motif). Any other Spec state, a
+/// `related` link (never reconciled — the caller only invokes this for `addresses`), an unknown
+/// idea/Spec, or a terminal idea leaves the status untouched. Returns whether the idea moved.
+///
+/// Runs on the CALLER's connection so it composes into the link transaction (`idea_add` /
+/// `idea_link`): the link row and the status reconcile commit atomically.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn reconcile_idea_status_to_spec(
+    conn: &mut SqliteConnection,
+    idea_id: &str,
+    spec_id: &str,
+) -> QueryResult<bool> {
+    let (Some(idea), Some(spec)) = (get_idea(conn, idea_id)?, get_spec(conn, spec_id)?) else {
+        return Ok(false);
+    };
+    match link_reconcile_action(&spec.status) {
+        Some(action) => apply_idea_lifecycle_action(conn, &idea, action, spec.number),
+        None => Ok(false),
+    }
+}
+
+/// The outcome of a GUARDED terminal transition ([`close_idea_if_live`]): the idea moved, the id
+/// was unknown, or the idea was ALREADY terminal (the resurrection guard tripped — no write).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalTransition {
+    /// The live idea was closed into the requested terminal state.
+    Closed(Idea),
+    /// No idea with that id.
+    Unknown,
+    /// The idea was already terminal (`implemented`/`closed`/`dropped`) — left UNTOUCHED, carrying
+    /// its existing `status` + fermeture trail (so a recorded motif is never erased).
+    AlreadyTerminal(Idea),
+}
+
+/// GUARDED terminal transition — the single authority `idea_implement` / `idea_close` / `idea_drop`
+/// call (review findings 01KY4S0G5GF4RV96YZF5HW4QZQ + 01KY4S0GQJS54GYY4DAFAQQDMP). Reads the idea
+/// and REFUSES to move it when it is ALREADY terminal (no silent resurrection, and — since a
+/// terminal idea is never re-closed — no existing `closed_reason` is ever overwritten by a later
+/// `None`). A LIVE idea (`open`/`planned`) is closed via [`close_idea`] into `status` (with the
+/// optional `reason`). The read + write run in ONE transaction so the guard cannot race a
+/// concurrent close. To move a terminal idea back to the backlog, use [`reopen_idea`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn close_idea_if_live(
+    conn: &mut SqliteConnection,
+    id: &str,
+    status: &str,
+    reason: Option<&str>,
+) -> QueryResult<TerminalTransition> {
+    conn.transaction(|conn| {
+        let Some(idea) = get_idea(conn, id)? else {
+            return Ok(TerminalTransition::Unknown);
+        };
+        if is_terminal_idea_status(&idea.status) {
+            return Ok(TerminalTransition::AlreadyTerminal(idea));
+        }
+        let closed = close_idea(conn, id, status, reason)?
+            .expect("idea read inside the txn must still exist for the update");
+        Ok(TerminalTransition::Closed(closed))
+    })
+}
+
+/// REOPEN a TERMINAL idea back to `open`, CLEARING its fermeture trail (`closed_at`/`closed_reason`
+/// → NULL) via [`set_idea_live_status`] — the explicit un-terminal path (review finding
+/// 01KY4S0G5GF4RV96YZF5HW4QZQ) that replaces the old "implement is a hidden un-drop". Returns the
+/// reopened idea; `None` for an unknown id; or a LIVE idea UNCHANGED (`open`/`planned` are not
+/// terminal, so there is nothing to reopen — reopening `planned` would lose its "in dev" signal).
+/// Runs in ONE transaction so the terminal check cannot race a concurrent transition.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn reopen_idea(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Idea>> {
+    conn.transaction(|conn| {
+        let Some(idea) = get_idea(conn, id)? else {
+            return Ok(None);
+        };
+        // A live idea is already `open`/`planned` — reopening `planned` would lose the "in dev"
+        // signal, so only a TERMINAL idea is pulled back to `open`; a live one is returned as-is.
+        if !is_terminal_idea_status(&idea.status) {
+            return Ok(Some(idea));
+        }
+        set_idea_live_status(conn, id, IDEA_STATUS_OPEN)
+    })
+}
+
+/// LINK an idea to a Spec with a `kind` (`addresses` | `related`) — an UPSERT: a fresh pair is
+/// inserted, an existing `(idea, spec)` pair has its `kind` UPDATED (idempotent, never a
+/// duplicate row). The caller (MCP `idea_link`) validates that both ids exist first, so a FK
+/// violation here is unexpected. Returns the resulting link row.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn link_idea_spec(
+    conn: &mut SqliteConnection,
+    idea_id: &str,
+    spec_id: &str,
+    kind: &str,
+) -> QueryResult<IdeaSpecLink> {
+    diesel::insert_into(idea_specs::table)
+        .values(NewIdeaSpecRow {
+            idea_id: idea_id.to_string(),
+            spec_id: spec_id.to_string(),
+            kind: kind.to_string(),
+            created_at: now_millis(),
+        })
+        .on_conflict((idea_specs::idea_id, idea_specs::spec_id))
+        .do_update()
+        .set(idea_specs::kind.eq(kind.to_string()))
+        .returning(IdeaSpecLink::as_returning())
+        .get_result(conn)
+}
+
+/// INSERT an idée↔Spec link ONLY if the pair is not already linked (keep the existing kind on
+/// conflict). The merge carry-over uses this so a source link never overwrites a kind the
+/// target already holds. Returns whether a row was inserted.
+fn insert_idea_spec_ignore(
+    conn: &mut SqliteConnection,
+    idea_id: &str,
+    spec_id: &str,
+    kind: &str,
+) -> QueryResult<bool> {
+    let n = diesel::insert_into(idea_specs::table)
+        .values(NewIdeaSpecRow {
+            idea_id: idea_id.to_string(),
+            spec_id: spec_id.to_string(),
+            kind: kind.to_string(),
+            created_at: now_millis(),
+        })
+        .on_conflict((idea_specs::idea_id, idea_specs::spec_id))
+        .do_nothing()
+        .execute(conn)?;
+    Ok(n > 0)
+}
+
+/// UNLINK an idée↔Spec pair. Returns the number of rows removed (0 when the pair was not
+/// linked — an idempotent no-op).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn unlink_idea_spec(
+    conn: &mut SqliteConnection,
+    idea_id: &str,
+    spec_id: &str,
+) -> QueryResult<usize> {
+    diesel::delete(
+        idea_specs::table
+            .filter(idea_specs::idea_id.eq(idea_id))
+            .filter(idea_specs::spec_id.eq(spec_id)),
+    )
+    .execute(conn)
+}
+
+/// The raw link rows of an idea (`idea_specs`), oldest-first. Used by the merge carry-over and
+/// as the low-level companion to [`linked_specs_for_idea`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_idea_specs(
+    conn: &mut SqliteConnection,
+    idea_id: &str,
+) -> QueryResult<Vec<IdeaSpecLink>> {
+    idea_specs::table
+        .filter(idea_specs::idea_id.eq(idea_id))
+        .order(idea_specs::created_at.asc())
+        .select(IdeaSpecLink::as_select())
+        .load(conn)
+}
+
+/// The Specs LINKED to an idea, enriched with each Spec's `title`/`status`/`number` (a join),
+/// oldest-link-first — the "Specs liées" an `idea_search` result and the Spec-detail view show.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn linked_specs_for_idea(
+    conn: &mut SqliteConnection,
+    idea_id: &str,
+) -> QueryResult<Vec<LinkedSpec>> {
+    idea_specs::table
+        .inner_join(specs::table)
+        .filter(idea_specs::idea_id.eq(idea_id))
+        .order(idea_specs::created_at.asc())
+        .select((
+            idea_specs::spec_id,
+            idea_specs::kind,
+            specs::title,
+            specs::status,
+            specs::number,
+        ))
+        .load::<LinkedSpec>(conn)
+}
+
+/// MERGE `source_ids` into `target_id`: the target absorbs each source's POINTS (its `body` is
+/// appended, preserved) and its Spec LINKS (carried over idempotently, keeping the target's
+/// kind on any pair it already holds), and each source is retired as `dropped` with a
+/// "merged into <target>" trail. Runs in ONE transaction. Returns the updated target, or
+/// `None` when the target id is unknown. Sources that are unknown, or equal to the target,
+/// are skipped. This is the dedup/fusion primitive (PRD Testing Decisions: "points préservés,
+/// liens Spec reportés").
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn merge_ideas(
+    conn: &mut SqliteConnection,
+    source_ids: &[String],
+    target_id: &str,
+) -> QueryResult<Option<Idea>> {
+    conn.transaction(|conn| {
+        let Some(target) = get_idea(conn, target_id)? else {
+            return Ok(None);
+        };
+        let now = now_millis();
+        let mut merged_body = target.body.clone();
+        for source_id in source_ids {
+            if source_id == target_id {
+                continue;
+            }
+            let Some(source) = get_idea(conn, source_id)? else {
+                continue;
+            };
+            // Preserve the source's points by appending its body to the target's.
+            if !source.body.trim().is_empty() {
+                if !merged_body.trim().is_empty() {
+                    merged_body.push_str("\n\n");
+                }
+                merged_body.push_str(&source.body);
+            }
+            // Carry over the source's Spec links (keep the target's kind on any shared pair), THEN
+            // strip them off the source so the dropped tombstone keeps NO phantom link (review
+            // finding 01KY4S0HVFQ2AQ6DKV41V2DE93 — a merged-away idea must have an empty link set).
+            for link in list_idea_specs(conn, source_id)? {
+                insert_idea_spec_ignore(conn, target_id, &link.spec_id, &link.kind)?;
+            }
+            diesel::delete(idea_specs::table.filter(idea_specs::idea_id.eq(source_id)))
+                .execute(conn)?;
+            // Retire the source as a dropped merge tombstone.
+            diesel::update(ideas::table.find(source_id))
+                .set((
+                    ideas::status.eq(IDEA_STATUS_DROPPED),
+                    ideas::closed_at.eq(Some(now)),
+                    ideas::closed_reason.eq(Some(format!("merged into {target_id}"))),
+                    ideas::updated_at.eq(now),
+                ))
+                .execute(conn)?;
+        }
+        // Persist the absorbed body on the target.
+        diesel::update(ideas::table.find(target_id))
+            .set((ideas::body.eq(merged_body), ideas::updated_at.eq(now)))
+            .returning(Idea::as_returning())
+            .get_result(conn)
+            .map(Some)
+    })
+}
+
+/// FTS5 full-text match over `ideas_fts` (external content on `ideas.rowid`), scoped to
+/// `project_id`, best-match first (`bm25` ascending — smaller is better), capped at `limit`.
+/// `match_query` is a caller-built FTS5 MATCH expression (see `crate::idea::build_fts_query`,
+/// which sanitizes the user's terms). Returns each hit's idea `id` + `bm25` `score`. An
+/// invalid/empty match expression should be avoided by the caller (it would error in FTS5).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn fts_match_ideas(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    match_query: &str,
+    limit: i64,
+) -> QueryResult<Vec<IdeaFtsHit>> {
+    use diesel::sql_types::{BigInt, Text};
+    diesel::sql_query(
+        "SELECT i.id AS id, bm25(ideas_fts) AS score \
+         FROM ideas_fts \
+         JOIN ideas i ON i.rowid = ideas_fts.rowid \
+         WHERE ideas_fts MATCH ? AND i.project_id = ? \
+         ORDER BY score ASC \
+         LIMIT ?",
+    )
+    .bind::<Text, _>(match_query)
+    .bind::<Text, _>(project_id)
+    .bind::<BigInt, _>(limit)
+    .load::<IdeaFtsHit>(conn)
+}
+
+/// One THEME group of a project's idea backlog: the `theme` (`None` = ungrouped ideas), the
+/// `total` count, and the per-STATUS breakdown (`open`/`planned`/`implemented`/`closed`/`dropped`).
+/// The row the by-theme Idées view renders — a header count + the mini status distribution (PRD
+/// Impl Decisions "regroupement par thème avec compteurs" + "mini-dots de répartition statut").
+/// `Serialize` for the MCP boundary. Produced by [`list_idea_themes`] via a GROUP BY.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, diesel::QueryableByName)]
+pub struct IdeaThemeGroup {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub theme: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub total: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub open: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub planned: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub implemented: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub closed: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub dropped: i64,
+}
+
+/// GROUP a project's ideas BY THEME with per-theme COUNTS + a per-status breakdown — the backend
+/// of the by-theme Idées view (PRD Impl Decisions: "regroupement par thème avec compteurs",
+/// "en-tête de groupe avec compteur + mini-dots de répartition statut"). One [`IdeaThemeGroup`]
+/// per distinct `theme` (the ungrouped ideas fold into a single `theme = None` group), ordered
+/// biggest group first then theme name (a stable, UI-friendly order). Scoped to `project_id`.
+///
+/// `include_terminal` sets the SCOPE (review finding 01KY4S0JCT7E7MMVT80Q1BSKE1): `false` (the
+/// maintained default the MCP `idea_themes` tool applies) counts only the ACTIVE backlog
+/// (`open`+`planned`) so a group's `total` matches the actionable ideas; `true` counts EVERY
+/// status (the full breakdown the renderer's mini-dots paint). A theme with no idea in the chosen
+/// scope drops out entirely (an active-only listing hides a wholly-terminal theme).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_idea_themes(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    include_terminal: bool,
+) -> QueryResult<Vec<IdeaThemeGroup>> {
+    // The active-only default restricts the rows counted to the live backlog; the opt-in spans all.
+    let scope = if include_terminal {
+        ""
+    } else {
+        "AND status IN ('open', 'planned') "
+    };
+    diesel::sql_query(format!(
+        "SELECT theme AS theme, \
+         COUNT(*) AS total, \
+         SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open, \
+         SUM(CASE WHEN status = 'planned' THEN 1 ELSE 0 END) AS planned, \
+         SUM(CASE WHEN status = 'implemented' THEN 1 ELSE 0 END) AS implemented, \
+         SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed, \
+         SUM(CASE WHEN status = 'dropped' THEN 1 ELSE 0 END) AS dropped \
+         FROM ideas \
+         WHERE project_id = ? {scope}\
+         GROUP BY theme \
+         ORDER BY total DESC, theme ASC"
+    ))
+    .bind::<diesel::sql_types::Text, _>(project_id)
+    .load::<IdeaThemeGroup>(conn)
+}
+
+// --- ANNEXES domain (v2.6 Phase 3, v27) ------------------------------------
+//
+// Annexes attach a doc/artefact/url/prototype to a Spec, with INTERNAL storage and DEDUP by
+// content_hash (PRD Impl Decisions "ANNEXES"). The "one physical copy" guarantee is a
+// CONTENT-ADDRESSED blob store: `annex_blobs`, keyed by the SHA-1 hex of the content, with a
+// GLOBAL dedup scope (the same bytes are stored once across the whole DB), and lightweight
+// per-Spec attachment rows (`annexes`) pointing at a blob. N attachments can share one blob;
+// removing the last attachment of a blob GC-drops it. This is the single persistence authority
+// the `annexe_*` MCP tools call.
+
+/// `annexes.kind` — a textual document.
+pub const ANNEX_KIND_DOC: &str = "doc";
+/// `annexes.kind` — a build/output artefact.
+pub const ANNEX_KIND_ARTEFACT: &str = "artefact";
+/// `annexes.kind` — an external URL (the "content" IS the URL string — an internal pointer,
+/// still content-addressed & deduped).
+pub const ANNEX_KIND_URL: &str = "url";
+/// `annexes.kind` — a prototype (e.g. an HTML mockup).
+pub const ANNEX_KIND_PROTOTYPE: &str = "prototype";
+
+/// Compute the CONTENT HASH that content-addresses an annexe's bytes: the SHA-1 hex digest of
+/// `content`, via the already-vendored gix hash backend (git's own object-hash algorithm —
+/// deterministic, stable across runs and toolchain versions, and collision-resistant enough
+/// that two distinct contents never share a hash, so the dedup is SAFE without a byte-compare).
+/// This is THE dedup key: the same content always maps to the same `annex_blobs` row.
+pub fn hash_content(content: &str) -> String {
+    let mut hasher = gix::hash::hasher(gix::hash::Kind::Sha1);
+    hasher.update(content.as_bytes());
+    // gix builds the Sha1 hasher with `safe_hash(false)`, so `try_finalize` never reports a
+    // collision-attack — the digest is always produced (see gix-hash `Hasher::try_finalize`).
+    hasher
+        .try_finalize()
+        .expect("sha1 finalize is infallible with gix collision-detection off")
+        .to_hex()
+        .to_string()
+}
+
+/// An `annexes` row: one per-Spec ATTACHMENT (a pointer into the content-addressed
+/// `annex_blobs` store via `content_hash`). `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = annexes)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Annex {
+    pub id: String,
+    pub spec_id: String,
+    /// `doc` | `artefact` | `url` | `prototype`.
+    pub kind: String,
+    pub title: String,
+    /// The dedup key / pointer into `annex_blobs`.
+    pub content_hash: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = annexes)]
+struct NewAnnexRow {
+    id: String,
+    spec_id: String,
+    kind: String,
+    title: String,
+    content_hash: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = annex_blobs)]
+struct NewAnnexBlobRow {
+    content_hash: String,
+    content: String,
+    byte_len: i64,
+    created_at: i64,
+}
+
+/// One annexe LIST row: the attachment fields + the blob's `byte_len` (a size hint), WITHOUT
+/// shipping the whole content in a list. `Serialize` for the MCP boundary. Produced by
+/// [`list_annexes`] via a join.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Queryable)]
+pub struct AnnexListItem {
+    pub id: String,
+    pub spec_id: String,
+    pub kind: String,
+    pub title: String,
+    pub content_hash: String,
+    pub byte_len: i64,
+    pub created_at: i64,
+}
+
+/// One annexe with its stored CONTENT (the `annexe_get` read): the attachment row + the
+/// content-addressed bytes + `byte_len`. `Serialize` for the MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AnnexView {
+    #[serde(flatten)]
+    pub annex: Annex,
+    /// The stored copy of the annexe's content (from `annex_blobs`).
+    pub content: String,
+    pub byte_len: i64,
+}
+
+/// ATTACH an annexe (`kind`/`title`) to `spec_id`, storing `content` in the content-addressed
+/// `annex_blobs` store (DEDUP by SHA-1 hash: the SAME content attached twice — to this Spec or
+/// another — stores ONE physical blob). Runs in ONE transaction: upsert-ignore the blob, then
+/// insert the attachment row referencing it. Returns the created [`Annex`]. The caller (MCP
+/// `annexe_add`) validates that the Spec exists first, so a FK violation here is unexpected.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn add_annexe(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    kind: &str,
+    title: &str,
+    content: &str,
+) -> QueryResult<Annex> {
+    let now = now_millis();
+    let content_hash = hash_content(content);
+    conn.transaction(|conn| {
+        // Content-addressed dedup: store the blob ONCE (INSERT OR IGNORE on the hash PK — an
+        // already-present hash keeps the single existing copy).
+        diesel::insert_into(annex_blobs::table)
+            .values(NewAnnexBlobRow {
+                content_hash: content_hash.clone(),
+                content: content.to_string(),
+                byte_len: content.len() as i64,
+                created_at: now,
+            })
+            .on_conflict(annex_blobs::content_hash)
+            .do_nothing()
+            .execute(conn)?;
+        diesel::insert_into(annexes::table)
+            .values(NewAnnexRow {
+                id: Uuid::now_v7().to_string(),
+                spec_id: spec_id.to_string(),
+                kind: kind.to_string(),
+                title: title.to_string(),
+                content_hash,
+                created_at: now,
+            })
+            .returning(Annex::as_returning())
+            .get_result(conn)
+    })
+}
+
+/// LIST the annexes attached to `spec_id`, newest-first, each with its blob `byte_len` (no
+/// content). The backend of the Spec-detail "Annexes" block (Phase 4).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_annexes(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Vec<AnnexListItem>> {
+    annexes::table
+        .inner_join(annex_blobs::table)
+        .filter(annexes::spec_id.eq(spec_id))
+        .order((annexes::created_at.desc(), annexes::id.desc()))
+        .select((
+            annexes::id,
+            annexes::spec_id,
+            annexes::kind,
+            annexes::title,
+            annexes::content_hash,
+            annex_blobs::byte_len,
+            annexes::created_at,
+        ))
+        .load::<AnnexListItem>(conn)
+}
+
+/// Fetch ONE annexe by id WITH its stored content (from the content-addressed store), or `None`
+/// when the id is unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_annexe(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<AnnexView>> {
+    let Some(annex) = annexes::table
+        .find(id)
+        .select(Annex::as_select())
+        .first(conn)
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let (content, byte_len): (String, i64) = annex_blobs::table
+        .find(&annex.content_hash)
+        .select((annex_blobs::content, annex_blobs::byte_len))
+        .first(conn)?;
+    Ok(Some(AnnexView {
+        annex,
+        content,
+        byte_len,
+    }))
+}
+
+/// REMOVE an annexe attachment by id. Returns whether a row was removed (`false` = unknown id,
+/// an idempotent no-op). GC-drops the underlying blob when this was its LAST reference, so the
+/// content-addressed store never accretes orphans (the PRD "entretien" ethos). Runs in ONE
+/// transaction (the row delete + the conditional blob GC commit atomically).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn remove_annexe(conn: &mut SqliteConnection, id: &str) -> QueryResult<bool> {
+    conn.transaction(|conn| {
+        let Some(annex) = annexes::table
+            .find(id)
+            .select(Annex::as_select())
+            .first(conn)
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        diesel::delete(annexes::table.find(id)).execute(conn)?;
+        // GC the blob when no attachment references it any more.
+        let still_referenced: i64 = annexes::table
+            .filter(annexes::content_hash.eq(&annex.content_hash))
+            .count()
+            .get_result(conn)?;
+        if still_referenced == 0 {
+            diesel::delete(annex_blobs::table.find(&annex.content_hash)).execute(conn)?;
+        }
+        Ok(true)
+    })
+}
+
+/// COUNT the distinct content blobs in the content-addressed store (test helper for the dedup
+/// assertion: attaching the same content twice must keep this at ONE).
+#[cfg(test)]
+pub fn annex_blob_count(conn: &mut SqliteConnection) -> QueryResult<i64> {
+    annex_blobs::table.count().get_result(conn)
+}
+
+// --- SPEC DEPENDENCIES domain (v2.6 Phase 3, v28) --------------------------
+//
+// Structural constraints between Specs (PRD Impl Decisions "DÉPENDANCES SPEC↔SPEC"), stored as
+// a DIRECTED graph in `spec_depends_on`: an edge `(from, to)` means "from depends on / comes
+// after to" (same orientation as `task_dependencies`). `blocks`/`after` are directional (feed
+// cycle detection + badges); `related` is context-only (excluded from both). Acyclicity is
+// enforced HERE (a reachability DFS before each insert), the single writer, since SQLite cannot
+// check transitive acyclicity.
+
+/// `spec_depends_on.kind` — a hard "don't do `from` before `to`" gate (directional; feeds cycle
+/// detection + badges).
+pub const SPEC_DEP_KIND_BLOCKS: &str = "blocks";
+/// `spec_depends_on.kind` — a "`from` comes after `to`" sequencing constraint (directional).
+pub const SPEC_DEP_KIND_AFTER: &str = "after";
+/// `spec_depends_on.kind` — CONTEXT only: never gates ordering, EXCLUDED from cycle detection
+/// (a `related` link is always accepted) and from the badge counts.
+pub const SPEC_DEP_KIND_RELATED: &str = "related";
+
+/// A `spec_depends_on` row: one directed edge `from_spec_id --depends_on--> to_spec_id` (from
+/// comes after to). `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = spec_depends_on)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct SpecDependency {
+    pub from_spec_id: String,
+    pub to_spec_id: String,
+    /// `blocks` | `after` (directional) | `related` (context only).
+    pub kind: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = spec_depends_on)]
+struct NewSpecDependency {
+    from_spec_id: String,
+    to_spec_id: String,
+    kind: String,
+    note: Option<String>,
+    created_at: i64,
+}
+
+/// Why adding a Spec dependency edge was refused (or the DB failed). Returned by
+/// [`add_spec_dependency`] so a UI/MCP caller can react precisely (mirrors [`DependencyError`]).
+#[derive(Debug)]
+pub enum SpecDependencyError {
+    /// The `from_spec_id` or `to_spec_id` does not resolve to a Spec.
+    SpecNotFound { id: String },
+    /// A Spec cannot depend on itself (the smallest cycle).
+    SelfDependency,
+    /// The edge would create a CYCLE in the directional dependency graph, so it is refused.
+    WouldCreateCycle {
+        from_spec_id: String,
+        to_spec_id: String,
+    },
+    /// A DB error surfaced while resolving or inserting.
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for SpecDependencyError {
+    fn from(e: diesel::result::Error) -> Self {
+        SpecDependencyError::Db(e)
+    }
+}
+
+/// Whether a dependency `kind` is DIRECTIONAL — participates in cycle detection + badges.
+/// `blocks`/`after` do; `related` (context only) does NOT.
+fn spec_dep_is_directional(kind: &str) -> bool {
+    kind == SPEC_DEP_KIND_BLOCKS || kind == SPEC_DEP_KIND_AFTER
+}
+
+/// The Specs `from` DIRECTLY depends on via a DIRECTIONAL edge (blocks/after; `related`
+/// EXCLUDED): its out-edges in the dependency graph — the prerequisites of `from`. Reads the
+/// forward direction of `spec_depends_on`.
+fn spec_dep_direct(conn: &mut SqliteConnection, from: &str) -> QueryResult<Vec<String>> {
+    spec_depends_on::table
+        .filter(spec_depends_on::from_spec_id.eq(from))
+        .filter(spec_depends_on::kind.ne(SPEC_DEP_KIND_RELATED))
+        .select(spec_depends_on::to_spec_id)
+        .load::<String>(conn)
+}
+
+/// Is `target` REACHABLE from `start` by following the DIRECTIONAL "depends on" edges (start's
+/// transitive prerequisites)? A DFS over `spec_depends_on` with `related` edges excluded. Used
+/// to detect a cycle BEFORE inserting an edge: adding `from --depends_on--> to` closes a cycle
+/// exactly when `from` is already reachable from `to`. The graph is a DAG by this very
+/// invariant, so the walk terminates; a `seen` set guards against revisiting.
+fn spec_dep_reaches(conn: &mut SqliteConnection, start: &str, target: &str) -> QueryResult<bool> {
+    let mut stack = vec![start.to_string()];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(node) = stack.pop() {
+        if node == target {
+            return Ok(true);
+        }
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        for next in spec_dep_direct(conn, &node)? {
+            if !seen.contains(&next) {
+                stack.push(next);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Add a Spec dependency edge `from_spec_id --depends_on--> to_spec_id` (from comes after to),
+/// REFUSING any DIRECTIONAL edge that would create a CYCLE. THE guarded entry point for the
+/// acyclic Spec-dependency graph (mirrors [`add_task_dependency`]). Steps (in ONE transaction):
+///
+///   1. Reject a SELF edge ([`SpecDependencyError::SelfDependency`]) — the DB CHECK catches it
+///      too, but the typed error is clearer.
+///   2. RESOLVE both endpoints ([`SpecDependencyError::SpecNotFound`]).
+///   3. CYCLE CHECK (directional kinds only — a `related` link never gates, so it can never
+///      cycle and is always accepted): if `from_spec_id` is already reachable from
+///      `to_spec_id` through directional edges, adding this one closes a cycle →
+///      [`SpecDependencyError::WouldCreateCycle`].
+///   4. UPSERT the edge (`ON CONFLICT` on the composite PK UPDATES the kind/note — re-linking a
+///      pair is idempotent and never a duplicate row).
+///
+/// Returns the resulting [`SpecDependency`]. `kind` is `blocks`/`after` (directional) or
+/// `related` (context only); `note` is an optional rationale.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn add_spec_dependency(
+    conn: &mut SqliteConnection,
+    from_spec_id: &str,
+    to_spec_id: &str,
+    kind: &str,
+    note: Option<&str>,
+) -> Result<SpecDependency, SpecDependencyError> {
+    conn.transaction(|conn| {
+        if from_spec_id == to_spec_id {
+            return Err(SpecDependencyError::SelfDependency);
+        }
+        for id in [from_spec_id, to_spec_id] {
+            if get_spec(conn, id)?.is_none() {
+                return Err(SpecDependencyError::SpecNotFound { id: id.to_string() });
+            }
+        }
+        // A cycle forms iff the prerequisite (`to`) already, transitively, depends on the
+        // dependent (`from`). Only checked for DIRECTIONAL kinds — `related` never gates.
+        if spec_dep_is_directional(kind) && spec_dep_reaches(conn, to_spec_id, from_spec_id)? {
+            return Err(SpecDependencyError::WouldCreateCycle {
+                from_spec_id: from_spec_id.to_string(),
+                to_spec_id: to_spec_id.to_string(),
+            });
+        }
+        let row = diesel::insert_into(spec_depends_on::table)
+            .values(NewSpecDependency {
+                from_spec_id: from_spec_id.to_string(),
+                to_spec_id: to_spec_id.to_string(),
+                kind: kind.to_string(),
+                note: note.map(|n| n.to_string()),
+                created_at: now_millis(),
+            })
+            // Re-linking a pair upserts the kind + note (idempotent, never a duplicate row).
+            .on_conflict((spec_depends_on::from_spec_id, spec_depends_on::to_spec_id))
+            .do_update()
+            .set((
+                spec_depends_on::kind.eq(kind.to_string()),
+                spec_depends_on::note.eq(note.map(|n| n.to_string())),
+            ))
+            .returning(SpecDependency::as_returning())
+            .get_result(conn)?;
+        Ok(row)
+    })
+}
+
+/// Remove a Spec dependency edge `(from_spec_id, to_spec_id)`. Returns rows deleted (0 = the
+/// edge was not present — an idempotent no-op). The inverse of [`add_spec_dependency`] (no cycle
+/// risk on removal).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn remove_spec_dependency(
+    conn: &mut SqliteConnection,
+    from_spec_id: &str,
+    to_spec_id: &str,
+) -> QueryResult<usize> {
+    diesel::delete(
+        spec_depends_on::table
+            .filter(spec_depends_on::from_spec_id.eq(from_spec_id))
+            .filter(spec_depends_on::to_spec_id.eq(to_spec_id)),
+    )
+    .execute(conn)
+}
+
+/// One edge of a Spec's dependency VIEW: the OTHER Spec (id + human-facing `title`/`number`/
+/// `status`) plus the link `kind` and `note`. `Serialize` for the MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Queryable)]
+pub struct SpecDepEdge {
+    /// The other Spec of the edge (the prerequisite for `blocked_by`, the dependent for
+    /// `unblocks`, or the context Spec for `related`).
+    pub spec_id: String,
+    pub kind: String,
+    pub note: Option<String>,
+    pub title: String,
+    pub number: i32,
+    pub status: String,
+}
+
+/// A Spec's full dependency VIEW + the COMPUTABLE badges (PRD "badges bloquée par N / débloque
+/// M"). `blocked_by`/`unblocks` are the DIRECTIONAL edges (their `_count` are the badge
+/// numbers); `related` is the context links (excluded from the counts). `Serialize` for the MCP
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SpecDependencyView {
+    /// The Spec's directional prerequisites (it depends on / comes after these) — "bloquée par".
+    pub blocked_by: Vec<SpecDepEdge>,
+    /// The directional dependents (these depend on / come after this Spec) — "débloque".
+    pub unblocks: Vec<SpecDepEdge>,
+    /// The non-directional CONTEXT links (either direction), the other Spec each.
+    pub related: Vec<SpecDepEdge>,
+    /// The "bloquée par N" badge count (= `blocked_by.len()`).
+    pub blocked_by_count: i64,
+    /// The "débloque M" badge count (= `unblocks.len()`).
+    pub unblocks_count: i64,
+}
+
+/// The DIRECTIONAL prerequisites of `spec_id` (edges where it is the `from`, kind != related):
+/// each carries the PREREQUISITE Spec's identity. The "bloquée par" list.
+fn spec_deps_blocked_by(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+) -> QueryResult<Vec<SpecDepEdge>> {
+    spec_depends_on::table
+        .inner_join(specs::table.on(specs::id.eq(spec_depends_on::to_spec_id)))
+        .filter(spec_depends_on::from_spec_id.eq(spec_id))
+        .filter(spec_depends_on::kind.ne(SPEC_DEP_KIND_RELATED))
+        .order(spec_depends_on::created_at.asc())
+        .select((
+            spec_depends_on::to_spec_id,
+            spec_depends_on::kind,
+            spec_depends_on::note,
+            specs::title,
+            specs::number,
+            specs::status,
+        ))
+        .load::<SpecDepEdge>(conn)
+}
+
+/// The DIRECTIONAL dependents of `spec_id` (edges where it is the `to`, kind != related): each
+/// carries the DEPENDENT Spec's identity. The "débloque" list.
+fn spec_deps_unblocks(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Vec<SpecDepEdge>> {
+    spec_depends_on::table
+        .inner_join(specs::table.on(specs::id.eq(spec_depends_on::from_spec_id)))
+        .filter(spec_depends_on::to_spec_id.eq(spec_id))
+        .filter(spec_depends_on::kind.ne(SPEC_DEP_KIND_RELATED))
+        .order(spec_depends_on::created_at.asc())
+        .select((
+            spec_depends_on::from_spec_id,
+            spec_depends_on::kind,
+            spec_depends_on::note,
+            specs::title,
+            specs::number,
+            specs::status,
+        ))
+        .load::<SpecDepEdge>(conn)
+}
+
+/// The `related` (context-only) links touching `spec_id`, either direction — each carries the
+/// OTHER Spec's identity. Not counted in the badges.
+fn spec_deps_related(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Vec<SpecDepEdge>> {
+    let mut out = spec_depends_on::table
+        .inner_join(specs::table.on(specs::id.eq(spec_depends_on::to_spec_id)))
+        .filter(spec_depends_on::from_spec_id.eq(spec_id))
+        .filter(spec_depends_on::kind.eq(SPEC_DEP_KIND_RELATED))
+        .order(spec_depends_on::created_at.asc())
+        .select((
+            spec_depends_on::to_spec_id,
+            spec_depends_on::kind,
+            spec_depends_on::note,
+            specs::title,
+            specs::number,
+            specs::status,
+        ))
+        .load::<SpecDepEdge>(conn)?;
+    let incoming = spec_depends_on::table
+        .inner_join(specs::table.on(specs::id.eq(spec_depends_on::from_spec_id)))
+        .filter(spec_depends_on::to_spec_id.eq(spec_id))
+        .filter(spec_depends_on::kind.eq(SPEC_DEP_KIND_RELATED))
+        .order(spec_depends_on::created_at.asc())
+        .select((
+            spec_depends_on::from_spec_id,
+            spec_depends_on::kind,
+            spec_depends_on::note,
+            specs::title,
+            specs::number,
+            specs::status,
+        ))
+        .load::<SpecDepEdge>(conn)?;
+    out.extend(incoming);
+    Ok(out)
+}
+
+/// The full dependency VIEW of `spec_id` — the directional `blocked_by` / `unblocks` lists (with
+/// their computable badge counts) + the `related` context links. The backend of the board /
+/// Spec-detail badges (PRD "badges calculables"; the UI is Phase 4).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn spec_dependency_view(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+) -> QueryResult<SpecDependencyView> {
+    let blocked_by = spec_deps_blocked_by(conn, spec_id)?;
+    let unblocks = spec_deps_unblocks(conn, spec_id)?;
+    let related = spec_deps_related(conn, spec_id)?;
+    Ok(SpecDependencyView {
+        blocked_by_count: blocked_by.len() as i64,
+        unblocks_count: unblocks.len() as i64,
+        blocked_by,
+        unblocks,
+        related,
+    })
+}
+
 /// Open an in-memory SQLite database with migrations applied — used by tests so
 /// they never touch the real `app_data_dir` DB.
 #[cfg(test)]
@@ -7711,6 +8992,1024 @@ mod tests {
         assert_eq!(rows[1].label, None);
     }
 
+    // --- IDEAS domain (v26) ------------------------------------------------
+
+    /// The `ideas` + `idea_specs` model (v26) round-trips: CREATE seeds an `open` idea (no
+    /// fermeture trail), `list_ideas` filters + bounds, `link_idea_spec` UPSERTS the kind (no
+    /// duplicate row), `linked_specs_for_idea` joins the Spec's title/status/number, `unlink`
+    /// removes the pair, and `close_idea` stamps a terminal state + `closed_at`/`closed_reason`.
+    /// Proves the v26 migration + `schema.rs` tables + the model columns are consistent.
+    #[test]
+    fn ideas_crud_round_trip_link_upsert_and_close() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/ideas-ws", None).unwrap();
+        let (spec, _rev) =
+            create_spec(&mut conn, &project.id, "Login flow", SpecSections::empty()).unwrap();
+
+        // CREATE seeds an open idea, no fermeture trail.
+        let idea = create_idea(
+            &mut conn,
+            &project.id,
+            "Rework the login flow",
+            "the empty-password branch is fragile",
+            Some("auth"),
+            IDEA_SOURCE_SESSION,
+        )
+        .expect("create idea");
+        assert_eq!(idea.status, IDEA_STATUS_OPEN);
+        assert_eq!(idea.theme.as_deref(), Some("auth"));
+        assert_eq!(idea.source, IDEA_SOURCE_SESSION);
+        assert!(idea.closed_at.is_none() && idea.closed_reason.is_none());
+        assert_eq!(get_idea(&mut conn, &idea.id).unwrap().unwrap().id, idea.id);
+
+        // A second idea in another theme + a third in another project (scope guard).
+        create_idea(
+            &mut conn,
+            &project.id,
+            "Dark mode",
+            "",
+            Some("ui"),
+            IDEA_SOURCE_MANUAL,
+        )
+        .unwrap();
+        let (other_proj, _) = create_project(&mut conn, "Other", "/tmp/other", None).unwrap();
+        create_idea(
+            &mut conn,
+            &other_proj.id,
+            "Elsewhere",
+            "",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+
+        // list_ideas is project-scoped + bounded; a theme filter narrows it.
+        let all = list_ideas(&mut conn, &project.id, IdeaStatusFilter::All, None, 50, 0).unwrap();
+        assert_eq!(all.len(), 2, "only this project's ideas");
+        let auth = list_ideas(
+            &mut conn,
+            &project.id,
+            IdeaStatusFilter::All,
+            Some("auth"),
+            50,
+            0,
+        )
+        .unwrap();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].id, idea.id);
+        // The bound really caps the dump.
+        assert_eq!(
+            list_ideas(&mut conn, &project.id, IdeaStatusFilter::All, None, 1, 0)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // LINK (kind=related), then re-link the SAME pair as addresses → the kind UPSERTS.
+        let link = link_idea_spec(&mut conn, &idea.id, &spec.id, IDEA_KIND_RELATED).unwrap();
+        assert_eq!(link.kind, IDEA_KIND_RELATED);
+        let relinked = link_idea_spec(&mut conn, &idea.id, &spec.id, IDEA_KIND_ADDRESSES).unwrap();
+        assert_eq!(
+            relinked.kind, IDEA_KIND_ADDRESSES,
+            "re-link upserts the kind"
+        );
+        assert_eq!(
+            list_idea_specs(&mut conn, &idea.id).unwrap().len(),
+            1,
+            "upsert kept ONE row (no duplicate)"
+        );
+
+        // linked_specs_for_idea joins the Spec's identity.
+        let linked = linked_specs_for_idea(&mut conn, &idea.id).unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].spec_id, spec.id);
+        assert_eq!(linked[0].kind, IDEA_KIND_ADDRESSES);
+        assert_eq!(linked[0].title, "Login flow");
+        assert_eq!(linked[0].number, spec.number);
+
+        // UNLINK removes the pair (idempotent second call → 0).
+        assert_eq!(unlink_idea_spec(&mut conn, &idea.id, &spec.id).unwrap(), 1);
+        assert_eq!(unlink_idea_spec(&mut conn, &idea.id, &spec.id).unwrap(), 0);
+        assert!(linked_specs_for_idea(&mut conn, &idea.id)
+            .unwrap()
+            .is_empty());
+
+        // CLOSE → implemented, terminal state + fermeture trail stamped.
+        let closed = close_idea(
+            &mut conn,
+            &idea.id,
+            IDEA_STATUS_IMPLEMENTED,
+            Some("shipped in the login rework"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(closed.status, IDEA_STATUS_IMPLEMENTED);
+        assert!(closed.closed_at.is_some());
+        assert_eq!(
+            closed.closed_reason.as_deref(),
+            Some("shipped in the login rework")
+        );
+        // Closing an unknown id → None.
+        assert!(close_idea(&mut conn, "nope", IDEA_STATUS_DROPPED, None)
+            .unwrap()
+            .is_none());
+    }
+
+    /// MERGE folds duplicates into one: the target absorbs each source's POINTS (body appended)
+    /// and its Spec LINKS (carried over, target's kind kept on a shared pair), and each source
+    /// is retired `dropped` with a "merged into" trail (PRD Testing Decisions: "points
+    /// préservés, liens Spec reportés").
+    #[test]
+    fn merge_ideas_preserves_points_and_carries_spec_links() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/merge-ws", None).unwrap();
+        let (spec_a, _) =
+            create_spec(&mut conn, &project.id, "Spec A", SpecSections::empty()).unwrap();
+        let (spec_b, _) =
+            create_spec(&mut conn, &project.id, "Spec B", SpecSections::empty()).unwrap();
+
+        let target = create_idea(
+            &mut conn,
+            &project.id,
+            "Faster search",
+            "point one",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        let source = create_idea(
+            &mut conn,
+            &project.id,
+            "Speed up search",
+            "point two",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+
+        // The target already addresses spec_a; the source relates to spec_a AND addresses spec_b.
+        link_idea_spec(&mut conn, &target.id, &spec_a.id, IDEA_KIND_ADDRESSES).unwrap();
+        link_idea_spec(&mut conn, &source.id, &spec_a.id, IDEA_KIND_RELATED).unwrap();
+        link_idea_spec(&mut conn, &source.id, &spec_b.id, IDEA_KIND_ADDRESSES).unwrap();
+
+        let merged = merge_ideas(&mut conn, std::slice::from_ref(&source.id), &target.id)
+            .unwrap()
+            .unwrap();
+
+        // Points preserved: the target's body carries BOTH ideas' text.
+        assert!(merged.body.contains("point one") && merged.body.contains("point two"));
+        // Links carried over: the target now links BOTH specs; the shared spec_a keeps the
+        // target's original kind (addresses), NOT the source's (related).
+        let links = linked_specs_for_idea(&mut conn, &target.id).unwrap();
+        assert_eq!(links.len(), 2, "target links both specs, deduped");
+        let a = links.iter().find(|l| l.spec_id == spec_a.id).unwrap();
+        assert_eq!(
+            a.kind, IDEA_KIND_ADDRESSES,
+            "shared pair keeps the target's kind"
+        );
+        assert!(links
+            .iter()
+            .any(|l| l.spec_id == spec_b.id && l.kind == IDEA_KIND_ADDRESSES));
+        // The source is retired as a dropped merge tombstone.
+        let src = get_idea(&mut conn, &source.id).unwrap().unwrap();
+        assert_eq!(src.status, IDEA_STATUS_DROPPED);
+        assert_eq!(
+            src.closed_reason.as_deref(),
+            Some(format!("merged into {}", target.id).as_str())
+        );
+        // The dropped source keeps NO phantom link — its idea_specs (incl. the DISTINCT spec_b it
+        // solely addressed) were carried to the target THEN stripped (finding 01KY4S0HVFQ2AQ6DKV41V2DE93).
+        assert!(
+            list_idea_specs(&mut conn, &source.id).unwrap().is_empty(),
+            "the merged-away source has an empty link set"
+        );
+        assert!(
+            linked_specs_for_idea(&mut conn, &source.id)
+                .unwrap()
+                .is_empty(),
+            "idea_get(source).linked_specs is empty after the merge"
+        );
+        // An unknown target → None.
+        assert!(merge_ideas(&mut conn, &[source.id], "nope")
+            .unwrap()
+            .is_none());
+    }
+
+    /// GUARDED terminal transition + reopen (findings 01KY4S0G5GF4RV96YZF5HW4QZQ +
+    /// 01KY4S0GQJS54GYY4DAFAQQDMP): `close_idea_if_live` refuses to move a terminal idea (no
+    /// resurrection, no motif erase) and `reopen_idea` restores a terminal idea to `open` clearing
+    /// the fermeture trail. The new `closed` status (v29) is terminal too.
+    #[test]
+    fn close_idea_if_live_guards_terminals_and_reopen_restores() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/guard", None).unwrap();
+        let mk = |c: &mut SqliteConnection, t: &str| {
+            create_idea(c, &project.id, t, "", None, IDEA_SOURCE_SESSION)
+                .unwrap()
+                .id
+        };
+
+        // A live idea closes; a second close (any terminal) is refused, status/motif intact.
+        let a = mk(&mut conn, "A");
+        let closed = close_idea_if_live(&mut conn, &a, IDEA_STATUS_CLOSED, Some("already covered"));
+        assert!(
+            matches!(closed.unwrap(), TerminalTransition::Closed(i) if i.status == IDEA_STATUS_CLOSED),
+            "a live idea closes to `closed`"
+        );
+        // `closed` is terminal → implement/drop/close all refused, and the motif is preserved.
+        for (status, reason) in [
+            (IDEA_STATUS_IMPLEMENTED, None),
+            (IDEA_STATUS_DROPPED, None),
+            (IDEA_STATUS_CLOSED, Some("different motif")),
+        ] {
+            assert!(
+                matches!(
+                    close_idea_if_live(&mut conn, &a, status, reason).unwrap(),
+                    TerminalTransition::AlreadyTerminal(_)
+                ),
+                "a terminal idea rejects a further transition"
+            );
+        }
+        let after = get_idea(&mut conn, &a).unwrap().unwrap();
+        assert_eq!(
+            after.status, IDEA_STATUS_CLOSED,
+            "status untouched by the refusals"
+        );
+        assert_eq!(
+            after.closed_reason.as_deref(),
+            Some("already covered"),
+            "the recorded motif is never overwritten"
+        );
+
+        // Unknown id → Unknown.
+        assert!(matches!(
+            close_idea_if_live(&mut conn, "nope", IDEA_STATUS_DROPPED, None).unwrap(),
+            TerminalTransition::Unknown
+        ));
+
+        // reopen_idea pulls the terminal idea back to open, clearing the trail.
+        let reopened = reopen_idea(&mut conn, &a).unwrap().unwrap();
+        assert_eq!(reopened.status, IDEA_STATUS_OPEN);
+        assert!(
+            reopened.closed_at.is_none() && reopened.closed_reason.is_none(),
+            "reopen clears closed_at/closed_reason"
+        );
+        // Reopening a LIVE idea leaves it unchanged (open); unknown id → None.
+        assert_eq!(
+            reopen_idea(&mut conn, &a).unwrap().unwrap().status,
+            IDEA_STATUS_OPEN
+        );
+        assert!(reopen_idea(&mut conn, "nope").unwrap().is_none());
+    }
+
+    /// RECONCILE-ON-LINK (finding 01KY4S0FM3EFQNX0V0NHEPGPRR): `reconcile_idea_status_to_spec`
+    /// maps the linked Spec's CURRENT state to the same move the transition automation would —
+    /// in_progress ⇒ open→planned, completed ⇒ implemented(+motif), any other state ⇒ unchanged.
+    #[test]
+    fn reconcile_idea_status_to_spec_matches_current_spec_state() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/reconcile", None).unwrap();
+        let mk = |c: &mut SqliteConnection, t: &str| {
+            create_idea(c, &project.id, t, "", None, IDEA_SOURCE_SESSION)
+                .unwrap()
+                .id
+        };
+
+        // A DRAFT Spec drives nothing.
+        let (draft, _) = create_spec(&mut conn, &project.id, "Draft", idea_lc_sections()).unwrap();
+        let i0 = mk(&mut conn, "vs draft");
+        assert!(!reconcile_idea_status_to_spec(&mut conn, &i0, &draft.id).unwrap());
+        assert_eq!(
+            get_idea(&mut conn, &i0).unwrap().unwrap().status,
+            IDEA_STATUS_OPEN
+        );
+
+        // An IN_PROGRESS Spec reconciles open → planned.
+        let (prog, _) = create_spec(&mut conn, &project.id, "Prog", idea_lc_sections()).unwrap();
+        transition_spec(&mut conn, &prog.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &prog.id, SpecTransition::Start, true).unwrap();
+        let i1 = mk(&mut conn, "vs in_progress");
+        assert!(reconcile_idea_status_to_spec(&mut conn, &i1, &prog.id).unwrap());
+        assert_eq!(
+            get_idea(&mut conn, &i1).unwrap().unwrap().status,
+            IDEA_STATUS_PLANNED,
+            "in_progress ⇒ planned at link time"
+        );
+
+        // A COMPLETED Spec reconciles open → implemented with the motif.
+        let (done, _) = create_spec(&mut conn, &project.id, "Done", idea_lc_sections()).unwrap();
+        transition_spec(&mut conn, &done.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &done.id, SpecTransition::Start, true).unwrap();
+        transition_spec(&mut conn, &done.id, SpecTransition::Review, false).unwrap();
+        transition_spec(&mut conn, &done.id, SpecTransition::Done, true).unwrap();
+        let i2 = mk(&mut conn, "vs completed");
+        assert!(reconcile_idea_status_to_spec(&mut conn, &i2, &done.id).unwrap());
+        let got = get_idea(&mut conn, &i2).unwrap().unwrap();
+        assert_eq!(
+            got.status, IDEA_STATUS_IMPLEMENTED,
+            "completed ⇒ implemented"
+        );
+        assert_eq!(
+            got.closed_reason.as_deref(),
+            Some(format!("implémentée via Spec #{}", done.number).as_str())
+        );
+
+        // A TERMINAL idea is never disturbed by a reconcile.
+        let i3 = mk(&mut conn, "already dropped");
+        close_idea(&mut conn, &i3, IDEA_STATUS_DROPPED, None).unwrap();
+        assert!(!reconcile_idea_status_to_spec(&mut conn, &i3, &prog.id).unwrap());
+        assert_eq!(
+            get_idea(&mut conn, &i3).unwrap().unwrap().status,
+            IDEA_STATUS_DROPPED
+        );
+    }
+
+    /// MIGRATION v29 (finding 01KY4S0H9BYRC6SK7RJHQ5KBE6): a fresh DB migrated through the head
+    /// accepts a `closed` idea (the widened CHECK), and a DB reverted to v28 REJECTS `closed`
+    /// until v29 is re-applied — proving v29 is the one migration that adds the status, and that a
+    /// DB already at 28 upgrades cleanly. FTS/index/FK are preserved (a search still works after).
+    #[test]
+    fn migration_v29_adds_the_closed_idea_status() {
+        let mut conn = open_in_memory(); // migrates through the head (incl. v29)
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/v29", None).unwrap();
+        let idea = create_idea(
+            &mut conn,
+            &project.id,
+            "Manually closed",
+            "body text for fts",
+            Some("auth"),
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        // `closed` is a VALID status on the migrated schema.
+        let closed = close_idea(&mut conn, &idea.id, IDEA_STATUS_CLOSED, Some("by constat"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.status, IDEA_STATUS_CLOSED);
+        // The FTS index + triggers survived the column rebuild: the idea is still searchable, and
+        // the status-scan index + idea_specs FK still hold (a link inserts + reads back).
+        let hits = fts_match_ideas(&mut conn, &project.id, "\"body\"*", 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == idea.id),
+            "fts still indexes the row"
+        );
+
+        // Revert v29 → the CHECK narrows back; setting `closed` must now FAIL.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v29 cleanly");
+        let reopened = create_idea(
+            &mut conn,
+            &project.id,
+            "Post-revert",
+            "",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        assert!(
+            close_idea(&mut conn, &reopened.id, IDEA_STATUS_CLOSED, None).is_err(),
+            "on a DB at v28 the CHECK rejects `closed`"
+        );
+
+        // Re-apply v29 → `closed` is valid again (a DB already at 28 upgrades cleanly).
+        run_migrations(&mut conn).expect("re-apply pending migrations (v29)");
+        assert!(
+            close_idea(&mut conn, &reopened.id, IDEA_STATUS_CLOSED, None).is_ok(),
+            "after re-applying v29 the DB accepts `closed`"
+        );
+    }
+
+    // --- Auto idea lifecycle piloted by the linked Spec (v2.6 Phase 2, task
+    //     01KXZ9K2GSB8V8R390BR0NKQSM) ---------------------------------------------
+
+    /// Sections for a COMPLETE draft (problem + solution present) so it can pass the pre-ready
+    /// validations — mirrors the lifecycle tests' `complete_sections`, duplicated here so the
+    /// idea-lifecycle tests are self-contained near the ideas domain.
+    fn idea_lc_sections() -> SpecSections {
+        SpecSections {
+            problem: "a real problem".into(),
+            solution: "a real solution".into(),
+            ..SpecSections::empty()
+        }
+    }
+
+    /// DONE-CRITERION ("in_progress -> planned ; completed -> implemented(+motif)"): a Spec linked
+    /// to an idea with `kind=addresses` drives that idea's status as it walks its lifecycle —
+    /// `start` promotes `open → planned` WITHOUT a fermeture trail, and `done` closes it
+    /// `implemented` with the motif "implémentée via Spec #N".
+    #[test]
+    fn addresses_link_drives_idea_planned_then_implemented() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/idea-lc1", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Ship it", idea_lc_sections()).unwrap();
+        let idea = create_idea(
+            &mut conn,
+            &project.id,
+            "A follow-up",
+            "",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        link_idea_spec(&mut conn, &idea.id, &spec.id, IDEA_KIND_ADDRESSES).unwrap();
+
+        // draft → ready leaves the idea untouched (no idea move on ready).
+        transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
+        assert_eq!(
+            get_idea(&mut conn, &idea.id).unwrap().unwrap().status,
+            IDEA_STATUS_OPEN,
+            "ready is inert for ideas"
+        );
+
+        // ready → in_progress: the idea leaves the open backlog as `planned`, NO fermeture trail.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap();
+        let planned = get_idea(&mut conn, &idea.id).unwrap().unwrap();
+        assert_eq!(planned.status, IDEA_STATUS_PLANNED, "start → planned");
+        assert!(
+            planned.closed_at.is_none() && planned.closed_reason.is_none(),
+            "planned is a LIVE state — no closure stamped"
+        );
+
+        // in_progress → in_review is inert (the idea stays planned).
+        transition_spec(&mut conn, &spec.id, SpecTransition::Review, false).unwrap();
+        assert_eq!(
+            get_idea(&mut conn, &idea.id).unwrap().unwrap().status,
+            IDEA_STATUS_PLANNED,
+            "review is inert for ideas"
+        );
+
+        // in_review → completed: the idea is closed `implemented` with the motif.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Done, true).unwrap();
+        let implemented = get_idea(&mut conn, &idea.id).unwrap().unwrap();
+        assert_eq!(
+            implemented.status, IDEA_STATUS_IMPLEMENTED,
+            "done → implemented"
+        );
+        assert!(
+            implemented.closed_at.is_some(),
+            "implemented stamps closed_at"
+        );
+        assert_eq!(
+            implemented.closed_reason.as_deref(),
+            Some(format!("implémentée via Spec #{}", spec.number).as_str()),
+            "the motif names the Spec"
+        );
+    }
+
+    /// DONE-CRITERION ("canceled -> open"): cancelling a linked Spec REOPENS its addressed idea
+    /// from `planned` back to `open` — NOT `dropped` — and, critically, the reopen path CLEARS the
+    /// fermeture trail (it does NOT reuse the closure-stamping `close_idea`). Also proves a
+    /// `done → implemented` idea can be re-implemented cleanly (no stale trail leaks in).
+    #[test]
+    fn cancel_reopens_addressed_idea_to_open_clearing_the_fermeture_trail() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/idea-lc2", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Maybe", idea_lc_sections()).unwrap();
+        let idea = create_idea(
+            &mut conn,
+            &project.id,
+            "A tracked need",
+            "",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        link_idea_spec(&mut conn, &idea.id, &spec.id, IDEA_KIND_ADDRESSES).unwrap();
+
+        // ready → in_progress → planned.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap();
+        assert_eq!(
+            get_idea(&mut conn, &idea.id).unwrap().unwrap().status,
+            IDEA_STATUS_PLANNED
+        );
+
+        // in_progress → cancelled: the idea returns to `open` with NO fermeture trail.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Cancel, true).unwrap();
+        let reopened = get_idea(&mut conn, &idea.id).unwrap().unwrap();
+        assert_eq!(
+            reopened.status, IDEA_STATUS_OPEN,
+            "cancel → open (reopen, not dropped)"
+        );
+        assert!(
+            reopened.closed_at.is_none() && reopened.closed_reason.is_none(),
+            "the reopen path CLEARS closed_at/closed_reason — no stale fermeture trail"
+        );
+    }
+
+    /// DONE-CRITERION ("related inertes"): a `kind=related` link drives NOTHING — an idea linked
+    /// only as `related` stays `open` through the whole Spec lifecycle (start / done / cancel).
+    #[test]
+    fn related_link_is_inert_across_the_whole_lifecycle() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/idea-lc3", None).unwrap();
+
+        // Spec 1: walk start → done with a related-only idea.
+        let (spec1, _) = create_spec(&mut conn, &project.id, "S1", idea_lc_sections()).unwrap();
+        let ctx_idea = create_idea(
+            &mut conn,
+            &project.id,
+            "context only",
+            "",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        link_idea_spec(&mut conn, &ctx_idea.id, &spec1.id, IDEA_KIND_RELATED).unwrap();
+        transition_spec(&mut conn, &spec1.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &spec1.id, SpecTransition::Start, true).unwrap();
+        assert_eq!(
+            get_idea(&mut conn, &ctx_idea.id).unwrap().unwrap().status,
+            IDEA_STATUS_OPEN,
+            "related link: start is inert"
+        );
+        transition_spec(&mut conn, &spec1.id, SpecTransition::Review, false).unwrap();
+        transition_spec(&mut conn, &spec1.id, SpecTransition::Done, true).unwrap();
+        let after_done = get_idea(&mut conn, &ctx_idea.id).unwrap().unwrap();
+        assert_eq!(
+            after_done.status, IDEA_STATUS_OPEN,
+            "related link: done is inert"
+        );
+        assert!(after_done.closed_at.is_none(), "related idea never closed");
+
+        // Spec 2: cancel with a related-only idea is likewise inert.
+        let (spec2, _) = create_spec(&mut conn, &project.id, "S2", idea_lc_sections()).unwrap();
+        link_idea_spec(&mut conn, &ctx_idea.id, &spec2.id, IDEA_KIND_RELATED).unwrap();
+        transition_spec(&mut conn, &spec2.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &spec2.id, SpecTransition::Start, true).unwrap();
+        transition_spec(&mut conn, &spec2.id, SpecTransition::Cancel, true).unwrap();
+        assert_eq!(
+            get_idea(&mut conn, &ctx_idea.id).unwrap().unwrap().status,
+            IDEA_STATUS_OPEN,
+            "related link: cancel is inert"
+        );
+    }
+
+    /// A TERMINAL idea is not disturbed by a linked Spec's transition: an already-`implemented`
+    /// idea (addressed by a Spec) stays implemented when that Spec starts, and reopening on a
+    /// Spec cancel only touches ideas in `planned` (never a terminal one). Guards the "left as-is"
+    /// branches of the propagation.
+    #[test]
+    fn terminal_idea_is_untouched_by_spec_transitions() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/idea-lc4", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "S", idea_lc_sections()).unwrap();
+        // An idea already resolved by other means, addressed by this Spec.
+        let done_idea = create_idea(
+            &mut conn,
+            &project.id,
+            "already done",
+            "",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        close_idea(
+            &mut conn,
+            &done_idea.id,
+            IDEA_STATUS_IMPLEMENTED,
+            Some("done elsewhere"),
+        )
+        .unwrap();
+        link_idea_spec(&mut conn, &done_idea.id, &spec.id, IDEA_KIND_ADDRESSES).unwrap();
+
+        transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap();
+        let still = get_idea(&mut conn, &done_idea.id).unwrap().unwrap();
+        assert_eq!(
+            still.status, IDEA_STATUS_IMPLEMENTED,
+            "start does not reopen a terminal idea"
+        );
+        assert_eq!(
+            still.closed_reason.as_deref(),
+            Some("done elsewhere"),
+            "its trail is intact"
+        );
+
+        // Cancel must not resurrect the terminal idea (only `planned` reopens).
+        transition_spec(&mut conn, &spec.id, SpecTransition::Cancel, true).unwrap();
+        assert_eq!(
+            get_idea(&mut conn, &done_idea.id).unwrap().unwrap().status,
+            IDEA_STATUS_IMPLEMENTED,
+            "cancel does not reopen a terminal idea"
+        );
+    }
+
+    /// DONE-CRITERION ("regroupement par thème avec compteurs", task 01KXZ9K3120W6KZQYAFM1P14NA):
+    /// `list_idea_themes` groups a project's ideas by theme with a correct total + a per-status
+    /// breakdown, folds ungrouped ideas into a single `theme = None` group, orders biggest-first,
+    /// and is project-scoped.
+    #[test]
+    fn list_idea_themes_groups_with_counts_and_status_breakdown() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/idea-themes", None).unwrap();
+        let (other, _) = create_project(&mut conn, "Other", "/tmp/idea-themes2", None).unwrap();
+
+        let mk = |conn: &mut SqliteConnection, title: &str, theme: Option<&str>, status: &str| {
+            let i = create_idea(conn, &project.id, title, "", theme, IDEA_SOURCE_SESSION).unwrap();
+            if status != IDEA_STATUS_OPEN {
+                // Use the live-status path for planned, the closure path for terminal states.
+                if status == IDEA_STATUS_PLANNED {
+                    set_idea_live_status(conn, &i.id, status).unwrap();
+                } else {
+                    close_idea(conn, &i.id, status, None).unwrap();
+                }
+            }
+            i
+        };
+
+        // theme "auth": 3 ideas — 1 open, 1 planned, 1 implemented.
+        mk(&mut conn, "a1", Some("auth"), IDEA_STATUS_OPEN);
+        mk(&mut conn, "a2", Some("auth"), IDEA_STATUS_PLANNED);
+        mk(&mut conn, "a3", Some("auth"), IDEA_STATUS_IMPLEMENTED);
+        // theme "ui": 1 dropped.
+        mk(&mut conn, "u1", Some("ui"), IDEA_STATUS_DROPPED);
+        // ungrouped (theme=None): 2 open.
+        mk(&mut conn, "n1", None, IDEA_STATUS_OPEN);
+        mk(&mut conn, "n2", None, IDEA_STATUS_OPEN);
+        // Another project's idea must NOT leak in.
+        create_idea(
+            &mut conn,
+            &other.id,
+            "elsewhere",
+            "",
+            Some("auth"),
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+
+        // include_terminal=true: the FULL breakdown (every status) the renderer's mini-dots paint.
+        let groups = list_idea_themes(&mut conn, &project.id, true).unwrap();
+        assert_eq!(
+            groups.len(),
+            3,
+            "auth + ui + the ungrouped group, project-scoped"
+        );
+
+        // Biggest group first: auth (3), then ungrouped (2), then ui (1).
+        let auth = &groups[0];
+        assert_eq!(auth.theme.as_deref(), Some("auth"));
+        assert_eq!(auth.total, 3);
+        assert_eq!(
+            (
+                auth.open,
+                auth.planned,
+                auth.implemented,
+                auth.closed,
+                auth.dropped
+            ),
+            (1, 1, 1, 0, 0),
+            "auth status breakdown"
+        );
+
+        let ungrouped = &groups[1];
+        assert_eq!(
+            ungrouped.theme, None,
+            "ungrouped ideas fold into a None-theme group"
+        );
+        assert_eq!(ungrouped.total, 2);
+        assert_eq!(ungrouped.open, 2);
+
+        let ui = &groups[2];
+        assert_eq!(ui.theme.as_deref(), Some("ui"));
+        assert_eq!((ui.total, ui.dropped), (1, 1));
+
+        // include_terminal=false (the maintained default): only the ACTIVE backlog is counted, so
+        // `auth`'s total drops to 2 (open+planned; the implemented one is terminal) and the wholly
+        // terminal `ui` theme (a lone dropped idea) drops out entirely.
+        let active = list_idea_themes(&mut conn, &project.id, false).unwrap();
+        assert_eq!(
+            active.len(),
+            2,
+            "active-only: auth + ungrouped (ui is gone)"
+        );
+        let auth_active = active
+            .iter()
+            .find(|g| g.theme.as_deref() == Some("auth"))
+            .unwrap();
+        assert_eq!(
+            (auth_active.total, auth_active.open, auth_active.planned),
+            (2, 1, 1),
+            "active-only auth total = open+planned"
+        );
+        assert_eq!(
+            (auth_active.implemented, auth_active.dropped),
+            (0, 0),
+            "active-only scope zeroes the terminal buckets"
+        );
+        assert!(
+            !active.iter().any(|g| g.theme.as_deref() == Some("ui")),
+            "a wholly-terminal theme is absent from the active default"
+        );
+
+        // An empty project yields no groups (either scope).
+        assert!(list_idea_themes(&mut conn, "no-such-project", true)
+            .unwrap()
+            .is_empty());
+    }
+
+    // --- ANNEXES domain (v27) ----------------------------------------------
+
+    /// DONE-CRITERION ("même artefact 2x = une copie"): attaching the SAME content twice —
+    /// even across two Specs — stores ONE physical blob (content-addressed dedup by
+    /// content_hash), while each attachment is its own `annexes` row. `list_annexes` carries
+    /// the blob byte_len, `get_annexe` returns the stored content, and `remove_annexe`
+    /// GC-drops the blob only on its LAST reference.
+    #[test]
+    fn annexes_dedup_by_content_hash_and_gc_on_last_remove() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/annex-ws", None).unwrap();
+        let (spec_a, _) =
+            create_spec(&mut conn, &project.id, "Spec A", SpecSections::empty()).unwrap();
+        let (spec_b, _) =
+            create_spec(&mut conn, &project.id, "Spec B", SpecSections::empty()).unwrap();
+
+        let content = "the shared artefact bytes";
+        let a1 = add_annexe(&mut conn, &spec_a.id, ANNEX_KIND_DOC, "doc one", content).unwrap();
+        // SAME content attached again on the same Spec…
+        let a2 = add_annexe(&mut conn, &spec_a.id, ANNEX_KIND_DOC, "doc dup", content).unwrap();
+        // …and on ANOTHER Spec — all three share ONE blob.
+        let b1 = add_annexe(&mut conn, &spec_b.id, ANNEX_KIND_URL, "same again", content).unwrap();
+
+        assert_ne!(a1.id, a2.id, "distinct attachment rows");
+        assert_eq!(a1.content_hash, a2.content_hash, "same content → same hash");
+        assert_eq!(a1.content_hash, b1.content_hash);
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            1,
+            "one copy stored despite three attachments"
+        );
+
+        // A DIFFERENT content adds a second blob.
+        add_annexe(
+            &mut conn,
+            &spec_a.id,
+            ANNEX_KIND_DOC,
+            "other",
+            "different bytes",
+        )
+        .unwrap();
+        assert_eq!(annex_blob_count(&mut conn).unwrap(), 2);
+
+        // list_annexes is per-Spec, newest-first, carrying byte_len (no content).
+        let listed = list_annexes(&mut conn, &spec_a.id).unwrap();
+        assert_eq!(listed.len(), 3, "3 attachments on Spec A");
+        assert_eq!(listed[0].byte_len, "different bytes".len() as i64);
+
+        // get_annexe returns the stored content.
+        let got = get_annexe(&mut conn, &a1.id).unwrap().unwrap();
+        assert_eq!(got.content, content);
+        assert_eq!(got.byte_len, content.len() as i64);
+        assert!(get_annexe(&mut conn, "nope").unwrap().is_none());
+
+        // Removing a1 keeps the shared blob (a2 + b1 still reference it).
+        assert!(remove_annexe(&mut conn, &a1.id).unwrap());
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            2,
+            "shared blob survives"
+        );
+        // Remove a2 + b1: the shared blob is now GC'd (last reference gone).
+        assert!(remove_annexe(&mut conn, &a2.id).unwrap());
+        assert!(remove_annexe(&mut conn, &b1.id).unwrap());
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            1,
+            "shared blob GC'd; only the 'different bytes' blob remains"
+        );
+        // Remove of an unknown id is an idempotent no-op.
+        assert!(!remove_annexe(&mut conn, "nope").unwrap());
+    }
+
+    /// Deleting a Spec cascades away its annexe attachment rows (the FK `ON DELETE CASCADE`).
+    #[test]
+    fn deleting_a_spec_cascades_its_annexes() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/annex-cascade", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
+        add_annexe(&mut conn, &spec.id, ANNEX_KIND_DOC, "d", "body").unwrap();
+        assert_eq!(list_annexes(&mut conn, &spec.id).unwrap().len(), 1);
+        delete_project(&mut conn, &project.id).unwrap();
+        assert!(
+            list_annexes(&mut conn, &spec.id).unwrap().is_empty(),
+            "the Spec's annexes cascaded away"
+        );
+    }
+
+    // --- SPEC DEPENDENCIES domain (v28) ------------------------------------
+
+    /// DONE-CRITERION ("lien refusé si cycle" + "badges calculables"): a directional link that
+    /// would CLOSE a cycle is refused; `related` links never cycle; and the badge view returns
+    /// correct "bloquée par N / débloque M" counts. The link is an UPSERT (re-link updates the
+    /// kind/note); unlink is idempotent.
+    #[test]
+    fn spec_deps_cycle_refused_related_free_and_badges_correct() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/spec-deps", None).unwrap();
+        let mk = |conn: &mut SqliteConnection, t: &str| {
+            create_spec(conn, &project.id, t, SpecSections::empty())
+                .unwrap()
+                .0
+        };
+        let a = mk(&mut conn, "A");
+        let b = mk(&mut conn, "B");
+        let c = mk(&mut conn, "C");
+
+        // A depends on B (A comes after B). Then B depends on C.
+        add_spec_dependency(
+            &mut conn,
+            &a.id,
+            &b.id,
+            SPEC_DEP_KIND_BLOCKS,
+            Some("no merge"),
+        )
+        .unwrap();
+        add_spec_dependency(&mut conn, &b.id, &c.id, SPEC_DEP_KIND_AFTER, None).unwrap();
+
+        // C --depends_on--> A would close a cycle (A→B→C→A): REFUSED.
+        let err =
+            add_spec_dependency(&mut conn, &c.id, &a.id, SPEC_DEP_KIND_BLOCKS, None).unwrap_err();
+        assert!(matches!(err, SpecDependencyError::WouldCreateCycle { .. }));
+
+        // The direct 2-cycle B→A is also refused (A→B exists).
+        assert!(matches!(
+            add_spec_dependency(&mut conn, &b.id, &a.id, SPEC_DEP_KIND_AFTER, None).unwrap_err(),
+            SpecDependencyError::WouldCreateCycle { .. }
+        ));
+
+        // A self edge is refused.
+        assert!(matches!(
+            add_spec_dependency(&mut conn, &a.id, &a.id, SPEC_DEP_KIND_BLOCKS, None).unwrap_err(),
+            SpecDependencyError::SelfDependency
+        ));
+        // An unknown Spec is refused.
+        assert!(matches!(
+            add_spec_dependency(&mut conn, &a.id, "nope", SPEC_DEP_KIND_BLOCKS, None).unwrap_err(),
+            SpecDependencyError::SpecNotFound { .. }
+        ));
+
+        // A `related` link is CONTEXT ONLY — it never gates, so C↔A related does NOT cycle even
+        // though the directional path A→B→C exists.
+        add_spec_dependency(&mut conn, &c.id, &a.id, SPEC_DEP_KIND_RELATED, Some("ctx")).unwrap();
+
+        // Badges: B is blocked-by C (1) and unblocks A (1).
+        let vb = spec_dependency_view(&mut conn, &b.id).unwrap();
+        assert_eq!(vb.blocked_by_count, 1, "B depends on C");
+        assert_eq!(vb.blocked_by[0].spec_id, c.id);
+        assert_eq!(vb.unblocks_count, 1, "A depends on B");
+        assert_eq!(vb.unblocks[0].spec_id, a.id);
+        assert!(vb.related.is_empty(), "B has no related links");
+
+        // A: blocked-by B (1), unblocks nobody (0), one related link to C.
+        let va = spec_dependency_view(&mut conn, &a.id).unwrap();
+        assert_eq!(va.blocked_by_count, 1);
+        assert_eq!(va.blocked_by[0].spec_id, b.id);
+        assert_eq!(va.blocked_by[0].note.as_deref(), Some("no merge"));
+        assert_eq!(va.unblocks_count, 0, "related does NOT count as unblock");
+        assert_eq!(
+            va.related.len(),
+            1,
+            "the C↔A related link surfaces as context"
+        );
+
+        // Re-link A→B upserts the kind + note (no duplicate row).
+        let relinked = add_spec_dependency(
+            &mut conn,
+            &a.id,
+            &b.id,
+            SPEC_DEP_KIND_AFTER,
+            Some("reworded"),
+        )
+        .unwrap();
+        assert_eq!(relinked.kind, SPEC_DEP_KIND_AFTER);
+        assert_eq!(relinked.note.as_deref(), Some("reworded"));
+        assert_eq!(
+            spec_dependency_view(&mut conn, &a.id)
+                .unwrap()
+                .blocked_by_count,
+            1,
+            "upsert did not add a second edge"
+        );
+
+        // Unlink is idempotent.
+        assert_eq!(remove_spec_dependency(&mut conn, &a.id, &b.id).unwrap(), 1);
+        assert_eq!(remove_spec_dependency(&mut conn, &a.id, &b.id).unwrap(), 0);
+        assert_eq!(
+            spec_dependency_view(&mut conn, &a.id)
+                .unwrap()
+                .blocked_by_count,
+            0,
+            "A no longer depends on B after unlink"
+        );
+    }
+
+    /// Deleting a Spec cascades away every dependency edge it participates in (both directions).
+    #[test]
+    fn deleting_a_spec_cascades_its_dependency_edges() {
+        let mut conn = open_in_memory();
+        let (project, _ws) =
+            create_project(&mut conn, "Proj", "/tmp/spec-dep-cascade", None).unwrap();
+        let (a, _) = create_spec(&mut conn, &project.id, "A", SpecSections::empty()).unwrap();
+        let (b, _) = create_spec(&mut conn, &project.id, "B", SpecSections::empty()).unwrap();
+        add_spec_dependency(&mut conn, &a.id, &b.id, SPEC_DEP_KIND_BLOCKS, None).unwrap();
+        assert_eq!(
+            spec_dependency_view(&mut conn, &b.id)
+                .unwrap()
+                .unblocks_count,
+            1
+        );
+        delete_project(&mut conn, &project.id).unwrap();
+        // Nothing left to view (the Specs + their edges are gone).
+        assert_eq!(
+            spec_dependency_view(&mut conn, &b.id)
+                .unwrap()
+                .unblocks_count,
+            0
+        );
+    }
+
+    /// The FTS5 index (external content on `ideas.rowid`, fed by the migration triggers) matches
+    /// on BOTH `title` and `body`, is project-scoped, and follows edits: an UPDATE to the body
+    /// re-indexes (the AFTER UPDATE trigger), and a DELETE removes the row from the index.
+    #[test]
+    fn ideas_fts_matches_title_body_scoped_and_follows_edits() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/fts-ws", None).unwrap();
+        let (other, _) = create_project(&mut conn, "Other", "/tmp/fts-other", None).unwrap();
+
+        let a = create_idea(
+            &mut conn,
+            &project.id,
+            "Authentication rework",
+            "harden the login path",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        create_idea(
+            &mut conn,
+            &project.id,
+            "Dark mode",
+            "a theme toggle",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+        // A same-word idea in ANOTHER project must NOT leak into the scoped match.
+        create_idea(
+            &mut conn,
+            &other.id,
+            "Login elsewhere",
+            "authentication too",
+            None,
+            IDEA_SOURCE_SESSION,
+        )
+        .unwrap();
+
+        // Match on a body term, project-scoped: only idea `a`.
+        let hits = fts_match_ideas(&mut conn, &project.id, "login", 10).unwrap();
+        assert_eq!(hits.len(), 1, "project-scoped, body-term match");
+        assert_eq!(hits[0].id, a.id);
+        // Match on a title term.
+        let title_hits = fts_match_ideas(&mut conn, &project.id, "authentication", 10).unwrap();
+        assert_eq!(title_hits.len(), 1);
+        assert_eq!(title_hits[0].id, a.id);
+
+        // The AFTER UPDATE trigger re-indexes: the old body term stops matching, a new one starts.
+        close_idea(&mut conn, &a.id, IDEA_STATUS_OPEN, None).ok(); // no-op body change path
+        diesel::update(ideas::table.find(&a.id))
+            .set((
+                ideas::body.eq("switch to passkeys"),
+                ideas::updated_at.eq(now_millis()),
+            ))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(
+            fts_match_ideas(&mut conn, &project.id, "login", 10)
+                .unwrap()
+                .is_empty(),
+            "old body term re-indexed away"
+        );
+        assert_eq!(
+            fts_match_ideas(&mut conn, &project.id, "passkeys", 10)
+                .unwrap()
+                .len(),
+            1,
+            "new body term indexed"
+        );
+
+        // The AFTER DELETE trigger removes the row from the index.
+        diesel::delete(ideas::table.find(&a.id))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(
+            fts_match_ideas(&mut conn, &project.id, "authentication", 10)
+                .unwrap()
+                .is_empty(),
+            "deleted idea gone from the index"
+        );
+    }
+
     /// The `domain_events` model (v12) round-trips through the migrated DB, `sequence`
     /// is strictly increasing (the monotonic global ordering key), and `list_domain_events`
     /// returns them in emission order. Proves the v12 migration + `schema.rs` `domain_events`
@@ -8123,14 +10422,22 @@ mod tests {
     }
 
     /// v13 migration reverts cleanly (`down.sql` drops `spec_revisions` then `specs`).
-    /// Since later phases landed v14 (tasks) then v15 (the `specs.workspace_id` index) ON
-    /// TOP of v13, we peel them back to front — v15, then v14, then v13 — so this still
-    /// genuinely exercises the Spec down-migration.
+    /// Since many later phases landed ON TOP of v13 (up through v29), we peel them back to
+    /// front — newest (v29) down to v13 — so this still genuinely exercises the Spec
+    /// down-migration.
     #[test]
     fn spec_domain_migration_reverts() {
         let mut conn = open_in_memory();
-        // Peel v15 (specs.workspace_id index), v14 (tasks/task_dependencies), then v13
+        // Peel every migration above v13 newest-first (v29 down to v14), then v13
         // (specs/spec_revisions); all must succeed. Each revert drops the current last link.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v29 (ideas add closed status) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v28 (spec_depends_on) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v27 (annexes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v26 (create_ideas) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v25 (tasks grill drop validated) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -8529,9 +10836,11 @@ mod tests {
         // added dir #20 the agent_session_specs link table; v2.5.11 added dir #21 the
         // tasks review-finding fields + dir #22 the tasks round + dir #23 the specs
         // reviewing_phase + dir #24 dropped the tasks.origin column + dir #25 dropped the
-        // `validated` grill state), so reaching the pre-v4 schema peels all of them then dir #4
-        // itself (21 reverts, reverse order).
-        for _ in 0..21 {
+        // `validated` grill state; v2.6 Phase 1 added dir #26 the ideas domain; v2.6 Phase 3
+        // added dir #27 the annexes domain + dir #28 the spec_depends_on graph; v2.6 Phase 5
+        // added dir #29 the ideas `closed` status), so reaching the pre-v4 schema peels all of
+        // them then dir #4 itself (25 reverts, reverse order).
+        for _ in 0..25 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -11651,6 +13960,12 @@ mod tests {
         // Peel v15 (specs.workspace_id index) then v14 (tasks/task_dependencies); both must
         // succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v28 (spec_depends_on) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v27 (annexes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v26 (create_ideas) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v25 (tasks grill drop validated) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v24 (tasks drop origin) cleanly");
@@ -12029,6 +14344,14 @@ mod tests {
         // domain_events) then v11 (data backfill) then v10 (canonical structure). After
         // this, `workspaces.root_path` does NOT exist yet (`path` does), and `projects` has
         // no `key`/`primary_workspace_id`.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v29 (ideas add closed status) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v28 (spec_depends_on) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v27 (annexes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v26 (create_ideas) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v25 (tasks grill drop validated) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -12937,15 +15260,17 @@ mod tests {
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the projects migration (dirs #25 → #3),
-        // then the projects migration (dir #2) itself — 23 reverts in reverse order
+        // Peel every migration stacked above the projects migration (dirs #28 → #3),
+        // then the projects migration (dir #2) itself — 26 reverts in reverse order
         // (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task
         // domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added dir #20
         // the agent_session_specs link table; v2.5.11 added dir #21 the tasks review-finding
         // fields + dir #22 the tasks round + dir #23 the specs reviewing_phase + dir #24
-        // dropped the tasks.origin column + dir #25 dropped the `validated` grill state).
-        // projects must then be absent.
-        for _ in 0..23 {
+        // dropped the tasks.origin column + dir #25 dropped the `validated` grill state;
+        // v2.6 Phase 1 added dir #26 the ideas domain; v2.6 Phase 3 added dir #27 the annexes
+        // domain + dir #28 the spec_depends_on graph; v2.6 Phase 5 added dir #29 the ideas
+        // `closed` status). projects must then be absent.
+        for _ in 0..27 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -13790,14 +16115,16 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Peel every migration stacked above the managed_commands migration (dirs
-        // #25 → #4), then the managed_commands migration (dir #3) itself — 22 reverts in
+        // #28 → #4), then the managed_commands migration (dir #3) itself — 25 reverts in
         // reverse order (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14
         // the task domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added
         // dir #20 the agent_session_specs link table; v2.5.11 added dir #21 the tasks
         // review-finding fields + dir #22 the tasks round + dir #23 the specs reviewing_phase
         // + dir #24 dropped the tasks.origin column + dir #25 dropped the `validated` grill
-        // state). managed_commands must then be absent.
-        for _ in 0..22 {
+        // state; v2.6 Phase 1 added dir #26 the ideas domain; v2.6 Phase 3 added dir #27 the
+        // annexes domain + dir #28 the spec_depends_on graph; v2.6 Phase 5 added dir #29 the
+        // ideas `closed` status). managed_commands must then be absent.
+        for _ in 0..26 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -13863,6 +16190,14 @@ mod tests {
         // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row + its v3
         // columns survive; the v4 columns are gone (a typed select of `unread` would now fail
         // to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v29 (ideas add closed status) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v28 (spec_depends_on) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v27 (annexes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v26 (create_ideas) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v25 (tasks grill drop validated) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -14055,6 +16390,14 @@ mod tests {
         // peels v15, v14, v13, v12, v11, v10, v9, v8, v7, then v5 (migrations revert in
         // reverse order). The instance row + its v3/v4 columns survive; the v5 columns are
         // gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v29 (ideas add closed status) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v28 (spec_depends_on) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v27 (annexes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v26 (create_ideas) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v25 (tasks grill drop validated) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -15343,6 +17686,14 @@ mod tests {
         // task domain) then v13 (v2.4 Phase 1 Spec domain) then v12 (v2.1 Phase 4
         // domain_events) then v11 (v2.1 data backfill) then v10 (v2.1 canonical structure)
         // then v9 (#11 project order) then v8 → the resume_agent_sessions column is gone.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v29 (ideas add closed status) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v28 (spec_depends_on) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v27 (annexes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v26 (create_ideas) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v25 (tasks grill drop validated) cleanly");
         conn.revert_last_migration(MIGRATIONS)

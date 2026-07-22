@@ -52,7 +52,8 @@ describe("app router", () => {
 
   it("mounts the Knowledge route at `/knowledge`", async () => {
     renderAt("/knowledge");
-    expect(await screen.findByRole("heading", { name: "Knowledge" })).toBeTruthy();
+    // The Idées view's own heading is "Ideas"; the section-nav still carries a "Knowledge" link.
+    expect(await screen.findByRole("heading", { name: "Ideas" })).toBeTruthy();
   });
 
   it("accepts a `?terminal=<id>` deep-link on `/` (the Runtime-tab open-terminal seam)", async () => {

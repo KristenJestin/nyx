@@ -43,6 +43,11 @@ use crate::mcp_tools_core::ToolOutcome;
 /// from nyx state.
 pub const AGENT_CONTEXT_TOOL: &str = "agent_context";
 
+/// How many OPEN backlog ideas the /nspec authoring manual surfaces up front (a bounded preview —
+/// the author then `idea_search`es the concrete topic; this is only the "there is a backlog, look
+/// at it" nudge, never a full dump).
+const SPEC_AUTHORING_IDEA_PREVIEW: i64 = 20;
+
 /// The agent ROLES a context can be rendered for (v2.5.8 agent harness, PDR-0020). The
 /// "principaux" (directly triggerable) are `spec` (authors a Spec), `dev` (orchestrates its
 /// implementation) and `doc` (syncs the doc); `coder` and `auditor` are the sub-agents the dev
@@ -115,6 +120,30 @@ You may not:
 
 The human DUMPS raw (a vague idea, an ill-formed problem). You GRILL (question, clarify,
 structure). The human VALIDATES. You never validate in their place.
+
+## Step 0 — Search the idea backlog FIRST (before you create anything)
+
+Before you grill or write a line of Spec, SEARCH the project's maintained idea backlog for the
+subject: idea_search(project_id, query="<the topic, in the user's words>"). That backlog is where
+the follow-ups raised during dev/review were captured — the need in front of you may ALREADY be
+tracked as an idea, and you must not re-create it as a duplicate Spec.
+
+- A matching idea exists? SURFACE it to the human ("this is already tracked as idea …") and build
+  the Spec AROUND it rather than starting a fresh, duplicate one.
+- Once the Spec exists (spec_create), AUTO-LINK every idea this Spec will resolve with
+  idea_link(idea_id, spec_id, kind="addresses"). That link drives the idea's lifecycle for free
+  (it goes planned when you start the Spec, implemented when you complete it, back to open if you
+  cancel). Link mere background as kind="related" (which drives no status change).
+- Re-run idea_search with the terms that surface during the grill (typos/variants are tolerated).
+  The goal is simple: NO duplicate Spec for a need the backlog already holds.
+
+RECONCILE the backlog while you author — cleanup is YOUR job here (it SHRINKS the pile, so no
+per-action user gate): CLOSE the ideas the work has already resolved with idea_close(id, reason=…)
+— that motif is the MANUAL closure; do NOT call idea_implement by hand, "implemented" is the AUTO
+path a linked addresses-Spec drives on completion. MERGE obvious duplicates with
+idea_merge(source_ids, target_id), and keep the backlog grouped by theme. AUTO-LINK
+(idea_link kind="addresses", above) and RECONCILIATION (idea_close / idea_merge / regroup) are
+DIFFERENT actions: one wires an idea to its Spec, the other curates the pile.
 
 ## Step 1 — Grill (the most important part)
 
@@ -231,6 +260,15 @@ nyx never flips the Spec's state for you; you do, with spec_transition:
    nyx, observed). Red -> re-launch the coder on it. NO LLM auditor here — checks only, per phase.
 3. Phase green -> next phase (respect the blocking edges).
 
+## Backlog capture (human-gated — PROPOSE, never auto-add)
+
+When an out-of-scope need or a follow-up surfaces during a dev pass (raised by you, or bubbled up in
+a coder's report), do NOT silently widen the scope and do NOT idea_add it on your own authority.
+PROPOSE it to the USER and, only AFTER they validate that specific addition, capture it with
+idea_add(project_id, title, body?, theme?, source="session") — a human gate on EVERY add, so the
+backlog never fills with unvetted junk. You do NOT reconcile the backlog (no idea_close, no
+idea_merge, no regroup) — that curation is the Spec author's job in /nspec.
+
 ## At the END only (every phase finished) — the 2-axis auditor ONCE
 
 1. Launch the 2-axis AUDITOR ONCE (NOT per phase): two parallel provider Task sub-agents (Standards +
@@ -308,7 +346,15 @@ You may not:
   once at the end. Every command goes through the nyx tools (observed), never a wild launch.
 - Task done -> task_transition done. Commit on the current branch.
 - kind=human task -> STOP (an action reserved for the user): hand it back to the orchestrator and
-  continue with the other independent tasks."#
+  continue with the other independent tasks.
+
+## Follow-ups you discover (SURFACE upward — you do NOT idea_add)
+
+You are a non-interactive sub-agent, so you never call idea_add yourself. A follow-up outside your
+task — tech debt, an edge case, an out-of-task improvement — you SURFACE to the dev orchestrator,
+in your final report or a task note, the SAME way you surface a scope-gap. The orchestrator then
+proposes it to the user, who alone gates whether it enters the backlog. Never capture it directly,
+never widen your task to do it."#
             }
             AgentRole::Auditor => {
                 r#"# Context: Auditor Agent
@@ -754,6 +800,58 @@ fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<Strin
             out.push_str(
                 "_Select the project first (pass project_id, or run from a workspace folder) to \
                  list its Specs._\n\n",
+            );
+        }
+    }
+
+    // The project's OPEN idea backlog — the maintained follow-ups the author must SEARCH before
+    // creating a duplicate Spec (PRD Impl Decisions: "INTÉGRÉ AU /nspec … au démarrage d'une Spec,
+    // l'agent cherche d'office les idées du sujet … et les auto-linker (kind=addresses)"). Surfaced
+    // up front as a bounded preview so the backlog is visible; the concrete lookup is idea_search
+    // on the subject, and the resolution is idea_link(kind=addresses) once the Spec exists.
+    out.push_str("## Existing ideas — search the backlog before you spec (anti-duplication)\n\n");
+    match project {
+        Some(p) => {
+            let ideas = db
+                .with_conn(|c| {
+                    db::list_ideas(
+                        c,
+                        &p.id,
+                        db::IdeaStatusFilter::One(db::IDEA_STATUS_OPEN),
+                        None,
+                        SPEC_AUTHORING_IDEA_PREVIEW,
+                        0,
+                    )
+                })
+                .map_err(internal_db)?;
+            if ideas.is_empty() {
+                out.push_str(
+                    "_No open ideas in this project yet — still, run \
+                     idea_search(project_id=…, query=…) on the subject before you author, in case \
+                     one is tracked._\n\n",
+                );
+            } else {
+                for i in &ideas {
+                    let theme = i.theme.as_deref().unwrap_or("—");
+                    out.push_str(&format!("- {} · {} · theme={}\n", i.id, i.title, theme));
+                }
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "Run idea_search(project_id=\"{}\", query=\"<the subject>\") to find the ideas on \
+                 THIS topic (typos/variants tolerated), SURFACE the matches to the human, and — once \
+                 the Spec exists — idea_link(idea_id, spec_id, kind=\"addresses\") every idea it \
+                 resolves, so a need already tracked is NOT re-created as a duplicate Spec. RECONCILE \
+                 as you author: idea_close(id, reason=…) the ones the work resolves (MANUAL motif — \
+                 idea_implement is the AUTO path a linked addresses-Spec drives), idea_merge obvious \
+                 duplicates, keep the list grouped by theme.\n\n",
+                p.id
+            ));
+        }
+        None => {
+            out.push_str(
+                "_Select the project first (pass project_id, or run from a workspace folder), then \
+                 idea_search its backlog before creating a Spec._\n\n",
             );
         }
     }
@@ -1205,6 +1303,110 @@ mod tests {
         );
     }
 
+    /// Review finding 01KY4ZJPNBJMYJDGWTMXWNYJZV: the Dev orchestrator's backlog capture is
+    /// HUMAN-GATED — an out-of-scope follow-up is PROPOSED to the user and only `idea_add`ed AFTER
+    /// they validate that specific add (never autonomous), and the Dev does NOT reconcile.
+    #[test]
+    fn render_dev_carries_human_gated_backlog_capture() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let text = render_agent_context(&db, AgentRole::Dev, None, &spec_id)
+            .unwrap()
+            .unwrap();
+        // PROPOSE to the user, then idea_add ONLY after they validate that specific addition.
+        assert!(
+            text.contains("PROPOSE it to the USER")
+                && text.contains("only AFTER they validate")
+                && text.contains("idea_add("),
+            "Dev proposes the follow-up and captures only after the user validates it",
+        );
+        // A human gate on EVERY add — the anti-autonomous wording (no on-its-own-authority add).
+        assert!(
+            text.contains("human gate on EVERY add"),
+            "every add is human-gated (backlog never fills with unvetted junk)",
+        );
+        assert!(
+            text.contains("do NOT idea_add it on your own authority"),
+            "Dev must NOT add autonomously",
+        );
+        // Dev does NOT reconcile — that curation belongs to /nspec.
+        assert!(
+            text.contains("You do NOT reconcile the backlog") && text.contains("/nspec"),
+            "reconciliation (close/merge/regroup) is the Spec author's job, not the Dev's",
+        );
+    }
+
+    /// Review finding 01KY4ZJQ6BCXHQZ8268P47ZGNH: the Coder is a non-interactive sub-agent — it
+    /// SURFACES a discovered follow-up UPWARD to the dev orchestrator (final report / note, like a
+    /// scope-gap) and never calls `idea_add` itself.
+    #[test]
+    fn render_coder_surfaces_followups_upward_not_idea_add() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let text = render_agent_context(&db, AgentRole::Coder, None, &spec_id)
+            .unwrap()
+            .unwrap();
+        // SURFACE upward to the orchestrator, in the final report or a note (same as a scope-gap).
+        assert!(
+            text.contains("SURFACE to the dev orchestrator"),
+            "coder surfaces follow-ups upward to the orchestrator",
+        );
+        assert!(
+            text.contains("final report") && text.contains("task note"),
+            "surfaced via the final report / a task note",
+        );
+        // It is explicitly told NOT to capture directly (no autonomous idea_add).
+        assert!(
+            text.contains("you never call idea_add yourself")
+                && text.contains("Never capture it directly"),
+            "coder is told NOT to idea_add itself",
+        );
+        // The direct-capture form (with source=session) is the DEV's tool, never the coder's.
+        assert!(
+            !text.contains("source=\"session\""),
+            "coder carries no direct idea_add capture instruction",
+        );
+    }
+
+    /// Review finding 01KY4ZJQPZZPE21Y3QDSDAACP4: the Spec author keeps its existing SEARCH +
+    /// auto-link AND now also RECONCILES the backlog (close resolved with the MANUAL motif, merge
+    /// duplicates, regroup by theme) — auto-link and reconciliation being DIFFERENT actions.
+    #[test]
+    fn render_spec_carries_backlog_search_and_reconciliation() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let text = render_agent_context(&db, AgentRole::Spec, None, &spec_id)
+            .unwrap()
+            .unwrap();
+        // The EXISTING search + auto-link wiring is preserved.
+        assert!(
+            text.contains("Search the idea backlog FIRST")
+                && text.contains("idea_search(")
+                && text.contains("kind=\"addresses\""),
+            "search + auto-link (addresses) is kept",
+        );
+        // The NEW reconciliation: close (manual) / merge duplicates / regroup by theme.
+        assert!(
+            text.contains("RECONCILE the backlog while you author"),
+            "reconciliation instruction added",
+        );
+        assert!(
+            text.contains("idea_close(") && text.contains("idea_merge("),
+            "close the resolved + merge duplicates",
+        );
+        assert!(text.contains("grouped by theme"), "regroup by theme");
+        // close = MANUAL motif; implemented = AUTO (do NOT call idea_implement by hand).
+        assert!(
+            text.contains("do NOT call idea_implement by hand"),
+            "manual close vs auto implemented is spelled out",
+        );
+        // auto-link and reconciliation are DISTINGUISHED as different actions.
+        assert!(
+            text.contains("DIFFERENT actions"),
+            "auto-link vs reconciliation are clearly distinguished",
+        );
+    }
+
     #[test]
     fn render_auditor_is_rendered_per_axis() {
         let _g = db_guard();
@@ -1344,6 +1546,12 @@ mod tests {
             text.contains("Existing Specs in the project (anti-duplication)"),
             "sibling-specs weaving section",
         );
+        // The idea-backlog wiring lives in the shared spec-author preamble, so an anchored render
+        // carries it too: search the backlog at Spec start, auto-link the resolved ideas.
+        assert!(
+            text.contains("Search the idea backlog FIRST") && text.contains("idea_search("),
+            "the /nspec idea_search wiring (Step 0) is in the spec-author preamble",
+        );
     }
 
     #[test]
@@ -1466,6 +1674,76 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("SPEC (authoring)"));
+    }
+
+    /// DONE-CRITERION (task 01KXZ9K3HZC5C1YF4HXVE1M77J: "/nspec déclenche idea_search au démarrage ;
+    /// auto-link kind=addresses ; pas de doublon Spec"): the /nspec authoring context WIRES the idea
+    /// backlog — it instructs idea_search at Spec start, auto-linking the resolved ideas as
+    /// kind=addresses to avoid a duplicate Spec, AND surfaces the project's OPEN ideas up front.
+    #[test]
+    fn spec_authoring_wires_idea_search_and_surfaces_the_open_backlog() {
+        let _g = db_guard();
+        let (db, project_id, _ws, _cwd) = seeded_project_without_spec();
+        // Seed an OPEN idea in the project's backlog + a dropped one (must not be surfaced).
+        let open_idea = db
+            .with_conn(|c| {
+                db::create_idea(
+                    c,
+                    &project_id,
+                    "Rework the auth token refresh",
+                    "",
+                    Some("auth"),
+                    db::IDEA_SOURCE_SESSION,
+                )
+            })
+            .unwrap();
+        let dropped = db
+            .with_conn(|c| {
+                db::create_idea(
+                    c,
+                    &project_id,
+                    "Abandoned thing",
+                    "",
+                    None,
+                    db::IDEA_SOURCE_SESSION,
+                )
+            })
+            .unwrap();
+        db.with_conn(|c| db::close_idea(c, &dropped.id, db::IDEA_STATUS_DROPPED, None))
+            .unwrap();
+
+        let out = agent_context(&db, &json!({ "role": "spec", "project_id": project_id })).unwrap();
+        assert!(out.effects.is_empty(), "authoring render is a pure read");
+        let text = out.result["context"].as_str().unwrap();
+
+        // The instruction (Step 0): idea_search at the start, auto-link addresses, no duplicate Spec.
+        assert!(
+            text.contains("Search the idea backlog FIRST"),
+            "Step 0 present in the preamble",
+        );
+        assert!(text.contains("idea_search("), "instructs idea_search");
+        assert!(
+            text.contains("kind=\"addresses\""),
+            "auto-link the resolved ideas as addresses",
+        );
+        assert!(
+            text.to_lowercase().contains("duplicate spec"),
+            "the anti-duplication goal is explicit",
+        );
+
+        // The concrete backlog surface: the OPEN idea is listed up front; the dropped one is not.
+        assert!(
+            text.contains("Existing ideas — search the backlog before you spec"),
+            "the backlog section header",
+        );
+        assert!(
+            text.contains(&open_idea.id) && text.contains("Rework the auth token refresh"),
+            "the open idea is surfaced up front",
+        );
+        assert!(
+            !text.contains("Abandoned thing"),
+            "a dropped idea is not surfaced in the open backlog",
+        );
     }
 
     /// When the cwd matches no nyx workspace/project (or no anchor is given at all), /nspec

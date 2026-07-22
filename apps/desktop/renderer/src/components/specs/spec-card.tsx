@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 
 import { Badge } from "@/components/ui/badge";
 
+import { DependencyBadges } from "./dependency-badges";
 import { priorityMeta, specKey } from "./spec-meta";
 import { ProgressBar } from "./spec-primitives";
 import type { SpecListEntry } from "./types";
@@ -31,6 +32,12 @@ export function SpecCardView({ spec }: { spec: SpecListEntry }) {
         </Badge>
       </div>
       <h3 className="mt-2 text-sm leading-snug text-foreground">{spec.title}</h3>
+      {/* Spec↔Spec dependency badges (PRD "surfacé sur le board") — present only when non-zero. */}
+      <DependencyBadges
+        blockedBy={spec.blocked_by_count}
+        unblocks={spec.unblocks_count}
+        className="mt-2"
+      />
       {spec.tasks_total > 0 ? (
         <div className="mt-3">
           <ProgressBar done={spec.tasks_done} total={spec.tasks_total} />
