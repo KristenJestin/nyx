@@ -29,9 +29,10 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5.10 | Surcouche terminal↔Spec : overlay live (avancement dev + création) | 📋 PRD prêt |
 | v2.5.11 | Boucle review : findings (tasks kind=review) + rework en rounds + résolution + retour-chat | 📋 PRD prêt |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
-| v2.7 | Capacités avancées | ⬜ à venir |
-| v2.8 | Migration finale et extinction Depot | ⬜ à venir |
-| tardif | Délégation & reprise cross-machine (handoff continuable) | 🔮 capturé — post-v2.8, position provisoire |
+| v2.7 | Machinerie prototype | ⬜ à venir |
+| v2.8 | Harnais customisable (rules/checks/agents/workflows + visualiser) | ⬜ à venir |
+| v2.9 | Migration finale et extinction Depot | ⬜ à venir |
+| tardif | Délégation & reprise cross-machine (handoff continuable) | 🔮 capturé — post-v2.9, position provisoire |
 
 > Le détail des chantiers menés hors de la ligne principale (review v2.4-review, terminal-blocks parké) vit dans
 > [`session-notes.md`](session-notes.md) ; les sections ci-dessous n'en gardent qu'un pointeur.
@@ -186,7 +187,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 > Point-release issue de l'audit v1→v2 : beaucoup de code de pilotage v1 a été recopié en v2 mais laissé
 > non-câblé ; la reprise des sessions avait le setting **et** la politique backend mais **aucune exécution**.
-> Comme v2.2.5, cette tranche **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
+> Comme v2.2.5, cette tranche **n'incrémente pas** la suite (v2.6 à v2.9 gardent leurs numéros).
 
 - rebrancher l'**UI Integrations** (install du plugin Claude, dont dépendent détection d'agent + icône + statut) + le toggle `resume_agent_sessions` dans le shell actif ;
 - **EXÉCUTER la reprise en mode LAZY** (à l'ouverture d'un terminal, pas eager au boot) : consommer `workspace_restore_plan`, re-porter park+inject `claude --resume` (réutilise `decide_resume` / `workspace_resume_plan`) ;
@@ -200,7 +201,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 **Status: ready** — PRD `01KXBNX508EYHSQ1CW7RWYKV95` (rev 2 courante ; la rev 1 `01KX905W…3M` est superseded)
 
 > Point-release qui rebranche le reste du cockpit v1 déjà recopié en v2 mais non-câblé.
-> Comme v2.2.5, elle **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
+> Comme v2.2.5, elle **n'incrémente pas** la suite (v2.6 à v2.9 gardent leurs numéros).
 
 - **close-warning** avant de tuer des sessions live (contrôles de fenêtre min/max/close = **hors scope**, fournis par le WM) ;
 - **kebab projet** + CRUD (rename/delete projet + workspace) ;
@@ -214,7 +215,7 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Status: livré** — PRD `01KXBQ8QVYR887Y1C79V6EEQK4`
 
-> Suivi de v2.4 (Specs). Point-release qui **n'incrémente pas** la suite (v2.6/v2.7/v2.8 gardent leurs numéros).
+> Suivi de v2.4 (Specs). Point-release qui **n'incrémente pas** la suite (v2.6 à v2.9 gardent leurs numéros).
 > Déclencheur : en absorbant Depot, on a constaté que son fork ne clonait que le narratif + une partie des tâches et **perdait des liens** (vécu au fork rev 1→2 du PRD cockpit). Le natif ne doit **pas** reproduire ça.
 
 - une révision de Spec devient un **cliché immuable complet** : narratif **+ tâches + dépendances** (aujourd'hui seul le narratif est figé ; les tâches pendent du Spec via `tasks.spec_id` et traversent les forks) ;
@@ -291,29 +292,39 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 
 **Gate :** les informations durables nécessaires aux agents et à l'utilisateur sont consultables et modifiables dans nyx, sans second système de mémoire.
 
-## v2.7 - Capacités avancées de la V2
+## v2.7 - Machinerie prototype
 
-Après validation des usages de v2.0 à v2.6 :
+PRD `01KXC8WVEYZM32Y1BAPWY3QJPS` (draft). Porter la machinerie prototype en natif — **la vraie douleur v1** — pour pouvoir retirer Depot :
 
-- milestones, catégories et graphes de dépendances avancés ;
 - prototypes comme annexe du Spec (un seul par Spec ; rounds conservés comme rollback ; forme par revue d'usage, cf. PDR-0009) ;
-- design-system imposé + rendu proto (Handlebars sidecar, Tailwind iframe, sync md5 ; cf. PDR-0010) ;
-- catalogues de composants ;
-- orchestration multi-agent via playbook éditable + verbes observables, pas un moteur (cf. PDR-0011) ;
-- automatisations ;
-- diagnostics et outils de réparation ;
-- import/export et sauvegardes de longue durée.
+- design-system imposé + **rendu proto** (Handlebars sidecar, Tailwind iframe, sync md5 ; cf. PDR-0010) ;
+- catalogues de composants **mappés** ;
+- **distill → dev fidèle** (le contrat de placement exécuté sans réinvention).
 
-> L'unload / lazy-resume des sessions agent idle (crux = détection d'activité réelle, idée depot
-> `01KX0X3ZZQMEPKBQX30SX47HJF`) est traité en **v2.5.5**.
->
-> La **machinerie prototype** (design-system rendu, composants mappés, **distill→dev fidèle** — la vraie douleur v1) est capturée en avance dans le PRD `01KXC8WVEYZM32Y1BAPWY3QJPS` (draft), pour ne pas perdre la conception faite en v2.5.8. Le **rôle prototype léger** + son entrée (`/nspec` propose un proto quand c'est graphique) sont livrés dès **v2.5.8**.
+Le **rôle prototype léger** + son entrée (`/nspec` propose un proto quand c'est graphique) sont déjà livrés en **v2.5.8** ; ici on livre la machinerie de rendu / mapping / distill.
 
-Chaque sous-système Depot doit recevoir une décision explicite : **porter, simplifier, remplacer ou supprimer**. Il n'est pas copié par défaut.
+**Gate :** un proto élu se distille en un dev fidèle au design retenu, sans Depot.
 
-**Gate :** chaque capacité avancée démontre un bénéfice sur la boucle travail -> agent -> review, sans transformer nyx en IDE ou gestionnaire de projet générique.
+## v2.8 - Harnais customisable (rules / checks / agents / workflows + visualiser)
 
-## v2.8 - Migration finale et extinction de Depot
+PRD `01KY4DQS06B939Z1CM8CPE7TW0` (draft). Livre PDR-0011/0019/0020 en entier : le triptyque **rules / checks / agents** (ce que Depot entassait dans « directives ») devient de la **donnée éditable**.
+
+- **Défauts nyx clé-en-main** : les 6 rôles hardcodés en Rust deviennent des templates DB seedés + un workflow par défaut qui tourne sans config ;
+- **agents forkables** par projet + **subagents custom** réutilisables cross-projet (ui-tester…), observés (fini le sous-agent caché) ;
+- **rules** (table `directives`) advisory, catégorisées, injectées par scope via marqueur — lean (faits transverses ; le comportement de rôle vit dans le template) ;
+- **checks** = `managed_commands.gate` déterministes, blocking, scopés (robustes aux renames : ce sont des commandes, pas des ancres fichier) ;
+- **workflows** composables + wiring (subagent / check → scope), assignés via `projects.workflow_id` ; lancement / observation des subagents **abstrait par provider** (fallback = session nyx observée, aucun angle mort) ;
+- **authoring 100% MCP** + **VISUALISER UI** requis. Édition UI directe = itératif, plus tard.
+
+Le **design-system rendu** reste en v2.7 ; ici c'est l'orchestration / rules / checks / agents.
+
+**Gate :** un projet neuf tourne sur le workflow défaut ; un scénario customisé (rule + subagent custom wiré + check gate) se reflète dans les contextes rendus, l'exécution observée et le visualiser.
+
+## Autres capacités avancées (à cadrer, post-v2.9)
+
+Non encore tranchées : milestones / catégories / graphes de dépendances avancés ; automatisations ; diagnostics et outils de réparation ; import/export et sauvegardes de longue durée. Chaque sous-système Depot reçoit une décision explicite — **porter, simplifier, remplacer ou supprimer** — jamais copié par défaut.
+
+## v2.9 - Migration finale et extinction de Depot
 
 - importer de façon idempotente projets liés, Spec, révisions, tâches, reviews, idées, ADR, directives, documents et pièces jointes retenues ;
 - gérer les chemins historiques WSL/Windows et les identités déjà présentes dans nyx ;
@@ -329,7 +340,7 @@ Chaque sous-système Depot doit recevoir une décision explicite : **porter, sim
 
 **Status: capturé (draft)** — Spec `01KXJS1PMAXT989QGPN34TA8S8` · **position PROVISOIRE**
 
-> Direction validée avec l'utilisateur, figée pour ne pas la perdre. **Un des derniers chantiers** : dépend de tout le socle natif (Spec + knowledge + `domain_events` + harnais v2.5.8) **et** de l'extinction de Depot (v2.8). D'autres tranches non encore définies viendront probablement **avant** — d'où la position provisoire.
+> Direction validée avec l'utilisateur, figée pour ne pas la perdre. **Un des derniers chantiers** : dépend de tout le socle natif (Spec + knowledge + `domain_events` + harnais v2.5.8) **et** de l'extinction de Depot (v2.9). D'autres tranches non encore définies viendront probablement **avant** — d'où la position provisoire.
 
 - **Besoin** : déléguer un job de dev agent continuable à une machine toujours allumée (serveur maison h24), éteindre son PC, laisser avancer, rapatrier le résultat pour le tester. **Relais séquentiel**, pas de sync concurrente.
 - **nyx = primitives locales pures** (0 réseau/secret) : artefact **auto-contenu** (état Spec/tâches/events/ideas/docs **+** code delta = bundle git + dirty + untracked) · `export`/`import` · **bail** (X en lecture seule sur l'origine pendant la délégation) · **réconciliation pilotée par agent** (union additive + escalade humaine, pas de moteur de merge).
@@ -357,8 +368,9 @@ v2.0 consolidation Electron/Rust
 -> v2.5.10 surcouche terminal↔spec (overlay live dev + création)
 -> v2.5.11 boucle review (findings review_tasks + rework en rounds + retour-chat)
 -> v2.6 knowledge
--> v2.7 capacités avancées retenues
--> v2.8 migration et suppression Depot
+-> v2.7 machinerie prototype
+-> v2.8 harnais (rules/checks/agents/workflows forkables + visualiser)
+-> v2.9 migration et suppression Depot
 ```
 
 ## Règle de contrôle du scope
