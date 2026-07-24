@@ -435,8 +435,24 @@ impl Runtime {
     /// deck eager-mounts every project terminal, so at relaunch the spawn usually precedes the
     /// plan), otherwise it waits for [`inject_resume_on_spawn`](Runtime::inject_resume_on_spawn).
     /// The `attempted` guard inside [`resume_parks::ResumeParks`] makes a re-pushed plan idempotent.
+    ///
+    /// FILTER — an already-LOADED terminal is never offered a resume (PRD
+    /// `01KY9PM1GK30FPVZVWQ3A7ZMJH`): a record whose PTY ALREADY hosts a live agent process is
+    /// SKIPPED outright — not parked, not injected. This is the belt-and-suspenders on top of the
+    /// [`inject_resume`](Runtime::inject_resume) liveness gate: it stops a stale `claude --resume
+    /// <external_id>` (a session id from a PREVIOUS run) from ever sitting parked against a terminal
+    /// that is already running its agent — so it can never be injected into that live agent, even by
+    /// a later drain. Only a terminal with NO live agent (a bare/relaunch shell, or an unloaded one
+    /// whose PTY is closed) is parked/offered. Keyed on the real process tree, so a live-idle Claude
+    /// (Idle BETWEEN turns) is filtered exactly like a Working one.
     pub fn park_resumes(&self, parks: &[(String, String, String)], events: &EventSink) {
+        let registry = nyx_core::agent::AgentRegistry::default();
         for (record_id, session_id, command) in parks {
+            // Skip a terminal that is ALREADY loaded (its PTY hosts a live agent process): offering
+            // it a resume would only risk typing a stale session id into the running agent.
+            if self.pty.agent_alive_in_record(record_id, &registry) {
+                continue;
+            }
             self.resume_parks.park(
                 record_id,
                 resume_parks::ResumePark {
@@ -444,8 +460,9 @@ impl Runtime {
                     command: command.clone(),
                 },
             );
-            // If the terminal is already live (spawned before the plan arrived), inject now —
-            // the shell prompt is ready by this point, so the resume line runs cleanly.
+            // If the terminal is already live (spawned before the plan arrived) but hosts NO agent
+            // yet — a fresh shell awaiting its `claude --resume` — inject now: the shell prompt is
+            // ready by this point, so the resume line runs cleanly (the inject re-checks liveness).
             if self.pty.is_live_record(record_id) {
                 self.inject_resume(record_id, events);
             }
@@ -470,28 +487,30 @@ impl Runtime {
     /// pending. A failed write marks the session `resume_failed` (no retry loop) and nudges the
     /// renderer to re-pull the agent sessions so the clean `resume-failed` state surfaces.
     fn inject_resume(&self, record_id: &str, events: &EventSink) {
-        // GATE ON THE *CURRENT* ACTIVITY (finding `01KXJDKDCZFA7QB1QQTE91N4GG` / #28) — the
-        // belt-and-suspenders that holds AT THE MOMENT OF INJECT, not just at plan time. A parked
-        // `claude --resume <id>` must NEVER be typed into a session that is right now `Working`
-        // (Claude generating OR a tool/sub-agent in flight) or `Waiting` (blocked on the user):
-        // doing so injects the resume line as keystrokes INTO a live, active agent (the dogfood
-        // bug — "resume relancé sur une session vivante"). The park may have been set — or re-armed
-        // after an idle-unload — while the session was Idle, and the session can have become active
-        // again SINCE (an immediate inject via `park_resumes` racing a re-pushed restore plan, or a
-        // reactivation between an idle-unload and its re-injection). The unload path already refuses
-        // to unload a non-Idle session; this re-checks the LIVE activity here so a briefly-stale
-        // Idle can never turn into an inject either. Only a genuinely-Idle session (or one with no
-        // activity entry at all — a fresh/dead PTY ⇒ Idle) is injected into. On a skip we DELIBERATELY
-        // leave the park PENDING and un-attempted (we do not `take_for_inject`), so a later fresh,
-        // Idle spawn can still drain it — the resume is deferred, never lost.
-        if let Some(snap) = self.activity.snapshot(record_id) {
-            if matches!(
-                snap.activity,
-                nyx_core::agent_activity::Activity::Working
-                    | nyx_core::agent_activity::Activity::Waiting
-            ) {
-                return;
-            }
+        // GATE ON REAL PROCESS LIVENESS (PRD `01KY9PM1GK30FPVZVWQ3A7ZMJH`) — the authoritative
+        // check that holds AT THE MOMENT OF INJECT. A parked `claude --resume <id>` must NEVER be
+        // typed into a terminal that ALREADY hosts a live agent process: doing so lands the resume
+        // line as keystrokes inside the running agent (the dogfood bug — "resume relancé sur une
+        // session vivante"), often with a STALE external session id from a previous run.
+        //
+        // This REPLACES the old `agent_activity`-only gate (which skipped only `Working`/`Waiting`).
+        // That proxy had a fatal hole: an `Idle` activity means EITHER a live agent waiting between
+        // two turns OR a crashed/exited agent whose last hook was a `TurnFinished` — indistinguishable
+        // from the activity alone, so a live-idle Claude slipped through and got the resume typed into
+        // it. The reliable discriminator is whether an agent PROCESS is alive in the terminal's PTY
+        // tree, which the sidecar can read because it OWNS the PTY (see
+        // [`pty::PtyManager::agent_alive_in_record`] / [`nyx_core::agent_liveness`]): a live agent in
+        // ANY state (Working, Waiting OR Idle-between-turns) reads `true` here and is SKIPPED, while a
+        // crashed/absent agent (the stale-`Idle` case the old gate mis-injected) — and a genuinely
+        // bare terminal (a fresh relaunch shell, or a revisit after an idle-unload closed the PTY) —
+        // reads `false` and IS injected. On a skip we DELIBERATELY leave the park PENDING and
+        // un-attempted (we do NOT `take_for_inject`), so a later bare spawn can still drain it — the
+        // resume is deferred, never lost.
+        if self
+            .pty
+            .agent_alive_in_record(record_id, &nyx_core::agent::AgentRegistry::default())
+        {
+            return;
         }
         let Some(park) = self.resume_parks.take_for_inject(record_id) else {
             return;

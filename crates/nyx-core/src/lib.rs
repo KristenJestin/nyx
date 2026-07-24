@@ -39,6 +39,7 @@
 
 pub mod agent;
 pub mod agent_activity;
+pub mod agent_liveness;
 pub mod agent_resume;
 pub mod agent_unload;
 pub mod ansi;

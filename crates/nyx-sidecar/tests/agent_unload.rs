@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,75 @@ fn marker_absent(rt: &Runtime, record_id: &str, needle: &str) -> bool {
 
 fn no_visits() -> HashSet<String> {
     HashSet::new()
+}
+
+/// Resolve a system binary (e.g. `sleep`) to an absolute path via `PATH`, so a COPY of it can be
+/// made under a name a test controls. Falls back to `/usr/bin/<name>` if `PATH` yields nothing.
+fn resolve_binary(name: &str) -> PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(name))
+                .find(|p| p.exists())
+        })
+        .unwrap_or_else(|| PathBuf::from("/usr/bin").join(name))
+}
+
+/// Launch a REAL, long-lived process the [`nyx_core::agent::AgentRegistry`] recognizes as an agent
+/// (named `claude`) as a CHILD of the terminal's live PTY shell, so the production liveness gate
+/// ([`nyx_sidecar::runtime::pty::PtyManager::agent_alive_in_record`] →
+/// [`nyx_core::agent_liveness::agent_alive_in_tree`]) observes a live agent in THAT terminal's
+/// process tree — the deterministic stand-in for a running Claude. This is the SAME cross-platform
+/// engine `agent_liveness`'s `live_probe_finds_a_real_descendant_by_name` unit test exercises, but
+/// rooted under the exact shell the gate inspects (not the test process).
+///
+/// The stand-in is a COPY of `sleep` renamed `claude`: BOTH its `comm` and its exe basename read
+/// `claude`, which `ClaudeCodeAdapter::detect` matches — robust to how `sysinfo` reports the name.
+/// It is backgrounded under the shell with its pid stashed in a shell var so [`kill_live_agent`] can
+/// terminate exactly it. BLOCKS until the gate actually sees the agent, so the caller asserts the
+/// gate's decision without racing the `exec`.
+fn spawn_live_agent_in_pty(rt: &Runtime, record: &str, dir: &Path) {
+    let claude = dir.join("claude");
+    if !claude.exists() {
+        std::fs::copy(resolve_binary("sleep"), &claude)
+            .expect("copy `sleep` into a `claude` stand-in");
+    }
+    // Background the agent under the shell (POSIX `&` + `$!` — the spawned shell is bash/sh). 30s is
+    // only a safety bound; the test kills the stand-in far sooner.
+    let line = format!("'{}' 30 & NYX_AGENT_PID=$!\n", claude.display());
+    assert!(
+        rt.pty().write_to_record(record, line.as_bytes()),
+        "the terminal's shell must be live to launch the agent stand-in"
+    );
+    let registry = nyx_core::agent::AgentRegistry::default();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if rt.pty().agent_alive_in_record(record, &registry) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    panic!("the live `claude` stand-in never appeared in the terminal's PTY process tree");
+}
+
+/// Terminate the live agent [`spawn_live_agent_in_pty`] launched (the crash/exit transition) and
+/// block until the gate no longer sees it — after this the terminal is truly BARE, so a parked
+/// resume is free to fire.
+fn kill_live_agent(rt: &Runtime, record: &str) {
+    assert!(
+        rt.pty()
+            .write_to_record(record, b"kill -9 $NYX_AGENT_PID\n"),
+        "the terminal's shell must be live to kill the agent stand-in"
+    );
+    let registry = nyx_core::agent::AgentRegistry::default();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !rt.pty().agent_alive_in_record(record, &registry) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    panic!("the `claude` stand-in never exited the PTY process tree after kill");
 }
 
 /// DONE-CRITERION 1 — "une session idle non visitée au-delà du seuil est déchargée". An idle,
@@ -334,26 +403,36 @@ fn action_in_flight_is_never_unloaded() {
     assert_eq!(u, vec![record.clone()]);
 }
 
-/// #28 — the RESUME INJECTION is gated on the CURRENT activity (belt-and-suspenders that holds AT
-/// THE MOMENT OF INJECT). A parked resume is NEVER typed into a session that is right now `Working`.
-/// A LIVE, WORKING terminal that receives a `set_resume_parks` push (the immediate `park_resumes`
-/// inject path — the PTY is already live) must NOT get the resume line written into it — otherwise
-/// it would land as keystrokes inside the running agent (the dogfood bug "resume relancé sur une
-/// session vivante"). The park is left PENDING on the skip, so once the turn ends (Idle) it drains
-/// and injects exactly once.
+/// PRD `01KY9PM1GK30FPVZVWQ3A7ZMJH` — the RESUME INJECTION is gated on the REAL PROCESS LIVENESS of
+/// an agent in the terminal's PTY, NOT on the `agent_activity` proxy. This REPLACES the old
+/// `resume_is_not_injected_into_a_working_session` test, which posed activity=`Working` on a BARE
+/// shell (no live agent) — a proxy that could not tell a live-idle Claude from a crashed one, so it
+/// encoded the very "Idle = safe" hypothesis this PRD retires.
+///
+/// NON-REGRESSION (the dogfood bug "resume relancé sur une session vivante"): a terminal that HOSTS
+/// A LIVE `claude` PROCESS — even one idle BETWEEN turns (activity reads `Idle`, exactly the case the
+/// old activity gate mis-injected into) — must NOT get a parked resume typed into it. The renderer's
+/// restore push (`park_resumes`, the immediate-inject path since the PTY is already live) is FILTERED
+/// OUT by the process-liveness gate: not parked, not injected. This is also the general "a live agent
+/// in ANY state (Working/Waiting/Idle) → skip" guarantee — a real Working/Waiting session always has
+/// a live process, so the liveness gate subsumes the old activity gate. Once the agent EXITS (a real
+/// crash/quit → its process leaves the tree), the SAME terminal is bare, so a resume pushed now
+/// injects cleanly.
 #[test]
-fn resume_is_not_injected_into_a_working_session() {
+fn resume_is_not_injected_into_a_live_agent_session() {
     let (rt, events, dir) = runtime();
     let record = seed_resumable_agent_terminal(&rt, &dir, true);
     rt.pty()
         .spawn(80, 24, "", &record, 0, events.clone())
         .expect("spawn pty");
 
-    // The session is WORKING (a prompt was submitted → Claude is generating).
-    rt.activity().apply(&record, ActivityEvent::PromptSubmitted);
+    // A REAL agent process is alive in the terminal (LIVE-IDLE: the activity stays `Idle`, no prompt
+    // was submitted — precisely the case the OLD activity-only gate wrongly injected into).
+    spawn_live_agent_in_pty(&rt, &record, &dir);
 
     // The renderer pushes the restore plan; the PTY is already live, so `park_resumes` WOULD inject
-    // immediately — but the activity gate SKIPS it because the session is Working.
+    // immediately — but the process-liveness FILTER skips it (a live agent hosts the terminal), so
+    // nothing is parked and nothing is typed into the running agent.
     rt.park_resumes(
         &[(
             record.clone(),
@@ -364,25 +443,35 @@ fn resume_is_not_injected_into_a_working_session() {
     );
     assert!(
         marker_absent(&rt, &record, "NYX_GATED_RESUME"),
-        "a resume is NOT injected into a WORKING session (gated on the CURRENT activity at inject)"
+        "a resume is NOT injected into a terminal hosting a LIVE agent process (the dogfood bug)"
     );
 
-    // The turn ends → Idle. The park was LEFT PENDING (not consumed by the skip), so the spawn-drain
-    // path a revisit runs now injects it exactly once into the now-idle shell.
-    rt.activity().apply(&record, ActivityEvent::TurnFinished);
-    rt.inject_resume_on_spawn(&record, &events);
+    // The agent EXITS (a real crash/quit — the process leaves the PTY tree). The terminal is now
+    // bare, so a resume pushed now injects immediately into the idle shell.
+    kill_live_agent(&rt, &record);
+    rt.park_resumes(
+        &[(
+            record.clone(),
+            "sess".into(),
+            "printf 'NYX_GATED_RESUME\\n'".into(),
+        )],
+        &events,
+    );
     assert!(
         wait_for_marker(&rt, &record, "NYX_GATED_RESUME"),
-        "once the session is Idle, the still-pending resume injects exactly once"
+        "once the live agent is gone the terminal is bare, so the resume injects exactly once"
     );
 }
 
-/// #28, item 3 — the idle-unload ↔ REACTIVATION race: a session UNLOADED (its resume re-armed) that
-/// becomes ACTIVE again BEFORE the re-injection must NOT get a `claude --resume` typed into it. After
-/// the unload re-parks the resume, we re-spawn the terminal and mark the session `Working` before the
-/// spawn-drain inject runs; the inject gate then SKIPS — no resume fires on the live, working session.
-/// (Contrast `unloaded_session_resumes_in_run_on_revisit`, where the revisit stays Idle and the
-/// resume DOES inject.) Once it goes Idle again, the still-pending re-armed resume injects cleanly.
+/// PRD `01KY9PM1GK30FPVZVWQ3A7ZMJH` — the idle-unload ↔ REACTIVATION race, re-expressed on REAL
+/// process liveness (this REPLACES the old activity=`Working` version, which relied on the retired
+/// "Idle = safe" proxy). A session UNLOADED (its resume re-armed) that a live `claude` re-attaches
+/// to BEFORE the re-injection must NOT get a `claude --resume` typed into it: after the unload
+/// re-parks the resume, we re-spawn the terminal and a REAL agent process comes up in it, so the
+/// spawn-drain inject is SKIPPED by the liveness gate — the re-armed park is left PENDING (never
+/// consumed). Only once the agent EXITS does the still-pending resume inject, exactly once. (Contrast
+/// `unloaded_session_resumes_in_run_on_revisit`, where the revisit stays BARE and the resume DOES
+/// inject.)
 #[test]
 fn reactivated_session_after_unload_is_not_resumed() {
     let (rt, events, dir) = runtime();
@@ -396,24 +485,63 @@ fn reactivated_session_after_unload_is_not_resumed() {
     assert_eq!(unloaded, vec![record.clone()]);
     assert!(!rt.pty().is_live_record(&record), "unloaded → PTY closed");
 
-    // REVISIT, but the session REACTIVATES before the resume is injected (a hook / keystroke arrived
-    // between the unload and the drain): re-spawn, mark it Working, THEN attempt the spawn-drain.
+    // REVISIT, but a live `claude` comes up in the re-spawned terminal BEFORE the drain (the session
+    // reactivated — a real agent re-attached between the unload and the drain): re-spawn, launch the
+    // real agent, THEN attempt the spawn-drain — the liveness gate SKIPS it, leaving the park pending.
     rt.pty()
         .spawn(80, 24, "", &record, 0, events.clone())
         .expect("re-spawn pty");
-    rt.activity().apply(&record, ActivityEvent::PromptSubmitted); // reactivated → Working.
+    spawn_live_agent_in_pty(&rt, &record, &dir);
     rt.inject_resume_on_spawn(&record, &events);
     assert!(
         marker_absent(&rt, &record, "claude --resume ext-"),
-        "a session that reactivated before the injection does NOT get a resume typed into it"
+        "a terminal hosting a live agent does NOT get its re-armed resume typed into it"
     );
 
-    // When it later goes Idle, the still-pending (never consumed) re-armed resume injects once.
-    rt.activity().apply(&record, ActivityEvent::TurnFinished);
+    // The agent EXITS → the terminal is bare again → the still-pending re-armed resume injects once.
+    kill_live_agent(&rt, &record);
     rt.inject_resume_on_spawn(&record, &events);
     assert!(
         wait_for_marker(&rt, &record, "claude --resume ext-"),
-        "once Idle again, the re-armed resume injects exactly once"
+        "once the live agent is gone, the re-armed resume injects exactly once"
+    );
+}
+
+/// PRD `01KY9PM1GK30FPVZVWQ3A7ZMJH`, the CRASH case the process-liveness gate must still resume (the
+/// counterpart of the non-regression above — and the hole the OLD `Idle`-injecting gate got RIGHT
+/// only by accident). A `claude` that has CRASHED/EXITED leaves NO process in the terminal's PTY
+/// tree, yet its last `agent_activity` hook was a `TurnFinished`, so the activity snapshot is a STALE
+/// `Idle` — INDISTINGUISHABLE from a live-idle agent by the activity alone. The gate keys on the REAL
+/// process (absent → the terminal is bare), NOT the stale proxy, so the parked resume INJECTS and
+/// recovers the session — exactly what a resume is for. This is the discriminator the old
+/// activity-only gate lacked (it read the same `Idle` for a live agent and a crashed one).
+#[test]
+fn crash_stale_idle_agent_is_resumed() {
+    let (rt, events, dir) = runtime();
+    let record = seed_resumable_agent_terminal(&rt, &dir, true);
+    rt.pty()
+        .spawn(80, 24, "", &record, 0, events.clone())
+        .expect("spawn pty");
+
+    // The agent RAN then CRASHED: the activity is a STALE `Idle` (last hook = TurnFinished), but NO
+    // `claude` process is alive in the terminal (we launch none — the crash left the shell bare).
+    rt.activity().apply(&record, ActivityEvent::PromptSubmitted);
+    rt.activity().apply(&record, ActivityEvent::TurnFinished);
+
+    // The renderer pushes the restore plan. The terminal hosts NO live agent, so the resume is parked
+    // and injected immediately into the bare shell — the stale `Idle` does NOT block it.
+    rt.park_resumes(
+        &[(
+            record.clone(),
+            "sess".into(),
+            "printf 'NYX_CRASH_RESUME\\n'".into(),
+        )],
+        &events,
+    );
+    assert!(
+        wait_for_marker(&rt, &record, "NYX_CRASH_RESUME"),
+        "a crashed agent (no live process) with a STALE Idle activity IS resumed (the gate keys on \
+         the real process, not the proxy)"
     );
 }
 

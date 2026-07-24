@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use nyx_core::agent::AgentRegistry;
 use nyx_core::osc133::{self, ExecOutcome};
 use nyx_core::osc7;
 use nyx_core::pty::{PauseGate, Pty};
@@ -414,6 +415,39 @@ impl PtyManager {
         };
         let pty = pty.lock().unwrap();
         read_terminal_info(pty.shell_pid(), foreground_pgid(&pty)).1
+    }
+
+    /// Whether the terminal `record_id` currently hosts a LIVE agent PROCESS in its PTY tree
+    /// (PRD `01KY9PM1GK30FPVZVWQ3A7ZMJH` — the real liveness signal). Resolves the record → live
+    /// pty → shell pid, then asks [`nyx_core::agent_liveness::agent_alive_in_tree`] whether the
+    /// process tree rooted at that shell pid contains a process a registered agent adapter
+    /// recognizes (`claude`, extensibly `codex`/`opencode`). CROSS-PLATFORM (a `sysinfo` PPID
+    /// walk, not `/proc`).
+    ///
+    /// Returns `false` when NO live PTY backs the record (a bare/unloaded/absent terminal — no
+    /// hosted agent) OR the shell pid is unavailable, so the lazy-resume gate treats such a
+    /// terminal as resumable. The point: a `record` whose PTY still runs a live `claude` (Idle
+    /// BETWEEN turns, or Working/Waiting) reads `true` here — distinguishing it from a crashed
+    /// agent whose stale `Idle` activity looks identical, which reads `false`.
+    pub fn agent_alive_in_record(&self, record_id: &str, registry: &AgentRegistry) -> bool {
+        let Some(shell_pid) = self.shell_pid_for_record(record_id) else {
+            return false;
+        };
+        nyx_core::agent_liveness::agent_alive_in_tree(shell_pid, registry)
+    }
+
+    /// The SHELL (root) pid of a single live terminal by its persistent RECORD id, or `None` when
+    /// no live PTY backs the record (or the platform reported no pid). The single-record analogue
+    /// of [`shell_pids_by_record`](Self::shell_pids_by_record), used by the liveness probe to root
+    /// its process-tree walk.
+    pub fn shell_pid_for_record(&self, record_id: &str) -> Option<u32> {
+        let pty = {
+            let terms = self.terminals.lock().unwrap();
+            let pty_id = self.live_records.lock().unwrap().get(record_id).copied()?;
+            Arc::clone(&terms.get(&pty_id)?.pty)
+        };
+        let pid = pty.lock().unwrap().shell_pid();
+        pid
     }
 
     /// Resize a live PTY (SIGWINCH to the child). Unknown id -> error.
