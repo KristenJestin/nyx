@@ -17,6 +17,10 @@
  * no longer a dependency.
  */
 export * from "./contract";
+// The ONE reading of a failure every surface goes through — the bridge rejects with a BridgeError
+// OBJECT, and reading it any other way puts `[object Object]` on screen (finding
+// `01KYVT6HVA260DTAEREQA4DFJN`).
+export * from "./error-text";
 export { electronBridge } from "./electron";
 
 import type { NyxBridge } from "./contract";

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { isBridgeError, nyxBridge } from "@/bridge";
+import { errorText, nyxBridge } from "@/bridge";
 import {
   ChevronRightIcon,
   DownloadIcon,
@@ -13,17 +13,6 @@ import { motion, useReducedMotion } from "motion/react";
 import { cn } from "@/lib/utils";
 import { toast } from "@/components/ui/toast";
 
-/**
- * Extract a human-readable reason from a caught bridge/IPC error. The bridge
- * serializes a backend `Result::Err` into a {@link isBridgeError} whose `message` is
- * the original backend string (e.g. "this command is running in at least one
- * workspace — stop it before editing"); a raw string is passed through; anything else
- * falls back to `fallback`. This is what lets a refused mutation surface its REAL
- * reason in the error toast (FEEDBACK #9), not a generic line.
- */
-function errorReason(e: unknown, fallback: string): string {
-  return isBridgeError(e) ? e.message : typeof e === "string" ? e : fallback;
-}
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabCount } from "@/components/ui/tabs";
@@ -182,7 +171,7 @@ export function CommandsSection({
         // edit shows e.g. "this command is running in at least one workspace — stop
         // it before editing", not the old generic line). A trimmed inline message is
         // kept inside the form for proximity.
-        const reason = errorReason(e, "Could not save the command.");
+        const reason = errorText(e, "Could not save the command.");
         setFormError(reason);
         toast.error(reason);
       } finally {
@@ -200,7 +189,7 @@ export function CommandsSection({
         await remove(id);
         toast.success(`Deleted “${name}”`);
       } catch (e) {
-        toast.error(errorReason(e, "Could not delete the command."));
+        toast.error(errorText(e, "Could not delete the command."));
       }
     },
     [remove],
@@ -215,7 +204,7 @@ export function CommandsSection({
         setFormKey((k) => k + 1);
         toast.success("Command resynced from package.json");
       } catch (e) {
-        toast.error(errorReason(e, "Could not resync the command."));
+        toast.error(errorText(e, "Could not resync the command."));
       }
     },
     [resyncSource],
@@ -227,7 +216,7 @@ export function CommandsSection({
         setFormKey((k) => k + 1);
         toast.success("Command unlinked from package.json");
       } catch (e) {
-        toast.error(errorReason(e, "Could not unlink the command."));
+        toast.error(errorText(e, "Could not unlink the command."));
       }
     },
     [unlinkSource],

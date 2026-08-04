@@ -1,5 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 
+import { errorText } from "@/bridge";
+
 /**
  * `<ErrorBoundary>` — a minimal, reusable React error boundary. The renderer previously had NONE, so a
  * throw anywhere in a routed page (e.g. the third-party `@pierre/diffs` viewer tearing down when the
@@ -61,7 +63,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     // renderer console is not piped into its log (the CDP review gate). Diagnostic only.
     if (typeof window !== "undefined") {
       window.__nyxLastTreeError = {
-        message: error?.message ?? String(error),
+        message: errorText(error),
         stack: error?.stack ?? "",
         componentStack: info.componentStack ?? "",
         at: Date.now(),

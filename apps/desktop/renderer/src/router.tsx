@@ -7,14 +7,18 @@ import {
   Outlet,
 } from "@tanstack/react-router";
 
+import { errorText } from "@/bridge";
 import { queryClient } from "@/lib/query";
 import { ActiveProjectProvider } from "@/components/terminals/active-project";
 import { BaseLayout } from "@/components/terminals/base-layout";
 import { TerminalsPage } from "@/components/terminals/terminals-page";
 import { BoardPage } from "@/components/specs/board-page";
 import { SpecDetailPage } from "@/components/specs/spec-detail-page";
+import { PrototypePage } from "@/components/specs/prototype-page";
 import { ReviewPage } from "@/components/review/review-page";
 import { KnowledgePage } from "@/components/knowledge/knowledge-page";
+import { CataloguePage } from "@/components/design/catalogue-page";
+import { ComponentDetailPage } from "@/components/design/component-detail-page";
 
 /**
  * The renderer's ROUTER — introduced in this pass to carry the multi-page navigation
@@ -120,6 +124,33 @@ const specReviewRoute = createRoute({
   component: ReviewPage,
 });
 
+/**
+ * The `/work/$specId/prototype` search params — an OPTIONAL deep-link the Spec's Prototype tab uses
+ * to open the workbench ON a given page (its contact sheet points each card at its own page):
+ *  - `page`: the prototype page's SLUG. Omitted / unknown → the workbench opens on the first page.
+ */
+interface PrototypeSearch {
+  readonly page?: string;
+}
+
+/**
+ * Prototype (`/work/$specId/prototype`) — the FULL-PAGE prototype workbench of a Spec (finding
+ * `01KYVMSMMBVSZNBBSBE18PRZAK`, the elected v8 design). Spec-scoped and reached ONLY from the Spec
+ * detail's Prototype tab (its "Open prototype" button + its contact sheet), in STRICT PARITY with
+ * the review page: no nav item, no top-level `/prototype` route — the same "no provisional exposure"
+ * invariant.
+ *
+ * The route exists because a prototype stands for a REAL WEB PAGE and a tab is not the size of one:
+ * inside the tab, the stage measured 486 × 489.
+ */
+const specPrototypeRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/work/$specId/prototype",
+  component: PrototypePage,
+  validateSearch: (search: Record<string, unknown>): PrototypeSearch =>
+    typeof search.page === "string" ? { page: search.page } : {},
+});
+
 /** Knowledge (`/knowledge`) — routed stub for now (real knowledge base ported later). */
 const knowledgeRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -127,12 +158,43 @@ const knowledgeRoute = createRoute({
   component: KnowledgePage,
 });
 
+/**
+ * Design-system CATALOGUE (`/design`, v2.7 Phase 3, task #10) — browse the project's
+ * `design_components` vocabulary (DS + NEW) with a rendered preview per component and DS/NEW/
+ * liés-page filters. Portée PROJET. The composant detail (task #11) opens from a card.
+ */
+const catalogueRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/design",
+  component: CataloguePage,
+});
+
+/**
+ * Composant DETAIL (`/design/$componentId`, task #11) — ONE component: its representative preview,
+ * its axes and its params. Reached from a catalogue card, and from nowhere else.
+ *
+ * IT TAKES NO SEARCH PARAMS ANY MORE (finding `01KYT10VE8624MKQ18AFHSE0W0`). It used to accept a
+ * `?variant=&node=` USAGE deep-link (finding `01KYSNWNDG6HBFJX017RE203SZ`) because the per-node
+ * editing lived here; that editing now lives in the Spec's PROTOTYPE tab, beside the composition it
+ * writes to, and the elected composition selects the node THERE instead of navigating here. A route
+ * still advertising a contract nothing honours is the same silent lie the deep-link was written to
+ * kill, so the contract leaves with the capability.
+ */
+const componentDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/design/$componentId",
+  component: ComponentDetailPage,
+});
+
 const routeTree = rootRoute.addChildren([
   terminalsRoute,
   workRoute,
   specDetailRoute,
   specReviewRoute,
+  specPrototypeRoute,
   knowledgeRoute,
+  catalogueRoute,
+  componentDetailRoute,
 ]);
 
 /**
@@ -143,11 +205,14 @@ const routeTree = rootRoute.addChildren([
  * (rail + section-nav) SURVIVES a page crash and the user can navigate away, instead of a blank window.
  */
 function RouteErrorFallback({ error }: { error: Error }) {
+  // TanStack types it `Error`, but what a page throws is often a BRIDGE ERROR OBJECT — read through
+  // the one path that knows the difference, or the screen quotes `[object Object]` at the user.
+  const message = errorText(error, "");
   return (
     <div className="flex h-svh flex-col items-center justify-center gap-3 bg-background p-6 text-center">
       <p className="text-sm text-muted-foreground">Something went wrong on this screen.</p>
-      {error?.message ? (
-        <p className="max-w-md font-mono text-2xs text-muted-foreground/70">{error.message}</p>
+      {message ? (
+        <p className="max-w-md font-mono text-2xs text-muted-foreground/70">{message}</p>
       ) : null}
     </div>
   );

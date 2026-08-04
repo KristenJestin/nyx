@@ -2,6 +2,7 @@ import { useState } from "react";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import {
   ActivityIcon,
+  LayoutTemplateIcon,
   ListChecksIcon,
   type LucideIcon,
   MessageSquareIcon,
@@ -22,6 +23,7 @@ import { useSpecDetail } from "./use-spec-detail";
 import { useSpecReviewComments } from "./use-spec-review-comments";
 import { ActivityTab } from "./tabs/activity-tab";
 import { AnnexesTab } from "./tabs/annexes-tab";
+import { PrototypeTab } from "./tabs/prototype-tab";
 import { ReviewTab } from "./tabs/review-tab";
 import { RuntimeTab } from "./tabs/runtime-tab";
 import { SpecTab } from "./tabs/spec-tab";
@@ -31,18 +33,28 @@ import type { SpecDetail } from "./types";
 const routeApi = getRouteApi("/work/$specId");
 
 /** The tab set, in the placement order the prototype's spec-page validated. */
-type SpecTabKey = "spec" | "tasks" | "review" | "annexes" | "activity" | "runtime";
+type SpecTabKey = "spec" | "tasks" | "review" | "annexes" | "prototype" | "activity" | "runtime";
 
 const TAB_META: Record<SpecTabKey, { label: string; icon: LucideIcon }> = {
   spec: { label: "Spec", icon: ScrollTextIcon },
   tasks: { label: "Tasks", icon: ListChecksIcon },
   review: { label: "Review", icon: MessageSquareIcon },
   annexes: { label: "Annexes", icon: PaperclipIcon },
+  // The proto is an annexe of the Spec (PDR-0009) → placed next to Annexes.
+  prototype: { label: "Prototype", icon: LayoutTemplateIcon },
   activity: { label: "Activity", icon: ActivityIcon },
   runtime: { label: "Runtime", icon: TerminalIcon },
 };
 
-const TAB_ORDER: SpecTabKey[] = ["spec", "tasks", "review", "annexes", "activity", "runtime"];
+const TAB_ORDER: SpecTabKey[] = [
+  "spec",
+  "tasks",
+  "review",
+  "annexes",
+  "prototype",
+  "activity",
+  "runtime",
+];
 
 /** The tab count pill (open tasks on the Tasks tab). */
 function tabCount(key: SpecTabKey, detail: SpecDetail): number | null {
@@ -170,6 +182,14 @@ export function SpecDetailPage() {
             </Tabs.Panel>
             <Tabs.Panel value="annexes">
               <AnnexesTab detail={detail} />
+            </Tabs.Panel>
+            {/* NOT `h-full` (finding `01KYT43KG9BR2J338MS6MVQXZW`, defect 3): pinning the panel to
+                the scroller's height turned the prototype tab into a column that had to fit its 6
+                blocks into that height, and the preview — its only flexible child — was left with
+                nothing. The tab is a normal flow that FLOWS INTO this scroller instead, and the
+                preview surface carries its own height. */}
+            <Tabs.Panel value="prototype">
+              <PrototypeTab detail={detail} />
             </Tabs.Panel>
             <Tabs.Panel value="activity">
               <ActivityTab detail={detail} />

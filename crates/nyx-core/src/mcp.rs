@@ -877,6 +877,42 @@ fn authority_is_loopback(authority: &str) -> bool {
 fn tool_descriptors() -> Vec<Value> {
     // Reusable JSON-Schema fragments for the common id/string arguments.
     let str_prop = |desc: &str| json!({ "type": "string", "description": desc });
+    // The SCOPED CSS SLOT, described IDENTICALLY on the two write paths that accept it
+    // (`design_refresh_component` and `proto_author_component`) — one contract, one wording, so an
+    // agent can never learn two different rules for one mechanism (finding
+    // 01KYVMTWB71R0D0CT1SV88J8DX).
+    let css_slot_prop = || {
+        str_prop(
+            "optional SCOPED CSS SLOT — the escape hatch, and the LAST resort. TAILWIND IS THE \
+             CHANNEL of this project: the look is made of utility classes on the template and of the \
+             axes' `classes`, first and by default. This slot is admitted ONLY for the four things no \
+             utility can express — a custom @keyframes, the CONTENT of a ::before/::after, a \
+             relational selector (:has), a @container query. A slot using NONE of them is REFUSED, \
+             because it is then CSS written INSTEAD of the design system. FOUR RULES, every one a \
+             REFUSAL and never a warning: (1) TOKENISED — a hard-coded colour (#hex, rgb(), oklch(), \
+             even `red`) is refused, every var(--x) must name a token the project really declares \
+             (design_tokens lists them), and a raw px on a property the system SCALES (padding, gap, \
+             border-radius, font-size…) is refused too — use var(--token) or a relative unit; (2) \
+             SCOPED — nyx REWRITES every selector under [data-nyx-css~=\"<scope>\"], the attribute it \
+             stamps on the component's root element(s), and RENAMES every @keyframes under that \
+             scope, so nothing you write can reach outside the component; write `:scope` (or `&`) to \
+             address the component's own root; a selector on html/body/:root, or one starting with a \
+             combinator (`+ .x`), is refused BY NAME rather than silently neutered; (3) BOUNDED — \
+             2048 bytes; (4) SIGNALLED — css_slot_reason is MANDATORY, and the exception is shown in \
+             the human review AND carried to the coder with that reason. Also refused: !important, \
+             url() (the preview frame grants no network, and no CSS slot will ever relax its CSP), \
+             @import / @font-face / @layer / @property / @apply, and markup. OMIT this argument to \
+             leave a stored slot ALONE; send \"\" to remove it.",
+        )
+    };
+    let css_slot_reason_prop = || {
+        str_prop(
+            "MANDATORY whenever css_slot is sent, at most 240 bytes: WHAT THE UTILITIES COULD NOT DO \
+             (\"a custom pulse keyframe — Tailwind has no utility for a keyframe\"). It is what makes \
+             the exception reviewable by a human, and it travels with the CSS all the way to the \
+             coder. A css_slot without it is refused.",
+        )
+    };
     let int_prop = |desc: &str| json!({ "type": "integer", "minimum": 0, "description": desc });
     let bool_prop = |desc: &str| json!({ "type": "boolean", "description": desc });
     // The per-run `env` map (R-WSCMD #7): an object of KEY→VALUE strings merged onto the
@@ -1827,11 +1863,15 @@ fn tool_descriptors() -> Vec<Value> {
                         state — the native equivalent of `depot context <role>`, with no depot CLI. \
                         Given a role and a Spec (spec_id, or resolved from the current workspace via \
                         cwd/workspace_id), returns the manual text: the role's preamble, the Spec's \
-                        structured sections, its current phase and that phase's tasks, and the \
-                        derived dev workspace + repos. Use it to load the working context for a \
-                        session before driving a Spec. For role=spec with NO Spec yet, it renders \
-                        the PROJECT-scoped authoring manual instead (a Spec is a project artifact \
-                        the author creates), resolving the project from project_id or the \
+                        structured sections, its current phase and that phase's tasks, and its \
+                        PROJECT + repos (plus the dev workspace when one is anchored). The answer \
+                        carries project_id beside the manual: a Spec belongs to a project from the \
+                        moment it exists, so the project is there even before any code and before \
+                        any dev workspace — which is the NORMAL state for role=prototype, and that \
+                        id is what every design_* tool takes. Use it to load the working context \
+                        for a session before driving a Spec. For role=spec with NO Spec yet, it \
+                        renders the PROJECT-scoped authoring manual instead (a Spec is a project \
+                        artifact the author creates), resolving the project from project_id or the \
                         cwd/workspace — never an error.",
         "inputSchema": {
             "type": "object",
@@ -1841,7 +1881,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "spec_id": str_prop("the Spec to render the context for (preferred)"),
                 "workspace_id": str_prop("optional: resolve the Spec via its anchored dev workspace when spec_id is absent"),
                 "cwd": str_prop("optional: resolve the Spec (or, for role=spec authoring, the project) via the workspace whose path matches this cwd when spec_id/workspace_id are absent"),
-                "project_id": str_prop("optional: for role=spec authoring with no Spec yet, the project to author in (else resolved from cwd/workspace_id)"),
+                "project_id": str_prop("optional: for role=spec authoring with no Spec yet, the project to author in (else resolved from cwd/workspace_id). When a Spec DOES resolve it is only checked, never applied — a Spec's project is a fact of the Spec, and naming another one is refused rather than ignored; read the project_id the answer returns instead"),
             },
             "required": ["role"],
         },
@@ -2333,6 +2373,910 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["id"],
         },
     }));
+    // Append the v2.7 PROTOTYPE tools: the agent's CONSTRAINED contract for driving a Spec's
+    // prototype annexe. Every action is a named, guarded tool with explicit states; each mutation
+    // records a `proto.*` domain event so no action of the agent is unseen. Kept OUT of V1_TOOLS.
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_GET_TOOL,
+        "description": "Read a Spec's PROTOTYPE and its EXPLICIT current state: the prototype, its \
+                        rounds, the current round + its page manifest, the pages, THEIR VERSIONS \
+                        AND VARIANTS (with the ids proto_recommend_variant / proto_elect_variant / \
+                        design_preview take — each row names its parent, so the lists join), the \
+                        DESIGN LOCK (`locked` + `design_lock`: which round is frozen, when, by \
+                        whom, and whether it was ever presented), and the OPEN pre-dev review \
+                        comments. Start here so you know where the prototype stands before acting — \
+                        a resumed session gets every identifier it needs from this one call. \
+                        `warnings` names the states worth saying out loud (a lock on a round nobody \
+                        presented). A Spec with no prototype yet returns { prototype: null }. \
+                        Read-only. \
+                        BOUNDED: the lists grow with the prototype, so the response is CAPPED \
+                        (64 KiB) — never assume it is complete. `sections.<name>` gives, per list, \
+                        { total, returned, truncated, next_offset }, and the top-level `truncated` \
+                        says whether anything was left out. Read the REST with section + offset \
+                        (section: rounds | current_round_manifest | pages | versions | variants | \
+                        open_feedback), following next_offset until it is null. A row whose text \
+                        was too long carries truncated_fields (field → its REAL byte length). A \
+                        variant row carries its IDENTITY, never its composition_json: render the \
+                        tree with design_preview(variant_id).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": str_prop("the Spec whose prototype to read"),
+                "section": str_prop("read ONE list as a page instead of the overview: rounds | current_round_manifest | pages | versions | variants | open_feedback"),
+                "offset": int_prop("where to resume inside `section` (follow the next_offset the previous page returned)"),
+                "limit": int_prop("how many rows to ask for (default 25, max 200 — the byte cap may still return fewer)"),
+            },
+            "required": ["spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_PRESENT_ROUND_TOOL,
+        "description": "PRESENT (freeze) a prototype round to the user — a handback. A presented \
+                        round is frozen: later feedback opens a NEW round, it is never mutated in \
+                        place. Unknown round id → invalid_id. Returns the presented round.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "round_id": str_prop("the round to present (from proto_get)") },
+            "required": ["round_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_ELECT_VARIANT_TOOL,
+        "description": "Record the USER's RETENU (chosen) variant for a page IN a round — the \
+                        user's design decision, distinct from the agent's per-version is_main \
+                        recommendation. The page must be pinned in the round (else invalid_state), \
+                        the variant must exist (else invalid_id), and it must BELONG to the (page, \
+                        version) that round pinned (else invalid_state, naming the variants that \
+                        ARE electable): the RETENU is the tree the coder receives under this page's \
+                        name, so another page's variant is a corruption of the contract, not a \
+                        preference. Returns the updated manifest entry.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "round_id": str_prop("the round the decision belongs to"),
+                "page_id": str_prop("the page being decided (must be pinned in the round)"),
+                "variant_id": str_prop("the chosen (RETENU) variant — one of the PINNED version's own (proto_get's `variants` section lists them with their page_version_id)"),
+                "rationale": str_prop("optional arbitration note for the audit log"),
+                "decided_by": str_prop("optional who decided (e.g. a user handle)"),
+            },
+            "required": ["round_id", "page_id", "variant_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_RECOMMEND_VARIANT_TOOL,
+        "description": "Pose YOUR (the agent's) RECOMMENDATION on a variant — is_main. This is the \
+                        agent tier of the two-tier election, and it is NOT the RETENU: it never \
+                        chooses for the user, it only says which variant you would keep. The user's \
+                        RETENU is recorded separately, by proto_elect_variant, on the round's \
+                        manifest. ONE-PER-VERSION and REVERSIBLE: recommending another variant of the \
+                        same page version simply moves the reco. Unknown variant → invalid_id; \
+                        refused (invalid_state) when the version is pinned in a design-LOCKED round \
+                        (open a new round instead). Returns the recommended variant.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "variant_id": str_prop("the variant you recommend (is_main) within its page version"),
+            },
+            "required": ["variant_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_FEEDBACK_CREATE_TOOL,
+        "description": "Raise a PRE-DEV review comment on a prototype, anchored to a NODE of the \
+                        component tree (node_key), not a CSS selector. Comments are a review \
+                        artifact used to correct the design BEFORE election — they are NEVER \
+                        transmitted to the coder. Unknown prototype → invalid_id. Returns the \
+                        created comment.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prototype_id": str_prop("the prototype to comment on (from proto_get)"),
+                "body": str_prop("the comment text"),
+                "node_key": str_prop("optional anchor: the tree-node key (omit for a global comment)"),
+                "origin_variant_id": str_prop("optional variant the comment was raised on"),
+                "author_kind": str_prop("optional: session (default, the agent) | user"),
+                "author_ref": str_prop("optional author handle (a session id or user handle)"),
+            },
+            "required": ["prototype_id", "body"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_FEEDBACK_RESOLVE_TOOL,
+        "description": "Resolve a pre-dev review comment (you addressed it), recording an optional \
+                        note and the variant that addressed it for the audit log. Unknown comment \
+                        → invalid_id. Returns the resolved comment.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "feedback_id": str_prop("the comment to resolve (from proto_get)"),
+                "resolution_note": str_prop("optional note on how it was addressed"),
+                "resolution_via_variant_id": str_prop("optional variant that addressed it"),
+            },
+            "required": ["feedback_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_REBASE_TOOL,
+        "description": "ROLL BACK onto an earlier round: open a NEW current round whose page \
+                        manifest COPIES the source round's pinned versions, so the design returns \
+                        to that snapshot and you iterate forward WITHOUT mutating the frozen source \
+                        round. Unknown or cross-prototype source → invalid_id. Returns the new \
+                        round.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prototype_id": str_prop("the prototype to rebase (from proto_get)"),
+                "source_round_id": str_prop("the earlier round to roll back onto"),
+                "label": str_prop("the new round's label (unique per prototype)"),
+                "summary": str_prop("optional summary of the new round"),
+            },
+            "required": ["prototype_id", "source_round_id", "label"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_DISTILL_TOOL,
+        "description": "FREEZE the elected round as THE design for the Spec — the 'distill' step, \
+                        which here just LOCKS the chosen round (the composition tree is already the \
+                        contract; there is no separate placement to rewrite). Validates the round \
+                        belongs to the prototype, and REFUSES to freeze what is not a decision: a \
+                        round that was never PRESENTED to the human, a round that pins NO page, and \
+                        a round where a pinned page still owes an arbitration (it would cross the \
+                        coder seam EMPTY — the refusal names those pages). MOVING an existing lock \
+                        is refused too unless you pass supersede: true — a second iteration \
+                        legitimately ends on a new round, but the design the coder consumes never \
+                        drifts by accident. Returns the design lock, the round it superseded (null \
+                        for a first freeze) and warnings.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prototype_id": str_prop("the prototype whose design to freeze"),
+                "round_id": str_prop("the elected round to freeze as THE design (presented, pinned and fully elected)"),
+                "decided_by": str_prop("optional who froze it (e.g. a user handle)"),
+                "supersede": bool_prop("set true to deliberately MOVE an already-posed design lock onto this round (what the coder consumes changes with it); re-freezing the SAME round never needs it"),
+            },
+            "required": ["prototype_id", "round_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_COMPOSITION_TOOL,
+        "description": "READ the FROZEN elected composition of a prototype — the coder SEAM. Exposed \
+                        ONLY once the design is LOCKED (proto_distill ran); an unlocked prototype \
+                        returns { composition: null }, so the seam never surfaces a moving election. \
+                        The payload gives, per page pinned in the locked round: the effective RETENU \
+                        variant + its composition_json (the NAMED TREE that IS the placement — \
+                        Regions/Order/Hierarchy intrinsic), each node classified by nature ([DS] a \
+                        catalogue component / [NEW] a proposed component to build / [inline] bespoke \
+                        markup), plus the pre-dev review as ANCHORS + COUNTS ONLY (which NODES were \
+                        corrected before the election, and how many comments were resolved / are \
+                        still open — NEVER the comment bodies: the pre-dev review is never \
+                        transmitted to the coder) and the design-system as a \
+                        REFERENCE (project + design + component ids, NOT injected content). The [NEW] \
+                        components are the anchor for the agent's derived dev tasks. THE PARCOURS \
+                        crosses too: a node that links to another page carries `navigates_to` (the \
+                        destination's page_id + the slug and title resolved at the read) with a \
+                        status — `pinned` (the destination is part of the frozen design), `unpinned` \
+                        (the page exists but this round does not ship it) or `unknown` (the page is \
+                        gone). Which page leads to which is a DESIGN decision, so it is handed over \
+                        rather than re-invented. Unknown prototype → invalid_id. Read-only. \
+                        BOUNDED PAGE BY PAGE: the response is CAPPED (64 KiB) and paginates by PAGE, \
+                        never inside a tree — a truncated placement would be a FALSE contract. Read \
+                        page_total / returned / truncated, follow next_offset until it is null, or \
+                        read ONE page directly with page: \"<slug or page_id>\". A page whose tree \
+                        exceeds the cap ON ITS OWN comes back with oversized: true, its real \
+                        composition_bytes and NO partial tree (split the page instead). A page whose \
+                        arbitration was never recorded is counted in unelected_pages and NAMED in \
+                        warnings[]: it crosses EMPTY (no elected_variant_id, no composition_json, no \
+                        nodes) and must not be built as if that were the design. The resolved \
+                        review anchors page separately (feedback_offset / \
+                        resolved_feedback_next_offset).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prototype_id": str_prop("the prototype whose frozen composition to read"),
+                "page": str_prop("read ONE elected page by slug or page_id (the targeted read — the whole budget for one tree)"),
+                "offset": int_prop("where to resume in the elected pages (follow the next_offset the previous page returned)"),
+                "limit": int_prop("how many elected pages to ask for (default 25, max 200 — the byte cap may still return fewer)"),
+                "feedback_offset": int_prop("where to resume in the resolved review ANCHORS (follow resolved_feedback_next_offset)"),
+            },
+            "required": ["prototype_id"],
+        },
+    }));
+    // Append the v2.7 PROTOTYPE CREATION tools (review #34): the 8 tools above are read/lifecycle
+    // and presuppose the proto tree exists; these CREATE + compose it so the agent can BOOTSTRAP a
+    // prototype end-to-end via MCP. Each respects the Phase-4 lock and emits prototypes://changed.
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_CREATE_TOOL,
+        "description": "CREATE the prototype on a Spec (one per Spec) and seed its first round (v1). \
+                        Start the prototype flow here. The Spec must exist (else invalid_id) and must \
+                        not already have a prototype (else invalid_state). Returns the prototype and \
+                        its current round.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": str_prop("the Spec to attach the prototype to"),
+                "description": str_prop("optional brief describing what the prototype covers"),
+            },
+            "required": ["spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_ADD_PAGE_TOOL,
+        "description": "Add a PAGE (a logical screen) to a prototype. slug is unique per prototype \
+                        (a duplicate → invalid_state); unknown prototype → invalid_id. Returns the \
+                        created page — KEEP ITS ID: a composition node targets a page BY ID \
+                        (`navigate_to`) to wire the PARCOURS, and an id is what survives a slug \
+                        rename. Create the pages of the parcours BEFORE composing the trees that \
+                        link to them. Then add a version (proto_add_version) and variants \
+                        (proto_add_variant), and pin it into a round (proto_pin_page).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prototype_id": str_prop("the prototype to add the page to"),
+                "slug": str_prop("the page slug (unique per prototype) — the name the frame \
+                    navigates with, RESOLVED from the page id at every render, so renaming it never \
+                    breaks a link"),
+                "title": str_prop("the page's human title"),
+                "position": json!({ "type": "integer", "minimum": 0, "description": "optional sort position (default 0)" }),
+            },
+            "required": ["prototype_id", "slug", "title"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_ADD_VERSION_TOOL,
+        "description": "Add a frozen VERSION (an iteration) to a page. You iterate by minting a NEW \
+                        version, never mutating an existing one. label is unique per page (duplicate \
+                        → invalid_state); unknown page → invalid_id. Returns the created version.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "page_id": str_prop("the page to add a version to"),
+                "label": str_prop("the version label (unique per page, e.g. v1)"),
+                "summary": str_prop("optional summary of what this version changes"),
+            },
+            "required": ["page_id", "label"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_ADD_VARIANT_TOOL,
+        "description": "Add a VARIANT (one concrete rendering) to a page version. composition_json is \
+                        the component TREE (the named placement), NOT an HTML blob. label is unique \
+                        per version (duplicate → invalid_state); unknown version → invalid_id. \
+                        Refused (invalid_state) when the version is pinned in a design-LOCKED round \
+                        (the frozen election must not drift — open a new round instead), and \
+                        (invalid_id) when a node NAVIGATES to a page this prototype does not have. \
+                        THE SHAPE IS CHECKED AT THE WRITE (invalid_argument): a composition_json \
+                        that is not valid JSON, one whose root is an ARRAY instead of ONE node \
+                        object (several blocks are the CHILDREN of one root), an [inline] node \
+                        whose markup carries Handlebars LOGIC (a block helper or a partial — the \
+                        same logic-less contract a component template obeys, named with the node's \
+                        key), and a states_json nyx cannot read. A tree that parses to nothing \
+                        renders nothing AND answers with an empty warnings[]. \
+                        Returns the created variant AND `warnings`: every node whose params carry a \
+                        key the component it references declares NOWHERE, or that omits one of that \
+                        component's REQUIRED params. Read them — they are the difference between a \
+                        typo and a node that renders empty in silence. They never refuse the write, \
+                        and nyx never guesses a mapping between two names.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "page_version_id": str_prop("the page version to add a variant to"),
+                "label": str_prop("the variant label (unique per version)"),
+                "title": str_prop("the variant's human title"),
+                "composition_json": str_prop("optional serialized component tree (the placement); \
+                    each node's params keys must be params or axes the referenced component \
+                    DECLARES; defaults to empty. A node may also carry `navigate_to`: the PAGE it \
+                    opens when clicked, as a `prototype_pages.id` (what proto_add_page returned) — \
+                    that is how a multi-page prototype shows a PARCOURS instead of screens that do \
+                    not answer each other. The link lives on the NODE and not on the component, \
+                    because a destination is a PLACEMENT decision (the same Button is a Continue \
+                    here and a Back there); it is an ID and never a slug, and nyx resolves it to the \
+                    current slug at every render, so renaming a page breaks nothing. A `navigate_to` \
+                    naming a page this prototype does not have is REFUSED (invalid_id, listing the \
+                    pages it does have), and so is one on a STRUCTURAL node (no component, no \
+                    inline — nothing to click). CYCLES are fine: a navigation is a user gesture at \
+                    click time, not an expansion at render time"),
+                "states_json": str_prop("optional VARIANCE AXES for this variant — the SAME model as \
+                    a component's: { \"axes\": [{ \"name\": \"loading\", \"default\": \"off\", \
+                    \"values\": [{ \"name\": \"off\" }, { \"name\": \"on\", \"classes\": \
+                    \"pointer-events-none opacity-70\" }] }] }. ONE AXIS PER NOTION THAT VARIES, each \
+                    value carrying the CONCRETE classes the renderer applies; the proto frame shows \
+                    ONE CHIP-BAR ROW PER AXIS. What classes cannot do is structural: \
+                    data-nyx-if=\"loading=on\" / data-nyx-if-not on the element that only EXISTS at \
+                    some values (data-nyx-state-case=\"<value>\" for a whole alternative rendering of \
+                    the first axis). A BASELINE value legitimately carries no `classes` when the \
+                    complement is conditioned on its axis. The FLAT list [\"idle\", \"loading\"] is \
+                    still read, as ONE anonymous axis named `state` with no classes"),
+                "position": json!({ "type": "integer", "minimum": 0, "description": "optional sort position (default 0)" }),
+            },
+            "required": ["page_version_id", "label", "title"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_PIN_PAGE_TOOL,
+        "description": "PIN a (page, version) into a round's manifest, so the round includes the page \
+                        and it becomes electable and renderable. Unknown round / page / version → \
+                        invalid_id. Refused (invalid_state) when the round is design-LOCKED (frozen). \
+                        Returns the manifest entry.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "round_id": str_prop("the round whose manifest to pin into"),
+                "page_id": str_prop("the page to pin"),
+                "page_version_id": str_prop("the page version to pin for that page"),
+                "position": json!({ "type": "integer", "minimum": 0, "description": "optional sort position (default 0)" }),
+            },
+            "required": ["round_id", "page_id", "page_version_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_OPEN_ROUND_TOOL,
+        "description": "OPEN a new, EMPTY current round to start a fresh iteration whose manifest you \
+                        compose from scratch (contrast proto_rebase, which clones an earlier round's \
+                        manifest). label is unique per prototype (duplicate → invalid_state); unknown \
+                        prototype → invalid_id. Returns the new round.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prototype_id": str_prop("the prototype to open a round on"),
+                "label": str_prop("the round label (unique per prototype)"),
+                "summary": str_prop("optional summary of the round"),
+            },
+            "required": ["prototype_id", "label"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_proto::PROTO_AUTHOR_COMPONENT_TOOL,
+        "description": "AUTHOR a [NEW] component into the project's design-system catalogue — for a \
+                        component a prototype proposes that is ABSENT from the catalogue (greenfield, \
+                        no on-disk source yet; the coder builds it to the app's standards). The \
+                        component appears in /design immediately. Unknown prototype → invalid_id; a \
+                        name ALREADY in the catalogue → invalid_state (it is not [NEW] then). THE \
+                        SHAPE OF params_json / states_json IS CHECKED HERE, exactly as on \
+                        design_refresh_component (invalid_argument, naming the field) — all the \
+                        more so since a [NEW] authored from its params alone IS its params. Returns \
+                        the created component.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prototype_id": str_prop("the prototype proposing the [NEW] component (resolves the project)"),
+                "name": str_prop("the component name (unique per project — must be absent from the catalogue)"),
+                "template": str_prop("optional LOGIC-LESS Handlebars template for the component — \
+                    plain {{param}} / {{{param}}} substitutions and {{{children}}} for a slot, ONE \
+                    self-contained element (no block helper: conditionals and repetition are \
+                    expressed by the composition TREE, variance by the axes below). It may REFERENCE \
+                    a SHARED sub-component instead of copying it — data-nyx-use=\"Spinner\" on a \
+                    placeholder element, data-nyx-param-<name> for the params it hands over, \
+                    data-nyx-use-axes=\"size=sm\" for the sub-component's OWN axes (NEVER inherited \
+                    from this component: an axis name is local, so you fix the values at the \
+                    reference site). nyx resolves it in the sidecar at every render, so one fix to \
+                    the sub-component reaches every host; an unknown target, a CYCLE (A -> B -> A) or \
+                    a nesting deeper than 8 is refused by the render and WARNED about at this write. \
+                    OMIT the template if you \
+                    have none (a [NEW] can be authored from its params/states alone); a template that \
+                    is present but BLANK is refused (invalid_argument)"),
+                "params_json": str_prop("optional params — an ARRAY of DESCRIPTORS, one per value the \
+                    template SUBSTITUTES: [{ name, type, label?, required?, default?, preview?, \
+                    options }]. `type` is one of SIX and NOTHING else: `text` (a string, substituted \
+                    escaped), `html` (raw markup, substituted verbatim), `number`, `boolean` (a value \
+                    the template really substitutes — a flag that makes the component LOOK different \
+                    is an AXIS with two values, not a param), `select` (a constrained value whose \
+                    `options` list is then MANDATORY, and is ignored on every other type), and the \
+                    DEPRECATED `state`. Any other word (\"enum\", \"string\", \"color\"…) is REFUSED, \
+                    not repaired. `required` = the CALLER must provide it (the component has no value \
+                    of its own), and a required param has no `default`; `default` = the component's \
+                    OWN fallback, only when it really carries one; `preview` = an EXAMPLE value used \
+                    ONLY to render an aperçu (resolution: preview > default > nothing), so give one \
+                    to every required param. A VARIANCE AXIS IS NEVER A PARAM — it goes in \
+                    states_json"),
+                "states_json": str_prop("optional VARIANCE AXES: { \"axes\": [{ \"name\": \"variant\", \
+                    \"default\": \"primary\", \"values\": [{ \"name\": \"primary\", \"classes\": \
+                    \"bg-primary text-primary-foreground\" }, { \"name\": \"outline\", \"classes\": \
+                    \"border border-input\" }] }] }. ONE AXIS PER NOTION THAT VARIES — `variant`, \
+                    `size`, and a boolean like `loading` (an axis with TWO values) — each value \
+                    carrying the CONCRETE classes the renderer applies to the root; the axes are \
+                    ORTHOGONAL, so you never enumerate their cross product. What classes cannot do is \
+                    structural: data-nyx-if=\"loading=on\" / data-nyx-if-not on the element that only \
+                    EXISTS at some values (data-nyx-state-case=\"<value>\" for a whole alternative \
+                    rendering of the first axis, data-nyx-axis=\"size\" to apply an axis on an INNER \
+                    element). A value with NO `classes` and NOTHING conditioned on its axis cannot \
+                    change one pixel and is WARNED about — but a BASELINE (`{ \"name\": \"off\" }`) is \
+                    correct as long as the complement is conditioned on the axis. The FLAT list \
+                    [\"default\", \"ghost\"] is still read, as ONE anonymous axis named `state`"),
+                "css_slot": css_slot_prop(),
+                "css_slot_reason": css_slot_reason_prop(),
+            },
+            "required": ["prototype_id", "name"],
+        },
+    }));
+    // Append the v2.7 DESIGN-SYSTEM tools (reviews #23, #40, #45): `design_inventory` DISCOVERS the
+    // component BUNDLES of the project's real front (and reads one on demand), and
+    // `design_refresh_component` STORES the agent's synthesis of a bundle. Kept OUT of V1_TOOLS (a
+    // new surface). The inventory's IPC twin is the `design_inventory` db-command (same
+    // `nyx_core::design::inventory_project` authority); it is no longer bound to any UI gesture
+    // (finding 01KYKX7HBP4ZSSS6ZDM31T6A5E) — `/design` only reads and repaints on the event.
+    descriptors.push(json!({
+        "name": crate::mcp_tools_design::DESIGN_INVENTORY_TOOL,
+        "description": "DISCOVER a project's design-system components from its repos, as BUNDLES. \
+                        A component is a SET of files, not a file: nyx scans the project's source \
+                        (the same repos the dev context sees, resolved from the root workspace) by \
+                        each repo's DETECTED-stack entry globs (Angular / React / Vue …, from \
+                        angular.json / package.json deps), groups each component's files (an \
+                        Angular component CLASS — recognized by its @Component decorator, so both \
+                        button.ts and button.component.ts work — plus the template resolved from \
+                        its templateUrl, the sibling .variants.* and the styles; a React .tsx plus \
+                        its css/variants siblings), FILTERS OUT the non-components (.service.ts / .types.ts / \
+                        .variants.ts / spec / stories), and UPSERTs each bundle into the catalogue \
+                        (idempotent — never duplicates, and NEVER clobbers a template you \
+                        synthesized). nyx does NOT write templates: YOU synthesize each bundle into \
+                        a self-contained logic-less Handlebars template + params + states and store \
+                        it with design_refresh_component. The response is BOUNDED (counters + up to \
+                        `limit` bundles, default 25, minimum 1, under a hard byte budget): \
+                        pending_count says how much work is left, `pending_only` narrows the list to \
+                        it, and `offset` PAGES through the rest whenever `truncated` is true. ONLY \
+                        `offset: 0` SCANS the disk; a page with `offset > 0` is a NON-MUTATING read \
+                        of the catalogue that scan persisted (mode: \"catalogue\"), so turning pages \
+                        costs nothing. PAGING CONTRACT: start at `offset: 0` and follow \
+                        `next_offset` until it is null — every entry of the population is then \
+                        returned EXACTLY ONCE and `total` is the same on every page, with AND \
+                        without `pending_only` (both halves enumerate the same set — what the LAST \
+                        SCAN discovered — in the same catalogue-name order, under the same pending \
+                        predicate). A scan someone else runs mid-traversal replaces that set: page \
+                        back to `offset: 0` to restart coherently. Pass `component` to READ ONE \
+                        bundle's files WITH their content \
+                        (the matter to synthesize) instead of listing — quote the `input_hash` it \
+                        returns when you store the synthesis. Two components sharing a base name in \
+                        different folders get DISTINCT path-qualified names (e.g. `list/data-table`): \
+                        always use the name the tool returns. The loop is INCREMENTAL: a bundle \
+                        whose sources have not changed since its last synthesis is never re-proposed \
+                        — the change detector folds in EVERY byte of every bundle file, so an edit \
+                        at any offset counts, however large the file. The scan also RECONCILES the \
+                        catalogue with reality: a component MOVED on disk is re-anchored by CONTENT \
+                        (same row, same synthesis — listed in `moved`), a greenfield [NEW] the front \
+                        now implements is MATERIALIZED in place (listed in `materialized`), and a row \
+                        whose source is GONE (deleted, or no longer matched by the globs) is reported \
+                        in `orphans`. Such a row is PRUNED only when it was never synthesized — \
+                        which loses nothing, a re-scan rebuilds it. A row CARRYING A SYNTHESIS is \
+                        never destroyed automatically: it is flagged an orphan and kept, like a row \
+                        the run is in no position to judge (its repo was not scanned, its scan met \
+                        an I/O error — see `scan_error_count`, or that repo discovered nothing at \
+                        all). `orphans[].kept_because` states which — `content_appeared` meaning a \
+                        synthesis landed on that row while this very run was pruning, and the \
+                        delete stood down. Use design_delete_component to \
+                        remove what the prune spares. NOTE `scan_error_count`: when it is non-zero \
+                        the walk could NOT read part of the tree, so NOTHING was pruned in the repos \
+                        concerned and `discovered` under-reports — fix the cause and re-run rather \
+                        than acting on the gap. The same rule applies when READING one bundle \
+                        (`component`): `read_error_count` non-zero means part of the matter could \
+                        NOT be read (each file names its failure in `files[].read_error`) — an \
+                        unreadable file is not an empty one, so re-read rather than synthesize on \
+                        the gap. A component is \
+                        NEVER re-pointed at another file merely because it has the same name. WHAT \
+                        COUNTS AS A COMPONENT here is not nyx's opinion, it is the project's \
+                        RECIPE: read it (and write it, once, after exploring the repo) with \
+                        design_recipe — that is the lever when this scan discovers far fewer \
+                        bundles than the front actually has. Pass \
+                        `globs` to OVERRIDE the detected-stack entry globs for this project \
+                        (persisted; empty array clears the override) — a shortcut for the entry \
+                        globs ALONE; design_recipe is the full lever. GREENFIELD-safe: a project \
+                        with no front yet discovers nothing without error.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project whose design-system to inventory"),
+                "component": str_prop("optional: READ this catalogue component's BUNDLE (its files \
+                    WITH their content) instead of listing — the matter you synthesize from"),
+                "limit": json!({ "type": "integer", "minimum": 1, "description": "how many bundles to echo (default 25, max 200, clamped to at least 1) — the counters carry the real scale" }),
+                "offset": json!({ "type": "integer", "minimum": 0, "description": "how many bundles to SKIP before echoing (default 0). 0 = a fresh disk SCAN; any other value = a non-mutating page of the persisted catalogue. When the response is `truncated`, ask again with the `next_offset` it returns (NOT offset+limit — a byte budget can cut a page short); `next_offset` is never equal to `offset`, so following it always progresses" }),
+                "pending_only": json!({ "type": "boolean", "description": "list only the bundles AWAITING a (re-)synthesis (never synthesized, or their sources changed)" }),
+                "globs": json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "optional per-project ENTRY glob OVERRIDE (e.g. \
+                        [\"src/app/**/*.component.ts\"]); replaces the detected-stack default. \
+                        An empty array clears a previously set override. Omit to leave it unchanged. \
+                        REFUSED (invalid_argument) once the project has a design_recipe: the recipe \
+                        supersedes this shortcut, so edit its `entries[].globs` instead of storing \
+                        a setting that would be ignored. \
+                        GLOB DIALECT (matched against each file's repo-relative, /-separated path): \
+                        `**/` = zero or more WHOLE directories, so `**/*.tsx` also matches a \
+                        root-level `Button.tsx` while `**/Button.tsx` does NOT match \
+                        `MyButton.tsx`; a trailing `**` (as in `src/**`) = any run of characters, \
+                        `/` included; `*` = any run WITHIN one path segment (never crosses a `/`); \
+                        `?` = exactly one character. No brace `{a,b}` or bracket `[abc]` \
+                        expansion, and no negation: pass several patterns instead.",
+                }),
+            },
+            "required": ["project_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_design::DESIGN_RECIPE_TOOL,
+        "description": "READ / WRITE the project's BUNDLE RECIPE — what constitutes a COMPONENT in \
+                        THIS repo. nyx lists the files and hashes them; the RECIPE says which of \
+                        them open a component and what its other files are, and it is YOURS to \
+                        write: explore the repo ONCE, understand the convention, write it here. \
+                        nyx then applies it deterministically at every scan (with the input hash \
+                        and the incremental loop). This is a ONE-OFF per PROJECT, not per scan. \
+                        Shapes: (1) { project_id } READS the effective recipe + `source` \
+                        (`custom` = you wrote it, `globs_override` = derived from a legacy `globs` \
+                        override, `stack_default` = derived from the DETECTED stack — what nyx \
+                        assumed before anyone told it) + `repos[]`, EACH with its detected stack \
+                        AND the recipe it is really scanned with, + `warnings[]`; (2) \
+                        { project_id, recipe: {…} } WRITES it; (3) { project_id, pins: [...] } \
+                        writes only the PINS; (4) { project_id, reset: true } goes back to the \
+                        default. A SECTION YOU DO NOT MENTION IS KEPT from the recipe that is \
+                        already effective (the response lists them in `inherited`); to CLEAR one, \
+                        write it as `[]`. The `recipe` echoed back is always the EFFECTIVE one — \
+                        every section, empty ones included — so what the next scan will apply is on \
+                        screen. A recipe is PROJECT-WIDE: in a monorepo whose repos run different \
+                        stacks it governs all of them (the globs are matched per repo), which the \
+                        read WARNS about, and the document it offers already covers every repo. \
+                        THE SHAPE: `entries` is an ORDERED list of rules — { globs, \
+                        extensions?, qualifiers?, requires_content?, template_attribute? } — the \
+                        FIRST rule matching a file claims it, and `requires_content` (e.g. \
+                        \"@Component\", \"defineWidget(\") then decides whether that file really \
+                        opens a component; `template_attribute` (e.g. \"templateUrl\", \"view\") is \
+                        read out of the entry as `attribute: './x.html'` and resolved against the \
+                        entry's directory. `siblings` maps a same-base-name neighbour to its ROLE \
+                        ({ extensions?, qualifiers?, role: template|style|variants }, first match \
+                        wins; a neighbour no rule claims is NOT in the bundle). \
+                        `family_qualifiers` are the dotted segments STRIPPED when deriving the \
+                        base name (so `button.component.ts` + `button.view.html` are ONE \
+                        component); `non_component_qualifiers` never open one (`.service.ts`); \
+                        `exclude` is a list of path globs (specs, stories, `.d.ts`); \
+                        `ignored_dirs` is the list of directory NAMES the walk never descends into, \
+                        pruned at every level (defaults to node_modules/.git/target/dist/build/out/ \
+                        … — override it to keep a front that legitimately lives under `build/`, or \
+                        to add `vendor`). READ THE \
+                        DEFAULT FIRST — it is exactly what nyx used to assume, and the best \
+                        template to edit. ESCAPE HATCH: what no rule can express is PINNED — \
+                        `pins: [{ entry, files: [{ path, role }], name? }]` names the files of \
+                        THAT component verbatim, bypassing every rule, and a pinned bundle is \
+                        catalogued, hashed and kept incremental like any other. Its NAME, when you \
+                        give none, is derived by YOUR recipe's `family_qualifiers`, exactly as a \
+                        discovered bundle's. A pin path is repo-relative and taken LITERALLY: an \
+                        absolute (`/etc/hosts`, `C:\\…`, `~/…`) or non-canonical (`./a`, `a//b`) \
+                        one is REFUSED rather than re-interpreted, and at scan time a path that \
+                        leaves the repo through a symlink is refused too (an `outside_repo` scan \
+                        error) — a pin reaches exactly what the walk reaches. A pinned file that \
+                        does not exist shows up in the inventory's `scan_errors` (fail-closed) \
+                        rather than being silently dropped. This tool CHANGES NOTHING BY ITSELF: \
+                        run design_inventory(project_id) afterwards to apply it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project whose bundle recipe to read / write"),
+                "recipe": json!({
+                    "type": "object",
+                    "description": "the recipe DOCUMENT to persist ({ version, entries[], \
+                        siblings[], family_qualifiers[], non_component_qualifiers[], exclude[], \
+                        ignored_dirs[], pins[] }). Read the current one first and edit that shape — \
+                        unknown fields are REFUSED rather than ignored, and `entries` may not be \
+                        empty (a recipe with no entry rule would inventory NOTHING). A section you \
+                        OMIT is KEPT from the current effective recipe (reported in `inherited`); \
+                        write `[]` to clear one. The total size of all patterns is bounded, so a \
+                        scan can never be made pathologically slow.",
+                }),
+                "pins": json!({
+                    "type": "array",
+                    "items": { "type": "object" },
+                    "description": "the explicitly PINNED components — [{ entry, files: [{ path, \
+                        role }], name? }] — for what no rule expresses. Writing this alone leaves \
+                        the rules untouched; [] clears the pins.",
+                }),
+                "reset": json!({ "type": "boolean", "description": "drop the stored recipe and go back to the default derived from the detected stack" }),
+            },
+            "required": ["project_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_design::DESIGN_REFRESH_COMPONENT_TOOL,
+        "description": "STORE your SYNTHESIS of a component that is ALREADY in the catalogue: \
+                        replace its Handlebars template + params_json + states_json (its identity \
+                        and its on-disk provenance are preserved), and record the bundle's INPUT \
+                        hash so design_inventory knows it is up to date and never re-proposes it \
+                        until its sources change. This is how you (re-)synthesize a bundle read \
+                        through design_inventory(component=…), and how you FIX a botched synthesis \
+                        — no delete-then-recreate. DISTINCT from proto_author_component, which \
+                        CREATES a greenfield [NEW] component and still refuses a name already in \
+                        the catalogue. The template must be LOGIC-LESS (PDR-0010): a block helper \
+                        is refused (invalid_argument) — express conditionals and repetition through \
+                        the composition TREE. It must also be NON-BLANK: this call REPLACES the \
+                        component's content, so a whitespace-only template would erase the stored \
+                        template AND its params/states — it is refused (invalid_argument). To remove \
+                        a component on purpose, use design_delete_component. THE SHAPE OF BOTH JSON \
+                        DOCUMENTS IS CHECKED HERE (invalid_argument, naming the field): params_json \
+                        must be an ARRAY of descriptor objects each carrying a `name`; states_json \
+                        must be valid JSON whose `axes` is an ARRAY of axes with a `name` and a \
+                        non-empty `values`. A blob nyx cannot read declares NOTHING, and would come \
+                        back with an empty warnings[] — which is the only 'done' this surface has. \
+                        An unknown component name → invalid_id. ALWAYS pass \
+                        back the `input_hash` design_inventory(component=…) gave you: if the \
+                        bundle's sources moved while you were synthesizing, your template is still \
+                        stored but NOT marked up to date (synthesized: false, source_changed: true) \
+                        so the change is re-proposed instead of being silently swallowed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project whose catalogue holds the component"),
+                "name": str_prop("the EXISTING component's name (as listed by design_inventory)"),
+                "template": str_prop("the synthesized Handlebars template (logic-less: plain \
+                    {{param}} / {{{param}}} substitutions and {{{children}}} only). ONE element is \
+                    enough: the variance is carried by the axes below, which the renderer applies as \
+                    classes on top of it. A SHARED sub-component (a spinner, an icon) is REFERENCED, \
+                    not copied — data-nyx-use=\"Spinner\" on a placeholder element, \
+                    data-nyx-param-<name> for the params it hands over, data-nyx-use-axes=\"size=sm\" \
+                    for the sub-component's OWN axes (NEVER inherited from this component: an axis \
+                    name is local to a component, so you fix the values at the reference site). nyx \
+                    resolves the reference in the sidecar at every render and hands the frame flat, \
+                    inert markup, so correcting the sub-component ONCE reaches every host with no \
+                    re-synthesis. An unknown target, a CYCLE (A -> B -> A, a self-reference included) \
+                    or a nesting deeper than 8 is refused by the render and WARNED about here"),
+                "params_json": str_prop("optional params — an ARRAY of DESCRIPTORS, one per value the \
+                    template SUBSTITUTES, derived from the component's declared inputs/props: \
+                    [{ name, type, label?, required?, default?, preview?, options }]. `type` is one \
+                    of SIX and NOTHING else: `text` (a string, substituted escaped), `html` (raw \
+                    markup, substituted verbatim), `number`, `boolean` (a value the template really \
+                    substitutes — a flag that makes the component LOOK different is an AXIS with two \
+                    values, not a param), `select` (a constrained value whose `options` list is then \
+                    MANDATORY, and is ignored on every other type), and the DEPRECATED `state`. Any \
+                    other word (\"enum\", \"string\", \"color\"…) is REFUSED, not repaired. \
+                    `required` = the CALLER must provide it (the component \
+                    has no value of its own — a button's label), and a required param has no \
+                    `default`; `default` ONLY when the source \
+                    declares one (an @Input with an initialiser, a React default prop); `preview` = \
+                    an EXAMPLE value used ONLY to render an aperçu. The catalogue vignette resolves \
+                    preview > default > nothing and REPORTS a required param that has neither, so \
+                    give every required param a preview value rather than a made-up default. A \
+                    VARIANCE AXIS IS NEVER A PARAM — it goes in states_json"),
+                "states_json": str_prop("optional VARIANCE AXES — the CVA/variants of the bundle, \
+                    RESOLVED: { \"axes\": [{ \"name\": \"variant\", \"default\": \"primary\", \
+                    \"values\": [{ \"name\": \"primary\", \"classes\": \"bg-primary \
+                    text-primary-foreground\" }, { \"name\": \"outline\", \"classes\": \"border \
+                    border-input\" }] }] }. ONE AXIS PER CVA AXIS (`variant`, `size`, and a boolean \
+                    like `loading` = an axis with TWO values), each value carrying the CONCRETE \
+                    classes you resolved from the .variants.* sidecar — nyx does not execute \
+                    TypeScript, so a dangling {{class}} renders nothing. The axes are ORTHOGONAL: the \
+                    renderer applies the active value of EVERY axis onto the root, so you never \
+                    enumerate the cross product. What classes cannot do is structural: \
+                    data-nyx-if=\"loading=on\" / data-nyx-if-not on the element that only EXISTS at \
+                    some values (data-nyx-state-case=\"<value>\" for a whole alternative rendering of \
+                    the first axis, data-nyx-axis=\"size\" to apply an axis on an INNER element). A \
+                    value with NO `classes` and NOTHING conditioned on its axis cannot change one \
+                    pixel and is WARNED about — but a BASELINE (`{ \"name\": \"off\" }`) is correct as \
+                    long as the complement is conditioned on the axis. The FLAT list [\"default\", \
+                    \"ghost\"] is still read, as ONE anonymous axis named `state`"),
+                "input_hash": str_prop("optional but RECOMMENDED: the bundle input_hash \
+                    design_inventory(component=…) returned when you READ this bundle. The synthesis \
+                    is marked up to date only if the sources are still at that state; otherwise the \
+                    bundle stays pending (source_changed: true)"),
+                "css_slot": css_slot_prop(),
+                "css_slot_reason": css_slot_reason_prop(),
+            },
+            "required": ["project_id", "name", "template"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_design::DESIGN_DELETE_COMPONENT_TOOL,
+        "description": "REMOVE a component from the project's design-system catalogue. Use it to \
+                        clean up what does not belong there: a greenfield [NEW] authored by \
+                        mistake, a duplicate, or an entry an earlier wrong glob catalogued that \
+                        design_inventory deliberately SPARED (see `orphans[].kept_because` — the \
+                        inventory prunes on its own the rows whose source really vanished, but \
+                        never on a scan it could not judge). An unknown name → invalid_id, so you \
+                        always know whether something was actually removed. This only touches the \
+                        CATALOGUE: a prototype composition references components BY NAME, so a node \
+                        pointing at a deleted component simply reads [NEW] (to be built) at the \
+                        next proto_composition — nothing frozen is rewritten. OTHER COMPONENTS ARE \
+                        NOT SO LUCKY: a template that REFERENCES this one (data-nyx-use) stops \
+                        rendering the moment the row is gone, so the response NAMES every host that \
+                        still does — re-synthesize each of them onto another component, or inline \
+                        the markup it was borrowing. \
+                        READ `ephemeral` AND `warnings[]`: a component's identity IS its SOURCE, so \
+                        deleting the row of a component whose file STILL matches the recipe is \
+                        UNDONE by the next design_inventory, which discovers it again as pending. \
+                        The response says so and names the two lasting fixes — RESTRICT the recipe \
+                        (design_recipe) when a whole family does not belong, or re-run with \
+                        exclude_source: true for this one bundle.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project whose catalogue holds the component"),
+                "name": str_prop("the component name to remove (exactly as design_inventory lists it)"),
+                "exclude_source": json!({
+                    "type": "boolean",
+                    "description": "also EXCLUDE the component's source from future scans, so the \
+                        removal LASTS: its bundle's paths are appended to the project's recipe \
+                        `exclude` list (the very exclusion the discovery already honours), which \
+                        MATERIALIZES the recipe as the project's own if it was still a default. \
+                        Nothing on disk is touched. Not needed for a greenfield [NEW] or a source \
+                        the recipe already ignores (nothing is written, and the response says so), \
+                        and REFUSED — with the delete — for a PINNED entry (remove the pin instead) \
+                        or when the recipe cannot hold one more exclusion (restrict it instead).",
+                }),
+            },
+            "required": ["project_id", "name"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_design::DESIGN_TOKENS_TOOL,
+        "description": "READ / INGEST / EDIT the project's THEME TOKENS — the other half of a \
+                        component's look. A synthesized template carries Tailwind CLASSES \
+                        (bg-primary, text-muted-foreground); those classes render GREY until the \
+                        project's tokens (--primary, --background, --radius, --font-sans …) exist, \
+                        because that is what the classes resolve against. Three shapes, one tool: \
+                        (1) { project_id } READS the layer; (2) { project_id, ingest: true } \
+                        DERIVES it FROM THE APP — it walks the project's repos (the same repos \
+                        design_inventory sees), ranks the stylesheets that look like the design \
+                        system (globals.css / styles.css / theme.css / tokens.css, an @theme block, \
+                        the canonical token names) and merges their GLOBAL custom properties \
+                        (:root / html / @theme / @layer, with .dark and prefers-color-scheme: dark \
+                        kept apart); (3) { project_id, set: {\"--primary\": \"oklch(…)\"}, remove: \
+                        [\"--x\"], dark?: true } EDITS it. RUN THE INGEST FIRST on any project with a \
+                        real front — before composing anything — and re-run it when the app's theme \
+                        moves. The layer is a PROJECT SINGLETON, REFERENCED and never copied: a \
+                        component must NOT carry its own colours, it carries the CLASS and this one \
+                        layer gives the class its colour, so `primary` has ONE identity and an edit \
+                        here applies to every component, composition and preview at once. It also \
+                        records WHERE it came from (sources[]: repo + repo-relative path), so the \
+                        link back to the app's stylesheet stays explicit. SAFE: an ingest that \
+                        retains nothing (greenfield, or every sheet refused) leaves a hand-authored \
+                        layer untouched and reports variable_count 0 — it can never erase a theme — \
+                        and it still RECORDS what it refused, because that run stores no token at \
+                        all, so the report is the only explanation a grey catalogue has (`changed` \
+                        is about the tokens, `provenance_changed` about that report). \
+                        THE INGEST OBEYS YOUR RECIPE: it prunes the same directories as \
+                        design_inventory (the recipe's ignored_dirs + the floor, so a .generated \
+                        mirror is never swept) and skips what your `exclude` globs match; a \
+                        documentation-site theme (VitePress/Docusaurus/Storybook — its own --vp-* / \
+                        --ifm-* namespace) can never outrank your application stylesheet. CHECK \
+                        `sources[]` AND `skipped[]` / `pruned_dirs[]`: they say where the tokens came \
+                        from AND why a sheet was refused — if your own stylesheet is in `skipped`, \
+                        the reason names what to fix (in your recipe, most of the time). The LAYER \
+                        KEEPS that report, so a plain read answers it too (`provenance`; null when \
+                        the stored layer was written by hand rather than ingested).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project whose theme tokens to read / ingest / edit"),
+                "ingest": json!({ "type": "boolean", "description": "re-derive the WHOLE layer from the app's own stylesheet(s) (cannot be combined with set/remove)" }),
+                "set": json!({
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "token name → CSS value to upsert (`--primary` or the bare `primary`, same thing)",
+                }),
+                "remove": json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "token names to drop from the layer",
+                }),
+                "dark": json!({ "type": "boolean", "description": "target the DARK theme map instead of the default/light one (set/remove only)" }),
+            },
+            "required": ["project_id"],
+        },
+    }));
+    // The agent's own EYES on its synthesis (finding 01KYT0Z3RYGF3A881SDQN0X9D7) AND on the whole
+    // page it presents (finding 01KYT45C6RC7K84V1CA3561SPF): every other design diagnostic judges
+    // the STRUCTURE, so every visual defect of this feature was found by the human and by no tool.
+    // nyx already knew how to render — this offers that to the agent that writes the component and
+    // to the one that composes the page, and says, in the descriptor AND in the payload, where its
+    // sight stops. ONE tool, TWO subjects, each named by its own argument (never a mode flag).
+    descriptors.push(json!({
+        "name": crate::mcp_tools_design::DESIGN_PREVIEW_TOOL,
+        "description": "SEE WHAT YOU WROTE — the RESOLVED MARKUP, exactly as the frame ends up \
+                        displaying it. NAME ONE SUBJECT: `component` (+ project_id) renders ONE \
+                        catalogue component at ONE axis combination and ONE param set; `variant_id` \
+                        renders a WHOLE proto COMPOSITION — the variant's node tree, which is the \
+                        thing you actually present to the human. Same resolution either way: your \
+                        templates substituted, every data-nyx-use reference expanded, each node at \
+                        ITS OWN combination (a composition node carries its axis values in its \
+                        params, which is where the shim reads them), the active value's classes \
+                        applied to their targets, data-nyx-if / data-nyx-if-not / \
+                        data-nyx-state-case evaluated (an absent element carrying `hidden`), and \
+                        every data-nyx-* consumed. Nothing else on this surface looks at a \
+                        rendering: the write-path warnings judge the STRUCTURE (a missing case, an \
+                        inert axis value, an unknown key, a refused param type), never the result. \
+                        THE LOOPS ARE: synthesize (design_refresh_component) -> render (this) -> \
+                        LOOK -> correct -> render again, ONE combination at a time; and, before \
+                        proto_present_round, RENDER THE COMPOSITION you are about to show and read \
+                        it. It makes visible, with no browser: an element that should exist at ONE \
+                        value but carries no condition (it is still there at the other one), a class \
+                        that never lands where you thought, a param that substitutes to nothing, a \
+                        reference that does not resolve, a page node nobody has built yet. \
+                        A COMPOSITION ALWAYS COMPLETES: a node whose component is not in the \
+                        catalogue ([NEW] not synthesized), carries no template, or fails to render \
+                        comes back as a PLACEHOLDER naming itself in the markup plus an entry in \
+                        `unrendered` (node_key, component, reason, correction) — the tree is never \
+                        failed as a block, because the forty nodes that are right are what you are \
+                        looking at. Use `node_key` to render ONE subtree when the whole page does \
+                        not fit. THE PARCOURS comes back too: `navigation` lists every node that \
+                        LINKS to another page (`navigate_to`), with the destination resolved from \
+                        its id to the slug and TITLE a human reads, and `navigation_broken_count` \
+                        says how many of them lead nowhere — a dead link is a click that silently \
+                        does nothing, which is exactly what a prototype exists to catch first. AXES you omit render at their own `default` (else their first \
+                        value) and the combination actually used comes BACK in `axes`, so a value \
+                        the axis does not declare is visibly not the one you asked for. ON A \
+                        COMPOSITION, `axes` pilots the VARIANT's OWN axes — the page-level ones its \
+                        states_json declares, which the frame shows one chip-bar row per: they \
+                        decide every data-nyx-if / data-nyx-if-not on them at EVERY node (an \
+                        [inline] node included), and their classes land where the shim puts them. \
+                        `declared_axes` says what this variant can be piloted on; an axis or a \
+                        value it does not declare is named in warnings, never silently dropped. PARAMS you \
+                        omit fall back to their `preview`, then their `default`, then NOTHING — the \
+                        aperçu's own order, so a call with no `params` shows exactly what the \
+                        catalogue tile shows; each one comes back with the `source` it resolved from \
+                        and `renders_empty`. (A COMPOSITION substitutes the node's OWN params and \
+                        nothing else: it shows the design as written, never a preview value the \
+                        design does not carry.) `children` fills the slot. \
+                        THE VIEWPORT, honestly: nyx LAYS NOTHING OUT — the markup is byte for byte \
+                        the same at every width — so `viewport` (a width in px, or mobile / tablet / \
+                        desktop) does exactly two real things: it is the width a frame must APPLY to \
+                        display this, and it reports which responsive CLASSES are in force at it \
+                        (the breakpoints, from your own --breakpoint-* tokens when you have them, \
+                        and every md: / lg: / max-* variant the markup carries, each with `active`). \
+                        Markup with NO responsive class at all is SAID to render identically at \
+                        every width — which is the answer to `is this responsive?`, and often the \
+                        defect. \
+                        WHAT IT DOES NOT DO, and the answer repeats it in `cannot_show`: it is \
+                        MARKUP, NOT AN IMAGE, and it is NOT a visual validation. It proves what is \
+                        THERE — which elements, which classes, which substitutions. It proves \
+                        nothing about how it LOOKS: no colour (you read `bg-primary`, not whether \
+                        the token behind it resolves or contrasts), no spacing, no alignment, no \
+                        size, no overflow, no font, no hover/focus state, and no idea what a page \
+                        REFLOWS to at a width. A class you invented and a class the theme really \
+                        defines read identically here. nyx produces NO IMAGE (no rendering engine in \
+                        the sidecar, no capture anywhere in the product, and an image would not fit \
+                        a response): do not wait for one, do not pretend you have one. Never report \
+                        a component or a page as visually validated on the strength of this: say \
+                        what you CHECKED (the structure) and what you did NOT (the rendering), and \
+                        when the open question IS visual, PRESENT the round and ASK. READ-ONLY, it \
+                        stores nothing. An unknown component or variant, a template still empty, a \
+                        variant with no tree, a reference that cannot resolve, a reference cycle and \
+                        an unknown node_key are EXPLICIT errors naming the correction, never a blank \
+                        answer. `html` is capped — `html_bytes` (the WHOLE run) + \
+                        `html_returned_bytes` + `truncated` say when it was cut.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project whose catalogue holds the component (COMPONENT subject only — with variant_id it is derived from the prototype's Spec)"),
+                "component": str_prop("SUBJECT 1 — the component's name, exactly as design_inventory lists it"),
+                "variant_id": str_prop("SUBJECT 2 — the proto VARIANT whose whole composition tree to render, against that project's catalogue (proto_add_variant returns the id; the elected one is `chosen_variant_id` in proto_get's round manifest and `elected_variant_id` in proto_composition)"),
+                "node_key": str_prop("with variant_id: render ONE subtree instead of the whole tree — the '/'-joined path of node keys from the root (Root/Header/Title), the same anchor proto_feedback uses. The lever for a page whose markup does not fit one answer"),
+                "viewport": json!({
+                    "description": "a WIDTH in CSS px (390), or one of mobile / tablet / desktop. \
+                                    It renders NOTHING differently — nyx lays nothing out — it \
+                                    reports which responsive CLASSES are in force at that width \
+                                    (and is the width a frame must apply to display the markup)",
+                    "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "string" }],
+                }),
+                "axes": json!({
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "axis name -> the value to render at (e.g. { \"variant\": \
+                                    \"ghost\", \"loading\": \"on\" }). COMPONENT subject: the axes \
+                                    the component's own states_json declares. COMPOSITION subject: \
+                                    the axes the VARIANT declares — they pilot the WHOLE page (one \
+                                    chip-bar row each in the frame) and decide every data-nyx-if / \
+                                    -if-not on them, at every node. \
+                                    An axis you omit renders at its `default`, else its first \
+                                    value; an axis, or a value, the subject does not declare is \
+                                    IGNORED and NAMED in warnings. The combination really used \
+                                    comes back in `axes`, and what the subject can be piloted on in \
+                                    `declared_axes` (composition subject)",
+                }),
+                "params": json!({
+                    "type": "object",
+                    "description": "COMPONENT subject: param name -> the value to substitute. A \
+                                    param you omit falls \
+                                    back to its `preview`, then its `default`, then the empty string \
+                                    (which is reported in `params[].renders_empty`). A key the \
+                                    component declares nowhere is substituted anyway AND named in \
+                                    warnings",
+                }),
+                "children": str_prop("COMPONENT subject: markup to put in the component's slot — what a composition's child nodes would render to (a slot component resolved with nothing in it renders to almost nothing)"),
+            },
+        },
+    }));
     descriptors
 }
 
@@ -2652,6 +3596,217 @@ mod tests {
         );
     }
 
+    /// DONE-CRITERION (finding `01KYSCY526C9N9B2BBH68A3N2X`): A TOOL SCHEMA MAY NOT DESCRIBE A SHAPE
+    /// THE TOOL NO LONGER ACCEPTS.
+    ///
+    /// The manual was rewritten at every step of the variance model; the tool descriptions followed
+    /// only partly, so `tools/list` still announced `states_json` as an "array of names" and
+    /// `params_json` as a bag with an `options` field — the OLD model, with no axes, no six types
+    /// and no `data-nyx-*`. That is what an agent inspecting the schemas WITHOUT reading the role
+    /// manual reads, and it is enough to make it write something the write path then warns about.
+    ///
+    /// The guard is the twin of the manual's (`!text.to_lowercase().contains("depot")`): it sweeps
+    /// EVERY agent-facing string of EVERY descriptor — the tool description and each input-schema
+    /// property description — and fails on a STALE FORMULATION, plus a positive half so a
+    /// description cannot pass by simply saying nothing.
+    #[test]
+    fn tool_descriptors_describe_the_variance_model_the_tools_actually_accept() {
+        // (tool, field, text) for every agent-facing string in the advertised surface.
+        let descriptors = tool_descriptors();
+        let mut texts: Vec<(String, String, String)> = Vec::new();
+        for descriptor in &descriptors {
+            let tool = descriptor["name"].as_str().unwrap_or_default().to_string();
+            if let Some(text) = descriptor["description"].as_str() {
+                texts.push((tool.clone(), "description".to_string(), text.to_string()));
+            }
+            if let Some(props) = descriptor["inputSchema"]["properties"].as_object() {
+                for (prop, schema) in props {
+                    if let Some(text) = schema["description"].as_str() {
+                        texts.push((tool.clone(), prop.clone(), text.to_string()));
+                    }
+                }
+            }
+        }
+        assert!(
+            texts.len() > 50,
+            "the sweep must actually see the surface, got {} strings",
+            texts.len()
+        );
+
+        // 1. THE STALE FORMULATIONS — each one is a shape the model stopped accepting, and each one
+        //    was really advertised before this finding. The list is SHARED with the guard over the
+        //    other agent-facing surface, the role manual (finding `01KYSNSBBT4N22ZTWQHFNQBDJQ`):
+        //    two copies would have drifted apart exactly as the two surfaces did.
+        for (tool, field, text) in &texts {
+            let lowered = text.to_lowercase();
+            for (stale, why) in crate::mcp_context::STALE_AGENT_FORMULATIONS {
+                assert!(
+                    !lowered.contains(stale),
+                    "tool `{tool}` ({field}) still advertises the stale form {stale:?}: {why}\n{text}"
+                );
+            }
+        }
+
+        // 2. THE POSITIVE HALF — what the two fields MUST say, wherever they are an argument. A
+        //    descriptor an agent reads instead of the manual has to carry the model itself.
+        let mut checked: Vec<&str> = Vec::new();
+        for (tool, field, text) in &texts {
+            match field.as_str() {
+                "states_json" => {
+                    checked.push(field);
+                    for needle in [
+                        "AXES",
+                        "\"axes\"",
+                        "classes",
+                        "data-nyx-if",
+                        "data-nyx-state-case",
+                        "`state`",
+                    ] {
+                        assert!(
+                            text.contains(needle),
+                            "tool `{tool}`: the states_json schema must describe the axes model \
+                             (missing {needle:?})\n{text}"
+                        );
+                    }
+                }
+                "params_json" => {
+                    checked.push(field);
+                    for needle in [
+                        "`text`",
+                        "`html`",
+                        "`number`",
+                        "`boolean`",
+                        "`select`",
+                        "`state`",
+                        "`options`",
+                        "`required`",
+                        "`default`",
+                        "`preview`",
+                        "REFUSED",
+                    ] {
+                        assert!(
+                            text.contains(needle),
+                            "tool `{tool}`: the params_json schema must describe the SIX types and \
+                             the required/default/preview contract (missing {needle:?})\n{text}"
+                        );
+                    }
+                }
+                // A `template` argument is where a component's markup is WRITTEN, so it is where the
+                // REFERENCE capability has to be advertised (finding `01KYSCZ822K4ZFAAYTG6GT6YWZ`):
+                // an agent reading only the schema must learn that a shared sub-component is
+                // referenced rather than copied, that its axes are NOT inherited, and that a cycle
+                // is refused. `proto_add_variant`'s `composition_json` is a TREE, not a template —
+                // only the two catalogue-writing tools carry this one.
+                "template" => {
+                    checked.push(field);
+                    for needle in [
+                        "data-nyx-use",
+                        "data-nyx-param-",
+                        "data-nyx-use-axes",
+                        "NEVER inherited",
+                        "CYCLE",
+                    ] {
+                        assert!(
+                            text.contains(needle),
+                            "tool `{tool}`: the template schema must describe the REFERENCE model \
+                             (missing {needle:?})\n{text}"
+                        );
+                    }
+                }
+                // A `composition_json` argument is where the PLACEMENT is written, so it is where the
+                // inter-page link has to be advertised (finding `01KYW34347CZSNXCYS35KDG3EY`): an
+                // agent reading only the schema must learn that a node can open another PAGE, that
+                // the link is an ID and not a slug, where it lives and why, what a dead one does —
+                // and that a cycle is fine, which is the question a reader would otherwise answer
+                // wrongly by analogy with `data-nyx-use`.
+                "composition_json" => {
+                    checked.push(field);
+                    for needle in [
+                        "navigate_to",
+                        "PARCOURS",
+                        "prototype_pages.id",
+                        "never a slug",
+                        "on the NODE and not on the component",
+                        "REFUSED",
+                        "CYCLES are fine",
+                    ] {
+                        assert!(
+                            text.contains(needle),
+                            "tool `{tool}`: the composition_json schema must describe the \
+                             inter-page link (missing {needle:?})\n{text}"
+                        );
+                    }
+                }
+                // The SCOPED CSS SLOT (finding `01KYVMTWB71R0D0CT1SV88J8DX`). Wherever it is an
+                // argument, the descriptor must state the ORDER (Tailwind is the channel), the four
+                // constructs that are the only admitted reasons, and the four constraints — each as
+                // a REFUSAL. An agent reading only the schema must not be able to conclude that the
+                // slot is a general-purpose stylesheet.
+                "css_slot" => {
+                    checked.push(field);
+                    for needle in [
+                        "TAILWIND IS THE CHANNEL",
+                        "LAST resort",
+                        "@keyframes",
+                        "::before/::after",
+                        ":has",
+                        "@container",
+                        "REFUSED",
+                        "TOKENISED",
+                        "SCOPED",
+                        "BOUNDED",
+                        "SIGNALLED",
+                        "data-nyx-css",
+                        "css_slot_reason",
+                        "relax its CSP",
+                    ] {
+                        assert!(
+                            text.contains(needle),
+                            "tool `{tool}`: the css_slot schema must state the rule and its four \
+                             constraints (missing {needle:?})\n{text}"
+                        );
+                    }
+                }
+                "css_slot_reason" => {
+                    checked.push(field);
+                    assert!(
+                        text.contains("MANDATORY")
+                            && text.contains("WHAT THE UTILITIES COULD NOT DO"),
+                        "tool `{tool}`: the reason is mandatory and says what the utilities could \
+                         not do\n{text}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        // …and the sweep cannot pass vacuously: the three tools that carry these arguments are
+        // named, so renaming or dropping one is a failure, not a silent hole.
+        for expected in [
+            crate::mcp_tools_proto::PROTO_ADD_VARIANT_TOOL,
+            crate::mcp_tools_proto::PROTO_AUTHOR_COMPONENT_TOOL,
+            crate::mcp_tools_design::DESIGN_REFRESH_COMPONENT_TOOL,
+        ] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(tool, field, _)| tool == expected && field == "states_json"),
+                "{expected} must still advertise a states_json argument"
+            );
+        }
+        assert!(
+            checked.iter().filter(|f| **f == "params_json").count() >= 2
+                && checked.iter().filter(|f| **f == "states_json").count() >= 3
+                && checked.iter().filter(|f| **f == "template").count() >= 2
+                // BOTH catalogue-writing tools advertise the slot, in the SAME words — one
+                // mechanism, one contract, so an agent cannot learn two different rules for it.
+                && checked.iter().filter(|f| **f == "css_slot").count() == 2
+                && checked.iter().filter(|f| **f == "css_slot_reason").count() == 2
+                // The PLACEMENT argument: wherever a tree is written, the parcours is advertised.
+                && checked.iter().filter(|f| **f == "composition_json").count() >= 1,
+            "every field is checked on every tool that takes it: {checked:?}"
+        );
+    }
+
     #[test]
     fn tools_list_advertises_v1_surface() {
         start_on_port(19013);
@@ -2858,6 +4013,22 @@ mod tests {
                 "v2.6 annexe tool {expected} must be listed"
             );
         }
+        // v2.7 Phase 2: the PROTOTYPE tools (the agent's constrained proto contract) advertised
+        // alongside, kept OUT of V1_TOOLS (a new surface).
+        for expected in crate::mcp_tools_proto::PROTO_TOOLS {
+            assert!(
+                names.contains(&expected),
+                "v2.7 proto tool {expected} must be listed"
+            );
+        }
+        // v2.7 review #23: the DESIGN-SYSTEM trigger (`design_inventory`) advertised alongside,
+        // kept OUT of V1_TOOLS (a new surface).
+        for expected in crate::mcp_tools_design::DESIGN_TOOLS {
+            assert!(
+                names.contains(&expected),
+                "v2.7 design tool {expected} must be listed"
+            );
+        }
         assert_eq!(
             names.len(),
             V1_TOOLS.len()
@@ -2865,7 +4036,9 @@ mod tests {
                 + 9
                 + crate::mcp_tools_spec::SPEC_TOOLS.len()
                 + crate::mcp_tools_idea::IDEA_TOOLS.len()
-                + crate::mcp_tools_annexe::ANNEXE_TOOLS.len(),
+                + crate::mcp_tools_annexe::ANNEXE_TOOLS.len()
+                + crate::mcp_tools_proto::PROTO_TOOLS.len()
+                + crate::mcp_tools_design::DESIGN_TOOLS.len(),
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
@@ -2876,7 +4049,10 @@ mod tests {
              agent_context + repo_diff + repo_git_view + repo_watch + repo_unwatch + \
              review_comment_list + review_comment_post + review_comment_resolve + review_task_list + \
              review_task_structure + review_submit_feedback + the 12 v2.6 idea tools + \
-             the 4 v2.6 annexe tools extension tools"
+             the 4 v2.6 annexe tools + the 16 v2.7 proto tools (9 read/lifecycle, incl. the agent \
+             recommendation proto_recommend_variant, + 7 creation/amorçage) + the 6 v2.7 design \
+             tools (design_inventory + design_recipe + design_refresh_component + \
+             design_delete_component + design_tokens + design_preview) extension tools"
         );
     }
 

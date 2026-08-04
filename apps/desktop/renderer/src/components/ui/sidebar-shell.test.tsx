@@ -42,7 +42,28 @@ describe("<SidebarShell> (shared left sidebar chassis)", () => {
       </SidebarShell>,
     );
     const aside = screen.getByRole("complementary", { name: "Rail" });
-    // The only child is the scrollable content region — no header border block.
+    // The only child is the scrollable content region — no header border block, and no FOOT block
+    // either: both slots are optional, so every rail that passes neither renders as it always did.
     expect(aside.querySelector(".border-b")).toBeNull();
+    expect(aside.querySelector(".border-t")).toBeNull();
+  });
+
+  /**
+   * The FOOT (finding `01KZ46P0FTMJXRTT32H6G5TEEN`) — the mirror of the header: pinned OUTSIDE the
+   * scrollable body, so a control put there stays at the bottom of the rail instead of riding the
+   * scroll of whatever list fills it.
+   */
+  it("pins the footer under the scrollable body, outside it", () => {
+    render(
+      <SidebarShell aria-label="Rail" footer={<span>round</span>}>
+        <p>scrollable body</p>
+      </SidebarShell>,
+    );
+    const foot = screen.getByText("round").parentElement!;
+    expect(foot.className).toContain("border-t");
+    expect(foot.className).toContain("shrink-0");
+    expect(foot.closest(".overflow-y-auto")).toBeNull();
+    const aside = screen.getByRole("complementary", { name: "Rail" });
+    expect(aside.lastElementChild).toBe(foot);
   });
 });

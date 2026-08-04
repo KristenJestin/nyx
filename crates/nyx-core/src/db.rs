@@ -46,15 +46,30 @@ const POOL_MAX_SIZE: u32 = 8;
 
 use crate::pathnorm;
 use crate::schema::{
-    agent_session_specs, agent_sessions, annex_blobs, annexes, command_instances, domain_events,
-    idea_specs, ideas, managed_commands, projects, repositories, review_comments, review_reads,
-    review_tasks, spec_depends_on, spec_revisions, specs, task_dependencies, tasks, terminals,
-    workspaces,
+    agent_session_prototypes, agent_session_specs, agent_sessions, annex_blobs, annexes,
+    command_instances, design, design_components, domain_events, idea_specs, ideas,
+    managed_commands, projects, prototype_design_lock, prototype_feedback, prototype_page_versions,
+    prototype_pages, prototype_round_pages, prototype_rounds, prototype_variants, prototypes,
+    repositories, review_comments, review_reads, review_tasks, spec_depends_on, spec_revisions,
+    specs, task_dependencies, tasks, terminals, workspaces,
 };
 
 /// The migrations baked into the binary at compile time from `migrations/`.
 /// Running them is idempotent (Diesel tracks applied versions in
 /// `__diesel_schema_migrations`), so we run them on every startup.
+///
+/// # A migration NUMBER is a global, cross-branch identity — never reuse one
+///
+/// `__diesel_schema_migrations` stores a NUMBER, never a name. Two branches that both claim the
+/// same number produce a silent divergence on any DB that saw one of them: the other is then
+/// reported as ALREADY APPLIED and its `up.sql` NEVER runs, while `schema.rs` keeps declaring the
+/// columns it was supposed to create — every read of the affected table then fails at runtime.
+/// This exact collision happened once (v2.7 and `feature/v2.8-engine` both wrote a 34; v2.8's
+/// `create_workflow_engine` landed first on the user's DB, so v2.7's `design_components_scan_state`
+/// was silently skipped), and the fix was to renumber the v2.7 one to 35. When adding a migration,
+/// pick a number free across ALL live branches, not just the checked-out one. Note the series
+/// carries holes (no directory 19; 34 belongs to v2.8) — the directory COUNT is NOT the highest
+/// number.
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 /// A terminal status. Stored as TEXT (`'alive'` | `'closed'`) — see the CHECK
@@ -8428,6 +8443,3137 @@ pub fn spec_dependency_view(
     })
 }
 
+// --- DESIGN-SYSTEM domain (v2.7 Phase 1, v30, PDR-0010) --------------------
+//
+// The design-system rapatriated NATIVELY as nyx's single authority (PRD Impl Decisions):
+// `design` (ONE row per project — the DESIGN.md + the derived theme tokens) and
+// `design_components` (ONE row per component — the imposed library). This is the persistence
+// socle the BUNDLE discovery (`crate::design::discover_bundles`) and the incremental synthesis
+// loop (`crate::design::mark_synthesized`, review #40) build on. CRUD only here — the
+// filesystem-facing behaviours (walk / glob / bundle grouping / hash) live in `crate::design`.
+
+/// A `design` row: ONE project's design-system. `Serialize` for the IPC/MCP boundary.
+/// `content` is the DESIGN.md markdown (couleurs / typo / spacing / elevation / guidelines);
+/// `theme_tokens_json` is the derived Tailwind tokens (`None` until derived from `content`).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = design)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Design {
+    pub id: String,
+    pub project_id: String,
+    pub content: String,
+    /// The derived Tailwind theme tokens (JSON), `None` until derived.
+    pub theme_tokens_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// The per-project INVENTORY GLOB OVERRIDE (v33): a JSON array of glob strings that REPLACES
+    /// the detected stack's default globs during the inventory ([`crate::design::inventory_project`]).
+    /// `None` (the default) = no override → the detected stack default is used; an empty array is
+    /// likewise treated as "no override" (see [`crate::design::resolve_component_globs`]).
+    pub inventory_globs_json: Option<String>,
+    /// The per-project BUNDLE RECIPE (v36): the JSON document an AGENT writes after exploring the
+    /// repo, describing what constitutes a component THERE — entry rules (globs + optional content
+    /// marker + optional template attribute), sibling roles, family / non-component qualifiers,
+    /// exclusions and explicit pins (see [`crate::design::BundleRecipe`]). `None` (the default, and
+    /// the only value for a row predating v36) = no recipe → the v33 glob override when set, else
+    /// the DETECTED stack's default recipe. This is the column that took the FRAMEWORK KNOWLEDGE
+    /// out of nyx's code (finding 01KYKXPHW103C0V5RBXQ29BBXQ).
+    pub bundle_recipe_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = design)]
+struct NewDesignRow {
+    id: String,
+    project_id: String,
+    content: String,
+    theme_tokens_json: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    inventory_globs_json: Option<String>,
+    bundle_recipe_json: Option<String>,
+}
+
+/// Fetch the design-system of `project_id`, or `None` when the project has none yet.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_design(conn: &mut SqliteConnection, project_id: &str) -> QueryResult<Option<Design>> {
+    design::table
+        .filter(design::project_id.eq(project_id))
+        .select(Design::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// UPSERT the design-system of `project_id` (the "1 per project" invariant, PDR-0010): INSERT
+/// the DESIGN.md `content` + derived `theme_tokens_json` when the project has none, else UPDATE
+/// the existing row in place (keeping its `id`/`created_at`). Keys on the `UNIQUE(project_id)`
+/// index. Returns the stored [`Design`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn upsert_design(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    content: &str,
+    theme_tokens_json: Option<&str>,
+) -> QueryResult<Design> {
+    let now = now_millis();
+    diesel::insert_into(design::table)
+        .values(NewDesignRow {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            content: content.to_string(),
+            theme_tokens_json: theme_tokens_json.map(|t| t.to_string()),
+            created_at: now,
+            updated_at: now,
+            // A fresh design row carries no glob override; a later `set_design_inventory_globs`
+            // sets it. The `do_update` below deliberately LEAVES `inventory_globs_json` untouched,
+            // so authoring DESIGN.md content never clobbers a project's inventory override.
+            inventory_globs_json: None,
+            // Same for the v36 bundle RECIPE: authoring DESIGN.md never touches how the front is
+            // inventoried.
+            bundle_recipe_json: None,
+        })
+        .on_conflict(design::project_id)
+        .do_update()
+        .set((
+            design::content.eq(content.to_string()),
+            design::theme_tokens_json.eq(theme_tokens_json.map(|t| t.to_string())),
+            design::updated_at.eq(now),
+        ))
+        .returning(Design::as_returning())
+        .get_result(conn)
+}
+
+/// PERSIST the per-project INVENTORY GLOB OVERRIDE (v33 — the "surchargeable par projet" seam of
+/// the design inventory). Upserts the project's single `design` row: when a design row already
+/// exists it is UPDATED in place (its `content` / `theme_tokens_json` preserved); when none
+/// exists a stub row (empty `content`) is created to carry the override. `globs = Some(&[..])`
+/// stores the JSON-encoded array; `globs = None` (or an empty slice) CLEARS the override so the
+/// inventory falls back to the detected stack default. Returns the stored [`Design`].
+///
+/// The read companion is [`design_inventory_globs`]; the precedence (override-vs-default) lives in
+/// [`crate::design::resolve_component_globs`], so this function only decides PERSISTENCE, not policy.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_design_inventory_globs(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    globs: Option<&[String]>,
+) -> QueryResult<Design> {
+    // An empty override is stored as NULL ("no override"), matching `resolve_component_globs`'s
+    // empty-is-no-override rule — a project can never silently inventory NOTHING by mis-config.
+    let json = match globs {
+        Some(g) if !g.is_empty() => Some(
+            serde_json::to_string(g)
+                .expect("serialize inventory globs (Vec<String> is always valid JSON)"),
+        ),
+        _ => None,
+    };
+    let now = now_millis();
+    diesel::insert_into(design::table)
+        .values(NewDesignRow {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            content: String::new(),
+            theme_tokens_json: None,
+            created_at: now,
+            updated_at: now,
+            inventory_globs_json: json.clone(),
+            bundle_recipe_json: None,
+        })
+        .on_conflict(design::project_id)
+        .do_update()
+        .set((
+            design::inventory_globs_json.eq(json),
+            design::updated_at.eq(now),
+        ))
+        .returning(Design::as_returning())
+        .get_result(conn)
+}
+
+/// PERSIST the per-project BUNDLE RECIPE (v36 — the FRAMEWORK KNOWLEDGE moved out of nyx's code,
+/// finding 01KYKXPHW103C0V5RBXQ29BBXQ). Upserts the project's single `design` row exactly like
+/// [`set_design_inventory_globs`]: an existing row is UPDATED in place (its `content` /
+/// `theme_tokens_json` / glob override preserved — the three are orthogonal), a missing one is
+/// created as a stub to carry the recipe. `None` (or a blank string) CLEARS it, so the project falls
+/// back to the v33 glob override when it has one and to the detected stack's default otherwise.
+///
+/// PERSISTENCE ONLY: this function neither parses nor validates. The SCHEMA and the precedence live
+/// in [`crate::design::BundleRecipe`] / [`crate::design::ProjectRecipe`], and the agent-facing tool
+/// validates BEFORE calling this — a recipe that cannot be parsed must never reach the column.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_design_bundle_recipe(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    recipe_json: Option<&str>,
+) -> QueryResult<Design> {
+    let json = recipe_json
+        .map(str::trim)
+        .filter(|j| !j.is_empty())
+        .map(|j| j.to_string());
+    let now = now_millis();
+    diesel::insert_into(design::table)
+        .values(NewDesignRow {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            content: String::new(),
+            theme_tokens_json: None,
+            created_at: now,
+            updated_at: now,
+            inventory_globs_json: None,
+            bundle_recipe_json: json.clone(),
+        })
+        .on_conflict(design::project_id)
+        .do_update()
+        .set((
+            design::bundle_recipe_json.eq(json),
+            design::updated_at.eq(now),
+        ))
+        .returning(Design::as_returning())
+        .get_result(conn)
+}
+
+/// The RAW per-project bundle-recipe JSON of `project_id` (v36), or `None` when the project has no
+/// design row or no recipe. Returned UNPARSED on purpose: the decode + the fallback policy belong to
+/// [`crate::design::ProjectRecipe`], so this layer stays pure persistence.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn design_bundle_recipe_json(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Option<String>> {
+    Ok(get_design(conn, project_id)?
+        .and_then(|d| d.bundle_recipe_json)
+        .map(|j| j.trim().to_string())
+        .filter(|j| !j.is_empty()))
+}
+
+/// The parsed per-project INVENTORY GLOB OVERRIDE of `project_id` (v33): the JSON array stored by
+/// [`set_design_inventory_globs`], decoded to `Vec<String>`. `None` when the project has no design
+/// row, no override set, or an empty/invalid override (all mean "use the detected stack default").
+/// The single read seam [`crate::design::inventory_project`] consults to resolve the effective globs.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn design_inventory_globs(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Option<Vec<String>>> {
+    let Some(design) = get_design(conn, project_id)? else {
+        return Ok(None);
+    };
+    Ok(design
+        .inventory_globs_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .filter(|g| !g.is_empty()))
+}
+
+/// PERSIST the project's THEME TOKEN LAYER (review #42 — the tokens are a first-class layer, and
+/// nothing used to write `theme_tokens_json` at all, so the preview iframe rendered every component
+/// GREY). Upserts the project's single `design` row: an existing row is UPDATED IN PLACE, keeping
+/// its DESIGN.md `content` and its inventory glob override (the token layer is orthogonal to both);
+/// when none exists a stub row (empty `content`) is created to carry the layer. `None` CLEARS it.
+///
+/// This is deliberately the ONLY write of the token layer, because the layer is the project's SINGLE
+/// identity for `primary` & co. — referenced by every component's classes rather than copied into
+/// each of them ("edit once, apply everywhere"). The producers are
+/// [`crate::design_tokens::ingest_project_tokens`] (derive it from the app's own stylesheet) and
+/// [`crate::design_tokens::edit_project_tokens`] (a human/agent edit). Returns the stored [`Design`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_design_theme_tokens(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    theme_tokens_json: Option<&str>,
+) -> QueryResult<Design> {
+    let now = now_millis();
+    diesel::insert_into(design::table)
+        .values(NewDesignRow {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            content: String::new(),
+            theme_tokens_json: theme_tokens_json.map(|t| t.to_string()),
+            created_at: now,
+            updated_at: now,
+            inventory_globs_json: None,
+            bundle_recipe_json: None,
+        })
+        .on_conflict(design::project_id)
+        .do_update()
+        .set((
+            design::theme_tokens_json.eq(theme_tokens_json.map(|t| t.to_string())),
+            design::updated_at.eq(now),
+        ))
+        .returning(Design::as_returning())
+        .get_result(conn)
+}
+
+/// A `design_components` row: ONE component of the imposed library. `Serialize` for the IPC/MCP
+/// boundary. `source_*` are `None` for a GREENFIELD component (no front yet); `source_path` is the
+/// component BUNDLE's ENTRY file. `visual_hash` is the md5 of that bundle's INPUTS as of its last
+/// SYNTHESIS (review #40), `None` until an agent synthesizes it. `template` is the Handlebars
+/// template (default `""` for a component DISCOVERED but not yet synthesized).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = design_components)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct DesignComponent {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    /// The source repo the component was inventoried from (`None` = greenfield).
+    pub source_repository_id: Option<String>,
+    /// The source path relative to the repo (`None` = greenfield).
+    pub source_path: Option<String>,
+    /// The md5 of the VISUAL part (template + styles, NOT the .ts logic), `None` until hashed.
+    pub visual_hash: Option<String>,
+    /// The Handlebars (logic-less) template compiled in the sidecar.
+    pub template: String,
+    /// The component's editable params (JSON), `None` when unset.
+    pub params_json: Option<String>,
+    /// The component's declared states (JSON — a state is itself a param), `None` when unset.
+    pub states_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// v35 — the bundle's INPUT hash AS OBSERVED BY THE LAST SCAN that discovered this source;
+    /// `None` when the last scan did NOT see it (source gone, repo not walked, or greenfield).
+    /// Together with `visual_hash` (the hash AS OF THE LAST SYNTHESIS) this is what lets a
+    /// NON-SCANNING catalogue page answer "does this bundle await a (re-)synthesis?" EXACTLY like
+    /// the scanning page does — the two used to disagree, and following the paging cursor then
+    /// skipped (or duplicated) work. Written by [`set_component_scan_state`] only.
+    pub scanned_input_hash: Option<String>,
+    /// v35 — epoch ms at which a scan IN A POSITION TO JUDGE found this row's source GONE while
+    /// the row carried a SYNTHESIS. Such a row is FLAGGED, never destroyed automatically: no scan
+    /// (which can silently fail to read a directory or a file) is ever proof enough to throw away
+    /// human-reviewed LLM work. Cleared the moment a scan rediscovers the source.
+    pub orphaned_at: Option<i64>,
+    /// v38 — the component's SCOPED CSS SLOT as authored, `{ "css": …, "reason": … }`
+    /// ([`crate::css_slot::CssSlot`]); `None` = no slot, which is nearly every component. The strict
+    /// escape hatch for what Tailwind utilities cannot express, admitted only for a custom
+    /// `@keyframes`, the content of a `::before` / `::after`, a `:has` selector or a `@container`
+    /// query — and refused for anything else at the write (finding `01KYVMTWB71R0D0CT1SV88J8DX`).
+    pub css_slot_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = design_components)]
+struct NewDesignComponentRow {
+    id: String,
+    project_id: String,
+    name: String,
+    source_repository_id: Option<String>,
+    source_path: Option<String>,
+    visual_hash: Option<String>,
+    template: String,
+    params_json: Option<String>,
+    states_json: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    css_slot_json: Option<String>,
+}
+
+/// The identifying + descriptive fields of a component, the input to [`upsert_component`] — the
+/// FULL-CONTROL write (the `[NEW]` author path). `visual_hash` is left to
+/// [`crate::design::mark_synthesized`] (an upsert NEVER overwrites the stored hash — see below).
+/// The DISCOVERY pass does not use this: it writes through [`upsert_component_discovery`], which
+/// touches no authored field. Use `Default` + struct-update so a caller sets only what it knows.
+#[derive(Debug, Clone, Default)]
+pub struct ComponentInput {
+    pub name: String,
+    pub source_repository_id: Option<String>,
+    pub source_path: Option<String>,
+    /// Only honoured on INSERT (a fresh component); an upsert of an existing component keeps
+    /// the stored hash so the synthesis loop stays authoritative for it.
+    pub visual_hash: Option<String>,
+    pub template: String,
+    pub params_json: Option<String>,
+    pub states_json: Option<String>,
+    /// v38 — the SCOPED CSS SLOT as authored ([`crate::css_slot::CssSlot::to_json`]); `None` = no
+    /// slot. Only the AUTHOR path fills it; the discovery pass writes through
+    /// [`upsert_component_discovery`], which touches no authored field.
+    pub css_slot_json: Option<String>,
+}
+
+/// What a content update does with the stored CSS SLOT. It is a THIRD state on purpose: the slot is
+/// a REVIEWED EXCEPTION — a human saw it in review and let it through — and re-synthesizing a
+/// template is not a decision about that exception. So it is KEPT unless the caller says otherwise,
+/// and removing it is an explicit gesture rather than the consequence of an omitted argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CssSlotWrite {
+    /// Leave the stored slot exactly as it is (an argument the caller did not send).
+    Keep,
+    /// Replace it with this authored blob.
+    Set(String),
+    /// REMOVE it — the component carries no exception any more.
+    Clear,
+}
+
+/// UPSERT a component into `project_id` keyed on the `UNIQUE(project_id, name)` index: INSERT a
+/// new component, or RECONCILE an existing one in place (keeping its `id`/`created_at`) — never a
+/// duplicate. The conflict update refreshes `source_*` / `template` / `params_json` /
+/// `states_json` / `updated_at` but DELIBERATELY leaves `visual_hash` untouched:
+/// [`crate::design::mark_synthesized`] is the sole authority for the hash, so a write here must
+/// not clobber it back to NULL. Returns the stored [`DesignComponent`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn upsert_component(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    input: &ComponentInput,
+) -> QueryResult<DesignComponent> {
+    let now = now_millis();
+    diesel::insert_into(design_components::table)
+        .values(NewDesignComponentRow {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            name: input.name.clone(),
+            source_repository_id: input.source_repository_id.clone(),
+            source_path: input.source_path.clone(),
+            visual_hash: input.visual_hash.clone(),
+            template: input.template.clone(),
+            params_json: input.params_json.clone(),
+            states_json: input.states_json.clone(),
+            created_at: now,
+            updated_at: now,
+            css_slot_json: input.css_slot_json.clone(),
+        })
+        .on_conflict((design_components::project_id, design_components::name))
+        .do_update()
+        .set((
+            design_components::source_repository_id.eq(input.source_repository_id.clone()),
+            design_components::source_path.eq(input.source_path.clone()),
+            design_components::template.eq(input.template.clone()),
+            design_components::params_json.eq(input.params_json.clone()),
+            design_components::states_json.eq(input.states_json.clone()),
+            design_components::css_slot_json.eq(input.css_slot_json.clone()),
+            design_components::updated_at.eq(now),
+        ))
+        .returning(DesignComponent::as_returning())
+        .get_result(conn)
+}
+
+/// FIND the component a DISCOVERED bundle maps to by its SOURCE — the `(project_id,
+/// source_repository_id, source_path)` triple — or `None` when that source is not catalogued yet.
+///
+/// The SOURCE, not the name, is a discovered component's IDENTITY (review: bundle name collision).
+/// Two `data-table.ts` living in two different directories are two DIFFERENT components that merely
+/// share a base name; keying the discovery on the name made the second silently overwrite the
+/// first. `source_repository_id` is matched NULL-aware (a loose scan / the synthetic
+/// current-folder member records no repo id), and the oldest row wins so the lookup is stable.
+pub fn find_component_by_source(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    source_repository_id: Option<&str>,
+    source_path: &str,
+) -> QueryResult<Option<DesignComponent>> {
+    let query = design_components::table
+        .filter(design_components::project_id.eq(project_id))
+        .filter(design_components::source_path.eq(source_path))
+        .into_boxed();
+    let query = match source_repository_id {
+        Some(id) => query.filter(design_components::source_repository_id.eq(id.to_string())),
+        None => query.filter(design_components::source_repository_id.is_null()),
+    };
+    query
+        .order(design_components::id.asc())
+        .select(DesignComponent::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// UPSERT the DISCOVERY of a component (review #40 — the BUNDLE pivot): record that the bundle
+/// rooted at `source_path` in `source_repository_id` exists and is CALLED `name`, WITHOUT touching
+/// its authored content. On INSERT the row is born EMPTY (no template yet — the LLM synthesis fills
+/// it later, so a component is catalogued even before it is synthesized); on a reconcile only the
+/// identity (`name` / `source_*`) and `updated_at` are refreshed, so a re-inventory NEVER clobbers a
+/// synthesized `template` / `params_json` / `states_json` / `visual_hash`.
+///
+/// KEYED ON THE SOURCE, in three steps (the bundle-name-collision fix):
+///   1. the row already catalogued FOR THIS SOURCE wins — only its `name` is reconciled, so a
+///      re-qualification (a homonym appearing elsewhere in the tree) RENAMES the row in place
+///      instead of orphaning its synthesis;
+///   2. else a row holding this `name` **with NO source of its own** — a GREENFIELD `[NEW]` the
+///      front now implements — is MATERIALIZED: its provenance is bound in place, so it turns
+///      `[NEW]` → `[DS]` without a duplicate at the next scan (review #41's round trip);
+///   3. else a brand-new component row is inserted.
+///
+/// # Step 2 is NARROW on purpose (review — adoption by NAME was a hijack)
+///
+/// Step 2 used to adopt ANY row holding the name, INCLUDING one that already carried a source. A
+/// catalogued + synthesized `src/ui/Card.tsx` deleted from disk, plus an UNRELATED
+/// `src/admin/legacy/Card.tsx` appearing elsewhere, re-pointed the SAME row (same id, same DS
+/// template) at the new file — and the next synthesis overwrote the design-system template under an
+/// unchanged name. Since [`classify_elected_nodes`] resolves a `[DS]` node BY NAME, a FROZEN
+/// composition then silently designated a DIFFERENT component.
+///
+/// So a row that ALREADY carries a source is NEVER re-pointed here. The only re-anchoring left is
+/// the MOVE, decided on CONTENT (never on the name) one level up by
+/// [`crate::design::reconcile_moved_sources`], before this function sees the bundle. Anything else
+/// INSERTS a new row and leaves the old one ORPHANED — reported, and pruned, by the inventory.
+///
+/// The caller ([`crate::design::assign_catalogue_names`]) reserves the name of every SOURCED row,
+/// so a name reaching step 2 can only be held by a greenfield row: step 2 can never steal a live
+/// component's name, and step 3 can never collide with `UNIQUE(project_id, name)`.
+///
+/// This is the deliberate split from [`upsert_component`] (which OWNS the content): the inventory
+/// discovers, the authoring tool synthesizes — two writers, no double authority over one field.
+///
+/// # A row that VANISHES under steps 1-2 is `None`, not an error (audit 01KYHYW25GKJBRTZVTSXQAMP9F)
+///
+/// Steps 1 and 2 both READ a row and then WRITE it. An EXPLICIT delete
+/// (`design_delete_component` / the `/design` card) committed in between used to make the `UPDATE`
+/// return `NotFound`, and the `?` carried that all the way up through
+/// [`crate::design::inventory_project`] — the whole inventory failed, after passes 2/3 had already
+/// committed, over a row somebody deliberately removed. This now answers `None`, the exact
+/// counterpart of [`ConditionalDelete::AlreadyGone`], and the caller SKIPS the line. Step 3 (the
+/// INSERT) never yields `None` — a brand-new row cannot be gone.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn upsert_component_discovery(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    name: &str,
+    source_repository_id: Option<&str>,
+    source_path: &str,
+) -> QueryResult<Option<DesignComponent>> {
+    let now = now_millis();
+    // 1. Already catalogued under THIS source → reconcile its NAME in place (identity = source).
+    if let Some(existing) =
+        find_component_by_source(conn, project_id, source_repository_id, source_path)?
+    {
+        if existing.name == name {
+            return Ok(Some(existing));
+        }
+        return diesel::update(design_components::table.find(&existing.id))
+            .set((
+                design_components::name.eq(name.to_string()),
+                design_components::updated_at.eq(now),
+            ))
+            .returning(DesignComponent::as_returning())
+            .get_result(conn)
+            .optional();
+    }
+    // 2. A row HOLDS this name. Bind the provenance ONLY when that row has none of its own (the
+    //    greenfield `[NEW]` the front now implements). A SOURCED holder is left strictly untouched
+    //    — a no-op rather than a hijack. The naming pass makes that branch unreachable from the
+    //    inventory; it is the belt to its braces, never a silent re-pointing.
+    if let Some(existing) = get_component_by_name(conn, project_id, name)? {
+        if existing.source_path.is_some() {
+            return Ok(Some(existing));
+        }
+        return bind_component_source(conn, &existing.id, source_repository_id, source_path);
+    }
+    // 3. A brand-new component.
+    diesel::insert_into(design_components::table)
+        .values(NewDesignComponentRow {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            name: name.to_string(),
+            source_repository_id: source_repository_id.map(str::to_string),
+            source_path: Some(source_path.to_string()),
+            visual_hash: None,
+            template: String::new(),
+            params_json: None,
+            states_json: None,
+            created_at: now,
+            updated_at: now,
+            // A DISCOVERED bundle carries no authored field, the CSS slot included: the exception is
+            // an agent's decision, never something a scan invents.
+            css_slot_json: None,
+        })
+        .returning(DesignComponent::as_returning())
+        .get_result(conn)
+        .map(Some)
+}
+
+/// BIND a component row's on-disk PROVENANCE (`source_repository_id` + `source_path`), leaving its
+/// `name`, `template`, `params_json`, `states_json` and `visual_hash` untouched. The single write
+/// behind the two — and only two — legitimate re-anchorings of a catalogue row:
+///
+///   * MATERIALIZATION: a greenfield `[NEW]` (no source) the front now implements becomes `[DS]`
+///     ([`upsert_component_discovery`] step 2);
+///   * MOVE: a row whose source vanished, re-anchored onto the bundle carrying its EXACT content
+///     ([`crate::design::reconcile_moved_sources`]).
+///
+/// Everything else INSERTS a new row: a component is never re-pointed on a name alone.
+///
+/// Returns `None` when the row is NO LONGER THERE — an EXPLICIT delete
+/// (`design_delete_component` / the `/design` card) landed between the caller's snapshot and this
+/// statement. The same race [`delete_component_if_unauthored`] answers with
+/// [`ConditionalDelete::AlreadyGone`], and the same answer: nothing to do, nothing lost, the caller
+/// SKIPS the line rather than failing the whole inventory (audit 01KYHYW25GKJBRTZVTSXQAMP9F).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn bind_component_source(
+    conn: &mut SqliteConnection,
+    id: &str,
+    source_repository_id: Option<&str>,
+    source_path: &str,
+) -> QueryResult<Option<DesignComponent>> {
+    diesel::update(design_components::table.find(id))
+        .set((
+            design_components::source_repository_id.eq(source_repository_id.map(str::to_string)),
+            design_components::source_path.eq(Some(source_path.to_string())),
+            design_components::updated_at.eq(now_millis()),
+        ))
+        .returning(DesignComponent::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// UPDATE the AUTHORED content of an existing component — its `template` + `params_json` +
+/// `states_json` (+ `updated_at`) — leaving its identity, provenance (`source_*`) and
+/// `visual_hash` untouched. Returns the updated row, or `None` when the id is unknown.
+///
+/// The write half of the SYNTHESIS loop (review #45): an agent re-synthesizes a bundle (or fixes a
+/// botched synthesis) through this, rather than the delete-then-recreate the `[NEW]` author path
+/// forced. The hash is written separately, at synthesis time, by
+/// [`crate::design::mark_synthesized`].
+///
+/// The CSS SLOT is DELIBERATELY not one of the fields this replaces: it is written separately, by
+/// [`set_component_css_slot`], because an omission must not erase it. See [`CssSlotWrite`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn update_component_content(
+    conn: &mut SqliteConnection,
+    id: &str,
+    template: &str,
+    params_json: Option<&str>,
+    states_json: Option<&str>,
+) -> QueryResult<Option<DesignComponent>> {
+    let now = now_millis();
+    diesel::update(design_components::table.find(id))
+        .set((
+            design_components::template.eq(template.to_string()),
+            design_components::params_json.eq(params_json.map(str::to_string)),
+            design_components::states_json.eq(states_json.map(str::to_string)),
+            design_components::updated_at.eq(now),
+        ))
+        .returning(DesignComponent::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// WRITE (or REMOVE, or leave alone) a component's SCOPED CSS SLOT — v38, finding
+/// `01KYVMTWB71R0D0CT1SV88J8DX`. Separate from [`update_component_content`] on purpose: the slot is
+/// a REVIEWED EXCEPTION, and a re-synthesis of the template is not a decision about it, so
+/// [`CssSlotWrite::Keep`] (an argument the caller did not send) is a real state and not a shorthand
+/// for `NULL`. Returns the row as it now stands, or `None` when the id is unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_component_css_slot(
+    conn: &mut SqliteConnection,
+    id: &str,
+    css_slot: &CssSlotWrite,
+) -> QueryResult<Option<DesignComponent>> {
+    let slot: Option<String> = match css_slot {
+        CssSlotWrite::Keep => return get_component(conn, id),
+        CssSlotWrite::Set(blob) => Some(blob.clone()),
+        CssSlotWrite::Clear => None,
+    };
+    diesel::update(design_components::table.find(id))
+        .set((
+            design_components::css_slot_json.eq(slot),
+            design_components::updated_at.eq(now_millis()),
+        ))
+        .returning(DesignComponent::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// Fetch ONE component by id, or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_component(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> QueryResult<Option<DesignComponent>> {
+    design_components::table
+        .find(id)
+        .select(DesignComponent::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// Fetch ONE component by its `(project_id, name)` key, or `None` when unknown. The read the
+/// inventory / sync use to reconcile a discovered component against the stored one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_component_by_name(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    name: &str,
+) -> QueryResult<Option<DesignComponent>> {
+    design_components::table
+        .filter(design_components::project_id.eq(project_id))
+        .filter(design_components::name.eq(name))
+        .select(DesignComponent::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// LIST the components of `project_id`, ordered by `name` (then id) for a deterministic
+/// catalogue. The read backing the design-system catalogue (project scope, PDR-0010).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_components(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Vec<DesignComponent>> {
+    design_components::table
+        .filter(design_components::project_id.eq(project_id))
+        .order((design_components::name.asc(), design_components::id.asc()))
+        .select(DesignComponent::as_select())
+        .load(conn)
+}
+
+/// SET a component's `visual_hash` (+ bump `updated_at`), returning the updated row or `None`
+/// when the id is unknown. The single hash-write authority: since review #40 the stored hash is
+/// the md5 of the component BUNDLE's INPUTS (its source files) AS OF ITS LAST SYNTHESIS — written
+/// by [`crate::design::mark_synthesized`], never by the discovery pass, so an observed change can
+/// never look "already handled".
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn update_component_visual_hash(
+    conn: &mut SqliteConnection,
+    id: &str,
+    visual_hash: &str,
+) -> QueryResult<Option<DesignComponent>> {
+    let now = now_millis();
+    diesel::update(design_components::table.find(id))
+        .set((
+            design_components::visual_hash.eq(Some(visual_hash.to_string())),
+            design_components::updated_at.eq(now),
+        ))
+        .returning(DesignComponent::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// What a SCAN concluded about a component's ORPHAN status — the third value the old `bool` did not
+/// have (review 01KYHVAB5ZQN6K56SSSPV55EJY).
+///
+/// A run that, by its own admission, was NOT in a position to judge (its repo was never walked, the
+/// walk met an I/O failure, the repo discovered nothing at all) used to write `orphaned = false`,
+/// i.e. ERASE the verdict of a previous run that WAS in a position to judge. The `/design` badge,
+/// the "Orphelines" filter and `flagged_orphan_count` then all dropped to zero on a row that IS
+/// orphaned — durably so when the repo stays out of the workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanVerdict {
+    /// The scan REDISCOVERED the source: the row is ALIVE — lower the flag.
+    Alive,
+    /// The scan WAS in a position to judge and found the source GONE — raise the flag (keeping the
+    /// date it was first raised).
+    Orphaned,
+    /// This run COULD NOT TELL. `orphaned_at` is left EXACTLY as it is — neither raised nor lowered
+    /// — so the verdict of the last competent run survives.
+    Undecidable,
+}
+
+/// RECORD what the LAST SCAN saw of a component (v35): its bundle's OBSERVED input hash
+/// (`scanned_input_hash`, `None` = the scan did not see this source at all) and its
+/// [`OrphanVerdict`] (`orphaned_at`). Returns whether the row actually MOVED — the caller uses it so
+/// an idle inventory (nothing changed on disk) still writes nothing and notifies nothing.
+///
+/// The two facts are written TOGETHER because they are the same observation seen from two sides:
+/// "the scan discovered this source" (a hash, never an orphan) versus "the scan, being in a
+/// position to judge, found it gone" (no hash, possibly an orphan). Splitting them would allow the
+/// impossible in-between (a row both freshly hashed and flagged orphaned).
+///
+/// The two are NOT symmetrical in the undecidable case, and deliberately so: `scanned_input_hash`
+/// means "what THIS scan saw", so a run that saw nothing legitimately clears it; `orphaned_at` is a
+/// VERDICT, which only a run in a position to judge may change ([`OrphanVerdict::Undecidable`]
+/// leaves it untouched).
+///
+/// It touches NEITHER `visual_hash` (the SYNTHESIS hash — [`crate::design::mark_synthesized_at`] is
+/// its only writer) NOR any authored field: an observation is not a synthesis.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_component_scan_state(
+    conn: &mut SqliteConnection,
+    id: &str,
+    scanned_input_hash: Option<&str>,
+    verdict: OrphanVerdict,
+) -> QueryResult<bool> {
+    let Some(existing) = get_component(conn, id)? else {
+        return Ok(false);
+    };
+    let now = now_millis();
+    // An already-flagged orphan KEEPS its original `orphaned_at` (the date it was first found
+    // gone), so re-running the inventory never rewrites the history the UI shows — and a run that
+    // could not judge keeps it too, rather than erasing a competent run's verdict.
+    let orphaned_at = match (verdict, existing.orphaned_at) {
+        (OrphanVerdict::Alive, _) => None,
+        (OrphanVerdict::Orphaned, Some(at)) => Some(at),
+        (OrphanVerdict::Orphaned, None) => Some(now),
+        (OrphanVerdict::Undecidable, at) => at,
+    };
+    if existing.scanned_input_hash.as_deref() == scanned_input_hash
+        && orphaned_at == existing.orphaned_at
+    {
+        return Ok(false); // nothing observed changed — an idle scan writes nothing
+    }
+    diesel::update(design_components::table.find(id))
+        .set((
+            design_components::scanned_input_hash.eq(scanned_input_hash.map(str::to_string)),
+            design_components::orphaned_at.eq(orphaned_at),
+            design_components::updated_at.eq(now),
+        ))
+        .execute(conn)?;
+    Ok(true)
+}
+
+/// REMOVE a component by id. Returns whether a row was removed (`false` = unknown id, an
+/// idempotent no-op).
+///
+/// The UNCONDITIONAL delete — the EXPLICIT gesture (`design_delete_component`, the `/design` card's
+/// delete). An AUTOMATIC delete (the inventory's élagage) must go through
+/// [`delete_component_if_unauthored`] instead: it decides on a snapshot, so it may not destroy on
+/// the strength of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn delete_component(conn: &mut SqliteConnection, id: &str) -> QueryResult<bool> {
+    let n = diesel::delete(design_components::table.find(id)).execute(conn)?;
+    Ok(n > 0)
+}
+
+/// The OUTCOME of the CONDITIONAL component delete ([`delete_component_if_unauthored`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalDelete {
+    /// The row was REALLY removed by this statement — the only outcome an automatic élagage may
+    /// count as "pruned".
+    Deleted,
+    /// The row is STILL THERE and now carries authored content: the condition REFUSED the delete.
+    /// A concurrent write landed between the caller's snapshot and this statement.
+    KeptContentAppeared,
+    /// The row is no longer there — something else (an explicit delete) removed it first. Nothing
+    /// was done and nothing was lost.
+    AlreadyGone,
+}
+
+/// The SQL twin of [`crate::design::carries_synthesis`], NEGATED: "this row carries NO authored
+/// content". Kept in ONE place, and pinned against the Rust predicate by
+/// `crate::design::tests::the_sql_delete_condition_matches_carries_synthesis_exactly`.
+///
+/// The four authored fields, and only them: the Handlebars `template`, the synthesis `visual_hash`,
+/// and the `params_json` / `states_json` shapes a `[NEW]` can be authored with WITHOUT a template
+/// (`proto_author_component` makes it optional). A row DISCOVERED by a scan has all four empty by
+/// construction, so a glob change still prunes exactly what it used to.
+///
+/// The blank test spells its character set out (`char(32)` space, `char(9)` tab, `char(10)` LF,
+/// `char(11)` VT, `char(12)` FF, `char(13)` CR) because SQLite's one-argument `trim(X)` strips
+/// SPACES ONLY, where Rust's `str::trim` strips every whitespace. On the exotic remainder (a
+/// template of nothing but a NBSP) the two still diverge — in the SAFE direction: SQL trims LESS, so
+/// it SPARES a row Rust calls blank. It can never delete one Rust would keep.
+const UNAUTHORED_COMPONENT_SQL: &str = "\
+     trim(template, char(32)||char(9)||char(10)||char(11)||char(12)||char(13)) = '' \
+     AND visual_hash IS NULL \
+     AND (params_json IS NULL \
+          OR trim(params_json, char(32)||char(9)||char(10)||char(11)||char(12)||char(13)) = '') \
+     AND (states_json IS NULL \
+          OR trim(states_json, char(32)||char(9)||char(10)||char(11)||char(12)||char(13)) = '')";
+
+/// REMOVE a component by id ONLY IF it still carries NO authored content, ATOMICALLY — the delete
+/// the AUTOMATIC élagage uses (review 01KYHV8DJ7XZG9F5TCRG2Q17Q1, CRITICAL).
+///
+/// # Why the condition lives in the `DELETE`, not above it
+///
+/// `inventory_project` reads the catalogue into a SNAPSHOT, walks every repo, then deletes. Between
+/// the read and the write, another session's `design_refresh_component` — which is atomic FOR
+/// ITSELF and returns OK to its agent — can commit an LLM synthesis onto the very row the snapshot
+/// judged empty. Any guard evaluated on that snapshot (however many of them) is judging a state
+/// that no longer exists, and the `DELETE` then destroys work an MCP tool has just acknowledged.
+/// Re-READING the row before deleting only shrinks the window; it does not close it.
+///
+/// So the condition is part of the statement: `DELETE FROM design_components WHERE id = ? AND
+/// <no authored content>`, inside a transaction. A concurrent write that puts content on the row
+/// makes the delete affect ZERO rows — the row is SPARED instead of destroyed — and the caller is
+/// told which of the two things happened, so it can count only the deletions it really made and
+/// report the spared row under its own reason.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn delete_component_if_unauthored(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> QueryResult<ConditionalDelete> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::Bool;
+    conn.transaction(|conn| {
+        let removed = diesel::delete(
+            design_components::table
+                .find(id)
+                .filter(sql::<Bool>(UNAUTHORED_COMPONENT_SQL)),
+        )
+        .execute(conn)?;
+        if removed > 0 {
+            return Ok(ConditionalDelete::Deleted);
+        }
+        // ZERO rows affected has exactly two causes, and they are not the same event: the row is
+        // still there but now carries content (SPARED — the race this delete exists for), or it is
+        // gone entirely (an explicit delete beat us to it — nothing to report as spared).
+        Ok(match get_component(conn, id)? {
+            Some(_) => ConditionalDelete::KeptContentAppeared,
+            None => ConditionalDelete::AlreadyGone,
+        })
+    })
+}
+
+// --- PROTOTYPE domain (v2.7 Phase 2, v31, PDR-0009/0010) -------------------
+//
+// The prototype as the 1:1 ANNEXE of a Spec, ported from Depot to the frozen decisions of this
+// PRD. This block is the PERSISTENCE authority (CRUD only); the DOMAIN EVENTS (task
+// 01KY4DFP6DRG8TK7J4VD4TSNQA) and the agent-session SEAM (task 01KY50ZPVSMZPSY351VJNR7Z0F)
+// build ON this. The tree is `Prototype → Page → PageVersion → Variant`, with whole-design
+// ROUNDS (the rollback unit) and pre-dev review FEEDBACK anchored to a tree node.
+//
+// KEY MODEL CHOICES (departures from Depot, per PDR-0009/0010):
+//   * 1 proto/Spec (UNIQUE(spec_id)), not N-per-revision.
+//   * The variant stores a COMPOSITION (`composition_json`), not an HTML blob.
+//   * States are a variant column (`states_json`), not a table (Depot: declared in the HTML).
+//   * Comments are anchored to a `node_key` (a TREE NODE, not a CSS selector) and OWNED by the
+//     prototype (durable cross-rounds — carried / to-re-anchor). They are a PRE-DEV review
+//     artifact and are NEVER transmitted to the coder (no read path here surfaces them to a
+//     coder context — the corrected composition ships, not the comments).
+//   * Two-tier election: `is_main` (AGENT reco, per version) ≠ `chosen_variant_id` (USER RETENU,
+//     round-scoped on the manifest).
+
+/// `prototype_feedback.status` — open (not yet addressed).
+pub const FEEDBACK_STATUS_OPEN: &str = "open";
+/// `prototype_feedback.status` — resolved (the agent addressed it, annotated for the audit log).
+pub const FEEDBACK_STATUS_RESOLVED: &str = "resolved";
+/// `prototype_feedback.status` — ignored (deliberately not addressed; a reason is required).
+pub const FEEDBACK_STATUS_IGNORED: &str = "ignored";
+/// `prototype_feedback.anchor_status` — the anchored node still exists → the comment is CARRIED
+/// across rounds ("porté").
+pub const ANCHOR_STATUS_ANCHORED: &str = "anchored";
+/// `prototype_feedback.anchor_status` — the anchored node vanished → the comment is "à
+/// ré-ancrer" (surfaced for re-anchoring, code-review style).
+pub const ANCHOR_STATUS_ORPHANED: &str = "orphaned";
+/// `prototype_feedback.author_kind` — an agent SESSION authored the comment.
+pub const FEEDBACK_AUTHOR_SESSION: &str = "session";
+/// `prototype_feedback.author_kind` — a human USER authored the comment.
+pub const FEEDBACK_AUTHOR_USER: &str = "user";
+
+// --- PROTOTYPE domain events (v2.7 Phase 2, task 01KY4DFP6DRG8TK7J4VD4TSNQA) ------
+//
+// The prototype mutations that MATTER to an observer (present a round, elect a variant, raise a
+// pre-dev comment, resolve one) each record a `domain_events` OUTBOX row INSIDE their own
+// transaction — exactly like the Spec/task lifecycle events. This makes the prototype's activity
+// DURABLE and ATOMIC with the mutation it describes, and it is the FIRST HALF of the agent
+// "contrat d'outil": every meaningful action leaves a visible, ordered trace, so no action of the
+// agent is unseen ("aucune action/navigation inaperçue" — PDR Impl Decisions). Every event
+// carries the concerned `prototype_id` + `spec_id` in its payload so a Spec- or workspace-scoped
+// feed can correlate it, plus the specific entity id (round / variant / feedback).
+
+/// The `aggregate` string for a prototype-domain event.
+const AGGREGATE_PROTOTYPE: &str = "prototype";
+/// A round was PRESENTED (frozen) to the user.
+pub const EVENT_PROTO_ROUND_PRESENTED: &str = "proto.round_presented";
+/// A variant was ELECTED (the USER's round-scoped RETENU).
+pub const EVENT_PROTO_VARIANT_ELECTED: &str = "proto.variant_elected";
+/// A pre-dev review comment was CREATED.
+pub const EVENT_PROTO_FEEDBACK_CREATED: &str = "proto.feedback_created";
+/// A pre-dev review comment was RESOLVED.
+pub const EVENT_PROTO_FEEDBACK_RESOLVED: &str = "proto.feedback_resolved";
+
+/// Resolve a prototype's correlation (`project_id`, anchor `workspace_id`, `spec_id`) inside the
+/// current transaction, by joining through its Spec — `None` when the prototype id does not
+/// resolve. The `workspace_id` is the Spec's anchor (`None` until posed). Read from the mutated
+/// prototype so an event is correlated for the mutation it describes.
+fn prototype_correlation(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+) -> QueryResult<Option<(String, Option<String>, String)>> {
+    let Some(spec_id) = prototypes::table
+        .find(prototype_id)
+        .select(prototypes::spec_id)
+        .first::<String>(conn)
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let (project_id, workspace_id) = match spec_correlation(conn, &spec_id)? {
+        Some(c) => c,
+        // The prototype resolves but its Spec vanished mid-transaction — no correlation to record.
+        None => return Ok(None),
+    };
+    Ok(Some((project_id, workspace_id, spec_id)))
+}
+
+/// Record ONE `domain_events` outbox row for a PROTOTYPE-domain mutation, INSIDE the caller's
+/// transaction. `event_type` is one of the `proto.*` wire strings; `prototype_id` is the
+/// concerned prototype (its correlation is resolved through its Spec). `extra` is folded into the
+/// payload alongside the always-present `prototype_id` / `spec_id` (e.g. the `round_id` /
+/// `variant_id` / `feedback_id` the event is about). A correlation that does not resolve (the
+/// prototype/Spec vanished) is a SILENT no-op — the mutation itself already succeeded and must
+/// not be rolled back by a missing audit correlation. The `source` is `"mcp"` (the prototype
+/// action surface is agent/MCP-driven, PDR-0009), and the UI mutates through the same authority.
+fn record_prototype_event(
+    conn: &mut SqliteConnection,
+    event_type: &str,
+    prototype_id: &str,
+    extra: serde_json::Value,
+) -> QueryResult<()> {
+    let Some((project_id, workspace_id, spec_id)) = prototype_correlation(conn, prototype_id)?
+    else {
+        return Ok(());
+    };
+    let mut payload = serde_json::json!({ "prototype_id": prototype_id, "spec_id": spec_id });
+    if let (Some(obj), Some(extra_obj)) = (payload.as_object_mut(), extra.as_object()) {
+        for (k, v) in extra_obj {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    record_domain_event(
+        conn,
+        NewDomainEvent {
+            project_id,
+            workspace_id,
+            aggregate: AGGREGATE_PROTOTYPE.to_string(),
+            event_type: event_type.to_string(),
+            source: "mcp".to_string(),
+            actor: None,
+            payload: payload.to_string(),
+            created_at: 0,
+        },
+    )?;
+    Ok(())
+}
+
+/// A `prototypes` row: ONE Spec's prototype (the annexe 1:1, PDR-0009). `Serialize` for the
+/// IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = prototypes)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Prototype {
+    pub id: String,
+    pub spec_id: String,
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Soft-removed (archived) prototype, `None` = live.
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = prototypes)]
+struct NewPrototypeRow {
+    id: String,
+    spec_id: String,
+    description: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+/// CREATE the prototype of `spec_id` and seed its first (`v1`) round, atomically. Enforces "1
+/// proto/Spec" (PDR-0009): a second create for the same Spec fails on the `UNIQUE(spec_id)`
+/// index (the caller surfaces the conflict). Returns the stored [`Prototype`]. The seeded round
+/// is the always-present "current" round the manifest hangs off.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_prototype(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    description: Option<&str>,
+) -> QueryResult<Prototype> {
+    conn.transaction(|conn| {
+        let now = now_millis();
+        let prototype = diesel::insert_into(prototypes::table)
+            .values(NewPrototypeRow {
+                id: Uuid::now_v7().to_string(),
+                spec_id: spec_id.to_string(),
+                description: description.map(str::to_string),
+                created_at: now,
+                updated_at: now,
+            })
+            .returning(Prototype::as_returning())
+            .get_result::<Prototype>(conn)?;
+        // Seed the always-present current round (Depot: createPrototype seeds an empty v1).
+        insert_round(conn, &prototype.id, "v1", None, 0)?;
+        Ok(prototype)
+    })
+}
+
+/// Fetch ONE prototype by id, or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_prototype(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Prototype>> {
+    prototypes::table
+        .find(id)
+        .select(Prototype::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// Fetch the prototype of `spec_id`, or `None` when the Spec has none (the "1 proto/Spec" read).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_prototype_for_spec(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+) -> QueryResult<Option<Prototype>> {
+    prototypes::table
+        .filter(prototypes::spec_id.eq(spec_id))
+        .select(Prototype::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// ARCHIVE (soft-remove) a prototype, keeping it for audit/rollback. Returns the updated row or
+/// `None` when the id is unknown. Idempotent (re-archiving refreshes the timestamp).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn archive_prototype(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Prototype>> {
+    let now = now_millis();
+    diesel::update(prototypes::table.find(id))
+        .set((
+            prototypes::archived_at.eq(Some(now)),
+            prototypes::updated_at.eq(now),
+        ))
+        .returning(Prototype::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// A `prototype_pages` row: a logical screen of the prototype. `Serialize` for the IPC/MCP
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = prototype_pages)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct PrototypePage {
+    pub id: String,
+    pub prototype_id: String,
+    pub slug: String,
+    pub title: String,
+    pub position: i32,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = prototype_pages)]
+struct NewPrototypePageRow {
+    id: String,
+    prototype_id: String,
+    slug: String,
+    title: String,
+    position: i32,
+    created_at: i64,
+}
+
+/// CREATE a page under `prototype_id`. `slug` is UNIQUE per prototype (the nav convention key);
+/// a duplicate slug fails on the index. Returns the stored [`PrototypePage`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_page(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+    slug: &str,
+    title: &str,
+    position: i32,
+) -> QueryResult<PrototypePage> {
+    diesel::insert_into(prototype_pages::table)
+        .values(NewPrototypePageRow {
+            id: Uuid::now_v7().to_string(),
+            prototype_id: prototype_id.to_string(),
+            slug: slug.to_string(),
+            title: title.to_string(),
+            position,
+            created_at: now_millis(),
+        })
+        .returning(PrototypePage::as_returning())
+        .get_result(conn)
+}
+
+/// LIST the pages of `prototype_id`, ordered by `position` then `slug` (deterministic).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_pages(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+) -> QueryResult<Vec<PrototypePage>> {
+    prototype_pages::table
+        .filter(prototype_pages::prototype_id.eq(prototype_id))
+        .order((prototype_pages::position.asc(), prototype_pages::slug.asc()))
+        .select(PrototypePage::as_select())
+        .load(conn)
+}
+
+/// The prototype's pages as the SEAM reads them: every page of the prototype, plus which of them the
+/// FROZEN round pins. Resolving a destination against BOTH is what lets the seam say not only
+/// "where" but "is that inside the design I am handing you".
+struct PageDirectory<'a> {
+    /// Every page of the prototype (id → (slug, title)).
+    pages: &'a [PrototypePage],
+    /// The page ids the frozen round's manifest pins.
+    pinned: Vec<String>,
+}
+
+impl PageDirectory<'_> {
+    /// Resolve ONE stored `page_id` into what the coder reads. Never `None`: an id that resolves to
+    /// nothing comes back NAMED as unknown, because a link the design states and nobody can follow
+    /// is exactly what the coder must be told about.
+    fn resolve(&self, page_id: &str) -> ElectedNavigation {
+        match self.pages.iter().find(|p| p.id == page_id) {
+            Some(page) => ElectedNavigation {
+                page_id: page_id.to_string(),
+                slug: Some(page.slug.clone()),
+                title: Some(page.title.clone()),
+                status: if self.pinned.iter().any(|id| id == page_id) {
+                    NAVIGATION_PINNED
+                } else {
+                    NAVIGATION_UNPINNED
+                }
+                .to_string(),
+            },
+            None => ElectedNavigation {
+                page_id: page_id.to_string(),
+                slug: None,
+                title: None,
+                status: NAVIGATION_UNKNOWN.to_string(),
+            },
+        }
+    }
+}
+
+/// The prototype's pages as the RENDER needs them — the page DIRECTORY a node's `navigate_to`
+/// resolves against (finding `01KYW34347CZSNXCYS35KDG3EY`).
+///
+/// ONE query, in the SAME deterministic order as [`list_pages`], projected onto the three fields a
+/// link needs: the ID it is stored as, and the SLUG + TITLE every surface displays. Written here
+/// rather than at each call site so the frame, the agent's preview and any future caller all resolve
+/// a destination the same way.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn render_pages(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+) -> QueryResult<Vec<crate::render::RenderPage>> {
+    Ok(list_pages(conn, prototype_id)?
+        .into_iter()
+        .map(|p| crate::render::RenderPage {
+            id: p.id,
+            slug: p.slug,
+            title: p.title,
+        })
+        .collect())
+}
+
+/// Fetch ONE page by id, or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_page(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<PrototypePage>> {
+    prototype_pages::table
+        .find(id)
+        .select(PrototypePage::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// A `prototype_page_versions` row: a FROZEN iteration of a page. `Serialize` for the IPC/MCP
+/// boundary. `archived_at` set = superseded but kept readable (rollback).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = prototype_page_versions)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct PrototypePageVersion {
+    pub id: String,
+    pub page_id: String,
+    pub label: String,
+    pub summary: Option<String>,
+    pub created_at: i64,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = prototype_page_versions)]
+struct NewPrototypePageVersionRow {
+    id: String,
+    page_id: String,
+    label: String,
+    summary: Option<String>,
+    created_at: i64,
+}
+
+/// CREATE a version of `page_id`. `label` is UNIQUE per page. A version is FROZEN on creation
+/// (the agent iterates by minting a NEW version, never mutating). Returns the stored row.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_page_version(
+    conn: &mut SqliteConnection,
+    page_id: &str,
+    label: &str,
+    summary: Option<&str>,
+) -> QueryResult<PrototypePageVersion> {
+    diesel::insert_into(prototype_page_versions::table)
+        .values(NewPrototypePageVersionRow {
+            id: Uuid::now_v7().to_string(),
+            page_id: page_id.to_string(),
+            label: label.to_string(),
+            summary: summary.map(str::to_string),
+            created_at: now_millis(),
+        })
+        .returning(PrototypePageVersion::as_returning())
+        .get_result(conn)
+}
+
+/// LIST the versions of `page_id`, newest first (`created_at` desc, id tiebreak). When
+/// `include_archived` is false, ARCHIVED versions are excluded (the live iterations); when true,
+/// every version is returned (the rollback history).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_page_versions(
+    conn: &mut SqliteConnection,
+    page_id: &str,
+    include_archived: bool,
+) -> QueryResult<Vec<PrototypePageVersion>> {
+    let mut query = prototype_page_versions::table
+        .filter(prototype_page_versions::page_id.eq(page_id))
+        .into_boxed();
+    if !include_archived {
+        query = query.filter(prototype_page_versions::archived_at.is_null());
+    }
+    query
+        .order((
+            prototype_page_versions::created_at.desc(),
+            prototype_page_versions::id.desc(),
+        ))
+        .select(PrototypePageVersion::as_select())
+        .load(conn)
+}
+
+/// Fetch ONE page version by id, or `None` when unknown. The existence read the proto CREATION
+/// tools (`proto_add_variant`) use to validate a `page_version_id` before minting a variant under
+/// it (an unknown id is a structured `invalid_id`, never a raw FK failure).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_page_version(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> QueryResult<Option<PrototypePageVersion>> {
+    prototype_page_versions::table
+        .find(id)
+        .select(PrototypePageVersion::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// The LATEST non-archived version of `page_id` (the one a fresh round pins by default), or
+/// `None` when the page has no live version.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn latest_page_version(
+    conn: &mut SqliteConnection,
+    page_id: &str,
+) -> QueryResult<Option<PrototypePageVersion>> {
+    prototype_page_versions::table
+        .filter(prototype_page_versions::page_id.eq(page_id))
+        .filter(prototype_page_versions::archived_at.is_null())
+        .order((
+            prototype_page_versions::created_at.desc(),
+            prototype_page_versions::id.desc(),
+        ))
+        .select(PrototypePageVersion::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// ARCHIVE a page version (freeze it out of the live set, keep it readable for ROLLBACK).
+/// Returns the updated row or `None` when unknown. Idempotent.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn archive_page_version(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> QueryResult<Option<PrototypePageVersion>> {
+    diesel::update(prototype_page_versions::table.find(id))
+        .set(prototype_page_versions::archived_at.eq(Some(now_millis())))
+        .returning(PrototypePageVersion::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// A `prototype_variants` row: one concrete rendering of a (page, version). `Serialize` for the
+/// IPC/MCP boundary. `composition_json` is the component TREE (PDR-0010); `states_json` the
+/// declared states; `is_main` the AGENT's within-version recommendation (≠ the USER's RETENU).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = prototype_variants)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct PrototypeVariant {
+    pub id: String,
+    pub page_version_id: String,
+    pub label: String,
+    pub title: String,
+    /// The serialized component tree (NOT an HTML blob, PDR-0010).
+    pub composition_json: String,
+    /// The declared states (JSON array of names — the `window.__nyxStates` port), `None` when
+    /// the variant declares none.
+    pub states_json: Option<String>,
+    /// The AGENT's within-version recommendation (`is_main` — reco de l'agent, PDR-0009).
+    pub is_main: bool,
+    pub position: i32,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = prototype_variants)]
+struct NewPrototypeVariantRow {
+    id: String,
+    page_version_id: String,
+    label: String,
+    title: String,
+    composition_json: String,
+    states_json: Option<String>,
+    is_main: bool,
+    position: i32,
+    created_at: i64,
+}
+
+/// The descriptive fields of a variant, the input to [`create_variant`]. `Default` + struct
+/// update so a caller sets only what it knows (an empty `composition_json` is a valid stub).
+#[derive(Debug, Clone, Default)]
+pub struct VariantInput {
+    pub label: String,
+    pub title: String,
+    pub composition_json: String,
+    pub states_json: Option<String>,
+    pub position: i32,
+}
+
+/// CREATE a variant of `page_version_id`. `label` is UNIQUE per version. `is_main` is left FALSE
+/// (the AGENT elects it separately via [`set_main_variant`]). Returns the stored variant.
+///
+/// GUARDED by the "élection figée" invariant: refused with [`RoundMutationError::RoundLocked`] when
+/// `page_version_id` is the version PINNED for its page in a design-LOCKED round (what the coder SEAM
+/// exposes). Adding a sibling variant there could flip the page's `effective_retained_variant` — a
+/// mono-variant page "retenue d'office" would gain a sibling and become ambiguous (`Some(only)` →
+/// `None`), drifting the composition [`elected_composition`] exposes. Iterate by opening a NEW round
+/// (rebase), never by growing what a frozen round pins (PDR-0009). Creating on a NON-locked round (or
+/// under a version not pinned in the frozen round) is unaffected.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_variant(
+    conn: &mut SqliteConnection,
+    page_version_id: &str,
+    input: &VariantInput,
+) -> Result<PrototypeVariant, RoundMutationError> {
+    if let Some(locked_round_id) = page_version_frozen_by_lock(conn, page_version_id)? {
+        return Err(RoundMutationError::RoundLocked { locked_round_id });
+    }
+    let variant = diesel::insert_into(prototype_variants::table)
+        .values(NewPrototypeVariantRow {
+            id: Uuid::now_v7().to_string(),
+            page_version_id: page_version_id.to_string(),
+            label: input.label.clone(),
+            title: input.title.clone(),
+            composition_json: input.composition_json.clone(),
+            states_json: input.states_json.clone(),
+            is_main: false,
+            position: input.position,
+            created_at: now_millis(),
+        })
+        .returning(PrototypeVariant::as_returning())
+        .get_result(conn)?;
+    Ok(variant)
+}
+
+/// LIST the variants of `page_version_id`, ordered by `position` then `label`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_variants(
+    conn: &mut SqliteConnection,
+    page_version_id: &str,
+) -> QueryResult<Vec<PrototypeVariant>> {
+    prototype_variants::table
+        .filter(prototype_variants::page_version_id.eq(page_version_id))
+        .order((
+            prototype_variants::position.asc(),
+            prototype_variants::label.asc(),
+        ))
+        .select(PrototypeVariant::as_select())
+        .load(conn)
+}
+
+/// Fetch ONE variant by id, or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_variant(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<PrototypeVariant>> {
+    prototype_variants::table
+        .find(id)
+        .select(PrototypeVariant::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// REPLACE a variant's `composition_json` (the component TREE), returning the updated variant or
+/// `None` when the id is unknown. The persistence primitive of the composant-detail's "params
+/// ENREGISTRÉS PAR NŒUD" (v2.7 Phase 3, task 01KY50ZPAYP0JN5G353JTZ6CGG): the caller edits ONE
+/// node's params in the tree (`nyx_core::render::set_node_params`) and writes the whole tree back
+/// here — the proto stays a COMPOSITION (never an HTML blob, PDR-0010).
+///
+/// GUARDED by the "élection figée" invariant: refused with [`RoundMutationError::RoundLocked`] when
+/// this variant is the EFFECTIVE RETENU of its page in a design-LOCKED round (what the coder SEAM
+/// exposes) — editing it in place would drift the frozen composition. Iterate by opening a NEW round
+/// (rebase) with a fresh version, never by mutating what a frozen round pins (PDR-0009).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn update_variant_composition(
+    conn: &mut SqliteConnection,
+    id: &str,
+    composition_json: &str,
+) -> Result<Option<PrototypeVariant>, RoundMutationError> {
+    if let Some(locked_round_id) = variant_frozen_by_lock(conn, id)? {
+        return Err(RoundMutationError::RoundLocked { locked_round_id });
+    }
+    let updated = diesel::update(prototype_variants::table.find(id))
+        .set(prototype_variants::composition_json.eq(composition_json.to_string()))
+        .returning(PrototypeVariant::as_returning())
+        .get_result(conn)
+        .optional()?;
+    Ok(updated)
+}
+
+/// ELECT `variant_id` as the AGENT's `is_main` for its page version, ATOMICALLY: clear `is_main`
+/// on every sibling variant of the same page version, then set it on the chosen one — so AT MOST
+/// ONE main per version holds (PDR-0009: `is_main` = reco de l'agent, reversible). Returns the
+/// elected [`PrototypeVariant`], or `None` when `variant_id` is unknown. This is the AGENT's
+/// recommendation only — distinct from the USER's round-scoped RETENU ([`elect_round_page_variant`]):
+/// it writes `prototype_variants.is_main` and NOTHING else, so it can never pose a RETENU
+/// (`prototype_round_pages.chosen_variant_id` is another table, written only by
+/// [`elect_round_page_variant`]).
+///
+/// GUARDED by the "élection figée" invariant, exactly like [`create_variant`]: refused with
+/// [`RoundMutationError::RoundLocked`] when the variant's page-version is the one PINNED for its page
+/// in a design-LOCKED round. The reco is a mutation of what a frozen round pins — iterate by opening
+/// a NEW round (rebase), never by re-annotating the frozen one (PDR-0009).
+pub fn set_main_variant(
+    conn: &mut SqliteConnection,
+    variant_id: &str,
+) -> Result<Option<PrototypeVariant>, RoundMutationError> {
+    let Some(variant) = get_variant(conn, variant_id)? else {
+        return Ok(None);
+    };
+    if let Some(locked_round_id) = page_version_frozen_by_lock(conn, &variant.page_version_id)? {
+        return Err(RoundMutationError::RoundLocked { locked_round_id });
+    }
+    let elected = conn.transaction(|conn| {
+        // Clear the flag on all siblings (incl. the target), then set it on the target — one
+        // main per version.
+        diesel::update(
+            prototype_variants::table
+                .filter(prototype_variants::page_version_id.eq(&variant.page_version_id)),
+        )
+        .set(prototype_variants::is_main.eq(false))
+        .execute(conn)?;
+        diesel::update(prototype_variants::table.find(variant_id))
+            .set(prototype_variants::is_main.eq(true))
+            .returning(PrototypeVariant::as_returning())
+            .get_result(conn)
+            .optional()
+    })?;
+    Ok(elected)
+}
+
+/// A `prototype_feedback` row: a PRE-DEV review comment, anchored to a tree node and OWNED by the
+/// prototype (durable cross-rounds). `Serialize` for the IPC/MCP boundary. NON transmis au coder
+/// (PDR-0009) — no read here feeds a coder context.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = prototype_feedback)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct PrototypeFeedback {
+    pub id: String,
+    pub prototype_id: String,
+    /// WHERE the comment was raised (a PLAIN id — the comment outlives this variant).
+    pub origin_variant_id: Option<String>,
+    /// THE ANCHOR: a stable key of a NODE of the component tree (not a CSS selector, PDR-0009).
+    pub node_key: Option<String>,
+    /// `anchored` (carried / "porté") | `orphaned` ("à ré-ancrer").
+    pub anchor_status: String,
+    pub body: String,
+    /// `open` | `resolved` | `ignored`.
+    pub status: String,
+    pub resolution_note: Option<String>,
+    pub resolution_via_variant_id: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub ignored_reason: Option<String>,
+    pub ignored_at: Option<i64>,
+    /// `session` | `user` (author = session/utilisateur, résolu à l'exécution).
+    pub author_kind: String,
+    pub author_ref: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = prototype_feedback)]
+struct NewPrototypeFeedbackRow {
+    id: String,
+    prototype_id: String,
+    origin_variant_id: Option<String>,
+    node_key: Option<String>,
+    anchor_status: String,
+    body: String,
+    status: String,
+    author_kind: String,
+    author_ref: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+/// The input to [`create_feedback`] — a new pre-dev review comment. `node_key` is the tree-node
+/// anchor (`None` = a global/free-form comment); `author_kind` is `session` | `user`.
+#[derive(Debug, Clone, Default)]
+pub struct FeedbackInput {
+    pub origin_variant_id: Option<String>,
+    pub node_key: Option<String>,
+    pub body: String,
+    pub author_kind: String,
+    pub author_ref: Option<String>,
+}
+
+/// CREATE a pre-dev review comment on `prototype_id`, `open` and `anchored`. Returns the stored
+/// [`PrototypeFeedback`]. The comment is owned by the PROTOTYPE (durable cross-rounds), anchored
+/// by `node_key` to a tree node (PDR-0009). It is a REVIEW artifact — never transmitted to the
+/// coder.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_feedback(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+    input: &FeedbackInput,
+) -> QueryResult<PrototypeFeedback> {
+    conn.transaction(|conn| {
+        let now = now_millis();
+        let feedback = diesel::insert_into(prototype_feedback::table)
+            .values(NewPrototypeFeedbackRow {
+                id: Uuid::now_v7().to_string(),
+                prototype_id: prototype_id.to_string(),
+                origin_variant_id: input.origin_variant_id.clone(),
+                node_key: input.node_key.clone(),
+                anchor_status: ANCHOR_STATUS_ANCHORED.to_string(),
+                body: input.body.clone(),
+                status: FEEDBACK_STATUS_OPEN.to_string(),
+                author_kind: input.author_kind.clone(),
+                author_ref: input.author_ref.clone(),
+                created_at: now,
+                updated_at: now,
+            })
+            .returning(PrototypeFeedback::as_returning())
+            .get_result::<PrototypeFeedback>(conn)?;
+        record_prototype_event(
+            conn,
+            EVENT_PROTO_FEEDBACK_CREATED,
+            prototype_id,
+            serde_json::json!({ "feedback_id": feedback.id }),
+        )?;
+        Ok(feedback)
+    })
+}
+
+/// LIST the comments of `prototype_id`, newest first (`created_at` desc, id tiebreak).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_feedback(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+) -> QueryResult<Vec<PrototypeFeedback>> {
+    prototype_feedback::table
+        .filter(prototype_feedback::prototype_id.eq(prototype_id))
+        .order((
+            prototype_feedback::created_at.desc(),
+            prototype_feedback::id.desc(),
+        ))
+        .select(PrototypeFeedback::as_select())
+        .load(conn)
+}
+
+/// Fetch ONE comment by id, or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_feedback(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> QueryResult<Option<PrototypeFeedback>> {
+    prototype_feedback::table
+        .find(id)
+        .select(PrototypeFeedback::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// RESOLVE a comment (the agent addressed it): set `status = resolved`, stamp `resolved_at`, and
+/// record the optional resolution annotation (`resolution_note`, the `resolution_via_variant_id`
+/// that addressed it). Returns the updated row or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn resolve_feedback(
+    conn: &mut SqliteConnection,
+    id: &str,
+    resolution_note: Option<&str>,
+    resolution_via_variant_id: Option<&str>,
+) -> QueryResult<Option<PrototypeFeedback>> {
+    conn.transaction(|conn| {
+        let now = now_millis();
+        let updated = diesel::update(prototype_feedback::table.find(id))
+            .set((
+                prototype_feedback::status.eq(FEEDBACK_STATUS_RESOLVED),
+                prototype_feedback::resolution_note.eq(resolution_note.map(str::to_string)),
+                prototype_feedback::resolution_via_variant_id
+                    .eq(resolution_via_variant_id.map(str::to_string)),
+                prototype_feedback::resolved_at.eq(Some(now)),
+                prototype_feedback::updated_at.eq(now),
+            ))
+            .returning(PrototypeFeedback::as_returning())
+            .get_result::<PrototypeFeedback>(conn)
+            .optional()?;
+        if let Some(feedback) = &updated {
+            record_prototype_event(
+                conn,
+                EVENT_PROTO_FEEDBACK_RESOLVED,
+                &feedback.prototype_id,
+                serde_json::json!({ "feedback_id": feedback.id }),
+            )?;
+        }
+        Ok(updated)
+    })
+}
+
+/// IGNORE a comment (deliberately not addressed): set `status = ignored`, stamp `ignored_at`, and
+/// record the required `ignored_reason` (an ignored comment without a stated reason loses its
+/// audit value). Returns the updated row or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn ignore_feedback(
+    conn: &mut SqliteConnection,
+    id: &str,
+    ignored_reason: &str,
+) -> QueryResult<Option<PrototypeFeedback>> {
+    let now = now_millis();
+    diesel::update(prototype_feedback::table.find(id))
+        .set((
+            prototype_feedback::status.eq(FEEDBACK_STATUS_IGNORED),
+            prototype_feedback::ignored_reason.eq(Some(ignored_reason.to_string())),
+            prototype_feedback::ignored_at.eq(Some(now)),
+            prototype_feedback::updated_at.eq(now),
+        ))
+        .returning(PrototypeFeedback::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// SET a comment's `anchor_status` — `anchored` (carried / "porté") or `orphaned` ("à
+/// ré-ancrer") — as a new round reconciles which tree nodes still exist. Returns the updated row
+/// or `None` when unknown. The durability-cross-rounds write (PDR-0009).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_feedback_anchor_status(
+    conn: &mut SqliteConnection,
+    id: &str,
+    anchor_status: &str,
+) -> QueryResult<Option<PrototypeFeedback>> {
+    diesel::update(prototype_feedback::table.find(id))
+        .set((
+            prototype_feedback::anchor_status.eq(anchor_status.to_string()),
+            prototype_feedback::updated_at.eq(now_millis()),
+        ))
+        .returning(PrototypeFeedback::as_returning())
+        .get_result(conn)
+        .optional()
+}
+
+/// A `prototype_rounds` row: a whole-design ROLLBACK round. `Serialize` for the IPC/MCP boundary.
+/// The current round is the max-`position` one; `presented_at` set = frozen (feedback opens a new
+/// round).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = prototype_rounds)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct PrototypeRound {
+    pub id: String,
+    pub prototype_id: String,
+    pub label: String,
+    pub summary: Option<String>,
+    pub position: i32,
+    /// When set, the round was PRESENTED (frozen). `None` = still in construction.
+    pub presented_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = prototype_rounds)]
+struct NewPrototypeRoundRow {
+    id: String,
+    prototype_id: String,
+    label: String,
+    summary: Option<String>,
+    position: i32,
+    created_at: i64,
+}
+
+/// Low-level INSERT of a round at an explicit `position` (used by [`create_prototype`]'s seed and
+/// by [`create_round`]). `label` is UNIQUE per prototype.
+fn insert_round(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+    label: &str,
+    summary: Option<&str>,
+    position: i32,
+) -> QueryResult<PrototypeRound> {
+    diesel::insert_into(prototype_rounds::table)
+        .values(NewPrototypeRoundRow {
+            id: Uuid::now_v7().to_string(),
+            prototype_id: prototype_id.to_string(),
+            label: label.to_string(),
+            summary: summary.map(str::to_string),
+            position,
+            created_at: now_millis(),
+        })
+        .returning(PrototypeRound::as_returning())
+        .get_result(conn)
+}
+
+/// CREATE a new round for `prototype_id` at the NEXT position (max existing + 1) — the new
+/// "current" round. `label` is UNIQUE per prototype. Feedback on a presented round opens a fresh
+/// round via this (PDR-0009: feedback ⇒ nouveau round, jamais muter). Returns the stored round.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn create_round(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+    label: &str,
+    summary: Option<&str>,
+) -> QueryResult<PrototypeRound> {
+    conn.transaction(|conn| {
+        let next_position = prototype_rounds::table
+            .filter(prototype_rounds::prototype_id.eq(prototype_id))
+            .select(diesel::dsl::max(prototype_rounds::position))
+            .first::<Option<i32>>(conn)?
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        insert_round(conn, prototype_id, label, summary, next_position)
+    })
+}
+
+/// REBASE (roll back) onto an earlier round: create a NEW current round whose manifest is a COPY
+/// of `source_round_id`'s (same pinned page versions), so the design returns to that snapshot and
+/// iteration continues forward WITHOUT mutating the frozen source (PDR-0009: rounds gardés comme
+/// rollback). The round-scoped election is NOT copied (a rebase re-opens the decisions). Returns
+/// the new round, or `None` when `source_round_id` is unknown. Atomic. This is the `proto_rebase`
+/// action's authority (task #12: actions via MCP).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn rebase_round(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+    source_round_id: &str,
+    label: &str,
+    summary: Option<&str>,
+) -> QueryResult<Option<PrototypeRound>> {
+    conn.transaction(|conn| {
+        // The source must exist AND belong to this prototype (no cross-prototype rebase).
+        let Some(source) = get_round(conn, source_round_id)? else {
+            return Ok(None);
+        };
+        if source.prototype_id != prototype_id {
+            return Ok(None);
+        }
+        let new_round = create_round(conn, prototype_id, label, summary)?;
+        let source_pages = list_round_pages(conn, source_round_id)?;
+        for entry in source_pages {
+            // Pin into the FRESH round via the unguarded row write — the new round is never locked,
+            // and the "élection figée" guard is on the public `set_round_page`, not the roll-forward.
+            set_round_page_row(
+                conn,
+                &new_round.id,
+                &entry.page_id,
+                &entry.page_version_id,
+                entry.position,
+            )?;
+        }
+        Ok(Some(new_round))
+    })
+}
+
+/// LIST the rounds of `prototype_id`, oldest first (`position` asc) — the rollback history in
+/// order.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_rounds(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+) -> QueryResult<Vec<PrototypeRound>> {
+    prototype_rounds::table
+        .filter(prototype_rounds::prototype_id.eq(prototype_id))
+        .order(prototype_rounds::position.asc())
+        .select(PrototypeRound::as_select())
+        .load(conn)
+}
+
+/// The CURRENT (max-`position`) round of `prototype_id` — the only mutable one — or `None` when
+/// the prototype has no round (never, after [`create_prototype`] seeds v1).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn current_round(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+) -> QueryResult<Option<PrototypeRound>> {
+    prototype_rounds::table
+        .filter(prototype_rounds::prototype_id.eq(prototype_id))
+        .order(prototype_rounds::position.desc())
+        .select(PrototypeRound::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// Fetch ONE round by id, or `None` when unknown.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_round(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<PrototypeRound>> {
+    prototype_rounds::table
+        .find(id)
+        .select(PrototypeRound::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// PRESENT a round to the user (a handback): stamp `presented_at`, FREEZING it (a presented round
+/// is never mutated — feedback opens a new one). Returns the updated round or `None` when unknown.
+/// Idempotent (re-presenting refreshes the stamp). Emits a `proto.round_presented` domain event
+/// atomically (the outbox — task #5).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn present_round(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+) -> QueryResult<Option<PrototypeRound>> {
+    conn.transaction(|conn| {
+        let updated = diesel::update(prototype_rounds::table.find(round_id))
+            .set(prototype_rounds::presented_at.eq(Some(now_millis())))
+            .returning(PrototypeRound::as_returning())
+            .get_result::<PrototypeRound>(conn)
+            .optional()?;
+        if let Some(round) = &updated {
+            record_prototype_event(
+                conn,
+                EVENT_PROTO_ROUND_PRESENTED,
+                &round.prototype_id,
+                serde_json::json!({ "round_id": round.id }),
+            )?;
+        }
+        Ok(updated)
+    })
+}
+
+/// A `prototype_round_pages` row: a round's manifest entry for one page (which version ships) +
+/// the USER's round-scoped RETENU. `Serialize` for the IPC/MCP boundary. `chosen_variant_id` +
+/// the decision record are the USER's election (≠ the AGENT's `is_main`).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = prototype_round_pages)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct PrototypeRoundPage {
+    pub id: String,
+    pub round_id: String,
+    pub page_id: String,
+    pub page_version_id: String,
+    pub position: i32,
+    /// The USER's RETENU for this page in this round (a PLAIN id), `None` = not chosen yet.
+    pub chosen_variant_id: Option<String>,
+    pub decision_rationale: Option<String>,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = prototype_round_pages)]
+struct NewPrototypeRoundPageRow {
+    id: String,
+    round_id: String,
+    page_id: String,
+    page_version_id: String,
+    position: i32,
+    created_at: i64,
+}
+
+/// PIN a page's version into a round's manifest (UPSERT on `(round_id, page_id)`): insert the
+/// entry, or update the pinned `page_version_id` / `position` in place. When the pinned version
+/// ADVANCES, any round-scoped election is RESET (the decision was about the old variant, PDR-0009
+/// rationale: the RETENU is round- AND version-scoped). Returns the stored [`PrototypeRoundPage`].
+///
+/// GUARDED by the "élection figée" invariant: refused with [`RoundMutationError::RoundLocked`] when
+/// `round_id` is a design-LOCKED round — re-pinning (or resetting the election of) a frozen round
+/// would drift the composition the coder SEAM exposes. Rebasing onto a NEW round stays possible: it
+/// pins into the fresh round via the internal [`set_round_page_row`], never through this guard.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn set_round_page(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+    page_id: &str,
+    page_version_id: &str,
+    position: i32,
+) -> Result<PrototypeRoundPage, RoundMutationError> {
+    guard_round_unlocked(conn, round_id)?;
+    Ok(set_round_page_row(
+        conn,
+        round_id,
+        page_id,
+        page_version_id,
+        position,
+    )?)
+}
+
+/// The UNGUARDED manifest UPSERT behind [`set_round_page`] — the raw row write, no lock check.
+/// Used by [`rebase_round`], which pins into a FRESH (never locked) round: the guard belongs on the
+/// public entry point, not on the internal roll-forward.
+#[cfg_attr(not(test), allow(dead_code))]
+fn set_round_page_row(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+    page_id: &str,
+    page_version_id: &str,
+    position: i32,
+) -> QueryResult<PrototypeRoundPage> {
+    diesel::insert_into(prototype_round_pages::table)
+        .values(NewPrototypeRoundPageRow {
+            id: Uuid::now_v7().to_string(),
+            round_id: round_id.to_string(),
+            page_id: page_id.to_string(),
+            page_version_id: page_version_id.to_string(),
+            position,
+            created_at: now_millis(),
+        })
+        .on_conflict((
+            prototype_round_pages::round_id,
+            prototype_round_pages::page_id,
+        ))
+        .do_update()
+        .set((
+            prototype_round_pages::page_version_id.eq(page_version_id.to_string()),
+            prototype_round_pages::position.eq(position),
+            // A new pinned version resets the (now stale) round-scoped election.
+            prototype_round_pages::chosen_variant_id.eq(None::<String>),
+            prototype_round_pages::decision_rationale.eq(None::<String>),
+            prototype_round_pages::decided_by.eq(None::<String>),
+            prototype_round_pages::decided_at.eq(None::<i64>),
+        ))
+        .returning(PrototypeRoundPage::as_returning())
+        .get_result(conn)
+}
+
+/// LIST the manifest of `round_id` (its pinned pages), ordered by `position` then `page_id`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_round_pages(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+) -> QueryResult<Vec<PrototypeRoundPage>> {
+    prototype_round_pages::table
+        .filter(prototype_round_pages::round_id.eq(round_id))
+        .order((
+            prototype_round_pages::position.asc(),
+            prototype_round_pages::page_id.asc(),
+        ))
+        .select(PrototypeRoundPage::as_select())
+        .load(conn)
+}
+
+/// Fetch the manifest entry for `(round_id, page_id)`, or `None` when the page is not pinned into
+/// the round.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_round_page(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+    page_id: &str,
+) -> QueryResult<Option<PrototypeRoundPage>> {
+    prototype_round_pages::table
+        .filter(prototype_round_pages::round_id.eq(round_id))
+        .filter(prototype_round_pages::page_id.eq(page_id))
+        .select(PrototypeRoundPage::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// ELECT the USER's RETENU variant for `(round_id, page_id)`: set `chosen_variant_id` + the
+/// arbitration record (`decision_rationale` / `decided_by` / `decided_at`) on the manifest entry.
+/// This is the USER's choice (PDR-0009: RETENU ≠ `is_main`), reversible. Returns the updated
+/// entry, or `None` when the page is not pinned into the round.
+///
+/// GUARDED by the "élection figée" invariant: refused with [`RoundMutationError::RoundLocked`] when
+/// `round_id` is a design-LOCKED round — re-electing on a frozen round would drift the composition
+/// the coder SEAM exposes. Feedback ⇒ open a NEW round (rebase), never re-elect a frozen one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn elect_round_page_variant(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+    page_id: &str,
+    chosen_variant_id: &str,
+    decision_rationale: Option<&str>,
+    decided_by: Option<&str>,
+) -> Result<Option<PrototypeRoundPage>, RoundMutationError> {
+    guard_round_unlocked(conn, round_id)?;
+    let updated = conn.transaction(|conn| {
+        let updated = diesel::update(
+            prototype_round_pages::table
+                .filter(prototype_round_pages::round_id.eq(round_id))
+                .filter(prototype_round_pages::page_id.eq(page_id)),
+        )
+        .set((
+            prototype_round_pages::chosen_variant_id.eq(Some(chosen_variant_id.to_string())),
+            prototype_round_pages::decision_rationale.eq(decision_rationale.map(str::to_string)),
+            prototype_round_pages::decided_by.eq(decided_by.map(str::to_string)),
+            prototype_round_pages::decided_at.eq(Some(now_millis())),
+        ))
+        .returning(PrototypeRoundPage::as_returning())
+        .get_result::<PrototypeRoundPage>(conn)
+        .optional()?;
+        if let Some(entry) = &updated {
+            let prototype_id = prototype_rounds::table
+                .find(&entry.round_id)
+                .select(prototype_rounds::prototype_id)
+                .first::<String>(conn)?;
+            record_prototype_event(
+                conn,
+                EVENT_PROTO_VARIANT_ELECTED,
+                &prototype_id,
+                serde_json::json!({
+                    "round_id": entry.round_id,
+                    "page_id": entry.page_id,
+                    "variant_id": chosen_variant_id,
+                }),
+            )?;
+        }
+        Ok::<_, diesel::result::Error>(updated)
+    })?;
+    Ok(updated)
+}
+
+/// CLEAR the round-scoped election of `(round_id, page_id)` (RETENU reversible, PDR-0009).
+/// Returns the updated entry or `None` when the page is not pinned into the round.
+///
+/// GUARDED by the "élection figée" invariant: refused with [`RoundMutationError::RoundLocked`] when
+/// `round_id` is a design-LOCKED round — clearing a frozen round's election would drift the
+/// composition the coder SEAM exposes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn clear_round_page_election(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+    page_id: &str,
+) -> Result<Option<PrototypeRoundPage>, RoundMutationError> {
+    guard_round_unlocked(conn, round_id)?;
+    let updated = diesel::update(
+        prototype_round_pages::table
+            .filter(prototype_round_pages::round_id.eq(round_id))
+            .filter(prototype_round_pages::page_id.eq(page_id)),
+    )
+    .set((
+        prototype_round_pages::chosen_variant_id.eq(None::<String>),
+        prototype_round_pages::decision_rationale.eq(None::<String>),
+        prototype_round_pages::decided_by.eq(None::<String>),
+        prototype_round_pages::decided_at.eq(None::<i64>),
+    ))
+    .returning(PrototypeRoundPage::as_returning())
+    .get_result(conn)
+    .optional()?;
+    Ok(updated)
+}
+
+/// RESOLVE the EFFECTIVE retained variant of `(round_id, page_id)` — the "variant retenu effectif"
+/// (PDR-0009). Two ways a page ends up with a RETENU:
+///   * the USER's EXPLICIT election (`chosen_variant_id`, set by [`elect_round_page_variant`]) —
+///     it always wins;
+///   * failing that, the frozen "page mono-variante = retenue d'office" clause: when NO variant
+///     was elected yet BUT the pinned page version carries EXACTLY ONE variant, that lone variant
+///     is retained "d'office" by the backend — there is nothing to arbitrate, so the user need
+///     take no action.
+///
+/// Returns the resolved variant id, or `None` when no design is retained yet: the page is not
+/// pinned into the round, or it offers SEVERAL variants and the user has not elected one (a real
+/// arbitration is still owed). A READ-side resolution — it MUTATES nothing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn effective_retained_variant(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+    page_id: &str,
+) -> QueryResult<Option<String>> {
+    let Some(entry) = get_round_page(conn, round_id, page_id)? else {
+        return Ok(None);
+    };
+    // The USER's explicit RETENU always wins.
+    if let Some(chosen) = entry.chosen_variant_id {
+        return Ok(Some(chosen));
+    }
+    // No explicit RETENU: a mono-variant pinned version is retained "d'office".
+    let variants = list_variants(conn, &entry.page_version_id)?;
+    Ok(match variants.as_slice() {
+        [only] => Some(only.id.clone()),
+        _ => None,
+    })
+}
+
+/// ONE page of a round's MANIFEST, resolved: the pinned entry (which page VERSION that round froze,
+/// and the USER's RETENU on it) plus the EFFECTIVE retained variant — the very pair [`proto_tree`]
+/// exposes for the CURRENT round, made available for ANY round. `Serialize` for the IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RoundManifestPage {
+    pub entry: PrototypeRoundPage,
+    /// The RETENU of this page IN THAT ROUND: the explicit `chosen_variant_id`, else the
+    /// mono-variant "retenue d'office". `None` when the round still owed an arbitration there.
+    pub effective_variant_id: Option<String>,
+}
+
+/// READ the MANIFEST of `round_id`, resolved page by page — what that round pinned, and what was
+/// retained in it (finding `01KZ3AP34K1PKS6W0E75RP7DF6`).
+///
+/// # Why this exists
+///
+/// [`proto_tree`] already answers with EVERY version and variant a page ever had
+/// (`include_archived = true`), but it resolves the ELECTION against the current round alone:
+/// `manifest_entry` / `effective_variant_id` are the CURRENT round's. So the rounds were listable
+/// and not readable — a surface could name `v3` and had no way to say WHICH version of each page
+/// `v3` froze, nor which variant was retained in it. This closes that one gap: with the tree
+/// already in hand, a manifest is all a surface needs to show a past round AS IT WAS.
+///
+/// A pure READ — it mutates nothing and decides nothing. Consulting a round is not a rollback:
+/// [`rebase_round`] stays the only way a round comes into being, and it stays the agent's
+/// (PDR-0009).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn round_manifest(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+) -> QueryResult<Vec<RoundManifestPage>> {
+    let mut out = Vec::new();
+    for entry in list_round_pages(conn, round_id)? {
+        let effective_variant_id = effective_retained_variant(conn, round_id, &entry.page_id)?;
+        out.push(RoundManifestPage {
+            entry,
+            effective_variant_id,
+        });
+    }
+    Ok(out)
+}
+
+/// A `prototype_design_lock` row: the FREEZE marker (PDR-0010 reframe — "Distill" se réduit à
+/// FIGER l'élection). `Serialize` for the IPC/MCP boundary. NO placement blob — the composition
+/// tree IS the contract.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = prototype_design_lock)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct PrototypeDesignLock {
+    pub prototype_id: String,
+    /// The round frozen as THE design (a PLAIN id).
+    pub locked_round_id: String,
+    pub decided_by: Option<String>,
+    pub locked_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = prototype_design_lock)]
+struct NewPrototypeDesignLockRow {
+    prototype_id: String,
+    locked_round_id: String,
+    decided_by: Option<String>,
+    locked_at: i64,
+}
+
+/// LOCK a prototype's design (freeze `locked_round_id` as THE design for the Spec): UPSERT on
+/// `prototype_id` (a re-lock updates it). Returns the stored [`PrototypeDesignLock`]. This is the
+/// reframed "distill" (figer l'élection) — no placement blob.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn lock_design(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+    locked_round_id: &str,
+    decided_by: Option<&str>,
+) -> QueryResult<PrototypeDesignLock> {
+    let now = now_millis();
+    diesel::insert_into(prototype_design_lock::table)
+        .values(NewPrototypeDesignLockRow {
+            prototype_id: prototype_id.to_string(),
+            locked_round_id: locked_round_id.to_string(),
+            decided_by: decided_by.map(str::to_string),
+            locked_at: now,
+        })
+        .on_conflict(prototype_design_lock::prototype_id)
+        .do_update()
+        .set((
+            prototype_design_lock::locked_round_id.eq(locked_round_id.to_string()),
+            prototype_design_lock::decided_by.eq(decided_by.map(str::to_string)),
+            prototype_design_lock::locked_at.eq(now),
+        ))
+        .returning(PrototypeDesignLock::as_returning())
+        .get_result(conn)
+}
+
+/// Fetch a prototype's design lock, or `None` when its design is not frozen yet.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn get_design_lock(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+) -> QueryResult<Option<PrototypeDesignLock>> {
+    prototype_design_lock::table
+        .find(prototype_id)
+        .select(PrototypeDesignLock::as_select())
+        .first(conn)
+        .optional()
+}
+
+// --- The "élection figée" IMMUTABILITY guard (freeze is ENFORCED, not just an exposure gate) -----
+//
+// [`lock_design`] freezes a round as THE design; [`elected_composition`] then EXPOSES that frozen
+// round's election to the coder SEAM. For the freeze to actually HOLD — "so what the coder sees can
+// never drift" — the round it points at must be IMMUTABLE: no mutation may alter the election or the
+// composition of a design-locked round. Without this, a `proto_elect_variant` (or a variant-params
+// edit) AFTER the lock would silently change what the harness consumes. PDR-0009's discipline is
+// "un round présenté est figé ; feedback ⇒ NOUVEAU round, jamais muter" — so the guard REFUSES the
+// mutation and orients the caller toward opening a new round (rebase), rather than snapshotting a
+// separate placement artefact (which the PDR non-goal forbids — the composition TREE is the contract).
+
+/// A prototype mutation was REFUSED because it targets a FROZEN (design-locked) round — the
+/// "élection figée" IMMUTABILITY invariant (PDR-0009). Once [`lock_design`] freezes a round, its
+/// election and elected composition are IMMUTABLE, so [`elected_composition`] (the coder SEAM) can
+/// never drift under the harness. Mapped to `invalid_state` at the MCP / IPC boundary, with a
+/// message orienting the caller toward opening a NEW round (rebase).
+#[derive(Debug)]
+pub enum RoundMutationError {
+    /// The targeted round — directly, or the round whose EXPOSED election a variant-composition
+    /// edit would change — is FROZEN by a design lock. Carries the frozen round id for a clear
+    /// refusal ("open a new round instead of mutating the frozen one").
+    RoundLocked { locked_round_id: String },
+    /// A DB error surfaced while resolving the lock or applying the mutation.
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for RoundMutationError {
+    fn from(e: diesel::result::Error) -> Self {
+        RoundMutationError::Db(e)
+    }
+}
+
+/// The design lock FREEZING `round_id`, if any: a [`PrototypeDesignLock`] whose `locked_round_id`
+/// is this round. `Some` ⇒ the round is FROZEN and its election/composition are IMMUTABLE. A round
+/// belongs to ONE prototype and a prototype holds ONE lock, so at most one row can match.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn round_design_lock(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+) -> QueryResult<Option<PrototypeDesignLock>> {
+    prototype_design_lock::table
+        .filter(prototype_design_lock::locked_round_id.eq(round_id))
+        .select(PrototypeDesignLock::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// GUARD a round-scoped mutation against the "élection figée" invariant: refuse with
+/// [`RoundMutationError::RoundLocked`] when `round_id` is FROZEN by a design lock, so the election
+/// the coder SEAM exposes can never drift. A NON-locked round passes untouched.
+#[cfg_attr(not(test), allow(dead_code))]
+fn guard_round_unlocked(
+    conn: &mut SqliteConnection,
+    round_id: &str,
+) -> Result<(), RoundMutationError> {
+    if round_design_lock(conn, round_id)?.is_some() {
+        return Err(RoundMutationError::RoundLocked {
+            locked_round_id: round_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether editing `variant_id`'s composition would DRIFT a FROZEN elected composition: returns the
+/// frozen round id when `variant_id` is the EFFECTIVE RETENU of its page in that prototype's LOCKED
+/// round — i.e. EXACTLY what [`elected_composition`] exposes. Editing a NON-exposed variant (a
+/// sibling not elected, or a page pinned to another version in the locked round) is unaffected — the
+/// guard is scoped to the exposed election, never over-broad.
+#[cfg_attr(not(test), allow(dead_code))]
+fn variant_frozen_by_lock(
+    conn: &mut SqliteConnection,
+    variant_id: &str,
+) -> QueryResult<Option<String>> {
+    let Some(variant) = get_variant(conn, variant_id)? else {
+        return Ok(None);
+    };
+    // variant → page_version → page → prototype: only the OWNING prototype's lock can expose it.
+    let Some(page_id) = prototype_page_versions::table
+        .find(&variant.page_version_id)
+        .select(prototype_page_versions::page_id)
+        .first::<String>(conn)
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let Some(page) = get_page(conn, &page_id)? else {
+        return Ok(None);
+    };
+    let Some(lock) = get_design_lock(conn, &page.prototype_id)? else {
+        return Ok(None);
+    };
+    // A refusal ONLY when THIS variant is what the frozen round exposes for its page.
+    if effective_retained_variant(conn, &lock.locked_round_id, &page.id)?.as_deref()
+        == Some(variant_id)
+    {
+        return Ok(Some(lock.locked_round_id));
+    }
+    Ok(None)
+}
+
+/// Whether CREATING a variant under `page_version_id` would DRIFT a FROZEN elected composition:
+/// returns the frozen round id when this page-version is the one PINNED for its page in the OWNING
+/// prototype's design-LOCKED round — i.e. the version whose variants the frozen election exposes.
+/// Adding a sibling variant there could flip the page's `effective_retained_variant`: a mono-variant
+/// page "retenue d'office" would gain a second variant and become ambiguous (`Some(only)` → `None`),
+/// so [`elected_composition`] would drift under the harness. A page-version NOT pinned in the locked
+/// round (an unpinned version, or the page pinned to another version) is unaffected — the guard is
+/// scoped to the exposed election, never over-broad.
+#[cfg_attr(not(test), allow(dead_code))]
+fn page_version_frozen_by_lock(
+    conn: &mut SqliteConnection,
+    page_version_id: &str,
+) -> QueryResult<Option<String>> {
+    // page_version → page → prototype: only the OWNING prototype's lock can freeze it.
+    let Some(page_id) = prototype_page_versions::table
+        .find(page_version_id)
+        .select(prototype_page_versions::page_id)
+        .first::<String>(conn)
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let Some(page) = get_page(conn, &page_id)? else {
+        return Ok(None);
+    };
+    let Some(lock) = get_design_lock(conn, &page.prototype_id)? else {
+        return Ok(None);
+    };
+    // A refusal ONLY when the LOCKED round pins THIS page to THIS version (what the frozen election
+    // exposes for the page). A version not pinned in the frozen round is unaffected.
+    if let Some(entry) = get_round_page(conn, &lock.locked_round_id, &page.id)? {
+        if entry.page_version_id == page_version_id {
+            return Ok(Some(lock.locked_round_id));
+        }
+    }
+    Ok(None)
+}
+
+// --- The ELECTED COMPOSITION contract: the coder SEAM (v2.7 Phase 4, task #8) --------
+//
+// The reframed "distill" (PDR-0009/0010) is just FIGER l'élection + EXPOSER la composition élue —
+// there is NO re-written placement spec, because the composition TREE already IS the placement
+// (Regions/Order/Hierarchy intrinsic). [`elected_composition`] ASSEMBLES that exposure into ONE
+// serializable contract a future HARNESS (a separate PRD) consumes to build the Spec's dev fidèle:
+//
+//   * FROZEN election — it reads off the design LOCK (`prototype_design_lock`, the freeze marker),
+//     NEVER the mutable current round. A prototype whose design is not locked yet exposes NOTHING
+//     (returns `None`): the seam only ever surfaces a FROZEN election, so what the coder sees can
+//     never drift under it (the "élection figée" guarantee).
+//   * the ELECTED composition per page — for every page pinned in the locked round, the EFFECTIVE
+//     RETENU variant (`effective_retained_variant`: the user's explicit election, else the frozen
+//     mono-variant "d'office") and its `composition_json` (the arbre nommé = placement), each node
+//     classified by its NATURE — the 3 PDR natures `[DS]` (a catalogue component) / `[NEW]` (a
+//     proposed component NOT in the catalogue — a candidate to build) / `[inline]` (bespoke markup).
+//   * the design-system as a SEAM — a REFERENCE (project + design row id + per-node component ids),
+//     NOT the injected content (no DESIGN.md markdown, no templates inlined). The harness resolves
+//     the reference when it weaves the design-system into the coder context; that INJECTION is the
+//     HARNESS PRD's job — v2.7 only POSES the seam (Non-goal: no coder-context injection here).
+//   * the pre-dev review record — WITHOUT ITS PROSE. PDR-0009 freezes "le feedback pré-dev n'est
+//     JAMAIS transmis au coder", and this seam is precisely what a coder harness consumes: exposing
+//     the comment BODIES here made that guarantee disciplinary ("the harness must not read this
+//     field") when the PDR states it as absolute. So the seam carries COUNTS + ANCHORS only
+//     ([`ResolvedFeedbackAnchor`]: which NODES were corrected, and when) plus the still-OPEN count (a
+//     gap signal) — no `body`, no `resolution_note`, no author. The guarantee is now STRUCTURAL: the
+//     prose is not in the payload to be transmitted. The full comments stay where they belong, on the
+//     LIVE authoring surface ([`proto_tree`], the /design-proto UI), which no coder reads (review #47).
+//
+// Deriving dev TASKS from this contract is the AGENT's job (PDR: "tâches dérivées par l'agent"): the
+// `[NEW]` nodes ([`ElectedPage::new_components`]) are the natural anchor — the components the coder
+// must build to the app's standards.
+
+/// A node's coder-contract NATURE: `[DS]` — an existing catalogue component.
+pub const NODE_NATURE_DS: &str = "ds";
+/// A node's coder-contract NATURE: `[NEW]` — a proposed component not in the catalogue (to build).
+pub const NODE_NATURE_NEW: &str = "new";
+/// A node's coder-contract NATURE: `[inline]` — bespoke one-off markup (not a component).
+pub const NODE_NATURE_INLINE: &str = "inline";
+
+/// A REFERENCE to the project's design-system — the SEAM, NOT injected content. Carries only
+/// POINTERS (`project_id`, the `design` row `design_id`) the harness resolves; NO DESIGN.md content
+/// or theme tokens are inlined here. `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DesignSystemRef {
+    pub project_id: String,
+    /// The `design` row id (the DESIGN.md the harness resolves), `None` when the project has no
+    /// design-system yet (greenfield — the agent creates the lib).
+    pub design_id: Option<String>,
+}
+
+/// ONE node of an elected composition, flattened + classified by its NATURE (the 3 PDR natures).
+/// The raw tree in [`ElectedPage::composition_json`] keeps the full placement; this list makes the
+/// natures machine-readable and carries the design-system reference PER NODE (`component_ref`).
+/// `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ElectedNode {
+    /// The `/`-joined node path (the `Root/Header/…` anchor convention).
+    pub node_key: String,
+    /// `ds` | `new` | `inline` (the 3 PDR natures — [`NODE_NATURE_DS`] / `NEW` / `INLINE`).
+    pub nature: String,
+    /// The component NAME this node instantiates (`ds`/`new`); `None` for an `inline` node.
+    pub component: Option<String>,
+    /// The `design_components` id for a `[DS]` node — a design-system REFERENCE (not the template);
+    /// `None` for a `[NEW]` (not in the catalogue) or an `[inline]` node.
+    pub component_ref: Option<String>,
+    /// The node's params (the state is a param), carried so the harness sees the parameterization.
+    pub params: serde_json::Map<String, serde_json::Value>,
+    /// The SCOPE ID of the CSS exception this node's component carries, `None` when it carries none
+    /// (nearly every node). A POINTER into [`ElectedPage::css_exceptions`], never a copy: a `Spinner`
+    /// placed thirty times has ONE exception, and duplicating it at each placement is how a shared
+    /// thing drifts (finding `01KYVMTWB71R0D0CT1SV88J8DX`). Its presence is what a display surface
+    /// badges on the node, and what tells the coder walking the tree that this placement is where
+    /// the exception lands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub css_scope: Option<String>,
+    /// The PAGE this node navigates to, when it does — the PARCOURS crossing the seam (finding
+    /// `01KYW34347CZSNXCYS35KDG3EY`). `None` for the overwhelming majority of nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigates_to: Option<ElectedNavigation>,
+}
+
+/// ONE navigation link of an elected page, as the coder reads it: WHERE it goes, under the name a
+/// human uses, and whether that destination is really part of the frozen design.
+///
+/// # Why a parcours crosses the seam at all
+///
+/// A prototype's whole point is to show a JOURNEY, not a pile of screens. "This button opens the
+/// checkout" is a DESIGN decision — as much as which component sits where — and it is settled in the
+/// proto, reviewed in the proto, and frozen with the election. If it did not cross here, the coder
+/// would receive a set of pages with no idea which one leads to which, and would re-invent the
+/// routing: the exact disappearance the CSS exceptions cross whole to avoid, one seam later.
+///
+/// It travels as the stored `page_id` PLUS the `slug` and `title` resolved AT THE READ. The id is
+/// what the model holds (it does not rename); the two readable fields are what makes the payload
+/// legible, and reading them at each read is what keeps them true after a rename.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ElectedNavigation {
+    /// The destination as the tree STORES it: a `prototype_pages.id`.
+    pub page_id: String,
+    /// The destination's slug, resolved at this read. `None` when the id resolves to no page.
+    pub slug: Option<String>,
+    /// The destination's human TITLE, resolved at this read. `None` when the id resolves to no page.
+    pub title: Option<String>,
+    /// [`NAVIGATION_PINNED`] | [`NAVIGATION_UNPINNED`] | [`NAVIGATION_UNKNOWN`] — never a silent
+    /// hole. A parcours that leaves the frozen design, or points at nothing, is stated as such.
+    pub status: String,
+}
+
+/// [`ElectedNavigation::status`] — the destination is a page PINNED in the frozen round: the
+/// parcours stays inside the design the coder is being handed.
+pub const NAVIGATION_PINNED: &str = "pinned";
+/// [`ElectedNavigation::status`] — the page exists in the prototype but is NOT in the frozen round:
+/// the link leaves the frozen design, and the coder is told rather than left to discover it.
+pub const NAVIGATION_UNPINNED: &str = "unpinned";
+/// [`ElectedNavigation::status`] — the page id resolves to NO page at all (deleted since the link
+/// was written). The destination is named anyway: a broken link is information, not a blank.
+pub const NAVIGATION_UNKNOWN: &str = "unknown";
+
+/// ONE CSS exception the elected page REACHES — the whole record, carried ONCE per page (finding
+/// `01KYVMTWB71R0D0CT1SV88J8DX`).
+///
+/// # Why the seam carries the CSS itself, and not a pointer
+///
+/// Everything else in this seam is a REFERENCE the harness resolves (the design system, a
+/// component id) because it is content the coder reads from the app. A CSS slot is the opposite: it
+/// exists NOWHERE ELSE. It was written in the proto, it was reviewed in the proto, and if it does
+/// not cross here the coder rebuilds the component without it — which is the exact disappearance
+/// this finding is about, one seam later. So the compiled CSS, its scope and its REASON travel
+/// whole. They are bounded ([`crate::css_slot::MAX_CSS_SLOT_BYTES`]) and deduplicated per page, so
+/// this cannot crowd out the placement.
+///
+/// `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ElectedCssException {
+    /// The scope id — the key [`ElectedNode::css_scope`] points at.
+    pub scope_id: String,
+    /// The component the exception belongs to.
+    pub component: String,
+    /// The `design_components` id, when the component is catalogued.
+    pub component_ref: Option<String>,
+    /// The CSS selector the exception is bounded to, LITERALLY — `[data-nyx-css~="c-spinner-…"]`.
+    /// nyx stamps that attribute on the component's root element(s); an implementation is free to
+    /// carry the scope any way it likes, as long as the rules stay inside the component.
+    pub scope: String,
+    /// WHY the exception exists, in the words of the agent that wrote it. This is what makes it
+    /// ACTIONABLE rather than a blob of CSS to paste: it says what the utilities could not do.
+    pub reason: String,
+    /// Which of the four infeasible-in-utilities constructs it uses
+    /// ([`crate::css_slot::SlotFeature`] codes) — the machine-readable form of the same statement.
+    pub features: Vec<String>,
+    /// The size of the authored CSS.
+    pub bytes: usize,
+    /// The COMPILED CSS — every selector already anchored on `scope`, every `@keyframes` already
+    /// renamed under it. What the preview really applied, and therefore what the implementation must
+    /// reproduce.
+    pub css: String,
+    /// `placement` — a node of this page instantiates the component; `reference` — the component is
+    /// reached only through another one's `data-nyx-use` (a shared `Spinner` is used without ever
+    /// being placed, and its animation still has to exist).
+    pub reached_by: String,
+    /// The refusal CODE when the stored slot no longer compiles — the exception is NAMED anyway, and
+    /// its `css` is empty. `None` for a slot that compiled.
+    pub refused: Option<String>,
+}
+
+/// [`ElectedCssException::reached_by`] — a node of the page instantiates the component.
+pub const CSS_EXCEPTION_PLACEMENT: &str = "placement";
+/// [`ElectedCssException::reached_by`] — only another component's `data-nyx-use` reaches it.
+pub const CSS_EXCEPTION_REFERENCE: &str = "reference";
+
+/// The elected design for ONE page of the frozen round. `Serialize` for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ElectedPage {
+    pub page_id: String,
+    pub slug: String,
+    pub title: String,
+    pub page_version_id: String,
+    /// The EFFECTIVE RETENU variant (`effective_retained_variant`), `None` when a multi-variant page
+    /// still owes an arbitration (a gap the harness sees — the election is incomplete for this page).
+    pub elected_variant_id: Option<String>,
+    /// The elected variant's `composition_json` — the arbre nommé = le PLACEMENT (the 3 natures are
+    /// intrinsic to the tree). `None` when no variant is retained yet.
+    pub composition_json: Option<String>,
+    /// The elected composition's nodes, flattened + classified by nature (the 3 natures explicit).
+    pub nodes: Vec<ElectedNode>,
+    /// The DISTINCT `[NEW]` component names the page REACHES — the candidates the coder must BUILD,
+    /// the anchor for the agent's derived tasks. "Reaches" is the tree's nodes PLUS everything their
+    /// templates reference through `data-nyx-use`, transitively: a shared `Spinner` is used without
+    /// ever being placed, and it still has to exist (finding `01KYSZPG9Y8QGGVED208SG5BTB`).
+    pub new_components: Vec<String>,
+    /// The SCOPED CSS EXCEPTIONS this page reaches, deduplicated, in document order (the placed ones
+    /// first, then the ones only a `data-nyx-use` reaches). EMPTY for a page that needed none, which
+    /// is the normal case. The list the coder reads to know what the design system could NOT express
+    /// here — and why (finding `01KYVMTWB71R0D0CT1SV88J8DX`).
+    pub css_exceptions: Vec<ElectedCssException>,
+}
+
+/// A RESOLVED pre-dev comment, reduced to its ANCHOR — what the coder SEAM exposes of the review
+/// (review #47). It says THAT a node was reviewed and corrected before the election, and WHERE;
+/// it says NOTHING of what was said. `Serialize` for the IPC/MCP boundary.
+///
+/// # Why the body is absent (PDR-0009, structurally)
+///
+/// The pre-dev review is NEVER transmitted to the coder. The seam used to carry whole
+/// [`PrototypeFeedback`] rows — `body`, `resolution_note`, author — which left that frozen decision
+/// resting on the harness's good behaviour. Reducing the projection makes the guarantee STRUCTURAL:
+/// there is no prose in the payload to leak. What remains is exactly the record of correction the
+/// harness may legitimately use — the node keys tell it which parts of the tree were reworked, and
+/// the count says the review was closed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ResolvedFeedbackAnchor {
+    /// The comment's id — a POINTER (the full comment is readable on the live authoring surface,
+    /// never through this seam).
+    pub id: String,
+    /// THE ANCHOR: the tree-node key the comment was raised on; `None` for a global comment.
+    pub node_key: Option<String>,
+    /// `anchored` (the node still exists) | `orphaned` ("à ré-ancrer") — the anchor's health.
+    pub anchor_status: String,
+    /// WHERE it was raised (a variant id), `None` when it was global.
+    pub origin_variant_id: Option<String>,
+    /// The variant the correction landed in, when the resolution named one.
+    pub resolution_via_variant_id: Option<String>,
+    /// WHEN it was resolved (epoch ms).
+    pub resolved_at: Option<i64>,
+}
+
+impl From<&PrototypeFeedback> for ResolvedFeedbackAnchor {
+    /// PROJECT a comment onto its anchor — the ONE place the seam drops the prose. Written as a
+    /// total field-by-field projection (never `..`), so a new prose field on [`PrototypeFeedback`]
+    /// cannot silently reach the coder seam.
+    fn from(f: &PrototypeFeedback) -> Self {
+        ResolvedFeedbackAnchor {
+            id: f.id.clone(),
+            node_key: f.node_key.clone(),
+            anchor_status: f.anchor_status.clone(),
+            origin_variant_id: f.origin_variant_id.clone(),
+            resolution_via_variant_id: f.resolution_via_variant_id.clone(),
+            resolved_at: f.resolved_at,
+        }
+    }
+}
+
+/// The FROZEN elected composition of a prototype — the coder SEAM a future harness consumes. Read
+/// off the design LOCK (the frozen election), never the mutable current round. `Serialize` for the
+/// IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ElectedComposition {
+    pub prototype_id: String,
+    pub spec_id: String,
+    /// The FREEZE marker (`prototype_design_lock`) — proof this is a FROZEN election, and WHICH
+    /// round is frozen.
+    pub locked: PrototypeDesignLock,
+    /// The design-system as a SEAM (reference, not injected content).
+    pub design_ref: DesignSystemRef,
+    /// One entry per page pinned in the frozen round, in manifest order.
+    pub pages: Vec<ElectedPage>,
+    /// The RESOLVED pre-dev comments as ANCHORS ONLY — WHICH nodes were corrected before the
+    /// election, never WHAT was said (PDR-0009, review #47). No body, no resolution note, no author.
+    pub resolved_feedback: Vec<ResolvedFeedbackAnchor>,
+    /// How many pre-dev comments were RESOLVED (the review record as a count).
+    pub resolved_feedback_count: i64,
+    /// How many pre-dev comments are STILL OPEN (a gap signal: the review is not fully resolved).
+    pub open_feedback_count: i64,
+}
+
+/// ASSEMBLE the FROZEN elected composition of `prototype_id` — the coder SEAM (v2.7 Phase 4, task
+/// #8). Returns `None` when the prototype is UNKNOWN or its design is NOT LOCKED yet (the election
+/// is not frozen — the seam refuses to expose a moving election). A pure READ — mutates nothing.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn elected_composition(
+    conn: &mut SqliteConnection,
+    prototype_id: &str,
+) -> QueryResult<Option<ElectedComposition>> {
+    // The election is exposed ONLY when FROZEN: read the design LOCK. No lock → nothing to expose.
+    let Some(lock) = get_design_lock(conn, prototype_id)? else {
+        return Ok(None);
+    };
+    let Some(prototype) = get_prototype(conn, prototype_id)? else {
+        return Ok(None);
+    };
+    let spec_id = prototype.spec_id.clone();
+    let project_id = get_spec(conn, &spec_id)?.map(|s| s.project_id);
+
+    // The design-system REFERENCE (pointers only — the harness resolves the content) + the catalogue
+    // used to split each node's nature into [DS] (known) vs [NEW] (unknown).
+    let (design_ref, catalogue) = match &project_id {
+        Some(pid) => {
+            let design = get_design(conn, pid)?;
+            let components = list_components(conn, pid)?;
+            (
+                DesignSystemRef {
+                    project_id: pid.clone(),
+                    design_id: design.map(|d| d.id),
+                },
+                components,
+            )
+        }
+        None => (
+            DesignSystemRef {
+                project_id: String::new(),
+                design_id: None,
+            },
+            Vec::new(),
+        ),
+    };
+    // name → (design_components.id, MATERIALIZED?), for the [DS]/[NEW] split + the per-node
+    // reference. "Materialized" = the component exists IN THE APP (it carries a `source_path`),
+    // which is what decides the nature — see [`classify_elected_nodes`].
+    let by_name: std::collections::BTreeMap<&str, &DesignComponent> =
+        catalogue.iter().map(|c| (c.name.as_str(), c)).collect();
+    // The REFERENCE graph of that same catalogue, built ONCE for the whole seam — one scan per
+    // template, never one per page: a component reached only from another component's TEMPLATE
+    // (`data-nyx-use`) is used just as really as one placed in the tree, and if it is not
+    // materialized it has to be BUILT (finding `01KYSZPG9Y8QGGVED208SG5BTB`).
+    let references = crate::render::ReferenceIndex::build(
+        catalogue
+            .iter()
+            .map(|c| (c.name.as_str(), c.template.as_str())),
+    );
+
+    // One entry per page pinned in the FROZEN round, in manifest order.
+    let manifest = list_round_pages(conn, &lock.locked_round_id)?;
+    // The PAGE DIRECTORY the nodes' `navigate_to` resolves against: every page of the prototype (a
+    // link may legitimately point at one the frozen round does not pin — and the seam says so),
+    // plus the ids the manifest pins. Read ONCE for the whole seam, never once per page.
+    let all_pages = list_pages(conn, prototype_id)?;
+    let directory = PageDirectory {
+        pages: &all_pages,
+        pinned: manifest.iter().map(|e| e.page_id.clone()).collect(),
+    };
+    let mut pages = Vec::with_capacity(manifest.len());
+    for entry in &manifest {
+        let (slug, title) = get_page(conn, &entry.page_id)?
+            .map(|p| (p.slug, p.title))
+            .unwrap_or_default();
+        let elected_variant_id =
+            effective_retained_variant(conn, &lock.locked_round_id, &entry.page_id)?;
+        let composition_json = match &elected_variant_id {
+            Some(vid) => get_variant(conn, vid)?.map(|v| v.composition_json),
+            None => None,
+        };
+        let (nodes, new_components, css_exceptions) = match &composition_json {
+            Some(json) => classify_elected_nodes(json, &by_name, &references, &directory),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
+        pages.push(ElectedPage {
+            page_id: entry.page_id.clone(),
+            slug,
+            title,
+            page_version_id: entry.page_version_id.clone(),
+            elected_variant_id,
+            composition_json,
+            nodes,
+            new_components,
+            css_exceptions,
+        });
+    }
+
+    // The pre-dev review record, PROSE-FREE (review #47): the resolved comments reduced to their
+    // ANCHORS + the two counts. The bodies stay on the live authoring surface — PDR-0009's "jamais
+    // transmis au coder" is enforced by what this projection OMITS, not by the reader's restraint.
+    let feedback = list_feedback(conn, prototype_id)?;
+    let open_feedback_count = feedback
+        .iter()
+        .filter(|f| f.status == FEEDBACK_STATUS_OPEN)
+        .count() as i64;
+    let resolved_feedback: Vec<ResolvedFeedbackAnchor> = feedback
+        .iter()
+        .filter(|f| f.status == FEEDBACK_STATUS_RESOLVED)
+        .map(ResolvedFeedbackAnchor::from)
+        .collect();
+    let resolved_feedback_count = resolved_feedback.len() as i64;
+
+    Ok(Some(ElectedComposition {
+        prototype_id: prototype_id.to_string(),
+        spec_id,
+        locked: lock,
+        design_ref,
+        pages,
+        resolved_feedback,
+        resolved_feedback_count,
+        open_feedback_count,
+    }))
+}
+
+/// Flatten a `composition_json` into `(nodes, new_components)`: classify each node by its NATURE
+/// against the catalogue `by_name` (name → (`design_components` id, materialized?)) and collect the
+/// DISTINCT `[NEW]` component names (the derived-task anchor). A pure STRUCTURAL container node (no
+/// component, no inline — it only groups children) carries NONE of the 3 natures and is OMITTED from
+/// the node list (its placement lives in the raw tree). A malformed composition yields empty lists
+/// (never an error — a read must not break the seam).
+///
+/// # The nature is the component's ORIGIN, not its presence in the catalogue (review #41)
+///
+/// `[DS]` means "this component EXISTS in the app — compose it, don't rebuild it"; `[NEW]` means
+/// "this component must be BUILT". The split used to be "is the name in the catalogue?", but
+/// `proto_author_component` INSERTS exactly such a row when it authors a greenfield `[NEW]` — so a
+/// component that had just been PROPOSED came back classified `[DS]` with an EMPTY
+/// `new_components`, and the coder, reading "it already exists", never created the build task.
+///
+/// So the criterion is the ORIGIN, carried by `source_path`:
+///   * no `source_path` → the component was never materialized in the app → `[NEW]` (it still
+///     carries a `component_ref`: the authored row IS the spec of what to build);
+///   * a `source_path` → discovered from the real front → `[DS]`.
+///
+/// The round trip closes itself: once the coder builds the component and the inventory discovers it,
+/// the SAME row gains its `source_path` ([`upsert_component_discovery`] step 2) and the very same
+/// frozen composition reads `[DS]` — with no duplicate row. Symmetrically, a `[DS]` whose source is
+/// deleted from the app is pruned by the inventory and its node falls back to `[NEW]`: the honest
+/// statement that it has to be (re)built.
+///
+/// # A component reached only by REFERENCE is a build candidate too (finding `01KYSZPG9Y8QGGVED208SG5BTB`)
+///
+/// A node is a PLACEMENT, but `data-nyx-use` means a component can be used without ever being
+/// placed: a `Spinner` referenced by a `[NEW]` Card is expanded into the page's markup and has to
+/// exist for the Card to work at all. It gets NO [`ElectedNode`] — it sits in no position of the
+/// tree, and inventing a `node_key` for it would be a lie about the placement — but it IS collected
+/// into `new_components` when it is not materialized, because that list is the anchor the agent
+/// derives dev TASKS from, and "build this" is exactly what is true of it. The reach is transitive
+/// and bounded: see [`crate::render::ReferenceIndex`].
+/// # The CSS EXCEPTIONS cross too, ONCE per page (finding `01KYVMTWB71R0D0CT1SV88J8DX`)
+///
+/// A component may carry a SCOPED CSS SLOT — the strict escape hatch for what Tailwind utilities
+/// cannot express. It exists nowhere but here, so it crosses whole (its scope, its compiled CSS, its
+/// REASON), deduplicated per page, with the node pointing at it by `css_scope`. Reference-reached
+/// components are included for the same reason their names are: a shared `Spinner`'s animation has
+/// to exist even though nothing places it.
+fn classify_elected_nodes(
+    composition_json: &str,
+    by_name: &std::collections::BTreeMap<&str, &DesignComponent>,
+    references: &crate::render::ReferenceIndex,
+    directory: &PageDirectory<'_>,
+) -> (Vec<ElectedNode>, Vec<String>, Vec<ElectedCssException>) {
+    let materialized =
+        |name: &str| -> bool { by_name.get(name).is_some_and(|c| c.source_path.is_some()) };
+    let mut nodes = Vec::new();
+    // Every component the page REACHES: first the ones its tree places (document order), then —
+    // appended below — the ones their templates reference, transitively.
+    let mut reached: Vec<String> = Vec::new();
+    for node in crate::render::composition_nodes(composition_json) {
+        let (nature, component, component_ref) = if node.inline {
+            (NODE_NATURE_INLINE, None, None)
+        } else if let Some(name) = &node.component {
+            if !reached.iter().any(|n| n == name) {
+                reached.push(name.clone());
+            }
+            match by_name.get(name.as_str()) {
+                // Catalogued AND materialized in the app → [DS].
+                Some(c) if c.source_path.is_some() => {
+                    (NODE_NATURE_DS, Some(name.clone()), Some(c.id.clone()))
+                }
+                // Catalogued but NOT materialized (a greenfield authored `[NEW]`) → still [NEW],
+                // and still an anchor for the dev task — with the authored row as its reference.
+                Some(c) => (NODE_NATURE_NEW, Some(name.clone()), Some(c.id.clone())),
+                None => (NODE_NATURE_NEW, Some(name.clone()), None),
+            }
+        } else {
+            // A structural container node: none of the 3 natures — skip it (placement stays in tree).
+            continue;
+        };
+        // The node POINTS at its component's exception when there is one — never a copy of it.
+        let css_scope = component
+            .as_deref()
+            .filter(|name| {
+                by_name.get(*name).is_some_and(|c| {
+                    crate::css_slot::CssSlot::parse(c.css_slot_json.as_deref()).is_some()
+                })
+            })
+            .map(crate::css_slot::component_scope_id);
+        nodes.push(ElectedNode {
+            node_key: node.node_key,
+            nature: nature.to_string(),
+            component,
+            component_ref,
+            params: node.params,
+            css_scope,
+            navigates_to: node.navigate_to.map(|page_id| directory.resolve(&page_id)),
+        });
+    }
+    // The placements first, then everything their templates reach transitively — the order the
+    // exceptions inherit, so a coder reads what is PLACED before what is merely referenced.
+    let placed = reached.len();
+    references.extend_with_referenced(&mut reached);
+    let mut css_exceptions: Vec<ElectedCssException> = Vec::new();
+    for (index, name) in reached.iter().enumerate() {
+        let Some(component) = by_name.get(name.as_str()) else {
+            continue;
+        };
+        let Some(slot) = crate::css_slot::CssSlot::parse(component.css_slot_json.as_deref()) else {
+            continue;
+        };
+        let scope_id = crate::css_slot::component_scope_id(name);
+        if css_exceptions.iter().any(|e| e.scope_id == scope_id) {
+            continue;
+        }
+        let reached_by = if index < placed {
+            CSS_EXCEPTION_PLACEMENT
+        } else {
+            CSS_EXCEPTION_REFERENCE
+        };
+        css_exceptions.push(match crate::css_slot::compile(&scope_id, &slot.css) {
+            Ok(compiled) => ElectedCssException {
+                scope_id,
+                component: name.clone(),
+                component_ref: Some(component.id.clone()),
+                features: compiled.feature_codes(),
+                scope: compiled.selector,
+                reason: slot.reason,
+                bytes: compiled.bytes,
+                css: compiled.css,
+                reached_by: reached_by.to_string(),
+                refused: None,
+            },
+            // A stored slot that no longer compiles applies NOWHERE — and the coder is told it
+            // exists rather than left to discover a component that used to have one.
+            Err(refusal) => ElectedCssException {
+                scope: crate::css_slot::scope_selector(&scope_id),
+                scope_id,
+                component: name.clone(),
+                component_ref: Some(component.id.clone()),
+                reason: slot.reason,
+                features: Vec::new(),
+                bytes: slot.css.len(),
+                css: String::new(),
+                reached_by: reached_by.to_string(),
+                refused: Some(refusal.code().to_string()),
+            },
+        });
+    }
+    // `[NEW]` = not in the catalogue at all, or catalogued without a `source_path` (never
+    // materialized in the app). The order is the tree's, then the references' — the placements a
+    // coder reads first stay first.
+    let new_components: Vec<String> = reached
+        .into_iter()
+        .filter(|name| !materialized(name))
+        .collect();
+    (nodes, new_components, css_exceptions)
+}
+
+// --- The PROTO TREE read-model: the UI data layer (review #24) ---------------------
+//
+// The future proto UI (onglet + viewer, rounds, élection, commentaires, composition — T25-T29)
+// consumes a read-model that did not exist: the WHOLE tree of a Spec's prototype (pages / versions
+// / variants / rounds), the election state per page (`is_main` = the AGENT's reco, carried on each
+// variant, versus the USER's round-scoped RETENU on the current round's manifest), and the anchored
+// pre-dev comments (open + resolved). [`proto_tree`] ASSEMBLES that in ONE serializable read the
+// IPC `proto_tree` db-command serves — the DATA layer T25-T29 render, distinct from the FROZEN
+// coder seam [`elected_composition`] exposes (that one reads off the LOCK; this one is the LIVE
+// authoring surface). A pure READ — mutates nothing. The election WRITES the UI drives (pose/retire
+// RETENU, comment/resolve, rollback) reuse the existing guarded `db` authority directly, so the
+// "élection figée" lock ([`guard_round_unlocked`]) still refuses a mutation on a frozen round.
+
+/// A page-VERSION with its variants — each variant carrying `is_main` (the AGENT's within-version
+/// recommendation). Part of the [`ProtoTree`] read-model. `Serialize` for the IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProtoTreeVersion {
+    pub version: PrototypePageVersion,
+    /// The version's variants (position-ordered); `is_main` marks the agent's reco.
+    pub variants: Vec<PrototypeVariant>,
+}
+
+/// A PAGE with its versions/variants + the CURRENT round's election state. Part of the [`ProtoTree`]
+/// read-model. `Serialize` for the IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProtoTreePage {
+    pub page: PrototypePage,
+    /// The page's versions (newest-first; includes archived versions — the rollback history), each
+    /// with its variants.
+    pub versions: Vec<ProtoTreeVersion>,
+    /// The CURRENT round's manifest entry for this page — `chosen_variant_id` is the USER's RETENU
+    /// (≠ the agent's `is_main`) + the arbitration record. `None` when the page is not pinned in the
+    /// current round.
+    pub manifest_entry: Option<PrototypeRoundPage>,
+    /// The EFFECTIVE retained variant for this page in the current round: the explicit RETENU, else
+    /// the mono-variant "retenue d'office". `None` when a multi-variant page still owes an arbitration.
+    pub effective_variant_id: Option<String>,
+}
+
+/// The full PROTOTYPE tree of a Spec — the UI data layer (review #24). Read off the LIVE current
+/// round (not the frozen lock): the authoring surface T25-T29 render. `Serialize` for the IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProtoTree {
+    pub prototype: Prototype,
+    /// The prototype's rounds, oldest-first (the rollback history — T26).
+    pub rounds: Vec<PrototypeRound>,
+    /// The CURRENT (mutable) round — the one election/comment writes target. `None` never happens
+    /// after `create_prototype` seeds v1, but modelled Option for total safety.
+    pub current_round: Option<PrototypeRound>,
+    /// The design FREEZE marker, `None` while the design is not locked. When set (and pointing at the
+    /// current round), the election is IMMUTABLE (élection figée) — the UI disables the write actions.
+    pub design_lock: Option<PrototypeDesignLock>,
+    /// The prototype's pages (position-ordered), each with its versions/variants + election state.
+    pub pages: Vec<ProtoTreePage>,
+    /// The OPEN pre-dev review comments (anchored to a node), newest-first — T28.
+    pub open_feedback: Vec<PrototypeFeedback>,
+    /// The RESOLVED pre-dev review comments (the record the design was corrected), newest-first.
+    pub resolved_feedback: Vec<PrototypeFeedback>,
+}
+
+/// ASSEMBLE the full PROTO TREE of `spec_id` — the UI data layer (review #24). Returns `None` when
+/// the Spec has NO prototype (a valid state, the UI's empty cue — not an error). A pure READ. The
+/// election state exposes BOTH tiers side by side: each variant's `is_main` (the agent's reco) and
+/// the current round's `chosen_variant_id` / `effective_variant_id` (the user's RETENU).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn proto_tree(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Option<ProtoTree>> {
+    let Some(prototype) = get_prototype_for_spec(conn, spec_id)? else {
+        return Ok(None);
+    };
+    let rounds = list_rounds(conn, &prototype.id)?;
+    let current = current_round(conn, &prototype.id)?;
+    let design_lock = get_design_lock(conn, &prototype.id)?;
+
+    let mut pages = Vec::new();
+    for page in list_pages(conn, &prototype.id)? {
+        let mut versions = Vec::new();
+        // include_archived = true: the tree is COMPLETE (the rollback history is visible).
+        for version in list_page_versions(conn, &page.id, true)? {
+            let variants = list_variants(conn, &version.id)?;
+            versions.push(ProtoTreeVersion { version, variants });
+        }
+        let (manifest_entry, effective_variant_id) = match &current {
+            Some(round) => (
+                get_round_page(conn, &round.id, &page.id)?,
+                effective_retained_variant(conn, &round.id, &page.id)?,
+            ),
+            None => (None, None),
+        };
+        pages.push(ProtoTreePage {
+            page,
+            versions,
+            manifest_entry,
+            effective_variant_id,
+        });
+    }
+
+    let feedback = list_feedback(conn, &prototype.id)?;
+    let open_feedback: Vec<PrototypeFeedback> = feedback
+        .iter()
+        .filter(|f| f.status == FEEDBACK_STATUS_OPEN)
+        .cloned()
+        .collect();
+    let resolved_feedback: Vec<PrototypeFeedback> = feedback
+        .into_iter()
+        .filter(|f| f.status == FEEDBACK_STATUS_RESOLVED)
+        .collect();
+
+    Ok(Some(ProtoTree {
+        prototype,
+        rounds,
+        current_round: current,
+        design_lock,
+        pages,
+        open_feedback,
+        resolved_feedback,
+    }))
+}
+
+// --- agent_session_prototypes: the proto ↔ session SEAM (v32, v2.7 Phase 2) -------
+//
+// The MANY-TO-MANY link between an agent SESSION and the prototypes it works — the proto twin of
+// `agent_session_specs` (PDR-0009: "le proto est rattaché à la session agent, COMME les Specs").
+// The auto-map ADDS a prototype to a session's set when the session works it via a `proto_*` MCP
+// mutation ([`link_terminal_active_session_prototype`]), the un-map vacates the set on `/clear`
+// ([`clear_session_prototypes`]), and the FUTURE proto overlay reads "the prototypes of a
+// terminal" via its ACTIVE session ([`prototypes_for_terminal`]). GENERIC over the provider —
+// everything keys on the session id, the common substrate (ADR-0010), never on a Claude specific.
+
+/// An `agent_session_prototypes` row: one (session, prototype) membership of the map. `Serialize`
+/// for the IPC/MCP boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = agent_session_prototypes)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct AgentSessionPrototype {
+    pub session_id: String,
+    pub prototype_id: String,
+    pub created_at: i64,
+}
+
+/// ADD `prototype_id` to `session_id`'s set (the auto-map's write). IDEMPOTENT: the (session,
+/// prototype) pair is the PRIMARY KEY, so re-working an already-mapped prototype is a no-op
+/// (INSERT … ON CONFLICT DO NOTHING). Returns `true` when the prototype was newly added, `false`
+/// when it was already in the set.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn link_session_prototype(
+    conn: &mut SqliteConnection,
+    session_id: &str,
+    prototype_id: &str,
+) -> QueryResult<bool> {
+    let inserted = diesel::insert_into(agent_session_prototypes::table)
+        .values((
+            agent_session_prototypes::session_id.eq(session_id),
+            agent_session_prototypes::prototype_id.eq(prototype_id),
+            agent_session_prototypes::created_at.eq(now_millis()),
+        ))
+        .on_conflict((
+            agent_session_prototypes::session_id,
+            agent_session_prototypes::prototype_id,
+        ))
+        .do_nothing()
+        .execute(conn)?;
+    Ok(inserted > 0)
+}
+
+/// VACATE `session_id`'s whole set (the un-map on `/clear`). The session ROW survives a `/clear`
+/// (refreshed in place, not ended), so its set would otherwise persist; this empties it
+/// explicitly. Idempotent (an empty set → 0). Returns the number of rows deleted.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn clear_session_prototypes(
+    conn: &mut SqliteConnection,
+    session_id: &str,
+) -> QueryResult<usize> {
+    diesel::delete(
+        agent_session_prototypes::table.filter(agent_session_prototypes::session_id.eq(session_id)),
+    )
+    .execute(conn)
+}
+
+/// The prototypes in `session_id`'s set, as full [`Prototype`] rows (join through the link table),
+/// newest-worked first (`created_at` desc, `prototype_id` tiebreak). Empty when the session has no
+/// set. A prototype deleted meanwhile is gone from the join (the FK CASCADE drops the link).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn prototypes_for_session(
+    conn: &mut SqliteConnection,
+    session_id: &str,
+) -> QueryResult<Vec<Prototype>> {
+    agent_session_prototypes::table
+        .inner_join(prototypes::table.on(prototypes::id.eq(agent_session_prototypes::prototype_id)))
+        .filter(agent_session_prototypes::session_id.eq(session_id))
+        .order((
+            agent_session_prototypes::created_at.desc(),
+            agent_session_prototypes::prototype_id.asc(),
+        ))
+        .select(Prototype::as_select())
+        .load(conn)
+}
+
+/// AUTO-MAP write: resolve `terminal_id`'s ACTIVE session and ADD `prototype_id` to its set. The
+/// generic core of the proto auto-map — a `proto_*` MCP mutation, attributed to its calling
+/// terminal, lands here (mirrors [`link_terminal_active_session_spec`]). Best-effort: a terminal
+/// with NO active session resolves to `None` and links nothing. Returns the session id the
+/// prototype was linked onto (`None` when there was no active session).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn link_terminal_active_session_prototype(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+    prototype_id: &str,
+) -> QueryResult<Option<String>> {
+    let Some(session) = active_session_for_terminal(conn, terminal_id)? else {
+        return Ok(None);
+    };
+    link_session_prototype(conn, &session.id, prototype_id)?;
+    Ok(Some(session.id))
+}
+
+/// The overlay resolution: the prototypes of `terminal_id` = the set of its ACTIVE session. No
+/// active session → an empty list. The anchor a FUTURE proto overlay reads (this seam poses it;
+/// the overlay is a follow-up slice). GENERIC — resolves through the session substrate.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn prototypes_for_terminal(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+) -> QueryResult<Vec<Prototype>> {
+    let Some(session) = active_session_for_terminal(conn, terminal_id)? else {
+        return Ok(Vec::new());
+    };
+    prototypes_for_session(conn, &session.id)
+}
+
 /// Open an in-memory SQLite database with migrations applied — used by tests so
 /// they never touch the real `app_data_dir` DB.
 #[cfg(test)]
@@ -9354,7 +12500,24 @@ mod tests {
             "fts still indexes the row"
         );
 
-        // Revert v29 → the CHECK narrows back; setting `closed` must now FAIL.
+        // Peel the migrations stacked above v29 first (v37 → v30), then revert v29 → the CHECK
+        // narrows back; setting `closed` must now FAIL.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 (proto interaction prefix rename) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v36 (design bundle recipe) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v35 (design components scan state) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v33 (design inventory globs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v32 (agent_session_prototypes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v31 (prototype domain) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v30 (design-system) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v29 cleanly");
         let reopened = create_idea(
@@ -10422,14 +13585,39 @@ mod tests {
     }
 
     /// v13 migration reverts cleanly (`down.sql` drops `spec_revisions` then `specs`).
-    /// Since many later phases landed ON TOP of v13 (up through v29), we peel them back to
-    /// front — newest (v29) down to v13 — so this still genuinely exercises the Spec
+    /// Since many later phases landed ON TOP of v13 (up through v37), we peel them back to
+    /// front — newest (v37) down to v13 — so this still genuinely exercises the Spec
     /// down-migration.
+    ///
+    /// THE CHAIN IS GUARDED AT BOTH ENDS (audit 01KYM2S8KKXEBKC1PP91WYX8TX). This test used to end
+    /// on its last `revert_last_migration(…).expect(…)` and assert NOTHING. But
+    /// `revert_last_migration` undoes whatever is on TOP, whatever label the `.expect` carries — so
+    /// a chain one revert SHORT left v13 applied and the test still passed. That is not theoretical:
+    /// it is exactly what happened at HEAD to its `task_domain` twin, whose v14 `down.sql` was never
+    /// once executed by the test that exists to execute it. The assertions below are the guard: the
+    /// TARGET must be GONE (a revert too few fails) and the migration JUST BELOW it must still be
+    /// THERE (a revert too many fails), then the up must restore it.
     #[test]
     fn spec_domain_migration_reverts() {
         let mut conn = open_in_memory();
-        // Peel every migration above v13 newest-first (v29 down to v14), then v13
+        // Peel every migration above v13 newest-first (v37 down to v14), then v13
         // (specs/spec_revisions); all must succeed. Each revert drops the current last link.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 (proto interaction prefix rename) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v36 (design bundle recipe) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v35 (design components scan state) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v33 (design inventory globs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v32 (agent_session_prototypes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v31 (prototype domain) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v30 (design-system) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v29 (ideas add closed status) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -10462,6 +13650,41 @@ mod tests {
             .expect("v14 (tasks/task_dependencies) reverts cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("v13 (specs/spec_revisions) reverts cleanly");
+
+        // THE TARGET FELL: v13's `down.sql` really ran, so both its tables are gone. One revert too
+        // FEW and these still resolve → the test fails instead of passing on an unexercised down.
+        assert!(
+            specs::table.count().get_result::<i64>(&mut conn).is_err(),
+            "after reverting v13, `specs` must be gone"
+        );
+        assert!(
+            spec_revisions::table
+                .count()
+                .get_result::<i64>(&mut conn)
+                .is_err(),
+            "after reverting v13, `spec_revisions` must be gone"
+        );
+        // AND NOT ONE MORE: v12 (`domain_events`) is the link just below and is still applied. One
+        // revert too MANY and this fails — the chain is pinned from both sides.
+        assert!(
+            domain_events::table
+                .count()
+                .get_result::<i64>(&mut conn)
+                .is_ok(),
+            "the chain stops AT v13: v12 (`domain_events`) must still be applied"
+        );
+
+        // The up restores it, and the Spec domain round-trips again.
+        run_migrations(&mut conn).expect("re-apply v13");
+        let (project, _root) = create_project(&mut conn, "revived", p("/rev", "C:\\rev"), None)
+            .expect("create_project after down→up");
+        let (spec, _revision) = create_spec(&mut conn, &project.id, "Spec", SpecSections::empty())
+            .expect("create_spec after down→up");
+        assert_eq!(
+            get_spec(&mut conn, &spec.id).unwrap().unwrap().id,
+            spec.id,
+            "v13's up.sql rebuilt a working Spec domain"
+        );
     }
 
     // --- Spec LIFECYCLE: guards + validations + guard-rails (v2.4 Phase 1) --
@@ -10838,9 +14061,14 @@ mod tests {
         // reviewing_phase + dir #24 dropped the tasks.origin column + dir #25 dropped the
         // `validated` grill state; v2.6 Phase 1 added dir #26 the ideas domain; v2.6 Phase 3
         // added dir #27 the annexes domain + dir #28 the spec_depends_on graph; v2.6 Phase 5
-        // added dir #29 the ideas `closed` status), so reaching the pre-v4 schema peels all of
-        // them then dir #4 itself (25 reverts, reverse order).
-        for _ in 0..25 {
+        // added dir #29 the ideas `closed` status; v2.7 Phase 1 added dir #30 the design-system
+        // domain; v2.7 Phase 2 added dir #31 the prototype domain + dir #32 the
+        // agent_session_prototypes link table; v2.7 review #32 added dir #33 the design inventory
+        // glob override + dir #35 the design components scan state + dir #36 the design bundle
+        // recipe + dir #37 the proto interaction prefix rename + dir #38 the design_components
+        // CSS slot), so reaching the pre-v4 schema peels all of them then dir #4 itself (33
+        // reverts, reverse order).
+        for _ in 0..33 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -13952,13 +17180,38 @@ mod tests {
     }
 
     /// v14 migration reverts cleanly (`down.sql` drops `task_dependencies` then `tasks`).
-    /// v2.4 Phase 3 landed v15 (the specs.workspace_id index) ON TOP, so we peel v15 first
-    /// (the new last link), then v14 — so this still genuinely exercises v14's down.sql.
+    /// Many later phases landed ON TOP of v14 (up through v37), so we peel them back to front —
+    /// newest (v37) down to v15, then v14 — so this still genuinely exercises v14's down.sql.
+    ///
+    /// THE CHAIN IS GUARDED AT BOTH ENDS (audit 01KYM2S8KKXEBKC1PP91WYX8TX). This test asserted
+    /// NOTHING after its reverts, and `revert_last_migration` undoes the migration on TOP whatever
+    /// label the `.expect` carries — so at HEAD, where the chain was one revert SHORT (14 instead of
+    /// 15), v14's `down.sql` was NEVER RUN and the test was green anyway. The assertions below give
+    /// it teeth in both directions: the TARGET must be gone, the link JUST BELOW must still be
+    /// there, and the up must restore a working task domain.
     #[test]
     fn task_domain_migration_reverts() {
         let mut conn = open_in_memory();
-        // Peel v15 (specs.workspace_id index) then v14 (tasks/task_dependencies); both must
-        // succeed. Each revert drops the current last link.
+        // Peel every migration above v14 newest-first (v37 down to v15), then v14
+        // (tasks/task_dependencies); all must succeed. Each revert drops the current last link.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 (proto interaction prefix rename) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v36 (design bundle recipe) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v35 (design components scan state) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v33 (design inventory globs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v32 (agent_session_prototypes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v31 (prototype domain) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v30 (design-system) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v29 (ideas add closed status) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v28 (spec_depends_on) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -13987,6 +17240,36 @@ mod tests {
             .expect("v15 (specs.workspace_id index) reverts cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("v14 (tasks/task_dependencies) reverts cleanly");
+
+        // THE TARGET FELL: v14's `down.sql` really ran. One revert too FEW and these still resolve.
+        assert!(
+            tasks::table.count().get_result::<i64>(&mut conn).is_err(),
+            "after reverting v14, `tasks` must be gone"
+        );
+        assert!(
+            task_dependencies::table
+                .count()
+                .get_result::<i64>(&mut conn)
+                .is_err(),
+            "after reverting v14, `task_dependencies` must be gone"
+        );
+        // AND NOT ONE MORE: v13 (`specs`) is the link just below and is still applied.
+        assert!(
+            specs::table.count().get_result::<i64>(&mut conn).is_ok(),
+            "the chain stops AT v14: v13 (`specs`) must still be applied"
+        );
+
+        // The up restores it, and the task domain round-trips again.
+        run_migrations(&mut conn).expect("re-apply v14");
+        let (project, _root) = create_project(&mut conn, "revived", p("/rev", "C:\\rev"), None)
+            .expect("create_project after down→up");
+        let task = create_task(&mut conn, &project.id, "A", NewTaskInput::slice())
+            .expect("create_task after down→up");
+        assert_eq!(
+            get_task(&mut conn, &task.id).unwrap().unwrap().id,
+            task.id,
+            "v14's up.sql rebuilt a working task domain"
+        );
     }
 
     // --- v2.1 identity authority: create/resolve/archive (task #4) -----------
@@ -14344,6 +17627,22 @@ mod tests {
         // domain_events) then v11 (data backfill) then v10 (canonical structure). After
         // this, `workspaces.root_path` does NOT exist yet (`path` does), and `projects` has
         // no `key`/`primary_workspace_id`.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 (proto interaction prefix rename) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v36 (design bundle recipe) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v35 (design components scan state) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v33 (design inventory globs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v32 (agent_session_prototypes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v31 (prototype domain) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v30 (design-system) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v29 (ideas add closed status) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -15260,8 +18559,8 @@ mod tests {
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the projects migration (dirs #28 → #3),
-        // then the projects migration (dir #2) itself — 26 reverts in reverse order
+        // Peel every migration stacked above the projects migration (dirs #38 → #3),
+        // then the projects migration (dir #2) itself — 35 reverts in reverse order
         // (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task
         // domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added dir #20
         // the agent_session_specs link table; v2.5.11 added dir #21 the tasks review-finding
@@ -15269,8 +18568,13 @@ mod tests {
         // dropped the tasks.origin column + dir #25 dropped the `validated` grill state;
         // v2.6 Phase 1 added dir #26 the ideas domain; v2.6 Phase 3 added dir #27 the annexes
         // domain + dir #28 the spec_depends_on graph; v2.6 Phase 5 added dir #29 the ideas
-        // `closed` status). projects must then be absent.
-        for _ in 0..27 {
+        // `closed` status; v2.7 Phase 1 added dir #30 the design-system domain; v2.7 Phase 2
+        // added dir #31 the prototype domain + dir #32 the agent_session_prototypes link table;
+        // v2.7 review #32 added dir #33 the design inventory glob override + dir #35 the design
+        // components scan state; v2.7 review #59 added dir #36 the design bundle recipe + dir #37
+        // the proto interaction prefix rename; the CSS-slot finding added dir #38 the
+        // design_components.css_slot_json column). projects must then be absent.
+        for _ in 0..35 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -16115,7 +19419,7 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Peel every migration stacked above the managed_commands migration (dirs
-        // #28 → #4), then the managed_commands migration (dir #3) itself — 25 reverts in
+        // #38 → #4), then the managed_commands migration (dir #3) itself — 34 reverts in
         // reverse order (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14
         // the task domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added
         // dir #20 the agent_session_specs link table; v2.5.11 added dir #21 the tasks
@@ -16123,8 +19427,13 @@ mod tests {
         // + dir #24 dropped the tasks.origin column + dir #25 dropped the `validated` grill
         // state; v2.6 Phase 1 added dir #26 the ideas domain; v2.6 Phase 3 added dir #27 the
         // annexes domain + dir #28 the spec_depends_on graph; v2.6 Phase 5 added dir #29 the
-        // ideas `closed` status). managed_commands must then be absent.
-        for _ in 0..26 {
+        // ideas `closed` status; v2.7 Phase 1 added dir #30 the design-system domain; v2.7
+        // Phase 2 added dir #31 the prototype domain + dir #32 the agent_session_prototypes link
+        // table; v2.7 review #32 added dir #33 the design inventory glob override + dir #35 the
+        // design components scan state; v2.7 review #59 added dir #36 the design bundle recipe +
+        // dir #37 the proto interaction prefix rename; the CSS-slot finding added dir #38 the
+        // design_components.css_slot_json column). managed_commands must then be absent.
+        for _ in 0..34 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -16190,6 +19499,22 @@ mod tests {
         // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row + its v3
         // columns survive; the v4 columns are gone (a typed select of `unread` would now fail
         // to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 (proto interaction prefix rename) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v36 (design bundle recipe) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v35 (design components scan state) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v33 (design inventory globs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v32 (agent_session_prototypes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v31 (prototype domain) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v30 (design-system) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v29 (ideas add closed status) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -16390,6 +19715,22 @@ mod tests {
         // peels v15, v14, v13, v12, v11, v10, v9, v8, v7, then v5 (migrations revert in
         // reverse order). The instance row + its v3/v4 columns survive; the v5 columns are
         // gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 (proto interaction prefix rename) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v36 (design bundle recipe) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v35 (design components scan state) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v33 (design inventory globs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v32 (agent_session_prototypes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v31 (prototype domain) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v30 (design-system) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v29 (ideas add closed status) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -17687,6 +21028,22 @@ mod tests {
         // domain_events) then v11 (v2.1 data backfill) then v10 (v2.1 canonical structure)
         // then v9 (#11 project order) then v8 → the resume_agent_sessions column is gone.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 (proto interaction prefix rename) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v36 (design bundle recipe) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v35 (design components scan state) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v33 (design inventory globs) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v32 (agent_session_prototypes) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v31 (prototype domain) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v30 (design-system) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v29 (ideas add closed status) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v28 (spec_depends_on) cleanly");
@@ -18194,5 +21551,1972 @@ mod tests {
             rows[0].external_session_id, "new",
             "the most recent (started_at) session is kept"
         );
+    }
+
+    // --- DESIGN-SYSTEM domain (v30) ----------------------------------------
+
+    /// The `design` + `design_components` model (v30) round-trips through the migrated DB and
+    /// proves the v30 migration + `schema.rs` tables + the model columns are consistent
+    /// (positional decoding of every nullable column). Exercises the full base CRUD:
+    /// `upsert_design` enforces "1 per project" (a second upsert UPDATES in place),
+    /// `upsert_component` enforces "1 per component" (a re-inventory RECONCILES, never
+    /// duplicates, and preserves the synthesis `visual_hash`), the reads scope by project,
+    /// `update_component_visual_hash` writes the hash, and `delete_component` removes it.
+    #[test]
+    fn design_and_components_crud_round_trip() {
+        let mut conn = open_in_memory();
+        let (project, ws) = create_project(&mut conn, "Proj", "/tmp/design-ws", None).unwrap();
+
+        // DESIGN: none yet, then upsert seeds ONE row.
+        assert!(get_design(&mut conn, &project.id).unwrap().is_none());
+        let design = upsert_design(
+            &mut conn,
+            &project.id,
+            "# DESIGN\ncolors: ...",
+            Some("{\"colors\":{}}"),
+        )
+        .expect("upsert design (insert)");
+        assert_eq!(design.content, "# DESIGN\ncolors: ...");
+        assert_eq!(design.theme_tokens_json.as_deref(), Some("{\"colors\":{}}"));
+
+        // A SECOND upsert UPDATES in place (1 per project) — same id, new content.
+        let design2 = upsert_design(&mut conn, &project.id, "# DESIGN v2", None)
+            .expect("upsert design (update)");
+        assert_eq!(design2.id, design.id, "1 per project: same row updated");
+        assert_eq!(design2.content, "# DESIGN v2");
+        assert!(
+            design2.theme_tokens_json.is_none(),
+            "tokens cleared on update"
+        );
+        assert_eq!(
+            list_components(&mut conn, &project.id).unwrap().len(),
+            0,
+            "no components yet"
+        );
+
+        // COMPONENTS: a real source repo + a greenfield component (no source).
+        let repo = create_repository(&mut conn, &project.id, "web", "web", false).unwrap();
+        let button = upsert_component(
+            &mut conn,
+            &project.id,
+            &ComponentInput {
+                name: "Button".into(),
+                source_repository_id: Some(repo.id.clone()),
+                source_path: Some("src/Button.tsx".into()),
+                template: "<button>{{label}}</button>".into(),
+                ..Default::default()
+            },
+        )
+        .expect("create Button");
+        assert_eq!(
+            button.source_repository_id.as_deref(),
+            Some(repo.id.as_str())
+        );
+        assert!(
+            button.visual_hash.is_none(),
+            "no hash until a synthesis records one"
+        );
+
+        let card = upsert_component(
+            &mut conn,
+            &project.id,
+            &ComponentInput {
+                name: "Card".into(),
+                // greenfield: no source repo/path (the agent will create the lib later).
+                ..Default::default()
+            },
+        )
+        .expect("create greenfield Card");
+        assert!(
+            card.source_repository_id.is_none() && card.source_path.is_none(),
+            "greenfield component carries no source"
+        );
+
+        // READ: list is project-scoped + name-ordered; get by id + by name resolve.
+        let listed = list_components(&mut conn, &project.id).unwrap();
+        assert_eq!(
+            listed.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["Button", "Card"],
+            "name-ordered catalogue"
+        );
+        assert_eq!(
+            get_component(&mut conn, &button.id).unwrap().unwrap().id,
+            button.id
+        );
+        assert_eq!(
+            get_component_by_name(&mut conn, &project.id, "Button")
+                .unwrap()
+                .unwrap()
+                .id,
+            button.id
+        );
+
+        // UPDATE the hash, then RE-INVENTORY the same component → reconcile in place, and the
+        // stored hash SURVIVES (the upsert must not clobber the synthesis hash).
+        update_component_visual_hash(&mut conn, &button.id, "abc123").unwrap();
+        let reinv = upsert_component(
+            &mut conn,
+            &project.id,
+            &ComponentInput {
+                name: "Button".into(),
+                source_repository_id: Some(repo.id.clone()),
+                source_path: Some("src/ui/Button.tsx".into()), // moved
+                template: "<button class=\"btn\">{{label}}</button>".into(),
+                ..Default::default()
+            },
+        )
+        .expect("re-inventory Button");
+        assert_eq!(reinv.id, button.id, "1 per component: reconciled in place");
+        assert_eq!(reinv.source_path.as_deref(), Some("src/ui/Button.tsx"));
+        assert_eq!(
+            reinv.visual_hash.as_deref(),
+            Some("abc123"),
+            "a re-write preserves the synthesis visual_hash"
+        );
+        assert_eq!(
+            list_components(&mut conn, &project.id).unwrap().len(),
+            2,
+            "upsert reconciled, never duplicated"
+        );
+
+        // Another project's design/components are scoped out.
+        let (other, _) = create_project(&mut conn, "Other", "/tmp/other-design", None).unwrap();
+        upsert_component(
+            &mut conn,
+            &other.id,
+            &ComponentInput {
+                name: "Button".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            list_components(&mut conn, &project.id).unwrap().len(),
+            2,
+            "other project's Button is scoped out"
+        );
+
+        // DELETE removes it (idempotent for an unknown id).
+        assert!(delete_component(&mut conn, &card.id).unwrap());
+        assert!(
+            !delete_component(&mut conn, &card.id).unwrap(),
+            "second delete is a no-op"
+        );
+        assert_eq!(list_components(&mut conn, &project.id).unwrap().len(), 1);
+
+        // CASCADE: dropping the project removes its design-system rows.
+        let _ = ws;
+        diesel::delete(projects::table.find(&project.id))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(get_design(&mut conn, &project.id).unwrap().is_none());
+        assert_eq!(list_components(&mut conn, &project.id).unwrap().len(), 0);
+    }
+
+    /// The per-project INVENTORY GLOB OVERRIDE (v33) round-trips: `set_design_inventory_globs`
+    /// persists it (creating the `design` row if absent), `design_inventory_globs` reads it back,
+    /// an empty/None override CLEARS it (→ "no override"), and setting the override NEVER clobbers
+    /// the DESIGN.md `content` (nor does authoring content clobber the override).
+    #[test]
+    fn design_inventory_globs_override_round_trips_and_is_orthogonal_to_content() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/glob-ws", None).unwrap();
+
+        // No design row yet → no override.
+        assert!(design_inventory_globs(&mut conn, &project.id)
+            .unwrap()
+            .is_none());
+
+        // Setting an override CREATES the design row (empty content) and stores the globs.
+        let globs = vec!["src/app/**/*.component.html".to_string()];
+        let d = set_design_inventory_globs(&mut conn, &project.id, Some(&globs)).unwrap();
+        assert_eq!(d.content, "", "a stub design row carries empty content");
+        assert_eq!(
+            design_inventory_globs(&mut conn, &project.id).unwrap(),
+            Some(globs.clone())
+        );
+
+        // Authoring DESIGN.md content PRESERVES the override (orthogonal columns).
+        upsert_design(&mut conn, &project.id, "# DESIGN\ncolors", None).unwrap();
+        assert_eq!(
+            design_inventory_globs(&mut conn, &project.id).unwrap(),
+            Some(globs),
+            "upsert_design does not clobber the inventory override"
+        );
+
+        // An EMPTY override clears it (→ no override), leaving content intact.
+        let d = set_design_inventory_globs(&mut conn, &project.id, Some(&[])).unwrap();
+        assert_eq!(d.content, "# DESIGN\ncolors", "clearing keeps the content");
+        assert!(design_inventory_globs(&mut conn, &project.id)
+            .unwrap()
+            .is_none());
+
+        // Setting then clearing with None likewise clears.
+        set_design_inventory_globs(&mut conn, &project.id, Some(&["**/*.tsx".to_string()]))
+            .unwrap();
+        assert!(design_inventory_globs(&mut conn, &project.id)
+            .unwrap()
+            .is_some());
+        set_design_inventory_globs(&mut conn, &project.id, None).unwrap();
+        assert!(design_inventory_globs(&mut conn, &project.id)
+            .unwrap()
+            .is_none());
+    }
+
+    // --- PROTOTYPE domain (v31) --------------------------------------------
+
+    /// Build a project + a Spec + its prototype, returning `(project_id, spec_id, prototype)`.
+    /// The seeded `v1` round is asserted so callers can rely on it.
+    fn seed_prototype(conn: &mut SqliteConnection) -> (String, String, Prototype) {
+        let (project, _ws) = create_project(conn, "Proj", "/tmp/proto-ws", None).unwrap();
+        let (spec, _rev) =
+            create_spec(conn, &project.id, "Feature", SpecSections::empty()).unwrap();
+        let proto = create_prototype(conn, &spec.id, Some("the feature UI")).unwrap();
+        // create_prototype seeds the always-present current round.
+        let rounds = list_rounds(conn, &proto.id).unwrap();
+        assert_eq!(rounds.len(), 1, "a v1 round is seeded");
+        assert_eq!(rounds[0].label, "v1");
+        (project.id, spec.id, proto)
+    }
+
+    /// "1 proto/Spec (annexe)" (PDR-0009): `create_prototype` seeds ONE prototype hung off the
+    /// Spec, a SECOND create for the same Spec is rejected by the `UNIQUE(spec_id)` index, the
+    /// per-Spec read resolves it, and deleting the Spec CASCADES the whole prototype tree away.
+    #[test]
+    fn prototype_is_one_per_spec_and_cascades() {
+        let mut conn = open_in_memory();
+        let (_project, spec_id, proto) = seed_prototype(&mut conn);
+
+        // 1 proto/Spec: the per-Spec read resolves it; a second create fails on UNIQUE(spec_id).
+        assert_eq!(
+            get_prototype_for_spec(&mut conn, &spec_id)
+                .unwrap()
+                .unwrap()
+                .id,
+            proto.id
+        );
+        assert!(
+            create_prototype(&mut conn, &spec_id, None).is_err(),
+            "a second prototype for the same Spec is rejected (1 proto/Spec)"
+        );
+
+        // Hang a full tree off it, then delete the Spec: everything cascades.
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let version = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        create_variant(
+            &mut conn,
+            &version.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "Layout A".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        diesel::delete(specs::table.find(&spec_id))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(get_prototype(&mut conn, &proto.id).unwrap().is_none());
+        assert!(
+            list_pages(&mut conn, &proto.id).unwrap().is_empty(),
+            "pages cascaded with the prototype"
+        );
+        assert!(
+            list_variants(&mut conn, &version.id).unwrap().is_empty(),
+            "variants cascaded down the tree"
+        );
+    }
+
+    /// THE v37 DATA MIGRATION — the prototype interaction vocabulary, IN THE STORED CONTENT
+    /// (finding 01KYS14G4V1Q5ERRAHB0QVW362). The markers were ported verbatim from Depot
+    /// (`data-depot-*`, `window.__depot*`) and are written INSIDE every synthesized template, so
+    /// renaming the code alone would leave the stored catalogue speaking a vocabulary nothing reads
+    /// — every state case shown at once, every conditional element stuck visible.
+    ///
+    /// What this proves, and it is the whole contract of a data migration over EXPENSIVE LLM
+    /// CONTENT: the prefix is rewritten (attributes AND globals), and NOTHING ELSE MOVES — the row
+    /// COUNT is identical, a template that never carried the prefix is byte-identical, the sibling
+    /// columns (`params_json`, `states_json`, `visual_hash`, `source_path`) and the timestamps are
+    /// untouched (`updated_at` is NOT bumped: nyx renaming its own vocabulary is not the agent
+    /// re-authoring the component), and the DOWN restores the original byte for byte.
+    #[test]
+    fn migration_v37_renames_the_interaction_prefix_without_losing_anything() {
+        let mut conn = open_in_memory();
+        // Step back BEFORE v37 so the seeded rows are what a pre-rename DB really holds. That also
+        // steps back before v38 (`design_components.css_slot_json`), which sits on top of it — so at
+        // this schema the Diesel MODEL of a component does not match the table, and every read and
+        // write of that ONE table goes through raw SQL here. It is not a workaround: a migration test
+        // that stepped back and then used the head model would only be testing today's schema.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 (proto interaction prefix rename) cleanly");
+
+        /// ONE `template` column, read at a schema the head model does not describe.
+        #[derive(diesel::QueryableByName)]
+        struct TemplateRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            template: String,
+        }
+        fn template_of(conn: &mut SqliteConnection, id: &str) -> String {
+            diesel::sql_query("SELECT template FROM design_components WHERE id = ?")
+                .bind::<diesel::sql_types::Text, _>(id)
+                .get_result::<TemplateRow>(conn)
+                .unwrap()
+                .template
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn seed_component(
+            conn: &mut SqliteConnection,
+            project_id: &str,
+            name: &str,
+            template: &str,
+            params_json: Option<&str>,
+            states_json: Option<&str>,
+            source_path: Option<&str>,
+            visual_hash: Option<&str>,
+        ) -> (String, i64) {
+            let id = Uuid::now_v7().to_string();
+            let now = now_millis();
+            diesel::sql_query(
+                "INSERT INTO design_components (id, project_id, name, source_repository_id, \
+                 source_path, visual_hash, template, params_json, states_json, created_at, \
+                 updated_at) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind::<diesel::sql_types::Text, _>(&id)
+            .bind::<diesel::sql_types::Text, _>(project_id)
+            .bind::<diesel::sql_types::Text, _>(name)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(source_path)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(visual_hash)
+            .bind::<diesel::sql_types::Text, _>(template)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(params_json)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(states_json)
+            .bind::<diesel::sql_types::BigInt, _>(now)
+            .bind::<diesel::sql_types::BigInt, _>(now)
+            .execute(conn)
+            .expect("seed a pre-v37 component");
+            (id, now)
+        }
+
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/rename-ws", None).unwrap();
+        // A template in the OLD vocabulary: a structural case, the generalized condition, the axis
+        // marker, the nav/flip affordances — and a global, the way an inline snippet spells it.
+        let legacy_template = "<button data-depot-state-case=\"default\" data-depot-axis=\"size\" \
+             class=\"bg-primary\" data-depot-page=\"home\" data-depot-set=\"size=lg\" \
+             data-depot-state=\"loading\">\
+             <i data-depot-if=\"loading=on\">◌</i>\
+             <span data-depot-if-not=\"loading=on\">{{label}}</span>\
+             <!-- window.__depotStates / __depotActiveState --></button>";
+        let migrated_template = "<button data-nyx-state-case=\"default\" data-nyx-axis=\"size\" \
+             class=\"bg-primary\" data-nyx-page=\"home\" data-nyx-set=\"size=lg\" \
+             data-nyx-state=\"loading\">\
+             <i data-nyx-if=\"loading=on\">◌</i>\
+             <span data-nyx-if-not=\"loading=on\">{{label}}</span>\
+             <!-- window.__nyxStates / __nyxActiveState --></button>";
+        let params_json = "[{\"name\":\"label\",\"type\":\"text\",\"required\":true}]";
+        let states_json = "{\"axes\":[{\"name\":\"size\",\"values\":[{\"name\":\"lg\"}]}]}";
+        let (carrier_id, carrier_stamp) = seed_component(
+            &mut conn,
+            &project.id,
+            "button",
+            legacy_template,
+            Some(params_json),
+            Some(states_json),
+            Some("src/ui/button.tsx"),
+            Some("h4sh"),
+        );
+        // The CONTROL: a component the rename has no business touching.
+        let untouched_template = "<div class=\"rounded-md p-4\">{{{children}}}</div>";
+        let (control_id, _) = seed_component(
+            &mut conn,
+            &project.id,
+            "card",
+            untouched_template,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // …and the same story on a composition's INLINE MARKUP.
+        let (spec, _rev) =
+            create_spec(&mut conn, &project.id, "Feature", SpecSections::empty()).unwrap();
+        let proto = create_prototype(&mut conn, &spec.id, None).unwrap();
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let version = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let legacy_composition =
+            "{\"nodes\":[{\"kind\":\"inline\",\"markup\":\"<section data-depot-if=\\\"loading=on\\\">\
+             <b data-depot-state-case=\\\"idle\\\">idle</b></section>\"}]}";
+        let migrated_composition =
+            "{\"nodes\":[{\"kind\":\"inline\",\"markup\":\"<section data-nyx-if=\\\"loading=on\\\">\
+             <b data-nyx-state-case=\\\"idle\\\">idle</b></section>\"}]}";
+        let variant = create_variant(
+            &mut conn,
+            &version.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "Layout A".into(),
+                composition_json: legacy_composition.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        #[derive(diesel::QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let count_components = |conn: &mut SqliteConnection| -> i64 {
+            diesel::sql_query("SELECT count(*) AS n FROM design_components")
+                .get_result::<CountRow>(conn)
+                .unwrap()
+                .n
+        };
+        let components_before = count_components(&mut conn);
+        let variants_before = prototype_variants::table
+            .count()
+            .get_result::<i64>(&mut conn)
+            .unwrap();
+
+        // THE UP.
+        run_migrations(&mut conn).expect("apply v37");
+
+        let after = get_component(&mut conn, &carrier_id).unwrap().unwrap();
+        assert_eq!(
+            after.template, migrated_template,
+            "every data-depot-* / __depot* in the stored template became data-nyx-* / __nyx*"
+        );
+        assert!(
+            !after.template.contains("data-depot-") && !after.template.contains("__depot"),
+            "not one occurrence of the old prefix survives in a migrated template"
+        );
+        // NOTHING ELSE MOVED on the very row that was rewritten.
+        assert_eq!(after.params_json.as_deref(), Some(params_json));
+        assert_eq!(after.states_json.as_deref(), Some(states_json));
+        assert_eq!(after.visual_hash.as_deref(), Some("h4sh"));
+        assert_eq!(after.source_path.as_deref(), Some("src/ui/button.tsx"));
+        assert_eq!(after.name, "button");
+        assert_eq!(after.created_at, carrier_stamp);
+        assert_eq!(
+            after.updated_at, carrier_stamp,
+            "`updated_at` is NOT bumped — this is nyx renaming its vocabulary, not a re-synthesis"
+        );
+
+        let control_after = get_component(&mut conn, &control_id).unwrap().unwrap();
+        assert_eq!(
+            control_after.template, untouched_template,
+            "a template that never carried the prefix is byte-identical"
+        );
+
+        let variant_after = get_variant(&mut conn, &variant.id).unwrap().unwrap();
+        assert_eq!(
+            variant_after.composition_json, migrated_composition,
+            "the INLINE MARKUP of a composition is migrated too"
+        );
+        assert_eq!(variant_after.created_at, variant.created_at);
+
+        // NOTHING WAS LOST: same number of rows on both tables.
+        assert_eq!(
+            count_components(&mut conn),
+            components_before,
+            "the migration UPDATEs in place — no row created, none dropped"
+        );
+        assert_eq!(
+            prototype_variants::table
+                .count()
+                .get_result::<i64>(&mut conn)
+                .unwrap(),
+            variants_before,
+        );
+
+        // THE DOWN restores the pre-rename vocabulary byte for byte (a reverted binary reads it).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v38 (design components css slot) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v37 cleanly");
+        assert_eq!(
+            template_of(&mut conn, &carrier_id),
+            legacy_template,
+            "down/up is REVERSIBLE — the original template comes back exactly"
+        );
+        assert_eq!(
+            get_variant(&mut conn, &variant.id)
+                .unwrap()
+                .unwrap()
+                .composition_json,
+            legacy_composition,
+        );
+        assert_eq!(
+            template_of(&mut conn, &control_id),
+            untouched_template,
+            "the down leaves the control row alone too",
+        );
+
+        // …and the up is IDEMPOTENT: re-applying lands on the same text, twice over.
+        run_migrations(&mut conn).expect("re-apply v37");
+        assert_eq!(
+            get_component(&mut conn, &carrier_id)
+                .unwrap()
+                .unwrap()
+                .template,
+            migrated_template,
+        );
+    }
+
+    /// "pages/versions/variants/states/rounds(rollback)": the hierarchy round-trips through the
+    /// migrated DB — a variant persists its COMPOSITION (not an HTML blob) + its declared STATES
+    /// (`states_json`), a page keeps multiple versions with the older one ARCHIVED-but-readable
+    /// (rollback), and creating a round bumps `position` so the newest is the current one while
+    /// earlier rounds stay for rollback.
+    #[test]
+    fn prototype_pages_versions_variants_states_and_rounds() {
+        let mut conn = open_in_memory();
+        let (_project, _spec_id, proto) = seed_prototype(&mut conn);
+
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", Some("first")).unwrap();
+        let variant = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "Layout A".into(),
+                composition_json: "{\"node\":\"Root\",\"children\":[]}".into(),
+                states_json: Some("[\"idle\",\"loading\",\"error\"]".into()),
+                position: 0,
+            },
+        )
+        .unwrap();
+        // Composition (a tree, not HTML) + declared states round-trip.
+        let stored = get_variant(&mut conn, &variant.id).unwrap().unwrap();
+        assert_eq!(
+            stored.composition_json,
+            "{\"node\":\"Root\",\"children\":[]}"
+        );
+        assert_eq!(
+            stored.states_json.as_deref(),
+            Some("[\"idle\",\"loading\",\"error\"]")
+        );
+
+        // ROLLBACK: mint a v2, archive v1 — v1 stays readable in the full history but drops out
+        // of the live set and out of `latest_page_version`.
+        let v2 = create_page_version(&mut conn, &page.id, "v2", None).unwrap();
+        archive_page_version(&mut conn, &v1.id).unwrap();
+        assert_eq!(
+            latest_page_version(&mut conn, &page.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            v2.id
+        );
+        assert_eq!(
+            list_page_versions(&mut conn, &page.id, false)
+                .unwrap()
+                .len(),
+            1,
+            "only the live version without archived"
+        );
+        assert_eq!(
+            list_page_versions(&mut conn, &page.id, true).unwrap().len(),
+            2,
+            "the archived v1 stays readable for rollback"
+        );
+
+        // ROUNDS: the seeded v1 plus a new round; the new one is current (max position).
+        let round2 = create_round(&mut conn, &proto.id, "v2", Some("second round")).unwrap();
+        assert!(round2.position > 0);
+        assert_eq!(
+            current_round(&mut conn, &proto.id).unwrap().unwrap().id,
+            round2.id,
+            "the newest round is the current (mutable) one"
+        );
+        assert_eq!(
+            list_rounds(&mut conn, &proto.id).unwrap().len(),
+            2,
+            "earlier rounds are kept for rollback"
+        );
+    }
+
+    /// "élection is_main(reco agent) != RETENU(choix user)" (PDR-0009): `set_main_variant` is the
+    /// AGENT's reco (at most one main per version, reversible), while `elect_round_page_variant`
+    /// is the USER's round-scoped RETENU (carries `decided_by`) — the two are DISTINCT records,
+    /// and advancing a round's pinned version RESETS the (now stale) RETENU.
+    #[test]
+    fn prototype_election_is_main_versus_retenu() {
+        let mut conn = open_in_memory();
+        let (_project, _spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let a = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let b = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "b".into(),
+                title: "B".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // is_main = AGENT reco: exactly one main per version, reversible.
+        set_main_variant(&mut conn, &a.id).unwrap();
+        assert!(get_variant(&mut conn, &a.id).unwrap().unwrap().is_main);
+        set_main_variant(&mut conn, &b.id).unwrap();
+        assert!(get_variant(&mut conn, &b.id).unwrap().unwrap().is_main);
+        assert!(
+            !get_variant(&mut conn, &a.id).unwrap().unwrap().is_main,
+            "moving the reco clears the previous main (one main per version)"
+        );
+
+        // RETENU = USER choice, round-scoped, distinct from is_main and carrying `decided_by`.
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+        let elected = elect_round_page_variant(
+            &mut conn,
+            &round.id,
+            &page.id,
+            &a.id,
+            Some("cleaner header"),
+            Some("user:kris"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(elected.chosen_variant_id.as_deref(), Some(a.id.as_str()));
+        assert_eq!(elected.decided_by.as_deref(), Some("user:kris"));
+        // The USER's RETENU (a) is INDEPENDENT of the AGENT's is_main (b) — distinct decisions.
+        assert!(get_variant(&mut conn, &b.id).unwrap().unwrap().is_main);
+
+        // Advancing the pinned version RESETS the stale round-scoped election.
+        let v2 = create_page_version(&mut conn, &page.id, "v2", None).unwrap();
+        let reset = set_round_page(&mut conn, &round.id, &page.id, &v2.id, 0).unwrap();
+        assert!(
+            reset.chosen_variant_id.is_none() && reset.decided_by.is_none(),
+            "a new pinned version drops the stale RETENU"
+        );
+    }
+
+    /// "page mono-variante = retenue d'office" (PDR-0009, clause GELÉE): with NO explicit election,
+    /// `effective_retained_variant` resolves a page whose pinned version carries EXACTLY ONE variant
+    /// to that lone variant (retained by the backend, no user action) — but a MULTI-variant page
+    /// with no election resolves to `None` (a real arbitration is owed), an explicit RETENU always
+    /// wins, and an UNPINNED page resolves to `None`.
+    #[test]
+    fn prototype_mono_variant_page_is_retained_doffice() {
+        let mut conn = open_in_memory();
+        let (_project, _spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let a = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+
+        // MONO-variant, no explicit election → the lone variant is retained "d'office".
+        assert_eq!(
+            effective_retained_variant(&mut conn, &round.id, &page.id)
+                .unwrap()
+                .as_deref(),
+            Some(a.id.as_str()),
+            "a mono-variant page is retained d'office by the backend"
+        );
+
+        // A SECOND variant makes the page ambiguous → nothing retained until the user elects.
+        let b = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "b".into(),
+                title: "B".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            effective_retained_variant(&mut conn, &round.id, &page.id)
+                .unwrap()
+                .is_none(),
+            "a multi-variant page has no d'office RETENU — the user must arbitrate"
+        );
+
+        // The USER's explicit RETENU always wins, even over the mono-variant default.
+        elect_round_page_variant(
+            &mut conn,
+            &round.id,
+            &page.id,
+            &b.id,
+            None,
+            Some("user:kris"),
+        )
+        .unwrap();
+        assert_eq!(
+            effective_retained_variant(&mut conn, &round.id, &page.id)
+                .unwrap()
+                .as_deref(),
+            Some(b.id.as_str()),
+            "an explicit RETENU wins over the mono-variant default"
+        );
+
+        // An UNPINNED page has no manifest entry → nothing retained.
+        let other = create_page(&mut conn, &proto.id, "about", "About", 1).unwrap();
+        assert!(
+            effective_retained_variant(&mut conn, &round.id, &other.id)
+                .unwrap()
+                .is_none(),
+            "an unpinned page has no retained variant"
+        );
+    }
+
+    /// review #24 — the PROTO TREE read-model (`proto_tree`): a Spec with NO prototype returns
+    /// `None` (the UI's empty cue); with one, the tree exposes pages/versions/variants + rounds, the
+    /// BOTH-TIER election (`is_main` = agent reco on the variant, RETENU = user choice on the current
+    /// round's manifest + the effective retained variant), and the anchored comments split open/resolved.
+    #[test]
+    fn proto_tree_exposes_pages_election_and_feedback() {
+        let mut conn = open_in_memory();
+
+        // A Spec with NO prototype → None (not an error).
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/proto-tree", None).unwrap();
+        let (bare_spec, _r) =
+            create_spec(&mut conn, &project.id, "Bare", SpecSections::empty()).unwrap();
+        assert!(
+            proto_tree(&mut conn, &bare_spec.id).unwrap().is_none(),
+            "a Spec with no prototype has no tree"
+        );
+
+        // Seed a prototype with one page/version + two variants; elect one as agent is_main and
+        // another as the user's RETENU (the two tiers must read back distinct).
+        let (_p, spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let a = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let b = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "b".into(),
+                title: "B".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+        set_main_variant(&mut conn, &a.id).unwrap(); // AGENT reco = a
+        elect_round_page_variant(
+            &mut conn,
+            &round.id,
+            &page.id,
+            &b.id,
+            None,
+            Some("user:kris"),
+        )
+        .unwrap(); // USER RETENU = b
+
+        // A resolved + an open anchored comment.
+        let open = create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                node_key: Some("Root/Header".into()),
+                body: "tighten spacing".into(),
+                author_kind: FEEDBACK_AUTHOR_USER.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let to_resolve = create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                node_key: Some("Root/Cta".into()),
+                body: "wrong label".into(),
+                author_kind: FEEDBACK_AUTHOR_USER.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        resolve_feedback(&mut conn, &to_resolve.id, Some("fixed"), None).unwrap();
+
+        let tree = proto_tree(&mut conn, &spec_id)
+            .unwrap()
+            .expect("has a tree");
+        assert_eq!(tree.prototype.id, proto.id);
+        assert_eq!(tree.rounds.len(), 1, "the seeded v1 round is listed");
+        assert_eq!(
+            tree.current_round.as_ref().unwrap().id,
+            round.id,
+            "the current round is exposed"
+        );
+        assert!(tree.design_lock.is_none(), "not frozen yet");
+        assert_eq!(tree.pages.len(), 1);
+        let tp = &tree.pages[0];
+        assert_eq!(tp.page.id, page.id);
+        assert_eq!(tp.versions.len(), 1);
+        assert_eq!(tp.versions[0].variants.len(), 2);
+        // is_main (agent reco = a) is carried on the variant, distinct from the RETENU (user = b).
+        let variant_a = tp.versions[0]
+            .variants
+            .iter()
+            .find(|v| v.id == a.id)
+            .unwrap();
+        assert!(variant_a.is_main, "the agent's is_main reco (a) is exposed");
+        assert_eq!(
+            tp.manifest_entry
+                .as_ref()
+                .unwrap()
+                .chosen_variant_id
+                .as_deref(),
+            Some(b.id.as_str()),
+            "the user's RETENU (b) is exposed on the manifest, distinct from is_main"
+        );
+        assert_eq!(
+            tp.effective_variant_id.as_deref(),
+            Some(b.id.as_str()),
+            "the effective retained variant is the explicit RETENU"
+        );
+        // Comments split open vs resolved.
+        assert_eq!(tree.open_feedback.len(), 1);
+        assert_eq!(tree.open_feedback[0].id, open.id);
+        assert_eq!(
+            tree.open_feedback[0].node_key.as_deref(),
+            Some("Root/Header")
+        );
+        assert_eq!(tree.resolved_feedback.len(), 1);
+        assert_eq!(tree.resolved_feedback[0].id, to_resolve.id);
+    }
+
+    /// "commentaires ANCRÉS à un nœud de l'arbre (durables cross-rounds : portés / à-ré-ancrer) +
+    /// résolution": a comment is anchored by `node_key` (a TREE NODE, not a CSS selector), OWNED
+    /// by the prototype (so it survives round churn), flips between CARRIED (`anchored`) and TO-
+    /// RE-ANCHOR (`orphaned`), and resolves / ignores with an audit annotation.
+    #[test]
+    fn prototype_feedback_node_anchor_durability_and_resolution() {
+        let mut conn = open_in_memory();
+        let (_project, _spec_id, proto) = seed_prototype(&mut conn);
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let variant = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Anchored to a TREE NODE (node_key), authored by a session, open + anchored.
+        let fb = create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                origin_variant_id: Some(variant.id.clone()),
+                node_key: Some("Root/Header/Title".into()),
+                body: "Title too small".into(),
+                author_kind: FEEDBACK_AUTHOR_SESSION.into(),
+                author_ref: Some("session:abc".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(fb.node_key.as_deref(), Some("Root/Header/Title"));
+        assert_eq!(fb.anchor_status, ANCHOR_STATUS_ANCHORED);
+        assert_eq!(fb.status, FEEDBACK_STATUS_OPEN);
+        assert_eq!(fb.author_kind, FEEDBACK_AUTHOR_SESSION);
+
+        // Durable cross-rounds: the node vanished in a new round → "à ré-ancrer".
+        set_feedback_anchor_status(&mut conn, &fb.id, ANCHOR_STATUS_ORPHANED).unwrap();
+        assert_eq!(
+            get_feedback(&mut conn, &fb.id)
+                .unwrap()
+                .unwrap()
+                .anchor_status,
+            ANCHOR_STATUS_ORPHANED
+        );
+        // Re-anchored (carried) again.
+        set_feedback_anchor_status(&mut conn, &fb.id, ANCHOR_STATUS_ANCHORED).unwrap();
+
+        // Resolution with the addressing variant recorded for the audit log.
+        let resolved = resolve_feedback(
+            &mut conn,
+            &fb.id,
+            Some("bumped to text-2xl"),
+            Some(variant.id.as_str()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.status, FEEDBACK_STATUS_RESOLVED);
+        assert!(resolved.resolved_at.is_some());
+        assert_eq!(
+            resolved.resolution_via_variant_id.as_deref(),
+            Some(variant.id.as_str())
+        );
+
+        // A second, ignored comment carries its required reason.
+        let fb2 = create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                node_key: Some("Root/Footer".into()),
+                body: "Footer color".into(),
+                author_kind: FEEDBACK_AUTHOR_USER.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ignored = ignore_feedback(&mut conn, &fb2.id, "out of scope")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ignored.status, FEEDBACK_STATUS_IGNORED);
+        assert_eq!(ignored.ignored_reason.as_deref(), Some("out of scope"));
+        assert_eq!(list_feedback(&mut conn, &proto.id).unwrap().len(), 2);
+    }
+
+    /// The FREEZE marker (`prototype_design_lock`, PDR-0010 reframe — no placement blob):
+    /// `lock_design` upserts the frozen round for the prototype and a re-lock updates it in place.
+    #[test]
+    fn prototype_design_lock_freeze_marker_upserts() {
+        let mut conn = open_in_memory();
+        let (_project, _spec_id, proto) = seed_prototype(&mut conn);
+        let r1 = current_round(&mut conn, &proto.id).unwrap().unwrap();
+        let r2 = create_round(&mut conn, &proto.id, "v2", None).unwrap();
+
+        assert!(get_design_lock(&mut conn, &proto.id).unwrap().is_none());
+        let lock = lock_design(&mut conn, &proto.id, &r1.id, Some("user:kris")).unwrap();
+        assert_eq!(lock.locked_round_id, r1.id);
+        // Re-lock onto the newer round updates the SAME marker in place.
+        let relock = lock_design(&mut conn, &proto.id, &r2.id, None).unwrap();
+        assert_eq!(relock.locked_round_id, r2.id);
+        assert_eq!(
+            get_design_lock(&mut conn, &proto.id)
+                .unwrap()
+                .unwrap()
+                .locked_round_id,
+            r2.id
+        );
+    }
+
+    /// The coder SEAM (v2.7 Phase 4, task #8): `elected_composition` ASSEMBLES the FROZEN elected
+    /// composition. It (a) exposes NOTHING until the design is LOCKED (the "élection figée"
+    /// guarantee — a moving election is never surfaced), then (b) exposes, per page pinned in the
+    /// LOCKED round, the effective RETENU variant + its `composition_json` (the arbre nommé =
+    /// placement) with each node classified by the 3 natures ([DS] materialized in the app / [NEW]
+    /// to build / [inline]), the design-system as a REFERENCE (ids, not content), and the resolved
+    /// pre-dev review + an open-count gap signal.
+    #[test]
+    fn elected_composition_exposes_frozen_election() {
+        let mut conn = open_in_memory();
+        let (project_id, spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+
+        // A design-system + one catalogue component (the [DS] reference target). It is [DS] because
+        // it is MATERIALIZED in the app — it carries an on-disk `source_path` (review #41: the
+        // nature is the ORIGIN, not the mere presence of a catalogue row).
+        let design = upsert_design(&mut conn, &project_id, "# DESIGN\nblue", None).unwrap();
+        let card = upsert_component(
+            &mut conn,
+            &project_id,
+            &ComponentInput {
+                name: "Card".into(),
+                source_path: Some("src/ui/Card.tsx".into()),
+                template: "<div>{{{children}}}</div>".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // A page whose elected variant's composition mixes the 3 natures: Card [DS], NewWidget [NEW]
+        // (not in the catalogue), and a bespoke [inline] node.
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let variant = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                composition_json:
+                    "{\"component\":\"Card\",\"children\":[{\"component\":\"NewWidget\"},{\"inline\":\"<hr/>\"}]}"
+                        .into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+        elect_round_page_variant(
+            &mut conn,
+            &round.id,
+            &page.id,
+            &variant.id,
+            None,
+            Some("user:k"),
+        )
+        .unwrap();
+
+        // A pre-dev comment resolved BEFORE election (a record) + one still open (a gap signal).
+        let fb_resolved = create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                node_key: Some("Card/NewWidget".into()),
+                body: "too small".into(),
+                author_kind: FEEDBACK_AUTHOR_SESSION.to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        resolve_feedback(&mut conn, &fb_resolved.id, Some("enlarged"), None).unwrap();
+        create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                node_key: Some("Card".into()),
+                body: "still open".into(),
+                author_kind: FEEDBACK_AUTHOR_SESSION.to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // (a) NOT FROZEN yet → the seam exposes nothing (élection figée guarantee).
+        assert!(
+            elected_composition(&mut conn, &proto.id).unwrap().is_none(),
+            "an unlocked prototype exposes NO composition"
+        );
+
+        // Freeze the election, then the seam exposes the FROZEN composition.
+        lock_design(&mut conn, &proto.id, &round.id, Some("user:kris")).unwrap();
+        let exposed = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+
+        assert_eq!(exposed.prototype_id, proto.id);
+        assert_eq!(exposed.spec_id, spec_id);
+        assert_eq!(
+            exposed.locked.locked_round_id, round.id,
+            "reads off the LOCK"
+        );
+        // Design-system as a REFERENCE (pointers, not content).
+        assert_eq!(exposed.design_ref.project_id, project_id);
+        assert_eq!(
+            exposed.design_ref.design_id.as_deref(),
+            Some(design.id.as_str())
+        );
+
+        // One page, its effective RETENU variant + the raw composition tree (the placement).
+        assert_eq!(exposed.pages.len(), 1);
+        let p = &exposed.pages[0];
+        assert_eq!(p.slug, "home");
+        assert_eq!(p.elected_variant_id.as_deref(), Some(variant.id.as_str()));
+        assert!(p.composition_json.as_ref().unwrap().contains("Card"));
+
+        // The 3 natures, made explicit + carrying the per-node design-system reference.
+        let ds = p.nodes.iter().find(|n| n.node_key == "Card").unwrap();
+        assert_eq!(ds.nature, NODE_NATURE_DS);
+        assert_eq!(ds.component_ref.as_deref(), Some(card.id.as_str()));
+        let new = p
+            .nodes
+            .iter()
+            .find(|n| n.node_key == "Card/NewWidget")
+            .unwrap();
+        assert_eq!(new.nature, NODE_NATURE_NEW);
+        assert!(
+            new.component_ref.is_none(),
+            "[NEW] has no catalogue reference"
+        );
+        let inline = p
+            .nodes
+            .iter()
+            .find(|n| n.node_key == "Card/inline")
+            .unwrap();
+        assert_eq!(inline.nature, NODE_NATURE_INLINE);
+        // The [NEW] components are the derived-task anchor.
+        assert_eq!(p.new_components, vec!["NewWidget".to_string()]);
+
+        // DONE-CRITERION (review #41): AUTHORING the [NEW] does NOT make it [DS]. The nature is the
+        // component's ORIGIN — a greenfield row has no `source_path`, so it is not in the app yet
+        // and STAYS the anchor of the dev task, now carrying its authored row as a reference.
+        let widget = upsert_component(
+            &mut conn,
+            &project_id,
+            &ComponentInput {
+                name: "NewWidget".into(),
+                template: "<aside>{{title}}</aside>".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let authored = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        let node = authored.pages[0]
+            .nodes
+            .iter()
+            .find(|n| n.node_key == "Card/NewWidget")
+            .unwrap();
+        assert_eq!(
+            node.nature, NODE_NATURE_NEW,
+            "an AUTHORED greenfield component is still to be BUILT"
+        );
+        assert_eq!(
+            node.component_ref.as_deref(),
+            Some(widget.id.as_str()),
+            "…and now points at the authored row (the spec of what to build)"
+        );
+        assert_eq!(
+            authored.pages[0].new_components,
+            vec!["NewWidget".to_string()],
+            "it never leaves the derived-task anchors while it is not in the app"
+        );
+
+        // MATERIALIZED (the coder shipped it, the inventory discovered it) → the SAME frozen node
+        // reads [DS] at the next read. The round trip, with no duplicate row.
+        bind_component_source(&mut conn, &widget.id, None, "src/ui/NewWidget.tsx")
+            .unwrap()
+            .expect("the row is still there, so the bind lands");
+        let built = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        let node = built.pages[0]
+            .nodes
+            .iter()
+            .find(|n| n.node_key == "Card/NewWidget")
+            .unwrap();
+        assert_eq!(node.nature, NODE_NATURE_DS);
+        assert_eq!(node.component_ref.as_deref(), Some(widget.id.as_str()));
+        assert!(
+            built.pages[0].new_components.is_empty(),
+            "materialized → no longer a [NEW] to build"
+        );
+        // The FROZEN tree itself never derived through any of it.
+        assert_eq!(built.pages[0].composition_json, p.composition_json);
+        delete_component(&mut conn, &widget.id).unwrap();
+
+        // The pre-dev review: the resolved comment as an ANCHOR record + the two counts.
+        assert_eq!(exposed.resolved_feedback.len(), 1);
+        assert_eq!(exposed.resolved_feedback[0].id, fb_resolved.id);
+        assert_eq!(
+            exposed.resolved_feedback[0].node_key.as_deref(),
+            Some("Card/NewWidget"),
+            "the ANCHOR (which node was corrected) is what the seam carries",
+        );
+        assert!(exposed.resolved_feedback[0].resolved_at.is_some());
+        assert_eq!(exposed.resolved_feedback_count, 1);
+        assert_eq!(exposed.open_feedback_count, 1);
+
+        // An unknown prototype exposes nothing.
+        assert!(elected_composition(&mut conn, "nope").unwrap().is_none());
+    }
+
+    /// DONE-CRITERION (finding `01KYVMTWB71R0D0CT1SV88J8DX`) — THE EXCEPTION REACHES THE CODER, WITH
+    /// ITS REASON. Everything else in this seam is a REFERENCE the harness resolves, because it
+    /// exists in the app; a scoped CSS slot exists NOWHERE else, so it travels whole. And it travels
+    /// for a component reached only through `data-nyx-use` too: the loader that started this finding
+    /// is used without ever being placed.
+    #[test]
+    fn the_coder_seam_carries_every_css_exception_with_its_scope_and_its_reason() {
+        let mut conn = open_in_memory();
+        let (project_id, _spec_id, proto) = seed_prototype(&mut conn);
+        // A placed `Card` with a `::before` slot, referencing a `Spinner` with a `@keyframes` one.
+        for (name, template, css, reason) in [
+            (
+                "Card",
+                "<section class=\"card\"><i data-nyx-use=\"Spinner\"></i>{{{children}}}</section>",
+                ".card::before { content: \"\" }",
+                "generated content has no utility",
+            ),
+            (
+                "Spinner",
+                "<span class=\"spin\"><b></b></span>",
+                "@keyframes spin { to { opacity: 1 } } .spin b { animation: spin 1s linear infinite }",
+                "a custom keyframe; Tailwind has no utility for one",
+            ),
+        ] {
+            upsert_component(
+                &mut conn,
+                &project_id,
+                &ComponentInput {
+                    name: name.into(),
+                    template: template.into(),
+                    css_slot_json: Some(
+                        crate::css_slot::CssSlot {
+                            css: css.into(),
+                            reason: reason.into(),
+                        }
+                        .to_json(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                composition_json: "{\"component\":\"Card\"}".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+        lock_design(&mut conn, &proto.id, &round.id, None).unwrap();
+
+        let exposed = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        let page = &exposed.pages[0];
+        assert_eq!(
+            page.css_exceptions.len(),
+            2,
+            "the PLACED component's exception and the REFERENCED one both cross"
+        );
+
+        let card = &page.css_exceptions[0];
+        assert_eq!(card.component, "Card");
+        assert_eq!(card.reached_by, CSS_EXCEPTION_PLACEMENT);
+        assert_eq!(card.reason, "generated content has no utility");
+        assert_eq!(card.features, vec!["pseudo_element".to_string()]);
+        assert_eq!(card.scope, crate::css_slot::scope_selector(&card.scope_id));
+        assert!(
+            card.css.starts_with(&card.scope),
+            "the CSS that crosses is already ANCHORED: {}",
+            card.css
+        );
+        assert!(card.refused.is_none());
+
+        let spinner = &page.css_exceptions[1];
+        assert_eq!(spinner.component, "Spinner");
+        assert_eq!(
+            spinner.reached_by, CSS_EXCEPTION_REFERENCE,
+            "a component USED without being PLACED still hands its exception over — that is the \
+             loader case"
+        );
+        assert!(
+            spinner
+                .css
+                .contains(&format!("@keyframes {}-spin", spinner.scope_id)),
+            "with its keyframes already localised: {}",
+            spinner.css
+        );
+
+        // The NODE points at its exception; it never carries a copy of it.
+        let node = page
+            .nodes
+            .iter()
+            .find(|n| n.component.as_deref() == Some("Card"))
+            .expect("the Card node");
+        assert_eq!(node.css_scope.as_deref(), Some(card.scope_id.as_str()));
+        let wire = serde_json::to_string(&exposed).unwrap();
+        assert_eq!(
+            wire.matches("generated content has no utility").count(),
+            1,
+            "one record per page, not one per placement"
+        );
+    }
+
+    /// THE PARCOURS CROSSES THE SEAM (finding `01KYW34347CZSNXCYS35KDG3EY`). "This button opens the
+    /// checkout" is a DESIGN decision, settled and frozen in the proto: if it did not cross here, the
+    /// coder would receive a set of pages with no idea which one leads to which, and re-invent the
+    /// routing. It crosses as the stored ID plus the SLUG and TITLE resolved at the read — and with a
+    /// STATUS, because a destination outside the frozen round, or gone entirely, is information the
+    /// coder must have rather than a blank.
+    #[test]
+    fn the_coder_seam_carries_the_parcours_with_its_destination_named() {
+        let mut conn = open_in_memory();
+        let (_project_id, _spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+        let home = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        // A second page that EXISTS but is NOT pinned in the round being frozen.
+        let draft = create_page(&mut conn, &proto.id, "draft", "Brouillon", 1).unwrap();
+        let v1 = create_page_version(&mut conn, &home.id, "v1", None).unwrap();
+        let composition = serde_json::json!({
+            "key": "Root",
+            "children": [
+                { "key": "ToHome", "component": "Card", "navigate_to": home.id },
+                { "key": "ToDraft", "component": "Card", "navigate_to": draft.id },
+                { "key": "ToGone", "component": "Card", "navigate_to": "pg-vanished" },
+            ]
+        })
+        .to_string();
+        create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                composition_json: composition,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &home.id, &v1.id, 0).unwrap();
+        lock_design(&mut conn, &proto.id, &round.id, None).unwrap();
+
+        let exposed = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        let nodes = &exposed.pages[0].nodes;
+        let link = |key: &str| -> ElectedNavigation {
+            nodes
+                .iter()
+                .find(|n| n.node_key == format!("Root/{key}"))
+                .and_then(|n| n.navigates_to.clone())
+                .unwrap_or_else(|| panic!("{key} carries a destination"))
+        };
+
+        // The normal case: a destination the frozen round PINS, named the way a human names it.
+        let to_home = link("ToHome");
+        assert_eq!(to_home.page_id, home.id);
+        assert_eq!(to_home.slug.as_deref(), Some("home"));
+        assert_eq!(to_home.title.as_deref(), Some("Home"));
+        assert_eq!(to_home.status, NAVIGATION_PINNED);
+
+        // A page that exists but is NOT part of the frozen design: the parcours LEAVES it, and the
+        // coder is told so rather than discovering a route to a page nobody handed over.
+        assert_eq!(link("ToDraft").status, NAVIGATION_UNPINNED);
+
+        // A page that is GONE: named anyway, with no slug to pretend it resolves.
+        let to_gone = link("ToGone");
+        assert_eq!(to_gone.status, NAVIGATION_UNKNOWN);
+        assert_eq!(to_gone.slug, None);
+
+        // A node with no link states none at all — the payload does not grow for the 99% of nodes
+        // that navigate nowhere.
+        let wire = serde_json::to_string(&exposed).unwrap();
+        assert_eq!(
+            wire.matches("navigates_to").count(),
+            3,
+            "one per LINKING node, and nothing for the others: {wire}"
+        );
+    }
+
+    /// DONE-CRITERION (review #47) — the contradiction is RESOLVED IN FAVOUR OF PDR-0009, and pinned
+    /// here: the coder SEAM carries the pre-dev review as COUNTS + ANCHORS, never as PROSE. The
+    /// manual states "le feedback pré-dev n'est JAMAIS transmis au coder"; the seam is what a coder
+    /// harness consumes, so the guarantee has to be STRUCTURAL — the body simply is not in the
+    /// payload. This asserts on the SERIALIZED form (what actually crosses MCP/IPC), so the day a
+    /// prose field is added back to the projection, this fails.
+    #[test]
+    fn the_coder_seam_never_carries_a_pre_dev_comment_body() {
+        let mut conn = open_in_memory();
+        let (_project_id, _spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let variant = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                composition_json: "{\"component\":\"Card\"}".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+
+        // Two comments whose PROSE is unmistakable, one resolved (with a resolution note), one open.
+        let resolved = create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                origin_variant_id: Some(variant.id.clone()),
+                node_key: Some("Card".into()),
+                body: "SECRET-BODY the coder must never read".into(),
+                author_kind: FEEDBACK_AUTHOR_USER.to_string(),
+                author_ref: Some("user:kris".into()),
+            },
+        )
+        .unwrap();
+        resolve_feedback(
+            &mut conn,
+            &resolved.id,
+            Some("SECRET-NOTE how it was fixed"),
+            Some(&variant.id),
+        )
+        .unwrap();
+        create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                node_key: Some("Card".into()),
+                body: "SECRET-OPEN still to address".into(),
+                author_kind: FEEDBACK_AUTHOR_SESSION.to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        lock_design(&mut conn, &proto.id, &round.id, None).unwrap();
+
+        let exposed = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        let wire = serde_json::to_string(&exposed).unwrap();
+        for prose in ["SECRET-BODY", "SECRET-NOTE", "SECRET-OPEN", "user:kris"] {
+            assert!(
+                !wire.contains(prose),
+                "the coder seam leaked pre-dev review prose ({prose}) — PDR-0009 forbids it",
+            );
+        }
+        assert!(
+            !wire.contains("\"body\"") && !wire.contains("resolution_note"),
+            "no prose FIELD at all crosses the seam",
+        );
+        // What DOES cross: the record that a node was reviewed and corrected, and the two counts.
+        assert_eq!(exposed.resolved_feedback.len(), 1);
+        assert_eq!(exposed.resolved_feedback[0].id, resolved.id);
+        assert_eq!(
+            exposed.resolved_feedback[0].node_key.as_deref(),
+            Some("Card")
+        );
+        assert_eq!(
+            exposed.resolved_feedback[0]
+                .resolution_via_variant_id
+                .as_deref(),
+            Some(variant.id.as_str()),
+        );
+        assert_eq!(exposed.resolved_feedback_count, 1);
+        assert_eq!(exposed.open_feedback_count, 1);
+
+        // The bodies are NOT lost — they live on the LIVE authoring surface, which no coder reads.
+        let tree = proto_tree(&mut conn, &proto.spec_id).unwrap().unwrap();
+        assert_eq!(
+            tree.resolved_feedback[0].body,
+            "SECRET-BODY the coder must never read"
+        );
+        assert_eq!(tree.open_feedback[0].body, "SECRET-OPEN still to address");
+    }
+
+    /// The "élection figée" IMMUTABILITY guard (review #22): once `lock_design` freezes a round, the
+    /// mutations that could alter its election/composition are REFUSED with
+    /// [`RoundMutationError::RoundLocked`] — `elect_round_page_variant`, `clear_round_page_election`,
+    /// `set_round_page`, and `update_variant_composition` on the EXPOSED (elected) variant. So (c)
+    /// `elected_composition` STAYS stable after a refused mutation (it never drifts). Editing a
+    /// NON-exposed sibling variant, and mutating a NON-locked round, remain allowed.
+    #[test]
+    fn locked_round_mutations_are_refused_so_election_never_drifts() {
+        let mut conn = open_in_memory();
+        let (_project_id, _spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+
+        // One page, two variants (a elected, b a sibling), pinned into the current round.
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let va = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                composition_json: "{\"component\":\"CardA\"}".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let vb = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "b".into(),
+                title: "B".into(),
+                composition_json: "{\"component\":\"CardB\"}".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+        elect_round_page_variant(&mut conn, &round.id, &page.id, &va.id, None, Some("user:k"))
+            .unwrap();
+
+        // A second (non-locked) version, to prove `set_round_page` is guarded on the locked round.
+        let v2 = create_page_version(&mut conn, &page.id, "v2", None).unwrap();
+
+        // FREEZE the round: from here its election is immutable.
+        lock_design(&mut conn, &proto.id, &round.id, Some("user:kris")).unwrap();
+        let frozen = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        assert_eq!(
+            frozen.pages[0].elected_variant_id.as_deref(),
+            Some(va.id.as_str())
+        );
+
+        // (a) Every election/composition mutation on the FROZEN round is refused as RoundLocked.
+        assert!(matches!(
+            elect_round_page_variant(&mut conn, &round.id, &page.id, &vb.id, None, None),
+            Err(RoundMutationError::RoundLocked { ref locked_round_id }) if *locked_round_id == round.id
+        ));
+        assert!(matches!(
+            clear_round_page_election(&mut conn, &round.id, &page.id),
+            Err(RoundMutationError::RoundLocked { .. })
+        ));
+        assert!(matches!(
+            set_round_page(&mut conn, &round.id, &page.id, &v2.id, 0),
+            Err(RoundMutationError::RoundLocked { .. })
+        ));
+        // Editing the EXPOSED (elected) variant's composition would drift the frozen tree → refused.
+        assert!(matches!(
+            update_variant_composition(&mut conn, &va.id, "{\"component\":\"Tampered\"}"),
+            Err(RoundMutationError::RoundLocked { .. })
+        ));
+
+        // (c) After all the refused attempts, the exposed composition is IDENTICAL (no drift).
+        let still = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        assert_eq!(
+            still.pages[0].elected_variant_id.as_deref(),
+            Some(va.id.as_str())
+        );
+        assert_eq!(
+            still.pages[0].composition_json.as_deref(),
+            Some("{\"component\":\"CardA\"}"),
+            "the frozen elected composition never drifted"
+        );
+
+        // Editing a NON-exposed sibling variant (b, not elected) is ALLOWED — the guard is scoped to
+        // what the seam exposes, never over-broad.
+        assert!(
+            update_variant_composition(&mut conn, &vb.id, "{\"component\":\"CardB2\"}")
+                .unwrap()
+                .is_some()
+        );
+        // …and it did not touch the exposed election either.
+        let after_sibling = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        assert_eq!(
+            after_sibling.pages[0].composition_json.as_deref(),
+            Some("{\"component\":\"CardA\"}")
+        );
+
+        // (b) The ROLLBACK path stays open (PDR-0009): rebase onto the frozen round opens a NEW,
+        // NON-locked round, whose election/manifest mutations succeed as before.
+        let r2 = rebase_round(&mut conn, &proto.id, &round.id, "v2", None)
+            .unwrap()
+            .unwrap();
+        assert!(round_design_lock(&mut conn, &r2.id).unwrap().is_none());
+        elect_round_page_variant(&mut conn, &r2.id, &page.id, &vb.id, None, Some("user:k"))
+            .unwrap()
+            .expect("a non-locked round elects freely");
+        set_round_page(&mut conn, &r2.id, &page.id, &v2.id, 0).unwrap();
+        clear_round_page_election(&mut conn, &r2.id, &page.id).unwrap();
+
+        // The frozen round's exposure is STILL the original election, untouched by the new round.
+        let final_exposed = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        assert_eq!(final_exposed.locked.locked_round_id, round.id);
+        assert_eq!(
+            final_exposed.pages[0].elected_variant_id.as_deref(),
+            Some(va.id.as_str())
+        );
+    }
+
+    /// Hardening (audit adversarial): `create_variant` is now GUARDED by the SAME "élection figée"
+    /// invariant as the other round-scoped mutations. Adding a variant to the page-VERSION pinned in
+    /// a design-LOCKED round would flip a mono-variant page "retenue d'office" from `Some(only)` to
+    /// `None` (a fresh sibling makes it ambiguous), drifting the composition the coder SEAM exposes.
+    /// So creating there is REFUSED with `RoundLocked`; creating on a NON-locked round (or under a
+    /// version not pinned in the frozen round) stays allowed, and `elected_composition` never drifts.
+    #[test]
+    fn create_variant_on_locked_round_is_refused_so_election_never_drifts() {
+        let mut conn = open_in_memory();
+        let (_project_id, _spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+
+        // A mono-variant page "retenue d'office": ONE variant pinned into the current round.
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let only = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                composition_json: "{\"component\":\"CardA\"}".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+
+        // FREEZE: the lone variant is retained "d'office" — the seam exposes it.
+        lock_design(&mut conn, &proto.id, &round.id, Some("user:kris")).unwrap();
+        let frozen = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        assert_eq!(
+            frozen.pages[0].elected_variant_id.as_deref(),
+            Some(only.id.as_str()),
+            "a mono-variant page is retained d'office"
+        );
+
+        // (a) Adding a SECOND variant to the PINNED version would flip effective_retained_variant to
+        // None (ambiguous) → refused as RoundLocked, pointing at the frozen round (open a new round).
+        assert!(matches!(
+            create_variant(
+                &mut conn,
+                &v1.id,
+                &VariantInput {
+                    label: "b".into(),
+                    title: "B".into(),
+                    composition_json: "{\"component\":\"CardB\"}".into(),
+                    ..Default::default()
+                },
+            ),
+            Err(RoundMutationError::RoundLocked { ref locked_round_id }) if *locked_round_id == round.id
+        ));
+
+        // (c) The frozen elected composition never drifted: still the lone variant, still mono.
+        let still = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        assert_eq!(
+            still.pages[0].elected_variant_id.as_deref(),
+            Some(only.id.as_str()),
+            "the frozen election never drifted"
+        );
+        assert_eq!(
+            list_variants(&mut conn, &v1.id).unwrap().len(),
+            1,
+            "no sibling variant was inserted under the frozen version"
+        );
+
+        // (b) Creating under a version NOT pinned in the frozen round is UNAFFECTED (the guard is
+        // scoped to the exposed election): a second page of the SAME locked prototype accepts variants.
+        let page2 = create_page(&mut conn, &proto.id, "settings", "Settings", 1).unwrap();
+        let v2 = create_page_version(&mut conn, &page2.id, "v1", None).unwrap();
+        assert!(
+            create_variant(
+                &mut conn,
+                &v2.id,
+                &VariantInput {
+                    label: "a".into(),
+                    title: "A".into(),
+                    ..Default::default()
+                },
+            )
+            .is_ok(),
+            "a version not pinned in the frozen round accepts variants"
+        );
+
+        // And the ROLLBACK path stays open (PDR-0009): a rebase opens a NEW, NON-locked round; adding
+        // a variant under a FRESH version pinned in that round is allowed (the frozen round pins the
+        // OLD version, not this one).
+        let r2 = rebase_round(&mut conn, &proto.id, &round.id, "v2", None)
+            .unwrap()
+            .unwrap();
+        let v1b = create_page_version(&mut conn, &page.id, "v2", None).unwrap();
+        set_round_page(&mut conn, &r2.id, &page.id, &v1b.id, 0).unwrap();
+        assert!(
+            create_variant(
+                &mut conn,
+                &v1b.id,
+                &VariantInput {
+                    label: "a".into(),
+                    title: "A".into(),
+                    ..Default::default()
+                },
+            )
+            .is_ok(),
+            "a fresh version in a NON-locked round accepts variants"
+        );
+
+        // The frozen round's exposure is STILL the original lone variant, untouched throughout.
+        let final_exposed = elected_composition(&mut conn, &proto.id).unwrap().unwrap();
+        assert_eq!(final_exposed.locked.locked_round_id, round.id);
+        assert_eq!(
+            final_exposed.pages[0].elected_variant_id.as_deref(),
+            Some(only.id.as_str())
+        );
+    }
+
+    /// "Events émis" (task #5): the four prototype mutations that matter to an observer each
+    /// record a `domain_events` OUTBOX row atomically — `proto.round_presented` (present a round),
+    /// `proto.variant_elected` (the USER RETENU), `proto.feedback_created`, `proto.feedback_resolved`.
+    /// Each event is correlated to the project + the prototype's Spec (the payload carries
+    /// `prototype_id` + `spec_id`), so no action of the agent is unseen.
+    #[test]
+    fn prototype_mutations_emit_domain_events() {
+        let mut conn = open_in_memory();
+        let (project_id, spec_id, proto) = seed_prototype(&mut conn);
+        let round = current_round(&mut conn, &proto.id).unwrap().unwrap();
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        let variant = create_variant(
+            &mut conn,
+            &v1.id,
+            &VariantInput {
+                label: "a".into(),
+                title: "A".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        set_round_page(&mut conn, &round.id, &page.id, &v1.id, 0).unwrap();
+
+        // Drive the four event-bearing mutations.
+        present_round(&mut conn, &round.id).unwrap();
+        elect_round_page_variant(
+            &mut conn,
+            &round.id,
+            &page.id,
+            &variant.id,
+            None,
+            Some("user:k"),
+        )
+        .unwrap();
+        let fb = create_feedback(
+            &mut conn,
+            &proto.id,
+            &FeedbackInput {
+                node_key: Some("Root".into()),
+                body: "tweak".into(),
+                author_kind: FEEDBACK_AUTHOR_SESSION.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        resolve_feedback(&mut conn, &fb.id, None, None).unwrap();
+
+        let events = list_domain_events(&mut conn).unwrap();
+        let proto_events: Vec<&DomainEvent> = events
+            .iter()
+            .filter(|e| e.aggregate == "prototype")
+            .collect();
+        let types: Vec<&str> = proto_events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            types.contains(&EVENT_PROTO_ROUND_PRESENTED),
+            "round_presented emitted"
+        );
+        assert!(
+            types.contains(&EVENT_PROTO_VARIANT_ELECTED),
+            "variant_elected emitted"
+        );
+        assert!(
+            types.contains(&EVENT_PROTO_FEEDBACK_CREATED),
+            "feedback_created emitted"
+        );
+        assert!(
+            types.contains(&EVENT_PROTO_FEEDBACK_RESOLVED),
+            "feedback_resolved emitted"
+        );
+
+        // Each event is correlated to the project + the prototype's Spec (payload carries both).
+        for e in &proto_events {
+            assert_eq!(e.project_id, project_id);
+            let payload: serde_json::Value = serde_json::from_str(&e.payload).unwrap();
+            assert_eq!(payload["prototype_id"], serde_json::json!(proto.id));
+            assert_eq!(payload["spec_id"], serde_json::json!(spec_id));
+        }
+    }
+
+    /// REBASE (rollback) clones the source round's manifest into a NEW current round without
+    /// mutating the frozen source (PDR-0009: rounds gardés comme rollback).
+    #[test]
+    fn rebase_round_clones_the_source_manifest() {
+        let mut conn = open_in_memory();
+        let (_project, _spec, proto) = seed_prototype(&mut conn);
+        let source = current_round(&mut conn, &proto.id).unwrap().unwrap();
+        let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let v1 = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
+        set_round_page(&mut conn, &source.id, &page.id, &v1.id, 0).unwrap();
+
+        let rebased = rebase_round(&mut conn, &proto.id, &source.id, "v2", Some("rollback"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            rebased.position > source.position,
+            "the rebase is the new current round"
+        );
+        let manifest = list_round_pages(&mut conn, &rebased.id).unwrap();
+        assert_eq!(manifest.len(), 1, "the source manifest was cloned");
+        assert_eq!(manifest[0].page_version_id, v1.id, "same pinned version");
+        // The source stays intact (frozen).
+        assert_eq!(
+            list_round_pages(&mut conn, &source.id).unwrap().len(),
+            1,
+            "the source round is untouched"
+        );
+        // A cross-prototype / unknown source is rejected.
+        assert!(rebase_round(&mut conn, &proto.id, "nope", "v3", None)
+            .unwrap()
+            .is_none());
+    }
+
+    /// `round_manifest` — WHAT A PAST ROUND PINNED, resolved (finding `01KZ3AP34K1PKS6W0E75RP7DF6`).
+    ///
+    /// The rounds were listable and not READABLE: [`proto_tree`] carries every version and variant a
+    /// page ever had, but it resolves the election against the CURRENT round only. This read answers
+    /// the other half for ANY round — the pinned page VERSION and the variant RETAINED in it, both
+    /// tiers of the retention included (the explicit RETENU, and the mono-variant "retenue
+    /// d'office"). It is a pure read: it opens no round and moves no election.
+    #[test]
+    fn round_manifest_reads_a_past_round_as_it_was() {
+        let mut conn = open_in_memory();
+        let (_project, _spec, proto) = seed_prototype(&mut conn);
+        let past = current_round(&mut conn, &proto.id).unwrap().unwrap();
+
+        // `home` offered TWO variants in that round and the user arbitrated for the second.
+        let home = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
+        let home_v1 = create_page_version(&mut conn, &home.id, "v1", None).unwrap();
+        fn variant(
+            conn: &mut SqliteConnection,
+            version_id: &str,
+            label: &str,
+            position: i32,
+        ) -> PrototypeVariant {
+            create_variant(
+                conn,
+                version_id,
+                &VariantInput {
+                    label: label.to_string(),
+                    title: label.to_string(),
+                    composition_json: format!("{{\"key\":\"{label}\"}}"),
+                    states_json: None,
+                    position,
+                },
+            )
+            .unwrap()
+        }
+        let home_a = variant(&mut conn, &home_v1.id, "a", 0);
+        let home_b = variant(&mut conn, &home_v1.id, "b", 1);
+        set_round_page(&mut conn, &past.id, &home.id, &home_v1.id, 0).unwrap();
+        elect_round_page_variant(&mut conn, &past.id, &home.id, &home_b.id, None, None)
+            .unwrap()
+            .unwrap();
+
+        // `settings` offered ONE — retained "d'office", with nothing for the user to arbitrate.
+        let settings = create_page(&mut conn, &proto.id, "settings", "Settings", 1).unwrap();
+        let settings_v1 = create_page_version(&mut conn, &settings.id, "v1", None).unwrap();
+        let settings_a = variant(&mut conn, &settings_v1.id, "a", 0);
+        set_round_page(&mut conn, &past.id, &settings.id, &settings_v1.id, 1).unwrap();
+
+        // …then the work moved ON: a NEW round pins a NEW version of `home`, and the user retains
+        // its own variant there. Nothing of that must leak into the reading of the past round.
+        let now = rebase_round(&mut conn, &proto.id, &past.id, "v2", None)
+            .unwrap()
+            .unwrap();
+        let home_v2 = create_page_version(&mut conn, &home.id, "v2", None).unwrap();
+        let home_c = variant(&mut conn, &home_v2.id, "c", 0);
+        set_round_page(&mut conn, &now.id, &home.id, &home_v2.id, 0).unwrap();
+        elect_round_page_variant(&mut conn, &now.id, &home.id, &home_c.id, None, None)
+            .unwrap()
+            .unwrap();
+
+        let manifest = round_manifest(&mut conn, &past.id).unwrap();
+        assert_eq!(manifest.len(), 2, "the past round pinned both pages");
+        assert_eq!(
+            manifest[0].entry.page_id, home.id,
+            "manifest order (position)"
+        );
+        assert_eq!(
+            manifest[0].entry.page_version_id, home_v1.id,
+            "the VERSION that round pinned — not the one the current round moved to"
+        );
+        assert_eq!(
+            manifest[0].effective_variant_id,
+            Some(home_b.id.clone()),
+            "the variant RETAINED in THAT round (the user's explicit RETENU)"
+        );
+        assert_ne!(
+            manifest[0].effective_variant_id,
+            Some(home_c.id),
+            "the current round's decision does not bleed into the past one"
+        );
+        assert_ne!(manifest[0].effective_variant_id, Some(home_a.id));
+        assert_eq!(
+            manifest[1].effective_variant_id,
+            Some(settings_a.id),
+            "the mono-variant clause resolves in a past round too (retenue d'office)"
+        );
+
+        // …and the CURRENT round reads as its own thing, off the same function.
+        let current = round_manifest(&mut conn, &now.id).unwrap();
+        assert_eq!(current[0].entry.page_version_id, home_v2.id);
+
+        // An unknown round pins nothing — a manifest is a list, never an error.
+        assert!(round_manifest(&mut conn, "nope").unwrap().is_empty());
+    }
+
+    /// "proto lié à la session agent (terminal)" + "seam prêt pour un futur overlay" (task #12):
+    /// the proto ↔ session link is MANY-TO-MANY (like `agent_session_specs`), resolves "the
+    /// prototypes of a terminal" through its ACTIVE session, is idempotent, is vacated by a
+    /// `/clear`, and cascades on both a session and a prototype delete.
+    #[test]
+    fn prototype_session_seam_links_resolves_and_cascades() {
+        let mut conn = open_in_memory();
+        let (_project, _spec, proto) = seed_prototype(&mut conn);
+        let terminal = create_terminal(&mut conn, "/work", None).unwrap();
+        let session = record_session_start(
+            &mut conn,
+            &terminal.id,
+            AGENT_KIND_CLAUDE_CODE,
+            capture("ext-1"),
+        )
+        .unwrap();
+
+        // Fresh session + terminal resolve to an EMPTY set.
+        assert!(prototypes_for_session(&mut conn, &session.id)
+            .unwrap()
+            .is_empty());
+        assert!(prototypes_for_terminal(&mut conn, &terminal.id)
+            .unwrap()
+            .is_empty());
+
+        // AUTO-MAP through the terminal's active session (idempotent).
+        assert_eq!(
+            link_terminal_active_session_prototype(&mut conn, &terminal.id, &proto.id).unwrap(),
+            Some(session.id.clone()),
+            "linked onto the terminal's active session"
+        );
+        assert!(
+            !link_session_prototype(&mut conn, &session.id, &proto.id).unwrap(),
+            "re-linking is a no-op (idempotent composite PK)"
+        );
+
+        // The overlay resolution: the prototypes of the terminal = its active session's set.
+        let resolved = prototypes_for_terminal(&mut conn, &terminal.id).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, proto.id);
+
+        // schema.rs ↔ migration v32: round-trip the link row via a typed select.
+        let rows: Vec<AgentSessionPrototype> = agent_session_prototypes::table
+            .filter(agent_session_prototypes::session_id.eq(&session.id))
+            .select(AgentSessionPrototype::as_select())
+            .load(&mut conn)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].created_at > 0);
+
+        // `/clear` vacates the set (the session row survives).
+        assert_eq!(clear_session_prototypes(&mut conn, &session.id).unwrap(), 1);
+        assert!(prototypes_for_session(&mut conn, &session.id)
+            .unwrap()
+            .is_empty());
+
+        // CASCADE on prototype delete: re-link, then delete the prototype → membership gone.
+        link_session_prototype(&mut conn, &session.id, &proto.id).unwrap();
+        diesel::delete(prototypes::table.find(&proto.id))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(prototypes_for_session(&mut conn, &session.id)
+            .unwrap()
+            .is_empty());
     }
 }

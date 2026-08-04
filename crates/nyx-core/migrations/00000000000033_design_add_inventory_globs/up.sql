@@ -1,0 +1,21 @@
+-- Schema v33: add the per-project INVENTORY GLOB OVERRIDE to `design` (v2.7 — Prototype :
+-- machinerie, review 01KYA12RGTQNJ60H3RNJR5XFXK, finding 01KYA145DT5HXAP6755Q0VZV1V —
+-- "Inventaire: détecter le stack + scanner les bons fichiers + exclure .generated").
+--
+-- ## Why (the per-project glob-config parked in Phase 1)
+--
+-- The inventory (`crate::design::inventory_project`) DETECTS a repo's stack (Angular / React /
+-- Vue …) and uses that stack's DEFAULT globs. But a project must be able to OVERRIDE those globs
+-- (the "surchargeable par projet" seam `resolve_component_globs` was already written for, but
+-- whose persistence was PARKED — the code carried a `// Parked: no persisted per-project
+-- glob-config yet` note). This column is that persistence: an OPTIONAL JSON array of glob
+-- strings, stored on the project's single `design` row (the natural home — it already keys the
+-- design-system config 1-per-project). NULL (the default, and the only value for a design row
+-- predating v33) means "no override" → the detected stack default is used. An empty array is
+-- likewise treated as "no override" by `resolve_component_globs` (never inventory NOTHING).
+--
+-- `ALTER TABLE ADD COLUMN` re-appends the column physically last — harmless: every `Design`
+-- read/write goes through Diesel `as_select()` / `as_returning()` (columns emitted BY NAME in
+-- `schema.rs` order), never a positional `SELECT *`, so the physical order is immaterial.
+
+ALTER TABLE design ADD COLUMN inventory_globs_json TEXT;

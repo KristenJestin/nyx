@@ -1,7 +1,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo, useRef } from "react";
 
-import { isBridgeError, nyxBridge } from "@/bridge";
+import { errorText, nyxBridge } from "@/bridge";
 import type { AnchorSide, ReviewComment } from "@/bridge";
 import { reviewKeys } from "@/lib/query";
 
@@ -89,9 +89,6 @@ export interface UseReviewComments {
 }
 
 const EMPTY: readonly ReviewComment[] = [];
-
-const errText = (e: unknown): string =>
-  isBridgeError(e) ? e.message : e instanceof Error ? e.message : String(e);
 
 /** Build a provisional comment for an optimistic post (reconciled by the `onSettled` re-pull). */
 function optimisticComment(over: Partial<ReviewComment>): ReviewComment {
@@ -334,9 +331,9 @@ export function useReviewComments(
   }, [repo, comments]);
 
   const error = query.error
-    ? errText(query.error)
+    ? errorText(query.error)
     : mutation.error
-      ? errText(mutation.error)
+      ? errorText(mutation.error)
       : null;
 
   return {

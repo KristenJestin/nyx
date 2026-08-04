@@ -78,6 +78,12 @@ pub enum ChangedTopic {
     /// is `ideas`; the front's re-pull on it is wired in Phase 4 (the Knowledge UI), but the
     /// mutation authority NAMES the topic here so the seam is single-authority end to end.
     Ideas,
+    /// The PROTOTYPE annexe changed (v2.7 — carried by the `proto_*` MCP tools so any open
+    /// proto view re-pulls after an agent action: present a round, elect a variant, raise or
+    /// resolve a comment). The wire string is `prototypes`; the front's re-pull on it (and the
+    /// future proto overlay, PDR-0009) is a later phase, but the mutation authority NAMES the
+    /// topic here so the seam is single-authority end to end.
+    Prototypes,
 }
 
 impl ChangedTopic {
@@ -92,6 +98,7 @@ impl ChangedTopic {
             ChangedTopic::Specs => "specs",
             ChangedTopic::Repos => "repos",
             ChangedTopic::Ideas => "ideas",
+            ChangedTopic::Prototypes => "prototypes",
         }
     }
 }
@@ -1820,37 +1827,51 @@ pub fn agent_session_event(
             // live activity is left untouched. A real end (logout, prompt_input_exit, …)
             // falls through to the normal end path below.
             if end.is_internal_transition() {
-                // UN-MAP (v2.5.10 Phase 1, task 01KXN0HTXFMZAJ0GTVWVBN2PGZ): a `/clear` RESETS
-                // the session's working context — vacate its Spec SET so the terminal overlay
-                // disappears — WITHOUT ending the row (the following SessionStart refreshes it
-                // in place, keeping the sidebar icon/dot steady). A `/resume` is also an
-                // internal transition but CONTINUES the same work, so it keeps the set; a
-                // `/compact` fires no SessionEnd at all, so it never reaches here. GENERIC: the
-                // reset DETECTION is per-provider (`end.resets_working_context()`), the CLEARING
-                // is provider-agnostic (`db::clear_session_specs`). Best-effort — a DB hiccup or
-                // no active session simply un-maps nothing.
+                // UN-MAP (v2.5.10 Phase 1, task 01KXN0HTXFMZAJ0GTVWVBN2PGZ ; proto set added v2.7
+                // Phase 2, task 01KY50ZPVSMZPSY351VJNR7Z0F): a `/clear` RESETS the session's working
+                // context — vacate BOTH its working sets (its Specs AND its prototypes) so the
+                // terminal overlays disappear — WITHOUT ending the row (the following SessionStart
+                // refreshes it in place, keeping the sidebar icon/dot steady). The prototype set is
+                // vacated "COMME les Specs" (PDR-0009: the proto hangs off the SAME agent session):
+                // its link table (`agent_session_prototypes`) survives a `/clear` (the row stays
+                // active), so it must be emptied explicitly too. A `/resume` is also an internal
+                // transition but CONTINUES the same work, so it keeps both sets; a `/compact` fires
+                // no SessionEnd at all, so it never reaches here. GENERIC: the reset DETECTION is
+                // per-provider (`end.resets_working_context()`), the CLEARING is provider-agnostic
+                // (`db::clear_session_specs` / `db::clear_session_prototypes`). Best-effort — a DB
+                // hiccup or no active session simply un-maps nothing.
                 if end.resets_working_context() {
-                    let cleared = db
-                        .with_conn(|c| -> Result<usize, diesel::result::Error> {
+                    let (specs_unmapped, protos_unmapped) = db
+                        .with_conn(|c| -> Result<(usize, usize), diesel::result::Error> {
                             let Some(session) = db::active_session_for(c, terminal_id, agent_kind)?
                             else {
-                                return Ok(0);
+                                return Ok((0, 0));
                             };
-                            db::clear_session_specs(c, &session.id)
+                            let specs = db::clear_session_specs(c, &session.id)?;
+                            let protos = db::clear_session_prototypes(c, &session.id)?;
+                            Ok((specs, protos))
                         })
-                        .unwrap_or(0);
-                    if cleared > 0 {
-                        // The set actually changed → push `specs://changed` so the terminal
-                        // overlay re-pulls (and, now empty, disappears).
-                        return Ok(ToolOutcome::changed(
+                        .unwrap_or((0, 0));
+                    // Push a `*://changed` for EACH set that actually emptied so the matching
+                    // terminal overlay re-pulls (and, now empty, disappears).
+                    let mut effects = Vec::new();
+                    if specs_unmapped > 0 {
+                        effects.push(ChangedTopic::Specs);
+                    }
+                    if protos_unmapped > 0 {
+                        effects.push(ChangedTopic::Prototypes);
+                    }
+                    if !effects.is_empty() {
+                        return Ok(ToolOutcome::changed_many(
                             json!({
                                 "event": "SessionEnd",
                                 "terminal_id": terminal_id,
                                 "ended": false,
-                                "reason": "clear — session Spec set vacated (overlay reset)",
-                                "specs_unmapped": cleared,
+                                "reason": "clear — session working sets vacated (overlays reset)",
+                                "specs_unmapped": specs_unmapped,
+                                "prototypes_unmapped": protos_unmapped,
                             }),
-                            ChangedTopic::Specs,
+                            effects,
                         ));
                     }
                 }
@@ -2331,7 +2352,16 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
             // The v2.6 ANNEXE tools (attach doc/artefact/url/prototype to a Spec, dedup by
             // content_hash) — same one-place sub-dispatcher, delegating to the SHARED
             // `nyx_core::db` annexe authority.
-            .or_else(|| crate::mcp_tools_annexe::dispatch_annexe_tool(db, name, args)),
+            .or_else(|| crate::mcp_tools_annexe::dispatch_annexe_tool(db, name, args))
+            // The v2.7 PROTOTYPE tools (the agent's constrained proto contract: read the explicit
+            // state, present a round, elect a variant, raise/resolve a pre-dev comment) — same
+            // one-place sub-dispatcher, delegating to the SHARED `nyx_core::db` prototype
+            // authority (which records the `proto.*` domain events in-transaction).
+            .or_else(|| crate::mcp_tools_proto::dispatch_proto_tool(db, name, args))
+            // The v2.7 DESIGN-SYSTEM trigger (review #23): `design_inventory` populates the
+            // component catalogue from the project's repos + re-syncs the visual hashes — same
+            // one-place sub-dispatcher, delegating to the SHARED `nyx_core::design::inventory_project`.
+            .or_else(|| crate::mcp_tools_design::dispatch_design_tool(db, name, args)),
     };
 
     // AUTO-MAP (v2.5.10 Phase 1, task 01KXN0HTAXXMXF3GXF4ACM2970): when a spec-scoped MCP
@@ -2347,6 +2377,18 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
     if let (Some(caller), Some(Ok(outcome))) = (caller_terminal_id, dispatched.as_ref()) {
         if let Some(spec_id) = crate::mcp_tools_spec::worked_spec_id(name, &outcome.result) {
             let _ = db.with_conn(|c| db::link_terminal_active_session_spec(c, caller, &spec_id));
+        }
+        // The PROTO twin (v2.7 — the proto ↔ session seam, task 01KY50ZPVSMZPSY351VJNR7Z0F): a
+        // `proto_*` MUTATION attributes the worked PROTOTYPE to the calling terminal's live
+        // session, so the future proto overlay resolves "the prototype of this terminal" the same
+        // way it resolves its Specs. Best-effort + ciblée: `worked_prototype_id` returns `Some`
+        // ONLY for the mutating proto tools (a `proto_get` read returns `None`).
+        if let Some(prototype_id) =
+            crate::mcp_tools_proto::worked_prototype_id(name, &outcome.result)
+        {
+            let _ = db.with_conn(|c| {
+                db::link_terminal_active_session_prototype(c, caller, &prototype_id)
+            });
         }
     }
     dispatched
@@ -3467,12 +3509,14 @@ mod tests {
         );
     }
 
-    /// DONE-CRITERION (task 01KXN0HTXFMZAJ0GTVWVBN2PGZ): "clear vide le set (overlay disparait) ;
-    /// compact et resume ne demappent pas ; nouvelle session = set vide". The un-map: a
-    /// `SessionEnd reason=clear` vacates the calling session's Spec set (pushing `specs://changed`
-    /// so the overlay re-pulls empty) WITHOUT ending the session, while `reason=resume` keeps the
-    /// set. (`/compact` fires no `SessionEnd`, so it never reaches this path — no un-map by
-    /// construction.)
+    /// DONE-CRITERION (task 01KXN0HTXFMZAJ0GTVWVBN2PGZ ; proto parity task
+    /// 01KY50ZPVSMZPSY351VJNR7Z0F): "clear vide le set (overlay disparait) ; compact et resume ne
+    /// demappent pas ; nouvelle session = set vide". The un-map: a `SessionEnd reason=clear`
+    /// vacates BOTH the calling session's Spec set AND its prototype set (pushing `specs://changed`
+    /// AND `prototypes://changed` so both overlays re-pull empty) WITHOUT ending the session, while
+    /// `reason=resume` keeps both. The proto set is vacated "COMME les Specs" (PDR-0009 — the proto
+    /// hangs off the same agent session). (`/compact` fires no `SessionEnd`, so it never reaches
+    /// this path — no un-map by construction.)
     #[test]
     fn un_map_clears_the_set_on_clear_but_not_on_resume() {
         let _g = db_guard();
@@ -3502,16 +3546,29 @@ mod tests {
                     .unwrap();
             crate::db::link_session_spec(c, &session.id, &a.id).unwrap();
             crate::db::link_session_spec(c, &session.id, &b.id).unwrap();
+            // A prototype hangs off Spec A; the session WORKS it (its proto set, PDR-0009 — the
+            // proto is rattaché à la SESSION AGENT, COMME les Specs).
+            let proto = crate::db::create_prototype(c, &a.id, Some("A's UI")).unwrap();
+            crate::db::link_session_prototype(c, &session.id, &proto.id).unwrap();
             (session.id, terminal.id)
         });
         let set = |db: &Db| {
             db.with_conn(|c| crate::db::specs_for_terminal(c, &terminal_id))
                 .unwrap()
         };
+        let proto_set = |db: &Db| {
+            db.with_conn(|c| crate::db::prototypes_for_terminal(c, &terminal_id))
+                .unwrap()
+        };
         assert_eq!(
             set(&db).len(),
             2,
             "the session starts with a set of 2 Specs"
+        );
+        assert_eq!(
+            proto_set(&db).len(),
+            1,
+            "the session starts with a set of 1 prototype"
         );
 
         // A `/clear` (SessionEnd reason=clear) VACATES the set and pushes `specs://changed`,
@@ -3529,12 +3586,16 @@ mod tests {
         .expect("clear handled");
         assert_eq!(
             cleared.effects,
-            vec![ChangedTopic::Specs],
-            "a real un-map pushes specs://changed so the overlay re-pulls empty"
+            vec![ChangedTopic::Specs, ChangedTopic::Prototypes],
+            "a real un-map pushes specs://changed AND prototypes://changed so both overlays re-pull empty"
         );
         assert!(
             set(&db).is_empty(),
             "clear vacated the session's Spec set (overlay disappears)"
+        );
+        assert!(
+            proto_set(&db).is_empty(),
+            "clear ALSO vacated the session's prototype set (parité « comme les Specs », PDR-0009)"
         );
         let still_active = db
             .with_conn(|c| crate::db::get_session(c, &session_id))
@@ -3546,16 +3607,23 @@ mod tests {
             "clear keeps the session active (only the Spec set is reset)"
         );
 
-        // Re-populate the set, then a `/resume` (SessionEnd reason=resume) must NOT un-map.
+        // Re-populate BOTH sets, then a `/resume` (SessionEnd reason=resume) must NOT un-map.
         let spec_c = db.with_conn(|c| {
             let (project, _) = crate::db::create_project(c, "P2", "/work2", None).unwrap();
             let (spec, _) =
                 crate::db::create_spec(c, &project.id, "C", crate::db::SpecSections::empty())
                     .unwrap();
             crate::db::link_session_spec(c, &session_id, &spec.id).unwrap();
+            let proto = crate::db::create_prototype(c, &spec.id, None).unwrap();
+            crate::db::link_session_prototype(c, &session_id, &proto.id).unwrap();
             spec.id
         });
         assert_eq!(set(&db).len(), 1, "the set has one Spec again");
+        assert_eq!(
+            proto_set(&db).len(),
+            1,
+            "the proto set has one prototype again"
+        );
         let resumed = agent_session_event(
             &db,
             &activity,
@@ -3576,6 +3644,11 @@ mod tests {
         assert_eq!(
             after_resume[0].id, spec_c,
             "the same Spec survives a resume"
+        );
+        assert_eq!(
+            proto_set(&db).len(),
+            1,
+            "resume keeps the prototype set intact too"
         );
     }
 

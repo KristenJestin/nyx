@@ -1,10 +1,23 @@
-# contract — Rust ↔ TS pipe-protocol parity (PDR-0007, task 523)
+# contract — Rust ↔ TS parity fixtures
+
+Where a rule or a wire format exists **twice**, once in Rust and once in
+TypeScript, this directory holds the **shared cases** that make the two halves
+fail *together*. The fixtures are plain data files read by both suites at test
+time: nothing here is a build step, and neither side builds the other.
+
+Two contracts live here today:
+
+1. **the pipe protocol** (`fixtures.json`, PDR-0007, task 523) — below;
+2. **the design half** (`design-fixtures.json`, finding
+   `01KYSNQWQD1324E0NA0172M66J`) — see the last section.
+
+## The pipe protocol
 
 The internal main ↔ sidecar transport is **length-prefixed MessagePack** (u32
 big-endian length + MessagePack payload). Both ends must encode/decode identical
 bytes. This directory holds the cross-language contract tests that guarantee it.
 
-## Pieces
+### Pieces
 
 - `fixtures.json` — the **canonical wire bytes** for every message kind, as
   `envelope_hex` (the MessagePack envelope) and `frame_hex` (the framed bytes).
@@ -18,7 +31,7 @@ bytes. This directory holds the cross-language contract tests that guarantee it.
   byte-for-byte. `protocol.test.ts` covers framing / incremental decode / version
   mismatch on the TS side.
 
-## Run
+### Run
 
 ```sh
 # Rust side (also (re)generates fixtures with NYX_GEN_FIXTURES=1):
@@ -28,7 +41,7 @@ cargo test -p nyx-sidecar --test contract
 cd contract && bun test
 ```
 
-## Regenerating fixtures
+### Regenerating fixtures
 
 After adding or changing a message kind, update both `fixtures()` (Rust) and
 `MESSAGES` (TS), then regenerate the canonical bytes from the Rust codec:
@@ -38,3 +51,150 @@ NYX_GEN_FIXTURES=1 cargo test -p nyx-sidecar --test contract
 ```
 
 and re-run both test suites. A drift on either side fails its test.
+
+## The design half — `design-fixtures.json`
+
+**Hand-written, never generated.** The variance rule (which axes a stored
+`states_json` declares, in which ORDER, and which of their values are INERT)
+exists twice — `crates/nyx-core/src/mcp_tools_design.rs` and
+`apps/desktop/renderer/src/components/design/axes.ts` — and so does the list of
+top-level keys `TokenLayer::to_json` emits versus the `RESERVED_KEYS` the
+renderer's theme builder must know about. Nothing made those pairs fail
+together, which is how the two readers ended up reading the tolerated map form
+in two different orders (finding `01KYSNPWWG9DA0AXP6D22GV5BK`).
+
+- `variance_cases[]` — a `template` + a `states_json` and the verdict both
+  implementations must return (axes in order, primary axis values, state cases,
+  substituted axes, conditions on unknown axes, inert values).
+- `token_layer_keys.keys` — every top-level key `to_json` emits.
+- `unrendered_nodes` — the REASONS a composition node cannot be rendered, their
+  stable `code`, the `short` phrase the placeholder prints, and cases running a
+  catalogue + composition through BOTH resolutions (finding
+  `01KYT78699XG6Q6P3VZC64W8H8`). The holes must be identical in both; only the
+  `data-nyx-*` vocabulary may differ — the FRAME preserves what the SHIM pilots,
+  the AGENT's answer carries none of it. A case may declare
+  `subject_states_json`: the axes the host hands the frame as `window.__nyxAxes`,
+  which the two resolutions treat OPPOSITELY (the agent resolves them itself, the
+  frame leaves them live) and which decide, PER AXIS, who applies it — every axis
+  a NODE declares and the shim does not is baked into that node's markup by BOTH
+  (finding `01KZ41YK39SGNKF6XV87A35GPN`). `expect.markup_absent[]` pins the marks
+  NEITHER resolution may leave behind.
+- `empty_param_cases` — when "this param resolves empty" is worth a WARNING
+  (finding `01KYVMTWVF3TH1XPEKV9MEBZTB`): the criterion is the SUBSTITUTION SITE
+  (content vs attribute) plus `required`, never the param's name.
+- `css_slot` — the SCOPED CSS SLOT vocabulary (finding
+  `01KYVMTWB71R0D0CT1SV88J8DX`): the scope attribute, the `<style>` marker
+  attribute, the caps, the four `features[].code` a review card ticks and the
+  `refusals[].code` an error carries in `error.data.css_slot_refusal`. Rust OWNS
+  the validation and the scoping (`crates/nyx-core/src/css_slot.rs`) and is the
+  only implementation of them — the renderer never compiles a slot, it DISPLAYS
+  what the sidecar already scoped. What crosses the boundary, and is therefore
+  pinned, is the VOCABULARY a display surface keys off. Each code also carries
+  its `short` — the exact words the card prints (finding
+  `01KZ3JTWB82DCG0C6JT06T4CAF`): pinned as codes ALONE, the loop asserted
+  "non-empty" for a feature and "differs from the code" for a refusal, so
+  renaming a displayed label left 409 tests green.
+- `navigation` — INTER-PAGE NAVIGATION (finding `01KYW34347CZSNXCYS35KDG3EY`,
+  consumed by `01KZ3JN69E32FYBF01NBE4FWJD`): the three `attributes` the render
+  stamps on a linking node's root (`data-nyx-page` = the SLUG,
+  `data-nyx-page-id` = the durable id, `data-nyx-page-missing` = the named
+  marker of a link that resolved to nothing), the three `statuses[]` a display
+  surface switches on, the three `seam_statuses[]` `proto_composition` answers
+  with, and `neutralisation_case` — a node whose template BAKES IN its own
+  `data-nyx-page` while its `navigate_to` resolves to nothing, with the exact
+  markup the render must leave. THE MARKER NEUTRALIZES, it does not only badge:
+  the whole navigation vocabulary is cleared off the root before what was
+  decided is written, so a baked-in link cannot survive beside an invalidation
+  and send the shim to a slug frozen in that template.
+- `param_types` — the SIX types a param descriptor may declare, the one that is
+  DEPRECATED, and the manual's own heading (finding
+  `01KZ3JTVM23C3MBATJZ3RYVPY6`, family 1). The list lived at three places joined
+  by nothing: the constant the write path refuses outside of, the renderer's
+  constant, and the PROSE of the Prototype role manual.
+- `node_key` — the `separator`, the `inline_label` and the CASES of the anchor
+  convention (family 2): a `node_key` is the `/`-join of every node's segment
+  label — explicit `key`, else `component`, else `inline`. It is what a pinned
+  comment is stored on and re-anchored by, and what a params write addresses.
+- `node_contract` — `max_nodes` and the case that proves WHAT the cap bounds
+  (family 3). Both halves carried 12 while bounding two different things —
+  MESSAGES in Rust, NODES in TypeScript — so on a composition where every node
+  has two defects the agent was told about 6 nodes and the human saw 12. It
+  bounds NODES on both sides now.
+- `viewports` — the three `named` widths (`mobile` 390, `tablet` 768, `desktop`
+  1280) and the `thumbnail_width` (family 7). Rust serves them to the AGENT
+  (`design_preview` reasons about which breakpoints are in force at them); the
+  renderer offers the same widths to the HUMAN as its stage presets.
+- `unrendered_nodes.placeholder_class` + `placeholder_style_declarations` +
+  `placeholder_attributes` (family 8) — the class the lenient render writes and
+  the frame's srcdoc is the ONLY thing to style. Renaming either side left 1316
+  tests green while every placeholder lost its box, its margin and its type size
+  and melted into the page as plain text.
+
+Who reads it:
+
+| side | test |
+| --- | --- |
+| Rust | `mcp_tools_design.rs::tests::the_shared_fixture_pins_both_implementations_of_the_variance_rule` |
+| Rust | `design_tokens/tests.rs::to_json_emits_exactly_the_keys_the_renderer_reserves` |
+| Rust | `mcp_context.rs::tests::the_manuals_canonical_component_passes_the_checks_the_write_path_applies` — asserts the `from_manual` case IS what the rendered role manual teaches |
+| Rust | `render.rs::tests::the_shared_fixture_pins_the_unrendered_reasons_and_both_resolutions` |
+| Rust | `mcp_tools_design.rs::tests::the_shared_fixture_pins_when_an_empty_param_is_worth_a_warning` |
+| Rust | `css_slot/tests.rs::the_shared_fixture_pins_the_slot_vocabulary` |
+| Rust | `render.rs::tests::the_shared_fixture_pins_the_navigation_vocabulary` |
+| Rust | `mcp_tools_design.rs::tests::the_shared_fixture_pins_the_six_param_types` |
+| Rust | `mcp_context.rs::tests::the_manual_teaches_exactly_the_six_param_types_the_write_path_accepts` — extracts the SIX BULLETS out of the rendered manual |
+| Rust | `render.rs::tests::the_shared_fixture_pins_the_node_key_convention` |
+| Rust | `mcp_tools_design.rs::tests::the_shared_fixture_pins_what_the_node_contract_cap_bounds` |
+| Rust | `render/viewport.rs::tests::the_shared_fixture_pins_the_named_viewport_widths` |
+| TS | `axes.test.ts` — the `the shared Rust ⟷ TS fixture` suite |
+| TS | `theme-css.test.ts` — every listed key is in `RESERVED_KEYS` |
+| TS | `use-design-render.test.tsx` — the unrendered, css-slot and navigation vocabularies |
+| TS | `params.test.ts` — the six param types, and `empty_param_cases` |
+| TS | `specs/composition-nodes.test.ts` — the `node_key` cases |
+| TS | `composition-contract.test.ts` — what the node-contract cap bounds |
+| TS | `viewports.test.ts` — the named widths |
+| TS | `frame-srcdoc.test.ts` — the placeholder class and its three declarations |
+| TS | `shim-seam.test.ts` — the neutralized link the render pins posts NO navigation |
+
+`unrendered_nodes` and `empty_param_cases` now have a TS reader too:
+`composition-holes.ts` was **removed** rather than re-synchronised —
+`design_render` answers `{ markup, node_count, unrendered[], unrendered_count }`
+and the frame only DISPLAYS that list (`use-design-render.test.tsx` pins
+`reasons[].code` / `reasons[].short` in both directions), and `params.test.ts`
+replays `empty_param_cases` against `paramsWithoutPreviewValue`.
+
+## The intra-TypeScript seam — `shim-seam.test.ts`
+
+Three pairs of names cannot be arrimé by a fixture and cannot be arrimé by an
+import either: the interaction shim (`design/proto-shim.ts`) ships as a
+**string**, inlined into a sandboxed `srcdoc` with a CSP nonce and evaluated in
+a frame that has no module system. It imports nothing, so the marker prefix, the
+`window.__nyx*` globals and the ten message types are spelled twice by
+construction (finding `01KZ3JTVM23C3MBATJZ3RYVPY6`, families 4, 5 and 6).
+
+`design/shim-seam.test.ts` is what replaces the impossible import: it runs the
+shim source over DOM built by `composition-markers.ts` and over the bootstrap
+`buildFrameSrcdoc` really emitted, and reads the shim's own source for the names
+it asks for. It also carries the two NEGATIVE tests of finding
+`01KZ3JTWB82DCG0C6JT06T4CAF`: no CSS selector may be computed in the shim (the
+tree is the contract), and a link the render NEUTRALIZED must post no navigation
+at all.
+
+One section has **no TS reader**, and by design:
+
+- `css_slot` — the validation and the scoping live in Rust ALONE. A second
+  implementation of "is this CSS admissible, and how is it bounded to the
+  component" is the one thing this contract must never have: the guarantee is
+  that the markup the sidecar hands over is ALREADY scoped. The renderer reads
+  `css_slots[]` (scope, css, reason, features) and displays it; the codes listed
+  here are what it may key off.
+
+```sh
+cargo test -p nyx-core --lib -- the_shared_fixture to_json_emits the_manual
+cd apps/desktop/renderer && bunx vitest run --project unit src/components/design/ \
+  src/components/specs/composition-nodes.test.ts
+```
+
+**Adding a case** must fail BOTH suites until BOTH implementations agree — that
+is the whole point. Adding one that only fails on one side means the other side
+was already right, and the case is worth keeping anyway.

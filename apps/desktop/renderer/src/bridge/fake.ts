@@ -7,6 +7,9 @@
  * It records invokes, lets a test push events to subscribers, and honors the
  * unsubscribe / binary / error guarantees the contract documents.
  */
+import { isBridgeError } from "./contract";
+import { errorText } from "./error-text";
+
 import type {
   BackendCommand,
   CommandAck,
@@ -110,7 +113,12 @@ export class FakeNyxBridge implements NyxBridge {
       if (h) return Promise.resolve(h(args) as R);
       if (this.catchAll) return Promise.resolve(this.catchAll(command, args) as R);
     } catch (e) {
-      return Promise.reject({ kind: "command" as const, message: String(e), source: command });
+      // A handler throwing an ALREADY BRIDGE-SHAPED refusal is rejected UNTOUCHED: that is how a
+      // test hands a surface a REAL `BridgeError` (kind + message + source), which is the exact
+      // shape the Electron adapter rejects with. Wrapping it would have re-created the very defect
+      // under test — `String(bridgeError)` is `[object Object]`.
+      if (isBridgeError(e)) return Promise.reject(e);
+      return Promise.reject({ kind: "command" as const, message: errorText(e), source: command });
     }
     return Promise.reject({
       kind: "command" as const,

@@ -3,6 +3,7 @@ import { Link, Outlet, useNavigate, useRouterState } from "@tanstack/react-route
 import {
   BookOpenIcon,
   BriefcaseIcon,
+  ComponentIcon,
   FolderPlusIcon,
   PlusIcon,
   SettingsIcon,
@@ -50,6 +51,18 @@ const NAV = [
   { to: "/work", icon: BriefcaseIcon, label: "Work" },
   { to: "/knowledge", icon: BookOpenIcon, label: "Knowledge" },
 ] as const;
+
+/**
+ * …and the FOOT of the same rail — the REFERENCE surfaces, under the work ones (finding
+ * `01KZ41YKMB63GFJ3QMK2ZHJN1C`).
+ *
+ * The CATALOGUE is a project-wide reference, not a place one works in: it is consulted FROM the
+ * screen one is on. It used to be duplicated as a `Catalogue` link in the PROTOTYPE page's own
+ * header — a global link living in the chrome of one page, three centimetres from a rail that
+ * already routed to it. The link is gone from there and the entry lives here, at the foot, beside
+ * the other always-available entry point (Settings). One place, whatever screen one is on.
+ */
+const FOOT_NAV = [{ to: "/design", icon: ComponentIcon, label: "Catalogue" }] as const;
 
 /** The uppercase initial shown on a project tile (first letter of its name, else `?`). */
 function projectInitial(project: ProjectTree["project"]): string {
@@ -483,6 +496,64 @@ export function BaseLayout() {
     };
   }, [createProject, projects, reorderProjects]);
 
+  /**
+   * ONE entry of the rail's section-nav — written once and rendered by BOTH groups ({@link NAV} at
+   * the top, {@link FOOT_NAV} at the foot), so a link's behaviour never depends on which group it
+   * sits in.
+   *
+   * The MAIN-SCREEN change (Terminals ↔ Work ↔ Knowledge ↔ Catalogue) is wrapped in a View
+   * Transition cross-fade so the screen — terminal included — fades instead of snapping in
+   * ("collé", user feedback). We intercept the click and drive the navigation ourselves inside
+   * `startNavTransition`: it snapshots the old DOM, cross-fades to the new, and only calls
+   * `navigate` inside the callback. The persistent terminal instance is untouched (no
+   * destroy/respawn) — the VT is pure chrome over the same detach→reattach. `startNavTransition`
+   * no-ops the VT under `prefers-reduced-motion` and when the API is absent (jsdom / old Chromium),
+   * so navigation always works. We keep `<Link>` (real anchor, active state, a11y) but let a
+   * modified / non-primary click fall through to the browser's default so it is not hijacked.
+   */
+  const renderNavItem = (item: {
+    to: (typeof NAV)[number]["to"] | (typeof FOOT_NAV)[number]["to"];
+    icon: typeof BriefcaseIcon;
+    label: string;
+  }) => {
+    const active = pathname === item.to;
+    return (
+      <li key={item.to} className="relative">
+        <Link
+          to={item.to}
+          title={item.label}
+          aria-label={item.label}
+          onClick={(e) => {
+            if (
+              e.defaultPrevented ||
+              e.button !== 0 ||
+              e.metaKey ||
+              e.ctrlKey ||
+              e.shiftKey ||
+              e.altKey
+            ) {
+              return;
+            }
+            if (pathname === item.to) return; // already here — no transition
+            e.preventDefault();
+            startNavTransition(() => {
+              void navigate({ to: item.to });
+            });
+          }}
+          className={cn(
+            "group flex size-9 items-center justify-center rounded-lg transition-colors",
+            active
+              ? "bg-muted text-foreground"
+              : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+          )}
+        >
+          <item.icon className="size-4" />
+        </Link>
+        {active ? <ActiveRail layoutId="rail-nav" /> : null}
+      </li>
+    );
+  };
+
   return (
     <div className="grid h-svh grid-cols-[60px_1fr] bg-background text-foreground">
       <aside className="flex h-svh flex-col items-center border-r border-border/60 bg-muted/40 py-3">
@@ -540,56 +611,14 @@ export function BaseLayout() {
         <div className="my-4 h-px w-7 bg-border/60" />
 
         <ul className="flex flex-1 flex-col items-center gap-1">
-          {NAV.map((item) => {
-            const active = pathname === item.to;
-            return (
-              <li key={item.to} className="relative">
-                <Link
-                  to={item.to}
-                  title={item.label}
-                  aria-label={item.label}
-                  // The MAIN-SCREEN change (Terminals ↔ Work ↔ Knowledge) is wrapped in a
-                  // View Transition cross-fade so the screen — terminal included — fades
-                  // instead of snapping in ("collé", user feedback). We intercept the click
-                  // and drive the navigation ourselves inside `startNavTransition`: it
-                  // snapshots the old DOM, cross-fades to the new, and only calls `navigate`
-                  // inside the callback. The persistent terminal instance is untouched (no
-                  // destroy/respawn) — the VT is pure chrome over the same detach→reattach.
-                  // `startNavTransition` no-ops the VT under `prefers-reduced-motion` and when
-                  // the API is absent (jsdom / old Chromium), so navigation always works.
-                  // We keep `<Link>` (real anchor, active state, a11y) but let a modified /
-                  // non-primary click fall through to the browser's default so it is not
-                  // hijacked.
-                  onClick={(e) => {
-                    if (
-                      e.defaultPrevented ||
-                      e.button !== 0 ||
-                      e.metaKey ||
-                      e.ctrlKey ||
-                      e.shiftKey ||
-                      e.altKey
-                    ) {
-                      return;
-                    }
-                    if (pathname === item.to) return; // already here — no transition
-                    e.preventDefault();
-                    startNavTransition(() => {
-                      void navigate({ to: item.to });
-                    });
-                  }}
-                  className={cn(
-                    "group flex size-9 items-center justify-center rounded-lg transition-colors",
-                    active
-                      ? "bg-muted text-foreground"
-                      : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-                  )}
-                >
-                  <item.icon className="size-4" />
-                </Link>
-                {active ? <ActiveRail layoutId="rail-nav" /> : null}
-              </li>
-            );
-          })}
+          {NAV.map((item) => renderNavItem(item))}
+        </ul>
+
+        {/* THE REFERENCE ENTRIES, at the foot — see [`FOOT_NAV`]. Same element, same active
+            indicator, same transition as the work entries above; only the place differs, because
+            what they are differs. */}
+        <ul className="flex flex-col items-center gap-1">
+          {FOOT_NAV.map((item) => renderNavItem(item))}
         </ul>
 
         {/* The global Settings entry point (rebranched from the removed sidebar head). It

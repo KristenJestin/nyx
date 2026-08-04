@@ -1,0 +1,49 @@
+-- Schema v38: give a `design_components` row its SCOPED CSS SLOT (v2.7 — Prototype : machinerie,
+-- review 01KYKX2A0JGWF8XNWWZ9YFF5MG, finding 01KYVMTWB71R0D0CT1SV88J8DX [MAJOR — tout ce qui n'est
+-- pas exprimable en classes utilitaires était SILENCIEUSEMENT PERDU : c'est ce qui a fait
+-- disparaître l'animation d'un loader, et le composant partait ensuite au coder sans que personne
+-- ne sache qu'il manquait quelque chose]).
+--
+-- ## Why 38 and not 34, and why the number is checked against the OTHER branches
+--
+-- Diesel records only a NUMBER in `__diesel_schema_migrations`, never a name. A number already
+-- applied elsewhere makes a migration NEVER RUN — the columns `schema.rs` declares would simply not
+-- exist, and every read of the table would fail at runtime. 34 belongs to `feature/v2.8-engine`
+-- (`create_workflow_engine`) and is already applied on the production DB; 35, 36 and 37 are this
+-- branch's. 38 is the next free number on every branch of this repository (the series also has a
+-- historical hole at 19 — the directory COUNT is not the max number).
+--
+-- ## Why ONE column, and why it lives on the COMPONENT
+--
+-- The slot is an EXCEPTION to the design system, admitted only for what Tailwind utilities cannot
+-- express (a custom `@keyframes`, the content of a `::before` / `::after`, a `:has` selector, a
+-- `@container` query). It lives on the COMPONENT, not on a composition NODE, for three reasons:
+--
+--   * what the coder BUILDS is a component. An exception attached to one PLACEMENT has no build
+--     target — the developer would have to invent where to put it — whereas on the component it is
+--     part of the component's specification and lands in the same file as the rest of it;
+--   * an exception must not MULTIPLY with placements. A `Spinner` placed thirty times has ONE
+--     animation; a per-node slot would make thirty copies that drift apart — precisely the defect
+--     `data-nyx-use` (finding 01KYSCZ822K4ZFAAYTG6GT6YWZ) was introduced to remove, and precisely
+--     the rule the project's token layer already states: edit once, apply everywhere;
+--   * a slot openable at any of the forty positions of a page IS the dumping ground the finding
+--     forbids ("le slot est une soupape, pas un fourre-tout"). On the component, it is a place to
+--     put what that component IS.
+--
+-- `css_slot_json` is a JSON object stored as TEXT (SQLite → `Nullable<Text>`), `{ "css": …,
+-- "reason": … }`. The two fields are ONE value: a slot travels with the reason it exists, into the
+-- review UI and into the coder seam, or it does not travel — "SIGNALÉE" is a constraint of the slot,
+-- not a nicety of a screen. The CSS is stored AS AUTHORED, never compiled: the scope id derives from
+-- the component's NAME, so a compiled form would freeze a scope that a rename invalidates. The
+-- scoping (every selector anchored on `[data-nyx-css~="<scope>"]`, every `@keyframes` renamed) is
+-- re-applied at every render by `nyx_core::css_slot::compile`, so the guarantee travels with the
+-- CODE and not with the row.
+--
+-- NULL = no slot, which is the state of the overwhelming majority of components and the only value a
+-- row predating v38 can have.
+--
+-- `ALTER TABLE ADD COLUMN` appends the column physically last — harmless: every `DesignComponent`
+-- read/write goes through Diesel `as_select()` / `as_returning()` (columns emitted BY NAME in
+-- `schema.rs` order), never a positional `SELECT *`.
+
+ALTER TABLE design_components ADD COLUMN css_slot_json TEXT;

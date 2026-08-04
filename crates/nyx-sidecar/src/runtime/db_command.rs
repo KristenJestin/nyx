@@ -1925,6 +1925,885 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)
                     .and_then(|view| Self::json(&view))
             }
+            // --- DESIGN-SYSTEM read/render seam (v2.7 Phase 3, PDR-0010) -------------
+            // The native design-system UI (iframe renderer / catalogue / composant detail) reads
+            // the `design` + `design_components` authority (Phase 1) and the composition renderer
+            // (`nyx_core::render`, Phase 3 task #6). These are PURE reads/renders + a per-node param
+            // persistence: no agent ACTION lives here (the agent drives the proto via the MCP
+            // `proto_*` tools, never a UI button — the "actions via MCP" seam of PDR-0009).
+            //
+            // `design_get` — a project's design-system row: the derived `theme_tokens_json` (the
+            // iframe's `@theme`) + the DESIGN.md `content`, or `null` when the project has none yet.
+            // `{ projectId }`. A pure read (no `changed` broadcast).
+            "design_get" => {
+                let project_id = self.arg_str("projectId")?;
+                self.db()
+                    .with_conn(|c| db::get_design(c, &project_id))
+                    .map_err(Self::db_err)
+                    .and_then(|design| Self::json(&design))
+            }
+            // --- THEME TOKENS: the layer that stops the preview rendering grey (review #42) ------
+            //
+            // A synthesized component carries Tailwind CLASSES (`bg-primary`); those classes are
+            // GREY until the project's tokens exist, because that is what they resolve against.
+            // Nothing ever wrote `theme_tokens_json`, so the iframe's `@theme` was always empty.
+            // These two commands are the UI twins of the `design_tokens` MCP tool, over the SAME
+            // `nyx_core::design_tokens` authority (PDR-0005: one authority for UI + MCP).
+            //
+            // `design_tokens_ingest` — DERIVE the layer from the app: walk the project's repos (the
+            // same resolution `design_inventory` uses), rank the stylesheets that look like the
+            // design system, merge their GLOBAL custom properties. The layer is REFERENCED, not
+            // copied: it records the source sheets and lives once per project, so `primary` keeps
+            // ONE identity across every component and preview. An ingest that detects nothing
+            // leaves a hand-authored layer untouched — it records only WHAT IT REFUSED.
+            // `{ projectId }` -> the run summary. Emits `prototypes://changed` only when it really
+            // moved.
+            "design_tokens_ingest" => {
+                let project_id = self.arg_str("projectId")?;
+                let run = self
+                    .db()
+                    .with_conn(|c| nyx_core::design_tokens::ingest_project_tokens(c, &project_id))
+                    .map_err(Self::db_err)?;
+                // EITHER half is news for the panel: `changed` says the TOKENS moved,
+                // `provenance_changed` says the run recorded what it REFUSED — which is all a run
+                // that retained no sheet writes, and the only diagnostic a grey catalogue has
+                // (finding `01KYSNVW31C0E8YQPET0505HW2`). The panel cannot re-run an ingest itself,
+                // so it has to be woken for the second case too.
+                if run.changed || run.provenance_changed {
+                    self.events.emit(Event::Changed {
+                        topic: "prototypes".to_string(),
+                    });
+                }
+                Self::json(&run)
+            }
+            // `design_tokens_set` — EDIT the layer in place: `variables` upserts `--name -> value`
+            // pairs, `remove` drops names, `dark: true` targets the dark map. Editing ONE token
+            // re-themes every component at once (that is the point of a referenced layer). The
+            // `sources[]` reference back to the app's stylesheet is preserved, so a later ingest can
+            // re-derive from upstream. `{ projectId, variables?, remove?, dark? }` -> the stored
+            // layer. Emits `prototypes://changed`.
+            "design_tokens_set" => {
+                let project_id = self.arg_str("projectId")?;
+                let dark = self.arg_opt_bool("dark").unwrap_or(false);
+                let mut set: std::collections::BTreeMap<String, String> =
+                    std::collections::BTreeMap::new();
+                if let Some(map) = self.args.get("variables").and_then(|v| v.as_object()) {
+                    for (name, value) in map {
+                        let Some(text) = value.as_str() else {
+                            return Err(format!(
+                                "{}: token '{name}' must be a CSS value string",
+                                self.command
+                            ));
+                        };
+                        set.insert(
+                            nyx_core::design_tokens::normalize_token_name(name),
+                            text.to_string(),
+                        );
+                    }
+                }
+                let remove: Vec<String> = self
+                    .args
+                    .get("remove")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(nyx_core::design_tokens::normalize_token_name)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let layer = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::design_tokens::edit_project_tokens(
+                            c,
+                            &project_id,
+                            &set,
+                            &remove,
+                            dark,
+                        )
+                    })
+                    .map_err(Self::db_err)?;
+                self.events.emit(Event::Changed {
+                    topic: "prototypes".to_string(),
+                });
+                Self::json(&serde_json::json!({
+                    "tokens_json": layer.to_json(),
+                    "variable_count": layer.variables.len(),
+                    "dark_count": layer.dark.len(),
+                }))
+            }
+            // `design_component_list` — the CATALOGUE read model: every `design_components` row of
+            // a project (DS + NEW, name-ordered) PLUS the set of component names the project's proto
+            // compositions USE (the "liés-page" filter). Portée PROJET (global), never scoped to one
+            // page. `{ projectId }` -> `{ components, linked_names }`. A pure read.
+            //
+            // "Uses" is TWO things since `data-nyx-use` exists (finding
+            // `01KYSZPG9Y8QGGVED208SG5BTB`): the components a composition TREE places, and the ones
+            // their TEMPLATES reference, transitively. A shared `Spinner` is typically reached only
+            // the second way — exactly the case the reference capability was asked for — and reading
+            // the trees alone showed it with no `linked` badge, i.e. as a legitimate deletion
+            // candidate while it is loaded on every page. The graph is built ONCE per call
+            // (`ReferenceIndex`: one scan per template, then pure edge-walking), never per card.
+            "design_component_list" => {
+                let project_id = self.arg_str("projectId")?;
+                #[derive(serde::Serialize)]
+                struct ComponentCatalog {
+                    components: Vec<db::DesignComponent>,
+                    /// Names used by at least one proto composition of the project (liés-page) —
+                    /// placed in a tree, or reached from one through `data-nyx-use`.
+                    linked_names: Vec<String>,
+                }
+                self.db()
+                    .with_conn(|c| {
+                        let components = db::list_components(c, &project_id)?;
+                        // Union the component names referenced across every proto composition of the
+                        // project (spec -> prototype -> page -> version -> variant.composition_json).
+                        let mut linked: Vec<String> = Vec::new();
+                        for spec in db::list_specs(c, &project_id)? {
+                            let Some(proto) = db::get_prototype_for_spec(c, &spec.id)? else {
+                                continue;
+                            };
+                            for page in db::list_pages(c, &proto.id)? {
+                                // `true` = include archived versions: a component that appears in
+                                // ANY iteration counts as linked-page (stable across rollbacks).
+                                for version in db::list_page_versions(c, &page.id, true)? {
+                                    for variant in db::list_variants(c, &version.id)? {
+                                        for name in nyx_core::render::referenced_component_names(
+                                            &variant.composition_json,
+                                        ) {
+                                            if !linked.contains(&name) {
+                                                linked.push(name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // …then everything those components' TEMPLATES reference, transitively.
+                        nyx_core::render::ReferenceIndex::build(
+                            components
+                                .iter()
+                                .map(|c| (c.name.as_str(), c.template.as_str())),
+                        )
+                        .extend_with_referenced(&mut linked);
+                        Ok::<_, diesel::result::Error>(ComponentCatalog {
+                            components,
+                            linked_names: linked,
+                        })
+                    })
+                    .map_err(Self::db_err)
+                    .and_then(|catalog| Self::json(&catalog))
+            }
+            // `design_component_get` — ONE `design_components` row by id (the composant-detail read
+            // model, task #11), or `null` when unknown. `{ componentId }`. A pure read.
+            "design_component_get" => {
+                let component_id = self.arg_str("componentId")?;
+                self.db()
+                    .with_conn(|c| db::get_component(c, &component_id))
+                    .map_err(Self::db_err)
+                    .and_then(|component| Self::json(&component))
+            }
+            // `design_component_nodes` — every COMPOSITION NODE across the project's proto
+            // compositions that instantiates a given component (task #11: "clic sur un nœud → détail
+            // pré-paramétré ... atteignable depuis l'arbre"). Each entry carries the variant it lives
+            // in (id + title + page title) and the node's `node_key` PATH + `params_json` so the
+            // detail opens ALREADY parameterized on that node. `{ projectId, componentName }` ->
+            // `{ nodes }`. A pure read.
+            "design_component_nodes" => {
+                let project_id = self.arg_str("projectId")?;
+                let component_name = self.arg_str("componentName")?;
+                #[derive(serde::Serialize)]
+                struct ComponentNode {
+                    variant_id: String,
+                    variant_title: String,
+                    page_title: String,
+                    node_key: String,
+                    /// The node's params serialized (the pre-parameterization payload).
+                    params_json: String,
+                }
+                self.db()
+                    .with_conn(|c| {
+                        let mut nodes: Vec<ComponentNode> = Vec::new();
+                        for spec in db::list_specs(c, &project_id)? {
+                            let Some(proto) = db::get_prototype_for_spec(c, &spec.id)? else {
+                                continue;
+                            };
+                            for page in db::list_pages(c, &proto.id)? {
+                                for version in db::list_page_versions(c, &page.id, true)? {
+                                    for variant in db::list_variants(c, &version.id)? {
+                                        for node in nyx_core::render::composition_nodes(
+                                            &variant.composition_json,
+                                        ) {
+                                            if node.component.as_deref() == Some(&component_name) {
+                                                nodes.push(ComponentNode {
+                                                    variant_id: variant.id.clone(),
+                                                    variant_title: variant.title.clone(),
+                                                    page_title: page.title.clone(),
+                                                    node_key: node.node_key,
+                                                    params_json: serde_json::Value::Object(
+                                                        node.params,
+                                                    )
+                                                    .to_string(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok::<_, diesel::result::Error>(nodes)
+                    })
+                    .map_err(Self::db_err)
+                    .and_then(|nodes| Self::json(&serde_json::json!({ "nodes": nodes })))
+            }
+            // `proto_variant_set_node_params` — PERSIST a node's params PER NODE (task #11): locate
+            // the node at `nodeKey` in the variant's composition tree, replace its params, and write
+            // the whole tree back (the proto stays a COMPOSITION, not an HTML blob). Unknown
+            // variant/node or a bad params blob is a readable error. Emits `prototypes://changed` so
+            // an open design surface re-pulls.
+            // `{ variantId, nodeKey, paramsJson }` -> `{ variant, warnings }`.
+            //
+            // `warnings` is THE NODE CONTRACT checked at the WRITE (finding
+            // `01KYQ0R9414Q5K63TBV9CCMC9J`): the keys just persisted are CONFRONTED with the params
+            // AND axes the component this node references declares. A key declared nowhere (a typo,
+            // the wrong name) and a `required` param left unprovided are reported DISTINCTLY, each
+            // naming the component, the node, the key and the correction. It is a WARNING, never a
+            // refusal — the user's edit is saved either way, and the surface SAYS what will render
+            // empty instead of letting the frame go blank in silence.
+            "proto_variant_set_node_params" => {
+                let variant_id = self.arg_str("variantId")?;
+                let node_key = self.arg_str("nodeKey")?;
+                let params_json = self.arg_str("paramsJson")?;
+                let params: serde_json::Map<String, Value> =
+                    match serde_json::from_str(&params_json) {
+                        Ok(serde_json::Value::Object(m)) => m,
+                        _ => {
+                            return Err(format!(
+                                "{}: paramsJson must be a JSON object",
+                                self.command
+                            ))
+                        }
+                    };
+                type SetNodeParamsOutcome = Result<(db::PrototypeVariant, Vec<String>), String>;
+                let (variant, warnings) = self
+                    .db()
+                    .with_conn(|c| -> Result<SetNodeParamsOutcome, diesel::result::Error> {
+                        let Some(variant) = db::get_variant(c, &variant_id)? else {
+                            return Ok(Err(format!("unknown variant {variant_id}")));
+                        };
+                        let root = match serde_json::from_str::<nyx_core::render::CompositionNode>(
+                            &variant.composition_json,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => return Ok(Err(format!("bad composition json: {e}"))),
+                        };
+                        let Some(updated) =
+                            nyx_core::render::set_node_params(&root, &node_key, params.clone())
+                        else {
+                            return Ok(Err(format!(
+                                "node '{node_key}' not found in variant {variant_id}"
+                            )));
+                        };
+                        let json = serde_json::to_string(&updated)
+                            .unwrap_or_else(|_| variant.composition_json.clone());
+                        // THE NODE CONTRACT, on the node that was just edited — computed BEFORE
+                        // the write guard so the diagnostic is about what the user typed, not
+                        // about whether the round happened to be locked.
+                        let warnings = node_contract_warnings(c, &variant, &json, &node_key)?;
+                        // GUARDED: editing a variant that is the FROZEN elected composition
+                        // of a design-locked round is refused (the "élection figée"
+                        // invariant) — iterate by opening a NEW round, never mutate a frozen
+                        // one (PDR-0009).
+                        match db::update_variant_composition(c, &variant_id, &json) {
+                            Ok(Some(v)) => Ok(Ok((v, warnings))),
+                            Ok(None) => Ok(Err(format!("unknown variant {variant_id}"))),
+                            Err(db::RoundMutationError::RoundLocked { locked_round_id }) => {
+                                Ok(Err(format!(
+                                    "variant {variant_id} is part of the FROZEN design \
+                                         (round {locked_round_id} is locked): its composition is \
+                                         immutable — open a NEW round to iterate (PDR-0009)"
+                                )))
+                            }
+                            Err(db::RoundMutationError::Db(e)) => Err(e),
+                        }
+                    })
+                    .map_err(Self::db_err)??;
+                // An open design surface (detail / renderer / catalogue) re-pulls after the edit.
+                self.events.emit(Event::Changed {
+                    topic: "prototypes".to_string(),
+                });
+                Self::json(&serde_json::json!({ "variant": variant, "warnings": warnings }))
+            }
+            // `design_render` — COMPILE a composition (component tree + params) to MARKUP entirely
+            // in the sidecar (Phase 3 task #6, `nyx_core::render`), the templates read data-driven
+            // from the project's `design_components`. The Electron renderer compiles NOTHING — it
+            // only displays this markup in the iframe (task #7).
+            //
+            // It runs the LENIENT render (`render_composition_lenient`, finding
+            // `01KYT78699XG6Q6P3VZC64W8H8`): the frame ALWAYS gets markup, and a node it cannot
+            // render comes back as a NAMED placeholder in place plus an entry in `unrendered[]`
+            // (`node_key`, `component`, `reason`, `detail`) instead of blanking the whole page. A
+            // composition under design always holds `[NEW]` nodes, so "mostly renderable, with
+            // holes" is the NORMAL state of a page in flight, not an edge case — and the renderer no
+            // longer has to compute its own notion of a hole to work around an all-or-nothing
+            // compile. The vocabulary is PRESERVED here (`Vocabulary::Preserve`): the shim pilots the
+            // `data-nyx-*` marks live, which is what the chip-bar, the in-place state change and the
+            // `data-nyx-page` navigation are made of.
+            //
+            // NAVIGATION (finding `01KYW34347CZSNXCYS35KDG3EY`): a node may state the PAGE it opens
+            // (`navigate_to`, a `prototype_pages.id`), and the render resolves that id to the slug
+            // the shim navigates with — `data-nyx-page` + `data-nyx-page-id` on the node's root. The
+            // resolution needs the prototype's page DIRECTORY, so `prototypeId` is what supplies it:
+            // WITHOUT it this render knows of no page, and every link comes back NAMED as unknown
+            // (`navigation[].status = "unknown_page"`, a `data-nyx-page-missing` marker in place)
+            // rather than silently dropped. Nothing is required for a composition with no link —
+            // which is every composition that predates this — so the argument is optional.
+            //
+            // THE AXES THE SHIM WILL PILOT (`subjectStatesJson`, finding
+            // `01KZ41YK39SGNKF6XV87A35GPN`): the very `states_json` the caller hands the frame as
+            // `window.__nyxAxes`. It is NOT resolved here — the shim applies it live, which is what
+            // the chip-bar and the in-place flip are — it is DECLARED, so each axis has exactly one
+            // applier. Every axis a NODE declares and the shim does not is baked into that node's
+            // markup instead, which is the only way a node's own `variant` / `size` / `loading` can
+            // act at all: nothing in the frame pilots them. Optional — an absent one means the frame
+            // gets no axes, so every node's own are baked (a page thumbnail, a variant that declares
+            // none).
+            //
+            // The only refusal left is a composition that does not PARSE — a READABLE error, never a
+            // silent empty frame. `{ projectId, compositionJson, prototypeId?, subjectStatesJson? }`
+            // -> `{ markup, node_count, unrendered, unrendered_count, css_slots, navigation }`. A
+            // pure render.
+            "design_render" => {
+                let project_id = self.arg_str("projectId")?;
+                let composition_json = self.arg_str("compositionJson")?;
+                let prototype_id = self.arg_opt_str("prototypeId");
+                let subject_states_json = self.arg_opt_str("subjectStatesJson");
+                let pages = match &prototype_id {
+                    Some(prototype_id) => self
+                        .db()
+                        .with_conn(|c| db::render_pages(c, prototype_id))
+                        .map_err(Self::db_err)?,
+                    None => Vec::new(),
+                };
+                let components = self
+                    .db()
+                    .with_conn(|c| db::list_components(c, &project_id))
+                    .map_err(Self::db_err)?;
+                let render_components: Vec<nyx_core::render::RenderComponent> = components
+                    .into_iter()
+                    .map(|c| nyx_core::render::RenderComponent {
+                        name: c.name,
+                        template: c.template,
+                        // A component REFERENCED by another one (`data-nyx-use`) has its OWN axes
+                        // resolved to concrete classes HERE, in the sidecar — so the whole catalogue
+                        // row crosses, states and params included, not just the template.
+                        states_json: c.states_json,
+                        params_json: c.params_json,
+                        // The component's SCOPED CSS SLOT crosses too: the render stamps the scope
+                        // on its root element(s) and appends the compiled stylesheet to the markup
+                        // (finding 01KYVMTWB71R0D0CT1SV88J8DX). The frame's CSP is untouched — it
+                        // already carries `style-src 'unsafe-inline'` for the theme layer.
+                        css_slot: nyx_core::css_slot::CssSlot::parse(c.css_slot_json.as_deref()),
+                    })
+                    .collect();
+                let resolved = nyx_core::render::render_composition_lenient(
+                    &render_components,
+                    &pages,
+                    &composition_json,
+                    subject_states_json.as_deref(),
+                )
+                .map_err(|e| format!("{}: {e}", self.command))?;
+                #[derive(serde::Serialize)]
+                struct UnrenderedNodeResult {
+                    node_key: String,
+                    component: Option<String>,
+                    /// The stable machine code — pinned by `contract/design-fixtures.json`.
+                    reason: &'static str,
+                    detail: String,
+                }
+                /// ONE scoped CSS slot the render emitted — what the review surface BADGES on the
+                /// node and counts in the chrome. `scope` is the literal selector the CSS is bounded
+                /// to, `features` names which infeasible-in-utilities constructs it uses, `reason`
+                /// says why the exception exists at all.
+                #[derive(serde::Serialize)]
+                struct CssSlotResult {
+                    scope_id: String,
+                    component: String,
+                    scope: String,
+                    reason: String,
+                    features: Vec<String>,
+                    bytes: usize,
+                    css: String,
+                    /// The refusal CODE when the stored slot no longer compiles (nothing was
+                    /// emitted) — `null` for a slot that applies.
+                    refused: Option<String>,
+                    detail: Option<String>,
+                }
+                /// ONE navigation link the render resolved — the PARCOURS, as the frame reads it.
+                /// `page` is the SLUG the shim posts (it is also what `data-nyx-page` carries on the
+                /// node's root) and `page_title` is what a human reads; both are resolved from the
+                /// `page_id` the tree stores, at every render. `status` is the machine code pinned
+                /// by `contract/design-fixtures.json` — `linked` for a link that works, and a NAMED
+                /// code for one that does not, never an absence.
+                #[derive(serde::Serialize)]
+                struct NavigationResult {
+                    node_key: String,
+                    page_id: String,
+                    page: Option<String>,
+                    page_title: Option<String>,
+                    status: &'static str,
+                    detail: String,
+                }
+                #[derive(serde::Serialize)]
+                struct RenderResult {
+                    markup: String,
+                    node_count: usize,
+                    unrendered: Vec<UnrenderedNodeResult>,
+                    unrendered_count: usize,
+                    css_slots: Vec<CssSlotResult>,
+                    css_slot_count: usize,
+                    navigation: Vec<NavigationResult>,
+                    navigation_count: usize,
+                    navigation_broken_count: usize,
+                }
+                let navigation_broken_count = resolved
+                    .navigation
+                    .iter()
+                    .filter(|l| l.status != nyx_core::render::NavigationStatus::Linked)
+                    .count();
+                Self::json(&RenderResult {
+                    markup: resolved.markup,
+                    node_count: resolved.node_count,
+                    unrendered_count: resolved.unrendered.len(),
+                    unrendered: resolved
+                        .unrendered
+                        .into_iter()
+                        .map(|u| UnrenderedNodeResult {
+                            node_key: u.node_key,
+                            component: u.component,
+                            reason: u.reason.code(),
+                            detail: u.detail,
+                        })
+                        .collect(),
+                    css_slot_count: resolved.css_slots.len(),
+                    css_slots: resolved
+                        .css_slots
+                        .into_iter()
+                        .map(|s| CssSlotResult {
+                            scope_id: s.scope_id,
+                            component: s.component,
+                            scope: s.selector,
+                            reason: s.reason,
+                            features: s.features,
+                            bytes: s.bytes,
+                            css: s.css,
+                            refused: s.refused,
+                            detail: s.detail,
+                        })
+                        .collect(),
+                    navigation_count: resolved.navigation.len(),
+                    navigation_broken_count,
+                    navigation: resolved
+                        .navigation
+                        .into_iter()
+                        .map(|l| NavigationResult {
+                            node_key: l.node_key,
+                            page_id: l.page_id,
+                            page: l.slug,
+                            page_title: l.title,
+                            status: l.status.code(),
+                            detail: l.detail,
+                        })
+                        .collect(),
+                })
+            }
+            // `design_inventory` — the RUNTIME TRIGGER (reviews #23, #40): DISCOVER the project's
+            // component BUNDLES and catalogue them. Resolves the project's repos the SAME way the dev
+            // context does (root workspace → derived members), scans them by the detected-stack ENTRY
+            // globs, groups each component's files into a BUNDLE (templateUrl resolved, non-components
+            // filtered out) and UPSERTs its discovery — never a template: the SYNTHESIS is an agent's
+            // job (`design_refresh_component`), so `pending_count` reports how many bundles await one.
+            // The UI twin of the `design_inventory` MCP tool, sharing the SAME
+            // `nyx_core::design::inventory_project` authority (PDR-0005). It also RECONCILES the
+            // catalogue with reality: a bundle MOVED on disk is re-anchored by CONTENT (same row,
+            // same synthesis), a greenfield [NEW] the front now implements is MATERIALIZED in place,
+            // and a row whose source is GONE is pruned under guards — all counted in the result.
+            // GREENFIELD-safe (no front → nothing, no error). Emits `prototypes://changed` so the
+            // `/design` catalogue re-pulls — only when the catalogue actually moved.
+            //
+            // The counters this returns are what the `/design` header REPORTS after a sync (review
+            // 01KYHPFDE21W0EMVX4J87RHGCV, CRITICAL): the button used to throw the whole result away,
+            // so an élagage — including one caused by a scan that could not read part of the tree —
+            // happened without a single signal, no confirmation and no undo. `pruned_count` says
+            // what was removed, `orphan_count` what is now flagged, `scan_error_count` whether the
+            // walk could read everything it looked at (non-zero ⇒ nothing was pruned in the repos
+            // concerned, and `discovered` under-reports).
+            //
+            // `{ projectId }` -> `{ discovered, repos_scanned, pending_count, synthesized_count,
+            // component_count, moved_count, materialized_count, orphan_count, pruned_count,
+            // flagged_orphan_count, scan_error_count }`. Called by the AGENT (its `design_inventory`
+            // MCP tool shares this exact `nyx_core::design::inventory_project` authority) — NO UI
+            // gesture triggers it since finding 01KYKX7HBP4ZSSS6ZDM31T6A5E; `/design` is a reader
+            // that repaints on the `prototypes://changed` this emits.
+            "design_inventory" => {
+                let project_id = self.arg_str("projectId")?;
+                let outcome = self
+                    .db()
+                    .with_conn(|c| nyx_core::design::inventory_project(c, &project_id))
+                    .map_err(Self::db_err)?;
+                // An open design surface (catalogue / renderer / detail) re-pulls after the
+                // inventory — but ONLY when the catalogue actually moved: a no-op sync has nothing
+                // to re-pull, and one broadcast per idle run is noise every listener pays for.
+                if outcome.catalogue_changed {
+                    self.events.emit(Event::Changed {
+                        topic: "prototypes".to_string(),
+                    });
+                }
+                #[derive(serde::Serialize)]
+                struct InventoryResult {
+                    discovered: usize,
+                    repos_scanned: usize,
+                    pending_count: usize,
+                    synthesized_count: usize,
+                    component_count: usize,
+                    /// Rows RE-ANCHORED onto a bundle that MOVED on disk (matched by CONTENT).
+                    moved_count: usize,
+                    /// Greenfield `[NEW]` rows a discovered bundle MATERIALIZED this run (#41).
+                    materialized_count: usize,
+                    /// Rows whose recorded source is GONE — pruned or spared (see `pruned_count`).
+                    orphan_count: usize,
+                    /// How many of those orphans this run actually REMOVED from the catalogue —
+                    /// the DELETEs that really affected a row, never the ones merely intended
+                    /// (the conditional delete spares a row a concurrent write gave content to).
+                    /// Only rows carrying NO authored content can land here — removing them loses
+                    /// nothing, a re-scan rebuilds them.
+                    pruned_count: usize,
+                    /// How many carry the PERSISTENT orphan flag: their source is gone and they
+                    /// hold authored content, so they were kept for an explicit human decision.
+                    /// Includes rows a run that COULD NOT JUDGE (repo not scanned / incomplete walk
+                    /// / empty scan) left flagged — such a run no longer erases the verdict of the
+                    /// last competent one, so the badge and the "Orphelines" filter stop blinking
+                    /// off on a transient I/O failure.
+                    flagged_orphan_count: usize,
+                    /// I/O failures the WALK met. Non-zero ⇒ the discovery is PARTIAL and NOTHING
+                    /// was pruned in the repos concerned.
+                    scan_error_count: usize,
+                }
+                Self::json(&InventoryResult {
+                    discovered: outcome.discovered,
+                    repos_scanned: outcome.repos_scanned,
+                    pending_count: outcome.pending.len(),
+                    synthesized_count: outcome.synthesized_count,
+                    component_count: outcome.component_count,
+                    moved_count: outcome.moved.len(),
+                    materialized_count: outcome.materialized.len(),
+                    orphan_count: outcome.orphans.len(),
+                    pruned_count: outcome.orphans.iter().filter(|o| o.pruned).count(),
+                    flagged_orphan_count: outcome
+                        .orphans
+                        .iter()
+                        .filter(|o| o.flagged_orphan)
+                        .count(),
+                    scan_error_count: outcome.scan_errors.count,
+                })
+            }
+            // `design_component_delete` — REMOVE a component from the project's catalogue (review
+            // #44: `db::delete_component` existed but was exposed NOWHERE, so an entry a wrong glob
+            // had catalogued could never be taken out). The UI twin of the `design_delete_component`
+            // MCP tool, over the SAME authority (`nyx_core::design::remove_component`, PDR-0005).
+            // Deleting touches the CATALOGUE only: a composition references components BY NAME, so a
+            // node pointing at a deleted component simply reads `[NEW]` (to be built) at the next
+            // read — nothing frozen is rewritten. An unknown id is a readable error, never a silent
+            // no-op. Emits `prototypes://changed`.
+            //
+            // IT SAYS WHAT IT REALLY ACHIEVES (finding 01KYSCX4PNKTMX17YVG9XD8KBZ). A component's
+            // identity IS its source: deleting the row of a component whose file still matches the
+            // project's recipe is UNDONE by the next inventory, which re-discovers it as pending. The
+            // gesture used to answer a bare `{ deleted: true }`. It now returns `ephemeral` + the
+            // discovery's `verdict` on that path + the `warnings[]` that name the correction
+            // (restrict the recipe, or exclude the source), so the surface can stop promising a
+            // removal that will not last. `excludeSource: true` writes the PERSISTENT exclusion (the
+            // recipe's own `exclude` list) exactly as the MCP tool does.
+            // `{ componentId, excludeSource? }` -> the removal (`deleted`, `effect`, `excluded`,
+            // `recipe_materialized`, `warnings`).
+            "design_component_delete" => {
+                let component_id = self.arg_str("componentId")?;
+                let exclude_source = self.arg_opt_bool("excludeSource").unwrap_or(false);
+                let removal = self
+                    .db()
+                    .with_conn(|c| {
+                        let Some(component) = db::get_component(c, &component_id)? else {
+                            return Ok(None);
+                        };
+                        let project_id = component.project_id.clone();
+                        nyx_core::design::remove_component(
+                            c,
+                            &project_id,
+                            &component,
+                            exclude_source,
+                        )
+                        .map(Some)
+                    })
+                    .map_err(Self::db_err)?;
+                // An unknown id, and a row that vanished between the read and the DELETE, are the
+                // same readable refusal they always were.
+                let deleted = removal.as_ref().is_some_and(|r| r.deleted);
+                let Some(removal) = removal else {
+                    return Err(format!(
+                        "{}: unknown component {component_id}",
+                        self.command
+                    ));
+                };
+                if let Some(refused) = &removal.refused {
+                    return Err(format!("{}: {refused}", self.command));
+                }
+                if !deleted {
+                    return Err(format!(
+                        "{}: unknown component {component_id}",
+                        self.command
+                    ));
+                }
+                self.events.emit(Event::Changed {
+                    topic: "prototypes".to_string(),
+                });
+                Self::json(&removal)
+            }
+            // --- PROTO read-model + UI-driven writes (review #24) --------------------
+            // The DATA layer the future proto UI (onglet + viewer / rounds / élection / commentaires
+            // / composition — T25-T29) consumes. Reads share `nyx_core::db` with the MCP `proto_*`
+            // tools (PDR-0005: one authority for UI + MCP); the WRITES are the USER's decisions
+            // (RETENU is the user's choice, distinct from the agent's is_main — PDR-0009) and reuse
+            // the SAME guarded `db` authority, so the "élection figée" lock still refuses a mutation
+            // on a design-locked round. Every write emits `prototypes://changed` so an open surface
+            // re-pulls (symmetric to the `proto_*` tools' `ChangedTopic::Prototypes`).
+            //
+            // `proto_tree` — the FULL tree of a Spec's prototype: pages/versions/variants + rounds +
+            // the both-tier election (is_main = agent reco on each variant vs RETENU = user choice on
+            // the current round) + anchored comments (open + resolved). `null` when the Spec has no
+            // prototype (the UI's empty cue). `{ specId }`. A pure read.
+            "proto_tree" => {
+                let spec_id = self.arg_str("specId")?;
+                self.db()
+                    .with_conn(|c| db::proto_tree(c, &spec_id))
+                    .map_err(Self::db_err)
+                    .and_then(|tree| Self::json(&tree))
+            }
+            // `proto_composition` — the FROZEN elected composition of a Spec's prototype (T29): the
+            // coder SEAM `db::elected_composition` exposes off the design LOCK — per page pinned in
+            // the frozen round, the arbre nommé = PLACEMENT with each node classified by its NATURE
+            // ([DS] catalogue / [NEW] to-build / [inline] bespoke) carrying a per-node design-system
+            // `component_ref`, the `[NEW]` candidates, and the pre-dev review as ANCHORS + COUNTS
+            // ONLY — never the comment BODIES (PDR-0009: the review is never transmitted to the
+            // coder, and this is the seam a coder harness consumes — review #47).
+            // `null` until the design is LOCKED (the "élection figée" empty cue: no lock → nothing to
+            // expose, so the seam never drifts). SAME `nyx_core::db` authority as the MCP
+            // `proto_composition` tool (PDR-0005: one authority for UI + MCP). `{ prototypeId }`. A
+            // pure read — no mutation, no `changed` broadcast; the live refresh rides the
+            // `prototypes://changed` channel the election/lock writes already push.
+            "proto_composition" => {
+                let prototype_id = self.arg_str("prototypeId")?;
+                self.db()
+                    .with_conn(|c| db::elected_composition(c, &prototype_id))
+                    .map_err(Self::db_err)
+                    .and_then(|composition| Self::json(&composition))
+            }
+            // `proto_elect` — POSE the USER's RETENU variant for a page in a round (T27). The page
+            // must be pinned in the round and the variant must exist (readable errors otherwise).
+            // GUARDED: electing on a design-LOCKED round is refused (élection figée) — orient toward a
+            // rollback. `{ roundId, pageId, variantId, rationale?, decidedBy? }` -> `{ round_page }`.
+            "proto_elect" => {
+                let round_id = self.arg_str("roundId")?;
+                let page_id = self.arg_str("pageId")?;
+                let variant_id = self.arg_str("variantId")?;
+                let rationale = self.arg_opt_str("rationale");
+                let decided_by = self.arg_opt_str("decidedBy");
+                let round_page = self
+                    .db()
+                    .with_conn(
+                        |c| -> Result<Result<db::PrototypeRoundPage, String>, diesel::result::Error> {
+                            if db::get_round_page(c, &round_id, &page_id)?.is_none() {
+                                return Ok(Err(format!(
+                                    "page {page_id} is not pinned in round {round_id}"
+                                )));
+                            }
+                            if db::get_variant(c, &variant_id)?.is_none() {
+                                return Ok(Err(format!("unknown variant {variant_id}")));
+                            }
+                            match db::elect_round_page_variant(
+                                c,
+                                &round_id,
+                                &page_id,
+                                &variant_id,
+                                rationale.as_deref(),
+                                decided_by.as_deref(),
+                            ) {
+                                Ok(Some(rp)) => Ok(Ok(rp)),
+                                Ok(None) => Ok(Err(format!(
+                                    "page {page_id} is not pinned in round {round_id}"
+                                ))),
+                                Err(db::RoundMutationError::RoundLocked { locked_round_id }) => {
+                                    Ok(Err(format!(
+                                        "round {locked_round_id} is FROZEN (its design is locked): \
+                                         its election is immutable — open a NEW round (rollback) to \
+                                         iterate (PDR-0009)"
+                                    )))
+                                }
+                                Err(db::RoundMutationError::Db(e)) => Err(e),
+                            }
+                        },
+                    )
+                    .map_err(Self::db_err)??;
+                self.events.emit(Event::Changed {
+                    topic: "prototypes".to_string(),
+                });
+                Self::json(&serde_json::json!({ "round_page": round_page }))
+            }
+            // `proto_election_clear` — RETIRE the USER's RETENU for a page in a round (RETENU is
+            // reversible, PDR-0009). Same lock guard as `proto_elect`. `{ roundId, pageId }` ->
+            // `{ round_page }`.
+            "proto_election_clear" => {
+                let round_id = self.arg_str("roundId")?;
+                let page_id = self.arg_str("pageId")?;
+                let round_page = self
+                    .db()
+                    .with_conn(
+                        |c| -> Result<Result<db::PrototypeRoundPage, String>, diesel::result::Error> {
+                            match db::clear_round_page_election(c, &round_id, &page_id) {
+                                Ok(Some(rp)) => Ok(Ok(rp)),
+                                Ok(None) => Ok(Err(format!(
+                                    "page {page_id} is not pinned in round {round_id}"
+                                ))),
+                                Err(db::RoundMutationError::RoundLocked { locked_round_id }) => {
+                                    Ok(Err(format!(
+                                        "round {locked_round_id} is FROZEN (its design is locked): \
+                                         its election is immutable — open a NEW round (rollback) to \
+                                         iterate (PDR-0009)"
+                                    )))
+                                }
+                                Err(db::RoundMutationError::Db(e)) => Err(e),
+                            }
+                        },
+                    )
+                    .map_err(Self::db_err)??;
+                self.events.emit(Event::Changed {
+                    topic: "prototypes".to_string(),
+                });
+                Self::json(&serde_json::json!({ "round_page": round_page }))
+            }
+            // `proto_comment_add` — ADD a pre-dev review comment anchored to a tree NODE (T28). The UI
+            // is the HUMAN façade, so `authorKind` defaults to `user` (an explicit value is honoured).
+            // Unknown prototype → readable error. Never transmitted to the coder (PDR-0009). `{
+            // prototypeId, body, nodeKey?, originVariantId?, authorKind?, authorRef? }` -> `{ feedback }`.
+            "proto_comment_add" => {
+                let prototype_id = self.arg_str("prototypeId")?;
+                let body = self.arg_str("body")?;
+                let node_key = self.arg_opt_str("nodeKey");
+                let origin_variant_id = self.arg_opt_str("originVariantId");
+                let author_kind = self
+                    .arg_opt_str("authorKind")
+                    .unwrap_or_else(|| db::FEEDBACK_AUTHOR_USER.to_string());
+                let author_ref = self.arg_opt_str("authorRef");
+                let input = db::FeedbackInput {
+                    origin_variant_id,
+                    node_key,
+                    body,
+                    author_kind,
+                    author_ref,
+                };
+                let feedback = self
+                    .db()
+                    .with_conn(
+                        |c| -> Result<
+                            Result<db::PrototypeFeedback, String>,
+                            diesel::result::Error,
+                        > {
+                            if db::get_prototype(c, &prototype_id)?.is_none() {
+                                return Ok(Err(format!("unknown prototype {prototype_id}")));
+                            }
+                            Ok(Ok(db::create_feedback(c, &prototype_id, &input)?))
+                        },
+                    )
+                    .map_err(Self::db_err)??;
+                self.events.emit(Event::Changed {
+                    topic: "prototypes".to_string(),
+                });
+                Self::json(&serde_json::json!({ "feedback": feedback }))
+            }
+            // `proto_comment_resolve` — RESOLVE a pre-dev review comment (T28), recording an optional
+            // note / the variant that addressed it. Unknown comment → readable error. `{ feedbackId,
+            // resolutionNote?, resolutionViaVariantId? }` -> `{ feedback }`.
+            "proto_comment_resolve" => {
+                let feedback_id = self.arg_str("feedbackId")?;
+                let resolution_note = self.arg_opt_str("resolutionNote");
+                let resolution_via_variant_id = self.arg_opt_str("resolutionViaVariantId");
+                let feedback = self
+                    .db()
+                    .with_conn(|c| {
+                        db::resolve_feedback(
+                            c,
+                            &feedback_id,
+                            resolution_note.as_deref(),
+                            resolution_via_variant_id.as_deref(),
+                        )
+                    })
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| format!("unknown feedback {feedback_id}"))?;
+                self.events.emit(Event::Changed {
+                    topic: "prototypes".to_string(),
+                });
+                Self::json(&serde_json::json!({ "feedback": feedback }))
+            }
+            // `proto_round_manifest` — the MANIFEST of ONE round, resolved (finding
+            // `01KZ3AP34K1PKS6W0E75RP7DF6`): per page pinned in it, the entry (which page VERSION
+            // that round froze + the USER's RETENU) and the EFFECTIVE retained variant — the same
+            // pair `proto_tree` resolves for the CURRENT round, for ANY round. It is what makes a
+            // PAST round CONSULTABLE: `proto_tree` already carries every version and variant
+            // (archived included), so a surface holding both can show a round exactly as it was.
+            // `{ roundId }` -> `RoundManifestPage[]`. An unknown round pins nothing, so it answers
+            // the empty manifest — a list, never an error.
+            //
+            // A pure READ: no mutation, no `changed` broadcast. CONSULTING IS NOT ROLLING BACK —
+            // it opens no round, copies no manifest and moves no election. `proto_round_rebase`
+            // below stays the only thing that creates a round, and the UI does not call it
+            // (PDR-0009: the agent opens a round to apply a correction; the human reads).
+            "proto_round_manifest" => {
+                let round_id = self.arg_str("roundId")?;
+                self.db()
+                    .with_conn(|c| db::round_manifest(c, &round_id))
+                    .map_err(Self::db_err)
+                    .and_then(|manifest| Self::json(&manifest))
+            }
+            // `proto_round_rebase` — ROLLBACK onto an earlier round (T26): open a NEW current round
+            // whose manifest COPIES the source round's pinned versions, so the design returns to that
+            // snapshot WITHOUT mutating the frozen source (PDR-0009: rounds gardés comme rollback).
+            // Unknown / cross-prototype source → readable error. `{ prototypeId, sourceRoundId, label,
+            // summary? }` -> `{ round }`.
+            "proto_round_rebase" => {
+                let prototype_id = self.arg_str("prototypeId")?;
+                let source_round_id = self.arg_str("sourceRoundId")?;
+                let label = self.arg_str("label")?;
+                let summary = self.arg_opt_str("summary");
+                let round = self
+                    .db()
+                    .with_conn(|c| {
+                        db::rebase_round(
+                            c,
+                            &prototype_id,
+                            &source_round_id,
+                            &label,
+                            summary.as_deref(),
+                        )
+                    })
+                    .map_err(Self::db_err)?
+                    .ok_or_else(|| {
+                        format!("unknown or cross-prototype source round {source_round_id}")
+                    })?;
+                self.events.emit(Event::Changed {
+                    topic: "prototypes".to_string(),
+                });
+                Self::json(&serde_json::json!({ "round": round }))
+            }
             other => Err(format!(
                 "db command '{other}' is not available over the sidecar transport"
             )),
@@ -2053,6 +2932,58 @@ fn mutates_workspace_tree(command: &str) -> bool {
 /// so its push stays on this legacy broadcast until it is migrated to a use case.
 fn pushes_workspace_tree_legacy(command: &str) -> bool {
     matches!(command, "delete_project" | "projects_reorder")
+}
+
+/// THE NODE CONTRACT for the ONE node `proto_variant_set_node_params` just edited (finding
+/// `01KYQ0R9414Q5K63TBV9CCMC9J`). It resolves the node's component through the project catalogue
+/// (variant → page version → page → prototype → Spec → project) and confronts the keys the node now
+/// carries with what that component DECLARES — its params and its axes.
+///
+/// Scoped to the EDITED node on purpose: this is the per-node authoring gesture, and reporting the
+/// whole tree here would drown the one thing the user just changed. The whole-tree read is the
+/// surface's job (the composition it displays) and the agent's is
+/// [`nyx_core::mcp_tools_proto`]'s `proto_add_variant`.
+///
+/// It never fails the write: an unresolvable project, an unknown component or a node that vanished
+/// yields NO warning rather than an error — a diagnostic must not be able to block a save.
+fn node_contract_warnings(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    variant: &db::PrototypeVariant,
+    composition_json: &str,
+    node_key: &str,
+) -> Result<Vec<String>, diesel::result::Error> {
+    let Some(node) = nyx_core::render::composition_nodes(composition_json)
+        .into_iter()
+        .find(|n| n.node_key == node_key)
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(component_name) = node.component.clone() else {
+        return Ok(Vec::new());
+    };
+    let Some(version) = db::get_page_version(conn, &variant.page_version_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(page) = db::get_page(conn, &version.page_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(prototype) = db::get_prototype(conn, &page.prototype_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(spec) = db::get_spec(conn, &prototype.spec_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(component) = db::get_component_by_name(conn, &spec.project_id, &component_name)?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(nyx_core::mcp_tools_design::node_contract_warnings(
+        &component_name,
+        node_key,
+        &node.params,
+        component.params_json.as_deref(),
+        component.states_json.as_deref(),
+    ))
 }
 
 #[cfg(test)]
@@ -4183,5 +5114,1237 @@ mod tests {
         };
         assert_eq!(by_id(&b_id)["blocked_by_count"].as_i64().unwrap(), 1);
         assert_eq!(by_id(&a_id)["unblocks_count"].as_i64().unwrap(), 1);
+    }
+
+    /// v2.7 Phase 3 — the DESIGN-SYSTEM read/render seam over the real dispatch: `design_get`
+    /// surfaces the theme tokens, `design_component_list` lists the components (DS + NEW) name-
+    /// ordered, and `design_render` compiles a composition to markup in the sidecar (an unknown
+    /// component being a READABLE error, never a silent empty frame).
+    #[test]
+    fn design_read_and_render_seam() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-design" }),
+            )
+            .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        // Seed a design + two components (one DS with a source, one greenfield NEW) directly.
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::upsert_design(
+                    c,
+                    &project_id,
+                    "# DESIGN",
+                    Some("{\"colors\":{\"primary\":\"#111\"}}"),
+                )?;
+                nyx_core::db::upsert_component(
+                    c,
+                    &project_id,
+                    &nyx_core::db::ComponentInput {
+                        name: "Button".into(),
+                        template: "<button>{{label}}</button>".into(),
+                        source_path: Some("src/Button.tsx".into()),
+                        ..Default::default()
+                    },
+                )?;
+                nyx_core::db::upsert_component(
+                    c,
+                    &project_id,
+                    &nyx_core::db::ComponentInput {
+                        name: "New".into(),
+                        template: "<div>new</div>".into(),
+                        ..Default::default()
+                    },
+                )?;
+                Ok::<_, diesel::result::Error>(())
+            })
+            .unwrap();
+
+        // design_get → the derived theme tokens.
+        let design = h
+            .run("design_get", serde_json::json!({ "projectId": project_id }))
+            .unwrap();
+        let design: Value = serde_json::from_str(&design).unwrap();
+        assert!(design["theme_tokens_json"]
+            .as_str()
+            .unwrap()
+            .contains("primary"));
+
+        // design_component_list → both components (name-ordered), no liés-page yet.
+        let list = h
+            .run(
+                "design_component_list",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap();
+        let list: Value = serde_json::from_str(&list).unwrap();
+        let names: Vec<&str> = list["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Button", "New"]);
+        assert!(list["linked_names"].as_array().unwrap().is_empty());
+
+        // design_render → the sidecar compiles the composition to markup.
+        let rendered = h
+            .run(
+                "design_render",
+                serde_json::json!({
+                    "projectId": project_id,
+                    "compositionJson": "{\"component\":\"Button\",\"params\":{\"label\":\"OK\"}}"
+                }),
+            )
+            .unwrap();
+        let rendered: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(rendered["markup"].as_str().unwrap(), "<button>OK</button>");
+
+        // An unknown component is a NAMED HOLE, not a blanked page (finding
+        // `01KYT78699XG6Q6P3VZC64W8H8`): the render COMPLETES, the node names itself in place, and
+        // `unrendered[]` carries the correction. A composition under design always holds `[NEW]`
+        // nodes, so refusing the whole tree over one of them was refusing the normal case.
+        let holed = h
+            .run(
+                "design_render",
+                serde_json::json!({
+                    "projectId": project_id,
+                    "compositionJson": "{\"key\":\"Root\",\"children\":[{\"component\":\"Button\",\"params\":{\"label\":\"OK\"}},{\"component\":\"Nope\"}]}"
+                }),
+            )
+            .unwrap();
+        let holed: Value = serde_json::from_str(&holed).unwrap();
+        let markup = holed["markup"].as_str().unwrap();
+        assert!(
+            markup.contains("<button>OK</button>"),
+            "the renderable node still draws: {markup}"
+        );
+        assert!(
+            markup.contains("data-unrendered-reason=\"not_in_catalogue\"")
+                && markup.contains("Nope"),
+            "the hole is named IN PLACE: {markup}"
+        );
+        assert_eq!(holed["unrendered_count"], serde_json::json!(1));
+        assert_eq!(holed["unrendered"][0]["node_key"], "Root/Nope");
+        assert_eq!(holed["unrendered"][0]["reason"], "not_in_catalogue");
+        assert!(holed["unrendered"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("proto_author_component"));
+
+        // A component carrying a SCOPED CSS SLOT hands the frame the mark AND the stylesheet, and
+        // the IPC answer NAMES the exception (finding `01KYVMTWB71R0D0CT1SV88J8DX`) — the review
+        // surface badges the node and counts the chip off THIS, never off a scan of the markup.
+        let button_id = h
+            .runtime
+            .db()
+            .with_conn(|c| db::get_component_by_name(c, &project_id, "Button"))
+            .unwrap()
+            .unwrap()
+            .id;
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                db::set_component_css_slot(
+                    c,
+                    &button_id,
+                    &db::CssSlotWrite::Set(
+                        nyx_core::css_slot::CssSlot {
+                            css: "@keyframes pulse { 50% { opacity: .5 } } \
+                                  .spin { animation: pulse 1s linear infinite }"
+                                .into(),
+                            reason: "a custom pulse keyframe".into(),
+                        }
+                        .to_json(),
+                    ),
+                )
+            })
+            .unwrap();
+        let slotted = h
+            .run(
+                "design_render",
+                serde_json::json!({
+                    "projectId": project_id,
+                    "compositionJson": "{\"component\":\"Button\",\"params\":{\"label\":\"OK\"}}"
+                }),
+            )
+            .unwrap();
+        let slotted: Value = serde_json::from_str(&slotted).unwrap();
+        let scope = nyx_core::css_slot::component_scope_id("Button");
+        let markup = slotted["markup"].as_str().unwrap();
+        assert!(
+            markup.starts_with(&format!("<button data-nyx-css=\"{scope}\">"))
+                && markup.contains(&format!("<style data-nyx-css-slot=\"{scope}\">")),
+            "the frame receives the mark AND the scoped stylesheet: {markup}"
+        );
+        assert_eq!(slotted["css_slot_count"], serde_json::json!(1));
+        assert_eq!(slotted["css_slots"][0]["component"], "Button");
+        assert_eq!(slotted["css_slots"][0]["reason"], "a custom pulse keyframe");
+        assert_eq!(
+            slotted["css_slots"][0]["scope"],
+            serde_json::json!(format!("[data-nyx-css~=\"{scope}\"]"))
+        );
+        assert_eq!(
+            slotted["css_slots"][0]["features"],
+            serde_json::json!(["keyframes"])
+        );
+        assert!(slotted["css_slots"][0]["refused"].is_null());
+
+        // …and the ONE refusal left is a composition that does not PARSE — a readable error, never
+        // a silent empty frame.
+        let err = h
+            .run(
+                "design_render",
+                serde_json::json!({ "projectId": project_id, "compositionJson": "not json" }),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("bad composition json"),
+            "readable render error: {err}"
+        );
+    }
+
+    /// DONE-CRITERION (finding `01KYW34347CZSNXCYS35KDG3EY`): `design_render` carries the PARCOURS —
+    /// a node linking to another PAGE of the prototype — and it carries it as the shim's own
+    /// vocabulary, so the frame navigates with no change to the shim at all.
+    ///
+    /// The page DIRECTORY is what an id resolves against, and the command is TOLD which prototype to
+    /// read it from (`prototypeId`). Without it the render knows of no page — and says so, by name,
+    /// instead of dropping the link: a click that silently does nothing is exactly the defect this
+    /// finding is about.
+    #[test]
+    fn design_render_carries_the_parcours_when_it_is_told_which_prototype() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-nav" }),
+            )
+            .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        let (prototype_id, pricing_id) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::upsert_component(
+                    c,
+                    &project_id,
+                    &nyx_core::db::ComponentInput {
+                        name: "Button".into(),
+                        template: "<button>{{label}}</button>".into(),
+                        ..Default::default()
+                    },
+                )?;
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Feature",
+                    nyx_core::db::SpecSections::empty(),
+                )?;
+                let proto = nyx_core::db::create_prototype(c, &spec.id, None)?;
+                nyx_core::db::create_page(c, &proto.id, "home", "Accueil", 0)?;
+                let pricing = nyx_core::db::create_page(c, &proto.id, "pricing", "Tarifs", 1)?;
+                Ok::<_, diesel::result::Error>((proto.id, pricing.id))
+            })
+            .unwrap();
+
+        let composition = serde_json::json!({
+            "component": "Button", "params": { "label": "Voir les tarifs" },
+            "navigate_to": pricing_id
+        })
+        .to_string();
+
+        // TOLD which prototype: the id resolves to the slug the shim reads, and the readable half
+        // (`page_title`) comes back beside it for the screen.
+        let linked = h
+            .run(
+                "design_render",
+                serde_json::json!({
+                    "projectId": project_id,
+                    "prototypeId": prototype_id,
+                    "compositionJson": composition,
+                }),
+            )
+            .unwrap();
+        let linked: Value = serde_json::from_str(&linked).unwrap();
+        assert_eq!(
+            linked["markup"].as_str().unwrap(),
+            format!(
+                "<button data-nyx-page=\"pricing\" data-nyx-page-id=\"{pricing_id}\">\
+                 Voir les tarifs</button>"
+            ),
+            "the shim's own attribute, unchanged, plus the durable id"
+        );
+        assert_eq!(linked["navigation_count"], serde_json::json!(1));
+        assert_eq!(linked["navigation_broken_count"], serde_json::json!(0));
+        assert_eq!(linked["navigation"][0]["status"], "linked");
+        assert_eq!(linked["navigation"][0]["page"], "pricing");
+        assert_eq!(linked["navigation"][0]["page_title"], "Tarifs");
+
+        // NOT told: the render completes, nothing navigates, and the link is NAMED in place —
+        // never dropped.
+        let blind = h
+            .run(
+                "design_render",
+                serde_json::json!({
+                    "projectId": project_id,
+                    "compositionJson": composition,
+                }),
+            )
+            .unwrap();
+        let blind: Value = serde_json::from_str(&blind).unwrap();
+        let markup = blind["markup"].as_str().unwrap();
+        assert!(
+            markup.contains(&format!("data-nyx-page-missing=\"{pricing_id}\""))
+                && !markup.contains("data-nyx-page=\""),
+            "the marker is there and nothing can navigate: {markup}"
+        );
+        assert_eq!(blind["navigation_broken_count"], serde_json::json!(1));
+        assert_eq!(blind["navigation"][0]["status"], "unknown_page");
+        assert!(blind["navigation"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("NO page directory"));
+    }
+
+    /// DONE-CRITERION (finding `01KYSZPG9Y8QGGVED208SG5BTB`): the catalogue's "liés-page" set counts
+    /// a component reached only from another component's TEMPLATE — transitively.
+    ///
+    /// `linked_names` was the union of the composition TREES alone. A shared `Spinner` — exactly the
+    /// case `data-nyx-use` was asked for — is placed in no tree, so its card came back with no
+    /// `linked` badge: a legitimate-looking deletion candidate, while it is expanded into every page
+    /// that draws a Button. (Deletion itself was already guarded — `still_referenced_warning` names
+    /// the hosts — so it was the LINK calculation that was behind, not the safety net.)
+    #[test]
+    fn a_component_reached_only_by_reference_counts_as_linked() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-linked" }),
+            )
+            .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                // Button REFERENCES Spinner, which REFERENCES Icon. `Orphan` is reached by nothing.
+                for (name, template) in [
+                    (
+                        "Button",
+                        "<button><i data-nyx-use=\"Spinner\"></i>{{label}}</button>",
+                    ),
+                    ("Spinner", "<span data-nyx-use=\"Icon\"></span>"),
+                    ("Icon", "<svg/>"),
+                    ("Orphan", "<hr/>"),
+                ] {
+                    nyx_core::db::upsert_component(
+                        c,
+                        &project_id,
+                        &nyx_core::db::ComponentInput {
+                            name: name.into(),
+                            template: template.into(),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Feature",
+                    nyx_core::db::SpecSections::empty(),
+                )?;
+                let proto = nyx_core::db::create_prototype(c, &spec.id, None)?;
+                let page = nyx_core::db::create_page(c, &proto.id, "home", "Home", 0)?;
+                let version = nyx_core::db::create_page_version(c, &page.id, "v1", None)?;
+                // The TREE places ONE component; the other two are reached only by reference.
+                nyx_core::db::create_variant(
+                    c,
+                    &version.id,
+                    &nyx_core::db::VariantInput {
+                        label: "a".into(),
+                        title: "A".into(),
+                        composition_json: "{\"component\":\"Button\"}".into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("create variant");
+                Ok::<_, diesel::result::Error>(())
+            })
+            .unwrap();
+
+        let list = h
+            .run(
+                "design_component_list",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap();
+        let list: Value = serde_json::from_str(&list).unwrap();
+        let linked: Vec<&str> = list["linked_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            linked,
+            vec!["Button", "Spinner", "Icon"],
+            "the tree's placement, then everything its templates reach — TRANSITIVELY. `Orphan` is \
+             reached by nothing and stays out, so the badge still means something"
+        );
+    }
+
+    /// v2.7 Phase 3 — the composant-detail "params ENREGISTRÉS PAR NŒUD" seam: `design_component_nodes`
+    /// lists the composition nodes that instantiate a component (each pre-parameterized), and
+    /// `proto_variant_set_node_params` persists an edited node's params back into the variant's
+    /// composition tree (which stays a COMPOSITION, not an HTML blob) + pushes `prototypes://changed`.
+    #[test]
+    fn design_component_nodes_and_per_node_param_persistence() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-node" }),
+            )
+            .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        // Seed a Spec + prototype + page/version/variant whose composition uses a `Button`.
+        let variant_id: String = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Feature",
+                    nyx_core::db::SpecSections::empty(),
+                )?;
+                let proto = nyx_core::db::create_prototype(c, &spec.id, None)?;
+                let page = nyx_core::db::create_page(c, &proto.id, "home", "Home", 0)?;
+                let version = nyx_core::db::create_page_version(c, &page.id, "v1", None)?;
+                let variant = nyx_core::db::create_variant(
+                    c,
+                    &version.id,
+                    &nyx_core::db::VariantInput {
+                        label: "a".into(),
+                        title: "A".into(),
+                        composition_json: "{\"component\":\"Root\",\"children\":[{\"component\":\"Button\",\"params\":{\"label\":\"Old\"}}]}".into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("create variant on unlocked round");
+                Ok::<_, diesel::result::Error>(variant.id)
+            })
+            .unwrap();
+
+        // design_component_nodes → the Button node, pre-parameterized (node_key + params).
+        let nodes = h
+            .run(
+                "design_component_nodes",
+                serde_json::json!({ "projectId": project_id, "componentName": "Button" }),
+            )
+            .unwrap();
+        let nodes: Value = serde_json::from_str(&nodes).unwrap();
+        let node = &nodes["nodes"][0];
+        assert_eq!(node["variant_id"].as_str().unwrap(), variant_id);
+        assert_eq!(node["node_key"].as_str().unwrap(), "Root/Button");
+        assert!(node["params_json"].as_str().unwrap().contains("Old"));
+
+        // proto_variant_set_node_params → persist the edited node params PER NODE.
+        h.run(
+            "proto_variant_set_node_params",
+            serde_json::json!({
+                "variantId": variant_id,
+                "nodeKey": "Root/Button",
+                "paramsJson": "{\"label\":\"New\",\"state\":\"loading\"}"
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            changed_count(&h.buf, "prototypes"),
+            1,
+            "pushed prototypes://changed once"
+        );
+
+        // The composition still holds a TREE (a composition, not an HTML blob) with the new params.
+        let stored: String = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                Ok::<_, diesel::result::Error>(
+                    nyx_core::db::get_variant(c, &variant_id)?
+                        .unwrap()
+                        .composition_json,
+                )
+            })
+            .unwrap();
+        assert!(stored.contains("New"), "new label persisted: {stored}");
+        assert!(
+            stored.contains("loading"),
+            "state param persisted: {stored}"
+        );
+        assert!(!stored.contains("Old"), "old label replaced: {stored}");
+
+        // An unknown node is a readable error, not a silent no-op.
+        let err = h
+            .run(
+                "proto_variant_set_node_params",
+                serde_json::json!({
+                    "variantId": variant_id,
+                    "nodeKey": "Root/Missing",
+                    "paramsJson": "{}"
+                }),
+            )
+            .unwrap_err();
+        assert!(err.contains("not found"), "readable node error: {err}");
+    }
+
+    /// DONE-CRITERION (finding `01KYQ0R9414Q5K63TBV9CCMC9J`): the per-node WRITE confronts the keys
+    /// it just persisted with what the referenced component DECLARES, and ANSWERS with the mismatch.
+    /// The reported shape — a node carrying `text` for a `Button` declaring `buttonLabel` + a
+    /// `variant` axis — used to save, render EMPTY and say nothing. Two DISTINCT messages (unknown
+    /// key / unprovided `required`), each naming component + node + key + the correction, and the
+    /// save still SUCCEEDS: nyx signals, it never refuses nor guesses a mapping.
+    #[test]
+    fn set_node_params_reports_what_the_node_owes_its_component() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-node-contract" }),
+            )
+            .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        let variant_id: String = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Feature",
+                    nyx_core::db::SpecSections::empty(),
+                )?;
+                let proto = nyx_core::db::create_prototype(c, &spec.id, None)?;
+                let page = nyx_core::db::create_page(c, &proto.id, "home", "Home", 0)?;
+                let version = nyx_core::db::create_page_version(c, &page.id, "v1", None)?;
+                // The CONTRACT: `buttonLabel` is required, `variant` is an AXIS. Neither is `text`.
+                nyx_core::db::upsert_component(
+                    c,
+                    &project_id,
+                    &nyx_core::db::ComponentInput {
+                        name: "Button".into(),
+                        template: "<button>{{buttonLabel}}</button>".into(),
+                        params_json: Some(
+                            r#"[{"name":"buttonLabel","type":"text","required":true}]"#.into(),
+                        ),
+                        states_json: Some(
+                            r#"{"axes":[{"name":"variant","values":[{"name":"ghost","classes":"bg-transparent"}]}]}"#
+                                .into(),
+                        ),
+                        ..Default::default()
+                    },
+                )?;
+                let variant = nyx_core::db::create_variant(
+                    c,
+                    &version.id,
+                    &nyx_core::db::VariantInput {
+                        label: "a".into(),
+                        title: "A".into(),
+                        composition_json:
+                            "{\"key\":\"Root\",\"children\":[{\"component\":\"Button\",\"key\":\"Reset\"}]}"
+                                .into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("create variant on unlocked round");
+                Ok::<_, diesel::result::Error>(variant.id)
+            })
+            .unwrap();
+
+        let saved = h
+            .run(
+                "proto_variant_set_node_params",
+                serde_json::json!({
+                    "variantId": variant_id,
+                    "nodeKey": "Root/Reset",
+                    "paramsJson": "{\"text\":\"Reset filters\"}"
+                }),
+            )
+            .expect("the save SUCCEEDS — the contract is a warning, never a refusal");
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert!(saved["variant"]["id"].is_string(), "the edit is persisted");
+        let warnings: Vec<String> = saved["warnings"]
+            .as_array()
+            .expect("the write answers with the node contract")
+            .iter()
+            .map(|w| w.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(warnings.len(), 2, "two DISTINCT defects: {warnings:?}");
+        assert!(
+            warnings[0].contains("Root/Reset")
+                && warnings[0].contains("'Button'")
+                && warnings[0].contains("'text'")
+                && warnings[0].contains("'buttonLabel'")
+                && warnings[0].contains("RENAME"),
+            "the unknown key names component + node + key + the correction: {}",
+            warnings[0]
+        );
+        assert!(
+            !warnings[0].to_lowercase().contains("did you mean"),
+            "no mapping between neighbouring names is ever guessed: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("Root/Reset")
+                && warnings[1].contains("REQUIRED")
+                && warnings[1].contains("'buttonLabel'"),
+            "the unprovided REQUIRED param is its own message: {}",
+            warnings[1]
+        );
+
+        // Corrected — every key declared, the required one provided — the write is SILENT.
+        let fixed = h
+            .run(
+                "proto_variant_set_node_params",
+                serde_json::json!({
+                    "variantId": variant_id,
+                    "nodeKey": "Root/Reset",
+                    "paramsJson": "{\"buttonLabel\":\"Reset filters\",\"variant\":\"ghost\"}"
+                }),
+            )
+            .unwrap();
+        let fixed: Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(
+            fixed["warnings"],
+            serde_json::json!([]),
+            "a node honouring the contract says nothing"
+        );
+    }
+
+    /// review #24 — the proto UI data layer over IPC: `proto_tree` exposes the tree + both-tier
+    /// election + comments; the UI-driven WRITES (elect / clear RETENU, comment add / resolve,
+    /// rollback) go through the SHARED guarded `db` authority, each pushing `prototypes://changed`,
+    /// and a mutation on a design-LOCKED round is REFUSED with a readable "FROZEN" error (élection figée).
+    #[test]
+    fn proto_tree_read_model_and_ui_writes_respect_the_lock() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-proto24" }),
+            )
+            .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        // Seed: Spec + prototype + one page/version + two variants, page pinned into the current round.
+        #[allow(clippy::type_complexity)]
+        let (spec_id, proto_id, round_id, page_id, variant_a, variant_b): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Feature",
+                    nyx_core::db::SpecSections::empty(),
+                )?;
+                let proto = nyx_core::db::create_prototype(c, &spec.id, None)?;
+                let round = nyx_core::db::current_round(c, &proto.id)?.unwrap();
+                let page = nyx_core::db::create_page(c, &proto.id, "home", "Home", 0)?;
+                let version = nyx_core::db::create_page_version(c, &page.id, "v1", None)?;
+                let a = nyx_core::db::create_variant(
+                    c,
+                    &version.id,
+                    &nyx_core::db::VariantInput {
+                        label: "a".into(),
+                        title: "A".into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("create variant a on unlocked round");
+                let b = nyx_core::db::create_variant(
+                    c,
+                    &version.id,
+                    &nyx_core::db::VariantInput {
+                        label: "b".into(),
+                        title: "B".into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("create variant b on unlocked round");
+                nyx_core::db::set_round_page(c, &round.id, &page.id, &version.id, 0).unwrap();
+                Ok::<_, diesel::result::Error>((spec.id, proto.id, round.id, page.id, a.id, b.id))
+            })
+            .unwrap();
+
+        // proto_tree read-model: the tree + rounds + variants are exposed; no RETENU / lock yet.
+        let tree: Value = serde_json::from_str(
+            &h.run("proto_tree", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tree["prototype"]["id"].as_str().unwrap(), proto_id);
+        assert_eq!(tree["rounds"].as_array().unwrap().len(), 1);
+        assert_eq!(tree["pages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            tree["pages"][0]["versions"][0]["variants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(tree["design_lock"].is_null(), "not frozen yet");
+
+        // proto_elect: POSE the USER's RETENU (b) → pushed once, and the tree reflects it.
+        h.run(
+            "proto_elect",
+            serde_json::json!({ "roundId": round_id, "pageId": page_id, "variantId": variant_b, "decidedBy": "user:kris" }),
+        )
+        .unwrap();
+        assert_eq!(changed_count(&h.buf, "prototypes"), 1, "elect pushed once");
+        let tree: Value = serde_json::from_str(
+            &h.run("proto_tree", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            tree["pages"][0]["manifest_entry"]["chosen_variant_id"]
+                .as_str()
+                .unwrap(),
+            variant_b,
+            "the RETENU is exposed on the manifest entry"
+        );
+        assert_eq!(
+            tree["pages"][0]["effective_variant_id"].as_str().unwrap(),
+            variant_b
+        );
+
+        // proto_election_clear: RETIRE the RETENU (reversible).
+        h.run(
+            "proto_election_clear",
+            serde_json::json!({ "roundId": round_id, "pageId": page_id }),
+        )
+        .unwrap();
+        let tree: Value = serde_json::from_str(
+            &h.run("proto_tree", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            tree["pages"][0]["manifest_entry"]["chosen_variant_id"].is_null(),
+            "the RETENU is cleared"
+        );
+
+        // proto_comment_add (author defaults to `user`) then proto_comment_resolve.
+        let added: Value = serde_json::from_str(
+            &h.run(
+                "proto_comment_add",
+                serde_json::json!({ "prototypeId": proto_id, "body": "tighten spacing", "nodeKey": "Root/Header" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let feedback_id = added["feedback"]["id"].as_str().unwrap().to_string();
+        assert_eq!(added["feedback"]["author_kind"].as_str().unwrap(), "user");
+        let tree: Value = serde_json::from_str(
+            &h.run("proto_tree", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tree["open_feedback"].as_array().unwrap().len(), 1);
+
+        h.run(
+            "proto_comment_resolve",
+            serde_json::json!({ "feedbackId": feedback_id, "resolutionNote": "done" }),
+        )
+        .unwrap();
+        let tree: Value = serde_json::from_str(
+            &h.run("proto_tree", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tree["open_feedback"].as_array().unwrap().len(), 0);
+        assert_eq!(tree["resolved_feedback"].as_array().unwrap().len(), 1);
+
+        // proto_round_rebase: rollback opens a NEW round (the history grows).
+        h.run(
+            "proto_round_rebase",
+            serde_json::json!({ "prototypeId": proto_id, "sourceRoundId": round_id, "label": "v2" }),
+        )
+        .unwrap();
+        let tree: Value = serde_json::from_str(
+            &h.run("proto_tree", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            tree["rounds"].as_array().unwrap().len(),
+            2,
+            "rollback added a round"
+        );
+
+        // `proto_round_manifest` — the round that is NO LONGER current is READABLE (finding
+        // `01KZ3AP34K1PKS6W0E75RP7DF6`): what it pinned per page, and what was retained in it.
+        // `proto_tree` above resolves the election against the CURRENT round only, so without this
+        // an earlier round was a label with no reachable content.
+        h.run(
+            "proto_elect",
+            serde_json::json!({ "roundId": round_id, "pageId": page_id, "variantId": variant_b }),
+        )
+        .unwrap();
+        let manifest: Value = serde_json::from_str(
+            &h.run(
+                "proto_round_manifest",
+                serde_json::json!({ "roundId": round_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest = manifest.as_array().unwrap();
+        assert_eq!(manifest.len(), 1, "the past round pinned one page");
+        assert_eq!(manifest[0]["entry"]["page_id"], serde_json::json!(page_id));
+        assert_eq!(
+            manifest[0]["effective_variant_id"],
+            serde_json::json!(variant_b),
+            "the variant RETAINED in that round, resolved"
+        );
+        // …and it is a pure READ: it opens no round, so the history did not grow.
+        let tree: Value = serde_json::from_str(
+            &h.run("proto_tree", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            tree["rounds"].as_array().unwrap().len(),
+            2,
+            "consulting a round creates none"
+        );
+        // An unknown round pins nothing — a manifest is a list, never an error.
+        assert_eq!(
+            h.run(
+                "proto_round_manifest",
+                serde_json::json!({ "roundId": "nope" })
+            )
+            .unwrap(),
+            "[]"
+        );
+
+        // LOCK the original round, then an election on it is REFUSED (élection figée) with a readable error.
+        h.runtime
+            .db()
+            .with_conn(|c| nyx_core::db::lock_design(c, &proto_id, &round_id, Some("user:kris")))
+            .unwrap();
+        let err = h
+            .run(
+                "proto_elect",
+                serde_json::json!({ "roundId": round_id, "pageId": page_id, "variantId": variant_a }),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("FROZEN"),
+            "electing on a locked round is refused: {err}"
+        );
+    }
+
+    /// T29 — the elected-composition read-model over IPC: `proto_composition` exposes NOTHING
+    /// (`null`) until the design is LOCKED (the "élection figée" empty cue = "pas encore figée"),
+    /// then exposes the FROZEN composition — the arbre nommé (placement) per page pinned in the
+    /// locked round, each node classified by its NATURE ([DS] catalogue with a design-system
+    /// `component_ref` / [NEW] to-build / [inline] bespoke), plus the [NEW] candidates. It reads off
+    /// the LOCK (`db::elected_composition`), the SAME authority the MCP tool serves (PDR-0005).
+    #[test]
+    fn proto_composition_exposes_the_frozen_election_over_ipc() {
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/dbcmd-proto-comp" }),
+            )
+            .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        // Seed: a design-system + one catalogue component (the [DS] target), a Spec + prototype, a
+        // page whose lone variant mixes the 3 natures (Card [DS] / NewWidget [NEW] / [inline]),
+        // pinned into the current round.
+        let (proto_id, round_id, variant_id): (String, String, String) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::upsert_design(c, &project_id, "# DESIGN", None).unwrap();
+                nyx_core::db::upsert_component(
+                    c,
+                    &project_id,
+                    &nyx_core::db::ComponentInput {
+                        name: "Card".into(),
+                        // [DS] = MATERIALIZED in the app: the nature is the component's ORIGIN (an
+                        // on-disk source), not the mere presence of a catalogue row (review #41).
+                        source_path: Some("src/ui/Card.tsx".into()),
+                        template: "<div>{{{children}}}</div>".into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "Feature",
+                    nyx_core::db::SpecSections::empty(),
+                )?;
+                let proto = nyx_core::db::create_prototype(c, &spec.id, None)?;
+                let round = nyx_core::db::current_round(c, &proto.id)?.unwrap();
+                let page = nyx_core::db::create_page(c, &proto.id, "home", "Home", 0)?;
+                let version = nyx_core::db::create_page_version(c, &page.id, "v1", None)?;
+                let variant = nyx_core::db::create_variant(
+                    c,
+                    &version.id,
+                    &nyx_core::db::VariantInput {
+                        label: "a".into(),
+                        title: "A".into(),
+                        composition_json: "{\"component\":\"Card\",\"children\":[{\"component\":\"NewWidget\"},{\"inline\":\"<hr/>\"}]}".into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("create variant on unlocked round");
+                nyx_core::db::set_round_page(c, &round.id, &page.id, &version.id, 0).unwrap();
+                Ok::<_, diesel::result::Error>((proto.id, round.id, variant.id))
+            })
+            .unwrap();
+
+        // Before the LOCK: the seam exposes NOTHING (`null`) — the "pas encore figée" empty cue.
+        let before = h
+            .run(
+                "proto_composition",
+                serde_json::json!({ "prototypeId": proto_id }),
+            )
+            .unwrap();
+        assert_eq!(before, "null", "no lock → no composition");
+
+        // FREEZE the round, then the composition is exposed off the lock.
+        h.runtime
+            .db()
+            .with_conn(|c| nyx_core::db::lock_design(c, &proto_id, &round_id, Some("user:kris")))
+            .unwrap();
+        let exposed: Value = serde_json::from_str(
+            &h.run(
+                "proto_composition",
+                serde_json::json!({ "prototypeId": proto_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(exposed["prototype_id"].as_str().unwrap(), proto_id);
+        assert_eq!(
+            exposed["locked"]["locked_round_id"].as_str().unwrap(),
+            round_id,
+            "reads off the LOCK"
+        );
+        // One page: its effective RETENU (the lone variant, retenue d'office) + the arbre nommé.
+        let page = &exposed["pages"][0];
+        assert_eq!(page["elected_variant_id"].as_str().unwrap(), variant_id);
+        assert!(page["composition_json"].as_str().unwrap().contains("Card"));
+        // The 3 natures made explicit, each carried on its node.
+        let nodes = page["nodes"].as_array().unwrap();
+        let nature = |key: &str| {
+            nodes
+                .iter()
+                .find(|n| n["node_key"] == key)
+                .unwrap_or_else(|| panic!("node {key} present"))["nature"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(nature("Card"), "ds");
+        assert_eq!(nature("Card/NewWidget"), "new");
+        assert_eq!(nature("Card/inline"), "inline");
+        // [DS] carries a design-system reference; [NEW] does not.
+        let ds = nodes.iter().find(|n| n["node_key"] == "Card").unwrap();
+        assert!(
+            ds["component_ref"].is_string(),
+            "[DS] node carries a design-system component_ref"
+        );
+        let new = nodes
+            .iter()
+            .find(|n| n["node_key"] == "Card/NewWidget")
+            .unwrap();
+        assert!(
+            new["component_ref"].is_null(),
+            "[NEW] has no catalogue reference"
+        );
+        // The [NEW] candidates — the derived-task anchor.
+        assert_eq!(page["new_components"][0].as_str().unwrap(), "NewWidget");
+    }
+
+    /// review #23 — the `design_inventory` IPC path (the CAPABILITY, kept intact when finding
+    /// 01KYKX7HBP4ZSSS6ZDM31T6A5E removed the `/design` button that used to call it): it POPULATES
+    /// `design_components` from the project's front and pushes `prototypes://changed` so the
+    /// catalogue re-pulls by itself; `design_component_list` then lists the real components.
+    #[test]
+    fn design_inventory_command_populates_catalogue_and_pushes() {
+        // A scratch front with two components under the project root.
+        let root = std::env::temp_dir().join(format!(
+            "nyx-dbcmd-inv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src/ui")).unwrap();
+        std::fs::write(root.join("src/Button.tsx"), "<button>{{label}}</button>").unwrap();
+        std::fs::write(root.join("src/ui/Card.tsx"), "<div class=\"card\"/>").unwrap();
+
+        let h = Harness::new();
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": root.to_str().unwrap() }),
+            )
+            .unwrap();
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        // The trigger populates the catalogue and reports the counts.
+        let out: Value = serde_json::from_str(
+            &h.run(
+                "design_inventory",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["component_count"].as_u64().unwrap(), 2);
+        assert_eq!(out["discovered"].as_u64().unwrap(), 2);
+        assert_eq!(
+            changed_count(&h.buf, "prototypes"),
+            1,
+            "design_inventory pushed prototypes://changed once"
+        );
+
+        // The catalogue read model now lists the real components (what `/design` shows).
+        let catalog: Value = serde_json::from_str(
+            &h.run(
+                "design_component_list",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let names: Vec<&str> = catalog["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Button", "Card"]);
+
+        // review — a run that changes NOTHING notifies nothing (it used to push per run, so an
+        // idle sync made every open surface re-pull for no reason).
+        let again: Value = serde_json::from_str(
+            &h.run(
+                "design_inventory",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(again["component_count"].as_u64().unwrap(), 2);
+        assert_eq!(again["orphan_count"].as_u64().unwrap(), 0);
+        assert_eq!(
+            changed_count(&h.buf, "prototypes"),
+            1,
+            "an idle inventory pushes NO second change"
+        );
+
+        // review #44 — the `/design` card's DELETE: `db::delete_component` was exposed nowhere, so
+        // an entry a wrong glob had catalogued could be removed from no surface at all.
+        let card_id = catalog["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Card")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let deleted: Value = serde_json::from_str(
+            &h.run(
+                "design_component_delete",
+                serde_json::json!({ "componentId": card_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deleted["deleted"], serde_json::json!(true));
+        assert_eq!(
+            changed_count(&h.buf, "prototypes"),
+            2,
+            "the removal pushes prototypes://changed so /design re-pulls"
+        );
+        let after: Value = serde_json::from_str(
+            &h.run(
+                "design_component_list",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            after["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Button"]
+        );
+        // An unknown id is a readable error, never a silent no-op.
+        assert!(h
+            .run(
+                "design_component_delete",
+                serde_json::json!({ "componentId": card_id }),
+            )
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// review #42 — the THEME TOKENS seam: nothing ever wrote `theme_tokens_json`, so the preview
+    /// iframe's `@theme` was empty and every `bg-primary` rendered GREY. `design_tokens_ingest`
+    /// DERIVES the layer from the app's own stylesheet (REFERENCED — it names the source sheet, and
+    /// stores ONE layer per project, never a copy per component) and `design_tokens_set` EDITS it;
+    /// both push `prototypes://changed` so `/design` and the frame re-pull.
+    #[test]
+    fn design_tokens_commands_ingest_from_the_app_and_edit_the_layer() {
+        let root = std::env::temp_dir().join(format!(
+            "nyx-dbcmd-tokens-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/styles.css"),
+            ":root{--primary:oklch(0.55 0.21 264);--background:oklch(1 0 0);\
+             --foreground:oklch(0.14 0 0);--radius:0.625rem}\
+             .dark{--primary:oklch(0.72 0.16 264)}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/Button.tsx"),
+            "<button class=\"bg-primary\"/>",
+        )
+        .unwrap();
+
+        let h = Harness::new();
+        let created: Value = serde_json::from_str(
+            &h.run(
+                "create_project",
+                serde_json::json!({ "name": "sandbox", "rootPath": root.to_str().unwrap() }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+
+        let run: Value = serde_json::from_str(
+            &h.run(
+                "design_tokens_ingest",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(run["changed"], serde_json::json!(true));
+        assert_eq!(run["variable_count"].as_u64().unwrap(), 4);
+        assert_eq!(run["dark_count"].as_u64().unwrap(), 1);
+        // REFERENCED: the layer says which app stylesheet `primary` comes from.
+        assert_eq!(
+            run["sources"][0]["path"],
+            serde_json::json!("src/styles.css")
+        );
+        assert_eq!(
+            changed_count(&h.buf, "prototypes"),
+            1,
+            "the ingest pushed prototypes://changed once"
+        );
+
+        // `design_get` — what the iframe reads — now carries the tokens `bg-primary` resolves
+        // against, instead of the NULL that made every preview grey.
+        let design: Value = serde_json::from_str(
+            &h.run("design_get", serde_json::json!({ "projectId": project_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        let tokens = design["theme_tokens_json"].as_str().unwrap();
+        assert!(tokens.contains("--primary"), "tokens: {tokens}");
+        assert!(tokens.contains("oklch(0.55 0.21 264)"));
+
+        // An idle re-ingest pushes nothing.
+        h.run(
+            "design_tokens_ingest",
+            serde_json::json!({ "projectId": project_id }),
+        )
+        .unwrap();
+        assert_eq!(changed_count(&h.buf, "prototypes"), 1, "idle ⇒ no push");
+
+        // EDIT once, apply everywhere — and the source reference survives the edit.
+        let edited: Value = serde_json::from_str(
+            &h.run(
+                "design_tokens_set",
+                serde_json::json!({
+                    "projectId": project_id,
+                    "variables": { "primary": "#ff0055" },
+                    "remove": ["--radius"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let stored = edited["tokens_json"].as_str().unwrap();
+        assert!(stored.contains("#ff0055"));
+        assert!(!stored.contains("0.625rem"), "--radius was removed");
+        assert!(stored.contains("src/styles.css"), "reference preserved");
+        assert_eq!(edited["variable_count"].as_u64().unwrap(), 3);
+        assert_eq!(
+            changed_count(&h.buf, "prototypes"),
+            2,
+            "the edit pushed once"
+        );
+
+        // A malformed token value is a readable error, never a silently mangled theme.
+        assert!(h
+            .run(
+                "design_tokens_set",
+                serde_json::json!({ "projectId": project_id, "variables": { "primary": 12 } }),
+            )
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

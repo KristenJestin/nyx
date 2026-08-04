@@ -12,6 +12,7 @@ import type { Spec } from "../specs/types";
 import { useSpecDetail } from "../specs/use-spec-detail";
 import { useSpecReviewComments } from "../specs/use-spec-review-comments";
 import { OverlayPanelActions } from "./overlay-panel-actions";
+import { OverlayPrototypes } from "./overlay-prototypes";
 import { OverlayTab } from "./overlay-tab";
 import {
   OVERLAY_PANEL_WIDTH,
@@ -297,8 +298,14 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
                 </header>
                 {/* FIDÈLE task rendering — the real `<TasksTab>` component, fed the review comments'
                     author map so its nested rounds derive provenance. `overflow-x-hidden` clamps the
-                    reused content to the 380px panel (no horizontal scrollbar / clipped text). */}
+                    reused content to the 380px panel (no horizontal scrollbar / clipped text).
+                    Above it, the Spec's PROTOTYPE PAGES (finding `01KYW342EE5DN6F70YB8VSTJR8`): each
+                    row opens the workbench ON that page. It renders nothing for a Spec that has no
+                    prototype, so a dev rail is never taxed by a block about an absence. */}
                 <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-4">
+                  <div className="mb-4 empty:mb-0">
+                    <OverlayPrototypes specId={spec.id} />
+                  </div>
                   <TasksTab detail={detail} authorByCommentId={authorByCommentId} />
                 </div>
               </motion.section>

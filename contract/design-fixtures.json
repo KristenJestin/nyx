@@ -1,0 +1,909 @@
+{
+ "_comment": "CROSS-LANGUAGE fixture for the DESIGN half of the contract (finding 01KYSNQWQD1324E0NA0172M66J). The variance rule and the token-layer key list exist TWICE — once in Rust (crates/nyx-core/src/mcp_tools_design.rs, crates/nyx-core/src/design_tokens.rs) and once in TypeScript (apps/desktop/renderer/src/components/design/axes.ts, theme-css.ts) — and nothing made the two fail together. This file is the CASES, read by both suites: Rust in mcp_tools_design.rs::tests::the_shared_fixture_pins_both_implementations_of_the_variance_rule and design_tokens/tests.rs::to_json_emits_exactly_the_keys_the_renderer_reserves, TypeScript in axes.test.ts and theme-css.test.ts. Hand-written, never generated: adding a case here must make BOTH suites fail until BOTH implementations agree. It is a DATA file — neither side builds the other.",
+ "variance_cases": [
+  {
+   "id": "manual-canonical-button",
+   "why": "The role manual's canonical example, VERBATIM. The Rust guard the_manuals_canonical_component_passes_the_checks_the_write_path_applies extracts these three blobs out of the RENDERED manual and asserts they are this case, so the chain is manual -> fixture -> both implementations: the day the manual's example changes, this file has to follow, and the renderer's copy of it stops being a copy.",
+   "from_manual": true,
+   "template": "<button class=\"inline-flex items-center justify-center rounded-md font-medium\"> <i data-nyx-if=\"loading=on\" class=\"mr-2 animate-spin\">◌</i>{{label}}</button>",
+   "states_json": "{ \"axes\": [ { \"name\": \"variant\", \"values\": [ { \"name\": \"primary\", \"classes\": \"bg-primary px-4 text-primary-foreground\" }, { \"name\": \"destructive\", \"classes\": \"bg-destructive px-4 text-destructive-foreground\" }, { \"name\": \"outline\", \"classes\": \"border border-input bg-background px-4\" } ] }, { \"name\": \"size\", \"values\": [ { \"name\": \"md\", \"classes\": \"h-9 text-sm\" }, { \"name\": \"lg\", \"classes\": \"h-11 text-base\" } ] }, { \"name\": \"loading\", \"values\": [ { \"name\": \"off\" }, { \"name\": \"on\", \"classes\": \"pointer-events-none opacity-70\" } ] } ] }",
+   "params_json": "[{ \"name\": \"label\", \"type\": \"text\", \"required\": true, \"preview\": \"Enregistrer\" }]",
+   "expect": {
+    "axes": [
+     "variant",
+     "size",
+     "loading"
+    ],
+    "primary_axis_values": [
+     "primary",
+     "destructive",
+     "outline"
+    ],
+    "state_cases": [],
+    "substituted_axes": [],
+    "unknown_condition_axes": [],
+    "inert": []
+   }
+  },
+  {
+   "id": "complement-credits-the-bare-baseline",
+   "why": "THE DISCRIMINATION RULE. `off` deliberately carries nothing and it is the COMPLEMENT — the element that exists at `on` and is gone at `off` — that makes it visible. Written here with data-nyx-if-not, the other way round, because the two spellings must never diverge.",
+   "template": "<button><span data-nyx-if-not=\"loading=on\">prêt</span></button>",
+   "states_json": "{\"axes\":[{\"name\":\"loading\",\"values\":[{\"name\":\"off\"},{\"name\":\"on\"}]}]}",
+   "expect": {
+    "axes": [
+     "loading"
+    ],
+    "primary_axis_values": [
+     "off",
+     "on"
+    ],
+    "state_cases": [],
+    "substituted_axes": [],
+    "unknown_condition_axes": [],
+    "inert": []
+   }
+  },
+  {
+   "id": "a-sibling-with-classes-credits-the-bare-value",
+   "why": "THE SAME DISCRIMINATION RULE, APPLIED TO THE OTHER MECHANISM (finding 01KYT103MXTKFBZMKF968FGW9P, observed on `checkbox`). `enabled` is bare and `disabled` carries `opacity-50`, with NO condition anywhere: choosing `enabled` rather than `disabled` still CHANGES THE RENDERING — it is the ABSENCE of `opacity-50` that defines `enabled`, exactly as it is the absence of classes that defines the baseline `off`. Reporting `enabled` inert pushed the author to INVENT classes on a baseline, which the manual explicitly forbids. If a sibling value of the SAME axis carries classes, switching between the two moves pixels, so neither is inert.",
+   "template": "<label class=\"inline-flex items-center gap-2\"><input type=\"checkbox\"/>{{label}}</label>",
+   "states_json": "{\"axes\":[{\"name\":\"disabled\",\"values\":[{\"name\":\"enabled\"},{\"name\":\"disabled\",\"classes\":\"opacity-50 pointer-events-none\"}]}]}",
+   "expect": {
+    "axes": [
+     "disabled"
+    ],
+    "primary_axis_values": [
+     "enabled",
+     "disabled"
+    ],
+    "state_cases": [],
+    "substituted_axes": [],
+    "unknown_condition_axes": [],
+    "inert": []
+   }
+  },
+  {
+   "id": "the-sibling-credit-is-per-axis-not-per-component",
+   "why": "…and it stops at the AXIS, like every other credit here. `variant` carries classes on `primary`, so its bare `ghost` is credited; `loading` carries none on either value and nothing conditions on it, so BOTH of its values stay inert and reported. A credit read over the whole component instead of over the axis would silence the second axis entirely — the real inert case, which the warning must keep naming.",
+   "template": "<button class=\"rounded-md\">{{label}}</button>",
+   "states_json": "{\"axes\":[{\"name\":\"variant\",\"values\":[{\"name\":\"primary\",\"classes\":\"bg-primary\"},{\"name\":\"ghost\"}]},{\"name\":\"loading\",\"values\":[{\"name\":\"off\"},{\"name\":\"on\"}]}]}",
+   "expect": {
+    "axes": [
+     "variant",
+     "loading"
+    ],
+    "primary_axis_values": [
+     "primary",
+     "ghost"
+    ],
+    "state_cases": [],
+    "substituted_axes": [],
+    "unknown_condition_axes": [],
+    "inert": [
+     {
+      "axis": "loading",
+      "value": "off"
+     },
+     {
+      "axis": "loading",
+      "value": "on"
+     }
+    ]
+   }
+  },
+  {
+   "id": "always-true-condition-credits-nothing",
+   "why": "The other half of the same rule: a condition true at EVERY value of its axis cannot discriminate anything — the element is there whatever the axis does, which is the same inertia as no condition at all.",
+   "template": "<button><i data-nyx-if=\"loading=off|on\">◌</i></button>",
+   "states_json": "{\"axes\":[{\"name\":\"loading\",\"values\":[{\"name\":\"off\"},{\"name\":\"on\"}]}]}",
+   "expect": {
+    "axes": [
+     "loading"
+    ],
+    "primary_axis_values": [
+     "off",
+     "on"
+    ],
+    "state_cases": [],
+    "substituted_axes": [],
+    "unknown_condition_axes": [],
+    "inert": [
+     {
+      "axis": "loading",
+      "value": "off"
+     },
+     {
+      "axis": "loading",
+      "value": "on"
+     }
+    ]
+   }
+  },
+  {
+   "id": "map-form-reads-in-declaration-order",
+   "why": "THE MAJOR FINDING 01KYSNPWWG9DA0AXP6D22GV5BK. The tolerated MAP form declares `variant` FIRST and `loading` second; alphabetically it is the reverse. The FIRST axis is the one data-nyx-state-case drives on both sides, so an alphabetical reading elects `loading` primary, leaves the two state cases matching nothing, and reports `variant` inert — every expectation below flips. Both sides must read DOCUMENT order.",
+   "template": "<button data-nyx-state-case=\"primary\" class=\"bg-primary\">{{label}}</button><button data-nyx-state-case=\"ghost\">{{label}}</button><i data-nyx-if=\"loading=on\">◌</i>",
+   "states_json": "{\"variant\":[\"primary\",\"ghost\"],\"loading\":[\"off\",\"on\"]}",
+   "expect": {
+    "axes": [
+     "variant",
+     "loading"
+    ],
+    "primary_axis_values": [
+     "primary",
+     "ghost"
+    ],
+    "state_cases": [
+     "primary",
+     "ghost"
+    ],
+    "substituted_axes": [],
+    "unknown_condition_axes": [],
+    "inert": []
+   }
+  },
+  {
+   "id": "substitution-needs-the-closing-pair",
+   "why": "Same finding, smaller: `{{state}` is a Handlebars typo that substitutes NOTHING. The Rust validator only looked for a single closing brace and credited the axis as alive, while the renderer's regex required the pair and reported it inert — one stored component, two verdicts.",
+   "template": "<button class=\"btn btn-{{state}\">{{label}}</button>",
+   "states_json": "[\"default\",\"ghost\"]",
+   "expect": {
+    "axes": [
+     "state"
+    ],
+    "primary_axis_values": [
+     "default",
+     "ghost"
+    ],
+    "state_cases": [],
+    "substituted_axes": [],
+    "unknown_condition_axes": [],
+    "inert": [
+     {
+      "axis": "state",
+      "value": "default"
+     },
+     {
+      "axis": "state",
+      "value": "ghost"
+     }
+    ]
+   }
+  },
+  {
+   "id": "legacy-substitution-is-the-honest-exception",
+   "why": "…and the well-formed spelling of the very same template: a whole axis rendered by substituting its name, on a front whose variants ARE plain class names. The legacy flat list is read as ONE anonymous axis named `state`.",
+   "template": "<button class=\"btn btn-{{state}}\">{{label}}</button>",
+   "states_json": "[\"default\",\"ghost\"]",
+   "expect": {
+    "axes": [
+     "state"
+    ],
+    "primary_axis_values": [
+     "default",
+     "ghost"
+    ],
+    "state_cases": [],
+    "substituted_axes": [
+     "state"
+    ],
+    "unknown_condition_axes": [],
+    "inert": []
+   }
+  },
+  {
+   "id": "condition-on-an-axis-nobody-declares",
+   "why": "A data-nyx-if naming an axis states_json does not declare is IGNORED by the shim (hiding on an unknown name would blank the aperçu), so it is reported instead — and it must be reported by both sides.",
+   "template": "<button class=\"rounded\"><i data-nyx-if=\"loading=on\">◌</i>{{label}}</button>",
+   "states_json": "{\"axes\":[{\"name\":\"variant\",\"values\":[{\"name\":\"a\",\"classes\":\"bg-primary\"}]}]}",
+   "expect": {
+    "axes": [
+     "variant"
+    ],
+    "primary_axis_values": [
+     "a"
+    ],
+    "state_cases": [],
+    "substituted_axes": [],
+    "unknown_condition_axes": [
+     "loading"
+    ],
+    "inert": []
+   }
+  }
+ ],
+ "unrendered_nodes": {
+  "_comment": "THE NODES A COMPOSITION CANNOT RENDER — the reasons, their labels, and the ONE difference between the two resolutions (finding 01KYT78699XG6Q6P3VZC64W8H8, MAJOR). This notion lived TWICE: `resolve_composition` named the holes in Rust for the AGENT, and the renderer had grown its own `composition-holes.ts` for the FRAME, because the Rust one CONSUMES the data-nyx-* vocabulary the shim needs. Rust now carries both — ONE walk (`resolve_node`) parameterized by `Vocabulary` — and this file is what stops the vocabulary of REASONS from drifting away from the surfaces that display it. Rust reads it in render.rs::tests::the_shared_fixture_pins_the_unrendered_reasons_and_both_resolutions; TypeScript reads it in use-design-render.test.tsx, which pins `reasons[].code` and `reasons[].short` in BOTH directions. `composition-holes.ts` is GONE — it was removed rather than re-synchronised: `design_render` answers `{ markup, node_count, unrendered[], unrendered_count }` and the frame only DISPLAYS that list (children before their parent, the nesting deduced from the `node_key` paths). `reasons[].code` and `reasons[].short` are the two strings a display surface may depend on. Hand-written, never generated: adding a case here must fail every implementation that does not agree.",
+  "placeholder_class": "nyx-unrendered",
+  "placeholder_class_note": "The class the LENIENT render puts on the <div> it substitutes for a node it cannot draw (render.rs::UNRENDERED_CLASS), and the ONLY hook the frame has to draw that hole as a hole (design/frame-srcdoc.ts). Nothing joined the two: renaming either left every suite green while the placeholders lost their dashed box, their margin and their type size, and melted into plain text in the middle of the page — the only signal INSIDE the surface, gone (finding 01KZ3JTWB82DCG0C6JT06T4CAF). The frame must style it, and must style it UNCONDITIONALLY: it is the composition's own state, not an interaction affordance a vignette may drop.",
+  "placeholder_style_declarations": [
+   "border",
+   "margin",
+   "font"
+  ],
+  "placeholder_style_note": "The three declarations that make the hole READ as a hole rather than as body text: an encadré (border), the space that detaches it from its neighbours (margin) and a type size that is not the page's (font). Pinned by NAME, not by value — the hues and the metrics are the frame's business, their PRESENCE is the guarantee.",
+  "placeholder_attributes": {
+   "node": "data-unrendered-node",
+   "component": "data-unrendered-component",
+   "reason": "data-unrendered-reason"
+  },
+  "reasons": [
+   {
+    "code": "not_in_catalogue",
+    "short": "not in the catalogue",
+    "why": "A [NEW] nobody has synthesized yet, a component deleted after the composition was written, or a typo. A deleted row leaves NO trace, so the three are indistinguishable from the composition alone and the detail names them all rather than picking the likeliest story."
+   },
+   {
+    "code": "no_template",
+    "short": "no template yet",
+    "why": "The row EXISTS but carries no template: the inventory discovered the bundle and nobody synthesized it. A DIFFERENT correction from building a [NEW], which is why it is a different reason."
+   },
+   {
+    "code": "template_has_logic",
+    "short": "template carries logic",
+    "why": "A Handlebars BLOCK helper, which PDR-0010 forbids. Corrected by expressing the conditional or the repetition through the TREE."
+   },
+   {
+    "code": "template_has_partial",
+    "short": "template includes a partial",
+    "why": "A `{{> Other}}` include (finding 01KYSZNX4TAVSGEVBVJM7W2B21). Kept apart from `template_has_logic` because the correction is not the same one: a block is rewritten into the tree, a partial into a data-nyx-use reference."
+   },
+   {
+    "code": "render_failed",
+    "short": "render failed",
+    "why": "Handlebars or the reference expansion refused this node — a template that does not compile, an unknown / cyclic / too-deep data-nyx-use. The RenderError message is carried verbatim."
+   }
+  ],
+  "cases": [
+   {
+    "id": "the-holes-are-named-in-place-and-the-rest-of-the-page-draws",
+    "why": "THE WHOLE POINT. Four nodes, three of them broken in three different ways, and the fourth renders. An all-or-nothing compile answered with one error line or a blank frame; this answers with the page, its holes named where they sit, and a list of what to do about each. `node_count` counts every node the walk visited, placeholders included.",
+    "catalogue": [
+     {
+      "name": "Card",
+      "template": "<section class=\"card\">{{{children}}}</section>"
+     },
+     {
+      "name": "Discovered",
+      "template": ""
+     },
+     {
+      "name": "Looper",
+      "template": "{{#each rows}}<li>{{this}}</li>{{/each}}"
+     }
+    ],
+    "composition": {
+     "component": "Card",
+     "children": [
+      {
+       "component": "PricingTable"
+      },
+      {
+       "component": "Discovered"
+      },
+      {
+       "component": "Looper"
+      }
+     ]
+    },
+    "expect": {
+     "node_count": 4,
+     "unrendered": [
+      {
+       "node_key": "Card/PricingTable",
+       "component": "PricingTable",
+       "reason": "not_in_catalogue"
+      },
+      {
+       "node_key": "Card/Discovered",
+       "component": "Discovered",
+       "reason": "no_template"
+      },
+      {
+       "node_key": "Card/Looper",
+       "component": "Looper",
+       "reason": "template_has_logic"
+      }
+     ],
+     "markup_contains": [
+      "<section class=\"card\">",
+      "data-unrendered-node=\"Card/PricingTable\"",
+      "data-unrendered-reason=\"not_in_catalogue\"",
+      "[UNRENDERED PricingTable — not in the catalogue]",
+      "[UNRENDERED Discovered — no template yet]",
+      "[UNRENDERED Looper — template carries logic]"
+     ]
+    }
+   },
+   {
+    "id": "a-partial-is-a-hole-of-its-own-naming-data-nyx-use",
+    "why": "A template STORED before the partial was refused. The node is not silently expanded with the host's context (params leaking by name collision, axes resolved nowhere, no cycle bound): it is a NAMED hole, and its detail carries the form that works.",
+    "catalogue": [
+     {
+      "name": "Spinner",
+      "template": "<i class=\"spin\">◌</i>"
+     },
+     {
+      "name": "Button",
+      "template": "<button>{{> Spinner}}{{label}}</button>"
+     }
+    ],
+    "composition": {
+     "component": "Button",
+     "params": {
+      "label": "OK"
+     }
+    },
+    "expect": {
+     "node_count": 1,
+     "unrendered": [
+      {
+       "node_key": "Button",
+       "component": "Button",
+       "reason": "template_has_partial"
+      }
+     ],
+     "markup_contains": [
+      "[UNRENDERED Button — template includes a partial]"
+     ],
+     "detail_contains": [
+      "data-nyx-use=\"Spinner\""
+     ]
+    }
+   },
+   {
+    "id": "the-frame-keeps-the-vocabulary-the-agent-consumes-it",
+    "why": "THE ONE DIFFERENCE BETWEEN THE TWO RESOLUTIONS, and the reason the frame could not simply be wired to the agent's one. Note the ORDER of the holes: the walk is depth-first CHILDREN-FIRST, so a hole nested under another hole is listed before it — the list is the order the walk records, not a pre-order reading of the tree. `data-nyx-page` is what the renderer's shim pilots LIVE (the page navigation), and the AGENT's resolution strips it because it has neither shim nor browser. WHAT IS **NOT** A DIFFERENCE IS A NODE'S OWN AXES (finding 01KZ41YK39SGNKF6XV87A35GPN): `loading=on` is fixed by the NODE, no subject declares that axis, and nothing in the frame can move it — so BOTH resolutions bake `opacity-70` and BOTH consume the `data-nyx-if` that decided it. The frame used to preserve that mark and resolve nothing, on the belief that the shim read a node's axis values off its params; it does not, and three controls of the node params form were dead because of it. The HOLES are identical in both — that is the part that must never be written twice.",
+    "catalogue": [
+     {
+      "name": "Button",
+      "template": "<button class=\"btn\" data-nyx-page=\"pricing\"><i data-nyx-if=\"loading=on\" class=\"spin\">◌</i>{{label}}</button>",
+      "states_json": "{\"axes\":[{\"name\":\"loading\",\"values\":[{\"name\":\"off\"},{\"name\":\"on\",\"classes\":\"opacity-70\"}]}]}"
+     }
+    ],
+    "composition": {
+     "component": "Root",
+     "children": [
+      {
+       "component": "Button",
+       "params": {
+        "label": "Go",
+        "loading": "on"
+       }
+      },
+      {
+       "component": "Ghost"
+      }
+     ]
+    },
+    "expect": {
+     "node_count": 3,
+     "unrendered": [
+      {
+       "node_key": "Root/Ghost",
+       "component": "Ghost",
+       "reason": "not_in_catalogue"
+      },
+      {
+       "node_key": "Root",
+       "component": "Root",
+       "reason": "not_in_catalogue"
+      }
+     ],
+     "markup_contains": [
+      "[UNRENDERED Ghost — not in the catalogue]",
+      "opacity-70"
+     ],
+     "frame_only_contains": [
+      "data-nyx-page=\"pricing\""
+     ],
+     "agent_only_contains": [],
+     "markup_absent": [
+      "data-nyx-if=\"loading=on\""
+     ]
+    }
+   },
+   {
+    "id": "the-shim-owns-the-subjects-axes-the-render-bakes-a-nodes-own",
+    "why": "ONE OWNER PER AXIS (finding 01KZ41YK39SGNKF6XV87A35GPN). `subject_states_json` is the very `states_json` the host hands the frame as `window.__nyxAxes` — the axes the shim applies LIVE over the whole document. The SAME catalogue and the SAME composition as the case above, with ONE change: the subject now declares `loading` too. So the FRAME must leave that axis entirely alone — no `opacity-70` baked, the `data-nyx-if` preserved for the shim — because a value baked under a live applier survives every flip and stacks with the next one. The AGENT has no shim, so it resolves the subject's axes itself (its ambient pass) and bakes `opacity-70` as before. This is the rule that keeps the component DETAIL preview untouched: there the composition is ONE node of the component, and the axes the panel pilots are that same component's.",
+    "subject_states_json": "{\"axes\":[{\"name\":\"loading\",\"default\":\"on\",\"values\":[{\"name\":\"off\"},{\"name\":\"on\",\"classes\":\"opacity-70\"}]}]}",
+    "catalogue": [
+     {
+      "name": "Button",
+      "template": "<button class=\"btn\" data-nyx-page=\"pricing\"><i data-nyx-if=\"loading=on\" class=\"spin\">◌</i>{{label}}</button>",
+      "states_json": "{\"axes\":[{\"name\":\"loading\",\"values\":[{\"name\":\"off\"},{\"name\":\"on\",\"classes\":\"opacity-70\"}]}]}"
+     }
+    ],
+    "composition": {
+     "component": "Root",
+     "children": [
+      {
+       "component": "Button",
+       "params": {
+        "label": "Go",
+        "loading": "on"
+       }
+      },
+      {
+       "component": "Ghost"
+      }
+     ]
+    },
+    "expect": {
+     "node_count": 3,
+     "unrendered": [
+      {
+       "node_key": "Root/Ghost",
+       "component": "Ghost",
+       "reason": "not_in_catalogue"
+      },
+      {
+       "node_key": "Root",
+       "component": "Root",
+       "reason": "not_in_catalogue"
+      }
+     ],
+     "markup_contains": [
+      "[UNRENDERED Ghost — not in the catalogue]"
+     ],
+     "frame_only_contains": [
+      "data-nyx-page=\"pricing\"",
+      "data-nyx-if=\"loading=on\""
+     ],
+     "agent_only_contains": [
+      "opacity-70"
+     ]
+    }
+   }
+  ]
+ },
+ "empty_param_cases": {
+  "_comment": "WHEN 'this param resolves empty' IS WORTH A WARNING (finding 01KYVMTWVF3TH1XPEKV9MEBZTB). The warning fired on EVERY component, because almost every synthesis declares a passthrough `class` — empty BY NATURE — and a warning that fires everywhere stops being read. The criterion is NOT the name `class` (that would only hold until `wrapperClass` or `testId`): it is WHERE THE TEMPLATE PUTS THE PARAM. Substituted into CONTENT, empty means a missing label — a hole a human sees, so WARN. Substituted only inside a TAG (an attribute value), the element renders identically without it, so SILENT. `required` overrides the site reading, because the descriptor itself asserts the component has no value of its own. Rust reads these cases in mcp_tools_design.rs::tests::the_shared_fixture_pins_when_an_empty_param_is_worth_a_warning; the renderer carries the same judgement in `paramsWithoutPreviewValue` (components/design/params.ts) and REPLAYS these very cases in params.test.ts, so a case added here fails whichever side does not agree.",
+  "cases": [
+   {
+    "id": "a-passthrough-class-is-empty-by-nature",
+    "why": "THE CASE THAT MADE THE WARNING UNREADABLE. `class` exists so a CALLER can add classes; its absence renders a perfectly complete button. It is not required, it substitutes only inside a class attribute, and nothing a human looks at changes.",
+    "template": "<button class=\"btn {{class}}\">Save</button>",
+    "param": {
+     "name": "class",
+     "required": false
+    },
+    "expect_warned": false
+   },
+   {
+    "id": "the-next-passthrough-must-be-silent-too-without-naming-it",
+    "why": "The same shape under a name no rule could have anticipated. A criterion keyed on the string `class` would have gone on shouting about this one — which is exactly how the over-signal comes back.",
+    "template": "<div data-testid=\"{{testId}}\" aria-label=\"{{ariaLabel}}\"><span>x</span></div>",
+    "param": {
+     "name": "testId",
+     "required": false
+    },
+    "expect_warned": false
+   },
+   {
+    "id": "a-label-substituted-into-content-still-bites",
+    "why": "THE REAL CASE THE WARNING EXISTS FOR, and the proof the triage did not silence it: `{{label}}` sits between the tags, so empty is a coloured pill with no text — a blank tile, the thing the human reports as broken.",
+    "template": "<button class=\"btn\">{{label}}</button>",
+    "param": {
+     "name": "label",
+     "required": false
+    },
+    "expect_warned": true
+   },
+   {
+    "id": "required-overrides-the-site-wherever-it-lands",
+    "why": "The descriptor asserts the component carries NO value of its own, so an empty one is a defect it DECLARED — attribute or not. It is also the safety net: if the site reading is ever wrong, the params that matter most keep their warning.",
+    "template": "<a href=\"{{href}}\">read</a>",
+    "param": {
+     "name": "href",
+     "required": true
+    },
+    "expect_warned": true
+   },
+   {
+    "id": "a-broken-mustache-substitutes-nothing-so-it-holes-nothing",
+    "why": "`{{label}` never substitutes (finding 01KYSNPWWG9DA0AXP6D22GV5BK, the closing PAIR is required). The param has NO site at all, and a param the template never substitutes is a different defect with a different correction — the variance and node contracts name that one.",
+    "template": "<button class=\"btn\">{{label}</button>",
+    "param": {
+     "name": "label",
+     "required": false
+    },
+    "expect_warned": false
+   }
+  ]
+ },
+ "token_layer_keys": {
+  "_comment": "Every TOP-LEVEL key TokenLayer::to_json emits for a layer that carries a provenance report. The renderer's theme builder FLATTENS any top-level key it does not RESERVE into a CSS custom property, so an unreserved key comes back out as `--pruned-dirs-count` inside @theme. Rust asserts to_json emits EXACTLY this list; TypeScript asserts every entry is in theme-css.ts's RESERVED_KEYS.",
+  "keys": [
+   "dark",
+   "pruned_dirs",
+   "pruned_dirs_count",
+   "skipped",
+   "skipped_count",
+   "source",
+   "sources",
+   "variables"
+  ]
+ },
+ "empty_run_blob": {
+  "_comment": "THE BLOB A RUN THAT RETAINED NO SHEET WRITES, over a project that had nothing stored (finding 01KYSNVW31C0E8YQPET0505HW2). Such a run stores zero token, so every design-system class renders grey and this report is the ONLY diagnostic there is — which is why it is written at all. Rust asserts a real ingest_project_tokens over such a tree stores exactly this object (design_tokens/tests.rs::the_blob_a_run_that_retains_nothing_writes_is_the_shared_fixture); TypeScript renders exactly it in the tokens panel (theme-tokens-panel.test.tsx), which used to build its own blob by hand — and built one no backend write could ever produce. Note what is NOT in here: no variables, no dark, no sources. A run that retained nothing has no business claiming any, and it leaves the ones a hand-authored theme already stored exactly where they are.",
+  "blob": {
+   "pruned_dirs": [
+    ".generated",
+    "node_modules"
+   ],
+   "pruned_dirs_count": 2,
+   "skipped": [
+    {
+     "repo": "web",
+     "path": "docs/.vitepress/theme/custom.css",
+     "reason": "doc_tool_theme"
+    },
+    {
+     "repo": "web",
+     "path": "src/brand.css",
+     "reason": "foreign_namespace"
+    },
+    {
+     "repo": "web",
+     "path": "src/page.css",
+     "reason": "not_a_token_sheet"
+    }
+   ],
+   "skipped_count": 3
+  }
+ },
+ "css_slot": {
+  "_comment": "The SCOPED CSS SLOT contract (finding 01KYVMTWB71R0D0CT1SV88J8DX). A component may carry ONE strict escape hatch for what Tailwind utilities cannot express. Rust OWNS the validation and the scoping (crates/nyx-core/src/css_slot.rs) and is the only implementation of them — the renderer never compiles a slot, it DISPLAYS what the sidecar already scoped. What crosses the language boundary, and is therefore pinned here, is the VOCABULARY a display surface keys off: the scope attribute, the style element's marker attribute, the four feature codes the review card ticks, the refusal codes an error may carry in error.data.css_slot_refusal, and the caps. Rust asserts this list in css_slot/tests.rs::the_shared_fixture_pins_the_slot_vocabulary; a display surface that hard-codes a code not in this list is a surface that will silently stop reacting the day the code changes. EACH CODE CARRIES ITS `short` — the exact words the review card prints beside it. They used to be pinned as CODES only, so the loop asserted 'non-empty' for a feature and 'differs from the code' for a refusal: renaming a displayed label left 409 tests green while the human read something nobody had agreed to. The wording IS the contract here — it is the whole of what the reviewer sees of a refusal — so `short` is compared for EQUALITY (finding 01KZ3JTWB82DCG0C6JT06T4CAF).",
+  "scope_attribute": "data-nyx-css",
+  "style_attribute": "data-nyx-css-slot",
+  "max_css_bytes": 2048,
+  "max_reason_bytes": 240,
+  "features": [
+   {
+    "code": "keyframes",
+    "short": "@keyframes",
+    "why": "A custom @keyframes — the animation no utility describes. The identifier is RENAMED under the scope, so two components may both call theirs `spin`."
+   },
+   {
+    "code": "pseudo_element",
+    "short": "::before / ::after",
+    "why": "The CONTENT of a ::before / ::after — generated content has no utility."
+   },
+   {
+    "code": "has",
+    "short": ":has(…)",
+    "why": "A relational selector, :has(…) — a parent styled from its children."
+   },
+   {
+    "code": "container",
+    "short": "@container",
+    "why": "A @container query — a rule on the CONTAINER's size, not the viewport's."
+   }
+  ],
+  "refusals": [
+   {
+    "code": "blank",
+    "short": "empty CSS",
+    "why": "The CSS is empty once trimmed. Sending \"\" is how a slot is REMOVED, and that is not a refusal — this is the internal guard."
+   },
+   {
+    "code": "no_reason",
+    "short": "no reason given",
+    "why": "A slot without css_slot_reason. SIGNALLED is a constraint of the slot, not a nicety of a screen: the reason travels to the review UI and to the coder."
+   },
+   {
+    "code": "reason_too_long",
+    "short": "reason too long",
+    "why": "Past max_reason_bytes."
+   },
+   {
+    "code": "too_large",
+    "short": "past the size cap",
+    "why": "Past max_css_bytes — what is being written is a stylesheet, not an exception."
+   },
+   {
+    "code": "markup",
+    "short": "markup inside the CSS",
+    "why": "The CSS carries `</`. Refused at the source rather than escaped on the way out, so nothing emitted can close the <style> element it travels in."
+   },
+   {
+    "code": "important",
+    "short": "!important",
+    "why": "!important — the slot exists for what utilities CANNOT do, never to OUTRANK them."
+   },
+   {
+    "code": "external_resource",
+    "short": "external resource",
+    "why": "url(…). The preview frame's CSP grants no network (default-src 'none'), and relaxing it for a CSS slot is a design failure, not an option."
+   },
+   {
+    "code": "at_rule",
+    "short": "at-rule not admitted",
+    "why": "An at-rule with no selector to anchor — @import, @font-face, @layer, @property, @page, @apply. Only @keyframes, @media, @supports and @container are admitted."
+   },
+   {
+    "code": "nested_rule",
+    "short": "nested rule",
+    "why": "A rule nested inside a declaration block: the scoper anchors SELECTORS, and a nested one would never see the anchor."
+   },
+   {
+    "code": "unterminated",
+    "short": "unterminated block",
+    "why": "A block, a string or a comment the scanner could not close. What cannot be read whole cannot be scoped."
+   },
+   {
+    "code": "bad_declaration",
+    "short": "not a declaration",
+    "why": "Something that is not `property: value`."
+   },
+   {
+    "code": "global_selector",
+    "short": "global selector",
+    "why": "html / body / :root / :host. Anchored on the scope it could never match — and a rule that silently does nothing is the disappearance this slot exists to end, so it is refused instead of neutered."
+   },
+   {
+    "code": "escaping_selector",
+    "short": "selector escaping the scope",
+    "why": "A selector starting with a combinator (`+ .x`): anchored on the scope it would select a SIBLING, i.e. outside the component."
+   },
+   {
+    "code": "misplaced_scope",
+    "short": "misplaced :scope",
+    "why": ":scope / & anywhere but as the FIRST token of a selector."
+   },
+   {
+    "code": "empty_selector",
+    "short": "empty selector",
+    "why": "A stray comma in a selector list."
+   },
+   {
+    "code": "hardcoded_colour",
+    "short": "hard-coded colour",
+    "why": "A colour written in the CSS instead of referenced from the token layer — #hex, rgb(), oklch(), or a named colour on a colour-valued property. No exception."
+   },
+   {
+    "code": "hardcoded_length",
+    "short": "hard-coded length",
+    "why": "A raw absolute length (px, pt, cm…) on a property the design system SCALES. A length in a transform, a duration or a plain number is not a themed value and is left alone."
+   },
+   {
+    "code": "unknown_token",
+    "short": "unknown token",
+    "why": "var(--x) naming a custom property the project's token layer does not declare. It would resolve to NOTHING. Skipped entirely on a project with no token layer at all (greenfield)."
+   },
+   {
+    "code": "no_escape_hatch",
+    "short": "no escape hatch used",
+    "why": "The slot uses NONE of the four features above — it is then CSS written INSTEAD of the design system, which is exactly what must not reach the coder."
+   }
+  ]
+ },
+ "navigation": {
+  "_comment": "INTER-PAGE NAVIGATION — a node of the composition LINKS to another page of the prototype (finding 01KYW34347CZSNXCYS35KDG3EY, MAJOR). Before this, the interactivity of a proto stopped at the axis flip INSIDE one frame, so a multi-page prototype was a collection of pages that did not answer each other — while a parcours is exactly what a prototype exists to show. The link lives on the composition NODE (`navigate_to`), not on the component: a destination is a PLACEMENT decision (the same Button is a Continue here and a Back there), the tree is what crosses the coder seam, and a design_components row is re-synthesized from the app's sources — a link authored into a template would not survive the next synthesis. It is stored BY PAGE ID, because a slug is renamed; the SLUG and the TITLE are resolved at every render, which is what keeps the readable half true and makes a rename free. CYCLES are fine and deliberately unbounded: a navigation is a USER GESTURE at click time, never an expansion at render time — the render walks the tree and never follows a link. `attributes` are what the render stamps on the linking node's root element(s); `statuses[].code` is what a display surface switches on. Rust reads this in render.rs::tests::the_shared_fixture_pins_the_navigation_vocabulary; the renderer's shim already intercepts `data-nyx-page` and posts its value to the host. Hand-written, never generated: adding a status here must fail every implementation that does not agree.",
+  "attributes": {
+   "page": "data-nyx-page",
+   "page_id": "data-nyx-page-id",
+   "missing": "data-nyx-page-missing"
+  },
+  "attribute_notes": "`data-nyx-page` carries the destination's SLUG — unchanged, so the shim that already reads it navigates with no change at all. `data-nyx-page-id` carries the durable id beside it, for a host that would rather not round-trip through a name that can be renamed. `data-nyx-page-missing` is the NAMED marker of a link that resolved to nothing. THE MARKER NEUTRALIZES, IT DOES NOT ONLY BADGE (finding 01KZ3JN69E32FYBF01NBE4FWJD): a node that states a destination has the WHOLE navigation vocabulary CLEARED off its root before the render writes what it decided, so a `data-nyx-page` a component's template baked in cannot survive beside the marker and send the shim to a slug frozen in that template. Before that, the rewrite dropped only the attributes it re-posed, and the click was badged rather than dead. NOTHING STYLES `[data-nyx-page-missing]` YET: no rule in the sidecar and none in the frame's srcdoc, which styles `[data-nyx-page]` and only that — the marker is visible in the markup and in `navigation[]`, and the badge is a renderer-side rule still to be written.",
+  "statuses": [
+   {
+    "code": "linked",
+    "short": "navigates",
+    "why": "The page id resolved: the node's root element(s) carry `data-nyx-page` (the slug) and `data-nyx-page-id`. The only status where the markup can navigate."
+   },
+   {
+    "code": "unknown_page",
+    "short": "page is gone",
+    "why": "The id resolves to NO page of this prototype — deleted since the link was written, or a render that was given no page directory at all. The node is marked `data-nyx-page-missing` and carries NO navigation. proto_add_variant REFUSES such a link at the write, so at render time this means a page that DISAPPEARED, never a link that was never valid."
+   },
+   {
+    "code": "no_anchor",
+    "short": "nothing to click",
+    "why": "The page resolved but the node renders no element of its own to hold the link — a STRUCTURAL node (no component, no inline) is only its children, and a template can render bare text. Stamping the children would silently make each of them clickable, a decision nobody wrote, so the link is NAMED instead."
+   }
+  ],
+  "seam_statuses": [
+   {
+    "code": "pinned",
+    "why": "proto_composition: the destination is a page the FROZEN round pins — the parcours stays inside the design being handed to the coder."
+   },
+   {
+    "code": "unpinned",
+    "why": "proto_composition: the page exists but is not in the frozen round — the link leaves the frozen design, and the coder is told rather than left to find out."
+   },
+   {
+    "code": "unknown",
+    "why": "proto_composition: the id resolves to no page at all. Named anyway — a broken link is information, not a blank."
+   }
+  ],
+  "neutralisation_case": {
+   "_comment": "A node whose template BAKES IN its own `data-nyx-page` and whose `navigate_to` resolves to NOTHING. The stamp must leave exactly one navigation mark — the marker — and no concurrent link: a dead link must not navigate, whatever the template wrote. Rust reads this in render.rs::tests::an_invalidated_link_leaves_no_concurrent_link_behind.",
+   "template": "<button class=\"btn\" data-nyx-page=\"pricing\" data-nyx-page-id=\"pg-old\">Voir</button>",
+   "navigate_to": "pg-gone",
+   "pages": [],
+   "expected_status": "unknown_page",
+   "expected_markup": "<button class=\"btn\" data-nyx-page-missing=\"pg-gone\">Voir</button>",
+   "absent_attributes": [
+    "data-nyx-page",
+    "data-nyx-page-id"
+   ]
+  }
+ },
+ "param_types": {
+  "_comment": "THE SIX TYPES A PARAM DESCRIPTOR MAY DECLARE (finding 01KYPSG0HPG2D28CMJEXRKNEVK), and the ONE that is deprecated. This list lived at THREE places with nothing joining them: the Rust constant the write path REFUSES outside of (mcp_tools_design.rs::PARAM_TYPES), the TypeScript constant the panel COERCES towards `text` outside of (design/params.ts::PARAM_TYPES), and the prose of the Prototype role manual that TEACHES them. A seventh type accepted on the Rust side alone would be stored, then silently rendered as a free-text field with its `options` dropped — the exact regression finding 01KYPSG0HPG2D28CMJEXRKNEVK already paid for once. Rust reads this in mcp_tools_design.rs::tests::the_shared_fixture_pins_the_six_param_types and — for the manual's own prose, EXTRACTED from the rendered text, never re-typed — in mcp_context.rs::tests::the_manual_teaches_exactly_the_six_param_types_the_write_path_accepts. TypeScript reads it in design/params.test.ts. ORDER MATTERS: it is the order the refusal message names, the order the manual bullets them and the order the panel's control offers them. Hand-written, never generated.",
+  "types": [
+   "text",
+   "html",
+   "state",
+   "boolean",
+   "number",
+   "select"
+  ],
+  "deprecated": "state",
+  "deprecated_note": "`state` used to mean 'the component's active state' — a variance AXIS smuggled into the params, the very ambiguity that let a variant be declared twice. Still PARSED (stored rows carry it) and warned about at the write; never taught as a choice.",
+  "manual_heading": "THE SIX TYPES, EXHAUSTIVELY",
+  "unknown_type_is_refused": true,
+  "unknown_type_note": "An unknown `type` is REFUSED at the write, naming the offending param and the accepted values — it is NOT repaired into `text`. The renderer, which only DISPLAYS a row already stored, coerces an unknown type to `text` rather than dropping the control: the two are not in contradiction, and both sides read this same list to decide what 'unknown' means."
+ },
+ "node_key": {
+  "_comment": "THE `node_key` CONVENTION — one rule, and it was written four times. A node_key is the `separator`-join of every node's SEGMENT LABEL from the root down, and a segment label is the node's explicit `key`, else its `component` name, else `inline_label`. It is the anchor a pinned comment is STORED on (prototype_feedback.node_key), the address the params write targets (proto_variant_set_node_params), and the path the coder seam hands over. Change a segment on one side alone and the stored comments stop re-anchoring while the params writes land on the wrong node — silently, both. Rust: render.rs::CompositionNode::key + composition_nodes + node_key_path, read here in render.rs::tests::the_shared_fixture_pins_the_node_key_convention. TypeScript: ONE implementation now (specs/composition-nodes.ts::nodeSegmentLabel, imported by composition-markers.ts and composition-tree.tsx instead of being re-typed), read here in specs/composition-nodes.test.ts. Hand-written, never generated.",
+  "separator": "/",
+  "inline_label": "inline",
+  "cases": [
+   {
+    "id": "the-explicit-key-wins-then-the-component-then-inline",
+    "why": "THE RULE ITSELF, in one tree. `key` overrides everything (that is what disambiguates same-named siblings); a node with no `key` is addressed by its component NAME; a node with neither is `inline` — including a `[inline]` one-off, whose markup is never part of its address.",
+    "composition": {
+     "component": "Page",
+     "children": [
+      {
+       "component": "Card",
+       "key": "Header"
+      },
+      {
+       "component": "Card"
+      },
+      {
+       "inline": "<hr/>"
+      },
+      {
+       "key": "Footer",
+       "children": [
+        {
+         "component": "Button"
+        }
+       ]
+      }
+     ]
+    },
+    "node_keys": [
+     "Page",
+     "Page/Header",
+     "Page/Card",
+     "Page/inline",
+     "Page/Footer",
+     "Page/Footer/Button"
+    ]
+   },
+   {
+    "id": "same-named-siblings-collide-unless-a-key-separates-them",
+    "why": "TWO `Button` siblings with no explicit key produce the SAME path — and that is the documented consequence of the convention, not a defect to paper over: a comment pinned on either re-anchors on the first. It is pinned so no implementation 'improves' it into an index suffix on one side only, which would move every stored anchor of the other.",
+    "composition": {
+     "key": "Root",
+     "children": [
+      {
+       "component": "Button"
+      },
+      {
+       "component": "Button"
+      }
+     ]
+    },
+    "node_keys": [
+     "Root",
+     "Root/Button",
+     "Root/Button"
+    ]
+   },
+   {
+    "id": "the-separator-is-not-escaped-and-depth-is-the-segment-count",
+    "why": "A segment carrying the separator itself SPLITS the path — the convention does not escape it. The renderer's tree reads DEPTH as `segments - 1`, so this is the case that stops one side from inventing an escaping the other does not perform.",
+    "composition": {
+     "key": "Root",
+     "children": [
+      {
+       "key": "a/b",
+       "children": [
+        {
+         "component": "Leaf"
+        }
+       ]
+      }
+     ]
+    },
+    "node_keys": [
+     "Root",
+     "Root/a/b",
+     "Root/a/b/Leaf"
+    ]
+   }
+  ]
+ },
+ "node_contract": {
+  "_comment": "THE NODE CONTRACT'S CAP, and WHAT IT BOUNDS (finding 01KYQ0R9414Q5K63TBV9CCMC9J for the check, 01KZ3JTVM23C3MBATJZ3RYVPY6 for this arrimage). The check is written twice — mcp_tools_design.rs::composition_contract_warnings for the AGENT and design/composition-contract.ts::compositionContractReport for the HUMAN — and the cap was 12 on both sides while bounding two DIFFERENT things: MESSAGES in Rust, NODES in TypeScript. On a composition where every node has two defects the agent was told about 6 nodes and the human saw 12, i.e. the two halves of one surface disagreed about which nodes are the broken ones. It bounds NODES on both sides now, and this case is what proves it: `max_nodes` nodes named, in placement order, whatever the number of messages each one produces. Rust reads it in mcp_tools_design.rs::tests::the_shared_fixture_pins_what_the_node_contract_cap_bounds; TypeScript in design/composition-contract.test.ts.",
+  "max_nodes": 12,
+  "case": {
+   "id": "every-node-broken-twice-still-names-max-nodes-nodes",
+   "why": "Fourteen nodes, each carrying an unknown key AND missing a required param — two defects, so two messages, on every one of them. Only the first `max_nodes` are NAMED, and they are the same twelve on both sides; the rest are COUNTED. A component the catalogue does not have is not a mismatch (it is a [NEW]) and never enters the count.",
+   "component": {
+    "name": "Button",
+    "params_json": "[{\"name\": \"label\", \"type\": \"text\", \"required\": true}]",
+    "states_json": null
+   },
+   "root_key": "Root",
+   "nodes": [
+    "n01",
+    "n02",
+    "n03",
+    "n04",
+    "n05",
+    "n06",
+    "n07",
+    "n08",
+    "n09",
+    "n10",
+    "n11",
+    "n12",
+    "n13",
+    "n14"
+   ],
+   "node_params": {
+    "caption": "x"
+   },
+   "expected_named_nodes": [
+    "Root/n01",
+    "Root/n02",
+    "Root/n03",
+    "Root/n04",
+    "Root/n05",
+    "Root/n06",
+    "Root/n07",
+    "Root/n08",
+    "Root/n09",
+    "Root/n10",
+    "Root/n11",
+    "Root/n12"
+   ],
+   "expected_total": 14,
+   "expected_truncated": true,
+   "expected_unknown_keys": [
+    "caption"
+   ],
+   "expected_missing_required": [
+    "label"
+   ]
+  }
+ },
+ "viewports": {
+  "_comment": "THE NAMED VIEWPORT WIDTHS the human vocabulary uses. Rust serves them to the AGENT (render/viewport.rs::NAMED_VIEWPORTS — `design_preview` resolves `viewport: \"tablet\"` to a width and reasons about which breakpoints are in force at it); the renderer offers the SAME widths to the HUMAN as the stage presets of the prototype page. They were a list of bare numbers on the TypeScript side, joined to the Rust list by nothing: move `tablet` to 834 in Rust and the agent reasons at 834 while the human validates at 768, with no test anywhere disagreeing. Rust reads this in render/viewport.rs::tests::the_shared_fixture_pins_the_named_viewport_widths, TypeScript in design/viewports.test.ts. The widths are EXACT: the stage lays the page out at exactly `width` CSS px (finding 01KZ3JPWNYP0B65Z31RRX1EEMT — a media query at 390 does not fire at 388).",
+  "named": [
+   {
+    "name": "mobile",
+    "width": 390
+   },
+   {
+    "name": "tablet",
+    "width": 768
+   },
+   {
+    "name": "desktop",
+    "width": 1280
+   }
+  ],
+  "thumbnail_width": 1280,
+  "thumbnail_note": "The width a PAGE THUMBNAIL is laid out at before being scaled down — the desktop preset, so a vignette shows the page the reader is about to open rather than its mobile reflow."
+ }
+}

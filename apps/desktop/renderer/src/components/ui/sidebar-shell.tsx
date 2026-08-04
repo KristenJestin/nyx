@@ -18,6 +18,14 @@ import { cn } from "@/lib/utils";
  *   (the prototype's `motion` width idiom), driven ENTIRELY by the parent (`open` is controlled).
  *   Reduced-motion collapses instantly.
  *
+ * ## A rail that folds to a STUB, not to nothing (`collapsedWidth` + `collapsed`)
+ * A closable rail defaults to folding to `0` — it leaves the screen entirely. The prototype page
+ * needs the other half of the same idiom (finding `01KYVMSMMBVSZNBBSBE18PRZAK`): its pages rail
+ * folds to a 52 px strip of miniatures and its right panel to a 48 px stub, so the scene takes the
+ * width back WITHOUT the user losing where they are — and the stub carries the control that unfolds
+ * it. `collapsedWidth` is that target width, `collapsed` the content shown at it. Both default to
+ * the previous behaviour (`0`, nothing), so the review's two flanks render byte-identically.
+ *
  * ## One toggle per flank (Finding 46)
  * A `collapsible` rail carries NO built-in close affordance: it is opened/closed SOLELY by its
  * parent's control (in the review, the two ReviewHeader buttons — the panel-left button for the
@@ -28,9 +36,16 @@ import { cn } from "@/lib/utils";
  *
  * The `header` slot renders in a bordered, non-scrolling block at the top; `children` fill the
  * scrollable region below. Tokens only — no raw hex, no magic px beyond the shared width.
+ *
+ * ## A FOOT that does not scroll (`footer`)
+ * The mirror of `header`, pinned at the BOTTOM with a top border. The prototype rail needs it for its
+ * round selector (finding `01KZ46P0FTMJXRTT32H6G5TEEN`): the user wants that control at the foot of
+ * the rail, and a foot laid inside `children` rides the scroll of the page list — it is not a foot,
+ * it is the end of a list. Optional, so every existing rail renders byte-identically.
  */
 export function SidebarShell({
   header,
+  footer,
   children,
   className,
   contentClassName,
@@ -39,9 +54,13 @@ export function SidebarShell({
   collapsible = false,
   open = true,
   width = 260,
+  collapsedWidth = 0,
+  collapsed,
 }: {
   /** Optional pinned header block (bordered, non-scrolling) at the top of the rail. */
   header?: React.ReactNode;
+  /** Optional pinned FOOT block (bordered, non-scrolling) at the bottom of the rail. */
+  footer?: React.ReactNode;
   /** The scrollable rail content (nav / sections). */
   children: React.ReactNode;
   /** Extra classes on the shell (rarely needed — geometry is fixed). */
@@ -59,6 +78,10 @@ export function SidebarShell({
   open?: boolean;
   /** The rail's open width in px (collapsible mode). Defaults to the shared 260. */
   width?: number;
+  /** The width a `collapsible` rail folds DOWN to. `0` (default) = it leaves the screen. */
+  collapsedWidth?: number;
+  /** What the folded rail shows at `collapsedWidth` (the stub + its unfold control). */
+  collapsed?: React.ReactNode;
 }) {
   const reduce = useReducedMotion();
   const borderClass = side === "right" ? "border-l" : "border-r";
@@ -66,6 +89,10 @@ export function SidebarShell({
   const headerBlock =
     header != null ? (
       <div className="shrink-0 border-b border-border/60 px-3 py-3">{header}</div>
+    ) : null;
+  const footerBlock =
+    footer != null ? (
+      <div className="shrink-0 border-t border-border/60 px-3 py-3">{footer}</div>
     ) : null;
   const body = (
     <div className={cn("min-h-0 flex-1 overflow-y-auto", contentClassName)}>{children}</div>
@@ -89,6 +116,7 @@ export function SidebarShell({
       >
         {headerBlock}
         {body}
+        {footerBlock}
       </aside>
     );
   }
@@ -99,13 +127,17 @@ export function SidebarShell({
   // (Finding 46) — the parent's header button is the single open/close affordance for the rail.
   const T: Transition = reduce ? { duration: 0 } : { type: "spring", duration: 0.4, bounce: 0.15 };
 
+  // A folded rail that still SHOWS something (a stub) stays in the a11y tree — it carries the
+  // control that unfolds it. One that folds to nothing keeps the previous `aria-hidden`.
+  const stubbed = !open && collapsed != null;
+
   return (
     <motion.aside
       aria-label={ariaLabel}
-      aria-hidden={!open}
+      aria-hidden={!open && !stubbed}
       data-open={open}
       initial={false}
-      animate={{ width: open ? width : 0 }}
+      animate={{ width: open ? width : collapsedWidth }}
       transition={T}
       className={cn(
         "h-svh shrink-0 overflow-hidden bg-muted/40",
@@ -113,10 +145,17 @@ export function SidebarShell({
         className,
       )}
     >
-      <div style={{ width }} className="flex h-full flex-col">
-        {headerBlock}
-        {body}
-      </div>
+      {stubbed ? (
+        <div style={{ width: collapsedWidth }} className="flex h-full flex-col">
+          {collapsed}
+        </div>
+      ) : (
+        <div style={{ width }} className="flex h-full flex-col">
+          {headerBlock}
+          {body}
+          {footerBlock}
+        </div>
+      )}
     </motion.aside>
   );
 }

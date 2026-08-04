@@ -200,6 +200,31 @@ describe("BaseLayout", () => {
     fireEvent.click(screen.getByRole("link", { name: "Work" }));
     expect(await screen.findByText("WORK PAGE")).toBeTruthy();
   });
+
+  /**
+   * DONE-CRITERION (finding `01KZ41YKMB63GFJ3QMK2ZHJN1C`, point 1) — THE CATALOGUE IS IN THE APP
+   * RAIL, AT ITS FOOT.
+   *
+   * It was ALSO a link in the PROTOTYPE page's own header — a project-wide reference living in the
+   * chrome of one page. That copy is gone (`specs/prototype-page.test.tsx` asserts its absence), so
+   * this is the one entry point, and it must be reachable from every screen: it is a rail entry like
+   * the others, placed with Settings rather than with the work sections, because it is consulted
+   * FROM a screen, not worked in.
+   */
+  it("routes to the catalogue from the FOOT of the rail, under the work sections", async () => {
+    renderLayout("/");
+    const catalogue = await screen.findByRole("link", { name: "Catalogue" });
+    expect(catalogue.getAttribute("href")).toBe("/design");
+    // AT THE FOOT: after every work section, and beside the Settings control.
+    const knowledge = screen.getByRole("link", { name: "Knowledge" });
+    expect(
+      knowledge.compareDocumentPosition(catalogue) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    const settings = screen.getByRole("button", { name: "Settings" });
+    expect(
+      catalogue.compareDocumentPosition(settings) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
 });
 
 describe("BaseLayout — restores the last entered project", () => {

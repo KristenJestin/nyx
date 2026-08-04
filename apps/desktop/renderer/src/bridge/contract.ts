@@ -870,6 +870,186 @@ export type BackendCommand =
   // Spec-detail dependency badges ("bloquée par N" / "débloque M"); the board reads the counts off
   // the enriched `spec_list`.
   | "spec_dependency_view"
+  // v2.7 DESIGN-SYSTEM read/render seam (Phase 3, PDR-0010). Pure reads/renders over the
+  // `design` / `design_components` authority (Phase 1) + the composition renderer
+  // (`nyx_core::render`, task #6), served by the sidecar `db_command` dispatch. No agent
+  // ACTION here — the agent drives the proto via the MCP `proto_*` tools, never a UI button.
+  // `design_get` ({ projectId }) — a project's design-system row: derived `theme_tokens_json`
+  // (the iframe `@theme`) + the DESIGN.md `content`, or `null`.
+  | "design_get"
+  // `design_tokens_ingest` ({ projectId }) → the ingest RUN — DERIVE the project's THEME TOKEN
+  // layer from the app's own stylesheet (review #42: nothing ever wrote `theme_tokens_json`, so the
+  // iframe's `@theme` was empty and every `bg-primary` rendered grey). Walks the same repos as
+  // `design_inventory`, under the project's RECIPE (its `exclude` globs + its `ignored_dirs`), and
+  // records WHERE the tokens live — the layer is REFERENCED, never copied per component.
+  //
+  // `{ repos_scanned, candidates, sources: [{ repository_id, repo, path, variable_count }],
+  //    skipped: [{ repo, path, reason }], skipped_count, pruned_dirs: string[], pruned_dirs_count,
+  //    variable_count, dark_count, changed, provenance_changed, tokens_json }`.
+  //
+  // `skipped[]` / `skipped_count` / `pruned_dirs[]` are the PROVENANCE half (finding
+  // 01KYSCX562SWDXZBBAPX397X8F): the run used to report only what it TOOK, so a layer merged from a
+  // `.generated` mirror plus a docs theme looked exactly like a healthy one. `reason` is a CODE —
+  // `recipe_exclude` / `doc_tool_theme` / `foreign_namespace` / `not_a_token_sheet` / `unreadable` /
+  // `peripheral_sheet` / `outranked` / `not_ranked` — and `skipped` is the bounded, most-informative
+  // head of the `skipped_count` discards, each list carrying its own TOTAL so a truncation never
+  // reads as a short list; `pruned_dirs[]` names the directories the walk never entered
+  // (`.generated` in there is the proof the generated mirror was not swept). A run that detects
+  // nothing leaves a hand-authored layer untouched (`changed: false`, which is about the TOKENS) and
+  // records only its report (`provenance_changed`) — that run stores no token at all, so everything
+  // renders grey and the report is the ONLY diagnostic there is (finding
+  // 01KYSNVW31C0E8YQPET0505HW2).
+  //
+  // Emits `prototypes://changed` when it moved. Driven by the AGENT (`design_tokens`); the `/design`
+  // tokens panel only READS the layer and lets a human EDIT one value — its ingest button was
+  // removed by finding 01KYKX7HBP4ZSSS6ZDM31T6A5E. That panel's PROVENANCE block renders whatever
+  // the STORED layer carries of this shape (`sources`, plus `skipped`/`skipped_count`/`pruned_dirs`
+  // — finding 01KYSHSPGSPC98C49X68MWY60D). The ingest PERSISTS those three keys into
+  // `theme_tokens_json` (finding 01KYSK7GS9C3ZRJYW00ZA0H6GF), whatever it retained: the panel cannot
+  // re-run an ingest, so anything living only in this response would be invisible to it. A stored
+  // layer WITHOUT them is one NO ingest ever wrote (a theme authored by hand), and the panel says
+  // exactly that rather than "rien n'a été écarté".
+  | "design_tokens_ingest"
+  // `design_tokens_set` ({ projectId, variables?, remove?, dark? }) → `{ tokens_json,
+  // variable_count, dark_count }` — EDIT that single layer. One edit re-themes every component,
+  // composition and preview at once. Emits `prototypes://changed`.
+  | "design_tokens_set"
+  // `design_render` ({ projectId, compositionJson, prototypeId? }) → `{ markup, node_count,
+  // unrendered, unrendered_count, css_slots, css_slot_count, navigation, navigation_count,
+  // navigation_broken_count }` — compile a composition (component tree + params) to MARKUP entirely
+  // in the sidecar (task #6). The renderer compiles NOTHING; it only displays this markup in the
+  // iframe (task #7).
+  //
+  // The render is LENIENT (finding `01KYT78699XG6Q6P3VZC64W8H8`): the frame ALWAYS gets markup, and
+  // a node the sidecar cannot render comes back as a NAMED placeholder IN PLACE plus one entry in
+  // `unrendered[]` — `{ node_key, component, reason, detail }` — instead of blanking the whole page.
+  // A composition under design always holds `[NEW]` nodes, so "mostly renderable, with holes" is the
+  // NORMAL state of a page in flight. The renderer therefore computes NO notion of a hole of its own
+  // (`composition-holes.ts` was deleted with this): it DISPLAYS this list.
+  //   * `node_count` — how many nodes the walk visited, placeholders included;
+  //   * `unrendered[].reason` — one of five stable machine codes pinned, with their short labels, by
+  //     `contract/design-fixtures.json` (`unrendered_nodes.reasons`), which is what the display maps
+  //     (see `UNRENDERED_REASON_LABELS` in `components/design/use-design-render`);
+  //   * `unrendered[]` is ordered depth-first CHILDREN BEFORE THEIR PARENT — a hole nested under a
+  //     hole is listed FIRST. A surface that reads it as a pre-order tree lies about the hierarchy;
+  //   * `unrendered_count` — the length of that list, stated by the sidecar itself.
+  //
+  // `prototypeId` IS WHAT MAKES A LINK NAVIGATE (finding `01KZ3JN69E32FYBF01NBE4FWJD`). A node may
+  // state the page it opens (`navigate_to`, a `prototype_pages.id`); resolving that id to the slug
+  // the shim navigates with needs the prototype's page DIRECTORY, and this argument is the only
+  // thing that supplies it. It is OPTIONAL — a composition that links nowhere owes it nothing — and
+  // that is exactly the trap: WITHOUT it the render knows of no page at all, so every link comes
+  // back `unknown_page`, stamped `data-nyx-page-missing` with NO `data-nyx-page`, and the whole
+  // inter-page parcours is dead with no error anywhere. Any host rendering a PROTOTYPE PAGE passes
+  // it; the one caller that existed never did.
+  //   * `navigation[]` — one entry per LINKING node, honoured or not:
+  //     `{ node_key, page_id, page, page_title, status, detail }`. `page` is the destination SLUG
+  //     (what `data-nyx-page` carries and the shim posts) and `page_title` what a human reads; both
+  //     are resolved AT EVERY RENDER off the stored id, so a rename is free and neither can go stale
+  //     — both `null` exactly when the id resolved to nothing;
+  //   * `navigation[].status` — one of three stable machine codes pinned, with their short labels,
+  //     by `contract/design-fixtures.json` (`navigation.statuses`): `linked` (the only one that
+  //     navigates), `unknown_page`, `no_anchor`. There is no code meaning "nothing happened";
+  //   * `navigation_count` / `navigation_broken_count` — the length of that list and how many of its
+  //     entries do NOT navigate, both stated by the sidecar itself.
+  // The only refusal left is a composition that does not PARSE: a readable error, never a blank.
+  | "design_render"
+  // `design_component_list` ({ projectId }) → `{ components, linked_names }` — the CATALOGUE read
+  // model (task #10): the project's `design_components` (DS + NEW) + the names referenced by its
+  // proto compositions (the "liés-page" filter). Portée PROJET.
+  | "design_component_list"
+  // `design_component_get` ({ componentId }) → `DesignComponent | null` — ONE component (the
+  // composant-detail read model, task #11).
+  | "design_component_get"
+  // `design_component_nodes` ({ projectId, componentName }) → `{ nodes }` — every COMPOSITION NODE
+  // across the project's proto compositions that instantiates the component, each pre-parameterized
+  // (variant + node_key path + params_json). Backs "clic sur un nœud → détail pré-paramétré" (#11).
+  | "design_component_nodes"
+  // `proto_variant_set_node_params` ({ variantId, nodeKey, paramsJson }) → `{ variant }` — PERSIST a
+  // node's params PER NODE into the variant's composition tree (task #11). Emits `prototypes://changed`.
+  | "proto_variant_set_node_params"
+  // `design_inventory` ({ projectId }) → `{ discovered, repos_scanned, pending_count,
+  // synthesized_count, component_count, moved_count, materialized_count, orphan_count,
+  // pruned_count, flagged_orphan_count, scan_error_count }` — the RUNTIME TRIGGER (reviews #23,
+  // #40): scan the project's repos, group each component's files into a BUNDLE (templateUrl
+  // resolved, non-components filtered) and UPSERT its discovery — the TEMPLATE is synthesized by an
+  // agent (`design_refresh_component`), so `pending_count` reports the bundles still awaiting one.
+  // It also RECONCILES the catalogue: a bundle MOVED on disk is re-anchored by CONTENT
+  // (`moved_count`), a greenfield [NEW] the front now implements is MATERIALIZED
+  // (`materialized_count`), and a row whose source is GONE is reported (`orphan_count`). Only a row
+  // carrying NO AUTHORED CONTENT (no template, no hash, no params, no states) is pruned
+  // (`pruned_count` counts the deletions that really happened — a synthesis committed by another
+  // session mid-run makes the delete stand down); one carrying content is flagged and KEPT
+  // (`flagged_orphan_count`, which also covers rows a run that could not judge left flagged — the
+  // badge no longer blinks off on a transient I/O failure).
+  // `scan_error_count` says whether the walk could read everything it
+  // looked at — non-zero means NOTHING was pruned in the repos concerned. The `/design` header
+  // `scan_error_count` says whether nothing was pruned in the repos concerned. Called by the AGENT
+  // (its `design_inventory` MCP tool shares the same authority) — NO `/design` gesture triggers it
+  // since finding 01KYKX7HBP4ZSSS6ZDM31T6A5E; the page repaints on the `prototypes://changed` this
+  // emits, and only when the catalogue actually moved. GREENFIELD-safe.
+  | "design_inventory"
+  // `design_component_delete` ({ componentId, excludeSource? }) → the REMOVAL — take a component out
+  // of the catalogue (review #44: the catalogue had NO removal at all, so an entry a wrong glob had
+  // catalogued was stuck there forever). Backs the `/design` card's delete action; its MCP twin is
+  // `design_delete_component`, over the same `nyx_core::design::remove_component` authority.
+  //
+  // `{ deleted, effect: { ephemeral, verdict, repo, source_path, recipe_source },
+  //    excluded: string[], recipe_materialized, refused, warnings: string[] }`.
+  //
+  // IT SAYS WHAT IT REALLY ACHIEVES (finding 01KYSCX4PNKTMX17YVG9XD8KBZ, UI half
+  // 01KYSHSPGSPC98C49X68MWY60D). A component's identity IS its source: deleting the row of a
+  // component whose file still matches the project's recipe is UNDONE by the next `design_inventory`,
+  // which re-discovers it as a pending component under a NEW id. The command used to answer a bare
+  // `{ deleted: true }`, so the surface promised a removal that did not last. `effect.ephemeral` +
+  // `effect.verdict` (the discovery's verdict on that path: `elected` / `pinned` / `excluded` /
+  // `no_rule` / `no_marker` / `pruned_dir` / `missing` / `unreadable`, or `greenfield` for a row with
+  // no source) say whether it lasts, and `warnings[]` carries the sentences that name the problem AND
+  // the correction — a caller DISPLAYS them, it does not re-write them: only the backend knows the
+  // verdict and the recipe.
+  //
+  // `excludeSource: true` is the DURABLE form of the same decision: the bundle's paths are appended
+  // to the project's recipe `exclude` list (materializing that recipe when the project still ran on a
+  // default — `recipe_materialized`) in the SAME transaction as the delete, so the next inventory
+  // cannot bring the row back; `excluded[]` lists the patterns written.
+  //
+  // REFUSALS come back as an ERROR and delete NOTHING: an unknown id, a PINNED entry (a pin bypasses
+  // `exclude`), a source path holding a glob character (`*` / `?` — an `exclude` entry IS a glob), an
+  // exclusion the recipe cannot hold (budget full), or an exclusion asked for a greenfield row. The
+  // caller must SHOW that message, not swallow it. Emits `prototypes://changed` on a real removal.
+  | "design_component_delete"
+  // --- PROTO read-model + UI-driven writes (review #24) — the data layer T25-T29 consume ------
+  // `proto_tree` ({ specId }) → the FULL tree of a Spec's prototype (pages/versions/variants + rounds
+  // + both-tier election is_main vs RETENU + anchored comments open/resolved), or `null` when the
+  // Spec has no prototype. A pure read.
+  | "proto_tree"
+  // `proto_composition` ({ prototypeId }) → the FROZEN elected composition (the coder SEAM): per page
+  // pinned in the design-LOCKED round, the arbre nommé = placement with each node's NATURE ([DS] with
+  // a per-node `component_ref` / [NEW] to-build / [inline]), the [NEW] candidates, and the resolved
+  // pre-dev review + open count. `null` until the design is LOCKED (the "pas encore figée" cue). A pure read.
+  | "proto_composition"
+  // `proto_round_manifest` ({ roundId }) → `RoundManifestPage[]` — the MANIFEST of ONE round,
+  // resolved: per page pinned in it, the entry (the page VERSION that round froze + the USER's
+  // RETENU) and the EFFECTIVE retained variant. The same pair `proto_tree` resolves for the CURRENT
+  // round, for ANY round — which is what makes a PAST round CONSULTABLE. A pure read: consulting a
+  // round creates nothing, copies nothing and moves no election.
+  | "proto_round_manifest"
+  // `proto_elect` ({ roundId, pageId, variantId, rationale?, decidedBy? }) → `{ round_page }` — POSE
+  // the USER's RETENU. Refused on a design-locked round (élection figée). Emits `prototypes://changed`.
+  | "proto_elect"
+  // `proto_election_clear` ({ roundId, pageId }) → `{ round_page }` — RETIRE the USER's RETENU
+  // (reversible). Same lock guard. Emits `prototypes://changed`.
+  | "proto_election_clear"
+  // `proto_comment_add` ({ prototypeId, body, nodeKey?, originVariantId?, authorKind?, authorRef? }) →
+  // `{ feedback }` — ADD a pre-dev comment anchored to a tree node (authorKind defaults to `user`).
+  // Emits `prototypes://changed`.
+  | "proto_comment_add"
+  // `proto_comment_resolve` ({ feedbackId, resolutionNote?, resolutionViaVariantId? }) → `{ feedback }`
+  // — RESOLVE a pre-dev comment. Emits `prototypes://changed`.
+  | "proto_comment_resolve"
+  // `proto_round_rebase` ({ prototypeId, sourceRoundId, label, summary? }) → `{ round }` — ROLLBACK
+  // onto an earlier round (opens a new round cloning its manifest). Emits `prototypes://changed`.
+  | "proto_round_rebase"
   // integrations
   | "integration_list"
   | "integration_install"
@@ -907,6 +1087,11 @@ export type BackendEvent =
   // MCP tool pushes `ChangedTopic::Ideas` → `ideas://changed`, so an open Idées view re-pulls its
   // themes/rows after an agent mutation with NO reload or poll (mirror of `specs://changed`).
   | "ideas://changed"
+  // v2.7 (Phase 2/3): the PROTOTYPE domain (prototypes / pages / variants / feedback / rounds).
+  // Every proto-driving MCP tool pushes `ChangedTopic::Prototypes` → `prototypes://changed`, so an
+  // open design-system surface (catalogue / composant detail / renderer) re-pulls after an agent
+  // mutation with NO reload or poll (mirror of `specs://changed`).
+  | "prototypes://changed"
   // v2.4 (task 01KX0F6GDZEH3YN6QJDB7FC0WC / 01KX0F6GY96096AHWD8RZ2BMM0): a WATCHED repo's
   // work-tree/ref changed (edit / commit / checkout). The living review re-pulls the
   // affected repo's `repo_diff` / `repo_git_view` — the "sans polling" refresh (Q-015).

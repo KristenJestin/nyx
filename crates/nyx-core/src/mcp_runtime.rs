@@ -60,6 +60,35 @@ pub fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, R
     }
 }
 
+/// An OPTIONAL array-of-strings argument, ORDER-preserving. Absent / null → `None`; a JSON array
+/// → `Some(Vec)` (an EMPTY array is accepted, yielding `Some(vec![])` so a caller can distinguish
+/// "clear the list" from "leave it untouched"); a non-array, or a non-string / empty-string
+/// element, → `invalid_argument`. The optional twin of [`crate::mcp_tools_core`]'s `require_str_vec`.
+pub fn optional_str_vec(args: &Value, key: &str) -> Result<Option<Vec<String>>, RpcError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, v) in arr.iter().enumerate() {
+                match v.as_str() {
+                    Some(s) if !s.is_empty() => out.push(s.to_string()),
+                    _ => {
+                        return Err(RpcError::new(
+                            RpcCode::InvalidArgument,
+                            format!("argument '{key}[{i}]' must be a non-empty string"),
+                        ))
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!("argument '{key}' must be an array of strings"),
+        )),
+    }
+}
+
 /// An OPTIONAL non-negative integer argument; negative/non-integer → error.
 pub fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, RpcError> {
     match args.get(key) {
@@ -96,6 +125,228 @@ pub fn optional_bool(args: &Value, key: &str) -> Result<Option<bool>, RpcError> 
 
 pub fn internal_db(e: diesel::result::Error) -> RpcError {
     RpcError::new(RpcCode::Internal, format!("db error: {e}"))
+}
+
+// --- The RESPONSE BUDGET: the hard cap EVERY agent-facing tool answers under ------------
+//
+// An MCP response the agent cannot read is a broken tool, and the failure mode is always the same:
+// a surface that GROWS with the project (a catalogue, a prototype, a review) is echoed WHOLE on a
+// naive call with no parameter. That is how a real front produced a 145 000-character
+// `design_inventory` reply (review #43) — and the exact same wall was waiting on `proto_get` and
+// `proto_composition`, which echoed every round, page, comment BODY and composition tree of a
+// prototype (review 01KYMF0KFZQG5JYZDGZCR85BAM).
+//
+// The budget lived in `mcp_tools_design` and covered `design_inventory` ALONE, because that is where
+// the overflow had been SEEN. It lives HERE now — beside the argument vocabulary every tool already
+// shares — so a tool is capped by REUSING the mechanism, not by re-inventing one.
+//
+// THE PRINCIPLE: a naive call is safe BY CONSTRUCTION, never by the agent remembering to paginate.
+// Three bounds compose:
+//   1. [`bounded_row`] caps ONE echoed row (its prose fields cut, its machine payloads dropped
+//      WHOLE — a half `*_json` is not a smaller payload, it is a CORRUPT one);
+//   2. [`under_response_budget`] / [`under_response_budget_strict`] cap a LIST by the sum of its
+//      items' serialized sizes;
+//   3. the caller computes the list budget as [`MAX_RESPONSE_BYTES`] MINUS its fixed head and
+//      [`RESPONSE_ENVELOPE_BYTES`], so the WHOLE serialized response — head, counters, separators —
+//      stays under the cap.
+// Every capped surface then says so explicitly (`truncated: true` + `total`/`returned`) and offers a
+// way to get the rest (`next_offset`, or a targeted read of ONE item).
+
+/// The RESPONSE-level byte budget shared by every agent-facing tool: items are emitted until it is
+/// spent, then `truncated` is raised. 64 KiB leaves an ample margin under any MCP transport limit
+/// while still handing the agent a couple of full source files (or a whole composition tree) per read.
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// The slack a caller SUBTRACTS from [`MAX_RESPONSE_BYTES`] before budgeting its lists, to pay for
+/// what the item budget does not measure: the response's own keys, its counters, the `,`/`[]`
+/// separators between items. Deliberately generous — the point of the cap is that it holds, not that
+/// it is tight.
+pub const RESPONSE_ENVELOPE_BYTES: usize = 4 * 1024;
+
+/// How many bytes of ONE string field of an echoed row survive [`bounded_row`]. 4 KiB is a long
+/// comment / summary / template and a short novel; past it, a field is reported by its REAL length
+/// instead of being carried.
+pub const MAX_ROW_FIELD_BYTES: usize = 4 * 1024;
+
+/// The ceiling on ONE echoed row AFTER its fields are capped ([`bounded_row`]). A row wider than
+/// this degrades to its IDENTITY (every string cut to [`IDENTITY_FIELD_BYTES`], `oversized: true`),
+/// so a single pathological row can never eat a whole response — which is what makes "at least one
+/// item always fits a list budget" a fact rather than a hope.
+pub const MAX_ROW_BYTES: usize = 16 * 1024;
+
+/// How many bytes of each string survive the IDENTITY degradation of an over-wide row.
+const IDENTITY_FIELD_BYTES: usize = 256;
+
+/// The serialized byte length of `value` — the unit EVERY budget in this module counts in.
+pub fn json_len(value: &Value) -> usize {
+    serde_json::to_string(value).map(|s| s.len()).unwrap_or(0)
+}
+
+/// Cut `s` to at most `max` BYTES without splitting a UTF-8 character (a byte-sliced string would
+/// panic, and a broken code point is not a shorter string — it is an invalid one). Returns the
+/// (possibly cut) slice and whether anything was left out.
+pub fn bounded_text(s: &str, max: usize) -> (&str, bool) {
+    if s.len() <= max {
+        return (s, false);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
+}
+
+/// [`bounded_text`] without the flag, for the callers that only want the slice.
+fn truncate_utf8(s: &str, max: usize) -> &str {
+    bounded_text(s, max).0
+}
+
+/// Cap every top-level STRING field of `value` at `max_field` bytes. Returns the capped object and
+/// the map `field name → REAL byte length` of what was cut (empty when nothing was).
+///
+/// A field whose name ends in `_json` is a MACHINE payload (`composition_json`, `params_json`,
+/// `states_json`): a prefix of it does not parse, so it is dropped WHOLE (`null`) rather than
+/// handed over corrupt. Everything else is PROSE, and a prefix of prose is still readable.
+fn cap_row_fields(value: &Value, max_field: usize) -> (Value, serde_json::Map<String, Value>) {
+    let mut cut = serde_json::Map::new();
+    let Some(object) = value.as_object() else {
+        return (value.clone(), cut);
+    };
+    let mut out = serde_json::Map::with_capacity(object.len());
+    for (key, field) in object {
+        match field.as_str() {
+            Some(text) if text.len() > max_field => {
+                cut.insert(key.clone(), json!(text.len()));
+                if key.ends_with("_json") {
+                    out.insert(key.clone(), Value::Null);
+                } else {
+                    out.insert(key.clone(), json!(truncate_utf8(text, max_field)));
+                }
+            }
+            _ => {
+                out.insert(key.clone(), field.clone());
+            }
+        }
+    }
+    (Value::Object(out), cut)
+}
+
+/// Bound ONE echoed row so no single item of a list can blow the response on its own.
+///
+/// EVERY string field is capped at [`MAX_ROW_FIELD_BYTES`]; the row then reports what it cut in
+/// `truncated_fields` (`{ field: REAL byte length }`) so the agent reads a SHORTENED value as
+/// shortened, never as the whole. A row still past [`MAX_ROW_BYTES`] after that (many wide fields at
+/// once) degrades to its IDENTITY and says `oversized: true` with its real `bytes`.
+///
+/// NOT for a payload whose PARTIAL form would be a false contract — the elected `composition_json`
+/// of `proto_composition` is paginated PAGE BY PAGE instead, never trimmed (review
+/// 01KYMF0KFZQG5JYZDGZCR85BAM: a silently truncated placement is worse than an overflow).
+pub fn bounded_row(value: &Value) -> Value {
+    let (capped, cut) = cap_row_fields(value, MAX_ROW_FIELD_BYTES);
+    if json_len(&capped) > MAX_ROW_BYTES {
+        let real = json_len(value);
+        let (mut identity, dropped) = cap_row_fields(value, IDENTITY_FIELD_BYTES);
+        if let Some(object) = identity.as_object_mut() {
+            object.insert("truncated_fields".into(), Value::Object(dropped));
+            object.insert("oversized".into(), json!(true));
+            object.insert("bytes".into(), json!(real));
+        }
+        return identity;
+    }
+    let mut capped = capped;
+    if !cut.is_empty() {
+        if let Some(object) = capped.as_object_mut() {
+            object.insert("truncated_fields".into(), Value::Object(cut));
+        }
+    }
+    capped
+}
+
+/// The shared emission loop: keep items while their serialized sizes fit `budget`. `always_first`
+/// forces the FIRST item out even when it alone exceeds the budget.
+fn fill_budget(items: Vec<Value>, budget: usize, always_first: bool) -> (Vec<Value>, bool) {
+    let total = items.len();
+    let mut kept: Vec<Value> = Vec::with_capacity(total);
+    let mut spent = 0usize;
+    for item in items {
+        let size = json_len(&item);
+        if spent + size > budget && !(always_first && kept.is_empty()) {
+            break;
+        }
+        spent += size;
+        kept.push(item);
+    }
+    let dropped = kept.len() < total;
+    (kept, dropped)
+}
+
+/// Emit `items` under a RESPONSE byte budget, NEVER returning an empty list for a lack of room: the
+/// first item is always emitted. Returns the kept items and whether anything was dropped.
+///
+/// This is the variant a PAGED traversal needs when an item has no hard ceiling of its own: a page
+/// that returns zero rows while rows remain would publish `next_offset == offset` and loop forever
+/// (or stop and silently lose the tail) — see `design_inventory`'s paging contract.
+pub fn under_response_budget(items: Vec<Value>, budget: usize) -> (Vec<Value>, bool) {
+    fill_budget(items, budget, true)
+}
+
+/// Emit `items` STRICTLY under the budget — nothing is emitted that does not fit, so the caller's
+/// total is a HARD bound rather than "the budget plus one item".
+///
+/// Use it when every item is itself bounded ([`bounded_row`], or a page reduced to its identity), so
+/// "at least one item fits" is guaranteed by construction ([`MAX_ROW_BYTES`] < any list budget) and
+/// the paging can never stall.
+pub fn under_response_budget_strict(items: Vec<Value>, budget: usize) -> (Vec<Value>, bool) {
+    fill_budget(items, budget, false)
+}
+
+/// The GUARD OF LAST RESORT, applied by the agent-tool ROUTERS to every response they return.
+///
+/// The paginated reads above cap themselves gracefully. This catches what nobody thought to cap:
+/// a tool that echoes back a document the agent itself sent, a config that grew, a shape added
+/// later. It keeps the response's IDENTIFYING scalars (ids, counts, flags — everything that
+/// serializes small) and DROPS the oversized fields, naming each with its real byte length, so an
+/// over-large answer degrades into a legible one instead of overflowing the transport.
+///
+/// Reaching it is a BUG in the tool, not a normal mode: `response_truncated: true` says so, and the
+/// hint names the paginating arguments. It is the reason "no agent-tool response can exceed the cap"
+/// is a property of the SYSTEM and not a promise each tool has to keep on its own.
+pub fn bounded_tool_result(name: &str, result: Value) -> Value {
+    if json_len(&result) <= MAX_RESPONSE_BYTES {
+        return result;
+    }
+    let real = json_len(&result);
+    let Some(object) = result.as_object() else {
+        return json!({
+            "response_truncated": true,
+            "response_bytes": real,
+            "response_cap": MAX_RESPONSE_BYTES,
+            "note": format!("the {name} response exceeded the response cap and was dropped"),
+        });
+    };
+    let mut kept = serde_json::Map::new();
+    let mut dropped = serde_json::Map::new();
+    for (key, field) in object {
+        let size = json_len(field);
+        if size <= IDENTITY_FIELD_BYTES * 4 {
+            kept.insert(key.clone(), field.clone());
+        } else {
+            dropped.insert(key.clone(), json!(size));
+        }
+    }
+    kept.insert("response_truncated".into(), json!(true));
+    kept.insert("response_bytes".into(), json!(real));
+    kept.insert("response_cap".into(), json!(MAX_RESPONSE_BYTES));
+    kept.insert("dropped_fields".into(), Value::Object(dropped));
+    kept.insert(
+        "note".into(),
+        json!(format!(
+            "the {name} response exceeded the {MAX_RESPONSE_BYTES}-byte cap, so the oversized \
+             fields were DROPPED (never cut: half a payload is not a smaller payload). Narrow the \
+             call — ask for ONE item, or page with offset/limit — and read the counters."
+        )),
+    );
+    Value::Object(kept)
 }
 
 /// An OPTIONAL non-negative integer argument as a `u64` (for `timeout_ms`).
@@ -1033,6 +1284,90 @@ fn render_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`bounded_row`] cuts PROSE and reports its real length, but DROPS a `*_json` payload whole —
+    /// a prefix of a machine document does not parse, so half of it is not a smaller payload but a
+    /// corrupt one (review 01KYMF0KFZQG5JYZDGZCR85BAM).
+    #[test]
+    fn bounded_row_cuts_prose_and_drops_machine_payloads_whole() {
+        let row = json!({
+            "id": "01ABC",
+            "body": "é".repeat(MAX_ROW_FIELD_BYTES),
+            "composition_json": "{\"component\":\"Page\"}".repeat(MAX_ROW_FIELD_BYTES),
+            "position": 3,
+        });
+        let bounded = bounded_row(&row);
+        assert_eq!(bounded["id"], json!("01ABC"), "the identity is untouched");
+        assert_eq!(bounded["position"], json!(3), "so are the scalars");
+        let body = bounded["body"].as_str().expect("prose survives, shortened");
+        assert!(body.len() <= MAX_ROW_FIELD_BYTES && !body.is_empty());
+        assert!(
+            body.chars().all(|c| c == 'é'),
+            "a multi-byte character is never split",
+        );
+        assert!(
+            bounded["composition_json"].is_null(),
+            "a machine payload is dropped WHOLE, never cut into invalid JSON",
+        );
+        // Both cuts are NAMED with the field's REAL byte length.
+        assert_eq!(
+            bounded["truncated_fields"]["body"],
+            json!(MAX_ROW_FIELD_BYTES * 2),
+        );
+        assert!(bounded["truncated_fields"]["composition_json"]
+            .as_u64()
+            .is_some());
+        // A row that fits is returned verbatim (no noise on the normal path).
+        let small = json!({ "id": "x", "body": "short" });
+        assert_eq!(bounded_row(&small), small);
+    }
+
+    /// The router's guard of last resort keeps a response's IDENTIFYING scalars and drops only the
+    /// oversized fields, naming each with its real weight — an over-large answer degrades into a
+    /// legible one instead of overflowing the transport.
+    #[test]
+    fn bounded_tool_result_degrades_an_oversized_answer_into_a_legible_one() {
+        let fits = json!({ "prototype_id": "p1", "ok": true });
+        assert_eq!(bounded_tool_result("proto_get", fits.clone()), fits);
+
+        let huge = json!({
+            "prototype_id": "p1",
+            "variant": { "composition_json": "x".repeat(MAX_RESPONSE_BYTES * 2) },
+        });
+        let capped = bounded_tool_result("proto_add_variant", huge);
+        assert!(json_len(&capped) <= MAX_RESPONSE_BYTES);
+        assert_eq!(capped["prototype_id"], json!("p1"), "the id survives");
+        assert_eq!(capped["response_truncated"], json!(true));
+        assert_eq!(capped["response_cap"], json!(MAX_RESPONSE_BYTES));
+        assert!(
+            capped["dropped_fields"]["variant"].as_u64().unwrap() as usize > MAX_RESPONSE_BYTES,
+            "what was dropped is named with its real weight",
+        );
+        assert!(capped["note"]
+            .as_str()
+            .unwrap()
+            .contains("proto_add_variant"));
+    }
+
+    /// The two emission modes: [`under_response_budget`] never returns an empty page (a paged
+    /// traversal must always progress), [`under_response_budget_strict`] never exceeds the budget
+    /// (the caller's total is then a HARD bound).
+    #[test]
+    fn the_two_budget_modes_differ_only_on_an_item_that_does_not_fit() {
+        let big = json!("x".repeat(1000));
+        let items = vec![big.clone(), big.clone(), big];
+        let (lenient, dropped) = under_response_budget(items.clone(), 10);
+        assert_eq!(lenient.len(), 1, "the first item always comes out");
+        assert!(dropped);
+        let (strict, dropped) = under_response_budget_strict(items.clone(), 10);
+        assert!(strict.is_empty(), "nothing that does not fit is emitted");
+        assert!(dropped);
+        // With room, both behave identically.
+        assert_eq!(
+            under_response_budget(items.clone(), 100_000).0.len(),
+            under_response_budget_strict(items, 100_000).0.len(),
+        );
+    }
 
     #[test]
     fn bound_output_under_tail_returns_all_untruncated() {

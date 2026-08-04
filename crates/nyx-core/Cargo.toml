@@ -13,6 +13,13 @@ crate-type = ["rlib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# LOGIC-LESS Handlebars renderer of a proto COMPOSITION into markup (v2.7 Phase 3, task
+# 01KY4DFPPM4KXFWWYCFQSMRKVX, PDR-0010). The whole compilation lives in the sidecar (this crate):
+# each `design_components` template is registered as a PARTIAL and the composition tree is walked
+# in Rust so the templates themselves stay logic-less. `default-features = false` keeps the surface
+# to the core mustache engine — none of the logic-carrying extras (rhai / script_helper /
+# string_helpers / dir_source / rust-embed) that would let a template smuggle in logic.
+handlebars = { version = "6", default-features = false }
 # Interactive + managed-command PTYs. No cmake.
 portable-pty = "0.9"
 anyhow = "1"

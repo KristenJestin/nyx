@@ -1,0 +1,38 @@
+-- Schema v36: add the per-project BUNDLE RECIPE to `design` (v2.7 — Prototype : machinerie,
+-- review 01KYKX2A0JGWF8XNWWZ9YFF5MG, finding 01KYKXPHW103C0V5RBXQ29BBXQ — "Recette de bundle
+-- apprise par l'agent : sortir le savoir de framework de nyx").
+--
+-- ## Why v36 (a migration NUMBER is a GLOBAL, cross-branch identity)
+--
+-- `__diesel_schema_migrations` stores a NUMBER, never a name: two branches claiming the same number
+-- make one of the two migrations NEVER run on any DB that saw the other, while `schema.rs` keeps
+-- declaring the columns it was supposed to create. 34 belongs to `feature/v2.8-engine`
+-- (`create_workflow_engine`) and 35 was just taken by v2.7 (`design_components_scan_state`), so the
+-- next free number across ALL live branches is 36. (The series also carries a hole at 19 — the
+-- directory COUNT is not the highest number.)
+--
+-- ## Why a NEW column instead of generalizing `inventory_globs_json` (v33)
+--
+-- v33's column is the per-project ENTRY GLOB OVERRIDE: a JSON array of glob strings. The recipe is a
+-- strictly richer document (entry rules with an optional content marker and an optional template
+-- attribute, sibling roles, family / non-component qualifiers, exclusions, explicit pins), so
+-- reusing the same column would mean storing two incompatible shapes under one name and guessing
+-- which is which at every read. Adding a column keeps BOTH facts explicit and makes the precedence
+-- readable in one line (`crate::design::ProjectRecipe`):
+--
+--   1. `bundle_recipe_json` when set — what the AGENT wrote after exploring the repo;
+--   2. else `inventory_globs_json` when set — the v33 glob override, mapped onto its equivalent
+--      recipe (`crate::design::recipe_from_legacy_globs`), so nothing a project already persisted
+--      changes behaviour;
+--   3. else the DETECTED STACK's default recipe — nyx's former hard-coded behaviour, unchanged.
+--
+-- It also means a project can go back to the default by clearing ONE column, without losing the
+-- glob override it had before.
+--
+-- NULL (the default, and the only value for a design row predating v36) = no recipe → rule 2 or 3.
+--
+-- `ALTER TABLE ADD COLUMN` re-appends the column physically last — harmless: every `Design`
+-- read/write goes through Diesel `as_select()` / `as_returning()` (columns emitted BY NAME in
+-- `schema.rs` order), never a positional `SELECT *`, so the physical order is immaterial.
+
+ALTER TABLE design ADD COLUMN bundle_recipe_json TEXT;

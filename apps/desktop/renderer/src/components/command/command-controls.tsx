@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import { PlayIcon, RotateCcwIcon, SquareIcon } from "lucide-react";
-import { nyxBridge } from "@/bridge";
+import { errorText, nyxBridge } from "@/bridge";
 
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -107,8 +107,7 @@ export function CommandControls({
         // The empty `catch {}` here is exactly what made a refused Start look like
         // it "did nothing".
         setFailed(true);
-        const message = typeof err === "string" ? err : ((err as Error)?.message ?? String(err));
-        onError?.(action, message);
+        onError?.(action, errorText(err, "The command failed."));
       } finally {
         setPending(null);
       }

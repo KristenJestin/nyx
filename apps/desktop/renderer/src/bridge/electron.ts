@@ -21,6 +21,8 @@
  *    Rust reader resumes (PRD / annexe §E);
  *  - wrap the window controls + apply request timeouts / abort signals.
  */
+import { errorText } from "./error-text";
+
 import type {
   AppPathsBridge,
   BackendCommand,
@@ -83,13 +85,9 @@ function windowApi(): NyxWindowApi {
 
 /** Build a {@link BridgeError} from a caught IPC/command failure. */
 function toBridgeError(kind: BridgeError["kind"], cause: unknown, source?: string): BridgeError {
-  const message =
-    cause instanceof Error
-      ? cause.message
-      : typeof cause === "string"
-        ? cause
-        : "bridge call failed";
-  return { kind, message, source, cause };
+  // The SAME reading every surface uses (finding `01KYVT6HVA260DTAEREQA4DFJN`) — this is where a
+  // native failure becomes the message the whole app will show, so it may not have a private one.
+  return { kind, message: errorText(cause, "bridge call failed"), source, cause };
 }
 
 /**

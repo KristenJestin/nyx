@@ -1,4 +1,6 @@
 import { useId, useState } from "react";
+
+import { errorText } from "@/bridge";
 import { useForm } from "@tanstack/react-form";
 import { z } from "zod";
 import {
@@ -186,7 +188,9 @@ export function CommandForm({
       // The parent re-lists + re-seeds the form on success (resync rewrites the
       // command; unlink turns the card hand-authored).
     } catch (e) {
-      setSourceError(typeof e === "string" ? e : "The source action failed.");
+      // The backend's OWN sentence when it has one (a pinned source, a missing script): it is
+      // the only text that says what to do about it.
+      setSourceError(errorText(e, "The source action failed."));
     } finally {
       setSourceBusy(null);
     }

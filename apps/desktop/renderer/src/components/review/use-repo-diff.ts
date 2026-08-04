@@ -1,7 +1,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
 
-import { isBridgeError, nyxBridge } from "@/bridge";
+import { errorText, nyxBridge } from "@/bridge";
 import type { RepoDiff } from "@/bridge";
 import { reviewKeys } from "@/lib/query";
 
@@ -126,13 +126,9 @@ export function useRepoDiff(repo: ReviewRepo | null, target: ReviewTarget): UseR
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repo?.workspaceId, repo?.repositoryId, targetKeyOf(target), enabled, living]);
 
-  const error = query.error
-    ? isBridgeError(query.error)
-      ? query.error.message
-      : query.error instanceof Error
-        ? query.error.message
-        : String(query.error)
-    : null;
+  // ONE reading of a failure, the bridge's shape first — a `design_*`/`repo_*` refusal crosses as a
+  // BridgeError OBJECT, and every other reading of it puts `[object Object]` on screen.
+  const error = query.error ? errorText(query.error) : null;
 
   return {
     diff: query.data,

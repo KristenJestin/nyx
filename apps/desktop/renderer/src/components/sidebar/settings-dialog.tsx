@@ -1,5 +1,5 @@
 import { forwardRef, useCallback, useImperativeHandle, useState, type ComponentType } from "react";
-import { nyxBridge, isBridgeError } from "@/bridge";
+import { errorText, nyxBridge } from "@/bridge";
 import { CheckCircle2Icon, PlugIcon, SettingsIcon, XCircleIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -63,13 +63,9 @@ function ProviderCard({ status, onRefresh }: ProviderCardProps) {
             : `${status.label} integration removed`,
         );
       } catch (e) {
-        // The bridge serializes a backend `Err` into a BridgeError whose `message`
-        // is the original backend string; fall back for a raw string / unknown.
-        const reason = isBridgeError(e)
-          ? e.message
-          : typeof e === "string"
-            ? e
-            : "Operation failed";
+        // The bridge serializes a backend `Err` into a BridgeError whose `message` is the original
+        // backend string — read through the ONE path that knows that shape.
+        const reason = errorText(e, "Operation failed");
         // Surface the real reason both inline (under the button) and as a toast.
         setError(reason);
         toast.error(reason);

@@ -45,7 +45,13 @@ const SECTIONS: Array<{ heading: string; pick: (r: SpecRevision) => string }> = 
  * key/title/status, so the banner would DUPLICATE it and — squeezed to 380px — break the title
  * into a per-word staircase (review finding, test terrain).
  */
-export function SpecTab({ detail, showBanner = true }: { detail: SpecDetail; showBanner?: boolean }) {
+export function SpecTab({
+  detail,
+  showBanner = true,
+}: {
+  detail: SpecDetail;
+  showBanner?: boolean;
+}) {
   const { revision } = detail;
   const anyBody = SECTIONS.some((s) => s.pick(revision).trim().length > 0);
   return (

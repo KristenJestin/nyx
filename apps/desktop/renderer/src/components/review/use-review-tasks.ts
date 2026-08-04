@@ -1,7 +1,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef } from "react";
 
-import { isBridgeError, nyxBridge } from "@/bridge";
+import { errorText, nyxBridge } from "@/bridge";
 import type { ReviewTask, ReviewUnread, TaskSeverity } from "@/bridge";
 import { reviewKeys } from "@/lib/query";
 
@@ -57,9 +57,6 @@ export interface UseReviewTasks {
 }
 
 const EMPTY_TASKS: readonly ReviewTask[] = [];
-
-const errText = (e: unknown): string =>
-  isBridgeError(e) ? e.message : e instanceof Error ? e.message : String(e);
 
 /** Build a provisional task for an optimistic promote (reconciled by the `onSettled` re-pull). */
 function optimisticTask(over: Partial<ReviewTask>): ReviewTask {
@@ -235,11 +232,11 @@ export function useReviewTasks(repo: ReviewRepo | null, specId: string | null): 
   );
 
   const error = tasksQuery.error
-    ? errText(tasksQuery.error)
+    ? errorText(tasksQuery.error)
     : taskMutation.error
-      ? errText(taskMutation.error)
+      ? errorText(taskMutation.error)
       : markReadMutation.error
-        ? errText(markReadMutation.error)
+        ? errorText(markReadMutation.error)
         : null;
 
   return {

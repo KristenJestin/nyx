@@ -1,0 +1,47 @@
+-- Schema v35: record on each `design_components` row WHAT THE LAST SCAN SAW of it (v2.7 —
+-- Prototype : machinerie, review 01KYHPFDE21W0EMVX4J87RHGCV, findings 01KYHQ8P2QJAG2G9EC5ZYPHDEN
+-- [CRITICAL — une lecture disque partiellement échouée faisait ÉLAGUER des lignes légitimes] et
+-- 01KYHQ9NGE1Q5WWWSW2SR79P9Z / 01KYHQ6YK1TS4E40Y5WSY77QHP [la pagination perdait et dupliquait
+-- des entrées]).
+--
+-- ## Why v35 and not v34 (review 01KYKX2A0JGWF8XNWWZ9YFF5MG, finding 01KYKX2XTW51V92EYRAHRXE5HQ)
+--
+-- The number 34 is ALREADY TAKEN by another branch's migration (`create_workflow_engine`, on
+-- `feature/v2.8-engine`), and it is ALREADY APPLIED on the user's production DB. Diesel records
+-- only a NUMBER in `__diesel_schema_migrations`, never a name: had this migration kept 34, Diesel
+-- would have considered it already applied and NEVER run it — `design_components` would be missing
+-- the two columns `schema.rs` declares, and every catalogue read would fail at runtime. 34 is
+-- therefore left to v2.8 (its `workflows` / `workflow_runs` tables are inert for v2.7) and this
+-- migration claims the next FREE number, 35. NB: the series also has a historical hole at 19 — the
+-- directory COUNT is not the max number.
+--
+-- ## Why two columns, and why they live on the ROW
+--
+-- Both findings come from the SAME hole: the inventory's knowledge of "what the disk currently
+-- holds" existed only for the duration of one run, so nothing could be asserted BETWEEN runs.
+--
+--   * `scanned_input_hash` — the component BUNDLE's INPUT hash AS OBSERVED BY THE LAST SCAN that
+--     actually discovered this row's source; NULL when the last scan did NOT see it (its source is
+--     gone, its repo was not walked, or the row is a greenfield `[NEW]` with no file at all).
+--     Distinct from `visual_hash`, which is the hash AS OF THE LAST SYNTHESIS — the two together
+--     ARE the "does this bundle await a (re-)synthesis?" predicate, so a NON-SCANNING catalogue
+--     page can now answer it EXACTLY like the scanning page 0 does (it used to only know
+--     `never_synthesized`, so `source_changed` bundles fell out of the paged population and half an
+--     agent's work list became unreachable). It is also what makes the two pages enumerate the SAME
+--     population: "the rows the last scan discovered" is now a persisted fact, not a per-run one.
+--   * `orphaned_at` — epoch ms at which the row's recorded source was found GONE by a scan that was
+--     in a position to judge, while the row CARRIED A SYNTHESIS (a non-empty template and/or a
+--     recorded hash). Such a row is NEVER destroyed automatically any more: an LLM synthesis is
+--     human-reviewed work, and no scan — which can silently fail to read a directory or a file — is
+--     ever proof enough to destroy it. It is FLAGGED here instead, stays in the catalogue, stays
+--     visible in `/design`, and its removal is an EXPLICIT gesture (`design_delete_component` or
+--     the `/design` card's delete). NULL = not orphaned (the default, and the only value for a row
+--     predating v35); the flag is CLEARED the moment a scan rediscovers the row's source (or a move
+--     re-anchors it).
+--
+-- `ALTER TABLE ADD COLUMN` re-appends both columns physically last — harmless: every
+-- `DesignComponent` read/write goes through Diesel `as_select()` / `as_returning()` (columns
+-- emitted BY NAME in `schema.rs` order), never a positional `SELECT *`.
+
+ALTER TABLE design_components ADD COLUMN scanned_input_hash TEXT;
+ALTER TABLE design_components ADD COLUMN orphaned_at INTEGER;

@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-import { isBridgeError } from "@/bridge";
+import { errorText } from "@/bridge";
 
 import { toast } from "@/components/ui/toast";
 import { AddWorkspaceDialog } from "./add-workspace-dialog";
@@ -7,11 +7,6 @@ import { ProjectDialog, type ProjectDialogMode } from "./project-dialog";
 import { basename, pickDirectory } from "./folder-picker";
 import { DEFAULT_ROOT_LABEL, defaultWorkspaceLabel } from "./project-item.utils";
 import type { ProjectTree, ProjectWithRoot, WorkspaceRecord } from "./use-projects";
-
-/** Extract the real backend reason from a caught bridge/IPC error (see FEEDBACK #9). */
-function errorReason(e: unknown, fallback: string): string {
-  return isBridgeError(e) ? e.message : typeof e === "string" ? e : fallback;
-}
 
 export interface UseManualAddDeps {
   createProject: (name: string, rootPath: string, rootName?: string) => Promise<ProjectWithRoot>;
@@ -208,7 +203,7 @@ export function useManualAdd({
         // The error toast carries the REAL backend reason (e.g. a delete refused
         // because a command is still running, or removing the root workspace); a
         // trimmed line stays inline too.
-        const reason = errorReason(e, "Could not complete the action. Please try again.");
+        const reason = errorText(e, "Could not complete the action. Please try again.");
         setError(reason);
         toast.error(reason);
       } finally {
@@ -251,7 +246,7 @@ export function useManualAdd({
       } catch (e) {
         // Surface the backend rejection (e.g. duplicate path in this project) both
         // inline (kept open so the user can pick a different folder) and as a toast.
-        const reason = errorReason(
+        const reason = errorText(
           e,
           "Could not add this folder (it may already be a workspace in this project).",
         );
@@ -309,8 +304,7 @@ export function useManualAdd({
                     toast.success(
                       resume ? "Agent-session resume enabled" : "Agent-session resume disabled",
                     ),
-                  (e: unknown) =>
-                    toast.error(errorReason(e, "Could not update the resume setting.")),
+                  (e: unknown) => toast.error(errorText(e, "Could not update the resume setting.")),
                 );
               }
             : undefined

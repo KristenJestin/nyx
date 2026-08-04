@@ -10,6 +10,7 @@ import { TasksTab } from "../specs/tabs/tasks-tab";
 import { parsePhases, type Spec } from "../specs/types";
 import { useSpecDetail } from "../specs/use-spec-detail";
 import { OverlayPanelActions } from "./overlay-panel-actions";
+import { OverlayPrototypes } from "./overlay-prototypes";
 
 /**
  * `<SpecLivePanel>` — the OPEN tiroir of the creation overlay (B): the Spec being AUTHORED,
@@ -81,6 +82,11 @@ export function SpecLivePanel({ spec, onClose }: { spec: Spec; onClose: () => vo
                 carries the key/title/status, so the SpecTab banner is suppressed here (no duplicate
                 banner, no per-word title staircase at 380px). */}
             <SpecTab detail={detail} showBanner={false} />
+            {/* 2 bis. The Spec's PROTOTYPE PAGES (finding `01KYW342EE5DN6F70YB8VSTJR8`) — the proto
+                is an annexe of the Spec, proposed WHILE it is authored, so it belongs on this live
+                panel too. Each row opens the workbench on ITS page (`?page=<slug>`); a Spec with no
+                prototype renders nothing here at all. */}
+            <OverlayPrototypes specId={spec.id} />
             {/* 3. Decomposed tasks, streamed live (reused `<TasksTab>`). */}
             <div>
               <MicroLabel className="mb-2 block px-1">Decomposed tasks</MicroLabel>

@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { isBridgeError } from "@/bridge";
+import { errorText } from "@/bridge";
 import { XCircleIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
@@ -7,11 +7,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/toast";
-
-/** Extract the real backend reason from a caught bridge/IPC error (see FEEDBACK #9). */
-function errorReason(e: unknown, fallback: string): string {
-  return isBridgeError(e) ? e.message : typeof e === "string" ? e : fallback;
-}
 
 export interface GlobalSectionProps {
   /** The project id whose settings are edited (null disables the controls). */
@@ -81,7 +76,7 @@ export function GlobalSection({
       await onRename(trimmed);
       toast.success("Project renamed");
     } catch (e) {
-      const reason = errorReason(e, "Could not rename the project.");
+      const reason = errorText(e, "Could not rename the project.");
       setError(reason);
       toast.error(reason);
     } finally {
@@ -98,7 +93,7 @@ export function GlobalSection({
         await onResumeChange(checked);
         toast.success(checked ? "Agent-session resume enabled" : "Agent-session resume disabled");
       } catch (e) {
-        toast.error(errorReason(e, "Could not update the resume setting."));
+        toast.error(errorText(e, "Could not update the resume setting."));
       }
     },
     [onResumeChange],

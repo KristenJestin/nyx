@@ -553,6 +553,214 @@ diesel::table! {
     }
 }
 
+// - v30 (v2.7 Phase 1 — the DESIGN-SYSTEM domain, task 01KY4DFM5BS3JVSEZYJZVEFBF6) adds
+//   `design` and `design_components`, the design-system rapatriated NATIVELY as the single
+//   authority (PDR-0010) so the later context seam can weave it into the coder's context and
+//   fix the broken proto→dev distill. `design`: ONE row per project (UNIQUE(project_id)) —
+//   `project_id` (FK CASCADE), `content` (NOT NULL TEXT default '' — the DESIGN.md markdown),
+//   `theme_tokens_json` (Nullable — the derived Tailwind tokens), epoch-ms `created_at`/
+//   `updated_at`. `design_components`: ONE row per component (UNIQUE(project_id, name)) —
+//   `project_id` (FK CASCADE), `name` (NOT NULL), `source_repository_id` (Nullable FK →
+//   repositories, ON DELETE SET NULL — NULL = greenfield) + `source_path` (Nullable) provenance,
+//   `visual_hash` (Nullable — the md5 of the VISUAL part for the task-3 incremental sync),
+//   `template` (NOT NULL TEXT default '' — the Handlebars template), `params_json`/`states_json`
+//   (Nullable JSON shapes), epoch-ms `created_at`/`updated_at`. The `*_json` columns are JSON
+//   stored as TEXT in SQLite → mapped `Nullable<Text>`. Column ORDER here must match the SQL
+//   migration exactly (Diesel positional decoding).
+diesel::table! {
+    design (id) {
+        id -> Text,
+        project_id -> Text,
+        content -> Text,
+        theme_tokens_json -> Nullable<Text>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        inventory_globs_json -> Nullable<Text>,
+        // v36 — the per-project BUNDLE RECIPE the agent writes (finding
+        // 01KYKXPHW103C0V5RBXQ29BBXQ): the FRAMEWORK KNOWLEDGE, out of nyx's code and into data.
+        bundle_recipe_json -> Nullable<Text>,
+    }
+}
+
+// - v37 (v2.7 — review 01KYKX2A0JGWF8XNWWZ9YFF5MG, finding 01KYS14G4V1Q5ERRAHB0QVW362) is a DATA
+//   migration, NOT a schema one: it rewrites the prototype INTERACTION VOCABULARY inside the stored
+//   CONTENT — `data-depot-*` → `data-nyx-*`, `__depot*` → `__nyx*` — in
+//   `design_components.template` and in the inline markup of `prototype_variants.composition_json`.
+//   The machinery was ported from Depot and had kept that tool's name, down to mechanisms invented
+//   here; the prefix is written INSIDE the synthesized templates, so the data moves with the code.
+//   No column is added, dropped or retyped — which is why nothing below changes.
+diesel::table! {
+    design_components (id) {
+        id -> Text,
+        project_id -> Text,
+        name -> Text,
+        source_repository_id -> Nullable<Text>,
+        source_path -> Nullable<Text>,
+        visual_hash -> Nullable<Text>,
+        template -> Text,
+        params_json -> Nullable<Text>,
+        states_json -> Nullable<Text>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        // v35 — what the LAST SCAN saw of this row: the bundle's INPUT hash AS OBSERVED
+        // (Nullable — NULL when the last scan did not see this source), and the epoch-ms at which
+        // a scan in a position to judge found the source GONE while the row carried a SYNTHESIS
+        // (Nullable — NULL = not orphaned). See the v35 migration.
+        scanned_input_hash -> Nullable<Text>,
+        orphaned_at -> Nullable<BigInt>,
+        // v38 — the component's SCOPED CSS SLOT (finding 01KYVMTWB71R0D0CT1SV88J8DX): the strict,
+        // tokenised, bounded and SIGNALLED escape hatch for what Tailwind utilities cannot express,
+        // stored as `{ "css": …, "reason": … }` (Nullable — NULL = no slot, the state of nearly
+        // every component). See the v38 migration for why it lives on the COMPONENT.
+        css_slot_json -> Nullable<Text>,
+    }
+}
+
+// - v31 (v2.7 Phase 2 — the PROTOTYPE domain, task 01KY4DFNPJHB2NNEH2CEG42GYE) adds the
+//   prototype-as-annexe-1:1-of-a-Spec tree ported from Depot to the frozen decisions of this
+//   PRD (PDR-0009/0010). `prototypes`: ONE row per Spec (UNIQUE(spec_id)) — `spec_id` (FK
+//   CASCADE), `description` (Nullable), epoch-ms `created_at`/`updated_at` + Nullable
+//   `archived_at`. `prototype_pages`: a logical screen — `prototype_id` (FK CASCADE), `slug`
+//   (UNIQUE per prototype — the nav convention), `title`, `position`, epoch-ms `created_at`.
+//   `prototype_page_versions`: a page iteration (frozen; older stays readable for rollback) —
+//   `page_id` (FK CASCADE), `label` (UNIQUE per page), Nullable `summary`, epoch-ms
+//   `created_at` + Nullable `archived_at`. `prototype_variants`: one rendering of a (page,
+//   version) — `page_version_id` (FK CASCADE), `label` (UNIQUE per version), `title`,
+//   `composition_json` (NOT NULL TEXT default '' — the component TREE, not an HTML blob,
+//   PDR-0010), `states_json` (Nullable — the declared states, the `window.__nyxStates`
+//   port), `is_main` (Bool — the AGENT's reco), `position`, epoch-ms `created_at`.
+//   `prototype_feedback`: pre-dev review comments OWNED BY THE PROTOTYPE (durable cross-rounds)
+//   — `prototype_id` (FK CASCADE), `origin_variant_id`/`node_key`/`resolution_via_variant_id`
+//   (Nullable PLAIN ids — the TREE-NODE anchor + soft refs), `anchor_status` (portés/à-ré-ancrer),
+//   `body`, `status`, `resolution_note`/`resolved_at`/`ignored_reason`/`ignored_at` (Nullable),
+//   `author_kind`/`author_ref`, epoch-ms `created_at`/`updated_at`. `prototype_rounds`: a
+//   whole-design ROLLBACK round — `prototype_id` (FK CASCADE), `label` (UNIQUE per prototype),
+//   Nullable `summary`, `position`, Nullable `presented_at` (freeze marker), epoch-ms
+//   `created_at`. `prototype_round_pages`: the round manifest + the USER's round-scoped RETENU
+//   — `round_id`/`page_id`/`page_version_id` (FK CASCADE), `position`, `chosen_variant_id` +
+//   decision record (Nullable PLAIN id), epoch-ms `created_at`, UNIQUE(round_id, page_id).
+//   `prototype_design_lock`: the minimal FREEZE marker (PDR-0010 reframe — no placement blob) —
+//   `prototype_id` (PK/FK CASCADE), `locked_round_id` (PLAIN id), Nullable `decided_by`,
+//   epoch-ms `locked_at`. All `*_json` are TEXT → `Nullable<Text>` (or NOT NULL `Text`). Column
+//   ORDER here must match the SQL migration exactly (Diesel positional decoding).
+diesel::table! {
+    prototypes (id) {
+        id -> Text,
+        spec_id -> Text,
+        description -> Nullable<Text>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        archived_at -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    prototype_pages (id) {
+        id -> Text,
+        prototype_id -> Text,
+        slug -> Text,
+        title -> Text,
+        position -> Integer,
+        created_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    prototype_page_versions (id) {
+        id -> Text,
+        page_id -> Text,
+        label -> Text,
+        summary -> Nullable<Text>,
+        created_at -> BigInt,
+        archived_at -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    prototype_variants (id) {
+        id -> Text,
+        page_version_id -> Text,
+        label -> Text,
+        title -> Text,
+        composition_json -> Text,
+        states_json -> Nullable<Text>,
+        is_main -> Bool,
+        position -> Integer,
+        created_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    prototype_feedback (id) {
+        id -> Text,
+        prototype_id -> Text,
+        origin_variant_id -> Nullable<Text>,
+        node_key -> Nullable<Text>,
+        anchor_status -> Text,
+        body -> Text,
+        status -> Text,
+        resolution_note -> Nullable<Text>,
+        resolution_via_variant_id -> Nullable<Text>,
+        resolved_at -> Nullable<BigInt>,
+        ignored_reason -> Nullable<Text>,
+        ignored_at -> Nullable<BigInt>,
+        author_kind -> Text,
+        author_ref -> Nullable<Text>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    prototype_rounds (id) {
+        id -> Text,
+        prototype_id -> Text,
+        label -> Text,
+        summary -> Nullable<Text>,
+        position -> Integer,
+        presented_at -> Nullable<BigInt>,
+        created_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    prototype_round_pages (id) {
+        id -> Text,
+        round_id -> Text,
+        page_id -> Text,
+        page_version_id -> Text,
+        position -> Integer,
+        chosen_variant_id -> Nullable<Text>,
+        decision_rationale -> Nullable<Text>,
+        decided_by -> Nullable<Text>,
+        decided_at -> Nullable<BigInt>,
+        created_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    prototype_design_lock (prototype_id) {
+        prototype_id -> Text,
+        locked_round_id -> Text,
+        decided_by -> Nullable<Text>,
+        locked_at -> BigInt,
+    }
+}
+
+// - v32 (v2.7 Phase 2 — the proto ↔ session SEAM, task 01KY50ZPVSMZPSY351VJNR7Z0F) adds
+//   `agent_session_prototypes`, the MANY-TO-MANY link between an agent session and the prototypes
+//   it works (shaped exactly like `agent_session_specs`, v20). `session_id` (FK → agent_sessions,
+//   CASCADE) + `prototype_id` (FK → prototypes, CASCADE) form the composite PRIMARY KEY (a
+//   prototype is in a session's set at most once; the auto-map's ADD is idempotent), plus an
+//   epoch-ms `created_at`. NO scalar pin — the session (not the terminal) is the unit of work.
+diesel::table! {
+    agent_session_prototypes (session_id, prototype_id) {
+        session_id -> Text,
+        prototype_id -> Text,
+        created_at -> BigInt,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
 diesel::joinable!(managed_commands -> projects (project_id));
@@ -571,6 +779,22 @@ diesel::joinable!(idea_specs -> ideas (idea_id));
 diesel::joinable!(idea_specs -> specs (spec_id));
 diesel::joinable!(annexes -> specs (spec_id));
 diesel::joinable!(annexes -> annex_blobs (content_hash));
+diesel::joinable!(design -> projects (project_id));
+diesel::joinable!(design_components -> projects (project_id));
+diesel::joinable!(design_components -> repositories (source_repository_id));
+diesel::joinable!(prototypes -> specs (spec_id));
+diesel::joinable!(prototype_pages -> prototypes (prototype_id));
+diesel::joinable!(prototype_page_versions -> prototype_pages (page_id));
+diesel::joinable!(prototype_variants -> prototype_page_versions (page_version_id));
+diesel::joinable!(prototype_feedback -> prototypes (prototype_id));
+diesel::joinable!(prototype_rounds -> prototypes (prototype_id));
+// `prototype_round_pages` FKs THREE tables (round_id + page_id + page_version_id); only the
+// primary parent (round) join is declared — the page / page_version edges are queried
+// explicitly by column so Diesel keeps a single unambiguous join per pair.
+diesel::joinable!(prototype_round_pages -> prototype_rounds (round_id));
+diesel::joinable!(prototype_design_lock -> prototypes (prototype_id));
+diesel::joinable!(agent_session_prototypes -> agent_sessions (session_id));
+diesel::joinable!(agent_session_prototypes -> prototypes (prototype_id));
 diesel::joinable!(tasks -> projects (project_id));
 diesel::joinable!(tasks -> specs (spec_id));
 // `task_dependencies` has TWO FKs into `tasks` (task_id + depends_on_task_id), and a
@@ -582,16 +806,27 @@ diesel::joinable!(tasks -> specs (spec_id));
 // declared (the CRUD queries the two directions explicitly by column instead).
 
 diesel::allow_tables_to_appear_in_same_query!(
+    agent_session_prototypes,
     agent_session_specs,
     agent_sessions,
     annex_blobs,
     annexes,
     command_instances,
+    design,
+    design_components,
     domain_events,
     idea_specs,
     ideas,
     managed_commands,
     projects,
+    prototype_design_lock,
+    prototype_feedback,
+    prototype_page_versions,
+    prototype_pages,
+    prototype_round_pages,
+    prototype_rounds,
+    prototype_variants,
+    prototypes,
     repositories,
     review_comments,
     review_reads,

@@ -1,7 +1,7 @@
 import { keepPreviousData, useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 
-import { isBridgeError, nyxBridge } from "@/bridge";
+import { errorText, nyxBridge } from "@/bridge";
 import type { ReviewComment } from "@/bridge";
 import { reviewKeys } from "@/lib/query";
 
@@ -52,9 +52,6 @@ export interface UseWorkspaceReview {
 }
 
 const EMPTY: readonly ReviewComment[] = [];
-
-const errText = (e: unknown): string =>
-  isBridgeError(e) ? e.message : e instanceof Error ? e.message : String(e);
 
 /** Count the OPEN roots of a repo's threads (a root whose status is not resolved). */
 function countThreads(threads: readonly CommentThread[]) {
@@ -244,9 +241,9 @@ export function useWorkspaceReview(
   }, [byRepo]);
 
   const error = queries.error
-    ? errText(queries.error)
+    ? errorText(queries.error)
     : mutation.error
-      ? errText(mutation.error)
+      ? errorText(mutation.error)
       : null;
 
   const refresh = useCallback(async () => {
