@@ -32,7 +32,24 @@ use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, Master
 /// wakeup primitive — so the core stays agnostic of the bridge's thresholds.
 #[derive(Clone, Default)]
 pub struct PauseGate {
-    inner: Arc<(Mutex<bool>, Condvar)>,
+    inner: Arc<(Mutex<GateState>, Condvar)>,
+}
+
+/// The gate's two bits, under one mutex.
+///
+/// `parked` is not policy — it is the gate's own OBSERVABLE state: whether the reader
+/// is currently blocked *at* the gate rather than inside a `read()`. The distinction is
+/// the whole contract: the gate is checked BEFORE each read, so pausing can never
+/// retract a `read()` already in flight — that pending read still delivers its chunk.
+/// "Not one byte flows" only becomes true once the reader has come back round and
+/// parked. Anything asserting that (see `pause_gate_is_lossless_and_ordered`) has to
+/// wait for the park, not for a delay.
+#[derive(Default)]
+struct GateState {
+    /// The bridge's pause bit.
+    paused: bool,
+    /// The reader is blocked at the gate right now (no read in flight).
+    parked: bool,
 }
 
 impl PauseGate {
@@ -41,8 +58,8 @@ impl PauseGate {
     /// beyond a redundant notify.
     pub fn set_paused(&self, paused: bool) {
         let (lock, cvar) = &*self.inner;
-        let mut p = lock.lock().unwrap();
-        *p = paused;
+        let mut state = lock.lock().unwrap();
+        state.paused = paused;
         if !paused {
             // Wake the reader so it loops back into `read()`.
             cvar.notify_all();
@@ -52,17 +69,39 @@ impl PauseGate {
     /// Whether the gate is currently paused.
     pub fn is_paused(&self) -> bool {
         let (lock, _) = &*self.inner;
-        *lock.lock().unwrap()
+        lock.lock().unwrap().paused
     }
 
     /// Block the calling (reader) thread while paused. Returns as soon as the gate
     /// is not paused. Called by the reader thread just before each `read()`.
     fn wait_while_paused(&self) {
         let (lock, cvar) = &*self.inner;
-        let mut p = lock.lock().unwrap();
-        while *p {
-            p = cvar.wait(p).unwrap();
+        let mut state = lock.lock().unwrap();
+        while state.paused {
+            // Publish the park BEFORE blocking, and wake anyone waiting to observe it.
+            state.parked = true;
+            cvar.notify_all();
+            state = cvar.wait(state).unwrap();
         }
+        state.parked = false;
+    }
+
+    /// TEST-ONLY: block until the reader is parked AT the gate, or `timeout` elapses;
+    /// returns whether it is parked.
+    ///
+    /// This is the observable condition a pause assertion needs. A reader that was
+    /// already inside `read()` when the pause landed parks only after that one pending
+    /// read completes and its chunk is sent — so once this returns `true`, everything
+    /// that could escape the gate is already on the channel and nothing further can
+    /// flow until [`Self::set_paused(false)`].
+    #[cfg(test)]
+    fn wait_until_parked(&self, timeout: std::time::Duration) -> bool {
+        let (lock, cvar) = &*self.inner;
+        let state = lock.lock().unwrap();
+        let (state, _) = cvar
+            .wait_timeout_while(state, timeout, |s| !s.parked)
+            .unwrap();
+        state.parked
     }
 }
 
@@ -564,6 +603,39 @@ impl Pty {
         *self.exit_code.lock().unwrap()
     }
 
+    /// Make sure the child is really gone, escalating past a signal it can survive.
+    ///
+    /// `portable_pty`'s Unix killer sends exactly ONE `SIGHUP`. An interactive shell
+    /// CATCHES that signal, so honouring it is its own decision, taken at a point it
+    /// controls — and a child that never gets there (a reader that has already left on a
+    /// hung-up consumer stops draining the PTY, and the shell's exit path then blocks on
+    /// a buffer nobody empties) simply stays alive. The waiter's `waitpid` then never
+    /// returns, and every `join()` below it blocks FOREVER: on Unix that froze whole test
+    /// runs (`resize_…`, `busy_…`, `no_thread_or_handle_leak_…` each hung ~17% of the
+    /// time when the pty module was looped), and in the app it would freeze whichever
+    /// thread closed the terminal — the same class of freeze the Windows note below
+    /// describes.
+    ///
+    /// So: wait a short grace for the child to honour the `SIGHUP` on its own — polling
+    /// the exit code the waiter records, i.e. the real condition — then send `SIGKILL`,
+    /// which no process can catch, block or defer.
+    #[cfg(unix)]
+    fn ensure_child_dead(&self, grace: std::time::Duration) {
+        let Some(pid) = self.shell_pid else { return };
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            if self.exit_code().is_some() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // SAFETY: `kill(2)` with a pid we own; a dead/reaped pid just yields ESRCH.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+
     /// Block until the child has exited and its exit code is recorded, then
     /// return it. Joins the waiter thread.
     pub fn wait(&mut self) -> Option<i32> {
@@ -585,6 +657,11 @@ impl Drop for Pty {
         // so the join below (Unix) would deadlock. Resuming lets it loop, hit EOF,
         // and exit. Harmless if it was already running.
         self.pause_gate.set_paused(false);
+        // …and make the kill STICK before joining a waiter that would otherwise block on
+        // `waitpid` for ever (see `ensure_child_dead`). The grace is what a shell needs to
+        // honour the SIGHUP itself; nothing waits on it once the child is gone.
+        #[cfg(unix)]
+        self.ensure_child_dead(std::time::Duration::from_millis(500));
         if let Some(handle) = self.waiter_handle.take() {
             // Fast + reliable: `child.wait()` returns right after the kill, then
             // the waiter closes the master.
@@ -1056,22 +1133,48 @@ mod tests {
         let (mut pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
         let gate = pty.pause_gate();
 
-        // Pause BEFORE issuing work, so the very first output is gated.
+        // Pause BEFORE issuing work, so the stream is gated from the start.
         gate.set_paused(true);
         assert!(gate.is_paused());
 
         // Emit a finite, numbered, ordered stream. `seq` is POSIX; the markers let
         // us assert exact count + order. End with a sentinel so we know we're done.
-        pty.write(b"for i in $(seq 1 200); do echo NYXLINE_$i; done; echo NYX_DONE\n")
+        // The sentinel is assembled from `$d` so the literal `NYX_DONE` cannot appear
+        // in the tty's ECHO of this very line — only in the shell's real output.
+        pty.write(b"d=DONE; for i in $(seq 1 200); do echo NYXLINE_$i; done; echo NYX_$d\n")
             .expect("write");
 
-        // While paused the consumer must observe NO output for a real interval
-        // (the reader is blocked at the gate; the kernel buffers the child).
-        std::thread::sleep(Duration::from_millis(300));
-        match rx.recv_timeout(Duration::from_millis(50)) {
+        // WAIT FOR THE READER TO REACH THE GATE — the observable condition, never a delay.
+        // The gate is checked before each `read()`, so a pause cannot retract a read
+        // already in flight: the reader thread starts with the `Pty` and may already be
+        // inside `read()` when we pause, in which case it still delivers ONE chunk (in
+        // practice the shell's own banner + prompt, `ESC[?2004h` + `sh-5.3$ `). Sleeping
+        // 300 ms and asserting the channel was empty asserted the opposite of the
+        // contract, and lost the race whenever the reader thread won the start.
+        assert!(
+            gate.wait_until_parked(Duration::from_secs(10)),
+            "the reader never reached the pause gate"
+        );
+
+        // Everything that escaped is on the channel already (the reader sends BEFORE it
+        // parks), so this drains it without racing. It is part of the stream and is kept
+        // for the losslessness check below — nothing is discarded.
+        let mut gated = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            gated.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        // …and it is only the banner: the gate really did hold the stream back.
+        assert!(
+            !gated.contains("NYXLINE_200"),
+            "the gate let the whole stream through before parking: {gated:?}"
+        );
+
+        // PARKED ⇒ not one further byte flows, for a real interval. This is now a
+        // property of the reader's state, not a bet on scheduling.
+        match rx.recv_timeout(Duration::from_millis(300)) {
             Err(mpsc::RecvTimeoutError::Timeout) => {} // expected: nothing flowed
             Ok(chunk) => panic!(
-                "paused reader must not deliver output, got {:?}",
+                "a reader parked at the gate must not deliver output, got {:?}",
                 String::from_utf8_lossy(&chunk)
             ),
             Err(mpsc::RecvTimeoutError::Disconnected) => panic!("unexpected early disconnect"),
@@ -1079,7 +1182,10 @@ mod tests {
 
         // Resume: the buffered stream must now drain in full, in order.
         gate.set_paused(false);
-        let out = read_until(&rx, "NYX_DONE", Duration::from_secs(5));
+        let out = format!(
+            "{gated}{}",
+            read_until(&rx, "NYX_DONE", Duration::from_secs(5))
+        );
 
         // Every line present, none dropped.
         for i in 1..=200 {

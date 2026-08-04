@@ -78,6 +78,7 @@ pub fn read_foreground_comm(pgid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     // --- Pure parser tests (no live pid required) -------------------------
 
@@ -126,21 +127,51 @@ mod tests {
 
     #[test]
     fn read_cwd_reflects_a_chdir() {
-        // Reading our own cwd before and after a chdir must change — this is the
-        // exact "after a cd, the live cwd is the new folder" property, exercised
-        // through the real readlink path. (current_dir is process-global; we
-        // restore it so we don't disturb sibling tests.)
-        let original = std::env::current_dir().unwrap();
-        let me = std::process::id();
-        let tmp = std::env::temp_dir();
-        std::env::set_current_dir(&tmp).unwrap();
-        let after = read_cwd(me).expect("read_cwd after chdir");
-        std::env::set_current_dir(&original).unwrap();
+        // The "after a cd, the live cwd is the new folder" property, observed on a CHILD
+        // shell rather than on ourselves.
+        //
+        // It used to `std::env::set_current_dir` and read its own /proc entry. But the
+        // current directory is process-GLOBAL mutable state and the harness runs the
+        // tests of one binary as threads: while this one had chdir'd away, its neighbour
+        // `read_cwd_of_self_matches_current_dir` was reading the very same global and
+        // failed — about one run in three, on a file nobody had touched. Restoring the
+        // directory afterwards does not help; the window is the point.
+        //
+        // A child that cds is the same observation on the same code path, and it is also
+        // the production shape: nyx reads a SHELL's cwd, never its own.
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+        let mut child = std::process::Command::new("sh")
+            // `$0` is the shell's own name, `$1` the directory to cd into. It reports the
+            // cd on stdout, then blocks on a stdin that is never written, so it stays
+            // alive (and observable) until we kill it.
+            .args(["-c", r#"cd "$1" || exit 1; printf R; read _"#, "sh"])
+            .arg(&tmp)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child shell");
 
-        let after_canon = std::fs::canonicalize(&after).unwrap();
-        let tmp_canon = std::fs::canonicalize(&tmp).unwrap();
+        // Synchronize on the child SAYING it has cd'd — an observable condition, not a
+        // delay — so the readlink below cannot race the chdir.
+        let mut ack = [0u8; 1];
+        let acked = child
+            .stdout
+            .as_mut()
+            .expect("child stdout")
+            .read_exact(&mut ack);
+        let after = acked.and_then(|()| {
+            read_cwd(child.id()).ok_or_else(|| {
+                std::io::Error::other("reading the child's /proc/<pid>/cwd must succeed")
+            })
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        let after = after.expect("the child must cd and expose its live cwd");
+
         assert_eq!(
-            after_canon, tmp_canon,
+            std::fs::canonicalize(&after).unwrap(),
+            tmp,
             "live cwd must reflect a chdir (the cd-then-observe property)"
         );
     }

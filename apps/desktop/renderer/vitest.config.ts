@@ -50,6 +50,12 @@ export default defineConfig({
           name: "unit",
           environment: "jsdom",
           globals: true,
+          // A test may take longer than vitest's 5 s default WITHOUT being wrong: the suite runs
+          // one fork per core and a starved worker spends most of a `waitFor` not scheduled at
+          // all (finding `01KYW0SA15GX1CZ4QFVY9VD75G`, see `vitest.setup.ts`). This bound has to
+          // sit above the async-utils one, or a test dies on the clock before its own assertion
+          // gets to speak, and the failure names the timer instead of the defect.
+          testTimeout: 20_000,
           include: ["src/**/*.{test,spec}.{ts,tsx}"],
           // Browser-only specs run in the `browser` project, not in jsdom.
           exclude: ["src/**/*.browser.{test,spec}.{ts,tsx}"],

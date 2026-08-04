@@ -1,6 +1,23 @@
 import "@testing-library/jest-dom/vitest";
+import { configure } from "@testing-library/dom";
 import { cleanup } from "@testing-library/react";
 import { afterEach, vi } from "vitest";
+
+/**
+ * HOW LONG A `waitFor` / `findBy*` MAY WAIT (finding `01KYW0SA15GX1CZ4QFVY9VD75G`).
+ *
+ * Testing Library's default is ONE second, and that second is WALL-CLOCK. The suite runs one fork
+ * per core, each mounting jsdom + React + xterm, so a worker regularly gets a fraction of a CPU:
+ * `restore-reconstruction` timed out with ZERO `pty_spawn` recorded — not because the spawn never
+ * came, but because the worker had not been scheduled enough to get there. That is a starved
+ * machine, not a broken assertion, and a suite that reddens for it stops being a signal.
+ *
+ * Raising the bound weakens NOTHING: every one of these waits polls an OBSERVABLE condition and
+ * returns the instant it holds, so a green run is not one millisecond slower. Only a test that is
+ * genuinely failing waits longer before saying so — which is the right trade for a deadline whose
+ * only job is to stop an infinite wait.
+ */
+configure({ asyncUtilTimeout: 5_000 });
 
 // jsdom has no ResizeObserver; the Terminal uses one to drive FitAddon. A no-op
 // stub keeps the component mountable without affecting the assertions (which
@@ -43,6 +60,13 @@ if (typeof window !== "undefined" && !window.matchMedia) {
 // (cleanup), then flush the microtask queue so any deferred PTY teardown runs before we
 // restore spies. The bridge double (`@/bridge/test-harness`) auto-resets itself in its
 // own afterEach (the Tauri `clearMocks()` is gone — only the Electron adapter ships).
+//
+// MIND THE ORDER ACROSS FILES: vitest runs `afterEach` hooks LAST-REGISTERED-FIRST, so a hook a
+// SPEC FILE declares runs BEFORE this one — i.e. before the unmount. A spec that tears down
+// module-level state of its own must therefore call `cleanup()` itself first, or it empties that
+// state under a tree still mounted and alive to repopulate it (finding
+// `01KYW0SA15GX1CZ4QFVY9VD75G`, see `sidebar/restore-reconstruction.test.tsx`). `cleanup()` is
+// idempotent, so calling it there leaves this one a no-op.
 afterEach(async () => {
   cleanup();
   // Let queued microtasks (deferred teardown) and timers settle.

@@ -195,6 +195,43 @@ function renderDetail() {
   return { router, ...render(<RouterProvider router={router} />) };
 }
 
+/** Anything that carries a `value` — an input, a textarea, a `<select>` picker. */
+type ValueControl = HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+
+/**
+ * A param control, WAITED UNTIL THE PANEL HAS SEEDED IT (finding `01KYW0SA15GX1CZ4QFVY9VD75G`).
+ *
+ * The controls are rendered the moment `design_component_get` answers; their values arrive one
+ * commit later, from the effect that seeds the representative instance (`preview > default`). A
+ * `findBy*` resolves on PRESENCE, so it can legitimately hand back a control that is still empty —
+ * and on a loaded machine it did, about one run in six:
+ *
+ *  - reading `.value` there compared `''` against the preview value, and
+ *  - a `fireEvent` fired there was WIPED by the seed landing right after, so the assertion that
+ *    followed waited a second for a rendering that would never come.
+ *
+ * The seeded value is the observable condition both of those actually need, so tests wait on IT.
+ * Nothing is asserted less: the value is still checked, by this very wait.
+ */
+async function seeded(el: HTMLElement, value: string): Promise<ValueControl> {
+  const control = el as ValueControl;
+  await waitFor(() => expect(control.value).toBe(value));
+  return control;
+}
+
+/**
+ * The same wait, read off the LIVE PREVIEW instead of a control — for the pickers whose control
+ * cannot say it. A `<select>` renders `options[0]` while the panel is still unseeded, so its
+ * `value` is already the seeded one and says nothing; the rendering, rebuilt from the values on
+ * every change, does. `marker` is a fragment the SEEDED rendering carries and the unseeded one
+ * cannot (a substituted default, the default variant's `data-state`).
+ */
+async function seededPreview(title: string, marker: string): Promise<HTMLElement> {
+  const frame = await screen.findByTitle(title);
+  await waitFor(() => expect(frame.getAttribute("srcdoc") ?? "").toContain(marker));
+  return frame;
+}
+
 describe("ComponentDetailPage", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -207,7 +244,7 @@ describe("ComponentDetailPage", () => {
     renderDetail();
     expect(await screen.findByRole("heading", { name: "Button" })).toBeTruthy();
     // A text param control (seeded with its default) and the STATE param as a segmented picker.
-    const label = (await screen.findByLabelText("label")) as HTMLInputElement;
+    const label = await seeded(await screen.findByLabelText("label"), "Hello");
     expect(label.value).toBe("Hello");
     expect(screen.getByRole("group", { name: "State" })).toBeTruthy();
     // The live preview iframe (once the sidecar render resolves).
@@ -333,6 +370,8 @@ describe("ComponentDetailPage", () => {
     currentComponent = LEGACY_ENUM;
     renderDetail();
 
+    // `align` is seeded to its declared `left` before the click below may replace it (see `seeded`).
+    await seededPreview("Button live preview", "text-left");
     const picker = await screen.findByRole("group", { name: "align" });
     expect([...picker.querySelectorAll("button")].map((b) => b.textContent)).toEqual([
       "left",
@@ -404,6 +443,8 @@ describe("ComponentDetailPage", () => {
   it("uses a dropdown for the state when the component declares many variants", async () => {
     currentComponent = MANY_VARIANTS;
     renderDetail();
+    // Seeded on the first declared variant — and only then is it ours to drive (see `seeded`).
+    await seededPreview("Button live preview", `data-state="${MANY_STATES[0]}"`);
     const select = (await screen.findByRole("combobox", { name: "State" })) as HTMLSelectElement;
     expect([...select.options].map((o) => o.value)).toEqual(MANY_STATES);
     // No segmented row of 8 buttons beside it.
@@ -425,7 +466,9 @@ describe("ComponentDetailPage", () => {
    */
   it("edits the content params (text AND html) and the preview follows", async () => {
     renderDetail();
-    fireEvent.change(await screen.findByLabelText("label"), { target: { value: "Enregistrer" } });
+    fireEvent.change(await seeded(await screen.findByLabelText("label"), "Hello"), {
+      target: { value: "Enregistrer" },
+    });
     fireEvent.change(screen.getByLabelText("body"), { target: { value: "<em>ok</em>" } });
 
     await waitFor(() => {
@@ -558,7 +601,7 @@ describe("ComponentDetailPage", () => {
     currentComponent = REQUIRED_PREVIEW;
     renderDetail();
 
-    const field = (await screen.findByLabelText("label")) as HTMLInputElement;
+    const field = await seeded(await screen.findByLabelText("label"), "Enregistrer");
     expect(screen.getByTestId("param-required-label").textContent).toBe("required");
     expect(field.getAttribute("aria-invalid")).toBeNull();
 
@@ -644,7 +687,10 @@ describe("ComponentDetailPage", () => {
     currentComponent = REQUIRED_PREVIEW;
     renderDetail();
 
-    expect(((await screen.findByLabelText("label")) as HTMLInputElement).value).toBe("Enregistrer");
+    // The controls exist before they are seeded (see `seeded`), so the wait is on the VALUE.
+    expect((await seeded(await screen.findByLabelText("label"), "Enregistrer")).value).toBe(
+      "Enregistrer",
+    );
     expect((screen.getByLabelText("hint") as HTMLInputElement).value).toBe("Astuce");
     expect(screen.getByTestId("param-required-label")).toBeTruthy();
     await waitFor(() => {

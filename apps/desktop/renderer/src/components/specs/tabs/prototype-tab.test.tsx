@@ -321,7 +321,16 @@ describe("Prototype TAB — the entry point, not the workbench", () => {
     });
     renderTab();
 
-    fireEvent.click(await screen.findByRole("button", { name: /rounds history/i }));
+    const trigger = await screen.findByRole("button", { name: /rounds history/i });
+    // WAIT FOR THE TRIGGER TO BE WIRED, not merely to exist (finding
+    // `01KYW0SA15GX1CZ4QFVY9VD75G`). Base UI mounts the button first and attaches the menu
+    // interaction — `aria-haspopup`, `aria-expanded`, the open handler — right after; a
+    // `findBy*` resolves on presence and could hand back the bare button, and the click
+    // then opened nothing at all (`aria-expanded` was absent, and the assertion below died
+    // on a menu that was never going to appear). `aria-expanded` IS that wiring, so it is
+    // the observable condition to wait on.
+    await waitFor(() => expect(trigger).toHaveAttribute("aria-expanded", "false"));
+    fireEvent.click(trigger);
     const earlier = await screen.findByTestId("proto-round-round0");
 
     // The history is CONSULTATION ONLY (finding `01KYW32N1BVDVTGS0WPMG2PJW2`): clicking an earlier

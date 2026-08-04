@@ -1,9 +1,9 @@
-﻿import { render, waitFor } from "@testing-library/react";
+﻿import { cleanup, render, waitFor } from "@testing-library/react";
 import { mockIPC } from "@/bridge/test-harness";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { TerminalManager } from "./terminal-manager";
-import { __resetTerminalStore } from "@/components/terminal/terminal-store";
+import { __resetTerminalStore, terminalStore } from "@/components/terminal/terminal-store";
 import type { TerminalRecord } from "./use-terminals";
 
 /**
@@ -77,15 +77,31 @@ const SCROLLBACK_C = "C_HISTORY_marker";
 
 describe("restore reconstruction at launch", () => {
   beforeEach(() => {
-    // installed per-test in each it() with the desired record set.
+    // The IPC double is installed per-test in each it() with the desired record set. What is
+    // checked here is the PRECONDITION every one of them depends on: no live instance survives
+    // from the previous test. `ensureTerminal` is idempotent by id, so a leftover instance for a
+    // re-used id silently skips the spawn the tests assert on — a cross-test leak that shows up
+    // as an empty spawn list three tests later and reads as a timeout. Named here, it fails where
+    // it happens.
+    expect(terminalStore.state.ids).toEqual([]);
   });
 
   afterEach(() => {
-    // The manager's terminals live in a module-level store; drop them so instances (and their
-    // PTYs) never leak across tests. Without this, a later test's `ensureTerminal` for a re-used
-    // id would find the previous test's instance and skip the spawn we assert on. (Previously this
-    // reset was implicit — the deck's per-render reconcile disposed leftovers on the initial empty
-    // list — but reconciliation now lives app-wide in `base-layout`, so the test owns its cleanup.)
+    // UNMOUNT FIRST, then drop the store. The manager's terminals live in a module-level store,
+    // and a later test's `ensureTerminal` for a re-used id would find the previous test's instance
+    // and skip the spawn we assert on. (Previously this reset was implicit — the deck's per-render
+    // reconcile disposed leftovers on the initial empty list — but reconciliation now lives
+    // app-wide in `base-layout`, so the test owns its cleanup.)
+    //
+    // The ORDER is the whole point (finding `01KYW0SA15GX1CZ4QFVY9VD75G`). Vitest runs `afterEach`
+    // hooks LAST-REGISTERED-FIRST, so this one runs BEFORE `vitest.setup.ts`'s `cleanup()` — i.e.
+    // the store used to be emptied while the previous test's tree was STILL MOUNTED, and that live
+    // tree re-created the instances it had just lost before the unmount arrived. The next test then
+    // opened on a store already holding ids `1` and `3`, spawned nothing, and failed with an empty
+    // spawn list that no amount of waiting could fill. Unmounting here first (RTL's `cleanup` is
+    // idempotent, so the setup file's own call stays a harmless no-op) leaves nothing alive to
+    // repopulate the store.
+    cleanup();
     __resetTerminalStore();
   });
 
