@@ -16,7 +16,8 @@ import type { ResumePark, WorkspaceRestorePlan } from "@/bridge";
  * is `active` or `unknown`. There is no longer a confident/doubtful partition: the v2.5.5
  * post-crash restore panel (which used to own the `uncertain` sessions) was reverted, so a crash
  * no longer produces `unknown` sessions and every resumable session simply resumes SILENTLY here,
- * gated only by the project resume toggle (`decide_resume`) and the #28 inject-time activity gate.
+ * gated only by the project resume toggle (`decide_resume`) and the sidecar's inject-time
+ * process-liveness gate (never injected into a terminal that already hosts a live agent process).
  *
  * ## Why here (lazy, not eager-at-boot)
  * The posture is LAZY: resume happens when you OPEN a workspace's terminals, not blindly at boot.

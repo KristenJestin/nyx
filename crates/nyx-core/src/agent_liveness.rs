@@ -37,9 +37,9 @@
 //! `pid → ProcNameNode` map, so the descendant logic is unit-tested (Unix AND the Windows
 //! `.exe` name form) without a live `sysinfo::System`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
 use crate::agent::AgentRegistry;
 
@@ -87,12 +87,12 @@ pub fn tree_hosts_agent(
         }
     }
 
-    let mut visited: HashMap<u32, ()> = HashMap::new();
+    let mut visited: HashSet<u32> = HashSet::new();
     let mut stack = vec![root];
     while let Some(pid) = stack.pop() {
         // The `visited` guard makes a cyclic/self-parent table terminate and never
         // re-examines a pid reachable by two paths.
-        if visited.insert(pid, ()).is_some() {
+        if !visited.insert(pid) {
             continue;
         }
         if let Some(node) = table.get(&pid) {
@@ -107,16 +107,23 @@ pub fn tree_hosts_agent(
     false
 }
 
-/// Snapshot the live process table into the pure `pid → ProcNameNode` map. Only real processes
-/// are kept (`thread_kind().is_none()`): `sysinfo` enumerates THREADS as standalone `Process`
-/// entries on Linux, and a thread carries its process's name — keeping only `None` entries counts
-/// each real process once and avoids a thread of an unrelated process masquerading in the graph
-/// (parity with [`crate::proc_stats`]'s thread filter).
+/// Snapshot the live process table into the pure `pid → ProcNameNode` map. Two entries are dropped:
+///
+///  - THREADS (`thread_kind().is_none()`): `sysinfo` enumerates them as standalone `Process` entries
+///    on Linux, and a thread carries its process's name — keeping only `None` entries counts each
+///    real process once and avoids a thread of an unrelated process masquerading in the graph
+///    (parity with [`crate::proc_stats`]'s thread filter).
+///  - ZOMBIES (`status() != Zombie`): a process that has ALREADY EXITED but whose parent has not
+///    reaped it yet still has a `/proc` entry carrying its name. Counting one would read a
+///    CRASHED agent as alive — the exact inversion this gate exists to prevent, and it would park
+///    the resume forever (nothing ever re-triggers the drain). A defunct agent is a dead agent.
 fn build_table(system: &System) -> HashMap<u32, ProcNameNode> {
     system
         .processes()
         .iter()
-        .filter(|(_, proc_)| proc_.thread_kind().is_none())
+        .filter(|(_, proc_)| {
+            proc_.thread_kind().is_none() && proc_.status() != ProcessStatus::Zombie
+        })
         .map(|(pid, proc_)| {
             (
                 pid.as_u32(),
@@ -281,7 +288,20 @@ mod tests {
         let found_sleep = agent_alive_with(me, |name| name == "sleep");
         let found_claude = agent_alive_with(me, |name| name == "claude");
 
+        // KILL WITHOUT REAPING: the child is now a ZOMBIE — it has EXITED, but because nothing
+        // `wait`ed on it its `/proc` entry survives with its name intact. This is the crashed-agent
+        // shape, and it MUST read as absent: counting a defunct process would keep the gate saying
+        // "an agent is alive" forever and the parked resume would never fire.
         let _ = child.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut gone = false;
+        while std::time::Instant::now() < deadline {
+            if !agent_alive_with(me, |name| name == "sleep") {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let _ = child.wait();
 
         assert!(
@@ -292,10 +312,10 @@ mod tests {
             !found_claude,
             "no real claude runs under the test, so the agent predicate must NOT match"
         );
-
-        // After the child is reaped, the predicate no longer matches (crashed/absent → false).
-        // (Best-effort: the OS may take a beat to reap; we assert the positive/negative contrast
-        // above, which is the load-bearing behavior.)
+        assert!(
+            gone,
+            "a killed-but-unreaped (zombie) descendant must NOT count as a live agent"
+        );
     }
 
     /// A gone root pid over the LIVE table is `false` without erroring (parity with the pure

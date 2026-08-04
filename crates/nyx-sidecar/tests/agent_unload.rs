@@ -156,7 +156,7 @@ fn resolve_binary(name: &str) -> PathBuf {
         .and_then(|paths| {
             std::env::split_paths(&paths)
                 .map(|d| d.join(name))
-                .find(|p| p.exists())
+                .find(|p| p.is_file())
         })
         .unwrap_or_else(|| PathBuf::from("/usr/bin").join(name))
 }

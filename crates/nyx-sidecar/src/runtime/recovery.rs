@@ -16,8 +16,9 @@
 //! card (Resume / Ignore). That special path is GONE. A crash is now treated as an ORDINARY
 //! (clean) shutdown: the boot reconcile marks NOTHING interrupted and flips NO session to
 //! `unknown`. The NORMAL resume path then applies — the SILENT lazy agent-session resume,
-//! gated by the project's `resume_agent_sessions` toggle AND the #28 activity gate (a resume
-//! is never injected into a live/working session). Toggle ON → the session resumes silently;
+//! gated by the project's `resume_agent_sessions` toggle AND the process-liveness gate (a resume
+//! is never injected into a terminal that already hosts a live agent process). Toggle ON → the
+//! session resumes silently;
 //! toggle OFF → nothing resumes. No card, no `interrupted` set, no doubtful-session UI.
 //!
 //! ## Why a sidecar-owned state file (and not a new DB column)
@@ -134,7 +135,7 @@ pub struct ReconcileOutcome {
 /// A crash is treated as a CLEAN shutdown: this does NOT flag any instance `interrupted`, does
 /// NOT flip any `active` agent session to `unknown`, and does NOT touch the shutdown snapshots.
 /// The NORMAL resume path takes over — the silent lazy agent-session resume gated by the
-/// project `resume_agent_sessions` toggle and the #28 activity gate — so nothing surfaces a
+/// project `resume_agent_sessions` toggle and the process-liveness gate — so nothing surfaces a
 /// crash-recovery card and nothing is blindly relaunched.
 pub fn reconcile_after_crash(data_dir: &Path) -> ReconcileOutcome {
     let had_file = RecoveryState::exists(data_dir);

@@ -102,8 +102,10 @@ impl ResumeParks {
             .insert(record_id.to_string(), park);
     }
 
-    /// Whether a resume is currently PENDING (parked, not yet injected) for `record_id`.
-    #[cfg(test)]
+    /// Whether a resume is currently PENDING (parked, not yet injected) for `record_id`. The CHEAP
+    /// (one hash lookup) pre-check the inject path runs BEFORE its expensive process-liveness gate,
+    /// so a terminal with nothing parked — every bare terminal, i.e. the common spawn — never pays a
+    /// full process-table scan. Non-destructive, unlike [`take_for_inject`](Self::take_for_inject).
     pub fn has_pending(&self, record_id: &str) -> bool {
         self.pending.lock().unwrap().contains_key(record_id)
     }

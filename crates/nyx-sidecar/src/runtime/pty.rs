@@ -326,18 +326,21 @@ impl PtyManager {
     /// null-is-idle treatment). This is the LIVE, non-persisted running source that
     /// `apply_terminal_live_overlay` overlays onto the runtime snapshot's terminal LINE.
     pub fn is_busy_record(&self, record_id: &str) -> bool {
-        let pty = {
-            let terms = self.terminals.lock().unwrap();
-            let Some(pty_id) = self.live_records.lock().unwrap().get(record_id).copied() else {
-                return false;
-            };
-            match terms.get(&pty_id) {
-                Some(t) => Arc::clone(&t.pty),
-                None => return false,
-            }
+        let Some(pty) = self.pty_for_record(record_id) else {
+            return false;
         };
         let busy = pty.lock().unwrap().is_busy();
         busy.unwrap_or(false)
+    }
+
+    /// Resolve a persistent RECORD id to its LIVE pty handle (record → live-pty join → registry),
+    /// cloning the `Arc` out from under BOTH registry locks so every per-record reader below does
+    /// its (possibly blocking) work WITHOUT holding them. `None` when no live PTY backs the record.
+    /// The single-record counterpart of the `busy_by_record` / `shell_pids_by_record` batch joins.
+    fn pty_for_record(&self, record_id: &str) -> Option<Arc<Mutex<Pty>>> {
+        let terms = self.terminals.lock().unwrap();
+        let pty_id = self.live_records.lock().unwrap().get(record_id).copied()?;
+        Some(Arc::clone(&terms.get(&pty_id)?.pty))
     }
 
     /// The OS busy bit of EVERY live terminal that carries a persistent RECORD id, as
@@ -408,11 +411,7 @@ impl PtyManager {
     /// so the caller simply detects no agent. Reuses the SAME `read_terminal_info` foreground read
     /// the auto-label path uses (its `.1` is the foreground `comm`).
     pub fn foreground_comm_record(&self, record_id: &str) -> Option<String> {
-        let pty = {
-            let terms = self.terminals.lock().unwrap();
-            let pty_id = self.live_records.lock().unwrap().get(record_id).copied()?;
-            Arc::clone(&terms.get(&pty_id)?.pty)
-        };
+        let pty = self.pty_for_record(record_id)?;
         let pty = pty.lock().unwrap();
         read_terminal_info(pty.shell_pid(), foreground_pgid(&pty)).1
     }
@@ -441,11 +440,7 @@ impl PtyManager {
     /// of [`shell_pids_by_record`](Self::shell_pids_by_record), used by the liveness probe to root
     /// its process-tree walk.
     pub fn shell_pid_for_record(&self, record_id: &str) -> Option<u32> {
-        let pty = {
-            let terms = self.terminals.lock().unwrap();
-            let pty_id = self.live_records.lock().unwrap().get(record_id).copied()?;
-            Arc::clone(&terms.get(&pty_id)?.pty)
-        };
+        let pty = self.pty_for_record(record_id)?;
         let pid = pty.lock().unwrap().shell_pid();
         pid
     }

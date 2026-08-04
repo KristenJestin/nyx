@@ -283,7 +283,7 @@ impl Runtime {
         // BEFORE the boot restore, re-arm the clean-shutdown marker to false for the run we are
         // starting. A crash is now treated exactly like a CLEAN shutdown — the reconcile flags
         // NOTHING interrupted and flips NO session to `unknown`; the normal SILENT resume path
-        // (lazy agent-session resume, gated by the project toggle + the #28 activity gate) takes
+        // (lazy agent-session resume, gated by the project toggle + the process-liveness gate) takes
         // over. `was_crash` is returned only so the boot can log that the previous run crashed.
         let outcome = recovery::reconcile_after_crash(&self.data_dir);
         // Reload the (re-armed) recovery state into the runtime so the idempotency journal is the
@@ -487,6 +487,15 @@ impl Runtime {
     /// pending. A failed write marks the session `resume_failed` (no retry loop) and nudges the
     /// renderer to re-pull the agent sessions so the clean `resume-failed` state surfaces.
     fn inject_resume(&self, record_id: &str, events: &EventSink) {
+        // NOTHING PARKED → nothing to gate. This runs BEFORE the liveness probe because that probe
+        // is a FULL process-table scan (hundreds of `/proc` reads), while this is one hash lookup:
+        // `inject_resume_on_spawn` fires on EVERY PtySpawn (`dispatch_runtime`), and opening a
+        // project eager-mounts every terminal — so without this the sidecar's request loop paid one
+        // whole scan per bare terminal for a drain that would have found nothing. (Same reasoning as
+        // `proc_stats::tree_stats_batch`'s one-scan-per-tick fix.)
+        if !self.resume_parks.has_pending(record_id) {
+            return;
+        }
         // GATE ON REAL PROCESS LIVENESS (PRD `01KY9PM1GK30FPVZVWQ3A7ZMJH`) — the authoritative
         // check that holds AT THE MOMENT OF INJECT. A parked `claude --resume <id>` must NEVER be
         // typed into a terminal that ALREADY hosts a live agent process: doing so lands the resume

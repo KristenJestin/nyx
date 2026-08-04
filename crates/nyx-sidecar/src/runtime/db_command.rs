@@ -341,7 +341,7 @@ impl Ctx<'_> {
     /// the existing resume policies — the resume decision (`agent_resume::workspace_resume_plan`
     /// over `decide_resume`) and the `restart_on_startup` restore rows. No new policy, no blind
     /// relaunch. The renderer's `use-lazy-resume` drains the resumable sessions SILENTLY (gated
-    /// by the project toggle + the #28 activity gate); a crash carries no special surface (the
+    /// by the project toggle + the process-liveness gate); a crash carries no special surface (the
     /// v2.5.5 interrupted/restore card was reverted in v2.5.8). Pure read; idempotent.
     fn workspace_restore_plan(&self, workspace_id: &str) -> Result<String, String> {
         // The workspace must exist (a readable error, not an empty plan, for an unknown id).
