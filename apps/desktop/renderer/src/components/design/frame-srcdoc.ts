@@ -68,7 +68,7 @@ export const HOST_MESSAGE_TYPES = ["pick-mode", "highlight-node", "pinned-nodes"
  * `shim-seam.test.ts` extracts the names the shim really asks for and confronts them with this list.
  */
 export const FRAME_GLOBAL_PREFIX = "__nyx";
-export const FRAME_GLOBALS = ["States", "ActiveState", "Axes", "AxisValues", "RootNode"] as const;
+export const FRAME_GLOBALS = ["States", "ActiveState", "Axes", "AxisValues"] as const;
 
 /**
  * The class the sidecar's LENIENT render puts on the placeholder of a node it could not draw
@@ -213,16 +213,6 @@ export interface FrameSrcdocInput {
    * the markup and still applies, so the page renders exactly as it will ship.
    */
   showCssSlotMark?: boolean;
-  /**
-   * The ROOT node's `node_key` (`window.__nyxRootNode`) — the region `#depot-root` itself stands for
-   * in the shim's element → node index (finding `01KYW32N1BVDVTGS0WPMG2PJW2`).
-   *
-   * Every OTHER node names itself in the markup, through the comment markers the host asks the
-   * sidecar to interleave ({@link markCompositionNodes}); the root cannot, because it has no parent
-   * to hold its bracket. Absent → the frame indexes nothing and every designation resolves to
-   * nothing, which is exactly what a host that never asked for the markers wants.
-   */
-  rootNode?: string | null;
   /**
    * CENTRE the instance in the frame box and clip it there (default `false` — a page flows from the
    * top-left, as a page must). This is the COMPONENT layout (finding `01KYPEG16E95WADT2VMCYBPCK5`,
@@ -494,7 +484,9 @@ body{margin:0;box-sizing:border-box;background-color:var(--background,var(--colo
   // The result is passed through {@link neutralizeClosers} like every other script text below:
   // `JSON.stringify` does NOT escape `/`, so a state, an axis or a node key an agent named
   // `a</script>b` would close the element early — truncating the shim, i.e. no chip-bar, no
-  // navigation and no node designation, silently and with nothing on screen to say so.
+  // navigation and no node designation, silently and with nothing on screen to say so. (The node
+  // KEYS do not travel here at all any more: the render stamps them into the markup itself, which
+  // goes through `neutralizeClosers` too.)
   const global = (name: (typeof FRAME_GLOBALS)[number], value: unknown): string =>
     `window.${FRAME_GLOBAL_PREFIX}${name}=${JSON.stringify(value)};`;
   const bootstrap =
@@ -508,9 +500,7 @@ body{margin:0;box-sizing:border-box;background-color:var(--background,var(--colo
         values: a.values.map((v) => ({ name: v.name, classes: v.classes ?? "" })),
       })),
     ) +
-    global("AxisValues", axisValues) +
-    // The ROOT node's key — the one node of the tree that cannot name itself in the markup.
-    global("RootNode", input.rootNode ?? null);
+    global("AxisValues", axisValues);
 
   return `<!doctype html>
 <html lang="en"${dark ? ` class="dark"` : ""}>

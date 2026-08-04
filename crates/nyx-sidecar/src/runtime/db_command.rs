@@ -5203,7 +5203,15 @@ mod tests {
             )
             .unwrap();
         let rendered: Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(rendered["markup"].as_str().unwrap(), "<button>OK</button>");
+        // …and the node NAMES ITSELF on its own root (`data-nyx-node`, finding
+        // `01KYW77Y65A9HYNDZ69M67S6B8`): that mark is what lets the frame's shim answer "which node
+        // of the named tree is this element?" without a second, marked-up render of the same
+        // composition — and `node_count` is the count of the TREE, nothing the render added.
+        assert_eq!(
+            rendered["markup"].as_str().unwrap(),
+            "<button data-nyx-node=\"Button\">OK</button>"
+        );
+        assert_eq!(rendered["node_count"], serde_json::json!(1));
 
         // An unknown component is a NAMED HOLE, not a blanked page (finding
         // `01KYT78699XG6Q6P3VZC64W8H8`): the render COMPLETES, the node names itself in place, and
@@ -5221,13 +5229,19 @@ mod tests {
         let holed: Value = serde_json::from_str(&holed).unwrap();
         let markup = holed["markup"].as_str().unwrap();
         assert!(
-            markup.contains("<button>OK</button>"),
+            markup.contains("<button data-nyx-node=\"Root/Button\">OK</button>"),
             "the renderable node still draws: {markup}"
         );
         assert!(
             markup.contains("data-unrendered-reason=\"not_in_catalogue\"")
                 && markup.contains("Nope"),
             "the hole is named IN PLACE: {markup}"
+        );
+        // …and the HOLE designates itself like any other node: a `[NEW]` node is precisely the one a
+        // reviewer clicks to open its params, so its placeholder carries the node mark too.
+        assert!(
+            markup.contains("data-nyx-node=\"Root/Nope\""),
+            "the hole is a node one can click: {markup}"
         );
         assert_eq!(holed["unrendered_count"], serde_json::json!(1));
         assert_eq!(holed["unrendered"][0]["node_key"], "Root/Nope");
@@ -5278,8 +5292,9 @@ mod tests {
         let scope = nyx_core::css_slot::component_scope_id("Button");
         let markup = slotted["markup"].as_str().unwrap();
         assert!(
-            markup.starts_with(&format!("<button data-nyx-css=\"{scope}\">"))
-                && markup.contains(&format!("<style data-nyx-css-slot=\"{scope}\">")),
+            markup.starts_with(&format!(
+                "<button data-nyx-node=\"Button\" data-nyx-css=\"{scope}\">"
+            )) && markup.contains(&format!("<style data-nyx-css-slot=\"{scope}\">")),
             "the frame receives the mark AND the scoped stylesheet: {markup}"
         );
         assert_eq!(slotted["css_slot_count"], serde_json::json!(1));
@@ -5377,8 +5392,8 @@ mod tests {
         assert_eq!(
             linked["markup"].as_str().unwrap(),
             format!(
-                "<button data-nyx-page=\"pricing\" data-nyx-page-id=\"{pricing_id}\">\
-                 Voir les tarifs</button>"
+                "<button data-nyx-node=\"Button\" data-nyx-page=\"pricing\" \
+                 data-nyx-page-id=\"{pricing_id}\">Voir les tarifs</button>"
             ),
             "the shim's own attribute, unchanged, plus the durable id"
         );

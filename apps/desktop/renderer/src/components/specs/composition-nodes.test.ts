@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import designFixtures from "../../../../../../contract/design-fixtures.json";
 
-import { markCompositionNodes, NODE_MARK_OPEN, rootNodeKey } from "./composition-markers";
 import {
   compositionNodes,
   INLINE_SEGMENT_LABEL,
@@ -95,8 +94,9 @@ describe("compositionNodes", () => {
  * THE ARRIMAGE of the `node_key` CONVENTION (finding `01KZ3JTVM23C3MBATJZ3RYVPY6`, family 2).
  *
  * ONE RULE, written four times: the Rust `CompositionNode::key` + `composition_nodes` +
- * `node_key_path`, and — in this language — a `segmentLabel` duplicated byte for byte in
- * `composition-markers.ts` plus two more derivations of the separator in `composition-tree.tsx`.
+ * `node_key_path`, and — in this language — a `segmentLabel` duplicated byte for byte in the
+ * (since deleted) comment-marker module plus two more derivations of the separator in
+ * `composition-tree.tsx`.
  * There is one implementation here now, and `contract/design-fixtures.json` (`node_key`) is what
  * holds it to the backend's: the same cases run through
  * `render.rs::tests::the_shared_fixture_pins_the_node_key_convention`.
@@ -127,16 +127,6 @@ describe("the shared Rust ⟷ TS fixture — the node_key convention", () => {
         compositionNodes(json).map((n) => n.nodeKey),
         testCase.why,
       ).toEqual(testCase.node_keys);
-      // The MARKERS bracket the very same paths — that is what makes a click in the frame resolve
-      // to the node a comment is stored on. Every non-root key must appear as a marker body.
-      const marked = markCompositionNodes(json) ?? "";
-      for (const nodeKey of testCase.node_keys.slice(1)) {
-        const encoded = encodeURIComponent(nodeKey).replace(/-/g, "%2D");
-        expect(marked, `${testCase.id}: ${nodeKey} is bracketed`).toContain(
-          `<!--${NODE_MARK_OPEN}${encoded}-->`,
-        );
-      }
-      expect(rootNodeKey(json)).toBe(testCase.node_keys[0]);
     },
   );
 

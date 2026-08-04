@@ -43,7 +43,6 @@ vi.mock("../design/composition-frame", () => ({
     showChrome?: boolean;
     showCssSlotMark?: boolean;
     pickMode?: string;
-    rootNodeKey?: string | null;
     selectedNodeKey?: string | null;
     pinnedNodeKeys?: readonly string[];
     onNodeSelect?: (nodeKey: string) => void;
@@ -66,7 +65,6 @@ vi.mock("../design/composition-frame", () => ({
           {String(props.showCssSlotMark ?? props.showChrome ?? true)}
         </span>
         <span data-testid="frame-pick-mode">{props.pickMode ?? "off"}</span>
-        <span data-testid="frame-root-node">{props.rootNodeKey ?? ""}</span>
         <span data-testid="frame-selected-node">{props.selectedNodeKey ?? ""}</span>
         <span data-testid="frame-pinned-nodes">{(props.pinnedNodeKeys ?? []).join(",")}</span>
       </div>
@@ -1759,14 +1757,16 @@ describe("PrototypePage — the dedicated prototype route", () => {
     renderPage();
     await screen.findByTitle("Home preview");
 
-    // The composition that CROSSED carries the node markers — that is what makes a click
-    // resolvable — and the STORED composition is untouched (the markers are an inert comment).
-    const sent = renderCalls.find((c) => c.includes("nyx-node%3A") || c.includes("nyx-node:"));
-    expect(sent).toBeTruthy();
-    expect(sent).toContain("Root/Reset".replace("/", "%2F"));
-    expect(
-      within(screen.getByTitle("Home preview")).getByTestId("frame-root-node").textContent,
-    ).toBe("Root");
+    // The composition CROSSES ONCE, exactly as it is stored — no marked-up second copy. What makes
+    // a click resolvable is stamped by the RENDER, on the other side of the seam (finding
+    // `01KYW77Y65A9HYNDZ69M67S6B8`); nothing here rewrites the tree on the way out.
+    expect(renderCalls.length, "one render request per composition").toBeGreaterThan(0);
+    for (const sent of renderCalls) {
+      expect(sent, "the renderer sends the STORED composition, untouched").not.toContain(
+        "nyx-node",
+      );
+    }
+    expect(renderCalls.some((c) => c.includes('"Reset"'))).toBe(true);
 
     // A click in the render, reported by the frame as the node it landed in.
     act(() => frameHarness.onNodeSelect?.("Root/Reset"));

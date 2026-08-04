@@ -36,7 +36,6 @@ import {
 } from "../design/use-design-render";
 
 import { specKey } from "./spec-meta";
-import { markCompositionNodes, rootNodeKey } from "./composition-markers";
 import { defaultVariant, displayVersion, panelPagesOf, treeAtRound } from "./proto-page-model";
 import type { ProtoTreePage } from "./proto-types";
 import { type OpenNode, CompositionTree } from "./tabs/composition-tree";
@@ -137,8 +136,9 @@ import { useSpecDetail } from "./use-spec-detail";
  * click point. What is NOT depot's is the target: depot computes a CSS SELECTOR, nyx resolves a NODE
  * of the named tree — the tree IS the contract here (`prototype_feedback.node_key`, re-anchored
  * across rounds, read by the coder seam), and a selector would be a second identity for it that dies
- * the first time a class is renamed. The node names reach the markup as inert comment markers the
- * renderer asks the sidecar to interleave ({@link markCompositionNodes}).
+ * the first time a class is renamed. The node names reach the markup because the SIDECAR STAMPS THEM
+ * there — `data-nyx-node` on each node's root element(s), beside the walk that knows the key — so
+ * the composition is sent and rendered ONCE (finding `01KYW77Y65A9HYNDZ69M67S6B8`).
  *
  * # CONSULTING A PAST ROUND — IN PLACE (finding `01KZ3AP34K1PKS6W0E75RP7DF6`)
  *
@@ -380,16 +380,6 @@ export function PrototypePage() {
     (activePage ? defaultVariant(activePage) : null);
   const composition = variant?.composition_json ?? null;
 
-  /**
-   * WHAT IS SENT TO THE RENDERER: the same composition, with an inert comment marker bracketing each
-   * node so the frame can attribute a clicked element back to its `node_key`
-   * ({@link markCompositionNodes}). The STORED composition is untouched — `NodeParamsPanel` and the
-   * comments read `variant.composition_json` as they always did; only the render request carries the
-   * markers, and a marker renders to an HTML comment, which the page can neither see nor lay out.
-   */
-  const renderComposition = useMemo(() => markCompositionNodes(composition), [composition]);
-  const rootKey = useMemo(() => rootNodeKey(composition), [composition]);
-
   const variantId = variant?.id ?? null;
   const axes = useMemo(() => parseAxes(variant?.states_json), [variant?.states_json]);
   const states = useMemo(() => primaryAxisStates(axes), [axes]);
@@ -416,7 +406,7 @@ export function PrototypePage() {
     // `01KZ41YK39SGNKF6XV87A35GPN`).
   } = useDesignRender(
     projectId,
-    renderComposition,
+    composition,
     tree?.prototype.id ?? null,
     variant?.states_json ?? null,
   );
@@ -424,7 +414,7 @@ export function PrototypePage() {
   const preview = previewState({
     hasVariant: variant !== null,
     projectId,
-    compositionJson: renderComposition,
+    compositionJson: composition,
     renderLoading,
     renderError,
     markup,
@@ -1035,7 +1025,6 @@ export function PrototypePage() {
                     // takes no pick at all: both sinks lead to a panel that is not there, and
                     // neither params nor comments are things one edits in the past.
                     pickMode={consulting ? "off" : pinMode ? "pin" : "select"}
-                    rootNodeKey={rootKey}
                     // The hovered COMMENT wins while it lasts, then the Params selection comes back:
                     // one ring, and the pane currently speaking owns it.
                     selectedNodeKey={hoveredNodeKey ?? selectedNodeKey}

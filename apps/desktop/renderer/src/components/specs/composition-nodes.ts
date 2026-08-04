@@ -51,11 +51,11 @@ export const INLINE_SEGMENT_LABEL = "inline";
  * A node's SEGMENT label: explicit `key`, else `component` name, else [`INLINE_SEGMENT_LABEL`].
  *
  * THE ONE IMPLEMENTATION IN THIS LANGUAGE (finding `01KZ3JTVM23C3MBATJZ3RYVPY6`, family 2). This
- * function was written twice, byte for byte, in two files — here and in `composition-markers.ts`,
- * which asks the sidecar to bracket the very same nodes. A rule copied is a rule that drifts, and
- * this one decides where a stored comment RE-ANCHORS and which node a params write LANDS ON: both
- * would have gone wrong silently. `contract/design-fixtures.json` (`node_key`) pins it against the
- * Rust `CompositionNode::key`.
+ * function was written twice, byte for byte, in two files — here and in the module that asked the
+ * sidecar to bracket the very same nodes with comment markers (gone since the RENDER stamps each
+ * node's key itself). A rule copied is a rule that drifts, and this one decides where a stored
+ * comment RE-ANCHORS and which node a params write LANDS ON: both would have gone wrong silently.
+ * `contract/design-fixtures.json` (`node_key`) pins it against the Rust `CompositionNode::key`.
  */
 export function nodeSegmentLabel(node: RawCompositionNode): string {
   if (typeof node.key === "string" && node.key.length > 0) return node.key;
@@ -64,7 +64,7 @@ export function nodeSegmentLabel(node: RawCompositionNode): string {
 }
 
 /** A child's `node_key`, from its parent's path — the ONE place the separator is written. */
-export function childNodeKey(parentKey: string, child: RawCompositionNode): string {
+function childNodeKey(parentKey: string, child: RawCompositionNode): string {
   return `${parentKey}${NODE_KEY_SEPARATOR}${nodeSegmentLabel(child)}`;
 }
 

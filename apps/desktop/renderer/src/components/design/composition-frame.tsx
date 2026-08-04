@@ -103,12 +103,11 @@ export interface CompositionFrameProps {
    *    with its FRAME-RELATIVE coordinates, so the host can anchor a comment popup there. The
    *    prototype's own nav/flip never fires while pinning.
    *
-   * It needs the composition to have been rendered WITH its node markers ([`markCompositionNodes`]);
-   * without them every designation resolves to nothing and only the declared affordances remain.
+   * It needs markup the SIDECAR rendered: the render is what stamps each node's `node_key` on the
+   * root element(s) it draws (`data-nyx-node`). Over markup from anywhere else every designation
+   * resolves to nothing and only the declared affordances remain.
    */
   pickMode?: "off" | "select" | "pin";
-  /** The ROOT node's `node_key` — the one node the markup cannot name (see [`FrameSrcdocInput.rootNode`]). */
-  rootNodeKey?: string | null;
   /** The node currently OPEN in the host's panel — ringed in the frame so the selection is legible. */
   selectedNodeKey?: string | null;
   /** The nodes that already carry an OPEN comment — ringed while `pin` mode is on, as depot does. */
@@ -184,7 +183,6 @@ export function CompositionFrame({
   showChipBar,
   showCssSlotMark,
   pickMode = "off",
-  rootNodeKey = null,
   selectedNodeKey = null,
   pinnedNodeKeys,
   onNodeSelect,
@@ -235,7 +233,6 @@ export function CompositionFrame({
       showChrome,
       showChipBar,
       showCssSlotMark,
-      rootNode: rootNodeKey,
       center,
     });
   }, [
@@ -249,7 +246,6 @@ export function CompositionFrame({
     showChrome,
     showChipBar,
     showCssSlotMark,
-    rootNodeKey,
     center,
   ]);
 

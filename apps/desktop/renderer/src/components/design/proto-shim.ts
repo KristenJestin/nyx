@@ -31,12 +31,13 @@
  *     `data-nyx-state` flips the FIRST axis to that value through the SAME applier as the
  *     chip-bar — "flip d'état sur place". `data-nyx-set="size=lg"` does it for ANY axis.
  *   * **DESIGNATING A NODE (finding `01KYW32N1BVDVTGS0WPMG2PJW2`)** — the render IS the composition:
- *     an element resolves to the `node_key` of the named tree it belongs to, read off the inert
- *     comment markers the host asked the sidecar to interleave ({@link markCompositionNodes}). In
- *     `select` mode a plain click posts `{ type: "select", nodeKey }` (the params gesture); in `pin`
- *     mode a full-cover capture layer swallows the click and posts `{ type: "pin", nodeKey, x, y }`
- *     (the comment anchor). Ported from depot's feedback shim, MINUS its `computeSelector`: nyx
- *     anchors on a NODE, never on a CSS selector — the tree is the contract.
+ *     an element resolves to the `node_key` of the named tree it belongs to, read off the
+ *     `data-nyx-node` the SIDECAR stamps on each node's root element(s) (`render.rs`'s `NODE_ATTR`,
+ *     pinned against this file by `contract/design-fixtures.json` → `node_mark`). In `select` mode a
+ *     plain click posts `{ type: "select", nodeKey }` (the params gesture); in `pin` mode a
+ *     full-cover capture layer swallows the click and posts `{ type: "pin", nodeKey, x, y }` (the
+ *     comment anchor). Ported from depot's feedback shim, MINUS its `computeSelector`: nyx anchors
+ *     on a NODE, never on a CSS selector — the tree is the contract.
  *
  * It also reports its content height to the parent (so a live preview can auto-size), and echoes the
  * whole active combination back (`{ type: "axes", values }`, plus `{ type: "state" }` for the first
@@ -371,7 +372,7 @@ export const PROTO_SHIM_SOURCE = String.raw`(function () {
     }
   }
 
-  // ==== THE NAMED TREE, READ BACK OFF THE MARKUP ==============================================
+  // ==== THE NAMED TREE, READ OFF THE MARKUP ===================================================
   // THE RENDER IS THE COMPOSITION (finding 01KYW32N1BVDVTGS0WPMG2PJW2). Clicking a component in the
   // page opens ITS params, and a pinned comment anchors on the element clicked — both need one
   // answer: WHICH NODE of the named tree is this element part of?
@@ -384,89 +385,57 @@ export const PROTO_SHIM_SOURCE = String.raw`(function () {
   // seam under the same Root/Header/Title paths. A selector would be a second identity for the same
   // node — one that dies the day a class changes, which is what a design round does for a living.
   //
-  // The node names reach the markup as inert HTML COMMENTS bracketing each node's markup, asked for
-  // by the host (see composition-markers.ts). They are read ONCE here into an element -> node_key
-  // map held on an expando, so nothing is written into the document the page could see.
-  var MARK_OPEN = "nyx-node:";
-  var MARK_CLOSE = "/nyx-node:";
+  // THE NAME IS IN THE MARKUP, STAMPED BY THE RENDER (finding 01KYW77Y65A9HYNDZ69M67S6B8). The
+  // sidecar puts a node's node_key on the ROOT element(s) of the markup that node draws, next to the
+  // walk that knows it and right where it already stamps data-nyx-css (render.rs, NODE_ATTR). The
+  // host used to ask for a SECOND render of the same composition with an inert HTML comment
+  // bracketing every node, and this file rebuilt an element -> node_key index out of those comments:
+  // n + 2(n-1) rendered nodes for a page of n, a node_count that counted markers, and the node_key
+  // convention living in two languages at once. Now there is no second render and no index — the
+  // mark travels ON the element, which is the only thing that has to stay in sync with it.
+  //
+  // ROOTS ONLY, and resolution is an ancestor walk. Marking every descendant is what outlined each
+  // <rect> of an icon's <svg> separately (seen in the running app), which reads as a rendering fault
+  // rather than a selection. contract/design-fixtures.json (node_mark) pins this attribute against
+  // the render that writes it — this source cannot import it, being a STRING evaluated in a
+  // sandboxed frame, so a seam test replays the real markup through the real shim instead.
+  var NODE_ATTR = "data-nyx-node";
   var pickMode = "off";
-  var byNode = {};
   var hoverEl = null;
   var pinnedKeys = [];
   var captureLayer = null;
 
-  function decodeKey(raw) {
-    try { return decodeURIComponent(raw); } catch (e) { return raw; }
-  }
-
-  // Walk one container's CHILD NODES: a marker comment opens (or closes) a node's region, and every
-  // element met while a region is open belongs to it — the deepest one, since the walk descends with
-  // the region it is in and any nested marker refines it.
-  //
-  // TWO ANSWERS ARE BUILT, and they are not the same question. __nyxNode is set on EVERY element so
-  // a click anywhere resolves to a node. byNode keeps only the REGION ROOTS — the elements whose
-  // key differs from their container's, i.e. the top of the node's own markup. That is what a
-  // RING is drawn on: highlighting every descendant too outlines each rect of an icon's <svg>
-  // separately (seen in the running app), which reads as a rendering fault rather than a selection.
-  function indexInto(container, key) {
-    var stack = [key];
-    var child = container.firstChild;
-    while (child) {
-      if (child.nodeType === 8) {
-        var body = String(child.nodeValue == null ? "" : child.nodeValue);
-        if (body.indexOf(MARK_CLOSE) === 0) {
-          if (stack.length > 1) { stack.pop(); }
-        } else if (body.indexOf(MARK_OPEN) === 0) {
-          stack.push(decodeKey(body.slice(MARK_OPEN.length)));
-        }
-      } else if (child.nodeType === 1) {
-        var current = stack[stack.length - 1];
-        child.__nyxNode = current;
-        if (current != null && current !== key) {
-          if (!byNode[current]) { byNode[current] = []; }
-          byNode[current].push(child);
-        }
-        indexInto(child, current);
-      }
-      child = child.nextSibling;
-    }
-  }
-
-  function indexNodes() {
-    byNode = {};
-    var root = doc.getElementById("depot-root");
-    if (!root) { return; }
-    // The ROOT node owns #depot-root itself: it has no parent to carry its bracket, so the host
-    // names it directly, and that element IS its region root. An unmarked render (no host asked for
-    // the markers) indexes to null keys and every gesture below simply resolves to nothing — the
-    // page still renders and still navigates.
-    var declaredRoot = globalOf("RootNode");
-    var rootKey = declaredRoot == null ? null : String(declaredRoot);
-    if (rootKey != null) {
-      root.__nyxNode = rootKey;
-      byNode[rootKey] = [root];
-    }
-    indexInto(root, rootKey);
-  }
-
-  // The node an element belongs to: itself, or the nearest ancestor that carries one.
+  // The node an element belongs to: itself, or the nearest ancestor that carries the mark. An
+  // unmarked render (a host that renders markup of its own) resolves to nothing everywhere, and
+  // every gesture below simply designates nothing — the page still renders and still navigates.
   function nodeKeyOf(el) {
     var node = el;
     while (node && node !== doc.body) {
-      if (node.__nyxNode != null) { return node.__nyxNode; }
+      if (node.getAttribute) {
+        var key = node.getAttribute(NODE_ATTR);
+        if (key != null) { return key; }
+      }
       node = node.parentNode;
     }
     return null;
   }
 
-  // Put className on exactly the elements of "keys", and on nothing else. Idempotent: the previous
-  // set is cleared first, so a selection change never leaves a stale ring behind.
+  // Put className on exactly the elements the "keys" name, and on nothing else. Idempotent: the
+  // previous set is cleared first, so a selection change never leaves a stale ring behind. The
+  // marked elements are read off the DOM at every call rather than indexed once — there is nothing
+  // to invalidate when the frame's markup is replaced.
   function markClass(keys, className) {
     var stale = doc.querySelectorAll("." + className);
     for (var s = 0; s < stale.length; s++) { stale[s].classList.remove(className); }
-    for (var k = 0; k < keys.length; k++) {
-      var els = byNode[keys[k]] || [];
-      for (var e2 = 0; e2 < els.length; e2++) { els[e2].classList.add(className); }
+    if (!keys.length) { return; }
+    var root = doc.getElementById("depot-root");
+    if (!root) { return; }
+    var marked = root.querySelectorAll("[" + NODE_ATTR + "]");
+    for (var m = 0; m < marked.length; m++) {
+      var key = marked[m].getAttribute(NODE_ATTR);
+      for (var k = 0; k < keys.length; k++) {
+        if (String(keys[k]) === key) { marked[m].classList.add(className); break; }
+      }
     }
   }
 
@@ -588,7 +557,6 @@ export const PROTO_SHIM_SOURCE = String.raw`(function () {
   }
 
   buildChipBar();
-  indexNodes();
   apply();
   reportHeight();
   post({ type: "ready" });

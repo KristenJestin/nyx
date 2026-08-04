@@ -801,8 +801,31 @@ pub fn render_composition(
 /// context = the node's `params` PLUS the raw `children` markup. `component` nodes resolve their
 /// template from `by_name` (unknown → [`RenderError::UnknownComponent`]); `inline` nodes render
 /// their own bespoke markup string; an empty node (neither) renders just its children. A node that
-/// NAVIGATES has its root element(s) stamped with the destination it resolves to.
+/// NAVIGATES has its root element(s) stamped with the destination it resolves to, and every node that
+/// draws markup of its own has them stamped with its [`NODE_ATTR`].
 fn render_node(
+    hb: &Handlebars<'static>,
+    by_name: &BTreeMap<&str, &RenderComponent>,
+    pages: &[RenderPage],
+    node: &CompositionNode,
+    node_key: &str,
+) -> Result<String, RenderError> {
+    let markup = render_node_markup(hb, by_name, pages, node, node_key)?;
+    // THE NODE'S NAME, on the roots of the region it draws — the LAST step, so it sits on exactly the
+    // elements this node owns, whatever the template and the references did below. A STRUCTURAL node
+    // is skipped: it has no markup of its own (it IS its children), so naming it would rename theirs.
+    // The strict render is the [`Vocabulary::Preserve`] twin, which is why it stamps unconditionally
+    // and why the two stay byte-identical.
+    Ok(if carries_own_markup(node) {
+        reference::stamp_node_key(&markup, node_key)
+    } else {
+        markup
+    })
+}
+
+/// [`render_node`] minus the node mark — the render itself. Split out so the mark is applied in ONE
+/// place, over every path this function can return through.
+fn render_node_markup(
     hb: &Handlebars<'static>,
     by_name: &BTreeMap<&str, &RenderComponent>,
     pages: &[RenderPage],
@@ -1172,6 +1195,37 @@ pub struct ResolvedComposition {
     /// is false, or because nobody honoured the condition at all. That was the defect.
     pub axes: Vec<(String, String)>,
 }
+
+/// The attribute that NAMES a node in the markup it renders to: its `node_key`, stamped on the ROOT
+/// element(s) of the node's own markup (finding `01KYW77Y65A9HYNDZ69M67S6B8`).
+///
+/// # What it is for
+///
+/// The prototype stage's whole gesture is "the render IS the composition": clicking a component in
+/// the page opens ITS params, and a pinned comment anchors on the element one clicked. Both need one
+/// answer — WHICH NODE of the named tree is this element part of? — and the frame's shim gets it by
+/// walking up to the nearest element carrying this attribute. Depot answers the same question with a
+/// computed CSS SELECTOR; nyx does not, and must not: here the TREE is the contract
+/// (`prototype_feedback.node_key`, re-anchored across rounds, read by the coder seam under the same
+/// `Root/Header/Title` paths), and a selector would be a SECOND identity for the same node — one that
+/// dies the first time a class is renamed, which is what a design round does for a living.
+///
+/// # Why the RENDER stamps it
+///
+/// Because the render is where the `node_key` convention already lives ([`node_key_path`]). The
+/// renderer used to ask for the same composition a SECOND time with an inert HTML comment bracketing
+/// each node, and read the names back out of those comments — which made one page cost `n + 2(n−1)`
+/// rendered nodes, made `node_count` count markers, and put the convention in TWO places, the Rust
+/// that produces it and the TypeScript that re-derived it. Stamped here, beside the walk that knows
+/// the key, it is written once and read as data.
+///
+/// # It is INTERACTION vocabulary, so the agent never sees it
+///
+/// [`Vocabulary::Preserve`] (the FRAME) carries it; [`Vocabulary::Consume`] (the AGENT) does not
+/// write it at all — an agent has no shim, no click and no frame, so a mark it cannot act on is a
+/// mark it must not read back, and the promise that a resolved answer keeps no `data-nyx-*` but
+/// [`crate::css_slot::SCOPE_ATTR`] stays literally true.
+pub const NODE_ATTR: &str = "data-nyx-node";
 
 /// The attribute the SHIM reads to navigate: the destination's SLUG (the shim posts its value to its
 /// host). Emitted by a render only for a link that RESOLVED.
@@ -1550,6 +1604,33 @@ impl LenientWalk<'_> {
 /// every node it could not render into `acc`. Never fails: an unrenderable node becomes a
 /// placeholder that keeps its children.
 fn resolve_node(
+    walk: &LenientWalk<'_>,
+    node: &CompositionNode,
+    node_key: &str,
+    acc: &mut ResolvedComposition,
+) -> String {
+    let markup = resolve_node_markup(walk, node, node_key, acc);
+    // THE NODE'S NAME, on the roots of the region it draws ([`NODE_ATTR`]) — the LAST step, so it
+    // covers the PLACEHOLDER of a node that could not be rendered exactly as it covers a node that
+    // was: a hole is a node one clicks to open its params, and it must designate itself like any
+    // other. A STRUCTURAL node is skipped: it has no markup of its own, so naming it would rename its
+    // children's roots.
+    //
+    // ONLY FOR THE FRAME. The mark is INTERACTION vocabulary: `Consume` answers an agent that has no
+    // shim and promises no `data-nyx-*` survives, and the way to keep that promise is not to write
+    // the mark rather than to write it and strip it back — a placeholder never goes through
+    // [`reference::resolve_axes`] at all, so a stamp there would have survived.
+    match walk.vocabulary {
+        Vocabulary::Preserve if carries_own_markup(node) => {
+            reference::stamp_node_key(&markup, node_key)
+        }
+        _ => markup,
+    }
+}
+
+/// [`resolve_node`] minus the node mark — the resolution itself. Split out so the mark is applied in
+/// ONE place, over every path this function can return through.
+fn resolve_node_markup(
     walk: &LenientWalk<'_>,
     node: &CompositionNode,
     node_key: &str,
@@ -2136,6 +2217,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The markup with every [`NODE_ATTR`] mark removed — for the assertions about the INTERACTION
+    /// vocabulary, which the node mark is not part of. Like [`crate::css_slot::SCOPE_ATTR`] it is an
+    /// IDENTITY (which node is this element?), never an instruction the shim's applier interprets.
+    fn strip_node_marks(markup: &str) -> String {
+        let mut out = String::with_capacity(markup.len());
+        let mut rest = markup;
+        let needle = format!(" {NODE_ATTR}=\"");
+        while let Some(at) = rest.find(&needle) {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + needle.len()..];
+            let end = after.find('"').map(|e| e + 1).unwrap_or(after.len());
+            rest = &after[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     fn components() -> Vec<RenderComponent> {
         vec![
             // A slot component: header text (escaped) + a raw html param + the composed slot.
@@ -2156,7 +2254,12 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        assert_eq!(out, "<button data-state=\"idle\">OK</button>");
+        // …and the node NAMES ITSELF on its own root: that mark is what makes a click in the frame
+        // resolve to a `node_key` of the named tree (finding `01KYW77Y65A9HYNDZ69M67S6B8`).
+        assert_eq!(
+            out,
+            "<button data-nyx-node=\"Button\" data-state=\"idle\">OK</button>"
+        );
     }
 
     #[test]
@@ -2171,10 +2274,14 @@ mod tests {
             ]
         });
         let out = render_composition(&components(), &[], &composition.to_string()).unwrap();
+        // Each node names its OWN root, and the two same-named siblings share one key — the
+        // documented consequence of the convention (`contract/design-fixtures.json`, `node_key`).
         assert_eq!(
             out,
-            "<section class=\"card\"><h2>Actions</h2><p>intro</p><div class=\"slot\">\
-             <button data-state=\"idle\">Yes</button><button data-state=\"idle\">No</button>\
+            "<section data-nyx-node=\"Card\" class=\"card\"><h2>Actions</h2><p>intro</p>\
+             <div class=\"slot\">\
+             <button data-nyx-node=\"Card/Button\" data-state=\"idle\">Yes</button>\
+             <button data-nyx-node=\"Card/Button\" data-state=\"idle\">No</button>\
              </div></section>"
         );
     }
@@ -2208,7 +2315,9 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        assert_eq!(out, "<hr class=\"thin\"/>");
+        // An `[inline]` one-off is a node like any other: it names itself, under the `inline` label
+        // the convention gives a node with neither `key` nor `component`.
+        assert_eq!(out, "<hr data-nyx-node=\"inline\" class=\"thin\"/>");
     }
 
     #[test]
@@ -2509,8 +2618,11 @@ mod tests {
         assert_eq!(resolved.css_slots.len(), 1);
         assert_eq!(resolved.css_slots[0].component, "Spinner");
         assert!(resolved.css_slots[0].refused.is_none());
-        // The BUTTON's own root is untouched — a component with no slot is not marked.
-        assert!(resolved.markup.starts_with("<button class=\"btn\">"));
+        // The BUTTON's own root carries NO scope — a component with no slot is not marked (its
+        // `data-nyx-node` is the node mark, which every node's root carries).
+        assert!(resolved
+            .markup
+            .starts_with("<button data-nyx-node=\"Button\" class=\"btn\">"));
     }
 
     /// …AND IT REACHES THE AGENT TOO. `resolve_component` / `Vocabulary::Consume` run
@@ -2613,7 +2725,7 @@ mod tests {
         // A composition that reaches NO slotted component gets nothing appended at all.
         let without = json!({ "component": "Card" }).to_string();
         let plain = render_composition(&catalogue, &[], &without).expect("strict");
-        assert_eq!(plain, "<section></section>");
+        assert_eq!(plain, "<section data-nyx-node=\"Card\"></section>");
         assert!(render_composition_lenient(&catalogue, &[], &without, None)
             .expect("lenient")
             .css_slots
@@ -3000,7 +3112,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "<button class=\"btn\">\
+            "<button data-nyx-node=\"Button\" class=\"btn\">\
              <span hidden><i class=\"animate-spin h-3 w-3\" aria-label=\"Payer\">◌</i></span>\
              Payer</button>",
             "the sub-component is INLINED at render time, its `sm` classes baked in and its param \
@@ -3019,7 +3131,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             loading,
-            "<button class=\"btn opacity-70\">\
+            "<button data-nyx-node=\"Button\" class=\"btn opacity-70\">\
              <span><i class=\"animate-spin h-3 w-3\" aria-label=\"Payer\">◌</i></span>\
              Payer</button>",
             "the node's own `loading=on` puts its classes on and shows what it gates"
@@ -3064,8 +3176,10 @@ mod tests {
         // that fixed it rather than left live (finding `01KZ41YK39SGNKF6XV87A35GPN`). Nothing in the
         // frame pilots a node's axes, so a surviving mark would only ever be re-read by a shim that
         // ignores it — which is how a `loading=off` node kept showing its spinner.
+        // The node MARK is not part of that vocabulary: like `data-nyx-css` it is an IDENTITY, never
+        // an instruction — the shim's applier never reads it, it only answers "which node is this".
         assert!(
-            !out.contains("data-nyx-"),
+            !strip_node_marks(&out).contains("data-nyx-"),
             "the whole node is inert once its own axes are resolved: {out}"
         );
     }
@@ -3087,7 +3201,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "<div><section><article><p>hello</p></article></section></div>"
+            "<div data-nyx-node=\"Host\"><section><article><p>hello</p></article></section></div>"
         );
     }
 
@@ -3459,8 +3573,10 @@ mod tests {
                 && changed.contains("<i class=\"spin\">"),
             "outline + xl + loading=on: the three values act — {changed}"
         );
+        // The node MARK is not part of that vocabulary — an identity, not an instruction: it names
+        // which node an element belongs to, and the applier never reads it.
         assert!(
-            !changed.contains("data-nyx-"),
+            !strip_node_marks(&changed).contains("data-nyx-"),
             "…and the marks that decided it are CONSUMED, or the shim would ignore the clause (an \
              axis it does not declare) and un-hide it again — {changed}"
         );
@@ -3691,9 +3807,10 @@ mod tests {
         // The SHIM's attribute carries the SLUG (nothing about the shim changes), and the durable
         // id travels beside it.
         assert!(
-            frame
-                .markup
-                .contains("<button data-nyx-page=\"pricing\" data-nyx-page-id=\"pg-pricing\""),
+            frame.markup.contains(
+                "<button data-nyx-node=\"Card/Button\" data-nyx-page=\"pricing\" \
+                     data-nyx-page-id=\"pg-pricing\""
+            ),
             "{}",
             frame.markup
         );
@@ -3786,6 +3903,8 @@ mod tests {
                            "navigate_to": "pg-home" })
         .to_string();
         let out = render_composition_lenient(&nav_catalogue(), &two_pages(), &bare, None).unwrap();
+        // …and nothing to NAME either: the node mark hangs on a root element too, so a node that
+        // renders bare text is designated through the node that encloses it.
         assert_eq!(out.markup, "hi", "the node still renders");
         assert_eq!(out.navigation[0].status, NavigationStatus::NoAnchor);
         assert!(matches!(
@@ -3803,7 +3922,12 @@ mod tests {
         .to_string();
         let out =
             render_composition_lenient(&nav_catalogue(), &two_pages(), &structural, None).unwrap();
-        assert_eq!(out.markup, "<button class=\"btn\">A</button>");
+        // The same rule governs the node MARK: a structural node names nothing of its own, and the
+        // child's root keeps ITS key rather than being renamed by a parent that draws nothing.
+        assert_eq!(
+            out.markup,
+            "<button data-nyx-node=\"Nav/Button\" class=\"btn\">A</button>"
+        );
         assert_eq!(out.navigation[0].status, NavigationStatus::NoAnchor);
         assert!(
             out.navigation[0].detail.contains("STRUCTURAL"),
@@ -4001,6 +4125,129 @@ mod tests {
                 "[{id}] node_key_path walks the SAME convention as composition_nodes"
             );
         }
+    }
+
+    /// THE ARRIMAGE OF THE NODE MARK (finding `01KYW77Y65A9HYNDZ69M67S6B8`).
+    ///
+    /// The render WRITES [`NODE_ATTR`]; the frame's shim READS it — and the shim is a STRING
+    /// `eval`-uated inside a sandboxed `srcdoc` with no module system and no bundler, so it can
+    /// import nothing from anywhere. The two halves therefore spell the attribute twice by
+    /// construction, and what stops them drifting is this file: `contract/design-fixtures.json`
+    /// (`node_mark`) carries the attribute name AND the markup this very render produces, and
+    /// `design/shim-seam.test.ts` runs the real shim source over that markup.
+    ///
+    /// A break here is SILENT in the app: a shim reading an attribute nobody writes indexes zero
+    /// nodes, so every click in the page designates nothing — no params open, no comment can be
+    /// pinned. That is the failure mode the whole seam-test family exists to make loud.
+    #[test]
+    fn the_shared_fixture_pins_the_node_mark() {
+        let section = crate::mcp_tools_design::design_fixture_section("node_mark");
+        assert_eq!(
+            section["attribute"].as_str().expect("the attribute"),
+            NODE_ATTR,
+            "the attribute the shim scans for is the one this render writes"
+        );
+        let case = &section["case"];
+        let catalogue: Vec<RenderComponent> = case["catalogue"]
+            .as_array()
+            .expect("a catalogue")
+            .iter()
+            .map(|c| {
+                RenderComponent::new(
+                    c["name"].as_str().unwrap_or_default(),
+                    c["template"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let composition = case["composition"].to_string();
+
+        // (1) THE MARKUP, byte for byte — this is what the renderer's seam test mounts and clicks.
+        let frame = render_composition_lenient(&catalogue, &[], &composition, None).expect("frame");
+        assert_eq!(
+            frame.markup,
+            case["expected_frame_markup"].as_str().expect("the markup"),
+            "the markup the FRAME receives, node marks included"
+        );
+        assert_eq!(
+            frame.node_count,
+            case["node_count"].as_u64().expect("a node_count") as usize,
+            "node_count counts the nodes of the TREE — nothing the render added for its own sake"
+        );
+
+        // (2) WHICH NODES ARE MARKED. Every node that draws markup of its own names its roots; a
+        // STRUCTURAL node draws nothing, so it names nothing and its children keep their own keys.
+        let marked: Vec<String> = marks_in(&frame.markup);
+        let pinned: Vec<String> = case["marked_node_keys"]
+            .as_array()
+            .expect("the marked keys")
+            .iter()
+            .map(|k| k.as_str().expect("a node key").to_string())
+            .collect();
+        assert_eq!(
+            marked, pinned,
+            "the node keys the markup names, in document order"
+        );
+        for unmarked in case["unmarked_node_keys"]
+            .as_array()
+            .expect("the unmarked keys")
+        {
+            let key = unmarked.as_str().expect("a node key");
+            assert!(
+                !marked.iter().any(|m| m == key),
+                "a structural node draws nothing of its own, so it names nothing: {key}"
+            );
+            // …and it IS a node of the tree — the fixture must not be pinning a typo.
+            assert!(
+                composition_nodes(&composition)
+                    .iter()
+                    .any(|n| n.node_key == key),
+                "{key} is a node of the composition"
+            );
+        }
+
+        // (3) THE STRICT RENDER IS THE PRESERVE TWIN — same bytes, node marks included. This is the
+        // invariant `the_lenient_frame_render_is_the_strict_one_when_nothing_is_missing` states, run
+        // on the case that exercises the mark.
+        assert_eq!(
+            render_composition(&catalogue, &[], &composition).expect("strict"),
+            frame.markup,
+            "the strict render stamps identically — byte for byte"
+        );
+
+        // (4) THE AGENT NEVER SEES IT. `Vocabulary::Consume` answers a reader with no shim, and it
+        // promises no `data-nyx-*` survives; the mark is not written there at all.
+        let agent = resolve_composition(&catalogue, &[], &composition, None, None, &[])
+            .expect("the agent's resolution");
+        assert!(
+            !agent.markup.contains(NODE_ATTR),
+            "the AGENT's resolution carries no node mark: {}",
+            agent.markup
+        );
+        assert_eq!(
+            agent.node_count, frame.node_count,
+            "…and both walk the same tree"
+        );
+    }
+
+    /// The `node_key`s a piece of markup NAMES, in document order — the mark read back off the
+    /// markup, which is how the frame reads it too.
+    fn marks_in(markup: &str) -> Vec<String> {
+        let needle = format!("{NODE_ATTR}=\"");
+        let mut out = Vec::new();
+        let mut rest = markup;
+        while let Some(at) = rest.find(&needle) {
+            let after = &rest[at + needle.len()..];
+            let end = after.find('"').expect("a closed attribute");
+            out.push(
+                after[..end]
+                    .replace("&quot;", "\"")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&"),
+            );
+            rest = &after[end..];
+        }
+        out
     }
 
     /// The navigation VOCABULARY is DATA, like the unrendered reasons: the attribute names the

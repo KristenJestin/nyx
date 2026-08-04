@@ -2,8 +2,6 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import designFixtures from "../../../../../../contract/design-fixtures.json";
 
-import { markCompositionNodes, NODE_MARK_OPEN, rootNodeKey } from "../specs/composition-markers";
-import { compositionNodes } from "../specs/composition-nodes";
 import {
   buildFrameSrcdoc,
   DEPOT_FRAME_SOURCE,
@@ -25,19 +23,25 @@ import { PROTO_SHIM_SOURCE } from "./proto-shim";
  * `PROTO_SHIM_SOURCE` is a **string**. It is inlined into a sandboxed `srcdoc` with a CSP nonce and
  * evaluated inside a frame that has no module system, no bundler and no access to this codebase — so
  * it can import NOTHING. Every name it shares with the app is therefore spelled twice by
- * construction: the marker prefix `composition-markers.ts` writes, the `window.__nyx*` globals
- * `frame-srcdoc.ts` writes, the message names and the two `source` names the host and the frame
- * agree on. Three of those pairs had a constant on ONE side that nobody imported and a literal
- * re-typed on the other, which is the same thing as having no constant at all.
+ * construction: the node mark the SIDECAR stamps, the `window.__nyx*` globals `frame-srcdoc.ts`
+ * writes, the message names and the two `source` names the host and the frame agree on. Three of
+ * those pairs had a constant on ONE side that nobody imported and a literal re-typed on the other,
+ * which is the same thing as having no constant at all.
  *
  * What replaces the impossible import is this: run the shim source over DOM and globals produced by
  * the REAL producers, and read the shim's own source for the names it really asks for. A rename on
  * either half then fails here — which is what "arrimage" means, as opposed to a copy that goes on
  * looking right while the gesture underneath it is dead.
  *
+ * THE NODE MARK'S PRODUCER IS RUST, and Rust cannot be imported here either: its half of the pair
+ * travels through `contract/design-fixtures.json` (`node_mark`), which carries the attribute name
+ * AND the exact markup `render_composition_lenient` emits for one composition. Rust asserts it
+ * produces that markup (`render.rs::tests::the_shared_fixture_pins_the_node_mark`); this file runs
+ * the real shim over it. Not one node key is typed on either side.
+ *
  * # What a break here looks like in the app
  *
- * Nothing throws. A marker prefix that no longer matches indexes zero nodes, so every click in the
+ * Nothing throws. A node attribute that no longer matches resolves zero nodes, so every click in the
  * page designates nothing: no params open, no comment can be pinned. A global name that no longer
  * matches reads `undefined`, so a component with three axes renders as one with none. A message name
  * that no longer matches is IGNORED by the other side, because both sides guard on it. Silence, in
@@ -71,29 +75,43 @@ function fromHost(message: Record<string, unknown>) {
   );
 }
 
+/** The node mark, read off the shared contract — never spelled in this file. */
+const NODE_MARK = designFixtures.node_mark;
+
 /**
- * Build the frame's DOM from a composition, THE WAY THE REAL CHAIN DOES: the composition goes
- * through {@link markCompositionNodes} — the real producer of the node markers — and the resulting
- * tree is emitted the way the sidecar's lenient render emits it (an `[inline]` node's markup
- * VERBATIM, a component node as an element wrapping its children).
+ * Emit a composition the way the sidecar's lenient render emits it — an `[inline]` node's markup
+ * VERBATIM, a component node as an element wrapping its children — with each node's `node_key`
+ * stamped on the root it draws, under the attribute the CONTRACT names.
  *
- * Not one marker string is typed here: they come out of the module under test. That is the whole
- * point — the fixture DOM of `proto-shim.test.ts` spells `nyx-node:Root%2FCard` by hand, which is a
- * THIRD copy of the convention and cannot fail when the first two drift apart.
+ * A stand-in, and it says so: the byte-exact article is `node_mark.case.expected_frame_markup`,
+ * which Rust really produced and which the family below runs the shim over. This one exists so the
+ * OTHER families (the message channel, the globals, the selector ban) can state a tree in three
+ * lines without carrying a catalogue.
  */
 function renderMarked(composition: unknown): string {
-  const marked = markCompositionNodes(JSON.stringify(composition));
-  const emit = (node: Record<string, unknown>): string => {
+  const emit = (node: Record<string, unknown>, nodeKey: string): string => {
     const kids = Array.isArray(node.children) ? (node.children as Record<string, unknown>[]) : [];
-    const inner = kids.map(emit).join("");
-    if (typeof node.inline === "string") return node.inline;
-    const name = typeof node.component === "string" ? node.component : "structural";
-    return `<div data-component="${name}">${inner}</div>`;
+    const inner = kids.map((kid) => emit(kid, `${nodeKey}/${segment(kid)}`)).join("");
+    const mark = ` ${NODE_MARK.attribute}="${nodeKey.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"`;
+    if (typeof node.inline === "string") {
+      return node.inline.replace(/^<([a-z]+)/i, (_m, tag: string) => `<${tag}${mark}`);
+    }
+    // A STRUCTURAL node draws nothing of its own, so it names nothing — the render's own rule.
+    if (typeof node.component !== "string") return inner;
+    return `<div data-component="${node.component}"${mark}>${inner}</div>`;
   };
-  return emit(JSON.parse(marked ?? "{}") as Record<string, unknown>);
+  const root = composition as Record<string, unknown>;
+  return emit(root, segment(root));
 }
 
-/** Parse a markup fragment into real nodes, COMMENTS INCLUDED — the markers are comments. */
+/** The `node_key` SEGMENT of one node — the convention, read off the same contract. */
+function segment(node: Record<string, unknown>): string {
+  if (typeof node.key === "string" && node.key.length > 0) return node.key;
+  if (typeof node.component === "string" && node.component.length > 0) return node.component;
+  return designFixtures.node_key.inline_label;
+}
+
+/** Parse a markup fragment into real nodes. */
 function parseFragment(markup: string): Node[] {
   const parsed = new DOMParser().parseFromString(`<body>${markup}</body>`, "text/html");
   return [...parsed.body.childNodes].map((node) => document.importNode(node, true));
@@ -118,11 +136,6 @@ function clearGlobals() {
   }
 }
 
-/** Write ONE global the way the srcdoc's bootstrap does, through the shared prefix. */
-function setGlobal(name: string, value: unknown) {
-  (window as unknown as Record<string, unknown>)[`${FRAME_GLOBAL_PREFIX}${name}`] = value;
-}
-
 /** Click an element the way a user does — the shim delegates on the document. */
 function click(element: Element) {
   element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -142,98 +155,107 @@ afterEach(() => {
 });
 
 /**
- * FAMILY 4 — THE NODE MARKERS. `composition-markers.ts` exports `NODE_MARK_OPEN` / `NODE_MARK_CLOSE`
- * and nobody imported them; the shim re-typed both literals in its own source. A coherent rename
- * (the constant and every caller) left the shim on the old prefix, both suites green, and the
- * central gesture of the screen — click a component in the render, open its params — dead.
+ * FAMILY 4 — THE NODE MARK. The renderer used to ASK the sidecar for a second, marked-up render of
+ * the same composition (an inert HTML comment bracketing every node) and rebuild an element →
+ * `node_key` index out of those comments. The mark now comes from the RENDER itself
+ * (`render.rs`'s `NODE_ATTR`, stamped where `data-nyx-css` is stamped), so the producer is Rust and
+ * the consumer is a string this file `eval`s — two languages, no import possible either way.
+ *
+ * `contract/design-fixtures.json` (`node_mark`) is the join: the attribute name, and the exact
+ * markup Rust emits for one composition. A rename on either side stops the central gesture of the
+ * screen — click a component in the render, open its params — and fails here.
  */
-describe("the seam: the node markers the host asks for are the ones the shim reads", () => {
-  const COMPOSITION = {
-    key: "Root",
-    component: "Page",
-    children: [
-      {
-        component: "Card",
-        children: [
-          { component: "Button", key: "Save", children: [{ inline: "<span>Save</span>" }] },
-        ],
-      },
-      { component: "Aside" },
-      // A HOSTILE segment label: `-` and `>` are exactly what would let a node's own name
-      // terminate the comment it travels in (`-->`). The producer escapes them and the shim decodes
-      // them back — a pair that has to be exercised TOGETHER, or the region silently breaks in half.
-      { component: "Odd", key: "a-->b" },
-    ],
-  };
+describe("the seam: the node mark the RENDER stamps is the one the shim reads", () => {
+  const CASE = NODE_MARK.case;
 
-  test("a click resolves to the node_key the SHARED convention produced", () => {
-    const root = mountFrame(renderMarked(COMPOSITION));
-    // The root's key is handed over separately — `#depot-root` is the one node the markup cannot
-    // name — and it comes from the real producer too.
-    setGlobal("RootNode", rootNodeKey(JSON.stringify(COMPOSITION)));
+  /** Every element the render really marked, with the key it carries — read off the markup. */
+  function markedElements(root: HTMLElement): { el: Element; nodeKey: string }[] {
+    return [...root.querySelectorAll(`[${NODE_MARK.attribute}]`)].map((el) => ({
+      el,
+      nodeKey: el.getAttribute(NODE_MARK.attribute) ?? "",
+    }));
+  }
+
+  test("the markup Rust emits names exactly the nodes the contract pins", () => {
+    const root = mountFrame(CASE.expected_frame_markup);
+    expect(
+      markedElements(root).map((m) => m.nodeKey),
+      CASE.why,
+    ).toEqual(CASE.marked_node_keys);
+    // …and a STRUCTURAL node names nothing: it draws no element of its own.
+    for (const nodeKey of CASE.unmarked_node_keys) {
+      expect(CASE.marked_node_keys, CASE.unmarked_note).not.toContain(nodeKey);
+    }
+  });
+
+  test("a click on a marked element resolves to the key the RENDER wrote on it", () => {
+    const root = mountFrame(CASE.expected_frame_markup);
+    installShim();
+    fromHost({ type: "pick-mode", mode: "select" });
+
+    for (const { el, nodeKey } of markedElements(root)) {
+      postSpy.mockClear();
+      click(el);
+      expect(postedOfType(postSpy, "select"), `clicking ${nodeKey}`).toEqual([
+        { source: DEPOT_FRAME_SOURCE, type: "select", nodeKey },
+      ]);
+    }
+  });
+
+  test("a click INSIDE a node walks up to it — the mark is on the roots only", () => {
+    // The Button's `<svg>` and its `<rect>` carry no mark: marking every descendant is what drew a
+    // ring around each rect of an icon separately (fourteen outlines for one node, seen in the app).
+    const root = mountFrame(CASE.expected_frame_markup);
+    installShim();
+    fromHost({ type: "pick-mode", mode: "select" });
+
+    const deep = root.querySelector("rect");
+    expect(deep, "the case carries an element nested inside a node").toBeTruthy();
+    expect(deep!.hasAttribute(NODE_MARK.attribute)).toBe(false);
+    const owner = deep!.closest(`[${NODE_MARK.attribute}]`)!.getAttribute(NODE_MARK.attribute);
+    postSpy.mockClear();
+    click(deep!);
+    expect(postedOfType(postSpy, "select")).toEqual([
+      { source: DEPOT_FRAME_SOURCE, type: "select", nodeKey: owner },
+    ]);
+  });
+
+  test("every marked node is a region the shim can RING, and only its own root", () => {
+    const root = mountFrame(CASE.expected_frame_markup);
+    installShim();
+
+    for (const { el, nodeKey } of markedElements(root)) {
+      fromHost({ type: "highlight-node", nodeKey });
+      const ringed = [...document.querySelectorAll(`.${PICK_CLASSES.selected}`)];
+      expect(ringed, `${nodeKey} rings its own root and nothing else`).toEqual([el]);
+    }
+    // A key nothing draws rings nothing, rather than ringing the whole page.
+    fromHost({ type: "highlight-node", nodeKey: CASE.unmarked_node_keys[0] });
+    expect(document.querySelectorAll(`.${PICK_CLASSES.selected}`).length).toBe(0);
+  });
+
+  test("a node whose own KEY is hostile to the attribute survives it verbatim", () => {
+    // A quote, an ampersand and an angle bracket in a node's `key`: the render ESCAPES them and the
+    // DOM gives them back — a pair that has to be exercised together, or the key silently truncates.
+    const hostile = CASE.marked_node_keys.find((k) => /["&<]/.test(k));
+    expect(hostile, "the case carries a hostile key").toBeTruthy();
+    const root = mountFrame(CASE.expected_frame_markup);
     installShim();
     fromHost({ type: "pick-mode", mode: "select" });
     postSpy.mockClear();
 
-    // The DEEPEST node wins, and the key it must answer with is READ OFF the other implementation
-    // of the same convention rather than typed here: `<span>` is the `[inline]` child of the Save
-    // button, so it belongs to that inline node, not to the button.
-    const keys = compositionNodes(JSON.stringify(COMPOSITION)).map((n) => n.nodeKey);
-    const deepest = keys.find((k) => k.endsWith("/Save/inline"));
-    expect(deepest, "the convention names the inline child of the Save button").toBeTruthy();
-    click(root.querySelector("span")!);
+    const el = markedElements(root).find((m) => m.nodeKey === hostile)!.el;
+    click(el);
     expect(postedOfType(postSpy, "select")).toEqual([
-      { source: DEPOT_FRAME_SOURCE, type: "select", nodeKey: deepest },
-    ]);
-
-    postSpy.mockClear();
-    click(root.querySelector('[data-component="Aside"]')!);
-    expect(postedOfType(postSpy, "select")).toEqual([
-      {
-        source: DEPOT_FRAME_SOURCE,
-        type: "select",
-        nodeKey: keys.find((k) => k.endsWith("/Aside")),
-      },
-    ]);
-
-    // …and the node whose own NAME could have cut its marker in half resolves like any other.
-    postSpy.mockClear();
-    click(root.querySelector('[data-component="Odd"]')!);
-    expect(postedOfType(postSpy, "select")).toEqual([
-      {
-        source: DEPOT_FRAME_SOURCE,
-        type: "select",
-        nodeKey: keys.find((k) => k.endsWith("/a-->b")),
-      },
+      { source: DEPOT_FRAME_SOURCE, type: "select", nodeKey: hostile },
     ]);
   });
 
-  test("every node of the tree is reachable — the two walks name the same set", () => {
-    mountFrame(renderMarked(COMPOSITION));
-    setGlobal("RootNode", rootNodeKey(JSON.stringify(COMPOSITION)));
-    installShim();
-
-    // `compositionNodes` is the OTHER reader of the same convention (the tree pane, the comment
-    // anchors). Every key it names must be an element the shim can ring, or a comment pinned from
-    // the tree would highlight nothing in the render.
-    const keys = compositionNodes(JSON.stringify(COMPOSITION)).map((n) => n.nodeKey);
-    expect(keys.length).toBeGreaterThan(3);
-    for (const nodeKey of keys) {
-      fromHost({ type: "highlight-node", nodeKey });
-      expect(
-        document.querySelectorAll(`.${PICK_CLASSES.selected}`).length,
-        `${nodeKey} is a region the shim can ring`,
-      ).toBeGreaterThan(0);
-    }
-  });
-
-  test("the marker prefix the shim scans for is the one the module writes", () => {
+  test("the attribute the shim scans for is the one the contract names", () => {
     // The behavioural tests above already bite; this states the pair in one line, so the failure
     // NAMES the divergence instead of only showing a gesture that stopped working.
-    expect(PROTO_SHIM_SOURCE).toContain(`var MARK_OPEN = "${NODE_MARK_OPEN}";`);
-    expect(markCompositionNodes(JSON.stringify(COMPOSITION)) ?? "").toContain(
-      `<!--${NODE_MARK_OPEN}`,
-    );
+    expect(PROTO_SHIM_SOURCE).toContain(`var NODE_ATTR = "${NODE_MARK.attribute}";`);
+    expect(CASE.expected_frame_markup).toContain(`${NODE_MARK.attribute}="`);
   });
 });
 
@@ -262,8 +284,7 @@ describe("the seam: the message channel between the frame and the host", () => {
   });
 
   test("each declared host type really DOES something, and a foreign source does nothing", () => {
-    mountFrame(renderMarked({ key: "Root", children: [{ component: "Card" }] }));
-    setGlobal("RootNode", "Root");
+    mountFrame(renderMarked({ key: "Root", component: "Page", children: [{ component: "Card" }] }));
     installShim();
 
     // `highlight-node` rings a node…
@@ -302,7 +323,7 @@ describe("the seam: the globals the srcdoc writes are the globals the shim reads
     expect(PROTO_SHIM_SOURCE).toContain(`window["${FRAME_GLOBAL_PREFIX}" + name]`);
   });
 
-  test("the REAL bootstrap drives the REAL applier — axes, active combination and root node", () => {
+  test("the REAL bootstrap drives the REAL applier — the axes and the active combination", () => {
     const srcdoc = buildFrameSrcdoc({
       markup: `<div data-nyx-axis="variant"></div>`,
       tailwindSource: "",
@@ -326,7 +347,6 @@ describe("the seam: the globals the srcdoc writes are the globals the shim reads
         },
       ],
       axisValues: { variant: "ghost", loading: "on" },
-      rootNode: "Root",
     });
 
     // The bootstrap the builder really emitted — not a hand-written stand-in.
@@ -337,19 +357,20 @@ describe("the seam: the globals the srcdoc writes are the globals the shim reads
     expect(bootstrap, "the srcdoc carries a bootstrap that writes the globals").toBeTruthy();
 
     mountFrame(
-      `<div data-nyx-axis="variant" id="target"><i data-nyx-if="loading=on" id="spin">◌</i></div>`,
+      `<div data-nyx-axis="variant" id="target" ${NODE_MARK.attribute}="Root">` +
+        `<i data-nyx-if="loading=on" id="spin">◌</i></div>`,
     );
     (0, eval)(bootstrap!);
     installShim();
 
-    // The applier read the AXES, the ACTIVE COMBINATION and the ROOT KEY through the same names.
+    // The applier read the AXES and the ACTIVE COMBINATION through the same names…
     expect(document.getElementById("target")!.className).toContain("bg-transparent");
     expect(document.getElementById("spin")!.hidden).toBe(false);
     expect(document.querySelectorAll("#depot-chip-bar .depot-chip").length).toBe(4);
+    // …and the node the RENDER named is the one the host can ring. The root's key travels in the
+    // MARKUP now, not as a global: the bootstrap has one name fewer to keep in sync.
     fromHost({ type: "highlight-node", nodeKey: "Root" });
-    expect(document.getElementById("depot-root")!.classList.contains(PICK_CLASSES.selected)).toBe(
-      true,
-    );
+    expect(document.getElementById("target")!.classList.contains(PICK_CLASSES.selected)).toBe(true);
   });
 });
 
@@ -357,8 +378,8 @@ describe("the seam: the globals the srcdoc writes are the globals the shim reads
  * INVARIANT — **THE TREE IS THE CONTRACT, NEVER A CSS SELECTOR** (finding
  * `01KZ3JTWB82DCG0C6JT06T4CAF`, point 3).
  *
- * It is the central argument of `composition-markers.ts` and of the shim's own header, and nothing
- * enforced it. Depot's feedback shim, which this one was ported from, anchors a comment on a
+ * It is the central argument of the node mark and of the shim's own header, and nothing enforced
+ * it. Depot's feedback shim, which this one was ported from, anchors a comment on a
  * SELECTOR computed by walking up the tree until `querySelectorAll(…).length === 1`; nyx anchors on
  * a NODE of the named tree, because a selector breaks the moment a class changes and a design round
  * changes classes for a living. Re-introducing `computeSelector` would have been a fifty-line paste
@@ -407,7 +428,6 @@ describe("the invariant: the anchor is a node of the tree, never a CSS selector"
         ],
       }),
     );
-    setGlobal("RootNode", "Root");
     installShim();
     fromHost({ type: "pick-mode", mode: "select" });
     postSpy.mockClear();
@@ -465,7 +485,6 @@ describe("the invariant: a link that resolves to nothing does not navigate", () 
 
   test("the neutralized markup Rust pins posts NO navigation at all", () => {
     const root = mountFrame(nav.neutralisation_case.expected_markup);
-    setGlobal("RootNode", "Root");
     installShim();
     postSpy.mockClear();
 

@@ -115,6 +115,16 @@ in two different orders (finding `01KYSNPWWG9DA0AXP6D22GV5BK`).
   convention (family 2): a `node_key` is the `/`-join of every node's segment
   label — explicit `key`, else `component`, else `inline`. It is what a pinned
   comment is stored on and re-anchored by, and what a params write addresses.
+- `node_mark` — the ATTRIBUTE the render stamps a node's `node_key` on
+  (`data-nyx-node`), the markup it emits for one composition, and which nodes
+  carry it (finding `01KYW77Y65A9HYNDZ69M67S6B8`). It is what makes a click in
+  the frame resolve to a node of the named tree — ROOTS ONLY, so a ring outlines
+  the node and not each `<rect>` of an icon inside it, and FRAME ONLY, so the
+  agent's resolution keeps its promise that no `data-nyx-*` but `data-nyx-css`
+  survives. The renderer used to ask for a SECOND, comment-marked render of the
+  same composition and read the names back out of the comments; that cost
+  `n + 2(n−1)` rendered nodes for a page of `n`, made `node_count` count
+  markers, and had the `node_key` convention living in two languages at once.
 - `node_contract` — `max_nodes` and the case that proves WHAT the cap bounds
   (family 3). Both halves carried 12 while bounding two different things —
   MESSAGES in Rust, NODES in TypeScript — so on a composition where every node
@@ -144,6 +154,7 @@ Who reads it:
 | Rust | `mcp_tools_design.rs::tests::the_shared_fixture_pins_the_six_param_types` |
 | Rust | `mcp_context.rs::tests::the_manual_teaches_exactly_the_six_param_types_the_write_path_accepts` — extracts the SIX BULLETS out of the rendered manual |
 | Rust | `render.rs::tests::the_shared_fixture_pins_the_node_key_convention` |
+| Rust | `render.rs::tests::the_shared_fixture_pins_the_node_mark` |
 | Rust | `mcp_tools_design.rs::tests::the_shared_fixture_pins_what_the_node_contract_cap_bounds` |
 | Rust | `render/viewport.rs::tests::the_shared_fixture_pins_the_named_viewport_widths` |
 | TS | `axes.test.ts` — the `the shared Rust ⟷ TS fixture` suite |
@@ -151,6 +162,7 @@ Who reads it:
 | TS | `use-design-render.test.tsx` — the unrendered, css-slot and navigation vocabularies |
 | TS | `params.test.ts` — the six param types, and `empty_param_cases` |
 | TS | `specs/composition-nodes.test.ts` — the `node_key` cases |
+| TS | `design/shim-seam.test.ts` — the `node_mark` markup, run through the real shim |
 | TS | `composition-contract.test.ts` — what the node-contract cap bounds |
 | TS | `viewports.test.ts` — the named widths |
 | TS | `frame-srcdoc.test.ts` — the placeholder class and its three declarations |
@@ -163,22 +175,26 @@ and the frame only DISPLAYS that list (`use-design-render.test.tsx` pins
 `reasons[].code` / `reasons[].short` in both directions), and `params.test.ts`
 replays `empty_param_cases` against `paramsWithoutPreviewValue`.
 
-## The intra-TypeScript seam — `shim-seam.test.ts`
+## The shim seam — `shim-seam.test.ts`
 
-Three pairs of names cannot be arrimé by a fixture and cannot be arrimé by an
-import either: the interaction shim (`design/proto-shim.ts`) ships as a
-**string**, inlined into a sandboxed `srcdoc` with a CSP nonce and evaluated in
-a frame that has no module system. It imports nothing, so the marker prefix, the
-`window.__nyx*` globals and the ten message types are spelled twice by
-construction (finding `01KZ3JTVM23C3MBATJZ3RYVPY6`, families 4, 5 and 6).
+Three pairs of names cannot be arrimé by an import: the interaction shim
+(`design/proto-shim.ts`) ships as a **string**, inlined into a sandboxed
+`srcdoc` with a CSP nonce and evaluated in a frame that has no module system. It
+imports nothing, so the node mark, the `window.__nyx*` globals and the ten
+message types are spelled twice by construction (finding
+`01KZ3JTVM23C3MBATJZ3RYVPY6`, families 4, 5 and 6).
 
 `design/shim-seam.test.ts` is what replaces the impossible import: it runs the
-shim source over DOM built by `composition-markers.ts` and over the bootstrap
-`buildFrameSrcdoc` really emitted, and reads the shim's own source for the names
-it asks for. It also carries the two NEGATIVE tests of finding
-`01KZ3JTWB82DCG0C6JT06T4CAF`: no CSS selector may be computed in the shim (the
-tree is the contract), and a link the render NEUTRALIZED must post no navigation
-at all.
+shim source over the bootstrap `buildFrameSrcdoc` really emitted and over the
+markup the SIDECAR really renders, and reads the shim's own source for the names
+it asks for. The node mark is the one pair whose producer is in the OTHER
+language, so it does travel through this contract — `node_mark` carries the
+attribute name and the byte-exact markup `render_composition_lenient` emits for
+one composition (finding `01KYW77Y65A9HYNDZ69M67S6B8`): Rust asserts it produces
+that markup, the seam test clicks its way through it. The file also carries the
+two NEGATIVE tests of finding `01KZ3JTWB82DCG0C6JT06T4CAF`: no CSS selector may
+be computed in the shim (the tree is the contract), and a link the render
+NEUTRALIZED must post no navigation at all.
 
 One section has **no TS reader**, and by design:
 

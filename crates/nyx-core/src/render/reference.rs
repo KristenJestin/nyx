@@ -923,6 +923,53 @@ fn rebuild_with_navigation(tag: &Tag, attrs: &[(&str, &str)], vocabulary: &[&str
     out
 }
 
+// ---------------------------------------------------------------------------
+// THE NODE MARK (finding `01KYW77Y65A9HYNDZ69M67S6B8`)
+// ---------------------------------------------------------------------------
+
+/// STAMP a node's own `node_key` onto the TOP-LEVEL elements of its markup — the ROOTS of the region
+/// that node draws, and the only elements a designation gesture has to recognise.
+///
+/// This is what makes the RENDER designable: a click in the frame resolves to the `node_key` of the
+/// named tree by walking up to the nearest element carrying [`super::NODE_ATTR`]. The name is written
+/// HERE, beside the walk that knows it and right where [`stamp_scope`] writes the CSS scope — the
+/// convention lives in ONE place, this one, instead of being re-derived by whoever reads the markup.
+///
+/// # Roots only, and the deepest owner wins
+///
+/// Only depth-0 tags are stamped, for the same reason [`stamp_navigation`] stamps only those: a
+/// node's markup IS its root element(s), and marking every descendant would ring each `<rect>` of an
+/// icon's `<svg>` separately instead of ringing the node. A tag that ALREADY carries the mark is left
+/// verbatim — the walk is depth-first, so it can only have been claimed by a DEEPER node (a component
+/// whose whole template is `{{{children}}}` puts a child's root at its own top level), and the
+/// deepest node is the one an element belongs to.
+///
+/// Markup with no element at all (a template rendering bare text) comes back untouched: there is
+/// nothing to name, which is exactly what the shim then resolves to — the enclosing node.
+pub(super) fn stamp_node_key(markup: &str, node_key: &str) -> String {
+    let tags = scan_tags(markup);
+    if tags.is_empty() {
+        return markup.to_string();
+    }
+    let value = encode_attribute(node_key);
+    let mut out = String::with_capacity(markup.len() + value.len() + 24);
+    let mut cursor = 0usize;
+    for tag in &tags {
+        let claimed = tag.attrs.iter().any(|a| a.name == super::NODE_ATTR);
+        if tag.depth != 0 || tag.kind == TagKind::Close || claimed {
+            continue;
+        }
+        // The attribute is INSERTED right after the tag name, so every other byte is preserved
+        // verbatim — the same rewrite-free path the scope and the navigation marks take.
+        let at = tag.start + 1 + tag.name.len();
+        out.push_str(&markup[cursor..at]);
+        out.push_str(&format!(" {}=\"{value}\"", super::NODE_ATTR));
+        cursor = at;
+    }
+    out.push_str(&markup[cursor..]);
+    out
+}
+
 /// Does ONE clause of a condition hold at the active combination? A clause on an axis the component
 /// does NOT declare is IGNORED (true), never falsified — the shim's rule, kept identical.
 fn clause_matches<'a>(

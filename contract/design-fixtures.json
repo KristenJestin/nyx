@@ -307,12 +307,16 @@
       }
      ],
      "markup_contains": [
-      "<section class=\"card\">",
+      "class=\"card\"",
       "data-unrendered-node=\"Card/PricingTable\"",
       "data-unrendered-reason=\"not_in_catalogue\"",
       "[UNRENDERED PricingTable — not in the catalogue]",
       "[UNRENDERED Discovered — no template yet]",
       "[UNRENDERED Looper — template carries logic]"
+     ],
+     "frame_only_contains": [
+      "<section data-nyx-node=\"Card\" class=\"card\">",
+      "<div data-nyx-node=\"Card/PricingTable\" class=\"nyx-unrendered\""
      ]
     }
    },
@@ -396,7 +400,8 @@
       "opacity-70"
      ],
      "frame_only_contains": [
-      "data-nyx-page=\"pricing\""
+      "data-nyx-page=\"pricing\"",
+      "data-nyx-node=\"Root/Button\""
      ],
      "agent_only_contains": [],
      "markup_absent": [
@@ -725,7 +730,7 @@
    "navigate_to": "pg-gone",
    "pages": [],
    "expected_status": "unknown_page",
-   "expected_markup": "<button class=\"btn\" data-nyx-page-missing=\"pg-gone\">Voir</button>",
+   "expected_markup": "<button data-nyx-node=\"Root\" class=\"btn\" data-nyx-page-missing=\"pg-gone\">Voir</button>",
    "absent_attributes": [
     "data-nyx-page",
     "data-nyx-page-id"
@@ -749,7 +754,7 @@
   "unknown_type_note": "An unknown `type` is REFUSED at the write, naming the offending param and the accepted values — it is NOT repaired into `text`. The renderer, which only DISPLAYS a row already stored, coerces an unknown type to `text` rather than dropping the control: the two are not in contradiction, and both sides read this same list to decide what 'unknown' means."
  },
  "node_key": {
-  "_comment": "THE `node_key` CONVENTION — one rule, and it was written four times. A node_key is the `separator`-join of every node's SEGMENT LABEL from the root down, and a segment label is the node's explicit `key`, else its `component` name, else `inline_label`. It is the anchor a pinned comment is STORED on (prototype_feedback.node_key), the address the params write targets (proto_variant_set_node_params), and the path the coder seam hands over. Change a segment on one side alone and the stored comments stop re-anchoring while the params writes land on the wrong node — silently, both. Rust: render.rs::CompositionNode::key + composition_nodes + node_key_path, read here in render.rs::tests::the_shared_fixture_pins_the_node_key_convention. TypeScript: ONE implementation now (specs/composition-nodes.ts::nodeSegmentLabel, imported by composition-markers.ts and composition-tree.tsx instead of being re-typed), read here in specs/composition-nodes.test.ts. Hand-written, never generated.",
+  "_comment": "THE `node_key` CONVENTION — one rule, and it was written four times. A node_key is the `separator`-join of every node's SEGMENT LABEL from the root down, and a segment label is the node's explicit `key`, else its `component` name, else `inline_label`. It is the anchor a pinned comment is STORED on (prototype_feedback.node_key), the address the params write targets (proto_variant_set_node_params), and the path the coder seam hands over. Change a segment on one side alone and the stored comments stop re-anchoring while the params writes land on the wrong node — silently, both. Rust: render.rs::CompositionNode::key + composition_nodes + node_key_path, read here in render.rs::tests::the_shared_fixture_pins_the_node_key_convention. TypeScript: ONE implementation (specs/composition-nodes.ts::nodeSegmentLabel, read by composition-tree.tsx instead of being re-typed), read here in specs/composition-nodes.test.ts. See `node_mark` for how the same key reaches the MARKUP, which is a different question and now has a single producer too. Hand-written, never generated.",
   "separator": "/",
   "inline_label": "inline",
   "cases": [
@@ -831,6 +836,78 @@
     ]
    }
   ]
+ },
+ "node_mark": {
+  "_comment": "THE NODE MARK — how a click in the RENDER resolves to a node of the NAMED TREE (finding 01KYW77Y65A9HYNDZ69M67S6B8). The render stamps a node's `node_key` on the ROOT element(s) of the markup that node draws, exactly where it already stamps `data-nyx-css`; the frame's shim walks up from the clicked element to the nearest one carrying it. THE TREE IS THE CONTRACT: a comment is stored on prototype_feedback.node_key, re-anchored across rounds by that key, and read by the coder seam under the same Root/Header/Title paths — a CSS SELECTOR would be a second identity for the same node, one that dies the first time a class is renamed. This section is the ARRIMAGE between the two halves that cannot import each other: Rust WRITES the attribute (render.rs::NODE_ATTR, read here in render.rs::tests::the_shared_fixture_pins_the_node_mark) and the shim READS it (design/proto-shim.ts, a STRING evaluated inside a sandboxed frame — no module system, no bundler, nothing it can import), replayed over this very markup in design/shim-seam.test.ts. It REPLACES the inert HTML comment markers the renderer used to ask for in a SECOND render of the same composition: that cost n + 2(n-1) rendered nodes for a page of n, made node_count count markers, and put the node_key convention in two places at once. Hand-written, never generated.",
+  "attribute": "data-nyx-node",
+  "roots_only": true,
+  "roots_only_note": "ONLY the root element(s) of a node's own markup carry the mark, never its descendants. That is what a RING is drawn on: marking every descendant outlined each <rect> of an icon's <svg> separately — fourteen outlines for one node, seen in the running app — which reads as a rendering fault rather than a selection. Resolution is therefore an ancestor walk, and the DEEPEST marked ancestor wins.",
+  "frame_only": true,
+  "frame_only_note": "The mark is INTERACTION vocabulary, so only the resolution destined for the FRAME carries it (Vocabulary::Preserve). The one destined for the AGENT (Vocabulary::Consume) does not write it at all: an agent has no shim, no frame and no click, so a mark it cannot act on is a mark it must not read back — and the promise that a resolved answer keeps no data-nyx-* but data-nyx-css stays literally true. The STRICT render is the Preserve twin and stamps identically, which is what keeps the_lenient_frame_render_is_the_strict_one_when_nothing_is_missing byte for byte.",
+  "case": {
+   "id": "every-node-that-draws-names-its-own-roots",
+   "why": "One page, and every shape the mark has to answer for: component nodes (Root, Card, Save), an [inline] one-off, a node whose own KEY is hostile to the attribute it travels in (a quote, an ampersand, an angle bracket — the analogue of the `-->` that could have cut a comment marker in half), and a STRUCTURAL node, which draws nothing of its own and therefore names nothing: its child keeps ITS key rather than being renamed by a parent that has no markup. The Button's <svg> and <rect> carry NO mark — they are inside the node, not the node — so a click on them resolves by walking up, which is the whole reason the mark sits on roots only.",
+   "catalogue": [
+    {
+     "name": "Page",
+     "template": "<main class=\"page\">{{{children}}}</main>"
+    },
+    {
+     "name": "Card",
+     "template": "<section class=\"card\">{{{children}}}</section>"
+    },
+    {
+     "name": "Button",
+     "template": "<button class=\"btn\"><svg class=\"icon\"><rect/></svg>{{label}}</button>"
+    }
+   ],
+   "composition": {
+    "key": "Root",
+    "component": "Page",
+    "children": [
+     {
+      "component": "Card",
+      "children": [
+       {
+        "component": "Button",
+        "key": "Save",
+        "params": {
+         "label": "Enregistrer"
+        }
+       },
+       {
+        "inline": "<hr class=\"rule\"/>"
+       }
+      ]
+     },
+     {
+      "key": "Group",
+      "children": [
+       {
+        "component": "Button",
+        "key": "a\"b&c<d",
+        "params": {
+         "label": "Odd"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "node_count": 6,
+   "expected_frame_markup": "<main data-nyx-node=\"Root\" class=\"page\"><section data-nyx-node=\"Root/Card\" class=\"card\"><button data-nyx-node=\"Root/Card/Save\" class=\"btn\"><svg class=\"icon\"><rect/></svg>Enregistrer</button><hr data-nyx-node=\"Root/Card/inline\" class=\"rule\"/></section><button data-nyx-node=\"Root/Group/a&quot;b&amp;c&lt;d\" class=\"btn\"><svg class=\"icon\"><rect/></svg>Odd</button></main>",
+   "marked_node_keys": [
+    "Root",
+    "Root/Card",
+    "Root/Card/Save",
+    "Root/Card/inline",
+    "Root/Group/a\"b&c<d"
+   ],
+   "unmarked_node_keys": [
+    "Root/Group"
+   ],
+   "unmarked_note": "A STRUCTURAL node (no component, no inline) is only its children: it draws no element of its own, so there is nothing to mark and nothing to ring. The same rule already governs a link — a `navigate_to` on a structural node is refused by the strict render and named `no_anchor` by the lenient one."
+  }
  },
  "node_contract": {
   "_comment": "THE NODE CONTRACT'S CAP, and WHAT IT BOUNDS (finding 01KYQ0R9414Q5K63TBV9CCMC9J for the check, 01KZ3JTVM23C3MBATJZ3RYVPY6 for this arrimage). The check is written twice — mcp_tools_design.rs::composition_contract_warnings for the AGENT and design/composition-contract.ts::compositionContractReport for the HUMAN — and the cap was 12 on both sides while bounding two DIFFERENT things: MESSAGES in Rust, NODES in TypeScript. On a composition where every node has two defects the agent was told about 6 nodes and the human saw 12, i.e. the two halves of one surface disagreed about which nodes are the broken ones. It bounds NODES on both sides now, and this case is what proves it: `max_nodes` nodes named, in placement order, whatever the number of messages each one produces. Rust reads it in mcp_tools_design.rs::tests::the_shared_fixture_pins_what_the_node_contract_cap_bounds; TypeScript in design/composition-contract.test.ts.",

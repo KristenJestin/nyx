@@ -477,10 +477,15 @@ describe("proto shim — the legacy prefix is still READ (never written)", () =>
   /**
    * DESIGNATING A NODE (finding `01KYW32N1BVDVTGS0WPMG2PJW2`) — the render IS the composition.
    *
-   * The node names reach the markup as inert HTML COMMENTS bracketing each node
-   * (`composition-markers.ts`); the shim reads them into an element -> node_key index and answers a
-   * click with the node it landed in. Ported from depot's feedback shim MINUS its `computeSelector`:
-   * here the anchor is a NODE of the named tree, never a CSS selector.
+   * The node names are in the markup because the SIDECAR STAMPED THEM there: `data-nyx-node` on the
+   * root element(s) of each node's own markup (`render.rs`'s `NODE_ATTR`, finding
+   * `01KYW77Y65A9HYNDZ69M67S6B8`). The shim walks up from the clicked element to the nearest mark.
+   * Ported from depot's feedback shim MINUS its `computeSelector`: here the anchor is a NODE of the
+   * named tree, never a CSS selector.
+   *
+   * The markup here is a hand-written stand-in for what the render emits; the BYTE-EXACT article
+   * Rust really produces is replayed through this same shim in `shim-seam.test.ts`, off
+   * `contract/design-fixtures.json`.
    */
   describe("designating a node", () => {
     /** `Root` > (`Root/Card` > `Root/Card/Save`) + `Root/Aside`, marked as the sidecar emits them. */
@@ -488,28 +493,14 @@ describe("proto shim — the legacy prefix is still READ (never written)", () =>
       document.body.replaceChildren();
       const root = document.createElement("div");
       root.id = "depot-root";
-      const card = document.createElement("section");
-      card.id = "card";
-      const save = document.createElement("button");
-      save.id = "save";
-      save.textContent = "Save";
-      const label = document.createElement("span");
-      label.id = "label";
-      label.textContent = "Save";
-      save.appendChild(label);
-      card.appendChild(document.createComment("nyx-node:Root%2FCard%2FSave"));
-      card.appendChild(save);
-      card.appendChild(document.createComment("/nyx-node:Root%2FCard%2FSave"));
-      root.appendChild(document.createComment("nyx-node:Root%2FCard"));
-      root.appendChild(card);
-      root.appendChild(document.createComment("/nyx-node:Root%2FCard"));
-      const aside = document.createElement("aside");
-      aside.id = "aside";
-      root.appendChild(document.createComment("nyx-node:Root%2FAside"));
-      root.appendChild(aside);
-      root.appendChild(document.createComment("/nyx-node:Root%2FAside"));
+      root.innerHTML =
+        `<div data-nyx-node="Root">` +
+        `<section id="card" data-nyx-node="Root/Card">` +
+        `<button id="save" data-nyx-node="Root/Card/Save"><span id="label">Save</span></button>` +
+        `</section>` +
+        `<aside id="aside" data-nyx-node="Root/Aside"></aside>` +
+        `</div>`;
       document.body.appendChild(root);
-      (window as unknown as { __nyxRootNode: string }).__nyxRootNode = "Root";
     }
 
     function host(message: Record<string, unknown>) {
@@ -555,11 +546,11 @@ describe("proto shim — the legacy prefix is still READ (never written)", () =>
       ]);
     });
 
-    test("the ROOT region is #depot-root itself — the one node the markup cannot name", () => {
-      // An element sitting in the root's own region (outside every bracket) resolves TO THE ROOT —
-      // the node `#depot-root` stands for, named by the host because the markup cannot name it.
+    test("an element in the ROOT node's own markup resolves to the root", () => {
+      // The root node names ITSELF now, like every other: `#depot-root` is the host's wrapper, not a
+      // node, so an element the root node draws resolves by the same ancestor walk as any other.
       const loose = document.createElement("p");
-      document.getElementById("depot-root")!.appendChild(loose);
+      document.querySelector('[data-nyx-node="Root"]')!.appendChild(loose);
       installShim();
       host({ type: "pick-mode", mode: "select" });
       postSpy.mockClear();
@@ -570,7 +561,7 @@ describe("proto shim — the legacy prefix is still READ (never written)", () =>
     });
 
     test("select mode never steals a declared interaction (nav wins over designation)", () => {
-      const root = document.getElementById("depot-root")!;
+      const root = document.querySelector<HTMLElement>('[data-nyx-node="Root"]')!;
       const link = document.createElement("a");
       link.id = "nav-link";
       link.setAttribute("data-nyx-page", "settings");

@@ -546,17 +546,10 @@ describe("buildFrameSrcdoc", () => {
       expect(html).toContain(`.${PICK_CLASSES.pinned}{outline:2px dashed #f59e0b`);
     });
 
-    test("hands the shim the ROOT node's key, and null when the host names none", () => {
-      expect(buildFrameSrcdoc({ ...base, rootNode: "Root" })).toContain(
-        'window.__nyxRootNode="Root"',
-      );
-      expect(buildFrameSrcdoc(base)).toContain("window.__nyxRootNode=null");
-    });
-
     /** Picking loosens NOTHING: same CSP, same two nonce'd scripts, no network. */
     test("changes no line of the CSP", () => {
       const plain = buildFrameSrcdoc(base);
-      const picking = buildFrameSrcdoc({ ...base, rootNode: "Root" });
+      const picking = buildFrameSrcdoc({ ...base, showChrome: true });
       const csp = (html: string) =>
         /content="([^"]*default-src[^"]*)"/.exec(html)?.[1] ?? "MISSING";
       expect(csp(picking)).toBe(csp(plain));

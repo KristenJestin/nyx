@@ -1332,15 +1332,21 @@ fn render_of_the_frozen_composition_is_structurally_coherent() {
     //   * [NEW] PricingTable rendered from the proto sketch; [inline] note rendered bespoke;
     //   * the Button's SCOPED CSS SLOT: its roots STAMPED with the scope, its stylesheet appended
     //     ONCE at the end however many times the component is placed, its selectors already anchored
-    //     and its `@keyframes` already renamed under that scope (finding 01KYVMTWB71R0D0CT1SV88J8DX).
+    //     and its `@keyframes` already renamed under that scope (finding 01KYVMTWB71R0D0CT1SV88J8DX);
+    //   * EVERY NODE NAMES ITS OWN ROOT (`data-nyx-node`, finding 01KYW77Y65A9HYNDZ69M67S6B8) — the
+    //     named tree is legible IN the markup, which is what makes a click in the frame resolve to a
+    //     `node_key` without a second render and without a CSS selector. Note the two Buttons: same
+    //     component, DIFFERENT keys, so `Root/Save` and `Root/Cancel` — the placement is what the
+    //     mark carries, not the component name.
     let scope = nyx_core::css_slot::component_scope_id("Button");
     let expected = format!(
         concat!(
-            r#"<section class="ds-card"><header>Facturation</header><div class="ds-card__body">"#,
-            r#"<button data-nyx-css="{scope}" class="ds-btn" data-state="idle">Enregistrer</button>"#,
-            r#"<button data-nyx-css="{scope}" class="ds-btn" data-state="idle">Annuler</button>"#,
-            r#"<table class="pricing" data-plan="pro"></table>"#,
-            r#"<p class="note">brouillon</p>"#,
+            r#"<section data-nyx-node="Root" class="ds-card"><header>Facturation</header>"#,
+            r#"<div class="ds-card__body">"#,
+            r#"<button data-nyx-node="Root/Save" data-nyx-css="{scope}" class="ds-btn" data-state="idle">Enregistrer</button>"#,
+            r#"<button data-nyx-node="Root/Cancel" data-nyx-css="{scope}" class="ds-btn" data-state="idle">Annuler</button>"#,
+            r#"<table data-nyx-node="Root/PricingTable" class="pricing" data-plan="pro"></table>"#,
+            r#"<p data-nyx-node="Root/inline" class="note">brouillon</p>"#,
             r#"</div></section>"#,
             "<style data-nyx-css-slot=\"{scope}\">@keyframes {scope}-pulse {{\n",
             "  50% {{ opacity: .55 }}\n",
@@ -1362,12 +1368,12 @@ fn render_of_the_frozen_composition_is_structurally_coherent() {
 
     // Explicit structural checks (readable intent, beyond the exact-equality above):
     assert!(
-        markup.contains(r#"<section class="ds-card">"#),
+        markup.contains(r#"<section data-nyx-node="Root" class="ds-card">"#),
         "the [DS] Card node was REPLACED by its design-system template (named, not a placeholder)"
     );
     assert!(
         markup.contains(&format!(
-            r#"<div class="ds-card__body"><button data-nyx-css="{scope}" class="ds-btn" data-state="idle">Enregistrer</button>"#
+            r#"<div class="ds-card__body"><button data-nyx-node="Root/Save" data-nyx-css="{scope}" class="ds-btn" data-state="idle">Enregistrer</button>"#
         )),
         "placement respected: the first Button is NESTED inside the Card slot"
     );
@@ -1384,11 +1390,13 @@ fn render_of_the_frozen_composition_is_structurally_coherent() {
         "the GLOBAL animation name never reaches the frame: {markup}"
     );
     assert!(
-        markup.contains(r#"<table class="pricing" data-plan="pro"></table>"#),
+        markup.contains(
+            r#"<table data-nyx-node="Root/PricingTable" class="pricing" data-plan="pro"></table>"#
+        ),
         "the [NEW] node renders from the proto sketch"
     );
     assert!(
-        markup.contains(r#"<p class="note">brouillon</p>"#),
+        markup.contains(r#"<p data-nyx-node="Root/inline" class="note">brouillon</p>"#),
         "the [inline] one-off renders its bespoke markup"
     );
 }
