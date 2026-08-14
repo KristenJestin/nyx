@@ -23,7 +23,9 @@ use serde_json::{json, Value};
 
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
-use crate::mcp_runtime::{internal_db, optional_bool, optional_str, optional_usize, require_str};
+use crate::mcp_runtime::{
+    internal_db, map_content_write_err, optional_bool, optional_str, optional_usize, require_str,
+};
 use crate::mcp_tools_core::{ChangedTopic, ToolOutcome};
 
 // --- Tool name constants (advertised in `tools/list`, dispatched below) ------
@@ -53,13 +55,16 @@ pub const SPEC_UNLINK_TOOL: &str = "spec_unlink";
 /// `spec_deps` — read a Spec's dependency view + the computable "bloquée par / débloque" badges.
 pub const SPEC_DEPS_TOOL: &str = "spec_deps";
 
-/// The Spec authoring + transition tool names — advertised in `tools/list` and routed by
-/// [`dispatch_spec_tool`]. A closed slice so a new tool is added in exactly one place.
-pub const SPEC_TOOLS: [&str; 12] = [
+/// The Spec authoring tool names — advertised in `tools/list` and routed by [`dispatch_spec_tool`].
+/// A closed slice so a new tool is added in exactly one place. `spec_transition` is DELIBERATELY
+/// ABSENT from the agent surface (v2.8 review N17(b)): the four Spec lifecycle transitions are now
+/// imposed by NYX at the graph node built for each (ndev/nspec cover start/review/done/cancel and
+/// ready), so the effector never transitions a Spec — it only authors the draft. (`task_transition`
+/// STAYS: no graph covers task-level granularity — N17(d).)
+pub const SPEC_TOOLS: [&str; 11] = [
     SPEC_CREATE_TOOL,
     SPEC_UPDATE_SECTION_TOOL,
     SPEC_FORK_TOOL,
-    SPEC_TRANSITION_TOOL,
     SPEC_SET_WORKSPACE_TOOL,
     TASK_ADD_TOOL,
     TASK_TRANSITION_TOOL,
@@ -146,7 +151,9 @@ fn parse_task_transition(name: &str) -> Result<db::TaskTransition, RpcError> {
 
 /// Map a [`db::SpecTransitionError`] onto the D8 RPC vocabulary. The lifecycle rules live
 /// in `db.rs`; this only translates the typed refusal into the agent-facing code/message.
-fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
+/// `pub(crate)` so the `nyx_next` handler ([`crate::mcp_engine`]) — which imposes a graph
+/// `transition` through the SAME guarded authority — surfaces the SAME refusal vocabulary.
+pub(crate) fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
     match e {
         db::SpecTransitionError::NotFound => RpcError::new(RpcCode::InvalidId, "unknown spec"),
         db::SpecTransitionError::InvalidSource { from, to } => RpcError::new(
@@ -158,6 +165,14 @@ fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
             RpcError::new(
                 RpcCode::InvalidState,
                 "spec is not ready: the pre-ready validations failed (see data.failures)",
+            )
+            .with_data(json!({ "failures": detail }))
+        }
+        db::SpecTransitionError::CompletionValidationFailed(failures) => {
+            let detail = serde_json::to_value(&failures).unwrap_or(Value::Null);
+            RpcError::new(
+                RpcCode::InvalidState,
+                "spec is not complete: the pre-done validations failed (see data.failures)",
             )
             .with_data(json!({ "failures": detail }))
         }
@@ -174,7 +189,7 @@ fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
 }
 
 /// Map a [`db::TaskTransitionError`] onto the D8 RPC vocabulary.
-fn map_task_transition_err(e: db::TaskTransitionError) -> RpcError {
+pub(crate) fn map_task_transition_err(e: db::TaskTransitionError) -> RpcError {
     match e {
         db::TaskTransitionError::NotFound => RpcError::new(RpcCode::InvalidId, "unknown task"),
         db::TaskTransitionError::InvalidSource { from, to } => RpcError::new(
@@ -200,12 +215,19 @@ fn map_task_transition_err(e: db::TaskTransitionError) -> RpcError {
 fn map_delete_task_err(e: db::DeleteTaskError) -> RpcError {
     match e {
         db::DeleteTaskError::NotFound => RpcError::new(RpcCode::InvalidId, "unknown task"),
+        // The refusal NAMES both legitimate moves, because the freeze covers only one of the two
+        // things a caller may be trying to do. Deleting planned work mid-build is what it stops;
+        // correcting a finding whose TEXT came out malformed is not the same authority, and the
+        // caller that hits this wall with a mangled description would otherwise have nowhere to go.
         db::DeleteTaskError::NotDraft { status } => RpcError::new(
             RpcCode::InvalidState,
             format!(
                 "task_delete is only legal while the parent Spec is 'draft' (this task's Spec \
-                 is '{status}'): once ready/in_progress, skip the task instead \
-                 (task_transition transition=skip), which keeps the audit trail"
+                 is '{status}'). To DROP the work: skip the task (task_transition \
+                 transition=skip), which cancels it and keeps the audit trail. To fix a review \
+                 finding whose TITLE or DESCRIPTION is wrong — malformed text, leftover markup: \
+                 rewrite it with review_task_structure(id, title, details), which edits the words \
+                 and changes nothing about what the build owes"
             ),
         ),
         db::DeleteTaskError::Db(e) => internal_db(e),
@@ -312,18 +334,38 @@ pub fn spec_create(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let (spec, revision) = db
         .with_conn(|c| db::create_spec(c, project_id, title, sections))
         .map_err(internal_db)?;
+    // BIND the run that authored it (F5): a `/nspec` run starts with no Spec and CREATES one here, so
+    // this is the moment — and the only one — where the run and its Spec can be tied together. Left
+    // untied, the run stays inert (every Spec query answers null/0, every transition applies to
+    // nothing) and the flow ends `done` on a Spec still `draft`, silently. Best-effort and strictly
+    // guarded (see [`crate::mcp_engine::bind_session_run_to_spec`]): with no in-flight run to bind —
+    // an author working outside any run — nothing happens and the created Spec is unaffected.
+    let bound_run_id = crate::mcp_engine::bind_session_run_to_spec(
+        db,
+        crate::mcp_engine::shared_runtime(),
+        &spec.id,
+    );
     Ok(ToolOutcome::changed(
-        json!({ "spec": spec, "revision": revision }),
+        json!({ "spec": spec, "revision": revision, "bound_run_id": bound_run_id }),
         ChangedTopic::Specs,
     ))
 }
 
-/// `spec_update_section` — `{ spec_id, section, value }` → `{ updated: true }`. Edits ONE
+/// `spec_update_section` — `{ spec_id, section, value, run_id? }` → `{ updated: true }`. Edits ONE
 /// structured section of the Spec's ACTIVE revision in place (NOT a fork) via the SHARED
 /// `db::update_active_revision_section`. An unknown Spec → `invalid_id`.
+///
+/// `run_id` is the HUMAN-GATED exception to the freeze (H12), and nothing else: a Spec that has left
+/// its writable state refuses every section write, EXCEPT for the run named here when that run carries
+/// the authorization nyx's engine wrote from a human's answer at the coder escalation gate ("the
+/// contradiction is in the Spec's TEXT — fix the Spec"). The caller does not claim the right; it names
+/// the run, and nyx reads whether the human granted it
+/// ([`crate::mcp_engine::spec_section_write_is_authorized`]). A `run_id` on a WRITABLE Spec changes
+/// nothing — that write needed no exception.
 pub fn spec_update_section(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id = require_str(args, "spec_id")?;
     let section = parse_section(require_str(args, "section")?)?;
+    let run_id = optional_str(args, "run_id")?;
     // `value` is REQUIRED but may legitimately be an empty string (clearing a section);
     // read it directly so an explicit "" is honored rather than rejected by `require_str`.
     let value =
@@ -340,9 +382,15 @@ pub fn spec_update_section(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
                 ))
             }
         };
-    let updated = db
-        .with_conn(|c| db::update_active_revision_section(c, spec_id, section, value))
-        .map_err(internal_db)?;
+    let human_gated = run_id
+        .map(|run_id| crate::mcp_engine::spec_section_write_is_authorized(db, run_id, spec_id))
+        .unwrap_or(false);
+    let updated = if human_gated {
+        db.with_conn(|c| db::update_active_revision_section_human_gated(c, spec_id, section, value))
+    } else {
+        db.with_conn(|c| db::update_active_revision_section(c, spec_id, section, value))
+    }
+    .map_err(map_content_write_err)?;
     if !updated {
         return Err(RpcError::new(
             RpcCode::InvalidId,
@@ -435,11 +483,12 @@ pub fn spec_set_workspace(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError
 /// DERIVES `executor` from `kind`, keeping the pairing coherent). A `kind=human` task
 /// SHOULD carry a `verification_command` so it is verifiable at close time.
 ///
-/// `phase` is a NAME (a string): nyx MATERIALIZES the Spec's plan from the names the tasks
-/// carry (get-or-create, 1-based, first-seen order — [`db::create_task`] →
-/// `resolve_or_create_phase`), so a task's phase always exists in the plan (no orphan). A
-/// phase name needs a `spec_id` (the plan lives on the Spec) — passing one without a Spec is
-/// refused.
+/// `phase` is a NAME (a string): while the Spec is `draft` nyx MATERIALIZES its plan from the
+/// names the tasks carry (get-or-create, 1-based, first-seen order — [`db::create_task`] →
+/// `resolve_or_create_phase`), so a task's phase always exists in the plan (no orphan). Once
+/// the Spec has LEFT draft that plan is frozen: an unknown name is REFUSED, naming the phases
+/// that exist, instead of growing the plan of a Spec already being built (K2). A phase name
+/// needs a `spec_id` (the plan lives on the Spec) — passing one without a Spec is refused.
 pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let title = require_str(args, "title")?;
@@ -460,12 +509,15 @@ pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     input.verification_command = optional_str(args, "verification_command")?.map(str::to_string);
     input.spec_id = optional_str(args, "spec_id")?.map(str::to_string);
     input.parent_task_id = optional_str(args, "parent_task_id")?.map(str::to_string);
-    // ROUND (v2.5.11): the rework sub-phase a finding is rattached to (PER-PHASE; the orchestrator
-    // opens it with `next_round_for_phase`). Omitted = the plan (round 0). A finding raised during
-    // rework carries its phase's current round so it reads "2.1", "4.1"…
+    // ROUND (v2.5.11): the rework sub-phase a finding is rattached to (PER-PHASE, so it reads "2.1",
+    // "4.1"…). OMITTED IS THE NORMAL CASE for a `kind=review` finding: `db::create_task` then fills
+    // it from the Spec's own review pass, because the auditor raising the finding cannot know which
+    // round it is in — and a finding that does not say which pass produced it cannot be arbitrated
+    // afterwards. An explicit value still wins, for the caller attributing a finding to another pass.
     input.round = optional_usize(args, "round")?.map(|r| r as i32);
-    // `phase` is a phase NAME: nyx materializes the plan from the names in first-seen order
-    // (get-or-create in `db::create_task`). It needs a Spec — the plan lives on the Spec.
+    // `phase` is a phase NAME: nyx materializes the plan from the names in first-seen order while
+    // the Spec is drafted, and refuses an unknown one after (`db::create_task`). It needs a Spec —
+    // the plan lives on the Spec.
     input.phase_name = optional_str(args, "phase")?.map(str::to_string);
     if input.phase_name.is_some() && input.spec_id.is_none() {
         return Err(RpcError::new(
@@ -476,7 +528,7 @@ pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 
     let task = db
         .with_conn(|c| db::create_task(c, project_id, title, input.clone()))
-        .map_err(internal_db)?;
+        .map_err(map_content_write_err)?;
     Ok(ToolOutcome::changed(
         json!({ "task": task }),
         ChangedTopic::Specs,
@@ -632,10 +684,9 @@ pub fn worked_spec_id(name: &str, result: &Value) -> Option<String> {
         cur.as_str().map(str::to_string)
     };
     match name {
-        // The Spec is returned directly as `result.spec`.
-        SPEC_CREATE_TOOL | SPEC_TRANSITION_TOOL | SPEC_SET_WORKSPACE_TOOL => {
-            str_at(result, &["spec", "id"])
-        }
+        // The Spec is returned directly as `result.spec`. (`spec_transition` is no longer an agent
+        // verb — N17(b); nyx transitions at the node, and `run_start` below is the map signal.)
+        SPEC_CREATE_TOOL | SPEC_SET_WORKSPACE_TOOL => str_at(result, &["spec", "id"]),
         // `spec_update_section` echoes the edited `result.spec_id`.
         SPEC_UPDATE_SECTION_TOOL => str_at(result, &["spec_id"]),
         // A fork returns the new `result.revision`, which carries its `spec_id`.
@@ -647,6 +698,13 @@ pub fn worked_spec_id(name: &str, result: &Value) -> Option<String> {
         // a work signal. It returns `result.finding`; its `spec_id` is the worked Spec. (This is the
         // "extend the auto-map when a finding promotion verb is added" the PRD calls for.)
         crate::mcp::REVIEW_SUBMIT_FEEDBACK_TOOL => str_at(result, &["finding", "spec_id"]),
+        // ENGINE cutover (v2.8 review N15): with the thin dispatcher the agent no longer calls the
+        // mutating `spec_*` verbs — nyx runs them INSIDE the `nyx_next` tick — so those signals never
+        // reach this auto-map, and the session ↔ Spec link (the terminal overlay's substrate) went
+        // unwritten. `run_start` RESOLVES + returns the bound `spec_id` (null for an unbound run), so
+        // OPENING a run on a Spec is the work signal that re-establishes the link EXPLICITLY, from the
+        // run, at the moment it opens — not inferred from a mutation that no longer happens agent-side.
+        crate::mcp_engine::RUN_START_TOOL => str_at(result, &["spec_id"]),
         // Reads, non-Spec tools, and the non-work Spec tools never map.
         _ => None,
     }
@@ -666,7 +724,8 @@ pub fn dispatch_spec_tool(
         SPEC_CREATE_TOOL => Some(spec_create(db, args)),
         SPEC_UPDATE_SECTION_TOOL => Some(spec_update_section(db, args)),
         SPEC_FORK_TOOL => Some(spec_fork(db, args)),
-        SPEC_TRANSITION_TOOL => Some(spec_transition(db, args)),
+        // `spec_transition` is intentionally NOT routed to the agent (N17(b)) — nyx transitions the
+        // Spec at the graph node; the effector never does. The function stays for the UI/tests.
         SPEC_SET_WORKSPACE_TOOL => Some(spec_set_workspace(db, args)),
         TASK_ADD_TOOL => Some(task_add(db, args)),
         TASK_TRANSITION_TOOL => Some(task_transition(db, args)),
@@ -722,10 +781,6 @@ mod tests {
             Some("S3")
         );
         assert_eq!(
-            worked_spec_id(SPEC_TRANSITION_TOOL, &json!({ "spec": { "id": "S4" } })).as_deref(),
-            Some("S4")
-        );
-        assert_eq!(
             worked_spec_id(TASK_ADD_TOOL, &json!({ "task": { "spec_id": "S5" } })).as_deref(),
             Some("S5")
         );
@@ -752,6 +807,24 @@ mod tests {
             )
             .as_deref(),
             Some("S7")
+        );
+        // N15 — OPENING a run on a Spec is the work signal under the thin dispatcher (the agent no
+        // longer calls the mutating spec_* verbs): `run_start` echoes the bound `spec_id`.
+        assert_eq!(
+            worked_spec_id(
+                crate::mcp_engine::RUN_START_TOOL,
+                &json!({ "run_id": "R1", "spec_id": "S8" })
+            )
+            .as_deref(),
+            Some("S8")
+        );
+        // An UNBOUND run (spec_id null) maps nothing.
+        assert_eq!(
+            worked_spec_id(
+                crate::mcp_engine::RUN_START_TOOL,
+                &json!({ "run_id": "R2", "spec_id": null })
+            ),
+            None
         );
         // Reads + non-Spec tools never map.
         assert_eq!(
@@ -1277,6 +1350,19 @@ mod tests {
             db.with_conn(|c| db::get_task(c, &bid)).unwrap().is_some(),
             "a refused delete removed nothing"
         );
+        // …and the wall NAMES both ways out, because the caller hitting it may be trying either of
+        // two different things. Dropping the work is `skip`; a finding whose TEXT came out malformed
+        // is a rewrite, and the caller that lands here with a mangled description had nowhere to go.
+        assert!(
+            err.message.contains("transition=skip"),
+            "the refusal names how to DROP the work: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("review_task_structure"),
+            "…and how to FIX a finding's wording, which the freeze was never about: {}",
+            err.message
+        );
     }
 
     /// DONE-CRITERION (v2.6 spec deps): `spec_link` refuses a cycle, `related` is context-only
@@ -1432,6 +1518,254 @@ mod tests {
         assert!(
             db::validate_phase_plan(&after.phases).is_empty(),
             "the auto-built plan is a coherent 1..N",
+        );
+    }
+
+    /// K2 — THE LIVE MISTAKE, REPRODUCED. Spec #12 was written with two phases ("Module de purge",
+    /// "Endpoint admin"). Mid-build, an auditor called `task_add` passing the phase's rendered LABEL
+    /// — "2 · Endpoint admin", the heading its manual prints — instead of the NAME. nyx materialized
+    /// it: a THIRD phase appeared in the plan of an `in_progress` Spec. The agent noticed and
+    /// cancelled its finding; the phantom phase stayed, and everything computed on phases counted it.
+    ///
+    /// A Spec's sections freeze outside `draft`, and tasks are refused on a `completed` one — yet its
+    /// PHASE PLAN could be extended by one misspelt free-text argument. So the unknown name is
+    /// REFUSED, nothing is written, and the refusal names the phases that do exist, since the mistake
+    /// is always a near-miss and the caller needs the exact string that works.
+    #[test]
+    fn a_phase_label_typed_on_a_spec_under_build_is_refused_and_the_plan_is_untouched() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({
+                "project_id": project_id,
+                "title": "S",
+                "problem": "the purge is manual",
+                "solution": "a purge module and an admin endpoint",
+            }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+
+        // THE PLAN, written while the Spec is drafted — the one place a name may mint a phase.
+        for (title, phase) in [
+            ("purge", "Module de purge"),
+            ("admin endpoint", "Endpoint admin"),
+        ] {
+            task_add(
+                &db,
+                &json!({ "project_id": project_id, "title": title, "spec_id": sid, "phase": phase }),
+            )
+            .expect("the plan is authored in draft");
+        }
+        let plan = r#"[{"number":1,"name":"Module de purge"},{"number":2,"name":"Endpoint admin"}]"#;
+        assert_eq!(
+            db.with_conn(|c| db::get_spec(c, &sid)).unwrap().unwrap().phases,
+            plan
+        );
+
+        // THE BUILD STARTS — from here the plan is the author's, and nobody else's.
+        db.with_conn(|c| {
+            db::transition_spec(c, &sid, db::SpecTransition::Ready, true).expect("ready");
+            db::transition_spec(c, &sid, db::SpecTransition::Start, true).expect("start");
+        });
+        let tasks_before = db.with_conn(|c| db::list_tasks_for_spec(c, &sid)).unwrap().len();
+
+        // THE MISTAKE: the auditor files its finding against the phase's LABEL.
+        let err = dispatch_spec_tool(
+            &db,
+            TASK_ADD_TOOL,
+            &json!({
+                "project_id": project_id,
+                "title": "Auditor: the purge drops rows it should keep",
+                "spec_id": sid,
+                "kind": "review",
+                "severity": "high",
+                "phase": "2 · Endpoint admin",
+            }),
+        )
+        .expect("task_add is routed")
+        .expect_err("a phase the plan does not hold must be refused");
+        assert_eq!(err.code, "invalid_argument");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str),
+            Some("unknown_phase"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("'Module de purge'") && err.message.contains("'Endpoint admin'"),
+            "the refusal names the phases that DO exist, so the caller can retry: {}",
+            err.message
+        );
+
+        // AND NOTHING HAPPENED: no phantom phase, no half-written finding.
+        assert_eq!(
+            db.with_conn(|c| db::get_spec(c, &sid)).unwrap().unwrap().phases,
+            plan,
+            "the plan of a Spec under build is what its author wrote"
+        );
+        assert_eq!(
+            db.with_conn(|c| db::list_tasks_for_spec(c, &sid)).unwrap().len(),
+            tasks_before,
+            "the refused call wrote no task either"
+        );
+
+        // The two ways through are both open: name a REAL phase, or name none and let nyx anchor it.
+        let named = task_add(
+            &db,
+            &json!({
+                "project_id": project_id,
+                "title": "Auditor: same finding, right name",
+                "spec_id": sid,
+                "kind": "review",
+                "severity": "high",
+                "phase": "Endpoint admin",
+            }),
+        )
+        .expect("an EXISTING phase is not a mutation");
+        assert_eq!(named.result["task"]["phase"], json!(2));
+        task_add(
+            &db,
+            &json!({
+                "project_id": project_id,
+                "title": "Auditor: no phase named",
+                "spec_id": sid,
+                "kind": "review",
+                "severity": "high",
+            }),
+        )
+        .expect("naming no phase is the auditor's normal case");
+        assert_eq!(
+            db.with_conn(|c| db::get_spec(c, &sid)).unwrap().unwrap().phases,
+            plan,
+            "neither route touched the plan"
+        );
+    }
+
+    /// THE AUDITOR'S FINDING CARRIES ITS ROUND, and nyx is the one that puts it there.
+    ///
+    /// Measured live: every finding of a Spec carried `round = NULL` — one task in a whole campaign
+    /// had one — so which audit round produced what could not be reconstructed from the database,
+    /// which is precisely the data needed to arbitrate what the audit cost. `task_add` has always
+    /// ACCEPTED a `round`; the auditor never passed one, because a sub-agent cannot know which round
+    /// it is in. So the engine fills it: the finding lands on the phase under review, in that phase's
+    /// current pass — and the N findings of ONE pass share it, while a pass raised after the previous
+    /// one is settled opens the next.
+    #[test]
+    fn task_add_fills_a_findings_phase_and_round_from_nyx() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let created = spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).unwrap();
+        let sid = spec_id_of(&created);
+
+        // A plan with one phase, DELIVERED — so phase 1 is the phase under review.
+        let slice = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "ship it", "spec_id": sid, "phase": "Delivery" }),
+        )
+        .unwrap();
+        let slice_id = slice.result["task"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            slice.result["task"]["round"],
+            json!(null),
+            "a PLAN slice is not a finding — it stays round-less (round 0)"
+        );
+        db.with_conn(|c| {
+            db::transition_task(c, &slice_id, db::TaskTransition::Start, None).unwrap();
+            db::transition_task(c, &slice_id, db::TaskTransition::Done, None).unwrap();
+        });
+
+        // THE AUDITOR RAISES A FINDING — exactly as it does, with no `round` and no `phase`.
+        let finding = |title: &str| {
+            dispatch_spec_tool(
+                &db,
+                TASK_ADD_TOOL,
+                &json!({
+                    "project_id": project_id,
+                    "title": title,
+                    "spec_id": sid,
+                    "kind": "review",
+                    "severity": db::TASK_SEVERITY_HIGH,
+                }),
+            )
+            .expect("task_add is routed")
+            .expect("task_add ok")
+            .result
+        };
+        let first = finding("Auditor: missing timeout guard");
+        assert_eq!(
+            first["task"]["phase"],
+            json!(1),
+            "the finding hangs on the phase under review (1), not on nothing"
+        );
+        assert_eq!(
+            first["task"]["round"],
+            json!(1),
+            "…in that phase's first pass — \"1.1\" — filled by nyx, not by the auditor"
+        );
+
+        // A SECOND finding of the SAME pass shares the round: one pass = one round holding N
+        // findings, which is what makes "what did round 1.1 produce" answerable.
+        let second = finding("Auditor: unbounded retry");
+        assert_eq!(second["task"]["round"], json!(1), "same open pass, same round");
+
+        // The pass is settled; the NEXT audit opens the next round.
+        for id in [
+            first["task"]["id"].as_str().unwrap(),
+            second["task"]["id"].as_str().unwrap(),
+        ] {
+            db.with_conn(|c| {
+                db::transition_task(c, id, db::TaskTransition::Start, None).unwrap();
+                db::transition_task(c, id, db::TaskTransition::Done, None).unwrap();
+            });
+        }
+        assert_eq!(
+            finding("Auditor: second pass")["task"]["round"],
+            json!(2),
+            "a pass raised after the previous one closed is a NEW round — \"1.2\""
+        );
+
+        // An explicit round still wins: the caller attributing a finding to another pass is obeyed.
+        let explicit = dispatch_spec_tool(
+            &db,
+            TASK_ADD_TOOL,
+            &json!({
+                "project_id": project_id, "title": "late", "spec_id": sid,
+                "kind": "review", "severity": db::TASK_SEVERITY_LOW, "round": 1,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(explicit.result["task"]["round"], json!(1));
+    }
+
+    /// …and a Spec with NO delivered phase has no pass to number a finding in. It is filed all the
+    /// same — raising a finding outside any review pass is legitimate — and stays un-phased and
+    /// round-less rather than being given an invented round.
+    #[test]
+    fn a_finding_on_a_spec_with_nothing_delivered_stays_round_less() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let created = spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).unwrap();
+        let sid = spec_id_of(&created);
+
+        let finding = task_add(
+            &db,
+            &json!({
+                "project_id": project_id, "title": "raised early", "spec_id": sid,
+                "kind": "review", "severity": db::TASK_SEVERITY_MEDIUM,
+            }),
+        )
+        .unwrap();
+        assert_eq!(finding.result["task"]["phase"], json!(null));
+        assert_eq!(
+            finding.result["task"]["round"],
+            json!(null),
+            "no delivered phase = no pass to belong to; nyx does not invent one"
         );
     }
 

@@ -453,6 +453,13 @@ impl ActivityEvent {
 /// a Claude activity hook arrives, the read path SNAPSHOTS it for the front
 /// ([`Self::snapshot`] / [`Self::snapshot_all`]), and the PTY/lifecycle layer CLEARS it
 /// ([`Self::clear`]) on PTY death / SessionEnd / close.
+///
+/// It holds the DOT and nothing else. The other reader of the same hook stream — the consent check,
+/// which needs to know that a HUMAN spoke — is served by the PERSISTED ledger
+/// ([`crate::db::HumanTurn`]) and not from here, and deliberately so: this store's whole contract is
+/// that it dies with the session (a `working` dot must never outlive the process that could still be
+/// working), and a human's turn must OUTLIVE it — a `claude -p` invocation is a whole session, so a
+/// turn kept here would be gone before the answer to the question it authorises came back.
 #[derive(Default)]
 pub struct AgentActivityStore {
     map: Mutex<HashMap<String, Entry>>,

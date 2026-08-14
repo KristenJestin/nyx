@@ -47,6 +47,10 @@ pub struct SidecarTerminalHost {
     /// (parity) and `terminal_liveness` reports the true `live` bit.
     live_records: Arc<Mutex<HashMap<String, u32>>>,
     events: EventSink,
+    /// The MCP server itself, ONLY to read its bound port when opening a shell: a terminal this
+    /// host spawns must export the port THIS instance listens on, and that is known solely at
+    /// call time (the server binds after the dispatcher is installed).
+    server: Arc<McpServer>,
 }
 
 impl SidecarTerminalHost {
@@ -57,14 +61,31 @@ impl SidecarTerminalHost {
 
 impl TerminalHost for SidecarTerminalHost {
     fn park_opening_command(&self, terminal_id: &str, command: &str) {
-        // The renderer owns terminal mounting; surface the parked opening command as a
-        // `changed` invalidation so the front re-pulls and mounts/opens the terminal.
-        // (The DB record was already created in nyx-core.) The opening command is
-        // carried in the record; the front reconciles it on the `terminals` refresh.
-        let _ = (terminal_id, command);
-        self.events.emit(Event::Changed {
-            topic: ChangedTopic::Terminals.as_str().to_string(),
-        });
+        // PARK the command against the record. The DB record was just created in nyx-core and has
+        // no shell yet, so the command cannot run now; it waits in the PTY manager and the spawn
+        // `open_terminal_shell` triggers right after types it in. (A terminal record carries no
+        // command column: nothing else would ever run it, which is why an MCP
+        // `create_terminal { command }` used to open a dead, silent shell.)
+        self.pty.park_opening_command(terminal_id, command);
+    }
+
+    fn open_terminal_shell(&self, terminal_id: &str, cwd: &str) {
+        // `"."` is the record's "no cwd was asked for" marker (what `create_terminal` stores when
+        // the argument is absent); the PTY manager spells that same default as an empty cwd.
+        let cwd = if cwd == "." { "" } else { cwd };
+        // The bound MCP port, read LIVE so the shell exports the port this instance is really
+        // listening on — an agent-opened terminal is exactly where a `claude` gets launched, and
+        // its SessionStart hook has to reach THIS nyx.
+        let mcp_port = self.server.bound_port();
+        if let Err(e) = self
+            .pty
+            .spawn_headless(cwd, terminal_id, mcp_port, self.events.clone())
+        {
+            // The record stands (the tool has already answered with its id), so say why it has no
+            // shell instead of leaving the caller to discover a mute terminal.
+            self.events
+                .log("warn", format!("terminal {terminal_id} got no shell: {e}"));
+        }
     }
 
     fn send_to_terminal(&self, terminal_id: &str, command: &str) -> Result<bool, String> {
@@ -97,6 +118,12 @@ impl TerminalHost for SidecarTerminalHost {
         // foreground bit is served from the DB exec-state by list_terminals), exactly as
         // in the v1 host.
         (self.is_live(terminal_id), None)
+    }
+
+    fn scrollback_is_behind(&self, terminal_id: &str) -> bool {
+        // The sidecar OWNS the PTY, so it sees both halves of the question — the pump's output
+        // and the renderer's `persist_scrollback` — and answers exactly, not by comparing clocks.
+        self.pty.scrollback_is_behind(terminal_id)
     }
 }
 
@@ -385,6 +412,7 @@ impl McpRuntime {
                 pty: Arc::clone(&self.pty),
                 live_records: self.pty.live_records(),
                 events: self.events.clone(),
+                server: Arc::clone(&self.server),
             },
             activity: Arc::clone(&self.activity),
             events: self.events.clone(),
@@ -480,15 +508,28 @@ mod tests {
     /// managed runner (the throwaway-runner path serves the extension tools). The SAME wiring
     /// [`McpRuntime::start`] installs, minus the live-HTTP server.
     fn dispatcher(db: Arc<Db>, buf: &Arc<Mutex<Vec<u8>>>) -> SidecarDispatcher {
+        dispatcher_with_pty(db, buf).0
+    }
+
+    /// Like [`dispatcher`] but ALSO hands back the `PtyManager` it is wired to, so a test can
+    /// drive the spawn side (what the renderer does when it mounts a terminal) against the SAME
+    /// manager the terminal tools reached.
+    fn dispatcher_with_pty(
+        db: Arc<Db>,
+        buf: &Arc<Mutex<Vec<u8>>>,
+    ) -> (SidecarDispatcher, Arc<PtyManager>) {
         let events = EventSink::new(Box::new(SharedBuf(buf.clone())));
-        let pty = Arc::new(PtyManager::new());
-        SidecarDispatcher {
+        let pty = Arc::new(PtyManager::new(Arc::clone(&db)));
+        let disp = SidecarDispatcher {
             db,
             runner: Arc::new(Mutex::new(None)),
             terminal_host: SidecarTerminalHost {
                 pty: Arc::clone(&pty),
                 live_records: pty.live_records(),
                 events: events.clone(),
+                // Never started, so `bound_port()` is 0 — a spawned shell exports no
+                // `NYX_MCP_PORT`, exactly as it does when a terminal races the boot `McpStart`.
+                server: Arc::new(McpServer::default()),
             },
             activity: Arc::new(AgentActivityStore::new()),
             events,
@@ -496,7 +537,8 @@ mod tests {
             // `repo_unwatch` tools report it as unavailable) — the extension-tool surface
             // under test here does not need one.
             git_watch: Arc::new(Mutex::new(None)),
-        }
+        };
+        (disp, pty)
     }
 
     /// done_criterion (T9) — a Spec MUTATION via the MCP tools pushes a `specs://changed`
@@ -591,6 +633,293 @@ mod tests {
         assert!(
             changed.contains(&"specs"),
             "the review mutation pushed `specs://changed` for the OVERLAY (finding = tasks kind=review), got: {changed:?}"
+        );
+    }
+
+    /// H1 (with F8) — a terminal created over MCP gets a REAL shell and runs its opening command,
+    /// with NOTHING mounted anywhere.
+    ///
+    /// The renderer mounts panes only for the project it is displaying, and that mount used to be
+    /// the only thing that spawned a PTY. So a terminal an agent opened in any other project — or
+    /// a loose one — never got a shell: the tool answered `has_command: true`, the record sat in
+    /// the sidebar mute, `send_to_terminal` answered `invalid_state` forever, and the parked
+    /// command waited for a mount that would only come if the human switched projects. An agent
+    /// driving nyx has to open sessions where the work is, not where the eye is.
+    ///
+    /// Drives the real chain with NO spawn from the test: `create_terminal { command }` through the
+    /// dispatcher → the `TerminalHost` park → the shell the tool opens itself → the command
+    /// observed EXECUTED in that shell's own VT screen, and `send_to_terminal` accepted.
+    ///
+    /// The marker is ASSEMBLED by the shell (`printf 'H1_%s' RAN`), so seeing `H1_RAN` on the
+    /// screen can only mean the line was EXECUTED — the terminal's echo of the typed line spells
+    /// `printf 'H1_%s' RAN`, never the marker itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_created_over_mcp_gets_its_shell_with_nothing_on_screen() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let db = Arc::new(temp_db());
+        let (disp, pty) = dispatcher_with_pty(Arc::clone(&db), &buf);
+
+        let created = disp
+            .call(
+                "create_terminal",
+                &serde_json::json!({ "command": "printf 'H1_%s' RAN", "label": "h1" }),
+            )
+            .expect("create_terminal succeeds");
+        assert_eq!(
+            created["has_command"],
+            serde_json::json!(true),
+            "the tool promises the command will run"
+        );
+        let record_id = created["terminal_id"].as_str().expect("a record id");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ran = false;
+        while std::time::Instant::now() < deadline && !ran {
+            if let Some(s) = pty.snapshot_by_record(record_id) {
+                ran = (0..s.main.rows).any(|r| s.main.row_text(r).contains("H1_RAN"));
+            }
+            if !ran {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
+        let screen = pty
+            .snapshot_by_record(record_id)
+            .map(|s| {
+                (0..s.main.rows)
+                    .map(|r| s.main.row_text(r))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // The shell is DRIVABLE, not just alive: the tool that used to answer `invalid_state`
+        // forever now writes into it.
+        let sent = disp.call(
+            "send_to_terminal",
+            &serde_json::json!({ "terminal_id": record_id, "command": "true" }),
+        );
+        pty.close_record(record_id);
+        assert!(
+            ran,
+            "the opening command must RUN in the shell the tool opened; screen was: {screen:?}"
+        );
+        assert!(
+            sent.is_ok(),
+            "an agent must be able to type into the terminal it just opened, got: {sent:?}"
+        );
+    }
+
+    /// F1 — the loop an agent actually needs, with NOTHING mounted anywhere: `create_terminal` →
+    /// `send_to_terminal` → `read_terminal` gives back what the shell printed.
+    ///
+    /// `terminals.scrollback` used to be written ONLY by the renderer's `persist_scrollback`, and
+    /// only while a pane was mounted. A terminal an agent opened off-screen therefore answered an
+    /// empty, `stale: true` buffer for as long as no human switched to that project: the agent
+    /// could drive a shell it could not read. What `read_terminal` means must not depend on whose
+    /// screen is showing what — that is the ambiguity the `live`/`stale` fields exist to remove,
+    /// not a second one to add. So while a terminal has NO view, the SIDECAR persists it.
+    ///
+    /// The test also pins the HAND-OVER in both directions, ownership being the whole design: once
+    /// a pane attaches the renderer owns the buffer again (the sidecar writes no more — there is no
+    /// renderer here, so the record simply stops moving), and what was accumulated before the mount
+    /// is still there.
+    ///
+    /// The markers are ASSEMBLED by the shell (`printf 'F1_%s' READBACK`), so reading `F1_READBACK`
+    /// can only mean the line was EXECUTED — the terminal's echo of the typed line spells
+    /// `printf 'F1_%s' READBACK`, never the marker itself.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_reads_back_the_terminal_it_drove_with_no_pane_anywhere() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let db = Arc::new(temp_db());
+        let (disp, pty) = dispatcher_with_pty(Arc::clone(&db), &buf);
+
+        // 1) OPEN — no pane exists, and none mounts until step 4.
+        let record_id = disp
+            .call("create_terminal", &serde_json::json!({ "label": "f1" }))
+            .expect("create_terminal succeeds")["terminal_id"]
+            .as_str()
+            .expect("a record id")
+            .to_string();
+
+        // 2) DRIVE.
+        disp.call(
+            "send_to_terminal",
+            &serde_json::json!({
+                "terminal_id": record_id,
+                "command": "printf 'F1_%s' READBACK",
+            }),
+        )
+        .expect("an agent can type into the terminal it opened");
+
+        // 3) READ BACK — the point of the whole loop.
+        let read = |disp: &SidecarDispatcher| {
+            disp.call(
+                "read_terminal",
+                &serde_json::json!({ "terminal_id": record_id }),
+            )
+            .expect("read_terminal succeeds")
+        };
+        let has_marker = |out: &serde_json::Value, marker: &str| {
+            out["output"].as_str().unwrap_or_default().contains(marker)
+        };
+        // Poll for the SETTLED answer: the marker saved AND the buffer level with the shell. The
+        // save is debounced (as the mounted renderer's is), so a read taken mid-burst legitimately
+        // says `stale` — what must never happen is that it stays that way because nobody is
+        // looking.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut out = read(&disp);
+        while std::time::Instant::now() < deadline
+            && !(has_marker(&out, "F1_READBACK") && out["stale"] == serde_json::json!(false))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            out = read(&disp);
+        }
+        assert!(
+            has_marker(&out, "F1_READBACK"),
+            "an agent must read back what the terminal it drove printed, with no pane anywhere; \
+             got: {out:?}"
+        );
+        assert_eq!(
+            out["live"],
+            serde_json::json!(true),
+            "the shell is running behind the record"
+        );
+        assert_eq!(
+            out["stale"], serde_json::json!(false),
+            "the buffer IS the terminal's present state — a read must not answer differently for \
+             want of someone looking at it"
+        );
+
+        // 4) A PANE ATTACHES: the renderer owns the buffer again, and the pre-mount history is
+        //    still in the record. Nothing else writes it here, so anything the shell prints from
+        //    now on must NOT appear — proving the sidecar really stopped (no double-write over the
+        //    renderer's saves) rather than the two of them racing over the same column.
+        let events = EventSink::new(Box::new(SharedBuf(Arc::new(Mutex::new(Vec::new())))));
+        pty.spawn(80, 24, "", &record_id, 0, events)
+            .expect("the mount takes over the shell");
+        disp.call(
+            "send_to_terminal",
+            &serde_json::json!({
+                "terminal_id": record_id,
+                "command": "printf 'F1_%s' AFTERMOUNT",
+            }),
+        )
+        .expect("send after the mount");
+        // Wait until the shell HAS printed it (on its VT screen), so the assertion below is about
+        // WHO saves, not about whether anything happened yet.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut printed = false;
+        while std::time::Instant::now() < deadline && !printed {
+            printed = pty
+                .snapshot_by_record(&record_id)
+                .map(|s| (0..s.main.rows).any(|r| s.main.row_text(r).contains("F1_AFTERMOUNT")))
+                .unwrap_or(false);
+            if !printed {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
+        let out = read(&disp);
+        pty.close_record(&record_id);
+        assert!(printed, "the shell must have printed the post-mount marker");
+        assert!(
+            has_marker(&out, "F1_READBACK"),
+            "the hand-over must not lose the history accumulated before the pane existed; got: \
+             {out:?}"
+        );
+        assert!(
+            !has_marker(&out, "F1_AFTERMOUNT"),
+            "once a pane is attached the RENDERER owns the scrollback; the sidecar must not keep \
+             writing over its saves; got: {out:?}"
+        );
+    }
+
+    /// F2 — `read_terminal` hands back the scrollback the FRONT last saved, and the front only
+    /// saves it while the terminal is mounted on screen. So a terminal that runs off-view returns
+    /// a frozen buffer; the text alone gives a caller no way to tell that apart from the present
+    /// state. The answer must SAY it, and say it exactly.
+    ///
+    /// Drives the real chain against a real shell: nothing saved yet while the shell prints →
+    /// `stale`; a save (what the mounted front does) → not `stale`; the shell prints again →
+    /// `stale` again; no shell at all → `live:false` and `stale`, since the buffer is then only
+    /// that terminal's final output.
+    #[cfg(unix)]
+    #[test]
+    fn read_terminal_says_when_its_scrollback_is_not_the_terminals_present_state() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let db = Arc::new(temp_db());
+        let (disp, pty) = dispatcher_with_pty(Arc::clone(&db), &buf);
+
+        let record_id = disp
+            .call("create_terminal", &serde_json::json!({ "label": "f2" }))
+            .expect("create_terminal succeeds")["terminal_id"]
+            .as_str()
+            .expect("a record id")
+            .to_string();
+        let events = EventSink::new(Box::new(SharedBuf(Arc::new(Mutex::new(Vec::new())))));
+        let pty_id = pty
+            .spawn(80, 24, "", &record_id, 0, events)
+            .expect("spawn the record's pty");
+
+        let read = |disp: &SidecarDispatcher| {
+            disp.call(
+                "read_terminal",
+                &serde_json::json!({ "terminal_id": record_id }),
+            )
+            .expect("read_terminal succeeds")
+        };
+        // Wait for the shell to have PRINTED something nobody saved — the state a terminal is in
+        // as soon as it runs while its pane is not mounted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !pty.scrollback_is_behind(&record_id) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let out = read(&disp);
+        assert_eq!(
+            out["live"],
+            serde_json::json!(true),
+            "the terminal's shell is running"
+        );
+        assert_eq!(
+            out["stale"], serde_json::json!(true),
+            "the shell printed output nyx has not saved — the returned buffer is NOT the terminal's present state"
+        );
+
+        // A save — exactly what the mounted front's debounced `persist_scrollback` does.
+        pty.mark_scrollback_persisted(&record_id);
+        let out = read(&disp);
+        assert_eq!(
+            out["stale"],
+            serde_json::json!(false),
+            "right after a save the buffer IS the terminal's present state"
+        );
+
+        // The shell prints again with nobody saving: behind once more.
+        pty.write(pty_id, b"printf 'F2_%s' MORE\n").expect("write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !pty.scrollback_is_behind(&record_id) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            read(&disp)["stale"],
+            serde_json::json!(true),
+            "new output with no save puts the buffer behind the shell again"
+        );
+
+        // No shell at all (closed, or the idle-unload took it): the buffer is that terminal's
+        // FINAL output, never its present state.
+        pty.close(pty_id);
+        let out = read(&disp);
+        assert_eq!(
+            out["live"],
+            serde_json::json!(false),
+            "no shell is running behind the record any more"
+        );
+        assert_eq!(
+            out["stale"],
+            serde_json::json!(true),
+            "a terminal with no shell can only return a PAST buffer"
         );
     }
 }

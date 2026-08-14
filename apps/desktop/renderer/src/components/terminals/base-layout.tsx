@@ -10,6 +10,7 @@ import {
   SlidersHorizontalIcon,
   SquareTerminalIcon,
   Trash2Icon,
+  WorkflowIcon,
 } from "lucide-react";
 import { Menu as BaseMenu } from "@base-ui/react/menu";
 import { motion, useReducedMotion } from "motion/react";
@@ -50,6 +51,7 @@ const NAV = [
   { to: "/", icon: SquareTerminalIcon, label: "Terminals" },
   { to: "/work", icon: BriefcaseIcon, label: "Work" },
   { to: "/knowledge", icon: BookOpenIcon, label: "Knowledge" },
+  { to: "/engine", icon: WorkflowIcon, label: "Engine" },
 ] as const;
 
 /**

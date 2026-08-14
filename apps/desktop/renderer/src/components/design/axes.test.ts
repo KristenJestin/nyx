@@ -20,17 +20,17 @@ import {
  * THE SHARED CROSS-LANGUAGE FIXTURE (finding `01KYSNQWQD1324E0NA0172M66J`).
  *
  * The variance rule exists twice — here and in `crates/nyx-core/src/mcp_tools_design.rs` — and this
- * suite used to RE-TYPE the manual's canonical example by hand, so it could not fail: it drifted,
+ * suite used to RE-TYPE the canonical example by hand, so it could not fail: it drifted,
  * which is exactly how the two implementations ended up reading the map form in two different
  * orders. `contract/design-fixtures.json` is now the CASES, read by both suites at test time (a
  * plain data file: nothing generates it, and neither side builds the other). A case added to it
- * fails BOTH suites until BOTH implementations agree, and the Rust side keeps it moored to the role
- * manual it is extracted from.
+ * fails BOTH suites until BOTH implementations agree, and the Rust side keeps its canonical case
+ * moored to the write path's own checks.
  */
 interface VarianceFixtureCase {
   readonly id: string;
   readonly why: string;
-  readonly from_manual?: boolean;
+  readonly canonical?: boolean;
   readonly template: string;
   readonly states_json: string;
   readonly expect: {
@@ -266,25 +266,25 @@ describe("inertAxisValues", () => {
    * THE DISCRIMINATION RULE, the exact twin of the write-path validator's `condition_discriminates`
    * (finding `01KYSCY4J8JANZEJPYME86B1VH`). A condition CREDITS a value when it renders that value
    * differently from another value of the SAME axis — never merely when it NAMES it. Asking the
-   * wrong question made the panel reproach the very shape the manual teaches.
+   * wrong question made the panel reproach the very shape the write path accepts.
    */
   describe("a condition credits what it DISCRIMINATES, not what it names", () => {
     /**
-     * The manual's canonical example — NOT a copy of it. It comes from the shared fixture, and the
-     * Rust guard `the_manuals_canonical_component_passes_the_checks_the_write_path_applies` asserts
-     * that fixture case IS what the rendered role manual carries. The hand-typed copy that used to
-     * sit here had already drifted from the manual (two variant values instead of three, different
-     * classes) without a single test noticing — finding `01KYSNQWQD1324E0NA0172M66J`.
+     * THE canonical component — NOT a copy of it. It comes from the shared fixture, which the Rust
+     * guard `the_canonical_component_passes_the_checks_the_write_path_applies` runs through the
+     * write path's own checks. The hand-typed copy that used to sit here had already drifted (two
+     * variant values instead of three, different classes) without a single test noticing — finding
+     * `01KYSNQWQD1324E0NA0172M66J`.
      */
-    const MANUAL_CASE = FIXTURE_CASES.find((c) => c.from_manual)!;
-    const CANONICAL_AXES = parseAxes(MANUAL_CASE.states_json);
+    const CANONICAL_CASE = FIXTURE_CASES.find((c) => c.canonical)!;
+    const CANONICAL_AXES = parseAxes(CANONICAL_CASE.states_json);
 
-    test("the manual's canonical component reports NOTHING", () => {
-      expect(inertAxisValues(CANONICAL_AXES, MANUAL_CASE.template)).toEqual([]);
+    test("the canonical component reports NOTHING", () => {
+      expect(inertAxisValues(CANONICAL_AXES, CANONICAL_CASE.template)).toEqual([]);
     });
 
     /**
-     * The REAL inert case is written with a boolean bare on BOTH sides: the manual's canonical
+     * The REAL inert case is written with a boolean bare on BOTH sides: the canonical
      * `loading` no longer qualifies, because its `on` carries classes and those classes DISCRIMINATE
      * the bare `off` (finding `01KYT103MXTKFBZMKF968FGW9P`).
      */
@@ -424,7 +424,7 @@ describe("inertAxisValues", () => {
 describe("the shared Rust ⟷ TS fixture", () => {
   test("carries the cases the guard is worth having for", () => {
     expect(FIXTURE_CASES.length).toBeGreaterThanOrEqual(7);
-    expect(FIXTURE_CASES.filter((c) => c.from_manual)).toHaveLength(1);
+    expect(FIXTURE_CASES.filter((c) => c.canonical)).toHaveLength(1);
   });
 
   for (const fixture of FIXTURE_CASES) {

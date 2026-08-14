@@ -258,6 +258,8 @@ export class Sidecar {
   private static readonly MAX_CRASH_RELAUNCHES = 1;
   /** Set true while a post-crash relaunch is in flight, so concurrent triggers don't double. */
   private relaunching = false;
+  /** The MCP port the LIVE sidecar bound (see {@link mcpPort}). */
+  private lastMcpPort = 0;
   /** Resolver for the in-flight boot handshake, settled by `handshake_ok`/timeout/error. */
   private bootSettle: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private bootTimer: ReturnType<typeof setTimeout> | null = null;
@@ -317,8 +319,22 @@ export class Sidecar {
 
   /** The single automatic relaunch after a crash — preserves the relaunch latch so a second
    *  crash is NOT auto-relaunched (no restart loop). */
-  private relaunchAfterCrash(): Promise<void> {
-    return this.spawnAndBoot();
+  private async relaunchAfterCrash(): Promise<void> {
+    await this.spawnAndBoot();
+    // …and START THE MCP SERVER AGAIN. `mcp_start` is issued once at boot by the caller of
+    // `start()`, and a relaunched sidecar is a FRESH process that never received it: it comes
+    // back serving the pipe (the UI works, so nothing looks wrong) with NO HTTP server bound.
+    // Every agent then loses the nyx tools until the app is restarted by hand — observed live.
+    // The supervisor owns the relaunch, so it owns restoring what the relaunch dropped.
+    //
+    // A bind failure stays a WARNING here exactly as it is at boot: a sidecar serving the pipe
+    // without its MCP surface is degraded, not dead, and killing the recovery over it would
+    // trade a partial loss for a total one.
+    const port = await this.startMcp().catch((e) => {
+      console.error(`[sidecar] MCP server did not restart after the crash relaunch: ${e}`);
+      return 0;
+    });
+    if (port > 0) console.log(`[sidecar] MCP server re-bound on 127.0.0.1:${port} after relaunch`);
   }
 
   /** Spawn the sidecar + await the bounded boot handshake. Shared by `start()` (which first
@@ -653,8 +669,18 @@ export class Sidecar {
   /** Start the in-sidecar MCP HTTP server (idempotent). Resolves the bound port. */
   async startMcp(): Promise<number> {
     const res = await this.requestRaw((id) => ({ category: "request", kind: "mcp_start", id }));
-    if (res.kind === "mcp_started") return res.port;
+    if (res.kind === "mcp_started") {
+      this.lastMcpPort = res.port;
+      return res.port;
+    }
     return this.throwError(res, "mcp_start");
+  }
+
+  /** The MCP port bound by the LIVE sidecar (0 before the first bind, or if it failed). A crash
+   *  relaunch re-binds and updates this, so it is the one place that knows where the agents'
+   *  tools currently answer. */
+  get mcpPort(): number {
+    return this.lastMcpPort;
   }
 
   /**

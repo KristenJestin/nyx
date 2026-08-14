@@ -383,11 +383,38 @@ impl CommandPty {
     /// Spawn `cmdline` read-only under the platform shell ([`resolve_shell`]) at
     /// `cwd`, with the environment inherited from nyx and a sane `$TERM`.
     ///
-    /// `env` is an OPTIONAL per-run set of `KEY=VALUE` overrides MERGED on top of the
-    /// inherited environment (PRD-4 R-WSCMD): each entry is applied AFTER the inherited
-    /// env, so it adds a new variable or overrides an inherited one (e.g. `VAULT_ENV`,
-    /// values from a `.env`). An empty slice is a plain inherited-env spawn. Secret
-    /// VALUES are NEVER logged here — only `cmd.env` receives them.
+    /// `env` is a set of `KEY=VALUE` entries MERGED on top of the inherited environment: each is
+    /// applied AFTER the inherited env, so it adds a new variable or overrides an inherited one,
+    /// and a later duplicate KEY wins over an earlier one. An empty slice is a plain
+    /// inherited-env spawn. Secret VALUES are NEVER logged here — only `cmd.env` receives them.
+    ///
+    /// # What the caller puts in `env` — two layers
+    ///
+    /// This function only merges what it is HANDED; the layering is the caller's, and every spawn
+    /// path composes it the same way (v2.8 review N31):
+    ///   1. the command's PERSISTED env (`managed_commands.env`, resolved by
+    ///      [`resolve_command_and_cwd`]) — the BASE, part of the command's definition, applied on
+    ///      EVERY path: an agent start/relaunch, the boot restore, and a `gate_check` nyx runs
+    ///      itself over its own PTY;
+    ///   2. a per-run `env` argument (`start_command` / `relaunch_command`) — a TRANSIENT override
+    ///      concatenated on top for that ONE start, so its keys win. A gate never gets one: it is
+    ///      not agent-initiated, so it runs on the persisted layer alone.
+    ///
+    /// # Non-interactive by design — a managed command must be SELF-CONTAINED
+    ///
+    /// The shell runs NON-interactively (`<shell> -c cmdline`, [`command_invocation`]),
+    /// so it does NOT source the user's rc (`~/.bashrc` / `~/.zshrc`): mise / nvm / bun /
+    /// direnv are NOT activated. A managed command therefore sees nyx's inherited
+    /// environment plus the merged `env`, NOT a nyx-terminal's interactively-sourced
+    /// one — so a command that needs a version-manager-provided tool must either declare
+    /// what it needs in its persisted env, reference the tool by an ABSOLUTE path, or wrap it in
+    /// a script that sources the environment itself. NOT sourcing the rc is a DELIBERATE
+    /// trade-off (v2.8 review N31: the env half is now FIXED by the persisted layer, the rc half
+    /// stays deferred by an explicit user decision): an interactive shell WOULD source the rc, but
+    /// it would also enable job control, putting a backgrounded descendant into its OWN process
+    /// group where the negative-pgid tree-kill (the anti-orphan / no-hang invariant of
+    /// [`KillHandle`]) cannot reach it. Non-interactive keeps every descendant in one killable
+    /// pgroup.
     ///
     /// Returns the handle and a [`Receiver`] yielding raw output chunks. The
     /// receiver disconnects (its sender drops) at EOF — i.e. when the command has
@@ -965,6 +992,26 @@ impl<S: RunnerSink> CommandRunner<S> {
         // reader observes the true live tail, not the debounced DB row.
         let live_scrollback = Arc::new(Mutex::new(String::new()));
 
+        // Fresh run = fresh scrollback, but RETAIN the last completed run (v5): archive the prior
+        // run's scrollback + outcome into the bounded `prev_*` columns (N=1), THEN reset the
+        // current row so a cold rehydrate of THIS new run never returns the previous run's output
+        // (the relaunch-piles-old-output bug) — while the prior run stays retrievable via
+        // `get_command_output(run="previous")`. The fresh live buffer above already starts empty;
+        // this clears the row to match. The front independently clears its xterm on the running
+        // transition below.
+        //
+        // It runs BEFORE the pump exists because it is a RESET, and the pump is the only other
+        // writer of this row: the pump persists the moment its command exits, so a command short
+        // enough to finish first (`echo hello; true`) had its whole output persisted and then wiped
+        // by this reset — the NEW run's output archived away as if it were the previous run's.
+        // Ordering it here puts the reset out of reach of anything but the prior run, whatever the
+        // command's duration. It stays ahead of the `running` transition below, so it still reads
+        // the PREVIOUS run's outcome to decide what to retain.
+        //
+        // The entries lock is still held: `CommandPty::spawn` above already forks a whole process
+        // tree under it, so one row write costs nothing next to that.
+        self.sink.archive_previous_run(instance_id);
+
         // Pump thread: coalesce output, persist scrollback (debounced/bounded), and
         // on disconnect reap the natural exit code and transition to success/error.
         let pump = spawn_command_pump(
@@ -994,16 +1041,6 @@ impl<S: RunnerSink> CommandRunner<S> {
             },
         );
         drop(entries);
-
-        // Fresh run = fresh scrollback, but RETAIN the last completed run (v5): archive
-        // the prior run's scrollback + outcome into the bounded `prev_*` columns (N=1),
-        // THEN reset the current row so a cold rehydrate of THIS new run never returns
-        // the previous run's output (the relaunch-piles-old-output bug) — while the
-        // prior run stays retrievable via `get_command_output(run="previous")`. The
-        // fresh live buffer above already starts empty; this archives + clears the DB
-        // row to match, before the new pump's first debounced persist. The front
-        // independently clears its xterm on the running transition below.
-        self.sink.archive_previous_run(instance_id);
 
         // Transition AFTER the entry exists so the persisted state and the live map
         // agree. The natural-exit path may race to overwrite this; it is guarded by
@@ -1343,8 +1380,11 @@ pub fn restore_commands_on_boot<S: RunnerSink>(db: &Db, runner: &CommandRunner<S
             // whole restore: skip this instance and normalize it instead.
             match crate::subfolder::resolve_run_dir(&row.workspace_path, row.subfolder.as_deref()) {
                 Ok(cwd) => {
+                    // The command's PERSISTED env (v44) applies here too: a command relaunched at
+                    // boot must see the SAME environment an agent start would give it (N31).
+                    let env = decode_command_env(row.env.as_deref());
                     if runner
-                        .start(&row.instance_id, &row.command, Some(&cwd))
+                        .start_with_env(&row.instance_id, &row.command, Some(&cwd), &env)
                         .is_ok()
                     {
                         relaunched.push(row.instance_id.clone());
@@ -1378,22 +1418,59 @@ fn normalize_unrelaunched(db: &Db, row: &RestoreRow) {
     }
 }
 
-/// Resolve an instance's command LINE + run cwd from the DB: the template `command`,
-/// and the workspace path joined with the VALIDATED subfolder (anti path-traversal /
-/// existence via [`crate::subfolder`]). `Err` BEFORE any spawn on an unknown instance
-/// or an invalid/missing subfolder.
+/// Decode a command's PERSISTED environment (the `managed_commands.env` column, v44) into the
+/// `(KEY, VALUE)` pairs [`CommandPty::spawn`] merges onto the inherited environment.
+///
+/// TOTAL by construction: absent, blank, not-JSON, not an object, or an object holding a
+/// non-string value all decode to an EMPTY vec. A malformed env must NEVER make a command
+/// unresolvable — a typo in a stored map would otherwise turn every start AND every gate of that
+/// command into a hard failure with no way to run it and fix it. The strict, REFUSING parse lives
+/// at the WRITE boundary (`mcp_runtime::optional_env_map`, used by `add_command`/`update_command`),
+/// which is where a caller mistake can still be named.
+///
+/// A non-string value is dropped alone, not the whole map: the sound keys still reach the process.
+/// The VALUES are never logged here — only returned for `cmd.env`.
+pub fn decode_command_env(raw: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
+}
+
+/// Everything a spawn path needs to launch ONE managed command: its command LINE, its run cwd, and
+/// its PERSISTED environment decoded to `(KEY, VALUE)` pairs. The triple [`resolve_command_and_cwd`]
+/// returns — named so the two resolvers (this one and `mcp_runtime`'s RPC-flavoured twin) state the
+/// same shape.
+pub type ResolvedCommand = (String, String, Vec<(String, String)>);
+
+/// Resolve an instance's command LINE + run cwd + PERSISTED environment from the DB: the template
+/// `command`, the workspace path joined with the VALIDATED subfolder (anti path-traversal /
+/// existence via [`crate::subfolder`]), and the template `env` decoded by
+/// [`decode_command_env`]. `Err` BEFORE any spawn on an unknown instance or an invalid/missing
+/// subfolder — but NEVER on a malformed env, which yields an empty one (see the decoder).
+///
+/// The env travels WITH the command line because it belongs to the COMMAND, not to the caller:
+/// every spawn path — an agent `start_command`, a boot restore, and a `gate_check` nyx runs itself
+/// over its own PTY — resolves the same triple and therefore gives the command the SAME
+/// environment (v2.8 review N31). A per-run `env` argument stays a transient override MERGED ON
+/// TOP of this base by the caller that accepts one.
 ///
 /// The shell-agnostic twin of the Tauri `bridge::resolve_command_and_cwd`, lifted into
 /// nyx-core so the lifecycle command surface (Tauri `command_start`/`command_relaunch`
 /// AND the Electron core-host's napi runner) resolve a run target identically. Returns
 /// a readable error STRING (the same vocabulary both shells surface to the user).
-pub fn resolve_command_and_cwd(db: &Db, instance_id: &str) -> Result<(String, String), String> {
+pub fn resolve_command_and_cwd(db: &Db, instance_id: &str) -> Result<ResolvedCommand, String> {
     let ctx = db
         .with_conn(|c| db::instance_run_context(c, instance_id))
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("unknown command instance {instance_id}"))?;
     let cwd = crate::subfolder::resolve_run_dir(&ctx.workspace_path, ctx.subfolder.as_deref())?;
-    Ok((ctx.command, cwd))
+    Ok((ctx.command, cwd, decode_command_env(ctx.env.as_deref())))
 }
 
 /// Best-effort graceful tree kill: SIGTERM the group, wait up to [`TERM_GRACE`]
@@ -1590,6 +1667,67 @@ mod tests {
             }
         }
         acc
+    }
+
+    /// N31 REGRESSION — a gate command spawned with an EMPTY env slice runs WITH nyx's inherited
+    /// process environment, NOT a stripped one. An empty slice means "no MERGED entries", never "no
+    /// environment": `CommandBuilder` seeds the child from the parent's live env, so a variable
+    /// present in nyx's process (an enriched PATH, DATABASE_URL, a port, …) reaches the command.
+    /// This guards against a future change that would accidentally clear the env and re-open the
+    /// "RED in the gate, GREEN by hand" gap.
+    #[test]
+    #[cfg(not(windows))]
+    fn gate_spawn_inherits_the_process_environment() {
+        with_posix_shell();
+        std::env::set_var("NYX_GATE_ENV_PROBE", "reaches-the-gate");
+        let (_cmd, rx) = CommandPty::spawn("echo GOT=$NYX_GATE_ENV_PROBE", small_size(), None, &[])
+            .expect("spawn gate probe");
+        let out = read_until(&rx, "GOT=", Duration::from_secs(5));
+        assert!(
+            out.contains("reaches-the-gate"),
+            "a gate command must inherit nyx's process env even with an empty override slice; got {out:?}"
+        );
+    }
+
+    // --- decode_command_env: the command's PERSISTED env (v44, N31) --------
+
+    /// The decoder is TOTAL: a well-formed object decodes to its pairs, and EVERY malformed shape
+    /// decodes to an EMPTY env instead of an error. That totality is what keeps a bad stored env
+    /// from making a command unresolvable — it would otherwise break the start AND the gate at once,
+    /// leaving no way to run the command and fix it.
+    #[test]
+    fn decode_command_env_is_total_and_never_fails() {
+        let mut pairs =
+            decode_command_env(Some(r#"{"DATABASE_URL":"postgres://x","PORT":"5433"}"#));
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("DATABASE_URL".to_string(), "postgres://x".to_string()),
+                ("PORT".to_string(), "5433".to_string()),
+            ]
+        );
+
+        for malformed in [
+            None,                        // no env stored at all
+            Some(""),                    // blank
+            Some("not json at all"),     // unparseable
+            Some(r#"["A","B"]"#),        // JSON, but not an object
+            Some(r#""DATABASE_URL=x""#), // JSON, but a bare string
+            Some("null"),
+        ] {
+            assert!(
+                decode_command_env(malformed).is_empty(),
+                "a malformed env decodes to an EMPTY one, got {:?} for {malformed:?}",
+                decode_command_env(malformed)
+            );
+        }
+
+        // A non-string VALUE drops that KEY alone — the sound keys still reach the process.
+        assert_eq!(
+            decode_command_env(Some(r#"{"PORT":5433,"GOOD":"yes"}"#)),
+            vec![("GOOD".to_string(), "yes".to_string())]
+        );
     }
 
     // --- command_invocation: shell family -> flag (pure, no spawn) ---------
@@ -2054,6 +2192,15 @@ mod tests {
         /// Every `clear_output` call's instance id, in order — so a test can assert the
         /// `clear_command_output` path reached the sink (review R-OUTPUT).
         cleared: Mutex<Vec<String>>,
+        /// When set to an instance id, `archive_previous_run` for it WAITS (bounded) until that
+        /// instance's scrollback is non-empty before doing its reset — deliberately handing the
+        /// new run's pump the race it can only sometimes win on its own.
+        ///
+        /// The reset must be ordered so that no pump exists yet to lose to. This turns "sometimes"
+        /// into "always": if the reset is reachable by a pump at all, this makes it reachable every
+        /// time, and the wiped output is the assertion. Off (`None`) for every other test, which
+        /// therefore pays nothing.
+        stall_archive_until_persisted: Mutex<Option<String>>,
     }
 
     /// The mock's retained prior run — mirrors the DB `prev_*` columns (v5).
@@ -2131,6 +2278,24 @@ mod tests {
                 .insert(instance_id.to_string(), serialized.to_string());
         }
         fn archive_previous_run(&self, instance_id: &str) {
+            // Give the new run's pump every chance to persist FIRST (see
+            // `stall_archive_until_persisted`). Bounded, so a correctly-ordered reset — called
+            // before any pump exists — simply waits out the window and proceeds.
+            if self.stall_archive_until_persisted.lock().unwrap().as_deref() == Some(instance_id) {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while Instant::now() < deadline {
+                    let persisted = self
+                        .scrollback
+                        .lock()
+                        .unwrap()
+                        .get(instance_id)
+                        .is_some_and(|s| !s.is_empty());
+                    if persisted {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             // Mirror `db::archive_and_reset_for_relaunch`: if the CURRENT run finished
             // (success|error), archive its scrollback + outcome into the bounded (N=1)
             // prev slot (OVERWRITING any earlier one), then reset the current run's
@@ -2969,6 +3134,45 @@ mod tests {
         assert!(
             sb.contains("hello"),
             "persisted scrollback must contain output, got {sb:?}"
+        );
+    }
+
+    /// A run short enough to finish before `start` returns keeps ITS OWN output.
+    ///
+    /// `start` resets the persisted scrollback so a new run never shows the previous one's output.
+    /// That reset and the run's own pump write the SAME row, so their order decides who owns it:
+    /// ordered after the pump, the reset wipes the output of the very run it was opening, and
+    /// archives it away as if it belonged to the run before. Nothing reports it — the caller reads
+    /// an empty buffer for a command that printed.
+    ///
+    /// The window is microseconds wide, so it only bit now and then (it is what made
+    /// `every_transition_is_persisted_and_emitted` fail under full-suite load and pass alone). The
+    /// mock holds the reset open until the pump has persisted, so the interleaving is the one under
+    /// test every run rather than one in fifty.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_run_that_finishes_before_start_returns_keeps_its_own_output() {
+        let (runner, sink) = new_runner();
+        *sink.stall_archive_until_persisted.lock().unwrap() = Some("i1".to_string());
+        runner.start("i1", "echo hello; true", None).expect("start");
+        assert!(
+            wait_state(&runner, "i1", RunState::Success, Duration::from_secs(5)),
+            "the command must finish"
+        );
+        // The pump persists BEFORE it transitions, so `Success` already implies the write landed;
+        // whatever the row holds now is final.
+        let sb = sink
+            .scrollback_of("i1")
+            .expect("scrollback persisted on exit");
+        assert!(
+            sb.contains("hello"),
+            "the run's own output must survive the fresh-run reset, got {sb:?}"
+        );
+        // And the reset still did its job: it is the run BEFORE that got archived — here there was
+        // none, so nothing was retained. The output above is not merely a reset that never ran.
+        assert!(
+            sink.prev_run_of("i1").is_none(),
+            "a first run has no previous run to retain"
         );
     }
 

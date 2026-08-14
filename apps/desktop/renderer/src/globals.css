@@ -55,6 +55,10 @@
   --color-input: var(--input);
   --color-info-foreground: var(--info-foreground);
   --color-info: var(--info);
+  /* The BRANCH hue — the engine graph paints a `selector` with it. It needed a tone of its own: it
+     used to share `primary` with the sub-workflow node, so a fork and a whole child run read alike.
+     Cyan is the one free region left between emerald (success) and blue (info). */
+  --color-branch: var(--branch);
   --color-foreground: var(--foreground);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-destructive: var(--destructive);
@@ -162,6 +166,7 @@
   --warning-foreground: oklch(0.21 0 0);
   --info: oklch(0.7137 0.1434 254.62);
   --info-foreground: oklch(0.985 0 0);
+  --branch: oklch(0.7854 0.1216 205.5);
 
   --background: oklch(1 0 0);
   --border: oklch(0.922 0 0);
@@ -224,6 +229,7 @@
   --warning-foreground: oklch(0.21 0 0);
   --info: oklch(0.7137 0.1434 254.62);
   --info-foreground: oklch(0.985 0 0);
+  --branch: oklch(0.7854 0.1216 205.5);
 
   --primary: oklch(0.7477 0.207 322.16);
   --primary-foreground: oklch(0.2103 0.0059 285.89);

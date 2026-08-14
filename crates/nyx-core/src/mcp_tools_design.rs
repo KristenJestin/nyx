@@ -3510,16 +3510,19 @@ fn route_design_tool(db: &Db, name: &str, args: &Value) -> Option<Result<ToolOut
 /// renderer's `axes.test.ts` (finding `01KYSNQWQD1324E0NA0172M66J`).
 ///
 /// The variance rule exists TWICE, once here and once in `axes.ts`, and only the Rust half was
-/// moored to anything: `mcp_context`'s guard extracts the manual's canonical example and runs it
-/// through this validator, while the TS suite RE-TYPED that example by hand. A hand copy cannot
+/// moored to anything: the TS suite RE-TYPED the canonical example by hand. A hand copy cannot
 /// fail — it drifts, silently, which is exactly how the two twins ended up reading the map form
 /// in two different orders.
 ///
 /// The fix is DATA, not a build dependency: the cases live in a checked-in JSON file that both
 /// suites read at test time (nothing generates it, and neither side builds the other). A case
-/// added to it fails BOTH suites until BOTH implementations agree — and the manual stays the
-/// source, because `the_manuals_canonical_component_passes_the_checks_the_write_path_applies`
-/// asserts the `from_manual` case IS what the rendered manual carries.
+/// added to it fails BOTH suites until BOTH implementations agree.
+///
+/// THE `canonical` CASE IS THE EXAMPLE ITSELF. It used to be transcribed in the Prototype role
+/// manual, and the guard extracted it back out of the render; that manual no longer teaches the
+/// variance model — the `design_*` tool DESCRIPTORS do, and every session gets them from
+/// `tools/list` — so the fixture is the source now, kept moored by
+/// `tests::the_canonical_component_passes_the_checks_the_write_path_applies`.
 #[cfg(test)]
 pub(crate) const DESIGN_FIXTURES: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -6750,8 +6753,56 @@ mod tests {
     ///
     /// BOTH DIRECTIONS, and in ORDER: a type added to the constant with no fixture line fails here,
     /// and a fixture line with no constant entry fails here too. The renderer's half is
-    /// `design/params.test.ts`; the manual's is
-    /// `mcp_context::tests::the_manual_teaches_exactly_the_six_param_types_the_write_path_accepts`.
+    /// `design/params.test.ts`; the AGENT-FACING half is
+    /// `mcp::tests::every_params_json_descriptor_teaches_exactly_the_types_the_write_path_accepts`
+    /// (the tool descriptors — the prose an agent really receives, now that no role manual
+    /// transcribes the list).
+    /// THE CANONICAL COMPONENT MUST PASS THE CHECKS IT ILLUSTRATES (finding
+    /// `01KYSCY4J8JANZEJPYME86B1VH`, re-pointed). The example and the validator must not contradict
+    /// each other: the example was written with a BARE baseline (`{ "name": "off" }`) while the
+    /// write path reported that value as one that "cannot change one pixel" — so the reference
+    /// taught exactly what the tool reproached, and an agent doing the right thing got a warning
+    /// for it.
+    ///
+    /// The guard used to extract the three blobs out of the RENDERED Prototype manual. That manual
+    /// no longer teaches the variance model (the `design_*` descriptors do), so the guard now reads
+    /// the SHARED FIXTURE — the same `canonical` case the renderer's `axes.test.ts` reads — and
+    /// runs it through the very functions the write path calls. It fails the day the example
+    /// changes shape, which is precisely when the pair has to be re-verified.
+    #[test]
+    fn the_canonical_component_passes_the_checks_the_write_path_applies() {
+        let (id, case) = variance_fixture_cases()
+            .into_iter()
+            .find(|(_, case)| case["canonical"] == Value::Bool(true))
+            .expect("exactly one fixture case is THE canonical component");
+        let template = case["template"].as_str().expect("a template").to_string();
+        let states = case["states_json"].as_str().expect("a states_json").to_string();
+        let params = case["params_json"].as_str().expect("a params_json").to_string();
+
+        // The case really is the shape the finding is about: a boolean axis whose BASELINE is bare,
+        // made visible by the COMPLEMENT alone (one `data-nyx-if`, no `data-nyx-if-not`).
+        assert!(
+            template.contains("data-nyx-if=\"loading=on\"") && !template.contains("data-nyx-if-not"),
+            "[{id}] the canonical template gates the spinner on `loading=on` and nothing else: {template}"
+        );
+        assert!(
+            states.contains("{ \"name\": \"off\" }"),
+            "[{id}] the canonical axes declare the baseline BARE: {states}"
+        );
+
+        // …and every WRITE-TIME check accepts it, warnings included.
+        ensure_params_json_accepted(Some(&params))
+            .expect("the canonical params declare only accepted types");
+        ensure_states_json_accepted(Some(&states))
+            .expect("the canonical axes are shaped as the write path demands");
+        let warnings = variance_warnings("Button", &template, Some(&states), Some(&params));
+        assert!(
+            warnings.is_empty(),
+            "[{id}] the canonical example must not be warned about by the validator it \
+             illustrates: {warnings:?}"
+        );
+    }
+
     #[test]
     fn the_shared_fixture_pins_the_six_param_types() {
         let section = design_fixture_section("param_types");

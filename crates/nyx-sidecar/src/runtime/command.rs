@@ -198,15 +198,28 @@ impl CommandRuntime {
         }
     }
 
-    /// Start an instance (idempotent on an already-running one). Resolves the command
-    /// line + cwd from the DB BEFORE spawning, so an unknown instance / bad subfolder is
-    /// a readable error and never a half-spawn. Mirrors the v1 `NyxCommandRunner::start`.
-    pub fn start(&self, instance_id: &str) -> anyhow::Result<CommandStatus> {
-        let (command, cwd) = command::resolve_command_and_cwd(&self.db, instance_id)
+    /// Start an instance (idempotent on an already-running one) with an OPTIONAL per-run
+    /// `env` merged onto the inherited environment. Resolves the command line + cwd from
+    /// the DB BEFORE spawning, so an unknown instance / bad subfolder is a readable error
+    /// and never a half-spawn. Mirrors the v1 `NyxCommandRunner::start`.
+    ///
+    /// The per-run `env` is the CALLER's to supply (never hardcoded here): the MCP `start_command`
+    /// carries the agent's map through [`nyx_core::mcp_runtime`] on the shared runner, and
+    /// the pipe lifecycle request carries none. It is merged ON TOP of the command's PERSISTED
+    /// env, which the resolution returns and which applies on every path (N31) — so a pipe start
+    /// with NO per-run map still gives the command the environment its definition declares. The
+    /// VALUES are never logged.
+    pub fn start(
+        &self,
+        instance_id: &str,
+        env: &[(String, String)],
+    ) -> anyhow::Result<CommandStatus> {
+        let (command, cwd, mut merged) = command::resolve_command_and_cwd(&self.db, instance_id)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        merged.extend_from_slice(env);
         let outcome = self
             .runner
-            .start_with_env(instance_id, &command, Some(&cwd), &[])
+            .start_with_env(instance_id, &command, Some(&cwd), &merged)
             .map_err(|e| anyhow::anyhow!("start failed: {e}"))?;
         let mut status = self.status_of(instance_id);
         status.was_running = outcome.was_running;
@@ -226,14 +239,21 @@ impl CommandRuntime {
         Ok(status)
     }
 
-    /// Relaunch (the explicit restart: stop-then-start if running, else a direct
-    /// start). Mirrors the v1 `NyxCommandRunner::relaunch`.
-    pub fn relaunch(&self, instance_id: &str) -> anyhow::Result<CommandStatus> {
-        let (command, cwd) = command::resolve_command_and_cwd(&self.db, instance_id)
+    /// Relaunch (the explicit restart: stop-then-start if running, else a direct start) with an
+    /// OPTIONAL per-run `env` merged ON TOP of the command's PERSISTED env (N31), both applied
+    /// onto the inherited environment of the FRESH process. Mirrors the v1
+    /// `NyxCommandRunner::relaunch`. The VALUES are never logged.
+    pub fn relaunch(
+        &self,
+        instance_id: &str,
+        env: &[(String, String)],
+    ) -> anyhow::Result<CommandStatus> {
+        let (command, cwd, mut merged) = command::resolve_command_and_cwd(&self.db, instance_id)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        merged.extend_from_slice(env);
         let outcome = self
             .runner
-            .relaunch_with_env(instance_id, &command, Some(&cwd), &[])
+            .relaunch_with_env(instance_id, &command, Some(&cwd), &merged)
             .map_err(|e| anyhow::anyhow!("relaunch failed: {e}"))?;
         let mut status = self.status_of(instance_id);
         status.was_running = outcome.was_running;

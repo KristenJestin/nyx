@@ -21,10 +21,12 @@
 //!      PHASED to the last delivered phase (F1, [`db::current_phase_for_spec`], stored as
 //!      `reviewing_phase`, F5) and ROUNDED at promotion. The chat + viewer retours land in the SAME
 //!      OPEN pass, so they SHARE round "1.1" ([`db::open_round_for_phase`], F2 — one pass = one round
-//!      holding N findings, not one round per comment); a distinct auditor pass opens "1.2"
-//!      ([`db::next_round_for_phase`]). This is the fix for the gap where a retour stayed
-//!      `phase=None`/`round=None` (excluded from the rail gauge). An auditor finding raised via
-//!      `task_add` rides the same per-phase round; a DIFFERENT phase numbers its rounds independently.
+//!      holding N findings, not one round per comment), and an AUDITOR finding raised through
+//!      `task_add` while that pass is open joins it — with no `round` passed, because nyx fills it
+//!      from the Spec's own pass rather than trusting a sub-agent to know which round it is in. This
+//!      is the fix for the gap where a retour stayed `phase=None`/`round=None` (excluded from the rail
+//!      gauge) and for the one where every auditor finding stayed `round=NULL`. A DIFFERENT phase
+//!      numbers its rounds independently ([`db::next_round_for_phase`]).
 //!   5. CODER → done: the agent CLOSES every finding (retour + auditor) through the plain
 //!      [`db::transition_task`] `done` path — a finding is agent-owned and agent-closable (v24; there
 //!      is no human-only gate on findings). Its source `review_comment` then resolves (human-only)
@@ -309,14 +311,16 @@ fn review_loop_chat_and_viewer_grill_rounds_resolve_stay_in_review() {
         Some(1),
         "the viewer retour shares round 1 (\"1.1\") — same open pass, one round holds both (F2)"
     );
-    // The open pass holds round 1, so phase 1's NEXT round is 2. `task_add` (explicit round) models a
-    // DISTINCT auditor pass opening "1.2" — and proves an auditor finding (agent-created, no
-    // `origin`) rides the SAME per-phase round axis.
-    let auditor_round = db
-        .with_conn(|c| db::next_round_for_phase(c, &spec_id, 1))
-        .unwrap();
+    // The AUDITOR raises its finding through `task_add` and passes NO round — it cannot know which
+    // round it is in, and making the axis depend on a sub-agent remembering to pass it is exactly how
+    // every finding of a campaign ended up with `round = NULL`. nyx fills it: the retour findings of
+    // round 1 are still OPEN, so the auditor's finding joins THAT pass rather than opening a new one
+    // (F2 again — one pass = one round holding N findings, whatever channel raised them). Phase 1's
+    // NEXT round is 2, and that is what a pass raised once this one settles gets.
     assert_eq!(
-        auditor_round, 2,
+        db.with_conn(|c| db::next_round_for_phase(c, &spec_id, 1))
+            .unwrap(),
+        2,
         "the open pass holds round 1 → phase 1's next round is 2 (\"1.2\")"
     );
     let auditor = tool(task_add(
@@ -328,7 +332,6 @@ fn review_loop_chat_and_viewer_grill_rounds_resolve_stay_in_review() {
             "kind": "review",
             "severity": TASK_SEVERITY_HIGH,
             "phase": "Delivery",
-            "round": auditor_round,
         }),
     ));
     let auditor_id = auditor["task"]["id"].as_str().unwrap().to_string();
@@ -339,8 +342,8 @@ fn review_loop_chat_and_viewer_grill_rounds_resolve_stay_in_review() {
     );
     assert_eq!(
         auditor["task"]["round"],
-        json!(auditor_round),
-        "…on phase 1's next round (\"1.2\")"
+        json!(1),
+        "…and nyx ROUNDS it into the pass that is open — \"1.1\" — without the auditor saying so"
     );
     assert!(
         auditor["task"].get("origin").is_none(),

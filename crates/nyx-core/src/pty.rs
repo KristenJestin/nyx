@@ -105,6 +105,12 @@ impl PauseGate {
     }
 }
 
+/// How long a shell is given to honour the `SIGHUP` on its own before
+/// [`Pty::kill_and_reap`] escalates to `SIGKILL`. Long enough for a shell to run its exit
+/// path, short enough that a close never feels stuck — and it only ever ELAPSES for a shell
+/// that ignored the hangup, which is precisely the case that used to block forever.
+pub const SHELL_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Env var carrying nyx's PERSISTENT terminal record id (`terminals.id`) into the
 /// spawned shell and everything it launches (PRD-5 task #3). An agent integration
 /// running INSIDE the shell (e.g. the Claude plugin's SessionStart hook) reads this
@@ -603,6 +609,26 @@ impl Pty {
         *self.exit_code.lock().unwrap()
     }
 
+    /// Terminate the child AND make the kill STICK — the teardown any caller that then JOINS a
+    /// thread depending on the child's death must use, instead of the bare [`kill`](Self::kill).
+    ///
+    /// `kill` alone is a single `SIGHUP` an interactive shell may simply not honour (see
+    /// [`ensure_child_dead`](Self::ensure_child_dead)); the shell then lives on, the master never
+    /// EOFs, the reader never disconnects, and the join blocks FOREVER. `Drop` has always done the
+    /// full sequence, but a caller holding the `Pty` alive (an `Arc` shared with a pump thread it
+    /// is about to join) never reaches `Drop` — that is exactly the deadlock cycle. So the whole
+    /// sequence lives HERE and `Drop` reuses it: kill, resume the pause-gate (a reader parked on
+    /// the condvar would never reach `read()` to see EOF), then escalate to `SIGKILL` after
+    /// `grace`.
+    pub fn kill_and_reap(&mut self, grace: std::time::Duration) {
+        let _ = self.killer.kill();
+        self.pause_gate.set_paused(false);
+        #[cfg(unix)]
+        self.ensure_child_dead(grace);
+        #[cfg(not(unix))]
+        let _ = grace;
+    }
+
     /// Make sure the child is really gone, escalating past a signal it can survive.
     ///
     /// `portable_pty`'s Unix killer sends exactly ONE `SIGHUP`. An interactive shell
@@ -648,20 +674,11 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        // Ensure the child is dead so both helper threads can terminate:
-        // the waiter unblocks from `wait`, and (on Unix) the reader sees EOF once
-        // the master/child fds close.
-        let _ = self.killer.kill();
-        // Resume the reader in case the bridge left it paused at the gate: a reader
-        // blocked on the pause condvar would never reach `read()` to observe EOF,
-        // so the join below (Unix) would deadlock. Resuming lets it loop, hit EOF,
-        // and exit. Harmless if it was already running.
-        self.pause_gate.set_paused(false);
-        // …and make the kill STICK before joining a waiter that would otherwise block on
-        // `waitpid` for ever (see `ensure_child_dead`). The grace is what a shell needs to
-        // honour the SIGHUP itself; nothing waits on it once the child is gone.
-        #[cfg(unix)]
-        self.ensure_child_dead(std::time::Duration::from_millis(500));
+        // Ensure the child is dead so both helper threads can terminate: the waiter unblocks
+        // from `wait`, and (on Unix) the reader sees EOF once the master/child fds close. The
+        // grace is what a shell needs to honour the SIGHUP itself; nothing waits on it once the
+        // child is gone.
+        self.kill_and_reap(SHELL_KILL_GRACE);
         if let Some(handle) = self.waiter_handle.take() {
             // Fast + reliable: `child.wait()` returns right after the kill, then
             // the waiter closes the master.

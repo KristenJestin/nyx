@@ -260,11 +260,16 @@ impl Harness {
         }
     }
 
-    fn recv_until<T>(&mut self, deadline: Duration, mut f: impl FnMut(&Message) -> Option<T>) -> T {
+    fn recv_until<T>(
+        &mut self,
+        deadline: Duration,
+        what: &str,
+        mut f: impl FnMut(&Message) -> Option<T>,
+    ) -> T {
         let start = Instant::now();
         loop {
             let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
-                panic!("timed out waiting for a matching message");
+                panic!("timed out after {deadline:?} waiting for {what}");
             };
             match self.recv(remaining) {
                 Some(msg) => {
@@ -272,7 +277,7 @@ impl Harness {
                         return v;
                     }
                 }
-                None => panic!("timed out waiting for a matching message"),
+                None => panic!("timed out after {deadline:?} waiting for {what}"),
             }
         }
     }
@@ -283,7 +288,7 @@ impl Harness {
             id,
             protocol_version: PROTOCOL_VERSION,
         });
-        self.recv_until(Duration::from_secs(5), |m| match m {
+        self.recv_until(Duration::from_secs(5), "the handshake ack", |m| match m {
             Message::Response(Response::HandshakeOk { .. }) => Some(()),
             _ => None,
         });
@@ -311,16 +316,20 @@ impl Harness {
             command: command.to_string(),
             args_json: args.to_string(),
         });
-        self.recv_until(Duration::from_secs(10), |m| match m {
-            Message::Response(Response::DbResult {
-                id: rid,
-                result_json,
-            }) if *rid == id => Some(Ok(serde_json::from_str(result_json).unwrap())),
-            Message::Response(Response::Error {
-                id: rid, message, ..
-            }) if *rid == id => Some(Err(message.clone())),
-            _ => None,
-        })
+        self.recv_until(
+            Duration::from_secs(10),
+            &format!("the `{command}` db-command reply"),
+            |m| match m {
+                Message::Response(Response::DbResult {
+                    id: rid,
+                    result_json,
+                }) if *rid == id => Some(Ok(serde_json::from_str(result_json).unwrap())),
+                Message::Response(Response::Error {
+                    id: rid, message, ..
+                }) if *rid == id => Some(Err(message.clone())),
+                _ => None,
+            },
+        )
     }
 
     /// Spawn a PTY bound to a persistent RECORD id (so a parked resume can key onto it) and
@@ -335,10 +344,14 @@ impl Harness {
             cwd: String::new(),
             record_id: record_id.to_string(),
         });
-        self.recv_until(Duration::from_secs(5), |m| match m {
-            Message::Response(Response::PtySpawned { terminal_id, .. }) => Some(*terminal_id),
-            _ => None,
-        })
+        self.recv_until(
+            Duration::from_secs(5),
+            "the PtySpawned reply",
+            |m| match m {
+                Message::Response(Response::PtySpawned { terminal_id, .. }) => Some(*terminal_id),
+                _ => None,
+            },
+        )
     }
 
     fn write_line(&mut self, terminal_id: u32, line: &str) {
@@ -355,22 +368,26 @@ impl Harness {
     /// text lands in `TerminalOutput` even when the program (`claude`) is not installed.
     fn read_until_marker(&mut self, needle: &str) -> String {
         let mut seen = Vec::new();
-        self.recv_until(Duration::from_secs(10), |m| match m {
-            Message::Event(Event::TerminalOutput { data, .. }) => {
-                seen.extend_from_slice(data);
-                String::from_utf8_lossy(&seen)
-                    .contains(needle)
-                    .then_some(())
-            }
-            _ => None,
-        });
+        self.recv_until(
+            Duration::from_secs(10),
+            &format!("terminal output containing {needle:?}"),
+            |m| match m {
+                Message::Event(Event::TerminalOutput { data, .. }) => {
+                    seen.extend_from_slice(data);
+                    String::from_utf8_lossy(&seen)
+                        .contains(needle)
+                        .then_some(())
+                }
+                _ => None,
+            },
+        );
         String::from_utf8_lossy(&seen).into_owned()
     }
 
     fn shutdown(mut self) {
         let id = self.id();
         self.send(Request::Shutdown { id });
-        self.recv_until(Duration::from_secs(5), |m| match m {
+        self.recv_until(Duration::from_secs(5), "the shutdown ack", |m| match m {
             Message::Response(Response::ShutdownAck { .. }) => Some(()),
             _ => None,
         });

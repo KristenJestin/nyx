@@ -29,15 +29,17 @@
 //! gap avoids pause/resume thrash.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use nyx_core::agent::AgentRegistry;
+use nyx_core::db::{self, Db};
 use nyx_core::osc133::{self, ExecOutcome};
 use nyx_core::osc7;
-use nyx_core::pty::{PauseGate, Pty};
+use nyx_core::pty::{PauseGate, Pty, SHELL_KILL_GRACE};
 use nyx_core::vt_screen::{ScreenSnapshot, VtScreen};
 use portable_pty::PtySize;
 
@@ -64,6 +66,18 @@ const HIGH_WATER: usize = 512 * 1024;
 /// Mirrors the v1 host's `LOW_WATER`.
 const LOW_WATER: usize = 128 * 1024;
 
+/// `(cols, rows)` of a shell spawned with no pane behind it
+/// ([`PtyManager::spawn_headless`]). The classic terminal default: nothing on screen dictates a
+/// geometry, and the mount that later attaches resizes the shell to its real pane.
+const HEADLESS_SIZE: (u16, u16) = (80, 24);
+
+/// Minimum delay between two SAVES of a view-less terminal's scrollback
+/// ([`ScrollbackOwner::save_headless`]). The bytes are accumulated on every chunk, so nothing
+/// waits on this — only the SQLite write does, which is why a flood must not trigger one per
+/// 16ms flush. Mirrors the renderer's own debounce (750ms) for a mounted terminal, so a read is
+/// no less fresh off-screen than on it.
+const HEADLESS_SAVE_INTERVAL: Duration = Duration::from_millis(750);
+
 /// Per-terminal flow-control accounting: the in-flight (sent-but-unacked) byte count
 /// and the live pause state. Shared between the pump thread (which reserves on emit
 /// and pauses at the high-water mark) and the ack handler (which frees quota and
@@ -76,6 +90,130 @@ struct FlowState {
     /// Total bytes emitted so far (the monotonically increasing `seq` base — actually
     /// we use a separate per-chunk seq below; this is informational).
     seq: u64,
+}
+
+/// The SIDECAR-owned scrollback of a terminal that has NO renderer view.
+///
+/// `terminals.scrollback` is normally written by the RENDERER (xterm's `SerializeAddon`,
+/// debounced) and only while the terminal's pane is mounted. A shell opened over MCP has no pane
+/// anywhere, so nothing ever saved it and `read_terminal` answered an empty buffer: an agent
+/// could drive a terminal it could not read. A read must mean the same thing whether or not a
+/// human happens to be looking at that project, so the sidecar persists what it pumps for as
+/// long as — and ONLY as long as — nobody else does.
+struct HeadlessScrollback {
+    db: Arc<Db>,
+    /// The persistent terminal RECORD id whose `scrollback` column this writes.
+    record_id: String,
+    /// Everything the shell has printed since the spawn, bounded to the column's own cap.
+    ///
+    /// This lock is also the HAND-OVER seam: [`ScrollbackOwner::hand_over_to_view`] takes it to
+    /// make the final save and flip `has_view` in ONE critical section, so the pump can neither
+    /// write after the renderer has become the owner (a double-write, clobbering its save) nor
+    /// leave its accumulated history unsaved (a lost pre-mount history).
+    buffer: Mutex<Vec<u8>>,
+}
+
+impl HeadlessScrollback {
+    /// Overwrite the record's `scrollback` with the accumulated buffer. `persist_scrollback` is
+    /// an overwrite (the same call the renderer's save makes), which is why the WHOLE history is
+    /// kept in memory rather than appended blindly. Best-effort: a failed write leaves the
+    /// previous buffer in place and the next save carries the same bytes again.
+    fn save(&self, buffer: &[u8]) {
+        let text = String::from_utf8_lossy(buffer);
+        let _ = self
+            .db
+            .with_conn(|c| db::persist_scrollback(c, &self.record_id, &text));
+    }
+}
+
+/// WHO owns a terminal's scrollback right now, and therefore where the pump's bytes go.
+///
+/// A pane attached (`has_view`) ⇒ the RENDERER owns it: the bytes are streamed to it and it
+/// saves the serialized buffer, exactly as before. No pane ⇒ the SIDECAR owns it: nothing
+/// crosses the pipe (no view means no ack, see [`LiveTerminal::has_view`]), so the pump keeps
+/// the bytes and saves them itself. The bit is the single authority for that question, read by
+/// the pump and flipped once, by the mount that takes the shell over.
+#[derive(Clone)]
+struct ScrollbackOwner {
+    /// Whether a RENDERER VIEW is wired to this PTY — see [`LiveTerminal::has_view`].
+    has_view: Arc<AtomicBool>,
+    /// Whether the persisted `terminals.scrollback` is BEHIND the shell — see
+    /// [`LiveTerminal::scrollback_dirty`].
+    dirty: Arc<AtomicBool>,
+    /// The sidecar's own persistence, present only for a shell spawned WITHOUT a view and
+    /// carrying a record id (there is nothing to write into otherwise). `None` once — and
+    /// because — the renderer has owned the buffer from the first byte.
+    sidecar: Option<Arc<HeadlessScrollback>>,
+}
+
+impl ScrollbackOwner {
+    /// Whether a renderer pane consumes (and acks) this terminal's output frames.
+    fn has_view(&self) -> bool {
+        self.has_view.load(Ordering::Relaxed)
+    }
+
+    /// The shell just printed: whatever is persisted is behind it, until a save says otherwise.
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the persisted scrollback is behind the shell (output has arrived since the last
+    /// save) — what `read_terminal` reports as `stale`.
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// ACCUMULATE one raw output chunk while no pane is attached. Called on every chunk (not
+    /// only on a flush) so the hand-over below has the FULL history to save — a mount must never
+    /// cost the terminal the last bytes it printed before the pane appeared.
+    fn record_headless(&self, chunk: &[u8]) {
+        let Some(sidecar) = &self.sidecar else { return };
+        let mut buffer = sidecar.buffer.lock().unwrap();
+        // A pane may have attached between the caller's `has_view` check and this lock: from
+        // that instant the renderer owns the buffer, so drop the chunk rather than grow a
+        // history nobody will save.
+        if self.has_view() {
+            return;
+        }
+        buffer.extend_from_slice(chunk);
+        // Keep only the tail the column can hold, so a chatty view-less shell cannot grow this
+        // without bound (the DB write bounds too, but the memory must be bounded here).
+        if buffer.len() > db::MAX_SCROLLBACK_BYTES {
+            let cut = buffer.len() - db::MAX_SCROLLBACK_BYTES;
+            buffer.drain(..cut);
+        }
+    }
+
+    /// SAVE the accumulated buffer into the record. Separate from
+    /// [`record_headless`](Self::record_headless) because the accumulation is per-chunk while
+    /// the SQLite write is debounced ([`HEADLESS_SAVE_INTERVAL`]).
+    fn save_headless(&self) {
+        let Some(sidecar) = &self.sidecar else { return };
+        let buffer = sidecar.buffer.lock().unwrap();
+        if self.has_view() {
+            return;
+        }
+        sidecar.save(&buffer);
+        // The record now carries what the shell has printed, so `read_terminal` reports it as
+        // the terminal's present state — the same answer a mounted terminal gives.
+        self.dirty.store(false, Ordering::Relaxed);
+    }
+
+    /// A pane TOOK THE TERMINAL OVER: make the last sidecar save, then hand ownership to the
+    /// renderer — both under the buffer lock, so a concurrent pump save can land neither in the
+    /// middle of the flip nor after it. From here the renderer's debounced `persist_scrollback`
+    /// is the only writer, exactly as for a terminal that was mounted from the start.
+    fn hand_over_to_view(&self) {
+        match &self.sidecar {
+            Some(sidecar) => {
+                let buffer = sidecar.buffer.lock().unwrap();
+                sidecar.save(&buffer);
+                self.dirty.store(false, Ordering::Relaxed);
+                self.has_view.store(true, Ordering::Relaxed);
+            }
+            None => self.has_view.store(true, Ordering::Relaxed),
+        }
+    }
 }
 
 /// One live interactive terminal: the kill/write/resize handles plus its flow state.
@@ -111,14 +249,40 @@ struct LiveTerminal {
     /// no output nor keystroke for N minutes is a candidate to unload (gated first by the
     /// `agent_activity == Idle` safety check). Shared with the pump thread by `Arc`.
     last_io: Arc<Mutex<Instant>>,
+    /// WHO owns this terminal's scrollback (and therefore whether its output is streamed or
+    /// persisted here) — see [`ScrollbackOwner`]. Holds:
+    ///
+    /// * `has_view` — whether a RENDERER VIEW is wired to this PTY, i.e. whether anyone consumes
+    ///   the [`Event::TerminalOutput`] frames and ACKS them back. `true` for a PTY the renderer
+    ///   spawned by mounting its pane, `false` for one
+    ///   [`spawn_headless`](PtyManager::spawn_headless) opened for an MCP `create_terminal` with
+    ///   no pane on screen, until a mount [`attaches`](PtyManager::attach_view). It gates the
+    ///   pump's EMIT because the flow quota is credited by the renderer alone: with no view,
+    ///   every frame crosses the pipe to be dropped by a renderer that has no instance for that
+    ///   id, so its bytes are never acked — the backlog would climb to `HIGH_WATER` and pause the
+    ///   reader FOREVER, hanging the very shell an agent opened. A view-less terminal therefore
+    ///   emits nothing and reserves nothing; its bytes reach the VT screen through the feeder and
+    ///   the record through the sidecar's own save.
+    /// * `dirty` — whether OUTPUT has arrived since this terminal's scrollback was last saved,
+    ///   i.e. whether `terminals.scrollback` is BEHIND the shell right now. Both halves of that
+    ///   question cross the sidecar (the pump sees the output; the save is either its own or the
+    ///   `persist_scrollback` db-command), so it holds the EXACT bit instead of guessing from a
+    ///   timestamp. Set by the pump on every chunk, cleared by whichever save happens.
+    /// * `sidecar` — the view-less persistence itself.
+    ///
+    /// Shared with the pump thread by `Arc`.
+    scrollback: ScrollbackOwner,
 }
 
 /// The live interactive-PTY registry + pump driver. The [`super::Runtime`] holds one;
 /// the pipe dispatch calls [`spawn`](PtyManager::spawn) / [`write`](PtyManager::write)
 /// / [`resize`](PtyManager::resize) / [`close`](PtyManager::close) /
 /// [`ack`](PtyManager::ack) on it.
-#[derive(Default)]
 pub struct PtyManager {
+    /// The SHARED pool, so a terminal with no renderer view can have its scrollback persisted
+    /// HERE (see [`HeadlessScrollback`]) — the sidecar owns that buffer for exactly as long as
+    /// no pane does.
+    db: Arc<Db>,
     terminals: Mutex<HashMap<u32, LiveTerminal>>,
     /// record-id -> live pty id. The sidecar registers this join itself when a PTY is
     /// spawned WITH a `record_id` (the v1 `register_terminal_pty`), so the MCP terminal
@@ -127,11 +291,39 @@ pub struct PtyManager {
     /// reports the true `live` bit. Wrapped in its OWN `Arc<Mutex>` so the MCP
     /// dispatcher (a separate thread) shares the SAME registry.
     live_records: Arc<Mutex<HashMap<String, u32>>>,
+    /// record-id -> the command line to type into that record's shell the moment its PTY spawns
+    /// (the v1 core-host `PendingTerminalCommands`). `create_terminal` over MCP accepts a
+    /// `command`, but the record it creates has NO shell yet — the renderer owns terminal
+    /// mounting, and the PTY only exists once it mounts the pane. So the command waits HERE and
+    /// [`spawn`](PtyManager::spawn) drains it. Kept in the PTY manager rather than in a policy
+    /// module (unlike the agent [`resume parks`](super::resume_parks)) because it carries no
+    /// policy at all: it is just bytes to type into a record's shell as soon as one exists.
+    opening_commands: Mutex<HashMap<String, String>>,
 }
 
 impl PtyManager {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(db: Arc<Db>) -> Self {
+        Self {
+            db,
+            terminals: Mutex::new(HashMap::new()),
+            live_records: Arc::new(Mutex::new(HashMap::new())),
+            opening_commands: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// PARK the command a terminal was OPENED with, to be typed into its shell as soon as that
+    /// shell exists. The record is brand new when this is called (`create_terminal` just wrote
+    /// it), so no PTY can be live for it yet — the only consumer is the upcoming
+    /// [`spawn`](PtyManager::spawn). Dropped un-run if the terminal is closed before it ever
+    /// mounts ([`close_record`](PtyManager::close_record)).
+    pub fn park_opening_command(&self, record_id: &str, command: &str) {
+        if record_id.is_empty() {
+            return;
+        }
+        self.opening_commands
+            .lock()
+            .unwrap()
+            .insert(record_id.to_string(), command.to_string());
     }
 
     /// Number of live terminals currently registered.
@@ -151,14 +343,52 @@ impl PtyManager {
         self.live_records.lock().unwrap().contains_key(record_id)
     }
 
-    /// Spawn an interactive shell PTY of `cols`x`rows`, start its pump (binary output
-    /// over `events` + OSC cwd/exec-state + exit), and return the live terminal id.
+    /// Whether the persisted `terminals.scrollback` for `record_id` is BEHIND its live shell —
+    /// output has arrived that the renderer has not saved. `false` for a record with no live PTY:
+    /// nothing is producing, so the buffer is not falling further behind (the caller still knows
+    /// there is no shell, from `live`).
+    pub fn scrollback_is_behind(&self, record_id: &str) -> bool {
+        self.with_live_terminal(record_id, |t| t.scrollback.dirty.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// The renderer just SAVED this record's scrollback: the persisted buffer is level with the
+    /// shell again. Called from the `persist_scrollback` db-command — the renderer's half of the
+    /// save, the only one for a terminal whose pane is mounted (a view-less one saves itself,
+    /// see [`ScrollbackOwner::save_headless`]).
+    pub fn mark_scrollback_persisted(&self, record_id: &str) {
+        self.with_live_terminal(record_id, |t| {
+            t.scrollback.dirty.store(false, Ordering::Relaxed)
+        });
+    }
+
+    /// Run `f` against the LIVE terminal backing a record id, if there is one. Resolves the record
+    /// through `live_records` (the same join the terminal tools use) under both registry locks.
+    fn with_live_terminal<T>(
+        &self,
+        record_id: &str,
+        f: impl FnOnce(&LiveTerminal) -> T,
+    ) -> Option<T> {
+        let pty_id = self.live_records.lock().unwrap().get(record_id).copied()?;
+        let terms = self.terminals.lock().unwrap();
+        terms.get(&pty_id).map(f)
+    }
+
+    /// Spawn an interactive shell PTY of `cols`x`rows` FOR A RENDERER VIEW (the mount of a
+    /// terminal pane), start its pump (binary output over `events` + OSC cwd/exec-state + exit),
+    /// and return the live terminal id.
     ///
     /// `cwd` empty -> the sidecar's cwd; `record_id` empty -> no `NYX_TERMINAL_ID`
     /// export. `mcp_port` is the MCP HTTP port THIS instance's sidecar bound (`0` when the MCP
     /// server has not started yet); `> 0` exports it as `NYX_MCP_PORT` so the Claude plugin's
     /// SessionStart hook reaches THIS instance (review `01KXAXQN32GASMEB05PDW5BZSR`). A spawn
     /// failure is a readable error (never a half-spawn).
+    ///
+    /// ATTACHES rather than spawns when a PTY is ALREADY live for `record_id`: a terminal opened
+    /// over MCP got its shell here without any pane (see
+    /// [`spawn_headless`](Self::spawn_headless)), so the mount that comes later — the user finally
+    /// switching to that project — must take over THAT shell. A second `Pty::spawn` would leave the
+    /// first one orphaned behind the record and show the user a fresh, wrong prompt.
     pub fn spawn(
         &self,
         cols: u16,
@@ -167,6 +397,90 @@ impl PtyManager {
         record_id: &str,
         mcp_port: u16,
         events: EventSink,
+    ) -> anyhow::Result<u32> {
+        if let Some(live) = self.live_pty_for(record_id) {
+            self.attach_view(live, cols, rows);
+            return Ok(live);
+        }
+        self.spawn_pty(cols, rows, cwd, record_id, mcp_port, events, true)
+    }
+
+    /// Spawn a shell for `record_id` with NO renderer view behind it — the MCP `create_terminal`
+    /// path. The terminal RECORD exists but nothing on screen shows it (its project is not the
+    /// displayed one, or it is a loose terminal), and the renderer only ever mounts the displayed
+    /// project's panes; without this the record would sit in the sidebar as an empty shell and
+    /// every `send_to_terminal` would answer `invalid_state`, so an agent could only drive nyx in
+    /// whatever project the human happened to be looking at.
+    ///
+    /// The shell is real from this instant: the parked opening command runs, `send_to_terminal`
+    /// writes, `list_terminals` reports it live. It just emits no output frames until a pane
+    /// [`attaches`](Self::attach_view) — see [`LiveTerminal::has_view`].
+    ///
+    /// Sized at [`HEADLESS_SIZE`]: no pane means no geometry to fit, and the attaching mount
+    /// resizes it to the real one.
+    pub fn spawn_headless(
+        &self,
+        cwd: &str,
+        record_id: &str,
+        mcp_port: u16,
+        events: EventSink,
+    ) -> anyhow::Result<u32> {
+        if let Some(live) = self.live_pty_for(record_id) {
+            return Ok(live);
+        }
+        let (cols, rows) = HEADLESS_SIZE;
+        self.spawn_pty(cols, rows, cwd, record_id, mcp_port, events, false)
+    }
+
+    /// The live pty id backing a RECORD id, or `None` for an empty/unbound record.
+    fn live_pty_for(&self, record_id: &str) -> Option<u32> {
+        if record_id.is_empty() {
+            return None;
+        }
+        self.live_records.lock().unwrap().get(record_id).copied()
+    }
+
+    /// A renderer pane took over an ALREADY-live PTY (the mount of a terminal whose shell was
+    /// opened headlessly over MCP): hand the scrollback back to the renderer, start emitting to
+    /// it, and resize the shell to the pane.
+    ///
+    /// The scrollback hand-over is what keeps the ownership unambiguous in BOTH directions: the
+    /// sidecar makes its final save and stops in one critical section
+    /// ([`ScrollbackOwner::hand_over_to_view`]), so the pre-mount history is in the record and no
+    /// second writer can clobber the renderer's saves afterwards.
+    ///
+    /// The flow quota is RESET rather than carried over: what the pump produced before the pane
+    /// existed was never sent to anyone, so counting it would charge the new view for bytes it
+    /// will never receive and could leave the reader paused with nobody able to credit it back.
+    fn attach_view(&self, terminal_id: u32, cols: u16, rows: u16) {
+        {
+            let terms = self.terminals.lock().unwrap();
+            let Some(t) = terms.get(&terminal_id) else {
+                return;
+            };
+            t.scrollback.hand_over_to_view();
+            let mut flow = t.flow.lock().unwrap();
+            flow.in_flight = 0;
+            if flow.paused {
+                flow.paused = false;
+                t.pause_gate.set_paused(false);
+            }
+        }
+        let _ = self.resize(terminal_id, cols, rows);
+    }
+
+    /// The shared spawn body of [`spawn`](Self::spawn) / [`spawn_headless`](Self::spawn_headless);
+    /// `has_view` says whether a renderer pane consumes (and acks) this PTY's output frames.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_pty(
+        &self,
+        cols: u16,
+        rows: u16,
+        cwd: &str,
+        record_id: &str,
+        mcp_port: u16,
+        events: EventSink,
+        has_view: bool,
     ) -> anyhow::Result<u32> {
         let size = PtySize {
             rows,
@@ -190,6 +504,22 @@ impl PtyManager {
         let screen = Arc::new(Mutex::new(VtScreen::new(rows, cols)));
         // Last-I/O clock (v2.5.5 unload): starts "now" at spawn — a fresh terminal is not idle.
         let last_io = Arc::new(Mutex::new(Instant::now()));
+        // WHO owns the scrollback. A shell spawned WITHOUT a view carries the sidecar's own
+        // persistence: the record it belongs to was created by the `create_terminal` that opened
+        // this very shell, so its `scrollback` column is empty and accumulating from nothing
+        // rewrites no history. Freshness starts level: nothing has been printed yet, so the
+        // (empty) persisted scrollback is not behind anything.
+        let scrollback = ScrollbackOwner {
+            has_view: Arc::new(AtomicBool::new(has_view)),
+            dirty: Arc::new(AtomicBool::new(false)),
+            sidecar: (!has_view && !record_id.is_empty()).then(|| {
+                Arc::new(HeadlessScrollback {
+                    db: Arc::clone(&self.db),
+                    record_id: record_id.to_string(),
+                    buffer: Mutex::new(Vec::new()),
+                })
+            }),
+        };
 
         // FEEDER thread: owns the slow, byte-wise VT parse OFF the pump's read→emit path. The
         // pump sends each raw chunk here (O(1)); this thread parses it into `screen`. Dropping
@@ -210,6 +540,7 @@ impl PtyManager {
         let pump_pty = Arc::clone(&pty);
         let pump_feed_tx = feed_tx.clone();
         let pump_last_io = Arc::clone(&last_io);
+        let pump_scrollback = scrollback.clone();
         let pump = std::thread::Builder::new()
             .name(format!("nyx-sidecar-pty-pump-{terminal_id}"))
             .spawn(move || {
@@ -222,6 +553,7 @@ impl PtyManager {
                     pty: pump_pty,
                     feed_tx: pump_feed_tx,
                     last_io: pump_last_io,
+                    scrollback: pump_scrollback,
                 });
             })?;
 
@@ -237,6 +569,7 @@ impl PtyManager {
                 screen,
                 feed_tx: Some(feed_tx),
                 last_io,
+                scrollback,
             },
         );
         // Register the record -> live pty join so the MCP terminal tools resolve this
@@ -247,6 +580,16 @@ impl PtyManager {
                 .lock()
                 .unwrap()
                 .insert(record_id.to_string(), terminal_id);
+            // OPENING COMMAND: a terminal opened over MCP with a `command` parked it when it had
+            // no shell to run it in. Its shell exists NOW, so type the line in — the same write a
+            // keystroke takes, `command` + a carriage return, so the shell executes it and stays
+            // interactive. Drained one-shot: re-opening the terminal later gives a bare shell.
+            let opening = self.opening_commands.lock().unwrap().remove(record_id);
+            if let Some(command) = opening {
+                let mut bytes = command.into_bytes();
+                bytes.push(b'\r');
+                let _ = self.write(terminal_id, &bytes);
+            }
         }
         Ok(terminal_id)
     }
@@ -268,8 +611,11 @@ impl PtyManager {
         }
     }
 
-    /// Close a terminal by its RECORD id (the MCP `close_terminal` live-PTY half).
+    /// Close a terminal by its RECORD id (the MCP `close_terminal` live-PTY half). Also drops any
+    /// opening command still waiting for a shell, so closing a terminal before it ever mounted
+    /// cannot leave a command that a later record with the same id would inherit.
     pub fn close_record(&self, record_id: &str) {
+        self.opening_commands.lock().unwrap().remove(record_id);
         let pty_id = self.live_records.lock().unwrap().get(record_id).copied();
         if let Some(id) = pty_id {
             self.close(id);
@@ -515,10 +861,15 @@ impl PtyManager {
             if let Some(rec) = &live.record_id {
                 self.live_records.lock().unwrap().remove(rec);
             }
-            // Kill the session-leader shell (portable-pty killer), then resume the gate
-            // so a paused reader can loop, hit EOF and the pump exits.
-            let _ = live.pty.lock().unwrap().kill();
-            live.pause_gate.set_paused(false);
+            // Kill the session-leader shell and make the kill STICK (`kill_and_reap`: SIGHUP,
+            // resume the gate so a paused reader can loop and hit EOF, then SIGKILL after the
+            // grace) BEFORE joining the pump. A bare `kill` is one SIGHUP an interactive shell
+            // may not honour — and the pump only exits when the master EOFs, i.e. when the shell
+            // dies, so the join below would block FOREVER on the sidecar's REQUEST LOOP: the pipe
+            // stops answering and the whole app freezes. `Drop for Pty` runs the same escalation,
+            // but it can never rescue us here — the `Pty` is behind an `Arc` the pump thread we
+            // are joining also holds, so `Drop` cannot run until that join returns.
+            live.pty.lock().unwrap().kill_and_reap(SHELL_KILL_GRACE);
             if let Some(handle) = live.pump.take() {
                 let _ = handle.join();
             }
@@ -632,6 +983,11 @@ struct PumpParams {
     feed_tx: Sender<Vec<u8>>,
     /// The last-PTY-I/O clock (v2.5.5 unload): refreshed on every output chunk.
     last_io: Arc<Mutex<Instant>>,
+    /// WHO owns the scrollback ([`ScrollbackOwner`]): the freshness bit the pump RAISES on every
+    /// chunk, and — while no pane is attached — the sidecar's own accumulation + save. Its
+    /// `has_view` is read at each flush, so a pane that attaches mid-stream starts receiving from
+    /// its next flush on.
+    scrollback: ScrollbackOwner,
 }
 
 /// The pump body (ported from the v1 napi `run_pump`): leading-edge coalescing, the
@@ -648,9 +1004,11 @@ fn run_pump(params: PumpParams) {
         pty,
         feed_tx,
         last_io,
+        scrollback,
     } = params;
     let mut pending: Vec<u8> = Vec::new();
     let mut last_flush = Instant::now();
+    let mut last_save = Instant::now();
     let mut osc133_tail: Vec<u8> = Vec::new();
     let mut exec_sm = osc133::ExecStateMachine::new();
 
@@ -660,6 +1018,10 @@ fn run_pump(params: PumpParams) {
         //   - `pending` NON-EMPTY: wait at most until the next scheduled flush so a
         //     steady flood coalesces on the 16ms cadence.
         let recv = if pending.is_empty() {
+            // About to block until the shell prints again: save its scrollback NOW if it is
+            // behind, so a one-shot output (the usual case an agent reads back) is in the record
+            // immediately instead of waiting for a chunk that may never come.
+            save_headless(&scrollback, &mut last_save, true);
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
         } else {
             let wait = FLUSH_INTERVAL.saturating_sub(last_flush.elapsed());
@@ -670,6 +1032,14 @@ fn run_pump(params: PumpParams) {
                 // OUTPUT is I/O: refresh the idle clock so a terminal actively printing (Claude
                 // streaming its answer, a build logging) is never seen as idle by the unload sweep.
                 *last_io.lock().unwrap() = Instant::now();
+                // The screen just moved on: whatever was last SAVED as this terminal's scrollback
+                // is now behind it, until the next save says otherwise.
+                scrollback.mark_dirty();
+                // With NO pane attached the sidecar is this terminal's only scrollback writer, so
+                // it keeps every chunk (the SAVE below is debounced, the accumulation is not — a
+                // mount must never cost the terminal the bytes it printed just before the pane
+                // appeared). A no-op once a pane owns the buffer.
+                scrollback.record_headless(&chunk);
                 // Forward the SAME raw bytes to the headless VT feeder (v2.2.5) with an O(1)
                 // channel send — the slow byte-wise parse runs on the FEEDER thread, so it never
                 // slows this read→emit loop and can never widen the read-ahead window that the
@@ -687,25 +1057,51 @@ fn run_pump(params: PumpParams) {
 
                 pending.extend_from_slice(&chunk);
                 if last_flush.elapsed() >= FLUSH_INTERVAL {
-                    flush(terminal_id, &mut pending, &events, &flow, &gate);
+                    flush(terminal_id, &mut pending, &events, &flow, &gate, &scrollback);
                     last_flush = Instant::now();
                 }
+                // A shell that never stops printing never reaches the trailing save above, so
+                // the debounced one keeps the record within one interval of the truth.
+                save_headless(&scrollback, &mut last_save, false);
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush(terminal_id, &mut pending, &events, &flow, &gate);
+                flush(terminal_id, &mut pending, &events, &flow, &gate, &scrollback);
                 last_flush = Instant::now();
+                save_headless(&scrollback, &mut last_save, false);
             }
             Err(RecvTimeoutError::Disconnected) => {
-                // Child exited / master closed: flush the tail, reap the code, emit
-                // `pty-exit`, exit the pump. The `feed_tx` clone drops here, so once close also
-                // drops the stored sender the feeder disconnects and exits.
-                flush(terminal_id, &mut pending, &events, &flow, &gate);
+                // Child exited / master closed: flush the tail, save what it last printed (the
+                // record is all that is left of it), reap the code, emit `pty-exit`, exit the
+                // pump. The `feed_tx` clone drops here, so once close also drops the stored
+                // sender the feeder disconnects and exits.
+                flush(terminal_id, &mut pending, &events, &flow, &gate, &scrollback);
+                save_headless(&scrollback, &mut last_save, true);
                 let code = pty.lock().unwrap().wait();
                 events.emit(Event::PtyExit { terminal_id, code });
                 break;
             }
         }
     }
+}
+
+/// Save a VIEW-LESS terminal's accumulated scrollback into its record, at most once per
+/// [`HEADLESS_SAVE_INTERVAL`] — the sidecar's twin of the renderer's debounced
+/// `persist_scrollback`, so a flood costs the shared pool one bounded write per interval instead
+/// of one per 16ms flush.
+///
+/// `force` bypasses the debounce for the two edges where waiting would leave the record wrong for
+/// an unbounded time: the pump is about to BLOCK on an idle shell, and the child has EXITED.
+/// A no-op for a terminal whose pane owns the buffer, and for one that has printed nothing since
+/// its last save.
+fn save_headless(scrollback: &ScrollbackOwner, last_save: &mut Instant, force: bool) {
+    if scrollback.has_view() || !scrollback.is_dirty() {
+        return;
+    }
+    if !force && last_save.elapsed() < HEADLESS_SAVE_INTERVAL {
+        return;
+    }
+    scrollback.save_headless();
+    *last_save = Instant::now();
 }
 
 /// The headless-VT FEEDER loop (v2.2.5): drain raw output chunks off the pump and parse them
@@ -741,14 +1137,26 @@ fn run_screen_feeder(rx: Receiver<Vec<u8>>, screen: Arc<Mutex<VtScreen>>) {
 /// pause-gate: once the in-flight backlog reaches the high-water mark we pause the
 /// gate, so the core reader blocks and the child gets OS backpressure — nothing is
 /// dropped, and memory is bounded to `HIGH_WATER + CHUNK_BYTES`.
+///
+/// With NO view attached (`has_view`), the buffer is DROPPED instead of emitted: the quota's only
+/// creditor is the renderer, so sending to a pane that does not exist would consume the whole
+/// high-water budget and then pause the reader with nobody able to ack it back — a headless shell
+/// that hangs after its first half-megabyte of output. Nothing is lost by dropping it: the feeder
+/// has already parsed the same bytes into the VT screen, and the pump has already handed them to
+/// [`ScrollbackOwner::record_headless`] for the record.
 fn flush(
     terminal_id: u32,
     pending: &mut Vec<u8>,
     events: &EventSink,
     flow: &Arc<Mutex<FlowState>>,
     gate: &PauseGate,
+    scrollback: &ScrollbackOwner,
 ) {
     if pending.is_empty() {
+        return;
+    }
+    if !scrollback.has_view() {
+        pending.clear();
         return;
     }
     let chunk = std::mem::take(pending);
@@ -906,6 +1314,23 @@ mod tests {
         EventSink::new(Box::new(Sink(Arc::new(Mutex::new(Vec::new())))))
     }
 
+    /// A manager over a fresh on-disk migrated `Db` under a unique temp dir (the sidecar cannot
+    /// use nyx-core's `#[cfg(test)]` `Db::in_memory`). The pool is what a view-less terminal's
+    /// scrollback is persisted into; the tests below that never look at a record still need one.
+    fn manager() -> PtyManager {
+        let dir = std::env::temp_dir().join(format!(
+            "nyx-pty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("nyx.db")).expect("open db");
+        PtyManager::new(Arc::new(db))
+    }
+
     /// Poll the snapshot until `pred` holds or we time out, returning the last snapshot.
     fn snapshot_until<F>(
         mgr: &PtyManager,
@@ -938,7 +1363,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn snapshot_reflects_shell_output() {
-        let mgr = PtyManager::new();
+        let mgr = manager();
         let id = mgr
             .spawn(80, 24, "", "", 0, discard_sink())
             .expect("spawn pty");
@@ -966,7 +1391,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn snapshot_captures_alt_screen_tui() {
-        let mgr = PtyManager::new();
+        let mgr = manager();
         let id = mgr
             .spawn(80, 24, "", "", 0, discard_sink())
             .expect("spawn pty");
@@ -998,7 +1423,7 @@ mod tests {
     /// An unknown / closed terminal has no snapshot.
     #[test]
     fn snapshot_none_for_unknown_terminal() {
-        let mgr = PtyManager::new();
+        let mgr = manager();
         assert!(mgr.snapshot(999_999).is_none());
     }
 
@@ -1025,7 +1450,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn busy_record_flips_true_while_a_foreground_command_runs() {
-        let mgr = PtyManager::new();
+        let mgr = manager();
         let record = "rec-busy";
         let id = mgr
             .spawn(80, 24, "", record, 0, discard_sink())
@@ -1058,7 +1483,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_pids_by_record_reports_live_record_backed_terminals() {
-        let mgr = PtyManager::new();
+        let mgr = manager();
         let record = "rec-stats";
         let id = mgr
             .spawn(80, 24, "", record, 0, discard_sink())
@@ -1089,7 +1514,7 @@ mod tests {
     fn foreground_comm_feeds_provider_agnostic_detection() {
         use nyx_core::agent::AgentRegistry;
 
-        let mgr = PtyManager::new();
+        let mgr = manager();
         let record = "rec-detect";
         let id = mgr
             .spawn(80, 24, "", record, 0, discard_sink())
@@ -1127,6 +1552,166 @@ mod tests {
 
         // An unknown record has no foreground comm (no live PTY).
         assert!(mgr.foreground_comm_record("no-such-record").is_none());
+        mgr.close(id);
+    }
+
+    // --- close never blocks the caller ---------------------------------------------------
+
+    /// [`PtyManager::close`] runs ON THE SIDECAR'S REQUEST LOOP (`close_terminal`, the idle-unload
+    /// sweep, `close_all` at shutdown), so a close that blocks freezes the whole pipe — no reply
+    /// to any request, ever.
+    ///
+    /// It CAN block: `close` joins the pump, the pump only exits when the PTY master EOFs, and the
+    /// master only EOFs when the shell dies — while `portable-pty`'s Unix killer sends exactly one
+    /// `SIGHUP`, which a shell is free to ignore. The `Drop for Pty` escalation cannot save the
+    /// caller either: the `Pty` sits behind an `Arc` the very pump thread being joined also holds,
+    /// so `Drop` cannot run until that join returns.
+    ///
+    /// `trap '' HUP` makes that state DETERMINISTIC — the shell explicitly ignores the hangup,
+    /// which a freshly-spawned interactive shell does by accident whenever the kill lands before it
+    /// reaches the point where it honours one (the real-world flake). The close must still return,
+    /// because it escalates to `SIGKILL` past the grace.
+    #[cfg(unix)]
+    #[test]
+    fn close_returns_even_when_the_shell_ignores_sighup() {
+        let mgr = Arc::new(manager());
+        let id = mgr
+            .spawn(80, 24, "", "rec-hup", 0, discard_sink())
+            .expect("spawn pty");
+        // Install the trap, then have the shell CONFIRM it is in place. The marker is assembled by
+        // `printf` so the confirmation cannot be satisfied by the terminal's echo of the typed line
+        // itself — only real post-`trap` output spells `HUP_TRAPPED`.
+        mgr.write(id, b"trap '' HUP; printf 'HUP_%s' TRAPPED\n")
+            .expect("write");
+        let snap = snapshot_until(&mgr, id, Duration::from_secs(5), |s| {
+            (0..s.main.rows).any(|r| s.main.row_text(r).contains("HUP_TRAPPED"))
+        })
+        .expect("a snapshot");
+        assert!(
+            (0..snap.main.rows).any(|r| snap.main.row_text(r).contains("HUP_TRAPPED")),
+            "the shell must confirm the SIGHUP trap is installed before we close; got rows: {:?}",
+            (0..snap.main.rows)
+                .map(|r| snap.main.row_text(r))
+                .collect::<Vec<_>>()
+        );
+
+        // Close from another thread so an unbounded `join` inside `close` FAILS this test with a
+        // readable timeout instead of hanging the whole test binary.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closer = Arc::clone(&mgr);
+        std::thread::spawn(move || {
+            closer.close(id);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(15)).expect(
+            "close must RETURN (escalating past the ignored SIGHUP) instead of blocking the \
+             request loop on the pump join",
+        );
+        assert!(!mgr.is_live(id), "the closed terminal left the registry");
+    }
+
+    // --- a shell with no pane behind it (H1) ----------------------------------------------
+
+    /// A sink that KEEPS the framed bytes, so a test can ask what actually crossed the pipe.
+    fn recording_sink() -> (EventSink, Arc<Mutex<Vec<u8>>>) {
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        (EventSink::new(Box::new(Sink(Arc::clone(&wire)))), wire)
+    }
+
+    /// Whether the framed wire bytes carry `marker` anywhere. Output frames are BINARY
+    /// MessagePack of the raw PTY bytes, so a marker the shell printed appears verbatim.
+    fn wire_carries(wire: &Arc<Mutex<Vec<u8>>>, marker: &str) -> bool {
+        last_subslice(&wire.lock().unwrap(), marker.as_bytes()).is_some()
+    }
+
+    /// A terminal opened over MCP gets its shell HERE, with no pane anywhere; the renderer's
+    /// mount, whenever it comes, must take THAT shell over instead of starting a second one.
+    /// A second `Pty::spawn` would strand the first shell — still running, still holding the
+    /// agent's session — behind a record now pointing at a fresh, empty prompt.
+    ///
+    /// Also pins the resize the attach owes the pane: the headless shell was sized at
+    /// [`HEADLESS_SIZE`] because nothing on screen dictated a geometry.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_takes_over_the_headless_shell_instead_of_spawning_a_second() {
+        let mgr = manager();
+        let record = "rec-attach";
+        let headless = mgr
+            .spawn_headless("", record, 0, discard_sink())
+            .expect("the MCP-opened shell");
+        // What the renderer does when the user finally switches to that project.
+        let mounted = mgr
+            .spawn(120, 40, "", record, 0, discard_sink())
+            .expect("the mount");
+        assert_eq!(
+            mounted, headless,
+            "the mount must take over the shell already backing the record"
+        );
+        assert_eq!(
+            mgr.live_count(),
+            1,
+            "one record, one shell — the mount must not leave an orphan running"
+        );
+        let snap = snapshot_until(&mgr, mounted, Duration::from_secs(5), |s| {
+            (s.main.cols, s.main.rows) == (120, 40)
+        })
+        .expect("a snapshot");
+        assert_eq!(
+            (snap.main.cols, snap.main.rows),
+            (120, 40),
+            "the attach must resize the shell to the pane it is now shown in"
+        );
+        mgr.close(mounted);
+    }
+
+    /// A shell with NO view streams nothing over the pipe, and starts streaming the moment one
+    /// attaches.
+    ///
+    /// This is not an optimisation: the flow quota is credited by the RENDERER alone
+    /// ([`PtyManager::ack`]). Frames sent to a pane that does not exist are dropped by a renderer
+    /// with no instance for that id, so their bytes are never acked — the backlog would climb to
+    /// [`HIGH_WATER`] and pause the reader with nobody left to release it, hanging the very shell
+    /// an agent opened as soon as it printed half a megabyte.
+    ///
+    /// The output is not lost to the sidecar: the marker is asserted PRESENT on the VT screen at
+    /// the same moment it is absent from the wire, so the test cannot pass by the shell simply
+    /// having printed nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_with_no_view_streams_nothing_until_a_pane_attaches() {
+        let mgr = manager();
+        let record = "rec-noview";
+        let (sink, wire) = recording_sink();
+        let id = mgr
+            .spawn_headless("", record, 0, sink)
+            .expect("the MCP-opened shell");
+
+        // The shell PRINTS while nothing is watching: the marker reaches the VT screen…
+        mgr.write(id, b"printf 'NOVIEW_%s' MARKER\n").expect("write");
+        snapshot_until(&mgr, id, Duration::from_secs(5), |s| {
+            (0..s.main.rows).any(|r| s.main.row_text(r).contains("NOVIEW_MARKER"))
+        })
+        .filter(|s| (0..s.main.rows).any(|r| s.main.row_text(r).contains("NOVIEW_MARKER")))
+        .expect("the shell must have printed the marker (the feeder sees it)");
+        // …and NOT the pipe: not one byte of a view-less terminal's output crosses it.
+        assert!(
+            !wire_carries(&wire, "NOVIEW"),
+            "a shell with no pane must not stream (its bytes could never be acked back)"
+        );
+
+        // A pane attaches: from here the terminal streams like any other.
+        mgr.spawn(80, 24, "", record, 0, discard_sink())
+            .expect("the mount");
+        mgr.write(id, b"printf 'ATTACHED_%s' MARKER\n")
+            .expect("write");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !wire_carries(&wire, "ATTACHED_MARKER") {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert!(
+            wire_carries(&wire, "ATTACHED_MARKER"),
+            "once a pane is attached the shell's output must reach the renderer"
+        );
         mgr.close(id);
     }
 }

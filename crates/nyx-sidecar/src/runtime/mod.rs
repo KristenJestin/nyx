@@ -201,9 +201,12 @@ impl Runtime {
         data_dir: PathBuf,
         resource_dir: Option<PathBuf>,
     ) -> Self {
+        // The PTY manager shares the pool: a terminal with NO renderer view has its scrollback
+        // persisted by the sidecar itself, into the SAME record `read_terminal` reads.
+        let pty = Arc::new(pty::PtyManager::new(Arc::clone(&db)));
         Self {
             db,
-            pty: Arc::new(pty::PtyManager::new()),
+            pty,
             command: Arc::new(Mutex::new(None)),
             mcp: Arc::new(Mutex::new(None)),
             git_watch: Arc::new(Mutex::new(None)),
@@ -715,6 +718,11 @@ impl Runtime {
     /// previous run crashed (handled like a clean shutdown since v2.5.8). We persist the clean
     /// marker WHILE keeping the idempotency journal.
     pub fn shutdown(&self) {
+        // R1 — STOP marking sessions `ended` for the rest of this shutdown, FIRST of all (before
+        // mcp.stop + close_all): the dying Claude PTYs fire `SessionEnd(prompt_input_exit)` that
+        // reaches the handler even after the listener is torn down, and marking `ended` there kills
+        // the next-boot resume. Armed here, that late SessionEnd leaves the row `active` instead.
+        nyx_core::mcp_tools_core::suppress_session_end_marking();
         // STOP THE MCP HTTP LISTENER FIRST — BEFORE any PTY is closed (`self.pty.close_all()`
         // below). Closing the interactive Claude PTYs makes each dying Claude fire a
         // `SessionEnd(reason=other)` hook that POSTs `agent_session_event` to our MCP server. If
@@ -884,8 +892,11 @@ impl Runtime {
                 Response::Ok { id: *id }
             }
             // --- Managed-command lifecycle (HHD) ---------------------------------
+            // The UI lifecycle requests carry NO per-run env (the map is an MCP-tool argument,
+            // which travels to the SAME runner through `mcp_runtime::start_command`), so these
+            // pass what the request holds: nothing.
             Request::CommandStart { id, instance_id } => match self.command() {
-                Some(cmd) => match cmd.start(instance_id) {
+                Some(cmd) => match cmd.start(instance_id, &[]) {
                     Ok(status) => status.into_response(*id),
                     Err(e) => err(*id, format!("command start failed: {e}")),
                 },
@@ -899,7 +910,7 @@ impl Runtime {
                 None => err(*id, "managed-command runtime not started".into()),
             },
             Request::CommandRelaunch { id, instance_id } => match self.command() {
-                Some(cmd) => match cmd.relaunch(instance_id) {
+                Some(cmd) => match cmd.relaunch(instance_id, &[]) {
                     Ok(status) => status.into_response(*id),
                     Err(e) => err(*id, format!("command relaunch failed: {e}")),
                 },

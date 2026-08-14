@@ -315,4 +315,156 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    /// F3 — the ORCHESTRATION journal never drowns the human fil. A run journals ONE outbox row per
+    /// tick, and the bound here is a SQL `LIMIT` on the newest rows: without the `run` aggregate
+    /// filter, a single run of a few hundred ticks would evict every "changement notable" from the
+    /// window and the cockpit would show nothing but machine grain. Worst shape on purpose — the run
+    /// is correlated through its SPEC and carries NO workspace, so its rows land project-scoped
+    /// (`workspace_id NULL`), which the timeline folds into EVERY workspace of the project.
+    #[test]
+    fn timeline_is_not_drowned_by_a_runs_tick_journal() {
+        let mut conn = open_in_memory();
+        let sink = NullEventSink;
+        let (project, _root) = usecase::create_project(
+            &mut conn,
+            &sink,
+            "Nyx",
+            &root_path("ticks"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let ws = usecase::register_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            "wt",
+            &root_path("ticks-wt"),
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        // The human-facing event the fil exists to show.
+        usecase::rename_workspace(&mut conn, &sink, &ws.id, "renamed", DomainEventSource::Ui)
+            .unwrap();
+
+        // …then a run of 200 ticks over it, journaled through the REAL engine seam.
+        let (spec, _rev) = db::create_spec(
+            &mut conn,
+            &project.id,
+            "Driven spec",
+            db::SpecSections {
+                problem: "p".into(),
+                solution: "s".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let workflow =
+            db::create_workflow(&mut conn, None, "wf", db::WORKFLOW_SCOPE_CUSTOM, None).unwrap();
+        let run =
+            db::create_workflow_run(&mut conn, &workflow.id, Some(&spec.id), None, "{}").unwrap();
+        for _ in 0..200 {
+            db::persist_run_tick(
+                &mut conn,
+                &run.id,
+                None,
+                "{}",
+                db::RUN_STATUS_RUNNING,
+                None,
+                &db::TickTrace {
+                    action_type: Some("spawn_subagent"),
+                    last_result: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let tl = timeline(&mut conn, &ws.id, DEFAULT_TIMELINE_LIMIT)
+            .unwrap()
+            .expect("workspace resolves");
+        assert!(
+            tl.entries.iter().any(|e| e.event_type == "workspace.renamed"),
+            "the rename is STILL in the fil after 200 ticks: {:?}",
+            tl.entries
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            tl.entries.iter().all(|e| e.aggregate != db::AGGREGATE_RUN),
+            "a tick is an audit row, never a timeline entry"
+        );
+        // The rows ARE in the outbox — they are excluded from this read, not withheld from the log.
+        let all = db::list_domain_events(&mut conn).unwrap();
+        assert_eq!(
+            all.iter()
+                .filter(|e| e.event_type == db::EVENT_RUN_TICK)
+                .count(),
+            200
+        );
+    }
+
+    /// A slash-command injection that FAILED is visible in nyx (H8) — in this fil, unlike a tick.
+    ///
+    /// The hook is best-effort and says why it injected nothing on stderr, which Claude Code hands
+    /// to nothing nyx can read: a failure was visible only to a human already in debug mode, which
+    /// is how a dead injection survived a whole release (F1). Unlike a per-tick row this one is RARE
+    /// by construction — only a failure writes one — so it belongs in the human-facing fil rather
+    /// than being excluded from it.
+    #[test]
+    fn a_failed_injection_reaches_the_workspace_fil() {
+        let mut conn = open_in_memory();
+        let sink = NullEventSink;
+        let (project, _root) = usecase::create_project(
+            &mut conn,
+            &sink,
+            "Nyx",
+            &root_path("inject"),
+            None,
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let ws = usecase::register_workspace(
+            &mut conn,
+            &sink,
+            &project.id,
+            "wt",
+            &root_path("inject-wt"),
+            DomainEventSource::Ui,
+        )
+        .unwrap();
+        let term = db::create_terminal(&mut conn, &root_path("inject-wt"), None).unwrap();
+        db::attach_terminal(&mut conn, &term.id, &ws.id, "auto").unwrap();
+
+        let filed = db::record_injection_failure(
+            &mut conn,
+            &term.id,
+            "ndev",
+            "run_start refused: workspace has 3 active Specs",
+        )
+        .unwrap();
+        assert!(filed, "the terminal resolves a project, so the row is filed");
+
+        let tl = timeline(&mut conn, &ws.id, DEFAULT_TIMELINE_LIMIT)
+            .unwrap()
+            .expect("workspace resolves");
+        let entry = tl
+            .entries
+            .iter()
+            .find(|e| e.event_type == db::EVENT_INJECTION_FAILED)
+            .expect("the failed injection is IN the fil the human reads");
+        assert!(
+            entry.payload.contains("3 active Specs") && entry.payload.contains("ndev"),
+            "…carrying the reason and the command it failed on: {}",
+            entry.payload,
+        );
+
+        // A terminal nyx does not know resolves no project, so there is nothing to scope a row to —
+        // and the report is dropped rather than filed under a guess.
+        assert!(
+            !db::record_injection_failure(&mut conn, "no-such-terminal", "ndev", "boom").unwrap(),
+            "an unresolvable terminal files nothing",
+        );
+    }
 }

@@ -377,6 +377,28 @@ is a UI gesture done in the nyx application itself; nyx tools operate on project
 already exist in nyx (you CAN, however, rename an existing project or change its \
 settings with set_project_settings).";
 
+/// How many requests the MCP surface serves AT ONCE (v2.8 L1). The accept loop hands each request
+/// to this pool instead of serving it on the accepting thread.
+///
+/// The single-thread assumption this replaces held only while every request was short. It is FALSE
+/// for `nyx_next`: a `gate_check` runs the project's own test suite ON the dispatch path, for up to
+/// [`crate::mcp_engine::GATE_TOTAL_TIMEOUT`]. Served inline, that one call accepted nothing else —
+/// no other agent, no other session, no other tool call — for as long as the gate took, and the
+/// user hit that freeze twice in a day on a suite of a few seconds run several times per task.
+///
+/// BOUNDED rather than one thread per request: an unbounded spawn turns a burst — or a client
+/// retrying a call it wrongly believes hung — into unbounded threads, which is a worse failure than
+/// the one being fixed. Four is sized on the only long operation there is: a gate holds one worker,
+/// and three stay free for everyone else.
+const REQUEST_WORKERS: usize = 4;
+
+/// How many ACCEPTED requests wait for a free worker. Only reached once all [`REQUEST_WORKERS`] are
+/// busy; past it the accept loop itself blocks and the kernel's listen backlog holds the pending
+/// connections. So a saturated pool QUEUES: no request is dropped, and none is ever answered by
+/// something other than the handler that served it. Bounded so a client looping on a call it thinks
+/// is wedged cannot grow nyx's memory (and its held sockets) without limit.
+const REQUEST_QUEUE_CAP: usize = 64;
+
 /// Resolve the MCP port (ADR-0003 D2): `NYX_MCP_PORT` when it parses to a non-zero
 /// `u16`, else [`DEFAULT_PORT`]. Port 0 ("any free port") is rejected so the port
 /// is stable between launches.
@@ -569,11 +591,30 @@ impl McpServer {
     /// Binds STRICTLY to `127.0.0.1` (ADR-0003 D1): the socket address is
     /// `Ipv4Addr::LOCALHOST`, never `0.0.0.0`, so the surface is unreachable off-box.
     pub fn start(self: &Arc<Self>) -> std::io::Result<u16> {
+        self.start_on(resolve_port())
+    }
+
+    /// TEST-ONLY: bind an EPHEMERAL port (`:0`) the OS picks, returning what it gave.
+    ///
+    /// The stability guarantee of [`start`](Self::start) is a PRODUCTION property (an onboarded
+    /// client's `http://127.0.0.1:<port>/mcp` config must survive a restart), which is why
+    /// [`resolve_port`] rejects 0. A TEST needs the opposite: several `cargo test` processes run
+    /// at once here, so any shared number makes them fail each other's binds with `AddrInUse` —
+    /// a suite that goes red for a reason unrelated to the code, which is how a real failure gets
+    /// dismissed as noise.
+    #[cfg(test)]
+    pub fn start_ephemeral(self: &Arc<Self>) -> std::io::Result<u16> {
+        self.start_on(0)
+    }
+
+    /// The shared bind body: latch the start, bind `127.0.0.1:port`, record the port the OS
+    /// really gave (`port` is what was ASKED for — 0 means "any free one"), and spawn the accept
+    /// loop.
+    fn start_on(self: &Arc<Self>, port: u16) -> std::io::Result<u16> {
         // Latch the start: only the first caller proceeds to bind a listener.
         if self.started.swap(true, Ordering::SeqCst) {
             return Ok(self.bound_port.load(Ordering::SeqCst));
         }
-        let port = resolve_port();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let server = match tiny_http::Server::http(addr) {
             Ok(s) => s,
@@ -586,8 +627,9 @@ impl McpServer {
                 ));
             }
         };
-        // tiny_http picks the real port when several share a default; record what we
-        // actually bound so health/onboarding reflect reality.
+        // The bound port can differ from the asked-for one (an ephemeral `:0` bind, or tiny_http
+        // picking when several share a default); record what we actually bound so
+        // health/onboarding reflect reality.
         let real_port = server
             .server_addr()
             .to_ip()
@@ -615,9 +657,11 @@ impl McpServer {
     /// closes the listening socket. After this returns, a new connection to the bound
     /// port is REFUSED — nothing accepts it — so a late `POST /mcp` (e.g. the
     /// `SessionEnd(reason=other)` hook of a Claude killed during shutdown) can no longer
-    /// reach the dispatcher. Bounded: `unblock` + a single `join` (the accept loop is
-    /// only ever inside a short synchronous request handler). Idempotent — a second call
-    /// (or a call before `start`) is a no-op.
+    /// reach the dispatcher. Bounded: `unblock` + a single `join`, and the accept loop is only ever
+    /// accepting or handing a request to the pool — never inside a handler, which is what lets an
+    /// ordered shutdown proceed while a gate is still running (the workers are detached and drain
+    /// themselves once this drops the queue's sender — see [`McpServer::accept_loop`]). Idempotent —
+    /// a second call (or a call before `start`) is a no-op.
     pub fn stop(&self) {
         // Take the listener clone FIRST so it is dropped at the end of this scope, AFTER
         // the accept-loop thread has been joined (and thus dropped its own clone).
@@ -655,12 +699,49 @@ impl McpServer {
         self.started.load(Ordering::SeqCst)
     }
 
-    /// The blocking accept loop: serve each request on the calling thread. Requests
-    /// are short synchronous JSON-RPC calls, so a single accept thread is adequate
-    /// for the local cas nominal.
+    /// The blocking accept loop: take each request off the listener and hand it to the WORKER POOL
+    /// ([`REQUEST_WORKERS`]) rather than serving it here. A request served on THIS thread is a
+    /// request that stops the loop from accepting the next one, and one `tools/call` legitimately
+    /// runs for minutes (a `nyx_next` whose `gate_check` runs the project's test suite) — so this
+    /// thread only ever accepts.
+    ///
+    /// The workers are DETACHED on purpose. [`McpServer::stop`] joins THIS thread, which is only
+    /// ever inside `incoming_requests` (or handing a request over), and dropping the queue's sender
+    /// on the way out lets the workers finish what they hold, drain what is queued, and exit on
+    /// their own. Joining them instead would make an ordered shutdown wait out whatever gate happens
+    /// to be running. They hold nothing that outlives them: a `tiny_http::Request` owns its own
+    /// socket, so a worker can still answer a connection accepted before the stop, and the listening
+    /// socket still closes the moment `stop` drops the last `Arc<Server>`.
     fn accept_loop(self: Arc<Self>, server: Arc<tiny_http::Server>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<tiny_http::Request>(REQUEST_QUEUE_CAP);
+        // One receiver shared by the pool: the workers compete for the next request, and whoever
+        // wins serves it. The lock is held ACROSS the `recv` only — never across the request — so a
+        // worker inside a 90s gate cannot keep the others off the queue.
+        let rx = Arc::new(Mutex::new(rx));
+        for n in 0..REQUEST_WORKERS {
+            let this = Arc::clone(&self);
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name(format!("nyx-mcp-worker-{n}"))
+                .spawn(move || loop {
+                    let next = rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                    match next {
+                        Ok(request) => this.handle_request(request),
+                        // The accept loop is gone and the queue is drained: nothing more will come.
+                        Err(_) => break,
+                    }
+                })
+                .expect("spawn nyx-mcp-worker thread");
+        }
         for request in server.incoming_requests() {
-            self.handle_request(request);
+            // A FULL queue blocks here rather than dropping the request: the connection waits in
+            // the kernel's listen backlog and is served as soon as a worker frees up. Every worker
+            // would have to be busy AND 64 requests already waiting to reach that, which on a
+            // loopback surface driven by a handful of local agents means something is very wrong —
+            // and queueing is still the honest answer to it.
+            if tx.send(request).is_err() {
+                break;
+            }
         }
     }
 
@@ -874,7 +955,11 @@ fn authority_is_loopback(authority: &str) -> bool {
 /// the per-tool argument schemas from the ADR's tool surface so a client can form
 /// valid calls; the call bodies live in [`crate::mcp_tools`]. Every descriptor's
 /// `name` stays in [`V1_TOOLS`] order; the schema mirrors each tool's `args` table.
-fn tool_descriptors() -> Vec<Value> {
+///
+/// `pub(crate)` so a tool's OWN module can bind its descriptor to its behaviour: the `nyx_next`
+/// action inventory is checked against the payloads the engine really builds, in the engine's own
+/// tests ([`crate::mcp_engine`]), where a new leaf is added.
+pub(crate) fn tool_descriptors() -> Vec<Value> {
     // Reusable JSON-Schema fragments for the common id/string arguments.
     let str_prop = |desc: &str| json!({ "type": "string", "description": desc });
     // The SCOPED CSS SLOT, described IDENTICALLY on the two write paths that accept it
@@ -925,6 +1010,24 @@ fn tool_descriptors() -> Vec<Value> {
                             onto the inherited environment for this run — e.g. {\"VAULT_ENV\":\"dev\"} \
                             or values from a .env. Each value must be a string. Applied only to the \
                             process this call spawns; on a no-op start (already running) it is ignored.",
+        })
+    };
+    // The PERSISTED `env` of a command TEMPLATE (v2.8 review N31): the environment stored WITH the
+    // command, applied on EVERY path that runs it — including a gate_check nyx runs itself, which
+    // the per-run `env` of start_command deliberately never reaches.
+    let command_env_prop = || {
+        json!({
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "optional PERSISTENT environment for this command (KEY→VALUE string map, \
+                            e.g. {\"DATABASE_URL\":\"postgres://…\"}), stored with the command and \
+                            applied EVERY time it runs — started by hand, started by you, or run by \
+                            nyx as a workflow gate. Use it for what the command NEEDS to be green \
+                            (the per-run `env` of start_command is a one-off override on top, and \
+                            never applies to a gate). Each value must be a string. Sent WHOLE: it \
+                            replaces the stored map rather than patching it, and {} (or null) clears \
+                            it. Reading back, a command reports only `env_keys` — values are never \
+                            echoed.",
         })
     };
     // Agent-facing one-liner per v1 tool: WHEN/WHY to use it, in plain terms. These
@@ -1100,12 +1203,13 @@ fn tool_descriptors() -> Vec<Value> {
     descriptors.push(json!({
         "name": ADD_COMMAND_TOOL,
         "description": "Create a per-project command TEMPLATE (name + command line, \
-                        optional run subfolder), via the SAME path as the UI's \
-                        command_create — one instance is materialized per existing \
-                        workspace of the project. A command line that is itself a package \
-                        manager invocation (`pnpm dev`, …) has its provenance inferred. \
-                        Returns the created template. A name already used in the project → \
-                        invalid_state.",
+                        optional run subfolder, optional persistent environment), via the \
+                        SAME path as the UI's command_create — one instance is materialized \
+                        per existing workspace of the project. A command line that is itself \
+                        a package manager invocation (`pnpm dev`, …) has its provenance \
+                        inferred. Returns the created template (its `env_keys` list the \
+                        stored environment's KEYS; the values are never echoed). A name \
+                        already used in the project → invalid_state.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1113,6 +1217,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "name": str_prop("command display name (must be unique within the project)"),
                 "command": str_prop("the command line to run"),
                 "subfolder": str_prop("optional run path relative to EACH workspace (default: workspace root). A run-path, NOT a scope: the template is materialized into every workspace and this subfolder is appended even if it does not exist there"),
+                "env": command_env_prop(),
             },
             "required": ["project_id", "name", "command"],
         },
@@ -1120,9 +1225,10 @@ fn tool_descriptors() -> Vec<Value> {
     descriptors.push(json!({
         "name": UPDATE_COMMAND_TOOL,
         "description": "Modify an existing command TEMPLATE's editable fields (name, \
-                        command, subfolder), via the SAME path as the UI's command_update. \
-                        Only the fields supplied are changed; omitted fields keep their \
-                        current value (pass subfolder:\"\" to clear it). Editing the command \
+                        command, subfolder, env), via the SAME path as the UI's \
+                        command_update. Only the fields supplied are changed; omitted fields \
+                        keep their current value (pass subfolder:\"\" to clear it, env:{} or \
+                        env:null to clear the stored environment). Editing the command \
                         of a package.json-linked template away from its canonical call \
                         DETACHES the source (same rule as the UI). Refused while any of the \
                         template's instances is running (invalid_state).",
@@ -1133,6 +1239,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "name": str_prop("new display name (optional; unchanged if omitted)"),
                 "command": str_prop("new command line (optional; unchanged if omitted)"),
                 "subfolder": str_prop("new run subfolder (optional; unchanged if omitted; empty string clears it to the workspace root)"),
+                "env": command_env_prop(),
             },
             "required": ["command_id"],
         },
@@ -1496,16 +1603,26 @@ fn tool_descriptors() -> Vec<Value> {
                         stripped), so after send_to_terminal you can read what the command \
                         produced. Tune the window with `tail_bytes` / `max_bytes`, set \
                         `strip_ansi:false` for raw output, and (for steady line output) page with \
-                        `since` (pass back the previous call's `cursor`). NOTE: the read reflects \
-                        the LAST \
-                        scrollback nyx persisted for the terminal, which is updated a moment after \
-                        new output appears (debounced by the UI); a read immediately after \
-                        send_to_terminal may be slightly behind — retry to see the latest. To avoid \
+                        `since` (pass back the previous call's `cursor`). \
+                        FRESHNESS — READ THIS BEFORE TRUSTING THE TEXT: the read returns the LAST \
+                        scrollback nyx persisted for the terminal, and nyx only keeps that buffer \
+                        up to date while the terminal is MOUNTED in the app (debounced). A \
+                        terminal that is not on screen — another project is showing, or nyx \
+                        unloaded an idle agent session — keeps running while its saved buffer \
+                        stands still, so the text can be arbitrarily old. Every answer therefore \
+                        carries `live` (a shell is running behind this terminal right now) and \
+                        `stale`. `stale:false` is the ONLY case you may read as the terminal's \
+                        PRESENT state. `stale:true` means a PAST snapshot: either `live:false` (no \
+                        shell any more — a closed or unloaded terminal, so this is its final saved \
+                        output) or the shell has printed things nyx has not saved yet (not \
+                        mounted, or the save debounce still in flight right after a \
+                        send_to_terminal — retry to see the latest). To avoid \
                         reading mid-command, first wait for the command to FINISH: poll \
                         list_terminals until that terminal's `exec_state_updated_at` advances to a \
                         settled `exec_state` (see list_terminals), then read. A \
                         closed terminal still returns its last saved scrollback as long as nyx \
-                        remembers it; an unknown id is an error. INCREMENTAL READS ARE BEST-EFFORT: \
+                        remembers it (`stale:true`); an unknown id is an error. \
+                        INCREMENTAL READS ARE BEST-EFFORT: \
                         scrollback is the re-serialized terminal grid, not an append-only log, so a \
                         resize/reflow, a full-screen (alt-screen) app, a `clear`, or eviction can \
                         rewrite it; an incremental read pages forward without dropping the head of \
@@ -1559,6 +1676,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "transcript_path": str_prop("path to the agent transcript file (SessionStart, optional)"),
                 "source": str_prop("SessionStart source: startup | resume | clear (optional)"),
                 "agent_kind": str_prop("which agent this is (default \"claude_code\")"),
+                "prompt": str_prop("UserPromptSubmit only: the raw text the HUMAN just submitted. nyx records that a human turn happened on this terminal (and its words), which is what lets the orchestration engine tell a human's answer from a session's"),
             },
             "required": ["hook_event_name", "session_id"],
         },
@@ -1656,13 +1774,17 @@ fn tool_descriptors() -> Vec<Value> {
                         implementation_decisions, testing_decisions, user_stories, out_of_scope), \
                         and the new markdown value (an empty string clears the section). Use \
                         spec_fork instead when you want to snapshot the current design into a new \
-                        revision before diverging.",
+                        revision before diverging. Sections are FROZEN once the Spec leaves draft; \
+                        the ONE exception is a correction a human authorized at a blocked-task \
+                        escalation gate — pass the run_id handed to you with that spawn, and nyx \
+                        checks the authorization itself (it is never granted by asking).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "spec_id": str_prop("the Spec whose active revision to edit"),
                 "section": str_prop("which section: problem | solution | implementation_decisions | testing_decisions | user_stories | out_of_scope"),
                 "value": str_prop("the section's new markdown content (empty string clears it)"),
+                "run_id": str_prop("the run whose human authorized this correction on a Spec that has left draft (the run_id of your spawn); ignored while the Spec is still a draft"),
             },
             "required": ["spec_id", "section", "value"],
         },
@@ -1683,31 +1805,8 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["spec_id"],
         },
     }));
-    descriptors.push(json!({
-        "name": crate::mcp_tools_spec::SPEC_TRANSITION_TOOL,
-        "description": "Move a Spec through its lifecycle: ready (draft→ready), start \
-                        (ready→in_progress), review (in_progress→in_review), done \
-                        (in_review→completed), or cancel. Transitions are guarded (the current \
-                        status must allow it) and the ready gate runs the pre-ready validations \
-                        (a problem + a solution must be present, the phase plan must be coherent). \
-                        start ALSO POSES the Spec's dev workspace anchor in the same operation: \
-                        pass workspace_id (from list_workspaces) or a cwd to resolve it from — the \
-                        anchor is set atomically with the ready→in_progress flip. The SENSITIVE \
-                        transitions (ready, start, done, cancel) require a human's explicit \
-                        confirmation: pass user_confirmed=true only once the user has agreed — \
-                        otherwise the transition is refused. Returns the updated spec.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "spec_id": str_prop("the Spec to transition"),
-                "transition": str_prop("ready | start | review | done | cancel"),
-                "user_confirmed": json!({ "type": "boolean", "description": "REQUIRED true for the sensitive transitions (ready/start/done/cancel): set it only after the user has explicitly confirmed. Ignored for review." }),
-                "workspace_id": str_prop("start only: the dev workspace to anchor the Spec on (from list_workspaces). Ignored for other transitions."),
-                "cwd": str_prop("start only: resolve the anchor workspace from the folder this runs in when workspace_id is absent (the workspace whose path matches). Ignored for other transitions."),
-            },
-            "required": ["spec_id", "transition"],
-        },
-    }));
+    // N17(b) — `spec_transition` is NOT advertised to the agent: nyx imposes every Spec lifecycle
+    // transition at the graph node built for it (ndev/nspec), so the effector never transitions a Spec.
     descriptors.push(json!({
         "name": crate::mcp_tools_spec::SPEC_SET_WORKSPACE_TOOL,
         "description": "RE-anchor a Spec on a dev workspace (its repos + project are derived \
@@ -1746,8 +1845,8 @@ fn tool_descriptors() -> Vec<Value> {
                 "acceptance_criteria": str_prop("optional acceptance/done criteria"),
                 "verification_command": str_prop("how a kind=human action is verified (required to close a human task)"),
                 "parent_task_id": str_prop("optional parent task (subtask decomposition)"),
-                "phase": str_prop("optional phase NAME; nyx materializes the Spec's plan from the names, in first-seen order (needs spec_id)"),
-                "round": int_prop("optional rework round (sub-phase) for a kind=review finding; omit for the plan (round 0). PER-PHASE (2.1, 4.1…)"),
+                "phase": str_prop("optional phase NAME (needs spec_id). While the Spec is DRAFT nyx materializes its plan from the names, in first-seen order — that is how the plan is written. Once the Spec has left draft the plan is FROZEN: a name it does not already hold is refused, listing the ones it holds. Pass the NAME alone, never the '2 · Some phase' heading a manual renders. On a kind=review finding, OMIT IT — nyx anchors the finding on the phase under review itself"),
+                "round": int_prop("rarely needed: the rework round of a kind=review finding. OMIT IT — nyx fills it from the Spec's own review pass (per-phase: 2.1, 4.1…), which it knows and you do not. Pass one only to attribute a finding to a pass other than the current one"),
             },
             "required": ["project_id", "title"],
         },
@@ -1860,28 +1959,32 @@ fn tool_descriptors() -> Vec<Value> {
     descriptors.push(json!({
         "name": crate::mcp_context::AGENT_CONTEXT_TOOL,
         "description": "Render an agent context manual (spec, dev, coder, auditor, doc, or prototype) LIVE from nyx \
-                        state — the native equivalent of `depot context <role>`, with no depot CLI. \
-                        Given a role and a Spec (spec_id, or resolved from the current workspace via \
-                        cwd/workspace_id), returns the manual text: the role's preamble, the Spec's \
-                        structured sections, its current phase and that phase's tasks, and its \
-                        PROJECT + repos (plus the dev workspace when one is anchored). The answer \
+                        state — the role's own contract plus the run's state. IF YOU WERE SPAWNED BY \
+                        A `nyx_next` ACTION, CALL THIS FIRST: the action hands you an `agent_id`, a \
+                        `label`, a `subject` and the `run_id` it is ticking, and nothing else — this \
+                        is where you read who you are and what the run holds. \
+                        Given a role and a run (run_id) or a Spec (spec_id, or resolved from the \
+                        current workspace via cwd/workspace_id), it returns: the role's preamble and \
+                        its prohibitions, the Spec's structured sections, its current phase and that \
+                        phase's tasks, and its PROJECT + repos (plus the dev workspace when one is \
+                        anchored). The answer \
                         carries project_id beside the manual: a Spec belongs to a project from the \
                         moment it exists, so the project is there even before any code and before \
                         any dev workspace — which is the NORMAL state for role=prototype, and that \
-                        id is what every design_* tool takes. Use it to load the working context \
-                        for a session before driving a Spec. For role=spec with NO Spec yet, it \
+                        id is what every design_* tool takes. For role=spec with NO Spec yet, it \
                         renders the PROJECT-scoped authoring manual instead (a Spec is a project \
-                        artifact the author creates), resolving the project from project_id or the \
-                        cwd/workspace — never an error.",
+                        artifact the author creates), resolving the project from run_id, project_id \
+                        or the cwd/workspace — never an error.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "role": str_prop("spec | dev | coder | auditor | doc | prototype — which manual to render"),
-                "axis": str_prop("for role=auditor: standards | spec — the review axis (the dev launches one auditor per axis at the end); ignored for other roles"),
+                "run_id": str_prop("the run you were spawned for — the ONE anchor a sub-agent needs: it carries the Spec the run drives and, before there is one, the workspace it opened against. Pass the run_id the spawn action was ticking; an unknown one is refused rather than rendered empty"),
                 "spec_id": str_prop("the Spec to render the context for (preferred)"),
                 "workspace_id": str_prop("optional: resolve the Spec via its anchored dev workspace when spec_id is absent"),
                 "cwd": str_prop("optional: resolve the Spec (or, for role=spec authoring, the project) via the workspace whose path matches this cwd when spec_id/workspace_id are absent"),
                 "project_id": str_prop("optional: for role=spec authoring with no Spec yet, the project to author in (else resolved from cwd/workspace_id). When a Spec DOES resolve it is only checked, never applied — a Spec's project is a fact of the Spec, and naming another one is refused rather than ignored; read the project_id the answer returns instead"),
+                "subject": str_prop("optional: the spawn action's own `subject`. When it names a Spec section (problem | solution | implementation_decisions | testing_decisions | user_stories | out_of_scope), ONLY that section is reproduced — pass back the subject you were spawned with, so the pass reads the commitment it is about and not the other five"),
             },
             "required": ["role"],
         },
@@ -2061,20 +2164,25 @@ fn tool_descriptors() -> Vec<Value> {
     }));
     descriptors.push(json!({
         "name": REVIEW_TASK_STRUCTURE_TOOL,
-        "description": "STRUCTURE a promoted review task (your step of the promotion \"grill\" — \
-                        and its FINAL step). The human lâche brut (raw feedback); you, the agent, \
-                        captured it as a `proposed` finding — now turn it into a clean coder task: \
-                        pass a sharp `title`, actionable `details`, and an optional `severity` \
-                        (info|low|medium|high|critical). This moves the task to `structured`, which \
-                        is READY for the coder — the grill has just two states, there is no separate \
-                        validate step. You may re-structure to refine it. Returns the updated task.",
+        "description": "REWRITE a review finding's text. Two uses. (1) STRUCTURE a promoted retour — \
+                        the human lâche brut, you captured it as a `proposed` finding, now turn it \
+                        into a clean coder task: a sharp `title`, actionable `details`, an optional \
+                        `severity` (info|low|medium|high|critical). That moves it to `structured`, \
+                        READY for the coder (the grill has two states, no separate validate step). \
+                        (2) REPAIR a finding whose own text came out wrong — a malformed tool call \
+                        that left markup in the description, a title that says the wrong thing. This \
+                        is the ONLY way to correct a finding mid-build: task_delete is draft-only, \
+                        and skipping cancels the WORK when only the wording is wrong. It edits the \
+                        text and nothing else — severity aside, the phase, round and status are \
+                        untouched, and a finding you raised directly is not filed into the retour \
+                        grill by being corrected. Returns the updated task.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": str_prop("the task id to structure (from review_task_list)"),
-                "title": str_prop("a sharp task title for the coder"),
-                "details": str_prop("optional: actionable task details for the coder"),
-                "severity": str_prop("optional: info | low | medium | high | critical"),
+                "id": str_prop("the finding to rewrite (from review_task_list, or the id task_add returned)"),
+                "title": str_prop("the finding's title — pass it again unchanged if only the details are wrong"),
+                "details": str_prop("optional: the finding's body, REPLACED wholesale (omit to clear it)"),
+                "severity": str_prop("optional: info | low | medium | high | critical (omit to leave it as it is)"),
             },
             "required": ["id", "title"],
         },
@@ -2373,6 +2481,317 @@ fn tool_descriptors() -> Vec<Value> {
             "required": ["id"],
         },
     }));
+    // The v2.8 GRAPH-AUTHORING surface: the agent builds an orchestration behavior tree from raw
+    // intent (the human validates it via the Phase-6 visualiser). Each mutation is guarded by a
+    // tree-coherence check that REFUSES an incoherent graph (cycle / dangling parent / a leaf with
+    // children / a second root). Advertised alongside, kept OUT of V1_TOOLS (a new v2.8 surface).
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::WORKFLOW_CREATE_TOOL,
+        "description": "Create a NEW (empty) orchestration workflow draft. Add its nodes with node_add \
+                        afterwards. `project_id` binds it to a project (which flow that project uses). \
+                        You may omit project_id ONLY for a global scope='custom' template: an unowned \
+                        ndev/nspec/ndoc workflow is a SEEDED built-in and is refused (fork one instead).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": str_prop("human name of the workflow"),
+                "scope": str_prop("optional: ndev | nspec | ndoc | custom | coder | prototyper (default custom). coder/prototyper are SUB-WORKFLOW scopes — a sub_workflow node's child target, never a top-level run"),
+                "project_id": str_prop("the project that owns/uses this workflow (from list_projects); may be omitted ONLY for a scope='custom' global template"),
+            },
+            "required": ["name"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::WORKFLOW_FORK_TOOL,
+        "description": "DEEP-COPY an existing workflow's whole node tree into a new PROJECT-OWNED \
+                        workflow (forked_from = the source). The customisation path: fork a built-in \
+                        default, then edit the copy — the source is never mutated. project_id is \
+                        REQUIRED (a fork is a project's customisation); for a scoped family \
+                        (ndev/nspec/ndoc) a project holds ONE, so a second such fork is refused.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": str_prop("the SOURCE workflow to fork"),
+                "name": str_prop("optional: name of the fork (defaults to '<source> (fork)')"),
+                "project_id": str_prop("the project that owns the fork (from list_projects)"),
+            },
+            "required": ["workflow_id", "project_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::WORKFLOW_ASSIGN_TOOL,
+        "description": "(Re)BIND a workflow to a project — the project↔workflow link (which workflow \
+                        the project uses). Sets the workflow's owning project.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": str_prop("the workflow to bind"),
+                "project_id": str_prop("the project to bind it to (from list_projects)"),
+            },
+            "required": ["workflow_id", "project_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::SLOT_BIND_TOOL,
+        "description": "BIND a graph's command SLOT to the managed commands THIS project answers it \
+                        with. A gate_check in a SHARED graph (the seeded built-ins) declares WHAT it \
+                        needs verified — `config.slot`, e.g. 'build_check' — never which command runs \
+                        it, because a command instance id is project data. This is the other half, and \
+                        it REPLACES forking a built-in to arm its gate: the built-in is left alone, so \
+                        it keeps receiving nyx's graph fixes, while a fork would freeze it at today's \
+                        revision forever. Register the check first (add_command → list_commands for \
+                        the instance_id). The binding is re-read at every tick, so a run refused on an \
+                        unbound slot resumes on the next nyx_next. Binding again REPLACES; an empty \
+                        command_ids UNBINDS (the gate goes back to refusing). Bind a command that \
+                        EXITS: a gate's verdict IS its exit code, so a watcher or a dev server is \
+                        REFUSED here — bind `bun test`, never `bun test --watch`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project this binding is for (from list_projects)"),
+                "slot": str_prop("the slot NAME the gate_check node declares — run_start's gate warning and the tick refusal both carry it (the warning under `slot`)"),
+                "command_ids": json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "the managed-command INSTANCE ids to run for that slot, in order (the instance_id from list_commands, not a template id). Empty = unbind",
+                }),
+            },
+            "required": ["project_id", "slot", "command_ids"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::NODE_ADD_TOOL,
+        "description": "Add a TYPED node to a workflow's tree. Types: composites sequence | loop | \
+                        selector, leaves spawn_subagent | gate_check | judge | transition | wait | \
+                        note | ask_human | produce. A parent-less node in a still-rootless workflow \
+                        becomes its root; otherwise pass parent_id (a composite). Refused if it would \
+                        make the tree incoherent (a leaf can't have children, no second root) — or if \
+                        a RUN is currently walking this workflow (let it finish, or run_delete it, \
+                        then edit the graph).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": str_prop("the workflow to add the node to"),
+                "type": str_prop("the node type (sequence/loop/selector/spawn_subagent/gate_check/judge/transition/wait/note/ask_human/produce)"),
+                "label": str_prop("optional: human label for the node"),
+                "config": json!({ "type": "object", "description": "the node's typed config JSON (unknown fields are REFUSED). Per type: spawn_subagent→{agent_id, inline?}; gate_check→{command_ids | slot, blocking?} (a gate names its OWN command instance ids, or declares a `slot` each project binds with slot_bind — the shape a SHARED graph uses; never both); transition→{target_state}; judge→{prompt, output_schema?, output_key?, append?}; ask_human→{prompt, output_key?, append?}; produce→{output_key?, append?}; loop→{until, max_iterations?}; selector→{branches:[{cond, child?}]}; note→{text}; sequence/wait→{}. output_key routes the result on the blackboard; append pushes onto an array instead of overwriting; inline runs the effector in-session (for an interactive one)" }),
+                "parent_id": str_prop("optional: the PARENT composite node (omit for the workflow's root node)"),
+                "order_index": json!({ "type": "integer", "description": "optional: sibling order under the parent (default 0)" }),
+            },
+            "required": ["workflow_id", "type"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::NODE_UPDATE_TOOL,
+        "description": "Edit a node's label and/or config (its type is immutable). At least one of \
+                        label / config is required. The one node edit ALLOWED while a run walks the \
+                        workflow (it moves no node id): the answer then carries a `warnings` entry \
+                        saying that run will execute the new config from its next tick.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": str_prop("the node to edit"),
+                "label": str_prop("optional: new label"),
+                "config": json!({ "type": "object", "description": "optional: the node's new typed config JSON object" }),
+            },
+            "required": ["node_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::NODE_REMOVE_TOOL,
+        "description": "Delete a node AND its whole subtree (the children cascade). Removing the root \
+                        leaves the workflow rootless (re-root it with a new parent-less node_add). \
+                        Refused while a RUN is walking this workflow.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "node_id": str_prop("the node to remove") },
+            "required": ["node_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::NODE_REORDER_TOOL,
+        "description": "Move a node: set its sibling order_index and, optionally, REPARENT it under a \
+                        new parent_id (kept otherwise). A reparent that would create a cycle (a node \
+                        under its own descendant) is refused, and so is any move while a RUN is \
+                        walking this workflow.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": str_prop("the node to move"),
+                "order_index": json!({ "type": "integer", "description": "the new sibling order under its parent" }),
+                "parent_id": str_prop("optional: reparent the node under this composite (kept unchanged if omitted)"),
+            },
+            "required": ["node_id", "order_index"],
+        },
+    }));
+    // The v2.8 authoring READ surface (review S1) + delete (review S4): discover workflows, read a
+    // graph's node ids, list a workflow's runs, and delete a project-owned workflow. Kept OUT of
+    // V1_TOOLS (part of the v2.8 authoring surface, counted via AUTHORING_TOOLS).
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::WORKFLOW_LIST_TOOL,
+        "description": "List orchestration workflows. WITH project_id: that project's OWN workflows \
+                        plus the built-in defaults it falls back to; WITHOUT: the built-in defaults. \
+                        Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("optional: also include this project's own workflows"),
+            },
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::WORKFLOW_GET_TOOL,
+        "description": "Get a workflow's metadata AND its whole node tree — the read that gives you \
+                        the node ids that node_update / node_remove / node_reorder require. \
+                        Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "workflow_id": str_prop("the workflow to read") },
+            "required": ["workflow_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::RUN_LIST_TOOL,
+        "description": "List a workflow's runs, newest first, each with its cursor, blackboard and \
+                        status. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "workflow_id": str_prop("the workflow whose runs to list") },
+            "required": ["workflow_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::WORKFLOW_DELETE_TOOL,
+        "description": "Delete a PROJECT-OWNED workflow and its nodes + runs (cascade) — for cleaning \
+                        up drafts and failed forks. A built-in default is REFUSED: fork it instead of \
+                        editing or deleting the shared default. So is a workflow a RUN is still \
+                        walking — the cascade would take that run down with it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "workflow_id": str_prop("the project-owned workflow to delete") },
+            "required": ["workflow_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_authoring::RUN_DELETE_TOOL,
+        "description": "Delete ONE workflow run by id — to clean up a run opened by mistake, including \
+                        a run on a built-in flow (which workflow_delete cannot reach). A run is a \
+                        leaf, so nothing else is affected.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "run_id": str_prop("the run to delete (from run_list)") },
+            "required": ["run_id"],
+        },
+    }));
+    // The v2.8 ENGINE run-lifecycle ENTRY. Since G6 the nyx COMMAND HOOK calls it, so a /nspec /ndev
+    // /ndoc session is handed its run_id with the manual and ticks nyx_next straight away; it stays
+    // advertised because that hook reaches the sidecar through THIS surface (an un-advertised tool is
+    // undispatchable — N17) and because a session that holds no run_id still needs a way to open one.
+    descriptors.push(json!({
+        "name": crate::mcp_engine::RUN_START_TOOL,
+        "description": "OPEN an orchestration RUN and get its run_id. IF YOU WERE STARTED BY A NYX \
+                        SLASH COMMAND (/nspec, /ndev, /ndoc) YOU ALREADY HAVE ONE: nyx's command hook \
+                        opened the run and injected its run_id with your dispatcher manual — go \
+                        straight to nyx_next. Call this only when you hold no run_id, then pass the \
+                        returned one to nyx_next in a loop. IDEMPOTENT: at most ONE live run per \
+                        (workflow, Spec), so a call made when a run is already live RESUMES it rather \
+                        than opening a second. nyx resolves WHICH workflow to run — an explicit \
+                        workflow_id, else the resolved project's active workflow of `scope` (default \
+                        'ndev') — and binds the run to the resolved Spec (from spec_id, workspace_id, \
+                        or cwd) when there is one. Returns { run_id, workflow_id, spec_id, scope, \
+                        warnings }: RELAY every warnings[].message to the human — each names \
+                        something they must act on (a run DROPPED because its graph changed, a gate \
+                        that verifies nothing, a run started bound to no Spec).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": str_prop("optional: the Spec to bind the run to (its lifecycle transitions then apply); resolved from workspace_id/cwd when omitted"),
+                "workspace_id": str_prop("optional: resolve the Spec + project from this workspace"),
+                "cwd": str_prop("optional: resolve the Spec + project from the workspace whose path matches this cwd"),
+                "workflow_id": str_prop("optional: run THIS workflow explicitly, bypassing scope resolution"),
+                "scope": str_prop("optional: which workflow family to run (ndev | nspec | ndoc); defaults to ndev. coder/prototyper are SUB-WORKFLOW-ONLY (opened by a sub_workflow node), not started here"),
+            },
+        },
+    }));
+    // The v2.8 ENGINE runtime tick. The session is a THIN dispatcher: call nyx_next in a loop,
+    // perform exactly the action it returns, then call it again with the result — nothing else.
+    // nyx holds the run state, advances the behavior tree, runs the quality gates ITSELF and
+    // BLOCKS while any is red, imposes the state transitions, and hands back one atomic action.
+    //
+    // THE ACTION INVENTORY BELOW IS A CONTRACT, NOT PROSE: each type is written `type[field, …]`,
+    // and a test BINDS that list to the payloads the engine really builds — every action type it can
+    // emit must be named here, and no field may be claimed that no payload carries
+    // (`nyx_next_descriptor_states_exactly_the_actions_the_engine_emits`). This descriptor is what
+    // EVERY dispatcher reads, and the failure mode it had was drift: it kept telling agents to paste
+    // a spawn's `context` for a whole release after the manuals were dissolved and the field removed.
+    // So state fields inside the brackets, where the guard can see them.
+    descriptors.push(json!({
+        "name": crate::mcp_engine::NYX_NEXT_TOOL,
+        "description": "Advance an orchestration RUN by one step and get the next action to perform. \
+                        The calling session is a thin dispatcher: call nyx_next(run_id), do EXACTLY \
+                        the action it returns, then call nyx_next again with last_result — repeat \
+                        until it returns {\"type\":\"done\"}. nyx owns the run: it walks the workflow \
+                        graph, runs the quality-gate commands itself and REFUSES to advance while a \
+                        blocking gate is red, applies the guarded Spec state transitions, and \
+                        updates the run's blackboard. \
+                        A tick returns { run_id, action, current_node_id, blackboard_delta, \
+                        blackboard_removed, status }. \
+                        `current_node_id` is WHERE the run is — the single answer to that, so no \
+                        action carries a node id of its own; `blackboard_delta` is only the run-state \
+                        keys that CHANGED this tick, and `blackboard_removed` the keys that were \
+                        DROPPED (a Spec-write grant revoked, a red gate cleared, a child run that \
+                        ended) — a key listed there no longer holds, whatever an earlier delta said. \
+                        THE ACTION IS EXACTLY ONE OF THESE, with exactly the fields listed \
+                        (a `?` marks a field that is absent when the graph declares nothing for it): \
+                        spawn_subagent[agent_id, label, mode, mechanism, subject?] — run agent_id as \
+                        a sub-agent to do what `label` says (mode native_task = your provider's own \
+                        sub-agent, inline = do it yourself in this session; `mechanism` names which). \
+                        It ships NO prompt and NO context: the sub-agent calls \
+                        agent_context(run_id=…, role=agent_id, subject=subject when present) and \
+                        PULLS its own manual and this run's state. Report {\"diff\": …}. \
+                        judge[prompt, output_schema] — answer `prompt` yourself, honouring \
+                        output_schema when it is not null; report {\"verdict\": …}. \
+                        ask_human[prompt, options, answer_key, child_run_id?, child_node_id?, via?, \
+                        human_turn_required?, context?] — put `prompt` to the HUMAN and wait for a \
+                        real answer; offer `options` verbatim when non-empty (nyx refuses an answer \
+                        outside them) and send the answer back under the field `answer_key` names. \
+                        When the action carries child_run_id, the question comes from a sub-workflow: \
+                        send the answer to nyx_next(run_id=child_run_id), NOT to this run. When it \
+                        carries human_turn_required, the answer COMMITS the Spec (an engaging \
+                        transition: ready / done / cancel): nyx checks that the human actually took a \
+                        turn on this session between its question and your answer, and REFUSES an \
+                        answer with no such turn behind it — including one they told you in advance. \
+                        So ask them, wait for their reply, and report it on the tick after it. \
+                        produce — produce the artefact the current node asks for; report its reference. \
+                        wait — pause; report {} to resume. \
+                        sub_workflow[child_run_id, context] — a CHILD run was opened for you: do what \
+                        `context` says (loop nyx_next(child_run_id) until it is done), then tick THIS \
+                        run again. \
+                        done — the run is over; stop calling. \
+                        AND NOTHING ELSE WILL EVER REACH YOU. gate_check, transition, \
+                        transition_task, query, fork_spec and note are nyx's OWN effects: nyx holds \
+                        the PTY, the Spec authority and the DB, so it runs them INSIDE the tick and \
+                        you never see them. Do not wait for one — a dispatcher parked on a gate_check \
+                        it expects to be handed waits for something that never comes; the tick that \
+                        runs the gate returns the NEXT dispatcher-facing action instead. A `note` \
+                        likewise never arrives as an action: the sentences the walk went past ride the \
+                        next action as its `notes` array — relay them to the human, they are the \
+                        run's own words. \
+                        Pass last_result as the object the previous action produced (e.g. \
+                        {\"diff\":…} for a spawn, {\"verdict\":…} for a judge).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": str_prop("the workflow run to advance"),
+                "last_result": json!({
+                    "type": "object",
+                    "description": "the result of the action nyx_next last returned (e.g. {\"diff\":…} for a spawn_subagent, {\"verdict\":…} for a judge); omit on the first call",
+                }),
+                "provider": str_prop("optional: the agent provider driving the session (e.g. claude), used to pick the sub-agent spawn mechanism; defaults to claude"),
+            },
+            "required": ["run_id"],
+        },
+    }));
     // Append the v2.7 PROTOTYPE tools: the agent's CONSTRAINED contract for driving a Spec's
     // prototype annexe. Every action is a named, guarded tool with explicit states; each mutation
     // records a `proto.*` domain event so no action of the agent is unseen. Kept OUT of V1_TOOLS.
@@ -2557,7 +2976,15 @@ fn tool_descriptors() -> Vec<Value> {
                         status — `pinned` (the destination is part of the frozen design), `unpinned` \
                         (the page exists but this round does not ship it) or `unknown` (the page is \
                         gone). Which page leads to which is a DESIGN decision, so it is handed over \
-                        rather than re-invented. Unknown prototype → invalid_id. Read-only. \
+                        rather than re-invented. THE SCOPED CSS EXCEPTIONS CROSS WHOLE — \
+                        `css_exceptions[]` per page: everything else here is a REFERENCE the app \
+                        already holds, but a css_slot exists NOWHERE else, so it travels entire (the \
+                        component it belongs to, its `[data-nyx-css~=\"…\"]` scope, the COMPILED CSS \
+                        with its selectors anchored and its @keyframes renamed, the constructs it \
+                        uses and the REASON it was written). Each node that lands on one points at it \
+                        with `css_scope`. Build them WITH the component: dropping one rebuilds the \
+                        component without what no utility could express. \
+                        Unknown prototype → invalid_id. Read-only. \
                         BOUNDED PAGE BY PAGE: the response is CAPPED (64 KiB) and paginates by PAGE, \
                         never inside a tree — a truncated placement would be a FALSE contract. Read \
                         page_total / returned / truncated, follow next_offset until it is null, or \
@@ -2728,7 +3155,10 @@ fn tool_descriptors() -> Vec<Value> {
         "name": crate::mcp_tools_proto::PROTO_AUTHOR_COMPONENT_TOOL,
         "description": "AUTHOR a [NEW] component into the project's design-system catalogue — for a \
                         component a prototype proposes that is ABSENT from the catalogue (greenfield, \
-                        no on-disk source yet; the coder builds it to the app's standards). The \
+                        no on-disk source yet; the coder builds it to the app's standards). THE \
+                        EXCEPTION, NOT THE RULE: composing from the catalogue is what you do, so run \
+                        design_inventory FIRST and author only what it does not have — an authored \
+                        [NEW] is a component somebody will have to build. The \
                         component appears in /design immediately. Unknown prototype → invalid_id; a \
                         name ALREADY in the catalogue → invalid_state (it is not [NEW] then). THE \
                         SHAPE OF params_json / states_json IS CHECKED HERE, exactly as on \
@@ -2797,6 +3227,9 @@ fn tool_descriptors() -> Vec<Value> {
     descriptors.push(json!({
         "name": crate::mcp_tools_design::DESIGN_INVENTORY_TOOL,
         "description": "DISCOVER a project's design-system components from its repos, as BUNDLES. \
+                        COMPOSING FROM THIS CATALOGUE IS THE RULE; AUTHORING A COMPONENT IS THE \
+                        EXCEPTION — call this before you write one, whether you are prototyping or \
+                        coding, and re-invent no rendering the project already has. \
                         A component is a SET of files, not a file: nyx scans the project's source \
                         (the same repos the dev context sees, resolved from the root workspace) by \
                         each repo's DETECTED-stack entry globs (Angular / React / Vue …, from \
@@ -2824,7 +3257,11 @@ fn tool_descriptors() -> Vec<Value> {
                         back to `offset: 0` to restart coherently. Pass `component` to READ ONE \
                         bundle's files WITH their content \
                         (the matter to synthesize) instead of listing — quote the `input_hash` it \
-                        returns when you store the synthesis. Two components sharing a base name in \
+                        returns when you store the synthesis. ONE BUNDLE AT A TIME: read it, \
+                        synthesize it, store it (design_refresh_component), render it \
+                        (design_preview), THEN take the next name off the pending list — fanning out \
+                        over ten bundles loses the matter of the first nine to the response cap, and \
+                        a synthesis is worth what its input was. Two components sharing a base name in \
                         different folders get DISTINCT path-qualified names (e.g. `list/data-table`): \
                         always use the name the tool returns. The loop is INCREMENTAL: a bundle \
                         whose sources have not changed since its last synthesis is never re-proposed \
@@ -3385,15 +3822,14 @@ mod tests {
         out
     }
 
-    /// Start a server on a deterministic free-but-fixed test port and wait until it
-    /// accepts connections, so the tests don't race the accept loop's bind.
-    fn start_on_port(port: u16) -> Arc<McpServer> {
-        let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(PORT_ENV, port.to_string());
+    /// Start a server on an OS-CHOSEN port and wait until it accepts connections, so the tests
+    /// neither race the accept loop's bind nor share a number: several `cargo test` processes
+    /// run at once here, and a hard-coded port made every server-backed test in the second one
+    /// fail with `Address already in use` — a red suite that says nothing about the code, which
+    /// is how a real failure gets dismissed as noise. Returns the server and its bound port.
+    fn start_test_server() -> (Arc<McpServer>, u16) {
         let server = Arc::new(McpServer::default());
-        let bound = server.start().expect("server starts");
-        std::env::remove_var(PORT_ENV);
-        assert_eq!(bound, port, "must bind the configured port");
+        let port = server.start_ephemeral().expect("server starts");
         // Spin until the listener is actually accepting.
         for _ in 0..100 {
             if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
@@ -3401,7 +3837,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        server
+        (server, port)
     }
 
     /// POST a body to `/mcp`, OPTIONALLY carrying the `X-Nyx-Terminal-Id` header — the
@@ -3463,20 +3899,20 @@ mod tests {
 
     #[test]
     fn binds_loopback_and_serves_health() {
-        let server = start_on_port(19011);
-        let (status, body) = http_request(19011, "GET", "/health", None);
+        let (server, port) = start_test_server();
+        let (status, body) = http_request(port, "GET", "/health", None);
         assert!(status.contains("200"), "health 200, got {status}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["status"], "ok");
-        assert_eq!(v["port"], 19011);
+        assert_eq!(v["port"], port);
         assert!(server.is_started());
     }
 
     #[test]
     fn mcp_initialize_handshake() {
-        start_on_port(19012);
+        let (_server, port) = start_test_server();
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-        let (status, body) = http_request(19012, "POST", "/mcp", Some(req));
+        let (status, body) = http_request(port, "POST", "/mcp", Some(req));
         assert!(status.contains("200"), "initialize 200, got {status}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
@@ -3490,9 +3926,9 @@ mod tests {
         // The handshake must carry a non-empty, consumer-facing `instructions` string
         // (MCP spec initialize result) telling an agent what nyx is and when to use it,
         // and it must be free of internal/dev jargon.
-        start_on_port(19021);
+        let (_server, port) = start_test_server();
         let req = r#"{"jsonrpc":"2.0","id":9,"method":"initialize","params":{}}"#;
-        let (status, body) = http_request(19021, "POST", "/mcp", Some(req));
+        let (status, body) = http_request(port, "POST", "/mcp", Some(req));
         assert!(status.contains("200"), "initialize 200, got {status}");
         let v: Value = serde_json::from_str(&body).unwrap();
         let instructions = v["result"]["instructions"]
@@ -3546,9 +3982,9 @@ mod tests {
         // Every advertised tool MUST carry a non-empty description, free of internal
         // jargon (no PRD / spike / SessionStart / ADR / dogfood / phase-2 dev-speak),
         // while preserving the useful instance_id-vs-command_id guidance for the agent.
-        start_on_port(19022);
+        let (_server, port) = start_test_server();
         let req = r#"{"jsonrpc":"2.0","id":10,"method":"tools/list"}"#;
-        let (_status, body) = http_request(19022, "POST", "/mcp", Some(req));
+        let (_status, body) = http_request(port, "POST", "/mcp", Some(req));
         let v: Value = serde_json::from_str(&body).unwrap();
         let tools = v["result"]["tools"].as_array().expect("tools array");
         for tool in tools {
@@ -3807,11 +4243,184 @@ mod tests {
         );
     }
 
+    /// Every agent-facing string of the advertised surface, as `(tool, field, text)` — the sweep the
+    /// descriptor guards share.
+    fn descriptor_texts() -> Vec<(String, String, String)> {
+        let mut texts: Vec<(String, String, String)> = Vec::new();
+        for descriptor in &tool_descriptors() {
+            let tool = descriptor["name"].as_str().unwrap_or_default().to_string();
+            if let Some(text) = descriptor["description"].as_str() {
+                texts.push((tool.clone(), "description".to_string(), text.to_string()));
+            }
+            if let Some(props) = descriptor["inputSchema"]["properties"].as_object() {
+                for (prop, schema) in props {
+                    if let Some(text) = schema["description"].as_str() {
+                        texts.push((tool.clone(), prop.clone(), text.to_string()));
+                    }
+                }
+            }
+        }
+        texts
+    }
+
+    /// THE SIX PARAM TYPES, MOORED TO THE FIXTURE — re-pointed (finding `01KZ3JTVM23C3MBATJZ3RYVPY6`,
+    /// family 1). The list of accepted `type` words lives at three places: the constant the write
+    /// path refuses outside of, the renderer's constant, and the PROSE an agent reads. That prose
+    /// used to be the Prototype role manual's; it is now the tool DESCRIPTORS, which every session
+    /// receives from `tools/list` whether or not it ever renders a manual — so this is where the
+    /// mooring goes. A seventh type accepted by the write path alone would be taught nowhere; a type
+    /// dropped from the constant would go on being taught, and every agent believing the prose would
+    /// have its synthesis refused.
+    #[test]
+    fn every_params_json_descriptor_teaches_exactly_the_types_the_write_path_accepts() {
+        let section = crate::mcp_tools_design::design_fixture_section("param_types");
+        let pinned: Vec<&str> = section["types"]
+            .as_array()
+            .expect("the types")
+            .iter()
+            .map(|t| t.as_str().expect("a type"))
+            .collect();
+        let deprecated = section["deprecated"].as_str().expect("the deprecated type");
+
+        let mut seen = 0usize;
+        for (tool, field, text) in descriptor_texts() {
+            if field != "params_json" {
+                continue;
+            }
+            seen += 1;
+            // EXACTLY the pinned set: each one taught…
+            for ty in &pinned {
+                assert!(
+                    text.contains(&format!("`{ty}`")),
+                    "tool `{tool}`: the params_json prose must teach the accepted type `{ty}`\n{text}"
+                );
+            }
+            // …and no OTHER word offered as a type (the ones a write really refuses).
+            for absent in ["`enum`", "`string`", "`color`", "`variant`", "`asset`"] {
+                assert!(
+                    !text.contains(absent),
+                    "tool `{tool}`: {absent} is not an accepted type and must not be taught\n{text}"
+                );
+            }
+            // The deprecated one is taught AS deprecated, never offered as a plain choice…
+            assert!(
+                text.contains("DEPRECATED") && text.contains(&format!("`{deprecated}`")),
+                "tool `{tool}`: `{deprecated}` must be taught as DEPRECATED\n{text}"
+            );
+            // …and an unknown type is REFUSED, not repaired into `text`.
+            assert_eq!(
+                section["unknown_type_is_refused"],
+                Value::Bool(true),
+                "the fixture states the write-path rule"
+            );
+            assert!(
+                text.contains("REFUSED, \\\n                    not repaired")
+                    || text.contains("REFUSED, not repaired"),
+                "tool `{tool}`: an unknown type is refused, never silently turned into `text`\n{text}"
+            );
+        }
+        assert!(
+            seen >= 2,
+            "both catalogue-writing tools advertise params_json, saw {seen}"
+        );
+    }
+
+    /// THE REFERENCE ATTRIBUTES ARE THE ONES THE RENDERER PARSES (finding `01KYSCZ822K4ZFAAYTG6GT6YWZ`,
+    /// re-pointed). The `data-nyx-use` vocabulary is taught by the `template` descriptors and read by
+    /// `crate::render::reference_sites`: a `data-nyx-uses` typo in the prose would teach something
+    /// nothing reads. So the taught names are assembled into a real element and handed to the very
+    /// reader the render uses and the very validator the write path applies.
+    #[test]
+    fn the_taught_reference_attributes_are_the_ones_the_render_reads() {
+        let mut seen = 0usize;
+        for (tool, field, text) in descriptor_texts() {
+            if field != "template" || !text.contains("data-nyx-use") {
+                continue;
+            }
+            seen += 1;
+            for taught in ["data-nyx-use=", "data-nyx-param-", "data-nyx-use-axes="] {
+                assert!(
+                    text.contains(taught),
+                    "tool `{tool}`: the reference vocabulary must name `{taught}`\n{text}"
+                );
+            }
+            // The taught names, assembled — exactly as an agent would write them.
+            let element = "<span data-nyx-use=\"Spinner\" data-nyx-use-axes=\"size=sm\" \
+                           data-nyx-param-label=\"{{label}}\"></span>";
+            let sites = crate::render::reference_sites(element);
+            assert_eq!(sites.len(), 1, "tool `{tool}`: one reference site: {element}");
+            assert_eq!(sites[0].component, "Spinner");
+            assert_eq!(
+                sites[0].params,
+                vec![("label".to_string(), "{{label}}".to_string())],
+                "tool `{tool}`: the taught attribute really names the param it claims to"
+            );
+            assert_eq!(sites[0].axes, vec![("size".to_string(), "sm".to_string())]);
+
+            // …and the write path's validator accepts it against the component it describes.
+            let catalogue = vec![crate::render::RenderComponent {
+                name: "Spinner".into(),
+                template: "<i class=\"animate-spin\">{{label}}</i>".into(),
+                states_json: Some(
+                    r#"{"axes":[{"name":"size","values":[{"name":"sm","classes":"h-3 w-3"}]}]}"#
+                        .into(),
+                ),
+                params_json: Some(r#"[{"name":"label","type":"text","required":true}]"#.into()),
+                css_slot: None,
+            }];
+            let warnings =
+                crate::mcp_tools_design::reference_warnings("Button", element, &catalogue);
+            assert!(
+                warnings.is_empty(),
+                "tool `{tool}`: the taught reference must not be warned about by the validator that \
+                 reads it: {warnings:?}"
+            );
+        }
+        assert!(seen >= 2, "both catalogue-writing tools teach it, saw {seen}");
+    }
+
+    /// THE PHASE PLAN EMERGES FROM THE NAMES, and `task_add` is where that is said. It used to be
+    /// taught by the spec-author manual too; the manual now carries the ROLE, so the call contract
+    /// lives with the call — where an agent gets it from `tools/list` without rendering anything.
+    ///
+    /// K2 — and it must say WHERE that stops. An auditor passed a phase's rendered LABEL on an
+    /// `in_progress` Spec and minted a third phase in its plan, because the descriptor promised
+    /// materialization and said nothing of the freeze. The rule and the text it is read from are one
+    /// thing: an agent that only reads this line must not be surprised by the refusal.
+    #[test]
+    fn the_task_add_descriptor_teaches_the_phase_plan_emerges_from_the_names() {
+        let phase = descriptor_texts()
+            .into_iter()
+            .find(|(tool, field, _)| {
+                tool == crate::mcp_tools_spec::TASK_ADD_TOOL && field == "phase"
+            })
+            .map(|(_, _, text)| text)
+            .expect("task_add advertises a `phase` argument");
+        assert!(
+            phase.contains("NAME") && phase.contains("first-seen order"),
+            "the plan is built from the phase NAMES, in first-seen order: {phase}"
+        );
+        assert!(
+            phase.contains("DRAFT") && phase.contains("FROZEN"),
+            "…while the Spec is DRAFT, and the plan is FROZEN after: {phase}"
+        );
+        assert!(
+            phase.contains("kind=review") && phase.contains("OMIT IT"),
+            "…and an auditor names no phase at all — nyx anchors its finding: {phase}"
+        );
+        for gone in ["spec_set_phases", "1..N"] {
+            assert!(
+                !phase.contains(gone),
+                "`{gone}` is not part of the contract any more: {phase}"
+            );
+        }
+    }
+
     #[test]
     fn tools_list_advertises_v1_surface() {
-        start_on_port(19013);
+        let (_server, port) = start_test_server();
         let req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
-        let (_status, body) = http_request(19013, "POST", "/mcp", Some(req));
+        let (_status, body) = http_request(port, "POST", "/mcp", Some(req));
         let v: Value = serde_json::from_str(&body).unwrap();
         let tools = v["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -4013,6 +4622,20 @@ mod tests {
                 "v2.6 annexe tool {expected} must be listed"
             );
         }
+        // The v2.8 engine runtime tick (nyx_next) is advertised alongside, kept OUT of V1_TOOLS.
+        assert!(
+            names.contains(&crate::mcp_engine::NYX_NEXT_TOOL),
+            "v2.8 nyx_next engine tool must be listed"
+        );
+        // The v2.8 GRAPH-AUTHORING tools (workflow_create/fork/assign + node CRUD + the v2.8-review
+        // reads workflow_list/workflow_get/run_list + workflow_delete) advertised alongside, kept
+        // OUT of V1_TOOLS (a new v2.8 surface).
+        for expected in crate::mcp_authoring::AUTHORING_TOOLS {
+            assert!(
+                names.contains(&expected),
+                "v2.8 authoring tool {expected} must be listed"
+            );
+        }
         // v2.7 Phase 2: the PROTOTYPE tools (the agent's constrained proto contract) advertised
         // alongside, kept OUT of V1_TOOLS (a new surface).
         for expected in crate::mcp_tools_proto::PROTO_TOOLS {
@@ -4034,9 +4657,11 @@ mod tests {
             V1_TOOLS.len()
                 + 24
                 + 9
+                + 2
                 + crate::mcp_tools_spec::SPEC_TOOLS.len()
                 + crate::mcp_tools_idea::IDEA_TOOLS.len()
                 + crate::mcp_tools_annexe::ANNEXE_TOOLS.len()
+                + crate::mcp_authoring::AUTHORING_TOOLS.len()
                 + crate::mcp_tools_proto::PROTO_TOOLS.len()
                 + crate::mcp_tools_design::DESIGN_TOOLS.len(),
             "exactly the v1 surface plus probe + wait_for_command + \
@@ -4049,18 +4674,20 @@ mod tests {
              agent_context + repo_diff + repo_git_view + repo_watch + repo_unwatch + \
              review_comment_list + review_comment_post + review_comment_resolve + review_task_list + \
              review_task_structure + review_submit_feedback + the 12 v2.6 idea tools + \
-             the 4 v2.6 annexe tools + the 16 v2.7 proto tools (9 read/lifecycle, incl. the agent \
-             recommendation proto_recommend_variant, + 7 creation/amorçage) + the 6 v2.7 design \
-             tools (design_inventory + design_recipe + design_refresh_component + \
+             the 4 v2.6 annexe tools + the 2 v2.8 engine runtime tools (run_start + nyx_next) + \
+             the 13 v2.8 graph-authoring tools (7 mutations + slot_bind + \
+             workflow_list/workflow_get/run_list reads + workflow_delete/run_delete) + the 16 v2.7 proto tools (9 read/lifecycle, \
+             incl. the agent recommendation proto_recommend_variant, + 7 creation/amorçage) + \
+             the 6 v2.7 design tools (design_inventory + design_recipe + design_refresh_component + \
              design_delete_component + design_tokens + design_preview) extension tools"
         );
     }
 
     #[test]
     fn tools_call_without_dispatcher_is_method_not_found() {
-        start_on_port(19014);
+        let (_server, port) = start_test_server();
         let req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_projects","arguments":{}}}"#;
-        let (_status, body) = http_request(19014, "POST", "/mcp", Some(req));
+        let (_status, body) = http_request(port, "POST", "/mcp", Some(req));
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             v["error"]["code"], -32601,
@@ -4078,14 +4705,178 @@ mod tests {
                 Ok(json!({ "tool": name, "args": arguments }))
             }
         }
-        let server = start_on_port(19015);
+        let (server, port) = start_test_server();
         server.set_dispatcher(Arc::new(Echo));
         let req = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_projects","arguments":{"k":1}}}"#;
-        let (_status, body) = http_request(19015, "POST", "/mcp", Some(req));
+        let (_status, body) = http_request(port, "POST", "/mcp", Some(req));
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["result"]["isError"], false);
         assert_eq!(v["result"]["structuredContent"]["tool"], "list_projects");
         assert_eq!(v["result"]["structuredContent"]["args"]["k"], 1);
+    }
+
+    /// A dispatcher whose `slow` tool PARKS inside the handler until the test releases it, and
+    /// whose every other tool returns at once. The block is a condvar, not a sleep: the test knows
+    /// exactly when a call is inside the handler (it is told), and exactly when it leaves (it says
+    /// so) — so the two threading tests below assert on facts, never on a race they hope to win.
+    struct ParkingDispatcher {
+        /// Announces that a `slow` call has REACHED the handler (one message per call).
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        released: Mutex<bool>,
+        release: std::sync::Condvar,
+    }
+
+    impl ParkingDispatcher {
+        fn new() -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (
+                Arc::new(ParkingDispatcher {
+                    entered: Mutex::new(tx),
+                    released: Mutex::new(false),
+                    release: std::sync::Condvar::new(),
+                }),
+                rx,
+            )
+        }
+
+        /// Let every parked `slow` call return.
+        fn release_all(&self) {
+            *self.released.lock().unwrap() = true;
+            self.release.notify_all();
+        }
+    }
+
+    impl ToolDispatcher for ParkingDispatcher {
+        fn call(&self, name: &str, _arguments: &Value) -> Result<Value, RpcError> {
+            if name != "slow" {
+                return Ok(json!({ "served": name }));
+            }
+            let _ = self.entered.lock().unwrap().send(());
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.release.wait(released).unwrap();
+            }
+            Ok(json!({ "served": "slow" }))
+        }
+    }
+
+    fn tools_call(id: u32, tool: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{{}}}}}}"#
+        )
+    }
+
+    /// POST a `tools/call` from its OWN thread, handing the response back over a channel so the test
+    /// can put a DEADLINE on being served (a `.join()` could only ever wait forever).
+    fn tools_call_async(port: u16, id: u32, tool: &str) -> std::sync::mpsc::Receiver<String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let body = tools_call(id, tool);
+        std::thread::spawn(move || {
+            let (_status, body) = http_request(port, "POST", "/mcp", Some(&body));
+            let _ = tx.send(body);
+        });
+        rx
+    }
+
+    /// v2.8 L1 — THE freeze the user hit twice in one day, reproduced: a LONG `tools/call` must not
+    /// stop the MCP surface from serving anything else.
+    ///
+    /// The real shape is a `nyx_next` whose `gate_check` runs the project's test suite inline (up to
+    /// `mcp_engine::GATE_TOTAL_TIMEOUT` = 90s); the user reproduced it by binding `sleep 60; bun
+    /// test` and watching the app freeze for a full minute. Here the duration is CONTROLLED — the
+    /// slow tool parks until this test releases it — so the test asserts the structural property
+    /// (the surface stays served) with no timing luck involved.
+    ///
+    /// Served on the accept thread, the second call gets nothing until the first returns; on the
+    /// worker pool it is answered while the first is still parked.
+    #[test]
+    fn a_parked_tool_call_does_not_freeze_the_rest_of_the_surface() {
+        let (dispatcher, entered) = ParkingDispatcher::new();
+        let (server, port) = start_test_server();
+        server.set_dispatcher(Arc::clone(&dispatcher) as Arc<dyn ToolDispatcher>);
+
+        let slow = tools_call_async(port, 1, "slow");
+        // Proceed only once the slow call is PROVABLY inside the handler, holding a worker.
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the slow tools/call reached the dispatcher");
+
+        // The surface must still answer, and answer CORRECTLY, while that call is in there.
+        let fast = tools_call_async(port, 2, "fast");
+        let body = fast.recv_timeout(Duration::from_secs(3)).expect(
+            "the MCP surface answered NOTHING while one tools/call was in flight — a long call is \
+             being served on the accept thread again, which freezes every other agent, session and \
+             tool call for as long as it runs",
+        );
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["structuredContent"]["served"], "fast");
+        assert_eq!(v["result"]["isError"], false);
+
+        // The liveness probe the cockpit polls is on the same surface and must survive it too.
+        let (health_status, health_body) = http_request(port, "GET", "/health", None);
+        assert!(
+            health_status.contains("200"),
+            "GET /health during a long tools/call: {health_status}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&health_body).unwrap()["status"],
+            "ok"
+        );
+
+        // And the long call itself still completes normally once its work is done.
+        dispatcher.release_all();
+        let slow_body = slow
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the released slow call returns");
+        let v: Value = serde_json::from_str(&slow_body).unwrap();
+        assert_eq!(v["result"]["structuredContent"]["served"], "slow");
+    }
+
+    /// v2.8 L1 — what happens when the pool SATURATES: the request WAITS for a free worker, and is
+    /// then served normally. It is never dropped, never answered by anything other than the handler,
+    /// and never met with a lie.
+    ///
+    /// Every worker is parked in the dispatcher, so the extra call cannot be served yet; the test
+    /// proves it is still QUEUED (it never reached the dispatcher, and nothing answered it), then
+    /// releases the pool and proves the SAME call is served.
+    #[test]
+    fn a_saturated_pool_queues_the_next_request_instead_of_dropping_it() {
+        let (dispatcher, entered) = ParkingDispatcher::new();
+        let (server, port) = start_test_server();
+        server.set_dispatcher(Arc::clone(&dispatcher) as Arc<dyn ToolDispatcher>);
+
+        // Fill every worker, and wait until each one is provably inside the handler.
+        let parked: Vec<_> = (0..REQUEST_WORKERS)
+            .map(|i| tools_call_async(port, i as u32, "slow"))
+            .collect();
+        for i in 0..REQUEST_WORKERS {
+            entered
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|e| panic!("worker {i} took a parked call: {e}"));
+        }
+
+        // One more, with nowhere to run it.
+        let queued = tools_call_async(port, 99, "queued");
+        assert!(
+            queued
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "with every worker busy the extra request must WAIT — it was answered, so something \
+             other than a worker replied to it"
+        );
+
+        // Freeing the pool serves it — the request was held, not thrown away.
+        dispatcher.release_all();
+        let body = queued.recv_timeout(Duration::from_secs(10)).expect(
+            "a request queued behind a saturated pool must be SERVED once a worker frees up, never \
+             dropped",
+        );
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["structuredContent"]["served"], "queued");
+        for (i, slow) in parked.into_iter().enumerate() {
+            slow.recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|e| panic!("parked call {i} returns: {e}"));
+        }
     }
 
     #[test]
@@ -4182,7 +4973,7 @@ mod tests {
                 .unwrap()
         };
 
-        let server = start_on_port(19041);
+        let (server, port) = start_test_server();
         server.set_dispatcher(Arc::new(AutoMapDispatcher { db: db.clone() }));
 
         // 1) `spec_create` carrying the X-Nyx-Terminal-Id header → the worked Spec joins the
@@ -4192,7 +4983,7 @@ mod tests {
             crate::mcp_tools_spec::SPEC_CREATE_TOOL,
             project_id
         );
-        let (status, body) = http_post_mcp(19041, &req, Some(&terminal_id));
+        let (status, body) = http_post_mcp(port, &req, Some(&terminal_id));
         assert!(status.contains("200"), "spec_create call 200, got {status}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -4222,7 +5013,7 @@ mod tests {
             crate::mcp_tools_spec::SPEC_CREATE_TOOL,
             project_id
         );
-        let (status2, body2) = http_post_mcp(19041, &req_no_hdr, None);
+        let (status2, body2) = http_post_mcp(port, &req_no_hdr, None);
         assert!(status2.contains("200"), "second call 200, got {status2}");
         let v2: Value = serde_json::from_str(&body2).unwrap();
         assert_eq!(
@@ -4259,14 +5050,14 @@ mod tests {
                 Err(RpcError::new(code, format!("synthetic {code}")))
             }
         }
-        let server = start_on_port(19023);
+        let (server, port) = start_test_server();
         server.set_dispatcher(Arc::new(D8Errors));
 
         let call_err = |id: u32, name: &str| -> Value {
             let req = format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{{}}}}}}"#
             );
-            let (_status, body) = http_request(19023, "POST", "/mcp", Some(&req));
+            let (_status, body) = http_request(port, "POST", "/mcp", Some(&req));
             serde_json::from_str::<Value>(&body).unwrap()
         };
 
@@ -4316,10 +5107,10 @@ mod tests {
                 .with_data(json!({ "requested": 2_000_000, "limit": 1_048_576 })))
             }
         }
-        let server = start_on_port(19031);
+        let (server, port) = start_test_server();
         server.set_dispatcher(Arc::new(OversizeWithData));
         let req = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_terminal","arguments":{}}}"#;
-        let (_status, body) = http_request(19031, "POST", "/mcp", Some(req));
+        let (_status, body) = http_request(port, "POST", "/mcp", Some(req));
         let v: Value = serde_json::from_str(&body).unwrap();
         // The string code is still present (not clobbered by the merge)...
         assert_eq!(
@@ -4353,10 +5144,10 @@ mod tests {
                     .with_data(json!({ "code": "ATTACKER_OVERRIDE", "field": "x" })))
             }
         }
-        let server = start_on_port(19032);
+        let (server, port) = start_test_server();
         server.set_dispatcher(Arc::new(CodeKeyInData));
         let req = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"probe","arguments":{}}}"#;
-        let (_status, body) = http_request(19032, "POST", "/mcp", Some(req));
+        let (_status, body) = http_request(port, "POST", "/mcp", Some(req));
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             v["error"]["data"]["code"], "invalid_argument",
@@ -4389,10 +5180,10 @@ mod tests {
                 }
             }
         }
-        let server = start_on_port(19019);
+        let (server, port) = start_test_server();
         server.set_dispatcher(Arc::new(ProbeOnly));
         let req = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"probe","arguments":{}}}"#;
-        let (status, body) = http_request(19019, "POST", "/mcp", Some(req));
+        let (status, body) = http_request(port, "POST", "/mcp", Some(req));
         assert!(status.contains("200"), "probe call 200, got {status}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["result"]["isError"], false);
@@ -4432,11 +5223,11 @@ mod tests {
                 }
             }
         }
-        let server = start_on_port(19024);
+        let (server, port) = start_test_server();
         server.set_dispatcher(Arc::new(SessionChannel));
         // The EXACT JSON-RPC a SessionStart `mcp_tool` hook would send.
         let req = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"agent_session_event","arguments":{"hook_event_name":"SessionStart","session_id":"claude-sid-1","cwd":"/work/proj","source":"startup","NYX_TERMINAL_ID":"term-xyz"}}}"#;
-        let (status, body) = http_request(19024, "POST", "/mcp", Some(req));
+        let (status, body) = http_request(port, "POST", "/mcp", Some(req));
         assert!(
             status.contains("200"),
             "session event call 200, got {status}"
@@ -4504,7 +5295,7 @@ mod tests {
                 }
             }
         }
-        let server = start_on_port(19020);
+        let (server, port) = start_test_server();
         server.set_dispatcher(Arc::new(Lifecycle {
             state: Mutex::new("idle".to_string()),
         }));
@@ -4515,7 +5306,7 @@ mod tests {
             let req = format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{name}","arguments":{args}}}}}"#
             );
-            let (status, body) = http_request(19020, "POST", "/mcp", Some(&req));
+            let (status, body) = http_request(port, "POST", "/mcp", Some(&req));
             assert!(status.contains("200"), "{name} call 200, got {status}");
             let v: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(v["result"]["isError"], false, "{name} must not be an error");
@@ -4551,17 +5342,18 @@ mod tests {
 
     #[test]
     fn start_is_single_instance_no_op_on_second_call() {
-        let server = start_on_port(19016);
+        let (server, port) = start_test_server();
         // A second start() on the SAME server is a no-op (latched): returns the same
         // bound port, does not bind a second listener.
         let again = server.start().expect("second start is a no-op");
-        assert_eq!(again, 19016);
+        assert_eq!(again, port);
 
-        // A SECOND McpServer trying to bind the SAME fixed port fails to bind (the
-        // OS refuses the duplicate listener) — proving a second nyx would not create
-        // a second server on the fixed port.
+        // A SECOND McpServer configured on the SAME port fails to bind (the OS refuses the
+        // duplicate listener) — proving a second nyx would not create a second server on the
+        // configured port. That port is the one THIS test's server was given, never a shared
+        // constant, so a concurrent test process can not be what makes the bind fail.
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var(PORT_ENV, "19016");
+        std::env::set_var(PORT_ENV, port.to_string());
         let second = Arc::new(McpServer::default());
         let result = second.start();
         std::env::remove_var(PORT_ENV);
@@ -4591,8 +5383,7 @@ mod tests {
 
     #[test]
     fn rejects_cross_origin_browser_request() {
-        let port = 19018;
-        start_on_port(port);
+        let (_server, port) = start_test_server();
         // A browser Origin pointing off-localhost is rejected (D9, anti-rebinding).
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         let req = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example.com\r\nConnection: close\r\n\r\n";
@@ -4626,8 +5417,7 @@ mod tests {
         // SAME-ORIGIN request that carries NO Origin header but a Host of the attacker's
         // hostname. The Host gate must reject it even though Origin is absent — this is
         // the bypass the Origin-only check missed.
-        let port = 19040;
-        start_on_port(port);
+        let (_server, port) = start_test_server();
         let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         let req = "POST /mcp HTTP/1.1\r\nHost: attacker.example.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         stream.write_all(req.as_bytes()).unwrap();

@@ -76,6 +76,11 @@ notify = "7"
 libc = "0.2"
 
 [dev-dependencies]
+# v2.8 P1 runtime spike (`tests/nyx_next_loop_spike.rs`): the integration test drives
+# the REAL `command::CommandPty` gate primitive, which takes a `portable_pty::PtySize`.
+# The lib already depends on portable-pty; the integration test (built without
+# `cfg(test)`) needs it in scope to construct that size.
+portable-pty = "0.9"
 # Probe (via kill(pid, 0)) that a child shell is really dead after pty close.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

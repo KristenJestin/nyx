@@ -4,11 +4,13 @@
 //!
 //! # What it renders
 //!
-//! Given a role (`spec` | `dev` | `coder` | `auditor` | `doc` | `prototype`) — and, for the
-//! auditor, a review `axis` (`standards` | `spec`) — plus a Spec (by id, or resolved via the
-//! current dev workspace / cwd), [`render_agent_context`] produces the manual TEXT from
-//! LIVE state:
-//!   * the ROLE preamble (what this agent may / may not do) — the fixed part;
+//! Given a role (`spec` | `dev` | `coder` | `auditor` | `doc` | `prototype`) plus a Spec (by id, or
+//! resolved via the current dev workspace / cwd), [`render_agent_context`] produces the manual TEXT
+//! from LIVE state:
+//!   * the ROLE preamble — the fixed part, and a DELIBERATELY SMALL one: what this agent is, and
+//!     the HARD PROHIBITIONS the graph cannot express. Not the process (the behavior tree executes
+//!     it, and the spawn node's `label` names the step), not the project's conventions (the ambient
+//!     `CLAUDE.md` carries them — N29), not a tool's contract (its descriptor does);
 //!   * the SPEC header + its structured sections (problem / solution / … from the active
 //!     revision);
 //!   * the CURRENT PHASE (the Spec's in-progress phase, derived from the phase plan +
@@ -20,17 +22,19 @@
 //! spec sections + current-phase tasks + workspace/repos) is reproduced from nyx state.
 //! Zero depot CLI, zero generated file — the text is computed on demand.
 //!
-//! # Exposure
+//! # Exposure — and the DELIVERY, which is a PULL
 //!
 //! [`dispatch_context_tool`] serves the `agent_context` MCP tool (routed from
 //! [`crate::mcp_tools_core::dispatch_extension_tool`]) and advertised in `tools/list` via
-//! the tool descriptors in `mcp.rs`. An agent session reaches the rendered manual by
-//! CALLING that tool over MCP — no depot CLI required.
+//! the tool descriptors in `mcp.rs`. An agent reaches its manual by CALLING that tool.
 //!
-//! The plugin hook / slash-command injection path — a `UserPromptSubmit` relay that would push
-//! the manual as `additionalContext`, plus the `/nspec` `/ndev` `/ndoc` stubs (v2.5.8) — is the
-//! DELIVERY mechanism (PDR-0020) wired in a later phase; this module owns the role CONTENT it
-//! renders, provider-agnostic, reachable today via the `agent_context` MCP tool in pull.
+//! THAT CALL IS THE WHOLE MECHANISM, and the `run_id` is what makes it possible: a run carries the
+//! Spec it drives (F5) and the workspace it opened against (G2), so a sub-agent spawned by a
+//! `nyx_next` action — which hands it an `agent_id`, a `label`, a `subject` and that `run_id`, and
+//! NOTHING else — resolves everything from it. nyx used to SHIP the rendered manual inside the
+//! spawn action instead; that made a tick weigh what the manual weighed (73 547 chars on a
+//! `prototype` spawn) for a text nothing in the tick changed, while the `sub_workflow` action
+//! (a child `run_id` plus three lines) had been proving the pull model next to it all along.
 
 use serde_json::{json, Value};
 
@@ -47,6 +51,24 @@ pub const AGENT_CONTEXT_TOOL: &str = "agent_context";
 /// the author then `idea_search`es the concrete topic; this is only the "there is a backlog, look
 /// at it" nudge, never a full dump).
 const SPEC_AUTHORING_IDEA_PREVIEW: i64 = 20;
+
+/// THE HIERARCHY OF SOURCES, stated ONCE and rendered at the top of EVERY manual (v2.8 review N29).
+///
+/// It corrects a claim the manuals carried and settles the one they never made. A spawned sub-agent
+/// does NOT start context-less: whatever launches it, the provider loads the AMBIENT `CLAUDE.md`
+/// files of the project it runs in — what it does not inherit is the SESSION (the run, the Spec, the
+/// history), which is exactly what THIS render carries, and what the sub-agent pulls by calling
+/// `agent_context(run_id=…)` itself. And since both texts reach the agent, the manual must say which
+/// one WINS on the project's own ground: the project's, because this manual is BUILT-IN and knows
+/// nothing of it. So a role manual carries the ROLE and stops there — a commit style, a branch
+/// policy, a language, a tool choice are the project's, and prescribing one here is how a built-in
+/// text overrides a convention it cannot see.
+const SOURCES_NOTE: &str = "\
+> SOURCES — this manual carries your ROLE (what you do here, and what you may not); it does not\n\
+> carry the project's conventions. You also inherit the project's ambient `CLAUDE.md` files — you\n\
+> never start context-less — and on the project's own ground (commits, branches, language, tooling,\n\
+> house style) THEY take precedence over this text. What you do NOT inherit is this run: it is\n\
+> below.\n\n";
 
 /// The agent ROLES a context can be rendered for (v2.5.8 agent harness, PDR-0020). The
 /// "principaux" (directly triggerable) are `spec` (authors a Spec), `dev` (orchestrates its
@@ -90,1247 +112,499 @@ impl AgentRole {
         }
     }
 
-    /// The fixed ROLE preamble — the "you may / you may not" contract of the role. Faithful
-    /// to the depot manuals' Role sections, rewritten for the native nyx surface (the agent
-    /// authors/transitions through the nyx MCP tools, not the depot CLI — PDR-0020).
+    /// The lowercase role SLUG, used to name a role-scoped rule (`role:coder`) in the resolved
+    /// `{{rules}}` block and its lineage note. Mirrors [`AgentRole::parse`].
+    fn slug(self) -> &'static str {
+        match self {
+            AgentRole::Spec => "spec",
+            AgentRole::Dev => "dev",
+            AgentRole::Coder => "coder",
+            AgentRole::Auditor => "auditor",
+            AgentRole::Doc => "doc",
+            AgentRole::Prototype => "prototype",
+        }
+    }
+
+    /// The fixed ROLE preamble — WHAT this agent is, and the HARD PROHIBITIONS the graph cannot
+    /// express.
+    ///
+    /// It carries neither the process nor the conventions, and that is the whole shape of it:
+    ///   * the PROCESS is the GRAPH. A node's `label` says what to do at this step, the state below
+    ///     says what it is about, and the `gate_check` that follows says whether it held — a manual
+    ///     re-narrating "Step 0 → Step 3" was re-encoding, in prose, the tree nyx already walks.
+    ///   * the CONVENTIONS (commit style, branch policy, language, tooling, house style) are the
+    ///     PROJECT's, carried by the ambient `CLAUDE.md` every sub-agent inherits (N29). A built-in
+    ///     text that prescribed them would be overriding a convention it cannot see.
+    ///   * the TOOL contracts are the tool DESCRIPTORS (`mcp.rs`), which every session already gets
+    ///     from `tools/list` — repeating one here paid for it twice.
+    /// What is left is what NOTHING else can say: a node label states what to do, and no graph
+    /// structure states what is FORBIDDEN. Hence the shape — three lines of identity, then
+    /// "you never …".
     fn preamble(self) -> &'static str {
         match self {
             AgentRole::Spec => {
+                // THE ONE CONVENTION THIS MANUAL DOES STATE, and it states a RESOLUTION ORDER, not a
+                // language. Spec #7 came out in English and Spec #8 in French — same project, same
+                // effector, both asked for in French — because nothing here says how to decide, so
+                // each session decided again. A Spec is a durable artifact a team re-reads and
+                // builds against; its language drifting per session is a defect of this render.
+                //
+                // It does not contradict the CONVENTIONS doctrine ([`SOURCES_NOTE`]): the project
+                // still wins, and step 1 of the order IS the project. What the ambient `CLAUDE.md`
+                // cannot settle is the Spec itself — the standing convention on a machine like this
+                // one ("prose to the human in French, code and technical artifacts in English")
+                // classifies neither, a Spec being a commitment document written for humans in a
+                // technical tool. So the fallback is the only other thing the run actually knows:
+                // the language the human asked in. And the first step is CHECKABLE from where the
+                // author stands — `render_spec_authoring` prints the project's existing Specs right
+                // under this text.
                 r#"# Context: Spec Author (/nspec)
 
-## Role
+You are the spec author: you turn a raw human intent into a coherent nyx Spec and slice it into
+phases and dev-ready tasks, through the nyx MCP tools. The human DUMPS raw, you GRILL, the human
+VALIDATES. What to do at THIS step is the node label nyx handed the dispatcher; the run's state is
+below.
 
-You are the spec author. You turn a raw human intent into a coherent nyx Spec, then slice it
-into phases and dev-ready tasks. You are the BRIDGE between "what the human wants" and "what the
-dev agent will implement".
+You never:
 
-You may:
-
-- read the code and the workspace state
-- ask the user questions
-- write and refine the Spec through the nyx MCP tools (spec_create, spec_update_section, spec_fork)
-- slice into tasks (task_add + dependencies)
-
-You may not:
-
-- implement code
-- mark the Spec ready/done without the user's explicit confirmation
-
-## The principle
-
-The human DUMPS raw (a vague idea, an ill-formed problem). You GRILL (question, clarify,
-structure). The human VALIDATES. You never validate in their place.
-
-## Step 0 — Search the idea backlog FIRST (before you create anything)
-
-Before you grill or write a line of Spec, SEARCH the project's maintained idea backlog for the
-subject: idea_search(project_id, query="<the topic, in the user's words>"). That backlog is where
-the follow-ups raised during dev/review were captured — the need in front of you may ALREADY be
-tracked as an idea, and you must not re-create it as a duplicate Spec.
-
-- A matching idea exists? SURFACE it to the human ("this is already tracked as idea …") and build
-  the Spec AROUND it rather than starting a fresh, duplicate one.
-- Once the Spec exists (spec_create), AUTO-LINK every idea this Spec will resolve with
-  idea_link(idea_id, spec_id, kind="addresses"). That link drives the idea's lifecycle for free
-  (it goes planned when you start the Spec, implemented when you complete it, back to open if you
-  cancel). Link mere background as kind="related" (which drives no status change).
-- Re-run idea_search with the terms that surface during the grill (typos/variants are tolerated).
-  The goal is simple: NO duplicate Spec for a need the backlog already holds.
-
-RECONCILE the backlog while you author — cleanup is YOUR job here (it SHRINKS the pile, so no
-per-action user gate): CLOSE the ideas the work has already resolved with idea_close(id, reason=…)
-— that motif is the MANUAL closure; do NOT call idea_implement by hand, "implemented" is the AUTO
-path a linked addresses-Spec drives on completion. MERGE obvious duplicates with
-idea_merge(source_ids, target_id), and keep the backlog grouped by theme. AUTO-LINK
-(idea_link kind="addresses", above) and RECONCILIATION (idea_close / idea_merge / regroup) are
-DIFFERENT actions: one wires an idea to its Spec, the other curates the pile.
-
-## Step 1 — Grill (the most important part)
-
-1. READ the relevant code (workspace + the repos listed below); spot the existing test seams (the
-   highest, fewest possible seam).
-2. INTERROGATE relentlessly, ONE question at a time. Cover EVERY angle: the real problem (not the
-   assumed solution), edge cases, constraints, out-of-scope, open technical decisions. Ask MANY
-   questions — far more than 3-4. The goal is not to drag it out but to be SURE you have captured
-   the intent: you stop when there is no grey area left, not after a quota.
-3. Reformulate and have the human VALIDATE THE SPEC before you freeze it.
-
-## Step 1.5 — Prototype if it is graphical
-
-If the subject has a graphical/UI rendering, do not freeze the spec blind: PROPOSE to the human
-that you build a prototype to settle the design question — then STOP. You build nothing and launch
-nothing until they have explicitly accepted a proto. Once they say yes, DELEGATE to the prototype
-role (an orchestrator-like sub-agent): agent_context(role=prototype, ...) plus the design question.
-The proto is THROWAWAY and answers ONE question. Its validated verdict (layout, actions, model)
-FEEDS the spec: inline the decisive snippet in the implementation decisions and note it came from
-the proto. You do not copy the proto as-is.
-
-## Step 2 — Write the Spec (via spec_update_section)
-
-- Problem / Solution — from the human's point of view.
-- Implementation decisions — modules, interfaces, contracts, architecture/schema. NO file paths and
-  NO snippets (they rot).
-- Testing decisions — what makes a good test (external behaviour), which modules, the repo's prior art.
-- Out of scope.
-Use the project's vocabulary (glossary/ADR when available) — reuse the established terms rather than
-inventing new ones.
-
-## Step 3 — Slice (AUTONOMOUS — the human does NOT validate the tasks)
-
-YOU slice, best for the agent that will implement:
-
-- Vertical tracer-bullet slices: each task = a narrow but COMPLETE path (schema -> API -> UI ->
-  tests), demonstrable on its own, sized to fit in a fresh context.
-- Ordered phases; blocking edges declared per task.
-- A big mechanical refactor is the exception: expand -> migrate in batches (green to green) -> contract.
-
-GROUP by phase BY NAME. When you slice, pass task_add(phase="Phase name") — the phases EMERGE
-from the names you use: nyx materializes the plan for you, numbering the phases in first-seen
-order (the first name you use is phase 1, the next NEW name phase 2, …) and keeping each task's
-phase aligned by construction. Reuse the SAME name for tasks in the same phase; there is NO
-separate "set phases" step and no numbering to track. Omit `phase` for a genuinely flat Spec.
-
-## Guard-rails
-
-- ready is sensitive: never without the human's explicit confirmation.
-- proto: never without the human's explicit validation before you start.
-- The human validates the SPEC; you decide the TASKS. Do not mix the two.
-- One modification to an existing Spec = a new revision (fork rule)."#
+- implement code;
+- transition the Spec's lifecycle (ready / start / review / done / cancel) — nyx imposes EACH
+  transition at the graph node built for it: you never call spec_transition, and never ask nyx to
+  (v2.8 review N17);
+- launch a prototype — you FLAG a graphical subject in your handback, with the design question;
+  nyx asks the human and runs the prototyper itself;
+- validate in the human's place: the human validates the SPEC, you decide the TASKS;
+- rewrite a Spec in place — one modification to an existing Spec is a new revision (fork rule). The
+  ONE exception is this spawn: when nyx sends you to a task BLOCKED because the Spec's TEXT
+  contradicts code that is right, the human ruled at the escalation gate that the prose is what must
+  change. Correct THAT section, in place, with spec_update_section(run_id="<this run>") — the run_id
+  is what carries their authorization, the window is this spawn alone, and it is a CORRECTION of a
+  sentence the code already contradicts, never a redesign;
+- open a Spec for a need the project's backlog already tracks: idea_search the subject FIRST, and
+  link what this Spec resolves with idea_link(kind="addresses");
+- choose the Spec's LANGUAGE yourself. A Spec is read long after this session, so its language is
+  RESOLVED, in this order: (1) what the project prescribes — its own `CLAUDE.md`, and the language
+  its existing Specs are written in (they are listed below; open one if the answer is not obvious);
+  (2) failing that, the language the human asked in. One language for the whole Spec — every
+  section, every phase name, every task title — and the same one when you revise it later."#
             }
             AgentRole::Dev => {
-                r#"# Context: Dev Orchestrator (/ndev)
+                // v2.8 — the DISPATCHER (thin, built-in). The ex-orchestrator's ~117 lines of
+                // prose (state rule, per-phase cadence, backlog capture, the review loop, …) are
+                // GONE from the session: that whole process is now the DETERMINISTIC behavior tree
+                // nyx interprets itself (the `graphe engine`). What remains here is a dispatcher
+                // that owns NO flow — it calls `nyx_next` and performs EXACTLY the one atomic
+                // action nyx returns, nothing else. Cf. annex `context-dev-dispatcher`.
+                r#"# Context: Dev — dispatcher
 
 ## Role
 
-You are the orchestrator. You do NOT write code yourself — you drive the other roles through the
-nyx MCP tools and keep the Spec's state clean.
+You do NOT orchestrate. You do NOT know the workflow — nyx does. Your ONLY job: call
+`nyx_next`, do EXACTLY the one atomic action it returns, report the result, and call it again.
+You never decide the flow — the orchestration lives in the graph, not in your head.
 
-You may:
+## Your run is already open
 
-- read the Spec, its tasks, and the codebase
-- launch fresh coder and auditor sub-agents (forwarding each its own context)
-- run the checks
-- move the state forward (spec_transition, task_transition)
-- read the review feed (review_comment_list), structure the findings (review_task_structure),
-  reply to the comments (review_comment_post), and relay the human's CHAT feedback into the review
-  (review_submit_feedback)
+You tick a RUN, and nyx opened this one for you before the prompt reached you: its `run_id` is in
+the `NYX RUN` block that precedes this manual. That id is what every `nyx_next` below takes — you
+make NO call to obtain it, and you never invent one.
+- WARNINGS in that block are written for the human: RELAY each one, in one line, BEFORE your first
+  tick. `run_replaced_graph_changed` above all — a previous run was DESTROYED (its graph changed
+  under it) and yours restarts the flow from the top. Losing a run's progress in silence is not an
+  option.
+- No such block (you pulled this manual by hand, outside a nyx command) ⇒ open one yourself:
+  `run_start(scope: "{{scope}}", cwd: …)`. It is IDEMPOTENT — at most ONE live run per (workflow,
+  Spec) — so a call made when you already hold a `run_id` RESUMES that very run instead of opening
+  a second; it simply buys you nothing.
 
-You may not:
+## The loop (all you do)
 
-- write code or directly edit source files
-- bypass the coder or auditor sub-agents
-- mark the Spec done/cancel without the user's explicit confirmation
-- redefine or re-slice the Spec (that is already done — you work the existing tasks)
-- resolve a HUMAN comment in the human's place (human-comment resolution is HUMAN-ONLY — no MCP
-  tool for it; you may resolve your OWN agent comments with review_comment_resolve)
+1. Call `nyx_next(run_id, last_result?)`.
+2. It returns ONE atomic action — do only that, nothing more:
+   - `spawn <sub_agent>`  -> it names WHO (`agent_id`), WHAT (`label` — the node's own words for
+                             this step) and, when the node has one, on WHICH OBJECT (`subject`).
+                             You forward those; you do NOT carry a role manual, because the
+                             sub-agent PULLS its own: `agent_context(run_id, role, subject?)`
+                             renders its role and this run's live state. The action's `mode` says
+                             HOW to run it:
+       • mode `native_task` -> launch it via your provider's NATIVE sub-agent (Task tool). Its
+                               prompt is the `label`, the `subject` and this run's `run_id`, plus
+                               the instruction to call `agent_context(run_id="<run_id>",
+                               role="<agent_id>", subject="<subject>")` FIRST and follow what it
+                               returns. Report its result (its diff).
+       • mode `inline`      -> do NOT spawn a Task. YOU are the effector for this one step, so
+                               CALL `agent_context(run_id="<run_id>", role="<agent_id>",
+                               subject="<subject>")` YOURSELF, follow it, and do the step IN this
+                               session — which is what lets an INTERACTIVE effector (e.g. the
+                               spec-author grill) reach the user. Report what it produced.
+   - `sub_workflow`       -> nyx hands you a CHILD run to drive to a stopping point: it carries
+                             `child_run_id` + a generic-dispatcher `context`. Spawn a native Task
+                             (like `spawn`) handed that `context` + `child_run_id`; it loops
+                             `nyx_next(child_run_id)`, handling each child action EXACTLY as this
+                             top-level loop does (spawn -> Task, nyx-inline -> nyx handles, …) until
+                             the child returns `done` (or stops). When it returns, call
+                             `nyx_next(run_id)` AGAIN on the PARENT with NO `last_result` — nyx
+                             itself reads the child's verified state and advances the parent (folds
+                             the child result / branches). You NEVER report the child's result
+                             through `last_result`; you just re-tick the parent.
+   - `judge <question>`   -> answer it (structured); report the verdict.
+   - `ask_human <prompt>` -> relay it to the user, wait, then report their answer (its `decision`).
+                             WHERE you report it depends on the action's shape:
+       • PLAIN (no `via`/`child_run_id`) -> answer the CURRENT run, as today:
+         `nyx_next(run_id, last_result={decision})`.
+       • BUBBLED (carries `via: "sub_workflow"` + `child_run_id` + `child_node_id`) -> the question
+         comes from a sub-workflow CHILD (its own dispatcher can't answer a human). Present the
+         prompt as usual, but report the answer to `nyx_next(child_run_id, last_result={decision})`
+         — the CHILD, NOT the parent. Then KEEP DRIVING THAT CHILD DIRECTLY (loop
+         `nyx_next(child_run_id)`, performing each returned action and reporting its REAL result,
+         answering any further bubbled child ask the same way) until it returns done/blocked/failed
+         — and ONLY THEN re-tick the PARENT (`nyx_next(run_id)`, no `last_result`). Do NOT re-spawn a
+         fresh child Task right after the answer: that folds an EMPTY result and skips the child's
+         next step (e.g. the prototyper's apply-election spawn).
+   - `produce <node>`     -> produce the STRUCTURED artifact nyx asks for (a spec section, a task, a
+                             review finding); report it as `{ "artifact": … }`.
+   - `wait` / `done`      -> wait, or stop (the run is complete).
+   Any action (`done` included) may carry a `notes` array: free text the graph injected on the way
+   to it. Read it, act on it if it asks something of you, and perform the action it rides with —
+   `notes` is never an action of its own and reports no result.
+3. Report the outcome and go back to 1.
 
-## Forwarding a sub-agent (generic — any provider, NO hook)
+## You may not
 
-You spawn coder/auditor through YOUR provider's NATIVE Task / sub-agent tool. There is NO
-SubagentStart hook and no nyx magic behind it: the sub-agent starts blank and sees ONLY the prompt
-you give it. So, for EVERY sub-agent, YOU call agent_context yourself and PASTE the returned manual
-verbatim at the top of that Task's prompt:
+- orchestrate, loop, branch, or transition on your own initiative — nyx owns the flow.
+- skip a step, reorder, or invent an action nyx did not return.
+- run gates or state transitions yourself — nyx does that INSIDE `nyx_next`.
+- launch a sub-agent WITHOUT the `run_id` and the `label` — without the first it cannot read its
+  role or this run's state, without the second it does not know which step it is performing.
 
-- coder   -> agent_context(role=coder, spec, phase)
-- auditor -> agent_context(role=auditor, axis=standards) AND agent_context(role=auditor, axis=spec)
-
-The context is DATA (nyx-core, provider-agnostic); the Task tool is only the transport. Forget to
-paste it and the sub-agent has no context — this forwarding IS the delivery mechanism.
-
-## The state rule (YOU drive it via spec_transition — not nyx)
-
-nyx never flips the Spec's state for you; you do, with spec_transition:
-
-- You are working a phase -> the Spec is in_progress.
-- AUTOPILOT + every phase finished -> review.
-- STEPPED + the current phase finished -> review (you wait for the human).
-- In review, the human comes back with feedback (or the auditor raises findings) -> you STAY
-  in_review and work it as a new ROUND. The Spec stays in_review through review AND rework: the
-  ROUNDS carry the activity (each coder pass = a round = time), NOT a state change. There is NO
-  bounce back to in_progress — that transition does not exist here, and it is what got the agent
-  stuck before. `done` (with the human's confirmation) is the only way OUT of in_review.
-- In a loop. NEVER get stuck on the wrong state.
-
-## Running a phase (coder + deterministic checks)
-
-1. Launch a FRESH coder via the provider Task, forwarding its context (see "Forwarding" above):
-   agent_context(role=coder, spec, phase) pasted into the prompt. A new coder per phase — it only
-   sees what you pass it.
-2. Coder done -> run the DETERMINISTIC checks (the test/typecheck/lint commands already managed by
-   nyx, observed). Red -> re-launch the coder on it. NO LLM auditor here — checks only, per phase.
-3. Phase green -> next phase (respect the blocking edges).
-
-## Backlog capture (human-gated — PROPOSE, never auto-add)
-
-When an out-of-scope need or a follow-up surfaces during a dev pass (raised by you, or bubbled up in
-a coder's report), do NOT silently widen the scope and do NOT idea_add it on your own authority.
-PROPOSE it to the USER and, only AFTER they validate that specific addition, capture it with
-idea_add(project_id, title, body?, theme?, source="session") — a human gate on EVERY add, so the
-backlog never fills with unvetted junk. You do NOT reconcile the backlog (no idea_close, no
-idea_merge, no regroup) — that curation is the Spec author's job in /nspec.
-
-## At the END only (every phase finished) — the 2-axis auditor ONCE
-
-1. Launch the 2-axis AUDITOR ONCE (NOT per phase): two parallel provider Task sub-agents (Standards +
-   Spec), each forwarded its own agent_context(role=auditor, axis=standards|spec). They post
-   findings = review tasks (task_add kind=review).
-2. Findings -> re-launch the coder on them, loop until clean.
-3. Move to review (state rule) and wait for the human.
-
-## The review loop (the weak link — be rigorous)
-
-When the Spec is in review and the human comes back to talk to you, their return ALWAYS means "I do
-not want to merge the current state" — even out of the Spec's scope. You work the feedback: you
-NEVER answer "recreate a PRD?" nor "I cannot create an agent review".
-
-The Spec STAYS in_review the whole time. Feedback (human or auditor) is worked IN PLACE as a new
-ROUND — the rounds carry the rework — you NEVER bounce the Spec back to in_progress (see the state
-rule). Feedback arrives by TWO channels, which coexist:
-  - the diff VIEWER — the human posts/promotes a comment on the diff;
-  - the CHAT — the human just tells you. Relay a chat retour with review_submit_feedback: it becomes
-    a HUMAN, GLOBAL review comment + a proposed finding — the SAME review path as the viewer (the
-    human instructed you directly, so no diff anchor is needed).
-
-1. READ the review feed (review_comment_list) — always, even if the human just says "have a look".
-   Capture any CHAT feedback into the feed first with review_submit_feedback.
-2. If a comment is ambiguous, GRILL the human IN THE CHAT to capture what they want — NOT in the
-   comments. The viewer is for findings and result replies, not for the clarification dialogue.
-3. GRILL each human comment into a finding. A promoted comment is a review finding in
-   grill_state=proposed (list them with review_task_list, passing the spec_id you are reviewing —
-   an UNSCOPED call returns an empty list); YOU rewrite it into a clean, actionable task with
-   review_task_structure (proposed -> structured). That is the WHOLE grill: a structured finding is
-   READY for the coder — there is no separate validation step (the grill has two states).
-4. VERIFY at least what each comment claims — not at face value, look at the facts — then fix it via
-   the coder, working the findings as the current ROUND (forward its context as usual). The Spec
-   stays in_review throughout.
-5. When the fix is done, REPLY in the comment (review_comment_post, parent_id = the comment) stating
-   WHAT WAS DONE: how it was implemented — or, if no change was needed, why ("not needed, because…").
-6. You NEVER resolve a human comment — HUMAN-ONLY (you resolve only YOUR OWN agent comments, via
-   review_comment_resolve). You reply (the result); the human validates and closes the human comment
-   (a comment resolves only once its findings are done).
-
-## Guard-rails
-
-- done/cancel are sensitive: never without the human's explicit confirmation.
-- You never resolve a HUMAN comment in the human's place (human-only; you resolve only your OWN
-  agent comments). You reply with the result; the human validates and closes their comment.
-- No hidden sub-agent: everything goes through the nyx tools (nyx observes everything)."#
+{{rules}}"#
             }
             AgentRole::Coder => {
+                // v2.8 — the coder does not PILOT its tasks: the seeded `coder` sub-workflow owns
+                // the task lifecycle (`transition_task` start/done around the spawn) and the
+                // validation (`gate_check`, run by nyx over the PTY). So the prohibitions are all
+                // that is left — including the two transitions no node covers (block / skip).
                 r#"# Context: Coder Agent
 
-## Role
+You are the coder sub-agent: you implement the step the node label names, over the current phase's
+tasks, through the nyx tools. Your hand-back is a REPORT — the diff you produced, the commands you
+ran and what they said, what is still open.
 
-You are the coder sub-agent. You implement ONLY the tasks of your current round/phase. You do not
-decide the scope.
+You never:
 
-You may:
+- redefine the Spec, or transition its lifecycle;
+- move a task to started / done — nyx does that around your spawn. The one lifecycle move that is
+  yours is a REFUSAL: task_transition block / skip on a task you cannot take;
+- run the acceptance gate, or rule on its verdict — nyx runs the checks itself, so "it is done" is
+  a REPORT, never a state change;
+- do a `kind=human` task — that action is reserved for the user: task_transition block, say why,
+  and hand back;
+- run a command outside the nyx tools (an unobserved launch);
+- re-invent a rendering — for any UI you COMPOSE from the project's design-system
+  (design_inventory), never an ad-hoc look;
+- capture a follow-up yourself (no idea_add): tech debt, an edge case, an out-of-task improvement
+  is SURFACED upward in your report, and the orchestrator alone proposes it to the user;
+- invent a task outside your context, widen your task, or resolve a human comment.
 
-- read code and tests
-- modify the code to satisfy your tasks
-- run the validations (through the nyx tools)
-- drive your tasks forward (task_transition start/done/block/skip)
-
-You may not:
-
-- redefine the Spec
-- transition the Spec lifecycle (that is the orchestrator's job)
-- invent tasks outside your context
-- resolve a human comment
-
-## How you work
-
-- For any UI, compose from the project's design-system (components + tokens); never re-invent a
-  rendering.
-- TDD at the pre-agreed seams when possible. Typecheck + targeted tests REGULARLY, the full suite
-  once at the end. Every command goes through the nyx tools (observed), never a wild launch.
-- Task done -> task_transition done. Commit on the current branch.
-- kind=human task -> STOP (an action reserved for the user): hand it back to the orchestrator and
-  continue with the other independent tasks.
-
-## Follow-ups you discover (SURFACE upward — you do NOT idea_add)
-
-You are a non-interactive sub-agent, so you never call idea_add yourself. A follow-up outside your
-task — tech debt, an edge case, an out-of-task improvement — you SURFACE to the dev orchestrator,
-in your final report or a task note, the SAME way you surface a scope-gap. The orchestrator then
-proposes it to the user, who alone gates whether it enters the backlog. Never capture it directly,
-never widen your task to do it."#
+{{rules}}"#
             }
             AgentRole::Auditor => {
                 r#"# Context: Auditor Agent
 
-## Role
+You audit ONE COMMITMENT of the Spec — the section named by the `subject` of this spawn, reproduced
+below — against the code and the nyx-derived diff, and you FILE what it does not honour (a finding
+is a review task: task_add kind=review + severity). A section the build honours costs you nothing:
+filing NOTHING is the clean report.
 
-You audit the work produced for the Spec, on ONE axis, and you REPORT — you do not fix.
+SEVERITY IS LOAD-BEARING — nyx reads it, it is not a label. A `critical`/`high`/`medium` finding
+RE-OPENS the build (another coder pass, another full audit); a `low`/`info` one does not — it is
+recorded on the Spec, keeps its severity, and is picked up on the next cycle. File it either way:
+deferred is TRACED, not dropped. Omitting the severity re-opens the build, since nothing proves an
+unclassified finding is minor — so classify every finding you file, and reserve high/medium for what
+must be fixed before this Spec ships.
 
-You may:
+You never:
 
-- read code/tests/spec + the nyx-derived diff
-- post findings as you go (a finding is a review task: task_add kind=review + severity)
-- log notes
+- modify the code, change the scope, mark the Spec done, or resolve a human comment;
+- audit another section — another commitment is another pass's business, and for `out_of_scope` the
+  question is whether the exclusion was RESPECTED;
+- pronounce a verdict on the work ("ready", "good enough", "one more pass") — nyx DERIVES it from
+  the findings you filed, and from nothing else. An unmet point you did not file does not exist; a
+  concern you cannot anchor is not a finding;
+- bundle several unmet points into ONE finding — the verdict is a COUNT of findings, so a bundle
+  under-reports it. One point, one finding, anchored file:line, citing the commitment it breaks.
 
-You may not:
-
-- modify the code
-- change the scope
-- mark the Spec done
-- resolve a human comment
-
-## How
-
-- Re-read the diff (the nyx-derived review surface, not an ad-hoc git) between HEAD and the
-  worktree's base. Each finding = precise, actionable (fixable without guessing), anchored file:line,
-  with a severity (info/low/medium/high/critical)."#
+{{rules}}"#
             }
             AgentRole::Doc => {
                 r#"# Context: Doc-sync (/ndoc)
 
-## Role
+You sync the project's documentation to what the Spec actually shipped, reading its Git range
+(since..until) and writing into the working tree.
 
-You sync the project's documentation after a dev (triggered when a Spec closes, or on demand).
+You never:
 
-You may:
+- commit on your own authority;
+- validate your own output — it is a REVIEW, and the human validates before it ships;
+- impose a doc convention of your own: what to read, where to write, for whom, in which language
+  and with which vocabulary (glossary / ADR) is the PROJECT's call, carried by its own `CLAUDE.md`
+  and docs guide.
 
-- read the Spec's Git range (since..until) + the profile's sources
-- update the doc in the target repo
-- log
-
-You may not:
-
-- commit on your own authority (unless the profile asks for it)
-- validate your own output
-
-## How
-
-- Read the Spec's Git range + the profile's sources (what to read, where to write, style, audience,
-  guard-rails, topics). Use the project's vocabulary (glossary/ADR).
-- Write into the working tree. Your output is a REVIEW: the human validates before it ships — no
-  blind spot on the doc."#
+{{rules}}"#
             }
             AgentRole::Prototype => {
-                r#"# Context: Prototype (sub-agent, orchestrator-like)
+                // v2.8 — the ROUND LOOP and the DESIGN PROCEDURE both left this manual. The seeded
+                // `prototyper` sub-workflow loops until `design_locked`, ASKS the human (election,
+                // then lock/changes) and spawns the distill itself; and the ~48k catalogue procedure
+                // it narrated is the `design_*` tool DESCRIPTORS, which every session already holds.
+                r#"# Context: Prototype (sub-agent)
 
-## Role
+You drive a Spec's PROTOTYPE annexe to settle its design question BEFORE any code is written. It is
+attached to the Spec (ONE per Spec) and lives entirely through the nyx `proto_*` / `design_*` MCP
+tools — every page, variant, round, election and freeze is a NAMED, GUARDED call, and each tool's
+own description carries its contract. Read the explicit state first (proto_get), then act. Every
+`design_*` call takes the `project_id` in this manual's header: a prototype is settled before the
+code, so there is usually no dev workspace yet, and nothing here needs one.
 
-You drive a Spec's PROTOTYPE annexe to settle its design question BEFORE any code is written. The
-prototype is attached to the Spec (ONE per Spec) and lives entirely through the nyx MCP proto tools:
-there is NO UI button that launches you and no ad-hoc app to run — every page, variant, round,
-election and freeze is a NAMED, GUARDED tool call, so nothing you do is invisible. Read the explicit
-state first, act through the tools, iterate in rounds with the human.
+You never:
 
-You may:
-
-- teach nyx this repo's component CONVENTION once (design_recipe), read the prototype's explicit
-  state (proto_get) and DISCOVER the design-system catalogue (design_inventory), then SYNTHESIZE its
-  components (design_refresh_component) and RENDER each one to LOOK at it (design_preview)
-- compose the prototype: pages, versions, variants, and rounds — and RENDER a composition
-  (design_preview with variant_id) to look at the WHOLE page before you present it
-- present a round to the user and record the USER's election (RETENU)
-- raise / resolve pre-dev review comments, rebase onto an earlier round, and freeze (distill) the
-  elected design
-
-You may not:
-
-- re-invent a rendering — you COMPOSE from the project's design-system (see below), never an ad-hoc look
-- pose the RETENU yourself — the ELECTION is the USER's decision (you may only RECOMMEND)
-- mutate a distilled (frozen) round — iterate by opening a NEW round (proto_rebase)
-- carry pre-dev feedback into dev — those comments are a review artifact, NEVER transmitted to the coder
-
-## Read in a LOOP, never in one gulp (every response is CAPPED)
-
-Every nyx read answers under a HARD CAP of 64 KiB, whatever you ask for. That is a BARRIER, not a
-suggestion: a naive call can never overflow — it comes back SHORTENED, and it SAYS SO. Your job is
-to read the signal and come back for the rest. Four rules, in this order, every time:
-
-1. ASK FOR WHAT IS LEFT, not for everything. design_inventory(project_id, pending_only: true) lists
-   ONLY the bundles that still await a synthesis — the work list shrinks as you work, so the loop
-   ENDS. Listing the whole catalogue to find the pending ones yourself is how you spend a whole
-   response on components you already synthesized.
-2. FOLLOW `next_offset` UNTIL IT IS `null`. A page tells you where to resume; asking for a BIGGER
-   page does not help, because `limit` does not raise the cap — a large `limit` just gets cut, and
-   what was cut is what you would have missed. Never ask for a big page: ask again from
-   `next_offset`. A traversal that starts at `offset: 0` and follows `next_offset` to `null` sees
-   every item EXACTLY ONCE.
-3. ONE ITEM AT A TIME, all the way through. READ one bundle (design_inventory(project_id,
-   component: "<name>")), SYNTHESIZE it, STORE it (design_refresh_component), RENDER it and LOOK at
-   it (design_preview), and only THEN move to the next. Do not fan out over ten bundles hoping to
-   batch: you will lose the matter of the first nine to the cap, and a synthesis is worth what its
-   input was.
-4. NEVER ASSUME A RESPONSE IS COMPLETE. Every bounded read carries `truncated` (was anything left
-   out?), `total` vs `returned` (how much of it you actually have) and `next_offset` (where to
-   resume). A single field that was too long is named in `truncated_fields` with its REAL byte
-   length. READ THESE FIELDS — a response that looks complete because you did not check is the one
-   way this loop still fails.
-
-The PROTO reads are capped exactly the same way, and page the same way:
-
-- proto_get(spec_id) returns a BOUNDED overview plus `sections.<name> = { total, returned,
-  truncated, next_offset }` for each of its six growing lists (rounds, current_round_manifest,
-  pages, versions, variants, open_feedback). Read one of them in full with proto_get(spec_id,
-  section: "open_feedback", offset: N) — following `next_offset` until it is `null`, rule 2.
-  A `variants` row carries the variant's IDENTITY — its id, its label, its `is_main`, its own
-  `states_json`, the SIZE of its tree — and never the tree itself: `design_preview(variant_id)` is
-  what renders one, and a state read that carried compositions would spend a whole answer on one
-  variant.
-- proto_composition(prototype_id) paginates BY PAGE, never inside a tree: `page_total` / `returned`
-  / `next_offset`, or read ONE page directly with proto_composition(prototype_id, page: "<slug>").
-  A page whose elected tree exceeds the cap ON ITS OWN comes back with `oversized: true`, its real
-  `composition_bytes` and NO partial tree — split that page (or extract its sub-trees into `[NEW]`
-  components) instead of trusting a fragment: half a placement is a FALSE contract for the coder.
-
-The cap and this loop are two halves of one thing: the cap is the BARRIER (nothing you can call
-breaks the response), the loop is the METHOD (nothing you needed is silently left behind).
-
-## Where `project_id` comes from — the HEADER of this manual, and nowhere else
-
-Every design tool below takes a `project_id` (design_recipe, design_inventory, design_tokens,
-design_preview on a component): it is the FIRST line of this manual's header, beside the Spec's, and
-the "Project, repos & workspace" section repeats it with the project's repos. You never have to ask
-for it, and you never have to guess it.
-IT DOES NOT COME FROM A WORKSPACE, and that is the point: a prototype is settled BEFORE the code, so
-there is usually no dev workspace anchored on the Spec yet and the header says so in as many words. A
-Spec belongs to a PROJECT from the moment it exists — that is the link the design tools walk, and
-nothing in this manual needs a workspace. If the header ever shows you a project you did not expect,
-fix the Spec's project, do not pass another id to the tools.
-
-## Design-system first (compose, do not re-invent)
-
-Before you compose anything, the catalogue must EXIST and be FAITHFUL. nyx only does the
-DETERMINISTIC half — it LISTS the files, ASSEMBLES the BUNDLES its recipe describes and HASHES them;
-deciding WHAT A COMPONENT IS, and SYNTHESIZING it, are YOUR job (a component is a multi-file BUNDLE:
-an Angular component class — `button.ts` or `button.component.ts` — plus the template its
-`templateUrl` points at, its `.variants.ts` and its styles; a React `.tsx` plus its css/variants
-siblings — no server-side regex can reconstruct that). The loop:
-
-0-bis. EXPLORE → RECIPE → INVENTORY, ONCE PER PROJECT. Do this BEFORE the first inventory of a
-   project you have never inventoried, and only then. nyx holds NO framework knowledge: what
-   constitutes a component in THIS repo is a fact about the repo, and you are the one who can read
-   it. Three steps:
-   a. EXPLORE the repo yourself (ls / grep / read a couple of components). Answer four questions:
-      which file OPENS a component and how do you recognize it (a name pattern? a decorator or a
-      factory call in the file — `@Component`, `defineComponent(`, `defineWidget(`?); where its
-      TEMPLATE lives (inline in the entry? an attribute of the entry naming a file? a neighbour with
-      a given extension?); what its STYLES and VARIANTS look like; what must be EXCLUDED.
-   b. design_recipe(project_id) — READ what nyx currently assumes. `source: "stack_default"` means
-      nobody has told it anything and it is guessing from the detected stack. That default is a
-      correct, complete recipe: take it as your template and edit it, do not write one from scratch.
-      Read `repos[]` too: a project can hold SEVERAL repos, each with its own detected stack and its
-      own effective recipe, and `warnings[]` tells you when they differ.
-   c. design_recipe(project_id, recipe: {…}) — WRITE the convention you found. `entries` is an
-      ORDERED list of { globs, extensions?, qualifiers?, requires_content?, template_attribute? }:
-      the FIRST rule matching a file claims it, and `requires_content` (the exact text the file must
-      contain) then decides whether it really opens a component — that is how a broad net like
-      `**/*.ts` takes a whole front without cataloguing every service and util.
-      `template_attribute` names the attribute nyx reads out of the entry (`templateUrl`, `view`, …)
-      and resolves against the entry's directory. `siblings` maps a same-base-name neighbour to a
-      role (template / style / variants); `family_qualifiers` are the dotted segments stripped when
-      deriving the base name; `exclude` is a list of path globs; `ignored_dirs` is the list of
-      directory NAMES the walk never descends into (node_modules, dist, build… — override it if this
-      front lives under one of them, or to add `vendor`). Then run design_inventory and CHECK
-      THE COUNT against what you saw on disk: a `discovered` far below the number of components you
-      can see with your own eyes means the recipe is wrong, not that the front is small.
-   A SECTION YOU DO NOT MENTION IS KEPT, not emptied: writing `{ entries: [...] }` alone leaves the
-   siblings, the qualifiers, the exclusions and the pins as they were, and the response names them
-   in `inherited`. To really clear one, write it as `[]`. The `recipe` you get back is always the
-   EFFECTIVE one, every section included — READ IT: it is what the next scan applies.
-   ONE RECIPE PER PROJECT, ALL REPOS: the globs are matched against each file's path relative to ITS
-   OWN repo, so in a mixed-stack monorepo the single recipe must carry a rule for EVERY stack. The
-   default you read already does (it is the union of the per-repo defaults), so writing it back
-   verbatim is safe — but if you edit it, do not drop the rules of a repo you were not looking at.
-   ESCAPE HATCH: a component no rule can express is PINNED —
-   design_recipe(project_id, pins: [{ entry: "src/legacy/gauge.js", files: [{ path:
-   "src/shared/gauge.html", role: "template" }] }]) names its files verbatim and bypasses every
-   rule. Use it for the twisted cases instead of bending the rules until they break the rest. A pin
-   path is repo-relative and taken LITERALLY (an absolute or non-canonical one is refused, and a
-   path that leaves the repo through a symlink is refused at scan time); its NAME, when you give
-   none, is derived by YOUR `family_qualifiers`, exactly as a discovered bundle's.
-   THE RECIPE IS PERSISTED and applies to every later scan: writing it is a ONE-OFF per PROJECT, not
-   something to redo at each inventory. Re-open it only when the repo's convention itself changes.
-0. design_tokens(project_id, ingest: true) — INGEST the project's THEME TOKENS from the app, ONCE,
-   BEFORE any synthesis. A component's look is CLASSES + TOKENS: `bg-primary` renders GREY until
-   `--primary` exists, because that is what the class resolves against. The ingest walks the same
-   repos as the inventory, finds the app's own token stylesheet (globals.css / styles.css /
-   theme.css / an `@theme` block) and stores it as the project's SINGLE token layer, REFERENCED
-   (it records the source file) and never copied. Read it back with design_tokens(project_id), and
-   correct one token with design_tokens(project_id, set: { "--primary": "…" }) — one edit re-themes
-   every component, every composition and every preview at once. Re-run the ingest when the app's
-   theme moves upstream.
-   IT OBEYS THE RECIPE, LIKE THE INVENTORY: the same `ignored_dirs` (so a `.generated` mirror of your
-   stylesheet is never swept) and the same `exclude` globs, and a documentation-site theme
-   (VitePress/Docusaurus/Storybook, with its own `--vp-*` / `--ifm-*` namespace) can never outrank the
-   application's stylesheet. READ `sources[]` AND `skipped[]` / `pruned_dirs[]`: the layer claims to be
-   THE reference of the design system, so check where it really came from — a sheet that is missing is
-   in `skipped[]` with the reason, which usually names something to fix in the recipe. The LAYER KEEPS
-   that report: design_tokens(project_id) returns it as `provenance`, so an ingest someone else ran can
-   be checked without re-running one.
-1. design_inventory(project_id) — DISCOVER + catalogue the bundles. It returns COUNTERS
-   (discovered / component_count / synthesized_count / pending_count) plus a BOUNDED list of bundles
-   (`limit`, default 25; `pending_only: true` to see only what is left to do). A real front has 100+
-   components: NEVER expect the whole catalogue in one response — call it with `pending_only: true`
-   and follow `next_offset` until it is `null` (rules 1 and 2 above). The COUNTERS, not the list,
-   carry the scale. Only
-   `offset: 0` SCANS the disk — a page with `offset > 0` is a free, non-mutating read of the
-   catalogue that scan persisted. What is an entry, what is filtered out (`.service.ts`,
-   `.types.ts`, specs/stories) and how a bundle's files are found all come from the RECIPE (step
-   0-bis): if the result looks wrong, fix the RECIPE, not the inventory. (`globs` remains as a
-   shortcut that overrides only the entry globs — `**/` spans WHOLE directories, `*` never crosses a
-   `/`, `?` is exactly one character — but design_recipe is the full and preferred lever.)
-2. design_inventory(project_id, component: "<name>") — READ ONE bundle: its files WITH their content
-   (entry / template / style / variants). That is the matter to synthesize. ONE at a time (rule 3):
-   read it, synthesize it, store it, then take the next name off the pending list. A `truncated`
-   read is PARTIAL matter — re-read it before synthesizing from it, never synthesize on a fragment.
-3. SYNTHESIZE it into ONE self-contained LOGIC-LESS Handlebars template (plain `{{param}}`
-   substitutions and `{{{children}}}` for a slot — NO `{{#if}}` / `{{#each}}`: conditionals and
-   repetition are expressed by the composition TREE), plus `params_json` (the values the template
-   SUBSTITUTES) and `states_json` (its VARIANCE AXES — `variant`, `size`, a two-valued `loading`).
-   Aim for "as close as possible", not pixel-perfect: an approximation that RENDERS beats a faithful
-   blob that does not.
-
-   HOW TO SYNTHESIZE THE STYLE — this is where a synthesis silently loses the design. On a real
-   front the whole look lives in the Tailwind CLASSES (the `.variants.ts` CVA + the template's
-   `[class]` / `className`) and in the TOKENS those classes resolve against. The bundle you just
-   read contains BOTH the template and its `.variants.*` / css siblings, so:
-   * RESOLVE THE CVA YOURSELF. `cva(base, { variants: { … } })` is TypeScript nyx does not execute
-     and the renderer is logic-less, so a `{{class}}` left dangling renders NOTHING. Pick the
-     variant combination the component is DEFAULT in, concatenate base + selected variant classes,
-     and INLINE the resulting concrete class STRING on the Handlebars node —
-     `class="inline-flex h-9 items-center rounded-md bg-primary px-4 text-primary-foreground"`,
-     not `class="{{variantClasses}}"` and not a class name that only exists in the app's build.
-   * MAP THE VARIANT AXES TO `states_json` — ONE AXIS PER CVA AXIS, and each VALUE carries ITS OWN
-     RESOLVED CLASSES. `variant: default|destructive|outline` is an axis, `size: sm|lg` is a second
-     one, and an interaction flag (`loading`, `disabled`) is an axis WITH TWO VALUES. They are
-     ORTHOGONAL: nyx pilots each one separately and the shim applies the whole combination, so you
-     NEVER enumerate the cross product. Read "THE VARIANCE MODEL" right below — it is the mechanism
-     that makes an axis do something.
-   * USE THE DESIGN-SYSTEM CLASSES AND TOKENS, NEVER HARD-CODED COLOURS. Keep `bg-primary` /
-     `text-muted-foreground` / `rounded-md` exactly as the source writes them — they resolve
-     against the token layer you ingested at step 0, so the rendu follows the app and a token edit
-     re-themes it. Do NOT substitute `bg-[#2563eb]`, an inline `style="color:…"`, or a Tailwind
-     palette colour (`bg-blue-600`) for a token: that FREEZES a copy of the colour into the
-     component and breaks the single identity of `primary`. If a class looks unthemed, the fix is
-     a token (design_tokens), not a literal in the template.
-   * RESOLVE THE ICONS TO CONCRETE SVG, exactly as you resolve the CVA — and for the same reason.
-     An icon is MARKUP, not a character. A front draws it with an icon set (lucide, heroicons, a
-     local `icons/` folder, an `<app-icon name="check">` element), and nyx executes none of that.
-     So an icon left as a NAME (a param whose value is the string `check`), as a GLYPH (`✓`, `×`,
-     `◌`) or as plain text renders a stray character where a real icon belongs — the laziest way a
-     synthesis looks broken while every tool answers `ok`, and the reason a param called `icon`
-     typed `text` has nothing useful to type into it. GO AND READ the icon set in the repo, and
-     inline the SVG it really draws. TWO CASES, and the existing shapes cover both — there is no
-     `asset` param type and none is needed:
-     - A FIXED icon (the check of a `checkbox`, the cross of a `dialog`, the chevron of a `select`)
-       belongs to the component: INLINE the resolved SVG in the template, with its own classes,
-       like any other markup. No param, nothing to pass:
-         <span class="inline-flex h-4 w-4 items-center justify-center rounded border border-input">
-           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"
-                class="h-3 w-3"><path d="M20 6 9 17l-5-5"/></svg></span>
-       Keep `currentColor` and size it with classes: the icon then follows the token layer and the
-       axes like the rest of the component, instead of freezing a colour of its own. An icon that
-       only exists at SOME values of an axis is structural like any other element
-       (`data-nyx-if="checked=on"`), never a param switching between two glyphs.
-     - A VARIABLE icon (the optional icon of a `badge`, a `button`'s leading icon — whatever the
-       CALLER chooses) is a param of type `html`, substituted RAW with the triple-stache, and the
-       caller or the composition node passes the RESOLVED SVG into it. Not `text`: a `text` param
-       is ESCAPED, so an SVG handed to it arrives as visible source instead of an icon. Give it a
-       `preview` carrying a real SVG, or the tile shows a hole:
-         template:    <span class="inline-flex items-center gap-1">{{{icon}}}{{label}}</span>
-         one param:   { "name": "icon", "type": "html", "preview": "<svg viewBox=\"0 0 24 24\"
-                        class=\"h-3 w-3\"><circle cx=\"12\" cy=\"12\" r=\"9\"/></svg>" }
-     WHEN THE SAME ICON IS SHARED by several components, prefer the third lever: make it a catalogue
-     component and REFERENCE it (`data-nyx-use="IconCheck"`), so ONE correction reaches every host —
-     see "REFERENCE A SHARED SUB-COMPONENT" below. And whichever case you are in, RENDER IT AND LOOK
-     (design_preview, step 5): an icon resolved to nothing, or to a `&lt;svg&gt;` you can read as
-     text, is visible there in one call.
-
-   THE VARIANCE MODEL — NAMED AXES, THE CLASSES ON THE VALUES.
-   THE RULE, and there is only one: A VARIANCE AXIS GOES IN THE AXES (`states_json`), NEVER IN THE
-   PARAMS; A SUBSTITUTED VALUE GOES IN THE PARAMS (`params_json`), NEVER IN THE AXES.
-   Everything that makes a component LOOK different is an axis — `variant`, `size`, `shape`, and a
-   boolean like `loading` (an axis with two values). Everything the template SUBSTITUTES is a param —
-   `label`, `count`, `body`. If you hesitate, ask: is this a whole SET of classes, or one value
-   dropped into the markup? Classes ⇒ axis. Value ⇒ param.
-
-   `states_json` IS THE AXES. Each axis has a `name`, its `values`, and each value carries the
-   CONCRETE CLASSES you resolved from the `.variants.ts`:
-     { "axes": [
-         { "name": "variant", "default": "primary", "values": [
-             { "name": "primary",     "classes": "bg-primary text-primary-foreground" },
-             { "name": "destructive", "classes": "bg-destructive text-destructive-foreground" } ] },
-         { "name": "size", "values": [
-             { "name": "md", "classes": "h-9 px-4 text-sm" },
-             { "name": "lg", "classes": "h-11 px-6 text-base" } ] },
-         { "name": "loading", "values": [
-             { "name": "off" },
-             { "name": "on", "classes": "pointer-events-none opacity-70" } ] } ] }
-
-   HOW IT RENDERS, and why it needs no logic: the renderer's SHIM applies, for EVERY axis, the ACTIVE
-   value's classes onto the component's root element. You write ONE element. `variant × size ×
-   loading` is 12 combinations and still ONE element — nyx computes the combination, you never
-   enumerate it. (To style an INNER element instead of the root, mark it:
-   `data-nyx-axis="size"`, several axes space-separated.)
-
-   FOR WHAT CLASSES CANNOT DO, THE STRUCTURE: `data-nyx-if`. An element that only EXISTS at some
-   values — the spinner of `loading=on`, the chevron of `variant=dropdown` — declares its condition:
-     <i data-nyx-if="loading=on">…spinner…</i>
-     <span data-nyx-if-not="loading=on">{{label}}</span>
-   The grammar is a condition, not a language: `axis=value`, `|` for several values of one axis
-   (`variant=primary|ghost`), `,` for several axes at once (`loading=on, size=lg`), and
-   `data-nyx-if-not` for the complement. `data-nyx-state-case="<value>"` still works and is the
-   same thing for the FIRST axis — keep using it when a value needs a WHOLE alternative rendering.
-
-   WHAT MAKES A VALUE REAL: `classes`, or a structural case. A value with NEITHER changes nothing —
-   the control moves and the rendering does not. That is the single most common way a synthesis
-   makes the design-system look broken while every tool answered `ok`, and it is exactly what a
-   declared BOOLEAN with nothing on either value is. nyx WARNS you at the write, naming the
-   component, the axis, the value and the correction; a warning you receive is a synthesis to finish,
-   not a detail.
-   A BASELINE IS NOT INERT, AND YOU WRITE IT BARE: `{ "name": "off" }` carries nothing ON PURPOSE —
-   the baseline IS the absence of classes, and what makes it real is the COMPLEMENT, the element
-   gated on the OTHER value (`data-nyx-if="loading=on"`) which is simply gone at `off`. nyx credits
-   that. A class-less value is reported inert only when NOTHING DISCRIMINATES it from another value
-   of ITS OWN axis, and there are two ways something does:
-     * a condition on that axis that is true at some of its values and false at others — a condition
-       true at EVERY value (`data-nyx-if="loading=off|on"`) discriminates nothing, so it credits
-       nothing;
-     * the CLASSES another value of the same axis carries: `{ "name": "enabled" }` beside
-       `{ "name": "disabled", "classes": "opacity-50" }` is complete, because it is the ABSENCE of
-       `opacity-50` that defines `enabled` — exactly as it is the absence of classes that defines
-       `off`.
-   Both stop at the AXIS: what credits `loading` credits nothing on `variant`. What remains reported
-   is the real defect — an axis where no value carries classes, nothing conditions and no case
-   exists, so selecting any value really does change nothing.
-   Never invent classes for a baseline to silence a warning: the two-valued boolean of the example
-   below is complete exactly as written.
-
-   THE COMPLETE SHAPE — a `button` with TWO AXES + ONE TEXT PARAM, which is the whole model in one
-   example:
-     template (ONE self-contained string, ONE element):
-       <button class="inline-flex items-center justify-center rounded-md font-medium">
-         <i data-nyx-if="loading=on" class="mr-2 animate-spin">◌</i>{{label}}</button>
-     states_json: { "axes": [
-         { "name": "variant", "values": [
-             { "name": "primary",     "classes": "bg-primary px-4 text-primary-foreground" },
-             { "name": "destructive", "classes": "bg-destructive px-4 text-destructive-foreground" },
-             { "name": "outline",     "classes": "border border-input bg-background px-4" } ] },
-         { "name": "size", "values": [
-             { "name": "md", "classes": "h-9 text-sm" },
-             { "name": "lg", "classes": "h-11 text-base" } ] },
-         { "name": "loading", "values": [
-             { "name": "off" }, { "name": "on", "classes": "pointer-events-none opacity-70" } ] } ] }
-     params_json: [{ "name": "label", "type": "text", "required": true, "preview": "Enregistrer" }]
-   THREE axes, ONE element, ONE param — and 3 × 2 × 2 = 12 renderings the user can reach. The
-   catalogue vignette shows the DEFAULT COMBINATION (each axis's `default`, else its first value);
-   the composant detail exposes ONE CONTROL PER AXIS. Nothing in the template decided anything.
-   (A clickable element carrying `data-nyx-state="<value>"` flips the FIRST axis IN the frame, and
-   `data-nyx-set="size=lg"` flips any axis — a shortcut over the same applier, never a second
-   declaration.)
-
-   REFERENCE A SHARED SUB-COMPONENT, DO NOT COPY IT — `data-nyx-use`. A spinner, an icon, a badge
-   used by five components must exist ONCE. Inlining it into each host DUPLICATES it and the copies
-   DRIFT: fixing the spinner in `Button` fixes it nowhere else, and nothing tells you which hosts
-   still carry the old one. So a template may REFERENCE another catalogue component:
-     <span data-nyx-if="loading=on" data-nyx-use="Spinner" data-nyx-use-axes="size=sm" data-nyx-param-label="{{label}}"></span>
-   * `data-nyx-use="<Name>"` — the element is a PLACEHOLDER: nyx replaces its CONTENT with that
-     component's rendering, in the sidecar, at every render. Everything else the element carries
-     stays YOURS — its classes, and its own `data-nyx-if`, which is how a `Button` shows its spinner
-     only at `loading=on` with the mechanism you already know.
-   * `data-nyx-param-<name>="…"` — ONE attribute per param you hand over. Your own template is
-     substituted FIRST, so `data-nyx-param-label="{{label}}"` FORWARDS your own param into it: no
-     new grammar, no logic.
-   * `data-nyx-use-axes="size=sm, tone=muted"` — the sub-component's OWN axes, FIXED here (the
-     `data-nyx-if` grammar, reused). An axis you omit renders at its `default`, else at its first value.
-   * the placeholder's CONTENT, if you write any, is handed over as the sub-component's
-     `{{{children}}}` slot.
-   AND `{{> Spinner}}` IS NOT IT — the Handlebars PARTIAL is REFUSED at the write, by name. It looks
-   like the natural spelling and it is the wrong one: a partial expands INSIDE your template with
-   YOUR context, so your params leak into the sub-component by name collision, its own axes are
-   resolved NOWHERE (no class applied, no `data-nyx-*` consumed) and a cycle through it is bounded
-   by nothing. `data-nyx-use` is the form that resolves all three.
-   THE AXES DO NOT FLOW DOWN, AND THAT IS THE RULE: a `Button` at `size=lg` does NOT make its
-   `Spinner` `lg`. An axis name is LOCAL to a component — `Button.size` and `Spinner.size` are two
-   vocabularies, with different values and different classes — so inheriting by name would map one
-   onto the other silently, which is precisely what nyx refuses to do with param names. YOU fix the
-   sub-component's values at the reference site. When it really must follow you, SAY SO with the
-   mechanism you already have, two gated references:
-     <span data-nyx-if="size=md" data-nyx-use="Spinner" data-nyx-use-axes="size=sm"></span>
-     <span data-nyx-if="size=lg" data-nyx-use="Spinner" data-nyx-use-axes="size=md"></span>
-   WHAT COMES OUT IS FLAT AND INERT: nyx resolves the sub-component's axes into concrete classes and
-   its conditions into what is really there, then strips every `data-nyx-*` of ITS own. Only YOUR
-   marks reach the frame — which is why a reference can never disturb your own axes.
-   THREE LEVERS, NOT ONE — pick deliberately:
-   * INLINE it when the markup belongs to this component alone (its own icon, its own layout).
-   * REFERENCE it (`data-nyx-use`) when the sub-component is SHARED and ITS params are decided by
-     YOU, once, as the author of the host. A reference is an implementation detail of your component:
-     it creates NO node in any composition tree, so a `Button` never makes a `Spinner` node grow in
-     every page that uses it — and the proto author neither sees it nor parameterizes it.
-   * COMPOSE IT IN THE TREE when the CALLER must choose what goes in: expose a slot
-     (`{{{children}}}`) and let the composition put a CHILD NODE there. That is the only way a
-     sub-component's params become the proto author's decision.
-   THE REFUSALS, and the write already names them for you: a reference to a component the catalogue
-   does NOT have (the render refuses it — synthesize it, author it with proto_author_component, or
-   inline its markup), a CYCLE (A → B → A, a self-reference included: a shared sub-component is a
-   LEAF of the reference graph, never a parent of its own host), and a nesting deeper than 8 levels.
-   A `required` param of the sub-component you leave out, a key it declares nowhere and an axis value
-   it does not have are named too.
-
-   TAILWIND FIRST, THE CSS SLOT LAST — `css_slot`. Tailwind is THE framework of this project and THE
-   channel for the look: utility classes on the template, and the axes' `classes` for what varies.
-   That is where the look goes, first and by default, and it is what the coder must receive — the
-   app's own conventions, not a stylesheet you invented.
-   BUT FOUR THINGS NO UTILITY CAN EXPRESS, and until now they were SILENTLY LOST: you wrote a
-   loader's animation, the write answered `ok`, the keyframes were nowhere, and the component reached
-   the developer without them and without a word. Those four, and nothing else:
-     * a custom `@keyframes` (and the `animation` that drives it);
-     * the CONTENT of a `::before` / `::after`;
-     * a RELATIONAL selector — `:has(…)` — a parent styled from its children;
-     * a `@container` query (a rule on the CONTAINER's width, not the viewport's).
-   A slot that uses NONE of them is REFUSED, by name: it is then CSS written INSTEAD of the design
-   system, which is precisely what must not reach the coder. Everything else — colours, spacing,
-   radii, typography, hover, responsive — is utilities, and it is refused here so it stays there.
-     css_slot:        "@keyframes pulse { 50% { opacity: .55 } }
-                       .spark i { animation: pulse 1.4s ease-in-out infinite }"
-     css_slot_reason: "a custom pulse keyframe — no Tailwind utility expresses a keyframe"
-   FOUR RULES. Each one is a REFUSAL at the write, never a warning — a warning is how the loader
-   disappeared in the first place, and you are still holding the CSS you just composed, so the fix
-   costs you one call:
-   1. TOKENISED. A hard-coded colour is a refusal in EVERY form — `#0a0a0a`, `rgb(…)`, `oklch(…)`,
-      and the word `red`. Every `var(--x)` must name a token THIS PROJECT declares (`design_tokens`
-      lists them); a `var()` that names nothing renders nothing, which is the same disappearance one
-      level down. A raw `px` on a property the system SCALES (padding, margin, gap, border-radius,
-      font-size, width…) is refused too — reference the scale, or use `rem` / `em` / `%`. A duration,
-      a plain number, a `translateY(-2px)` inside a keyframe is a MOTION and not a token: those are
-      left alone.
-   2. SCOPED — AND NYX GUARANTEES IT, IT DOES NOT ASK YOU FOR IT. Every selector you write is
-      REWRITTEN under `[data-nyx-css~="<scope>"]`, an attribute nyx stamps on your component's root
-      element(s); every `@keyframes` name is RENAMED under that scope, so two components can both
-      call theirs `spin`. Write `:scope` (or `&`) for the component's own root — `:scope::after { … }`.
-      Two shapes are refused BY NAME rather than quietly turned into nothing: a selector on
-      `html` / `body` / `:root` (once scoped it could never match, and a rule that silently does
-      nothing is the very thing we are ending), and a selector that STARTS with a combinator
-      (`+ .sibling`) — scoped, that one would reach OUT of your component.
-   3. BOUNDED — 2048 bytes. Past that, what you are writing is a stylesheet, not an exception.
-   4. SIGNALLED — `css_slot_reason` is MANDATORY (240 bytes) and says WHAT THE UTILITIES COULD NOT
-      DO. The exception is shown to the human IN REVIEW, and it is carried to the coder WITH that
-      reason. That is the whole point: the developer inherits the exception, never discovers it.
-   ALSO REFUSED: `!important` (the slot exists for what utilities CANNOT do, never to OUTRANK them),
-   `url(…)` (the preview frame grants no network at all, and no CSS slot will ever relax its CSP),
-   `@import` / `@font-face` / `@layer` / `@property` / `@apply` (nothing to anchor — and `@apply`
-   belongs on the template's `class`), a nested rule, and markup.
-   OMITTING `css_slot` LEAVES A STORED ONE ALONE — re-synthesizing a template is not a decision about
-   an exception a human already reviewed. Send `css_slot: ""` to remove it, deliberately. Whatever you
-   send, the answer echoes back the slot the component NOW carries (`css_slot`: its scope, its
-   compiled CSS, the constructs it uses, its reason) — read it, and read `css_slots[]` in
-   design_preview: an exception nobody named is an exception nobody reviewed.
-
-   THE LEGACY FLAT FORM STILL WORKS. `states_json: ["default","destructive"]` is read as ONE
-   anonymous axis named `state` whose values carry no classes, driven by `data-nyx-state-case` —
-   exactly as before. It is not deprecated, it is the degenerate case of the model: one axis, no
-   classes. Use the AXES form for anything with more than one axis, or with classes to apply.
-
-   THE `params_json` SCHEMA, IN FULL — it is a CONTRACT, not free-form JSON. An ARRAY of
-   DESCRIPTORS, one per editable input of the component:
-     { "name": "label",          // REQUIRED — the mustache name the template substitutes
-       "type": "text",           // one of the SIX below and nothing else (omitted ⇒ `text`)
-       "label": "Libellé",       // optional — what the panel shows above the control (default: name)
-       "required": true,         // optional — the CALLER must provide it (see below)
-       "default": "Enregistrer", // optional — the component's OWN fallback (see below)
-       "preview": "Enregistrer", // optional — an EXAMPLE, only to render an aperçu (see below)
-       "options": ["sm", "lg"] } // the allowed values — MANDATORY for `select`
-   THE SIX TYPES, EXHAUSTIVELY — there is no seventh:
-   * `text`    — a string, substituted ESCAPED (`{{param}}`); a one-line input.
-   * `html`    — raw markup, substituted VERBATIM (`{{{param}}}`); a textarea. A content param may
-                 be plain text OR html (PDR-0010) — that is what this type is for.
-   * `state`   — DEPRECATED, do NOT write it. It used to mean "the component's active state" — a
-                 variance AXIS smuggled into the params, which is the very ambiguity that let a
-                 variant be declared twice. An axis goes in `states_json`; nyx renders one control
-                 per axis on its own. Still parsed (rows carry it), and WARNED about at the write.
-   * `boolean` — a switch. WARNING, read this before using it: a boolean param can change NOTHING in
-                 the rendering — it is substituted as the text `true`/`false`, it carries no classes
-                 and it gates no element, so the toggle is decorative. If the flag makes the
-                 component LOOK different (`loading`, `disabled`, `checked`), it is AN AXIS WITH TWO
-                 VALUES — put it in `states_json`. Keep `boolean` for a value the template really
-                 substitutes (an `aria-*`, a data attribute the coder will read).
-   * `number`  — a numeric input.
-   * `select`  — a constrained VALUE chosen from `options`, which is then MANDATORY: a `select`
-                 with no options has nothing to choose from and degrades into a free-text field.
-   `options` means something for `select` ONLY; on any other type it is ignored.
-   AN UNKNOWN `type` IS REFUSED, NOT REPAIRED. `"enum"`, `"string"`, `"color"`, `"variant"`… are not
-   in the list: design_refresh_component / proto_author_component REJECT the write, naming the
-   offending param and the six accepted values. This used to be a SILENT fallback to `text` — a
-   choice you declared as constrained came back as a free-text field, `options` ignored, and the
-   write still answered `ok`. Fix the word and re-send: the call that tells you is the one that
-   stores it.
-   AND SO IS A DOCUMENT NYX CANNOT READ — the SHAPE is checked at the write, on both blobs, because a
-   blob that parses to nothing declares NOTHING and every warning list then comes back EMPTY, which
-   is the manual's only "done". Refused, each naming its field: `params_json` that is not valid JSON,
-   whose root is not an ARRAY (an object has nowhere to put `name`), whose entry is not an object or
-   carries no usable `name`; `states_json` that is not valid JSON, whose root is neither
-   `{ "axes": [...] }` nor an array, whose `axes` is not an ARRAY, or whose axis has no `name` or an
-   empty / non-array `values`. The shape is a FACT and it is refused; whether an axis value really
-   changes a pixel is a JUDGEMENT and stays a warning.
-
-   A VARIANT IS EXPRESSED ONCE — AND IT IS `states_json`. The tempting second way is a param:
-   `{ "name": "variant", "type": "select", "options": ["default", "destructive"] }`. Do NOT — it
-   duplicates a notion the component has only ONE of, and the copy is the decorative one:
-   * a `select` param is substituted into the template as a VALUE (`{{variant}}`), and a CVA variant
-     is not a value: it is a whole SET of classes (`inline-flex h-9 rounded-md bg-primary px-4
-     text-primary-foreground`). No single substitution produces that, and a logic-less template
-     cannot map one onto the other — so the dropdown moves and the rendering does not.
-   * `states_json` is the AXIS the whole chain pilots: the per-axis control of the composant detail,
-     the preview's chip-bar row, the combination handed to the shim, the values persisted per
-     composition node. It APPLIES THE CLASSES — it is the one that CHANGES THE RENDERING.
-   So: the component's variant axis → an AXIS in `states_json`, with its classes on each value, and
-   NO param beside it. Keep `select` for a constrained VALUE the template really substitutes (an
-   alignment token in `class="text-{{align}}"`, a link target, a unit). Declaring both is how a
-   component ends up with two controls over one notion, one of which lies — and nyx warns you,
-   naming the component and the entry to drop.
-
-   MARK WHAT IS REQUIRED, AND GIVE A PREVIEW VALUE — two DIFFERENT questions, and confusing them is
-   how a catalogue ends up either lying or blank. WHY: the catalogue card renders ONE instance of
-   the component — with no chip-bar and no variant listing — and a param it cannot resolve is
-   substituted with the EMPTY STRING, so the tile shows a coloured pill with no label for a
-   `button`, an empty box for a `card`. But a `button` HAS NO DEFAULT LABEL: the label is
-   MANDATORY, the caller must supply it. Writing `"default": "Enregistrer"` to fill the tile MISSTATES
-   the component's contract — and whoever composes with it reads that as truth. So each entry of
-   `params_json` answers the two questions separately:
-   * `required` (boolean) — MUST the caller provide this param? Say `true` whenever the component
-     has no value of its own for it (a `@Input()` with no initialiser, a required React prop, the
-     content a `card` exists to show). A required param has NO default, by definition.
-   * `default` — the component's OWN fallback, and ONLY when the source carries one:
-     `@Input() label = 'Enregistrer'`, a React default prop, a `defaultValue` in the variants file.
-     That is a FACT about the component: use it verbatim, and write nothing when there is none.
-   * `preview` — an EXAMPLE value, used ONLY to render an aperçu (the catalogue vignette, the
-     composant detail's representative instance). Give one to EVERY required param, and to any
-     param whose rendering would otherwise be empty. It is neither a default nor a production
-     value: nyx never persists it into a composition, and never shows it as the component's
-     contract. Realistic and SHORT — it is read in a 160 px tile, not in a page. Not
-     `"lorem ipsum"`, not `"text"`, not the param's own name.
-   A COMPLETE `params_json`, every field and every useful type in one blob — for a `button` whose
-   variants live (once) in `states_json`:
-   `[{ "name": "label", "type": "text", "required": true, "preview": "Enregistrer" },
-     { "name": "title", "type": "text", "required": true, "preview": "Chiffre d'affaires" },
-     { "name": "align", "type": "select", "options": ["left", "center", "right"], "default": "left" },
-     { "name": "count", "type": "number", "preview": 3 },
-     { "name": "body", "type": "html", "preview": "<strong>3</strong> éléments" }]`
-   No `variant` param in it, no `state` one, and no `disabled` boolean either: the first duplicates
-   an axis, the second IS an axis under another name, and the third is an axis with two values.
-   Params are VALUES; axes are what varies.
-   The aperçu resolves `preview` first, then `default`, then NOTHING — nyx will NOT invent
-   content in your place: a plausible label is a fact about the real component, and you are the one
-   who just read it. A required param with no preview value is REPORTED on the card as an incomplete
-   synthesis, and its tile stays empty.
-   * A SLOT (`{{{children}}}`) has no value to write, but the component around it must still read:
-     if it renders to nothing without children, give the surrounding params enough matter that the
-     tile shows the component's SHAPE.
-   The test is simple: rendered from its preview values ALONE, does the vignette LOOK LIKE the component?
-   If it comes out blank, the synthesis is incomplete — go back and fill the previews.
-4. design_refresh_component(project_id, name, template, params_json?, states_json?) — STORE it. It
-   updates a component ALREADY in the catalogue (and is how you FIX a botched synthesis — no
-   delete-then-recreate) and records the bundle's INPUT hash, so the next inventory sees it up to
-   date. INCREMENTAL: a bundle whose sources have not changed is never re-synthesized; only a real
-   source change puts it back in `pending`.
-   READ WHAT IT ANSWERS. It REFUSES a synthesis it knows to be broken — a blank or logic-carrying
-   template, a param `type` outside the six — and it stores-but-WARNS about the rest. Every
-   `warnings[]` entry names THE COMPONENT, THE FAULTY FIELD AND THE CORRECTION: an axis value with
-   neither `classes` nor a structural case, a state you declared with no `data-nyx-state-case` (and a
-   case no axis declares), a `data-nyx-if` on an axis that does not exist, a notion declared BOTH
-   as a param and as an axis, a `boolean` param that cannot change the rendering, a param still
-   typed `state` — plus, for a template that REFERENCES another component, a `data-nyx-use` naming
-   one the catalogue does not have, a reference CYCLE, a `required` param of the sub-component you
-   did not hand over, a `data-nyx-param-*` it declares nowhere and a `data-nyx-use-axes` clause it
-   cannot honour. An empty `warnings[]` is the only "done"; a non-empty one is a synthesis to
-   finish, and you are still holding everything you need to finish it.
-5. design_preview(project_id, component, axes?, params?, children?) — LOOK AT WHAT YOU JUST STORED.
-   Every other diagnostic on this surface judges the STRUCTURE of your synthesis (a missing case, an
-   inert value, an unknown key, a refused type) and NOT ONE of them ever looks at the result. That is
-   not a nuance: on the very feature that built this machinery, EVERY visual defect — a spinner that
-   never hid, a loader, the colours — was found by the HUMAN and by no tool, because nothing gave the
-   synthesizer eyes. This is the eyes.
-   THE LOOP, and run it on every component you store: SYNTHESIZE (step 4) → RENDER (this) → LOOK at
-   the markup → CORRECT → render again, until what comes back is what you meant to write. ONE
-   combination per call, and render the combinations that MATTER: the default one, then each value of
-   each axis you claimed does something. A component you stored and never rendered is a component
-   NOBODY has seen.
-   WHAT COMES BACK is the RESOLVED markup — what the frame ends up displaying: your template
-   substituted, every `data-nyx-use` reference expanded, the active value's classes applied to their
-   targets, `data-nyx-if` / `data-nyx-if-not` / `data-nyx-state-case` evaluated (an element absent at
-   this combination carries `hidden`), and no `data-nyx-*` left anywhere. An axis you omit renders at
-   its `default`, else its first value, and the combination really used comes back in `axes`. A param
-   you omit falls back to its `preview`, then its `default`, then NOTHING — the aperçu's own order, so
-   a call with no `params` is exactly what the catalogue tile shows, and a param that resolved to
-   nothing is NAMED (that is what an empty box in the frame is made of). `children` fills the slot.
-   WHAT YOU CAN SEE IN IT, which is most of what actually goes wrong: an element that should exist at
-   ONE value but carries no condition — it is STILL THERE at the other value, and that is the spinner
-   bug, visible in one call; a class that never lands where you thought; a reference that does not
-   resolve (an explicit refusal naming the component, never a silent hole); a param substituting to
-   nothing; a slot that renders empty.
-   THE SAME TOOL RENDERS A WHOLE COMPOSITION — design_preview(variant_id, axes?, node_key?,
-   viewport?).
-   Name ONE subject: `component` (with project_id) for one catalogue component, `variant_id` for a
-   variant's WHOLE node tree. There is ONE tool because it is one question ("what does what I wrote
-   look like?"), one resolution and one set of limits; what tells the two apart is the argument that
-   NAMES the subject, and the answer echoes it back in `subject`. The composition form is what you
-   run BEFORE proto_present_round — see the prototype cycle below.
-   A COMPOSITION HAS ITS OWN AXES, and `axes` pilots them exactly as it pilots a component's: they
-   are the ones the VARIANT declares in its `states_json`, they are PAGE-LEVEL (the frame shows one
-   chip-bar row per axis), and they decide every `data-nyx-if` / `data-nyx-if-not` written on them —
-   at every node of the tree, an `[inline]` node included. An axis you omit renders at its `default`,
-   else its first value; the combination really used comes back in `axes`, and what this variant CAN
-   be piloted on in `declared_axes`. An axis, or a value, the variant does not declare is NAMED in
-   `warnings` — asking for it never silently does nothing. RENDER EACH VALUE THAT MATTERS: an element
-   gated on `loading=on` must be ABSENT at `off`, and that check is one call.
-   A COMPOSITION SUBSTITUTES THE NODE'S OWN PARAMS AND NOTHING ELSE: no `preview` fallback there,
-   because a page must show the design AS WRITTEN — a node that renders empty renders empty, and that
-   is what the human would have seen.
-   IT ALWAYS COMPLETES, AND IT NAMES WHAT IT COULD NOT RENDER. A composition under design holds
-   `[NEW]` nodes nobody has synthesized yet — that is normal, and failing the whole tree on the first
-   of them would hide the forty nodes that are RIGHT. So such a node comes back as a PLACEHOLDER in
-   the markup (`class="nyx-unrendered"`, naming the node) plus an entry in `unrendered[]`
-   (`node_key`, `component`, `reason`, and the correction), and everything around it renders. READ
-   `unrendered[]` BEFORE PRESENTING: each entry is a hole where the human expects a design.
-   THE VIEWPORT, AND WHAT IT REALLY MEANS HERE — `viewport: 390` (CSS px) or `"mobile"` / `"tablet"`
-   / `"desktop"`. Be exact about what it does, because it is easy to over-read: nyx LAYS NOTHING OUT.
-   The markup is byte for byte the same at every width; no width reflows anything and nothing here
-   measures a box. A viewport does exactly two real things: it is the width a FRAME must apply to
-   display this markup, and it says which responsive CLASSES are in force at it — the breakpoints
-   (from your project's own `--breakpoint-*` tokens when it declares them, else Tailwind's defaults)
-   and every `md:` / `lg:` / `max-*` variant your markup carries, each with `active`. That is a real
-   verdict, and it catches the real defect: markup carrying NO responsive class renders IDENTICALLY
-   at every width, and the answer SAYS SO. Whether the result then LOOKS right at that width is a
-   rendering, and you are not looking at one.
-   WHAT YOU CANNOT SEE IN IT — READ THIS BEFORE YOU CALL ANYTHING CHECKED. It is MARKUP, NOT AN
-   IMAGE, and it is NOT a visual validation. You see a CLASS; you never see the pixel that class
-   produces. No colour (`bg-primary` says nothing about whether the token behind it resolves, or
-   contrasts with the text on top of it), no spacing, no alignment, no size, no overflow, no
-   wrapping, no font, no z-order, no hover/focus/disabled appearance — and no answer at all to "does
-   it LOOK like the component it is supposed to be". A class you invented and a class the theme
-   really defines read IDENTICALLY here. A WHOLE PAGE IS NO DIFFERENT — it is more markup, not more
-   sight: nothing here tells you whether the page fits, whether two blocks collide, whether anything
-   overflows, or what it becomes at a width. A composition you have only rendered here is a
-   composition NOBODY HAS SEEN. So when you hand back: say what you CHECKED (the structure — which
-   elements exist, which classes are applied, which params substituted, which nodes are still holes)
-   and say what you did NOT (the rendering). NEVER report a component or a page as visually validated
-   on the strength of this tool. The human is still the only eye on the visual, and letting them
-   believe otherwise is the exact failure this tool exists to correct — so when the open question IS
-   a visual one (a colour, a contrast, a spacing, a responsive layout, "is this the right look"),
-   PRESENT the round and ASK.
-   THE IMAGE: nyx produces none, on purpose and for now — for a whole COMPOSITION exactly as for a
-   component, and the answer to "can I export a screenshot of the page?" is NO. The sidecar has no
-   rendering engine, nothing in the product captures one, and an image does not fit a 64 KiB JSON
-   response; the only thing that can turn this markup into pixels is the app's own preview frame — so
-   a capture is a decision about the ARCHITECTURE (the sidecar driving a running app), not one more
-   argument on this tool. Do not wait for it, and do not pretend you have it.
-6. design_delete_component(project_id, name) — REMOVE an entry that does not belong in the catalogue
-   (a `[NEW]` authored by mistake, a duplicate, an entry an earlier wrong glob brought in).
-   A DELETE ALONE IS EPHEMERAL WHEN THE FILE IS STILL THERE: a component's identity IS its source, so
-   as long as the file matches the recipe the next design_inventory discovers it again, pending. The
-   response tells you (`ephemeral: true` + `warnings[]`); it is NOT a way to "keep only N components".
-   To make it last: RESTRICT the recipe (step 0-bis) when a whole family does not belong — that is the
-   real fix — or, for ONE bundle, design_delete_component(project_id, name, exclude_source: true),
-   which appends its paths to the recipe's `exclude` list (and materializes the recipe as yours). A
-   greenfield `[NEW]` has no source: deleting it is already definitive.
-   IT ALSO NAMES WHO STILL REFERENCES IT: a component other templates point at with `data-nyx-use`
-   is a shared sub-component, and removing it makes every one of those hosts FAIL to render. The
-   response lists them — re-synthesize each host onto another component, or inline the markup it was
-   borrowing, before you consider the removal done.
-
-Two layers, two homes — never mix them. A COMPONENT owns its structure and its CLASSES; the PROJECT
-owns the TOKENS those classes resolve against, once, for the whole catalogue. That is what makes a
-theme editable in one place and applied everywhere; a component that carries its own colours is a
-copy that will drift.
-
-The catalogue tracks the app: a component is identified by its SOURCE, never by its name. A bundle
-that MOVES on disk is re-anchored by CONTENT — same row, same synthesis (`moved`); a row whose
-source is GONE is reported in `orphans` and pruned, unless the run could not judge it
-(`kept_because`), which is exactly what design_delete_component is for. Nothing is ever re-pointed
-at another file just because the name matches.
-
-Then COMPOSE from that catalogue — the project's components + tokens — exactly as the coder does;
-never re-invent a bespoke rendering. A variant's `composition_json` is a NAMED COMPONENT TREE (the
-placement), not an HTML blob. When the design needs a component the catalogue does NOT have, AUTHOR
-it greenfield with proto_author_component(prototype_id, name, …): it enters the catalogue as a
-`[NEW]` component the coder will build — you do not hand-roll it inline. (That tool CREATES and
-refuses a name already catalogued; to update an existing one, use design_refresh_component.) An
-authored `[NEW]` STAYS `[NEW]` until the app really implements it: the nature is the component's
-ORIGIN (does it exist in the app?), not its presence in the catalogue — authoring it never makes
-the coder believe it is already built.
-
-## The prototype cycle (all agent-driven, via MCP)
-
-0. proto_get(spec_id) — READ where the prototype stands (rounds, current round + its manifest, pages,
-   their VERSIONS and VARIANTS, the design LOCK, open comments) before every action. No blind
-   navigation. The overview is BOUNDED: check `truncated` and each `sections.<name>.next_offset`, and
-   pull the rest one list at a time with proto_get(spec_id, section: "<name>", offset: N) — do not
-   act on a list you only half read.
-   THIS IS WHERE THE IDS COME FROM, and it is what makes a RESUMED session possible: a version id, a
-   variant id and a round id are all in this one answer, each row naming its parent (`page_id`,
-   `page_version_id`), so you never have to remember what an earlier call returned. `locked` and
-   `design_lock` say whether the design is FROZEN and on WHICH round — read them before you try to
-   elect or compose, rather than discovering the freeze through a refusal. And `warnings` names what
-   is legal but worth saying (a frozen round nobody ever presented).
-   A CONFLICT ALSO HANDS YOU AN ID: creating a page / version / variant / round whose slug or label
-   already exists is refused WITH the existing row's id, so a re-run of a step you already did is one
-   call, not a search.
-1. proto_create(spec_id, description?) — CREATE the prototype on the Spec (one per Spec); it seeds
-   the first round (`v1`). Start here.
-2. COMPOSE the pages:
-   - proto_add_page(prototype_id, slug, title) — a logical screen (`slug` unique per prototype). It
-     returns the page's ID: KEEP IT — that id is what a node LINKS to when you wire the parcours
-     (below). Create every page of the parcours BEFORE composing the trees that link to them.
-   - proto_add_version(page_id, label) — a frozen ITERATION of that page; you iterate by minting a
-     NEW version, never mutating an existing one.
-   - proto_add_variant(page_version_id, label, title, composition_json?, states_json?) — one concrete
-     rendering (`composition_json` = the component tree). Add SEVERAL radically different variants
-     when the question is "what does it look like?".
-
-     A NODE'S KEYS ARE THE COMPONENT'S KEYS. A node is `{ "component": "<catalogue name>", "params":
-     { … } }`, and every key of `params` must be one that component DECLARES — a name from its
-     `params_json`, or one of its AXES from `states_json`. Anything else is substituted by NOTHING:
-     the node renders without it, and it used to do so in total silence. proto_add_variant now
-     ANSWERS with `warnings` naming, per node, the keys the component declares nowhere and the
-     `required` params the node does not provide. READ THEM — they are the only thing between a typo
-     and an empty rendering. nyx never guesses a mapping (`text` is not `buttonLabel`), so the
-     correction is always yours: rename the key onto the declared one, or provide the missing value.
-
-         { "component": "Button",
-           "params": { "buttonLabel": "Reset filters", "variant": "ghost", "size": "sm" } }
-
-     If you do not know what a component declares, READ it before composing with it — a component's
-     `params_json` / `states_json` ARE the contract.
-
-     THE TREE'S OWN SHAPE IS CHECKED AT THE WRITE, and refused rather than warned about: a
-     `composition_json` that is not valid JSON, and one whose root is an ARRAY instead of ONE node
-     object (several blocks are the CHILDREN of one root — `{ "key": "root", "children": [ … ] }`).
-     Both used to store with `warnings: []`, which is the worst possible answer: the node-contract
-     check ran over a tree that parsed to nothing, found no node, and reported nothing wrong.
-     AN `[inline]` NODE IS A TEMPLATE LIKE ANY OTHER, and obeys the same LOGIC-LESS contract: a
-     `{{#if}}` / `{{#each}}` block or a `{{> partial}}` in its markup is refused here exactly as it
-     is in a component's template, naming the node. Express the condition with the composition TREE,
-     or with `data-nyx-if` on a component's axes.
-
-     A PROTOTYPE SHOWS A PARCOURS, NOT A PILE OF SCREENS — `navigate_to`. A node may LINK to another
-     page of the prototype: clicking it navigates there in the frame. It is ONE field on the node,
-     and it holds the destination page's ID:
-
-         { "component": "Button", "params": { "label": "Voir les tarifs" },
-           "navigate_to": "<the id proto_add_page returned>" }
-
-     ON THE NODE, NEVER ON THE COMPONENT, and that is a decision, not an accident: a destination is a
-     PLACEMENT choice. The same `Button` is a "Continue" on one page and a "Back" on another, so a
-     link baked into the component would need one component per destination — the copy-instead-of-
-     reference drift `data-nyx-use` exists to end. Two more reasons agree: the composition TREE is
-     what crosses to the coder, so a parcours travels with the placement it belongs to; and a
-     component row is RE-SYNTHESIZED from the app's real sources, so a link written into a template
-     would be erased by the next design_refresh_component.
-     BY ID, NEVER BY SLUG. A slug gets renamed; an id does not. nyx resolves the id to the current
-     slug AT EVERY RENDER — so renaming a page costs you nothing, and the frame still navigates.
-     What you and the human READ is resolved the same way: design_preview answers `navigation[]` with
-     the destination's slug AND title per linking node.
-     A DEAD LINK IS REFUSED AT THE WRITE. `navigate_to` naming a page this prototype does not have is
-     an `invalid_id` listing the pages it DOES have — a page is never "not created yet on purpose",
-     unlike a `[NEW]` component. A link on a STRUCTURAL node (no `component`, no `inline`) is refused
-     too: such a node is only its children, so there would be nothing to click. If a page DISAPPEARS
-     after the fact, the render says so in place (`navigation[].status = "unknown_page"`) and refuses
-     to navigate — never a click that silently does nothing. The refusal is STRUCTURAL: a node that
-     states a destination has the whole navigation vocabulary cleared off its root before the render
-     writes what it decided, so a `data-nyx-page` a component's template happened to bake in can
-     neither outrank the modelled link nor survive beside the invalidation marker.
-     CYCLES ARE FINE. `A → B → A` is what a "Back" button IS. A navigation is a USER GESTURE at click
-     time, not an expansion at render time: the render walks the tree and never follows a link, so a
-     cycle costs nothing and is refused nowhere. (That is the whole difference with `data-nyx-use`,
-     whose cycle would be an infinite expansion and IS refused.)
-   - proto_recommend_variant(variant_id) — YOUR recommendation among a version's variants (`is_main`).
-     Say which one you would keep, and why in your handback. ONE per version and REVERSIBLE (calling
-     it on a sibling moves the reco). It is NOT the decision: it never poses the RETENU, which only
-     the user's proto_elect_variant records.
-3. proto_pin_page(round_id, page_id, page_version_id) — PIN a (page, version) into the current
-   round's manifest, so the round "sees" the page and it becomes electable / renderable.
-3-bis. RENDER WHAT YOU ARE ABOUT TO PRESENT — design_preview(variant_id) on every variant the round
-   pins, BEFORE proto_present_round (the id is what proto_add_variant returned; proto_get's
-   `variants` section lists every one of them, and for a round already elected it is
-   `chosen_variant_id` in proto_get's manifest, `elected_variant_id` in
-   proto_composition). The composition IS the deliverable: presenting a tree you never
-   resolved is how a page reaches the human with a node nobody built, a param substituting to
-   nothing, or a component that renders empty — and the human then finds, one by one, what a single
-   call would have shown you. Read `unrendered[]` first (each entry is a HOLE where a design should
-   be: a `[NEW]` to synthesize, a typo in a node's component name), then read the markup itself, then
-   — for the responsive question — call it again with `viewport: "mobile"` and read which of your
-   `md:` / `lg:` classes are in force there, and whether you wrote any at all. Use `node_key` to walk
-   a big page branch by branch. If the variant declares AXES, render each value that matters —
-   design_preview(variant_id, axes: { "loading": "on" }) — and check the element gated on it is
-   really absent at the other value; `axes` in the answer says which combination you looked at, and
-   `declared_axes` what else there is to look at. Read `navigation[]`: every node that LINKS to
-   another page, with the
-   destination resolved to its slug and title — and `navigation_broken_count`, which is how many of
-   your links lead NOWHERE. A parcours you never walked is a parcours the human walks for you.
-   Read `css_slots[]` too: every SCOPED CSS EXCEPTION this page carries,
-   with the scope it is bounded to and the REASON it exists. An exception is a departure from the
-   design system — NAME IT in your handback so the human reviews it, because it will be carried,
-   verbatim and with its reason, to the coder. It is still NOT a visual validation and it is NOT an
-   image: step 5 of the design loop lists exactly what you do not see, and your handback must say it.
-4. proto_present_round(round_id) — PRESENT (freeze) the round to the user: a handback. A presented
-   round is frozen; later feedback opens a new round.
-5. PRE-DEV review, anchored to the tree — it comes BEFORE the election, because its whole purpose is
-   to CORRECT the design while it can still be corrected (PDR-0009):
-   - proto_feedback_create(prototype_id, body, node_key?) — raise a comment anchored to a TREE NODE
-     (`node_key`), not a CSS selector. These are NEVER transmitted to the coder.
-   - proto_feedback_resolve(feedback_id, resolution_note?, resolution_via_variant_id?) — resolve it
-     once addressed. Addressing it means a NEW version/variant (step 2) in a NEW round (step 7) — you
-     never mutate a presented round.
-   Only once the open comments are worked does the design deserve a verdict.
-6. The USER ELECTS: proto_elect_variant(round_id, page_id, variant_id, rationale?, decided_by?)
-   records the USER's RETENU (chosen) variant for the page in the round. This is the USER's design
-   decision — DISTINCT from `is_main`, the agent's per-version RECOMMENDATION you pose with
-   proto_recommend_variant (a variant attribute surfaced by proto_get, reversible, NOT the verdict).
-   You record what the user decided; you never pose the RETENU on your own authority. The page must
-   be pinned in the round first.
-   THE VARIANT MUST BE ONE OF THE PINNED VERSION'S OWN, and a variant from another page — or from
-   another version of the right page — is REFUSED, naming the ones that ARE electable. The RETENU is
-   the tree the coder receives UNDER THIS PAGE'S NAME: another page's variant would cross the seam as
-   this page's design, which is a corruption of the contract and not a preference.
-7. proto_rebase(prototype_id, source_round_id, label) — ROLL BACK onto an earlier round: opens a NEW
-   current round whose manifest COPIES that round's pinned versions, so you iterate forward WITHOUT
-   mutating the frozen source (rounds are kept as rollback points). Use proto_open_round(prototype_id,
-   label) instead to start a fresh EMPTY round composed from scratch.
-8. proto_distill(prototype_id, round_id, decided_by?) — FREEZE the elected round as THE design for
-   the Spec. This LOCKS the election (the composition tree is already the contract — no separate
-   placement to rewrite).
-   IT REFUSES TO FREEZE WHAT IS NOT A DECISION, and each refusal names what to do: a round that was
-   never PRESENTED (nobody was shown it, so nobody decided), a round that pins NO page (nothing to
-   freeze), and a round where a pinned page still owes an arbitration — that page would cross the
-   seam EMPTY, and the coder would read an empty page as the design. Elect it, or unpin it.
-   AND THE LOCK DOES NOT MOVE ON ITS OWN. Distilling a SECOND round while one is already frozen is
-   refused unless you pass `supersede: true`. The forward path stays open — a new iteration
-   legitimately becomes THE design — but it is a deliberate gesture: what the coder consumes changes
-   with it, and the answer says which round was superseded. Re-distilling the SAME round is
-   idempotent and needs nothing.
-
-## The lock (élection figée)
-
-Once a round is distilled, its election is FROZEN: proto_elect_variant / proto_add_variant /
-proto_pin_page on that round are REFUSED (invalid_state). To iterate again, OPEN A NEW ROUND
-(proto_rebase / proto_open_round) — a frozen round is never mutated, so the design the coder will
-consume can never drift under it.
-
-## The composition seam (what dev consumes)
-
-proto_composition(prototype_id) READS the FROZEN elected composition — the coder SEAM. It exposes
-NOTHING until the design is locked (`{ composition: null }`). Once locked it gives, per page: the
-effective RETENU variant + its NAMED TREE = the placement, each node classified by one of THREE
-natures —
-- `[DS]`     — a component that EXISTS in the app (it has an on-disk source): compose it, don't
-  rebuild it;
-- `[NEW]`    — a component to BUILD: it is not (or no longer) in the app, whether or not it is
-  already in the catalogue — an authored greenfield `[NEW]` is one of these. These are the ANCHORS
-  of the derived dev tasks;
-- `[inline]` — bespoke markup.
-The nature is the component's ORIGIN, recalculated at every read: the day the coder ships an authored
-`[NEW]` and the inventory discovers it, the SAME node reads `[DS]` — with no duplicate row.
-The design-system is carried as a REFERENCE (project + design + component ids, NOT injected content).
-This frozen tree — not the illustrative rendering — is what feeds the Spec's dev.
-
-It is READ PAGE BY PAGE, and a tree is never cut: follow `next_offset` to `null` to see every elected
-page, or ask for one with `page: "<slug>"`. A page returned WHOLE is a whole placement; a page marked
-`oversized` is one that could not cross the seam at all, and it is on you to split it. A page with NO
-elected variant crosses EMPTY — it is counted in `unelected_pages` and NAMED in `warnings[]`, because
-an empty page is an arbitration nobody made, never a design. proto_distill refuses to freeze such a
-round, so seeing one here means a freeze posed before that guard, or a variant that disappeared under
-it: do not build those pages.
-
-THE PARCOURS CROSSES IT TOO — `navigates_to` on every node that LINKS to another page. "This button
-opens the checkout" is a DESIGN decision, settled and frozen here like any other; if it did not
-cross, the coder would get a set of pages with no idea which leads to which, and would re-invent the
-routing. It carries the destination's `page_id` (what the tree stores) plus the `slug` and `title`
-resolved at the read, and a `status`: `pinned` (the destination is part of the frozen design),
-`unpinned` (the page exists but this round does not ship it — the parcours leaves what you handed
-over) or `unknown` (the page is gone). Named in all three cases, never a blank.
-
-THE CSS EXCEPTIONS CROSS THIS SEAM WHOLE — `css_exceptions[]`, per page. Everything else here is a
-REFERENCE the harness resolves, because it exists in the app; a scoped CSS slot exists NOWHERE else,
-so it travels entire: the component it belongs to, the SCOPE it is bounded to
-(`[data-nyx-css~="…"]`), the COMPILED CSS (selectors already anchored, `@keyframes` already renamed),
-the constructs it uses, and the REASON the agent wrote it. `reached_by` says whether a node PLACES the
-component or another component merely REFERENCES it. Each node that lands on one points at it with
-`css_scope` — one record per page, never a copy per placement. If it did not cross, the coder would
-rebuild the component without it, which is the disappearance this exists to end, one seam later.
-
-The pre-dev review crosses this seam as ANCHORS AND COUNTS ONLY — which NODES were corrected before
-the election, how many comments were resolved, how many are still open. Never a comment BODY: the
-pre-dev feedback is NEVER transmitted to the coder, and the seam is built so it cannot be. The
-comments themselves stay on the prototype (proto_get), where you and the user work them.
-
-## Rounds & the human loop
-
-Iterate with the human in ROUNDS until the design matches their intent: compose → present → gather +
-resolve the pre-dev feedback → the user elects the RETENU → rebase for the next round. The feedback
-comes BEFORE the election on purpose: it is what corrects the design, and a design is elected once it
-is right, not corrected once it is elected. When the design is settled and elected, distill it to lock
-it. The settled verdict FEEDS the Spec (the /nspec author inlines the decisive decision); the
-composition seam then carries the concrete placement to dev."#
+- re-invent a rendering — you COMPOSE from the project's design-system catalogue, and a component
+  the catalogue does NOT have is AUTHORED as a `[NEW]` (proto_author_component) for the coder to
+  build, never hand-rolled inline;
+- pose the RETENU — the ELECTION is the USER's decision (proto_elect_variant records it); you may
+  RECOMMEND (proto_recommend_variant) and nothing more;
+- mutate a distilled (frozen) round — you iterate by opening a NEW one (proto_rebase);
+- carry pre-dev feedback into dev — those comments are a review artifact, NEVER transmitted to the
+  coder;
+- decide to iterate again, or to freeze: ONE spawn = ONE round. nyx asks the human, then re-spawns
+  you for the next round or hands you the freeze;
+- report a design as visually VALIDATED on the strength of design_preview — it renders MARKUP, not
+  an image. Say what you CHECKED (the structure) and what you did NOT (the rendering), and when the
+  open question IS visual (a colour, a spacing, a layout), PRESENT the round and ASK."#
             }
         }
     }
 
-    /// The auditor's AXIS-specific instruction block, appended after the base auditor preamble by
-    /// [`render_agent_context`]. The dev orchestrator launches TWO auditors at the end, one per
-    /// axis (`agent_context(role=auditor, axis=standards|spec)`). `None` (no axis passed) renders
-    /// BOTH descriptions so the reader picks one.
-    fn auditor_axis_block(axis: Option<AuditAxis>) -> &'static str {
-        match axis {
-            Some(AuditAxis::Standards) => {
-                "\n\n## Your axis = standards\n\n\
-                 Does the code respect the repo's DOCUMENTED standards \
-                 (CODING_STANDARDS/CONTRIBUTING) plus the smell baseline (Fowler ch.3)? The repo \
-                 standard wins; smells are judgements, not hard violations; skip whatever the \
-                 tooling already enforces."
-            }
-            Some(AuditAxis::Spec) => {
-                "\n\n## Your axis = spec\n\n\
-                 Does the code faithfully implement the Spec? (a) missing/partial requirements; \
-                 (b) unrequested behaviour (scope creep); (c) requirements that look done but are \
-                 wrong. Cite the Spec line for each finding."
-            }
-            None => {
-                "\n\n## Your axis = standards | spec (pick one)\n\n\
-                 - STANDARDS: does the code respect the repo's documented standards \
-                 (CODING_STANDARDS/CONTRIBUTING) + the smell baseline (Fowler ch.3)? The repo \
-                 standard wins; smells are judgements, not hard violations; skip what the tooling \
-                 enforces.\n\
-                 - SPEC: does the code faithfully implement the Spec? (a) missing/partial; \
-                 (b) unrequested behaviour (scope creep); (c) looks done but wrong. Cite the Spec \
-                 line for each finding."
-            }
-        }
-    }
 }
 
-/// The AUDITOR's review axis (v2.5.8, PDR-0020): the dev orchestrator launches one auditor per
-/// axis at the end of the run. `standards` checks the repo's documented conventions + smell
-/// baseline; `spec` checks faithful implementation of the Spec.
+// ===========================================================================
+// `{{rules}}` — customisable effector rules, injected at a template marker.
+//
+// v2.8 keeps the EFFECTORS (coder / auditor / doc) customisable: their role template carries a
+// `{{rules}}` marker that nyx RESOLVES by scope (always / role:<role> / fork) + lineage and
+// REPLACES with the project's directives. The DISPATCHER (dev) carries the marker too, but a thin
+// one: it resolves to the ALWAYS scope only (it does not code → no role directives; it is built-in
+// and NOT forked → no fork rules). Cf. annexes `context-effecteur` + `context-dev-dispatcher`.
+//
+// SCOPE OF THIS SLICE: the RESOLUTION + INJECTION MECHANISM (this module) is what Phase 5 owns. A
+// persistent, per-project rules STORE (a `rules` table + authoring CRUD) does NOT exist yet — so
+// [`resolve_rule_set`] returns an EMPTY set today and a stock render injects an explicit "no rules
+// configured" block under the resolved-scope header (the marker is still resolved by scope). Once
+// the store lands, only [`resolve_rule_set`] changes; the marker, the scoping, the lineage and the
+// injection are already in place (and unit-tested with a populated [`RuleSet`]).
+// ===========================================================================
+
+/// The literal marker a role TEMPLATE carries at its rules injection point. [`render_agent_context`]
+/// RESOLVES it (scope + lineage) and REPLACES it with the rendered rules block. A template WITHOUT
+/// the marker (`spec` / `prototype`, outside the v2.8 effector/dispatcher scope) is passed through
+/// untouched.
+const RULES_MARKER: &str = "{{rules}}";
+
+/// The SCOPE that gates whether a project directive ("rule") is injected into a given render, and
+/// which group it lands in. Resolution order at the marker is ALWAYS → ROLE(role) → FORK (the annex
+/// `context-effecteur` ordering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuditAxis {
-    Standards,
-    Spec,
+enum RuleScope {
+    /// Applies to EVERY agent of the project (e.g. "pnpm, never npm", the commit convention).
+    Always,
+    /// Applies only to a specific ROLE (e.g. `role:coder` = "compose from the design-system").
+    Role(AgentRole),
+    /// Added by a project FORK of a built-in template — carried ONLY when the render has a fork
+    /// lineage (a forked effector), never on a built-in, non-forked render.
+    Fork,
 }
 
-impl AuditAxis {
-    /// Parse the `axis` argument. An unknown axis → `None` (the caller maps it to
-    /// `invalid_argument`).
-    fn parse(name: &str) -> Option<Self> {
-        match name {
-            "standards" => Some(AuditAxis::Standards),
-            "spec" => Some(AuditAxis::Spec),
-            _ => None,
+/// One project directive injected at the `{{rules}}` marker. `curated` mirrors the annex's
+/// curated|proposed chip: a human-vetted rule vs an agent-proposed one (surfaced but not yet
+/// blessed).
+#[derive(Debug, Clone)]
+struct Rule {
+    scope: RuleScope,
+    text: String,
+    curated: bool,
+}
+
+impl Rule {
+    /// A convenience constructor for a curated rule of a given scope. Test-only until the
+    /// per-project rules store lands (production builds resolve to an empty [`RuleSet`]).
+    #[cfg(test)]
+    fn curated(scope: RuleScope, text: &str) -> Self {
+        Rule {
+            scope,
+            text: text.to_string(),
+            curated: true,
         }
+    }
+}
+
+/// The LINEAGE of a forked effector's template — the `forked_from` provenance the annex renders
+/// ("forked_from coder (built-in)"). Present ⇒ the render is a project FORK (its FORK-scoped rules
+/// apply + the lineage note is emitted); absent ⇒ a built-in, non-forked render.
+#[derive(Debug, Clone)]
+struct Lineage {
+    /// The built-in role this effector was forked from (its slug, e.g. "coder").
+    forked_from: String,
+}
+
+/// A project's configurable directives + the render's lineage — everything the `{{rules}}` marker
+/// resolves against. v2.8 ships the RESOLUTION + INJECTION; the persistent per-project STORE is a
+/// follow-up (see the module note above), so [`RuleSet::empty`] is what a stock render injects
+/// today (fully resolved by scope, just with nothing configured).
+#[derive(Debug, Clone, Default)]
+struct RuleSet {
+    rules: Vec<Rule>,
+    lineage: Option<Lineage>,
+}
+
+impl RuleSet {
+    /// The default source used by [`render_agent_context`] until a per-project rules store exists:
+    /// no rules, no lineage (a built-in, non-forked render).
+    fn empty() -> Self {
+        RuleSet::default()
     }
 
-    /// The header suffix label (`STANDARDS` / `SPEC`).
-    fn label(self) -> &'static str {
-        match self {
-            AuditAxis::Standards => "STANDARDS",
-            AuditAxis::Spec => "SPEC",
+    /// The SCOPES considered when resolving the marker for `role`, in injection order — the SINGLE
+    /// SOURCE OF TRUTH for the always → role:<role> → fork policy (both the rule resolution and the
+    /// label/heading rendering derive from this list, so a new scope is added in exactly one place).
+    /// ALWAYS for every role; plus the render's own `role` scope and (when this render carries a fork
+    /// lineage) the `fork` scope for the EFFECTORS. The DISPATCHER (`dev`) considers ALWAYS only (no
+    /// role directives — it does not code; no fork — it is built-in, not forked).
+    fn applicable_scopes(&self, role: AgentRole) -> Vec<RuleScope> {
+        let mut scopes = vec![RuleScope::Always];
+        if role != AgentRole::Dev {
+            scopes.push(RuleScope::Role(role));
+            if self.lineage.is_some() {
+                scopes.push(RuleScope::Fork);
+            }
+        }
+        scopes
+    }
+
+    /// The group LABELS of the applicable scopes for `role`, in injection order — derived from
+    /// [`RuleSet::applicable_scopes`] via [`scope_label`], so labels stay in lockstep with the rule
+    /// resolution.
+    fn resolved_scope_labels(&self, role: AgentRole) -> Vec<String> {
+        self.applicable_scopes(role)
+            .into_iter()
+            .map(scope_label)
+            .collect()
+    }
+
+    /// Resolve the rules injected for `role`, in annex order (always → role → fork), by collecting
+    /// the rules of each applicable scope from [`RuleSet::applicable_scopes`] — the shared policy.
+    fn resolve_for(&self, role: AgentRole) -> Vec<&Rule> {
+        let mut out: Vec<&Rule> = Vec::new();
+        for scope in self.applicable_scopes(role) {
+            out.extend(self.rules.iter().filter(|r| r.scope == scope));
+        }
+        out
+    }
+
+    /// Render the resolved-rules block that REPLACES the `{{rules}}` marker for `role`. The header
+    /// names the RESOLVED scopes + the lineage, so the resolution is observable even when the
+    /// project has configured no rules yet; an empty set renders an explicit "no rules" note under
+    /// that same header (the marker is still resolved by scope).
+    fn render_block(&self, role: AgentRole) -> String {
+        let scopes = self.resolved_scope_labels(role).join(" + ");
+        let lineage = match &self.lineage {
+            Some(l) => format!("forked_from {}", l.forked_from),
+            None => "no lineage (built-in, not forked)".to_string(),
+        };
+        let mut out = format!(
+            "## Rules (project directives)\n\n\
+             Resolved at the rules marker by scope ({scopes}) — {lineage}. These are project \
+             directives injected by nyx; follow them as part of your context.\n\n"
+        );
+        let resolved = self.resolve_for(role);
+        if resolved.is_empty() {
+            out.push_str(
+                "_No project rules configured yet (the per-project rules store is not wired \
+                 yet — the marker still resolves by scope)._",
+            );
+            return out;
+        }
+        // Group the resolved rules by their scope, in the same always → role → fork order.
+        for label in self.resolved_scope_labels(role) {
+            let group: Vec<&&Rule> = resolved
+                .iter()
+                .filter(|r| scope_label(r.scope) == label)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("### {label}\n"));
+            for rule in group {
+                let tag = if rule.curated { "curated" } else { "proposed" };
+                out.push_str(&format!("- {} [{}]\n", rule.text, tag));
+            }
+            out.push('\n');
+        }
+        out.trim_end().to_string()
+    }
+
+    /// Resolve + inject the `{{rules}}` marker into a role `section`. A section without the marker
+    /// (spec / prototype) is returned unchanged.
+    fn inject(&self, section: &str, role: AgentRole) -> String {
+        if section.contains(RULES_MARKER) {
+            section.replace(RULES_MARKER, &self.render_block(role))
+        } else {
+            section.to_string()
         }
     }
+}
+
+/// The group LABEL of a scope (`always` / `role:<role>` / `fork`) — the key that lines a rule up
+/// under its heading in [`RuleSet::render_block`].
+fn scope_label(scope: RuleScope) -> String {
+    match scope {
+        RuleScope::Always => "always".to_string(),
+        RuleScope::Role(role) => format!("role:{}", role.slug()),
+        RuleScope::Fork => "fork".to_string(),
+    }
+}
+
+/// Render the `{{rules}}` REPLACEMENT for the STATIC role template (review finding #35): with NO
+/// run, the project rules are RESOLVED AT RUN, so the marker names the scopes it WILL resolve
+/// (always / role:<role> / fork) but DEFERS the directives themselves. Reuses the live block's
+/// scope naming ([`RuleSet::resolved_scope_labels`]) so the reader sees the same shape cold as
+/// bound.
+fn deferred_rules_block(role: AgentRole) -> String {
+    let scopes = RuleSet::empty().resolved_scope_labels(role).join(" + ");
+    format!(
+        "## Rules (project directives)\n\n\
+         _Resolved at run by scope ({scopes}) — bind a run to a Spec to see the project's \
+         directives injected here._"
+    )
+}
+
+/// Replace the `{{rules}}` marker in a role `section` with the [`deferred_rules_block`] placeholder
+/// (the static-template path). A section WITHOUT the marker (spec / prototype) is returned
+/// unchanged — mirroring [`RuleSet::inject`] for the live path.
+fn inject_deferred_rules(section: &str, role: AgentRole) -> String {
+    if section.contains(RULES_MARKER) {
+        section.replace(RULES_MARKER, &deferred_rules_block(role))
+    } else {
+        section.to_string()
+    }
+}
+
+/// Resolve the [`RuleSet`] for a render. TODAY this is always EMPTY: the persistent per-project
+/// rules STORE (a `rules` table + authoring CRUD, plus the effector-fork lineage that feeds the
+/// FORK scope) does not exist yet, so there is nothing to load. The MECHANISM around it — the
+/// marker, the scope resolution, the lineage-aware fork scope and the injection — is fully in
+/// place, so populating this (once the store lands) is the ONLY change needed for live rules.
+fn resolve_rule_set(_db: &Db, _role: AgentRole, _spec_id: &str) -> RuleSet {
+    RuleSet::empty()
 }
 
 /// A Spec's CURRENT PHASE: the lowest phase number that still has un-done tasks, resolved
@@ -1378,6 +652,15 @@ fn resolve_current_phase(phases_json: &str, tasks: &[db::Task]) -> Option<Curren
     })
 }
 
+/// The NUMBER of a Spec's CURRENT BUILD phase (the lowest phase still carrying open work),
+/// resolved from its `phases` plan + `tasks` — the coder's active phase. `None` for a flat plan
+/// (no phases) or an all-terminal Spec. Shares the [`resolve_current_phase`] logic (the render's
+/// current-phase seam) so the `phase_open_tasks` query and the effector manual never drift, without
+/// exposing the private [`CurrentPhase`] struct across modules (v2.8 lot 2).
+pub(crate) fn current_build_phase_number(phases_json: &str, tasks: &[db::Task]) -> Option<i32> {
+    resolve_current_phase(phases_json, tasks).map(|p| p.number)
+}
+
 /// Render one structured section as a `## <Heading>\n\n<body>` block, or an empty string
 /// when the body is blank (a blank section is omitted, not rendered as an empty heading).
 fn section_block(heading: &str, body: &str) -> String {
@@ -1385,6 +668,31 @@ fn section_block(heading: &str, body: &str) -> String {
         String::new()
     } else {
         format!("## {heading}\n\n{}\n\n", body.trim())
+    }
+}
+
+/// The human HEADING a Spec section is rendered under — the same wording the full render uses, so a
+/// narrowed context reads identically to the block it replaces.
+fn section_heading(section: db::SpecSection) -> &'static str {
+    match section {
+        db::SpecSection::Problem => "Problem",
+        db::SpecSection::Solution => "Solution",
+        db::SpecSection::ImplementationDecisions => "Implementation decisions",
+        db::SpecSection::TestingDecisions => "Testing decisions",
+        db::SpecSection::UserStories => "User stories",
+        db::SpecSection::OutOfScope => "Out of scope",
+    }
+}
+
+/// The BODY of one section of an active revision.
+fn revision_section(revision: &db::SpecRevision, section: db::SpecSection) -> &str {
+    match section {
+        db::SpecSection::Problem => &revision.problem,
+        db::SpecSection::Solution => &revision.solution,
+        db::SpecSection::ImplementationDecisions => &revision.implementation_decisions,
+        db::SpecSection::TestingDecisions => &revision.testing_decisions,
+        db::SpecSection::UserStories => &revision.user_stories,
+        db::SpecSection::OutOfScope => &revision.out_of_scope,
     }
 }
 
@@ -1415,13 +723,140 @@ fn task_line(task: &db::Task) -> String {
 /// `Ok(None)` when the Spec is unknown (the caller maps it to `invalid_id`). The render is
 /// deterministic and side-effect-free (a pure read over the shared `db` accessors).
 ///
-/// `axis` scopes the AUDITOR render to one review axis (standards | spec); it is ignored for the
-/// other roles.
+/// `subject` is the spawn's per-node FOCUS ([`crate::engine::SpawnConfig::subject`]). When it names
+/// one of the Spec's own sections, the Spec block is NARROWED to THAT section — see
+/// [`spec_section_focus`]. `None` (or a subject that names no section) renders every section, as
+/// before.
 pub fn render_agent_context(
     db: &Db,
     role: AgentRole,
-    axis: Option<AuditAxis>,
     spec_id: &str,
+    subject: Option<&str>,
+) -> Result<Option<String>, RpcError> {
+    let rules = resolve_rule_set(db, role, spec_id);
+    render_agent_context_with_rules(db, role, spec_id, &rules, subject)
+}
+
+/// The Spec SECTION a spawn's `subject` names, or `None` when it names none.
+///
+/// F6 — an audit pass is spawned with `subject = "user_stories"` (one of the four commitment
+/// sections the ndev graph walks) and audits THAT commitment only; its own manual says "that section
+/// is reproduced below". Copying the OTHER five in was the bulk of the pass's context, re-paid four
+/// times per audit cycle. So the render carries the named section and drops the rest.
+///
+/// Matching is on the section's canonical slug (the [`db::SpecSections`] field name), trimmed and
+/// case-insensitive, with `-`/space accepted for `_` — the graph writes the slug, a hand-authored
+/// node may not. A subject that names NO section (a free-form focus: a file, a component, a
+/// question) leaves the render untouched: narrowing on a guess would hide the Spec from a spawn that
+/// never asked for a section.
+fn spec_section_focus(subject: &str) -> Option<db::SpecSection> {
+    let key = subject.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match key.as_str() {
+        "problem" => Some(db::SpecSection::Problem),
+        "solution" => Some(db::SpecSection::Solution),
+        "implementation_decisions" => Some(db::SpecSection::ImplementationDecisions),
+        "testing_decisions" => Some(db::SpecSection::TestingDecisions),
+        "user_stories" => Some(db::SpecSection::UserStories),
+        "out_of_scope" => Some(db::SpecSection::OutOfScope),
+        _ => None,
+    }
+}
+
+/// UI SEAM for the engine graph's NODE INSPECTOR (v2.8 Phase 6): render the EFFECTOR context a
+/// `spawn_subagent` node's sub-agent will READ, keyed by the spawn node's `agent_id` (its role slug,
+/// e.g. `coder` / `auditor`). The sub-agent itself reaches the same text through the `agent_context`
+/// tool; this seam lets the inspector show it without a run ticking.
+///
+///   * `spec_id = Some(id)` — a RUN is bound: the SAME LIVE [`render_agent_context`] the MCP
+///     `agent_context` tool serves (one authority for UI + MCP), with the `{{rules}}` marker
+///     RESOLVED by scope (always / role:<role> / fork) + lineage — the annex `context-effecteur`
+///     view. `Ok(None)` when the Spec is unknown (the caller maps it to an empty inspector).
+///   * `spec_id = None` — NO run bound (review finding #35): the STATIC role TEMPLATE (the
+///     sub-agent's brief), with the run-resolved sections shown as explicit "resolved at run"
+///     placeholders (see [`render_role_template`]). Always `Ok(Some(_))` for a valid role, so a
+///     built-in with no run shows its brief instead of an empty inspector.
+///
+/// `subject` is the spawn node's own `subject`: when it names a Spec section, the bound render is
+/// NARROWED to it (see [`spec_section_focus`]) — the inspector then shows exactly what the pass
+/// spawned on that section will read. It has no effect on the run-less template.
+///
+/// `Err(invalid_argument)` when `agent_id` is not a known role. A pure, side-effect-free read.
+pub fn render_effector_context(
+    db: &Db,
+    agent_id: &str,
+    spec_id: Option<&str>,
+    subject: Option<&str>,
+) -> Result<Option<String>, RpcError> {
+    let role = AgentRole::parse(agent_id).ok_or_else(|| {
+        RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "'{agent_id}' is not a renderable effector role (accepted: spec, dev, coder, \
+                 auditor, doc, prototype)"
+            ),
+        )
+    })?;
+    match spec_id {
+        Some(spec_id) => render_agent_context(db, role, spec_id, subject),
+        None => Ok(Some(render_role_template(role))),
+    }
+}
+
+/// RENDER the STATIC role TEMPLATE of an effector — its role MANUAL (the sub-agent's brief) —
+/// WITHOUT a Spec/run (review finding #35). The node inspector shows this the moment a
+/// `spawn_subagent` node is clicked with NO run bound: the brief is STATIC, so it is visible cold.
+///
+/// The parts that DEPEND on a run — the Spec/Project/Workspace header, the current phase + its
+/// tasks, the workspace & repos, and the resolved `{{rules}}` — are rendered as EXPLICIT
+/// "resolved at run" placeholders (parity with the live render's section order), never requiring a
+/// Spec; a bound run swaps them for the live values via [`render_agent_context`]. A pure function,
+/// no DB read (the role manual is a compile-time constant + the deferred-scope naming).
+pub fn render_role_template(role: AgentRole) -> String {
+    let mut out = String::new();
+
+    // Header — the STATIC template banner. No run, so the Spec/Project/Workspace coordinates are
+    // DEFERRED: they resolve when a run binds this workflow to a Spec.
+    out.push_str(&format!(
+        "=== NYX CONTEXT — {} (role template) ===\n",
+        role.label()
+    ));
+    out.push_str("Spec    : (resolved at run — no run bound yet)\n");
+    out.push_str("Workspace: (resolved at run — no run bound yet)\n\n");
+
+    // WHERE THE INSTRUCTIONS COME FROM, before any of them (N29).
+    out.push_str(SOURCES_NOTE);
+
+    // A one-line note: this IS the static brief; the run-specific parts fill in when a run binds.
+    out.push_str(
+        "> This is the sub-agent's STATIC role template (its brief). The Spec / Project / \
+         Workspace header, the current phase & tasks, the workspace & repos, and the project rules \
+         are RESOLVED AT RUN — bind this workflow to a run on a Spec to see them.\n\n",
+    );
+
+    // The ROLE preamble (the manual) — the STATIC part. The `{{rules}}` marker is replaced by the
+    // DEFERRED placeholder (rules resolve per run).
+    out.push_str(&inject_deferred_rules(role.preamble(), role));
+    out.push_str("\n\n");
+
+    // The run-resolved sections, as EXPLICIT placeholders (same shape/order as the live render).
+    out.push_str("## Current phase — (resolved at run)\n\n");
+    out.push_str("_The Spec's current phase and its tasks appear here once a run is bound._\n\n");
+    out.push_str("## Workspace & repos — (resolved at run)\n\n");
+    out.push_str("_The dev workspace and its repos appear here once a run is bound._\n");
+
+    out
+}
+
+/// Like [`render_agent_context`], but with an EXPLICIT [`RuleSet`] injected at the `{{rules}}`
+/// marker. The public entry resolves the set from state (empty today — no store); this seam lets a
+/// test drive a POPULATED set through the real render to prove the marker resolves + injects by
+/// scope (always / role:<role> / fork) + lineage.
+fn render_agent_context_with_rules(
+    db: &Db,
+    role: AgentRole,
+    spec_id: &str,
+    rules: &RuleSet,
+    subject: Option<&str>,
 ) -> Result<Option<String>, RpcError> {
     let bundle = db
         .with_conn(|c| -> Result<Option<_>, diesel::result::Error> {
@@ -1469,13 +904,8 @@ pub fn render_agent_context(
 
     let mut out = String::new();
 
-    // Header line (native equivalent of depot's `=== DEPOT CONTEXT — <ROLE> ===`). The AUDITOR
-    // header carries its axis (`AUDITOR · STANDARDS`), so two parallel auditors read distinctly.
-    let header_role = match (role, axis) {
-        (AgentRole::Auditor, Some(a)) => format!("{} · {}", role.label(), a.label()),
-        _ => role.label().to_string(),
-    };
-    out.push_str(&format!("=== NYX CONTEXT — {header_role} ===\n"));
+    // Header line (native equivalent of depot's `=== DEPOT CONTEXT — <ROLE> ===`).
+    out.push_str(&format!("=== NYX CONTEXT — {} ===\n", role.label()));
     out.push_str(&format!(
         "Spec    : {} (#{} · {})\n",
         spec.title, spec.number, spec.status
@@ -1506,12 +936,13 @@ pub fn render_agent_context(
     }
     out.push('\n');
 
-    // ROLE preamble (the fixed contract). The AUDITOR gets its axis-specific instruction block
-    // appended (the dev launches one auditor per axis at the end).
-    out.push_str(role.preamble());
-    if role == AgentRole::Auditor {
-        out.push_str(AgentRole::auditor_axis_block(axis));
-    }
+    // WHERE THE INSTRUCTIONS COME FROM, before any of them (N29): the project's ambient `CLAUDE.md`
+    // outranks this manual on the project's own ground; this manual carries the ROLE.
+    out.push_str(SOURCES_NOTE);
+
+    // ROLE preamble (the fixed contract). Its `{{rules}}` marker is RESOLVED + INJECTED by scope; a
+    // preamble with no marker (spec / prototype) passes through unchanged.
+    out.push_str(&rules.inject(role.preamble(), role));
     out.push_str("\n\n");
 
     // SPEC AUTHOR live state: the project's OTHER Specs, so the author does not duplicate an
@@ -1529,23 +960,43 @@ pub fn render_agent_context(
         }
     }
 
-    // SPEC sections (the six structured sections from the active revision).
+    // SPEC sections (the six structured sections from the active revision) — under the SAME
+    // identifying header whether all six are carried or only the one this spawn is about (F6).
     out.push_str(&format!(
         "## Spec — {} (revision {})\n\n",
         revision.title, revision.revision_number
     ));
-    out.push_str(&section_block("Problem", &revision.problem));
-    out.push_str(&section_block("Solution", &revision.solution));
-    out.push_str(&section_block(
-        "Implementation decisions",
-        &revision.implementation_decisions,
-    ));
-    out.push_str(&section_block(
-        "Testing decisions",
-        &revision.testing_decisions,
-    ));
-    out.push_str(&section_block("User stories", &revision.user_stories));
-    out.push_str(&section_block("Out of scope", &revision.out_of_scope));
+    match subject.and_then(spec_section_focus) {
+        // NARROWED: the spawn names ONE section — carry that one, and SAY it is the only one, so a
+        // sub-agent never mistakes the absence of the others for an empty Spec (F6).
+        Some(section) => {
+            out.push_str(&format!(
+                "_Your subject is `{}` — only that section is reproduced here, on purpose. The \
+                 Spec's other sections are another pass's business; their absence is not an empty \
+                 Spec._\n\n",
+                section.as_str()
+            ));
+            out.push_str(&section_block(
+                section_heading(section),
+                revision_section(&revision, section),
+            ));
+        }
+        // No subject, or a subject naming no section: the whole Spec, unchanged.
+        None => {
+            out.push_str(&section_block("Problem", &revision.problem));
+            out.push_str(&section_block("Solution", &revision.solution));
+            out.push_str(&section_block(
+                "Implementation decisions",
+                &revision.implementation_decisions,
+            ));
+            out.push_str(&section_block(
+                "Testing decisions",
+                &revision.testing_decisions,
+            ));
+            out.push_str(&section_block("User stories", &revision.user_stories));
+            out.push_str(&section_block("Out of scope", &revision.out_of_scope));
+        }
+    }
 
     // CURRENT PHASE + its tasks (the live execution scope). A flat plan renders ALL tasks.
     let current = resolve_current_phase(&spec.phases, &tasks);
@@ -1616,10 +1067,9 @@ pub fn render_agent_context(
             "- workspace: {} ({}, workspace_id={})\n",
             ctx.workspace.name, ctx.workspace.root_path, ctx.workspace.id
         )),
-        None => out.push_str(
-            "- workspace: (none anchored on this Spec — a dev workspace is the CODE link and is \
-             created when the code is; the design tools above need only the project_id)\n",
-        ),
+        // The WHY is on the header's Workspace line, once (v2.8): repeating it here said the same
+        // thing twice to every role.
+        None => out.push_str("- workspace: (none anchored — see the header)\n"),
     }
     out.push('\n');
 
@@ -1648,6 +1098,9 @@ fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<Strin
         None => out.push_str("Project : (not resolved — select the project to author in)\n"),
     }
     out.push_str("Spec    : (none yet — you are authoring a new one)\n\n");
+
+    // WHERE THE INSTRUCTIONS COME FROM, before any of them (N29).
+    out.push_str(SOURCES_NOTE);
 
     // The fixed SPEC-author contract (grill → write → decompose → spec_create + guard-rails).
     out.push_str(AgentRole::Spec.preamble());
@@ -1683,8 +1136,13 @@ fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<Strin
     // The project's OPEN idea backlog — the maintained follow-ups the author must SEARCH before
     // creating a duplicate Spec (PRD Impl Decisions: "INTÉGRÉ AU /nspec … au démarrage d'une Spec,
     // l'agent cherche d'office les idées du sujet … et les auto-linker (kind=addresses)"). Surfaced
-    // up front as a bounded preview so the backlog is visible; the concrete lookup is idea_search
-    // on the subject, and the resolution is idea_link(kind=addresses) once the Spec exists.
+    // up front as a bounded preview so the backlog is visible.
+    //
+    // AND IT IS THE ONLY HOME THE CONTRACT HAS. The nspec GRAPH walks no idea node, so the
+    // "no duplicate Spec" rule has no structural equivalent — deleting the preamble's Step 0
+    // therefore had to land it somewhere, and this is the one place that can state it with THIS
+    // project's id already in the call. Two verbs, not a procedure: SEARCH before you author, and
+    // LINK what the Spec resolves (`idea_link` then drives the idea's lifecycle by itself).
     out.push_str("## Existing ideas — search the backlog before you spec (anti-duplication)\n\n");
     match project {
         Some(p) => {
@@ -1714,13 +1172,11 @@ fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<Strin
                 out.push('\n');
             }
             out.push_str(&format!(
-                "Run idea_search(project_id=\"{}\", query=\"<the subject>\") to find the ideas on \
-                 THIS topic (typos/variants tolerated), SURFACE the matches to the human, and — once \
-                 the Spec exists — idea_link(idea_id, spec_id, kind=\"addresses\") every idea it \
-                 resolves, so a need already tracked is NOT re-created as a duplicate Spec. RECONCILE \
-                 as you author: idea_close(id, reason=…) the ones the work resolves (MANUAL motif — \
-                 idea_implement is the AUTO path a linked addresses-Spec drives), idea_merge obvious \
-                 duplicates, keep the list grouped by theme.\n\n",
+                "Run idea_search(project_id=\"{}\", query=\"<the subject>\") on THIS topic before \
+                 you author: a match means the need is already tracked, so SURFACE it and build the \
+                 Spec around it rather than opening a duplicate Spec. Then link every idea this \
+                 Spec resolves with idea_link(idea_id, spec_id, kind=\"addresses\") — that link \
+                 drives the idea's lifecycle on its own.\n\n",
                 p.id
             ));
         }
@@ -1742,9 +1198,8 @@ fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<Strin
                  its sections with spec_update_section, then slice it into tasks with task_add, \
                  grouping each by a phase NAME (task_add(phase=\"Phase name\")) — nyx builds the \
                  phase plan from those names, in first-seen order. The Spec stays PROJECT-scoped \
-                 while authored; the dev workspace anchor is posed only when implementation \
-                 STARTS, by spec_transition(transition=\"start\", workspace_id=…) — which the \
-                 user confirms.\n",
+                 while authored; nyx poses the dev workspace anchor itself, at the transition node \
+                 that opens the implementation.\n",
                 p.id
             ));
         }
@@ -1763,8 +1218,10 @@ fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<Strin
 
 /// RESOLVE the Spec id for a context render from the tool args, in this order (PDR-0020):
 ///   1. an explicit `spec_id`;
-///   2. the Spec anchored on the `workspace_id` (its dev workspace);
-///   3. the Spec anchored on the workspace whose path matches `cwd` ("sans id → spec
+///   2. the `run_id`'s own Spec — the anchor a SPAWNED sub-agent has, and the only one it needs.
+///      It STOPS at the run: bound ⇒ that Spec, unbound ⇒ none (see below);
+///   3. the Spec anchored on the `workspace_id` (its dev workspace);
+///   4. the Spec anchored on the workspace whose path matches `cwd` ("sans id → spec
 ///      résolue via cwd").
 ///
 /// Returns `Ok(None)` when none resolves (the caller maps it to `invalid_id`).
@@ -1772,26 +1229,100 @@ fn resolve_spec_id(db: &Db, args: &Value) -> Result<Option<String>, RpcError> {
     if let Some(spec_id) = optional_str(args, "spec_id")? {
         return Ok(Some(spec_id.to_string()));
     }
+    if let Some(run_id) = optional_str(args, "run_id")? {
+        let run = require_run(db, run_id)?;
+        if let Some(spec_id) = run.spec_id {
+            return Ok(Some(spec_id));
+        }
+        // AN UNBOUND RUN RESOLVES NO SPEC, and that is an ANSWER — not a reason to look further.
+        //
+        // Reaching past the run to its workspace would raise the ambiguity a real project always
+        // carries (several active Specs, so no location names one), which is exactly what `run_start`
+        // declines to raise for a flow that AUTHORS its own Spec (G2). The hook pulls this render to
+        // inject it (G6), so the refusal would land there and inject nothing — the two would cancel
+        // out in the very case that motivated them.
+        //
+        // It would also be wrong on its own merits: a run that drives no Spec would be handed the
+        // state of one it has nothing to do with.
+        return Ok(None);
+    }
     if let Some(workspace_id) = optional_str(args, "workspace_id")? {
-        let spec = db
-            .with_conn(|c| db::spec_for_workspace(c, workspace_id))
-            .map_err(internal_db)?;
-        return Ok(spec.map(|s| s.id));
+        return unique_spec_for_workspace(db, workspace_id);
     }
     if let Some(cwd) = optional_str(args, "cwd")? {
         let normalized = crate::pathnorm::normalize(cwd);
-        let spec = db
-            .with_conn(|c| -> Result<Option<db::Spec>, diesel::result::Error> {
-                // Match the cwd against the best workspace, then find the Spec anchored on it.
-                match best_workspace_for_cwd(c, &normalized)? {
-                    Some(ws) => db::spec_for_workspace(c, &ws.id),
-                    None => Ok(None),
-                }
-            })
+        let ws = db
+            .with_conn(|c| best_workspace_for_cwd(c, &normalized))
             .map_err(internal_db)?;
-        return Ok(spec.map(|s| s.id));
+        return match ws {
+            Some(ws) => unique_spec_for_workspace(db, &ws.id),
+            None => Ok(None),
+        };
     }
     Ok(None)
+}
+
+/// THE RUN ANCHOR — load the run `run_id` names, or refuse with `invalid_id`.
+///
+/// A run is the ONE identifier that resolves everything a spawned sub-agent needs: it carries the
+/// Spec it drives (F5) and the workspace it opened against (G2). That is what lets a `spawn_subagent`
+/// action ship an id instead of a manual — the sub-agent calls `agent_context(run_id=…)` and pulls
+/// its own state. An unknown id is REFUSED rather than silently resolving nothing: a sub-agent that
+/// got a bad id must learn it here, not discover an empty render.
+fn require_run(db: &Db, run_id: &str) -> Result<db::WorkflowRun, RpcError> {
+    db.with_conn(|c| db::get_workflow_run(c, run_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| RpcError::new(RpcCode::InvalidId, format!("unknown run {run_id}")))
+}
+
+/// The `reason` marker on the AMBIGUOUS-location refusal — the machine handle a caller uses to tell
+/// "this location anchors several Specs" apart from every other `invalid_argument`. `run_start` reads
+/// it to start an authoring flow UNBOUND instead of losing the call (G2).
+const AMBIGUOUS_SPEC_REASON: &str = "spec_ambiguous_for_workspace";
+
+/// Whether `e` is the AMBIGUOUS-location refusal [`unique_spec_for_workspace`] raises (a workspace
+/// with several active Specs), as opposed to any other refusal a Spec resolution can produce.
+pub(crate) fn is_ambiguous_spec(e: &RpcError) -> bool {
+    e.data
+        .as_ref()
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+        == Some(AMBIGUOUS_SPEC_REASON)
+}
+
+/// Resolve the ONE ACTIVE Spec anchored on `workspace_id`, REFUSING when several are — a workspace
+/// with more than one started Spec cannot resolve one by location alone, so picking the newest
+/// silently (as [`db::spec_for_workspace`] would) attributes work to an ARBITRARY Spec (v2.8 review
+/// N14(b)). The refusal LISTS the candidates so the caller can pass an explicit `spec_id`.
+///
+/// The candidate set is [`db::active_specs_for_workspace`]: the TERMINAL Specs a workspace
+/// accumulates as it ships (`completed` / `cancelled`) are NOT candidates, so a workspace whose only
+/// live Spec is X resolves to X however many finished ones share it — and the message below, which
+/// says "active Specs", is true.
+fn unique_spec_for_workspace(db: &Db, workspace_id: &str) -> Result<Option<String>, RpcError> {
+    let specs = db
+        .with_conn(|c| db::active_specs_for_workspace(c, workspace_id))
+        .map_err(internal_db)?;
+    match specs.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.id.clone())),
+        many => {
+            let candidates = many
+                .iter()
+                .map(|s| format!("{} (\"{}\")", s.id, s.title))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "workspace {workspace_id} has {} active Specs — resolving one by location alone \
+                     is ambiguous; pass an explicit spec_id. Candidates: {candidates}",
+                    many.len()
+                ),
+            )
+            .with_data(json!({ "reason": AMBIGUOUS_SPEC_REASON })))
+        }
+    }
 }
 
 /// Whether a normalized `cwd` is the workspace's `root_path` or nested under it (so a cwd
@@ -1865,6 +1396,29 @@ fn resolve_project(db: &Db, args: &Value) -> Result<Option<db::Project>, RpcErro
             .map_err(internal_db)?;
         return Ok(project);
     }
+    if let Some(run_id) = optional_str(args, "run_id")? {
+        // Same anchor as the Spec resolution: the run's Spec names its project, and an UNBOUND run
+        // (a /nspec that has not created one yet — the authoring render's whole case) still names
+        // the workspace it opened against (G2).
+        let run = require_run(db, run_id)?;
+        let project = db
+            .with_conn(|c| -> Result<Option<db::Project>, diesel::result::Error> {
+                if let Some(spec_id) = run.spec_id.as_deref() {
+                    if let Some(spec) = db::get_spec(c, spec_id)? {
+                        return db::get_project(c, &spec.project_id);
+                    }
+                }
+                match run.workspace_id.as_deref() {
+                    Some(ws) => match db::get_workspace(c, ws)? {
+                        Some(ws) => db::get_project(c, &ws.project_id),
+                        None => Ok(None),
+                    },
+                    None => Ok(None),
+                }
+            })
+            .map_err(internal_db)?;
+        return Ok(project);
+    }
     if let Some(workspace_id) = optional_str(args, "workspace_id")? {
         let project = db
             .with_conn(|c| -> Result<Option<db::Project>, diesel::result::Error> {
@@ -1893,8 +1447,61 @@ fn resolve_project(db: &Db, args: &Value) -> Result<Option<db::Project>, RpcErro
     Ok(None)
 }
 
-/// `agent_context` — `{ role, axis?, spec_id? | workspace_id? | cwd? }` → `{ role, spec_id,
-/// context }`. Render a role manual LIVE from nyx state. A pure READ (no `changed` effect).
+/// The PROJECT alone a `run_start` resolves from its anchors (`project_id` | `workspace_id` | `cwd`),
+/// with no Spec involved — what an authoring flow still needs to pick its active workflow when the
+/// location anchors several Specs and [`resolve_run_target`] therefore resolves none (G2).
+pub(crate) fn resolve_run_project(db: &Db, args: &Value) -> Result<Option<String>, RpcError> {
+    Ok(resolve_project(db, args)?.map(|p| p.id))
+}
+
+/// RESOLVE the `(project_id, spec_id)` a `run_start` binds a run to, from the SAME anchors a
+/// context render uses (`spec_id` | `workspace_id` | `cwd`). The Spec is OPTIONAL — an unbound run
+/// simply has no lifecycle to transition — while the project drives [`db::resolve_active_workflow`]
+/// (which workflow /ndev runs). When only a `spec_id` is given, the project falls back to that
+/// Spec's own project, so a run started by id still resolves the project's workflow (v2.8 review B2).
+pub(crate) fn resolve_run_target(
+    db: &Db,
+    args: &Value,
+) -> Result<(Option<String>, Option<String>), RpcError> {
+    let spec_id = resolve_spec_id(db, args)?;
+    // The project resolved from the RUN's OWN anchors (project_id | workspace_id | cwd), independent
+    // of the Spec.
+    let anchor_project = resolve_project(db, args)?.map(|p| p.id);
+    // The Spec's own project (a fact of the Spec).
+    let spec_project = match spec_id.as_deref() {
+        Some(sid) => db
+            .with_conn(|c| db::get_spec(c, sid))
+            .map_err(internal_db)?
+            .map(|s| s.project_id),
+        None => None,
+    };
+    // CONFRONT a disagreement rather than silently picking one (v2.8 review N14(a), the same guard
+    // agent_context already applies): a spec_id whose project ≠ the project the cwd / workspace_id /
+    // project_id resolves is refused, never quietly overridden either way.
+    if let (Some(anchor), Some(owner)) = (&anchor_project, &spec_project) {
+        if anchor != owner {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "spec {} belongs to project {owner}, but the cwd / workspace_id / project_id you \
+                     passed resolves project {anchor} — they disagree. Drop the mismatched anchor, or \
+                     pass a spec_id of project {anchor}",
+                    spec_id.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+    }
+    Ok((anchor_project.or(spec_project), spec_id))
+}
+
+/// `agent_context` — `{ role, spec_id? | run_id? | workspace_id? | cwd?, scope?, subject? }` →
+/// `{ role, spec_id, context }`. Render a role manual LIVE from nyx state. A pure READ (no `changed`
+/// effect).
+///
+/// THIS IS THE DELIVERY MECHANISM. A `spawn_subagent` action ships `agent_id` + `label` + `mode`
+/// (+ `subject`) and NO manual: the sub-agent it launches calls THIS, with the `run_id` it was
+/// handed, and pulls its own role + state. `subject` mirrors the spawn node's own subject, so a pass
+/// spawned on ONE Spec section reads THAT section (see [`spec_section_focus`]).
 pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let role_name = require_str(args, "role")?;
     let role = AgentRole::parse(role_name).ok_or_else(|| {
@@ -1905,17 +1512,13 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
             ),
         )
     })?;
-    // Optional `axis` scopes the AUDITOR render (standards | spec). An unknown axis is rejected;
-    // an axis on a non-auditor role is accepted but ignored by the render.
-    let axis = match optional_str(args, "axis")? {
-        Some(name) => Some(AuditAxis::parse(name).ok_or_else(|| {
-            RpcError::new(
-                RpcCode::InvalidArgument,
-                format!("unknown axis '{name}' (accepted: standards, spec)"),
-            )
-        })?),
-        None => None,
-    };
+    // The dispatcher's run SCOPE (ndev | nspec | ndoc) — substituted into the `{{scope}}` marker of
+    // the dispatcher manual so its `run_start` opens the RIGHT flow. Defaults to ndev; absent from
+    // (and a no-op for) the effector manuals (v2.8 review N1).
+    let scope = optional_str(args, "scope")?.unwrap_or("ndev").to_string();
+    // The spawn's per-node FOCUS, when the caller is re-fetching an effector manual it was handed
+    // narrowed (F6). Absent = the whole Spec, as before.
+    let subject = optional_str(args, "subject")?.map(str::to_string);
     match resolve_spec_id(db, args)? {
         // An anchored Spec resolves (a dev in progress, or an explicit spec_id): render its
         // LIVE manual — UNCHANGED for every role, including a spec author refining an existing
@@ -1944,9 +1547,9 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
                     ));
                 }
             }
-            let context = render_agent_context(db, role, axis, &spec_id)?.ok_or_else(|| {
-                RpcError::new(RpcCode::InvalidId, format!("unknown spec {spec_id}"))
-            })?;
+            let context = render_agent_context(db, role, &spec_id, subject.as_deref())?
+                .ok_or_else(|| RpcError::new(RpcCode::InvalidId, format!("unknown spec {spec_id}")))?
+                .replace("{{scope}}", &scope);
             Ok(ToolOutcome::read(json!({
                 "role": role_name,
                 "spec_id": spec_id,
@@ -1965,7 +1568,23 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
         // Specs or an unresolved project (a graceful "select a project" manual then). Every
         // OTHER role keeps the invalid_id contract unchanged.
         None => {
-            if role == AgentRole::Spec {
+            if role == AgentRole::Dev {
+                // The DISPATCHER owns no flow and binds no Spec itself — `run_start` resolves (or,
+                // for a fresh nspec, CREATES) the run. So it renders STANDALONE, with NO Spec
+                // required: this is what lets /nspec (which starts a brand-new Spec — none yet) and
+                // /ndoc drive the engine the SAME way /ndev does (v2.8 review N1). The `{{scope}}`
+                // marker carries the invoked flow into its `run_start` call.
+                let context = format!(
+                    "{SOURCES_NOTE}{}",
+                    inject_deferred_rules(AgentRole::Dev.preamble(), AgentRole::Dev)
+                )
+                .replace("{{scope}}", &scope);
+                Ok(ToolOutcome::read(json!({
+                    "role": role_name,
+                    "spec_id": Value::Null,
+                    "context": context,
+                })))
+            } else if role == AgentRole::Spec {
                 let project = resolve_project(db, args)?;
                 let context = render_spec_authoring(db, project.as_ref())?;
                 Ok(ToolOutcome::read(json!({
@@ -2090,7 +1709,7 @@ mod tests {
     fn render_carries_role_spec_sections_current_phase_tasks_and_workspace_repos() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Coder, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Coder, &spec_id, None)
             .unwrap()
             .unwrap();
         // Role preamble.
@@ -2121,156 +1740,654 @@ mod tests {
         assert!(text.contains("- workspace: "), "the anchored workspace");
     }
 
+    /// N29 — THE HIERARCHY OF SOURCES, on every manual surface. A sub-agent inherits the project's
+    /// ambient `CLAUDE.md` (the "starts blank" claim was false), and that ambient text OUTRANKS the
+    /// built-in manual on the project's own ground — so no manual prescribes a commit style, a
+    /// branch policy, a language or a tooling choice.
+    #[test]
+    fn every_manual_states_the_project_claude_md_outranks_it() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+
+        let mut manuals: Vec<String> = Vec::new();
+        for role in [
+            AgentRole::Spec,
+            AgentRole::Dev,
+            AgentRole::Coder,
+            AgentRole::Auditor,
+            AgentRole::Doc,
+            AgentRole::Prototype,
+        ] {
+            manuals.push(render_agent_context(&db, role, &spec_id, None).unwrap().unwrap());
+            // …and the STATIC template (no run bound) says it too.
+            manuals.push(render_role_template(role));
+        }
+        // The two run-less entry points: the /nspec authoring manual and the standalone dispatcher.
+        manuals.push(render_spec_authoring(&db, None).unwrap());
+        let dispatcher = agent_context(&db, &json!({ "role": "dev", "scope": "ndev" })).unwrap();
+        manuals.push(dispatcher.result["context"].as_str().unwrap().to_string());
+
+        for text in &manuals {
+            assert!(
+                text.contains("SOURCES — this manual carries your ROLE"),
+                "every manual states where its instructions come from",
+            );
+            assert!(
+                text.contains("ambient `CLAUDE.md` files")
+                    && text.contains("never start context-less")
+                    && text.contains("THEY take precedence over this text"),
+                "the ambient CLAUDE.md is inherited AND outranks the manual",
+            );
+        }
+
+        // The FALSE claim is gone from the dispatcher: a spawned sub-agent inherits the project's
+        // ambient CLAUDE.md — what it does not inherit is the SESSION.
+        let dev = render_agent_context(&db, AgentRole::Dev, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !dev.contains("starts blank"),
+            "the 'starts blank' claim must not survive — it is false",
+        );
+        // …and so is the FORWARDING that claim justified: the dispatcher carries no manual at all
+        // now, it hands a `run_id` and the sub-agent pulls its own role + state.
+        assert!(
+            !dev.contains("PASTING") && !dev.contains("paste"),
+            "the dispatcher no longer pastes a forwarded manual anywhere:\n{dev}",
+        );
+        assert!(
+            dev.contains("agent_context(run_id=") && dev.contains("PULLS its own"),
+            "it names the call the sub-agent makes to read its own role + state",
+        );
+
+        // No built-in manual prescribes a project convention (N29): the branch policy and the doc
+        // profile's style/audience prescriptions are the project's business.
+        for (role, text) in [
+            (AgentRole::Coder, &manuals[4]),
+            (AgentRole::Doc, &manuals[8]),
+        ] {
+            for gone in ["Commit on the current branch", "the profile's sources"] {
+                assert!(
+                    !text.contains(gone),
+                    "{}: the project-convention prescription `{gone}` must not survive",
+                    role.slug(),
+                );
+            }
+        }
+    }
+
+    /// THE SPEC'S LANGUAGE IS RESOLVED, NEVER GUESSED. Spec #7 was authored in English and Spec #8
+    /// in French — same project, same effector, both requested in French — because the role said
+    /// nothing and each session decided for itself. The manual now carries the ORDER (the project's
+    /// convention and its existing Specs first; the language the human asked in only when nothing
+    /// else decides), on every surface the author can be reading it from: the run-bound render, the
+    /// static template, and the run-less authoring manual.
+    #[test]
+    fn the_spec_author_is_told_how_to_resolve_the_specs_language() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+
+        for (surface, text) in [
+            (
+                "the run-bound render",
+                render_agent_context(&db, AgentRole::Spec, &spec_id, None)
+                    .unwrap()
+                    .unwrap(),
+            ),
+            ("the static template", render_role_template(AgentRole::Spec)),
+            (
+                "the authoring manual",
+                render_spec_authoring(&db, None).unwrap(),
+            ),
+        ] {
+            assert!(
+                text.contains("choose the Spec's LANGUAGE yourself"),
+                "{surface}: picking the language per session is what the rule forbids:\n{text}",
+            );
+            // The ORDER is the rule — a list of sources with no precedence resolves nothing.
+            let project = text
+                .find("what the project prescribes")
+                .unwrap_or_else(|| panic!("{surface}: the project decides first:\n{text}"));
+            let existing = text
+                .find("its existing Specs are written in")
+                .unwrap_or_else(|| panic!("{surface}: the Specs already written count too:\n{text}"));
+            let human = text
+                .find("the language the human asked in")
+                .unwrap_or_else(|| panic!("{surface}: the fallback is the human's own:\n{text}"));
+            assert!(
+                project < existing && existing < human,
+                "{surface}: the human's language is the FALLBACK, after what the project says:\n{text}",
+            );
+            assert!(
+                text.contains("One language for the whole Spec"),
+                "{surface}: the resolved language holds across the sections and the revisions:\n{text}",
+            );
+        }
+    }
+
     #[test]
     fn render_each_role_uses_its_own_preamble() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        assert!(render_agent_context(&db, AgentRole::Dev, None, &spec_id)
+        assert!(render_agent_context(&db, AgentRole::Dev, &spec_id, None)
             .unwrap()
             .unwrap()
-            .contains("Dev Orchestrator"));
+            .contains("Dev — dispatcher"));
         assert!(
-            render_agent_context(&db, AgentRole::Auditor, None, &spec_id)
+            render_agent_context(&db, AgentRole::Auditor, &spec_id, None)
                 .unwrap()
                 .unwrap()
                 .contains("Auditor Agent")
         );
     }
 
+    /// v2.8 (task 01KY71J3MVTQ1V86J92GNC9FKH, annex `context-dev-dispatcher`): the DEV context is
+    /// now a THIN DISPATCHER. It calls `nyx_next` and performs EXACTLY the atomic action nyx
+    /// returns — it orients NOTHING itself: it never loops / branches / transitions on its own
+    /// initiative (the whole orchestration moved into the graph). This test pins both the
+    /// dispatcher mandate AND the ABSENCE of the ex-orchestrator's prose.
     #[test]
-    fn render_dev_carries_state_rule_cadence_and_review_loop() {
+    fn render_dev_is_the_thin_dispatcher_not_the_orchestrator() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Dev, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Dev, &spec_id, None)
             .unwrap()
             .unwrap();
 
-        // Brick 1 — sub-agent forwarding: the orchestrator itself calls agent_context and pastes
-        // the manual into the provider's NATIVE Task (generic, no SubagentStart hook).
+        // The dispatcher mandate: call nyx_next, do exactly the one action it returns, nothing else.
+        assert!(text.contains("Dev — dispatcher"), "dispatcher header");
         assert!(
-            text.contains("agent_context(role=coder, spec, phase)"),
-            "forwards the coder context",
+            text.contains("You do NOT orchestrate")
+                && text.contains("You do NOT know the workflow — nyx does"),
+            "it does not orchestrate and does not know the flow",
         );
         assert!(
-            text.contains("NATIVE Task") && text.contains("SubagentStart hook"),
-            "generic provider Task, no SubagentStart hook",
-        );
-
-        // Brick 2 — agent-driven state rule via spec_transition (in_progress <-> review, never stuck).
-        assert!(
-            text.contains("The state rule") && text.contains("via spec_transition"),
-            "explicit state rule driven by spec_transition",
+            text.contains("call\n`nyx_next`") || text.contains("call `nyx_next`"),
+            "its only job is to call nyx_next",
         );
         assert!(
-            text.contains("every phase finished -> review"),
-            "autopilot -> review",
+            text.contains("EXACTLY the one atomic action it returns"),
+            "it does exactly the returned atomic action",
         );
         assert!(
-            text.contains("NEVER get stuck on the wrong state"),
-            "never stuck on the wrong state",
+            text.contains("You never decide the flow"),
+            "it never decides the flow",
         );
-        // Brick 2b — STATUT IN-PLACE (v2.5.11): the Spec STAYS in_review during rework; the rounds
-        // carry the activity; NO bounce back to in_progress (the fix for the stuck state).
+        // It NEVER loops / branches / transitions of its own initiative, and never runs gates.
         assert!(
-            text.contains("The Spec stays in_review through review AND rework"),
-            "the Spec stays in_review during review + rework (no bounce)",
+            text.contains("orchestrate, loop, branch, or transition on your own initiative"),
+            "no self-initiated loop / branch / transition",
         );
         assert!(
-            text.contains("bounce back to in_progress"),
-            "the rework is worked in place as rounds — never bouncing to in_progress",
-        );
-        // Brick 2c — the CHAT is a review channel too (retour-chat, v2.5.11): relay chat feedback
-        // via review_submit_feedback (the same review path as the viewer).
-        assert!(
-            text.contains("review_submit_feedback"),
-            "the chat retour is a review channel (review_submit_feedback)",
+            text.contains("run gates or state transitions yourself — nyx does that INSIDE"),
+            "gates + transitions happen inside nyx_next, not in the session",
         );
 
-        // Brick 3 — cadence: deterministic checks per phase, the 2-axis LLM auditor ONCE at the end.
+        // Sub-workflow doctrine (v2.8 lot 2): driving a `sub_workflow` action drives the CHILD run,
+        // then re-ticks the PARENT with NO last_result (nyx folds the child's verified state itself).
         assert!(
-            text.contains("NO LLM auditor here"),
-            "no per-phase LLM auditor",
+            text.contains("`sub_workflow`")
+                && text.contains("nyx_next(child_run_id)")
+                && text.contains("re-tick the parent"),
+            "the sub_workflow case: drive the child, re-tick the parent with no last_result",
         );
+        // A BUBBLED ask_human (`via: \"sub_workflow\"` + child_run_id) is answered against the CHILD,
+        // then the dispatcher keeps driving THAT child before it re-ticks the parent.
         assert!(
-            text.contains("2-axis AUDITOR ONCE (NOT per phase)"),
-            "2-axis auditor once at the end, not per phase",
+            text.contains(r#"`via: "sub_workflow"`"#)
+                && text.contains("nyx_next(child_run_id, last_result={decision})")
+                && text.contains("KEEP DRIVING THAT CHILD DIRECTLY"),
+            "the bubbled ask_human case: answer the child run, keep driving it, then re-tick the parent",
         );
 
-        // Brick 4 — review loop: read the feed, grill each comment through the grill lifecycle, reply,
-        // and NEVER emit the "recreate a PRD" parasite re-prompt.
+        // The ex-orchestrator's prose is GONE (it is now the behavior-tree graph, not the context):
+        // no state rule, no per-phase cadence, no 2-axis auditor drive, no review loop, no backlog
+        // capture in the dispatcher.
+        for gone in [
+            "Dev Orchestrator",
+            "The state rule",
+            "2-axis AUDITOR ONCE",
+            "review_comment_list",
+            "review_task_structure",
+            "recreate a PRD",
+            "idea_add(",
+        ] {
+            assert!(
+                !text.contains(gone),
+                "the ex-orchestrator prose `{gone}` must NOT survive in the thin dispatcher",
+            );
+        }
+    }
+
+    /// G6 — the dispatcher makes NO call before its first tick. The nyx command hook opens the run
+    /// and injects its `run_id` with this very manual, so the "call `run_start` ONCE, before the
+    /// loop" step is gone and the session's first act is `nyx_next(run_id)`.
+    ///
+    /// What replaces it is not silence: the id has to be pointed at (nothing else hands the
+    /// dispatcher one), the `warnings` that rode with it have to reach the human (the agent no
+    /// longer reads them off its own call — see `hook_push_injection_e2e`), and `run_start` STAYS
+    /// dispatchable, so the manual says plainly why calling it is unnecessary rather than leaving
+    /// an advertised tool looking like a required step.
+    #[test]
+    fn the_dispatcher_is_handed_its_run_and_opens_none() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let text = render_agent_context(&db, AgentRole::Dev, &spec_id, None)
+            .unwrap()
+            .unwrap();
+
+        // The run is a GIVEN, named where the injection puts it.
         assert!(
-            text.contains("review_comment_list"),
-            "reads the review feed",
+            text.contains("Your run is already open") && text.contains("`NYX RUN` block"),
+            "the manual says the run_id is already in hand, and where: {text}",
         );
         assert!(
-            text.contains("review_task_list")
-                && text.contains("review_task_structure")
-                && text.contains("proposed -> structured"),
-            "grills each comment through the grill lifecycle (proposed -> structured)",
+            text.contains("make NO call to obtain it"),
+            "…and that no call is needed to obtain it",
+        );
+        // The warnings the hook injected beside it are the human's, and they get relayed.
+        assert!(
+            text.contains("RELAY each one") && text.contains("run_replaced_graph_changed"),
+            "the injected warnings are relayed to the human before the first tick",
+        );
+        // `run_start` is still dispatchable (N17: an un-advertised tool is undispatchable, and the
+        // hook reaches the sidecar through the same surface), so the manual states what a second
+        // call does — resume — instead of implying a required step.
+        assert!(
+            text.contains("IDEMPOTENT") && text.contains("RESUMES that very run"),
+            "a stray run_start resumes the same run, and the manual says so",
+        );
+        // The pre-tick step itself is GONE.
+        for gone in [
+            "call `run_start` EXACTLY ONCE",
+            "Before the loop",
+            "First: open your run",
+            "it returns the `run_id` you pass to every `nyx_next`",
+        ] {
+            assert!(
+                !text.contains(gone),
+                "the pre-tick `run_start` step `{gone}` must NOT survive: the hook opened the run",
+            );
+        }
+    }
+
+    /// THE DELIVERY MECHANISM, stated where the spawn happens. The action carries identifiers, not a
+    /// manual, so the dispatcher must know the two halves of the pull — or the sub-agent is spawned
+    /// with no role at all. NEITHER MODE MAY BE MUTE: a `native_task` sub-agent is TOLD to call
+    /// `agent_context` first, and an `inline` step — where the dispatcher IS the effector — makes
+    /// that call ITSELF.
+    #[test]
+    fn the_dispatcher_hands_the_run_id_and_lets_the_sub_agent_pull_its_own_context() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let text = render_agent_context(&db, AgentRole::Dev, &spec_id, None)
+            .unwrap()
+            .unwrap();
+
+        // What the action carries: WHO, WHAT FOR, on WHICH object — and no manual.
+        assert!(
+            text.contains("`agent_id`") && text.contains("`label`") && text.contains("`subject`"),
+            "the spawn action names the agent, the step and the object",
         );
         assert!(
-            text.contains("no separate validation step"),
-            "the grill has two states — a structured finding is coder-ready (no validate step, #31)",
+            text.contains("you do NOT carry a role manual"),
+            "and states, in as many words, that no manual travels with it",
+        );
+
+        // The NATIVE branch: the sub-agent is told to make the call, with the run_id it was handed.
+        assert!(
+            text.contains(r#"agent_context(run_id="<run_id>","#)
+                && text.contains("PULLS its own"),
+            "the native_task branch hands the run_id and names the call to make FIRST",
+        );
+
+        // The INLINE branch: the dispatcher IS the effector, so IT calls agent_context.
+        let inline = text
+            .split("mode `inline`")
+            .nth(1)
+            .expect("the manual has an inline branch");
+        assert!(
+            inline.contains("YOURSELF"),
+            "in inline mode the dispatcher makes the agent_context call itself: {inline}",
+        );
+
+        // The F6 reuse plumbing is GONE — it existed only to avoid re-sending a manual that no
+        // longer travels.
+        for gone in ["context_already_sent", "context_recall", "PASTE THE ONE YOU KEPT"] {
+            assert!(
+                !text.contains(gone),
+                "the forwarding-era rule `{gone}` must not survive",
+            );
+        }
+    }
+
+    /// N1 — the DISPATCHER renders STANDALONE (no Spec required), with the invoked SCOPE substituted
+    /// into the manual — so /nspec (which starts a FRESH Spec — none yet) and /ndoc drive the engine
+    /// the same way /ndev does, instead of erroring "could not resolve a Spec".
+    #[test]
+    fn dispatcher_renders_standalone_with_the_invoked_scope() {
+        let _g = db_guard();
+        let (db, _spec_id, _ws, _cwd) = seeded();
+        // role=dev + a scope + NO spec/cwd → the standalone dispatcher (no Spec resolves).
+        let out = agent_context(&db, &json!({ "role": "dev", "scope": "nspec" }))
+            .expect("agent_context ok")
+            .result;
+        let ctx = out["context"].as_str().expect("a rendered context");
+        assert!(
+            ctx.contains("Dev — dispatcher"),
+            "the dispatcher manual renders with no Spec bound"
         );
         assert!(
-            text.contains("review_comment_post"),
-            "replies in the comment with review_comment_post",
+            ctx.contains(r#"scope: "nspec""#),
+            "the invoked scope is substituted into run_start: {ctx}"
+        );
+        assert!(!ctx.contains("{{scope}}"), "the scope marker is resolved");
+        assert_eq!(out["spec_id"], serde_json::Value::Null);
+    }
+
+    /// The dispatcher's `{{rules}}` marker resolves to the ALWAYS scope ONLY — no `role:dev` (it
+    /// does not code) and no `fork` (built-in, not forked) — per the annex `context-dev-dispatcher`.
+    #[test]
+    fn render_dev_dispatcher_rules_resolve_to_always_only() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        // A populated set carrying every scope + a fork lineage — the dispatcher must still resolve
+        // to ALWAYS only (it ignores role:dev + fork), proving the thin resolution.
+        let rules = RuleSet {
+            rules: vec![
+                Rule::curated(RuleScope::Always, "pnpm, never npm"),
+                Rule::curated(RuleScope::Role(AgentRole::Dev), "should be ignored for dev"),
+                Rule {
+                    scope: RuleScope::Fork,
+                    text: "should be ignored for a built-in dispatcher".into(),
+                    curated: false,
+                },
+            ],
+            lineage: Some(Lineage {
+                forked_from: "dev".into(),
+            }),
+        };
+        let text = render_agent_context_with_rules(&db, AgentRole::Dev, &spec_id, &rules, None)
+            .unwrap()
+            .unwrap();
+        // The marker itself is consumed (resolved), and the block names the ALWAYS-only resolution.
+        assert!(
+            !text.contains(RULES_MARKER),
+            "the {{rules}} marker is resolved"
         );
         assert!(
-            text.contains("NEVER resolve a human comment") || text.contains("never resolve"),
-            "human-only resolution",
+            text.contains("Resolved at the rules marker by scope (always)"),
+            "dispatcher resolves the always scope only",
         );
         assert!(
-            text.contains("recreate a PRD"),
-            "explicit anti-pattern captured",
+            text.contains("pnpm, never npm"),
+            "the always rule is injected"
+        );
+        assert!(
+            !text.contains("should be ignored"),
+            "role:dev + fork rules are NOT injected into the dispatcher",
         );
     }
 
+    /// The coder manual is PROHIBITIONS and nothing else. The seeded `coder` sub-workflow owns the
+    /// task lifecycle (`transition_task` start/done) and the validation (`gate_check`, run by nyx
+    /// over the PTY), and the node's label says what to do — so what is left is the set of things
+    /// NO graph structure can state: the transitions that are not the coder's, the gate that is not
+    /// its verdict, the `kind=human` task it must refuse, the `block`/`skip` no node covers, and
+    /// the follow-up it may not capture itself.
     #[test]
-    fn render_coder_carries_work_rules() {
+    fn render_coder_carries_only_the_prohibitions_the_graph_cannot_express() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Coder, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Coder, &spec_id, None)
             .unwrap()
             .unwrap();
         assert!(text.contains("design-system"), "compose from design-system");
-        assert!(text.contains("full suite"), "full suite once at the end");
         assert!(
-            text.contains("kind=human task -> STOP"),
-            "kind=human STOP rule",
+            text.contains("do a `kind=human` task"),
+            "kind=human is reserved for the user",
+        );
+        // The two transitions NO node covers are the only ones left.
+        assert!(
+            text.contains("task_transition block / skip"),
+            "block/skip stay with the coder (no node covers them)",
+        );
+        assert!(
+            text.contains("move a task to started / done — nyx does that around your spawn"),
+            "start/done are the graph's transition_task nodes, not the coder's",
+        );
+        assert!(
+            text.contains("run the acceptance gate, or rule on its verdict"),
+            "the gate is nyx's (gate_check), not the coder's",
+        );
+        // The hand-back contract replaces the self-declared "done".
+        assert!(
+            text.contains("a REPORT") && text.contains("never a state change"),
+            "the coder reports; it does not move the state",
+        );
+        // The state-driving prose is GONE.
+        for gone in [
+            "task_transition start/done",
+            "the full suite\n  once at the end",
+            "Task done -> task_transition done",
+            "continue with the other independent tasks",
+        ] {
+            assert!(
+                !text.contains(gone),
+                "the state-driving instruction `{gone}` must not survive in the coder manual",
+            );
+        }
+        // …and so is the PROCESS the graph executes: the node label says what to do at this step.
+        for gone in ["## How you work", "TDD at the pre-agreed seams", "Typecheck + targeted"] {
+            assert!(
+                !text.contains(gone),
+                "the narrated process `{gone}` belongs to the graph, not to the manual",
+            );
+        }
+    }
+
+    /// v2.8 (task 01KY71J3MVTQ1V86J92GNC9FKH, annex `context-effecteur`): an EFFECTOR (coder)
+    /// renders its ROLE context PLUS `{{rules}}` injected at the marker, resolved by scope
+    /// (always / role:coder / fork) + lineage. This drives a POPULATED [`RuleSet`] through the real
+    /// render seam to prove the marker resolves + injects (grouped, ordered, role-isolated).
+    #[test]
+    fn render_effector_injects_rules_resolved_by_scope_and_lineage() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let rules = RuleSet {
+            rules: vec![
+                Rule::curated(RuleScope::Always, "pnpm, never npm"),
+                Rule::curated(RuleScope::Always, "sandbox-* libs auto-include"),
+                Rule::curated(
+                    RuleScope::Role(AgentRole::Coder),
+                    "compose from the design-system",
+                ),
+                // A DIFFERENT role's rule must NOT leak into the coder render.
+                Rule::curated(
+                    RuleScope::Role(AgentRole::Auditor),
+                    "auditor-only directive",
+                ),
+                Rule {
+                    scope: RuleScope::Fork,
+                    text: "amounts in cents, never a float".into(),
+                    curated: false,
+                },
+            ],
+            lineage: Some(Lineage {
+                forked_from: "coder".into(),
+            }),
+        };
+        let text = render_agent_context_with_rules(&db, AgentRole::Coder, &spec_id, &rules, None)
+            .unwrap()
+            .unwrap();
+
+        // The role context is still there, and the marker is consumed (resolved).
+        assert!(
+            text.contains("Context: Coder Agent"),
+            "role context preserved"
+        );
+        assert!(!text.contains(RULES_MARKER), "the marker is resolved");
+        // The injected block header names the RESOLVED scopes + the lineage.
+        assert!(
+            text.contains("## Rules (project directives)")
+                && text
+                    .contains("Resolved at the rules marker by scope (always + role:coder + fork)")
+                && text.contains("forked_from coder"),
+            "rules block header names the resolved scopes + lineage",
+        );
+        // Each scope group carries its rule, tagged curated|proposed.
+        assert!(
+            text.contains("### always")
+                && text.contains("- pnpm, never npm [curated]")
+                && text.contains("- sandbox-* libs auto-include [curated]"),
+            "always-scoped rules injected",
+        );
+        assert!(
+            text.contains("### role:coder")
+                && text.contains("- compose from the design-system [curated]"),
+            "role:coder rule injected",
+        );
+        assert!(
+            text.contains("### fork")
+                && text.contains("- amounts in cents, never a float [proposed]"),
+            "fork rule injected (proposed tag)",
+        );
+        // Role isolation: another role's rule is NOT injected here.
+        assert!(
+            !text.contains("auditor-only directive"),
+            "a role:auditor rule does not leak into the coder render",
+        );
+        // The rules land AFTER the role contract (injected at the marker at the end of the template).
+        let contract_at = text.find("Context: Coder Agent").unwrap();
+        let rules_at = text.find("## Rules (project directives)").unwrap();
+        assert!(
+            rules_at > contract_at,
+            "rules injected after the role contract"
         );
     }
 
-    /// Review finding 01KY4ZJPNBJMYJDGWTMXWNYJZV: the Dev orchestrator's backlog capture is
-    /// HUMAN-GATED — an out-of-scope follow-up is PROPOSED to the user and only `idea_add`ed AFTER
-    /// they validate that specific add (never autonomous), and the Dev does NOT reconcile.
+    /// coder / auditor / doc each render their role context WITH the `{{rules}}` marker RESOLVED,
+    /// even against the empty default source (no store yet): the marker is consumed and an explicit
+    /// scope-named "no rules configured" block is injected. The auditor's block also lands after its
+    /// axis instruction, and the resolved scopes name each effector's own role scope.
     #[test]
-    fn render_dev_carries_human_gated_backlog_capture() {
+    fn render_effectors_resolve_the_rules_marker_with_the_empty_default_source() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Dev, None, &spec_id)
+        for (role, scope_label) in [
+            (AgentRole::Coder, "role:coder"),
+            (AgentRole::Doc, "role:doc"),
+        ] {
+            let text = render_agent_context(&db, role, &spec_id, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !text.contains(RULES_MARKER),
+                "{scope_label}: marker resolved"
+            );
+            assert!(
+                text.contains("## Rules (project directives)"),
+                "{scope_label}: rules block injected",
+            );
+            assert!(
+                text.contains(&format!("scope (always + {scope_label})")),
+                "{scope_label}: resolved scopes name the effector's own role scope (no fork, unforked)",
+            );
+            assert!(
+                text.contains("No project rules configured yet"),
+                "{scope_label}: empty store renders the explicit no-rules note",
+            );
+        }
+        // The auditor: the rules block resolves at the END of its own manual.
+        let auditor = render_agent_context(&db, AgentRole::Auditor, &spec_id, None)
             .unwrap()
             .unwrap();
-        // PROPOSE to the user, then idea_add ONLY after they validate that specific addition.
+        assert!(!auditor.contains(RULES_MARKER), "auditor marker resolved");
         assert!(
-            text.contains("PROPOSE it to the USER")
-                && text.contains("only AFTER they validate")
-                && text.contains("idea_add("),
-            "Dev proposes the follow-up and captures only after the user validates it",
+            auditor.contains("scope (always + role:auditor)"),
+            "auditor resolves its own role scope",
         );
-        // A human gate on EVERY add — the anti-autonomous wording (no on-its-own-authority add).
-        assert!(
-            text.contains("human gate on EVERY add"),
-            "every add is human-gated (backlog never fills with unvetted junk)",
+        let how_at = auditor.find("One point, one finding").unwrap();
+        let rules_at = auditor.find("## Rules (project directives)").unwrap();
+        assert!(rules_at > how_at, "auditor rules land after its manual");
+    }
+
+    /// The out-of-scope roles (spec / prototype) carry NO `{{rules}}` marker, so their render is
+    /// passed through untouched — no rules block, and certainly no stray unresolved marker.
+    #[test]
+    fn non_effector_roles_carry_no_rules_marker() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        for role in [AgentRole::Spec, AgentRole::Prototype] {
+            let text = render_agent_context(&db, role, &spec_id, None)
+                .unwrap()
+                .unwrap();
+            assert!(!text.contains(RULES_MARKER), "no stray marker");
+            assert!(
+                !text.contains("## Rules (project directives)"),
+                "no rules block for a non-effector role",
+            );
+        }
+    }
+
+    /// The pure resolution semantics: always for every role; `role:<role>` scoped to that role;
+    /// `fork` only with a lineage; the DISPATCHER (dev) is always-only.
+    #[test]
+    fn resolve_for_orders_scopes_isolates_roles_and_gates_fork_on_lineage() {
+        let set = RuleSet {
+            rules: vec![
+                Rule::curated(RuleScope::Always, "A"),
+                Rule::curated(RuleScope::Role(AgentRole::Coder), "C"),
+                Rule::curated(RuleScope::Role(AgentRole::Auditor), "U"),
+                Rule::curated(RuleScope::Fork, "F"),
+            ],
+            lineage: Some(Lineage {
+                forked_from: "coder".into(),
+            }),
+        };
+        // Coder (forked): always → role:coder → fork, in that order; auditor's rule excluded.
+        let coder: Vec<&str> = set
+            .resolve_for(AgentRole::Coder)
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(
+            coder,
+            vec!["A", "C", "F"],
+            "coder: always + role:coder + fork, ordered"
         );
-        assert!(
-            text.contains("do NOT idea_add it on your own authority"),
-            "Dev must NOT add autonomously",
+        // Auditor (same set): its own role rule, not the coder's.
+        let auditor: Vec<&str> = set
+            .resolve_for(AgentRole::Auditor)
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(
+            auditor,
+            vec!["A", "U", "F"],
+            "auditor: always + role:auditor + fork"
         );
-        // Dev does NOT reconcile — that curation belongs to /nspec.
-        assert!(
-            text.contains("You do NOT reconcile the backlog") && text.contains("/nspec"),
-            "reconciliation (close/merge/regroup) is the Spec author's job, not the Dev's",
+        // Dispatcher: always only (no role, no fork), even with the populated set + lineage.
+        let dev: Vec<&str> = set
+            .resolve_for(AgentRole::Dev)
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(dev, vec!["A"], "dev dispatcher: always only");
+        // No lineage → fork is dropped for the effectors too.
+        let unforked = RuleSet {
+            rules: set.rules.clone(),
+            lineage: None,
+        };
+        let coder_unforked: Vec<&str> = unforked
+            .resolve_for(AgentRole::Coder)
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(
+            coder_unforked,
+            vec!["A", "C"],
+            "unforked coder: no fork scope"
         );
     }
 
@@ -2281,22 +2398,18 @@ mod tests {
     fn render_coder_surfaces_followups_upward_not_idea_add() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Coder, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Coder, &spec_id, None)
             .unwrap()
             .unwrap();
-        // SURFACE upward to the orchestrator, in the final report or a note (same as a scope-gap).
+        // SURFACE upward to the orchestrator, in the report — never captured on its own authority.
         assert!(
-            text.contains("SURFACE to the dev orchestrator"),
-            "coder surfaces follow-ups upward to the orchestrator",
-        );
-        assert!(
-            text.contains("final report") && text.contains("task note"),
-            "surfaced via the final report / a task note",
+            text.contains("SURFACED upward in your report"),
+            "coder surfaces follow-ups upward instead of capturing them",
         );
         // It is explicitly told NOT to capture directly (no autonomous idea_add).
         assert!(
-            text.contains("you never call idea_add yourself")
-                && text.contains("Never capture it directly"),
+            text.contains("capture a follow-up yourself (no idea_add)")
+                && text.contains("the orchestrator alone proposes it to the user"),
             "coder is told NOT to idea_add itself",
         );
         // The direct-capture form (with source=session) is the DEV's tool, never the coder's.
@@ -2306,888 +2419,189 @@ mod tests {
         );
     }
 
-    /// Review finding 01KY4ZJQPZZPE21Y3QDSDAACP4: the Spec author keeps its existing SEARCH +
-    /// auto-link AND now also RECONCILES the backlog (close resolved with the MANUAL motif, merge
-    /// duplicates, regroup by theme) — auto-link and reconciliation being DIFFERENT actions.
+    /// ANTI-DUPLICATION SURVIVES THE DISSOLUTION, and it had to: the nspec GRAPH walks no idea node,
+    /// so "no duplicate Spec for a need the backlog already tracks" is a prohibition with NO
+    /// structural equivalent. It is kept as a prohibition (the Spec preamble) and as a CALL with
+    /// this project's id in it (the authoring render's live backlog block). What went is the
+    /// PROCEDURE around it — the narrated Step 0, and the backlog housekeeping (close / merge /
+    /// regroup), which prohibits nothing and which the idea tools' own descriptors carry.
     #[test]
-    fn render_spec_carries_backlog_search_and_reconciliation() {
+    fn render_spec_forbids_a_duplicate_spec_and_wires_the_backlog_call() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Spec, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Spec, &spec_id, None)
             .unwrap()
             .unwrap();
-        // The EXISTING search + auto-link wiring is preserved.
+        // The PROHIBITION, self-contained: search first, link what the Spec resolves.
         assert!(
-            text.contains("Search the idea backlog FIRST")
-                && text.contains("idea_search(")
+            text.contains("open a Spec for a need the project's backlog already tracks")
+                && text.contains("idea_search")
                 && text.contains("kind=\"addresses\""),
-            "search + auto-link (addresses) is kept",
+            "the anti-duplication prohibition names both verbs:\n{text}",
         );
-        // The NEW reconciliation: close (manual) / merge duplicates / regroup by theme.
+        // The narrated procedure is gone.
+        for gone in [
+            "## Step 0",
+            "RECONCILE the backlog while you author",
+            "do NOT call idea_implement by hand",
+        ] {
+            assert!(
+                !text.contains(gone),
+                "the narrated backlog procedure `{gone}` must not survive",
+            );
+        }
+
+        // And the AUTHORING render (no Spec yet — where a duplicate is actually created) carries the
+        // call with the project's own id already in it.
+        let (db2, project_id, _ws2, _cwd2) = seeded_project_without_spec();
+        let project = db2
+            .with_conn(|c| db::get_project(c, &project_id))
+            .unwrap()
+            .unwrap();
+        let authoring = render_spec_authoring(&db2, Some(&project)).unwrap();
         assert!(
-            text.contains("RECONCILE the backlog while you author"),
-            "reconciliation instruction added",
+            authoring.contains(&format!("idea_search(project_id=\"{project_id}\"")),
+            "the authoring render wires the call with THIS project's id:\n{authoring}",
         );
         assert!(
-            text.contains("idea_close(") && text.contains("idea_merge("),
-            "close the resolved + merge duplicates",
-        );
-        assert!(text.contains("grouped by theme"), "regroup by theme");
-        // close = MANUAL motif; implemented = AUTO (do NOT call idea_implement by hand).
-        assert!(
-            text.contains("do NOT call idea_implement by hand"),
-            "manual close vs auto implemented is spelled out",
-        );
-        // auto-link and reconciliation are DISTINGUISHED as different actions.
-        assert!(
-            text.contains("DIFFERENT actions"),
-            "auto-link vs reconciliation are clearly distinguished",
+            authoring.contains("rather than opening a duplicate Spec")
+                && authoring.contains("idea_link(idea_id, spec_id, kind=\"addresses\")"),
+            "and states what a match means + the link that follows",
         );
     }
 
+    /// The AUDITOR audits ONE COMMITMENT of the Spec — the section the spawn's `subject` names —
+    /// and files findings; it never rules on the work. Its manual must SAY both, name the four
+    /// commitment sections it can be pointed at, and carry NOTHING of the invented "axes" it used to
+    /// pick from (v2.8: the questions come from the Spec, the verdict from the findings).
     #[test]
-    fn render_auditor_is_rendered_per_axis() {
+    fn render_auditor_audits_one_named_commitment_and_pronounces_no_verdict() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let standards = render_agent_context(
-            &db,
-            AgentRole::Auditor,
-            Some(AuditAxis::Standards),
-            &spec_id,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            standards.contains("AUDITOR · STANDARDS"),
-            "axis in the header",
-        );
-        assert!(
-            standards.contains("Your axis = standards") && standards.contains("CODING_STANDARDS"),
-            "standards axis block",
-        );
-        assert!(
-            !standards.contains("Your axis = spec\n"),
-            "the spec axis block is not mixed in",
-        );
+        let auditor = render_agent_context(&db, AgentRole::Auditor, &spec_id, None)
+            .unwrap()
+            .unwrap();
 
-        let spec_axis =
-            render_agent_context(&db, AgentRole::Auditor, Some(AuditAxis::Spec), &spec_id)
+        assert!(auditor.contains("=== NYX CONTEXT — AUDITOR ==="), "header");
+        assert!(
+            auditor.contains("ONE COMMITMENT") && auditor.contains("`subject`"),
+            "the mandate: one commitment, named by the spawn's subject",
+        );
+        // WHICH commitment is the graph's business, not the manual's: the spawn node names it and
+        // the render carries THAT section, saying so.
+        for section in [
+            "user_stories",
+            "testing_decisions",
+            "implementation_decisions",
+            "out_of_scope",
+        ] {
+            let pass = render_agent_context(&db, AgentRole::Auditor, &spec_id, Some(section))
                 .unwrap()
                 .unwrap();
-        assert!(spec_axis.contains("AUDITOR · SPEC"), "axis in the header");
+            assert!(
+                pass.contains(&format!("Your subject is `{section}`")),
+                "a pass spawned on `{section}` is told so, and gets that section alone",
+            );
+        }
         assert!(
-            spec_axis.contains("Your axis = spec") && spec_axis.contains("scope creep"),
-            "spec axis block",
+            auditor.contains("task_add kind=review") && auditor.contains("file:line"),
+            "the finding rules survive: a finding is a review task, anchored",
         );
-
-        // No axis -> both descriptions offered so the reader picks one.
-        let no_axis = render_agent_context(&db, AgentRole::Auditor, None, &spec_id)
-            .unwrap()
-            .unwrap();
         assert!(
-            no_axis.contains("standards | spec (pick one)"),
-            "axis-less auditor offers both",
+            auditor.contains("pronounce a verdict") && auditor.contains("DERIVES"),
+            "it is forbidden a verdict — nyx derives one from the findings",
         );
+        // The invented axes are GONE — no vocabulary left for the auditor to pick an angle.
+        for gone in [
+            "Your axis",
+            "standards | spec (pick one)",
+            "CODING_STANDARDS",
+            "scope creep",
+        ] {
+            assert!(
+                !auditor.contains(gone),
+                "the axis prose `{gone}` must not survive in the auditor manual",
+            );
+        }
     }
 
-    /// Review finding 01KYA146WYNK80SVFSXX3KKMPJ: the prototype manual must reflect the REAL v2.7
-    /// machinery (it was stuck on the stale "throwaway app / one command to launch" text that
-    /// named none of the shipped tools). It must describe design_inventory + the create → pages →
-    /// versions → variants → pin → present → feedback → election (is_main ≠ RETENU) → rebase →
-    /// distill cycle, the proto_composition seam (3 natures), the lock, and the design-system
-    /// consigne — so an agent can drive a proto end-to-end from it.
-    ///
-    /// Review #48 adds the ORDER to what is pinned: the manual used to list the pre-dev feedback
-    /// AFTER the election, while the review PRECEDES it (the feedback corrects the design before the
-    /// user retains a variant — PDR-0009). An agent following the manual top to bottom must execute a
-    /// VALID sequence, so the assertions below check positions, not just presence.
+    /// THE PROTOTYPE MANUAL IS PROHIBITIONS, AND THE PROCEDURE IS THE TOOLS'. It used to carry
+    /// ~71 800 characters — 48 000 of them a "Design-system first" procedure its own text called
+    /// "ONCE PER PROJECT", plus the round loop the `prototyper` graph drives. Every contract it
+    /// narrated is the `design_*` / `proto_*` DESCRIPTORS an agent already receives in `tools/list`
+    /// (guarded by `mcp::tests::tool_descriptors_describe_the_variance_model_the_tools_actually_accept`),
+    /// so narrating it here billed the same text twice. What no descriptor and no node label can
+    /// state is what the role may NOT do — this test pins exactly that, and pins the absence of the
+    /// rest.
     #[test]
-    fn render_prototype_role_carries_the_v2_7_machinery() {
+    fn render_prototype_carries_the_prohibitions_and_no_procedure() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Prototype, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Prototype, &spec_id, None)
             .unwrap()
             .unwrap();
         assert!(text.contains("Context: Prototype"), "prototype preamble");
-        // Design-system FIRST: inventory the catalogue + the compose-don't-reinvent consigne
-        // (mirror of the coder's).
-        assert!(
-            text.contains("design_inventory(project_id)")
-                && text.contains("never re-invent a bespoke"),
-            "design-system consigne (inventory + compose, don't re-invent)",
-        );
-        // Finding 01KYKXPHW103C0V5RBXQ29BBXQ — the RECIPE pivot: nyx holds NO framework knowledge,
-        // so the manual must teach the sequence EXPLORE → RECIPE → INVENTORY, say it is done ONCE
-        // per project, and name the escape hatch (pins).
-        assert!(
-            text.contains("EXPLORE → RECIPE → INVENTORY, ONCE PER PROJECT")
-                && text.contains("design_recipe(project_id)")
-                && text.contains("design_recipe(project_id, recipe:")
-                && text.contains("nyx holds NO framework knowledge"),
-            "the explore → write the recipe → inventory sequence, once per project",
-        );
-        assert!(
-            text.contains("ESCAPE HATCH")
-                && text.contains("design_recipe(project_id, pins:")
-                && text.contains("bypasses every"),
-            "the pin escape hatch for what no rule expresses",
-        );
-        assert!(
-            text.contains("ONE-OFF per PROJECT, not")
-                && text.contains("if the result looks wrong, fix the RECIPE"),
-            "the recipe is written once and is the lever when the inventory looks wrong",
-        );
-        // Review #40 — the BUNDLE pivot: the manual must describe the REAL flow (nyx discovers the
-        // bundles, the AGENT synthesizes each one into a logic-less Handlebars template + params +
-        // states and stores it back), the BOUNDED response, and the INCREMENTAL rule.
-        assert!(
-            text.contains("BUNDLE")
-                && text.contains("design_inventory(project_id, component:")
-                && text.contains("design_refresh_component(project_id, name, template"),
-            "the bundle flow: list bundles → read one → synthesize → store it",
-        );
-        assert!(
-            text.contains("LOGIC-LESS") && text.contains("pending_only"),
-            "the logic-less synthesis target + the bounded/pending work list",
-        );
-        assert!(
-            text.contains("INCREMENTAL") && text.contains("never re-synthesized"),
-            "an unchanged bundle is never re-synthesized",
-        );
-        // Review 01KYMF0KZJBSK064AH0X4ZDQ29 — the INCREMENTAL LOOP, made explicit and imperative.
-        // The barrier is the hard response cap (its twin finding); THIS is the method, and the
-        // manual has to spell it out in order, or a naive agent still tries to slurp the catalogue.
-        assert!(
-            text.contains("Read in a LOOP, never in one gulp") && text.contains("64 KiB"),
-            "the manual names the incremental loop and the cap it lives under",
-        );
-        assert!(
-            text.contains("ASK FOR WHAT IS LEFT")
-                && text.contains("pending_only: true")
-                && text.contains("the work list shrinks as you work"),
-            "rule 1: list with pending_only, so the loop ends",
-        );
-        assert!(
-            text.contains("FOLLOW `next_offset` UNTIL IT IS `null`")
-                && text.contains("`limit` does not raise the cap"),
-            "rule 2: follow next_offset rather than asking for a big page",
-        );
-        assert!(
-            text.contains("ONE ITEM AT A TIME") && text.contains("SYNTHESIZE it, STORE it"),
-            "rule 3: one bundle at a time, synthesized before the next",
-        );
-        assert!(
-            text.contains("NEVER ASSUME A RESPONSE IS COMPLETE")
-                && text.contains("`truncated`")
-                && text.contains("`total` vs `returned`")
-                && text.contains("`truncated_fields`"),
-            "rule 4: the truncation signal is named, field by field",
-        );
-        // …and the SAME discipline is carried onto the (now capped) proto reads.
-        assert!(
-            text.contains("proto_get(spec_id, section:")
-                && text.contains("sections.<name>")
-                && text.contains("proto_composition(prototype_id, page:")
-                && text.contains("`oversized: true`"),
-            "the proto reads are paged the same way (sections / by page / oversized)",
-        );
-        // The two halves are named as complementary: barrier + method.
-        assert!(
-            text.contains("the cap is the BARRIER") && text.contains("the loop is the METHOD"),
-            "the hard cap and the guidance are described as two halves of one thing",
-        );
-        // Review #42 — the CSS/tokens half of a synthesis. The manual used to say "synthesize the
-        // bundle" and stop there, so an agent produced structure with no style: the `.variants.ts`
-        // CVA was left as a dangling `{{class}}`, the variant axes never reached `states_json`, and
-        // hard-coded colours crept in. It must now spell out the three rules.
-        assert!(
-            text.contains("design_tokens(project_id, ingest: true)")
-                && text.contains("renders GREY until"),
-            "the tokens are ingested from the app BEFORE any synthesis (the grey-preview cause)",
-        );
-        assert!(
-            text.contains("RESOLVE THE CVA YOURSELF")
-                && text.contains(".variants.ts")
-                && text.contains("INLINE the resulting concrete class STRING"),
-            "CVA → concrete class strings inlined on the Handlebars nodes",
-        );
-        assert!(
-            text.contains("MAP THE VARIANT AXES TO `states_json` — ONE AXIS PER CVA AXIS")
-                && text.contains("each VALUE carries ITS OWN\n     RESOLVED CLASSES")
-                && text.contains("an axis WITH TWO VALUES"),
-            "each CVA axis becomes a NAMED axis whose values carry their classes",
-        );
-        // Finding 01KYQ0R84KVF6QVQXQ9YVG9Z8T — THE RULE, in the manual, once. The model used to
-        // expose four overlapping representations of the same notion (param / state / CVA axis /
-        // boolean) with nothing saying which was which, and the four reported symptoms all came from
-        // that flou. The manual must state the rule, and it must be one sentence.
-        assert!(
-            text.contains("A VARIANCE AXIS GOES IN THE AXES (`states_json`), NEVER IN THE")
-                && text.contains(
-                    "A SUBSTITUTED VALUE GOES IN THE PARAMS (`params_json`), NEVER IN THE AXES"
-                )
-                && text.contains("Classes ⇒ axis. Value ⇒ param."),
-            "THE RULE is written down, in one line, both ways",
-        );
-        // HOW a variant is actually RENDERED: the shim applies the ACTIVE value's classes of every
-        // axis, so ONE element expresses the whole product. `data-nyx-state-case` remains, and
-        // `data-nyx-if` generalizes it to a condition on any axis value (the structural half).
-        assert!(
-            text.contains("THE VARIANCE MODEL — NAMED AXES, THE CLASSES ON THE VALUES")
-                && text
-                    .contains("the ACTIVE\n   value's classes onto the component's root element")
-                && text.contains("You write ONE element")
-                && text.contains("you never\n   enumerate it"),
-            "the axes applier is documented as the normal way to express a variant",
-        );
-        assert!(
-            text.contains("FOR WHAT CLASSES CANNOT DO, THE STRUCTURE: `data-nyx-if`")
-                && text.contains("data-nyx-if=\"loading=on\"")
-                && text.contains("data-nyx-if-not")
-                && text.contains("`data-nyx-state-case=\"<value>\"` still works"),
-            "the structural half is the generalized data-nyx-if, and the state case survives",
-        );
-        assert!(
-            text.contains("WHAT MAKES A VALUE REAL: `classes`, or a structural case")
-                && text
-                    .contains("naming the\n   component, the axis, the value and the correction"),
-            "an inert value is named as THE defect, and the write-time warning is announced",
-        );
-        assert!(
-            text.contains("THE COMPLETE SHAPE — a `button` with TWO AXES + ONE TEXT PARAM")
-                && text.contains("{ \"name\": \"variant\", \"values\": [")
-                && text.contains("{ \"name\": \"size\", \"values\": [")
-                && text.contains("{ \"name\": \"loading\", \"values\": [")
-                && text.contains("\"name\": \"label\", \"type\": \"text\", \"required\": true")
-                && text.contains("THREE axes, ONE element, ONE param"),
-            "a COMPLETE example: two axes + a structural boolean + one text param, ONE element",
-        );
-        // RETRO-COMPATIBILITY, said to the agent: the flat list is not deprecated, it is the
-        // degenerate case. 173 stored components are written that way.
-        assert!(
-            text.contains("THE LEGACY FLAT FORM STILL WORKS")
-                && text.contains("ONE\n   anonymous axis named `state`"),
-            "the flat states_json is documented as the one-axis degenerate case, not as dead",
-        );
-        assert!(
-            text.contains("USE THE DESIGN-SYSTEM CLASSES AND TOKENS, NEVER HARD-CODED COLOURS")
-                && text.contains("bg-[#2563eb]"),
-            "design-system classes/tokens rather than a frozen copy of a colour",
-        );
-        // Finding 01KYPSG0HPG2D28CMJEXRKNEVK — the params CONTRACT itself. The manual asked for a
-        // `params_json` without ever saying what may be IN it: the agent guessed `type: "enum"`,
-        // the UI silently fell back to `text`, its `options` were dropped, and a constrained choice
-        // came out as a free-text field. The schema must be written down, exhaustively.
-        assert!(
-            text.contains("THE `params_json` SCHEMA, IN FULL")
-                && text.contains("THE SIX TYPES, EXHAUSTIVELY")
-                && text.contains("`text`")
-                && text.contains("`html`")
-                && text.contains("`state`")
-                && text.contains("`boolean`")
-                && text.contains("`number`")
-                && text.contains("`select`"),
-            "the six accepted param types are listed exhaustively",
-        );
-        assert!(
-            text.contains("MANDATORY for `select`")
-                && text.contains("`options` means something for `select` ONLY"),
-            "what `options` is for, and where it is required",
-        );
-        // The two param shapes that are really an AXIS in disguise, named as such in the type list
-        // (finding 01KYQ0R84KVF6QVQXQ9YVG9Z8T): the DEPRECATED `state`, and the boolean whose toggle
-        // is decorative until it becomes a two-valued axis.
-        assert!(
-            text.contains("`state`   — DEPRECATED, do NOT write it")
-                && text.contains("a boolean param can change NOTHING in\n                 the rendering")
-                && text.contains("it is AN AXIS WITH TWO\n                 VALUES"),
-            "the deprecated `state` type and the inert boolean are named where an agent reads types",
-        );
-        assert!(
-            text.contains("AN UNKNOWN `type` IS REFUSED, NOT REPAIRED")
-                && text.contains("\"enum\"")
-                && text.contains("SILENT fallback to `text`"),
-            "an unknown type is refused at the write, and the manual says why",
-        );
-        assert!(
-            text.contains("A COMPLETE `params_json`")
-                && text.contains("no `disabled` boolean either")
-                && text.contains("\"name\": \"align\", \"type\": \"select\", \"options\"")
-                && text.contains("\"required\": true")
-                && text.contains("\"preview\"")
-                && text.contains("\"default\""),
-            "a COMPLETE JSON example carrying every field and the useful types",
-        );
-        // The DUPLICATION, arbitrated: a variant is declared ONCE, and `states_json` is the one
-        // that renders — a `select` param over the same names is decorative by construction.
-        assert!(
-            text.contains("A VARIANT IS EXPRESSED ONCE — AND IT IS `states_json`")
-                && text.contains("is not a value: it is a whole SET of classes")
-                && text.contains("the one that")
-                && text.contains("CHANGES THE RENDERING"),
-            "the variant is expressed once, and the manual says which one is authoritative and why",
-        );
-        // Finding 01KYPD8K75EC2AAY1KVAS2XZNX then 01KYPJ1RC6WJX1Z9CPPV23FG27 — the PARAMS half of a
-        // synthesis. The catalogue tile renders ONE instance, so a param the agent leaves without a
-        // usable value is substituted with the EMPTY STRING: a `button` becomes an unlabeled pill, a
-        // `card` an empty box. But "give every param a realistic DEFAULT" was the WRONG cure: a
-        // `button` has no default label — the label is REQUIRED — so a default written to fill the
-        // tile MISSTATES the contract. The manual must ask for the two notions SEPARATELY.
-        assert!(
-            text.contains("MARK WHAT IS REQUIRED, AND GIVE A PREVIEW VALUE")
-                && text.contains("nyx will NOT invent")
-                && text.contains("content in your place"),
-            "required + preview are asked for separately, and nyx fabricates neither",
-        );
-        assert!(
-            text.contains("the catalogue card renders ONE instance")
-                && text.contains("no chip-bar and no variant listing")
-                && text.contains("substituted with the EMPTY STRING")
-                && text.contains("HAS NO DEFAULT LABEL"),
-            "the WHY: the vignette is one instance, and a required param has no default to render",
-        );
-        assert!(
-            text.contains("`required` (boolean)")
-                && text.contains("A required param has NO default, by definition")
-                && text.contains("ONLY when the source carries one")
-                && text.contains("@Input() label = 'Enregistrer'"),
-            "required is the contract; a default exists only when the SOURCE declares one",
-        );
-        assert!(
-            text.contains("used ONLY to render an aperçu")
-                && text.contains("Give one to EVERY required param")
-                && text
-                    .contains("The aperçu resolves `preview` first, then `default`, then NOTHING")
-                && text.contains("does the vignette LOOK LIKE the component?"),
-            "the preview value: what it is for, who needs one, and how the aperçu resolves it",
-        );
-        // The full agent-driven cycle: create → pages/versions/variants → pin → present → elect.
-        assert!(
-            text.contains("proto_create(spec_id")
-                && text.contains("proto_add_page(")
-                && text.contains("proto_add_version(")
-                && text.contains("proto_add_variant(")
-                && text.contains("proto_pin_page(")
-                && text.contains("proto_present_round("),
-            "the create/compose/pin/present cycle is spelled out",
-        );
-        // Election: the USER poses the RETENU (proto_elect_variant), distinct from is_main.
-        assert!(
-            text.contains("proto_elect_variant(") && text.contains("RETENU"),
-            "the user's RETENU election via proto_elect_variant",
-        );
-        assert!(
-            text.contains("is_main") && text.contains("DISTINCT from"),
-            "is_main (agent reco) is distinguished from the RETENU (user decision)",
-        );
-        // Review #46: the agent can actually POSE its reco — the manual names the tool that does it.
-        assert!(
-            text.contains("proto_recommend_variant(variant_id)")
-                && text.contains("it never poses the RETENU"),
-            "the agent's is_main reco is posable (proto_recommend_variant) and never poses the RETENU",
-        );
-        // Pre-dev feedback anchored to a node, NOT transmitted to the coder.
-        assert!(
-            text.contains("proto_feedback_create(")
-                && text.contains("proto_feedback_resolve(")
-                && text.contains("NEVER transmitted to the coder"),
-            "node-anchored pre-dev feedback, never transmitted to the coder",
-        );
-        // DONE-CRITERION (review #48): the cycle is in USE ORDER — an agent that follows it top to
-        // bottom runs a VALID sequence. The decisive pair: the pre-dev review comes BEFORE the
-        // election (it corrects the design; the election settles a corrected design), and both come
-        // after the presentation and before the distill freeze.
-        let at = |needle: &str| {
-            text.find(needle)
-                .unwrap_or_else(|| panic!("the manual names {needle}"))
-        };
-        let steps = [
-            "proto_create(spec_id",
-            "proto_add_page(",
-            "proto_add_variant(",
-            "proto_pin_page(",
-            "proto_present_round(",
-            "proto_feedback_create(",
-            "proto_elect_variant(",
-            "proto_rebase(",
-            "proto_distill(",
-        ];
-        for pair in steps.windows(2) {
-            assert!(
-                at(pair[0]) < at(pair[1]),
-                "the cycle is out of order: {} must be described before {}",
-                pair[0],
-                pair[1],
-            );
-        }
-        // …and the closing summary of the human loop tells the SAME story (it used to invert it).
-        assert!(
-            text.contains(
-                "compose → present → gather +\nresolve the pre-dev feedback → the user elects the \
-                 RETENU → rebase for the next round"
+
+        // THE PROHIBITIONS — each one is a rule the graph's structure cannot express.
+        for (needle, why) in [
+            (
+                "re-invent a rendering",
+                "compose from the catalogue; a missing component is AUTHORED as [NEW]",
             ),
-            "the round-loop summary lists the feedback BEFORE the election too",
-        );
-        // Rebase (rollback) + distill (freeze/lock the election).
-        assert!(
-            text.contains("proto_rebase(") && text.contains("proto_distill("),
-            "rebase (rollback) + distill (freeze) are described",
-        );
-        // The lock: once distilled, election mutations are refused → open a new round.
-        assert!(
-            text.contains("élection figée") && text.contains("REFUSED (invalid_state)"),
-            "the lock refuses election mutations once distilled",
-        );
-        // The composition seam + its 3 natures + greenfield [NEW] authoring.
-        assert!(
-            text.contains("proto_composition(prototype_id)")
-                && text.contains("`[DS]`")
-                && text.contains("`[NEW]`")
-                && text.contains("`[inline]`")
-                && text.contains("proto_author_component("),
-            "the coder seam (proto_composition) with the 3 natures + [NEW] authoring",
-        );
-        // The stale wording is GONE (recadré for the greenfield machinery).
-        assert!(
-            !text.contains("One command to launch") && !text.contains("throwaway branch"),
-            "the stale 'one command to launch / throwaway branch' text is removed",
-        );
-        // Finding 01KYS14G4V1Q5ERRAHB0QVW362 — THE MANUAL TEACHES ONE VOCABULARY, AND IT IS `nyx`.
-        // The machinery was ported from Depot and the interaction markers kept the OTHER TOOL'S
-        // NAME, right down to mechanisms invented here (`data-depot-if`, `data-depot-axis`). The
-        // manual is where that reached the agent: an agent who reads it writes what it reads. So
-        // the whole rendered text is checked for the word — not just the attributes — because a
-        // single leftover mention is a synthesis emitting the dead prefix all over again.
-        assert!(
-            !text.to_lowercase().contains("depot"),
-            "the manual must not name the other tool anywhere — the vocabulary is data-nyx-*",
-        );
-        // Finding 01KYSNSBBT4N22ZTWQHFNQBDJQ — THE SAME SWEEP AS THE TOOL DESCRIPTORS, on the SAME
-        // list ([`STALE_AGENT_FORMULATIONS`]). The descriptors got a stale-wording guard; the manual
-        // did not, so it kept summarizing `states_json` as "its declared states/variants" — a
-        // formulation forbidden in a descriptor, in the first sentence an agent reads about the
-        // field. Same rule, both surfaces, one list: a wording chased off one can no longer survive
-        // on the other.
-        let lowered = text.to_lowercase();
-        for (stale, why) in STALE_AGENT_FORMULATIONS {
-            assert!(
-                !lowered.contains(stale),
-                "the manual still teaches the stale form {stale:?}: {why}",
-            );
-        }
-        assert!(
-            text.contains("data-nyx-if")
-                && text.contains("data-nyx-if-not")
-                && text.contains("data-nyx-state-case")
-                && text.contains("data-nyx-axis")
-                && text.contains("data-nyx-state")
-                && text.contains("data-nyx-set")
-                && text.contains("data-nyx-use")
-                && text.contains("data-nyx-use-axes")
-                && text.contains("data-nyx-param-"),
-            "…and it teaches the whole nyx vocabulary explicitly",
-        );
-        // Finding 01KYT0Z3RYGF3A881SDQN0X9D7 (MAJOR) — THE AGENT MUST BE TOLD IT CAN SEE, AND TOLD
-        // WHAT IT STILL CANNOT. The warnings validate the STRUCTURE and never the RENDERING, so on
-        // this very feature every visual defect was found by the human and by no tool. The manual
-        // now names the tool, teaches the LOOP, and — this is the half that matters most — states
-        // where the agent's sight stops, so "I rendered it" never becomes "I validated it".
-        assert!(
-            text.contains("design_preview(project_id, component, axes?, params?, children?)")
-                && text.contains("SYNTHESIZE (step 4) → RENDER (this) → LOOK at\n   the markup → CORRECT → render again"),
-            "the manual names design_preview and teaches the synthesize → render → look → correct loop",
-        );
-        assert!(
-            text.contains("WHAT YOU CANNOT SEE IN IT")
-                && text.contains("MARKUP, NOT AN\n   IMAGE, and it is NOT a visual validation")
-                && text
-                    .contains("You see a CLASS; you never see the pixel that class\n   produces")
-                && text.contains(
-                    "NEVER report a component or a page as visually validated\n   on the strength \
-                     of this tool"
-                ),
-            "…and it says explicitly what the resolved markup does NOT show, and forbids claiming \
-             the visual was validated",
-        );
-        assert!(
-            text.contains("THE IMAGE: nyx produces none")
-                && text.contains("The sidecar has no\n   rendering engine")
-                && text.contains("nothing in the product captures one"),
-            "the image question is answered in the manual too — no capture, and why",
-        );
-        // Finding 01KYT45C6RC7K84V1CA3561SPF (MAJOR) — THE COMPOSITION IS THE DELIVERABLE, and the
-        // agent had no way to render one. The manual must teach the SECOND subject of the same tool,
-        // must run it BEFORE the round is presented, must say what an unrenderable node does, and
-        // must state — franchement — what a viewport really decides here, so `viewport` is never
-        // read as "nyx laid this out at 390px".
-        assert!(
-            text.contains("design_preview(variant_id, axes?, node_key?,\n   viewport?)")
-                && text.contains("RENDER WHAT YOU ARE ABOUT TO PRESENT")
-                && text.contains("BEFORE proto_present_round"),
-            "the manual names the composition subject and puts it before the handback",
-        );
-        // Finding 01KZ3JS7PNF3F8GFB3GYRK6CKH — a VARIANT declares axes too, and they pilot the whole
-        // page. The manual must say so where it teaches the composition subject, or the agent has no
-        // reason to render the value that matters.
-        assert!(
-            text.contains("A COMPOSITION HAS ITS OWN AXES")
-                && text.contains("`declared_axes`")
-                && text.contains("must be ABSENT at `off`"),
-            "…and it teaches that a variant's axes are pilotable and must be looked at",
-        );
-        assert!(
-            text.contains("IT ALWAYS COMPLETES, AND IT NAMES WHAT IT COULD NOT RENDER")
-                && text.contains("class=\"nyx-unrendered\"")
-                && text.contains("READ\n   `unrendered[]` BEFORE PRESENTING"),
-            "…and it teaches that a [NEW] node is NAMED, never a failed tree",
-        );
-        assert!(
-            text.contains("nyx LAYS NOTHING OUT")
-                && text.contains("byte for byte the same at every width")
-                && text.contains("which responsive CLASSES are in force"),
-            "…and it says what a viewport really decides, instead of pretending it renders one",
-        );
-        assert!(
-            text.contains("A WHOLE PAGE IS NO DIFFERENT")
-                && text.contains(
-                    "A composition you have only rendered here is a\n   composition \
-                                  NOBODY HAS SEEN"
-                ),
-            "…and the honesty paragraph covers the composition, so the new subject reopens nothing",
-        );
-        // Finding 01KYT2CM2BVNZYS7Z8NFK51RCN — THE ICONS, taught as a DISCIPLINE, exactly like the
-        // CVA resolution beside it. Nothing was missing from the model (the user checked and said
-        // so): what was missing was the instruction, so a lazy synthesis put a glyph or a name where
-        // the real SVG belongs and the `icon` param had nothing useful to type into it. Both cases
-        // must be named, because their answers are opposite — inline for a FIXED icon, an `html`
-        // param (or a reference) for a VARIABLE one.
-        assert!(
-            text.contains("RESOLVE THE ICONS TO CONCRETE SVG")
-                && text.contains("An icon is MARKUP, not a character"),
-            "the manual teaches resolving icons to concrete SVG, like the CVA",
-        );
-        assert!(
-            text.contains("A FIXED icon")
-                && text.contains("INLINE the resolved SVG in the template")
-                && text.contains("A VARIABLE icon")
-                && text.contains("is a param of type `html`, substituted RAW")
-                && text.contains("data-nyx-use=\"IconCheck\""),
-            "…with the two cases named and the third lever (a shared icon is REFERENCED)",
-        );
-        assert!(
-            text.contains("there is no\n     `asset` param type and none is needed"),
-            "…and it says the existing shapes suffice — no primitive was added for this",
-        );
-        // Finding 01KYVMTWB71R0D0CT1SV88J8DX (MAJOR) — TAILWIND FIRST, THE CSS SLOT LAST. Everything
-        // the utilities cannot express used to be SILENTLY LOST (the loader's animation), so the
-        // manual must teach the ORDER (utilities are the channel), the four constructs that are the
-        // only admitted reasons, and the four constraints — each as a REFUSAL, not a suggestion.
-        assert!(
-            text.contains("TAILWIND FIRST, THE CSS SLOT LAST")
-                && text.contains("Tailwind is THE framework of this project and THE\n   channel")
-                && text.contains("SILENTLY LOST"),
-            "the manual teaches the order: utilities first, the slot as the last resort",
-        );
-        assert!(
-            text.contains("a custom `@keyframes`")
-                && text.contains("the CONTENT of a `::before` / `::after`")
-                && text.contains(":has(…)")
-                && text.contains("a `@container` query")
-                && text.contains("A slot that uses NONE of them is REFUSED"),
-            "…names the four constructs that are the only admitted reasons, and the refusal of \
-             anything else",
-        );
-        assert!(
-            text.contains("1. TOKENISED")
-                && text.contains("A hard-coded colour is a refusal in EVERY form")
-                && text.contains("2. SCOPED — AND NYX GUARANTEES IT, IT DOES NOT ASK YOU FOR IT")
-                && text.contains("3. BOUNDED — 2048 bytes")
-                && text.contains("4. SIGNALLED")
-                && text.contains("`css_slot_reason` is MANDATORY"),
-            "…and the four constraints, in order, each stated as a refusal",
-        );
-        assert!(
-            text.contains("no CSS slot will ever relax its CSP"),
-            "…and it says the CSP is never relaxed for a slot — the frame's contract is not \
-             negotiable either",
-        );
-        assert!(
-            text.contains("css_exceptions[]")
-                && text.contains("the REASON the agent wrote it")
-                && text.contains("`css_scope`"),
-            "…and the seam section says the exception reaches the coder WITH its reason",
-        );
-        // Finding 01KYW34347CZSNXCYS35KDG3EY (MAJOR) — A PROTOTYPE SHOWS A PARCOURS. Nothing let a
-        // node target ANOTHER PAGE, so a multi-page proto was a collection of screens that did not
-        // answer each other. The manual must teach the field, WHERE the link lives and why, that it
-        // is an ID and not a slug, what a dead link does, and that a cycle is fine — that last one
-        // stated rather than left open, because the natural reflex is to assume it is refused like a
-        // `data-nyx-use` cycle.
-        assert!(
-            text.contains("A PROTOTYPE SHOWS A PARCOURS, NOT A PILE OF SCREENS — `navigate_to`")
-                && text.contains("\"navigate_to\": \"<the id proto_add_page returned>\""),
-            "the manual teaches the inter-page link and its shape",
-        );
-        assert!(
-            text.contains("ON THE NODE, NEVER ON THE COMPONENT")
-                && text.contains("a destination is a\n     PLACEMENT choice")
-                && text.contains("BY ID, NEVER BY SLUG"),
-            "…and it argues WHERE the link lives, and why it is an id",
-        );
-        assert!(
-            text.contains("A DEAD LINK IS REFUSED AT THE WRITE")
-                && text.contains("navigation[].status = \"unknown_page\"")
-                && text.contains("never a click that silently does nothing"),
-            "…and it says what a link to a page that is gone does — refusal, then a named marker",
-        );
-        assert!(
-            text.contains("CYCLES ARE FINE")
-                && text.contains("A navigation is a USER GESTURE at click\n     time"),
-            "…and the cycle question is CLOSED in the text, not left to the reader",
-        );
-        assert!(
-            text.contains("THE PARCOURS CROSSES IT TOO — `navigates_to`")
-                && text.contains("`pinned`")
-                && text.contains("`unpinned`"),
-            "…and the seam section says the parcours reaches the coder, with its status",
-        );
-    }
-
-    /// DONE-CRITERION (finding `01KYSCY4J8JANZEJPYME86B1VH`): THE MANUAL AND THE VALIDATOR MUST NOT
-    /// CONTRADICT EACH OTHER. The manual's canonical component was written with a BARE baseline
-    /// (`{ "name": "off" }`) while the write path reported that value as one that "cannot change one
-    /// pixel" — so the text taught exactly what the tool reproached, and an agent doing the right
-    /// thing got a warning for it.
-    ///
-    /// The guard is not a COPY of the example (a copy drifts in silence): it EXTRACTS the canonical
-    /// blocks out of the rendered manual and runs them through the very functions the write path
-    /// calls. It fails the day the example changes shape — which is precisely when the pair has to
-    /// be re-verified — and the day a check starts reproaching what the manual teaches.
-    #[test]
-    fn the_manuals_canonical_component_passes_the_checks_the_write_path_applies() {
-        let _g = db_guard();
-        let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Prototype, None, &spec_id)
-            .unwrap()
-            .unwrap();
-        let example_at = text
-            .find("THE COMPLETE SHAPE — a `button` with TWO AXES + ONE TEXT PARAM")
-            .expect("the manual carries the canonical example");
-        let example = &text[example_at..];
-        let between = |from: &str, to: &str| -> String {
-            let start = example
-                .find(from)
-                .unwrap_or_else(|| panic!("the canonical example must carry '{from}'"));
-            let rest = &example[start + from.len()..];
-            let end = rest
-                .find(to)
-                .unwrap_or_else(|| panic!("'{to}' must follow '{from}' in the canonical example"));
-            rest[..end].trim().to_string()
-        };
-        let template = between(
-            "template (ONE self-contained string, ONE element):",
-            "states_json:",
-        );
-        let states = between("states_json:", "params_json:");
-        let params = between("params_json:", "\n");
-
-        // The example really is the shape the finding is about: a boolean axis whose BASELINE is
-        // bare, made visible by the COMPLEMENT alone (one `data-nyx-if`, no `data-nyx-if-not`).
-        assert!(
-            template.contains("data-nyx-if=\"loading=on\"")
-                && !template.contains("data-nyx-if-not"),
-            "the canonical template gates the spinner on `loading=on` and nothing else: {template}"
-        );
-        assert!(
-            states.contains("{ \"name\": \"off\" }"),
-            "the canonical axes declare the baseline BARE: {states}"
-        );
-        // Both blobs are valid JSON — the manual hands an agent something it can send verbatim.
-        serde_json::from_str::<Value>(&states).expect("the canonical states_json is valid JSON");
-        serde_json::from_str::<Value>(&params).expect("the canonical params_json is valid JSON");
-
-        // …and every WRITE-TIME check accepts it, warnings included.
-        crate::mcp_tools_design::ensure_params_json_accepted(Some(&params))
-            .expect("the canonical params declare only accepted types");
-        crate::mcp_tools_design::ensure_states_json_accepted(Some(&states))
-            .expect("the canonical axes are shaped as the write path demands");
-        let warnings = crate::mcp_tools_design::variance_warnings(
-            "Button",
-            &template,
-            Some(&states),
-            Some(&params),
-        );
-        assert!(
-            warnings.is_empty(),
-            "the manual's canonical example must not be warned about by the validator it teaches: \
-             {warnings:?}"
-        );
-
-        // …AND IT IS THE CASE THE RENDERER'S SUITE READS (finding `01KYSNQWQD1324E0NA0172M66J`).
-        // The TS twin used to RE-TYPE this example by hand, so it could not fail — it drifted. The
-        // example now lives in `contract/design-fixtures.json`, which both suites read, and THIS is
-        // where it stays moored to the manual: the day the manual's canonical component changes, the
-        // fixture has to follow, and the renderer is judged on the new one.
-        let collapse =
-            |text: &str| -> String { text.split_whitespace().collect::<Vec<_>>().join(" ") };
-        let (id, case) = crate::mcp_tools_design::variance_fixture_cases()
-            .into_iter()
-            .find(|(_, case)| case["from_manual"] == Value::Bool(true))
-            .expect("one fixture case IS the manual's canonical component");
-        assert_eq!(
-            collapse(case["template"].as_str().unwrap_or_default()),
-            collapse(&template),
-            "[{id}] the shared fixture's template must BE the manual's, whitespace aside"
-        );
-        for (field, from_manual) in [("states_json", &states), ("params_json", &params)] {
-            let fixture: Value = serde_json::from_str(case[field].as_str().unwrap_or_default())
-                .unwrap_or_else(|_| panic!("[{id}] the fixture's {field} is valid JSON"));
-            let manual: Value = serde_json::from_str(from_manual)
-                .unwrap_or_else(|_| panic!("the manual's {field} is valid JSON"));
-            assert_eq!(
-                fixture, manual,
-                "[{id}] the shared fixture's {field} must BE the manual's"
-            );
-        }
-    }
-
-    /// THE SAME DISCIPLINE, applied to the SIX PARAM TYPES (finding `01KZ3JTVM23C3MBATJZ3RYVPY6`,
-    /// family 1). The list of accepted `type` words lives at THREE places — the constant the write
-    /// path refuses outside of, the renderer's constant, and this manual's prose — and the prose was
-    /// moored to neither. A seventh type accepted by the write path alone would be taught nowhere
-    /// and rendered as a free-text field with its `options` silently dropped; a type removed from
-    /// the constant would go on being taught, and every agent believing the manual would have its
-    /// synthesis refused.
-    ///
-    /// Like the canonical component above, this is not a COPY of the list: it EXTRACTS the bullets
-    /// out of the RENDERED manual, in order, and confronts them with
-    /// `contract/design-fixtures.json` — the same file the write path's constant
-    /// (`the_shared_fixture_pins_the_six_param_types`) and the renderer's (`params.test.ts`) are
-    /// held to. It fails the day any one of the three moves alone.
-    #[test]
-    fn the_manual_teaches_exactly_the_six_param_types_the_write_path_accepts() {
-        let _g = db_guard();
-        let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Prototype, None, &spec_id)
-            .unwrap()
-            .unwrap();
-        let section = crate::mcp_tools_design::design_fixture_section("param_types");
-        let heading = section["manual_heading"]
-            .as_str()
-            .expect("the fixture names the manual's heading");
-        let at = text
-            .find(heading)
-            .unwrap_or_else(|| panic!("the manual carries the `{heading}` section"));
-
-        // The bullets, in order. A bullet opens with `* \`<type>\``; a line indented past the bullet
-        // marker CONTINUES the current one; anything else ENDS the list.
-        let mut taught: Vec<String> = Vec::new();
-        let mut ended = false;
-        for line in text[at..].lines().skip(1) {
-            if let Some(rest) = line.trim().strip_prefix("* `") {
-                taught.push(rest.split('`').next().unwrap_or_default().to_string());
-                continue;
-            }
-            if !taught.is_empty() && !line.starts_with("        ") {
-                ended = true;
-                break;
-            }
-        }
-        assert!(
-            ended && !taught.is_empty(),
-            "the `{heading}` section is a bullet list this guard can read: {taught:?}"
-        );
-
-        let pinned: Vec<&str> = section["types"]
-            .as_array()
-            .expect("the types")
-            .iter()
-            .map(|t| t.as_str().expect("a type"))
-            .collect();
-        assert_eq!(
-            taught, pinned,
-            "the manual bullets EXACTLY the accepted types, in the accepted order"
-        );
-
-        // …the one that is deprecated is TAUGHT as deprecated, never offered as a plain choice…
-        let deprecated = section["deprecated"].as_str().expect("the deprecated type");
-        let bullet_at = text[at..]
-            .find(&format!("* `{deprecated}`"))
-            .expect("the manual bullets the deprecated type");
-        let bullet = &text[at + bullet_at..];
-        let bullet_end = bullet[1..].find("* `").map_or(bullet.len(), |i| i + 1);
-        assert!(
-            bullet[..bullet_end].contains("DEPRECATED"),
-            "`{deprecated}` is taught as DEPRECATED — it is parsed, never offered"
-        );
-
-        // …and an unknown type is taught as REFUSED, not repaired. The renderer coerces an unknown
-        // type towards `text` because it only DISPLAYS a row already stored; that is not a second
-        // opinion about the write, and the manual is where the difference is stated.
-        assert_eq!(
-            section["unknown_type_is_refused"],
-            Value::Bool(true),
-            "the fixture states the write-path rule"
-        );
-        assert!(
-            text[at..].contains("AN UNKNOWN `type` IS REFUSED, NOT REPAIRED"),
-            "the manual says an unknown type is refused, never silently turned into `text`"
-        );
-    }
-
-    /// The SAME discipline, applied to the REFERENCE capability (finding
-    /// `01KYSCZ822K4ZFAAYTG6GT6YWZ`): the manual's canonical `data-nyx-use` line is EXTRACTED from
-    /// the rendered manual and handed to the very reader the render uses and the very validator the
-    /// write path applies. It fails the day the taught attribute names drift from the parsed ones —
-    /// a `data-nyx-uses` typo in the text would otherwise teach something nothing reads.
-    #[test]
-    fn the_manuals_canonical_reference_is_the_one_the_render_and_the_write_path_read() {
-        let _g = db_guard();
-        let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Prototype, None, &spec_id)
-            .unwrap()
-            .unwrap();
-        let section_at = text
-            .find("REFERENCE A SHARED SUB-COMPONENT, DO NOT COPY IT")
-            .expect("the manual teaches the reference capability");
-        let example = text[section_at..]
-            .lines()
-            .find(|line| {
-                line.contains("data-nyx-use=\"Spinner\"") && line.contains("data-nyx-param-")
-            })
-            .expect("the section carries the canonical reference line")
-            .trim()
-            .to_string();
-
-        // 1. The READER the render uses finds it, with its param and its fixed axis.
-        let sites = crate::render::reference_sites(&example);
-        assert_eq!(sites.len(), 1, "one reference site: {example}");
-        assert_eq!(sites[0].component, "Spinner");
-        assert_eq!(
-            sites[0].params,
-            vec![("label".to_string(), "{{label}}".to_string())],
-            "the taught attribute really names the param it claims to: {example}"
-        );
-        assert_eq!(sites[0].axes, vec![("size".to_string(), "sm".to_string())]);
-
-        // 2. The VALIDATOR the write path applies accepts it against the component it describes.
-        let catalogue = vec![crate::render::RenderComponent {
-            name: "Spinner".into(),
-            template: "<i class=\"animate-spin\">{{label}}</i>".into(),
-            states_json: Some(
-                r#"{"axes":[{"name":"size","values":[{"name":"sm","classes":"h-3 w-3"}]}]}"#.into(),
+            (
+                "pose the RETENU",
+                "the election is the USER's decision — the agent may only recommend",
             ),
-            params_json: Some(r#"[{"name":"label","type":"text","required":true}]"#.into()),
-            css_slot: None,
-        }];
-        let warnings = crate::mcp_tools_design::reference_warnings("Button", &example, &catalogue);
+            (
+                "mutate a distilled (frozen) round",
+                "a frozen round is never mutated; iterate by opening a new one",
+            ),
+            (
+                "carry pre-dev feedback into dev",
+                "the pre-dev comments are never transmitted to the coder",
+            ),
+            (
+                "decide to iterate again, or to freeze",
+                "ONE spawn = ONE round; nyx drives the rounds",
+            ),
+            (
+                "visually VALIDATED on the strength of design_preview",
+                "a markup render is not an eye — say what you checked and what you did not",
+            ),
+        ] {
+            assert!(
+                text.contains(needle),
+                "the prohibition `{needle}` ({why}) must survive the dissolution",
+            );
+        }
+
+        // THE PROCEDURE IS GONE — every one of these headings opened a block that re-narrated a
+        // tool's own description.
+        for gone in [
+            "## Design-system first",
+            "EXPLORE → RECIPE → INVENTORY, ONCE PER PROJECT",
+            "Read in a LOOP, never in one gulp",
+            "THE VARIANCE MODEL",
+            "THE SIX TYPES, EXHAUSTIVELY",
+            "REFERENCE A SHARED SUB-COMPONENT",
+            "TAILWIND FIRST, THE CSS SLOT LAST",
+            "## The prototype cycle (all agent-driven, via MCP)",
+            "## The composition seam (what dev consumes)",
+        ] {
+            assert!(
+                !text.contains(gone),
+                "the narrated procedure `{gone}` belongs to the tool descriptors, not here",
+            );
+        }
+
+        // AND THE SIZE IS THE POINT: the whole render, live Spec included, is now a fraction of the
+        // preamble it used to open with.
         assert!(
-            warnings.is_empty(),
-            "the manual's canonical reference must not be warned about by the validator it \
-             teaches: {warnings:?}"
+            text.len() < 6_000,
+            "the prototype render is {} chars — the dissolution is what this number is for",
+            text.len(),
         );
     }
-
     /// A Spec with NO dev workspace anchored — the PROTOTYPE's nominal state, because a prototype is
     /// settled BEFORE the code exists (finding `01KZ3JQYRN95EETZ0JBQXED13T`). The manual used to
     /// render `Workspace: (not anchored yet)` and NOTHING else: no project line, no `project_id`
@@ -3218,7 +2632,7 @@ mod tests {
             .expect("spec");
             (project.id, spec.id)
         });
-        let text = render_agent_context(&db, AgentRole::Prototype, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Prototype, &spec_id, None)
             .unwrap()
             .unwrap();
         assert!(
@@ -3235,13 +2649,28 @@ mod tests {
             "the project's repos are the ones the inventory walks — they belong to the project",
         );
         assert!(
-            text.contains("Where `project_id` comes from"),
+            text.contains("`design_*` call takes the `project_id` in this manual's header"),
             "the manual SAYS where the id it keeps asking for comes from",
         );
         // …and it must not tell the agent to go and find a workspace it does not have.
         assert!(
             !text.contains("(not anchored yet)"),
             "the workspace-less state is stated as normal, not as a missing prerequisite",
+        );
+        // It is stated ONCE, on the header's Workspace line — the section below points at it
+        // instead of repeating the same paragraph to every role (v2.8 render slim).
+        assert!(
+            text.contains("Workspace: (no dev workspace anchored — normal before the code exists"),
+            "the header carries the WHY",
+        );
+        assert_eq!(
+            text.matches("normal before the code exists").count(),
+            1,
+            "…and says it exactly once",
+        );
+        assert!(
+            text.contains("- workspace: (none anchored — see the header)"),
+            "the section points at the header rather than repeating it",
         );
 
         // The tool ECHOES the project id beside the manual, so a caller never parses the header.
@@ -3267,26 +2696,28 @@ mod tests {
         );
     }
 
+    /// v2.8: the proto DECISION is nspec's graph (`judge "graphic render?"` → `ask_human "go through
+    /// a proto?"` → `sub_workflow prototyper`). The author FLAGS a graphical subject and keeps what
+    /// it does with the verdict — it no longer proposes, waits, or launches the prototype role.
     #[test]
-    fn spec_role_proposes_the_proto_and_waits_for_validation() {
-        // T8 entry point: /nspec PROPOSES a proto when the subject is graphical and WAITS for the
-        // human's explicit go before delegating to the prototype role.
+    fn spec_role_flags_a_graphical_subject_and_never_launches_the_proto() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Spec, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Spec, &spec_id, None)
             .unwrap()
             .unwrap();
         assert!(
-            text.contains("Prototype if it is graphical"),
-            "proto proposed for a graphical subject",
+            text.contains("launch a prototype") && text.contains("you FLAG a graphical subject"),
+            "the author flags; it never launches",
         );
         assert!(
-            text.contains("PROPOSE to the human") && text.contains("then STOP"),
-            "proposes and stops until explicit acceptance",
+            text.contains("nyx asks the human and runs the prototyper itself"),
+            "the asking and the launching are nyx's",
         );
+        // The delegation call is gone — an effector never spawns another effector.
         assert!(
-            text.contains("agent_context(role=prototype"),
-            "delegates to the prototype role once accepted",
+            !text.contains("agent_context(role=prototype"),
+            "the spec author no longer delegates to the prototype role itself",
         );
     }
 
@@ -3294,16 +2725,16 @@ mod tests {
     fn render_doc_role_carries_doc_sync_context() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Doc, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Doc, &spec_id, None)
             .unwrap()
             .unwrap();
         assert!(text.contains("Context: Doc-sync"), "doc-sync preamble");
         assert!(
-            text.contains("Git range (since..until)"),
+            text.contains("Git range\n(since..until)"),
             "reads the Spec's git range",
         );
         assert!(
-            text.contains("Your output is a REVIEW"),
+            text.contains("validate your own output — it is a REVIEW"),
             "output is a review the human validates",
         );
     }
@@ -3312,34 +2743,29 @@ mod tests {
     fn render_spec_role_carries_authoring_context_and_sibling_specs() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Spec, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Spec, &spec_id, None)
             .unwrap()
             .unwrap();
-        // The written /nspec authoring context: preamble + exhaustive grill + autonomous slicing +
-        // guard-rails + the proto proposal.
+        // The /nspec authoring context: the role, its prohibitions, and the project's live state.
         assert!(text.contains("Spec Author"), "spec author preamble");
         assert!(
-            text.contains("ONE question at a time"),
-            "exhaustive grill rule"
+            text.contains("the human validates the SPEC, you decide the TASKS"),
+            "who validates what stays a prohibition, not a procedure",
         );
         assert!(
-            text.contains("AUTONOMOUS") && text.contains("does NOT validate the tasks"),
-            "autonomous decomposition rule",
-        );
-        assert!(
-            text.contains("ready is sensitive"),
-            "ready guard-rail present",
+            text.contains("transition the Spec's lifecycle"),
+            "the absolute no-transition prohibition is present (N17)",
         );
         // Anti-duplication live weaving: the project's other Specs (here: none besides this one).
         assert!(
             text.contains("Existing Specs in the project (anti-duplication)"),
             "sibling-specs weaving section",
         );
-        // The idea-backlog wiring lives in the shared spec-author preamble, so an anchored render
-        // carries it too: search the backlog at Spec start, auto-link the resolved ideas.
+        // The idea-backlog prohibition lives in the shared spec-author preamble, so an anchored
+        // render carries it too.
         assert!(
-            text.contains("Search the idea backlog FIRST") && text.contains("idea_search("),
-            "the /nspec idea_search wiring (Step 0) is in the spec-author preamble",
+            text.contains("backlog already tracks") && text.contains("idea_search"),
+            "the anti-duplication prohibition is in the spec-author preamble",
         );
     }
 
@@ -3416,9 +2842,12 @@ mod tests {
         // The AUTHORING contract (grill / decompose / create the Spec).
         assert!(text.contains("SPEC (authoring)"), "authoring header");
         assert!(text.contains("Spec Author"), "spec-author preamble");
-        assert!(text.contains("ONE question at a time"), "grill rule");
         assert!(
-            text.contains("AUTONOMOUS") && text.contains("does NOT validate the tasks"),
+            text.contains("The human DUMPS raw, you GRILL, the human\nVALIDATES"),
+            "the grill contract",
+        );
+        assert!(
+            text.contains("the human validates the SPEC, you decide the TASKS"),
             "autonomous decompose rule",
         );
         assert!(
@@ -3505,15 +2934,15 @@ mod tests {
         assert!(out.effects.is_empty(), "authoring render is a pure read");
         let text = out.result["context"].as_str().unwrap();
 
-        // The instruction (Step 0): idea_search at the start, auto-link addresses, no duplicate Spec.
+        // The PROHIBITION (the role) — search first, link what the Spec resolves, no duplicate.
         assert!(
-            text.contains("Search the idea backlog FIRST"),
-            "Step 0 present in the preamble",
+            text.contains("open a Spec for a need the project's backlog already tracks"),
+            "the anti-duplication prohibition is in the preamble",
         );
-        assert!(text.contains("idea_search("), "instructs idea_search");
+        assert!(text.contains("idea_search"), "instructs idea_search");
         assert!(
             text.contains("kind=\"addresses\""),
-            "auto-link the resolved ideas as addresses",
+            "link the resolved ideas as addresses",
         );
         assert!(
             text.to_lowercase().contains("duplicate spec"),
@@ -3524,6 +2953,11 @@ mod tests {
         assert!(
             text.contains("Existing ideas — search the backlog before you spec"),
             "the backlog section header",
+        );
+        // The render carries the one thing it alone can give — the call with THIS project's id.
+        assert!(
+            text.contains(&format!("idea_search(project_id=\"{project_id}\"")),
+            "the project-scoped call is spelled out with the real id",
         );
         assert!(
             text.contains(&open_idea.id) && text.contains("Rework the auth token refresh"),
@@ -3566,43 +3000,442 @@ mod tests {
             .contains("SPEC (authoring)"));
     }
 
-    /// The authoring fallback is SPEC-only: a NON-spec role with no resolvable Spec keeps its
-    /// unchanged `invalid_id` contract (the other roles are untouched by finding #19).
+    /// The no-Spec fallbacks are TARGETED: the authoring manual is SPEC-only, and the standalone
+    /// DISPATCHER render is DEV-only (N1). Any OTHER role (coder/auditor/doc) with no resolvable Spec
+    /// keeps its unchanged `invalid_id` contract.
     #[test]
-    fn non_spec_roles_without_a_spec_still_error_invalid_id() {
+    fn other_roles_without_a_spec_still_error_invalid_id() {
         let _g = db_guard();
         let (db, _project_id, workspace_id, _cwd) = seeded_project_without_spec();
-        let err = agent_context(&db, &json!({ "role": "dev", "workspace_id": workspace_id }))
+        let err = agent_context(&db, &json!({ "role": "coder", "workspace_id": workspace_id }))
             .unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidId);
     }
 
-    /// The REDESIGN (finding 01KXG68DN5DSCFDFA6C87NJHGV, preamble half): the spec-author
-    /// preamble instructs grouping BY NAME via `task_add(phase="…")` and says the plan is
-    /// materialized from those names — with NO separate `spec_set_phases` call and NO 1..N
-    /// numbering to track.
+    /// THE PHASE-PLAN CONTRACT MOVED TO THE TOOL THAT TAKES IT. `task_add(phase="<name>")` and the
+    /// first-seen ordering are the `task_add` DESCRIPTOR's business — an agent gets it from
+    /// `tools/list` whether or not it ever renders a manual — so the spec preamble must not teach it
+    /// a second time. The positive half is
+    /// `mcp::tests::the_task_add_descriptor_teaches_the_phase_plan_emerges_from_the_names`.
     #[test]
-    fn spec_preamble_instructs_task_add_by_phase_name() {
+    fn spec_preamble_does_not_re_teach_the_task_add_phase_contract() {
         let _g = db_guard();
         let (db, spec_id, _ws, _cwd) = seeded();
-        let text = render_agent_context(&db, AgentRole::Spec, None, &spec_id)
+        let text = render_agent_context(&db, AgentRole::Spec, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        for gone in ["task_add(phase=", "first-seen", "spec_set_phases", "1..N"] {
+            assert!(
+                !text.contains(gone),
+                "`{gone}` is the task_add descriptor's contract, not the manual's",
+            );
+        }
+    }
+
+    /// Review finding #35: the node inspector must show the STATIC role template even with NO run.
+    /// `render_effector_context(agent_id, None)` returns the role MANUAL (the sub-agent's brief) for
+    /// a valid role — needing no Spec — with the run-specific sections marked "resolved at run" and
+    /// the `{{rules}}` marker DEFERRED (its scopes named, its directives bound per run).
+    #[test]
+    fn effector_context_without_a_spec_renders_the_static_role_template() {
+        let _g = db_guard();
+        let db = Db::in_memory(); // NO Spec anywhere — the static template needs none.
+
+        let text = render_effector_context(&db, "coder", None, None)
+            .unwrap()
+            .unwrap();
+
+        // The STATIC role manual (the sub-agent's brief) is present cold.
+        assert!(
+            text.contains("Context: Coder Agent"),
+            "the role manual is rendered without a run",
+        );
+        assert!(
+            text.contains("(role template)"),
+            "the header marks it a static template",
+        );
+        // The run-specific sections are EXPLICIT "resolved at run" placeholders, never required.
+        assert!(
+            text.contains("Spec    : (resolved at run"),
+            "the Spec header is deferred",
+        );
+        assert!(
+            text.contains("Current phase — (resolved at run)"),
+            "the current phase is deferred",
+        );
+        assert!(
+            text.contains("Workspace & repos — (resolved at run)"),
+            "the workspace/repos are deferred",
+        );
+        // The `{{rules}}` marker is CONSUMED into a deferred block that names its scopes — no stray
+        // marker, no live directives (those bind per run).
+        assert!(
+            !text.contains(RULES_MARKER),
+            "the rules marker is resolved (deferred)",
+        );
+        assert!(
+            text.contains("Resolved at run by scope (always + role:coder)"),
+            "the deferred rules block names the scopes it will resolve",
+        );
+    }
+
+    /// The static template is available for EVERY renderable role; the auditor's states the
+    /// commitment mandate cold (the SECTION it examines is named per spawn, not in the manual), and
+    /// an unknown role is still `invalid_argument`.
+    #[test]
+    fn effector_template_covers_each_role_and_rejects_an_unknown_one() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        for (agent_id, needle) in [
+            ("spec", "Context: Spec Author"),
+            ("auditor", "Context: Auditor Agent"),
+            ("doc", "Context: Doc-sync"),
+        ] {
+            let text = render_effector_context(&db, agent_id, None, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                text.contains(needle),
+                "{agent_id}: role manual present cold"
+            );
+            assert!(
+                text.contains("(role template)"),
+                "{agent_id}: static-template header",
+            );
+        }
+        // The auditor template states its mandate cold: ONE commitment, named by the spawn's subject.
+        let auditor = render_effector_context(&db, "auditor", None, None)
             .unwrap()
             .unwrap();
         assert!(
-            text.contains("task_add(phase="),
-            "preamble instructs grouping by phase NAME via task_add(phase=…)",
+            auditor.contains("ONE COMMITMENT") && auditor.contains("`subject`"),
+            "the auditor template carries the commitment mandate without a run",
         );
-        assert!(
-            text.contains("first-seen"),
-            "preamble explains the plan emerges from the names in first-seen order",
-        );
-        assert!(
-            !text.contains("spec_set_phases"),
-            "the removed spec_set_phases tool is NOT mentioned",
-        );
-        assert!(
-            !text.contains("1..N"),
-            "there is no 1..N numbering to track anymore",
+        // An unknown role is rejected (the inspector falls back to the node config).
+        assert_eq!(
+            render_effector_context(&db, "bogus", None, None)
+                .unwrap_err()
+                .code,
+            RpcCode::InvalidArgument,
         );
     }
+
+    /// When a run IS bound (a Spec resolves), the effector context is the LIVE enriched manual, not
+    /// the deferred template — the run-specific sections carry REAL values (finding #35: "enrichi si
+    /// un run est lié"). A pure passthrough to [`render_agent_context`].
+    #[test]
+    fn effector_context_with_a_spec_renders_the_live_enriched_manual() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let text = render_effector_context(&db, "coder", Some(&spec_id), None)
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("Context: Coder Agent"), "role manual present");
+        assert!(
+            !text.contains("(role template)"),
+            "not the static-template header when a run is bound",
+        );
+        assert!(
+            text.contains("Current phase — 1 · Foundation"),
+            "the LIVE current phase, not a placeholder",
+        );
+        assert!(
+            !text.contains("Current phase — (resolved at run)"),
+            "no deferred placeholder when a run is bound",
+        );
+    }
+
+    // ========================================================================
+    // F6 — the Spec is not copied WHOLE into a pass that audits ONE section
+    // ========================================================================
+
+    /// A Spec whose SIX sections carry a distinct, recognisable body — so a render can be checked
+    /// section by section. Returns `(db, spec_id)`.
+    fn seeded_six_sections() -> (Db, String) {
+        let db = Db::in_memory();
+        let spec_id = db.with_conn(|c| {
+            let (project, root) =
+                db::create_project(c, "Proj", "/tmp/nyx-sections", None).expect("project");
+            let (spec, _rev) = db::create_spec_with_workspace(
+                c,
+                &project.id,
+                &root.id,
+                "My Feature",
+                db::SpecSections {
+                    problem: "BODY-PROBLEM".into(),
+                    solution: "BODY-SOLUTION".into(),
+                    implementation_decisions: "BODY-IMPL".into(),
+                    testing_decisions: "BODY-TESTING".into(),
+                    user_stories: "BODY-STORIES".into(),
+                    out_of_scope: "BODY-SCOPE".into(),
+                },
+            )
+            .expect("spec");
+            spec.id
+        });
+        (db, spec_id)
+    }
+
+    /// F6 — an audit PASS is spawned with a `subject` naming ONE Spec commitment and audits that
+    /// one only ("that section is reproduced below", says its own manual). The render carries THAT
+    /// section and NOT the other five: copying the whole Spec into each of the four passes of an
+    /// audit cycle paid for the same text four times, and three of those copies were for sections
+    /// the pass is explicitly told are not its business.
+    #[test]
+    fn a_subject_naming_a_spec_section_narrows_the_render_to_it() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_six_sections();
+        let text = render_effector_context(&db, "auditor", Some(&spec_id), Some("user_stories"))
+            .unwrap()
+            .unwrap();
+        assert!(text.contains("BODY-STORIES"), "the subject's own section");
+        for other in [
+            "BODY-PROBLEM",
+            "BODY-SOLUTION",
+            "BODY-IMPL",
+            "BODY-TESTING",
+            "BODY-SCOPE",
+        ] {
+            assert!(
+                !text.contains(other),
+                "{other} is another pass's business — it must not be copied in",
+            );
+        }
+        // The identifying header stays (the Spec is still named), and the narrowing is STATED, so
+        // the sub-agent never reads the missing sections as an empty Spec.
+        assert!(text.contains("## Spec — My Feature"), "Spec header kept");
+        assert!(
+            text.contains("only that section is reproduced here, on purpose"),
+            "the render says it is narrowed, and how to read the rest",
+        );
+        // The ROLE manual is untouched by the narrowing.
+        assert!(text.contains("Context: Auditor Agent"), "role manual kept");
+    }
+
+    /// Every one of the six section slugs narrows to its OWN body — the mapping is not a special
+    /// case for the four commitments the ndev audit walks.
+    #[test]
+    fn each_spec_section_slug_narrows_to_its_own_body() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_six_sections();
+        for (subject, body) in [
+            ("problem", "BODY-PROBLEM"),
+            ("solution", "BODY-SOLUTION"),
+            ("implementation_decisions", "BODY-IMPL"),
+            ("testing_decisions", "BODY-TESTING"),
+            ("user_stories", "BODY-STORIES"),
+            ("out_of_scope", "BODY-SCOPE"),
+            // Tolerated spellings of the same slug (a hand-authored node, not the seed).
+            ("  Out-Of-Scope ", "BODY-SCOPE"),
+        ] {
+            let text = render_effector_context(&db, "auditor", Some(&spec_id), Some(subject))
+                .unwrap()
+                .unwrap();
+            assert!(
+                text.contains(body),
+                "subject '{subject}' must carry {body}",
+            );
+        }
+    }
+
+    /// A spawn with NO subject is UNCHANGED: the whole Spec, as before. And so is a subject that
+    /// names no section (a free-form focus — a file, a component, a question): narrowing on a guess
+    /// would hide the Spec from a spawn that never asked for a section.
+    #[test]
+    fn no_subject_or_a_non_section_subject_keeps_the_whole_spec() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_six_sections();
+        for subject in [None, Some("the login page"), Some("")] {
+            let text = render_effector_context(&db, "coder", Some(&spec_id), subject)
+                .unwrap()
+                .unwrap();
+            for body in [
+                "BODY-PROBLEM",
+                "BODY-SOLUTION",
+                "BODY-IMPL",
+                "BODY-TESTING",
+                "BODY-STORIES",
+                "BODY-SCOPE",
+            ] {
+                assert!(text.contains(body), "subject {subject:?} keeps {body}");
+            }
+            assert!(
+                !text.contains("only that section is reproduced here, on purpose"),
+                "subject {subject:?} narrows nothing, so it announces nothing",
+            );
+        }
+    }
+
+    /// The `agent_context` verb takes the SAME `subject` — this is the escape hatch a dispatcher
+    /// uses to RE-FETCH the manual a spawn action handed it (F6 part A's `context_already_sent`).
+    /// What it returns must be the very text the spawn carried.
+    #[test]
+    fn agent_context_subject_reproduces_the_manual_the_spawn_carried() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_six_sections();
+        let forwarded =
+            render_effector_context(&db, "auditor", Some(&spec_id), Some("out_of_scope"))
+                .unwrap()
+                .unwrap();
+        let refetched = agent_context(
+            &db,
+            &json!({ "role": "auditor", "spec_id": spec_id, "subject": "out_of_scope" }),
+        )
+        .unwrap();
+        assert_eq!(
+            refetched.result["context"].as_str().unwrap(),
+            forwarded,
+            "the re-fetch returns the manual the spawn forwarded, narrowing included",
+        );
+    }
+
+    // ========================================================================
+    // The SIZE of a role render is a measured budget, not a guess
+    // ========================================================================
+
+    /// The UPPER BOUNDS, in characters, of what a role render costs. Taken from the numbers a REAL
+    /// render produces on [`seeded_realistic`] (a Spec with six written sections and ten tasks —
+    /// the shape of the run that ran out of window), with room to breathe: this is a regression
+    /// guard, not a straitjacket.
+    ///
+    ///   * ROLE MANUAL — the STATIC preamble, the only part a manual edit can inflate. Measured
+    ///     after the dissolution: prototype 1 638 (was 71 356), spec 1 074 (was 5 770), coder 1 230,
+    ///     auditor 1 066, doc 530. The bound is per role and deliberately tight: the whole point of
+    ///     the item is that a role manual is a preamble and a list of prohibitions, so a manual that
+    ///     grows past 2 500 has started narrating a process again.
+    ///   * PROTOTYPE RENDER, measured 17 070 — was 86 766, and the 69 696 that went is the design
+    ///     procedure now carried by the `design_*` tool descriptors. What is LEFT is almost entirely
+    ///     the Spec's own six sections, which is what a render is supposed to be.
+    ///   * AUDITOR PASS, measured 4 694 – 6 203 depending on the section (whole-Spec: 16 823) —
+    ///     the `subject` narrowing, which survives as a parameter of the `agent_context` call the
+    ///     sub-agent now makes itself.
+    const ROLE_MANUAL_MAX: usize = 2_500;
+    const PROTOTYPE_CONTEXT_MAX: usize = 25_000;
+    const AUDIT_PASS_CONTEXT_MAX: usize = 8_000;
+    const AUDIT_CYCLE_CONTEXT_MAX: usize = 24_000;
+
+    /// A Spec of REALISTIC weight: six written sections and ten tasks — what a live run renders
+    /// against, and what the F6 measurements were taken on. Returns `(db, spec_id)`.
+    fn seeded_realistic() -> (Db, String) {
+        let db = Db::in_memory();
+        let body = |label: &str, lines: usize| {
+            (0..lines)
+                .map(|i| {
+                    format!(
+                        "- {label} commitment #{i}: the build owes this, stated in a sentence long \
+                         enough to be realistic prose.\n"
+                    )
+                })
+                .collect::<String>()
+        };
+        let spec_id = db.with_conn(|c| {
+            let (project, root) =
+                db::create_project(c, "Proj", "/tmp/nyx-ctx-size", None).expect("project");
+            db::create_repository(c, &project.id, "api", ".", false).expect("repo");
+            let (spec, _rev) = db::create_spec_with_workspace(
+                c,
+                &project.id,
+                &root.id,
+                "My Feature",
+                db::SpecSections {
+                    problem: body("problem", 20),
+                    solution: body("solution", 30),
+                    implementation_decisions: body("impl", 30),
+                    testing_decisions: body("testing", 20),
+                    user_stories: body("story", 20),
+                    out_of_scope: body("scope", 15),
+                },
+            )
+            .expect("spec");
+            for i in 0..10 {
+                db::create_task(
+                    c,
+                    &project.id,
+                    &format!("Task {i}"),
+                    db::NewTaskInput {
+                        spec_id: Some(spec.id.clone()),
+                        phase_name: Some("Foundation".to_string()),
+                        ..db::NewTaskInput::slice()
+                    },
+                )
+                .expect("task");
+            }
+            spec.id
+        });
+        (db, spec_id)
+    }
+
+    /// THE RENDER HAS A MEASURED BUDGET. A single tick returning a spawn used to ship 73 547
+    /// characters, 71 798 of them the forwarded manual (~18k tokens); one ndev audit cycle paid that
+    /// four times over and the dispatcher's window gave out. The manual no longer travels at all —
+    /// but it is still RENDERED, on demand, by the sub-agent's own `agent_context` call, so the
+    /// sizes are asserted rather than assumed: an edit that re-inflates a role manual, or re-widens
+    /// what a pass is given, fails here rather than in a live run.
+    #[test]
+    fn a_role_render_stays_inside_its_measured_budget() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_realistic();
+
+        // EVERY role manual is a preamble + prohibitions. This is the guard against a process
+        // creeping back into one of them.
+        for role in [
+            AgentRole::Spec,
+            AgentRole::Coder,
+            AgentRole::Auditor,
+            AgentRole::Doc,
+            AgentRole::Prototype,
+        ] {
+            let manual = role.preamble();
+            assert!(
+                manual.len() <= ROLE_MANUAL_MAX,
+                "the {} manual is {} chars, over the {ROLE_MANUAL_MAX} budget — a role manual says \
+                 what the agent is and what it may NOT do; the process is the graph's",
+                role.slug(),
+                manual.len(),
+            );
+        }
+
+        let prototype = render_effector_context(&db, "prototype", Some(&spec_id), None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            prototype.len() <= PROTOTYPE_CONTEXT_MAX,
+            "the prototype context is {} chars, over the {PROTOTYPE_CONTEXT_MAX} budget",
+            prototype.len(),
+        );
+
+        // The FOUR ndev audit passes — each is ONE Spec commitment, and each is bounded on its own.
+        let mut cycle = 0usize;
+        for subject in [
+            "user_stories",
+            "testing_decisions",
+            "implementation_decisions",
+            "out_of_scope",
+        ] {
+            let pass = render_effector_context(&db, "auditor", Some(&spec_id), Some(subject))
+                .unwrap()
+                .unwrap();
+            assert!(
+                pass.len() <= AUDIT_PASS_CONTEXT_MAX,
+                "the '{subject}' audit pass is {} chars, over the {AUDIT_PASS_CONTEXT_MAX} budget",
+                pass.len(),
+            );
+            cycle += pass.len();
+        }
+        assert!(
+            cycle <= AUDIT_CYCLE_CONTEXT_MAX,
+            "a 4-pass audit cycle is {cycle} chars, over the {AUDIT_CYCLE_CONTEXT_MAX} budget",
+        );
+
+        // And the narrowing is what buys it: the same cycle unnarrowed is several times bigger.
+        let whole = render_effector_context(&db, "auditor", Some(&spec_id), None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            cycle < whole.len() * 2,
+            "four narrowed passes ({cycle}) must cost less than two whole-Spec ones ({})",
+            whole.len() * 2,
+        );
+    }
+
 }

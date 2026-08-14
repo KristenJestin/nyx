@@ -138,6 +138,12 @@ export class XtermInstance {
   private pendingResync = false;
 
   private readonly cwd?: string;
+  /**
+   * Whether prior scrollback was written as read-only DEAD HISTORY at construction. It is the
+   * restore authority when present, so the screen re-hydration below stands down: its repaint
+   * starts by clearing the screen, which would wipe the history just written.
+   */
+  private readonly hasDeadHistory: boolean;
   private onPtyId?: (id: number | null) => void;
   private onTitle?: (title: string) => void;
 
@@ -151,6 +157,7 @@ export class XtermInstance {
   constructor(options: XtermInstanceOptions) {
     this.recordId = options.recordId;
     this.cwd = options.cwd;
+    this.hasDeadHistory = !!options.deadHistory;
     this.onPtyId = options.onPtyId;
     this.onTitle = options.onTitle;
 
@@ -243,6 +250,14 @@ export class XtermInstance {
       { cols: this.term.cols, rows: this.term.rows },
     );
 
+    // RE-HYDRATE the screen BEFORE the spawn, because `pty_spawn` on a record whose shell is
+    // already running ATTACHES to it rather than starting a new one — an agent opened it over
+    // MCP, or it survived a renderer reload — and that shell has been printing into a pane that
+    // did not exist. The backend streams a terminal's output only once a view is attached, so
+    // doing it here means the repaint can neither duplicate nor be duplicated by the live stream
+    // that starts at the attach. A record with nothing to restore answers with no bytes.
+    await this.rehydrateScreen();
+
     const id = await nyxBridge.invoke<number>("pty_spawn", {
       cwd: this.cwd,
       cols,
@@ -267,6 +282,29 @@ export class XtermInstance {
     if (this.pendingResync) {
       this.pendingResync = false;
       this.resyncSize();
+    }
+  }
+
+  /**
+   * Ask the backend for this record's screen re-hydration bytes and write them into xterm, so a
+   * pane taking over a running shell shows what that shell is on instead of opening blank. The
+   * stream is a self-resetting full repaint (alt-screen included), never sent to the PTY.
+   *
+   * Skipped when dead history was restored: that is already this pane's restore authority, and
+   * the repaint's leading screen-clear would erase it. Best-effort — a backend that has nothing
+   * to restore, or fails to answer, leaves the fresh terminal as it was.
+   */
+  private async rehydrateScreen(): Promise<void> {
+    if (this.hasDeadHistory) return;
+    try {
+      const { bytes } = await nyxBridge.invoke<{ bytes: number[] }>(
+        "terminal_screen_rehydration",
+        { recordId: this.recordId },
+      );
+      if (!this.disposed && bytes && bytes.length > 0) this.term.write(Uint8Array.from(bytes));
+    } catch {
+      // Nothing to re-hydrate is the normal case for a brand-new terminal, and a failure here
+      // must never cost the pane its shell.
     }
   }
 

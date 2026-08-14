@@ -43,11 +43,12 @@
 //!     `install_deploys_bare_user_scope_stubs_via_settings_seam_and_uninstall_removes_them`
 //!     (the install vehicle deploys them to `~/.claude/commands/` + removes them on uninstall).
 //!
-//! The REAL PUSH channel (the hook detecting the stub sentinel → POSTing `agent_context` →
-//! emitting `additionalContext`) — which this gate proves only STRUCTURALLY (VOLET 2a: the
-//! stub CONTAINS the sentinel) and via the PULL fallback (VOLET 2b) — is exercised end-to-end
-//! against the real `nyx-session-hook.cjs` under `node` in the sibling integration test
-//! `tests/hook_push_injection_e2e.rs` (review finding 01KXEFFTBEC6MC8S892NEFMJMN).
+//! The REAL PUSH channel (the hook detecting the command invocation → POSTing `agent_context` →
+//! emitting `additionalContext`) — which this gate proves only STRUCTURALLY (VOLET 2a: the stub
+//! DECLARES what its command triggers) and via the PULL fallback (VOLET 2b) — is exercised
+//! end-to-end against the real `nyx-session-hook.cjs` under `node` in the sibling integration
+//! test `tests/hook_push_injection_e2e.rs` (review finding 01KXEFFTBEC6MC8S892NEFMJMN), which
+//! also binds the hook's command table to the sentinel this gate asserts.
 
 use std::path::PathBuf;
 
@@ -127,7 +128,15 @@ fn live_project() -> (TempDir, Db, String, String, String, String) {
 /// ([`dispatch_spec_tool`]) — the same entry point the sidecar dispatches. Panics on a
 /// mis-route or a tool error (a green cycle must never hit one).
 fn spec_tool(db: &Db, name: &str, args: Value) -> ToolOutcome {
-    dispatch_spec_tool(db, name, &args)
+    // N17(b): `spec_transition` is no longer routed to the AGENT (nyx imposes every Spec transition
+    // at the graph node). The FUNCTION + its guards remain — the UI uses them, and this harness drives
+    // the lifecycle through it directly (the confirmation guard it asserts lives on the function).
+    let outcome = if name == "spec_transition" {
+        Some(nyx_core::mcp_tools_spec::spec_transition(db, &args))
+    } else {
+        dispatch_spec_tool(db, name, &args)
+    };
+    outcome
         .unwrap_or_else(|| panic!("spec tool `{name}` was not routed"))
         .unwrap_or_else(|e| panic!("spec tool `{name}` failed: [{:?}] {}", e.code, e.message))
 }
@@ -211,11 +220,12 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
     );
     assert!(spec_manual.contains("Spec Author"), "spec-author preamble");
     assert!(
-        spec_manual.contains("ONE question at a time"),
-        "exhaustive grill rule is in the manual",
+        spec_manual.contains("the human DUMPS raw, you GRILL")
+            || spec_manual.contains("The human DUMPS raw, you GRILL"),
+        "the grill contract is in the manual",
     );
     assert!(
-        spec_manual.contains("AUTONOMOUS") && spec_manual.contains("does NOT validate the tasks"),
+        spec_manual.contains("the human validates the SPEC, you decide the TASKS"),
         "autonomous slicing rule",
     );
     assert!(
@@ -301,26 +311,41 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
         "the start transition posed the dev workspace anchor (so agent_context(role=dev) resolves)",
     );
 
-    // --- DEV (/ndev): the orchestrator manual renders LIVE — the state rule, the cadence,
-    //     the review loop, and the CURRENT phase resolved from the task statuses. ---
+    // --- DEV (/ndev): v2.8 — the dev context is now a THIN DISPATCHER (annex
+    //     `context-dev-dispatcher`). It calls `nyx_next` and performs EXACTLY the atomic action nyx
+    //     returns — it orients NOTHING itself (no state rule, no per-phase cadence, no review loop
+    //     in the session: that whole orchestration is the behavior-tree graph). The render still
+    //     weaves the LIVE current phase resolved from the task statuses. ---
     let dev_manual = render(&db, json!({ "role": "dev", "workspace_id": workspace_id }));
     assert!(
         dev_manual.contains("=== NYX CONTEXT — DEV ==="),
         "dev header"
     );
-    assert!(dev_manual.contains("Dev Orchestrator"), "dev preamble");
     assert!(
-        dev_manual.contains("The state rule") && dev_manual.contains("via spec_transition"),
-        "agent-driven state rule",
+        dev_manual.contains("Dev — dispatcher"),
+        "thin dispatcher preamble"
     );
     assert!(
-        dev_manual.contains("2-axis AUDITOR ONCE (NOT per phase)"),
-        "auditor once at the end, not per phase",
+        dev_manual.contains("You do NOT orchestrate") && dev_manual.contains("nyx_next"),
+        "dispatcher mandate: call nyx_next, do the returned action, orchestrate nothing",
     );
     assert!(
-        dev_manual.contains("review_comment_list") && dev_manual.contains("review_comment_post"),
-        "review loop is in the manual",
+        dev_manual.contains("orchestrate, loop, branch, or transition on your own initiative"),
+        "the session never loops/branches/transitions of its own initiative",
     );
+    // The ex-orchestrator prose (state rule, 2-axis auditor drive, review loop) is GONE from the
+    // session — it now lives in the graph, not the dispatcher context.
+    for gone in [
+        "Dev Orchestrator",
+        "The state rule",
+        "2-axis AUDITOR ONCE",
+        "review_comment_list",
+    ] {
+        assert!(
+            !dev_manual.contains(gone),
+            "the ex-orchestrator prose `{gone}` must NOT survive in the dispatcher context",
+        );
+    }
     // Live phase resolution: phase 1 is current (it still has open work), its task is listed,
     // the phase-2 task is NOT. The NUMBER "1" is resolved LIVE from the task phases `task_add`
     // materialized + task statuses; the NAME "Foundation" comes from the plan `task_add` built
@@ -340,22 +365,23 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
     assert_no_depot(&dev_manual, "dev");
 
     // The dev FORWARDS sub-agents by pulling their manuals itself (generic, no hook): the
-    // coder and both auditor axes render on demand.
+    // coder and the auditor render on demand. v2.8 — the auditor has ONE manual: it audits the
+    // Spec COMMITMENT its spawn names (`subject`), so the render carries no review "axis" any more.
     let coder_manual = render(&db, json!({ "role": "coder", "spec_id": sid }));
     assert!(coder_manual.contains("Coder Agent"), "coder manual pulls");
-    let auditor_std = render(
-        &db,
-        json!({ "role": "auditor", "axis": "standards", "spec_id": sid }),
+    let auditor = render(&db, json!({ "role": "auditor", "spec_id": sid }));
+    assert!(
+        auditor.contains("=== NYX CONTEXT — AUDITOR ==="),
+        "auditor manual pulls"
     );
     assert!(
-        auditor_std.contains("AUDITOR · STANDARDS"),
-        "auditor standards axis"
+        auditor.contains("ONE COMMITMENT") && auditor.contains("`subject`"),
+        "the auditor audits the commitment its spawn names",
     );
-    let auditor_spec = render(
-        &db,
-        json!({ "role": "auditor", "axis": "spec", "spec_id": sid }),
+    assert!(
+        !auditor.contains("Your axis"),
+        "the invented review axes are gone from the manual",
     );
-    assert!(auditor_spec.contains("AUDITOR · SPEC"), "auditor spec axis");
 
     // --- Run the phases: close phase 1 → the current phase advances to 2 LIVE. ---
     spec_tool(
@@ -489,7 +515,7 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
     );
     assert!(doc_manual.contains("Doc-sync"), "doc-sync preamble");
     assert!(
-        doc_manual.contains("Your output is a REVIEW"),
+        doc_manual.contains("validate your own output — it is a REVIEW"),
         "doc output is a review the human validates",
     );
     assert!(
@@ -505,8 +531,9 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
 
 /// (a) The three BARE user-scope command stubs (`resources/claude-commands/`, deployed to
 /// `~/.claude/commands/` — finding 01KXEJVZ) each carry their role sentinel + `$ARGUMENTS` +
-/// the `agent_context` pull-fallback note, so the hook's `UserPromptSubmit` PUSH branch fires
-/// AND a hook-less provider can PULL. MULTI-PROVIDER: only Claude Code's `~/.claude/commands/`
+/// the `agent_context` pull-fallback note: the sentinel DECLARES the run the command opens (the
+/// hook's `UserPromptSubmit` PUSH branch mirrors it, bound by `hook_push_injection_e2e`) and the
+/// note lets a hook-less provider PULL. MULTI-PROVIDER: only Claude Code's `~/.claude/commands/`
 /// user-scope dir is modeled in the codebase; there is NO user-scope `.agents` deploy target,
 /// so `.agents`-style providers rely on the universal PULL channel (VOLET 2b) — a documented
 /// limit, not an invented deploy. The compiled-in [`nyx_core::plugin::USER_COMMAND_STUBS`]
@@ -515,7 +542,13 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
 fn user_scope_command_stubs_carry_the_injection_sentinel() {
     let root = commands_root();
     let compiled = nyx_core::plugin::USER_COMMAND_STUBS;
-    for (file, role) in [("nspec.md", "spec"), ("ndev.md", "dev"), ("ndoc.md", "doc")] {
+    // All three stubs now inject the DISPATCHER (`role=dev`); nspec/ndoc carry their `scope=` so
+    // run_start opens the right flow (v2.8 review N1).
+    for (file, marker) in [
+        ("nspec.md", "role=dev scope=nspec"),
+        ("ndev.md", "role=dev"),
+        ("ndoc.md", "role=dev scope=ndoc"),
+    ] {
         let path = root.join(file);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
         // The vehicle deploys the compiled-in constant; it MUST equal the on-disk source the
@@ -531,8 +564,8 @@ fn user_scope_command_stubs_carry_the_injection_sentinel() {
         );
         let text = String::from_utf8(bytes).expect("utf-8 stub");
         assert!(
-            text.contains(&format!("NYX-AGENT-CONTEXT role={role}")),
-            "`{file}` carries the role={role} sentinel the hook keys on",
+            text.contains(&format!("NYX-AGENT-CONTEXT {marker}")),
+            "`{file}` carries the `{marker}` sentinel the hook keys on",
         );
         assert!(
             text.contains("$ARGUMENTS"),
@@ -578,10 +611,10 @@ fn agent_context_pull_is_the_universal_fallback_without_any_stub() {
 
     // Pull by spec_id.
     assert!(render(&db, json!({ "role": "spec", "spec_id": sid })).contains("Spec Author"));
-    // Pull by workspace_id (the anchored dev workspace).
+    // Pull by workspace_id (the anchored dev workspace) — v2.8 thin dispatcher context.
     assert!(
         render(&db, json!({ "role": "dev", "workspace_id": workspace_id }))
-            .contains("Dev Orchestrator")
+            .contains("Dev — dispatcher")
     );
     // Pull by cwd (a path nested under the workspace root) — the hook's `{ role, cwd }` shape.
     let nested = format!("{root}/crates/api");
@@ -665,13 +698,12 @@ fn confirmation_guardrails_are_intact() {
     );
     let sid = created.result["spec"]["id"].as_str().unwrap().to_string();
 
-    // `ready` without confirmation → refused by the sensitive-transition guard.
-    let err = dispatch_spec_tool(
+    // `ready` without confirmation → refused by the sensitive-transition guard (tested on the
+    // function directly — spec_transition is no longer agent-routed, N17(b)).
+    let err = nyx_core::mcp_tools_spec::spec_transition(
         &db,
-        "spec_transition",
         &json!({ "spec_id": sid, "transition": "ready" }),
     )
-    .expect("routed")
     .unwrap_err();
     assert_eq!(err.code, RpcCode::InvalidState);
     assert!(
@@ -699,12 +731,10 @@ fn confirmation_guardrails_are_intact() {
     );
 
     // `done` (also sensitive) without confirmation → refused too.
-    let done_err = dispatch_spec_tool(
+    let done_err = nyx_core::mcp_tools_spec::spec_transition(
         &db,
-        "spec_transition",
         &json!({ "spec_id": sid, "transition": "done" }),
     )
-    .expect("routed")
     .unwrap_err();
     assert_eq!(done_err.code, RpcCode::InvalidState);
     assert!(

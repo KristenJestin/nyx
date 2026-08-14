@@ -14,6 +14,7 @@ import {
 import { Breadcrumb, BreadcrumbCurrent, breadcrumbLinkClass } from "@/components/ui/breadcrumb";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs } from "@/components/ui/tabs";
+import { SpecRunButton } from "@/components/engine/run-modal";
 
 import { DependencyBadges } from "./dependency-badges";
 import { SpecSidebar } from "./spec-sidebar";
@@ -133,13 +134,18 @@ export function SpecDetailPage() {
                 {spec.title}
               </h1>
             </div>
-            {/* Spec↔Spec dependency badges (PRD "badges dépendances sur le détail Spec"). Present
-                only when non-zero; the same `<DependencyBadges>` the board card surfaces. */}
-            <DependencyBadges
-              blockedBy={deps.blocked_by_count}
-              unblocks={deps.unblocks_count}
-              className="shrink-0 pt-1"
-            />
+            <div className="flex shrink-0 items-center gap-2 pt-0.5">
+              {/* Spec↔Spec dependency badges (PRD "badges dépendances sur le détail Spec"). Present
+                  only when non-zero; the same `<DependencyBadges>` the board card surfaces. */}
+              <DependencyBadges
+                blockedBy={deps.blocked_by_count}
+                unblocks={deps.unblocks_count}
+                className="pt-0.5"
+              />
+              {/* The Spec's ORCHESTRATION RUN — the shared engine graph + the run's blackboard, in a
+                  modal. The runtime lives with the Spec, not on `/engine` (which is structural). */}
+              <SpecRunButton specId={specId} />
+            </div>
           </div>
         </header>
 

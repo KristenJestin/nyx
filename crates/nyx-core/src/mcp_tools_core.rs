@@ -45,7 +45,8 @@ use crate::command::{CommandRunner, RunState, RunnerSink};
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
 use crate::mcp_runtime::{
-    internal_db, optional_bool, optional_str, optional_usize, require_str, status_json,
+    internal_db, map_content_write_err, optional_bool, optional_env_map, optional_str,
+    optional_usize, require_str, status_json,
 };
 
 /// The default `tail_bytes` window for the output/scrollback reads — the token-safe
@@ -78,6 +79,12 @@ pub enum ChangedTopic {
     /// is `ideas`; the front's re-pull on it is wired in Phase 4 (the Knowledge UI), but the
     /// mutation authority NAMES the topic here so the seam is single-authority end to end.
     Ideas,
+    /// The ORCHESTRATION graph changed (v2.8 — carried by the `workflow_*` / `node_*` authoring
+    /// MCP tools so any open Engine visualiser re-pulls the re-built tree after an agent authoring
+    /// mutation). The wire string is `workflows`; the front's re-pull on it is wired in Phase 6
+    /// (the React Flow graph UI), but the mutation authority NAMES the topic here so the seam is
+    /// single-authority end to end (the same forward-declared pattern as `Specs` / `Ideas`).
+    Workflows,
     /// The PROTOTYPE annexe changed (v2.7 — carried by the `proto_*` MCP tools so any open
     /// proto view re-pulls after an agent action: present a round, elect a variant, raise or
     /// resolve a comment). The wire string is `prototypes`; the front's re-pull on it (and the
@@ -98,6 +105,7 @@ impl ChangedTopic {
             ChangedTopic::Specs => "specs",
             ChangedTopic::Repos => "repos",
             ChangedTopic::Ideas => "ideas",
+            ChangedTopic::Workflows => "workflows",
             ChangedTopic::Prototypes => "prototypes",
         }
     }
@@ -146,8 +154,23 @@ impl ToolOutcome {
 pub trait TerminalHost: Send + Sync {
     /// Park `command` to be injected into the terminal's shell once its PTY spawns (the
     /// SAME role as Tauri's `PendingTerminalCommands` + the Electron host's command park).
-    /// Called by `create_terminal` for a terminal opened with a `command`.
+    /// Called by `create_terminal` for a terminal opened with a `command`, BEFORE
+    /// [`Self::open_terminal_shell`] — that spawn is what drains the park.
     fn park_opening_command(&self, terminal_id: &str, command: &str);
+
+    /// START the record's shell NOW, without waiting for anything on screen.
+    ///
+    /// The shell's front end mounts a terminal pane only for the project it is DISPLAYING, and
+    /// that mount is what spawns the PTY — so a terminal an agent opened anywhere else (another
+    /// project, or loose) never got a shell at all: it sat in the sidebar as an empty record,
+    /// `send_to_terminal` answered `invalid_state` forever, and the opening command stayed parked
+    /// for a spawn that would only come if the human happened to switch to that project. An agent
+    /// driving nyx has to be able to open a session where the work is, so `create_terminal` asks
+    /// for the shell itself instead of hoping a pane appears.
+    ///
+    /// `cwd` is the record's stored cwd; `"."` means no directory was asked for — the shell's own
+    /// default. A host that owns no PTY does nothing (the record exists, with no shell).
+    fn open_terminal_shell(&self, terminal_id: &str, cwd: &str);
 
     /// Write `command + "\r"` into the terminal's live shell (the SAME path as
     /// `pty_write`). Returns `Ok(true)` when written, `Ok(false)` when the terminal has
@@ -172,6 +195,16 @@ pub trait TerminalHost: Send + Sync {
     /// authority), or `None` when it cannot be derived. A record with no live PTY → `(false,
     /// None)`. Used to enrich `list_terminals`.
     fn terminal_liveness(&self, terminal_id: &str) -> (bool, Option<bool>);
+
+    /// Whether the record's PERSISTED scrollback is BEHIND its live shell: output has arrived
+    /// that has not been saved into `terminals.scrollback` yet.
+    ///
+    /// The persisted scrollback is written by the SHELL's front end, and only for a terminal it
+    /// currently has mounted — so a live terminal the user is not looking at keeps running into a
+    /// buffer nobody updates. `read_terminal` reads that buffer, so without this bit it would hand
+    /// back an arbitrarily old snapshot with nothing marking it as past. `false` for a record with
+    /// no live PTY (nothing is producing) and for a host that owns no PTY at all.
+    fn scrollback_is_behind(&self, terminal_id: &str) -> bool;
 }
 
 /// A [`TerminalHost`] that owns no live PTY — every terminal looks closed/idle and a
@@ -183,6 +216,7 @@ pub struct NoTerminalHost;
 
 impl TerminalHost for NoTerminalHost {
     fn park_opening_command(&self, _terminal_id: &str, _command: &str) {}
+    fn open_terminal_shell(&self, _terminal_id: &str, _cwd: &str) {}
     fn send_to_terminal(&self, _terminal_id: &str, _command: &str) -> Result<bool, String> {
         Ok(false)
     }
@@ -192,6 +226,9 @@ impl TerminalHost for NoTerminalHost {
     fn close_terminal_pty(&self, _terminal_id: &str) {}
     fn terminal_liveness(&self, _terminal_id: &str) -> (bool, Option<bool>) {
         (false, None)
+    }
+    fn scrollback_is_behind(&self, _terminal_id: &str) -> bool {
+        false
     }
 }
 
@@ -232,7 +269,7 @@ fn optional_str_set(
 /// A REQUIRED array-of-strings argument, ORDER-preserving (`command_ids`). Missing /
 /// not-an-array / non-string element → `invalid_argument`. An empty array is accepted (a
 /// no-op batch). Empty-string ids are rejected.
-fn require_str_vec(args: &Value, key: &str) -> Result<Vec<String>, RpcError> {
+pub(crate) fn require_str_vec(args: &Value, key: &str) -> Result<Vec<String>, RpcError> {
     match args.get(key) {
         Some(Value::Array(arr)) => {
             let mut out = Vec::with_capacity(arr.len());
@@ -382,6 +419,14 @@ fn map_template_write_err_generic(e: diesel::result::Error) -> RpcError {
 
 /// The JSON view of a command TEMPLATE (parity with the Tauri `template_json`).
 fn template_json(t: &db::ManagedCommand) -> Value {
+    // `env_keys`, never the env itself: an env VALUE is a secret by default (the runner's
+    // "values are never logged" invariant), and the KEYS are what an agent needs to see —
+    // what the command declares, and whether its last write landed (N31).
+    let mut env_keys: Vec<String> = crate::command::decode_command_env(t.env.as_deref())
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    env_keys.sort();
     json!({
         "command_id": t.id,
         "project_id": t.project_id,
@@ -390,6 +435,7 @@ fn template_json(t: &db::ManagedCommand) -> Value {
         "subfolder": t.subfolder,
         "source_kind": t.source_kind,
         "package_manager": t.package_manager,
+        "env_keys": env_keys,
     })
 }
 
@@ -773,7 +819,7 @@ pub fn review_comment_post(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
                 },
             )
         })
-        .map_err(internal_db)?;
+        .map_err(map_content_write_err)?;
     Ok(ToolOutcome::changed(
         json!({ "comment": comment }),
         ChangedTopic::Repos,
@@ -899,7 +945,7 @@ pub fn review_submit_feedback(db: &Db, args: &Value) -> Result<ToolOutcome, RpcE
 
     let (comment, finding) = db
         .with_conn(
-            |c| -> diesel::QueryResult<(crate::db::ReviewComment, crate::db::Task)> {
+            |c| -> Result<(crate::db::ReviewComment, crate::db::Task), crate::db::ContentWriteError> {
                 use diesel::Connection;
                 // The comment + its finding commit ATOMICALLY (the inner `create_task` transaction
                 // nests as a savepoint) — a chat retour never leaves an orphan comment on failure.
@@ -933,7 +979,7 @@ pub fn review_submit_feedback(db: &Db, args: &Value) -> Result<ToolOutcome, RpcE
                 })
             },
         )
-        .map_err(internal_db)?;
+        .map_err(map_content_write_err)?;
 
     Ok(ToolOutcome::changed_many(
         json!({ "comment": comment, "finding": finding }),
@@ -957,13 +1003,47 @@ fn path_matches(workspace_path: &str, cwd_normalized: &str) -> bool {
 
 // --- Command-template CRUD tools -------------------------------------------
 
-/// `add_command` — `{ project_id, name, command, subfolder? }` → `{ command }`. Parity
+/// Decode the optional `env` argument of `add_command`/`update_command` into what to WRITE in
+/// `managed_commands.env` (v44, N31). Two nested options, because a partial update needs three
+/// answers, not two:
+///   - `None` — the argument is ABSENT: leave the stored env exactly as it is;
+///   - `Some(None)` — an explicit `null` or an EMPTY object `{}`: CLEAR the column (the command
+///     goes back to the inherited environment alone);
+///   - `Some(Some(json))` — the serialized KEY→VALUE object to store.
+///
+/// The parse is the STRICT one ([`optional_env_map`]): a non-object, or ANY non-string value, is
+/// `invalid_argument`. This is the WRITE boundary, the one place a caller mistake can still be
+/// named — past it the reader is deliberately total, so a stored env can never make a command
+/// unresolvable. SECRET HYGIENE: a refusal names the offending KEY and never echoes its value.
+fn optional_env_column(args: &Value, key: &str) -> Result<Option<Option<String>>, RpcError> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(_) => {
+            let pairs = optional_env_map(args, key)?;
+            if pairs.is_empty() {
+                return Ok(Some(None));
+            }
+            let map: serde_json::Map<String, Value> = pairs
+                .into_iter()
+                .map(|(k, v)| (k, Value::from(v)))
+                .collect();
+            Ok(Some(Some(Value::Object(map).to_string())))
+        }
+    }
+}
+
+/// `add_command` — `{ project_id, name, command, subfolder?, env? }` → `{ command }`. Parity
 /// with the Tauri `add_command` (reuses `pkgjson::infer_command_source` + `db::create_template`).
+///
+/// `env` persists the command's OWN environment (N31): the base every spawn path applies — an
+/// agent start/relaunch, the boot restore, and a `gate_check` nyx runs itself. Omitted → none.
 pub fn add_command(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let name = require_str(args, "name")?;
     let command = require_str(args, "command")?;
     let subfolder = optional_str(args, "subfolder")?;
+    let env = optional_env_column(args, "env")?;
     let (source_kind, package_manager) = crate::pkgjson::infer_command_source(command, None, None);
     let source = db::CommandSource {
         source_kind,
@@ -973,7 +1053,18 @@ pub fn add_command(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
         package_manager,
     };
     let template = db
-        .with_conn(|c| db::create_template(c, project_id, name, command, subfolder, source))
+        .with_conn(|c| -> Result<db::ManagedCommand, diesel::result::Error> {
+            let created = db::create_template(c, project_id, name, command, subfolder, source)?;
+            match env.flatten() {
+                // Only a non-empty map is written: an absent / cleared env leaves the column NULL,
+                // which is already the state a fresh row is in.
+                Some(env) => {
+                    db::set_template_env(c, &created.id, Some(&env))?;
+                    Ok(db::get_template(c, &created.id)?.unwrap_or(created))
+                }
+                None => Ok(created),
+            }
+        })
         .map_err(|e| map_template_write_err(project_id, e))?;
     Ok(ToolOutcome::changed(
         json!({ "command": template_json(&template) }),
@@ -1122,9 +1213,13 @@ pub fn project_set_repos(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError>
     ))
 }
 
-/// `update_command` — `{ command_id, name?, command?, subfolder? }` → `{ command }`.
+/// `update_command` — `{ command_id, name?, command?, subfolder?, env? }` → `{ command }`.
 /// Partial update; the package.json source-detach rule runs; refused while any instance
 /// is running. Parity with the Tauri `update_command`.
+///
+/// `env` REPLACES the command's persisted environment WHOLE (it is not a per-key patch — a partial
+/// merge would leave no way to remove a key), and an explicit `null` or `{}` CLEARS it. Omitted, it
+/// is left untouched like every other field.
 pub fn update_command<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
@@ -1135,6 +1230,7 @@ pub fn update_command<S: RunnerSink>(
     let new_command = optional_str(args, "command")?;
     let subfolder_present = args.get("subfolder").map(|v| !v.is_null()).unwrap_or(false);
     let new_subfolder = optional_str(args, "subfolder")?;
+    let new_env = optional_env_column(args, "env")?;
 
     assert_template_not_running(db, runner, command_id)?;
 
@@ -1156,6 +1252,9 @@ pub fn update_command<S: RunnerSink>(
                 db::update_template(c, command_id, name, command, subfolder)?;
                 if detach {
                     db::set_template_source(c, command_id, db::CommandSource::default())?;
+                }
+                if let Some(env) = new_env {
+                    db::set_template_env(c, command_id, env.as_deref())?;
                 }
                 db::get_template(c, command_id)
             },
@@ -1685,6 +1784,35 @@ fn session_context_line(db: &Db, session: &db::AgentSession) -> String {
 ///
 /// `activity` is the host's runtime store. Parity with the Tauri `agent_session_event`
 /// for the session half (over the shared `agent`/`db` layer).
+/// R1 — set by the HOST at the START of an ordered shutdown (before it stops the MCP listener and
+/// kills the PTYs). While true, a real `SessionEnd` does NOT mark its session `ended`: the row stays
+/// `active` so lazy-resume reclaims it next boot. This is the fix for R1 — on a normal close, the
+/// dying Claude PTYs fire `SessionEnd(prompt_input_exit)` that reaches this handler even AFTER
+/// `mcp.stop()` (proven by diag: the POST lands after `shutdown()` began), ending the session and
+/// killing the resume. This is the SECOND deliberate process-global on the crate's dispatch path
+/// (after the engine runtime): the handler is a free fn, and threading a flag through the entire MCP
+/// dispatch would be far more invasive; the sidecar owns the single toggle.
+static SESSION_END_SUPPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The host calls this at ordered-shutdown START so in-flight / late `SessionEnd`s are IGNORED
+/// (they must not end a session we want to resume — R1). Idempotent; never reset within a process
+/// (a shutdown is terminal for the process).
+pub fn suppress_session_end_marking() {
+    SESSION_END_SUPPRESSED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn session_end_marking_suppressed() -> bool {
+    SESSION_END_SUPPRESSED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// TEST-ONLY: clear the (process-global) suppression flag so a test that toggles it does not leak
+/// into the next (the tests serialize on `db_guard`, so a reset inside the lock is isolated).
+#[cfg(test)]
+fn reset_session_end_suppression() {
+    SESSION_END_SUPPRESSED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub fn agent_session_event(
     db: &Db,
     activity: &AgentActivityStore,
@@ -1699,6 +1827,26 @@ pub fn agent_session_event(
         )
     })?;
     let terminal_id = require_str(args, "NYX_TERMINAL_ID")?;
+
+    // --- A slash-command INJECTION that failed (H8) ----------------------------
+    // The hook reports its own failure here rather than only on stderr, which Claude Code hands to
+    // nobody nyx can read. Handled BEFORE the activity resolution and returned from: this is a
+    // REPORT about the turn, not a beat of it, and re-asserting "running" on the way past would make
+    // the live dot depend on whether an injection happened to fail.
+    if let Some(reason) = optional_str(args, "nyx_injection_failed")? {
+        let command = optional_str(args, "nyx_injection_command")?.unwrap_or("");
+        let filed = db
+            .with_conn(|c| db::record_injection_failure(c, terminal_id, command, reason))
+            .map_err(internal_db)?;
+        return Ok(ToolOutcome::changed(
+            json!({
+                "terminal_id": terminal_id,
+                "injection_failed": reason,
+                "recorded": filed,
+            }),
+            ChangedTopic::Specs,
+        ));
+    }
 
     // --- Per-turn ACTIVITY hooks (the live dot; never persisted) --------------
     // Resolve the runtime activity transition from the raw hook name + the relevant
@@ -1715,6 +1863,24 @@ pub fn agent_session_event(
         // reject them). `is_activity_hook` covers the recognized-but-no-op case (e.g. a
         // `Notification` whose type we ignore) so it is still acknowledged, not errored.
         if is_activity_hook(hook_name) {
+            // The HUMAN spoke. Recorded off the SAME hook that moves the dot, but for a different
+            // reader and into a different store: the orchestration engine has to know that a PERSON
+            // — not the session — took a turn on this terminal, and this hook is the only signal on
+            // the whole dispatch path an agent cannot produce (H6, see [`db::HumanTurn`]). It goes
+            // to the DB, not to the runtime activity map, because the answer it authorises can
+            // arrive in a LATER session than the question (`claude -p` opens and closes a whole
+            // session per prompt). The raw text rides along so a consent answer is journaled with
+            // the words that authorised it.
+            //
+            // The turn's IDENTITY is Claude Code's own `prompt_id` when the hook carries one; when
+            // it does not, `record_human_turn` mints one. BEST-EFFORT: this hook must never fail a
+            // prompt, so a DB hiccup records nothing rather than erroring (nyx then simply proves
+            // no turn, which is the safe answer).
+            if hook_name == "UserPromptSubmit" {
+                let prompt = optional_str(args, "prompt")?.unwrap_or_default();
+                let turn_id = optional_str(args, "prompt_id")?;
+                let _ = db.with_conn(|c| db::record_human_turn(c, terminal_id, turn_id, prompt));
+            }
             let tool_name = args.get("tool_name").and_then(|v| v.as_str());
             let notification_type = args.get("notification_type").and_then(|v| v.as_str());
             if let Some(activity_event) =
@@ -1882,6 +2048,18 @@ pub fn agent_session_event(
                     "reason": "internal transition (clear/resume) — session kept active",
                 })));
             }
+            // R1 — the HOST is shutting down: a dying PTY's `SessionEnd` must NOT end the session,
+            // or lazy-resume cannot reclaim it next boot. Leave the row `active` (and the activity
+            // untouched — the process is going away anyway). This catches the late POST that
+            // outlives `mcp.stop()`, which closing the listener alone did not.
+            if session_end_marking_suppressed() {
+                return Ok(ToolOutcome::read(json!({
+                    "event": "SessionEnd",
+                    "terminal_id": terminal_id,
+                    "ended": false,
+                    "reason": "host shutting down — session kept active for resume (R1)",
+                })));
+            }
             // A real SessionEnd ALSO clears the runtime activity (the anti-phantom
             // reflex on the clean-end path — no live turn survives the session ending).
             activity.clear(terminal_id);
@@ -1943,9 +2121,9 @@ pub fn agent_session_event(
 // --- Interactive-terminal tools (DB-record half + TerminalHost) ------------
 
 /// `create_terminal` — `{ cwd?, command?, label? }` → `{ terminal_id, cwd, workspace_id,
-/// has_command }`. Writes the record + resolves auto-attach + parks any opening command,
-/// then asks the shell to refresh its terminal deck (the front mounts the xterm + spawns
-/// the PTY). Parity with the Tauri `create_terminal`.
+/// has_command }`. Writes the record + resolves auto-attach + parks any opening command, then
+/// STARTS the shell — see [`TerminalHost::open_terminal_shell`] for why the tool opens it rather
+/// than leaving it to the front's mount.
 pub fn create_terminal(
     db: &Db,
     host: &dyn TerminalHost,
@@ -1970,9 +2148,12 @@ pub fn create_terminal(
         .map_err(internal_db)?;
 
     let has_command = command.is_some();
+    // PARK BEFORE OPENING: the shell that `open_terminal_shell` starts is what drains the park and
+    // types the opening command in, so the command must already be waiting when it comes up.
     if let Some(command) = command {
         host.park_opening_command(&terminal_id, command);
     }
+    host.open_terminal_shell(&terminal_id, &stored_cwd);
     Ok(ToolOutcome::changed(
         json!({
             "terminal_id": terminal_id,
@@ -2202,11 +2383,24 @@ pub fn close_terminal(
 }
 
 /// `read_terminal` — `{ terminal_id, tail_bytes?, max_bytes?, since?, strip_ansi? }` →
-/// `{ terminal_id, output, total_bytes, returned_bytes, truncated, reset, cursor }`. Reads
-/// the persisted (front-serialized) scrollback. Parity with the Tauri `read_terminal`
-/// (returning the bounded window; `strip_ansi` post-processing is the same byte-exact
-/// window — the shell may further strip if it wants the exact rendered field).
-pub fn read_terminal(db: &Db, args: &Value) -> Result<Value, RpcError> {
+/// `{ terminal_id, output, total_bytes, returned_bytes, truncated, reset, cursor, live, stale }`.
+/// Reads the persisted (front-serialized) scrollback.
+///
+/// It ALSO states the buffer's FRESHNESS, because that buffer is not always the terminal's present
+/// state and the difference is invisible in the text: the scrollback is serialized by the shell's
+/// front end and only for a terminal it currently has MOUNTED. A terminal in another project, or
+/// one the idle-unload closed, keeps its last saved buffer for as long as it stays out of view —
+/// arbitrarily long. So the answer carries:
+///   * `live` — a shell is running behind this record right now;
+///   * `stale` — what you are reading is NOT the terminal's present state, either because no shell
+///     is running any more (`live: false`, a closed or unloaded terminal: the buffer is its final
+///     saved output) or because its shell has printed things nyx has not saved yet
+///     (`scrollback_is_behind`: the terminal is not mounted in the UI, or the save debounce is
+///     still in flight right after a `send_to_terminal`).
+///
+/// `stale: false` is therefore the only reading a caller may treat as "this is what the terminal
+/// shows now"; anything else is a past snapshot, said out loud rather than passed off as current.
+pub fn read_terminal(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<Value, RpcError> {
     let terminal_id = require_str(args, "terminal_id")?;
     let (effective_tail, since, strip) = parse_window_knobs(args)?;
     let scrollback = match db
@@ -2230,6 +2424,8 @@ pub fn read_terminal(db: &Db, args: &Value) -> Result<Value, RpcError> {
     } else {
         window.output.clone()
     };
+    let (live, _busy) = host.terminal_liveness(terminal_id);
+    let stale = !live || host.scrollback_is_behind(terminal_id);
     Ok(json!({
         "terminal_id": terminal_id,
         "output": output,
@@ -2238,6 +2434,8 @@ pub fn read_terminal(db: &Db, args: &Value) -> Result<Value, RpcError> {
         "truncated": window.truncated,
         "reset": window.reset,
         "cursor": window.cursor,
+        "live": live,
+        "stale": stale,
     }))
 }
 
@@ -2331,13 +2529,38 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         crate::mcp::CLEAR_COMMAND_OUTPUT_TOOL => Some(clear_command_output(db, runner, args)),
         // Agent-session channel (session lifecycle + runtime activity).
         crate::mcp::AGENT_SESSION_EVENT_TOOL => Some(agent_session_event(db, activity, args)),
+        // The v2.8 ENGINE run-lifecycle entry: OPEN a run and get its run_id (the dispatcher calls
+        // this once, then loops on nyx_next). Resolves the workflow + optional Spec binding. It
+        // reaches the SAME process-global engine registry the tick below does, because opening a run
+        // can REPLACE a dead one and deleting that row takes the very tick guard a live tick holds.
+        crate::mcp_engine::RUN_START_TOOL => Some(crate::mcp_engine::run_start(
+            db,
+            crate::mcp_engine::shared_runtime(),
+            args,
+        )),
+        // The v2.8 ENGINE runtime tick: the thin dispatcher calls this in a loop. It advances the
+        // run's behavior tree, runs the gate_check managed commands ITSELF over the PTY (refusing
+        // to advance while a blocking gate is red), imposes state transitions through the guarded
+        // Spec authority, and returns the next atomic action. Uses the session-global engine
+        // registry so the signature stays stable across shells. The CALLER SESSION rides along —
+        // the terminal this MCP connection is bound to — because the consent check (H6) is a
+        // question about who is on the other end (it reads that terminal's persisted human-turn
+        // ledger itself, from the same `db`).
+        crate::mcp_engine::NYX_NEXT_TOOL => Some(crate::mcp_engine::nyx_next(
+            db,
+            crate::mcp_engine::shared_runtime(),
+            crate::mcp_engine::CallerSession {
+                terminal_id: caller_terminal_id,
+            },
+            args,
+        )),
         // Interactive-terminal tools (DB-record half + the shell's TerminalHost).
         crate::mcp::CREATE_TERMINAL_TOOL => Some(create_terminal(db, host, args)),
         crate::mcp::SEND_TO_TERMINAL_TOOL => Some(send_to_terminal(db, host, args)),
         crate::mcp::SEND_KEYS_TOOL => Some(send_keys(db, host, args)),
         crate::mcp::LIST_TERMINALS_TOOL => read(list_terminals(db, host, args)),
         crate::mcp::CLOSE_TERMINAL_TOOL => Some(close_terminal(db, host, args)),
-        crate::mcp::READ_TERMINAL_TOOL => read(read_terminal(db, args)),
+        crate::mcp::READ_TERMINAL_TOOL => read(read_terminal(db, host, args)),
         // The v2.4 Phase-5 tools (routed by their own sub-dispatchers so a Spec/context tool
         // is added in exactly one place): the Spec authoring + transition tools
         // (create/update/fork/transition Spec, add/transition/depend tasks) and the
@@ -2353,6 +2576,10 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
             // content_hash) — same one-place sub-dispatcher, delegating to the SHARED
             // `nyx_core::db` annexe authority.
             .or_else(|| crate::mcp_tools_annexe::dispatch_annexe_tool(db, name, args))
+            // The v2.8 GRAPH-AUTHORING tools (workflow_create/fork/assign + node CRUD) — the MCP
+            // layer over the Phase-2 workflow/node CRUD, adding the tree-coherence guard that
+            // refuses an incoherent graph. Same one-place sub-dispatcher.
+            .or_else(|| crate::mcp_authoring::dispatch_authoring_tool(db, name, args))
             // The v2.7 PROTOTYPE tools (the agent's constrained proto contract: read the explicit
             // state, present a round, elect a variant, raise/resolve a pre-dev comment) — same
             // one-place sub-dispatcher, delegating to the SHARED `nyx_core::db` prototype
@@ -3094,7 +3321,7 @@ mod tests {
         // A project + Spec + a spec-scoped human comment, promoted to a `proposed` finding (the
         // human's "lâche brut" now creates a `tasks kind=review` row, not a `review_tasks` row).
         let (spec_id, finding) = db
-            .with_conn(|c| -> diesel::QueryResult<(String, crate::db::Task)> {
+            .with_conn(|c| -> Result<(String, crate::db::Task), crate::db::ContentWriteError> {
                 let (project, root) = crate::db::create_project(c, "Proj", "/work", None)?;
                 let (spec, _) = crate::db::create_spec(
                     c,
@@ -3161,6 +3388,109 @@ mod tests {
         assert_eq!(
             tasks[0]["from_comment_id"],
             finding.from_comment_id.unwrap()
+        );
+    }
+
+    /// A MALFORMED FINDING HAS A REPAIR PATH, MID-BUILD. Observed live: an auditor's tool call came
+    /// out mangled and left a stray `<parameter name=…>` line in the finding's description. Nothing
+    /// could clean it — `task_delete` is draft-only, and `skip` cancels the WORK when all that is
+    /// wrong is the wording — so a badly-formed finding was permanent for the rest of the build.
+    ///
+    /// Rewriting a finding's TEXT is not the authority `task_delete` withholds: the freeze exists so
+    /// work in progress cannot redefine its own target, and the words of a finding are not its target
+    /// — the severity, the phase, the round and the status all stay put, so what the build owes is
+    /// unchanged. And a finding raised DIRECTLY (no grill) is not filed into the retour grill by being
+    /// corrected: a repair says nothing about a promotion that never happened.
+    #[test]
+    fn a_malformed_finding_is_repaired_mid_build_without_entering_the_grill() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+
+        // A Spec driven to in_progress — the FROZEN state where `task_delete` refuses — carrying an
+        // auditor finding whose description came out malformed.
+        let (spec_id, finding) = db
+            .with_conn(|c| -> Result<(String, crate::db::Task), crate::db::ContentWriteError> {
+                let (project, root) = crate::db::create_project(c, "Proj", "/work", None)?;
+                let (spec, _) = crate::db::create_spec(
+                    c,
+                    &project.id,
+                    "Spec",
+                    crate::db::SpecSections {
+                        problem: "p".into(),
+                        solution: "s".into(),
+                        ..Default::default()
+                    },
+                )?;
+                let finding = crate::db::create_task(
+                    c,
+                    &project.id,
+                    "Auditor: retry loop unbounded",
+                    crate::db::NewTaskInput {
+                        spec_id: Some(spec.id.clone()),
+                        description: Some(
+                            "Cap the retries.\n<parameter name=\"severity\">high</parameter>".into(),
+                        ),
+                        ..crate::db::NewTaskInput::review(crate::db::TASK_SEVERITY_HIGH)
+                    },
+                )?;
+                crate::db::transition_spec(c, &spec.id, crate::db::SpecTransition::Ready, true)
+                    .expect("ready");
+                crate::db::transition_spec_with_workspace(
+                    c,
+                    &spec.id,
+                    crate::db::SpecTransition::Start,
+                    true,
+                    Some(&root.id),
+                )
+                .expect("start");
+                Ok((spec.id, finding))
+            })
+            .expect("a Spec under build carrying a malformed finding");
+        assert_eq!(
+            finding.grill_state, None,
+            "a directly-raised auditor finding entered no grill"
+        );
+
+        // THE REPAIR — the same words, minus the markup the mangled call left behind.
+        let repaired = review_task_structure(
+            &db,
+            &json!({
+                "id": finding.id,
+                "title": "Auditor: retry loop unbounded",
+                "details": "Cap the retries.",
+            }),
+        )
+        .expect("a finding's text is repairable while the Spec is frozen");
+        assert_eq!(
+            repaired.result["task"]["description"],
+            json!("Cap the retries."),
+            "the stray markup is gone"
+        );
+
+        // What the build OWES is untouched — the repair changed words, not obligations.
+        let stored = db
+            .with_conn(|c| crate::db::get_task(c, &finding.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.severity.as_deref(), Some(crate::db::TASK_SEVERITY_HIGH));
+        assert_eq!(stored.status, finding.status);
+        assert_eq!(stored.phase, finding.phase);
+        assert_eq!(stored.round, finding.round);
+
+        // And it did NOT enter the retour grill: the review viewer's promotion panel lists the
+        // findings GRILLED from a comment, and this one was never promoted from one.
+        assert_eq!(
+            stored.grill_state, None,
+            "repairing a directly-raised finding must not stamp a grill state on it"
+        );
+        let grilled = review_task_list(
+            &db,
+            &json!({ "workspace_id": "ws", "repository_id": "repo", "spec_id": spec_id }),
+        )
+        .expect("list");
+        assert!(
+            grilled["tasks"].as_array().unwrap().is_empty(),
+            "a repaired auditor finding does not appear in the promotion panel as a grilled retour"
         );
     }
 
@@ -3232,7 +3562,7 @@ mod tests {
 
         // A project + Spec on a workspace (the finding lives on the Spec).
         let (spec_id, ws_id) = db
-            .with_conn(|c| -> diesel::QueryResult<(String, String)> {
+            .with_conn(|c| -> Result<(String, String), crate::db::ContentWriteError> {
                 let (project, root) = crate::db::create_project(c, "Proj", "/work", None)?;
                 let (spec, _) = crate::db::create_spec(
                     c,
@@ -3331,7 +3661,7 @@ mod tests {
         // A Spec with TWO plan phases: One(1) DELIVERED (done), Two(2) still open → the derived
         // last-delivered phase is 1.
         let (spec_id, ws_id) = db
-            .with_conn(|c| -> diesel::QueryResult<(String, String)> {
+            .with_conn(|c| -> Result<(String, String), crate::db::ContentWriteError> {
                 let (project, root) = crate::db::create_project(c, "Proj", "/work", None)?;
                 let (spec, _) = crate::db::create_spec(
                     c,
@@ -3741,6 +4071,47 @@ mod tests {
         assert_eq!(after["terminals"].as_array().unwrap().len(), 0);
     }
 
+    /// H1 — `create_terminal` OPENS the shell itself, for the record it just wrote and at the cwd
+    /// it stored. Leaving that to the front's mount made the tool depend on what the human had on
+    /// screen: the front mounts only the displayed project's panes, so a terminal opened anywhere
+    /// else never got a shell at all.
+    ///
+    /// The ORDER is the other half of the contract: the opening command is parked BEFORE the
+    /// shell is asked for, because that shell is what drains the park — park after and the
+    /// command misses its own terminal.
+    #[test]
+    fn create_terminal_opens_the_shell_for_the_record_it_wrote() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = RecordingHost::default();
+        let created = create_terminal(
+            &db,
+            &host,
+            &json!({ "cwd": "/tmp/h1-open", "command": "echo hi" }),
+        )
+        .unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            *host.opened.lock().unwrap(),
+            vec![(tid.clone(), "/tmp/h1-open".to_string())],
+            "the tool must ask for the record's shell, at the cwd it stored"
+        );
+        assert_eq!(
+            *host.parked.lock().unwrap(),
+            vec![tid],
+            "the opening command must be parked before the shell that drains it is asked for"
+        );
+
+        // With no cwd argument the record stores the `.` default, and that is what the host is
+        // told — it is the host that spells "the shell's own working directory".
+        let bare = create_terminal(&db, &host, &json!({})).unwrap();
+        let bare_id = bare.result["terminal_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            host.opened.lock().unwrap().last(),
+            Some(&(bare_id, ".".to_string()))
+        );
+    }
+
     #[test]
     fn send_to_terminal_without_live_pty_is_invalid_state_not_unknown() {
         let _g = db_guard();
@@ -3866,6 +4237,143 @@ mod tests {
         let removed = remove_command(&db, &runner, &json!({ "command_id": cmd_id })).unwrap();
         assert_eq!(removed.result["removed"], json!(true));
         assert_eq!(removed.effects, vec![ChangedTopic::Commands]);
+    }
+
+    /// N31 — the persisted env is SETTABLE from the agent surface: `add_command` stores it,
+    /// `update_command` replaces it, and an explicit `{}` (or `null`) CLEARS it. The read-back
+    /// reports the KEYS only — an env value is a secret and is never echoed.
+    #[test]
+    fn add_and_update_command_set_then_clear_the_persisted_env() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/cmdenv", None))
+            .unwrap();
+        let runner = noop_runner();
+
+        // add_command stores the map…
+        let added = add_command(
+            &db,
+            &json!({
+                "project_id": project.id,
+                "name": "tests",
+                "command": "cargo test",
+                "env": { "DATABASE_URL": "postgres://secret", "RUST_LOG": "debug" },
+            }),
+        )
+        .unwrap();
+        let cmd_id = added.result["command"]["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            added.result["command"]["env_keys"],
+            json!(["DATABASE_URL", "RUST_LOG"]),
+            "the surface advertises the KEYS"
+        );
+        let stored = |db: &Db, id: &str| {
+            db.with_conn(|c| db::get_template(c, id))
+                .unwrap()
+                .unwrap()
+                .env
+        };
+        assert!(
+            !added.result["command"].to_string().contains("secret"),
+            "an env VALUE is never echoed back"
+        );
+        assert_eq!(
+            crate::command::decode_command_env(stored(&db, &cmd_id).as_deref()).len(),
+            2,
+            "both entries are persisted and decodable"
+        );
+
+        // …update_command REPLACES it whole (the dropped key is gone, not merged)…
+        let updated = update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "env": { "RUST_LOG": "info" } }),
+        )
+        .unwrap();
+        assert_eq!(updated.result["command"]["env_keys"], json!(["RUST_LOG"]));
+
+        // …an omitted env leaves it untouched…
+        let untouched = update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "name": "tests-renamed" }),
+        )
+        .unwrap();
+        assert_eq!(untouched.result["command"]["env_keys"], json!(["RUST_LOG"]));
+
+        // …and an explicit {} clears the column outright.
+        let cleared =
+            update_command(&db, &runner, &json!({ "command_id": cmd_id, "env": {} })).unwrap();
+        assert_eq!(cleared.result["command"]["env_keys"], json!([]));
+        assert_eq!(stored(&db, &cmd_id), None, "the column is NULL, not '{{}}'");
+
+        // `null` clears it too (the same "no environment" answer, spelled the other way).
+        update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "env": { "A": "1" } }),
+        )
+        .unwrap();
+        update_command(&db, &runner, &json!({ "command_id": cmd_id, "env": null })).unwrap();
+        assert_eq!(stored(&db, &cmd_id), None);
+    }
+
+    /// N31 — the WRITE boundary is where a caller mistake is still named: a non-string env value is
+    /// refused as `invalid_argument` naming ONLY the key, never the value (which may be a secret).
+    #[test]
+    fn add_and_update_command_refuse_a_non_string_env_value_naming_only_the_key() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/cmdenvbad", None))
+            .unwrap();
+        let runner = noop_runner();
+
+        let err = add_command(
+            &db,
+            &json!({
+                "project_id": project.id,
+                "name": "tests",
+                "command": "cargo test",
+                "env": { "PORT": 5433 },
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(err.message.contains("env.PORT"), "names the key: {err:?}");
+        assert!(!err.message.contains("5433"), "never echoes the value");
+        // The refusal happens BEFORE the write: no half-created template.
+        assert!(db
+            .with_conn(|c| db::list_templates(c, &project.id))
+            .unwrap()
+            .is_empty());
+
+        // Same rule on update, and a non-object env is refused too.
+        let added = add_command(
+            &db,
+            &json!({ "project_id": project.id, "name": "tests", "command": "cargo test" }),
+        )
+        .unwrap();
+        let cmd_id = added.result["command"]["command_id"].as_str().unwrap();
+        let err = update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "env": { "PORT": 5433 } }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(err.message.contains("env.PORT"));
+        let err = update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "env": "DATABASE_URL=x" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
     }
 
     #[test]
@@ -4057,7 +4565,8 @@ mod tests {
     fn read_terminal_unknown_id_is_invalid_id() {
         let _g = db_guard();
         let db = Db::in_memory();
-        let err = read_terminal(&db, &json!({ "terminal_id": "nope" })).unwrap_err();
+        let err =
+            read_terminal(&db, &NoTerminalHost, &json!({ "terminal_id": "nope" })).unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidId);
     }
 
@@ -4087,6 +4596,158 @@ mod tests {
         assert_eq!(out.effects, vec![ChangedTopic::AgentSessions]);
         assert_eq!(out.result["activity"], json!(true));
         assert!(activity.snapshot(&tid).unwrap().activity == Activity::Working);
+    }
+
+    /// H6 — the same hook ALSO records that a HUMAN took a turn on this terminal: the raw text they
+    /// typed and the turn's IDENTITY (Claude Code's `prompt_id`). This is the signal the
+    /// orchestration engine checks before it lets an answer commit a Spec, and it is the only one on
+    /// the whole dispatch path an agent cannot produce: no tool call writes this row, only a person
+    /// pressing enter. A hook that is not a prompt must not write it either — otherwise the agent's
+    /// own tool traffic would forge the very proof.
+    ///
+    /// And the row OUTLIVES THE SESSION, which is the fix: `SessionEnd` drops the live dot (no turn
+    /// can still be running once the session is gone) and leaves the ledger standing. A `claude -p`
+    /// invocation IS a whole session — start, one prompt, end — so a ledger that died with it was
+    /// gone before the answer it authorises ever came back, and the consent check refused authentic
+    /// answers for exactly that reason.
+    #[test]
+    fn a_user_prompt_hook_records_the_human_turn_and_it_outlives_the_session() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        let ledger = || db.with_conn(|c| db::last_human_turn(c, &tid)).unwrap();
+        assert_eq!(ledger(), None, "no prompt, no turn");
+
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "NYX_TERMINAL_ID": tid,
+                "prompt": "oui, passe-la en ready",
+                "prompt_id": "prompt-1",
+            }),
+        )
+        .unwrap();
+        let turn = ledger().expect("the human's turn is recorded");
+        assert_eq!(turn.turn_id, "prompt-1", "the turn is NAMED by the prompt id");
+        assert_eq!(turn.prompt, "oui, passe-la en ready");
+
+        // A tool the AGENT runs is a beat of its turn, not a turn of the human's.
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "PreToolUse", "NYX_TERMINAL_ID": tid, "tool_name": "Bash" }),
+        )
+        .unwrap();
+        assert_eq!(
+            ledger().unwrap().turn_id,
+            "prompt-1",
+            "an agent's own tool traffic must never count as the human speaking"
+        );
+
+        // THE SESSION ENDS — the whole of a `claude -p` invocation. The dot goes (nothing is
+        // running), the human's turn STAYS: they typed it, and it is still the last thing they said.
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "NYX_TERMINAL_ID": tid,
+                "session_id": "sess-1",
+                "reason": "prompt_input_exit",
+            }),
+        )
+        .unwrap();
+        assert!(
+            activity.snapshot(&tid).is_none(),
+            "the session ending clears the live dot"
+        );
+        assert_eq!(
+            ledger().expect("the ledger survives the session").turn_id,
+            "prompt-1",
+            "the human turn outlives the session it was typed in"
+        );
+
+        // A provider that sends NO prompt id still produces a DISTINCT turn — nyx mints the identity
+        // itself, because all the consent check asks is "is this another turn than the one I saw?".
+        agent_session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "NYX_TERMINAL_ID": tid,
+                "prompt": "yes",
+            }),
+        )
+        .unwrap();
+        let next = ledger().expect("the next turn is recorded");
+        assert_ne!(next.turn_id, "prompt-1", "a new prompt is a new turn");
+        assert_eq!(next.prompt, "yes");
+    }
+
+    /// R1 — while the host is SHUTTING DOWN, a real `SessionEnd` (e.g. `prompt_input_exit` from a
+    /// dying PTY) must NOT end the session: it stays `active` so lazy-resume reclaims it next boot.
+    /// Without the suppression, that late SessionEnd (which outlives `mcp.stop()`) ended the session
+    /// and killed the resume — the whole of R1. The mirror (no suppression → still ends) proves the
+    /// guard is scoped to the shutdown window, not a blanket change.
+    #[test]
+    fn a_session_end_during_host_shutdown_keeps_the_session_active() {
+        let _g = db_guard();
+        reset_session_end_suppression(); // a prior test must not leak the flag in
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let (session_id, terminal_id) = db.with_conn(|c| {
+            let terminal = crate::db::create_terminal(c, "/work", None).unwrap();
+            let session = crate::db::record_session_start(
+                c,
+                &terminal.id,
+                crate::db::AGENT_KIND_CLAUDE_CODE,
+                crate::db::SessionCapture {
+                    external_session_id: "ext-r1".into(),
+                    cwd: "/work".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            (session.id, terminal.id)
+        });
+        let end_event = json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "ext-r1",
+            "reason": "prompt_input_exit",
+            "NYX_TERMINAL_ID": terminal_id,
+        });
+
+        // The host begins its ordered shutdown → suppress. The dying PTY's SessionEnd is IGNORED.
+        suppress_session_end_marking();
+        let out = agent_session_event(&db, &activity, &end_event).expect("handled");
+        assert_eq!(out.result["ended"], json!(false));
+        let survived = db
+            .with_conn(|c| crate::db::get_session(c, &session_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            survived.state,
+            crate::db::SESSION_STATE_ACTIVE,
+            "the session survives the shutdown SessionEnd → resumable next boot",
+        );
+
+        // Mirror: WITHOUT suppression (the app running normally) the SAME event DOES end it.
+        reset_session_end_suppression();
+        agent_session_event(&db, &activity, &end_event).expect("handled");
+        let ended = db
+            .with_conn(|c| crate::db::get_session(c, &session_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ended.state,
+            crate::db::SESSION_STATE_ENDED,
+            "outside a shutdown, a real SessionEnd still ends the session (unchanged)",
+        );
     }
 
     /// A `Stop` hook drives activity back to `idle` AND raises the focus-aware "response
@@ -4736,15 +5397,26 @@ mod tests {
         );
     }
 
-    /// A [`TerminalHost`] that RECORDS which terminal PTYs it was asked to close, so a test
-    /// can assert the destructive `remove_workspace` cascade killed the workspace's live
-    /// terminals via the host (review 01KWEX11, done_criterion #2).
+    /// A [`TerminalHost`] that RECORDS what it was asked to do — which terminal PTYs to close
+    /// (review 01KWEX11, done_criterion #2: the destructive `remove_workspace` cascade kills the
+    /// workspace's live terminals through the host) and which shells to OPEN, in order, with the
+    /// cwd asked for.
     #[derive(Default)]
     struct RecordingHost {
         closed: std::sync::Mutex<Vec<String>>,
+        opened: std::sync::Mutex<Vec<(String, String)>>,
+        parked: std::sync::Mutex<Vec<String>>,
     }
     impl TerminalHost for RecordingHost {
-        fn park_opening_command(&self, _: &str, _: &str) {}
+        fn park_opening_command(&self, terminal_id: &str, _: &str) {
+            self.parked.lock().unwrap().push(terminal_id.to_string());
+        }
+        fn open_terminal_shell(&self, terminal_id: &str, cwd: &str) {
+            self.opened
+                .lock()
+                .unwrap()
+                .push((terminal_id.to_string(), cwd.to_string()));
+        }
         fn send_to_terminal(&self, _: &str, _: &str) -> Result<bool, String> {
             Ok(false)
         }
@@ -4756,6 +5428,9 @@ mod tests {
         }
         fn terminal_liveness(&self, _: &str) -> (bool, Option<bool>) {
             (false, None)
+        }
+        fn scrollback_is_behind(&self, _: &str) -> bool {
+            false
         }
     }
 

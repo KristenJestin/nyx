@@ -147,9 +147,12 @@ pub const MCP_DESCRIPTOR_FILE: &str = ".mcp.json";
 /// (`resources/claude-commands/`, deliberately OUTSIDE the plugin bundle so Claude Code
 /// never namespaces them `/<plugin>:<cmd>` — dogfood finding 01KXEJVZ). Each is deployed
 /// VERBATIM into the user-scope command dir ([`PluginInstall::commands_dir`]) so the human
-/// invokes `/nspec` `/ndev` `/ndoc` BARE. The content is UNCHANGED from the former in-plugin
-/// stubs: it carries the `<!-- NYX-AGENT-CONTEXT role=… -->` sentinel + `$ARGUMENTS`, so the
-/// hook's `UserPromptSubmit` branch still fires and injects the live-rendered role manual.
+/// invokes `/nspec` `/ndev` `/ndoc` BARE — that INVOCATION is what the hook's `UserPromptSubmit`
+/// branch keys on to inject the live-rendered role manual. Each stub DECLARES the run its command
+/// opens in a `<!-- NYX-AGENT-CONTEXT role=… scope=… -->` sentinel: the hook never reads that text
+/// (a hook receives the prompt as TYPED, never the expanded body), but the push-injection e2e
+/// binds the hook's command table to this declaration, so the two cannot drift. `$ARGUMENTS`
+/// carries the human's free text through.
 /// `(file_name, verbatim_content)` — the SAME bytes the byte-identity + push-injection tests
 /// read from the canonical source dir on disk.
 pub const USER_COMMAND_STUBS: [(&str, &str); 3] = [
@@ -1402,13 +1405,16 @@ mod tests {
         std::fs::write(&user_file, "keep me").unwrap();
 
         install_with(&inst, &cli).unwrap();
-        for ((name, _), role) in USER_COMMAND_STUBS.iter().zip(["spec", "dev", "doc"]) {
+        for ((name, _), marker) in USER_COMMAND_STUBS
+            .iter()
+            .zip(["role=dev scope=nspec", "role=dev", "role=dev scope=ndoc"])
+        {
             let deployed = commands_dir.join(name);
             let body = std::fs::read_to_string(&deployed)
                 .unwrap_or_else(|e| panic!("stub {name} deployed: {e}"));
             assert!(
-                body.contains(&format!("NYX-AGENT-CONTEXT role={role}")),
-                "deployed {name} carries the role={role} sentinel"
+                body.contains(&format!("NYX-AGENT-CONTEXT {marker}")),
+                "deployed {name} carries the `{marker}` dispatcher sentinel"
             );
             assert!(
                 body.contains("$ARGUMENTS"),
@@ -1650,13 +1656,16 @@ mod tests {
     /// GUARD (finding 01KXEJVZ): the three BARE user-scope command stubs the install vehicle
     /// deploys ([`USER_COMMAND_STUBS`]) must ship in nyx-core's canonical `resources/
     /// claude-commands/` source (OUTSIDE the plugin bundle), and each must carry its role
-    /// sentinel + `$ARGUMENTS` so the hook's `UserPromptSubmit` injection still fires. The
-    /// compiled-in constant and the on-disk canonical file are asserted byte-identical (the
-    /// push-injection e2e reads the on-disk copy; the deploy writes the constant).
+    /// sentinel + `$ARGUMENTS`. The compiled-in constant and the on-disk canonical file are
+    /// asserted byte-identical (the push-injection e2e reads the on-disk copy — it binds the
+    /// hook's command table to the sentinel DECLARED there; the deploy writes the constant).
     #[test]
     fn nyx_core_ships_the_user_scope_command_stubs() {
         let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        for ((name, content), role) in USER_COMMAND_STUBS.iter().zip(["spec", "dev", "doc"]) {
+        for ((name, content), marker) in USER_COMMAND_STUBS
+            .iter()
+            .zip(["role=dev scope=nspec", "role=dev", "role=dev scope=ndoc"])
+        {
             let on_disk = crate_root.join("resources/claude-commands").join(name);
             let bytes = std::fs::read(&on_disk)
                 .unwrap_or_else(|e| panic!("canonical stub `{name}` must ship: {e}"));
@@ -1666,8 +1675,8 @@ mod tests {
                 "the compiled-in `{name}` must match the on-disk canonical source byte-for-byte"
             );
             assert!(
-                content.contains(&format!("NYX-AGENT-CONTEXT role={role}")),
-                "`{name}` must carry the role={role} sentinel the hook keys on"
+                content.contains(&format!("NYX-AGENT-CONTEXT {marker}")),
+                "`{name}` must declare the `{marker}` sentinel the hook's command table mirrors"
             );
             assert!(
                 content.contains("$ARGUMENTS"),

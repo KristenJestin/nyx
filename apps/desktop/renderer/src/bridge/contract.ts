@@ -559,6 +559,88 @@ export interface TerminalSpecs {
 }
 
 // ---------------------------------------------------------------------------
+// v2.8 orchestration ENGINE — the behavior-tree graph read models (Phase 6). These mirror, on the
+// wire, the `nyx_core::db` `Workflow` / `Node` / `WorkflowRun` serde shapes (snake_case) the sidecar
+// engine read-commands return. The graph is DATA (PRD "Orchestration = donnée"); the renderer
+// reconstructs the pure tree from the flat `EngineNode` rows (`parent_id` + `order_index`).
+// ---------------------------------------------------------------------------
+
+/** A workflow's `scope` — which built-in flow the tree IS (mirror of the DB CHECK vocabulary). */
+export type WorkflowScope = "ndev" | "nspec" | "ndoc" | "custom";
+
+/** A workflow_run's lifecycle status (mirror of the DB CHECK vocabulary). */
+export type WorkflowRunStatus = "running" | "blocked" | "done" | "failed";
+
+/**
+ * A `workflows` row (mirror of `nyx_core::db::Workflow`). `project_id` null = a BUILT-IN nyx default
+ * (the seeded ndev/nspec/ndoc); `root_node_id` null = an empty draft; `forked_from` null = not a fork.
+ */
+export interface EngineWorkflow {
+  readonly id: string;
+  readonly project_id: string | null;
+  readonly name: string;
+  readonly scope: WorkflowScope;
+  readonly root_node_id: string | null;
+  readonly forked_from: string | null;
+  readonly created_at: number;
+  readonly updated_at: number;
+}
+
+/**
+ * A `nodes` row (mirror of `nyx_core::db::Node`). The tree is PURE: `parent_id` null = the workflow's
+ * root, and a composite's ORDERED children are the rows with `parent_id = it` sorted by `order_index`.
+ * `type_` is the behavior-tree vocabulary (the field is `type_` on the wire — `type` is a Rust
+ * keyword); `config` is a typed JSON-object STRING decoded per node kind.
+ */
+export interface EngineNode {
+  readonly id: string;
+  readonly workflow_id: string;
+  readonly parent_id: string | null;
+  readonly order_index: number;
+  readonly type_: string;
+  readonly label: string;
+  readonly config: string;
+  readonly created_at: number;
+  readonly updated_at: number;
+}
+
+/** `engine_workflow_graph` result — one workflow + its full node dump (for tree reconstruction). */
+export interface EngineWorkflowGraph {
+  readonly workflow: EngineWorkflow;
+  readonly nodes: readonly EngineNode[];
+}
+
+/**
+ * A `workflow_runs` row (mirror of `nyx_core::db::WorkflowRun`). `current_node_id` is the live cursor
+ * (the node the run is parked on — the runtime view HIGHLIGHTS it); `blackboard` is the run's JSON
+ * scratchpad STRING (last gate verdict, phase index, findings count, …) the runtime panel renders.
+ */
+export interface EngineWorkflowRun {
+  readonly id: string;
+  readonly workflow_id: string;
+  readonly spec_id: string | null;
+  /** The run that OPENED this one through a `sub_workflow` node, or `null` for a top-level run. A Spec
+   *  therefore has one ROOT run per flow plus the child runs its graph delegated to (v2.8 lot 2). */
+  readonly parent_run_id: string | null;
+  readonly current_node_id: string | null;
+  readonly blackboard: string;
+  readonly status: WorkflowRunStatus;
+  readonly started_at: number;
+  readonly updated_at: number;
+  /** The RECEIPT of the consent question the engine put to the human for this run (H6), as a JSON
+   *  string, or `null` when there is none open. Written and cleared by the ENGINE alone — it records
+   *  what was asked and to which session, so the tick that receives the answer can tell a human's
+   *  from a session's. The UI does not answer it (the human answers in the conversation), it only
+   *  mirrors the column. */
+  readonly pending_consent: string | null;
+}
+
+/** `engine_effector_context` result — the rendered effector manual (null when the Spec is unknown). */
+export interface EngineEffectorContext {
+  readonly context: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // The bridge surface, grouped by capability
 // ---------------------------------------------------------------------------
 
@@ -679,6 +761,12 @@ export type BackendCommand =
   | "pty_close"
   | "register_terminal_pty"
   | "terminal_info"
+  // The ANSI byte stream that repaints a terminal's screen (main + alt-screen) into a
+  // freshly-created xterm: the shell a mounting pane TAKES OVER has been running without it —
+  // opened by an agent over MCP, or still alive from before a reload — so without this the pane
+  // opens blank on a session that is mid-work. `{ recordId }` → `{ bytes: number[] }`, empty
+  // when there is nothing to restore. Non-destructive and self-resetting (idempotent).
+  | "terminal_screen_rehydration"
   // terminals
   | "create_terminal"
   | "list_terminals"
@@ -870,6 +958,31 @@ export type BackendCommand =
   // Spec-detail dependency badges ("bloquée par N" / "débloque M"); the board reads the counts off
   // the enriched `spec_list`.
   | "spec_dependency_view"
+  // v2.8 ORCHESTRATION ENGINE read models (Phase 6 — the React Flow graph view). Pure reads over
+  // the SAME `nyx_core::db` engine accessors + `render_agent_context` the Phase-2/4/5 interpreter,
+  // authoring and context tools use (one authority for UI + MCP, PDR-0005). No mutation, nothing
+  // persisted; the graph is READ-ONLY (authoring stays MCP-first).
+  //
+  // `engine_workflow_list` ({ projectId? }) — the workflows the picker offers: the BUILT-IN defaults
+  // (seeded ndev/nspec/ndoc, `project_id` null) plus the active project's OWN forked/custom ones.
+  | "engine_workflow_list"
+  // `engine_workflow_graph` ({ workflowId }) — one workflow + ALL its nodes (the deterministic dump
+  // the renderer reconstructs the pure tree from — `parent_id` + `order_index`).
+  | "engine_workflow_graph"
+  // `engine_run_list` ({ workflowId }) — the workflow's runs newest-first; the runtime view reads the
+  // latest for `current_node_id` + the blackboard JSON.
+  | "engine_run_list"
+  // `engine_spec_runs` ({ specId }) — the runs bound to ONE Spec, ACROSS workflows, newest-first.
+  // The SPEC-side runtime view (the run modal opened from `/work/$specId` and from the dev overlay)
+  // reads it: it starts from a Spec, and a Spec is driven by its ndev run plus the child-workflow
+  // runs ndev spawns. An unknown Spec is an EMPTY list (the modal shows its "no run yet" state).
+  | "engine_spec_runs"
+  // `engine_effector_context` ({ role, specId?, subject? }) — the EFFECTOR context the node inspector
+  // shows for a spawn node. `specId` present (a run bound) → the LIVE `render_agent_context` (role
+  // template + resolved `{{rules}}`); `specId` absent (no run, finding #35) → the STATIC role template
+  // (the sub-agent's brief) with run-specific parts marked "resolved at run". `subject` is the spawn
+  // node's own subject: naming a Spec section narrows the manual to it, as the run forwards it.
+  | "engine_effector_context"
   // v2.7 DESIGN-SYSTEM read/render seam (Phase 3, PDR-0010). Pure reads/renders over the
   // `design` / `design_components` authority (Phase 1) + the composition renderer
   // (`nyx_core::render`, task #6), served by the sidecar `db_command` dispatch. No agent
@@ -1087,6 +1200,10 @@ export type BackendEvent =
   // MCP tool pushes `ChangedTopic::Ideas` → `ideas://changed`, so an open Idées view re-pulls its
   // themes/rows after an agent mutation with NO reload or poll (mirror of `specs://changed`).
   | "ideas://changed"
+  // v2.8 (Phase 4/6): the ORCHESTRATION graph (workflows / nodes) — every `workflow_*` / `node_*`
+  // authoring MCP tool pushes `ChangedTopic::Workflows` → `workflows://changed`, so an open Engine
+  // view re-pulls its re-built tree after an agent authoring mutation (mirror of `ideas://changed`).
+  | "workflows://changed"
   // v2.7 (Phase 2/3): the PROTOTYPE domain (prototypes / pages / variants / feedback / rounds).
   // Every proto-driving MCP tool pushes `ChangedTopic::Prototypes` → `prototypes://changed`, so an
   // open design-system surface (catalogue / composant detail / renderer) re-pulls after an agent

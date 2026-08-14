@@ -32,6 +32,7 @@
 const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
+const net = require("node:net");
 const { app } = require("electron");
 
 const { Sidecar } = require("../dist/main/sidecar.js");
@@ -71,6 +72,23 @@ async function invoke(sidecar, command, args) {
   return sidecar.invoke(command, args || {});
 }
 
+/** Whether something ACCEPTS a loopback connection on `port`. The manager remembers the port it
+ *  bound at boot, so only a live socket can tell a re-bound server from a stale number. */
+function portListening(port) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    const done = (ok) => {
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(2000);
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+    socket.connect(port, "127.0.0.1");
+  });
+}
+
 /** Wait until `predicate()` is true or the deadline elapses (poll the manager state). */
 async function waitFor(predicate, ms, label) {
   const deadline = Date.now() + ms;
@@ -97,7 +115,11 @@ app.whenReady().then(async () => {
   await sidecar.start();
   if (sidecar.currentState !== "ready") return fail(`initial state=${sidecar.currentState}, expected ready`);
   const firstPid = sidecar.pid;
-  console.log(`[smoke-crash-recovery] sidecar booted (pid=${firstPid}) ✓`);
+  // Start the MCP server exactly as the app's boot does — the agents' surface is part of what a
+  // crash must not silently cost, so the scenario has to include it.
+  const bootPort = await sidecar.startMcp();
+  if (!(bootPort > 0)) return fail(`the MCP server did not bind at boot (port ${bootPort})`);
+  console.log(`[smoke-crash-recovery] sidecar booted (pid=${firstPid}, mcp=${bootPort}) ✓`);
 
   // Seed via the sidecar's OWN command surface so the rows land in the same nyx.db: a project
   // + a managed command (which materializes one instance), then start that instance so it is
@@ -155,6 +177,18 @@ app.whenReady().then(async () => {
   console.log(
     `[smoke-crash-recovery] EXACTLY ONE relaunch ✓ — pid ${firstPid} -> ${secondPid}, recovering x${recoveringCount}`,
   );
+
+  // --- 3b. Assert the MCP SERVER came back with the relaunch -----------------------------
+  // `mcp_start` is issued ONCE, by the caller of `start()`. A relaunched sidecar is a fresh
+  // process that never received it, so it used to come back serving the pipe — the UI works,
+  // nothing looks wrong — with NO HTTP server bound, and every agent silently lost the nyx
+  // tools until the app was restarted by hand. Asserted by CONNECTING: the remembered port
+  // survives the crash, so only a live socket proves the relaunch re-bound the server.
+  if (!(sidecar.mcpPort > 0)) return fail(`no MCP port after the relaunch (got ${sidecar.mcpPort})`);
+  if (!(await portListening(sidecar.mcpPort))) {
+    return fail(`nothing listens on 127.0.0.1:${sidecar.mcpPort} — the relaunch lost the MCP server`);
+  }
+  console.log(`[smoke-crash-recovery] MCP server re-bound after the relaunch ✓ (127.0.0.1:${sidecar.mcpPort})`);
 
   // --- 4. Assert state rebuilt (crash treated as a clean shutdown — v2.5.8 revert) --------
   // SQLite was reopened + state rebuilt: the previously-seeded instance is still queryable via

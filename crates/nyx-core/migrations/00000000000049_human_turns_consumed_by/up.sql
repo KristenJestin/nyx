@@ -1,0 +1,36 @@
+-- Schema v49: `human_turns.consumed_by` — the run a human turn has ALREADY authorised, so one turn
+-- authorises at most ONE commitment.
+--
+-- ## The defect this closes
+--
+-- v48 made the consent check compare two IDENTITIES: the turn that stood when nyx posed the question
+-- (`workflow_runs.pending_consent`) against the last turn on that terminal when the answer comes
+-- back. Nothing ever SPENT the turn. Two runs parked on a commitment question asked from the SAME
+-- terminal each name a turn as their reference; the human types ONCE; both then read a last turn
+-- DIFFERENT from their own, and BOTH accept. One sentence authorises two Spec commitments — and the
+-- second of them is exactly what the mechanism exists to refuse: an answer nobody gave to that
+-- question.
+--
+-- It takes no concurrency to reach. Two `/ndev` on two Specs from one terminal is the ordinary way to
+-- work, and the two runs need only be parked at the same time.
+--
+-- ## Shape
+--
+-- ONE nullable column on the ledger row, holding the id of the RUN whose commitment that turn paid
+-- for; NULL is a turn nobody has spent. The run id is what identifies the commitment — the WORDS of
+-- the question it settled are journaled in the outbox (`run.consent_answered`), which is where a
+-- Spec's consent history already lives, so nothing of it needs copying here.
+--
+-- The spending is a CONDITIONAL write (`… WHERE consumed_by IS NULL`) inside the SAME transaction
+-- that closes the question: of two runs reaching it on one turn exactly one writes, and the other is
+-- told it lost instead of committing through a smaller window.
+--
+-- NO foreign key to `workflow_runs`, for the reason this table has none of its own — and for one
+-- more: a CASCADE (or a SET NULL) on a deleted run would UN-SPEND a turn that really was spent. What
+-- this column records is history, and deleting the run does not undo the human having answered it.
+--
+-- The mark travels with the row it sits on. A NEW turn REPLACES the terminal's row and lands unspent;
+-- re-delivering the SAME turn (a hook POST that landed twice) keeps what the row already holds — a
+-- duplicate that handed a spent turn back unspent would be the defect again by another door.
+
+ALTER TABLE human_turns ADD COLUMN consumed_by TEXT;

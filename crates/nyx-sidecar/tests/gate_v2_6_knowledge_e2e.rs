@@ -15,11 +15,14 @@
 //!
 //!   1. **CAPTURE** — `idea_add` (MCP) captures a follow-up as an `open` idea.
 //!   2. **LIFECYCLE piloté par la Spec liée (kind=addresses)** — `spec_create` + `idea_link`
-//!      (addresses), then `spec_transition start` flips the idea `open → planned`, and
-//!      `spec_transition done` closes it `implemented` with the motif "implémentée via Spec #N";
-//!      a bonus `cancel` leg reopens a `planned` idea back to `open` with the fermeture trail
-//!      cleared. All observed through `idea_get` (MCP) — the propagation is driven by the REAL
-//!      transition tool, never a direct DB poke.
+//!      (addresses), then the ENGINE moves the Spec: nyx imposes every lifecycle transition at the
+//!      graph node built for it, so the gate AUTHORS that graph over MCP (`workflow_create` +
+//!      `node_add`: an `ask_human` approval, then the `transition` leaves), opens it with
+//!      `run_start` and ticks it with `nyx_next`. The `start` node flips the idea `open → planned`,
+//!      the `done` node closes it `implemented` with the motif "implémentée via Spec #N"; a bonus
+//!      `cancel` leg reopens a `planned` idea back to `open` with the fermeture trail cleared. All
+//!      observed through `idea_get` (MCP) — the propagation is driven by the REAL transition
+//!      surface, never a direct DB poke.
 //!   3. **DÉDUP / FUSION** — two near-duplicate ideas, `idea_merge` (MCP): one survives `open`,
 //!      the bodies (points) are preserved, the source's Spec link is carried over, the source is
 //!      retired `dropped`.
@@ -36,7 +39,8 @@
 //!      counts of the linked pair.
 //!
 //! WHY THE REAL MCP PIPE+HTTP (not the in-process tool fns): the knowledge write tools
-//! (`idea_add`/`idea_merge`/`idea_link`/`annexe_add`/`spec_link`/`spec_transition`) are the AGENT
+//! (`idea_add`/`idea_merge`/`idea_link`/`annexe_add`/`spec_link`) and the orchestration surface that
+//! drives a Spec's lifecycle (`workflow_create`/`node_add`/`run_start`/`nyx_next`) are the AGENT
 //! surface, reached over the sidecar's loopback MCP HTTP server (`tools/call`); the read models
 //! the UI paints (`idea_search`/`idea_themes`/`annexe_list`/`spec_dependency_view`) are the
 //! db_command surface. Driving BOTH here — and asserting they AGREE on the same rows — is the
@@ -293,8 +297,11 @@ impl Harness {
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
+        // The `X-Nyx-Terminal-Id` header the plugin `.mcp.json` carries — every call an agent makes
+        // says which terminal it runs in, and the engine's consent check (H6) is a question about
+        // that terminal's human. Sending it here is what makes this a faithful agent call.
         let req = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-Nyx-Terminal-Id: {SESSION_TERMINAL_ID}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(req.as_bytes()).unwrap();
@@ -331,11 +338,58 @@ impl Harness {
     }
 }
 
-/// Sensitive Spec transitions (ready/start/done/cancel) demand explicit human confirmation — the
-/// gate confirms as the user would. Small helper so the scenario reads as the intent, not the flag.
-fn confirmed(mut args: Value) -> Value {
-    args["user_confirmed"] = json!(true);
-    args
+/// Author a purpose-built lifecycle workflow over the MCP graph-authoring surface: a `sequence` root
+/// holding `leaves` (each a `(type, config)` pair) in order. Returns the workflow id, ready for
+/// `run_start`. A Spec transition is imposed by the ENGINE at the graph node built for it, so the
+/// gate builds the graph that carries the transitions its scenario needs.
+fn author_lifecycle_workflow(
+    h: &mut Harness,
+    project_id: &str,
+    name: &str,
+    leaves: &[(&str, Value)],
+) -> String {
+    let workflow = h.mcp_call(
+        "workflow_create",
+        json!({ "name": name, "scope": "custom", "project_id": project_id }),
+    );
+    let workflow_id = workflow["workflow"]["id"].as_str().unwrap().to_string();
+    let root = h.mcp_call(
+        "node_add",
+        json!({ "workflow_id": workflow_id, "type": "sequence", "label": name }),
+    );
+    let root_id = root["node"]["id"].as_str().unwrap().to_string();
+    for (order_index, (node_type, config)) in leaves.iter().enumerate() {
+        h.mcp_call(
+            "node_add",
+            json!({
+                "workflow_id": workflow_id,
+                "type": node_type,
+                "parent_id": root_id,
+                "order_index": order_index,
+                "config": config,
+            }),
+        );
+    }
+    workflow_id
+}
+
+/// The terminal every MCP call in this parcours comes from — the session the agent runs in.
+const SESSION_TERMINAL_ID: &str = "term-knowledge-e2e";
+
+/// THE HUMAN TYPES, over the REAL hook channel: a `UserPromptSubmit` `agent_session_event`, exactly
+/// what the nyx plugin POSTs when the person presses enter. It is the only signal on this surface an
+/// agent cannot produce, and the two ENGAGING approvals below (ready / done) do not go through
+/// without one (H6).
+fn human_says(h: &mut Harness, prompt: &str) {
+    h.mcp_call(
+        "agent_session_event",
+        json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-knowledge-e2e",
+            "NYX_TERMINAL_ID": SESSION_TERMINAL_ID,
+            "prompt": prompt,
+        }),
+    );
 }
 
 /// THE durable-memory parcours smoke: capture → Spec-driven lifecycle → dedup → /nspec surfacing →
@@ -399,20 +453,68 @@ fn durable_memory_parcours_end_to_end_over_the_real_sidecar() {
         json!({ "idea_id": idea_login, "spec_id": spec_a_id, "kind": "addresses" }),
     );
 
-    // ready → start (in_progress, anchored on the dev workspace): the idea leaves the open backlog
-    // as `planned` — driven purely by the REAL `spec_transition` tool.
-    h.mcp_call(
-        "spec_transition",
-        confirmed(json!({ "spec_id": spec_a_id, "transition": "ready" })),
+    // The lifecycle graph: an `ask_human` approval, then ready → start, a second approval, then
+    // review → done. The engaging moves (ready/done) name the blackboard key their approval lands
+    // on (`gate_on`); the entry `start` is authorized by the launch and `review` is not sensitive.
+    let lifecycle_wf = author_lifecycle_workflow(
+        &mut h,
+        &project_id,
+        "GateKnowledge — Spec A lifecycle",
+        &[
+            (
+                "ask_human",
+                json!({ "prompt": "ready to put Spec A in dev?", "output_key": "approved", "options": ["yes", "no"] }),
+            ),
+            (
+                "transition",
+                json!({ "target_state": "ready", "gate_on": "approved" }),
+            ),
+            ("transition", json!({ "target_state": "start" })),
+            (
+                "ask_human",
+                json!({ "prompt": "Spec A delivered?", "output_key": "delivered", "options": ["yes", "no"] }),
+            ),
+            ("transition", json!({ "target_state": "review" })),
+            (
+                "transition",
+                json!({ "target_state": "done", "gate_on": "delivered" }),
+            ),
+        ],
     );
-    let started = h.mcp_call(
-        "spec_transition",
-        confirmed(
-            json!({ "spec_id": spec_a_id, "transition": "start", "workspace_id": root_ws_id }),
-        ),
+    // The run is BOUND to Spec A and carries the dev workspace: the entry `start` node poses it as
+    // the Spec's anchor in the same op.
+    let run = h.mcp_call(
+        "run_start",
+        json!({ "workflow_id": lifecycle_wf, "spec_id": spec_a_id, "workspace_id": root_ws_id }),
+    );
+    let run_id = run["run_id"].as_str().unwrap().to_string();
+    let asked = h.mcp_call("nyx_next", json!({ "run_id": run_id }));
+    assert_eq!(
+        asked["action"]["type"], "ask_human",
+        "STEP 2: the run parks on the approval that gates the engaging `ready`"
     );
     assert_eq!(
-        started["spec"]["status"], "in_progress",
+        asked["action"]["human_turn_required"], true,
+        "STEP 2: and it says the answer is the human's to give — nyx will check they gave it (H6)"
+    );
+
+    // The dispatcher relays the question and the HUMAN answers, in the chat: their turn lands on the
+    // session's terminal through the real hook channel. Without it the very same relay is refused.
+    human_says(&mut h, "oui, passe-la en ready");
+
+    // ready → start (in_progress, anchored on the dev workspace): the idea leaves the open backlog
+    // as `planned` — driven purely by the engine's `transition` nodes, over the REAL `nyx_next`.
+    let parked = h.mcp_call(
+        "nyx_next",
+        json!({ "run_id": run_id, "last_result": { "decision": "yes" } }),
+    );
+    assert_eq!(
+        parked["action"]["type"], "ask_human",
+        "STEP 2: the approved ready+start walked to the delivery approval"
+    );
+    let in_dev = h.db_command("spec_detail", json!({ "specId": spec_a_id }));
+    assert_eq!(
+        in_dev["spec"]["status"], "in_progress",
         "STEP 2: the Spec is in dev"
     );
     let planned = h.mcp_call("idea_get", json!({ "id": idea_login }));
@@ -425,17 +527,20 @@ fn durable_memory_parcours_end_to_end_over_the_real_sidecar() {
         "STEP 2: `planned` is a LIVE state — no fermeture trail stamped"
     );
 
-    // review → done (completed): the idea is closed `implemented` with the closure motif.
-    h.mcp_call(
-        "spec_transition",
-        json!({ "spec_id": spec_a_id, "transition": "review" }),
-    );
-    let done = h.mcp_call(
-        "spec_transition",
-        confirmed(json!({ "spec_id": spec_a_id, "transition": "done" })),
+    // review → done (completed): the idea is closed `implemented` with the closure motif. Approving
+    // the delivery walks the last two `transition` nodes and the run reaches its end.
+    human_says(&mut h, "c'est bon pour moi, on livre");
+    let finished = h.mcp_call(
+        "nyx_next",
+        json!({ "run_id": run_id, "last_result": { "decision": "yes" } }),
     );
     assert_eq!(
-        done["spec"]["status"], "completed",
+        finished["action"]["type"], "done",
+        "STEP 2: the lifecycle run walked review → done to its end"
+    );
+    let completed = h.db_command("spec_detail", json!({ "specId": spec_a_id }));
+    assert_eq!(
+        completed["spec"]["status"], "completed",
         "STEP 2: the Spec completed"
     );
     let implemented = h.mcp_call("idea_get", json!({ "id": idea_login }));
@@ -469,19 +574,41 @@ fn durable_memory_parcours_end_to_end_over_the_real_sidecar() {
         "idea_link",
         json!({ "idea_id": cancel_idea_id, "spec_id": spec_cancel_id, "kind": "addresses" }),
     );
-    h.mcp_call(
-        "spec_transition",
-        confirmed(json!({ "spec_id": spec_cancel_id, "transition": "ready" })),
+    // Its own lifecycle graph: one approval, then ready → start → cancel.
+    let cancel_wf = author_lifecycle_workflow(
+        &mut h,
+        &project_id,
+        "GateKnowledge — cancel leg",
+        &[
+            (
+                "ask_human",
+                json!({ "prompt": "abandon the throttling Spec?", "output_key": "approved", "options": ["yes", "no"] }),
+            ),
+            (
+                "transition",
+                json!({ "target_state": "ready", "gate_on": "approved" }),
+            ),
+            ("transition", json!({ "target_state": "start" })),
+            (
+                "transition",
+                json!({ "target_state": "cancel", "gate_on": "approved" }),
+            ),
+        ],
     );
-    h.mcp_call(
-        "spec_transition",
-        confirmed(
-            json!({ "spec_id": spec_cancel_id, "transition": "start", "workspace_id": root_ws_id }),
-        ),
+    let cancel_run = h.mcp_call(
+        "run_start",
+        json!({ "workflow_id": cancel_wf, "spec_id": spec_cancel_id, "workspace_id": root_ws_id }),
     );
-    h.mcp_call(
-        "spec_transition",
-        confirmed(json!({ "spec_id": spec_cancel_id, "transition": "cancel" })),
+    let cancel_run_id = cancel_run["run_id"].as_str().unwrap().to_string();
+    h.mcp_call("nyx_next", json!({ "run_id": cancel_run_id }));
+    human_says(&mut h, "oui, annule celle-là");
+    let cancelled = h.mcp_call(
+        "nyx_next",
+        json!({ "run_id": cancel_run_id, "last_result": { "decision": "yes" } }),
+    );
+    assert_eq!(
+        cancelled["action"]["type"], "done",
+        "STEP 2 (bonus): the cancel run walked ready → start → cancel to its end"
     );
     let reopened = h.mcp_call("idea_get", json!({ "id": cancel_idea_id }));
     assert_eq!(

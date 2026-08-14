@@ -89,6 +89,42 @@ pub fn optional_str_vec(args: &Value, key: &str) -> Result<Option<Vec<String>>, 
     }
 }
 
+/// An OPTIONAL per-run ENVIRONMENT map argument (`{ "KEY": "VALUE", … }`) decoded to the
+/// `(KEY, VALUE)` pairs [`CommandRunner::start_with_env`] merges onto the inherited environment.
+/// Absent / null → an EMPTY vec (no per-run env, the runner's inherit-only path). A non-object,
+/// or ANY non-string value, → `invalid_argument` — the advertised schema states "Each value must
+/// be a string", so a number/bool/array is a caller mistake worth naming rather than coercing.
+///
+/// SECRET HYGIENE: an env VALUE is a secret by default (the runner's "secret values are never
+/// logged" invariant), so a refusal names the offending KEY and NEVER echoes the value.
+pub fn optional_env_map(args: &Value, key: &str) -> Result<Vec<(String, String)>, RpcError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Object(map)) => {
+            let mut out = Vec::with_capacity(map.len());
+            for (name, value) in map {
+                match value.as_str() {
+                    Some(s) => out.push((name.clone(), s.to_string())),
+                    None => {
+                        return Err(RpcError::new(
+                            RpcCode::InvalidArgument,
+                            format!(
+                                "argument '{key}.{name}' must be a string (each env value is a \
+                                 string)"
+                            ),
+                        ))
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!("argument '{key}' must be an object of KEY→VALUE strings"),
+        )),
+    }
+}
+
 /// An OPTIONAL non-negative integer argument; negative/non-integer → error.
 pub fn optional_usize(args: &Value, key: &str) -> Result<Option<usize>, RpcError> {
     match args.get(key) {
@@ -125,6 +161,62 @@ pub fn optional_bool(args: &Value, key: &str) -> Result<Option<bool>, RpcError> 
 
 pub fn internal_db(e: diesel::result::Error) -> RpcError {
     RpcError::new(RpcCode::Internal, format!("db error: {e}"))
+}
+
+/// Map a [`crate::db::ContentWriteError`] onto the RPC vocabulary: a status refusal is a clean
+/// `invalid_state` (the Spec's lifecycle froze this content), an unrecognised phase name is an
+/// `invalid_argument` (the caller passed a name, and it is the wrong one), a DB error stays
+/// `internal` (B4).
+pub fn map_content_write_err(e: crate::db::ContentWriteError) -> RpcError {
+    match e {
+        crate::db::ContentWriteError::Forbidden { status, what } => RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "cannot write {what} while the Spec is '{status}': {what} are frozen once the Spec \
+                 leaves its writable state (sections/tasks in draft, comments before it closes)"
+            ),
+        )
+        .with_data(json!({ "reason": "spec_state_forbids_write", "status": status })),
+        // K2 — a phase name the plan does not hold, on a Spec past `draft`. It used to MATERIALIZE
+        // one, so a single mistyped free-text argument grew the plan of a Spec under build. The
+        // refusal QUOTES the plan, because the mistake is always a near-miss (a rendered heading, a
+        // paraphrase) and what the caller needs is the exact string that would have worked.
+        crate::db::ContentWriteError::UnknownPhase {
+            name,
+            status,
+            phases,
+        } => {
+            let plan = if phases.is_empty() {
+                "it has NO phase plan — its tasks are flat, so omit `phase`".to_string()
+            } else {
+                format!(
+                    "its phases are {}",
+                    phases
+                        .iter()
+                        .map(|p| format!("'{p}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "phase '{name}' is not a phase of this Spec, and its plan is frozen while it is \
+                     '{status}' — {plan}. Pass one of those names EXACTLY (the NAME alone, never the \
+                     '2 · Some phase' heading a manual renders), or omit `phase` altogether: on a \
+                     kind=review finding nyx anchors the phase itself. A name nyx does not know \
+                     would ADD a phase to a Spec already being built, which no task may do"
+                ),
+            )
+            .with_data(json!({
+                "reason": "unknown_phase",
+                "phase": name,
+                "status": status,
+                "phases": phases,
+            }))
+        }
+        crate::db::ContentWriteError::Db(e) => internal_db(e),
+    }
 }
 
 // --- The RESPONSE BUDGET: the hard cap EVERY agent-facing tool answers under ------------
@@ -500,11 +592,16 @@ fn resolve_instance_id(db: &Db, args: &Value) -> Result<String, RpcError> {
     Ok(first.id)
 }
 
-/// Resolve an instance's command line + run cwd, mapping to the D8 vocabulary: an
-/// unknown instance → `invalid_id` (disambiguating a template id), an invalid/missing
-/// subfolder → `invalid_argument`. Errors BEFORE any spawn. Reuses the shared
-/// `command::resolve_command_and_cwd` for the resolution itself.
-fn resolve_command_and_cwd(db: &Db, instance_id: &str) -> Result<(String, String), RpcError> {
+/// Resolve an instance's command line + run cwd + PERSISTED environment, mapping to the D8
+/// vocabulary: an unknown instance → `invalid_id` (disambiguating a template id), an
+/// invalid/missing subfolder → `invalid_argument`. Errors BEFORE any spawn. Same triple as the
+/// shared `command::resolve_command_and_cwd`, with the RPC error vocabulary this surface owes its
+/// callers; the env is decoded by the SAME total decoder, so a malformed one yields an empty env
+/// rather than an unstartable command.
+fn resolve_command_and_cwd(
+    db: &Db,
+    instance_id: &str,
+) -> Result<crate::command::ResolvedCommand, RpcError> {
     let ctx = db
         .with_conn(|c| db::instance_run_context(c, instance_id))
         .map_err(internal_db)?;
@@ -514,7 +611,25 @@ fn resolve_command_and_cwd(db: &Db, instance_id: &str) -> Result<(String, String
     };
     let cwd = crate::subfolder::resolve_run_dir(&ctx.workspace_path, ctx.subfolder.as_deref())
         .map_err(|e| RpcError::new(RpcCode::InvalidArgument, e))?;
-    Ok((ctx.command, cwd))
+    Ok((
+        ctx.command,
+        cwd,
+        crate::command::decode_command_env(ctx.env.as_deref()),
+    ))
+}
+
+/// Compose the environment ONE agent-initiated start hands the runner: the command's PERSISTED env
+/// (the base, part of its definition) with the per-run `env` argument concatenated ON TOP. The
+/// spawn applies the pairs in order, so a key present in BOTH takes the PER-RUN value — the caller
+/// of this one start overrides the command's own setting for this run only, and never edits it.
+/// Neither layer's VALUES are ever logged.
+fn merge_run_env(
+    persisted: Vec<(String, String)>,
+    per_run: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut merged = persisted;
+    merged.extend(per_run);
+    merged
 }
 
 /// Assert the instance EXISTS (a launchable instance, not a template). Used by
@@ -571,20 +686,31 @@ fn status_result(instance_id: &str, status: Value) -> Value {
 
 // --- The four runtime command tools ----------------------------------------
 
-/// `start_command` — `{ instance_id | (name, workspace_id) }` → `{ instance_id,
+/// `start_command` — `{ instance_id | (name, workspace_id), env? }` → `{ instance_id,
 /// state, running, finished, exit_code, unread, was_running, restarted }`. Idempotent
 /// on an already-running instance (no double-spawn; the guard is at the runner
 /// boundary). Resolves command + cwd BEFORE spawning. Parity with the Tauri
 /// `start_command`.
+///
+/// `env` (the advertised per-run KEY→VALUE string map, R-WSCMD #7) is decoded by
+/// [`optional_env_map`] and MERGED, by [`merge_run_env`], ON TOP of the command's PERSISTED env
+/// (`managed_commands.env`, N31) before both are applied over the inherited environment: the
+/// command's own definition is the base every path honours — a gate included — and this argument is
+/// a TRANSIENT override for this one start, whose keys win a collision. It is parsed BEFORE the
+/// spawn, so a malformed map is a clean `invalid_argument` and never a process started with half its
+/// environment. On a no-op start (already running) the runner ignores it, exactly as the schema
+/// states. The VALUES of neither layer are ever logged.
 pub fn start_command<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<Value, RpcError> {
     let instance_id = resolve_instance_id(db, args)?;
-    let (command, cwd) = resolve_command_and_cwd(db, &instance_id)?;
+    let per_run_env = optional_env_map(args, "env")?;
+    let (command, cwd, persisted_env) = resolve_command_and_cwd(db, &instance_id)?;
+    let env = merge_run_env(persisted_env, per_run_env);
     let outcome = runner
-        .start_with_env(&instance_id, &command, Some(&cwd), &[])
+        .start_with_env(&instance_id, &command, Some(&cwd), &env)
         .map_err(|e| RpcError::new(RpcCode::Internal, format!("start failed: {e}")))?;
     let mut result = status_result(&instance_id, runner_status(runner, &instance_id));
     if let Some(map) = result.as_object_mut() {
@@ -618,18 +744,24 @@ pub fn stop_command<S: RunnerSink>(
     Ok(result)
 }
 
-/// `relaunch_command` — `{ instance_id }` → `{ instance_id, …status, was_running,
+/// `relaunch_command` — `{ instance_id, env? }` → `{ instance_id, …status, was_running,
 /// restarted }`. The EXPLICIT restart (always re-spawns; never two live processes).
 /// `restarted:true`. Parity with the Tauri `relaunch_command`.
+///
+/// `env` is decoded by [`optional_env_map`] and MERGED ON TOP of the command's PERSISTED env
+/// ([`merge_run_env`], N31), both applied onto the inherited environment of the FRESH process
+/// (a relaunch always spawns, so the map always applies). The VALUES are never logged.
 pub fn relaunch_command<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<Value, RpcError> {
     let instance_id = require_str(args, "instance_id")?;
-    let (command, cwd) = resolve_command_and_cwd(db, instance_id)?;
+    let per_run_env = optional_env_map(args, "env")?;
+    let (command, cwd, persisted_env) = resolve_command_and_cwd(db, instance_id)?;
+    let env = merge_run_env(persisted_env, per_run_env);
     let outcome = runner
-        .relaunch_with_env(instance_id, &command, Some(&cwd), &[])
+        .relaunch_with_env(instance_id, &command, Some(&cwd), &env)
         .map_err(|e| RpcError::new(RpcCode::Internal, format!("relaunch failed: {e}")))?;
     let mut result = status_result(instance_id, runner_status(runner, instance_id));
     if let Some(map) = result.as_object_mut() {
@@ -1756,5 +1888,334 @@ mod tests {
         assert_eq!(ui_sink.kinds(), vec![DomainEventKind::WorkspaceCreated]);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- The per-run `env` map (R-WSCMD #7) --------------------------------
+
+    /// A persistence-free [`RunnerSink`] that only ACCUMULATES each instance's output, so a test
+    /// can read back what the spawned process actually printed.
+    #[derive(Default)]
+    struct OutputSink {
+        output: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    }
+
+    impl OutputSink {
+        fn output_of(&self, instance_id: &str) -> String {
+            let map = self.output.lock().unwrap();
+            String::from_utf8_lossy(map.get(instance_id).map(Vec::as_slice).unwrap_or(&[]))
+                .to_string()
+        }
+    }
+
+    impl RunnerSink for std::sync::Arc<OutputSink> {
+        fn on_state(&self, _instance_id: &str, _state: RunState, _exit_code: Option<i32>) {}
+        fn on_acknowledge(&self, _instance_id: &str) {}
+        fn on_output(&self, instance_id: &str, bytes: &[u8]) {
+            self.output
+                .lock()
+                .unwrap()
+                .entry(instance_id.to_string())
+                .or_default()
+                .extend_from_slice(bytes);
+        }
+        fn persist_scrollback(&self, _instance_id: &str, _serialized: &str) {}
+        fn archive_previous_run(&self, _instance_id: &str) {}
+        fn clear_output(&self, _instance_id: &str) {}
+    }
+
+    /// A `Db` holding ONE project rooted at a real temp dir plus a managed-command template
+    /// running `command`. Returns `(db, instance_id, root)` — the instance id is the launchable
+    /// id `start_command` / `relaunch_command` resolve.
+    fn db_with_command(tag: &str, command: &str) -> (Db, String, std::path::PathBuf) {
+        let db = Db::in_memory();
+        let root = temp_subdir(tag);
+        let instance_id = db.with_conn(|c| {
+            let (project, _ws) =
+                db::create_project(c, "P", root.to_str().unwrap(), None).expect("project");
+            db::create_template(
+                c,
+                &project.id,
+                "dev",
+                command,
+                None,
+                db::CommandSource::default(),
+            )
+            .expect("template");
+            db::instance_ids_for_project(c, &project.id)
+                .expect("instances")
+                .into_iter()
+                .next()
+                .expect("one materialized instance")
+        });
+        (db, instance_id, root)
+    }
+
+    #[cfg(not(windows))]
+    fn new_output_runner() -> (
+        CommandRunner<std::sync::Arc<OutputSink>>,
+        std::sync::Arc<OutputSink>,
+    ) {
+        let sink = std::sync::Arc::new(OutputSink::default());
+        let runner = CommandRunner::new(
+            std::sync::Arc::clone(&sink),
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+        (runner, sink)
+    }
+
+    /// Wait until `instance_id` reaches `state` (or time out).
+    #[cfg(not(windows))]
+    fn wait_state<S: RunnerSink>(
+        runner: &CommandRunner<S>,
+        instance_id: &str,
+        state: RunState,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if runner.state_of(instance_id) == state {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// THE defect: the advertised `env` map reaches the SPAWNED PROCESS. Mirrors
+    /// `command::tests::start_with_env_passes_env_to_the_spawned_process` one layer up — through
+    /// the TOOL, which used to drop the argument on the floor and pass an empty slice.
+    #[test]
+    #[cfg(not(windows))]
+    fn start_command_applies_the_env_argument_to_the_spawned_process() {
+        let _g = db_guard();
+        let (db, instance_id, root) = db_with_command("env-start", "echo VAR=$NYX_TEST_VAR; true");
+        let (runner, sink) = new_output_runner();
+
+        start_command(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "env": { "NYX_TEST_VAR": "vault-value-123" } }),
+        )
+        .expect("start");
+        assert!(
+            wait_state(&runner, &instance_id, RunState::Success),
+            "the echo command finishes"
+        );
+        assert!(
+            sink.output_of(&instance_id).contains("VAR=vault-value-123"),
+            "the tool's env map must reach the spawned process, got: {:?}",
+            sink.output_of(&instance_id)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// N31 — the TWO env layers compose: the command's PERSISTED env is the base every path applies
+    /// (the gate included), and the per-run `env` argument is a TRANSIENT override merged ON TOP for
+    /// this one start — so a key present in both takes the PER-RUN value while the others survive.
+    #[test]
+    #[cfg(not(windows))]
+    fn start_command_merges_the_persisted_env_with_the_per_run_one() {
+        let _g = db_guard();
+        let (db, instance_id, root) = db_with_command(
+            "env-merge",
+            "echo BASE=$NYX_TEST_BASE SHARED=$NYX_TEST_SHARED; true",
+        );
+        db.with_conn(|c| {
+            let command_id = db::get_instance(c, &instance_id)
+                .expect("instance")
+                .expect("materialized")
+                .command_id;
+            db::set_template_env(
+                c,
+                &command_id,
+                Some(
+                    r#"{"NYX_TEST_BASE":"from-the-command","NYX_TEST_SHARED":"from-the-command"}"#,
+                ),
+            )
+            .expect("persist env");
+        });
+        let (runner, sink) = new_output_runner();
+
+        start_command(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "env": { "NYX_TEST_SHARED": "from-this-run" } }),
+        )
+        .expect("start");
+        assert!(
+            wait_state(&runner, &instance_id, RunState::Success),
+            "the echo command finishes"
+        );
+        let out = sink.output_of(&instance_id);
+        assert!(
+            out.contains("BASE=from-the-command"),
+            "a key only the COMMAND declares survives the merge, got: {out:?}"
+        );
+        assert!(
+            out.contains("SHARED=from-this-run"),
+            "on a collision the PER-RUN value wins, got: {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// N31 — with NO per-run argument at all, an agent start still gives the command the environment
+    /// its own definition declares: exactly what a gate does, so both surfaces agree.
+    #[test]
+    #[cfg(not(windows))]
+    fn start_command_applies_the_persisted_env_without_any_argument() {
+        let _g = db_guard();
+        let (db, instance_id, root) =
+            db_with_command("env-persisted", "echo VAR=$NYX_TEST_PERSISTED; true");
+        db.with_conn(|c| {
+            let command_id = db::get_instance(c, &instance_id)
+                .expect("instance")
+                .expect("materialized")
+                .command_id;
+            db::set_template_env(
+                c,
+                &command_id,
+                Some(r#"{"NYX_TEST_PERSISTED":"stored-value"}"#),
+            )
+            .expect("persist env");
+        });
+        let (runner, sink) = new_output_runner();
+
+        start_command(&db, &runner, &json!({ "instance_id": instance_id })).expect("start");
+        assert!(
+            wait_state(&runner, &instance_id, RunState::Success),
+            "the echo command finishes"
+        );
+        assert!(
+            sink.output_of(&instance_id).contains("VAR=stored-value"),
+            "the persisted env applies with no per-run argument, got: {:?}",
+            sink.output_of(&instance_id)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The relaunch twin: the FRESH process a relaunch spawns carries the map too.
+    #[test]
+    #[cfg(not(windows))]
+    fn relaunch_command_applies_the_env_argument_to_the_fresh_process() {
+        let _g = db_guard();
+        let (db, instance_id, root) =
+            db_with_command("env-relaunch", "echo VAR=$NYX_TEST_VAR; true");
+        let (runner, sink) = new_output_runner();
+
+        relaunch_command(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "env": { "NYX_TEST_VAR": "relaunch-val" } }),
+        )
+        .expect("relaunch");
+        assert!(
+            wait_state(&runner, &instance_id, RunState::Success),
+            "the relaunched echo command finishes"
+        );
+        assert!(
+            sink.output_of(&instance_id).contains("VAR=relaunch-val"),
+            "the relaunch env map must reach the fresh process, got: {:?}",
+            sink.output_of(&instance_id)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An ABSENT `env` still starts (the inherit-only path) — the map is optional.
+    #[test]
+    #[cfg(not(windows))]
+    fn start_command_without_env_still_starts() {
+        let _g = db_guard();
+        let (db, instance_id, root) = db_with_command("env-absent", "echo NOENV; true");
+        let (runner, sink) = new_output_runner();
+
+        let result = start_command(&db, &runner, &json!({ "instance_id": instance_id }))
+            .expect("start with no env");
+        assert_eq!(result["instance_id"], json!(instance_id));
+        assert!(wait_state(&runner, &instance_id, RunState::Success));
+        assert!(sink.output_of(&instance_id).contains("NOENV"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A NON-STRING value is REFUSED before any spawn ("Each value must be a string"), and the
+    /// refusal names the KEY only — an env value is a secret and is never echoed.
+    #[test]
+    fn start_command_refuses_a_non_string_env_value() {
+        let _g = db_guard();
+        let (db, instance_id, root) = db_with_command("env-bad", "true");
+        let (runner, _sink) = {
+            let sink = std::sync::Arc::new(OutputSink::default());
+            let runner = CommandRunner::new(
+                std::sync::Arc::clone(&sink),
+                portable_pty::PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            );
+            (runner, sink)
+        };
+
+        let err = start_command(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "env": { "PORT": 3111 } }),
+        )
+        .expect_err("a non-string env value is refused");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(err.message.contains("env.PORT"), "got {:?}", err.message);
+        assert_eq!(
+            runner.state_of(&instance_id),
+            RunState::Idle,
+            "the refusal happens BEFORE any spawn"
+        );
+
+        // A non-object `env` is refused the same way.
+        let err = start_command(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "env": "PORT=3111" }),
+        )
+        .expect_err("a non-object env is refused");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The parser itself: an absent map is empty, a well-formed one keeps every pair (an EMPTY
+    /// string value is a legitimate env value), and a bad value never leaks into the message.
+    #[test]
+    fn optional_env_map_decodes_a_string_map_and_hides_values() {
+        assert!(optional_env_map(&json!({}), "env").unwrap().is_empty());
+        assert!(optional_env_map(&json!({ "env": null }), "env")
+            .unwrap()
+            .is_empty());
+
+        let mut pairs = optional_env_map(
+            &json!({ "env": { "A": "1", "B": "", "SECRET": "s3cr3t" } }),
+            "env",
+        )
+        .unwrap();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "".to_string()),
+                ("SECRET".to_string(), "s3cr3t".to_string()),
+            ]
+        );
+
+        let err = optional_env_map(&json!({ "env": { "SECRET": ["s3cr3t"] } }), "env")
+            .expect_err("a non-string value is refused");
+        assert!(err.message.contains("env.SECRET"));
+        assert!(
+            !err.message.contains("s3cr3t"),
+            "the VALUE is never echoed in the refusal: {:?}",
+            err.message
+        );
     }
 }

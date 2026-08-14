@@ -34,21 +34,30 @@
  *   - merges `{ NYX_TERMINAL_ID: process.env.NYX_TERMINAL_ID }` into that object — EXACTLY
  *     what the old `jq '. + {NYX_TERMINAL_ID: $tid}'` did. The core's `agent_session_event`
  *     requires `NYX_TERMINAL_ID` (env) + `hook_event_name` + `session_id` (stdin).
- *   - POSTs the JSON-RPC `tools/call name=agent_session_event` to
- *     `http://127.0.0.1:${NYX_MCP_PORT||8765}/mcp` over native node `http`.
+ *   - POSTs the JSON-RPC `tools/call name=agent_session_event` to the sidecar of the nyx that
+ *     installed this plugin, over native node `http` (see `resolvePort`).
  *
- * SLASH-COMMAND MANUAL INJECTION (v2.5.8 / PDR-0020): the bundled `/nspec` `/ndev` `/ndoc`
- * command stubs each carry a sentinel marker (`NYX-AGENT-CONTEXT role=<role>`). When a
- * `UserPromptSubmit` prompt carries that marker, this hook derives the role from it, POSTs a
- * SECOND `tools/call name=agent_context` (`{ role, cwd }`) to the SAME sidecar, and relays the
- * rendered role manual back to Claude as `UserPromptSubmit` `additionalContext` — the exact
- * mirror of the SessionStart context relay below. ZERO argument parsing: the marker only names
- * the role; the human's free text (id + instruction) stays untouched for the agent to read.
- * `agent_context` resolves the Spec from `cwd`, so no id is needed. Fully best-effort — a
- * missing marker, a sidecar that is down, or an unresolved Spec simply injects nothing.
+ * SLASH-COMMAND RUN OPENING + MANUAL INJECTION (v2.5.8 / PDR-0020, then v2.8 G6): the `/nspec`
+ * `/ndev` `/ndoc` command stubs are the triggers. When a `UserPromptSubmit` prompt INVOKES one of
+ * them, this hook OPENS THE RUN ITSELF — `tools/call name=run_start` (`{ scope, cwd }`), then
+ * `tools/call name=agent_context` (`{ role, scope, run_id }`) — and relays ONE `additionalContext`
+ * carrying the `run_id`, the `run_start` warnings and the dispatcher manual, so the session's FIRST
+ * act is `nyx_next(run_id)`. WHY THE HOOK AND NOT THE SESSION: an agent that fetched its own manual
+ * and opened its own run spent two calls before the first tick, resolved anchors the hook already
+ * receives (`cwd`), and left "who opens the run" to whichever agent got there first.
+ * IT READS THE COMMAND NAME AND, AT MOST, ONE TOKEN: the Spec id, when the first argument IS a
+ * whole canonical one (`specIdFromPrompt`). `/ndev` and `/ndoc` work ON an existing Spec and their
+ * stubs offer to name it, and a `cwd` cannot honour that in a project holding several active Specs
+ * — a location resolves none of them and the run never opens. Everything else in the prompt is the
+ * human's instruction and stays untouched for the agent to read. Fully
+ * best-effort — a prompt that is not a nyx command, a sidecar that is down, a REFUSED `run_start`
+ * (no run ⇒ NOTHING is injected: a manual without a `run_id` would send the session hunting for
+ * one) or a refused `agent_context` injects nothing, but each of those says WHY on stderr (see
+ * `trace`) instead of failing mute.
  *
- * GUARANTEES: best-effort, ~1s timeout, NEVER throws, ALWAYS exits 0. A hook that crashes
- * (or whose server is down) must not disturb the user's Claude Code session.
+ * GUARANTEES: best-effort, BOUNDED (~1s per call, and `RUN_OPEN_TIMEOUT_MS` for the two calls
+ * that open a run — they do real server-side work before answering), NEVER throws, ALWAYS exits
+ * 0. A hook that crashes (or whose server is down) must not disturb the user's Claude session.
  */
 "use strict";
 
@@ -57,33 +66,292 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const EVENT = process.argv[2] || ""; // hook name (informational; stdin is authoritative)
-const PORT = process.env.NYX_MCP_PORT || "8765";
 const TERMINAL_ID = process.env.NYX_TERMINAL_ID || "";
 const TIMEOUT_MS = 1000;
+/**
+ * The bound for the two calls that OPEN a run (`run_start`, then `agent_context`), as opposed to
+ * the fire-and-forget `agent_session_event` POST that keeps the 1s above.
+ *
+ * WHY IT IS NOT 1s. `run_start` OPENS THE RUN SERVER-SIDE BEFORE IT ANSWERS, and it has grown real
+ * work: a machine-wide scan for stranded runs (plus queries per stranded run), a RECURSIVE walk of
+ * the graphs the run will drive following every `sub_workflow` hop, and the consent / query
+ * warnings. The MCP surface serves it on a pool of 4 workers, one of which a `gate_check` can hold
+ * for up to 90s. So the POST genuinely exceeds 1000ms on a busy machine — and the timeout does NOT
+ * cancel the run: the row is created (or resumed) and only the ANSWER is lost. The session then
+ * gets no `run_id`, nothing is injected, and the user's `/ndev` starts with no manual over a run
+ * that exists. The idempotency (at most one live run per (workflow, spec)) means the next
+ * invocation RESUMES that run rather than piling up another — losing the answer costs a turn, not
+ * a run — but a turn is exactly what the hook took the call away from the agent to save.
+ *
+ * Still BOUNDED, and bounded by what a human will sit through: this hook runs on the prompt the
+ * user just submitted, so the wait is visible. Claude Code's own hook budget is far larger.
+ */
+const RUN_OPEN_TIMEOUT_MS = 8000;
+/** nyx's default MCP port — the last resort, and only ever right when ONE nyx runs (see below). */
+const DEFAULT_PORT = "8765";
 
 /**
- * The sentinel a `/nspec` `/ndev` `/ndoc` command stub embeds in its expanded prompt body
- * (`<!-- NYX-AGENT-CONTEXT role=<role> -->`). A `UserPromptSubmit` carrying it means the user
- * ran a nyx slash command → we render that role's manual and inject it (see `roleFromPrompt`).
- * Only the three TRIGGERABLE roles ship as stubs; coder/auditor/prototype are pull-only (the
- * dev orchestrator fetches them via `agent_context`), so an unknown role in the marker is
- * ignored rather than trusted.
+ * The port of THE nyx that installed this plugin.
+ *
+ * `NYX_MCP_PORT` first: nyx exports it into every shell it spawns, straight from the bind, so it
+ * is authoritative. It is absent when the terminal was spawned before the port was bound, or when
+ * the session did not start from a nyx terminal at all.
+ *
+ * Then the port nyx TEMPLATED into this plugin's OWN `.mcp.json` when it installed it — the very
+ * file the MCP client reads to reach the sidecar. Taking it from there is what keeps the hook and
+ * the tools pointed at the SAME nyx, for one small read.
+ *
+ * The literal default comes last, and it is a trap on a machine running more than one nyx: they
+ * all default to 8765, so a hook that reaches for it POSTs into whichever one bound the port
+ * first — a DIFFERENT application, which answers `unknown tool` to calls meant for this one, and
+ * does so silently. That is the case reading the sibling `.mcp.json` exists to avoid.
  */
-const AGENT_ROLE_MARKER = /NYX-AGENT-CONTEXT\s+role=([a-z][a-z-]*)/i;
-const TRIGGERABLE_ROLES = new Set(["spec", "dev", "doc"]);
+function resolvePort() {
+  const injected = (process.env.NYX_MCP_PORT || "").trim();
+  if (injected) return injected;
+  try {
+    const root = process.env.CLAUDE_PLUGIN_ROOT;
+    if (!root) return DEFAULT_PORT;
+    const parsed = JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf8"));
+    for (const server of Object.values(parsed || {})) {
+      const url = server && typeof server.url === "string" ? server.url : "";
+      const m = url.match(/:(\d+)\//);
+      if (m) return m[1];
+    }
+  } catch (_e) {
+    /* no plugin root, unreadable or malformed file → the literal default */
+  }
+  return DEFAULT_PORT;
+}
+
+const PORT = resolvePort();
 
 /**
- * Derive the agent role from a submitted prompt, or "" when it carries no nyx sentinel (a
- * normal prompt) or names a role we do not inject. Pure + defensive: a non-string / missing
- * prompt yields "". ZERO argument parsing — only the marker's role token is read; the human's
- * free text is never inspected.
+ * The nyx slash commands, the run each one OPENS (`run_start {scope}`) and the manual injected
+ * with it (`agent_context {role}`).
+ *
+ * The TRIGGER is the command NAME because that is ALL a `UserPromptSubmit` hook ever sees:
+ * Claude Code hands the hook the prompt the human TYPED (`prompt: "/nspec feature-42 …"`) and
+ * expands the stub body only afterwards, so the `<!-- NYX-AGENT-CONTEXT role=… scope=… -->`
+ * sentinel a stub declares NEVER reaches this hook — keying on it injected nothing, ever.
+ * The stub's sentinel stays the DECLARATION of what its command triggers; the push-injection
+ * e2e asserts this table agrees with it, so a drift on either side fails there.
  */
-function roleFromPrompt(prompt) {
+const NYX_COMMANDS = {
+  nspec: { role: "dev", scope: "nspec" },
+  ndev: { role: "dev", scope: "ndev" },
+  ndoc: { role: "dev", scope: "ndoc" },
+};
+
+/** The leading slash-command invocation of a prompt (Claude Code allows leading blanks). */
+const SLASH_COMMAND = /^\s*\/([a-z][a-z0-9:_-]*)(?=\s|$)/i;
+
+/**
+ * The slash command a prompt INVOKES (`"/nspec feature-42 go"` → `"nspec"`), or "" when the
+ * prompt is not a command invocation. Pure + defensive: a non-string / missing prompt yields
+ * "". ZERO argument parsing — only the command name is read; the human's free text is never
+ * inspected.
+ */
+function commandFromPrompt(prompt) {
   if (typeof prompt !== "string" || prompt.length === 0) return "";
-  const m = prompt.match(AGENT_ROLE_MARKER);
-  if (!m) return "";
-  const role = m[1].toLowerCase();
-  return TRIGGERABLE_ROLES.has(role) ? role : "";
+  const m = prompt.match(SLASH_COMMAND);
+  return m ? m[1].toLowerCase() : "";
+}
+
+/**
+ * A Spec id, and nothing that merely resembles one: the CANONICAL uuid shape nyx mints its ids in,
+ * anchored so a token is either the whole id or not an id at all.
+ */
+const SPEC_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The Spec id the human NAMED, when the command's first argument is one (`"/ndev 019ff517-… fix
+ * the probe"` → `"019ff517-…"`), else "".
+ *
+ * WHY the hook reads this ONE token when its rule is to parse nothing: `/ndev` and `/ndoc` work ON
+ * an existing Spec, and their stubs advertise "an optional Spec id selects the Spec to work on".
+ * The `cwd` alone cannot honour that — a real project holds several active Specs, so resolving one
+ * by location is REFUSED as ambiguous, and the run never opens. The typed id is the only anchor
+ * that disambiguates, and it was going unread: a live session had to notice on its own that "the
+ * UUID in your command IS the spec_id" and open the run itself.
+ *
+ * Still zero interpretation of the human's TEXT: only the first token, only when it is a whole
+ * canonical id. Anything else — a slug, a sentence, a partial id — leaves this empty and the run
+ * resolves from the `cwd` exactly as before, so a human writing prose can never have a word of it
+ * mistaken for an anchor.
+ */
+function specIdFromPrompt(prompt) {
+  if (typeof prompt !== "string") return "";
+  const rest = prompt.replace(SLASH_COMMAND, "").trim();
+  if (!rest) return "";
+  const first = rest.split(/\s+/, 1)[0];
+  return SPEC_ID.test(first) ? first : "";
+}
+
+/**
+ * The reason of the LAST trace, so the caller can report to nyx the same sentence it wrote to
+ * stderr. One variable rather than a return value threaded through three helpers: every failure
+ * already funnels through `trace`, and duplicating the wording is how the two ends drift apart.
+ */
+let lastTraced = "";
+
+/**
+ * Say WHY no manual was injected. A hook must never break the prompt, so this branch stays
+ * best-effort and exits 0 — but "best effort" is not a licence to be undiagnosable: four different
+ * situations (the prompt is not a nyx command, the sidecar is unreachable, `run_start` refused,
+ * `agent_context` refused) used to be one silence, which is how a dead injection survived a whole
+ * release. stderr is written FIRST because it is the only sink that still works when the sidecar
+ * itself is down, and Claude Code shows it in debug mode without ever feeding it to the model. The
+ * reason is also kept so a nyx command's failure can be FILED in nyx (see `report`) — stderr alone
+ * is read by nobody, which is precisely how the dead injection went unnoticed. Silent on the happy
+ * path and on any non-command prompt.
+ */
+function trace(reason) {
+  lastTraced = String(reason);
+  try {
+    process.stderr.write(`nyx-hook UserPromptSubmit: no manual injected — ${reason}\n`);
+  } catch (_e) {
+    /* a closed stderr must never break the hook */
+  }
+}
+
+/**
+ * FILE in nyx that a nyx command's injection failed, carrying the reason already traced. Rides
+ * `agent_session_event`, the channel this hook already POSTs on every prompt — the core recognises
+ * `nyx_injection_failed`, records it in the domain-event outbox and does NOT touch the live dot,
+ * because this is a report about the turn and not a beat of it.
+ *
+ * Only for a NYX command: a foreign slash command is a non-event, and filing it would turn an
+ * audit trail into noise. Best-effort like everything here — a report that cannot be sent (the
+ * sidecar being down is one of the reasons we report) changes nothing else.
+ */
+async function report(command, reason) {
+  try {
+    await post(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: {
+          name: "agent_session_event",
+          arguments: {
+            NYX_TERMINAL_ID: TERMINAL_ID,
+            hook_event_name: "UserPromptSubmit",
+            nyx_injection_failed: reason,
+            nyx_injection_command: command,
+          },
+        },
+      }),
+    );
+  } catch (_e) {
+    /* a report is the last thing that may break a prompt */
+  }
+}
+
+/**
+ * The rendered manual out of an `agent_context` response, or "" after tracing what went wrong.
+ * Every failure mode gets its OWN wording so the trace names the cause instead of the symptom.
+ */
+function manualFromResponse(resp) {
+  if (!resp || resp.error) {
+    trace(
+      `agent_context unreachable on 127.0.0.1:${PORT} — ${(resp && resp.error) || "no response"} (is the nyx sidecar running?)`,
+    );
+    return "";
+  }
+  if (resp.status !== 200) {
+    trace(`agent_context answered HTTP ${resp.status}`);
+    return "";
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(resp.body);
+  } catch (_e) {
+    trace("agent_context answered a body that is not JSON");
+    return "";
+  }
+  if (parsed && parsed.error) {
+    trace(`agent_context refused: ${parsed.error.message || JSON.stringify(parsed.error)}`);
+    return "";
+  }
+  const manual = parsed?.result?.structuredContent?.context;
+  if (typeof manual !== "string" || manual.length === 0) {
+    trace("agent_context answered without result.structuredContent.context");
+    return "";
+  }
+  return manual;
+}
+
+/**
+ * The opened run (`{ runId, warnings }`) out of a `run_start` response, or `null` after tracing
+ * what went wrong — failure mode for failure mode, like [`manualFromResponse`].
+ *
+ * A REFUSAL is the mode that matters here (`/ndev` on a location anchoring no Spec, or several):
+ * it must NOT degrade into injecting a manual with no run. The session's first act is
+ * `nyx_next(run_id)`, so a context carrying no id sends it hunting for one — the very pre-tick
+ * scramble the hook took over. No run ⇒ nothing injected, and the SERVER's own sentence is what
+ * the trace carries, because it is the one that names which anchor was missing.
+ */
+function runFromResponse(resp) {
+  if (!resp || resp.error) {
+    // NO ANSWER is not the same as NO RUN: `run_start` opens the run BEFORE it answers, so a
+    // timeout leaves a run this session never learns the id of. Say that rather than only blaming
+    // the sidecar — the recovery (invoke the command again; the run is RESUMED, never duplicated)
+    // is not the same one a genuinely-down sidecar calls for.
+    trace(
+      `run_start unreachable on 127.0.0.1:${PORT} — ${(resp && resp.error) || "no response"} ` +
+        `(is the nyx sidecar running? on a TIMEOUT the run may have opened anyway: invoking the ` +
+        `command again RESUMES it rather than opening a second one)`,
+    );
+    return null;
+  }
+  if (resp.status !== 200) {
+    trace(`run_start answered HTTP ${resp.status}`);
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(resp.body);
+  } catch (_e) {
+    trace("run_start answered a body that is not JSON");
+    return null;
+  }
+  if (parsed && parsed.error) {
+    trace(`run_start refused: ${parsed.error.message || JSON.stringify(parsed.error)}`);
+    return null;
+  }
+  const opened = parsed?.result?.structuredContent;
+  const runId = opened && opened.run_id;
+  if (typeof runId !== "string" || runId.length === 0) {
+    trace("run_start answered without result.structuredContent.run_id");
+    return null;
+  }
+  return { runId, warnings: Array.isArray(opened.warnings) ? opened.warnings : [] };
+}
+
+/**
+ * The header the injection LEADS with: the `run_id` the session ticks, and the `run_start`
+ * warnings.
+ *
+ * The id is stated twice — as a field and inside the call that consumes it — because it is the one
+ * value EVERY subsequent call takes and the session never obtains it any other way.
+ *
+ * The WARNINGS ride here rather than being dropped: `run_start` returns them written for a human to
+ * act on (a run destroyed because its graph changed, a gate that verifies nothing, a location so
+ * ambiguous the run started bound to no Spec). Opening the run for the session and swallowing them
+ * would hide exactly what taking the call away from the agent must not cost the human.
+ */
+function runBlock(run) {
+  let block = `=== NYX RUN (opened by nyx for this command — you need no run_start) ===\nrun_id: ${run.runId}\nTick it: nyx_next(run_id="${run.runId}").\n`;
+  if (run.warnings.length > 0) {
+    block += "WARNINGS from run_start — RELAY each one to the user, in one line, before you tick:\n";
+    for (const w of run.warnings) {
+      const code = w && typeof w.code === "string" ? w.code : "warning";
+      const message = w && typeof w.message === "string" ? w.message : JSON.stringify(w);
+      block += `- [${code}] ${message}\n`;
+    }
+  }
+  return `${block}\n`;
 }
 
 /**
@@ -136,14 +404,19 @@ function readStdin() {
   });
 }
 
-/** Best-effort POST of the JSON-RPC body; resolves on any outcome (never rejects). */
-function post(body) {
+/**
+ * Best-effort POST of the JSON-RPC body; resolves on any outcome (never rejects) with either
+ * `{ status, body }` (the sidecar answered) or `{ error }` (it did not: down, timeout, socket
+ * error). The two must stay apart — a caller that cannot tell them apart cannot say WHY it
+ * injected nothing.
+ */
+function post(body, timeoutMs = TIMEOUT_MS) {
   return new Promise((resolve) => {
     let settled = false;
     const done = (value) => {
       if (settled) return;
       settled = true;
-      resolve(typeof value === "string" ? value : "");
+      resolve(value);
     };
     let req;
     try {
@@ -165,30 +438,35 @@ function post(body) {
           res.on("data", (d) => {
             respBody += d;
           });
-          res.on("end", () => done(respBody));
-          res.on("error", () => done());
+          res.on("end", () => done({ status: res.statusCode, body: respBody }));
+          res.on("error", (e) => done({ error: reason(e) }));
         },
       );
     } catch (_e) {
-      done();
+      done({ error: reason(_e) });
       return;
     }
-    req.on("error", done); // ECONNREFUSED (server down) etc. — best-effort, swallow.
-    req.setTimeout(TIMEOUT_MS, () => {
+    req.on("error", (e) => done({ error: reason(e) })); // ECONNREFUSED (server down) etc.
+    req.setTimeout(timeoutMs, () => {
       try {
         req.destroy();
       } catch (_e) {
         /* ignore */
       }
-      done();
+      done({ error: `no answer within ${timeoutMs}ms` });
     });
     try {
       req.write(body);
       req.end();
-    } catch (_e) {
-      done();
+    } catch (e) {
+      done({ error: reason(e) });
     }
   });
+}
+
+/** A short, loggable cause out of a node error (`ECONNREFUSED`, a message, or a fallback). */
+function reason(e) {
+  return (e && (e.code || e.message)) || "request failed";
 }
 
 async function main() {
@@ -230,7 +508,7 @@ async function main() {
     params: { name: "agent_session_event", arguments: args },
   });
 
-  const responseBody = await post(body);
+  const response = await post(body);
 
   // SessionStart: relay nyx's resolved context as `additionalContext` so the agent
   // situates itself inside nyx (project/workspace/terminal) with no prompting (#22). The
@@ -239,7 +517,7 @@ async function main() {
   // session still works). Only SessionStart carries `context`, so we gate on it.
   if (args.hook_event_name === "SessionStart") {
     try {
-      const ctx = JSON.parse(responseBody)?.result?.structuredContent?.context;
+      const ctx = JSON.parse(response.body || "")?.result?.structuredContent?.context;
       if (ctx && typeof ctx === "string") {
         process.stdout.write(
           JSON.stringify({
@@ -255,39 +533,81 @@ async function main() {
     }
   }
 
-  // UserPromptSubmit — the `/nspec` `/ndev` `/ndoc` slash-command manual injection (v2.5.8 /
-  // PDR-0020). When the submitted prompt carries the stub's `NYX-AGENT-CONTEXT role=<role>`
-  // sentinel, POST a SECOND `agent_context` call ({ role, cwd }) and relay the rendered manual
-  // as `additionalContext` — the mirror of the SessionStart relay above. `agent_context`
-  // resolves the Spec from `cwd`, so no id is parsed here. Best-effort and NEVER throws: a
-  // sidecar that is down, an unresolved Spec, or a garbled response simply injects nothing (the
-  // agent still has the stub's own fallback instruction to pull the manual itself).
+  // UserPromptSubmit — the `/nspec` `/ndev` `/ndoc` run opening + manual injection (v2.5.8 /
+  // PDR-0020, then v2.8 G6). When the submitted prompt INVOKES one of those commands, OPEN the run
+  // (`run_start { scope, cwd }`) and fetch the dispatcher manual FOR THAT RUN
+  // (`agent_context { role, scope, run_id }`), then relay BOTH in ONE `additionalContext` — the
+  // mirror of the SessionStart relay above. The hook anchors the run on the `cwd` Claude Code hands
+  // it, so nothing here parses the human's text and no agent resolves an anchor a second time.
+  // Best-effort and NEVER throws: a sidecar that is down, a refused `run_start` or a refused
+  // `agent_context` injects nothing — but it TRACES why on stderr.
   if (args.hook_event_name === "UserPromptSubmit") {
-    const role = roleFromPrompt(args.prompt);
-    if (role) {
+    const command = commandFromPrompt(args.prompt);
+    const trigger = command ? NYX_COMMANDS[command] : null;
+    if (trigger) {
+      let injected = false;
       try {
         const cwd = typeof args.cwd === "string" ? args.cwd : "";
-        const ctxBody = JSON.stringify({
+        // The Spec the human NAMED, when they named one. It is passed BESIDE the `cwd`, not instead
+        // of it: the id resolves WHICH Spec, the cwd still anchors the run's dev workspace.
+        const specId = specIdFromPrompt(args.prompt);
+        const runBody = JSON.stringify({
           jsonrpc: "2.0",
           id: 2,
           method: "tools/call",
-          params: { name: "agent_context", arguments: { role, cwd } },
+          params: {
+            name: "run_start",
+            // `scope` is the flow this command runs (nspec | ndev | ndoc); `cwd` is the anchor the
+            // run resolves its project and dev workspace from; `spec_id` — when the human typed one
+            // — is what lets `/ndev` and `/ndoc` open at all in a project holding several active
+            // Specs, where a location alone is ambiguous and refused.
+            arguments: specId
+              ? { scope: trigger.scope, cwd, spec_id: specId }
+              : { scope: trigger.scope, cwd },
+          },
         });
-        const ctxResp = await post(ctxBody);
-        const manual = JSON.parse(ctxResp)?.result?.structuredContent?.context;
-        if (manual && typeof manual === "string") {
-          process.stdout.write(
-            JSON.stringify({
-              hookSpecificOutput: {
-                hookEventName: "UserPromptSubmit",
-                additionalContext: manual,
-              },
-            }),
-          );
+        const run = runFromResponse(await post(runBody, RUN_OPEN_TIMEOUT_MS));
+        if (run) {
+          const ctxBody = JSON.stringify({
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: {
+              name: "agent_context",
+              // The RUN is the anchor now: it carries the Spec it drives and the workspace it
+              // opened against, so the manual renders off it and no anchor is resolved twice.
+              arguments: { role: trigger.role, scope: trigger.scope, run_id: run.runId },
+            },
+          });
+          const manual = manualFromResponse(await post(ctxBody, RUN_OPEN_TIMEOUT_MS));
+          if (manual) {
+            process.stdout.write(
+              JSON.stringify({
+                hookSpecificOutput: {
+                  hookEventName: "UserPromptSubmit",
+                  additionalContext: `${runBlock(run)}${manual}`,
+                },
+              }),
+            );
+            injected = true;
+          }
         }
-      } catch (_e) {
-        // No manual injected on a parse/shape/network error — harmless (best-effort).
+      } catch (e) {
+        trace(`unexpected hook error: ${reason(e)}`);
       }
+      // A nyx command that got NOTHING is filed in nyx, with the sentence already traced. The
+      // happy path files nothing at all.
+      if (!injected) {
+        await report(command, lastTraced || "no manual injected, with no reason traced");
+      }
+    } else if (command) {
+      // A slash command that is not ours. Traced (not silent) because this is EXACTLY the shape
+      // the dead injection took: `/nspec` reaching the hook as something the table does not know
+      // must be visible in one debug line, not inferred from an absence.
+      const known = Object.keys(NYX_COMMANDS)
+        .map((c) => `/${c}`)
+        .join(" ");
+      trace(`/${command} is not a nyx command (${known})`);
     }
   }
 }

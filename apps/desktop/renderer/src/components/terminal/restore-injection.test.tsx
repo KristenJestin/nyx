@@ -161,6 +161,90 @@ describe("<Terminal> restore injection (dead history)", () => {
   });
 });
 
+describe("<Terminal> screen re-hydration (a pane taking over a running shell)", () => {
+  afterEach(() => {
+    __resetTerminalStore();
+  });
+
+  /**
+   * A shell can be running long before any pane exists: an agent opens a terminal over MCP and
+   * drives it while its project is not the one on screen. When the human finally opens that
+   * project, the mount ATTACHES to that shell — and used to show a BLANK pane, because
+   * everything it printed before the pane existed lives in the backend and the renderer never
+   * asked for it.
+   */
+  it("repaints the screen of the shell it takes over", async () => {
+    const calls: string[] = [];
+    const ptyWrites: string[] = [];
+    const decoder = new TextDecoder();
+    mockIPC(
+      (cmd, args) => {
+        calls.push(cmd);
+        const a = (args ?? {}) as Record<string, unknown>;
+        switch (cmd) {
+          case "terminal_screen_rehydration":
+            return { bytes: Array.from(new TextEncoder().encode("SHELL_WAS_HERE_77")) };
+          case "pty_spawn":
+            return 300;
+          case "pty_write":
+            ptyWrites.push(decoder.decode(Uint8Array.from((a.data as number[]) ?? [])));
+            return null;
+          default:
+            return null;
+        }
+      },
+      { shouldMockEvents: true },
+    );
+
+    let term: XTerm | null = null;
+    render(
+      <Terminal
+        recordId="rehydrate-1"
+        onInstance={(t) => {
+          term = t;
+        }}
+      />,
+    );
+    await waitFor(() => expect(term).not.toBeNull());
+    await waitFor(() => expect(readBuffer(term)).toContain("SHELL_WAS_HERE_77"));
+
+    // The re-hydration is asked for BEFORE the attach: the backend streams a terminal's output
+    // only to an attached view, so this ordering is what keeps the repaint and the live stream
+    // from doubling each other.
+    expect(calls).toContain("terminal_screen_rehydration");
+    expect(calls.indexOf("terminal_screen_rehydration")).toBeLessThan(calls.indexOf("pty_spawn"));
+    // A repaint is for the SCREEN — it must never be typed into the shell.
+    expect(ptyWrites.join("")).not.toContain("SHELL_WAS_HERE_77");
+  });
+
+  /** Nothing to restore (a brand-new terminal): nothing written, and the spawn still happens. */
+  it("writes nothing when the backend has no screen to restore", async () => {
+    const calls: string[] = [];
+    mockIPC(
+      (cmd) => {
+        calls.push(cmd);
+        if (cmd === "terminal_screen_rehydration") return { bytes: [] };
+        if (cmd === "pty_spawn") return 301;
+        return null;
+      },
+      { shouldMockEvents: true },
+    );
+
+    let term: XTerm | null = null;
+    render(
+      <Terminal
+        recordId="rehydrate-2"
+        onInstance={(t) => {
+          term = t;
+        }}
+      />,
+    );
+    await waitFor(() => expect(term).not.toBeNull());
+    await waitFor(() => expect(calls).toContain("pty_spawn"));
+    expect(readBuffer(term).trim()).toBe("");
+  });
+});
+
 /** Read the whole xterm buffer (screen + scrollback) as a newline-joined string. */
 function readBuffer(term: XTerm | null): string {
   if (!term) return "";
