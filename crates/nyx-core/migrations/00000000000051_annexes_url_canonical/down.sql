@@ -1,0 +1,30 @@
+-- Revert schema v51. NOTHING is undone, and this file says so rather than pretending otherwise.
+--
+-- WHAT v51 CHANGED IS DATA, NOT SCHEMA. Its `up` left the schema byte-identical to what v50 left:
+-- it dropped `idx_annexes_url_unique_per_spec` only to be able to rewrite rows underneath it, and
+-- recreated it with the same definition at the end. There is therefore no object to drop here —
+-- and dropping that index would be WRONG, because it belongs to v50, which is still applied. A
+-- revert that removed it would leave the base one migration behind its own schema.
+--
+-- WHAT CANNOT COME BACK. The `up` canonicalised the stored URLs (case of the scheme and the host,
+-- trailing slash), then deleted the attachments that had become duplicates of one another. Both
+-- are lossy in the same way v50's dedup was: the pre-canonical spelling is not recorded anywhere,
+-- and a DELETE is not reversible. What the deleted rows carried beyond the URL — their `title`
+-- (the LABEL), their `id`, their `created_at` — is restored by nothing, this revert included. The
+-- URL itself is intact: it is the kept row's content, in canonical form, and its blob is
+-- referenced.
+--
+-- WHAT REVERTING IS STILL FOR. The chain must be walkable — a `down.sql` is how the migrations
+-- below stay reachable, and the v51 test peels it to reach v50. Reverting v51 puts the base back
+-- in the state where `add_annexe` (which canonicalises regardless of the schema version, the rule
+-- lives in the Rust authority) simply writes new links over data that stays as it is.
+--
+-- THE NO-OP STATEMENT BELOW IS THE REPO'S CONVENTION FOR THIS EXACT CASE. v11
+-- (`00000000000011_backfill_canonical_v1_data`) is the other pure-DATA migration here — no schema
+-- to undo, an `up` that does not invert — and its `down.sql` states the intentional no-op and then
+-- WRITES it, as a statement matching no row. Every other migration directory carries at least one
+-- statement in its `down.sql`; v51 follows the same shape rather than being the one exception, so
+-- that "this reverses nothing" reads as a decision taken on purpose and not as an unfinished file.
+-- The column named is the one the `up` rewrote, and `WHERE 1 = 0` is what keeps it inert: no row is
+-- matched, no `content_hash` moves, the v50 unique index is not exercised.
+UPDATE annexes SET content_hash = content_hash WHERE 1 = 0;

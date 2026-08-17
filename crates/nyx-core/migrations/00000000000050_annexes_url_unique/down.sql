@@ -1,0 +1,16 @@
+-- Revert schema v50: drop the per-Spec URL uniqueness. An index carries no data, so the revert
+-- is a plain drop — every `annexes` row that exists at this point survives untouched, and
+-- attaching the same url twice to one Spec becomes possible again.
+--
+-- It does NOT resurrect the duplicate links the `up` deduplicated: a DELETE is not reversible, and
+-- what it removed was by construction a redundant attachment of a URL the Spec still carries (same
+-- `spec_id`, same `content_hash`, same blob).
+--
+-- WHAT THE REVERT DOES NOT GIVE BACK: the `title` — the LABEL — of the deleted duplicates, along
+-- with their `id` and their `created_at`. The deduplicated key is `(spec_id, content_hash)` and
+-- `title` is NOT part of it, so two attachments of the SAME url on the SAME Spec could carry two
+-- DIFFERENT labels; the `up` kept only the oldest row, hence only the FIRST label a human gave
+-- that link (`up.sql` "WHICH ROW IS KEPT"). Those alternative labels are restored by nothing —
+-- this revert included. The URL itself is fully preserved: it is the kept row's content, and its
+-- blob is still referenced.
+DROP INDEX IF EXISTS idx_annexes_url_unique_per_spec;

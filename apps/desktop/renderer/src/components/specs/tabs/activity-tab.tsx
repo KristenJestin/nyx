@@ -191,7 +191,7 @@ export function ActivityTab({ detail }: { detail: SpecDetail }) {
 
   if (loading) {
     return (
-      <div className="mx-auto max-w-2xl">
+      <div className="mx-auto max-w-3xl">
         <p className="text-sm text-muted-foreground">Loading activity…</p>
       </div>
     );
@@ -199,7 +199,7 @@ export function ActivityTab({ detail }: { detail: SpecDetail }) {
 
   if (entries.length === 0) {
     return (
-      <div className="mx-auto max-w-2xl">
+      <div className="mx-auto max-w-3xl">
         <p className="text-sm text-muted-foreground">No activity recorded yet.</p>
       </div>
     );
@@ -211,7 +211,10 @@ export function ActivityTab({ detail }: { detail: SpecDetail }) {
   const ordered = [...entries].sort((a, b) => b.sequence - a.sequence);
 
   return (
-    <div className="mx-auto max-w-2xl">
+    // `max-w-3xl`, like Spec / Tasks / Review / Runtime / Prototype: the column width is set per tab
+    // in this app, and this tab was one of the two left at `2xl` — so the content jumped ~96px wide
+    // when you moved between tabs. Aligned on the majority rather than kept as an exception.
+    <div className="mx-auto max-w-3xl">
       <ol className="relative flex flex-col">
         {ordered.map((ev, i) => {
           // The BOTTOM (oldest) entry closes the timeline — no connector line below it.

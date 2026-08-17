@@ -83,11 +83,101 @@ function windowApi(): NyxWindowApi {
   return (window as unknown as { nyxWindow: NyxWindowApi }).nyxWindow;
 }
 
+/**
+ * The channel `window.nyxCore.invoke` rides (mirror of `CORE_CHANNELS.invoke` in
+ * `apps/desktop/src/shared/ipc.ts`, declared locally like {@link CoreEventEnvelope} so the frontend
+ * does not import from the electron app package). It is not used to CALL anything here — the
+ * preload owns the channel — only to reconstruct, exactly, the wrapper Electron builds from it.
+ */
+const CORE_INVOKE_CHANNEL = "nyx:core/invoke";
+
+/**
+ * The wrapper `ipcRenderer.invoke` puts around EVERY rejection: when a main-process
+ * `ipcMain.handle` throws, the renderer side does not re-raise that error — it throws a NEW one
+ * whose message is `` `Error invoking remote method '${channel}': ${error}` ``. The trailing
+ * interpolation stringifies the deserialized error, which is where the second `Error: ` comes from.
+ * Both halves are fixed strings, so both can be removed EXACTLY rather than guessed at.
+ */
+const IPC_WRAP_PREFIX = `Error invoking remote method '${CORE_INVOKE_CHANNEL}': `;
+/** `Error.prototype.toString()` on the main-side error, i.e. `name + ": "` with the default name. */
+const STRINGIFIED_ERROR_PREFIX = "Error: ";
+
+/** A non-null object, without asserting anything about its fields. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** The `message` a value carries, when it carries one as a string — a SHAPE test, not a class one. */
+function messageField(value: unknown): string | null {
+  return isRecord(value) && typeof value.message === "string" ? value.message : null;
+}
+
+/**
+ * The failure BEHIND an `ipcRenderer.invoke` rejection — the backend's own refusal, without the
+ * transport's wrapping (second human review, finding F6).
+ *
+ * # What was on screen
+ *
+ * A duplicate link showed, in the block's `role="alert"`:
+ * `Error invoking remote method 'nyx:core/invoke': Error: url '…' is already attached to this Spec`.
+ * The sentence the Rust authority wrote with care was last, behind a channel name and two stacked
+ * `Error:`. Nothing downstream was at fault: `errorText` renders a message VERBATIM, which is its
+ * whole point — it was handed a message that had already been wrapped.
+ *
+ * # Why HERE and nowhere else
+ *
+ * This is the ONE place a native failure becomes the `BridgeError` the app will show
+ * ({@link toBridgeError}). Peeling in a hook or a component would put a copy of this knowledge in
+ * every surface, free to drift — the defect `error-text.ts` exists to prevent. Peeling here fixes
+ * every command at once, which is the point of having a single conversion.
+ *
+ * # Two branches, in order of preference, and a refusal to guess
+ *
+ * (a) Electron may attach the ORIGINAL, deserialized error as `cause`. When it does, that object
+ *     carries the authority's sentence with no wrapping at all — it is handed on as-is and NO
+ *     string is touched. Which Electron builds do this cannot be settled from source (the
+ *     renderer-side `invoke` lives in the binary's V8 snapshot), so the branch is WRITTEN rather
+ *     than assumed, and costs nothing when it is not taken.
+ * (b) Otherwise the two fixed prefixes above are removed — reconstructed from the channel name the
+ *     code already knows, not matched by an approximate pattern.
+ *
+ * If the message does NOT start with that exact wrapper, the value is returned UNTOUCHED: a
+ * failure that never crossed this channel (a timeout, an abort, a rejection raised in-process)
+ * keeps its own words, and no speculative slice can ever eat a legitimate sentence.
+ *
+ * # It reads a SHAPE, and it does not read a message to show it
+ *
+ * The inspection is structural — a `message` field of type string — and never a prototype test:
+ * an error that crossed an IPC boundary may well have lost its prototype (`error-text.ts` lists
+ * that case), and the guard-rail `error-text.guard.test.ts` refuses class tests in every surface
+ * for that exact reason. Note also what this function does NOT do: it never decides what to
+ * DISPLAY. It picks WHICH value the one reader — {@link errorText} — is then handed.
+ */
+function unwrapCoreInvokeRejection(e: unknown): unknown {
+  const wrapped = messageField(e);
+  if (wrapped === null || !wrapped.startsWith(IPC_WRAP_PREFIX)) return e;
+  // (a) The original failure, when this build attached it.
+  const cause = isRecord(e) ? e.cause : undefined;
+  if ((messageField(cause) ?? "").trim().length > 0) return cause;
+  // (b) The exact wrapper, removed.
+  const inner = wrapped.slice(IPC_WRAP_PREFIX.length);
+  return inner.startsWith(STRINGIFIED_ERROR_PREFIX)
+    ? inner.slice(STRINGIFIED_ERROR_PREFIX.length)
+    : inner;
+}
+
 /** Build a {@link BridgeError} from a caught IPC/command failure. */
 function toBridgeError(kind: BridgeError["kind"], cause: unknown, source?: string): BridgeError {
   // The SAME reading every surface uses (finding `01KYVT6HVA260DTAEREQA4DFJN`) — this is where a
   // native failure becomes the message the whole app will show, so it may not have a private one.
-  return { kind, message: errorText(cause, "bridge call failed"), source, cause };
+  // What it reads is the failure BEHIND the IPC wrapper; `cause` still carries the raw value, which
+  // the contract keeps for logging and never for control flow.
+  return {
+    kind,
+    message: errorText(unwrapCoreInvokeRejection(cause), "bridge call failed"),
+    source,
+    cause,
+  };
 }
 
 /**

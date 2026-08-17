@@ -4823,10 +4823,46 @@ fn build_pool(url: &str) -> anyhow::Result<Pool<ConnectionManager<SqliteConnecti
         .map_err(|e| anyhow::anyhow!("failed to build SQLite pool at {url}: {e}"))
 }
 
+diesel::define_sql_function! {
+    /// SQL view of [`canonical_annexe_url`], registered on the connection that runs the migrations
+    /// ([`register_migration_functions`]) and used by v51's `up.sql`.
+    ///
+    /// A data migration that has to re-normalise stored URLs would otherwise need a SECOND copy of
+    /// the canonicalisation rule, written in SQLite string functions and free to drift from the
+    /// one the writer applies — the exact split this codebase refuses elsewhere (one authority for
+    /// UI + MCP, PDR-0005). Lending the Rust function to SQL keeps ONE rule.
+    fn nyx_canonical_url(url: diesel::sql_types::Text) -> diesel::sql_types::Text;
+}
+
+diesel::define_sql_function! {
+    /// SQL view of [`hash_content`] — the SHA-1 that names a blob in the content-addressed
+    /// `annex_blobs` store. SQLite has no hash function of its own, so a migration that changes a
+    /// blob's CONTENT cannot compute the new `content_hash` without this; the alternative was to
+    /// move the data fix-up out of the migration chain entirely, where `run_migrations` could not
+    /// guarantee it ran exactly once, in order, before the schema it depends on.
+    fn nyx_sha1(content: diesel::sql_types::Text) -> diesel::sql_types::Text;
+}
+
+/// Register the SQL functions the migration chain needs on `conn`, replacing any earlier
+/// registration (SQLite keeps them per-CONNECTION, so this is scoped to the connection that runs
+/// the migrations and leaks into no query path). Both are DETERMINISTIC — the same input always
+/// gives the same output — which is what lets SQLite use them inside the migration's statements.
+fn register_migration_functions(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    nyx_canonical_url_utils::register_impl(conn, |url: String| canonical_annexe_url(&url))
+        .map_err(|e| anyhow::anyhow!("failed to register nyx_canonical_url: {e}"))?;
+    nyx_sha1_utils::register_impl(conn, |content: String| hash_content(&content))
+        .map_err(|e| anyhow::anyhow!("failed to register nyx_sha1: {e}"))?;
+    Ok(())
+}
+
 /// Apply all pending embedded migrations. Idempotent. Returns `Err` if any
 /// migration fails — the caller (boot setup) must propagate the error, which
 /// causes nyx to refuse to start rather than serving a broken schema (D1).
+///
+/// The helper SQL functions are registered FIRST: v51 calls them, and an unregistered function is
+/// a "no such function" error at prepare time — i.e. a failed migration and a refused start.
 pub fn run_migrations(conn: &mut SqliteConnection) -> anyhow::Result<()> {
+    register_migration_functions(conn)?;
     conn.run_pending_migrations(MIGRATIONS)
         .map_err(|e| anyhow::anyhow!("failed to run migrations: {e}"))?;
     Ok(())
@@ -8427,6 +8463,33 @@ pub const ANNEX_KIND_URL: &str = "url";
 /// `annexes.kind` — a prototype (e.g. an HTML mockup).
 pub const ANNEX_KIND_PROTOTYPE: &str = "prototype";
 
+/// The WHOLE `annexes.kind` vocabulary, in the order every surface publishes it. The v27 CHECK
+/// constraint holds the same set; this is its Rust face, so a caller never re-lists it by hand.
+pub const ANNEX_KINDS: [&str; 4] = [
+    ANNEX_KIND_DOC,
+    ANNEX_KIND_ARTEFACT,
+    ANNEX_KIND_URL,
+    ANNEX_KIND_PROTOTYPE,
+];
+
+/// Resolve a wire `kind` string to the vocabulary, `None` for anything outside it — the ONE place
+/// the closed set is matched. The MCP `annexe_add` / `annexe_list` handlers and the app's
+/// `annexe_add` db-command all go through this instead of each keeping a private copy of the same
+/// four arms: a fifth kind added above then reaches every surface, rather than compiling fine and
+/// being refused by three matches nobody thought to widen.
+pub fn annex_kind_from_str(kind: &str) -> Option<&'static str> {
+    ANNEX_KINDS.into_iter().find(|known| *known == kind)
+}
+
+/// The refusal sentence for a `kind` outside [`ANNEX_KINDS`] — ONE wording, so the agent and the
+/// app read the same words (each surface only prefixes it with its own context).
+pub fn unknown_annex_kind_message(kind: &str) -> String {
+    format!(
+        "unknown kind '{kind}' (accepted: {})",
+        ANNEX_KINDS.join(", ")
+    )
+}
+
 /// Compute the CONTENT HASH that content-addresses an annexe's bytes: the SHA-1 hex digest of
 /// `content`, via the already-vendored gix hash backend (git's own object-hash algorithm —
 /// deterministic, stable across runs and toolchain versions, and collision-resistant enough
@@ -8505,11 +8568,263 @@ pub struct AnnexView {
     pub byte_len: i64,
 }
 
+// --- The `url` annexe: an EXTERNAL LINK on a Spec (v50) ----------------------
+//
+// A `kind='url'` annexe is the Spec's external-link model (PRD "Liens externes sur un Spec"): no
+// second table, no `spec_links` — the attachment row IS the link, its blob content IS the URL and
+// its `title` IS the label. What makes it a LINK rather than "any string filed under url" is the
+// set of rules below — every one of them applied by [`add_annexe`], and by nothing else:
+//
+//   * VALIDATION — an absolute `http`/`https` URL, checked HERE (the single write authority), so a
+//     `javascript:` payload, a `mailto:`, a relative `/docs/x` or a bare `not a url` never reaches
+//     the store. Other kinds are untouched: a `doc`'s content is free text.
+//   * CANONICALISATION — the URL is reduced to a CANONICAL form ([`canonical_annexe_url`]) before
+//     it is validated, hashed and stored: surrounding blanks trimmed, scheme and host lowered, the
+//     path's trailing slash dropped. That form is what the dedup index sees, so `HTTPS://X/a/` and
+//     `https://x/a` are ONE link. `url` ONLY: a `doc` / `artefact` / `prototype` is a DOCUMENT
+//     whose bytes and edges may be meaningful, and none of them is touched.
+//   * BOUND — at most [`ANNEXE_URL_MAX_CHARS`] characters, measured on the canonical form. `url`
+//     only: the other kinds carry whole documents and are not bounded here.
+//   * DEDUPLICATION — one URL per Spec, enforced by the v50 PARTIAL unique index
+//     `(spec_id, content_hash) WHERE kind = 'url'`. The refusal surfaces here as a NAMED error
+//     instead of a raw constraint violation, so every caller (MCP tool, UI db-command) reports the
+//     same sentence.
+//
+// DECLARED SCOPE DEVIATION (human review 01M07WC6BXJ85YTDPY00P0H56R, finding F1). The PRD listed
+// "normalisation poussée d'URL (trailing slash, casse du host)" as OUT and its Impl Decisions
+// "VALIDATION" said NO normalisation was applied — `https://x` and `https://x/` were two distinct
+// links, and that was assumed. Using the feature proved the opposite: the same string was judged
+// valid by a case-INSENSITIVE rule ([`strip_prefix_ci`], RFC 3986 §3.1) and then hashed
+// case-SENSITIVELY, so `HTTPS://x` filed itself beside `https://x` as a second link on ONE target.
+// The user ruled the point be fixed HERE rather than forked; the deviation is recorded in the PRD
+// annexe `implementation-decisions-addenda`, the write stores the canonical form, and the v51
+// migration brings the rows written before it to the same form. What remains OUT is listed on
+// [`canonical_annexe_url`] — `www.` above all, a DIFFERENT host and therefore a different link.
+
+/// The longest a `url` annexe may be, in CHARACTERS (not bytes — a percent-encoded path is ASCII,
+/// but an IDN or a UTF-8 query is not, and the user's rule is expressed in characters).
+///
+/// 2 048 is the user's call: the pragmatic historical ceiling (old IE / server request lines), far
+/// above any real ticket, PR or documentation link, and low enough that nothing absurd is stored.
+/// Nothing bounded the input before — `add_annexe` computed `byte_len` and compared it to nothing —
+/// so an 8 000-character URL went in and the UI truncated it on screen, which hid the problem
+/// rather than preventing it (review finding F3).
+///
+/// `kind='url'` ONLY. A `doc`, an `artefact` and a `prototype` carry whole DOCUMENTS — bounding
+/// them would break the pre-existing v27 surface on its first prototype.
+const ANNEXE_URL_MAX_CHARS: usize = 2048;
+
+/// An annexe write was REFUSED. `InvalidUrl` / `UrlHasWhitespace` / `UrlTooLong` / `DuplicateUrl`
+/// are the `kind='url'` rules ([`add_annexe`]); `Db` is any other persistence failure. The messages
+/// are STABLE — the MCP tool and the UI db-command both surface them verbatim, so a caller never
+/// re-words the refusal.
+#[derive(Debug)]
+pub enum AnnexeError {
+    /// A `url` annexe whose content is not an absolute `http`/`https` URL (another scheme, a
+    /// relative path, or an unparseable string). Mapped to `invalid_argument` at the MCP boundary.
+    InvalidUrl(String),
+    /// A `url` annexe LONGER than [`ANNEXE_URL_MAX_CHARS`] characters, measured on the CANONICAL
+    /// form — the string that would actually be stored. Carries that length, not the URL: quoting
+    /// a 8 000-character string back at the caller helps nobody. Mapped to `invalid_argument` at
+    /// the MCP boundary. `url` ONLY — a doc, an artefact or a prototype is a DOCUMENT and is not
+    /// bounded here (a prototype's HTML passes 2 048 characters by construction).
+    UrlTooLong(usize),
+    /// A `url` annexe carrying a whitespace or a control character INSIDE it. A DISTINCT refusal
+    /// from [`AnnexeError::InvalidUrl`] on purpose: `"https://x <script>"` IS absolute, so blaming
+    /// the absence of a scheme would send the caller looking for a defect that is not there — and
+    /// the edges are not the cause either, they are trimmed off before this check
+    /// ([`canonical_annexe_url`]). Mapped to `invalid_argument` at the MCP boundary, like its
+    /// sibling.
+    UrlHasWhitespace(String),
+    /// A `url` annexe whose URL is ALREADY attached to this Spec — the v50 partial unique index.
+    /// Mapped to `invalid_state` at the MCP boundary (the link exists; adding it again is a no-op
+    /// the caller must know about).
+    DuplicateUrl(String),
+    /// Any other DB failure while writing the attachment.
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for AnnexeError {
+    fn from(e: diesel::result::Error) -> Self {
+        AnnexeError::Db(e)
+    }
+}
+
+impl std::fmt::Display for AnnexeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnnexeError::InvalidUrl(url) => write!(
+                f,
+                "invalid url '{url}': a url annexe must be an ABSOLUTE http:// or https:// URL"
+            ),
+            AnnexeError::UrlTooLong(chars) => write!(
+                f,
+                "url too long: {chars} characters — a url annexe is limited to \
+                 {ANNEXE_URL_MAX_CHARS} characters"
+            ),
+            AnnexeError::UrlHasWhitespace(url) => write!(
+                f,
+                "invalid url '{url}': a url annexe must not carry WHITESPACE or CONTROL characters \
+                 inside it (surrounding blanks are trimmed off; percent-encode the rest)"
+            ),
+            AnnexeError::DuplicateUrl(url) => {
+                write!(f, "url '{url}' is already attached to this Spec")
+            }
+            AnnexeError::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// `haystack` without a case-insensitive `prefix`, or `None` when it does not start with it. A URL
+/// scheme is case-insensitive (RFC 3986 §3.1), so `HTTPS://x` is a valid absolute URL.
+fn strip_prefix_ci<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = haystack.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &haystack[prefix.len()..])
+}
+
+/// The CANONICAL form of a `url` annexe's content — the string that is validated, hashed, stored
+/// and therefore DEDUPLICATED. Applied at the write, for `kind='url'` ONLY, and by the v51
+/// migration on the rows written before it (through the `nyx_canonical_url` SQL function, so the
+/// rule has ONE implementation and the store cannot drift from the writer).
+///
+/// FOUR stages, in this order, and NOTHING ELSE:
+///
+/// 1. TRIM of the surrounding blanks. Copying a link out of a mail, a ticket or a chat almost
+///    always drags a space along, and `"  https://x  "` is the same link as `https://x` — refusing
+///    it blamed the paste, not the URL. What sits INSIDE is still refused ([`check_annexe_url`]).
+/// 2. SCHEME lowercased. It is case-INSENSITIVE (RFC 3986 §3.1) and the validation already treats
+///    it so ([`strip_prefix_ci`]): `HTTPS://x` was judged valid by a case-insensitive rule and then
+///    hashed case-SENSITIVELY, which is how one target became two links.
+/// 3. HOST lowercased — the host ALONE. `EXEMPLE.test` and `exemple.test` are the same machine
+///    (DNS is case-insensitive), while the PATH, the QUERY and the FRAGMENT are case-SENSITIVE and
+///    are never touched, and neither is the `userinfo@` (a password's case is meaningful).
+/// 4. The path's TRAILING SLASH removed, query and fragment included (`…/1/?a=1` → `…/1?a=1`), a
+///    root path becoming no path at all (`https://x/` → `https://x`).
+///
+/// EXPLICITLY OUT (review finding F1, and this list is the contract):
+///  * the `www.` prefix is NOT stripped — `www.exemple.test` and `exemple.test` are two DISTINCT
+///    hosts that may serve different content, so a Spec may legitimately carry both;
+///  * no percent-decoding, no query sorting, no default-port removal, no fragment removal;
+///  * `…/a//` is an EMPTY final segment, not a trailing slash: only a LONE final slash is dropped,
+///    which is also what keeps this function idempotent (its output is never re-shortened).
+fn canonical_annexe_url(raw: &str) -> String {
+    let url = raw.trim();
+    // The scheme is matched case-insensitively and REWRITTEN in lower case. A string that is not
+    // absolute http(s) has no canonical form here — it is handed back trimmed and
+    // [`check_annexe_url`] refuses it right after, on the string the caller will see quoted.
+    let (scheme, rest) = if let Some(rest) = strip_prefix_ci(url, "https://") {
+        ("https://", rest)
+    } else if let Some(rest) = strip_prefix_ci(url, "http://") {
+        ("http://", rest)
+    } else {
+        return url.to_string();
+    };
+    // The AUTHORITY is everything before the path / query / fragment — the same cut
+    // [`check_annexe_url`] makes, so the two agree on where the host ends.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = match authority.rsplit_once('@') {
+        // `user:pass@` is case-SENSITIVE: only what follows it is lowered.
+        Some((userinfo, host)) => format!("{userinfo}@{}", host.to_ascii_lowercase()),
+        None => authority.to_ascii_lowercase(),
+    };
+    // The PATH stops at the query or the fragment; both are carried over untouched, which is what
+    // makes `…/1/?a=1` and `…/1?a=1` converge instead of diverging on the suffix.
+    let (path, suffix) = match tail.find(['?', '#']) {
+        Some(cut) => tail.split_at(cut),
+        None => (tail, ""),
+    };
+    let path = match path.strip_suffix('/') {
+        Some(head) if !head.ends_with('/') => head,
+        _ => path,
+    };
+    format!("{scheme}{authority}{path}{suffix}")
+}
+
+/// Is `url` an ABSOLUTE `http`/`https` URL with a non-empty host — and if not, WHICH refusal is it?
+/// The whole validation rule of a `url` annexe (PRD Impl Decisions "VALIDATION"), returning the
+/// [`AnnexeError`] the caller surfaces rather than a bare `false`, because the two ways to fail are
+/// not the same defect and must not read as one:
+///
+///  * [`AnnexeError::InvalidUrl`] — a genuine scheme/host defect: another scheme (`ftp:`,
+///    `javascript:`, `mailto:`) or a relative reference (`/docs/x`, `example.com`);
+///  * [`AnnexeError::UrlHasWhitespace`] — a whitespace or control character INSIDE an otherwise
+///    absolute URL (the edges are gone by now, [`canonical_annexe_url`] trimmed them).
+///
+/// The scheme/host check runs FIRST so each refusal names the defect that actually dominates:
+/// `not a url at all` carries blanks too, but what is wrong with it is that it has no scheme.
+///
+/// Deliberately hand-rolled — the rule is a scheme + a host, not a full RFC 3986 parse, and nyx
+/// pulls no URL crate for it.
+///
+/// PRIVATE on purpose, like its siblings [`strip_prefix_ci`], [`canonical_annexe_url`] and
+/// [`annexe_title_for`]: the rule lives in the WRITE authority and nowhere else. Exporting it would
+/// invite a caller to re-check a URL before calling [`add_annexe`] — a second copy of the rule,
+/// free to drift from this one. The surfaces (the MCP tool, the app's db-command, the renderer) all
+/// take the refusal from the returned error instead, which is why none of them needs this function.
+fn check_annexe_url(url: &str) -> Result<(), AnnexeError> {
+    let Some(rest) = strip_prefix_ci(url, "https://").or_else(|| strip_prefix_ci(url, "http://"))
+    else {
+        return Err(AnnexeError::InvalidUrl(url.to_string()));
+    };
+    // The AUTHORITY is everything before the path / query / fragment; the host is what follows the
+    // optional `userinfo@`. It must exist and must not start on the port separator (`http://:80/`).
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .expect("split always yields at least one element");
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_userinfo, host)| host)
+        .unwrap_or(authority);
+    if host.is_empty() || host.starts_with(':') {
+        return Err(AnnexeError::InvalidUrl(url.to_string()));
+    }
+    // A URL never carries raw whitespace or control characters (they must be percent-encoded);
+    // rejecting them here also kills "https://x\n <script>"-style smuggling. The EDGES are not
+    // this case — they were trimmed — so the refusal names what is really wrong: the inside.
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(AnnexeError::UrlHasWhitespace(url.to_string()));
+    }
+    Ok(())
+}
+
+/// The TITLE an annexe is stored with: the caller's label, or — for a `url` whose label is blank —
+/// the URL itself. `annexes.title` is NOT NULL and the constraint is NOT relaxed (PRD Impl
+/// Decisions "LABEL"); a link with no label therefore reads as its own URL rather than as an empty
+/// row. Non-url kinds keep whatever they were given.
+fn annexe_title_for<'a>(kind: &str, title: &'a str, content: &'a str) -> &'a str {
+    if kind == ANNEX_KIND_URL && title.trim().is_empty() {
+        content
+    } else {
+        title
+    }
+}
+
 /// ATTACH an annexe (`kind`/`title`) to `spec_id`, storing `content` in the content-addressed
 /// `annex_blobs` store (DEDUP by SHA-1 hash: the SAME content attached twice — to this Spec or
 /// another — stores ONE physical blob). Runs in ONE transaction: upsert-ignore the blob, then
 /// insert the attachment row referencing it. Returns the created [`Annex`]. The caller (MCP
 /// `annexe_add`) validates that the Spec exists first, so a FK violation here is unexpected.
+///
+/// The `url` kind carries the EXTERNAL-LINK rules (v50), and ONLY that kind does. They run as ONE
+/// pipeline, in this order, BEFORE the transaction — so a refusal writes nothing, not even a blob:
+///  * CANONICALISATION ([`canonical_annexe_url`]): blanks trimmed, scheme and host lowered, the
+///    path's trailing slash dropped. The canonical string is what is validated, hashed, stored and
+///    shown, so a pasted `"  HTTPS://X/a/  "` lands as — and dedups against — `https://x/a`;
+///  * BOUND: at most [`ANNEXE_URL_MAX_CHARS`] characters of canonical form, else
+///    [`AnnexeError::UrlTooLong`]. Measured here — after the canonicalisation, so the blanks a
+///    paste dragged along never count against it, and on the exact string that would be stored;
+///  * VALIDATION ([`check_annexe_url`]): an absolute `http`/`https` URL, else
+///    [`AnnexeError::InvalidUrl`], or [`AnnexeError::UrlHasWhitespace`] when the defect is a
+///    whitespace / control character INSIDE the string;
+///  * DEDUPLICATION: the same URL may not be attached twice to one Spec — the v50 partial unique
+///    index refuses it, surfaced as the NAMED [`AnnexeError::DuplicateUrl`] rather than a raw
+///    constraint error.
+///
+/// A blank `title` on a `url` falls back to the URL itself ([`annexe_title_for`]) — the CANONICAL
+/// one, since that is the string actually stored.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn add_annexe(
     conn: &mut SqliteConnection,
@@ -8517,10 +8832,29 @@ pub fn add_annexe(
     kind: &str,
     title: &str,
     content: &str,
-) -> QueryResult<Annex> {
+) -> Result<Annex, AnnexeError> {
+    // For a `url`, everything downstream — validation, hash, blob, title fallback, refusal
+    // sentences — works on the CANONICAL form and never on the raw argument. Other kinds are
+    // handed through byte-for-byte: a doc's content is a DOCUMENT, and its edges may be meaningful.
+    let canonical;
+    let content = if kind == ANNEX_KIND_URL {
+        canonical = canonical_annexe_url(content);
+        // The BOUND is measured on the canonical form — AFTER the trim and the normalisation, and
+        // BEFORE the shape is checked: a URL that only overflows because of the blanks around it
+        // has nothing wrong with it, and what is measured must be what is stored.
+        let chars = canonical.chars().count();
+        if chars > ANNEXE_URL_MAX_CHARS {
+            return Err(AnnexeError::UrlTooLong(chars));
+        }
+        check_annexe_url(&canonical)?;
+        canonical.as_str()
+    } else {
+        content
+    };
     let now = now_millis();
     let content_hash = hash_content(content);
-    conn.transaction(|conn| {
+    let title = annexe_title_for(kind, title, content);
+    let inserted = conn.transaction(|conn| {
         // Content-addressed dedup: store the blob ONCE (INSERT OR IGNORE on the hash PK — an
         // already-present hash keeps the single existing copy).
         diesel::insert_into(annex_blobs::table)
@@ -8544,16 +8878,41 @@ pub fn add_annexe(
             })
             .returning(Annex::as_returning())
             .get_result(conn)
-    })
+    });
+    match inserted {
+        Ok(annex) => Ok(annex),
+        // The ONLY unique constraint an `annexes` insert can trip is the v50 partial index (its
+        // PK is a fresh UUIDv7): the link is already on this Spec.
+        Err(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _,
+        )) if kind == ANNEX_KIND_URL => Err(AnnexeError::DuplicateUrl(content.to_string())),
+        Err(e) => Err(AnnexeError::Db(e)),
+    }
 }
 
 /// LIST the annexes attached to `spec_id`, newest-first, each with its blob `byte_len` (no
 /// content). The backend of the Spec-detail "Annexes" block (Phase 4).
+///
+/// `kind` NARROWS the read to one facet of the vocabulary — `Some(ANNEX_KIND_URL)` is how a caller
+/// reads a Spec's EXTERNAL LINKS and nothing else (the MCP `annexe_list` `kind` argument, the app's
+/// links block). `None` is the unfiltered read, byte-identical to the pre-v50 behaviour: same rows,
+/// same newest-first order. The ORDER is never touched by the filter (PRD Impl Decisions "ORDRE" —
+/// newest-first by `created_at`, no `position`, no reordering).
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn list_annexes(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Vec<AnnexListItem>> {
-    annexes::table
+pub fn list_annexes(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    kind: Option<&str>,
+) -> QueryResult<Vec<AnnexListItem>> {
+    let mut query = annexes::table
         .inner_join(annex_blobs::table)
-        .filter(annexes::spec_id.eq(spec_id))
+        .filter(annexes::spec_id.eq(spec_id.to_string()))
+        .into_boxed();
+    if let Some(kind) = kind {
+        query = query.filter(annexes::kind.eq(kind.to_string()));
+    }
+    query
         .order((annexes::created_at.desc(), annexes::id.desc()))
         .select((
             annexes::id,
@@ -14586,6 +14945,10 @@ mod tests {
         // Peel the migrations stacked above v29 first (v38 → v30, incl. our v34), then revert v29
         // → the CHECK narrows back; setting `closed` must now FAIL.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v48 (human_turns) cleanly");
@@ -14998,8 +15361,16 @@ mod tests {
         let a1 = add_annexe(&mut conn, &spec_a.id, ANNEX_KIND_DOC, "doc one", content).unwrap();
         // SAME content attached again on the same Spec…
         let a2 = add_annexe(&mut conn, &spec_a.id, ANNEX_KIND_DOC, "doc dup", content).unwrap();
-        // …and on ANOTHER Spec — all three share ONE blob.
-        let b1 = add_annexe(&mut conn, &spec_b.id, ANNEX_KIND_URL, "same again", content).unwrap();
+        // …and on ANOTHER Spec — all three share ONE blob. (An `artefact`, not a `url`: since v50
+        // a `url`'s content must BE an http(s) URL, which these free-form bytes are not.)
+        let b1 = add_annexe(
+            &mut conn,
+            &spec_b.id,
+            ANNEX_KIND_ARTEFACT,
+            "same again",
+            content,
+        )
+        .unwrap();
 
         assert_ne!(a1.id, a2.id, "distinct attachment rows");
         assert_eq!(a1.content_hash, a2.content_hash, "same content → same hash");
@@ -15022,7 +15393,7 @@ mod tests {
         assert_eq!(annex_blob_count(&mut conn).unwrap(), 2);
 
         // list_annexes is per-Spec, newest-first, carrying byte_len (no content).
-        let listed = list_annexes(&mut conn, &spec_a.id).unwrap();
+        let listed = list_annexes(&mut conn, &spec_a.id, None).unwrap();
         assert_eq!(listed.len(), 3, "3 attachments on Spec A");
         assert_eq!(listed[0].byte_len, "different bytes".len() as i64);
 
@@ -15058,12 +15429,903 @@ mod tests {
         let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/annex-cascade", None).unwrap();
         let (spec, _) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
         add_annexe(&mut conn, &spec.id, ANNEX_KIND_DOC, "d", "body").unwrap();
-        assert_eq!(list_annexes(&mut conn, &spec.id).unwrap().len(), 1);
+        assert_eq!(list_annexes(&mut conn, &spec.id, None).unwrap().len(), 1);
         delete_project(&mut conn, &project.id).unwrap();
         assert!(
-            list_annexes(&mut conn, &spec.id).unwrap().is_empty(),
+            list_annexes(&mut conn, &spec.id, None).unwrap().is_empty(),
             "the Spec's annexes cascaded away"
         );
+    }
+
+    // --- EXTERNAL LINKS: the `url` annexe (v50, v51) ------------------------
+    //
+    // A link is NOT a second model — it is `annexes` + `annex_blobs` seen through `kind='url'`.
+    // These tests hold that claim: the uniqueness that makes a link list a list (and its being
+    // PARTIAL, so the other kinds keep their right to duplicates), the validation that makes the
+    // stored string a URL, the canonical form it is stored in and deduplicated on, the label
+    // fallback, and the lifecycle a link inherits for free — cascade, blob GC, and survival
+    // through a fork.
+
+    /// A project + two Specs, for the link tests. Returns `(project_id, spec_a, spec_b)`.
+    fn two_specs(conn: &mut SqliteConnection, tag: &str) -> (String, String, String) {
+        let (project, _ws) = create_project(conn, "Proj", &format!("/tmp/{tag}"), None).unwrap();
+        let (a, _) = create_spec(conn, &project.id, "Spec A", SpecSections::empty()).unwrap();
+        let (b, _) = create_spec(conn, &project.id, "Spec B", SpecSections::empty()).unwrap();
+        (project.id, a.id, b.id)
+    }
+
+    /// DONE-CRITERION ("La migration crée l'index partiel et son rollback le retire proprement"):
+    /// v50's index is what REFUSES a duplicate link, and the proof is that reverting it makes the
+    /// very same duplicate go through. The chain is pinned at both ends — after the revert the
+    /// `annexes` table (v27) must still be there, so one revert too many fails instead of passing
+    /// on an unexercised `down.sql` — and re-applying restores the refusal.
+    ///
+    /// TWO reverts, since v51 (the canonical form) now sits on top: its `down` is a no-op on the
+    /// schema by design, so peeling it changes nothing here beyond reaching v50.
+    #[test]
+    fn migration_v50_adds_the_partial_unique_index_on_url_annexes() {
+        let mut conn = open_in_memory();
+        let (_p, spec_a, _spec_b) = two_specs(&mut conn, "annex-url-migration");
+        let url = "https://jira.example.test/BROWSE-1";
+
+        add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "Ticket", url).unwrap();
+        assert!(
+            matches!(
+                add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "again", url),
+                Err(AnnexeError::DuplicateUrl(_))
+            ),
+            "at head the index refuses the second attachment of the same url"
+        );
+
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
+        assert!(
+            diesel::sql_query("SELECT id FROM annexes")
+                .execute(&mut conn)
+                .is_ok(),
+            "the chain stops AT v50: v27's annexes table must still be applied"
+        );
+        let duplicate = add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "again", url)
+            .expect("without the index the duplicate goes through — the index IS the constraint");
+        assert_eq!(
+            list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_URL))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Re-applying is the REAL upgrade path of an inherited base: the duplicate is STILL THERE,
+        // and nothing removed it by hand. A unique index cannot be built over duplicated rows, so
+        // the up has to dedup first — which is exactly what it does.
+        run_migrations(&mut conn)
+            .expect("re-apply v50 OVER the duplicate — the up dedups it first");
+        let kept = list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_URL)).unwrap();
+        assert_eq!(kept.len(), 1, "the migration deduplicated by itself");
+        assert_ne!(kept[0].id, duplicate.id, "the OLDEST row is the one kept");
+        assert_eq!(kept[0].title, "Ticket", "…with the FIRST label given to it");
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            1,
+            "no blob orphaned: the deleted duplicate shared its content with the kept row"
+        );
+        assert!(
+            matches!(
+                add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "again", url),
+                Err(AnnexeError::DuplicateUrl(_))
+            ),
+            "the up restores the refusal"
+        );
+    }
+
+    /// DONE-CRITERION ("La migration crée l'index partiel…") on the UPGRADE path the previous test
+    /// only touches with one pair: an inherited v27 base where duplicate links have accumulated for
+    /// a while. `run_migrations` must SURVIVE it — a failing migration propagates out of [`Db::open`]
+    /// and makes nyx refuse to start — so the up deduplicates BEFORE creating the index.
+    ///
+    /// What is pinned here beyond "it does not crash": WHICH row survives (the oldest of each
+    /// `(spec_id, content_hash)` group, `created_at` then `id`), that the dedup is per SPEC (the
+    /// same url on another Spec is not a duplicate), that it is PARTIAL (a doc attached twice keeps
+    /// both rows), and that it orphans no blob.
+    #[test]
+    fn migration_v50_deduplicates_inherited_url_annexes_before_indexing() {
+        let mut conn = open_in_memory();
+        let (_p, spec_a, spec_b) = two_specs(&mut conn, "annex-url-legacy-dedup");
+        let url = "https://jira.example.test/BROWSE-1";
+        let other = "https://github.test/o/r/pull/7";
+
+        // Back to the v27 world: no index, so the base can rot exactly as a real one did.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
+
+        // Three attachments of the SAME url on spec_a, plus an untouched neighbourhood: the same
+        // url on spec_b (a distinct link), another url on spec_a, and a doc attached twice (the
+        // duplicate right the partial index preserves).
+        let first = add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "Ticket", url).unwrap();
+        let second = add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "same ticket", url).unwrap();
+        let third = add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "again", url).unwrap();
+        add_annexe(&mut conn, &spec_b, ANNEX_KIND_URL, "Ticket", url).unwrap();
+        add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "The PR", other).unwrap();
+        add_annexe(&mut conn, &spec_a, ANNEX_KIND_DOC, "notes", "prose").unwrap();
+        add_annexe(&mut conn, &spec_a, ANNEX_KIND_DOC, "same notes", "prose").unwrap();
+
+        // The three link rows are written within the same millisecond, so `created_at` alone would
+        // not say which is oldest. Stamp them apart to pin the documented rule on a real ordering.
+        for (id, at) in [(&first.id, 1_000), (&second.id, 2_000), (&third.id, 3_000)] {
+            diesel::update(annexes::table.find(id))
+                .set(annexes::created_at.eq(at))
+                .execute(&mut conn)
+                .unwrap();
+        }
+        assert_eq!(list_annexes(&mut conn, &spec_a, None).unwrap().len(), 6);
+        let blobs_before = annex_blob_count(&mut conn).unwrap();
+
+        run_migrations(&mut conn).expect("the up migrates an INHERITED base carrying duplicates");
+
+        // spec_a keeps ONE row per distinct url — the OLDEST of the duplicated group, with its
+        // first label — and the other Spec's identical link is untouched.
+        let links_a = list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_URL)).unwrap();
+        assert_eq!(links_a.len(), 2, "one row per distinct url on this Spec");
+        let ticket = links_a
+            .iter()
+            .find(|r| r.content_hash == first.content_hash)
+            .expect("the ticket link survived");
+        assert_eq!(ticket.id, first.id, "the OLDEST duplicate is the kept one");
+        assert_eq!(ticket.title, "Ticket", "…with its first label");
+        assert_eq!(
+            list_annexes(&mut conn, &spec_b, Some(ANNEX_KIND_URL))
+                .unwrap()
+                .len(),
+            1,
+            "the dedup is per SPEC: the same url on another Spec is a distinct link"
+        );
+
+        // PARTIAL: the twice-attached doc keeps BOTH rows — only `kind='url'` is deduplicated.
+        assert_eq!(
+            list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_DOC))
+                .unwrap()
+                .len(),
+            2,
+            "a doc attached twice keeps its right to the duplicate"
+        );
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            blobs_before,
+            "the dedup orphans no blob: a deleted duplicate shares its content with the kept row"
+        );
+
+        // And the index it could finally build is live.
+        assert!(
+            matches!(
+                add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "once more", url),
+                Err(AnnexeError::DuplicateUrl(_))
+            ),
+            "the freshly-built index refuses the next duplicate"
+        );
+    }
+
+    /// REVIEW FINDING F1 — the v51 migration, on the base the finding was written from: a Spec
+    /// carrying the SAME pull request three times because the three spellings hashed differently.
+    ///
+    /// The rows are planted through the schema, NOT through [`add_annexe`]: the writer
+    /// canonicalises now, so it cannot produce the legacy state the migration exists for. Reverting
+    /// v51 first is what makes the `up` run again — and it runs its `down.sql`, which must leave
+    /// v50's index standing (it belongs to v50, still applied).
+    ///
+    /// What is pinned: the three spellings collapse to ONE row, the OLDEST with its first label;
+    /// the stored string is the canonical one; the same link on ANOTHER Spec survives as its own
+    /// row (the dedup is per Spec); a `doc` holding the very same raw string is NOT rewritten and
+    /// keeps its blob alive; and the blob nothing references any more is GC'd.
+    #[test]
+    fn migration_v51_canonicalises_and_rededuplicates_inherited_url_annexes() {
+        /// Attach a row the way the pre-canonical writer did: the RAW string, hashed as-is.
+        fn plant(
+            conn: &mut SqliteConnection,
+            spec_id: &str,
+            kind: &str,
+            title: &str,
+            raw: &str,
+            created_at: i64,
+        ) -> String {
+            let content_hash = hash_content(raw);
+            diesel::insert_into(annex_blobs::table)
+                .values(NewAnnexBlobRow {
+                    content_hash: content_hash.clone(),
+                    content: raw.to_string(),
+                    byte_len: raw.len() as i64,
+                    created_at,
+                })
+                .on_conflict(annex_blobs::content_hash)
+                .do_nothing()
+                .execute(conn)
+                .unwrap();
+            let id = Uuid::now_v7().to_string();
+            diesel::insert_into(annexes::table)
+                .values(NewAnnexRow {
+                    id: id.clone(),
+                    spec_id: spec_id.to_string(),
+                    kind: kind.to_string(),
+                    title: title.to_string(),
+                    content_hash,
+                    created_at,
+                })
+                .execute(conn)
+                .unwrap();
+            id
+        }
+
+        /// Is a blob still in the content-addressed store, by hash?
+        fn blob_exists(conn: &mut SqliteConnection, content_hash: &str) -> bool {
+            annex_blobs::table
+                .find(content_hash.to_string())
+                .count()
+                .get_result::<i64>(conn)
+                .unwrap()
+                > 0
+        }
+
+        let mut conn = open_in_memory();
+        let (_p, spec_a, spec_b) = two_specs(&mut conn, "annex-url-v51");
+        let pr = "https://github.test/nyx/pull/1";
+        let pr_slash = "https://github.test/nyx/pull/1/";
+
+        // Back to the pre-v51 world. The `down` is a no-op on the schema BY DESIGN — v50's index is
+        // v50's, and reverting v51 must not take it with it.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        assert!(
+            index_exists(&mut conn, "idx_annexes_url_unique_per_spec"),
+            "reverting v51 leaves v50's index alone — it is not v51's to drop"
+        );
+
+        // Spec #1 as the user found it: three spellings of ONE pull request…
+        let oldest = plant(&mut conn, &spec_a, ANNEX_KIND_URL, "PR 1", pr, 1_000);
+        plant(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_URL,
+            "the same PR",
+            pr_slash,
+            2_000,
+        );
+        plant(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_URL,
+            "shouting",
+            "HTTPS://GITHUB.test/nyx/pull/1",
+            3_000,
+        );
+        // …a second url whose canonical form nothing else holds (its old blob WILL be stranded)…
+        plant(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_URL,
+            "docs",
+            "https://docs.test/guide/",
+            4_000,
+        );
+        // …a doc whose content happens to BE the slashed url string (one shared blob, and the doc
+        // is a document: nothing may rewrite it)…
+        let doc = plant(&mut conn, &spec_a, ANNEX_KIND_DOC, "notes", pr_slash, 5_000);
+        // …and the same link on ANOTHER Spec, which is not a duplicate of anything.
+        plant(&mut conn, &spec_b, ANNEX_KIND_URL, "PR 1", pr_slash, 6_000);
+        assert_eq!(list_annexes(&mut conn, &spec_a, None).unwrap().len(), 5);
+
+        run_migrations(&mut conn).expect("v51 migrates an INHERITED, pre-canonical base");
+
+        // ONE row for the pull request, the OLDEST, with its first label — and the canonical string
+        // is what it now points at.
+        let links_a = list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_URL)).unwrap();
+        assert_eq!(
+            links_a.len(),
+            2,
+            "the three spellings collapsed into one row"
+        );
+        let kept = links_a
+            .iter()
+            .find(|r| r.id == oldest)
+            .expect("the OLDEST row is the kept one");
+        assert_eq!(kept.title, "PR 1", "…with the first label a human gave it");
+        assert_eq!(
+            get_annexe(&mut conn, &kept.id).unwrap().unwrap().content,
+            pr,
+            "the stored string is the CANONICAL one"
+        );
+
+        // The dedup is per SPEC: the other Spec keeps its link — canonicalised, not deleted.
+        let links_b = list_annexes(&mut conn, &spec_b, Some(ANNEX_KIND_URL)).unwrap();
+        assert_eq!(links_b.len(), 1);
+        assert_eq!(
+            get_annexe(&mut conn, &links_b[0].id)
+                .unwrap()
+                .unwrap()
+                .content,
+            pr
+        );
+
+        // The doc is untouched — content AND blob. `url` only, exactly like the v50 index.
+        assert_eq!(
+            get_annexe(&mut conn, &doc).unwrap().unwrap().content,
+            pr_slash,
+            "a doc is a DOCUMENT: its bytes are never canonicalised"
+        );
+
+        // Blob ledger: the canonical PR, the canonical docs guide, and the slashed string the doc
+        // still holds. The `https://docs.test/guide/` blob is stranded and GC'd; the shouting one
+        // too.
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            3,
+            "the strays are GC'd, and the blob a doc still references is not"
+        );
+        for gone in ["HTTPS://GITHUB.test/nyx/pull/1", "https://docs.test/guide/"] {
+            assert!(
+                !blob_exists(&mut conn, &hash_content(gone)),
+                "'{gone}' is referenced by nothing after the re-point — GC'd"
+            );
+        }
+        assert!(
+            blob_exists(&mut conn, &hash_content(pr_slash)),
+            "…but the slashed string survives: the doc still points at it"
+        );
+        let orphans: i64 = annex_blobs::table
+            .filter(
+                annex_blobs::content_hash
+                    .ne_all(annexes::table.select(annexes::content_hash).into_boxed()),
+            )
+            .count()
+            .get_result(&mut conn)
+            .unwrap();
+        assert_eq!(orphans, 0, "the up leaves NO blob unreferenced");
+
+        // And the index the up rebuilt is live, over canonical data: any spelling is now refused.
+        assert!(
+            matches!(
+                add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "again", pr_slash),
+                Err(AnnexeError::DuplicateUrl(_))
+            ),
+            "the rebuilt index refuses the next spelling of the same link"
+        );
+    }
+
+    /// DONE-CRITERION ("Une même URL ne peut être attachée deux fois à la même Spec, mais reste
+    /// attachable à deux Specs distinctes" + "Un doublon sur `kind` doc/artefact/prototype reste
+    /// autorisé — preuve que la contrainte est bien partielle"). The dedup is on the ATTACHMENT and
+    /// scoped to ONE Spec; the shared blob across Specs is the wanted behaviour, not a collision.
+    #[test]
+    fn url_annexes_are_unique_per_spec_while_other_kinds_may_be_duplicated() {
+        let mut conn = open_in_memory();
+        let (_p, spec_a, spec_b) = two_specs(&mut conn, "annex-url-dedup");
+        let url = "https://github.test/o/r/pull/7";
+
+        add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "The PR", url).unwrap();
+        assert!(
+            matches!(
+                add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "the same PR", url),
+                Err(AnnexeError::DuplicateUrl(_))
+            ),
+            "one url per Spec"
+        );
+
+        // The SAME url on ANOTHER Spec is a different attachment — and it shares the ONE blob.
+        add_annexe(&mut conn, &spec_b, ANNEX_KIND_URL, "The PR", url).unwrap();
+        assert_eq!(
+            list_annexes(&mut conn, &spec_b, Some(ANNEX_KIND_URL))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            1,
+            "content-addressed: two Specs pointing at one url store it once"
+        );
+
+        // The index is PARTIAL: every other kind keeps its right to a duplicate on ONE Spec.
+        for kind in [ANNEX_KIND_DOC, ANNEX_KIND_ARTEFACT, ANNEX_KIND_PROTOTYPE] {
+            add_annexe(&mut conn, &spec_a, kind, "first", "identical bytes").unwrap();
+            add_annexe(&mut conn, &spec_a, kind, "second", "identical bytes")
+                .unwrap_or_else(|e| panic!("a {kind} may be attached twice to one Spec: {e}"));
+        }
+        assert_eq!(
+            list_annexes(&mut conn, &spec_a, None).unwrap().len(),
+            7,
+            "1 url + 3 kinds × 2 duplicates"
+        );
+    }
+
+    /// DONE-CRITERION ("Les schémas non http(s), les URL relatives et les chaînes invalides sont
+    /// refusés avec une erreur stable"). The rule lives in the WRITE authority, so no caller can
+    /// bypass it; a refusal writes NOTHING (not even the blob), and the message is the same
+    /// sentence every surface shows.
+    #[test]
+    fn url_annexes_refuse_anything_that_is_not_an_absolute_http_url() {
+        let mut conn = open_in_memory();
+        let (_p, spec_a, _b) = two_specs(&mut conn, "annex-url-validation");
+
+        for bad in [
+            "ftp://example.test/x", // another scheme
+            "javascript:alert(1)",  // the one that must never be clickable
+            "mailto:someone@example.test",
+            "file:///etc/passwd",
+            "/docs/design",   // relative reference
+            "example.test",   // scheme-less
+            "//example.test", // protocol-relative
+            "http://",        // no host
+            "https://",
+            "http://:8080/x", // a port with no host
+            "not a url at all",
+            "",
+            "   ", // blank once trimmed: nothing left to be a URL
+        ] {
+            let refused = add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "label", bad);
+            assert!(
+                matches!(refused, Err(AnnexeError::InvalidUrl(_))),
+                "'{bad}' must be refused as an invalid url, got {refused:?}"
+            );
+        }
+        assert!(
+            list_annexes(&mut conn, &spec_a, None).unwrap().is_empty(),
+            "a refused link writes NO attachment"
+        );
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            0,
+            "…and NO blob either — the check runs before the transaction"
+        );
+        assert_eq!(
+            add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "label", "nope")
+                .unwrap_err()
+                .to_string(),
+            "invalid url 'nope': a url annexe must be an ABSOLUTE http:// or https:// URL",
+            "the refusal is a STABLE sentence the surfaces show verbatim"
+        );
+        // …and that sentence now fires ONLY on a real scheme/host defect: a string that IS
+        // absolute but carries a blank inside is a DIFFERENT refusal, pinned in its own test.
+        assert!(
+            matches!(
+                add_annexe(
+                    &mut conn,
+                    &spec_a,
+                    ANNEX_KIND_URL,
+                    "label",
+                    "https://exa mple.test"
+                ),
+                Err(AnnexeError::UrlHasWhitespace(_))
+            ),
+            "an absolute url with an inner blank is not an 'absolute url' problem"
+        );
+
+        // …and the shapes a real link takes are all accepted, scheme case included (RFC 3986).
+        for good in [
+            "http://example.test",
+            "HTTPS://Example.TEST/Path",
+            "https://example.test/a/b?q=1&r=2#frag",
+            "http://localhost:3000/",
+            "https://user@example.test/private",
+            "http://[::1]:8080/health",
+        ] {
+            add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "label", good)
+                .unwrap_or_else(|e| panic!("'{good}' is a valid absolute http(s) url: {e}"));
+        }
+
+        // The rule is scoped to `url`: a doc's content is free text and stays free text.
+        add_annexe(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_DOC,
+            "notes",
+            "not a url at all",
+        )
+        .unwrap();
+    }
+
+    /// REVIEW FINDING F2 — the EDGES of a `url` are trimmed before anything else, and the inside
+    /// is refused with its OWN sentence. Copying a link out of a mail, a ticket or a chat drags a
+    /// blank along; that blank is not a defect of the URL, so it is removed rather than blamed —
+    /// and what remains is the string that is validated, hashed, stored and deduplicated. What sits
+    /// INSIDE is still refused (the anti-smuggling guard does not move), only with a sentence that
+    /// names the whitespace instead of accusing the URL of not being absolute.
+    #[test]
+    fn a_pasted_url_is_trimmed_and_only_its_inside_is_refused() {
+        let mut conn = open_in_memory();
+        let (_p, spec_a, spec_b) = two_specs(&mut conn, "annex-url-trim");
+
+        // The paste, blanks included, is ACCEPTED — and stored without them.
+        let pasted = add_annexe(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_URL,
+            "",
+            "  https://example.test/chemin  ",
+        )
+        .expect("surrounding blanks are trimmed, not refused");
+        assert_eq!(
+            get_annexe(&mut conn, &pasted.id).unwrap().unwrap().content,
+            "https://example.test/chemin",
+            "the STORED string is the trimmed one"
+        );
+        assert_eq!(
+            pasted.title, "https://example.test/chemin",
+            "…and the label fallback uses that same string, not the raw paste"
+        );
+
+        // …so the paste and the clean form are ONE link on that Spec, not two.
+        assert!(
+            matches!(
+                add_annexe(
+                    &mut conn,
+                    &spec_a,
+                    ANNEX_KIND_URL,
+                    "again",
+                    "https://example.test/chemin"
+                ),
+                Err(AnnexeError::DuplicateUrl(_))
+            ),
+            "the pasted url and its trimmed twin dedup against each other"
+        );
+
+        // The INSIDE is untouched by the trim: whitespace and control characters still refuse —
+        // the "\n <script>" smuggling shape included — with the sentence that names them.
+        for smuggled in [
+            "https://example.test/x\n<script>alert(1)</script>",
+            "https://example.test/a b",
+            "https://example.test/\u{7}bell",
+        ] {
+            let refused = add_annexe(&mut conn, &spec_b, ANNEX_KIND_URL, "label", smuggled);
+            assert!(
+                matches!(refused, Err(AnnexeError::UrlHasWhitespace(_))),
+                "'{smuggled}' must be refused for its INSIDE, got {refused:?}"
+            );
+        }
+        assert_eq!(
+            add_annexe(
+                &mut conn,
+                &spec_b,
+                ANNEX_KIND_URL,
+                "label",
+                "https://example.test/a b"
+            )
+            .unwrap_err()
+            .to_string(),
+            "invalid url 'https://example.test/a b': a url annexe must not carry WHITESPACE or \
+             CONTROL characters inside it (surrounding blanks are trimmed off; percent-encode the \
+             rest)",
+            "a STABLE sentence of its own — it never says 'must be an ABSOLUTE … URL'"
+        );
+
+        // NON-REGRESSION (v27): the trim is `url`-only. A doc, an artefact and a prototype are
+        // DOCUMENTS — their edges may be meaningful and are stored byte-for-byte.
+        for kind in [ANNEX_KIND_DOC, ANNEX_KIND_ARTEFACT, ANNEX_KIND_PROTOTYPE] {
+            let padded = format!("\n  {kind} body  \n");
+            let doc = add_annexe(&mut conn, &spec_b, kind, "titre", &padded).unwrap();
+            assert_eq!(
+                get_annexe(&mut conn, &doc.id).unwrap().unwrap().content,
+                padded,
+                "a {kind}'s content is NOT trimmed"
+            );
+        }
+    }
+
+    /// REVIEW FINDING F1 — a `url` is stored in its CANONICAL form, and the dedup runs on THAT.
+    ///
+    /// THIS TEST IS THE INVERSE OF THE ONE IT REPLACES. Until this review it pinned the PRD's
+    /// "absence de normalisation" ("a trailing slash makes a DISTINCT link"), so that nobody would
+    /// "helpfully" add a normaliser later. Using the feature showed the decision was wrong in the
+    /// one place it mattered: `HTTPS://x` was accepted by a case-INSENSITIVE validation
+    /// ([`strip_prefix_ci`], RFC 3986 §3.1) and then hashed case-SENSITIVELY, so ONE target filed
+    /// itself as several links. The user ruled the point be fixed here (a DECLARED deviation, see
+    /// the `url` annexe header) — and the old contract had to be RETRACTED, not left standing next
+    /// to a test that contradicts it.
+    #[test]
+    fn url_annexes_are_stored_and_deduplicated_in_canonical_form() {
+        /// Attach an UNLABELLED link — the shape every case below takes.
+        fn link(conn: &mut SqliteConnection, spec: &str, url: &str) -> Result<Annex, AnnexeError> {
+            add_annexe(conn, spec, ANNEX_KIND_URL, "", url)
+        }
+
+        let mut conn = open_in_memory();
+        let (_p, spec_a, spec_b) = two_specs(&mut conn, "annex-url-canonical");
+
+        // The three spellings the user actually hit, on ONE Spec: the second and the third are the
+        // FIRST one, and are refused as the duplicates they are.
+        let first = add_annexe(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_URL,
+            "canonical",
+            "HTTPS://EXEMPLE.test/chemin/",
+        )
+        .unwrap();
+        assert_eq!(
+            get_annexe(&mut conn, &first.id).unwrap().unwrap().content,
+            "https://exemple.test/chemin",
+            "scheme and host lowered, trailing slash gone — THAT is what is stored"
+        );
+        for same in [
+            "https://exemple.test/chemin",
+            "https://exemple.test/chemin/",
+            "HTTPS://Exemple.Test/chemin",
+            "  https://exemple.test/chemin  ",
+        ] {
+            assert!(
+                matches!(
+                    add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "again", same),
+                    Err(AnnexeError::DuplicateUrl(_))
+                ),
+                "'{same}' is the same link as its canonical form"
+            );
+        }
+        assert_eq!(
+            list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_URL))
+                .unwrap()
+                .len(),
+            1,
+            "one target, ONE row"
+        );
+        assert_eq!(annex_blob_count(&mut conn).unwrap(), 1, "…and ONE blob");
+
+        // The trailing slash goes even when a query or a fragment follows it, and a root path
+        // becomes no path at all — otherwise the two spellings would still diverge on the suffix.
+        for (raw, canonical) in [
+            ("https://exemple.test/1/?a=1", "https://exemple.test/1?a=1"),
+            ("https://exemple.test/1?a=1", "https://exemple.test/1?a=1"),
+            ("https://autre.test/1/#frag", "https://autre.test/1#frag"),
+            ("https://racine.test/", "https://racine.test"),
+            ("https://encore.test", "https://encore.test"),
+        ] {
+            let stored = match link(&mut conn, &spec_b, raw) {
+                Ok(annexe) => get_annexe(&mut conn, &annexe.id).unwrap().unwrap().content,
+                // The second member of each converging pair is refused AS a duplicate, which is
+                // the convergence itself.
+                Err(AnnexeError::DuplicateUrl(url)) => url,
+                Err(e) => panic!("'{raw}' should be storable: {e}"),
+            };
+            assert_eq!(stored, canonical, "'{raw}' canonicalises to '{canonical}'");
+        }
+
+        // WHAT IS NOT NORMALISED, and stays two links (finding F1, "hors de ce finding").
+        //
+        // The PATH is case-SENSITIVE — a server may serve `/Chemin` and `/chemin` differently — and
+        // so are the query and the fragment; only the host is lowered.
+        let (_p2, spec_c, spec_d) = two_specs(&mut conn, "annex-url-case-kept");
+        link(&mut conn, &spec_c, "https://x.test/Chemin").unwrap();
+        link(&mut conn, &spec_c, "https://x.test/chemin")
+            .expect("the PATH keeps its case: two distinct links");
+        link(&mut conn, &spec_c, "https://x.test/a?Q=1").unwrap();
+        link(&mut conn, &spec_c, "https://x.test/a?q=1").expect("the QUERY keeps its case too");
+        assert_eq!(
+            list_annexes(&mut conn, &spec_c, Some(ANNEX_KIND_URL))
+                .unwrap()
+                .len(),
+            4
+        );
+
+        // `www.` is NOT stripped: `www.exemple.test` and `exemple.test` are two HOSTS, free to
+        // serve different content. A Spec may carry both, and that is assumed.
+        link(&mut conn, &spec_d, "https://www.exemple.test").unwrap();
+        link(&mut conn, &spec_d, "https://exemple.test")
+            .expect("`www.` is a different host — a DISTINCT link");
+        assert_eq!(
+            list_annexes(&mut conn, &spec_d, Some(ANNEX_KIND_URL))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// REVIEW FINDING F3 — a `url` is BOUNDED at 2 048 characters, and nothing else is.
+    ///
+    /// Nothing bounded the input before: `add_annexe` computed a `byte_len` it compared to nothing,
+    /// so an 8 000-character URL was stored whole and the UI truncated it on screen — which hid the
+    /// problem instead of preventing it. The bound is measured on the CANONICAL form, so the blanks
+    /// a paste dragged along and the trailing slash the canonicalisation drops never count against
+    /// it, and what is measured is exactly what is stored.
+    #[test]
+    fn a_url_is_bounded_at_2048_characters_and_the_other_kinds_are_not() {
+        let mut conn = open_in_memory();
+        let (_p, spec_a, spec_b) = two_specs(&mut conn, "annex-url-length");
+        let prefix = "https://x.test/";
+        let body = ANNEXE_URL_MAX_CHARS - prefix.len();
+        let at_bound = format!("{prefix}{}", "a".repeat(body));
+        let over_bound = format!("{at_bound}a");
+        assert_eq!(at_bound.chars().count(), 2048);
+        assert_eq!(over_bound.chars().count(), 2049);
+
+        // The two bounds, pinned on either side of the line.
+        add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "", &at_bound)
+            .expect("2048 characters is the LIMIT, not one past it");
+        let refused = add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "", &over_bound);
+        assert!(
+            matches!(refused, Err(AnnexeError::UrlTooLong(2049))),
+            "2049 characters is refused by a NAMED error carrying the length, got {refused:?}"
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "url too long: 2049 characters — a url annexe is limited to 2048 characters",
+            "a STABLE sentence citing the bound — not a raw DB error, not a panic"
+        );
+
+        // MEASURED AFTER trim and canonicalisation: the same 2048 characters pasted with blanks
+        // around them, and a 2049-character spelling whose trailing slash the canonicalisation
+        // drops, are both WITHIN the bound.
+        add_annexe(
+            &mut conn,
+            &spec_b,
+            ANNEX_KIND_URL,
+            "",
+            &format!("   {at_bound}   "),
+        )
+        .expect("the blanks are gone before the count");
+        let with_slash = format!("{prefix}{}/", "b".repeat(body));
+        assert_eq!(with_slash.chars().count(), 2049);
+        add_annexe(&mut conn, &spec_b, ANNEX_KIND_URL, "", &with_slash)
+            .expect("the trailing slash is dropped before the count too");
+
+        // NON-REGRESSION (v27): the bound is `url`-only. A doc, an artefact and a prototype carry
+        // whole documents — a prototype's HTML passes 2 048 characters by construction.
+        let long_document = "x".repeat(ANNEXE_URL_MAX_CHARS * 4);
+        for kind in [ANNEX_KIND_DOC, ANNEX_KIND_ARTEFACT, ANNEX_KIND_PROTOTYPE] {
+            let attached = add_annexe(&mut conn, &spec_b, kind, "titre", &long_document)
+                .unwrap_or_else(|e| panic!("a {kind} is NOT length-bounded: {e}"));
+            assert_eq!(
+                get_annexe(&mut conn, &attached.id)
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                long_document,
+                "…and it is stored whole"
+            );
+        }
+    }
+
+    /// REVIEW FINDING F1, the canonicalisation rule seen from its own function: what it touches and
+    /// — the longer half of the list — what it deliberately leaves alone. Pinning it here keeps the
+    /// rule readable without walking a Spec, a blob and an index for every case.
+    #[test]
+    fn canonical_annexe_url_touches_the_scheme_the_host_and_the_trailing_slash_only() {
+        for (raw, canonical) in [
+            // The three rules.
+            ("HTTP://X.TEST", "http://x.test"),
+            ("  https://X.test/A/  ", "https://x.test/A"),
+            ("https://x.test/1/?a=1", "https://x.test/1?a=1"),
+            ("https://x.test/1/#F", "https://x.test/1#F"),
+            ("https://x.test/", "https://x.test"),
+            // The userinfo is case-SENSITIVE (a password's case is meaningful); only what follows
+            // the `@` is lowered.
+            ("https://User:Pw@X.test/a", "https://User:Pw@x.test/a"),
+            // Left alone, on purpose: `www.`, the port, the percent-encoding, the query order, the
+            // fragment — and an empty final segment, which is not a "trailing slash".
+            ("https://www.x.test", "https://www.x.test"),
+            ("https://x.test:443/a", "https://x.test:443/a"),
+            ("https://x.test/%7Euser", "https://x.test/%7Euser"),
+            ("https://x.test/a?b=2&a=1", "https://x.test/a?b=2&a=1"),
+            ("https://x.test/a#frag", "https://x.test/a#frag"),
+            ("https://x.test/a//", "https://x.test/a//"),
+            // Not an absolute http(s) URL: handed back trimmed, for `check_annexe_url` to refuse
+            // and quote.
+            ("  not a url  ", "not a url"),
+            ("ftp://X.test/a/", "ftp://X.test/a/"),
+        ] {
+            assert_eq!(canonical_annexe_url(raw), canonical, "canonical of '{raw}'");
+            assert_eq!(
+                canonical_annexe_url(&canonical_annexe_url(raw)),
+                canonical,
+                "…and the rule is IDEMPOTENT: '{canonical}' is already canonical"
+            );
+        }
+    }
+
+    /// DONE-CRITERION ("Sans label fourni, le title vaut l'URL"). `annexes.title` is NOT NULL and
+    /// the constraint is NOT relaxed (PRD Impl Decisions "LABEL"), so an unlabelled link reads as
+    /// its own URL rather than as an empty row. A blank-but-present label is the same case.
+    #[test]
+    fn a_url_annexe_without_a_label_is_titled_with_its_url() {
+        let mut conn = open_in_memory();
+        let (_p, spec_a, spec_b) = two_specs(&mut conn, "annex-url-label");
+        let url = "https://example.test/adr/7";
+
+        let unlabelled = add_annexe(&mut conn, &spec_a, ANNEX_KIND_URL, "", url).unwrap();
+        assert_eq!(unlabelled.title, url);
+        let blank = add_annexe(&mut conn, &spec_b, ANNEX_KIND_URL, "   ", url).unwrap();
+        assert_eq!(blank.title, url, "a blank label is no label");
+
+        // A real label is kept as-is.
+        let labelled = add_annexe(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_URL,
+            "ADR 7",
+            "https://example.test/adr/7/full",
+        )
+        .unwrap();
+        assert_eq!(labelled.title, "ADR 7");
+    }
+
+    /// DONE-CRITERION ("Le fork d'une Spec conserve exactement les mêmes liens, sans ligne
+    /// dupliquée" + cascade + blob GC). NOTHING was implemented for the fork: an annexe hangs off
+    /// `specs(id)` — the LOGICAL identity — while [`fork_spec`] only opens a new REVISION, so the
+    /// links are carried with no copy. This test is the proof, not the feature.
+    ///
+    /// The lifecycle it walks has TWO distinct deletion paths, and they do NOT behave alike — each
+    /// is asserted for what it really does: [`remove_annexe`] (the Rust authority) drops the
+    /// attachment AND GC-drops the blob on the last reference, while the `ON DELETE CASCADE` of a
+    /// Spec deletion drops the attachments ONLY and leaves the blobs behind. "Cascade et GC du
+    /// blob" is therefore two facts, not one promise — see the assertion on the cascade below.
+    #[test]
+    fn spec_links_survive_a_fork_and_follow_the_spec_lifecycle() {
+        let mut conn = open_in_memory();
+        let (project, spec_a, _spec_b) = two_specs(&mut conn, "annex-url-fork");
+
+        let ticket = add_annexe(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_URL,
+            "Ticket",
+            "https://jira.test/BROWSE-1",
+        )
+        .unwrap();
+        let pr = add_annexe(
+            &mut conn,
+            &spec_a,
+            ANNEX_KIND_URL,
+            "The PR",
+            "https://github.test/o/r/pull/7",
+        )
+        .unwrap();
+
+        let before = list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_URL)).unwrap();
+        let revision = fork_spec(&mut conn, &spec_a, Some("round 2")).unwrap();
+        assert_eq!(
+            revision.revision_number, 2,
+            "the fork opened a new revision"
+        );
+
+        let after = list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_URL)).unwrap();
+        assert_eq!(after, before, "the SAME rows — not copies, not losses");
+        assert_eq!(
+            after.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![pr.id.as_str(), ticket.id.as_str()],
+            "same ids, same newest-first order"
+        );
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            2,
+            "the fork duplicated no content"
+        );
+
+        // GC on the LAST reference: dropping one link frees exactly its own blob.
+        assert!(remove_annexe(&mut conn, &pr.id).unwrap());
+        assert_eq!(annex_blob_count(&mut conn).unwrap(), 1);
+
+        // CASCADE: deleting the Spec takes its link attachments with it (FK ON DELETE CASCADE).
+        diesel::delete(specs::table.find(&spec_a))
+            .execute(&mut conn)
+            .unwrap();
+        assert!(
+            list_annexes(&mut conn, &spec_a, Some(ANNEX_KIND_URL))
+                .unwrap()
+                .is_empty(),
+            "the Spec's links cascaded away with it"
+        );
+        // …and the `ticket` blob is STILL THERE, now referenced by nothing. This is ASSUMED, not an
+        // oversight of this test: the blob GC lives in the Rust `remove_annexe` (count the remaining
+        // references, drop the blob at zero) while the cascade is a pure SQL delete — v27's FK runs
+        // from `annexes` TOWARDS `annex_blobs`, so it stops at the attachment rows. Deleting a Spec
+        // therefore leaves one orphan row per distinct blob it held. That is the v27 store behaviour
+        // this PRD is explicitly forbidden to change (task 1 Scope: "ne pas toucher au store
+        // `annex_blobs`"), so it is PINNED here rather than left implicit: a future cascade-aware GC
+        // must FAIL this assertion and rewrite it, instead of silently making the comment stale.
+        assert_eq!(
+            annex_blob_count(&mut conn).unwrap(),
+            1,
+            "the cascade drops the attachments, NOT the blobs (v27 behaviour, assumed)"
+        );
+        delete_project(&mut conn, &project).unwrap();
     }
 
     // --- SPEC DEPENDENCIES domain (v28) ------------------------------------
@@ -15709,6 +16971,10 @@ mod tests {
         let mut conn = open_in_memory();
         // Peel every migration above v13 newest-first (v37 down to v14), then v13
         // (specs/spec_revisions); all must succeed. Each revert drops the current last link.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -16414,8 +17680,9 @@ mod tests {
         // dir #39 traversal + query node, #40 builtin_revision, #41 fork_spec, #42 workspace, and
         // #43 the sub-workflow vocabulary + parent_run_id, #44 the managed_commands env, #45
         // the workflow_runs pending_consent, #46 the command_slots table, #47
-        // workflows.forked_from_revision, #48 the human_turns ledger and #49 its consumed_by mark).
-        for _ in 0..45 {
+        // workflows.forked_from_revision, #48 the human_turns ledger, #49 its consumed_by mark and
+        // #50 the annexes url unique index and #51 the annexes url canonical form).
+        for _ in 0..47 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -19542,6 +20809,10 @@ mod tests {
         // Peel every migration above v14 newest-first (v37 down to v15), then v14
         // (tasks/task_dependencies); all must succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v48 (human_turns) cleanly");
@@ -19998,6 +21269,10 @@ mod tests {
         // domain_events) then v11 (data backfill) then v10 (canonical structure). After
         // this, `workspaces.root_path` does NOT exist yet (`path` does), and `projects` has
         // no `key`/`primary_workspace_id`.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -20954,9 +22229,11 @@ mod tests {
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the projects migration (dirs #38 → #3),
-        // then the projects migration (dir #2) itself — 36 reverts in reverse order
-        // (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task
+        // Peel every migration stacked above the projects migration (dirs #51 → #3),
+        // then the projects migration (dir #2) itself — 49 reverts in reverse order
+        // (the repo has 50 migration dirs numbered #1..#51, #19 never existed, so reverting
+        // down to and including #2 is 50 - 1 = 49 steps;
+        // v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task
         // domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added dir #20
         // the agent_session_specs link table; v2.5.11 added dir #21 the tasks review-finding
         // fields + dir #22 the tasks round + dir #23 the specs reviewing_phase + dir #24
@@ -20974,8 +22251,9 @@ mod tests {
         // sub-workflow vocabulary + parent_run_id + dir #44 the managed_commands env + dir #45 the
         // workflow_runs pending_consent + dir #46 the command_slots table + dir #47
         // workflows.forked_from_revision + dir #48 the human_turns ledger + dir #49 its consumed_by
-        // mark). projects must then be absent.
-        for _ in 0..47 {
+        // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form).
+        // projects must then be absent.
+        for _ in 0..49 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -21820,8 +23098,10 @@ mod tests {
         let mut conn = open_in_memory();
 
         // Peel every migration stacked above the managed_commands migration (dirs
-        // #38 → #4), then the managed_commands migration (dir #3) itself — 35 reverts in
-        // reverse order (v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14
+        // #51 → #4), then the managed_commands migration (dir #3) itself — 48 reverts in
+        // reverse order (the repo has 50 migration dirs numbered #1..#51, #19 never existed,
+        // so reverting down to and including #3 is 50 - 2 = 48 steps;
+        // v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14
         // the task domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added
         // dir #20 the agent_session_specs link table; v2.5.11 added dir #21 the tasks
         // review-finding fields + dir #22 the tasks round + dir #23 the specs reviewing_phase
@@ -21839,8 +23119,9 @@ mod tests {
         // sub-workflow vocabulary + parent_run_id + dir #44 the managed_commands env + dir #45 the
         // workflow_runs pending_consent + dir #46 the command_slots table + dir #47
         // workflows.forked_from_revision + dir #48 the human_turns ledger + dir #49 its consumed_by
-        // mark). managed_commands must then be absent.
-        for _ in 0..46 {
+        // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form).
+        // managed_commands must then be absent.
+        for _ in 0..48 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -21906,6 +23187,10 @@ mod tests {
         // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row + its v3
         // columns survive; the v4 columns are gone (a typed select of `unread` would now fail
         // to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -22146,6 +23431,10 @@ mod tests {
         // peels v15, v14, v13, v12, v11, v10, v9, v8, v7, then v5 (migrations revert in
         // reverse order). The instance row + its v3/v4 columns survive; the v5 columns are
         // gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -23551,6 +24840,10 @@ mod tests {
         // domain_events) then v11 (v2.1 data backfill) then v10 (v2.1 canonical structure)
         // then v9 (#11 project order) then v8 → the resume_agent_sessions column is gone.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v48 (human_turns) cleanly");
@@ -24645,6 +25938,10 @@ mod tests {
 
         // Peel v47 then v46 → the table is gone, so v46 is the migration that creates it.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v48 (human_turns) cleanly");
@@ -24733,6 +26030,10 @@ mod tests {
         // stacked above the engine one (v38 → v35) and `0034` itself — parking the DB with the
         // design-system `0030` still applied but NO workflow tables.
         let mut conn = open_in_memory();
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -24965,6 +26266,10 @@ mod tests {
             "the migrated schema carries the mark"
         );
 
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         assert!(
@@ -25283,6 +26588,10 @@ mod tests {
         // write of that ONE table goes through raw SQL here. It is not a workaround: a migration test
         // that stepped back and then used the head model would only be testing today's schema.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v48 (human_turns) cleanly");
@@ -25488,6 +26797,10 @@ mod tests {
         );
 
         // THE DOWN restores the pre-rename vocabulary byte for byte (a reverted binary reads it).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v51 (annexes url canonical form) cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert v50 (annexes url unique index) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)

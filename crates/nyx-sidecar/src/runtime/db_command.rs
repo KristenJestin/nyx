@@ -192,6 +192,23 @@ impl Ctx<'_> {
             .ok_or_else(|| format!("{}: missing string arg '{name}'", self.command))
     }
 
+    /// Read a required string arg that must also be NON-EMPTY, or a readable error — the rule the
+    /// MCP surface applies to every required string (`nyx_core::mcp_runtime::require_str`, whose
+    /// arm is `Some(s) if !s.is_empty()`) and that [`Ctx::arg_str`] deliberately does NOT:
+    /// `arg_str` checks PRESENCE only, and the many commands reading through it keep that
+    /// contract. Used by the arms whose MCP twin refuses `""` — the three v50 annexe commands
+    /// (`annexe_link_list`, `annexe_add`, `annexe_remove`), whose twins read every required string
+    /// through `require_str` — so the same call is refused on both surfaces. The sentence is
+    /// `arg_str`'s: absent and empty are ONE refusal for the caller, exactly as they are for
+    /// `require_str`.
+    fn arg_str_nonempty(&self, name: &str) -> Result<String, String> {
+        let value = self.arg_str(name)?;
+        if value.is_empty() {
+            return Err(format!("{}: missing string arg '{name}'", self.command));
+        }
+        Ok(value)
+    }
+
     /// Read an optional string arg (`null`/absent -> `None`).
     fn arg_opt_str(&self, name: &str) -> Option<String> {
         self.args
@@ -1935,9 +1952,154 @@ impl Ctx<'_> {
             "annexe_list" => {
                 let spec_id = self.arg_str("specId")?;
                 self.db()
-                    .with_conn(|c| db::list_annexes(c, &spec_id))
+                    .with_conn(|c| db::list_annexes(c, &spec_id, None))
                     .map_err(Self::db_err)
                     .and_then(|annexes| Self::json(&annexes))
+            }
+            // `annexe_link_list` — a Spec's EXTERNAL LINKS, resolved (v50). The Spec-detail "Links"
+            // block needs the URL itself, and `annexe_list` deliberately never ships blob content;
+            // so this READ composes the two existing authority accessors —
+            // `db::list_annexes(spec, Some("url"))` for the rows (the SAME `kind` narrowing the MCP
+            // `annexe_list` tool exposes, hence the same newest-first order) then `db::get_annexe`
+            // for each row's stored URL. The same composition pattern as `idea_list`
+            // (list + per-item resolve); no new DB function, no second model, and the MCP tool
+            // surface is untouched.
+            //
+            // `{ specId }` -> `[{ id, spec_id, title, url, created_at }]`. `title` is the LABEL (the
+            // URL itself when the link was stored without one). A pure read: no mutation, no
+            // `changed` broadcast — the live refresh rides the `specs://changed` the writes push.
+            "annexe_link_list" => {
+                #[derive(serde::Serialize)]
+                struct SpecLink {
+                    id: String,
+                    spec_id: String,
+                    title: String,
+                    url: String,
+                    created_at: i64,
+                }
+                // NON-EMPTY like its MCP twin's `require_str(args, "spec_id")`: a `specId: ""` must
+                // not read as "a Spec with no link" and hand the block an empty list where the
+                // agent gets `invalid_argument` — the three v50 annexe arms share one argument
+                // rule.
+                let spec_id = self.arg_str_nonempty("specId")?;
+                self.db()
+                    .with_conn(|c| {
+                        let rows = db::list_annexes(c, &spec_id, Some(db::ANNEX_KIND_URL))?;
+                        let mut links = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            // The attachment and its blob are written in one transaction and the
+                            // blob is GC'd only on the LAST reference, so a listed row always
+                            // resolves; a row that somehow does not is SKIPPED rather than failing
+                            // the whole block (a link list is never worth a broken panel).
+                            if let Some(view) = db::get_annexe(c, &row.id)? {
+                                links.push(SpecLink {
+                                    id: row.id,
+                                    spec_id: row.spec_id,
+                                    title: row.title,
+                                    url: view.content,
+                                    created_at: row.created_at,
+                                });
+                            }
+                        }
+                        Ok::<_, diesel::result::Error>(links)
+                    })
+                    .map_err(Self::db_err)
+                    .and_then(|links| Self::json(&links))
+            }
+            // `annexe_add` — ATTACH an annexe to a Spec from the APP (v50). The human façade of the
+            // MCP `annexe_add` tool over the SAME `db::add_annexe` authority (PDR-0005: one
+            // authority for UI + MCP), so a link added here and a link added by the agent land in
+            // the exact same state — including the `url` rules, which live in the authority and not
+            // in either caller: absolute http(s) only, stored in CANONICAL form (blanks trimmed,
+            // scheme and host lowered, trailing slash dropped — so a pasted url lands and dedups as
+            // that form, while whitespace INSIDE it is still refused, with its own sentence), at
+            // most 2048 characters (`url` only — a prototype's HTML is not bounded), ONE occurrence
+            // of a URL per Spec, and a blank label stored as the URL itself. Every one of those
+            // refusals reaches this surface exactly as it reaches the agent's: same sentence, same
+            // rule, one authority. `{ specId, kind, title?, content }` ->
+            // `{ annexe }` (`title` optional for a `url`, REQUIRED for every other kind — see the
+            // argument guard below). A mutation → pushes `specs://changed` (the Spec detail
+            // re-pulls).
+            "annexe_add" => {
+                // The ARGUMENT rules are the MCP handler's, verbatim
+                // (`mcp_tools_annexe::annexe_add` + its `parse_kind`), so the two surfaces refuse
+                // the same calls and not only agree on the state `db::add_annexe` writes: the
+                // `kind` vocabulary is CLOSED (a typo must not fall through to the v27 CHECK as an
+                // opaque DB error), `title` is optional ONLY for a `url` — read through
+                // `arg_opt_str`, so ABSENT, EMPTY (`""`) and BLANK (`"   "`) are one and the same
+                // case there, all three storing the URL itself as the title; every other kind
+                // REQUIRES a label, present AND non-empty — and the
+                // three FREE-FORM required strings (`specId`, `title` outside `url`, `content`) are
+                // read through `arg_str_nonempty`, i.e. the `require_str` rule, so the EMPTY string
+                // is refused here as it is over MCP (plain `arg_str` checks PRESENCE only, which
+                // would let `title: ""` through on this surface alone). `kind` is the one required
+                // string still read by `arg_str`: it is not free-form, and its CLOSED vocabulary
+                // already refuses `""` on the `other` arm below — the empty `kind` is refused on
+                // both surfaces too, only with this arm's `unknown kind ''` sentence rather than a
+                // vacuity one. Today the app's only caller is the Links block (always `kind='url'`),
+                // so this is a guard for the day a non-url app write surface appears, not a live
+                // refusal.
+                let spec_id = self.arg_str_nonempty("specId")?;
+                let raw_kind = self.arg_str("kind")?;
+                // The vocabulary and its refusal sentence come from the AUTHORITY
+                // (`db::annex_kind_from_str` / `db::unknown_annex_kind_message`), the same pair the
+                // MCP handler resolves through — a fourth copy of the four arms here is how the two
+                // surfaces would come to accept different words for the same closed set.
+                let kind = db::annex_kind_from_str(&raw_kind).ok_or_else(|| {
+                    format!(
+                        "{}: {}",
+                        self.command,
+                        db::unknown_annex_kind_message(&raw_kind)
+                    )
+                })?;
+                let title = if kind == db::ANNEX_KIND_URL {
+                    self.arg_opt_str("title").unwrap_or_default()
+                } else {
+                    self.arg_str_nonempty("title")?
+                };
+                let content = self.arg_str_nonempty("content")?;
+                let annexe = self
+                    .db()
+                    .with_conn(
+                        |c| -> Result<Result<db::Annex, String>, diesel::result::Error> {
+                            if db::get_spec(c, &spec_id)?.is_none() {
+                                return Ok(Err(format!("unknown spec {spec_id}")));
+                            }
+                            match db::add_annexe(c, &spec_id, kind, &title, &content) {
+                                Ok(annexe) => Ok(Ok(annexe)),
+                                // The authority's own sentence — the app SHOWS the refusal, it
+                                // does not re-word it (an invalid URL and a duplicate link are
+                                // both user-facing).
+                                Err(db::AnnexeError::Db(e)) => Err(e),
+                                Err(refusal) => Ok(Err(refusal.to_string())),
+                            }
+                        },
+                    )
+                    .map_err(Self::db_err)??;
+                self.events.emit(Event::Changed {
+                    topic: "specs".to_string(),
+                });
+                Self::json(&serde_json::json!({ "annexe": annexe }))
+            }
+            // `annexe_remove` — DETACH an annexe from the APP (v50). Idempotent (`removed: false`
+            // for an unknown id), GC-ing the blob on the last reference — the SAME
+            // `db::remove_annexe` authority the MCP `annexe_remove` tool calls, so removing a link
+            // from either surface leaves the identical state. `{ id }` -> `{ removed, id }`. A
+            // mutation → pushes `specs://changed`.
+            "annexe_remove" => {
+                // NON-EMPTY like its MCP twin's `require_str(args, "id")`: idempotence is for an
+                // UNKNOWN id, not for a missing one — an `id: ""` is a caller bug, and answering it
+                // with the calm `{ removed: false }` where the agent gets `invalid_argument` would
+                // put the two surfaces out of step.
+                let id = self.arg_str_nonempty("id")?;
+                let removed = self
+                    .db()
+                    .with_conn(|c| db::remove_annexe(c, &id))
+                    .map_err(Self::db_err)?;
+                self.events.emit(Event::Changed {
+                    topic: "specs".to_string(),
+                });
+                Self::json(&serde_json::json!({ "removed": removed, "id": id }))
             }
             // `spec_dependency_view` — a Spec's full dependency view: the directional `blocked_by` /
             // `unblocks` edges (with their computable badge counts) + the `related` context links.
@@ -3128,14 +3290,25 @@ mod tests {
     /// so a data dir of `PathBuf::new()` would write that file relative to the test binary's
     /// CWD (the crate root), polluting the source tree. Pinning the temp dir keeps every
     /// runtime artefact inside it.
+    ///
+    /// The name is `{pid}-{nanos}-{seq}`, and the `seq` is what makes it UNIQUE. `pid` only
+    /// separates concurrent test PROCESSES; the clock does not separate the threads INSIDE one —
+    /// `SystemTime` on Windows advances in ~15 ms ticks, so two tests starting in the same tick used
+    /// to get the SAME directory, hence the same `nyx.db`, and ran the migrations against each other
+    /// ("table terminals already exists", "database is locked", "duplicate column name…"). That was
+    /// a 1-in-20 flake of `cargo test -p nyx-sidecar --lib -- annexe`, and it fell on whichever test
+    /// happened to share the tick — including the app/MCP parity test that carries a PRD
+    /// done_criterion. A process-global counter cannot tie, whatever the clock does.
     fn temp_db() -> (std::path::PathBuf, Arc<Db>) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "nyx-dbcmd-{}-{}",
+            "nyx-dbcmd-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Arc::new(Db::open(&dir.join("nyx.db")).expect("open db"));
@@ -5152,14 +5325,16 @@ mod tests {
                     nyx_core::db::ANNEX_KIND_PROTOTYPE,
                     "Mockup L1",
                     "<html>mockup</html>",
-                )?;
+                )
+                .expect("attach the prototype annexe");
                 nyx_core::db::add_annexe(
                     c,
                     &spec.id,
                     nyx_core::db::ANNEX_KIND_URL,
                     "Design ref",
                     "https://example.test/design",
-                )?;
+                )
+                .expect("attach the url annexe");
                 Ok::<_, diesel::result::Error>(spec.id)
             })
             .unwrap();
@@ -5178,6 +5353,263 @@ mod tests {
             annexes[0].get("content").is_none(),
             "the list never ships the blob content"
         );
+    }
+
+    /// DONE-CRITERION ("App et MCP produisent le même état final pour add et remove"): a link
+    /// attached from the APP (`annexe_add` db-command) and the SAME link attached by the AGENT
+    /// (the `annexe_add` MCP tool) leave rows that differ in nothing but their id and Spec — both
+    /// go through the ONE `nyx_core::db` authority (PDR-0005), so there is no second set of rules
+    /// to drift. Removal is symmetric, and each app-side write pushes `specs://changed` so an open
+    /// Spec detail re-pulls.
+    #[test]
+    fn app_and_mcp_annexe_writes_reach_the_same_state() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-annexe-parity");
+        let (spec_app, spec_mcp) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let (a, _) =
+                    nyx_core::db::create_spec(c, &project_id, "App side", Default::default())?;
+                let (b, _) =
+                    nyx_core::db::create_spec(c, &project_id, "MCP side", Default::default())?;
+                Ok::<_, diesel::result::Error>((a.id, b.id))
+            })
+            .unwrap();
+        let url = "https://jira.example.test/BROWSE-42";
+
+        let before = changed_count(&h.buf, "specs");
+        let from_app: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "annexe_add",
+                serde_json::json!({ "specId": spec_app, "kind": "url", "title": "Ticket", "content": url }),
+            )
+            .expect("the app attaches the link"),
+        )
+        .unwrap();
+        assert_eq!(
+            changed_count(&h.buf, "specs"),
+            before + 1,
+            "an app-side annexe write pushes specs://changed"
+        );
+
+        let from_mcp = nyx_core::mcp_tools_annexe::annexe_add(
+            h.runtime.db(),
+            &serde_json::json!({ "spec_id": spec_mcp, "kind": "url", "title": "Ticket", "content": url }),
+        )
+        .expect("the agent attaches the same link");
+
+        // Same kind, same label, same content hash (one physical copy for both Specs).
+        for field in ["kind", "title", "content_hash"] {
+            assert_eq!(
+                from_app["annexe"][field], from_mcp.result["annexe"][field],
+                "the two surfaces agree on '{field}'"
+            );
+        }
+        assert_eq!(
+            h.runtime
+                .db()
+                .with_conn(|c| nyx_core::db::list_annexes(c, &spec_app, Some("url")))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The APP surface refuses exactly what the MCP surface refuses — the authority's rules,
+        // surfaced with the authority's own sentence.
+        let duplicate = h
+            .run(
+                "annexe_add",
+                serde_json::json!({ "specId": spec_app, "kind": "url", "title": "again", "content": url }),
+            )
+            .expect_err("the same url twice on one Spec is refused from the app too");
+        assert!(duplicate.contains("already attached"), "got: {duplicate}");
+        let bad = h
+            .run(
+                "annexe_add",
+                serde_json::json!({ "specId": spec_app, "kind": "url", "content": "javascript:alert(1)" }),
+            )
+            .expect_err("a non-http(s) url is refused from the app too");
+        assert!(
+            bad.contains("ABSOLUTE http:// or https:// URL"),
+            "got: {bad}"
+        );
+        // REVIEW FINDING F3 — the 2048-character bound is one more rule of that same authority, so
+        // it must reach BOTH surfaces with the SAME sentence, exactly as InvalidUrl and
+        // DuplicateUrl do. Asserted side by side rather than separately: the point is the parity.
+        let too_long = format!("https://x.test/{}", "a".repeat(2100));
+        let app_refusal = h
+            .run(
+                "annexe_add",
+                serde_json::json!({ "specId": spec_app, "kind": "url", "content": too_long }),
+            )
+            .expect_err("an over-long url is refused from the app");
+        let mcp_refusal = nyx_core::mcp_tools_annexe::annexe_add(
+            h.runtime.db(),
+            &serde_json::json!({ "spec_id": spec_mcp, "kind": "url", "content": too_long }),
+        )
+        .expect_err("…and from the agent");
+        assert_eq!(
+            app_refusal, mcp_refusal.message,
+            "one authority, one sentence, on both surfaces"
+        );
+        assert!(
+            app_refusal.contains("limited to 2048 characters"),
+            "got: {app_refusal}"
+        );
+        // …and the ARGUMENT rules of the MCP handler too, not only the authority's: the `kind`
+        // vocabulary is CLOSED (refused as an argument, never as an opaque v27 CHECK error) and
+        // every kind but `url` REQUIRES its label — PRESENT and NON-EMPTY, since `require_str`
+        // refuses `""` on the MCP side and a present-only check would let the app write a
+        // label-less doc the agent cannot. The parity the app must keep the day a non-url write
+        // surface exists.
+        let bad_kind = h
+            .run(
+                "annexe_add",
+                serde_json::json!({ "specId": spec_app, "kind": "lien", "title": "x", "content": "prose" }),
+            )
+            .expect_err("a kind outside the vocabulary is refused from the app too");
+        assert!(bad_kind.contains("unknown kind 'lien'"), "got: {bad_kind}");
+        let no_title = h
+            .run(
+                "annexe_add",
+                serde_json::json!({ "specId": spec_app, "kind": "doc", "content": "prose" }),
+            )
+            .expect_err("a doc without a label is refused from the app, as it is over MCP");
+        assert!(
+            no_title.contains("missing string arg 'title'"),
+            "got: {no_title}"
+        );
+        let empty_title = h
+            .run(
+                "annexe_add",
+                serde_json::json!({ "specId": spec_app, "kind": "doc", "title": "", "content": "prose" }),
+            )
+            .expect_err("an EMPTY label is refused from the app, as it is over MCP");
+        assert!(
+            empty_title.contains("missing string arg 'title'"),
+            "got: {empty_title}"
+        );
+        // The MCP twin of that exact call — same refusal, so the two surfaces stay in step on
+        // vacuity and not only on presence.
+        let empty_title_mcp = nyx_core::mcp_tools_annexe::annexe_add(
+            h.runtime.db(),
+            &serde_json::json!({ "spec_id": spec_mcp, "kind": "doc", "title": "", "content": "prose" }),
+        )
+        .expect_err("the agent is refused the same empty label");
+        assert!(
+            empty_title_mcp
+                .message
+                .contains("missing or empty required argument 'title'"),
+            "got: {}",
+            empty_title_mcp.message
+        );
+        // …and the SAME vacuity rule on the two OTHER required strings, each against its MCP twin —
+        // `title` was only one third of the guard, and a silent revert of either `arg_str_nonempty`
+        // to a presence-only `arg_str` must redden here.
+        let empty_spec_id = h
+            .run(
+                "annexe_add",
+                serde_json::json!({ "specId": "", "kind": "url", "content": "https://x.test/a" }),
+            )
+            .expect_err("an EMPTY specId is refused from the app, as it is over MCP");
+        assert!(
+            empty_spec_id.contains("missing string arg 'specId'"),
+            "got: {empty_spec_id}"
+        );
+        let empty_spec_id_mcp = nyx_core::mcp_tools_annexe::annexe_add(
+            h.runtime.db(),
+            &serde_json::json!({ "spec_id": "", "kind": "url", "content": "https://x.test/a" }),
+        )
+        .expect_err("the agent is refused the same empty spec id");
+        assert!(
+            empty_spec_id_mcp
+                .message
+                .contains("missing or empty required argument 'spec_id'"),
+            "got: {}",
+            empty_spec_id_mcp.message
+        );
+        let empty_content = h
+            .run(
+                "annexe_add",
+                serde_json::json!({ "specId": spec_app, "kind": "url", "content": "" }),
+            )
+            .expect_err("an EMPTY content is refused from the app, as it is over MCP");
+        assert!(
+            empty_content.contains("missing string arg 'content'"),
+            "got: {empty_content}"
+        );
+        let empty_content_mcp = nyx_core::mcp_tools_annexe::annexe_add(
+            h.runtime.db(),
+            &serde_json::json!({ "spec_id": spec_mcp, "kind": "url", "content": "" }),
+        )
+        .expect_err("the agent is refused the same empty content");
+        assert!(
+            empty_content_mcp
+                .message
+                .contains("missing or empty required argument 'content'"),
+            "got: {}",
+            empty_content_mcp.message
+        );
+
+        // `annexe_link_list` resolves what the block renders: the label AND the url itself.
+        let links: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "annexe_link_list",
+                serde_json::json!({ "specId": spec_app }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let links = links.as_array().unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["title"], "Ticket");
+        assert_eq!(links[0]["url"], url);
+        // The two SISTER v50 commands read their required string under the same rule as `annexe_add`
+        // (their MCP twins both go through `require_str`): an empty one REJECTS — it is neither "a
+        // Spec with no link" nor the calm idempotent `removed: false` of an unknown id.
+        let empty_link_list = h
+            .run("annexe_link_list", serde_json::json!({ "specId": "" }))
+            .expect_err("an EMPTY specId is refused, not read as a Spec with no link");
+        assert!(
+            empty_link_list.contains("missing string arg 'specId'"),
+            "got: {empty_link_list}"
+        );
+        let empty_remove = h
+            .run("annexe_remove", serde_json::json!({ "id": "" }))
+            .expect_err("an EMPTY id is refused, not reported as an idempotent no-op");
+        assert!(
+            empty_remove.contains("missing string arg 'id'"),
+            "got: {empty_remove}"
+        );
+
+        // REMOVE: the app on one Spec, the MCP tool on the other — same final state (no row left,
+        // and the shared blob GC'd once its LAST reference is gone).
+        let removed: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "annexe_remove",
+                serde_json::json!({ "id": from_app["annexe"]["id"] }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(removed["removed"], true);
+        nyx_core::mcp_tools_annexe::annexe_remove(
+            h.runtime.db(),
+            &serde_json::json!({ "id": from_mcp.result["annexe"]["id"] }),
+        )
+        .expect("the agent detaches its link");
+
+        for spec_id in [&spec_app, &spec_mcp] {
+            assert!(
+                h.runtime
+                    .db()
+                    .with_conn(|c| nyx_core::db::list_annexes(c, spec_id, Some("url")))
+                    .unwrap()
+                    .is_empty(),
+                "both surfaces end with no link"
+            );
+        }
     }
 
     /// `spec_dependency_view` returns the directional `blocked_by`/`unblocks` edges + the badge

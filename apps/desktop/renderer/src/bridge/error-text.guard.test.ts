@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { join, relative, resolve, sep } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -27,6 +27,11 @@ const SRC = resolve(__dirname, "..");
 /** The ONE module allowed to know how a failure is read — everything else calls `errorText`. */
 const THE_ONE_PATH = "bridge/error-text.ts";
 
+/** A path in the ONE spelling this file compares in — `node:path` yields `\` on Windows. */
+function toPosix(path: string): string {
+  return path.split(sep).join("/");
+}
+
 /** Every `.ts`/`.tsx` of the renderer that is PRODUCT code (tests may construct errors freely). */
 function sourceFiles(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -43,13 +48,24 @@ function sourceFiles(dir: string, out: string[] = []): string[] {
   return out;
 }
 
-/** `file:line` for every line of `files` matching `pattern`, ignoring the ones inside a comment. */
+/**
+ * `file:line` for every line of `files` matching `pattern`, ignoring the ones inside a comment.
+ *
+ * A GUARD THAT DOES NOT BITE ON EVERY MACHINE IS NOT A GUARD. Two Windows-only defects made this
+ * one report ITSELF (and every prose mention of the defect) instead of the surfaces it polices, so
+ * the whole file was red on a Windows checkout and told nobody anything:
+ *  - `relative()` yields `bridge\error-text.ts`, which never equals the `/`-spelled
+ *    {@link THE_ONE_PATH}, so the ONE module allowed to read a failure was scanned like any other;
+ *  - the repo checks out CRLF, and `.` in a JS regex does NOT match `\r`, so `/\/\/.*$/` never
+ *    reached the end of a `//` line and NOTHING was stripped as a comment.
+ * The path is normalized and the line's trailing `\r` is dropped BEFORE either rule runs.
+ */
 function offenders(pattern: RegExp, files: readonly string[]): string[] {
   const hits: string[] = [];
   for (const file of files) {
-    const rel = relative(SRC, file);
+    const rel = toPosix(relative(SRC, file));
     if (rel === THE_ONE_PATH) continue;
-    const lines = readFileSync(file, "utf8").split("\n");
+    const lines = readFileSync(file, "utf8").split(/\r?\n/);
     lines.forEach((line, i) => {
       // A COMMENT may name the defect — this file, and a dozen others, explain it at length.
       const code = line.replace(/\/\/.*$/, "").replace(/^\s*\*.*$/, "");
@@ -65,7 +81,7 @@ describe("every reading of a failure goes through errorText", () => {
   /** There IS product source to scan — a broken walk must not pass by finding nothing. */
   it("scans the renderer's own sources", () => {
     expect(FILES.length).toBeGreaterThan(100);
-    expect(FILES.map((f) => relative(SRC, f))).toContain(THE_ONE_PATH);
+    expect(FILES.map((f) => toPosix(relative(SRC, f)))).toContain(THE_ONE_PATH);
   });
 
   /**

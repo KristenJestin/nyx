@@ -12,8 +12,12 @@ export interface UseAnnexes {
 /**
  * `use-annexes` — the LIVE annexes of one Spec (`annexe_list`): the attachments (kind/title +
  * blob size + dedup hash), newest-first, kept fresh off the coarse `specs://changed` push with NO
- * polling. Backs the Spec-detail "Annexes" block. A `null` id / a backend rejection / a shell that
- * returns nothing degrade to an EMPTY list — the block reads as "no annexes", never as broken.
+ * polling. Backs the Spec-detail "Documents" block. A `null` id / a backend rejection / a shell
+ * that returns nothing degrade to an EMPTY list — the block reads as empty, never as broken.
+ *
+ * It lists EVERY kind, `url` included. The Spec-detail surface renders the `url` rows through
+ * `useSpecLinks` instead (they are clickable links with their own add/remove gestures), so the
+ * "Documents" block draws the NON-url attachments off this same read.
  */
 export function useAnnexes(specId: string | null): UseAnnexes {
   const [annexes, setAnnexes] = useState<readonly AnnexListItem[]>([]);
@@ -41,7 +45,8 @@ export function useAnnexes(specId: string | null): UseAnnexes {
         });
     void load();
 
-    // Live: re-pull on `specs://changed` (a MCP `annexe_add`/`annexe_remove` mutation) — no polling.
+    // Live: re-pull on `specs://changed` (a MCP `annexe_add`/`annexe_remove` mutation, or the same
+    // write from this app's own Links block) — no polling.
     let torndown = false;
     let unlisten: (() => void) | null = null;
     void nyxBridge

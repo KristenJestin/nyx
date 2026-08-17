@@ -951,8 +951,46 @@ export type BackendCommand =
   // blended score, and the idea's linked Specs.
   | "idea_search"
   // `annexe_list` ({ specId }) — a Spec's annexes newest-first, each with its blob `byte_len` (no
-  // content in the list). Backs the Spec-detail "Annexes" block.
+  // content in the list). Backs the Spec-detail "Documents" block (the `url` rows it also returns
+  // are drawn by the neighbouring "Links" block instead, off `annexe_link_list`).
   | "annexe_list"
+  // v50 — `annexe_link_list` ({ specId }) → `SpecLink[]`: the Spec's EXTERNAL LINKS, RESOLVED. A
+  // link is a `url` annexe whose stored content IS the URL, and `annexe_list` never ships content,
+  // so this read composes the shared authority's `kind`-narrowed list with a per-row resolve and
+  // hands back `{ id, spec_id, title, url, created_at }` newest-first. Backs the Spec-detail
+  // "Links" block. Pure read — the live refresh rides `specs://changed`. `specId` is a required
+  // string: absent or empty REJECTS (as the MCP `annexe_list` twin does), it is not an empty list.
+  | "annexe_link_list"
+  // v50 — the APP-side annexe WRITES (the Spec-detail "Links" block). Both go through the SAME
+  // `nyx_core::db` annexe authority the MCP `annexe_*` tools call (PDR-0005), so a link added or
+  // removed here lands in exactly the state the agent's tool would have produced — including the
+  // `url` rules, which live in that authority: absolute http(s) only, stored in CANONICAL form —
+  // surrounding blanks trimmed, scheme and host lowered, the path's trailing slash dropped, so a
+  // pasted ` HTTPS://X/a/ ` is stored and deduplicated as `https://x/a`, while whitespace or
+  // control characters INSIDE it are still refused with their own sentence —, at most 2048
+  // characters (the other kinds are stored byte-for-byte, edges included, and are NOT
+  // length-bounded), ONE occurrence of a URL per Spec, and a blank `title` stored as the URL
+  // itself. Each mutation pushes `specs://changed`, so
+  // the open Spec detail re-pulls with no optimistic patching.
+  //
+  // `annexe_add` ({ specId, kind, title?, content }) → `{ annexe }`. `kind` is a CLOSED vocabulary
+  // — `doc | artefact | url | prototype` — and `title` is optional ONLY for `kind='url'`, where
+  // ABSENT, EMPTY (`''`) and BLANK (`'   '`) are the SAME case — "no label given" — and all three
+  // store the URL itself as the title; `doc` / `artefact` / `prototype` REQUIRE a non-empty one.
+  // That is the rule the backend applies, not prose: the same conditionality the MCP tool publishes
+  // in its JSON-Schema. A refused write rejects with the BACKEND's own sentence — the surface
+  // DISPLAYS it, it does not re-word it. The refusal is either an ARGUMENT one, and there the rule
+  // (not a list) is that EVERY required string is refused ABSENT **or** EMPTY, as the MCP surface's
+  // `require_str` refuses it — `title` is the ONE exception, and only for `kind='url'`: it escapes
+  // BOTH halves of that rule there, so an empty `title` on a link is accepted where an empty
+  // `content` is not — while a `kind` outside the vocabulary is refused as such; or the refusal is
+  // the annexe authority's (a non-http(s) URL, whitespace inside it, over 2048 characters, or a URL
+  // already attached to this Spec).
+  | "annexe_add"
+  // `annexe_remove` ({ id }) → `{ removed, id }`. Idempotent for an UNKNOWN id (reports
+  // `removed: false`) — but `id` is a required string, so absent or empty is the argument refusal
+  // above, not a calm `false`; the stored content is GC'd once no annexe references it any more.
+  | "annexe_remove"
   // `spec_dependency_view` ({ specId }) — a Spec's dependency view: the directional `blocked_by` /
   // `unblocks` edges + their computable badge counts + the `related` context links. Backs the
   // Spec-detail dependency badges ("bloquée par N" / "débloque M"); the board reads the counts off

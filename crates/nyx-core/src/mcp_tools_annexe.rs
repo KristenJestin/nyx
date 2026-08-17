@@ -19,9 +19,9 @@
 
 use serde_json::{json, Value};
 
-use crate::db::{self, Db};
+use crate::db::{self, AnnexeError, Db};
 use crate::mcp::{RpcCode, RpcError};
-use crate::mcp_runtime::{internal_db, require_str};
+use crate::mcp_runtime::{internal_db, optional_str, require_str};
 use crate::mcp_tools_core::{ChangedTopic, ToolOutcome};
 
 // --- Tool name constants (advertised in `tools/list`, dispatched below) ------
@@ -46,19 +46,44 @@ pub const ANNEXE_TOOLS: [&str; 4] = [
 
 // --- Argument helpers ------------------------------------------------------
 
+/// The `invalid_argument` a `kind` outside the vocabulary maps to — the authority's own sentence
+/// ([`db::unknown_annex_kind_message`]), so both `kind` arguments refuse in the same words.
+fn unknown_kind(kind: &str) -> RpcError {
+    RpcError::new(
+        RpcCode::InvalidArgument,
+        db::unknown_annex_kind_message(kind),
+    )
+}
+
 /// Resolve the annexe `kind` arg to the vocabulary (`doc` | `artefact` | `url` | `prototype`).
 /// REQUIRED (an annexe has a type). An unknown value → `invalid_argument`.
 fn parse_kind(args: &Value) -> Result<&'static str, RpcError> {
-    match require_str(args, "kind")? {
-        "doc" => Ok(db::ANNEX_KIND_DOC),
-        "artefact" => Ok(db::ANNEX_KIND_ARTEFACT),
-        "url" => Ok(db::ANNEX_KIND_URL),
-        "prototype" => Ok(db::ANNEX_KIND_PROTOTYPE),
-        other => Err(RpcError::new(
-            RpcCode::InvalidArgument,
-            format!("unknown kind '{other}' (accepted: doc, artefact, url, prototype)"),
-        )),
-    }
+    let raw = require_str(args, "kind")?;
+    db::annex_kind_from_str(raw).ok_or_else(|| unknown_kind(raw))
+}
+
+/// Resolve an OPTIONAL annexe `kind` FILTER (the `annexe_list` narrowing). Absent / `null` → `None`
+/// (the unfiltered read, byte-identical to the pre-v50 behaviour). Any other value must be IN the
+/// vocabulary — `invalid_argument` otherwise, the same refusal as [`parse_kind`], because a typo
+/// must never silently widen the read.
+///
+/// Read off the raw argument rather than through `optional_str`, which folds an EMPTY string into
+/// "absent": for a CLOSED vocabulary that is exactly the silent widening this refuses — a
+/// `kind: ""` would have returned EVERY kind instead of being named as the bad value it is.
+fn parse_kind_filter(args: &Value) -> Result<Option<&'static str>, RpcError> {
+    let raw = match args.get("kind") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.as_str(),
+        Some(_) => {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                "argument 'kind' must be a string".to_string(),
+            ))
+        }
+    };
+    db::annex_kind_from_str(raw)
+        .map(Some)
+        .ok_or_else(|| unknown_kind(raw))
 }
 
 /// The `invalid_id` an unknown annexe id maps to.
@@ -66,16 +91,50 @@ fn unknown_annexe(id: &str) -> RpcError {
     RpcError::new(RpcCode::InvalidId, format!("unknown annexe {id}"))
 }
 
+/// Map an [`AnnexeError`] to its MCP code, keeping the authority's own sentence: a bad URL is an
+/// `invalid_argument` (the caller passed a non-http(s) string, one carrying whitespace / control
+/// characters inside it, or one past the 2 048-character bound — THREE sentences, one code,
+/// because all three are the argument's own defect), a duplicate link is an `invalid_state` (the
+/// link is already there — the Spec's state, not the argument, is what refuses), and anything else
+/// is the usual `internal` DB mapping.
+fn annexe_err(e: AnnexeError) -> RpcError {
+    match e {
+        AnnexeError::InvalidUrl(_)
+        | AnnexeError::UrlHasWhitespace(_)
+        | AnnexeError::UrlTooLong(_) => RpcError::new(RpcCode::InvalidArgument, e.to_string()),
+        AnnexeError::DuplicateUrl(_) => RpcError::new(RpcCode::InvalidState, e.to_string()),
+        AnnexeError::Db(db_err) => internal_db(db_err),
+    }
+}
+
 // --- Tool handlers ---------------------------------------------------------
 
-/// `annexe_add` — `{ spec_id, kind, title, content }` → `{ annexe }`. Attaches an annexe to a
+/// `annexe_add` — `{ spec_id, kind, title?, content }` → `{ annexe }`. Attaches an annexe to a
 /// Spec, storing `content` in the content-addressed store (DEDUP: the same content attached
 /// twice stores ONE physical copy). The Spec existence is VALIDATED up front (a bad id →
 /// `invalid_id`). For a `url` annexe the "content" IS the URL string (an internal pointer).
+///
+/// The `url` kind adds the EXTERNAL-LINK rules of the authority, and they are the ones
+/// [`annexe_err`] maps just above — same list, same order as `db::add_annexe` applies them:
+///  * the URL is stored in CANONICAL form (surrounding blanks trimmed, scheme and host lowered, the
+///    path's trailing slash dropped), so that form is what the caller gets back and what dedups;
+///  * at most 2 048 characters of that canonical form (`invalid_argument`);
+///  * it must be an absolute http(s) URL (`invalid_argument`), and a whitespace or control
+///    character INSIDE it is refused too — with its OWN sentence, not the absolute-URL one;
+///  * the same URL may not be attached twice to one Spec (`invalid_state`).
+///
+/// Only `url` carries any of them: a doc / artefact / prototype is a DOCUMENT, stored byte-for-byte
+/// and not length-bounded. `title` is OPTIONAL for a `url` — absent, empty or blank all store the
+/// URL itself as the title (`annexes.title` stays NOT NULL). Every other kind still REQUIRES a
+/// title, exactly as before.
 pub fn annexe_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id = require_str(args, "spec_id")?;
     let kind = parse_kind(args)?;
-    let title = require_str(args, "title")?;
+    let title = if kind == db::ANNEX_KIND_URL {
+        optional_str(args, "title")?.unwrap_or("")
+    } else {
+        require_str(args, "title")?
+    };
     let content = require_str(args, "content")?;
 
     if db
@@ -91,19 +150,24 @@ pub fn annexe_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 
     let annexe = db
         .with_conn(|c| db::add_annexe(c, spec_id, kind, title, content))
-        .map_err(internal_db)?;
+        .map_err(annexe_err)?;
     Ok(ToolOutcome::changed(
         json!({ "annexe": annexe }),
         ChangedTopic::Specs,
     ))
 }
 
-/// `annexe_list` — `{ spec_id }` → `{ annexes }`. Lists a Spec's annexes newest-first, each with
-/// its metadata + blob `byte_len` (NO content — use `annexe_get` for the bytes). Read-only.
+/// `annexe_list` — `{ spec_id, kind? }` → `{ annexes }`. Lists a Spec's annexes newest-first, each
+/// with its metadata + blob `byte_len` (NO content — use `annexe_get` for the bytes). Read-only.
+///
+/// `kind` is the OPTIONAL narrowing (v50): `kind: "url"` reads the Spec's EXTERNAL LINKS and
+/// nothing else, which is why the link surface needed NO new tool. Omitting it leaves the read
+/// exactly as it was — same rows, same order.
 pub fn annexe_list(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id = require_str(args, "spec_id")?;
+    let kind = parse_kind_filter(args)?;
     let annexes = db
-        .with_conn(|c| db::list_annexes(c, spec_id))
+        .with_conn(|c| db::list_annexes(c, spec_id, kind))
         .map_err(internal_db)?;
     Ok(ToolOutcome::read(json!({ "annexes": annexes })))
 }
@@ -286,6 +350,32 @@ mod tests {
             annexe_get(&db, &json!({ "id": "nope" })).unwrap_err().code,
             RpcCode::InvalidId
         );
+
+        // REVIEW FINDING F3 — the length bound reaches the AGENT with the authority's own sentence,
+        // under the code its two siblings already use: the argument is what is wrong, not the
+        // Spec's state. Only `url` is bounded — a prototype four times the size goes through.
+        let too_long = format!("https://x.test/{}", "a".repeat(2100));
+        let refused = annexe_add(
+            &db,
+            &json!({ "spec_id": spec_id, "kind": "url", "content": too_long }),
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, RpcCode::InvalidArgument);
+        assert_eq!(
+            refused.message,
+            "url too long: 2115 characters — a url annexe is limited to 2048 characters",
+            "the tool SHOWS the authority's sentence, it does not re-word it"
+        );
+        annexe_add(
+            &db,
+            &json!({
+                "spec_id": spec_id,
+                "kind": "prototype",
+                "title": "mockup",
+                "content": "x".repeat(8192),
+            }),
+        )
+        .expect("a prototype is not length-bounded");
     }
 
     #[test]
@@ -293,5 +383,199 @@ mod tests {
         let _g = db_guard();
         let (db, _s) = seeded();
         assert!(dispatch_annexe_tool(&db, "list_projects", &json!({})).is_none());
+    }
+
+    /// DONE-CRITERION ("`annexe_list` avec `kind='url'` ne retourne que les liens ; sans `kind`, la
+    /// sortie est identique à aujourd'hui"): the OPTIONAL narrowing is what makes the Spec's
+    /// external LINKS readable without a new tool. The unfiltered call is asserted to be
+    /// byte-identical to the filtered-off behaviour (same rows, same newest-first order), so the
+    /// added argument cannot have moved the existing read; and a bogus `kind` is refused rather
+    /// than silently widening it.
+    #[test]
+    fn annexe_list_filters_on_kind_and_is_unchanged_without_it() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded();
+
+        for (kind, title, content) in [
+            ("doc", "the doc", "some prose"),
+            ("url", "Jira", "https://jira.example.test/BROWSE-1"),
+            ("prototype", "L1", "<html>mockup</html>"),
+            ("url", "the PR", "https://github.test/o/r/pull/7"),
+        ] {
+            annexe_add(
+                &db,
+                &json!({ "spec_id": spec_id, "kind": kind, "title": title, "content": content }),
+            )
+            .expect("annexe_add ok");
+        }
+
+        // WITHOUT `kind`: every annexe, newest-first — the pre-v50 read, untouched.
+        let all = annexe_list(&db, &json!({ "spec_id": spec_id })).unwrap();
+        let all_rows = all.result["annexes"].as_array().unwrap().clone();
+        assert_eq!(all_rows.len(), 4);
+        assert_eq!(
+            all_rows
+                .iter()
+                .map(|r| r["title"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["the PR", "L1", "Jira", "the doc"],
+            "newest-first, every kind"
+        );
+        assert!(all.effects.is_empty(), "list is a read");
+
+        // `kind: null` is the SAME unfiltered read (an absent optional is not a filter).
+        let explicit_null = annexe_list(&db, &json!({ "spec_id": spec_id, "kind": null })).unwrap();
+        assert_eq!(explicit_null.result["annexes"], json!(all_rows));
+
+        // WITH `kind: "url"`: the LINKS only, in the same order, unchanged rows.
+        let links = annexe_list(&db, &json!({ "spec_id": spec_id, "kind": "url" })).unwrap();
+        let link_rows = links.result["annexes"].as_array().unwrap();
+        assert_eq!(link_rows.len(), 2, "only the two url annexes");
+        assert!(link_rows.iter().all(|r| r["kind"] == "url"));
+        assert_eq!(
+            link_rows
+                .iter()
+                .map(|r| r["title"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["the PR", "Jira"],
+            "the links keep the newest-first order of the unfiltered read"
+        );
+        assert_eq!(
+            link_rows.to_vec(),
+            all_rows
+                .iter()
+                .filter(|r| r["kind"] == "url")
+                .cloned()
+                .collect::<Vec<_>>(),
+            "the filtered read is EXACTLY the url subset of the unfiltered one"
+        );
+
+        // A kind outside the vocabulary is refused — never a silently unfiltered read. The EMPTY
+        // string is one of those values and not "no filter": `optional_str` folds `""` into
+        // absent, which for a CLOSED vocabulary is the silent widening this guards against.
+        for bogus in ["bogus", ""] {
+            assert_eq!(
+                annexe_list(&db, &json!({ "spec_id": spec_id, "kind": bogus }))
+                    .unwrap_err()
+                    .code,
+                RpcCode::InvalidArgument,
+                "kind '{bogus}' must be refused, not read as the unfiltered list"
+            );
+        }
+    }
+
+    /// DONE-CRITERION ("Le schéma d'outil documente le paramètre optionnel" + "Le nombre total
+    /// d'outils MCP est inchangé"): `tools/list` advertises `kind` on `annexe_list` WITHOUT making
+    /// it required, and the annexe surface is still the SAME FOUR tools — the link feature added
+    /// no tool, so the surface-count test elsewhere needs no edit.
+    #[test]
+    fn annexe_list_tool_schema_documents_the_optional_kind() {
+        let descriptor = crate::mcp::tool_descriptors()
+            .into_iter()
+            .find(|d| d["name"] == ANNEXE_LIST_TOOL)
+            .expect("annexe_list is advertised");
+        assert!(
+            descriptor["inputSchema"]["properties"]["kind"].is_object(),
+            "the kind parameter is documented in the tool schema"
+        );
+        assert_eq!(
+            descriptor["inputSchema"]["required"],
+            json!(["spec_id"]),
+            "kind is OPTIONAL — only spec_id is required"
+        );
+        assert_eq!(ANNEXE_TOOLS.len(), 4, "no tool was added for the links");
+    }
+
+    /// FINDINGS `01M033H5Y1765GH2V77XF8KDSF` / `01M032WP4YZFMBK9HNCHSBK490`: THE PUBLISHED SCHEMA OF
+    /// `annexe_add` MUST SAY WHAT THE HANDLER DOES ABOUT `title`.
+    ///
+    /// v50 relaxed `title` for `kind='url'` ONLY (an unlabelled link is stored with the URL as its
+    /// title), but the descriptor dropped `title` from `required` for the FOUR kinds — so an agent
+    /// trusting `tools/list` and omitting `title` on a `doc` got an `invalid_argument` at call time.
+    /// `tools/list` is the EXTERNAL contract, the one surface with no compiler behind it; this test
+    /// pins both halves TOGETHER so neither can move alone: the JSON-Schema condition, and the
+    /// handler's behaviour for each kind.
+    #[test]
+    fn annexe_add_tool_schema_matches_the_handlers_title_rule() {
+        let descriptor = crate::mcp::tool_descriptors()
+            .into_iter()
+            .find(|d| d["name"] == ANNEXE_ADD_TOOL)
+            .expect("annexe_add is advertised");
+        let schema = &descriptor["inputSchema"];
+
+        // The unconditional half: `title` is NOT in the flat `required` (a url may omit it)…
+        assert_eq!(
+            schema["required"],
+            json!(["spec_id", "kind", "content"]),
+            "the always-required arguments"
+        );
+        // …and the CONDITION lives in the schema, not only in the property's prose: every kind but
+        // `url` still requires it.
+        assert_eq!(
+            schema["allOf"],
+            json!([{
+                "if": {
+                    "properties": { "kind": { "enum": ["doc", "artefact", "prototype"] } },
+                    "required": ["kind"],
+                },
+                "then": { "required": ["title"] },
+            }]),
+            "the schema itself says: kind != url ⇒ title required"
+        );
+
+        // THE HANDLER, kind by kind — the other half of the same contract.
+        let _g = db_guard();
+        let (db, spec_id) = seeded();
+        for kind in ["doc", "artefact", "prototype"] {
+            let refused = annexe_add(
+                &db,
+                &json!({ "spec_id": spec_id, "kind": kind, "content": "body" }),
+            )
+            .unwrap_err();
+            assert_eq!(
+                refused.code,
+                RpcCode::InvalidArgument,
+                "a {kind} still REQUIRES a title, exactly as the schema now says"
+            );
+        }
+        let url = "https://jira.example.test/BROWSE-1";
+        let unlabelled = annexe_add(
+            &db,
+            &json!({ "spec_id": spec_id, "kind": "url", "content": url }),
+        )
+        .expect("a url may be attached WITHOUT a title");
+        assert_eq!(
+            unlabelled.result["annexe"]["title"], url,
+            "an omitted label stores the URL itself as the title"
+        );
+
+        // REVIEW FINDING F4 — the PROSE must say the same thing as the handler, for the THREE ways
+        // to give no label. The behaviour does not change (an empty `title` was already accepted on
+        // a url while an empty `content` is refused): what changes is that the published contract
+        // now states it, instead of leaving a reader to discover the asymmetry at call time.
+        let title_doc = schema["properties"]["title"]["description"]
+            .as_str()
+            .expect("title is documented");
+        for case in ["absent", "empty", "blank"] {
+            assert!(
+                title_doc.to_ascii_lowercase().contains(case),
+                "the published description names the '{case}' case; got: {title_doc}"
+            );
+        }
+        for (label, url) in [
+            (json!(""), "https://jira.example.test/BROWSE-2"),
+            (json!("   "), "https://jira.example.test/BROWSE-3"),
+        ] {
+            let stored = annexe_add(
+                &db,
+                &json!({ "spec_id": spec_id, "kind": "url", "title": label, "content": url }),
+            )
+            .unwrap_or_else(|e| {
+                panic!("a {label} title is 'no label' on a url, not a refusal: {e:?}")
+            })
+            .result["annexe"]["title"]
+                .clone();
+            assert_eq!(stored, json!(url), "…and the URL becomes the title");
+        }
     }
 }

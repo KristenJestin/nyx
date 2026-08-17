@@ -182,9 +182,20 @@ export interface SpecDetail {
 }
 
 /**
+ * The `annexes.kind` value an EXTERNAL LINK is stored under (`nyx_core::db::ANNEX_KIND_URL`). A
+ * link is not a model of its own: it is an annexe whose CONTENT is the URL string and whose
+ * `title` is the label, which is why it survives a fork with the rest of them.
+ */
+export const ANNEX_KIND_URL = "url";
+
+/**
  * A `annexes` LIST row (the wire shape of `nyx_core::db::AnnexListItem`, v2.6): a Spec attachment
  * (kind/title) + its content-addressed blob's `byte_len` (a size hint) + the dedup `content_hash`,
- * WITHOUT the blob content. Rendered in the Spec-detail "Annexes" block (`annexe_list` db-command).
+ * WITHOUT the blob content. Rendered in the Spec-detail "Documents" block (`annexe_list`
+ * db-command).
+ *
+ * For a `kind: "url"` row the blob content IS the URL, which this list deliberately does not ship
+ * — the "Links" block reads {@link SpecLink} (the `annexe_link_list` db-command) instead.
  */
 export interface AnnexListItem {
   readonly id: string;
@@ -195,6 +206,24 @@ export interface AnnexListItem {
   /** The dedup key / pointer into the content-addressed blob store. */
   readonly content_hash: string;
   readonly byte_len: number;
+  readonly created_at: number;
+}
+
+/**
+ * One EXTERNAL LINK of a Spec (the wire shape of the `annexe_link_list` db-command, v50): a `url`
+ * annexe RESOLVED — the attachment row plus the URL read out of the content-addressed store.
+ *
+ * There is no `spec_links` table: this is `annexes` + `annex_blobs` seen through one facet. Which
+ * is why a link needs no fork handling — the attachment hangs off the Spec's LOGICAL id, so a
+ * forked revision keeps it without a copy.
+ */
+export interface SpecLink {
+  readonly id: string;
+  readonly spec_id: string;
+  /** The LABEL. Equals {@link url} when the link was stored without one (`annexes.title` is NOT NULL). */
+  readonly title: string;
+  /** The absolute http(s) URL (the annexe's stored content). */
+  readonly url: string;
   readonly created_at: number;
 }
 

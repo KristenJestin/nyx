@@ -2437,26 +2437,56 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         INTERNALLY in nyx (not a fragile link to a repo file that will move). The \
                         content is content-addressed and DEDUPED: attaching the same content twice \
                         (to this Spec or another) stores ONE physical copy. For a 'url' annexe the \
-                        content IS the URL string. Returns the created annexe.",
+                        content IS the URL string — that is how an EXTERNAL LINK (a ticket, a PR, a \
+                        doc) is attached to a Spec, and it survives a fork. A 'url' carries extra \
+                        rules: the content must be an ABSOLUTE http:// or https:// URL (anything else \
+                        is refused), and the SAME url cannot be attached twice to one Spec (the \
+                        second add is refused — doc/artefact/prototype may still be duplicated). \
+                        A url is stored in CANONICAL form: surrounding blanks trimmed, scheme and \
+                        host lowered, the path's trailing slash dropped — so ' HTTPS://X/a/ ' is \
+                        stored, and deduplicated, as 'https://x/a' (the path, the query and the \
+                        fragment keep their case, and 'www.x' stays a different host from 'x'). \
+                        Whitespace or control characters INSIDE it are still refused, with their \
+                        own message, and a url past 2048 characters is refused too. The other \
+                        kinds are stored byte-for-byte and are NOT length-bounded. Returns the \
+                        created annexe.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "spec_id": str_prop("the Spec to attach the annexe to"),
                 "kind": str_prop("annexe type: doc | artefact | url | prototype"),
-                "title": str_prop("the annexe's title"),
-                "content": str_prop("the annexe's content (the document/artefact text, or the URL string for kind=url) — stored internally"),
+                "title": str_prop("the annexe's title (the LABEL of a link). REQUIRED for kind=doc|artefact|prototype, where it is refused ABSENT or EMPTY. For kind=url it is OPTIONAL and the three ways to give no label are the SAME case: absent, empty ('') and blank ('   ') all store the URL itself as the title"),
+                "content": str_prop("the annexe's content (the document/artefact text, or the absolute http(s) URL string for kind=url) — stored internally"),
             },
-            "required": ["spec_id", "kind", "title", "content"],
+            // `title` is CONDITIONALLY required, and the condition is expressed HERE rather than in
+            // the property's prose alone: the handler (`mcp_tools_annexe::annexe_add`) only relaxes
+            // it for `kind='url'` (an unlabelled link is stored with the URL as its title), and
+            // still calls `require_str` for doc / artefact / prototype. A flat
+            // `required: [spec_id, kind, content]` would advertise a shape three of the four kinds
+            // are refused for — the published contract must not describe writes the tool rejects.
+            "required": ["spec_id", "kind", "content"],
+            "allOf": [{
+                "if": {
+                    "properties": { "kind": { "enum": ["doc", "artefact", "prototype"] } },
+                    "required": ["kind"],
+                },
+                "then": { "required": ["title"] },
+            }],
         },
     }));
     descriptors.push(json!({
         "name": crate::mcp_tools_annexe::ANNEXE_LIST_TOOL,
         "description": "List a Spec's annexes, newest-first — each with its kind, title, \
                         content_hash and byte size (NOT the content; use annexe_get for the bytes). \
-                        Read-only.",
+                        Pass kind to narrow the read to ONE facet: kind='url' lists the Spec's \
+                        EXTERNAL LINKS and nothing else (there is no separate link tool — a link IS \
+                        a url annexe). Omitting kind lists everything. Read-only.",
         "inputSchema": {
             "type": "object",
-            "properties": { "spec_id": str_prop("the Spec whose annexes to list") },
+            "properties": {
+                "spec_id": str_prop("the Spec whose annexes to list"),
+                "kind": str_prop("optional: keep only this annexe type (doc | artefact | url | prototype) — omit for all of them"),
+            },
             "required": ["spec_id"],
         },
     }));

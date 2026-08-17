@@ -19,7 +19,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 
-import { isBridgeError, type NyxBridge, type PtyOutput } from "./contract";
+import { type BridgeError, isBridgeError, type NyxBridge, type PtyOutput } from "./contract";
 import { electronBridge } from "./electron";
 import { FakeNyxBridge } from "./fake";
 
@@ -216,5 +216,86 @@ describe("NyxBridge contract — electron flow-control ack", () => {
     } finally {
       core.cleanup();
     }
+  });
+});
+
+// --- Electron-only: the IPC wrapper never reaches the user ------------------
+//
+// Second human review, finding F6. A duplicate link showed, in the Links block's `role="alert"`:
+// `Error invoking remote method 'nyx:core/invoke': Error: url '…' is already attached to this
+// Spec` — the authority's sentence last, behind the channel name and two stacked `Error:`. Nothing
+// downstream was at fault: `errorText` renders a message verbatim, and it was handed one that had
+// already been wrapped by `ipcRenderer.invoke`. The unwrapping therefore lives at the ONE place a
+// native failure becomes a `BridgeError` (`electron.ts::toBridgeError`), and these tests hold it
+// there — including the case where there is nothing to unwrap, which must pass through untouched.
+describe("NyxBridge contract — electron refusal messages", () => {
+  /** What `ipcRenderer.invoke` rejects with when a main-process handler throws `sentence`. */
+  function ipcWrapped(sentence: string, cause?: Error): Error {
+    const wrapped = new Error(`Error invoking remote method 'nyx:core/invoke': Error: ${sentence}`);
+    if (cause) (wrapped as { cause?: unknown }).cause = cause;
+    return wrapped;
+  }
+
+  /** Drive a real `electronBridge.invoke` whose transport rejects with `rejection`. */
+  async function refusal(rejection: unknown): Promise<BridgeError> {
+    const core = installFakeNyxCore({ annexe_add: () => Promise.reject(rejection) });
+    try {
+      const settled: unknown = await electronBridge
+        .invoke("annexe_add", { specId: "s1" })
+        .then(() => null, (e: unknown) => e);
+      expect(isBridgeError(settled)).toBe(true);
+      return settled as BridgeError;
+    } finally {
+      core.cleanup();
+    }
+  }
+
+  it("shows the backend's sentence ALONE — no channel name, no stacked `Error:`", async () => {
+    // Every refusal of the link write path, exactly as the Rust authority words them.
+    for (const sentence of [
+      "url 'https://www.youtube.com' is already attached to this Spec",
+      "invalid url 'not a url': a url annexe must be an ABSOLUTE http:// or https:// URL",
+      "invalid url 'https://x.test/a b': a url annexe must not carry WHITESPACE or CONTROL " +
+        "characters inside it (surrounding blanks are trimmed off; percent-encode the rest)",
+      "url too long: 2049 characters — a url annexe is limited to 2048 characters",
+    ]) {
+      const refused = await refusal(ipcWrapped(sentence));
+      expect(refused.message).toBe(sentence);
+      expect(refused.message).not.toContain("invoking remote method");
+      expect(refused.message.startsWith("Error:")).toBe(false);
+    }
+  });
+
+  it("reads the ORIGINAL error when the transport attaches it, rather than cutting a string", async () => {
+    // Whether an Electron build attaches the deserialized error as `cause` cannot be settled from
+    // source, so the adapter covers both. When it IS there it wins, and the wrapper's own text —
+    // deliberately mangled here — is never consulted.
+    const refused = await refusal(
+      ipcWrapped("MANGLED, must not be read", new Error("url 'https://x.test' is already attached")),
+    );
+    expect(refused.message).toBe("url 'https://x.test' is already attached");
+  });
+
+  it("leaves a message that did NOT cross that channel INTACT — no speculative slicing", async () => {
+    // A failure raised in-process, and a wrapper naming ANOTHER channel: neither matches the exact
+    // prefix, so neither is touched. This is what makes the peel safe on a sentence that happens to
+    // read like a wrapper.
+    for (const untouched of [
+      "sidecar is not running (state=stopped)",
+      "Error invoking remote method 'nyx:window/close': Error: nope",
+      "Error: a backend sentence that starts like a stringified error",
+    ]) {
+      const refused = await refusal(new Error(untouched));
+      expect(refused.message).toBe(untouched);
+    }
+  });
+
+  it("keeps the rest of the BridgeError shape: kind, source, and the RAW value as cause", async () => {
+    const raw = ipcWrapped("url 'https://x.test' is already attached to this Spec");
+    const refused = await refusal(raw);
+    expect(refused.kind).toBe("command");
+    expect(refused.source).toBe("annexe_add");
+    // `cause` is the original thrown value — for logging, never for control flow (contract.ts).
+    expect(refused.cause).toBe(raw);
   });
 });
