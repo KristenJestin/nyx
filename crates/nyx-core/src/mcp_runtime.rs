@@ -60,6 +60,48 @@ pub fn optional_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, R
     }
 }
 
+/// An OPTIONAL string argument on an ANCHORING tool — [`optional_str`]'s STRICTER twin, and the
+/// ONE place the three anchoring tools read their anchor from (`spec_set_workspace.workspace_id`,
+/// `workspace_add.spec_id`, `create_workspace.spec_id`). Absent / null → `None`; an EMPTY string →
+/// `invalid_argument`; a non-string → `invalid_argument`.
+///
+/// WHY THESE ARGUMENTS AND NOT THE OTHERS (review F2). [`optional_str`] maps `""` to `None`
+/// deliberately, and for 122 call sites that is right: `None` means "the caller said nothing", so
+/// normalizing an empty string to silence loses nothing. On an ANCHORING argument `None` does not
+/// mean silence — IT IS AN EFFECT: detach the Spec from its workspace, or register a workspace with
+/// no Spec linked. The normalization therefore converts a CALLER'S BUG (an uninitialized variable
+/// reaching the wire as `""`) into a silent mutation: an agent that believes it is anchoring
+/// detaches instead, and nothing anywhere says so (observed: a Spec left with `workspace_id` NULL
+/// after a `spec_set_workspace(workspace_id: "")`). An empty string is not a way to say "none", so
+/// here it is REFUSED rather than reinterpreted.
+///
+/// `absent_means` completes the refusal with what the caller should pass INSTEAD to obtain the
+/// no-anchor behaviour they may actually have wanted — it differs per tool (detaching is not the
+/// same act as not linking), and naming it is what tells the empty string apart from the absence.
+///
+/// [`optional_str`] itself is deliberately UNCHANGED: its semantics are a repo-wide convention
+/// (`require_str` refuses `""`, `optional_str` absorbs it), and re-deciding it for 122 call sites is
+/// its own subject, not a side effect of this one.
+pub fn anchor_str<'a>(
+    args: &'a Value,
+    key: &str,
+    absent_means: &str,
+) -> Result<Option<&'a str>, RpcError> {
+    if let Some(Value::String(s)) = args.get(key) {
+        if s.is_empty() {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "argument '{key}' is an EMPTY string, which is not a way to say 'none' — it \
+                     would silently {absent_means}. Pass a real id, or omit '{key}' (or send null) \
+                     if that is what you meant"
+                ),
+            ));
+        }
+    }
+    optional_str(args, key)
+}
+
 /// An OPTIONAL array-of-strings argument, ORDER-preserving. Absent / null → `None`; a JSON array
 /// → `Some(Vec)` (an EMPTY array is accepted, yielding `Some(vec![])` so a caller can distinguish
 /// "clear the list" from "leave it untouched"); a non-array, or a non-string / empty-string
@@ -1095,10 +1137,14 @@ fn validate_existing_dir(path: &str) -> Result<(), RpcError> {
 /// (`mkdir -p` semantics) — the `create_workspace` creating-intent precondition. Already a
 /// directory → a no-op success (idempotent); a path that exists as a FILE, or that cannot
 /// be created, is rejected with the D8 `invalid_argument` vocabulary.
-fn ensure_dir_created(path: &str) -> Result<(), RpcError> {
+///
+/// Returns whether THIS call created the folder (`true`) or it was already there (`false`) —
+/// the signal [`compensate_created_dir`] needs to undo a *fresh* mkdir when the DB write that
+/// follows fails, without ever touching a pre-existing path.
+fn ensure_dir_created(path: &str) -> Result<bool, RpcError> {
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.is_dir() {
-            return Ok(()); // already a directory: idempotent create.
+            return Ok(false); // already a directory: idempotent create, nothing to compensate.
         }
         return Err(RpcError::new(
             RpcCode::InvalidArgument,
@@ -1107,12 +1153,62 @@ fn ensure_dir_created(path: &str) -> Result<(), RpcError> {
             ),
         ));
     }
-    std::fs::create_dir_all(path).map_err(|e| {
-        RpcError::new(
-            RpcCode::InvalidArgument,
-            format!("could not create directory '{path}': {e}"),
-        )
-    })
+    std::fs::create_dir_all(path)
+        .map_err(|e| {
+            RpcError::new(
+                RpcCode::InvalidArgument,
+                format!("could not create directory '{path}': {e}"),
+            )
+        })
+        .map(|()| true)
+}
+
+/// COMPENSATE a `create_workspace` whose DB write failed AFTER its `mkdir`: remove the folder
+/// this run created, and ONLY if it is still EMPTY. Deliberately `remove_dir` (never
+/// `remove_dir_all`): a folder that already has content is left alone, so a racing writer's
+/// data can never be destroyed by a rollback. `created == false` (a pre-existing path) is a
+/// no-op — nyx never removes a path it did not create. Best-effort: a failed cleanup is not
+/// worth masking the original error the caller is about to return.
+///
+/// LEAF-ONLY, BY DECISION (phase-1 review): [`ensure_dir_created`] goes through
+/// `create_dir_all`, so ONE call can bring `a`, `a/b` AND `a/b/c` into existence, yet this
+/// compensation removes only `a/b/c`. Walking back up the parents is deliberately NOT done:
+/// it turns a rollback into a recursive deletion — which this PRD puts out of scope — and
+/// nothing distinguishes, after the fact, a parent THIS call created from one a concurrent
+/// writer created in between. A single `remove_dir` on the leaf is the one removal that is
+/// provably safe (it simply fails the moment anything lives in the folder). What survives is
+/// therefore at most a chain of EMPTY directories on the path the caller itself asked for —
+/// never data, never a workspace row. Frozen by
+/// [`tests::the_compensation_of_a_multi_segment_mkdir_removes_the_leaf_only`].
+///
+/// # ⚠️ READ THIS BEFORE MAKING ANY STRATEGY *FILL* THE WORKSPACE FOLDER
+///
+/// Leaf-only also means this compensation SILENTLY STOPS WORKING the day the folder is no
+/// longer empty when it runs — and A POPULATED GIT WORKTREE IS NOT AN EMPTY FOLDER. `remove_dir`
+/// simply fails, best-effort swallows the error, and the rollback cleans up NOTHING: a DB
+/// failure occurring after the fill would leave an orphan worktree BOTH on disk AND in the
+/// parent repo's metadata (`.git/worktrees/<name>`). The atomicity guarantee this PRD just
+/// established would be gone WITHOUT A SINGLE ERROR SURFACING — which is precisely why this
+/// warning is written on the function itself and not only in an overview comment.
+///
+/// Consequences, decided 2026-08-18 and binding on the future fill PRD (depot idea
+/// `01M04W3RZ333NC01R216MNXAFK`):
+///
+/// * ANY strategy that puts content in the folder MUST BRING ITS OWN COMPENSATION — for a git
+///   worktree: `git worktree remove --force`, then `git worktree prune` on the parent repo, so
+///   neither the disk nor `.git/worktrees` keeps an orphan. That compensation must itself be
+///   assumed FALLIBLE (dirty tree, lock held by another process) and stay best-effort, exactly
+///   like this one: a failed cleanup must never mask the original error being returned.
+/// * Do NOT "fix" this function by promoting it to `remove_dir_all` to cover the filled case.
+///   The leaf-only rule is what makes a rollback structurally unable to destroy a concurrent
+///   writer's data; a filling strategy owns the removal of what IT created, and only that.
+///
+/// The rest of the fill-strategy decisions (extension point, strategy A, branch, git safety)
+/// are recorded on [`create_workspace`].
+fn compensate_created_dir(path: &str, created: bool) {
+    if created {
+        let _ = std::fs::remove_dir(path);
+    }
 }
 
 /// Last path segment of `path` (the `workspace_add` default name): the basename after the
@@ -1157,42 +1253,102 @@ fn map_create_workspace_err(project_id: &str, e: diesel::result::Error) -> RpcEr
 }
 
 /// Shared body of `workspace_add` / `create_workspace`: register the workspace through the
-/// SHARED use case [`crate::usecase::register_workspace`] — the ONE application service the
-/// UI bridge ALSO drives (PDR-0005, task #7). The use case composes
+/// SHARED use case [`crate::usecase::register_workspace_anchored`] — the ONE application
+/// service the UI bridge ALSO reaches, there through the UNANCHORED
+/// `usecase::register_workspace` (PDR-0005, task #7). The use case composes
 /// [`crate::repository::register_workspace`] (insert + auto-detect Git repos under
 /// `root_path`, done_criterion #5) AND emits a `workspace.created` domain event through the
 /// injected [`crate::usecase::EventSink`] seam (task #8). Its failure is mapped to the D8
 /// vocabulary. The on-disk path handling (validate-existing vs mkdir-p) is done by the
 /// caller BEFORE this, so the two tools differ only in their filesystem precondition, not
-/// in the persistence path. Returns `{ workspace }`.
+/// in the persistence path.
+///
+/// `spec_id` (v2.5, OPTIONAL) ANCHORS that Spec on the freshly registered workspace inside the
+/// SAME DB transaction: either both writes land or neither does — a refused anchor leaves NO
+/// partial workspace behind. Returns `{ workspace }`, plus `spec` (the anchored Spec, whose
+/// status is untouched) when a `spec_id` was given — so the no-`spec_id` payload is
+/// byte-for-byte the pre-v2.5 one.
 fn create_workspace_inner(
     db: &Db,
     events: &dyn crate::usecase::EventSink,
     project_id: &str,
     name: &str,
     path: &str,
+    spec_id: Option<&str>,
 ) -> Result<Value, RpcError> {
-    let workspace = db
+    let (workspace, spec) = db
         .with_conn(|c| {
-            crate::usecase::register_workspace(
+            crate::usecase::register_workspace_anchored(
                 c,
                 events,
                 project_id,
                 name,
                 path,
+                spec_id,
                 crate::usecase::DomainEventSource::Mcp,
             )
         })
-        .map_err(|e| map_create_workspace_err(project_id, e))?;
-    Ok(json!({ "workspace": workspace }))
+        .map_err(|e| match e {
+            crate::usecase::RegisterWorkspaceError::Db(e) => {
+                map_create_workspace_err(project_id, e)
+            }
+            crate::usecase::RegisterWorkspaceError::Anchor(e) => {
+                crate::mcp_tools_spec::map_set_workspace_err(e)
+            }
+        })?;
+    match spec {
+        Some(spec) => Ok(json!({ "workspace": workspace, "spec": spec })),
+        None => Ok(json!({ "workspace": workspace })),
+    }
 }
 
-/// `workspace_add` — `{ project_id, path, name? }` → `{ workspace }`. Registers an EXISTING
-/// on-disk folder as a workspace (the *register an existing dir* tool — contrast
-/// `create_workspace`, which CREATES the folder first). The path is VALIDATED on disk
+/// PREVALIDATE the optional `spec_id` of `workspace_add` / `create_workspace` — READ-ONLY,
+/// through the shared [`crate::db::check_spec_anchorable`] authority — BEFORE any filesystem
+/// work. An unknown Spec, a `draft`/terminal one, or one belonging to another project is
+/// refused HERE, so `create_workspace` never `mkdir`s a folder for a link it was always going
+/// to reject. Returns the `spec_id` (borrowed) when present.
+fn prevalidate_spec_anchor<'a>(
+    db: &Db,
+    args: &'a Value,
+    project_id: &str,
+) -> Result<Option<&'a str>, RpcError> {
+    // [`anchor_str`], not `optional_str`: on THIS argument the empty string would mean "register the
+    // workspace unlinked" — the exact opposite of what a caller passing a `spec_id` is asking for
+    // (review F2). And it is read HERE, in the read-only prevalidation, which is what puts the
+    // refusal BEFORE `create_workspace`'s `mkdir`: an argument nyx will never accept must not cost a
+    // folder on disk.
+    let Some(spec_id) = anchor_str(
+        args,
+        "spec_id",
+        "register the workspace with NO Spec anchored",
+    )?
+    else {
+        return Ok(None);
+    };
+    db.with_conn(|c| crate::db::check_spec_anchorable(c, spec_id, project_id))
+        .map_err(crate::mcp_tools_spec::map_set_workspace_err)?;
+    Ok(Some(spec_id))
+}
+
+/// `workspace_add` — `{ project_id, path, name?, spec_id? }` → `{ workspace, spec? }`.
+/// Registers an EXISTING on-disk folder as a workspace (the *register an existing dir* tool —
+/// contrast `create_workspace`, which CREATES the folder first). The path is VALIDATED on disk
 /// BEFORE the shared-use-case write; `name` defaults to the path's last segment when
 /// omitted. Delegates the persistence + repo detection + domain-event emission to
-/// [`crate::usecase::register_workspace`] (the same use case the UI bridge calls).
+/// [`crate::usecase::register_workspace_anchored`] — the same use case the UI bridge reaches,
+/// but through the UNANCHORED `usecase::register_workspace`, never this DIRECT entry point.
+///
+/// `spec_id` (OPTIONAL) anchors that `ready`/`in_progress` Spec on the workspace in the SAME
+/// transaction, without ever transitioning it. It is PREVALIDATED before the FS check.
+///
+/// FUTURE FILL STRATEGIES: the decisions of 2026-08-18 (extension point, the compensation trap,
+/// strategy A / branch / git safety) are recorded on [`create_workspace`] and
+/// [`compensate_created_dir`] — READ THEM BEFORE TOUCHING EITHER TOOL, since both serve the same
+/// use case and share [`create_workspace_inner`]. They land on `create_workspace` because it is
+/// the one that owns the folder's existence; `workspace_add` registers a folder someone ELSE
+/// created, so it neither fills nor compensates — but a strategy that provisions a worktree
+/// out-of-band and then registers it arrives through THIS entry point, with the same
+/// consequences to think through.
 pub fn workspace_add(
     db: &Db,
     events: &dyn crate::usecase::EventSink,
@@ -1215,14 +1371,75 @@ pub fn workspace_add(
             derived
         }
     };
+    // The Spec anchor is prevalidated FIRST: a doomed link never reaches the filesystem.
+    let spec_id = prevalidate_spec_anchor(db, args, project_id)?;
     validate_existing_dir(path)?;
-    create_workspace_inner(db, events, project_id, &name, path)
+    create_workspace_inner(db, events, project_id, &name, path, spec_id)
 }
 
-/// `create_workspace` — `{ project_id, name, path }` → `{ workspace }`. The *creating-intent*
-/// sibling of `workspace_add`: it `mkdir -p`s the folder BEFORE registering, so an agent can
-/// ask nyx to track a folder that does not exist on disk yet. Both then share the SAME
-/// [`crate::usecase::register_workspace`] use case (the same one the UI bridge drives).
+/// `create_workspace` — `{ project_id, name, path, spec_id? }` → `{ workspace, spec? }`. The
+/// *creating-intent* sibling of `workspace_add`: it `mkdir -p`s the folder BEFORE registering,
+/// so an agent can ask nyx to track a folder that does not exist on disk yet. Both then share
+/// the SAME [`crate::usecase::register_workspace_anchored`] use case — the same one the UI
+/// bridge reaches through the UNANCHORED `usecase::register_workspace`.
+///
+/// ORDER (v2.5): the optional `spec_id` is PREVALIDATED before the `mkdir`, so a Spec that can
+/// never be anchored (unknown, `draft`, terminal, other project) leaves NO folder behind. And
+/// if the DB write fails AFTER a successful `mkdir`, the folder THIS call created is
+/// compensated — removed only while still empty, never touching a pre-existing path
+/// ([`compensate_created_dir`]).
+///
+/// # FUTURE FILL STRATEGIES — decisions of 2026-08-18, recorded here on purpose
+///
+/// This tool `mkdir`s and does NOTHING else: the folder it creates stays EMPTY — no clone, no
+/// worktree — because provisioning is explicitly out of scope for this PRD. A LATER PRD (depot
+/// idea `01M04W3RZ333NC01R216MNXAFK`) will add FILL STRATEGIES, a git worktree being the first.
+/// The five points below were already arbitrated with the user; they live HERE, on the function
+/// an agent will actually open, so that agent re-discovers nothing and forgets nothing.
+///
+/// 1. EXTENSION POINT. The current sequence is: prevalidation → [`ensure_dir_created`] →
+///    [`create_workspace_inner`] (DB) → [`compensate_created_dir`] if the DB fails. The fill
+///    inserts itself BETWEEN `ensure_dir_created` and `create_workspace_inner` (the exact spot
+///    is marked in the body below). Recommended shape: a `FillStrategy` enum consumed by an
+///    EXHAUSTIVE `match` with NO underscore arm — adding a variant then breaks the build at
+///    every site that must handle it, instead of silently falling through to the wrong
+///    behaviour. That pattern was just validated on this very PRD: see `SpecAnchor` in
+///    [`crate::mcp_context`] and the justification carried on its declaration. Do NOT build a
+///    speculative plugin abstraction while only ONE real strategy exists.
+///
+/// 2. THE MAIN TRAP, AND THE COSTLIEST ONE TO FORGET: compensation. [`compensate_created_dir`]
+///    does a LEAF-ONLY `remove_dir`, deliberately, so it will NOT clean a folder that has
+///    content — and a populated git worktree is not empty. Every filling strategy must
+///    therefore supply its own compensation (`git worktree remove --force`, then `prune`), and
+///    that compensation can itself fail. The full warning is written on that function: read it
+///    before writing any strategy.
+///
+/// 3. STRATEGY A — the only one planned for the first PRD: the source repo is THE ROOT, i.e.
+///    the `root_path` of the project's PRIMARY workspace (`projects.primary_workspace_id`).
+///    Design constraint to keep in mind, because it shapes the whole thing: nyx NEVER SCANS a
+///    workspace to guess its repos (see the header of [`crate::repository`]) — repos are
+///    EXPLICIT `relative_path` + `name` associations. So when the project declares explicit
+///    repos, the root is the one whose `relative_path` carries the MONO-REPO convention
+///    [`crate::repository::MONO_REPO_RELATIVE_PATH`] — `"."`, not the empty string. That is the
+///    canonical stored value everywhere (the module header of [`crate::repository`], the
+///    synthetic current-folder fallback); the empty string is tolerated ONLY as an alias when
+///    JOINING a path (`repository::join_relative`), so a selector that looks for it finds
+///    nothing on a normally configured mono-repo. Flat refusal if that path is not a git repo.
+///    Note also that `relative_path` ALREADY EXISTS in the model, so a future sub-repo strategy
+///    slots in without any redesign.
+///
+/// 4. BRANCH. A new branch is created SYSTEMATICALLY, its name derived from the workspace name.
+///    Base = the LOCAL HEAD of the source repo, NOT `origin/<default>`: no network access, and
+///    predictable behaviour offline. If the branch already exists, git refuses on its own —
+///    surface that error AS IS rather than inventing a suffix.
+///
+/// 5. GIT SAFETY. gix 0.85 is the PRIMARY backend, but for READING; it does not write worktrees.
+///    Worktree WRITES therefore go through the CLI fallback [`crate::proc_util::command`]
+///    (`"git"`), already used by [`crate::git_diff`]. That is an ASSUMED choice, not an
+///    oversight. `git worktree add` is atomic and takes its own locks, which sharply reduces the
+///    safety work left on the nyx side; what remains is mapping git errors onto the [`RpcCode`]
+///    vocabulary, on the model of [`map_create_workspace_err`], which already does exactly that
+///    for diesel errors.
 pub fn create_workspace(
     db: &Db,
     events: &dyn crate::usecase::EventSink,
@@ -1231,8 +1448,18 @@ pub fn create_workspace(
     let project_id = require_str(args, "project_id")?;
     let name = require_str(args, "name")?;
     let path = require_str(args, "path")?;
-    ensure_dir_created(path)?;
-    create_workspace_inner(db, events, project_id, name, path)
+    // Every validation that can be done WITHOUT touching the disk happens first.
+    let spec_id = prevalidate_spec_anchor(db, args, project_id)?;
+    let created = ensure_dir_created(path)?;
+    // ↓↓↓ THE FILL STRATEGY INSERTS ITSELF EXACTLY HERE ↓↓↓ — after the folder exists, before the
+    // DB write. Today the folder stays EMPTY (provisioning is out of scope). See the
+    // "FUTURE FILL STRATEGIES" section on this function for the five decisions of 2026-08-18, and
+    // [`compensate_created_dir`] for the compensation trap: a filled folder is NOT cleaned by the
+    // rollback below, so a strategy that fills MUST bring its own compensation here.
+    create_workspace_inner(db, events, project_id, name, path, spec_id).inspect_err(|_| {
+        // The DB half failed: undo the folder we just created (only if still empty).
+        compensate_created_dir(path, created);
+    })
 }
 
 /// The single entry point a shell's MCP dispatcher calls for the workspace registration
@@ -1825,16 +2052,19 @@ mod tests {
         assert!(dispatch_workspace_tool(&db, &sink, "list_projects", &json!({})).is_none());
     }
 
-    /// CONVERGENCE (task #7, PDR-0005): the UI bridge and the MCP surface reach the SAME
-    /// `usecase::register_workspace` for "create a workspace". This test drives BOTH paths
-    /// against the SAME in-process authority and asserts they produce the SAME persisted
-    /// effect (a workspace row) AND the SAME domain event — proving neither path carries a
-    /// private business path.
+    /// CONVERGENCE (task #7, PDR-0005): the UI bridge and the MCP surface share ONE
+    /// application service for "create a workspace" — `usecase::register_workspace_anchored`.
+    /// Since v2.5 they enter it through DISTINCT entry points and converge only INSIDE it.
+    /// This test drives BOTH paths against the SAME in-process authority and asserts they
+    /// produce the SAME persisted effect (a workspace row) AND the SAME domain event —
+    /// proving neither path carries a private business path.
     ///
     /// - MCP path: `dispatch_workspace_tool("create_workspace", …)` (the exact call the
-    ///   sidecar dispatcher makes).
+    ///   sidecar dispatcher makes) → `create_workspace_inner` → the anchored use case
+    ///   DIRECTLY, so the tool can carry its optional `spec_id`.
     /// - UI path: `usecase::register_workspace` (the exact call the UI bridge's
-    ///   `create_workspace` db-command makes — see `db_command.rs`).
+    ///   `create_workspace` db-command makes — see `db_command.rs`): the UNANCHORED wrapper,
+    ///   which reaches the same use case with `spec_id = None`.
     #[test]
     fn ui_and_mcp_create_workspace_share_one_use_case() {
         use crate::usecase::{self, test_support::RecordingEventSink, DomainEventKind};
@@ -1861,7 +2091,7 @@ mod tests {
         .expect("ok");
         let mcp_ws_id = mcp_res["workspace"]["id"].as_str().unwrap().to_string();
 
-        // UI path — the SAME use case the db-command bridge calls, with its own sink.
+        // UI path — the UNANCHORED wrapper the db-command bridge calls, with its own sink.
         let ui_sink = RecordingEventSink::new();
         let ui_ws = db
             .with_conn(|c| {
@@ -1886,6 +2116,572 @@ mod tests {
         // Both emitted the SAME domain-event kind through the SAME use case's seam.
         assert_eq!(mcp_sink.kinds(), vec![DomainEventKind::WorkspaceCreated]);
         assert_eq!(ui_sink.kinds(), vec![DomainEventKind::WorkspaceCreated]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- `spec_id` anchoring on the workspace tools (v2.5) -----------------
+
+    /// Seed a project plus a Spec driven to `status`, returning `(db, project_id, spec_id)`.
+    /// `ready` and `in_progress` are the two ANCHORABLE statuses; `draft` is the refused one.
+    fn seeded_project_with_spec(status: &str) -> (Db, String, String) {
+        let db = Db::in_memory();
+        let (project_id, spec_id) = db.with_conn(|c| {
+            let (project, _root) = db::create_project(c, "P", "/tmp/spec-anchor", None).unwrap();
+            let sections = db::SpecSections {
+                problem: "p".into(),
+                solution: "s".into(),
+                ..db::SpecSections::empty()
+            };
+            let (spec, _) = db::create_spec(c, &project.id, "S", sections).unwrap();
+            if status != db::SPEC_STATUS_DRAFT {
+                db::transition_spec(c, &spec.id, db::SpecTransition::Ready, true).unwrap();
+            }
+            if status == db::SPEC_STATUS_IN_PROGRESS {
+                db::transition_spec(c, &spec.id, db::SpecTransition::Start, true).unwrap();
+            }
+            (project.id, spec.id)
+        });
+        (db, project_id, spec_id)
+    }
+
+    /// DONE-CRITERION: "avec `spec_id`, les deux outils retournent un workspace dont la Spec
+    /// ready/in_progress est déjà ancrée et dont le statut est inchangé". Drives BOTH tools
+    /// (`create_workspace` on a fresh folder, `workspace_add` on an existing one) and asserts
+    /// the returned workspace carries the anchor AND that the Spec never transitioned.
+    #[test]
+    fn both_workspace_tools_anchor_the_spec_without_transitioning_it() {
+        let _g = db_guard();
+        for status in [db::SPEC_STATUS_READY, db::SPEC_STATUS_IN_PROGRESS] {
+            let (db, project_id, spec_id) = seeded_project_with_spec(status);
+            let base = temp_subdir("anchor");
+
+            // --- create_workspace: the folder does not exist yet.
+            let fresh = base.join("created");
+            let res = dispatch_workspace_tool(
+                &db,
+                &crate::usecase::NullEventSink,
+                "create_workspace",
+                &json!({
+                    "project_id": project_id,
+                    "name": "created",
+                    "path": fresh.to_string_lossy(),
+                    "spec_id": spec_id,
+                }),
+            )
+            .expect("dispatched")
+            .expect("create_workspace with spec_id ok");
+            let ws_id = res["workspace"]["id"].as_str().unwrap().to_string();
+            assert_eq!(
+                res["spec"]["workspace_id"],
+                json!(ws_id),
+                "the tool echoes the Spec ALREADY anchored on the new workspace ({status})"
+            );
+            assert_eq!(
+                res["spec"]["status"],
+                json!(status),
+                "anchoring NEVER transitions the Spec ({status})"
+            );
+            // The anchor is PERSISTED, not just echoed.
+            let stored = db
+                .with_conn(|c| db::get_spec(c, &spec_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.workspace_id.as_deref(), Some(ws_id.as_str()));
+            assert_eq!(stored.status, status, "the status is untouched in the DB");
+
+            // --- workspace_add: an EXISTING folder, re-anchoring the same Spec elsewhere.
+            let existing = base.join("added");
+            std::fs::create_dir_all(&existing).unwrap();
+            let res = dispatch_workspace_tool(
+                &db,
+                &crate::usecase::NullEventSink,
+                "workspace_add",
+                &json!({
+                    "project_id": project_id,
+                    "path": existing.to_string_lossy(),
+                    "spec_id": spec_id,
+                }),
+            )
+            .expect("dispatched")
+            .expect("workspace_add with spec_id ok");
+            let added_id = res["workspace"]["id"].as_str().unwrap().to_string();
+            assert_eq!(res["spec"]["workspace_id"], json!(added_id));
+            assert_eq!(res["spec"]["status"], json!(status));
+            let stored = db
+                .with_conn(|c| db::get_spec(c, &spec_id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.workspace_id.as_deref(),
+                Some(added_id.as_str()),
+                "workspace_add moved the anchor to the registered folder"
+            );
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// DONE-CRITERION: "draft, état terminal, Spec inconnue ou autre projet échouent avant
+    /// écriture DB et avant `mkdir`". Every refused `spec_id` leaves the filesystem UNTOUCHED
+    /// (no folder created) and the project workspace-less.
+    #[test]
+    fn create_workspace_refuses_a_bad_spec_before_touching_the_filesystem() {
+        let _g = db_guard();
+        let base = temp_subdir("prevalidate");
+
+        // A REFUSED case is driven as (label, db, project_id, spec_id, expected code, a needle
+        // the message must carry — the wording is agent-facing, so it is locked too).
+        let cases: Vec<(&str, Db, String, String, RpcCode, &str)> = {
+            let mut v = Vec::new();
+            // draft → invalid_state (still being authored).
+            let (db, project_id, spec_id) = seeded_project_with_spec(db::SPEC_STATUS_DRAFT);
+            v.push((
+                "draft",
+                db,
+                project_id,
+                spec_id,
+                RpcCode::InvalidState,
+                "can only be set while it is ready or in_progress",
+            ));
+            // terminal (cancelled) → invalid_state.
+            let (db, project_id, spec_id) = seeded_project_with_spec(db::SPEC_STATUS_READY);
+            db.with_conn(|c| db::transition_spec(c, &spec_id, db::SpecTransition::Cancel, true))
+                .unwrap();
+            v.push((
+                "cancelled",
+                db,
+                project_id,
+                spec_id,
+                RpcCode::InvalidState,
+                "can only be set while it is ready or in_progress",
+            ));
+            // unknown Spec → invalid_id.
+            let (db, project_id, _) = seeded_project_with_spec(db::SPEC_STATUS_READY);
+            v.push((
+                "unknown",
+                db,
+                project_id,
+                "no-such-spec".to_string(),
+                RpcCode::InvalidId,
+                "unknown spec",
+            ));
+            // a Spec of ANOTHER project → invalid_argument. The refusal is worded against the
+            // TARGET project: on this path NO workspace exists yet to belong to one.
+            let (db, _spec_project, spec_id) = seeded_project_with_spec(db::SPEC_STATUS_READY);
+            let foreign = db
+                .with_conn(|c| db::create_project(c, "Other", "/tmp/other", None))
+                .unwrap()
+                .0;
+            v.push((
+                "other project",
+                db,
+                foreign.id,
+                spec_id,
+                RpcCode::InvalidArgument,
+                "the workspace would be registered in project",
+            ));
+            v
+        };
+
+        for (label, db, project_id, spec_id, expected, needle) in cases {
+            let fresh = base.join(format!("never-created-{}", label.replace(' ', "-")));
+            assert!(!fresh.exists(), "precondition: {label} path is absent");
+            let err = dispatch_workspace_tool(
+                &db,
+                &crate::usecase::NullEventSink,
+                "create_workspace",
+                &json!({
+                    "project_id": project_id,
+                    "name": "WS",
+                    "path": fresh.to_string_lossy(),
+                    "spec_id": spec_id,
+                }),
+            )
+            .expect("dispatched")
+            .unwrap_err();
+            assert_eq!(err.code, expected, "{label} is refused with the D8 code");
+            assert!(
+                err.message.contains(needle),
+                "{label} explains itself with '{needle}', got: {}",
+                err.message
+            );
+            // NOTHING on this path may speak of a workspace BELONGING to a project: the
+            // prevalidation runs before any workspace is created or even looked up.
+            assert!(
+                !err.message.contains("workspace belongs to project"),
+                "{label} must not claim a workspace that does not exist yet, got: {}",
+                err.message
+            );
+            // BEFORE mkdir: nothing on disk.
+            assert!(
+                !fresh.exists(),
+                "{label} was refused BEFORE the folder was created"
+            );
+            // BEFORE the DB write: the project gained no workspace beyond its root.
+            let live = db
+                .with_conn(|c| db::list_workspaces(c, &project_id))
+                .unwrap();
+            assert!(
+                live.iter().all(|w| w.name != "WS"),
+                "{label} wrote no workspace row"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REVIEW F2 — THE EMPTY `spec_id`, ON THE TWO PARAMETERS THIS PRD ADDED.
+    ///
+    /// The symmetric half of the `spec_set_workspace` bug, on the anchoring surface this PRD is
+    /// itself responsible for: `workspace_add(spec_id: "")` and `create_workspace(spec_id: "")` went
+    /// through `optional_str` → `None` → NO anchoring, with no error whatsoever. The caller believed
+    /// it had linked the Spec and walked away with an UNLINKED workspace — the failure mode is
+    /// exactly the observed one, only the direction differs (not anchoring instead of un-anchoring).
+    ///
+    /// Two properties are pinned per tool: `""` is REFUSED with `invalid_argument` naming the
+    /// argument, and — for `create_workspace` — the refusal lands BEFORE the `mkdir`, so a mistyped
+    /// anchor leaves nothing on disk; and `null` / ABSENT are untouched, still registering an
+    /// UNLINKED workspace without an error, which is the whole point of the parameter being
+    /// optional.
+    #[test]
+    fn an_empty_spec_id_is_refused_before_the_mkdir_while_null_and_absent_still_register() {
+        let _g = db_guard();
+        let base = temp_subdir("empty-spec-id");
+
+        // --- create_workspace: "" is refused, and NOTHING is created (neither folder nor row).
+        let (db, project_id, _spec_id) = seeded_project_with_spec(db::SPEC_STATUS_READY);
+        let never = base.join("never-created");
+        assert!(!never.exists(), "precondition: the folder is absent");
+        let err = dispatch_workspace_tool(
+            &db,
+            &crate::usecase::NullEventSink,
+            "create_workspace",
+            &json!({
+                "project_id": project_id,
+                "name": "WS-empty",
+                "path": never.to_string_lossy(),
+                "spec_id": "",
+            }),
+        )
+        .expect("dispatched")
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("spec_id") && err.message.contains("EMPTY string"),
+            "the refusal names the offending argument and its fault, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("not a way to say 'none'"),
+            "…and distinguishes the empty string from the ABSENCE, got: {}",
+            err.message
+        );
+        assert!(
+            !never.exists(),
+            "the refusal landed BEFORE the mkdir — an argument nyx will never accept costs no folder"
+        );
+        assert!(
+            db.with_conn(|c| db::list_workspaces(c, &project_id))
+                .unwrap()
+                .iter()
+                .all(|w| w.name != "WS-empty"),
+            "…and no workspace row either"
+        );
+
+        // --- create_workspace: null and ABSENT are UNCHANGED — the workspace is created, UNLINKED.
+        for (label, anchor) in [
+            ("null", json!({ "spec_id": Value::Null })),
+            ("absent", json!({})),
+        ] {
+            let dir = base.join(format!("created-{label}"));
+            let mut args = json!({
+                "project_id": project_id,
+                "name": format!("WS-{label}"),
+                "path": dir.to_string_lossy(),
+            });
+            if let Some(spec_id) = anchor.get("spec_id") {
+                args["spec_id"] = spec_id.clone();
+            }
+            let res = dispatch_workspace_tool(
+                &db,
+                &crate::usecase::NullEventSink,
+                "create_workspace",
+                &args,
+            )
+            .expect("dispatched")
+            .unwrap_or_else(|e| panic!("{label} must still register a workspace: {e:?}"));
+            assert!(dir.exists(), "{label}: the folder WAS created");
+            assert!(
+                res.get("spec").is_none(),
+                "{label}: no Spec was anchored, and the payload says nothing about one: {res}"
+            );
+            assert!(
+                res["workspace"]["id"].is_string(),
+                "{label}: the workspace itself was registered: {res}"
+            );
+        }
+
+        // --- workspace_add: the SAME two properties, on a folder that already exists.
+        let existing = base.join("already-there");
+        std::fs::create_dir_all(&existing).unwrap();
+        let err = dispatch_workspace_tool(
+            &db,
+            &crate::usecase::NullEventSink,
+            "workspace_add",
+            &json!({
+                "project_id": project_id,
+                "path": existing.to_string_lossy(),
+                "name": "WS-add-empty",
+                "spec_id": "",
+            }),
+        )
+        .expect("dispatched")
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("spec_id") && err.message.contains("EMPTY string"),
+            "workspace_add refuses it the same way, got: {}",
+            err.message
+        );
+        assert!(
+            db.with_conn(|c| db::list_workspaces(c, &project_id))
+                .unwrap()
+                .iter()
+                .all(|w| w.name != "WS-add-empty"),
+            "the refused workspace_add wrote no row"
+        );
+
+        // …and the unlinked registration still works, on that very folder.
+        let res = dispatch_workspace_tool(
+            &db,
+            &crate::usecase::NullEventSink,
+            "workspace_add",
+            &json!({
+                "project_id": project_id,
+                "path": existing.to_string_lossy(),
+                "name": "WS-add-null",
+                "spec_id": Value::Null,
+            }),
+        )
+        .expect("dispatched")
+        .expect("null still means: register it, anchor nothing");
+        assert!(
+            res.get("spec").is_none(),
+            "null anchors no Spec, without an error: {res}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `workspace_add` applies the SAME prevalidation: a draft Spec is refused and NO workspace
+    /// row is written, even though the folder legitimately exists.
+    #[test]
+    fn workspace_add_refuses_a_draft_spec_and_writes_nothing() {
+        let _g = db_guard();
+        let (db, project_id, spec_id) = seeded_project_with_spec(db::SPEC_STATUS_DRAFT);
+        let existing = temp_subdir("add-draft");
+
+        let err = dispatch_workspace_tool(
+            &db,
+            &crate::usecase::NullEventSink,
+            "workspace_add",
+            &json!({
+                "project_id": project_id,
+                "path": existing.to_string_lossy(),
+                "spec_id": spec_id,
+            }),
+        )
+        .expect("dispatched")
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidState);
+        assert!(
+            existing.is_dir(),
+            "a refusal NEVER removes a pre-existing folder"
+        );
+        let live = db
+            .with_conn(|c| db::list_workspaces(c, &project_id))
+            .unwrap();
+        assert_eq!(live.len(), 1, "only the project's root workspace remains");
+
+        let _ = std::fs::remove_dir_all(&existing);
+    }
+
+    /// DONE-CRITERION: "une erreur DB ne laisse aucun workspace partiel ; un dossier neuf et
+    /// vide est compensé, un chemin préexistant reste intact". The DB failure is a real one —
+    /// an unknown project's FK violation, raised AFTER the `mkdir` — so the compensation path
+    /// is the one under test.
+    #[test]
+    fn a_db_failure_compensates_a_freshly_created_dir_but_never_a_preexisting_one() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let base = temp_subdir("compensate");
+
+        // (a) FRESH folder + failing DB write → the folder we created is removed.
+        let fresh = base.join("fresh-ws");
+        assert!(!fresh.exists());
+        let err = dispatch_workspace_tool(
+            &db,
+            &crate::usecase::NullEventSink,
+            "create_workspace",
+            &json!({ "project_id": "no-such-project", "name": "WS", "path": fresh.to_string_lossy() }),
+        )
+        .expect("dispatched")
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+        assert!(
+            !fresh.exists(),
+            "the folder created by this call was compensated after the DB failure"
+        );
+
+        // (b) PRE-EXISTING folder + failing DB write → the folder stays, untouched.
+        let preexisting = base.join("preexisting-ws");
+        std::fs::create_dir_all(&preexisting).unwrap();
+        std::fs::write(preexisting.join("keep.txt"), b"user data").unwrap();
+        let err = dispatch_workspace_tool(
+            &db,
+            &crate::usecase::NullEventSink,
+            "create_workspace",
+            &json!({ "project_id": "no-such-project", "name": "WS", "path": preexisting.to_string_lossy() }),
+        )
+        .expect("dispatched")
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+        assert!(
+            preexisting.is_dir() && preexisting.join("keep.txt").is_file(),
+            "a path nyx did not create is NEVER removed, content intact"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The compensation is LEAF-ONLY and that limit is INTENTIONAL: `create_workspace` on a
+    /// path with SEVERAL missing segments `mkdir -p`s them all, but a DB failure removes only
+    /// the last one — the intermediate parents stay. Walking back up would make the rollback a
+    /// recursive deletion, which the PRD puts out of scope (see [`compensate_created_dir`]).
+    /// This test exists to make that residue a frozen, deliberate outcome rather than a
+    /// surprise: what is left behind is EMPTY directories, and no workspace row.
+    #[test]
+    fn the_compensation_of_a_multi_segment_mkdir_removes_the_leaf_only() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let base = temp_subdir("multi-segment");
+        let parent = base.join("a");
+        let intermediate = parent.join("b");
+        let leaf = intermediate.join("c");
+        assert!(!parent.exists(), "precondition: 3 segments are all missing");
+
+        // The DB write fails (unknown project) AFTER the mkdir -p created the three segments.
+        let err = dispatch_workspace_tool(
+            &db,
+            &crate::usecase::NullEventSink,
+            "create_workspace",
+            &json!({ "project_id": "no-such-project", "name": "WS", "path": leaf.to_string_lossy() }),
+        )
+        .expect("dispatched")
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+
+        assert!(!leaf.exists(), "the LEAF segment is compensated");
+        assert!(
+            intermediate.is_dir() && parent.is_dir(),
+            "the parents created by the same mkdir -p SURVIVE — the compensation is leaf-only \
+             by decision, and what remains is empty directories on the requested path"
+        );
+        assert!(
+            std::fs::read_dir(&intermediate).unwrap().next().is_none(),
+            "…and the residue is EMPTY: nothing was written under it"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The ANCHOR half failing rolls the WORKSPACE half back: the two writes share ONE
+    /// transaction, so a refused anchor leaves NO partial workspace row. The refusal must be
+    /// raised INSIDE the transaction, which the tool cannot be made to do (it would take the
+    /// Spec being cancelled BETWEEN the prevalidation and the write) — so the test drives the
+    /// shared use case directly, which is exactly what the tool wraps.
+    ///
+    /// Only the DB half is under test here: the folder pre-exists (`temp_subdir` creates it)
+    /// and no tool-level compensation runs, so this test proves NOTHING about the filesystem.
+    /// [`a_db_failure_compensates_a_freshly_created_dir_but_never_a_preexisting_one`] is the
+    /// one that covers the `mkdir` compensation.
+    #[test]
+    fn a_refused_anchor_rolls_the_workspace_insert_back() {
+        let _g = db_guard();
+        let (db, project_id, spec_id) = seeded_project_with_spec(db::SPEC_STATUS_DRAFT);
+        let dir = temp_subdir("rollback");
+
+        let err = db
+            .with_conn(|c| {
+                crate::usecase::register_workspace_anchored(
+                    c,
+                    &crate::usecase::NullEventSink,
+                    &project_id,
+                    "WS",
+                    &dir.to_string_lossy(),
+                    Some(&spec_id),
+                    crate::usecase::DomainEventSource::Mcp,
+                )
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::usecase::RegisterWorkspaceError::Anchor(_)),
+            "the anchor half refused, got {err:?}"
+        );
+        let live = db
+            .with_conn(|c| db::list_workspaces(c, &project_id))
+            .unwrap();
+        assert_eq!(
+            live.len(),
+            1,
+            "the workspace insert rolled back with the refused anchor (root only)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DONE-CRITERION: "sans `spec_id`, le contrat existant est strictement inchangé". `spec_id`
+    /// was added to BOTH tools, so BOTH are driven here: the result payload carries `workspace`
+    /// and NOTHING else — no `spec` key — exactly as before v2.5. The two differ only in their
+    /// filesystem precondition (`workspace_add` registers an EXISTING folder, `create_workspace`
+    /// creates it), never in the shape of what they return.
+    #[test]
+    fn without_spec_id_the_result_payload_is_unchanged() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/no-spec", None))
+            .unwrap();
+        let base = temp_subdir("no-spec");
+
+        // (tool, does the folder have to exist BEFORE the call?)
+        for (tool, preexisting) in [("create_workspace", false), ("workspace_add", true)] {
+            let dir = base.join(tool);
+            if preexisting {
+                std::fs::create_dir_all(&dir).unwrap();
+            }
+
+            let res = dispatch_workspace_tool(
+                &db,
+                &crate::usecase::NullEventSink,
+                tool,
+                &json!({ "project_id": project.id, "name": tool, "path": dir.to_string_lossy() }),
+            )
+            .expect("dispatched")
+            .expect("ok");
+            assert!(res["workspace"].is_object(), "{tool} returns the workspace");
+            assert!(
+                res.get("spec").is_none(),
+                "{tool}: no spec_id ⇒ no `spec` key: the pre-v2.5 payload is preserved"
+            );
+            assert_eq!(
+                res.as_object().map(|o| o.len()),
+                Some(1),
+                "{tool}: the payload carries EXACTLY the pre-v2.5 key set"
+            );
+            assert!(dir.is_dir(), "{tool}: the folder handling is unchanged");
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

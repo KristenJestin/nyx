@@ -1041,8 +1041,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "stop_command" => "Stop a running managed command. Identify it by its `instance_id` from list_commands. The result reports `changed` (whether a live process was actually stopped) and `was_running`, so a stop on an already-idle command is a clear no-op rather than a false success.",
             "relaunch_command" => "Restart a managed command in place (stop then start the same instance) — useful after a config or code change. This ALWAYS restarts (unlike start_command, which no-ops on a running command); the result reports `restarted:true`. Identify it by its `instance_id` from list_commands. Pass an optional `env` map (KEY→VALUE strings) to set environment variables for the fresh run, merged onto the inherited environment.",
             "get_command_output" => "Read a managed command's captured output (logs, errors, a dev server's URL, test results). Identify the command by `instance_id`, or by `name` within a `workspace_id`. Returns a token-safe tail by default, with terminal color/control codes already stripped (set strip_ansi:false for raw bytes). Use `grep` to return only matching lines (e.g. errors) or `tail_lines` for the last N lines. Reads are incremental: the result includes a `cursor` you can pass back as `since` to fetch only new output on the next read. Oversize handling: a request whose window exceeds the 1 MiB ceiling fails with a structured error carrying `error.data.code=\"output_too_large\"` plus `error.data.requested`/`error.data.limit` (bytes) — detect that code and retry with a smaller `tail_bytes` rather than guessing.",
-            "workspace_add" => "Register an EXISTING on-disk folder as a workspace under a project, so nyx tracks it and can run commands in it. The folder must already exist — a non-existent path or a file (not a directory) is rejected. Use create_workspace instead when nyx should CREATE the folder.",
-            "create_workspace" => "CREATE a new folder on disk (mkdir -p, including any missing parents) and register it as a workspace under a project. Use when the folder does not exist yet and the user wants nyx to start tracking a brand-new working folder. To register a folder that already exists, use workspace_add (which does NOT create anything).",
+            "workspace_add" => "Register an EXISTING on-disk folder as a workspace under a project, so nyx tracks it and can run commands in it. The folder must already exist — a non-existent path or a file (not a directory) is rejected. Use create_workspace instead when nyx should CREATE the folder. Pass spec_id to ANCHOR a ready/in_progress Spec on the workspace in the same operation (the Spec's status is never changed). The result then carries the anchored Spec under `spec` next to `workspace`, so you do not need a second call to read it back; without spec_id the result is `{workspace}` alone.",
+            "create_workspace" => "CREATE a new folder on disk (mkdir -p, including any missing parents) and register it as a workspace under a project. Use when the folder does not exist yet and the user wants nyx to start tracking a brand-new working folder. To register a folder that already exists, use workspace_add (which does NOT create anything). Pass spec_id to ANCHOR a ready/in_progress Spec on the workspace in the same operation (validated before the folder is created; the Spec's status is never changed). The result then carries the anchored Spec under `spec` next to `workspace`, so you do not need a second call to read it back; without spec_id the result is `{workspace}` alone.",
             _ => "",
         }
     };
@@ -1119,6 +1119,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         "project_id": str_prop("project to register the workspace in"),
                         "path": str_prop("path to an EXISTING on-disk folder (must already exist and be a directory; not created)"),
                         "name": str_prop("optional display name (defaults to the path's basename)"),
+                        "spec_id": str_prop("optional Spec to ANCHOR on this workspace in the same operation, so later calls resolve the Spec from the workspace instead of needing its id. The Spec must be ready or in_progress and belong to the same project; anchoring never changes its status. An EMPTY string is refused rather than read as 'no Spec' — omit the argument to register the workspace unlinked"),
                     }),
                     vec!["project_id", "path"],
                 ),
@@ -1127,6 +1128,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         "project_id": str_prop("project to create the workspace in"),
                         "name": str_prop("workspace display name"),
                         "path": str_prop("folder path to CREATE (mkdir -p, including missing parents) then register; use workspace_add if the folder already exists"),
+                        "spec_id": str_prop("optional Spec to ANCHOR on this workspace in the same operation, so later calls resolve the Spec from the workspace instead of needing its id. The Spec must be ready or in_progress and belong to the same project; anchoring never changes its status. It is validated BEFORE the folder is created — an EMPTY string is refused there too, so a mistyped anchor leaves no folder behind; omit the argument to create the workspace unlinked"),
                     }),
                     vec!["project_id", "name", "path"],
                 ),
@@ -1350,6 +1352,15 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                     "type": "boolean",
                     "description": "optional; when true, resume this project's active agent \
                                    sessions at relaunch instead of a bare shell. Unchanged if omitted.",
+                }),
+                "worktrees_root": json!({
+                    "type": "string",
+                    "description": "optional; the ROOT FOLDER this project's dev workspaces are \
+                                   created under. Set it once and a flow that opens a workspace \
+                                   (e.g. /nspec answered 'go' at its commit) derives the folder \
+                                   from it instead of asking you where. Pass an empty string (or \
+                                   null) to CLEAR it, which puts the flow back on asking. Unchanged \
+                                   if omitted.",
                 }),
             },
             "required": ["project_id"],
@@ -1809,17 +1820,18 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     // transition at the graph node built for it (ndev/nspec), so the effector never transitions a Spec.
     descriptors.push(json!({
         "name": crate::mcp_tools_spec::SPEC_SET_WORKSPACE_TOOL,
-        "description": "RE-anchor a Spec on a dev workspace (its repos + project are derived \
-                        through that workspace), or detach it by omitting workspace_id. Only \
-                        allowed while the Spec is in_progress — a draft/ready Spec is refused: the \
-                        anchor is first posed at the ready→in_progress start transition \
-                        (spec_transition), and this tool only CORRECTS it afterwards. The \
-                        workspace must exist. Returns the updated spec.",
+        "description": "Anchor a Spec on a dev workspace (its repos + project are derived \
+                        through that workspace), or detach it by omitting workspace_id. Allowed \
+                        while the Spec is ready or in_progress — a draft Spec (still being \
+                        authored) and a settled/parked one are refused. Linking NEVER changes the \
+                        Spec's status. The workspace must exist and belong to the SAME project as \
+                        the Spec. Re-applying the anchor the Spec already has is a no-op. Returns \
+                        the updated spec.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the in_progress Spec to re-anchor/detach"),
-                "workspace_id": str_prop("the dev workspace to anchor on (from list_workspaces); omit or null to detach"),
+                "spec_id": str_prop("the ready or in_progress Spec to anchor/re-anchor/detach"),
+                "workspace_id": str_prop("the dev workspace to anchor on (from list_workspaces); omit or null to detach. An EMPTY string is refused, never read as a detach — detaching is an act you ask for by omitting the argument, not something an uninitialized variable should trigger"),
             },
             "required": ["spec_id"],
         },
@@ -1971,18 +1983,41 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         carries project_id beside the manual: a Spec belongs to a project from the \
                         moment it exists, so the project is there even before any code and before \
                         any dev workspace — which is the NORMAL state for role=prototype, and that \
-                        id is what every design_* tool takes. For role=spec with NO Spec yet, it \
-                        renders the PROJECT-scoped authoring manual instead (a Spec is a project \
-                        artifact the author creates), resolving the project from run_id, project_id \
-                        or the cwd/workspace — never an error.",
+                        id is what every design_* tool takes. For role=spec with NO Spec yet (ZERO \
+                        anchored on the location), it renders the PROJECT-scoped authoring manual \
+                        instead (a Spec is a project artifact the author creates), resolving the \
+                        project from run_id, project_id or the cwd/workspace — never an error for \
+                        want of a Spec. That exemption covers ZERO ONLY: role=spec is NOT exempt \
+                        from the AMBIGUOUS case, where a location anchoring SEVERAL active Specs is \
+                        refused for EVERY role alike (the location is settled before the role is \
+                        read) — see RESOLUTION ORDER. \
+                        RESOLUTION ORDER: spec_id, then run_id (a run bound to no Spec resolves \
+                        NONE — the answer stops at the run), then workspace_id, then cwd. Resolving \
+                        BY LOCATION (workspace_id / cwd) is exact: the ONE active Spec anchored \
+                        there resolves; zero resolves none — and SAYS so rather than rendering a \
+                        manual that looks scoped: the answer stays ok for role=dev/spec but carries \
+                        a `warnings` entry, plus the SAME sentence inside the rendered text as a \
+                        'NO SPEC ANCHORED' line. THE THREE CASE-0 CODES, exhaustively — they say \
+                        WHICH of three very different situations you are in, so read the code and \
+                        not just the null spec_id: 'spec_none_on_location' when the location IS a \
+                        workspace and it simply anchors no active Spec (legitimate — a project's \
+                        first /nspec starts exactly there); 'spec_location_unresolved' when no \
+                        workspace matched at all — that one means you are calling from the wrong \
+                        folder; 'spec_run_unbound' when a run_id was passed and RESOLVED but the \
+                        RUN drives no Spec — the location is not at fault and 'pass a cwd' would \
+                        name the wrong fix, an authoring run simply has no Spec until it creates \
+                        one. SEVERAL is refused with \
+                        invalid_argument, data.reason='spec_ambiguous_for_workspace' and the \
+                        candidates listed — nyx never picks the most recent. Terminal \
+                        (completed/cancelled) and archived Specs are never candidates.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "role": str_prop("spec | dev | coder | auditor | doc | prototype — which manual to render"),
                 "run_id": str_prop("the run you were spawned for — the ONE anchor a sub-agent needs: it carries the Spec the run drives and, before there is one, the workspace it opened against. Pass the run_id the spawn action was ticking; an unknown one is refused rather than rendered empty"),
                 "spec_id": str_prop("the Spec to render the context for (preferred)"),
-                "workspace_id": str_prop("optional: resolve the Spec via its anchored dev workspace when spec_id is absent"),
-                "cwd": str_prop("optional: resolve the Spec (or, for role=spec authoring, the project) via the workspace whose path matches this cwd when spec_id/workspace_id are absent"),
+                "workspace_id": str_prop("optional: resolve the Spec via its anchored dev workspace when spec_id is absent — exactly one active Spec must be anchored there (several is refused with the candidates listed, none resolves nothing)"),
+                "cwd": str_prop("optional: resolve the Spec (or, for role=spec authoring, the project) via the workspace whose path matches this cwd when spec_id/workspace_id are absent. The deepest matching workspace root wins; then the same one-active-Spec rule as workspace_id applies"),
                 "project_id": str_prop("optional: for role=spec authoring with no Spec yet, the project to author in (else resolved from cwd/workspace_id). When a Spec DOES resolve it is only checked, never applied — a Spec's project is a fact of the Spec, and naming another one is refused rather than ignored; read the project_id the answer returns instead"),
                 "subject": str_prop("optional: the spawn action's own `subject`. When it names a Spec section (problem | solution | implementation_decisions | testing_decisions | user_stories | out_of_scope), ONLY that section is reproduced — pass back the subject you were spawned with, so the pass reads the commitment it is about and not the other five"),
             },
@@ -2731,13 +2766,28 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         or cwd) when there is one. Returns { run_id, workflow_id, spec_id, scope, \
                         warnings }: RELAY every warnings[].message to the human — each names \
                         something they must act on (a run DROPPED because its graph changed, a gate \
-                        that verifies nothing, a run started bound to no Spec).",
+                        that verifies nothing, a run started bound to no Spec, or a cwd that \
+                        matched NO workspace — code 'run_location_unresolved', the run then opens \
+                        with no workspace anchor at all and its effectors resolve no repos, which \
+                        usually means the caller is running from the wrong folder). \
+                        RESOLVING BY LOCATION (workspace_id / cwd) is exact: the ONE active Spec \
+                        anchored there binds the run; zero or several bind none — nyx never picks \
+                        the most recent. What happens next depends on the flow: one that works ON a \
+                        Spec (ndev, ndoc, coder, prototyper) is REFUSED, with the candidates listed \
+                        on the ambiguous case (data.reason='spec_ambiguous_for_workspace'); a flow \
+                        that works on NO existing Spec — scope 'nspec', which creates its own, or \
+                        'custom', which declares none — STARTS UNBOUND, keeps its workspace \
+                        anchor, and reports the ambiguity as a warning \
+                        (code 'spec_ambiguous_started_unbound'). That exception reads the `scope` \
+                        ARGUMENT, so an explicit workflow_id — which leaves scope at its 'ndev' \
+                        default — keeps the refusal. Pass an explicit spec_id to work on one of \
+                        the candidates.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "spec_id": str_prop("optional: the Spec to bind the run to (its lifecycle transitions then apply); resolved from workspace_id/cwd when omitted"),
-                "workspace_id": str_prop("optional: resolve the Spec + project from this workspace"),
-                "cwd": str_prop("optional: resolve the Spec + project from the workspace whose path matches this cwd"),
+                "workspace_id": str_prop("optional: resolve the Spec + project from this workspace — exactly one active Spec must be anchored there for the run to bind one"),
+                "cwd": str_prop("optional: resolve the Spec + project from the workspace whose path matches this cwd (deepest matching root wins), then the same one-active-Spec rule as workspace_id"),
                 "workflow_id": str_prop("optional: run THIS workflow explicitly, bypassing scope resolution"),
                 "scope": str_prop("optional: which workflow family to run (ndev | nspec | ndoc); defaults to ndev. coder/prototyper are SUB-WORKFLOW-ONLY (opened by a sub_workflow node), not started here"),
             },
@@ -2799,7 +2849,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         run again. \
                         done — the run is over; stop calling. \
                         AND NOTHING ELSE WILL EVER REACH YOU. gate_check, transition, \
-                        transition_task, query, fork_spec and note are nyx's OWN effects: nyx holds \
+                        transition_task, query, fork_spec, create_workspace and note are nyx's OWN \
+                        effects: nyx holds \
                         the PTY, the Spec authority and the DB, so it runs them INSIDE the tick and \
                         you never see them. Do not wait for one — a dispatcher parked on a gate_check \
                         it expects to be handed waits for something that never comes; the tick that \
@@ -3803,9 +3854,28 @@ mod tests {
             body
         );
         stream.write_all(req.as_bytes()).unwrap();
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw).unwrap();
-        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+        read_http_response(&mut stream)
+    }
+
+    /// Read a whole HTTP response off `stream` and return its `(status_line, body)`.
+    ///
+    /// ON BYTES, NEVER THROUGH A `String`. A chunked response INTERLEAVES its
+    /// `\r\n<size>\r\n` framing at arbitrary byte offsets of the payload, so the RAW stream can
+    /// carry a multi-byte UTF-8 character CUT IN HALF by a chunk header even though the DECODED
+    /// body is perfectly valid text. Reading the raw stream with `read_to_string` therefore failed
+    /// with "stream did not contain valid UTF-8" as soon as the catalog's byte length happened to
+    /// land a chunk boundary inside one of the `—` these descriptions are full of: a test that
+    /// reddens on the LENGTH of a tool description, saying nothing whatever about the code (and
+    /// `dechunk` would then have panicked slicing at a non-char boundary anyway). Framing is
+    /// decoded on bytes; UTF-8 is asserted ONCE, on the reassembled body, where it is real.
+    fn read_http_response(stream: &mut TcpStream) -> (String, String) {
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let (head, body) = match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(i) => (&raw[..i], &raw[i + 4..]),
+            None => (&raw[..], &[][..]),
+        };
+        let head = String::from_utf8_lossy(head).into_owned();
         let status_line = head.lines().next().unwrap_or("").to_string();
         // tiny_http streams a large response with `Transfer-Encoding: chunked` (no
         // Content-Length) once the body exceeds its buffering threshold — which the full
@@ -3819,35 +3889,40 @@ mod tests {
         let body = if is_chunked {
             dechunk(body)
         } else {
-            body.to_string()
+            body.to_vec()
         };
-        (status_line, body)
+        (
+            status_line,
+            String::from_utf8(body).expect("the DECODED body is valid UTF-8"),
+        )
     }
 
     /// Decode an HTTP/1.1 `Transfer-Encoding: chunked` body into its payload: repeatedly
     /// read a hex chunk-size line, then that many bytes, until the terminating `0` chunk.
     /// A tiny decoder (the test bodies are small JSON) so the test HTTP client needs no
-    /// HTTP crate.
-    fn dechunk(mut s: &str) -> String {
-        let mut out = String::new();
+    /// HTTP crate. Byte-oriented on purpose — see [`read_http_response`].
+    fn dechunk(mut s: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
         // The loop ends the moment the remaining input no longer starts with a
         // `size-line CRLF` header — the same exit the previous `let-else break`
         // expressed — while the inner `break`s (terminating `0` chunk, truncated
         // body) still short-circuit before the next iteration.
-        while let Some((size_line, rest)) = s.split_once("\r\n") {
+        while let Some(i) = s.windows(2).position(|w| w == b"\r\n") {
+            let (size_line, rest) = (&s[..i], &s[i + 2..]);
             // The chunk-size line may carry `;ext` extensions — take the hex prefix only.
+            let size_line = String::from_utf8_lossy(size_line);
             let hex = size_line.split(';').next().unwrap_or("").trim();
             let n = usize::from_str_radix(hex, 16).unwrap_or(0);
             if n == 0 {
                 break;
             }
             if rest.len() < n {
-                out.push_str(rest);
+                out.extend_from_slice(rest);
                 break;
             }
-            out.push_str(&rest[..n]);
+            out.extend_from_slice(&rest[..n]);
             // Skip the chunk's trailing CRLF before the next size line.
-            s = rest[n..].strip_prefix("\r\n").unwrap_or(&rest[n..]);
+            s = rest[n..].strip_prefix(&b"\r\n"[..]).unwrap_or(&rest[n..]);
         }
         out
     }
@@ -3889,20 +3964,7 @@ mod tests {
             body
         );
         stream.write_all(req.as_bytes()).unwrap();
-        let mut raw = String::new();
-        stream.read_to_string(&mut raw).unwrap();
-        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
-        let status_line = head.lines().next().unwrap_or("").to_string();
-        let is_chunked = head.lines().any(|l| {
-            let l = l.to_ascii_lowercase();
-            l.starts_with("transfer-encoding:") && l.contains("chunked")
-        });
-        let body = if is_chunked {
-            dechunk(body)
-        } else {
-            body.to_string()
-        };
-        (status_line, body)
+        read_http_response(&mut stream)
     }
 
     #[test]
@@ -4059,6 +4121,181 @@ mod tests {
         assert!(
             create.contains("create") && create.contains("workspace_add"),
             "create_workspace says it CREATES a folder and points at workspace_add, got: {create}"
+        );
+        // v2.5: BOTH workspace tools advertise the OPTIONAL `spec_id` anchor — declared in
+        // `properties` but ABSENT from `required`, so the pre-v2.5 call shape stays valid —
+        // AND they announce what `spec_id` adds to the RESULT, since a tools/list reader has
+        // no other way to learn that the anchored Spec comes back with the workspace.
+        for name in ["workspace_add", "create_workspace"] {
+            let desc = desc_of(name);
+            assert!(
+                desc.contains("spec_id") && desc.contains("under `spec`"),
+                "{name} announces the conditional `spec` key of its RESULT, got: {desc}"
+            );
+            let schema = tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .map(|t| &t["inputSchema"])
+                .unwrap_or_else(|| panic!("{name} is advertised"));
+            assert!(
+                schema["properties"]["spec_id"].is_object(),
+                "{name} advertises the optional spec_id anchor"
+            );
+            let required = schema["required"].as_array().expect("required array");
+            assert!(
+                !required.iter().any(|r| r == "spec_id"),
+                "{name} keeps spec_id OPTIONAL (the existing contract is unchanged without it)"
+            );
+        }
+    }
+
+    /// DONE-CRITERION (task `01KYA4D8ZWDK8D0H28PVRE5PGJ`): the surfaces an agent reads BEFORE it
+    /// calls anything — the tool descriptors — must state the resolution contract EXACTLY, because
+    /// a descriptor that leaves it implicit is how "nyx probably picks the one I mean" gets
+    /// believed. Three things are asserted, on the four tools concerned:
+    ///   * the ANCHORING tools bound the link to `ready`/`in_progress` and promise NO status change
+    ///     (and the corrective `spec_set_workspace` says a draft is refused);
+    ///   * the RESOLVING tools spell out 0/1/N — the ambiguity `reason`, the candidate list, and
+    ///     the explicit denial that the most recent Spec wins;
+    ///   * `run_start` documents the AUTHORING exception: unbound + a warning, never an arbitrary
+    ///     Spec;
+    ///   * and the ZERO case speaks by CODE on both tools — `agent_context` names every case-0
+    ///     code it can emit (scanned from `mcp_context.rs`, so a new one added mute goes red) and
+    ///     `run_start` names `run_location_unresolved`.
+    #[test]
+    fn the_spec_anchor_and_resolution_tools_document_the_contract_they_enforce() {
+        let tools = tool_descriptors();
+        let desc_of = |n: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t["name"] == n)
+                .and_then(|t| t["description"].as_str())
+                .unwrap_or_else(|| panic!("{n} is advertised"))
+                .to_lowercase()
+        };
+
+        // ANCHORING — bounded to ready/in_progress, and never a transition.
+        for name in ["workspace_add", "create_workspace"] {
+            let desc = desc_of(name);
+            assert!(
+                desc.contains("ready/in_progress") || desc.contains("ready or in_progress"),
+                "{name} bounds the anchor to the two anchorable statuses, got: {desc}"
+            );
+            assert!(
+                desc.contains("status is never changed"),
+                "{name} promises the link poses no transition, got: {desc}"
+            );
+        }
+        let set_ws = desc_of(crate::mcp_tools_spec::SPEC_SET_WORKSPACE_TOOL);
+        assert!(
+            set_ws.contains("ready or in_progress") && set_ws.contains("never changes"),
+            "spec_set_workspace states the same two facts, got: {set_ws}"
+        );
+        assert!(
+            set_ws.contains("draft") && set_ws.contains("refused"),
+            "spec_set_workspace says a draft Spec is REFUSED (no anchoring an unfinished Spec), \
+             got: {set_ws}"
+        );
+
+        // RESOLVING — the 0/1/N contract, named, with the recency pick explicitly denied.
+        for name in [
+            crate::mcp_context::AGENT_CONTEXT_TOOL,
+            crate::mcp_engine::RUN_START_TOOL,
+        ] {
+            let desc = desc_of(name);
+            assert!(
+                desc.contains("spec_ambiguous_for_workspace"),
+                "{name} names the machine-readable ambiguity reason, got: {desc}"
+            );
+            assert!(
+                desc.contains("never picks the most recent"),
+                "{name} denies the newest-wins reading outright, got: {desc}"
+            );
+        }
+
+        // …and the AUTHORING exception, which only run_start has.
+        let run_start = desc_of(crate::mcp_engine::RUN_START_TOOL);
+        assert!(
+            run_start.contains("spec_ambiguous_started_unbound")
+                && run_start.contains("starts unbound"),
+            "run_start documents that an authoring flow proceeds unbound with a warning, got: \
+             {run_start}"
+        );
+
+        // THE CASE-0 CODES of `agent_context` — the OTHER end of the same 0/1/N contract, and the
+        // one an agent meets on its nominal path (a first `/nspec` has no Spec yet).
+        //
+        // The list is NOT hand-kept here. It is SCANNED out of `mcp_context.rs`, whose
+        // `*_WARNING_CODE` constants ARE that channel — so a FOURTH code declared there without a
+        // word in the descriptor turns this test red, which is exactly the failure being closed: an
+        // enumeration that names 2 of its 3 codes reads as EXHAUSTIVE, and an agent meeting the
+        // missing one concludes nyx is broken rather than that its run is simply unbound.
+        //
+        // NEITHER VISIBILITY NOR INDENTATION IS PART OF THE PATTERN: `const`, `pub const` and
+        // `pub(crate) const` all read the same. Promoting a code to `pub(crate)` so a test can pin
+        // it by name — precisely what `mcp_engine.rs`'s `RUN_LOCATION_UNRESOLVED_WARNING_CODE` was
+        // just put through — must not be the move that drops it out of the scan. And the scan now
+        // AUDITS ITS OWN READING: every line declaring a `*_WARNING_CODE` must also yield a
+        // literal, so a declaration this pattern cannot parse (wrapped onto two lines, say) fails
+        // the count instead of vanishing from it in silence.
+        const CONTEXT_SRC: &str =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_context.rs"));
+        // `const NAME…` whatever its indentation and whatever visibility precedes it — the
+        // declaration keyword identifies the line, never the column it happens to start in.
+        fn const_declaration(line: &str) -> Option<&str> {
+            let (vis, rest) = line.trim_start().split_once("const ")?;
+            let vis = vis.trim_end();
+            (vis.is_empty() || vis == "pub" || (vis.starts_with("pub(") && vis.ends_with(')')))
+                .then_some(rest)
+        }
+        let agent_ctx = desc_of(crate::mcp_context::AGENT_CONTEXT_TOOL);
+        let mut declared = 0usize;
+        let mut scanned: Vec<&str> = Vec::new();
+        for line in CONTEXT_SRC.lines() {
+            let Some(rest) = const_declaration(line) else {
+                continue;
+            };
+            if !rest.contains("_WARNING_CODE") {
+                continue;
+            }
+            declared += 1;
+            let Some((_, literal)) = rest.split_once("_WARNING_CODE: &str = \"") else {
+                continue;
+            };
+            let code = literal.trim_end_matches("\";").trim_end_matches('"');
+            assert!(
+                agent_ctx.contains(code),
+                "agent_context must NAME the warning code '{code}' it can emit — a descriptor that \
+                 lists only some of its codes is read as the whole list, got: {agent_ctx}"
+            );
+            scanned.push(code);
+        }
+        assert_eq!(
+            scanned.len(),
+            declared,
+            "every `*_WARNING_CODE` DECLARED in mcp_context.rs was actually read by the scan — a \
+             declaration whose literal the pattern cannot reach must fail here rather than slip \
+             through unconfronted; {declared} declared, read {scanned:?}"
+        );
+        assert_eq!(
+            scanned.len(),
+            3,
+            "the scan really found mcp_context.rs's 3 case-0 codes (a pattern that silently matched \
+             nothing would make the loop above vacuous); got {scanned:?}"
+        );
+
+        // run_start's OWN location code — the run-side half of the same review finding: a `cwd`
+        // matching no workspace opens a run with no anchor and effectors with no repos.
+        //
+        // Pinned by NAME only, not by the same scan: `mcp_engine.rs` declares seven warning codes,
+        // and several are covered by the descriptor as a CATEGORY rather than by their code (a
+        // stale graph fork, a query on an unbound run). Widening the rule to that module is a
+        // separate decision from this PRD's.
+        assert!(
+            run_start.contains(crate::mcp_engine::RUN_LOCATION_UNRESOLVED_WARNING_CODE),
+            "run_start names '{}' among the warnings it tells the caller to relay, got: \
+             {run_start}",
+            crate::mcp_engine::RUN_LOCATION_UNRESOLVED_WARNING_CODE
         );
     }
 

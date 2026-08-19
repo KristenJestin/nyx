@@ -13,6 +13,9 @@ effector, inline, so it can grill you). Follow it. If both are absent (nyx sidec
 them yourself: call `run_start` with `{ "scope": "nspec", "cwd": "<this workspace>" }`, then the
 `agent_context` MCP tool with `{ "role": "dev", "scope": "nspec", "run_id": "<the run it opened>" }`.
 
-Read the text below as the human's intent, not as flags to parse: an optional Spec id selects the Spec to work on; the free text is the instruction. With no id, a fresh Spec is created through the flow.
+Read the text below as the human's intent, not as flags to parse: an optional Spec id selects the Spec
+to work on; the free text is the instruction. With no id, a fresh Spec is created through the flow —
+so a workspace anchoring zero Specs, or several, does NOT refuse this flow: it starts bound to no Spec
+(never an arbitrary one), keeps the workspace anchor, and reports the ambiguity as a warning.
 
 $ARGUMENTS

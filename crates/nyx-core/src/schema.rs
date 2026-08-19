@@ -150,6 +150,13 @@ diesel::table! {
     }
 }
 
+// - the worktrees_root migration (the WHERE of a dev workspace) adds `projects.worktrees_root` — the
+//   project-level root folder
+//   every dev workspace of that project lands under, NULLABLE and NULL by default (a project that
+//   never sets it is asked for a path instead, so nothing changes for anyone who ignores it).
+//   Appended LAST on `projects` (positional decoding), same shape and same level as
+//   `resume_agent_sessions` (v8). The same migration widens `nodes.type` with `create_workspace`, the
+//   leaf that lands one from a graph.
 diesel::table! {
     projects (id) {
         id -> Text,
@@ -163,6 +170,7 @@ diesel::table! {
         key -> Text,
         primary_workspace_id -> Nullable<Text>,
         archived_at -> Nullable<BigInt>,
+        worktrees_root -> Nullable<Text>,
     }
 }
 
@@ -561,15 +569,15 @@ diesel::table! {
 //   — the tree root, set after nodes exist), `forked_from` (Nullable self-FK SET NULL — fork
 //   provenance), epoch-ms `created_at`/`updated_at`. `nodes`: the PURE tree — `workflow_id` (FK
 //   CASCADE), `parent_id` (Nullable self-FK CASCADE — NULL = root), `order_index` (sibling order),
-//   `type` (TEXT CHECK: the 3 composites + 8 leaves; a SQL/Rust keyword, exposed as `type_` via
-//   `#[sql_name = "type"]` like `tasks`), `label`, `config` (TEXT JSON typed per node kind), epoch-ms
-//   timestamps. `workflow_runs`: one live execution — `workflow_id` (FK CASCADE), `spec_id` (Nullable
-//   FK → specs SET NULL), `current_node_id` (Nullable FK → nodes SET NULL — the cursor), `blackboard`
-//   (TEXT JSON scratchpad, default '{}'), `status` (TEXT CHECK running|blocked|done|failed),
-//   epoch-ms `started_at`/`updated_at`. The tree is reconstructible from the rows alone (root =
-//   `root_node_id`/`parent_id IS NULL`; a composite's ordered children = rows with `parent_id = it`
-//   sorted by `order_index`). Column ORDER here must match the SQL migration exactly (Diesel
-//   positional decoding).
+//   `type` (TEXT CHECK: the 3 composites + the 13 leaves of `db::NODE_TYPES`; a SQL/Rust keyword,
+//   exposed as `type_` via `#[sql_name = "type"]` like `tasks`), `label`, `config` (TEXT JSON typed
+//   per node kind), epoch-ms timestamps. `workflow_runs`: one live execution — `workflow_id` (FK
+//   CASCADE), `spec_id` (Nullable FK → specs SET NULL), `current_node_id` (Nullable FK → nodes SET
+//   NULL — the cursor), `blackboard` (TEXT JSON scratchpad, default '{}'), `status` (TEXT CHECK
+//   running|blocked|done|failed), epoch-ms `started_at`/`updated_at`. The tree is reconstructible
+//   from the rows alone (root = `root_node_id`/`parent_id IS NULL`; a composite's ordered children =
+//   rows with `parent_id = it` sorted by `order_index`). Column ORDER here must match the SQL
+//   migration exactly (Diesel positional decoding).
 diesel::table! {
     workflows (id) {
         id -> Text,

@@ -24,7 +24,8 @@ use serde_json::{json, Value};
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
 use crate::mcp_runtime::{
-    internal_db, map_content_write_err, optional_bool, optional_str, optional_usize, require_str,
+    anchor_str, internal_db, map_content_write_err, optional_bool, optional_str, optional_usize,
+    require_str,
 };
 use crate::mcp_tools_core::{ChangedTopic, ToolOutcome};
 
@@ -297,8 +298,10 @@ fn parse_spec_dep_kind(args: &Value) -> Result<&'static str, RpcError> {
     }
 }
 
-/// Map a [`db::SetSpecWorkspaceError`] onto the D8 RPC vocabulary.
-fn map_set_workspace_err(e: db::SetSpecWorkspaceError) -> RpcError {
+/// Map a [`db::SetSpecWorkspaceError`] onto the D8 RPC vocabulary. `pub(crate)` so the
+/// workspace tools (`workspace_add` / `create_workspace`, which anchor through the same
+/// authority when given a `spec_id`) refuse with the SAME words as `spec_set_workspace`.
+pub(crate) fn map_set_workspace_err(e: db::SetSpecWorkspaceError) -> RpcError {
     match e {
         db::SetSpecWorkspaceError::SpecNotFound => {
             RpcError::new(RpcCode::InvalidId, "unknown spec")
@@ -309,9 +312,33 @@ fn map_set_workspace_err(e: db::SetSpecWorkspaceError) -> RpcError {
         db::SetSpecWorkspaceError::InvalidState { status } => RpcError::new(
             RpcCode::InvalidState,
             format!(
-                "a Spec's workspace anchor can only be set while it is in_progress \
-                 (this Spec is '{status}'): the anchor is posed at the ready→in_progress \
-                 start transition (spec_transition transition=start, workspace_id=…)"
+                "a Spec's workspace anchor can only be set while it is ready or in_progress \
+                 (this Spec is '{status}'): a draft is still being authored, and a settled \
+                 Spec's anchor is frozen. Linking a workspace never transitions the Spec"
+            ),
+        ),
+        db::SetSpecWorkspaceError::ProjectMismatch {
+            spec_project_id,
+            workspace_project_id,
+        } => RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "workspace belongs to project {workspace_project_id} but the Spec belongs to \
+                 project {spec_project_id}: a Spec can only anchor on a workspace of its own \
+                 project"
+            ),
+        ),
+        // The PREVALIDATION twin: no workspace exists yet on this path (the folder is not even
+        // created), so the refusal names the TARGET project instead of claiming a workspace.
+        db::SetSpecWorkspaceError::SpecProjectMismatch {
+            spec_project_id,
+            target_project_id,
+        } => RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "the Spec belongs to project {spec_project_id} but the workspace would be \
+                 registered in project {target_project_id}: a Spec can only anchor on a \
+                 workspace of its own project"
             ),
         ),
         db::SetSpecWorkspaceError::Db(e) => internal_db(e),
@@ -433,6 +460,12 @@ pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// the SAME operation: the dev workspace is resolved from an explicit `workspace_id`, else
 /// from `cwd` (the same cwd→workspace matcher `resolve_spec_id` uses). For every other
 /// transition no anchor is posed (`workspace_id`/`cwd` are ignored).
+///
+/// An EMPTY `workspace_id` is REFUSED on `start` — the FOURTH anchoring surface, hardened
+/// 2026-08-19 (finding `01M080S6Y5CTWK53FYY9YJF1GY`, HORS PERIMETRE ASSUME of PRD
+/// 01KYA475AX5JBGSS8WK5J8NM1S). The refusal lives in [`crate::mcp_context::resolve_workspace_for_start`],
+/// with the reasoning; here it matters that it happens BEFORE the write, so a refused anchor
+/// leaves the Spec's status exactly where it was.
 pub fn spec_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id = require_str(args, "spec_id")?;
     let transition = parse_spec_transition(require_str(args, "transition")?)?;
@@ -465,9 +498,17 @@ pub fn spec_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// dev workspace (repos + project DERIVED through it), or DETACHES it when `workspace_id`
 /// is absent/null. Delegates to the SHARED `db::set_spec_workspace` (the GUARD: a non-null
 /// workspace must exist).
+///
+/// An EMPTY `workspace_id` is REFUSED (review F2), through [`anchor_str`]: here `None` is not
+/// "nothing was said", it is the DETACH, so absorbing `""` into it turned an uninitialized caller
+/// variable into a silent un-anchoring. Absent and null keep their meaning exactly — detach.
 pub fn spec_set_workspace(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id = require_str(args, "spec_id")?;
-    let workspace_id = optional_str(args, "workspace_id")?;
+    let workspace_id = anchor_str(
+        args,
+        "workspace_id",
+        "DETACH the Spec from its dev workspace",
+    )?;
     let spec = db
         .with_conn(|c| db::set_spec_workspace(c, spec_id, workspace_id))
         .map_err(map_set_workspace_err)?;
@@ -903,11 +944,15 @@ mod tests {
         assert_eq!(out.result["spec"]["status"], "draft");
     }
 
-    /// The STATE GUARD through the tool (review finding #25): `spec_set_workspace` is REFUSED
-    /// (invalid_state) on a draft AND a ready Spec — the standalone anchor is only legal once
-    /// the Spec is in_progress. After the `start` transition it succeeds (a re-anchor/correction).
+    /// The STATE GUARD through the tool, AMENDED (v2.5): `spec_set_workspace` is REFUSED
+    /// (invalid_state) on a DRAFT Spec — authoring never poses the anchor — but a READY Spec
+    /// is now ANCHORABLE, because the dev workspace usually exists before the work starts.
+    /// The link NEVER transitions the Spec: `ready` stays `ready`.
+    ///
+    /// RENAMED from `spec_set_workspace_refused_before_in_progress` by the phase-1 review: the
+    /// old name asserted the contract this very amendment removed.
     #[test]
-    fn spec_set_workspace_refused_before_in_progress() {
+    fn spec_set_workspace_allows_ready_and_refuses_draft() {
         let _g = db_guard();
         let (db, project_id, ws) = seeded_db();
         let created = spec_create(
@@ -922,19 +967,23 @@ mod tests {
             spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidState);
         assert!(
-            err.message.contains("in_progress"),
-            "the refusal cites in_progress"
+            err.message.contains("ready or in_progress"),
+            "the refusal names the anchorable statuses, got: {}",
+            err.message
         );
 
-        // ready → still refused.
+        // ready → NOW ALLOWED, and the status does not move.
         spec_transition(
             &db,
             &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
         )
         .unwrap();
-        let err =
-            spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap_err();
-        assert_eq!(err.code, RpcCode::InvalidState);
+        let ok = spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap();
+        assert_eq!(ok.result["spec"]["workspace_id"], ws);
+        assert_eq!(
+            ok.result["spec"]["status"], "ready",
+            "anchoring a ready Spec does not transition it"
+        );
 
         // in_progress (via start, which itself anchors) → the standalone re-anchor is allowed.
         spec_transition(
@@ -944,6 +993,215 @@ mod tests {
         .unwrap();
         let ok = spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap();
         assert_eq!(ok.result["spec"]["workspace_id"], ws);
+    }
+
+    /// REVIEW F2 — THE EMPTY STRING IS NOT A WAY TO SAY "NONE", and here saying "none" is an ACT.
+    ///
+    /// `optional_str` maps `""` to `None`, which is right for the 122 arguments where `None` means
+    /// "the caller said nothing". On THIS argument `None` means DETACH, so the normalization turned
+    /// an uninitialized caller variable into a silent un-anchoring: a caller who believed it was
+    /// anchoring detached instead, and the tool answered `ok` (observed in the DB: a Spec left with
+    /// `workspace_id` NULL). `""` is now REFUSED — while `null` and ABSENT keep their meaning down
+    /// to the letter, which is the other half of the contract and is asserted here too, because a
+    /// guard that also broke the detach would be a worse bug than the one it fixes.
+    #[test]
+    fn an_empty_workspace_id_is_refused_while_null_and_absent_still_detach() {
+        let _g = db_guard();
+        let (db, project_id, ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+        let anchor = || {
+            spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws }))
+                .expect("anchoring a ready Spec is allowed");
+        };
+        let stored_anchor = || {
+            db.with_conn(|c| db::get_spec(c, &sid))
+                .unwrap()
+                .unwrap()
+                .workspace_id
+        };
+
+        // THE BUG: an EMPTY workspace_id on an ANCHORED Spec is refused, and changes NOTHING.
+        anchor();
+        let err = spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": "" }))
+            .expect_err("an empty string is a caller bug, not a detach order");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("workspace_id"),
+            "the refusal NAMES the offending argument, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("EMPTY string") && err.message.contains("not a way to say 'none'"),
+            "…and tells the empty string apart from the absence, got: {}",
+            err.message
+        );
+        assert_eq!(
+            stored_anchor().as_deref(),
+            Some(ws.as_str()),
+            "the refused call left the anchor exactly where it was"
+        );
+
+        // THE UNCHANGED HALF #1 — an explicit null still DETACHES.
+        let detached =
+            spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": Value::Null }))
+                .expect("null is the documented detach");
+        assert!(detached.result["spec"]["workspace_id"].is_null());
+        assert!(stored_anchor().is_none(), "null detached, as it always did");
+
+        // THE UNCHANGED HALF #2 — an ABSENT workspace_id detaches too.
+        anchor();
+        assert_eq!(stored_anchor().as_deref(), Some(ws.as_str()), "re-anchored");
+        let detached = spec_set_workspace(&db, &json!({ "spec_id": sid }))
+            .expect("omitting the argument is the other documented detach");
+        assert!(detached.result["spec"]["workspace_id"].is_null());
+        assert!(
+            stored_anchor().is_none(),
+            "absent detached, as it always did"
+        );
+    }
+
+    /// FINDING `01M080S6Y5CTWK53FYY9YJF1GY` — THE FOURTH ANCHORING SURFACE, closed 2026-08-19
+    /// (HORS PERIMETRE ASSUME of PRD 01KYA475AX5JBGSS8WK5J8NM1S, on the user's decision).
+    ///
+    /// F2 hardened three tools and left this one on the record as an observation: on
+    /// `spec_transition(start)`, `workspace_id` still went through `optional_str`, so `""` read as
+    /// "the caller said nothing", fell through to `cwd`, and then to nothing at all — and the Spec
+    /// went `ready → in_progress` UNANCHORED while the tool answered `ok`. One notch worse than the
+    /// F2 cases, because this one COMMITS the Spec on its way past: an engaged build with no dev
+    /// workspace, and no sentence anywhere saying so.
+    ///
+    /// The three clauses of the finding's own verification are asserted here, and the last two are
+    /// what make the first one a guard rather than a mere refusal: ABSENCE must still start the Spec
+    /// unanchored, and a `cwd` that resolves a workspace must still anchor it. Only the empty STRING
+    /// changed meaning.
+    #[test]
+    fn an_empty_workspace_id_is_refused_on_start_while_absence_and_cwd_keep_their_meaning() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project_id, workspace_id, cwd) = db.with_conn(|c| {
+            let (project, root) = db::create_project(c, "Proj", "/tmp/nyx-fourth", None).unwrap();
+            (project.id, root.id, root.root_path)
+        });
+        let ready_spec = || {
+            let created = spec_create(
+                &db,
+                &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+            )
+            .unwrap();
+            let sid = spec_id_of(&created);
+            spec_transition(
+                &db,
+                &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            )
+            .unwrap();
+            sid
+        };
+        let stored = |sid: &str| {
+            let spec = db.with_conn(|c| db::get_spec(c, sid)).unwrap().unwrap();
+            (spec.status, spec.workspace_id)
+        };
+
+        // (1) THE BUG — `""` is refused, and the Spec does not move.
+        let sid = ready_spec();
+        let err = spec_transition(
+            &db,
+            &json!({
+                "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ""
+            }),
+        )
+        .expect_err("an empty anchor is a caller bug, not an order to start unanchored");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("workspace_id")
+                && err.message.contains("EMPTY string")
+                && err.message.contains("not a way to say 'none'"),
+            "the refusal names the argument and tells `\"\"` apart from the absence, got: {}",
+            err.message
+        );
+        assert_eq!(
+            stored(&sid),
+            (db::SPEC_STATUS_READY.to_string(), None),
+            "the refused call left the Spec ready and unanchored — it did not half-commit it"
+        );
+
+        // (2) THE UNCHANGED HALF #1 — the SAME Spec, with the argument OMITTED, still starts
+        //     unanchored. The guard refuses a spelling, not the behaviour behind it.
+        let started = spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true }),
+        )
+        .expect("omitting workspace_id is the documented unanchored start");
+        assert_eq!(started.result["spec"]["status"], "in_progress");
+        assert!(started.result["spec"]["workspace_id"].is_null());
+        assert_eq!(
+            stored(&sid),
+            (db::SPEC_STATUS_IN_PROGRESS.to_string(), None),
+            "absent still starts the Spec with no anchor, as it always did"
+        );
+
+        // (3) THE UNCHANGED HALF #2 — a `cwd` inside a workspace still anchors it.
+        let other = ready_spec();
+        let nested = format!("{cwd}/crates/api");
+        let anchored = spec_transition(
+            &db,
+            &json!({
+                "spec_id": other, "transition": "start", "user_confirmed": true, "cwd": nested
+            }),
+        )
+        .expect("the cwd road is untouched");
+        assert_eq!(anchored.result["spec"]["workspace_id"], workspace_id);
+        assert_eq!(
+            stored(&other),
+            (
+                db::SPEC_STATUS_IN_PROGRESS.to_string(),
+                Some(workspace_id.clone())
+            ),
+            "a cwd that resolves a workspace still anchors the Spec it starts"
+        );
+    }
+
+    /// The PROJECT GUARD through the tool (v2.5): anchoring on a workspace of ANOTHER project
+    /// is `invalid_argument` and writes nothing.
+    #[test]
+    fn spec_set_workspace_refuses_a_workspace_of_another_project() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let (_other_project, other_root) = db
+            .with_conn(|c| db::create_project(c, "Other", "/tmp/other-proj", None))
+            .unwrap();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+
+        let err = spec_set_workspace(
+            &db,
+            &json!({ "spec_id": sid, "workspace_id": other_root.id }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("its own project"),
+            "the refusal explains the project mismatch, got: {}",
+            err.message
+        );
     }
 
     /// `spec_transition` start is SENSITIVE and POSES the anchor in one op (review finding #25):

@@ -75,6 +75,18 @@ pub const DEFAULT_ASK_HUMAN_OUTPUT_KEY: &str = "human";
 /// node via `TransitionTaskConfig.task_key` (v2.8 lot 2).
 pub const DEFAULT_TASK_KEY: &str = "task_id";
 
+/// The blackboard key a `create_workspace` reads the workspace NAME from by default. Overridable per
+/// node via `CreateWorkspaceConfig.name_key`. An ABSENT/empty value is not an error: the effects layer
+/// then derives the name from the run's Spec, which is the only place that knows it.
+pub const DEFAULT_WORKSPACE_NAME_KEY: &str = "workspace_name";
+
+/// The blackboard key a `create_workspace` — and the `workspace_target_free` fact that PREVALIDATES
+/// it — reads the worktrees ROOT from by default. Overridable per node via
+/// `CreateWorkspaceConfig.root_key` / `QueryConfig.root_key`. It is the key the `project_worktrees_root`
+/// fact writes AND the key the question asked when nothing is configured writes into: ONE key, so the
+/// folder a graph checks is the folder it then creates.
+pub const DEFAULT_WORKTREES_ROOT_KEY: &str = "worktrees_root";
+
 /// The RUN-SCOPED fact that authorizes ONE Spec-section write on a Spec whose sections are otherwise
 /// FROZEN (H12). The freeze stays the rule — the human is its only exception — so this key is written
 /// by the ENGINE ALONE, from a human's answer to an `ask_human` that declares
@@ -98,8 +110,9 @@ pub const LOOP_ITER_KEY: &str = "loop_iter";
 // Node types
 // ============================================================================
 
-/// A behavior-tree node type — the FULL PRD vocabulary (3 composites + 8 leaves). Mirrors the DB
-/// `nodes.type` CHECK ([`db::NODE_TYPES`]).
+/// A behavior-tree node type — the FULL PRD vocabulary (the 3 composites + the 13 leaves enumerated
+/// below). Mirrors the DB `nodes.type` CHECK ([`db::NODE_TYPES`]), whose `[&str; 16]` is the count
+/// that fails to compile when a type is added on one side only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeType {
     // Composites.
@@ -122,6 +135,9 @@ pub enum NodeType {
     /// Marks a task through the guarded task lifecycle (start/done/block/skip) — a nyx-own inline
     /// effect, the task-level twin of [`NodeType::Transition`]. UNGATED by default (v2.8 lot 2).
     TransitionTask,
+    /// Opens the DEV WORKSPACE of the run's bound Spec — a nyx-own inline effect that goes through
+    /// the SAME `create_workspace` the MCP tool calls, anchor included.
+    CreateWorkspace,
     /// Opens a CHILD run of another flow (a fresh sub-agent drives it) and folds the child's VERIFIED
     /// blackboard result back onto the parent board — the one HYBRID leaf (a nyx-own inline effect
     /// that ALSO suspends the parent while the child runs) (v2.8 lot 2).
@@ -147,6 +163,7 @@ impl NodeType {
             db::NODE_TYPE_QUERY => NodeType::Query,
             db::NODE_TYPE_FORK_SPEC => NodeType::ForkSpec,
             db::NODE_TYPE_TRANSITION_TASK => NodeType::TransitionTask,
+            db::NODE_TYPE_CREATE_WORKSPACE => NodeType::CreateWorkspace,
             db::NODE_TYPE_SUB_WORKFLOW => NodeType::SubWorkflow,
             db::NODE_TYPE_ASK_HUMAN => NodeType::AskHuman,
             db::NODE_TYPE_PRODUCE => NodeType::Produce,
@@ -169,6 +186,7 @@ impl NodeType {
             NodeType::Query => db::NODE_TYPE_QUERY,
             NodeType::ForkSpec => db::NODE_TYPE_FORK_SPEC,
             NodeType::TransitionTask => db::NODE_TYPE_TRANSITION_TASK,
+            NodeType::CreateWorkspace => db::NODE_TYPE_CREATE_WORKSPACE,
             NodeType::SubWorkflow => db::NODE_TYPE_SUB_WORKFLOW,
             NodeType::AskHuman => db::NODE_TYPE_ASK_HUMAN,
             NodeType::Produce => db::NODE_TYPE_PRODUCE,
@@ -311,6 +329,18 @@ pub struct QueryConfig {
     /// transition that acts on it can never be told about two different tasks (H9).
     #[serde(default)]
     pub task_key: Option<String>,
+    /// For the WORKSPACE PREVALIDATION fact (`workspace_target_free`), the blackboard key holding the
+    /// worktrees ROOT (default [`DEFAULT_WORKTREES_ROOT_KEY`]) — the SAME field name
+    /// [`CreateWorkspaceConfig`] uses, for the same reason `task_key` is shared with
+    /// `transition_task`: a check and the write it guards must be told about ONE folder, or the check
+    /// answers about a path nobody is about to create.
+    #[serde(default)]
+    pub root_key: Option<String>,
+    /// For `workspace_target_free`, the blackboard key holding the workspace NAME (default
+    /// [`DEFAULT_WORKSPACE_NAME_KEY`]) — again the field [`CreateWorkspaceConfig`] names, so the
+    /// prevalidation and the effect derive the SAME folder.
+    #[serde(default)]
+    pub name_key: Option<String>,
 }
 
 /// `ask_human` config — `{prompt, output_key?, append?, options?}`. `options` is the CLOSED set of
@@ -357,6 +387,36 @@ pub struct TransitionTaskConfig {
     pub task_key: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub gate_on: Option<String>,
+}
+
+/// `create_workspace` config — `{root_key?, name_key?, gate_on?}`: WHERE the dev workspace of the
+/// run's bound Spec lands, named through BLACKBOARD KEYS rather than literals, because the answer is
+/// per-run (a human's reply, a project's setting) and a shared graph holds neither.
+///
+/// ONE source, and it is a ROOT: `root_key` names the board key holding the FOLDER WORKSPACES LAND
+/// UNDER, which the effects layer JOINS with the workspace NAME. It used to be two — an explicit
+/// `path_key` "what a preceding `ask_human` wrote" that WON over the root and was taken AS the final
+/// folder — and that second source is what shipped the incident of 2026-08-18: the question asked for
+/// a root ("Set it once with `worktrees_root`"), the human answered `d:\projects\_worktrees`, and the
+/// workspace was registered ON that root — the common parent of every worktree — after which every
+/// later run collided with it. One source cannot disagree with itself: whatever fills this key, a
+/// SUBFOLDER is derived under it, so no branch of any graph can register a bare root.
+///
+/// `name_key` names the board key holding the workspace NAME (default
+/// [`DEFAULT_WORKSPACE_NAME_KEY`]); when nothing is on the board the effects layer derives it from the
+/// Spec, which is the only place that knows it.
+///
+/// `gate_on` is the OPTIONAL affirmative board key the effect fires on (UNGATED when absent) — the
+/// same shape as [`TransitionTaskConfig::gate_on`], so the human answer that asked for a workspace is
+/// what opens one.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreateWorkspaceConfig {
+    #[serde(default)]
+    pub root_key: Option<String>,
+    #[serde(default)]
+    pub name_key: Option<String>,
     #[serde(default)]
     pub gate_on: Option<String>,
 }
@@ -518,6 +578,53 @@ impl Condition {
         }
         true
     }
+
+    /// The blackboard key (its ROOT, [`board_key_root`]) this condition tests for an AFFIRMATIVE
+    /// value — `None` when the condition carries no consent at all. The POLARITY reading rule (4)'s
+    /// selector arm rests on ([`crate::mcp_authoring::sensitive_node_gate`]), and the same reading
+    /// [`Tree::ask_human_commitment`] uses to tell whether an answer ROUTES to a sensitive node.
+    ///
+    /// ONE shape qualifies: `{var: K, eq: <literal>}` where the literal is an approval the runtime
+    /// can actually MATCH. Everything else is refused, and each refusal is a reproduced bypass or its
+    /// immediate neighbour:
+    ///
+    ///   * `always` — the else branch: it tests nothing;
+    ///   * a cond with no `var` — likewise;
+    ///   * `eq` on a NON-affirmative literal (`{var: "ready_ok", eq: "no"}`) — the branch a REFUSAL
+    ///     takes; it was routing a `create_workspace` to a real `mkdir` on a human's "no";
+    ///   * `truthy: true` — on the closed answer set J1 forces (`["go", "no"]`) the string "no" is
+    ///     TRUTHY, so this is the `always` branch wearing a var's name;
+    ///   * `truthy: false`, `ne`, and a bare `var` — they select on NOT-a-given-value, which is the
+    ///     complement of a consent, never a consent;
+    ///   * an affirmative WORD the runtime cannot match — `eq: "YES"`, `eq: " yes "`. See
+    ///     [`crate::mcp_engine::eq_literal_is_affirmative`]: [`Condition::matches`] compares by EXACT
+    ///     JSON equality, with no trim and no case folding, so those two branches never fire and the
+    ///     selector dies on [`EngineError::SelectorNoBranch`] instead.
+    ///
+    /// Extra tests ANDed beside a qualifying `eq` (a `ne`, a `truthy`) only NARROW the branch, so they
+    /// are left alone: they can make it fire less often, never on a value the `eq` already refused.
+    pub fn affirmative_key(&self) -> Option<&str> {
+        // `always` wins over every other field (it is the else branch), so a cond carrying it tests
+        // nothing whatever else it names.
+        if self.always == Some(true) {
+            return None;
+        }
+        let var = self.var.as_deref()?;
+        let expected = self.eq.as_ref()?;
+        if !crate::mcp_engine::eq_literal_is_affirmative(expected) {
+            return None;
+        }
+        Some(board_key_root(var))
+    }
+}
+
+/// The blackboard key a config field NAMES, reduced to what it actually depends on: the dot-path's
+/// FIRST segment, because [`Blackboard::get`] splits on dots, so a `gate_on: "answer.decision"` hangs
+/// on the key `answer`. ONE reading, shared by the authoring guard
+/// ([`crate::mcp_authoring`]) and by the runtime classifications here, so the two layers cannot
+/// disagree about which question fills which key.
+pub fn board_key_root(k: &str) -> &str {
+    k.split('.').next().unwrap_or(k)
 }
 
 /// JSON truthiness: `true`, a non-empty string, a non-zero number, a non-empty array/object. `null`
@@ -815,12 +922,12 @@ impl Tree {
     /// it is. A list of sensitive labels would drift from the graphs it describes and would protect no
     /// fork; the structure already states the commitment, in two shapes:
     ///
-    ///   * [`HumanCommitment::SpecTransition`] — an engaging `transition` fires only on its `gate_on`
-    ///     blackboard key ([`TransitionConfig::gate_on`]), and authoring REFUSES such a transition
-    ///     without a preceding `ask_human`, so the ask that WRITES a gate_on key is the one the Spec's
-    ///     move hangs on. The engaging CLASSIFICATION comes from
-    ///     [`crate::mcp_engine::transition_is_engaging_target`] — the reading the runtime gate and the
-    ///     authoring guard already share, so a third one cannot appear here.
+    ///   * a member of [`SensitiveEffect`] the answer DECIDES — the engaging `transition`, the
+    ///     `fork_spec`, the `create_workspace`. That set is **the** census, shared with the authoring
+    ///     rule that demands a gate for exactly those nodes
+    ///     ([`crate::mcp_authoring::sensitive_node_gate`]), because the two halves used to be spelled
+    ///     out separately and disagreed on two members out of three: see [`SensitiveEffect`] for what
+    ///     that cost.
     ///   * [`HumanCommitment::AnotherRound`] — a `loop` exits on its `until` key, so the ask that
     ///     WRITES that key is what decides whether the body runs AGAIN; and when the body SPENDS (a
     ///     `spawn_subagent` or a `sub_workflow` sits under it), running it again is a real commitment
@@ -830,35 +937,41 @@ impl Tree {
     ///     It committed no transition, so H6 left it out; it commits a build round, which is why it is
     ///     in now.
     ///
-    /// A Spec move outranks a round: both can hold at once (an answer that gates a transition AND
-    /// re-opens a loop), and the graver commitment is the one the human is told about.
+    /// The graver commitment is the one the human is told about ([`SensitiveEffect::gravity`]): several
+    /// can hold at once (an answer that gates a transition AND re-opens a loop), and a sensitive effect
+    /// always outranks a round.
+    ///
+    /// # What "DECIDES" means here, and how it differs from the authoring rule
+    ///
+    /// Two readings, the same two the authoring rule's condition (ii) uses ([`Self::answer_decides`]):
+    /// the sensitive node's own `gate_on`, or a `selector` branch on the way DOWN to it that tests the
+    /// key affirmatively ([`Condition::affirmative_key`]). The second is not optional — rule (4)
+    /// explicitly accepts a `create_workspace` with NO `gate_on` when the branch routing to it IS the
+    /// consent, and that is the shape shipped in `/nspec`'s `go` arm.
+    ///
+    /// What this does NOT re-check is the authoring rule's conditions (i) "the question necessarily
+    /// ran" and (iii) "nothing else writes the key". They make a graph AUTHORABLE; here they would only
+    /// NARROW the set of questions nyx demands a human turn for, and narrowing is the dangerous
+    /// direction. A question wrongly classified as committing costs one human turn; a question wrongly
+    /// classified as ordinary is the hole this closed.
     pub fn ask_human_commitment(&self, node_id: &str) -> Option<HumanCommitment> {
         let idx = self.index_of(node_id)?;
         if self.nodes[idx].node_type != NodeType::AskHuman {
             return None;
         }
         let written = self.ask_human_written_key(idx);
-        // A `gate_on` is read through [`Blackboard::get`], which splits on dots, so the key it
-        // actually depends on is the path's FIRST segment — the same reading the loop test below
-        // already applies. Comparing the whole path let a `gate_on: "answer.decision"` slip the
-        // classification, and with it the human-turn check the Spec's move hangs on.
-        let gates_an_engaging_transition = self.nodes.iter().any(|n| {
-            if n.node_type != NodeType::Transition {
-                return false;
-            }
-            let Ok(cfg) = serde_json::from_value::<TransitionConfig>(n.config.clone()) else {
-                return false;
-            };
-            let gated_on_root = cfg
-                .gate_on
-                .as_deref()
-                .and_then(|k| k.split('.').next())
-                .map(str::to_string);
-            gated_on_root.as_deref() == Some(written.as_str())
-                && crate::mcp_engine::transition_is_engaging_target(&cfg.target_state)
-        });
-        if gates_an_engaging_transition {
-            return Some(HumanCommitment::SpecTransition);
+        let parents = self.parent_indices();
+        // THE CENSUS, read once: every sensitive node this answer decides, and the graver of them.
+        let governed = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| SensitiveEffect::of(n.node_type, &n.config).map(|e| (i, e)))
+            .filter(|(i, _)| self.answer_decides(*i, &parents, &written))
+            .map(|(_, effect)| effect)
+            .max_by_key(SensitiveEffect::gravity);
+        if let Some(effect) = governed {
+            return Some(HumanCommitment::from(effect));
         }
         let reopens_a_spending_loop = self.nodes.iter().enumerate().any(|(i, n)| {
             if n.node_type != NodeType::Loop {
@@ -868,12 +981,91 @@ impl Tree {
                 .ok()
                 .and_then(|cfg| cfg.until)
                 .and_then(|until| until.var)
-                .and_then(|var| var.split('.').next().map(str::to_string))
+                .map(|var| board_key_root(&var).to_string())
                 .as_deref()
                 == Some(written.as_str());
             exits_on_the_answer && self.subtree_spends(i)
         });
         reopens_a_spending_loop.then_some(HumanCommitment::AnotherRound)
+    }
+
+    /// The PARENT of every node, by arena index — derived from the children lists the tree was wired
+    /// with, so it is the very edge set the interpreter walks. `None` for the root.
+    fn parent_indices(&self) -> Vec<Option<usize>> {
+        let mut parents = vec![None; self.nodes.len()];
+        for (i, node) in self.nodes.iter().enumerate() {
+            for &child in &node.children {
+                parents[child] = Some(i);
+            }
+        }
+        parents
+    }
+
+    /// Whether an answer landing on the blackboard key `key` DECIDES whether the sensitive node at
+    /// `idx` fires — the runtime half of the authoring rule's condition (ii).
+    ///
+    /// Two readings, and only two:
+    ///
+    ///   * the node's OWN `gate_on` ([`SensitiveEffect::gate_key_root`]) — the runtime gate fires the
+    ///     effect only when that key holds an affirmative. Read at its ROOT, because
+    ///     [`Blackboard::get`] splits on dots: comparing the whole path let a
+    ///     `gate_on: "answer.decision"` slip the classification, and with it the human-turn check;
+    ///   * FAILING THAT — a node with NO `gate_on` at all — a `selector` branch the ANCESTOR CHAIN
+    ///     descends through, testing the key affirmatively ([`Condition::affirmative_key`]). Rule
+    ///     (4)(ii) accepts that shape as the consent precisely because nothing else stands between the
+    ///     answer and the effect, so the runtime has to demand the human turn there too.
+    ///
+    /// The two readings are ordered, not summed, and that is deliberate. A node that DECLARES a
+    /// `gate_on` names the key its effect fires on; the branch above it only decides whether the run
+    /// gets as far as asking. Counting both would classify ndev's "review" — which routes to a
+    /// `guarded_commit` whose OWN `confirm` question gates the transition — as committing the Spec,
+    /// and the question that actually commits it would no longer be the one nearest the effect.
+    ///
+    /// The climb walks the ancestor chain and never leaves it — a selector in a SIBLING branch decides
+    /// nothing about this node. Where the authoring rule requires EVERY branch naming a child to agree,
+    /// this asks only whether ONE does: authoring decides whether a graph may EXIST, this decides
+    /// whether to DEMAND a human turn, and the conservative side of those two questions is not the
+    /// same side.
+    fn answer_decides(&self, idx: usize, parents: &[Option<usize>], key: &str) -> bool {
+        if let Some(gate) = SensitiveEffect::gate_key_root(&self.nodes[idx].config) {
+            return gate == key;
+        }
+        let mut cursor = idx;
+        while let Some(parent) = parents[cursor] {
+            if self.nodes[parent].node_type == NodeType::Selector
+                && self.selector_routes_on(parent, cursor, key)
+            {
+                return true;
+            }
+            cursor = parent;
+        }
+        false
+    }
+
+    /// Whether any branch of the `selector` at `selector` that selects the child at `child` tests
+    /// `key` for an APPROVAL. Which branch selects which child is read exactly as
+    /// [`Executor::pick_branch`] reads it: `branch.child`, defaulting to the branch's own position.
+    fn selector_routes_on(&self, selector: usize, child: usize, key: &str) -> bool {
+        let Ok(cfg) = serde_json::from_value::<SelectorConfig>(self.nodes[selector].config.clone())
+        else {
+            return false;
+        };
+        let Some(position) = self.nodes[selector]
+            .children
+            .iter()
+            .position(|&c| c == child)
+        else {
+            return false;
+        };
+        cfg.branches.iter().enumerate().any(|(i, branch)| {
+            branch.child.unwrap_or(i) == position
+                && branch
+                    .cond
+                    .as_ref()
+                    .and_then(Condition::affirmative_key)
+                    .map(|k| k == key)
+                    .unwrap_or(false)
+        })
     }
 
     /// Whether anything under `idx` (itself included) SPENDS — opens a sub-agent or a child run. It is
@@ -965,6 +1157,88 @@ impl Tree {
     }
 }
 
+/// A node that COMMITS something a human alone may commit — **the** census of "what is sensitive",
+/// and the ONE place it is written down.
+///
+/// Three members, and they are the three IRREVERSIBLE-ish effects nyx fires on its own:
+///
+///   * an ENGAGING `transition` (ready / done / cancel) — it moves the Spec's lifecycle;
+///   * a `fork_spec` — it opens a new revision of the Spec (a ready Spec drops back to `draft`);
+///   * a `create_workspace` — it MKDIRS on the user's disk, inserts a workspace row and REWRITES
+///     `specs.workspace_id`. It is the most physical of the three; `fork_spec`, which touches no
+///     disk, was gated from the start.
+///
+/// # Why it is an enum here rather than a predicate over there
+///
+/// The list used to exist TWICE, and the two copies disagreed. The authoring rule
+/// ([`crate::mcp_authoring::sensitive_node_gate`]) counted all three; the runtime classification
+/// ([`Tree::ask_human_commitment`]) counted the engaging `transition` and nothing else. Each half was
+/// correct read alone, and their INTERSECTION covered one node type out of three: an `ask_human` whose
+/// answer only governed a `fork_spec` or a `create_workspace` was certified HUMAN-GATED by authoring
+/// and asked for NO human turn at runtime, so the session driving the run answered it itself — a Spec
+/// really forked, a folder really created on disk (finding `01M0C3BZPWV832D802C0GZFTMC`; the shipped
+/// `/nspec` "create a new revision?" question was on the wrong side of it).
+///
+/// So both layers now read THIS. Adding a fourth sensitive type is one arm added to [`Self::of`], and
+/// the authoring guard, the runtime commitment and the human-turn demand all move with it; there is
+/// no second list left to forget. [`HumanCommitment`] carries one variant per member for the same
+/// reason — a new member fails to compile until its refusal sentence is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensitiveEffect {
+    /// An ENGAGING `transition` — `ready` / `done` / `cancel`.
+    SpecTransition,
+    /// A `fork_spec` — a new editable revision of the bound Spec.
+    CreateRevision,
+    /// A `create_workspace` — a folder on the user's disk, anchored to the Spec.
+    CreateWorkspace,
+}
+
+impl SensitiveEffect {
+    /// The config field EVERY sensitive node names its runtime consent gate with — the blackboard key
+    /// whose affirmative value fires the effect ([`TransitionConfig::gate_on`],
+    /// [`ForkSpecConfig::gate_on`], [`CreateWorkspaceConfig::gate_on`], all spelled the same on
+    /// purpose so this reading is one reading).
+    pub const GATE_FIELD: &'static str = "gate_on";
+
+    /// Classify a node from its TYPE and its CONFIG, or `None` when it commits nothing a human alone
+    /// may commit. The ENGAGING classification of a `transition` comes from
+    /// [`crate::mcp_engine::transition_is_engaging_target`] — the reading the runtime gate and the
+    /// authoring guard already share, so a third one cannot appear here.
+    pub fn of(node_type: NodeType, config: &Value) -> Option<SensitiveEffect> {
+        match node_type {
+            NodeType::ForkSpec => Some(SensitiveEffect::CreateRevision),
+            NodeType::CreateWorkspace => Some(SensitiveEffect::CreateWorkspace),
+            NodeType::Transition => config
+                .get("target_state")
+                .and_then(Value::as_str)
+                .filter(|t| crate::mcp_engine::transition_is_engaging_target(t))
+                .map(|_| SensitiveEffect::SpecTransition),
+            _ => None,
+        }
+    }
+
+    /// The ROOT ([`board_key_root`]) of the blackboard key a sensitive node's own runtime gate reads,
+    /// or `None` when it declares none. Reading the ROOT is what a `gate_on: "answer.decision"` needs:
+    /// [`Blackboard::get`] splits on dots, so that gate hangs on the key `answer`.
+    pub fn gate_key_root(config: &Value) -> Option<&str> {
+        config
+            .get(Self::GATE_FIELD)
+            .and_then(Value::as_str)
+            .map(board_key_root)
+    }
+
+    /// Which commitment a single answer is TOLD about when it governs several — the graver one. A
+    /// Spec move outranks a revision, a revision outranks a folder, and all three outrank a build
+    /// round ([`HumanCommitment::AnotherRound`], which is not a member of this set).
+    fn gravity(&self) -> u8 {
+        match self {
+            SensitiveEffect::SpecTransition => 3,
+            SensitiveEffect::CreateRevision => 2,
+            SensitiveEffect::CreateWorkspace => 1,
+        }
+    }
+}
+
 /// What a human's answer to an `ask_human` COMMITS — the fact that makes it a question only a human
 /// may answer, and so the fact that makes nyx demand a witnessed human turn behind the reply (H6,
 /// then J2). DERIVED from the graph by [`Tree::ask_human_commitment`], never declared on a node.
@@ -978,18 +1252,45 @@ pub enum HumanCommitment {
     /// The answer, and nothing else, lets an ENGAGING Spec transition (`ready` / `done` / `cancel`)
     /// fire — it moves the Spec's lifecycle.
     SpecTransition,
+    /// The answer, and nothing else, lets a `fork_spec` fire — it opens a NEW REVISION of the Spec
+    /// and drops the ready one back to an editable draft.
+    CreateRevision,
+    /// The answer, and nothing else, lets a `create_workspace` fire — it MKDIRS on the user's disk,
+    /// registers the workspace and re-anchors the Spec on it.
+    CreateWorkspace,
     /// The answer re-opens a `loop` whose body SPENDS sub-agents — it buys another build round.
     AnotherRound,
+}
+
+impl From<SensitiveEffect> for HumanCommitment {
+    /// One variant per member of the census, so a fourth [`SensitiveEffect`] does not compile until
+    /// its own sentence is written below.
+    fn from(effect: SensitiveEffect) -> Self {
+        match effect {
+            SensitiveEffect::SpecTransition => HumanCommitment::SpecTransition,
+            SensitiveEffect::CreateRevision => HumanCommitment::CreateRevision,
+            SensitiveEffect::CreateWorkspace => HumanCommitment::CreateWorkspace,
+        }
+    }
 }
 
 impl HumanCommitment {
     /// What the answer commits, as ONE clause both the refusal and the up-front warning drop into a
     /// sentence — so the session is told what it is being stopped from disposing of, not merely that
-    /// it was stopped.
+    /// it was stopped. It NAMES the effect: a session told "the Spec's lifecycle" when the answer
+    /// actually opens a folder goes looking for the wrong thing.
     pub fn what_it_commits(&self) -> &'static str {
         match self {
             HumanCommitment::SpecTransition => {
                 "COMMITS the Spec (an engaging transition: ready / done / cancel)"
+            }
+            HumanCommitment::CreateRevision => {
+                "COMMITS a NEW REVISION of the Spec — a fork that reopens it as an editable draft, so \
+                 the version that was ready is no longer the one being worked on"
+            }
+            HumanCommitment::CreateWorkspace => {
+                "COMMITS a DEV WORKSPACE — a folder CREATED on the user's disk and anchored to the \
+                 Spec, which also becomes the Spec's workspace"
             }
             HumanCommitment::AnotherRound => {
                 "COMMITS another build round — a fresh sub-agent pass, with the time and the money it \
@@ -1064,13 +1365,17 @@ pub enum Action {
     /// Read a nyx fact `query` (e.g. `spec_status`) and write it to the blackboard key `write` — a
     /// nyx-own inline effect the T4 handler resolves itself (never surfaced to the dispatcher).
     /// `target` parameterizes `spec_can_transition` (the transition it asks about); `task_key` names
-    /// the board key holding the task a TASK-GRAINED fact reads (`task_close_route`).
+    /// the board key holding the task a TASK-GRAINED fact reads (`task_close_route`); `root_key` /
+    /// `name_key` name the board keys the WORKSPACE prevalidation reads (`workspace_target_free`) —
+    /// the very keys the `create_workspace` it guards reads, so both resolve ONE folder.
     Query {
         node_id: String,
         query: String,
         write: String,
         target: Option<String>,
         task_key: Option<String>,
+        root_key: Option<String>,
+        name_key: Option<String>,
     },
     /// Fork the run's bound Spec into a new editable draft revision — a nyx-own inline effect the T4
     /// handler resolves itself. `gate_on` = the blackboard key a preceding ask_human approved (N13).
@@ -1086,6 +1391,23 @@ pub enum Action {
         task_id: String,
         transition: String,
         reason: Option<String>,
+        gate_on: Option<String>,
+    },
+    /// Open the DEV WORKSPACE of the run's bound Spec — a nyx-own inline effect the T4 handler
+    /// resolves itself (never surfaced to the dispatcher), through the SAME `create_workspace` the
+    /// MCP tool calls, Spec anchor included.
+    ///
+    /// Both strings are RESOLVED FROM THE BOARD by the engine (the pure half): `root` is the folder
+    /// workspaces land UNDER — whatever filled that key, a project's configured `worktrees_root` read
+    /// by a preceding `query` or a root a preceding `ask_human` answered — and `name` the workspace
+    /// name. Either can be EMPTY, and the handler owns what an empty one means (no root at all is an
+    /// `invalid_argument`; an empty name is DERIVED from the Spec), because only it can see the Spec.
+    /// There is deliberately NO second "explicit path" source: see [`CreateWorkspaceConfig`].
+    /// `gate_on` is the OPTIONAL affirmative board key (UNGATED when None).
+    CreateWorkspace {
+        node_id: String,
+        root: String,
+        name: String,
         gate_on: Option<String>,
     },
     /// Pause — report the ack to resume.
@@ -1138,6 +1460,7 @@ impl Action {
             | Action::Query { node_id, .. }
             | Action::ForkSpec { node_id, .. }
             | Action::TransitionTask { node_id, .. }
+            | Action::CreateWorkspace { node_id, .. }
             | Action::Wait { node_id }
             | Action::Note { node_id, .. }
             | Action::AskHuman { node_id, .. }
@@ -1880,6 +2203,8 @@ impl Engine {
                     write: cfg.write,
                     target: cfg.target,
                     task_key: cfg.task_key,
+                    root_key: cfg.root_key,
+                    name_key: cfg.name_key,
                 }
             }
             NodeType::ForkSpec => {
@@ -1901,6 +2226,26 @@ impl Engine {
                     task_id,
                     transition: cfg.transition,
                     reason: cfg.reason,
+                    gate_on: cfg.gate_on,
+                }
+            }
+            NodeType::CreateWorkspace => {
+                let cfg: CreateWorkspaceConfig = self.parse_config(idx)?;
+                // Each source is RESOLVED FROM THE BOARD through the same `{{path}}` interpolation the
+                // prompt leaves and `transition_task`'s task id use — the engine stays pure and the
+                // graph names KEYS, never literals. A key nothing wrote interpolates to the empty
+                // string, which is exactly the "unset" the handler branches on.
+                let read = |key: Option<&str>, default: &str| -> String {
+                    let key = key.unwrap_or(default);
+                    if key.is_empty() {
+                        return String::new();
+                    }
+                    interpolate(&format!("{{{{{key}}}}}"), &self.board)
+                };
+                Action::CreateWorkspace {
+                    node_id,
+                    root: read(cfg.root_key.as_deref(), DEFAULT_WORKTREES_ROOT_KEY),
+                    name: read(cfg.name_key.as_deref(), DEFAULT_WORKSPACE_NAME_KEY),
                     gate_on: cfg.gate_on,
                 }
             }

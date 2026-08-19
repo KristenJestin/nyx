@@ -59,7 +59,7 @@ Le détail d'une Spec met en avant **une action principale selon son `status`** 
 
 La review n'est **pas une section de navigation** ; elle a **deux surfaces**, selon la profondeur :
 
-- **Onglet Review sur la Spec** — apparaît **uniquement quand un workspace est attaché** (dev lancé : `in_progress` / `blocked` / `in_review` / `completed`). Il affiche les **commentaires de la Spec courante** (threads, open/resolved/outdated, par repo) + un **bouton « Ouvrir la review »** vers l'écran plein écran. En `draft` / `ready` : pas de workspace → pas d'onglet.
+- **Onglet Review sur la Spec** — apparaît **uniquement une fois le dev lancé**, c'est-à-dire à partir du `status` `in_progress` (puis `blocked` / `in_review` / `completed`). Il affiche les **commentaires de la Spec courante** (threads, open/resolved/outdated, par repo) + un **bouton « Ouvrir la review »** vers l'écran plein écran. En `draft` / `ready` : pas d'onglet. La règle se lit sur le **`status`**, pas sur la présence d'un workspace : une Spec `ready` **peut** déjà être ancrée sur un workspace (l'ancre est posable dès `ready` via `workspace_add` / `create_workspace`, sans transition) sans que la review s'ouvre pour autant.
 - **Écran review plein écran** — la surface profonde (diff complet + commentaires + findings), lancée depuis l'onglet ou le header.
 
 Le **signal** (review prête, commentaires non lus, findings) vit dans **Overview / Attention Inbox** → ouvre la review de la Spec concernée. Travail libre sans Spec : même review depuis le workspace.
@@ -88,7 +88,7 @@ Le détail d'une Spec met en avant **une action principale** = la prochaine éta
 
 - **Spec** : l'**agent** l'écrit (grill) ; l'humain lit / valide. Non éditable par l'humain dans cette version.
 - **Annexes** et **Activity** : présents dans tous les status.
-- **Tasks / Runtime / Review** : seulement quand un **workspace est attaché** (`in_progress`→).
+- **Tasks / Runtime / Review** : seulement à partir de `in_progress` (→). Règle de **`status`** et non de présence d'un workspace : une Spec `ready` peut déjà porter son workspace (ancre posable dès `ready`, cf. plus haut) sans afficher ces onglets — c'est le lancement du dev qui les ouvre.
 - **Tasks** : décomposition de l'agent (lecture). Les **human tasks** (`executor=human`) y apparaissent avec un badge « toi » et sont **actionnables** (tu les marques `done`) — seule exception à la lecture seule ; l'agent les annonce aussi en chat, et une task agent bloquée affiche « bloquée par [human task] ». L'**Attention Inbox** (roll-up transverse de tous les signaux) est **différée** et non requise (Q-007 / PDR-0021).
 - **Runtime** = ce qui tourne pour la Spec dans son worktree : terminaux + session(s) agent (dev + subagents) + managed commands/services (l'arbre terminal/workspace). Disparaît en `completed` (worktree nettoyé au merge).
 - **Review** = onglet (commentaires de la Spec + bouton → écran plein écran), dominant en `in_review`, historique en `completed`/`cancelled`.

@@ -188,11 +188,43 @@
 //! ├─ query "final status"  → final_status
 //! └─ selector "commit"
 //!    ├─ (proto_verdict == "hold")  note "prototype dead — left as a draft"   (the H4 STOP, before the commit)
-//!    ├─ (final_status == "draft")  sequence [ ask_human "confirm ready" {yes/no} → ready_ok,
-//!    │                                        selector [ (ready_ok=="yes") transition "ready"
-//!    │                                                   (else)            note "left as draft" ] ]   (N16)
+//!    ├─ (final_status == "draft")  sequence [ ask_human "confirm ready" {yes / go / no} → ready_ok,
+//!    │                                        selector "route the commitment"
+//!    │                                          ├─ (ready_ok=="yes")  transition "ready"
+//!    │                                          ├─ (ready_ok=="go")   sequence "ready + a dev workspace"
+//!    │                                          │     ├─ query project_worktrees_root → worktrees_root (+ _configured)
+//!    │                                          │     ├─ selector [ (worktrees_root_configured falsy) ask_human "workspace root" → worktrees_root
+//!    │                                          │     │             (else)                            note "using the configured root" ]
+//!    │                                          │     ├─ query workspace_target_free → workspace_free (+ _reason)   (PREVALIDATION)
+//!    │                                          │     ├─ selector [ (workspace_free truthy) transition "ready"
+//!    │                                          │     │             (else)                  note "target folder taken" ]   (N16)
+//!    │                                          │     └─ create_workspace {root_key} {gate_on: workspace_free}
+//!    │                                          └─ (else)             note "left as draft" ]   (N16)
 //!    └─ (else)                     note "not a draft — nothing to commit"     (SAFE default)
 //! ```
+//!
+//! THE THIRD ANSWER IS A SECOND SHAPE OF YES (revision 21, repaired in 22). 'go' takes the very same
+//! engaging `ready` transition 'yes' does — BOTH are affirmative words on their own, compared WHOLE,
+//! so the B3 gate is HEAD's and reads nothing less than the entire answer — and it opens the dev
+//! workspace ANCHORED to the Spec, through the same `create_workspace` the MCP tool calls (one guarded
+//! write: folder + workspace row + anchor, and the anchor moves no status, which is why `ready` comes
+//! first). The rider rides on WHICH affirmative was given, never on text appended to one: an answer
+//! like "yes with workspace" would oblige a gate to read part of a reply, and a gate that reads part
+//! of a reply reads "ok, actually no" as approval. WHERE the folder lands is read as a FACT before it
+//! is asked as a question: a project that configured `worktrees_root` is never asked; one that did not
+//! is asked once — for a ROOT, written to the very key the setting fills, so BOTH branches derive the
+//! Spec's own subfolder under it. NOTHING FILLS the folder — it lands EMPTY, deliberately (depot idea
+//! `01M04W3RZ333NC01R216MNXAFK` owns the filling). This branch is a HORS PERIMETRE ASSUME of PRD
+//! 01KYA475AX5JBGSS8WK5J8NM1S on the user's decision of 2026-08-18; the note that records it sits on
+//! the branch in [`build_nspec`].
+//!
+//! 'go' IS ONE ANSWER, SO IT IS ONE COMMITMENT (revision 22). "Ready AND a workspace" cannot half
+//! happen: everything knowable up front — where the folder goes, and whether a workspace of the
+//! project already holds it (`workspace_target_free`) — is settled BEFORE the `ready` transition, and
+//! the transition and the `create_workspace` then hang off that one verdict. The shape it replaces
+//! committed `ready` first and opened the workspace after; the day the creation failed, the Spec sat
+//! `ready` with no workspace and nothing said so. It is the prevalidation rule this PRD already
+//! applies to the disk ("prevalidate, then mkdir"), applied to the TRANSITION.
 //!
 //! A `sub_workflow` CHILD THAT DIED IS A FACT THE PARENT MUST TEST (H4). The child's status lands on
 //! the parent board (`proto_result.status`) whatever it is — and a value nothing reads changes nothing:
@@ -340,17 +372,42 @@ use serde_json::{json, Value};
 
 use crate::db;
 use crate::db::{
-    NODE_TYPE_ASK_HUMAN as ASK_HUMAN, NODE_TYPE_FORK_SPEC as FORK_SPEC,
-    NODE_TYPE_GATE_CHECK as GATE_CHECK, NODE_TYPE_JUDGE as JUDGE, NODE_TYPE_LOOP as LOOP,
-    NODE_TYPE_NOTE as NOTE, NODE_TYPE_QUERY as QUERY, NODE_TYPE_SELECTOR as SELECTOR,
-    NODE_TYPE_SEQUENCE as SEQUENCE, NODE_TYPE_SPAWN_SUBAGENT as SPAWN,
-    NODE_TYPE_SUB_WORKFLOW as SUB_WORKFLOW, NODE_TYPE_TRANSITION as TRANSITION,
-    NODE_TYPE_TRANSITION_TASK as TRANSITION_TASK,
+    NODE_TYPE_ASK_HUMAN as ASK_HUMAN, NODE_TYPE_CREATE_WORKSPACE as CREATE_WORKSPACE,
+    NODE_TYPE_FORK_SPEC as FORK_SPEC, NODE_TYPE_GATE_CHECK as GATE_CHECK, NODE_TYPE_JUDGE as JUDGE,
+    NODE_TYPE_LOOP as LOOP, NODE_TYPE_NOTE as NOTE, NODE_TYPE_QUERY as QUERY,
+    NODE_TYPE_SELECTOR as SELECTOR, NODE_TYPE_SEQUENCE as SEQUENCE,
+    NODE_TYPE_SPAWN_SUBAGENT as SPAWN, NODE_TYPE_SUB_WORKFLOW as SUB_WORKFLOW,
+    NODE_TYPE_TRANSITION as TRANSITION, NODE_TYPE_TRANSITION_TASK as TRANSITION_TASK,
 };
 
 /// The current code revision of the built-in default graphs. BUMP this whenever a `build_*` graph
 /// changes so an EXISTING DB's built-in is upgraded on the next boot ([`ensure_builtin`] replaces the
-/// tree when the stored `workflows.builtin_revision` is older — v2.8 review N11). Revision 19 stops
+/// tree when the stored `workflows.builtin_revision` is older — v2.8 review N11).
+///
+/// Revision 22 REPAIRS revision 21's workspace branch, on the two defects a live run found the day it
+/// shipped (human review finding `01M0B5AG0XR4BG6DSGEFGKW6C4`). The question now asks for a ROOT and
+/// writes the SAME board key the configured setting fills, so both branches DERIVE the Spec's
+/// subfolder under it — 21 took the answer as the final folder, which registered the user's whole
+/// worktrees root as one workspace and then collided with itself on every later run. And the `ready`
+/// transition now sits UNDER a prevalidation of that folder instead of before the creation, so 'go'
+/// is all-or-nothing: 21 committed `ready` first and left the Spec ready with no workspace when the
+/// creation failed. A DB holding 21 MUST be upgraded off it — its nspec asks for a root and would use
+/// the answer as a workspace path.
+///
+/// Revision 21 gives nspec's final consent a THIRD answer: 'go' marks the Spec ready exactly as
+/// 'yes' does — both are affirmative words the B3 gate accepts WHOLE — and a second selector on that
+/// same answer then OPENS the dev workspace anchored to it (a `create_workspace` node — the folder
+/// goes under the project's `worktrees_root` when it is configured, and the graph asks for a path
+/// only when it is not). HORS PERIMETRE ASSUME of PRD 01KYA475AX5JBGSS8WK5J8NM1S, user decision of
+/// 2026-08-18 — the full note is on the branch itself in [`build_nspec`]. And it is THIS bump that
+/// makes the branch real for a DB that already exists: without it `ensure_builtin` would see a
+/// built-in at the current revision and leave the old tree in place, so the new answer would exist in
+/// the code and in no running nyx. It is 21 rather than 20 because a revision 20 of the same branch
+/// was installed in working DBs while its consent answer ('yes with workspace') still needed a gate
+/// that read PART of a reply; that reading was retracted, and a DB holding 20 must be upgraded off it
+/// or its nspec asks a question whose answer no longer opens the transition.
+///
+/// Revision 19 stops
 /// the prototyper putting a question to a human about an EMPTY set: the election runs only once the
 /// round actually holds pages to elect on (`design_round_pages`, checked by a "compose a round" loop
 /// that costs [`PROTO_ROUND_ATTEMPTS`] effector passes and then dies naming what never held), and the
@@ -405,7 +462,7 @@ use crate::db::{
 /// top of revision 5's N17 lifecycle-entry work and revision 4's N16/N19/spec_can_transition
 /// corrections. Every earlier built-in (a lower revision or a pre-N11 NULL, treated as 0) upgrades on
 /// the first boot.
-const BUILTIN_REVISION: i32 = 19;
+const BUILTIN_REVISION: i32 = 22;
 
 /// The SLOT the seeded coder's `checks` gate declares — the name a project binds its real build check
 /// to (`slot_bind slot="build_check" command_ids=[…]`, [`crate::mcp_authoring::slot_bind`]).
@@ -1574,6 +1631,38 @@ fn build_nspec(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
         json!({ "text": "The prototype did not complete — the Spec is left as a draft (not marked ready). Re-run /nspec to retry the prototype." }),
     )?;
     let confirm = node(tc, wf, Some(&commit), 1, SEQUENCE, "confirm ready", json!({}))?;
+    // ┌───────────────────────────────────────────────────────────────────────────────────────────┐
+    // │ HORS PERIMETRE ASSUME — the third answer, and the node type it needs.                     │
+    // │                                                                                           │
+    // │ This work is OUTSIDE the declared scope of PRD 01KYA475AX5JBGSS8WK5J8NM1S. The user asked │
+    // │ for it ANYWAY, on 2026-08-18, in full knowledge and after an explicit warning from the    │
+    // │ orchestrator; a PRD in review being frozen, a human review finding was the only route     │
+    // │ that did not fork it. It is written here, at the place that was changed, so the RECORDED  │
+    // │ scope and the SHIPPED code stay reconcilable afterwards — and that reconciliation is done │
+    // │ ITEM BY ITEM: all THREE crossed items are named, not only the one this branch is about.   │
+    // │                                                                                           │
+    // │   * 01M02VRMPMRK1P8536ZYBAS4DS — "Consentement final et choix du workflow nspec" ("Les    │
+    // │     options non/oui et un eventuel oui avec workspace appartiennent au workflow           │
+    // │     d'authoring. Ce PRD ne modifie ni nspec ni les transitions draft vers ready ou ready  │
+    // │     vers in_progress"). CROSSED BY this very branch: the third answer, the selectors that │
+    // │     route it, and the `ready` transition it takes.                                        │
+    // │                                                                                           │
+    // │   * 01KYA49F5T2H02YY4VT7SCBGSX — "Internes du moteur d'orchestration 2.8 […] 2.8 est      │
+    // │     in_progress/fige ; ce PRD fournit seulement le resolveur partage". CROSSED BY the     │
+    // │     SIXTEENTH node type, `create_workspace` (traced on `db::NODE_TYPE_CREATE_WORKSPACE`): │
+    // │     its engine vocabulary (`NodeType`, `CreateWorkspaceConfig`, its `Action` arm) and     │
+    // │     inline runtime effect, the new `query` fact `project_worktrees_root`, and the        │
+    // │     widening of the `nodes.type` CHECK. It ADDS a node type; it changes NOTHING about how │
+    // │     an existing one is READ — the B3 consent gate and the authoring rule that demands it  │
+    // │     are exactly HEAD's, which is what the shape below is built around.                    │
+    // │                                                                                           │
+    // │   * 01M02VRGBAY6HV0A97A938DQ33 — "Provisioning physique du workspace […] le choix du      │
+    // │     root_path […] necessite un verbe configurable par projet dans un PRD separe". CROSSED │
+    // │     BY `projects.worktrees_root` (traced on `db::Project::worktrees_root`): it IS that    │
+    // │     per-project verb, and the run now DERIVES the path from it instead of receiving one.  │
+    // │     It is BOUNDED to the WHERE — the WHAT (clone, worktree, root files, setup commands)   │
+    // │     stays out, with idea 01M04W3RZ333NC01R216MNXAFK.                                      │
+    // └───────────────────────────────────────────────────────────────────────────────────────────┘
     node(
         tc,
         wf,
@@ -1582,24 +1671,43 @@ fn build_nspec(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
         ASK_HUMAN,
         "confirm ready",
         json!({
-            "prompt": "Mark the Spec ready for build?",
+            "prompt": "Mark the Spec ready for build? Answer 'yes' to mark it ready, 'go' to mark it ready AND open the dev workspace anchored to it (the same yes, plus a folder to build in), or 'no' to leave it a draft.",
             "output_key": "ready_ok",
-            "options": ["yes", "no"],
+            // THREE answers, and TWO of them are a yes. Both are words the B3 gate accepted at HEAD
+            // ([`crate::mcp_engine`]'s `board_value_is_affirmative`: yes/y/ok/approve(d)/ready/go/
+            // true, compared WHOLE), and that is the whole trick — the rider is not carried by TEXT
+            // ADDED TO an answer, it is carried by WHICH affirmative was given. An answer like "yes
+            // with workspace" would have forced the gate to read less than the whole reply, and a
+            // gate that reads less than the whole reply reads "ok, actually no" as an approval. The
+            // set stays CLOSED (N19), so nothing outside these three reaches the selectors below.
+            "options": ["yes", "go", "no"],
         }),
     )?;
+    // ROUTE THE COMMITMENT — ONE selector, three answers, three children. 'yes' and 'go' are the SAME
+    // yes, but they no longer select the same child: 'go' asked for a Spec that is ready AND a
+    // workspace, and that pair has to be decided TOGETHER (see the sequence below), so it gets a
+    // branch of its own. Each `transition` under here is a DIRECT child of a selector whose branch
+    // COMPARES the answer the ask_human just above wrote, which is exactly what the shape rule
+    // B3/N13/N16 asks for ([`crate::mcp_authoring::sensitive_node_gate`]: a sensitive node needs an
+    // ask_human that NECESSARILY ran before it, and whose answer its own `gate_on` — or a selector
+    // branch on the way down to it — reads). Nothing about that rule was relaxed to make this branch
+    // legal: what changed for it is that the rule now CLIMBS to the ancestors, which is what lets the
+    // `create_workspace` at the bottom of the 'go' sequence hang on the very same answer.
     let route_ready = node(
         tc,
         wf,
         Some(&confirm),
         1,
         SELECTOR,
-        "route ready",
+        "route the commitment",
         json!({ "branches": [
             { "cond": { "var": "ready_ok", "eq": "yes" }, "child": 0 },
-            { "cond": { "always": true }, "child": 1 },
+            { "cond": { "var": "ready_ok", "eq": "go" }, "child": 1 },
+            { "cond": { "always": true }, "child": 2 },
         ] }),
     )?;
-    // 'yes' → the engaging ready transition (gate_on is satisfied because "yes" is affirmative).
+    // 'yes' — the plain commitment, nothing to prepare. The engaging ready transition, gated as at
+    // HEAD: its key holds 'yes' or 'go', each an affirmative ON ITS OWN, compared WHOLE.
     node(
         tc,
         wf,
@@ -1609,15 +1717,163 @@ fn build_nspec(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
         "ready",
         json!({ "target_state": "ready", "gate_on": "ready_ok" }),
     )?;
+    // 'go' — READY **AND** A WORKSPACE, DECIDED AS ONE. The old shape committed the transition first
+    // and opened the workspace after, as a rider routed by a second selector on the same answer; when
+    // the `create_workspace` then failed, the `ready` was already committed and the Spec sat ready
+    // with NO workspace — half of what was asked for, and nobody asked for the half. So everything
+    // that CAN be checked is checked BEFORE the transition: this sequence resolves WHERE the folder
+    // goes, PREVALIDATES that folder, and only then commits. It is the prevalidation philosophy this
+    // PRD already applies to the filesystem ("the prevalidation precedes the mkdir"), carried up to
+    // the graph, where the thing to protect is the TRANSITION.
+    let workspace = node(
+        tc,
+        wf,
+        Some(&route_ready),
+        1,
+        SEQUENCE,
+        "ready + a dev workspace",
+        json!({}),
+    )?;
     // else → a CLEAN exit (N16): the Spec is deliberately left as a draft.
     node(
         tc,
         wf,
         Some(&route_ready),
-        1,
+        2,
         NOTE,
         "left as draft",
         json!({ "text": "Left as a draft — mark it ready later (it stays editable meanwhile)." }),
+    )?;
+    // WHERE the folder goes is a FACT before it is a question: read the project's configured
+    // worktrees root, and only ASK when there is none (the decision of 2026-08-18 — a project that
+    // said once where its workspaces live is never asked again). The fact writes TWO keys:
+    // `worktrees_root` (the root itself) and `worktrees_root_configured` (the branchable half) — the
+    // selector below tests the SECOND so the question may write the FIRST.
+    node(
+        tc,
+        wf,
+        Some(&workspace),
+        0,
+        QUERY,
+        "worktrees root",
+        json!({ "query": "project_worktrees_root", "write": "worktrees_root" }),
+    )?;
+    let where_to = node(
+        tc,
+        wf,
+        Some(&workspace),
+        1,
+        SELECTOR,
+        "where does it go?",
+        json!({ "branches": [
+            { "cond": { "var": "worktrees_root_configured", "truthy": false }, "child": 0 },
+            { "cond": { "always": true }, "child": 1 },
+        ] }),
+    )?;
+    // NOT configured → ask, and ask for THE SAME THING the setting holds: a ROOT. The answer lands on
+    // `worktrees_root`, the very key the configured value would have filled, so the two branches hand
+    // the node below one value with one meaning — and the folder is DERIVED under it either way. The
+    // question used to write a key of its own that the effect took as the FINAL path, so answering
+    // this question with what it asked for registered the worktrees root ITSELF as a workspace.
+    // FREE-FORM on purpose: a folder path is not a closed answer set, and no selector branches on this
+    // key (the J1 rule asks for `options` only where a branch compares the answer by equality — which
+    // is why the branch above reads `worktrees_root_configured` instead).
+    node(
+        tc,
+        wf,
+        Some(&where_to),
+        0,
+        ASK_HUMAN,
+        "workspace root",
+        json!({
+            "prompt": "This project has no worktrees root configured. Under WHICH ROOT FOLDER should its dev workspaces be created? Give an absolute path to the PARENT folder (e.g. D:/work/_worktrees) — nyx creates a subfolder named after the Spec inside it, so answer with the folder that holds your worktrees, not the workspace folder itself. (Set it once with set_project_settings `worktrees_root` and you will not be asked again.)",
+            "output_key": "worktrees_root",
+        }),
+    )?;
+    // Configured → the SAFE default (N12(d)): nyx uses it and asks nothing.
+    node(
+        tc,
+        wf,
+        Some(&where_to),
+        1,
+        NOTE,
+        "using the configured root",
+        json!({ "text": "Creating the dev workspace under the project's configured worktrees root — no question needed." }),
+    )?;
+    // THE PREVALIDATION, and it is here — BEFORE the transition — on purpose. It asks the one thing
+    // that can be known in advance and that BIT in production: is the folder this run is about to open
+    // already a workspace of this project? A second `go` on a project whose root is set derives a
+    // DIFFERENT subfolder per Spec, so this normally answers "free"; it answers "taken" for the run
+    // that would otherwise commit a `ready` and then fail on the DB's UNIQUE(project_id, path).
+    node(
+        tc,
+        wf,
+        Some(&workspace),
+        2,
+        QUERY,
+        "is the folder free?",
+        json!({ "query": "workspace_target_free", "write": "workspace_free" }),
+    )?;
+    let free_to_commit = node(
+        tc,
+        wf,
+        Some(&workspace),
+        3,
+        SELECTOR,
+        "free to commit?",
+        json!({ "branches": [
+            { "cond": { "var": "workspace_free", "truthy": true }, "child": 0 },
+            { "cond": { "always": true }, "child": 1 },
+        ] }),
+    )?;
+    // FREE → commit. The transition sits UNDER the prevalidation, so `ready` is only taken when the
+    // workspace that comes with it can be opened.
+    node(
+        tc,
+        wf,
+        Some(&free_to_commit),
+        0,
+        TRANSITION,
+        "ready",
+        json!({ "target_state": "ready", "gate_on": "ready_ok" }),
+    )?;
+    // TAKEN → NEITHER half happens, and the run SAYS which folder and why (the fact's own
+    // `<write>_reason`, interpolated) instead of failing on it three nodes later (N12(d)).
+    node(
+        tc,
+        wf,
+        Some(&free_to_commit),
+        1,
+        NOTE,
+        "target folder taken",
+        json!({ "text": "{{workspace_free_reason}} — so NOTHING was changed: the Spec is still a draft and no workspace was opened. Set the project's `worktrees_root` to a folder that holds one subfolder per worktree (set_project_settings), then re-run /nspec." }),
+    )?;
+    // THE WORKSPACE ITSELF — a NODE, not prose: it calls the same `create_workspace` the MCP tool
+    // does, so the folder, the workspace row and the SPEC ANCHOR are one guarded write (the `spec_id`
+    // this PRD delivered), and the anchor is not re-implemented here. It reads ONE key, a ROOT, and
+    // derives `<project key>-<number>` under it — the name the human already knows the Spec by.
+    //
+    // GATED ON THE PREVALIDATION, not on the answer: the human consent for this branch is the selector
+    // that routed it (it compared the WHOLE answer to 'go'), and what this gate adds is the OTHER half
+    // of the pair — the node fires exactly when the transition above did, so `go` is all-or-nothing.
+    //
+    // NOTHING FILLS THE FOLDER, and that is assumed: no clone, no `git worktree add`. The workspace
+    // lands EMPTY. Putting something in it is the subject of the next PRD (depot idea
+    // 01M04W3RZ333NC01R216MNXAFK); the decisions already taken for it — including the compensation
+    // trap a filled folder springs — are recorded on `crate::mcp_runtime::create_workspace` and
+    // `compensate_created_dir`. What THIS branch settles is the WHERE, so that PRD only has to plug
+    // the filling in at a location nobody has to re-decide.
+    node(
+        tc,
+        wf,
+        Some(&workspace),
+        4,
+        CREATE_WORKSPACE,
+        "dev workspace",
+        json!({
+            "root_key": "worktrees_root",
+            "gate_on": "workspace_free",
+        }),
     )?;
     node(
         tc,

@@ -1072,17 +1072,36 @@ pub fn add_command(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     ))
 }
 
-/// `set_project_settings` — `{ project_id, name?, resume_agent_sessions? }` → `{ project }`.
-/// Modify an EXISTING project's mutable settings (rename + the PRD-5 #5 resume opt-in),
-/// the MCP mirror of the UI's project-settings modal. It reuses the SAME `db::update_project`
-/// / `db::set_project_resume_agent_sessions` writes the UI bridge drives, so both surfaces
+/// `set_project_settings` — `{ project_id, name?, resume_agent_sessions?, worktrees_root? }` →
+/// `{ project }`. Modify an EXISTING project's mutable settings (rename, the PRD-5 #5 resume opt-in,
+/// and the worktrees root), the MCP mirror of the UI's project-settings modal. It reuses the SAME
+/// `db::update_project` / `db::set_project_resume_agent_sessions` /
+/// `db::set_project_worktrees_root` writes the UI bridge drives, so both surfaces
 /// converge on one code path. Partial update: only the supplied fields change. Returns the
 /// project's post-write state and a `workspaces` changed effect so any open front re-pulls
 /// (the agent-driven mutation the UI never invoked is reflected without a manual reload).
+///
+/// `worktrees_root` is the ROOT FOLDER this project's dev workspaces land under. It is the one
+/// argument here where an EMPTY string is a VALUE and not a silence: passing `""` (or `null`) CLEARS
+/// the setting, which is the state a flow needing a workspace reads as "ask the human where". So it
+/// is read from the raw args rather than through [`optional_str`], whose `"" → None` would make
+/// "clear it" and "leave it alone" the same request.
 pub fn set_project_settings(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let new_name = optional_str(args, "name")?;
     let new_resume = optional_bool(args, "resume_agent_sessions")?;
+    let new_worktrees_root: Option<Option<&str>> = match args.get("worktrees_root") {
+        // Omitted → unchanged. Explicitly null/empty → cleared. A path → set.
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(Some(s.as_str())),
+        Some(_) => {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                "argument 'worktrees_root' must be a string (or null to clear it)",
+            ))
+        }
+    };
 
     // Validate the id up front so an unknown project yields a clean `invalid_id` rather
     // than a silent zero-row no-op (the writes return rows-updated, not Err, on a bad id).
@@ -1113,6 +1132,11 @@ pub fn set_project_settings(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
 
     if let Some(resume) = new_resume {
         db.with_conn(|c| db::set_project_resume_agent_sessions(c, project_id, resume))
+            .map_err(internal_db)?;
+    }
+
+    if let Some(root) = new_worktrees_root {
+        db.with_conn(|c| db::set_project_worktrees_root(c, project_id, root))
             .map_err(internal_db)?;
     }
 
@@ -4418,6 +4442,74 @@ mod tests {
             .unwrap();
         assert_eq!(after.name, "New", "omitted name is unchanged");
         assert!(!after.resume_agent_sessions, "resume toggled back OFF");
+    }
+
+    /// The worktrees-root project setting: `worktrees_root` is OPTIONAL and EMPTY by default, set and cleared
+    /// through the SAME `set_project_settings` `resume_agent_sessions` goes through, PERSISTED, and
+    /// RENDERED by `list_projects` (which is where a flow — or a human — reads it back). Clearing it
+    /// is an EXPLICIT empty string / null, never an omission: omitting the field leaves it alone.
+    #[test]
+    fn set_project_settings_carries_the_worktrees_root_and_list_projects_renders_it() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/wtr", None))
+            .unwrap();
+        assert_eq!(
+            project.worktrees_root, None,
+            "a fresh project configures no worktrees root"
+        );
+
+        let out = set_project_settings(
+            &db,
+            &json!({ "project_id": project.id, "worktrees_root": "D:/work/trees" }),
+        )
+        .unwrap();
+        assert_eq!(
+            out.result["project"]["worktrees_root"],
+            json!("D:/work/trees")
+        );
+        assert_eq!(
+            db.with_conn(|c| db::get_project(c, &project.id))
+                .unwrap()
+                .unwrap()
+                .worktrees_root
+                .as_deref(),
+            Some("D:/work/trees"),
+            "the setting is persisted"
+        );
+        // list_projects RENDERS it — the read surface a flow (and the UI) sees.
+        let listed = list_projects(&db).unwrap();
+        assert_eq!(
+            listed["projects"][0]["worktrees_root"],
+            json!("D:/work/trees")
+        );
+
+        // An OMITTED field is untouched…
+        set_project_settings(&db, &json!({ "project_id": project.id, "name": "P2" })).unwrap();
+        assert_eq!(
+            db.with_conn(|c| db::get_project(c, &project.id))
+                .unwrap()
+                .unwrap()
+                .worktrees_root
+                .as_deref(),
+            Some("D:/work/trees"),
+            "omitting worktrees_root leaves it alone"
+        );
+        // …and an EXPLICIT empty string CLEARS it (back to "ask the human where").
+        set_project_settings(
+            &db,
+            &json!({ "project_id": project.id, "worktrees_root": "" }),
+        )
+        .unwrap();
+        assert_eq!(
+            db.with_conn(|c| db::get_project(c, &project.id))
+                .unwrap()
+                .unwrap()
+                .worktrees_root,
+            None,
+            "an empty string clears the setting"
+        );
     }
 
     #[test]

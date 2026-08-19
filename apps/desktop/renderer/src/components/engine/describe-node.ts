@@ -50,6 +50,8 @@ export function describeNode(
       return describeSubWorkflow(cfg);
     case "transition_task":
       return describeTransitionTask(cfg);
+    case "create_workspace":
+      return describeCreateWorkspace(cfg);
     default:
       return null;
   }
@@ -64,6 +66,8 @@ function queryFactPhrase(query: string, target: string | undefined): string {
       return "the Spec's open tasks";
     case "spec_can_transition":
       return `whether the Spec can transition${target ? ` to \`${target}\`` : ""}`;
+    case "workspace_target_free":
+      return "whether the dev workspace folder is still free";
     default:
       return query ? `the \`${query}\` fact` : "a nyx fact";
   }
@@ -122,6 +126,28 @@ function describeTransitionTask(cfg: Record<string, unknown>): string {
   const gate = asString(cfg.gate_on);
   const gated = gate ? `, only if \`${gate}\` was approved` : "";
   return `Moves the task named by \`${key}\` to \`${t}\`${gated}.`;
+}
+
+/**
+ * `create_workspace` → "Creates the Spec's dev workspace under the root in `worktrees_root`…". The
+ * sentence must name WHERE the folder lands, because that is the node's whole decision and it is
+ * taken from the BLACKBOARD, never from a literal: `root_key` holds the ROOT — the folder workspaces
+ * land UNDER — and the Spec's own subfolder is DERIVED inside it. The sentence says "under" and never
+ * "at", because the node no longer has a second, un-derived source: a `path_key` taken as the final
+ * folder is what registered a user's whole worktrees root as one workspace (finding
+ * `01M0B5AG0XR4BG6DSGEFGKW6C4`). The `gate_on` clause is worded exactly like `transition`'s, since it
+ * is the same gate — an UNGATED node fires unconditionally and the clause is dropped.
+ */
+function describeCreateWorkspace(cfg: Record<string, unknown>): string {
+  const rootKey = asString(cfg.root_key);
+  const nameKey = asString(cfg.name_key);
+  const gateOn = asString(cfg.gate_on);
+  const named = nameKey ? `\`${nameKey}\`` : "the Spec";
+  const where = rootKey
+    ? `under the root in \`${rootKey}\`, in a subfolder named after ${named}`
+    : "nowhere — it names no root key";
+  const clause = gateOn ? `, only if \`${gateOn}\` was approved` : "";
+  return `Creates the Spec's dev workspace ${where}, and anchors the Spec to it${clause}.`;
 }
 
 /** `loop` → "Repeats its contents until `grill_status = complete`, 25 iterations max." */

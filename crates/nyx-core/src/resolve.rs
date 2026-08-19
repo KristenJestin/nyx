@@ -1,23 +1,52 @@
-//! Auto-attach resolver: map a terminal's live cwd to a KNOWN workspace, and
-//! decide the resulting binding under the hybrid auto/manual rule.
+//! cwd→workspace resolution: map a live cwd to a KNOWN workspace, and — on the
+//! terminal side — decide the resulting binding under the hybrid auto/manual
+//! rule.
+//!
+//! TWO CONSUMERS, ONE SELECTOR. [`resolve_workspace`] is the repo's single
+//! cwd→workspace selector, and it is NOT terminal-only:
+//!
+//! - TERMINAL auto-attach — [`decide_attachment`] turns the match into a
+//!   binding, which [`auto_attach_terminal`] (and the MCP terminal-create path,
+//!   `mcp_tools_core::resolve_attach_for_new_terminal`) persists.
+//! - MCP Spec/PROJECT resolution by cwd — `mcp_context::best_workspace_for_cwd`
+//!   maps `db::Workspace` rows into [`WorkspaceMatch`], calls
+//!   [`resolve_workspace`], then maps the winning id back to its row for
+//!   `resolve_spec_id` / `resolve_workspace_for_start` / `resolve_project`.
+//!
+//! So the MATCHING and the RANKING below (deepest ancestor wins, ties broken on
+//! the LOWEST id, candidate set unfiltered — archived workspaces and removed
+//! folders still compete, a deliberate limit documented at
+//! `mcp_context::best_workspace_for_cwd`) decide BOTH which workspace a terminal
+//! attaches to AND which Spec/project an MCP call resolves from a cwd. Change
+//! them HERE, once, for both at a time; neither consumer re-derives its own
+//! ranking, and neither may start to.
 //!
 //! Two layers, both pure (no IO, no DB), so they unit-test in isolation:
 //!
-//! 1. [`CwdProvider`] — the platform-agnostic source of a terminal's current
-//!    working directory. Linux uses `/proc`; Windows/macOS use OSC 7. Both feed
+//! 1. [`CwdProvider`] — the platform-agnostic source of a TERMINAL's current
+//!    working directory (NO MCP path uses it: their cwd arrives in the tool
+//!    call). Linux uses `/proc`; Windows/macOS use OSC 7. Both feed
 //!    a NORMALIZED cwd into the same resolver, so nothing above this layer is
 //!    platform-specific. If no reliable cwd is available the provider yields
 //!    `None` and the resolver makes NO change (never guesses).
 //!
 //! 2. [`resolve_workspace`] / [`decide_attachment`] — the matching + decision.
-//!    Matching is ONLY against already-known workspaces (auto-attach creates
-//!    nothing). The LONGEST canonical ancestor wins for nested workspaces.
+//!    Matching is ONLY against already-known workspaces (NEITHER consumer ever
+//!    creates one). The LONGEST canonical ancestor wins for nested workspaces.
 //!    A terminal in `manual` mode is never moved by the cwd; in `auto` mode it
 //!    follows the resolved match, and stays put when there is no match.
+//!    [`decide_attachment`] is the TERMINAL half only — the MCP Spec/project
+//!    consumer stops at [`resolve_workspace`] and never binds anything. (The MCP
+//!    TERMINAL-create path of the first bullet does bind, but it is a terminal
+//!    consumer: it goes through this same terminal half.)
 //!
-//! The bridge wires the live `/proc`/OSC7 cwd + the workspace list from the DB
-//! into these functions, then persists the decided attachment via the Task-#1
-//! `attach_terminal`/`detach_terminal` DB functions.
+//! The terminal bridge wires the live `/proc`/OSC7 cwd + the workspace list from
+//! the DB into these functions, then persists the decided attachment via the
+//! Task-#1 `attach_terminal`/`detach_terminal` DB functions. Both MCP paths read
+//! `db::all_workspaces` for themselves: the Spec/project one writes nothing at
+//! all, and the terminal-create one persists its own `attach_terminal` in
+//! `mcp_tools_core`. [`auto_attach_terminal`] is the ONLY function in this module
+//! that touches the DB.
 
 use crate::pathnorm;
 
@@ -78,9 +107,17 @@ pub struct WorkspaceMatch {
 ///
 /// "Longest ancestor wins": for nested workspaces `/p` and `/p/feat`, a cwd of
 /// `/p/feat/src` resolves to `/p/feat` (the deeper, more specific match), never
-/// the shallower `/p`. Ties on depth are broken by id for determinism (they
-/// cannot share a path within a project; across projects an arbitrary-but-stable
-/// pick is acceptable and never invents data).
+/// the shallower `/p`. Ties on depth are broken by the LOWEST id — the incumbent,
+/// ids being time-ordered UUIDv7 — for determinism (two workspaces cannot share a
+/// path within a project, but two PROJECTS may register one folder, so the tie is
+/// reachable; a stable pick never invents data and never re-points an existing
+/// cwd when a newer workspace is registered).
+///
+/// THE ONE cwd→workspace SELECTOR, deliberately: terminal auto-attach
+/// ([`decide_attachment`]) and the MCP Spec/project resolution by cwd
+/// (`mcp_context::best_workspace_for_cwd`, which maps the winning id back to its
+/// `db::Workspace` row) both land here, so a cwd can never resolve to one
+/// workspace for a terminal and another for a Spec.
 pub fn resolve_workspace<'a>(
     cwd: &str,
     workspaces: impl IntoIterator<Item = &'a WorkspaceMatch>,

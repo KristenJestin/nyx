@@ -2,8 +2,10 @@
 //!
 //! Two facts force this to be a PURE, LEXICAL normalizer rather than
 //! `std::fs::canonicalize`:
-//! - **Comparison vs. existence.** Auto-attach matches a terminal's live cwd
-//!   against stored workspace paths. `fs::canonicalize` requires the path to
+//! - **Comparison vs. existence.** The cwd→workspace resolver
+//!   ([`crate::resolve::resolve_workspace`]) matches a live cwd against stored
+//!   workspace paths — for terminal auto-attach AND for the MCP Spec/project
+//!   resolution by cwd. `fs::canonicalize` requires the path to
 //!   exist and (on Windows) returns a `\\?\` verbatim prefix, so it is unusable
 //!   for comparing a workspace folder that may be on a different mount, deleted,
 //!   or never created locally. We need a STRING canonical form that two
@@ -51,8 +53,9 @@ fn is_sep(c: char) -> bool {
 /// IO-free — see the module docs for why we do not use `fs::canonicalize`.
 ///
 /// The result is the form stored in `workspaces.path` and the form the
-/// auto-attach resolver compares a live cwd against; both sides MUST route
-/// through here so a `cd` and a stored workspace collapse to the same string.
+/// cwd→workspace resolver compares a live cwd against (terminal auto-attach and
+/// MCP Spec/project resolution alike); both sides MUST route through here so a
+/// `cd` and a stored workspace collapse to the same string.
 pub fn normalize(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -222,9 +225,10 @@ fn drive_rooted(s: &str) -> Option<(char, &str)> {
 
 /// True if `ancestor` is the same directory as `descendant` or a parent of it,
 /// comparing CANONICAL paths on component boundaries. Both inputs must already
-/// be [`normalize`]d. This is the matching primitive auto-attach uses: a live
-/// cwd matches a workspace when the workspace path is an ancestor-or-equal of
-/// the cwd; the LONGEST such match wins (see the resolver).
+/// be [`normalize`]d. This is the matching primitive the cwd→workspace resolver
+/// uses — terminal auto-attach and MCP Spec/project resolution alike: a live cwd
+/// matches a workspace when the workspace path is an ancestor-or-equal of the
+/// cwd; the LONGEST such match wins (see [`crate::resolve::resolve_workspace`]).
 ///
 /// Component-boundary safety: `/home/work` matches `/home/work` and
 /// `/home/work/sub`, but NOT `/home/work2` (which a naive `starts_with` would

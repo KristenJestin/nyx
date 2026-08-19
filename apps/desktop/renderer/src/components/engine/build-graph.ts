@@ -117,8 +117,9 @@ export interface EnginePillData extends Record<string, unknown> {
  *  invisible in the flattened chain. */
 export interface EngineEdgeData extends Record<string, unknown> {
   readonly variant: "flow";
-  /** For an edge entering a selector branch: the branch's readable condition (e.g. `spec_status =
-   *  ready`, `always`). Absent on a plain sequential edge. */
+  /** For an edge entering a selector branch: the readable condition under which that branch is taken
+   *  (e.g. `spec_status = ready`, `always`) — every condition routing there, OR-ed, when the selector
+   *  aims several branches at the one child. Absent on a plain sequential edge. */
   readonly branchCondition?: string;
   /** The Y of the edge's HORIZONTAL run, chosen after layout as a lane that crosses NO node (N38
    *  review). Absent when the edge needs no sideways run (a straight drop) or no clear lane exists. */
@@ -616,21 +617,77 @@ export function describeCondition(cond: unknown): string | null {
   return varName; // a bare `var` — truthiness/presence test.
 }
 
-/** The readable condition on the SELECTOR branch that routes to the child at `childIndex` (its position
+/** What a branch whose `cond` is PRESENT but names neither a `var` nor `always: true` is labelled —
+ *  `{}`, `{"eq": "yes"}`, `{"always": false}`. nyx-core deserializes all of these without error
+ *  (`Condition`'s fields are all optional) and `Condition::matches` then returns `false` for every
+ *  board: such a branch can NEVER fire. It is the exact opposite of the default arm, and its own
+ *  `Condition::describe()` says so — "nothing (neither a var nor 'always')". It is worth a WORD
+ *  rather than a blank, because a blank is what made it readable as the default. */
+export const NEVER_MATCHES_LABEL = "never (no var, no always)";
+
+/** The readable condition under which a SELECTOR routes to the child at `childIndex` (its position
  *  among the selector's ordered children). Mirrors nyx-core's `SelectorBranch` (`{cond, child}`, where
- *  an absent `child` defaults to the branch's own position). Returns e.g. `spec_status = ready` /
- *  `always`, or `null` when no branch targets that child. Powers the branch-edge labels (N18(b)). */
+ *  an absent `child` defaults to the branch's own position).
+ *
+ *  SEVERAL branches may target the SAME child — nyx-core allows it (`pick_branch` takes the first that
+ *  matches), and `/nspec`'s `route ready` shipped exactly that shape (`ready_ok = yes` and
+ *  `ready_ok = go` both selecting the one `transition`) until revision 22 gave `go` a branch of its
+ *  own. ALL of their conditions are returned, as one
+ *  DISJUNCTION in branch order: `ready_ok = yes OR ready_ok = go`. Showing only the first would claim
+ *  the other values fall through to the `ELSE` arm — the exact opposite of what the graph does, on the
+ *  one surface a human reads instead of the config. One branch → its condition VERBATIM
+ *  (`spec_status = ready` / `always`), so a 1-branch-per-child selector reads exactly as before.
+ *
+ *  THE THREE SHAPES ARE READ FROM THE BRANCH, NOT FROM A RENDERED STRING (finding
+ *  `01M0AE30KM8MC6PD7DWRSM06PW`). `describeCondition` answers `null` for TWO shapes nyx-core holds
+ *  apart, and collapsing on that answer merged them:
+ *    1. NO `cond` key at all → `cond: None`, which `pick_branch` matches UNCONDITIONALLY: the default
+ *       arm. The child is reachable whatever the others test, so the disjunction collapses onto it and
+ *       this returns `null` (the inspector's `ELSE`).
+ *    2. `always: true` → same reachability, same collapse. Tested on the SHAPE, not on the rendered
+ *       string, so a blackboard var literally named `always` (`{"var": "always"}` — a real presence
+ *       test, rendered `always` too) no longer COLLAPSES the disjunction and no longer erases what its
+ *       siblings contribute. Its rendered string stays ambiguous for a caller that compares against
+ *       `"always"` (the inspector's `isDefault` does): that half is the annexe note of the same
+ *       finding, pre-existing and left as it stands.
+ *    3. `cond` PRESENT but with neither → matches NEVER ([`NEVER_MATCHES_LABEL`]). It contributes
+ *       nothing to the disjunction and, above all, DESTROYS nothing: on
+ *       `[{cond:{var:"x",eq:1},child:0},{cond:{},child:0}]` the answer is `x = 1`, not `ELSE`.
+ *       The old short-circuit returned `null` there — painting an arm reached only when `x == 1` as
+ *       the one reached always, which is the very reversal this function exists to prevent.
+ *  No selector seeded in nyx-core carries shape 3 today, but nothing REFUSES it either
+ *  (`validate_node_config` has no `selector` arm and never looks inside a branch), so it is authorable.
+ *
+ *  `null` when no branch targets that child. Powers the branch-edge labels (N18(b)) and the
+ *  inspector's branch list. */
 export function describeBranchCondition(selectorConfig: string, childIndex: number): string | null {
   const branches = parseNodeConfig(selectorConfig).branches;
   if (!Array.isArray(branches)) return null;
+  const conditions: string[] = [];
+  let sawNeverMatching = false;
   for (let i = 0; i < branches.length; i += 1) {
     const b = branches[i];
     if (!b || typeof b !== "object") continue;
     const rec = b as Record<string, unknown>;
     const target = typeof rec.child === "number" ? rec.child : i;
-    if (target === childIndex) return describeCondition(rec.cond);
+    if (target !== childIndex) continue;
+    const cond = rec.cond;
+    // (1) The DEFAULT arm — nothing to OR it with.
+    if (cond === undefined || cond === null) return null;
+    // (2) `always: true` — likewise, and read from the shape so a var named `always` is not it.
+    if (typeof cond === "object" && (cond as Record<string, unknown>).always === true) {
+      return "always";
+    }
+    const described = describeCondition(cond);
+    // (3) Present, undescribable ⇒ unreachable through this branch. Skip it, keep what we have.
+    if (described === null) {
+      sawNeverMatching = true;
+      continue;
+    }
+    if (!conditions.includes(described)) conditions.push(described); // the same test twice is noise.
   }
-  return null;
+  if (conditions.length > 0) return conditions.join(" OR ");
+  return sawNeverMatching ? NEVER_MATCHES_LABEL : null;
 }
 
 /** Render a `Condition` comparison value plainly (a string without quotes, else its JSON form). */

@@ -521,11 +521,18 @@ pub fn set_primary_workspace(
 // --- Workspace use cases ----------------------------------------------------
 
 /// USE CASE — register a non-root workspace at `path` in `project_id` and auto-detect its
-/// repositories. The single orchestration both the UI (`create_workspace`) and the MCP
-/// (`workspace_add` / `create_workspace`) funnel into once the on-disk path is ready
-/// (each adapter owns its own path precondition — validate-existing vs `mkdir -p`). It
-/// composes [`crate::repository::register_workspace`] (insert + auto-detect) and emits a
-/// [`DomainEventKind::WorkspaceCreated`] on success. Returns the new workspace.
+/// repositories: the UNANCHORED entry point, for callers that have no Spec to anchor. It
+/// DELEGATES to [`register_workspace_anchored`] with `spec_id = None` — it composes nothing
+/// itself, so the insert + auto-detect ([`crate::repository::register_workspace`]) and the
+/// [`DomainEventKind::WorkspaceCreated`] emission live in exactly ONE place, shared with the
+/// anchored path. Returns the new workspace.
+///
+/// PRODUCTION CALLER: the sidecar/UI bridge's `create_workspace` DB command
+/// (`nyx-sidecar/src/runtime/db_command.rs`) — plus tests. NOT the MCP: since v2.5
+/// `workspace_add` / `create_workspace` go straight to [`register_workspace_anchored`]
+/// (`mcp_runtime::create_workspace_inner`) so they can carry their optional `spec_id`. This
+/// signature is load-bearing for that bridge and stays as it is; the on-disk path
+/// precondition (validate-existing vs `mkdir -p`) is still the adapter's, not this layer's.
 pub fn register_workspace(
     conn: &mut SqliteConnection,
     events: &dyn EventSink,
@@ -534,7 +541,69 @@ pub fn register_workspace(
     path: &str,
     source: DomainEventSource,
 ) -> QueryResult<Workspace> {
-    let workspace = conn.transaction(|conn| {
+    // The UNANCHORED contract, byte-for-byte: delegate with `spec_id = None`. With no Spec to
+    // anchor the anchoring half cannot fail, so the only error shape reachable here is `Db`.
+    match register_workspace_anchored(conn, events, project_id, name, path, None, source) {
+        Ok((workspace, _)) => Ok(workspace),
+        Err(RegisterWorkspaceError::Db(e)) => Err(e),
+        // Unreachable (no `spec_id` ⇒ no anchor step). Collapse to a rollback rather than
+        // panic, the same way `content_write_to_query_err` handles its impossible arms.
+        Err(RegisterWorkspaceError::Anchor(_)) => Err(diesel::result::Error::RollbackTransaction),
+    }
+}
+
+/// Why [`register_workspace_anchored`] refused: either the workspace INSERT failed (`Db` — an
+/// unknown project's FK violation, a duplicate path's UNIQUE violation…) or the Spec ANCHOR
+/// was refused (`Anchor` — unknown/`draft`/terminal Spec, or a Spec of another project). Both
+/// arms leave the DB untouched: the two writes share ONE transaction.
+#[derive(Debug)]
+pub enum RegisterWorkspaceError {
+    /// The workspace registration itself failed.
+    Db(diesel::result::Error),
+    /// The Spec anchor was refused (the whole transaction rolled back).
+    Anchor(db::SetSpecWorkspaceError),
+}
+
+impl From<diesel::result::Error> for RegisterWorkspaceError {
+    fn from(e: diesel::result::Error) -> Self {
+        RegisterWorkspaceError::Db(e)
+    }
+}
+
+impl From<db::SetSpecWorkspaceError> for RegisterWorkspaceError {
+    fn from(e: db::SetSpecWorkspaceError) -> Self {
+        match e {
+            db::SetSpecWorkspaceError::Db(e) => RegisterWorkspaceError::Db(e),
+            other => RegisterWorkspaceError::Anchor(other),
+        }
+    }
+}
+
+/// USE CASE — register a workspace AND (optionally) ANCHOR a Spec on it, in ONE transaction.
+/// The v2.5 widening of [`register_workspace`]: a dev workspace is very often created/declared
+/// FOR a Spec, so the two writes must be one coherent operation — either the workspace exists
+/// AND the Spec points at it, or NEITHER happened (a refused anchor rolls the workspace insert
+/// back, leaving no partial workspace behind).
+///
+/// The anchor goes through the SHARED [`db::set_spec_workspace`] authority, so it inherits its
+/// guards verbatim (`ready`/`in_progress` only, same project, existing workspace) and its
+/// `spec.workspace_changed` outbox row. It NEVER transitions the Spec — the status is read for
+/// the guard, never written.
+///
+/// The caller is expected to have PREVALIDATED `spec_id` with [`db::check_spec_anchorable`]
+/// before touching the filesystem; this function re-applies the guards anyway (the DB is the
+/// authority, and the workspace only exists here). Returns the new workspace and the anchored
+/// Spec (`None` when `spec_id` is absent).
+pub fn register_workspace_anchored(
+    conn: &mut SqliteConnection,
+    events: &dyn EventSink,
+    project_id: &str,
+    name: &str,
+    path: &str,
+    spec_id: Option<&str>,
+    source: DomainEventSource,
+) -> Result<(Workspace, Option<db::Spec>), RegisterWorkspaceError> {
+    let (workspace, spec) = conn.transaction(|conn| {
         let workspace = crate::repository::register_workspace(conn, project_id, name, path)?;
         let correlation = DomainEventCorrelation {
             project_id: workspace.project_id.clone(),
@@ -548,14 +617,19 @@ pub fn register_workspace(
             &correlation,
             source,
         )?;
-        Ok::<_, diesel::result::Error>(workspace)
+        // SAME transaction: a refused anchor rolls the workspace insert back with it.
+        let spec = match spec_id {
+            None => None,
+            Some(spec_id) => Some(db::set_spec_workspace(conn, spec_id, Some(&workspace.id))?),
+        };
+        Ok::<_, RegisterWorkspaceError>((workspace, spec))
     })?;
     events.emit(DomainEvent::new(
         DomainEventKind::WorkspaceCreated,
         DomainEntity::Workspace,
         &workspace.id,
     ));
-    Ok(workspace)
+    Ok((workspace, spec))
 }
 
 /// USE CASE — RENAME a workspace's display `name` (a human label; the identity `path` is

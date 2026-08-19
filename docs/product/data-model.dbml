@@ -300,7 +300,7 @@ Table specs {
     (project_id, status)
   }
 
-  Note: 'Ticket durable et unite de travail de l humain (PDR-0014). Cle humaine = projects.key + "-" + number (ex. NYX-42) ; slug descriptif conserve pour l URL. priority stockee (string). workspace_id = pointeur unique vers le worktree de dev, pose au lancement, ecrasable, jamais perdu.'
+  Note: 'Ticket durable et unite de travail de l humain (PDR-0014). Cle humaine = projects.key + "-" + number (ex. NYX-42) ; slug descriptif conserve pour l URL. priority stockee (string). workspace_id = pointeur unique vers le worktree de dev, posable des que la Spec est ready (sans transition de statut) ou au lancement du dev, ecrasable, jamais perdu.'
 }
 
 Table spec_revisions {

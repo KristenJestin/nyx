@@ -340,7 +340,12 @@ function BranchList({
   return (
     <ol data-testid="selector-branches" className="flex flex-col gap-2.5">
       {childRows.map((child, index) => {
-        // The branch that routes to this child; an `always` / missing condition IS the default arm.
+        // What routes to this child — EVERY condition that does, OR-ed when several branches aim at
+        // the same child. Only the two shapes that really match unconditionally read as the default
+        // arm: NO `cond` at all (`null` here) and `always: true`. A branch whose `cond` is present
+        // but tests nothing matches NEVER, and `describeBranchCondition` now names it
+        // (`NEVER_MATCHES_LABEL`) instead of answering `null` — so `ELSE` below cannot be painted on
+        // an arm that can never fire (finding `01M0AE30KM8MC6PD7DWRSM06PW`).
         const raw = describeBranchCondition(selectorConfig, index);
         const isDefault = raw === null || raw === "always";
         return (

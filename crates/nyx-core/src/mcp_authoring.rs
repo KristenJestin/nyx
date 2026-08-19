@@ -66,13 +66,13 @@
 //! front's re-pull on it is wired in Phase 6 (the React Flow visualiser); the topic is NAMED here so
 //! the seam is single-authority end to end (the same forward-declared pattern as `Specs` / `Ideas`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use diesel::Connection;
 use serde_json::{json, Value};
 
 use crate::db::{self, Db};
-use crate::engine::{NodeType, Tree};
+use crate::engine::{board_key_root, NodeType, SensitiveEffect, Tree};
 use crate::mcp::{RpcCode, RpcError};
 use crate::mcp_runtime::{internal_db, optional_str, require_str};
 use crate::mcp_tools_core::{ChangedTopic, ToolOutcome};
@@ -348,10 +348,17 @@ fn known_config_fields(node_type: &str) -> &'static [&'static str] {
         ],
         db::NODE_TYPE_PRODUCE => &["output_key", "append"],
         db::NODE_TYPE_TRANSITION => &["target_state", "gate_on"],
-        db::NODE_TYPE_QUERY => &["query", "write", "target", "task_key"],
+        db::NODE_TYPE_QUERY => &[
+            "query", "write", "target", "task_key", "root_key", "name_key",
+        ],
         db::NODE_TYPE_FORK_SPEC => &["gate_on"],
         db::NODE_TYPE_TRANSITION_TASK => &["transition", "task_key", "reason", "gate_on"],
         db::NODE_TYPE_SUB_WORKFLOW => &["scope", "workflow_id", "inject", "retrieve", "output_key"],
+        // create_workspace — exactly the fields [`crate::engine::CreateWorkspaceConfig`] decodes, so a fork of
+        // /nspec can be re-authored through node_add/node_update like every other type. Without
+        // this arm the type fell to the catch-all below, which MEANS "takes no config" — and the
+        // node is inexecutable without one.
+        db::NODE_TYPE_CREATE_WORKSPACE => &["root_key", "name_key", "gate_on"],
         db::NODE_TYPE_NOTE => &["text", "clear_gate_block", "revoke_spec_write"],
         db::NODE_TYPE_LOOP => &["until", "max_iterations"],
         db::NODE_TYPE_SELECTOR => &["branches"],
@@ -452,9 +459,10 @@ fn validate_node_config(node_type: &str, config: &Value) -> Result<(), RpcError>
                     .unwrap_or(true)
             {
                 // An ENGAGING transition (ready/done/cancel) is a COMMITMENT — a graph may impose it
-                // only behind a human approval. It needs a `gate_on` naming the blackboard key a
-                // PRECEDING ask_human approves (B3); the preceding-ask_human SHAPE is enforced by
-                // validate_tree. (Entry `start` and `in_review` need no gate.)
+                // only behind a human approval. It needs a `gate_on` naming the blackboard key an
+                // ask_human approves (B3); WHICH ask_human is allowed to approve it — one that
+                // necessarily runs before it, on the branch that reaches it — is the SHAPE
+                // [`sensitive_node_gate`] enforces. (Entry `start` and `in_review` need no gate.)
                 Err(RpcError::new(
                     RpcCode::InvalidArgument,
                     format!(
@@ -467,9 +475,9 @@ fn validate_node_config(node_type: &str, config: &Value) -> Result<(), RpcError>
             }
         }
         db::NODE_TYPE_FORK_SPEC if !non_empty("gate_on") => {
-            // A fork is a sensitive Spec mutation: it needs a `gate_on` naming the blackboard key a
-            // PRECEDING ask_human approves (the preceding-ask_human SHAPE is checked by validate_tree),
-            // so nyx never forks implicitly (v2.8 review N13).
+            // A fork is a sensitive Spec mutation: it needs a `gate_on` naming the blackboard key an
+            // ask_human approves (WHICH ask_human may approve it is the SHAPE [`sensitive_node_gate`]
+            // checks), so nyx never forks implicitly (v2.8 review N13).
             Err(RpcError::new(
                 RpcCode::InvalidArgument,
                 "a 'fork_spec' node needs a 'gate_on' naming the blackboard key a preceding ask_human \
@@ -494,6 +502,26 @@ fn validate_node_config(node_type: &str, config: &Value) -> Result<(), RpcError>
             } else {
                 Ok(())
             }
+        }
+        db::NODE_TYPE_CREATE_WORKSPACE if !non_empty("root_key") => {
+            // create_workspace — the folder must RESOLVE from the node's ONE declared source, NAMED.
+            //
+            // The RUNTIME would not strictly force it: `CreateWorkspaceConfig` defaults `root_key` to
+            // `None` and the engine then reads [`crate::engine::DEFAULT_WORKTREES_ROOT_KEY`], so a
+            // config-less node runs whenever the board happens to carry `worktrees_root`. THAT is the
+            // reason the WRITE side is stricter, not laxer: "wherever the board happens to hold a root"
+            // is not a decision a graph should take implicitly — the one thing this node does is say
+            // WHERE, and a node that says it by omission says it to whatever a sibling last wrote.
+            // `name_key`/`gate_on` stay optional (the name falls back to the Spec's, and an absent gate
+            // means UNGATED). There is no second "explicit path" source to fall back on any more, and
+            // that removal is the point: a node that took a whole path took it AS the workspace, so the
+            // same value meant "the folder to create" here and "the folder to create it UNDER" there.
+            Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                "a 'create_workspace' node needs a 'root_key' — the blackboard key holding the ROOT \
+                 its folder is created under (a `query project_worktrees_root`, or an ask_human that \
+                 asked for one). Without it there is no folder to derive",
+            ))
         }
         db::NODE_TYPE_SUB_WORKFLOW => {
             // The child target must RESOLVE: a non-empty `scope`, or an explicit `workflow_id` override
@@ -524,16 +552,16 @@ fn validate_node_config(node_type: &str, config: &Value) -> Result<(), RpcError>
             } else {
                 // The fact NAME must be one nyx actually resolves — a mis-typed `query` would branch
                 // the graph on a permanent `null` at runtime, so it is refused at authoring (B2). The
-                // accepted set is shared with the runtime resolver (never drifts).
+                // accepted set is shared with the runtime resolver — the TEST and BOTH listings (this
+                // one and the runtime's) read `mcp_engine::QUERY_FACTS`, so none of them can drift
+                // from it (this one did, by one fact, inside this PRD's working tree).
                 let query = config.get("query").and_then(Value::as_str).unwrap_or("");
                 if !crate::mcp_engine::valid_query(query) {
                     Err(RpcError::new(
                         RpcCode::InvalidArgument,
                         format!(
-                            "query '{query}' is not a known nyx fact (accepted: spec_status, \
-                             spec_can_transition, spec_open_tasks, spec_open_findings, \
-                             spec_deferred_findings, phase_open_tasks, phase_next_task, \
-                             task_close_route, design_round_pages, design_locked)"
+                            "query '{query}' is not a known nyx fact (accepted: {})",
+                            crate::mcp_engine::QUERY_FACTS.join(", ")
                         ),
                     ))
                 } else if query == "spec_can_transition" {
@@ -675,12 +703,16 @@ fn parse_node_type(args: &Value) -> Result<&str, RpcError> {
     if NodeType::from_db(t).is_some() {
         Ok(t)
     } else {
+        // The listing is READ from [`db::NODE_TYPES`], never re-typed beside it — the same rule
+        // `mcp_engine::QUERY_FACTS` now enforces for the `query` facts, and for the same reason: a
+        // hand-kept copy drifts from the set it describes, and this sentence is reached exactly when
+        // somebody needs it to be complete. It had already fallen a type behind twice (`sub_workflow`,
+        // then `create_workspace`), each time telling an author their node type did not exist.
         Err(RpcError::new(
             RpcCode::InvalidArgument,
             format!(
-                "unknown node type '{t}' (accepted: sequence, loop, selector, spawn_subagent, \
-                 judge, ask_human, produce, gate_check, transition, wait, note, query, fork_spec, \
-                 transition_task, sub_workflow)"
+                "unknown node type '{t}' (accepted: {})",
+                db::NODE_TYPES.join(", ")
             ),
         ))
     }
@@ -743,6 +775,400 @@ fn validate_project(db: &Db, project_id: &str) -> Result<(), RpcError> {
 
 // --- Tree coherence (the single validation authority) ----------------------
 
+/// Whether a node COMMITS something a human alone may commit — the set the shape rule (4) of
+/// [`validate_tree`] demands a gate for.
+///
+/// A THIN READ of [`crate::engine::SensitiveEffect`], which is where the set itself lives, together
+/// with what each member commits and why. It is deliberately not a second list: this rule and the
+/// RUNTIME's human-turn demand ([`crate::engine::Tree::ask_human_commitment`]) each used to carry
+/// their own, and the runtime's held ONE of the three — so a `fork_spec` or a `create_workspace` this
+/// function certified HUMAN-GATED asked for no human turn at all, and the session driving the run
+/// answered for the human (finding `01M0C3BZPWV832D802C0GZFTMC`).
+fn is_sensitive_node(n: &db::Node) -> bool {
+    let Some(node_type) = NodeType::from_db(&n.type_) else {
+        return false;
+    };
+    let config: Value = serde_json::from_str(&n.config).unwrap_or_else(|_| json!({}));
+    SensitiveEffect::of(node_type, &config).is_some()
+}
+
+/// Every blackboard key a node WRITES, reduced to the flat root the board actually holds — the reading
+/// behind rule (4)'s SINGLE-WRITER condition (iii) in [`sensitive_node_gate`].
+///
+/// Derived from the config, node type by node type, and it covers every write the interpreter
+/// performs ([`crate::engine::Executor::apply_result`] and `mcp_engine::drive`):
+///
+///   * `ask_human` / `judge` / `produce` / `sub_workflow` — the `output_key`, else the type's DEFAULT
+///     key (`human` / `verdict` / `artifact` / `sub_result`). A leaf with no `output_key` still
+///     writes, and it writes a key another node is free to name.
+///   * `sub_workflow` ALSO folds each `retrieve[].to` FLAT onto the PARENT board (`engine.set_board`),
+///     so those count — it is the widest write in the vocabulary, which is why
+///     [`validate_board_copies`] already validates them as writes.
+///   * `query` — its `write`, plus the companion `<write>_reason` `drive` folds beside it.
+///   * `spawn_subagent` (`last_diff`, `spawns`), `gate_check` (`gate_green`,
+///     [`crate::mcp_engine::LAST_GATE_RESULT_KEY`], [`crate::mcp_engine::BLOCKING_GATE_RED_KEY`]),
+///     `loop` ([`crate::engine::LOOP_ITER_KEY`]), `sub_workflow`
+///     ([`crate::mcp_engine::subworkflow_child_key`]) — FIXED keys the engine writes WITHOUT the
+///     node's config naming them, but any `output_key` may name them, so they are listed rather than
+///     assumed unreachable.
+///
+/// The last three of those were MISSING (finding `01M0C3F7V89HJFDGWJEBP12P0N`): `last_gate_result`,
+/// `blocking_gate_red` and `__child_run_id__<node>` were written by `drive` and censused by nobody, so
+/// a graph could satisfy condition (iii) on a key a `gate_check` or a `sub_workflow` also writes. It
+/// was never a bypass — those three carry an object, an array and a UUID, and
+/// [`crate::mcp_engine::board_value_is_affirmative`] credits none of them, so they can REVOKE a
+/// consent but never fabricate one — but "the list is the contract" has to mean the list, and
+/// [`crate::mcp_authoring::tests`]'s census test now fails when a fixed key is added without one.
+///
+/// What it does NOT model: the VALUE a write carries, nor whether the writer is on the path actually
+/// taken. It answers "which nodes may touch this key at all", never "what will be in it" — deliberately,
+/// because rule (4) wants the conservative half of that question.
+fn node_written_board_keys(n: &db::Node) -> Vec<String> {
+    let cfg: Value = serde_json::from_str(&n.config).unwrap_or_else(|_| json!({}));
+    let str_field = |name: &str| -> Option<String> {
+        cfg.get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| board_key_root(s).to_string())
+    };
+    let with_default = |default: &str| -> Vec<String> {
+        vec![str_field("output_key").unwrap_or_else(|| default.to_string())]
+    };
+    match n.type_.as_str() {
+        db::NODE_TYPE_ASK_HUMAN => with_default(crate::engine::DEFAULT_ASK_HUMAN_OUTPUT_KEY),
+        db::NODE_TYPE_JUDGE => with_default(crate::engine::DEFAULT_JUDGE_OUTPUT_KEY),
+        // The two remaining result-producing leaves' fixed defaults, spelled as `apply_result` spells
+        // them (`write_result(leaf, "artifact"/"sub_result", …)`).
+        db::NODE_TYPE_PRODUCE => with_default("artifact"),
+        db::NODE_TYPE_SUB_WORKFLOW => {
+            let mut keys = with_default("sub_result");
+            // The CHILD-run handle `drive` parks the leaf on — keyed per node, written and cleared by
+            // the `sub_workflow` arm, and named by no config field.
+            keys.push(crate::mcp_engine::subworkflow_child_key(&n.id));
+            for copy in cfg
+                .get("retrieve")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(to) = copy.get("to").and_then(Value::as_str) {
+                    let to = to.trim();
+                    if !to.is_empty() {
+                        keys.push(board_key_root(to).to_string());
+                    }
+                }
+            }
+            keys
+        }
+        db::NODE_TYPE_QUERY => match str_field("write") {
+            Some(write) => vec![format!("{write}_reason"), write],
+            None => Vec::new(),
+        },
+        db::NODE_TYPE_SPAWN_SUBAGENT => vec!["last_diff".to_string(), "spawns".to_string()],
+        // A `gate_check` writes THREE keys, and only the first is a config-visible one: `drive` also
+        // folds the full verdict object and (for a BLOCKING gate) the red-gate anchor array.
+        db::NODE_TYPE_GATE_CHECK => vec![
+            "gate_green".to_string(),
+            crate::mcp_engine::LAST_GATE_RESULT_KEY.to_string(),
+            crate::mcp_engine::BLOCKING_GATE_RED_KEY.to_string(),
+        ],
+        db::NODE_TYPE_LOOP => vec![crate::engine::LOOP_ITER_KEY.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// A config field read RAW — the string as authored, dots and all. [`board_key_root`] is the right
+/// reading for "which key does this DEPEND on"; this is the reading for "what will the engine
+/// actually look up", which is what the two dead-gate closures below need to tell apart.
+fn raw_field(n: &db::Node, name: &str) -> Option<String> {
+    serde_json::from_str::<Value>(&n.config)
+        .ok()?
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The board path `raw` names, when an `ask_human`'s ANSWER could ever satisfy a read of it — `None`
+/// for a DOTTED path, which no answer can (finding `01M0C3FGCACXCZA1ZESRV73N0R`(a)).
+///
+/// An answer is always a SCALAR: `mcp_engine::human_answer` accepts a string / number / bool and
+/// refuses an object or an array outright. `Blackboard::set` then puts that scalar under ONE flat
+/// key. A read of `ok.deep` goes through [`crate::engine::Blackboard::get`], which splits on dots and
+/// descends — into a scalar, so it resolves to nothing, forever. The gate cannot open and the branch
+/// cannot match, whatever the human answers.
+///
+/// This is the READ side of the pair [`validate_board_write_key`] already refuses on the WRITE side,
+/// and for the same reason it gives there: "the key was accepted, the write happened, and only the
+/// read was impossible: nothing anywhere said so". It is NOT a blanket ban on dotted reads — a
+/// `selector` may perfectly well branch on `proto_result.status`, because a `sub_workflow` writes an
+/// OBJECT there, and `/nspec` ships exactly that. What is refused is a dotted read counting as a
+/// CONSENT, since the value under it would have to be a human's answer and a human's answer is flat.
+fn answer_readable_key(raw: &str) -> Option<&str> {
+    (!raw.is_empty() && !raw.contains('.')).then_some(raw)
+}
+
+/// Whether an `ask_human`'s answer lands on its key in a shape a consent read can ever accept —
+/// `false` for `append: true` (finding `01M0C3FGCACXCZA1ZESRV73N0R`(b)).
+///
+/// `Executor::write_result` honours `append` by calling `Blackboard::append`, so the key holds an
+/// ARRAY (`["yes"]`), not the answer. [`crate::mcp_engine::board_value_is_affirmative`] knows only
+/// `Bool` and `String`, so an array is never an approval; and a selector `eq` compares against the
+/// array, which no affirmative literal equals. Both readings of condition (ii) are therefore dead,
+/// and crediting such a question would certify a gate that can never open. An appending question is
+/// a TRANSCRIPT (`/nspec`'s "steer" accumulates the grill's answers); it is not a decision.
+fn answer_can_fill(ask: &db::Node) -> bool {
+    !serde_json::from_str::<Value>(&ask.config)
+        .ok()
+        .and_then(|c| c.get("append").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// The blackboard key a selector branch tests for an AFFIRMATIVE value — rule (4)'s POLARITY
+/// condition — or `None` when the branch carries no consent at all.
+///
+/// A THIN READ of [`crate::engine::Condition::affirmative_key`], which is where the shape and every
+/// refusal are written down, and which the RUNTIME classification
+/// ([`crate::engine::Tree::ask_human_commitment`]) reads too — the selector arm of rule (4) and the
+/// human-turn demand behind it must route on the same branches or neither claim means anything.
+fn branch_affirmative_key(cond: &crate::engine::Condition) -> Option<String> {
+    cond.affirmative_key().map(str::to_string)
+}
+
+/// The `ask_human` node that GATES a sensitive node, or `None` when nothing does — the whole of rule
+/// (4). THREE conditions, and ALL THREE are needed; any one alone is a guard that only looks like one.
+///
+/// **(i) THE QUESTION MUST HAVE BEEN ASKED.** The `ask_human` has to be a node that NECESSARILY ran
+/// before this one: a preceding sibling — of the sensitive node itself, or of any of its ANCESTORS —
+/// inside a `sequence` or a `loop` body, the two composites that walk their children in order (a
+/// `loop` re-enters at cursor 0, so a left sibling ran in every pass). A `selector` gives no such
+/// guarantee: it PICKS one child, so nothing to a branch's left is known to have run, and a sibling
+/// branch's `ask_human` is a question this run may never have been asked at all.
+///
+/// **WHY IT CLIMBS.** The rule used to look at the node's own siblings only, and that is what left
+/// `create_workspace` ungatable: the seeded `/nspec` asks "mark it ready?" ONE selector higher, and
+/// the branch that answer selects is a whole sequence — read where the folder goes, prevalidate it,
+/// commit, create. A consent given higher up the chain is still a consent; refusing to look at it
+/// would have meant either a false gate or an un-authorable graph. What must NOT follow is that the
+/// whole tree counts: the climb walks the ANCESTOR CHAIN, which is exactly the branch the run took to
+/// reach the node, and never leaves it.
+///
+/// **(ii) THAT ANSWER MUST DECIDE THIS NODE, AND DECIDE IT AFFIRMATIVELY.** "A human was asked
+/// something first" is not consent — it is chronology. So the key the question WRITES has to be one
+/// the path to this node actually reads, in a way that only an APPROVAL satisfies. Exactly two
+/// readings qualify:
+///
+///   * the sensitive node's own `gate_on` — the RUNTIME gate fires the node only when that key holds
+///     an affirmative ([`crate::mcp_engine::board_value_is_affirmative`]), so the polarity is enforced
+///     where the effect happens;
+///   * the `cond` of a `selector` branch the chain descends THROUGH, when that cond is an AFFIRMATIVE
+///     test on the key ([`branch_affirmative_key`]) — the routing IS the decision, the N16 pattern:
+///     approve → the node, refuse → a safe note that never freezes the run.
+///
+/// AND THE READING MUST BE ONE AN ANSWER CAN SATISFY. Both readings above are refused when they are
+/// DOTTED ([`answer_readable_key`]) and the crediting question is refused when it APPENDS
+/// ([`answer_can_fill`]): in each case the value the gate reads is provably not the answer — nothing
+/// (a dot-path descending into a scalar) or an array. Such a graph used to VALIDATE and then never
+/// fire its sensitive node, or die on `SelectorNoBranch`; a gate the author believes is posed and that
+/// cannot open is a wrong answer to a question about consent, even though it is the safe wrong answer.
+///
+/// Any other branch contributes NOTHING to the decision — an `always`/default branch, a cond with no
+/// `var`, a `truthy`, a `ne`, and (the reproduced bypass) an `eq` on a REFUSAL: `{var: "ready_ok",
+/// eq: "no"}` routing a `create_workspace` used to validate, and answering "no" then made the folder.
+/// A branch that contributes nothing leaves the child reachable with no approval behind it, so no
+/// approval is accountable for it. A child named by MORE THAN ONE branch counts only when EVERY one of
+/// them tests the SAME key affirmatively — otherwise the child is reachable by a route that key never
+/// decided. Which branch selects which child, and how a cond reads, both come from
+/// [`crate::engine::SelectorConfig`] / [`crate::engine::Condition`], the interpreter's own decoding.
+///
+/// **(iii) NOTHING ELSE MAY WRITE THAT KEY.** The question's key must have exactly ONE writer in the
+/// whole workflow: the crediting `ask_human` itself ([`node_written_board_keys`]). Without (iii),
+/// (i) and (ii) together still only proved that a key with the right NAME was filled by a question
+/// once — and the reproduced bypass is three nodes long: `sequence[ ask_human{output_key:
+/// "approved"}, query{write: "approved"}, transition{ready, gate_on: "approved"} ]` validated, the
+/// human answered "no", the `query` overwrote it with `true`, and the Spec moved to `ready`. A single
+/// writer is what makes "the value the gate reads is the answer the human gave" a property of the
+/// GRAPH rather than a hope about execution order, and it is checked over the whole workflow rather
+/// than over the path, because "the path" is exactly the thing static analysis cannot pin down.
+///
+/// # What this rule does NOT guarantee
+///
+/// Stated flatly, because four widenings of this guard each shipped a comment that promised more than
+/// the code held:
+///
+///   * **Not that the human APPROVED.** It proves that an approval is the only thing that can reach
+///     the node, given the graph. What actually lands on the key is a runtime fact; the `gate_on` arm
+///     leans on the runtime gate for it, the selector arm on the branch's `eq`.
+///   * **Not that the answer is a HUMAN's.** `ask_human` is a node type here, not an observed turn.
+///     Whether a real human answered is `mcp_engine`'s `human_turn_required` / `accept_consent_answer`
+///     business, and this rule neither sees nor replaces it. That delegation is only worth anything
+///     because the two layers now read THE SAME SET ([`crate::engine::SensitiveEffect`]): while they
+///     each kept their own, this rule certified `fork_spec` and `create_workspace` as human-gated and
+///     the runtime demanded no human turn for either, so the delegation went nowhere.
+///   * **Not that the key is unwritable.** (iii) covers the writes a node DECLARES in its config PLUS
+///     the fixed keys the engine writes on a node's behalf, per [`node_written_board_keys`]. A node
+///     type added later that writes a key that list does not name is invisible here; the list is the
+///     contract, and `mcp_authoring::tests`'s census test is what keeps it one.
+///   * **Not that the branch is REACHED.** (i) proves the question necessarily ran; nothing proves the
+///     run gets as far as the sensitive node, and nothing needs to.
+///   * **Not that the gate is LIVE beyond the two shapes named above.** A dotted read and an appending
+///     question are refused because no answer can satisfy them, but this rule does not simulate the
+///     run: it cannot tell an author that the answer they will actually get is off-vocabulary, nor
+///     that a `gate_on` whose key a `query` fills will be `false` on the day.
+///   * **Not that the graph is safe.** It answers ONE question — is this commitment behind a human
+///     approval — for the three members of [`crate::engine::SensitiveEffect`], and nothing about the
+///     rest.
+///
+/// # The alternative this does NOT take (for the user to arbitrate)
+///
+/// All of the above is AUTHORING-time analysis: it reads the graph and reasons about what execution
+/// could do. The engine, at the instant it is about to run a sensitive node, does not have to reason
+/// — it holds the actual value on the actual board, and it already tells a real human turn from a
+/// replayed one (`mcp_engine`'s `human_turn_required` / `accept_consent_answer`). The one thing it
+/// does not keep today is WHICH node last wrote a board key: the blackboard is a flat JSON object, so
+/// that provenance would have to be recorded on the write side — an addition to
+/// [`crate::engine::Blackboard`], not an inference. With it, a RUNTIME check — "refuse the effect
+/// unless the gate key's current value was written by an `ask_human` on a human turn" — needs no
+/// single-writer approximation, no polarity read of `cond` literals, and no ancestor climb, and it
+/// holds for graphs authored before it existed. Its cost is the mirror image: the refusal lands
+/// mid-run instead of at `node_add`, so an author meets it as a parked run rather than as a rejected
+/// edit. The two are complementary, not exclusive. Whether to add it — and whether this static rule
+/// then relaxes — is a design decision for the user; it is written down here, not built.
+fn sensitive_node_gate<'a>(nodes: &'a [db::Node], node: &db::Node) -> Option<&'a db::Node> {
+    let by_id: HashMap<&str, &db::Node> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    // Children per parent in EXECUTION order — the same `(order_index, id)` ordering
+    // [`Tree::from_rows`] rebuilds, so "the branch that selects this child" is read off the very
+    // sequence the interpreter walks.
+    let mut children_of: HashMap<&str, Vec<&db::Node>> = HashMap::new();
+    for n in nodes {
+        if let Some(p) = n.parent_id.as_deref() {
+            children_of.entry(p).or_default().push(n);
+        }
+    }
+    for kids in children_of.values_mut() {
+        kids.sort_by(|a, b| {
+            a.order_index
+                .cmp(&b.order_index)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+
+    let field = |n: &db::Node, name: &str| -> Option<String> {
+        serde_json::from_str::<Value>(&n.config)
+            .ok()?
+            .get(name)
+            .and_then(Value::as_str)
+            .map(|s| board_key_root(s).to_string())
+    };
+    // The key an `ask_human` fills: its `output_key`, else the shared default the engine writes to.
+    let written_key = |n: &db::Node| -> String {
+        field(n, "output_key")
+            .unwrap_or_else(|| crate::engine::DEFAULT_ASK_HUMAN_OUTPUT_KEY.to_string())
+    };
+    // The key the branches that route `child` test AFFIRMATIVELY — at most one, and only when EVERY
+    // branch naming that child tests THE SAME key that way. One branch that routes there
+    // unconditionally, on a refusal, or on a non-discriminating test (a `truthy` on a closed answer
+    // set is an `always` in disguise) makes the child reachable without an approval, so the whole
+    // selector then decides NOTHING and contributes nothing (ii).
+    let routing_keys = |selector: &db::Node, child: &str| -> Vec<String> {
+        let Ok(cfg) = serde_json::from_str::<crate::engine::SelectorConfig>(&selector.config)
+        else {
+            return Vec::new();
+        };
+        let Some(position) = children_of
+            .get(selector.id.as_str())
+            .and_then(|kids| kids.iter().position(|k| k.id == child))
+        else {
+            return Vec::new();
+        };
+        let mut approved: Option<String> = None;
+        for (i, branch) in cfg.branches.iter().enumerate() {
+            if branch.child.unwrap_or(i) != position {
+                continue;
+            }
+            let Some(cond) = branch.cond.as_ref() else {
+                return Vec::new();
+            };
+            // A DOTTED read is a read no answer can satisfy ([`answer_can_fill`]), so the branch
+            // decides nothing — and, unlike a plain non-affirmative branch, it also makes the child
+            // reachable on the `always` fall-through. Treated exactly like one: the whole selector
+            // contributes nothing.
+            let Some(key) = answer_readable_key(cond.var.as_deref().unwrap_or(""))
+                .and(branch_affirmative_key(cond))
+            else {
+                return Vec::new();
+            };
+            match &approved {
+                Some(previous) if *previous != key => return Vec::new(),
+                _ => approved = Some(key),
+            }
+        }
+        approved.into_iter().collect()
+    };
+
+    // (iii) SINGLE WRITER — who, in the WHOLE workflow, can put a value under each board key.
+    let mut writers_of: HashMap<String, Vec<&str>> = HashMap::new();
+    for n in nodes {
+        for key in node_written_board_keys(n) {
+            writers_of.entry(key).or_default().push(n.id.as_str());
+        }
+    }
+    let is_sole_writer = |ask: &db::Node, key: &str| -> bool {
+        writers_of
+            .get(key)
+            .map(|w| w.len() == 1 && w[0] == ask.id)
+            .unwrap_or(false)
+    };
+
+    // The keys whose AFFIRMATIVE value DECIDES whether this node fires, accumulated as the climb goes
+    // up: its own runtime gate first (the gate itself tests the polarity), then every selector branch
+    // the path descends through that tests a key for an approval. A question found at level N sits
+    // ABOVE everything collected below it, so its answer is available to all of them.
+    let mut decides: HashSet<String> = HashSet::new();
+    decides.extend(
+        raw_field(node, SensitiveEffect::GATE_FIELD)
+            .as_deref()
+            .and_then(answer_readable_key)
+            .map(str::to_string),
+    );
+    let mut cursor = node;
+    for _ in 0..nodes.len() {
+        let Some(parent) = cursor
+            .parent_id
+            .as_deref()
+            .and_then(|p| by_id.get(p).copied())
+        else {
+            return None;
+        };
+        match parent.type_.as_str() {
+            // Ordered composites: every left sibling has necessarily run.
+            db::NODE_TYPE_SEQUENCE | db::NODE_TYPE_LOOP => {
+                let asked = children_of
+                    .get(parent.id.as_str())
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|s| {
+                        s.type_ == db::NODE_TYPE_ASK_HUMAN && s.order_index < cursor.order_index
+                    })
+                    .filter(|s| answer_can_fill(s))
+                    .find(|s| {
+                        let key = written_key(s);
+                        decides.contains(&key) && is_sole_writer(s, &key)
+                    });
+                if asked.is_some() {
+                    return asked;
+                }
+            }
+            // A selector guarantees no ordering, but the edge carries the test that chose this branch.
+            db::NODE_TYPE_SELECTOR => decides.extend(routing_keys(parent, &cursor.id)),
+            _ => {}
+        }
+        cursor = parent;
+    }
+    None
+}
+
 /// Validate a workflow's node rows form a COHERENT tree, or return the reason it does not. An empty
 /// (node-less) draft is a valid intermediate state. The rules, layered:
 ///
@@ -751,6 +1177,10 @@ fn validate_project(db: &Db, project_id: &str) -> Result<(), RpcError> {
 ///   2. A LEAF node may not have children (`type`/enfants invalides).
 ///   3. No cycle / orphan: every node's `parent_id` chain must reach THE root without looping. A
 ///      disconnected cycle that coexists with a valid root passes (1), so this closes it.
+///   4. A SENSITIVE node ([`is_sensitive_node`]) is HUMAN-GATED — an `ask_human` that necessarily runs
+///      before it, whose answer decides it AFFIRMATIVELY, and whose key nothing else writes
+///      ([`sensitive_node_gate`], which also states what that does NOT guarantee).
+///   5. A question a BRANCH answers declares that branch's answers ([`Tree::ask_human_unconstrained_branch`], J1).
 pub(crate) fn validate_tree(nodes: &[db::Node], root_id: Option<&str>) -> Result<(), String> {
     if nodes.is_empty() {
         return Ok(());
@@ -820,55 +1250,41 @@ pub(crate) fn validate_tree(nodes: &[db::Node], root_id: Option<&str>) -> Result
         }
     }
 
-    // (4) A SENSITIVE commitment — an ENGAGING transition (ready/done/cancel) or a `fork_spec` — must
-    //     be HUMAN-gated (v2.8 review B3 / N13). TWO accepted shapes:
-    //       * a `sequence[ …, ask_human, node ]` — a preceding-sibling ask_human approves it; OR
-    //       * a SELECTOR branch — the branch condition (tested on a key an ask_human wrote) ROUTES to
-    //         it, so the routing IS the gate, and a sibling branch is the clean refusal exit (the N16
-    //         pattern: approve → the node / refuse → a safe note, so a refusal never freezes the run).
-    //     Either way the RUNTIME still checks the node's `gate_on` before the effect fires.
-    let is_sensitive = |n: &db::Node| -> bool {
-        if n.type_ == db::NODE_TYPE_FORK_SPEC {
-            return true;
-        }
-        if n.type_ != db::NODE_TYPE_TRANSITION {
-            return false;
-        }
-        serde_json::from_str::<Value>(&n.config)
-            .ok()
-            .and_then(|c| {
-                c.get("target_state")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .map(|t| crate::mcp_engine::transition_is_engaging_target(&t))
-            .unwrap_or(false)
-    };
+    // (4) A SENSITIVE commitment — an ENGAGING transition (ready/done/cancel), a `fork_spec`, or a
+    //     `create_workspace` — must be HUMAN-GATED (v2.8 review B3 / N13 / N16). See
+    //     [`sensitive_node_gate`] for the rule and for why it climbs to the ANCESTORS.
     for n in nodes {
-        if !is_sensitive(n) {
+        if !is_sensitive_node(n) {
             continue;
         }
-        let Some(parent) = n.parent_id.as_deref() else {
+        if n.parent_id.is_none() {
             return Err(format!(
-                "sensitive node {} ('{}') has no parent — it must be a selector branch, or sit in a \
-                 sequence after an ask_human that approves it",
+                "sensitive node {} ('{}') has no parent — a sensitive node cannot BE the graph: it \
+                 must sit under an ask_human that approves it (in its sequence or in an ancestor's), \
+                 with that answer read by its own `gate_on` or by the selector branch that routes to \
+                 it",
                 n.id, n.type_
             ));
-        };
-        // Routed as a SELECTOR branch → the condition + the runtime gate are the gate (N16); no
-        // preceding-sibling ask_human required.
-        if type_of.get(parent).map(|t| *t == db::NODE_TYPE_SELECTOR).unwrap_or(false) {
-            continue;
         }
-        let approved_before = nodes.iter().any(|s| {
-            s.parent_id.as_deref() == Some(parent)
-                && s.order_index < n.order_index
-                && s.type_ == db::NODE_TYPE_ASK_HUMAN
-        });
-        if !approved_before {
+        if sensitive_node_gate(nodes, n).is_none() {
             return Err(format!(
-                "sensitive node {} ('{}') must be PRECEDED by an ask_human in its sequence, or routed \
-                 by a selector branch (its human gate) — B3 / N13 / N16",
+                "sensitive node {} ('{}') is not HUMAN-GATED. It needs ONE ask_human meeting all \
+                 three conditions: (i) it NECESSARILY runs before — a preceding sibling of the node \
+                 itself, or of one of its ancestors, in a sequence or a loop body (an ask_human in a \
+                 selector's sibling branch is a question this run may never be asked), and it must \
+                 NOT be an `append: true` question — its key would hold an array, never an approval; \
+                 (ii) its key decides this node AFFIRMATIVELY — read by the node's own `gate_on`, or \
+                 tested by every selector branch on the way down to it as `{{\"var\": <that key>, \
+                 \"eq\": <yes/y/ok/approve(d)/ready/go/true>}}`, the literal spelled EXACTLY like \
+                 that (the runtime compares by exact equality, so \"YES\" or \" yes \" never match) \
+                 and the key un-dotted (a dot-path read of a human's answer resolves to nothing); an \
+                 `always` branch, a `truthy`, a `ne`, or an `eq` on a REFUSAL such as \"no\" decides \
+                 nothing — answering no would fire the node; (iii) NOTHING ELSE in this workflow \
+                 writes that key — no query `write`, no judge/produce/sub_workflow `output_key`, no \
+                 sub_workflow `retrieve` `to`, and none of the fixed keys the engine writes itself \
+                 (`gate_green`, `last_gate_result`, `blocking_gate_red`, `last_diff`, `spawns`, \
+                 `loop_iter`) — since a second writer can replace the human's answer before the gate \
+                 reads it. B3 / N13 / N16",
                 n.id, n.type_
             ));
         }

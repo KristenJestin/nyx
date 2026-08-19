@@ -279,9 +279,13 @@ impl SidecarDispatcher {
                 .expect("runtime command tool dispatch");
         }
 
-        // 2) Workspace registration tools (pure pool writes). Both funnel through the
-        //    SHARED `usecase::register_workspace` (PDR-0005, the same use case the UI bridge
-        //    drives). The use case persists a `workspace.created` `domain_events` row IN its
+        // 2) Workspace registration tools (pure pool writes). Both funnel through the SHARED
+        //    `usecase::register_workspace_anchored` (PDR-0005), which they call DIRECTLY since
+        //    v2.5 so they can carry their optional `spec_id`. That is a DISTINCT entry point
+        //    from the UI bridge's `create_workspace` db-command, which reaches the same use
+        //    case through the UNANCHORED `usecase::register_workspace` (`spec_id = None`); the
+        //    two paths meet only INSIDE the anchored use case, never before it.
+        //    The use case persists a `workspace.created` `domain_events` row IN its
         //    transaction (task #9) and then emits the DOMAIN event through the injected sink
         //    AFTER commit — here the real-time [`PushEventSink`] (task #10), which pushes the
         //    v2.0 unsolicited `workspaces://changed` so the renderer re-pulls WITHOUT a reload
@@ -634,6 +638,127 @@ mod tests {
             changed.contains(&"specs"),
             "the review mutation pushed `specs://changed` for the OVERLAY (finding = tasks kind=review), got: {changed:?}"
         );
+    }
+
+    /// FINDING `01M0BN0R0Q0VXK9JM7TGXX9D7W` — A WORKSPACE OPENED BY THE GRAPH REACHES THE SIDEBAR,
+    /// through the SHELL, without a relaunch. The sibling of the two tests above, on the road that
+    /// had none.
+    ///
+    /// `create_workspace` the TOOL is reached at step 2 of `dispatch`, which injects a
+    /// `PushEventSink`: the use case emits `workspace.created` after commit and the sink pushes
+    /// `workspaces://changed`. `create_workspace` the NODE runs INSIDE a `nyx_next` tick, where no
+    /// shell sink reaches — the call passes a `NullEventSink` — so its only road out is step 3's
+    /// `emit_effects`, over the tick's own `ToolOutcome::effects`. Those effects named `Specs` and
+    /// nothing else, and the sidebar re-pulls on `workspaces://changed` ALONE: on 2026-08-18 a `go`
+    /// answered in `/nspec` created DEPOT-6, wrote the row, made the folder, anchored the Spec — and
+    /// the sidebar stayed empty until the app was restarted, which is indistinguishable from a flow
+    /// that failed.
+    ///
+    /// This drives the FULL sidecar chain the human's screen depends on: `dispatch("nyx_next")` →
+    /// the tick runs the node's effect inline → `ToolOutcome::effects` → `emit_effects` → a PUSHED
+    /// `Event::Changed { topic: "workspaces" }` on the pipe (which `main/sidecar.ts` maps to
+    /// `workspaces://changed`, the topic `use-projects` re-lists on).
+    #[test]
+    fn a_workspace_opened_by_a_graph_tick_pushes_the_sidebar_invalidation() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let db = Arc::new(temp_db());
+        // The folder the node opens the workspace UNDER — a fresh empty dir, never the project's.
+        let roots = std::env::temp_dir().join(format!(
+            "nyx-graph-ws-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&roots).unwrap();
+
+        // A project, a Spec driven to `ready` (the anchor's precondition), and a one-node graph whose
+        // only node is the `create_workspace` the `go` branch reaches.
+        let (project, _root_ws) = db
+            .with_conn(|c| db::create_project(c, "Proj", "/tmp/mcp-graph-ws", None))
+            .expect("project");
+        let spec_id = db
+            .with_conn(|c| {
+                db::create_spec(
+                    c,
+                    &project.id,
+                    "Spec",
+                    db::SpecSections {
+                        problem: "the workspace never shows up".into(),
+                        solution: "say the pool changed".into(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .expect("spec")
+            .0
+            .id;
+        db.with_conn(|c| db::transition_spec(c, &spec_id, db::SpecTransition::Ready, true))
+            .expect("the spec is ready — the anchor's precondition");
+        let run_id = db
+            .with_conn(|c| {
+                let wf = db::create_workflow(c, None, "graph-ws", db::WORKFLOW_SCOPE_CUSTOM, None)?;
+                db::create_node(
+                    c,
+                    &wf.id,
+                    None,
+                    0,
+                    db::NODE_TYPE_CREATE_WORKSPACE,
+                    "open the dev workspace",
+                    "{}",
+                )?;
+                let board = serde_json::json!({ "worktrees_root": roots.to_string_lossy() });
+                db::create_workflow_run(c, &wf.id, Some(&spec_id), None, &board.to_string())
+            })
+            .expect("run")
+            .id;
+
+        let disp = dispatcher(Arc::clone(&db), &buf);
+        let out = disp
+            .call("nyx_next", &serde_json::json!({ "run_id": run_id }))
+            .expect("the tick runs the create_workspace node");
+        assert_eq!(
+            out["status"], "done",
+            "the one-node graph ran to completion"
+        );
+
+        // The effect really landed — the topic below would otherwise be a claim about nothing.
+        let ws = db
+            .with_conn(|c| db::list_workspaces(c, &project.id))
+            .expect("workspaces")
+            .into_iter()
+            .find(|w| w.root_path != nyx_core::pathnorm::normalize("/tmp/mcp-graph-ws"))
+            .expect("the node opened the Spec's dev workspace");
+        assert_eq!(
+            db.with_conn(|c| db::get_spec(c, &spec_id))
+                .unwrap()
+                .unwrap()
+                .workspace_id
+                .as_deref(),
+            Some(ws.id.as_str()),
+            "and anchored it on the Spec"
+        );
+
+        let changed: Vec<String> = captured_events(&buf)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Changed { topic } => Some(topic),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            changed.iter().any(|t| t == "workspaces"),
+            "the graph tick pushed `workspaces://changed` — the ONLY topic the sidebar re-pulls on, \
+             and the difference between a workspace that appears and one the user reads as a \
+             failure. Got: {changed:?}"
+        );
+        assert!(
+            changed.iter().any(|t| t == "specs"),
+            "and it still pushes `specs://changed` for the run cursor / the anchored Spec: \
+             {changed:?}"
+        );
+        std::fs::remove_dir_all(&roots).ok();
     }
 
     /// H1 (with F8) — a terminal created over MCP gets a REAL shell and runs its opening command,

@@ -432,6 +432,34 @@ pub struct Project {
     pub primary_workspace_id: Option<String>,
     /// Soft-archive timestamp, epoch ms (v10). `None` while the project is active.
     pub archived_at: Option<i64>,
+    /// The ROOT FOLDER under which this project's dev workspaces land (the worktrees_root
+    /// migration) — the WHERE of a workspace, set once per project instead of asked for every
+    /// time. `None`/empty (the default, and the only value for a project predating that
+    /// migration) means UNSET, and a flow that needs a workspace ASKS the human for A ROOT — the same
+    /// value this column holds, so the folder is DERIVED under it either way.
+    ///
+    /// Project-level, like [`Project::resume_agent_sessions`], because where worktrees live follows
+    /// the project's layout far more than the machine's — but NOT (yet) mirrored like it. The only
+    /// write path is the MCP one ([`set_project_worktrees_root`], reached by
+    /// `mcp_tools_core::set_project_settings`); the UI's project-settings modal, which does expose
+    /// `resume_agent_sessions`, has NO field for this and the bridge has no db-command for it. So
+    /// today a human sets it by asking an agent — which is what the seeded `/nspec` question tells
+    /// them to do ("Set it once with set_project_settings `worktrees_root`"). The UI half is a
+    /// deliberate gap to close, not an existing surface: do not read the pairing above as done.
+    ///
+    /// nyx stores the ROOT ONLY. What lands in the folder is not decided here — today
+    /// [`crate::mcp_runtime::create_workspace`] `mkdir`s it and stops (the folder stays EMPTY), and
+    /// the fill strategies are the next PRD's subject (depot idea `01M04W3RZ333NC01R216MNXAFK`; the
+    /// decisions are recorded on `create_workspace` itself).
+    ///
+    /// HORS PERIMETRE ASSUME. This per-project setting IS the "verbe configurable par projet" that
+    /// out-of-scope item 01M02VRGBAY6HV0A97A938DQ33 of PRD 01KYA475AX5JBGSS8WK5J8NM1S sent to a
+    /// SEPARATE PRD ("Provisioning physique du workspace […] le choix du root_path […] necessite un
+    /// verbe configurable par projet dans un PRD separe"), shipped here on the user's explicit
+    /// decision of 2026-08-18. It is BORNE to the WHERE (the root folder, and the derivation of a
+    /// path under it); the WHAT — clone, worktree, root files, setup commands — stays out of scope
+    /// and belongs to idea 01M04W3RZ333NC01R216MNXAFK. Full note on `build_nspec` in `crate::seed`.
+    pub worktrees_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -1676,29 +1704,21 @@ pub fn list_specs(conn: &mut SqliteConnection, project_id: &str) -> QueryResult<
         .load(conn)
 }
 
-/// The most recent LIVE Spec ANCHORED on `workspace_id` (its `workspace_id` points at it),
-/// or `None` when no live Spec is anchored there. Newest first (`created_at` desc) so a
-/// cwd/workspace-resolved agent context lands on the Spec currently being worked — the
-/// resolution path the v2.4 Phase-5 agent-context render uses when no explicit `spec_id`
-/// is given (PDR-0020: "sans id → spec résolue via cwd"). Archived Specs are excluded.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn spec_for_workspace(
-    conn: &mut SqliteConnection,
-    workspace_id: &str,
-) -> QueryResult<Option<Spec>> {
-    specs::table
-        .filter(specs::workspace_id.eq(workspace_id))
-        .filter(specs::archived_at.is_null())
-        .order(specs::created_at.desc())
-        .select(Spec::as_select())
-        .first(conn)
-        .optional()
-}
+// NO `spec_for_workspace` LIVES HERE — deliberately. A "the most recent LIVE Spec anchored on this
+// workspace" read (`ORDER BY created_at DESC ... LIMIT 1`) used to sit at this spot and is GONE: it
+// answered a location question by picking the NEWEST candidate silently, which attributes work to an
+// ARBITRARY Spec the moment a workspace carries more than one (v2.8 review N14(b)). It survived as
+// dead code called only by a test — one re-wiring away from putting newest-wins back into the
+// resolution path — so it was deleted rather than left as a trap. The ONE candidate-set read for
+// resolving a Spec by location is [`active_specs_for_workspace`] below, whose caller
+// (`mcp_context::unique_spec_for_workspace`) REFUSES the N case instead of choosing.
 
 /// Every ACTIVE Spec anchored on `workspace_id`, newest first — the CANDIDATE SET for resolving a
-/// Spec BY LOCATION (a `cwd` / `workspace_id`). Where [`spec_for_workspace`] silently returns the
-/// first of several, this returns them ALL so a caller can DETECT the ambiguity: a workspace with
-/// several started Specs cannot resolve ONE by location alone (v2.8 review N14(b)).
+/// Spec BY LOCATION (a `cwd` / `workspace_id`). It returns them ALL, never "the first of several",
+/// so a caller can DETECT the ambiguity: a workspace with several started Specs cannot resolve ONE
+/// by location alone (v2.8 review N14(b)). The `created_at desc` order is a STABLE listing order for
+/// the candidate LIST a refusal prints — never a priority: no caller may read element 0 as "the
+/// answer".
 ///
 /// ACTIVE = non-archived AND NON-TERMINAL. A `completed` / `cancelled` Spec has reached its end:
 /// counting it as a candidate makes a workspace read ambiguous — or resolve WRONG — over work that
@@ -2713,19 +2733,82 @@ pub enum SetSpecWorkspaceError {
     SpecNotFound,
     /// A non-null `workspace_id` was given but no workspace resolves to it (the GUARD).
     WorkspaceNotFound,
-    /// The STATE GUARD: the standalone anchor is only legal while the Spec is `in_progress`.
-    /// A Spec in `draft`/`ready` (or a terminal state) is refused — the anchor is posed at
-    /// the ready→in_progress transition (the review finding), never earlier. Carries the
-    /// current status so the caller can explain the refusal.
+    /// The STATE GUARD: the standalone anchor is only legal while the Spec is `ready` or
+    /// `in_progress` ([`SPEC_ANCHORABLE_STATUSES`]). A Spec still in `draft` — or in a
+    /// terminal/parked state (`blocked`, `in_review`, `completed`, `cancelled`,
+    /// `archived`) — is refused: the anchor is a CONTEXT operation posed once the Spec is
+    /// at least `ready`, never during authoring and never after the work is settled.
+    /// Carries the current status so the caller can explain the refusal.
     InvalidState { status: String },
+    /// The PROJECT GUARD: the target workspace exists but belongs to ANOTHER project than
+    /// the Spec. Anchoring across projects would make the derived repos/project of the Spec
+    /// contradict its own `project_id`, so it is refused. Carries both sides.
+    ProjectMismatch {
+        spec_project_id: String,
+        workspace_project_id: String,
+    },
+    /// The SAME project guard, but raised on the PREVALIDATION path
+    /// ([`check_spec_anchorable`]), where NO workspace exists yet: the Spec belongs to another
+    /// project than the one the workspace is about to be registered in. Distinct from
+    /// [`SetSpecWorkspaceError::ProjectMismatch`] so the refusal can be worded in terms of the
+    /// TARGET project instead of claiming a workspace that has not been created or looked up.
+    SpecProjectMismatch {
+        spec_project_id: String,
+        target_project_id: String,
+    },
     /// A DB error surfaced while resolving or updating.
     Db(diesel::result::Error),
 }
+
+/// The Spec statuses in which the workspace anchor may be (re)posed or detached through the
+/// standalone path: `ready` and `in_progress`. A `ready` Spec is anchorable because the dev
+/// workspace often EXISTS before the work starts (v2.5: `workspace_add`/`create_workspace`
+/// with a `spec_id`) — linking it is a CONTEXT operation that never transitions the Spec.
+/// `draft` (still authoring) and every terminal/parked status stay refused.
+pub const SPEC_ANCHORABLE_STATUSES: [&str; 2] = [SPEC_STATUS_READY, SPEC_STATUS_IN_PROGRESS];
 
 impl From<diesel::result::Error> for SetSpecWorkspaceError {
     fn from(e: diesel::result::Error) -> Self {
         SetSpecWorkspaceError::Db(e)
     }
+}
+
+/// PREVALIDATE — READ-ONLY — that `spec_id` could be anchored on a workspace of `project_id`,
+/// BEFORE that workspace exists (and, for `create_workspace`, before ANY folder is created on
+/// disk). Applies the SAME two guards [`set_spec_workspace`] applies, minus the workspace
+/// lookup (there is nothing to look up yet): the Spec must exist
+/// ([`SetSpecWorkspaceError::SpecNotFound`]), it must be in [`SPEC_ANCHORABLE_STATUSES`]
+/// ([`SetSpecWorkspaceError::InvalidState`]), and it must belong to `project_id`
+/// ([`SetSpecWorkspaceError::SpecProjectMismatch`] — the PREVALIDATION twin of
+/// [`SetSpecWorkspaceError::ProjectMismatch`], worded against the TARGET project because no
+/// workspace exists here to belong to one). Writes NOTHING and never transitions the Spec —
+/// it only reads the row.
+///
+/// Returns `()`, NOT the row it read: the prevalidated snapshot is deliberately dropped. The
+/// authority on the Spec a caller echoes is [`set_spec_workspace`], which re-reads it INSIDE
+/// the anchoring transaction — echoing this read-only snapshot would surface a Spec captured
+/// before the write, outside any transaction.
+pub fn check_spec_anchorable(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    project_id: &str,
+) -> Result<(), SetSpecWorkspaceError> {
+    let spec = match get_spec(conn, spec_id)? {
+        None => return Err(SetSpecWorkspaceError::SpecNotFound),
+        Some(s) => s,
+    };
+    if !SPEC_ANCHORABLE_STATUSES.contains(&spec.status.as_str()) {
+        return Err(SetSpecWorkspaceError::InvalidState {
+            status: spec.status.clone(),
+        });
+    }
+    if spec.project_id != project_id {
+        return Err(SetSpecWorkspaceError::SpecProjectMismatch {
+            spec_project_id: spec.project_id.clone(),
+            target_project_id: project_id.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The refusal a STATE-GUARDED content write returns when the Spec's status forbids it (v2.8 review
@@ -2795,16 +2878,28 @@ fn require_spec_status(
 }
 
 /// SET (or CLEAR) a Spec's `workspace_id` — the anchor on a dev workspace (the v2.1 seam,
-/// realized here). STATE-GUARDED: only a Spec that is `in_progress` may (re)anchor or detach
-/// through this standalone path — a `draft`/`ready` (or terminal) Spec is refused with
-/// [`SetSpecWorkspaceError::InvalidState`], because the anchor is posed at the ready→in_progress
-/// transition ([`transition_spec_with_workspace`]), never at authoring (the review finding).
+/// realized here). STATE-GUARDED to [`SPEC_ANCHORABLE_STATUSES`]: a `ready` OR `in_progress`
+/// Spec may (re)anchor or detach through this standalone path; a `draft` Spec (still being
+/// authored) and every terminal/parked status are refused with
+/// [`SetSpecWorkspaceError::InvalidState`]. The guard was WIDENED from `in_progress` alone
+/// (v2.5): the dev workspace frequently exists BEFORE the work starts, so `workspace_add` /
+/// `create_workspace` can anchor a `ready` Spec — but the link is a CONTEXT operation and
+/// NEVER transitions the Spec (the status is read for the guard, never written here; `start`
+/// still poses the anchor of its own move via [`transition_spec_with_workspace`]).
 /// Also GUARDED: a non-null `workspace_id` MUST resolve to an existing workspace (else
-/// [`SetSpecWorkspaceError::WorkspaceNotFound`]), so a Spec never anchors on a dangling id;
-/// passing `None` DETACHES the Spec (a sane, allowed state while in_progress — the pointer is
-/// "posé au lancement, écrasable, jamais perdu", data-model.dbml). Bumps `updated_at`.
-/// Returns the updated [`Spec`]. Runs in ONE transaction so a refusal writes nothing. This
-/// is the SINGLE nyx-core owner of the standalone anchor write (UI + MCP route here).
+/// [`SetSpecWorkspaceError::WorkspaceNotFound`]), so a Spec never anchors on a dangling id,
+/// AND that workspace must belong to the SAME project as the Spec (else
+/// [`SetSpecWorkspaceError::ProjectMismatch`]) — a cross-project anchor would make the
+/// derived repos/project contradict the Spec's own `project_id`. Passing `None` DETACHES the
+/// Spec (a sane, allowed state — the pointer is "posé au lancement, écrasable, jamais
+/// perdu", data-model.dbml).
+///
+/// IDEMPOTENT: re-applying the anchor the Spec ALREADY carries (including `None` on an
+/// already-detached Spec) is a NO-OP — it leaves `updated_at` untouched and emits NO event,
+/// so a re-run never manufactures Activity noise. A real MOVE writes the new target and
+/// records EXACTLY ONE correlated `spec.workspace_changed` event. Returns the [`Spec`] as it
+/// stands after the call. Runs in ONE transaction so a refusal writes nothing. This is the
+/// SINGLE nyx-core owner of the standalone anchor write (UI + MCP route here).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn set_spec_workspace(
     conn: &mut SqliteConnection,
@@ -2818,23 +2913,36 @@ pub fn set_spec_workspace(
             None => return Err(SetSpecWorkspaceError::SpecNotFound),
             Some(s) => s,
         };
-        // STATE GUARD: the standalone (re)anchor/detach is only legal while in_progress. In
-        // draft/ready the anchor must NOT be posed — it belongs to the start transition.
-        if existing.status != SPEC_STATUS_IN_PROGRESS {
+        // STATE GUARD: the standalone (re)anchor/detach is legal while `ready` or
+        // `in_progress`. In `draft` the anchor must NOT be posed (the Spec is still being
+        // authored), and once the work is settled/parked the anchor is frozen.
+        if !SPEC_ANCHORABLE_STATUSES.contains(&existing.status.as_str()) {
             return Err(SetSpecWorkspaceError::InvalidState {
                 status: existing.status.clone(),
             });
         }
-        // GUARD: a non-null anchor must point at an existing workspace.
+        // GUARD: a non-null anchor must point at an EXISTING workspace of the SAME project.
         if let Some(ws_id) = workspace_id {
-            let ws_exists = workspaces::table
+            let ws_project = workspaces::table
                 .find(ws_id)
-                .select(workspaces::id)
+                .select(workspaces::project_id)
                 .first::<String>(conn)
                 .optional()?;
-            if ws_exists.is_none() {
-                return Err(SetSpecWorkspaceError::WorkspaceNotFound);
+            match ws_project {
+                None => return Err(SetSpecWorkspaceError::WorkspaceNotFound),
+                Some(p) if p != existing.project_id => {
+                    return Err(SetSpecWorkspaceError::ProjectMismatch {
+                        spec_project_id: existing.project_id.clone(),
+                        workspace_project_id: p,
+                    });
+                }
+                Some(_) => {}
             }
+        }
+        // NO-OP: the Spec already carries this exact anchor. Return it untouched — no
+        // `updated_at` bump, no `spec.workspace_changed` event (idempotent re-anchor).
+        if existing.workspace_id.as_deref() == workspace_id {
+            return Ok(existing);
         }
         let spec = diesel::update(specs::table.find(spec_id))
             .set((
@@ -5219,7 +5327,8 @@ pub fn detect_branch(path: &str) -> Option<String> {
 // Pure DB functions taking `&mut SqliteConnection`, unit-tested against an
 // in-memory database; the bridge wraps each in a `#[tauri::command]`. Paths are
 // normalized via `crate::pathnorm` BEFORE storage so UNIQUE(project_id, path)
-// and the auto-attach ancestor matching operate on canonical strings.
+// and the cwd→workspace ancestor matching (`crate::resolve`, shared by terminal
+// auto-attach and MCP Spec/project resolution) operate on canonical strings.
 
 /// Derive a canonical uppercase-alpha `key` STUB from a project name (v10). Keeps
 /// ASCII letters, uppercases them, and caps the length; empty input (or a name with no
@@ -5447,6 +5556,28 @@ pub fn set_project_resume_agent_sessions(
         .execute(conn)
 }
 
+/// Persist a project's `worktrees_root` — the root folder its dev workspaces land under (the
+/// worktrees_root migration), bumping `updated_at`. `None` (or a blank string, normalised to
+/// `None` here) CLEARS it, which puts the flow back on asking the human for a path. Returns rows
+/// updated (0 if the id is unknown).
+///
+/// Blank is normalised rather than stored because an empty string and "unset" are the SAME state for
+/// every reader — `spec_anchor`'s empty-string lesson (review F2) one table over: a config whose
+/// "absent" has two spellings gets checked for one of them.
+pub fn set_project_worktrees_root(
+    conn: &mut SqliteConnection,
+    id: &str,
+    root: Option<&str>,
+) -> QueryResult<usize> {
+    let root = root.map(str::trim).filter(|s| !s.is_empty());
+    diesel::update(projects::table.find(id))
+        .set((
+            projects::worktrees_root.eq(root),
+            projects::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
 /// Whether the PROJECT owning `terminal_id` opts in to agent-session resume
 /// (PRD-5 #5). Resolves the terminal's workspace → project → `resume_agent_sessions`
 /// in one join. Returns `false` when the terminal is unknown, has NO workspace (a
@@ -5552,9 +5683,16 @@ pub fn list_workspaces(
         .load(conn)
 }
 
-/// Every workspace across all projects — the candidate set the auto-attach
-/// resolver matches a live cwd against (matching is global; binding then records
-/// the single best match). Ordered by path for deterministic iteration.
+/// Every workspace across all projects — the candidate set fed to
+/// [`crate::resolve::resolve_workspace`], the repo's single cwd→workspace selector.
+/// Matching is GLOBAL (never project-scoped), and this read is SHARED by BOTH of that
+/// selector's consumers: TERMINAL auto-attach (`resolve::auto_attach_terminal` and the
+/// MCP terminal-create path, `mcp_tools_core::resolve_attach_for_new_terminal`), which
+/// turns the winner into a persisted binding — and the MCP Spec/project resolution by
+/// cwd (`mcp_context::best_workspace_for_cwd`), which only READS the winner and binds
+/// NOTHING. So a match here does not imply a write. The set filters nothing (archived
+/// and folder-removed rows still compete — a deliberate limit documented at
+/// `mcp_context::best_workspace_for_cwd`). Ordered by path for deterministic iteration.
 pub fn all_workspaces(conn: &mut SqliteConnection) -> QueryResult<Vec<Workspace>> {
     workspaces::table
         .order((workspaces::root_path.asc(), workspaces::id.asc()))
@@ -9324,10 +9462,10 @@ pub const WORKFLOW_SCOPE_CODER: &str = "coder";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const WORKFLOW_SCOPE_PROTOTYPER: &str = "prototyper";
 
-/// A node's `type` — the FULL PRD behavior-tree vocabulary (the 3 composites + the 8 leaves),
-/// CHECK-enforced in the migration. The schema carries the COMPLETE model (ask_human/produce
-/// included) so the DB is forward-compatible even though the T3 interpreter fully executes only
-/// the six leaves in its scope.
+/// A node's `type` — the FULL PRD behavior-tree vocabulary (the 3 composites + the 13 leaves),
+/// CHECK-enforced in the migration. The schema carries the COMPLETE model rather than the subset any
+/// one interpreter happens to run: it was written that way at T3, when the interpreter executed six
+/// of these leaves and no more, so that a graph authored then still reads today.
 pub const NODE_TYPE_SEQUENCE: &str = "sequence";
 pub const NODE_TYPE_LOOP: &str = "loop";
 pub const NODE_TYPE_SELECTOR: &str = "selector";
@@ -9359,12 +9497,33 @@ pub const NODE_TYPE_SUB_WORKFLOW: &str = "sub_workflow";
 /// blackboard key (`task_key`, default `task_id`) and is UNGATED by default (an optional `gate_on`)
 /// (v2.8 lot 2).
 pub const NODE_TYPE_TRANSITION_TASK: &str = "transition_task";
+/// A `create_workspace` opens the DEV WORKSPACE of the run's bound Spec — a nyx-own inline effect
+/// that calls the very same [`crate::mcp_runtime::create_workspace`] the MCP tool does, so the folder
+/// creation, the workspace row and the SPEC ANCHOR stay ONE guarded write with ONE compensation,
+/// never a second implementation of the anchor (the worktrees_root migration).
+///
+/// Where the folder goes is the node's whole configuration, and it is ONE value: a ROOT — the
+/// project's [`Project::worktrees_root`], or a root a preceding `ask_human` answered when none is
+/// configured — with a DERIVED name joined under it, always. The node used to take a second,
+/// un-derived "explicit path" source that won over the root; a human who answered the question with
+/// what it asked for (a root) got the root itself registered as the workspace. What goes IN the
+/// folder is not this node's business — `create_workspace` `mkdir`s and stops, so the workspace lands
+/// EMPTY (see the fill-strategy decisions recorded on that function).
+///
+/// HORS PERIMETRE ASSUME. This SIXTEENTH node type was added to the orchestration engine 2.8, which
+/// is FROZEN (in_progress), and outside the declared scope of PRD 01KYA475AX5JBGSS8WK5J8NM1S — whose
+/// out-of-scope item 01KYA49F5T2H02YY4VT7SCBGSX says so by name ("Internes du moteur d'orchestration
+/// 2.8 […] ce PRD fournit seulement le resolveur partage"). Shipped anyway on the user's explicit
+/// decision of 2026-08-18. The same crossing carries the engine vocabulary, the inline effect, the
+/// `project.worktrees_root` query fact and the widening of the `nodes.type` CHECK; the full note is
+/// on `build_nspec` in `crate::seed`, which names all THREE items this pass crossed.
+pub const NODE_TYPE_CREATE_WORKSPACE: &str = "create_workspace";
 
-/// The fifteen valid node `type` values, in the migration's CHECK order — the vocabulary the
+/// The sixteen valid node `type` values, in the migration's CHECK order — the vocabulary the
 /// interpreter and the authoring layer validate against. Every [`NODE_TYPES`] entry round-trips
 /// through [`crate::engine::NodeType`].
 #[cfg_attr(not(test), allow(dead_code))]
-pub const NODE_TYPES: [&str; 15] = [
+pub const NODE_TYPES: [&str; 16] = [
     NODE_TYPE_SEQUENCE,
     NODE_TYPE_LOOP,
     NODE_TYPE_SELECTOR,
@@ -9380,6 +9539,7 @@ pub const NODE_TYPES: [&str; 15] = [
     NODE_TYPE_FORK_SPEC,
     NODE_TYPE_SUB_WORKFLOW,
     NODE_TYPE_TRANSITION_TASK,
+    NODE_TYPE_CREATE_WORKSPACE,
 ];
 
 /// A workflow_run's `status` (CHECK-enforced in the migration).
@@ -14945,6 +15105,8 @@ mod tests {
         // Peel the migrations stacked above v29 first (v38 → v30, incl. our v34), then revert v29
         // → the CHECK narrows back; setting `closed` must now FAIL.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -15460,8 +15622,10 @@ mod tests {
     /// `annexes` table (v27) must still be there, so one revert too many fails instead of passing
     /// on an unexercised `down.sql` — and re-applying restores the refusal.
     ///
-    /// TWO reverts, since v51 (the canonical form) now sits on top: its `down` is a no-op on the
-    /// schema by design, so peeling it changes nothing here beyond reaching v50.
+    /// THREE reverts, since two migrations now sit on top of v50: the TIMESTAMPED head
+    /// `20260818130000` (`projects.worktrees_root` + the widened `nodes.type` CHECK) and v51 (the
+    /// canonical form), whose `down` is a no-op on the schema by design — so peeling both changes
+    /// nothing here beyond reaching v50.
     #[test]
     fn migration_v50_adds_the_partial_unique_index_on_url_annexes() {
         let mut conn = open_in_memory();
@@ -15477,6 +15641,8 @@ mod tests {
             "at head the index refuses the second attachment of the same url"
         );
 
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -15535,7 +15701,10 @@ mod tests {
         let url = "https://jira.example.test/BROWSE-1";
         let other = "https://github.test/o/r/pull/7";
 
-        // Back to the v27 world: no index, so the base can rot exactly as a real one did.
+        // Back to the v27 world: no index, so the base can rot exactly as a real one did. Three
+        // reverts — the TIMESTAMPED head `20260818130000` and v51 both sit above v50.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -15672,8 +15841,11 @@ mod tests {
         let pr = "https://github.test/nyx/pull/1";
         let pr_slash = "https://github.test/nyx/pull/1/";
 
-        // Back to the pre-v51 world. The `down` is a no-op on the schema BY DESIGN — v50's index is
-        // v50's, and reverting v51 must not take it with it.
+        // Back to the pre-v51 world — peeling the TIMESTAMPED head `20260818130000` first, since it
+        // sits above v51. The v51 `down` is a no-op on the schema BY DESIGN — v50's index is v50's,
+        // and reverting v51 must not take it with it.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         assert!(
@@ -16972,6 +17144,8 @@ mod tests {
         // Peel every migration above v13 newest-first (v37 down to v14), then v13
         // (specs/spec_revisions); all must succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -17681,8 +17855,11 @@ mod tests {
         // #43 the sub-workflow vocabulary + parent_run_id, #44 the managed_commands env, #45
         // the workflow_runs pending_consent, #46 the command_slots table, #47
         // workflows.forked_from_revision, #48 the human_turns ledger, #49 its consumed_by mark and
-        // #50 the annexes url unique index and #51 the annexes url canonical form).
-        for _ in 0..47 {
+        // #50 the annexes url unique index, #51 the annexes url canonical form and the
+        // TIMESTAMPED head dir 20260818130000 `projects.worktrees_root` + the widened
+        // `nodes.type` CHECK).
+        // Count: dirs #4..#18 (15) + #20..#51 (32) + the timestamped head (1) = 48.
+        for _ in 0..48 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -18773,16 +18950,25 @@ mod tests {
         );
     }
 
-    /// STATE GUARD (review finding): the standalone [`set_spec_workspace`] REFUSES to anchor a
-    /// Spec that is not `in_progress` — a `draft` and a `ready` Spec are both rejected with
-    /// [`SetSpecWorkspaceError::InvalidState`], writing NOTHING. The anchor is posed at the
-    /// ready→in_progress transition, never at authoring. Once in_progress it is allowed.
+    /// STATE GUARD, AMENDED (v2.5, PRD "Résolution Spec sans id"): the guard on the standalone
+    /// [`set_spec_workspace`] is WIDENED from `in_progress` alone to
+    /// [`SPEC_ANCHORABLE_STATUSES`] = `{ready, in_progress}` — the dev workspace usually exists
+    /// BEFORE the work starts, so `ready` must be anchorable. The widening is NOT a removal:
+    /// this test still proves that `draft` (authoring) AND the terminal states are refused with
+    /// [`SetSpecWorkspaceError::InvalidState`], writing NOTHING.
+    ///
+    /// NAME KEPT ON PURPOSE (phase-1 review): the PRD's done criterion designates
+    /// `set_spec_workspace_refused_outside_in_progress` BY NAME as "the test to amend", so the
+    /// name is the traceability link back to it and is not renamed. Read it as "refused
+    /// OUTSIDE the anchorable window", which is what it proves — the window just widened from
+    /// `{in_progress}` to `{ready, in_progress}`. Its MCP twin, designated by no decision, was
+    /// renamed to `spec_set_workspace_allows_ready_and_refuses_draft`.
     #[test]
     fn set_spec_workspace_refused_outside_in_progress() {
         let mut conn = open_in_memory();
         let (project, root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
 
-        // draft → refused.
+        // draft → STILL refused (the anchor is never posed while authoring).
         let (draft, _) = create_spec(&mut conn, &project.id, "S", complete_sections()).unwrap();
         let err = set_spec_workspace(&mut conn, &draft.id, Some(&root.id)).unwrap_err();
         assert!(
@@ -18798,18 +18984,172 @@ mod tests {
             "the refused anchor wrote nothing"
         );
 
-        // ready → still refused.
+        // ready → NOW ALLOWED (the widening), and the status is untouched by the link.
         transition_spec(&mut conn, &draft.id, SpecTransition::Ready, true).unwrap();
-        let err = set_spec_workspace(&mut conn, &draft.id, Some(&root.id)).unwrap_err();
-        assert!(
-            matches!(&err, SetSpecWorkspaceError::InvalidState { status } if status == SPEC_STATUS_READY),
-            "anchoring a ready Spec is refused as InvalidState, got {err:?}"
+        let anchored_ready = set_spec_workspace(&mut conn, &draft.id, Some(&root.id)).unwrap();
+        assert_eq!(
+            anchored_ready.workspace_id.as_deref(),
+            Some(root.id.as_str()),
+            "a ready Spec can be anchored"
+        );
+        assert_eq!(
+            anchored_ready.status, SPEC_STATUS_READY,
+            "anchoring NEVER transitions the Spec"
         );
 
-        // in_progress → allowed.
+        // in_progress → allowed (unchanged).
         transition_spec(&mut conn, &draft.id, SpecTransition::Start, true).unwrap();
+        set_spec_workspace(&mut conn, &draft.id, None).unwrap();
         let linked = set_spec_workspace(&mut conn, &draft.id, Some(&root.id)).unwrap();
         assert_eq!(linked.workspace_id.as_deref(), Some(root.id.as_str()));
+        assert_eq!(linked.status, SPEC_STATUS_IN_PROGRESS);
+
+        // TERMINAL → refused. `cancelled` (and every settled/parked status) freezes the anchor.
+        let (other, _) = create_spec(&mut conn, &project.id, "T", complete_sections()).unwrap();
+        transition_spec(&mut conn, &other.id, SpecTransition::Cancel, true).unwrap();
+        let err = set_spec_workspace(&mut conn, &other.id, Some(&root.id)).unwrap_err();
+        assert!(
+            matches!(&err, SetSpecWorkspaceError::InvalidState { status } if status == SPEC_STATUS_CANCELLED),
+            "anchoring a cancelled Spec is refused as InvalidState, got {err:?}"
+        );
+        assert_eq!(
+            get_spec(&mut conn, &other.id)
+                .unwrap()
+                .unwrap()
+                .workspace_id,
+            None,
+            "the refused anchor on a terminal Spec wrote nothing"
+        );
+
+        // `completed` — the other terminal status — is refused too.
+        let (done, _) = create_spec(&mut conn, &project.id, "U", complete_sections()).unwrap();
+        transition_spec(&mut conn, &done.id, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &done.id, SpecTransition::Start, true).unwrap();
+        transition_spec(&mut conn, &done.id, SpecTransition::Review, true).unwrap();
+        transition_spec(&mut conn, &done.id, SpecTransition::Done, true).unwrap();
+        let err = set_spec_workspace(&mut conn, &done.id, Some(&root.id)).unwrap_err();
+        assert!(
+            matches!(&err, SetSpecWorkspaceError::InvalidState { status } if status == SPEC_STATUS_COMPLETED),
+            "anchoring a completed Spec is refused as InvalidState, got {err:?}"
+        );
+    }
+
+    /// The PROJECT GUARD (v2.5): a workspace that EXISTS but belongs to ANOTHER project is
+    /// refused with [`SetSpecWorkspaceError::ProjectMismatch`] and writes NOTHING — a Spec's
+    /// derived repos/project can never contradict its own `project_id`.
+    #[test]
+    fn set_spec_workspace_refuses_a_workspace_of_another_project() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (other_project, other_root) =
+            create_project(&mut conn, "Other", "/other", None).unwrap();
+        let spec = spec_in_progress_unanchored(&mut conn, &project.id);
+
+        let err = set_spec_workspace(&mut conn, &spec.id, Some(&other_root.id)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                SetSpecWorkspaceError::ProjectMismatch { spec_project_id, workspace_project_id }
+                    if spec_project_id == &project.id && workspace_project_id == &other_project.id
+            ),
+            "a cross-project anchor is refused, got {err:?}"
+        );
+        assert_eq!(
+            get_spec(&mut conn, &spec.id).unwrap().unwrap().workspace_id,
+            None,
+            "the refused cross-project anchor wrote nothing"
+        );
+    }
+
+    /// IDEMPOTENCE: re-applying the anchor a Spec ALREADY carries is a NO-OP — `updated_at` is
+    /// untouched and NO `spec.workspace_changed` event is recorded. A real MOVE writes the new
+    /// target and records EXACTLY ONE correlated event.
+    #[test]
+    fn set_spec_workspace_same_target_is_a_no_op_and_a_move_emits_exactly_one_event() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let feat = create_workspace(&mut conn, &project.id, "feat", "/work/feat").unwrap();
+        let spec = spec_in_progress_unanchored(&mut conn, &project.id);
+
+        // Detach on an ALREADY-detached Spec: no-op (no write, no event).
+        let noop_detach = set_spec_workspace(&mut conn, &spec.id, None).unwrap();
+        assert_eq!(noop_detach.updated_at, spec.updated_at);
+        assert_eq!(
+            workspace_changed_events(&mut conn, &spec.id),
+            0,
+            "a no-op detach emits nothing"
+        );
+
+        // First anchor: ONE event.
+        let anchored = set_spec_workspace(&mut conn, &spec.id, Some(&root.id)).unwrap();
+        assert_eq!(
+            workspace_changed_events(&mut conn, &spec.id),
+            1,
+            "the anchor emitted exactly one event"
+        );
+
+        // Same target again: NO-OP — same updated_at, still exactly one event.
+        let again = set_spec_workspace(&mut conn, &spec.id, Some(&root.id)).unwrap();
+        assert_eq!(
+            again.updated_at, anchored.updated_at,
+            "re-applying the same anchor does not bump updated_at"
+        );
+        assert_eq!(again.status, anchored.status, "and never moves the status");
+        assert_eq!(
+            workspace_changed_events(&mut conn, &spec.id),
+            1,
+            "re-applying the same anchor emits no further event"
+        );
+
+        // A MOVE to another workspace: the new target is written and ONE more event recorded.
+        let moved = set_spec_workspace(&mut conn, &spec.id, Some(&feat.id)).unwrap();
+        assert_eq!(moved.workspace_id.as_deref(), Some(feat.id.as_str()));
+        assert_eq!(
+            workspace_changed_events(&mut conn, &spec.id),
+            2,
+            "the move recorded exactly one additional event"
+        );
+        let events = recent_domain_events_for_spec(&mut conn, &spec.id, 50).unwrap();
+        let last = events
+            .iter()
+            .find(|e| e.event_type == "spec.workspace_changed")
+            .unwrap();
+        assert_eq!(
+            last.workspace_id.as_deref(),
+            Some(feat.id.as_str()),
+            "the event is correlated to the NEW anchor"
+        );
+    }
+
+    /// Count the `spec.workspace_changed` outbox rows recorded for `spec_id`.
+    fn workspace_changed_events(conn: &mut SqliteConnection, spec_id: &str) -> usize {
+        recent_domain_events_for_spec(conn, spec_id, 100)
+            .unwrap()
+            .iter()
+            .filter(|e| e.event_type == "spec.workspace_changed")
+            .count()
+    }
+
+    /// DELETING a workspace DETACHES every Spec anchored on it instead of cascading the
+    /// deletion: `specs.workspace_id REFERENCES workspaces(id) ON DELETE SET NULL` (migration
+    /// 13). Already acquired by the schema — asserted here so it can never regress.
+    #[test]
+    fn deleting_a_workspace_sets_anchored_specs_workspace_id_to_null() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let feat = create_workspace(&mut conn, &project.id, "feat", "/work/feat").unwrap();
+        let spec = spec_in_progress_unanchored(&mut conn, &project.id);
+        set_spec_workspace(&mut conn, &spec.id, Some(&feat.id)).unwrap();
+
+        delete_workspace(&mut conn, &feat.id).unwrap();
+
+        let got = get_spec(&mut conn, &spec.id)
+            .unwrap()
+            .expect("the Spec SURVIVES its workspace's deletion");
+        assert_eq!(
+            got.workspace_id, None,
+            "ON DELETE SET NULL detached the Spec instead of deleting it"
+        );
     }
 
     /// The `start` transition POSES the workspace anchor in the SAME operation
@@ -18852,13 +19192,67 @@ mod tests {
             Some(root.id.as_str()),
             "start posed the anchor in the same operation"
         );
-        // Persisted and resolvable through the workspace.
+        // Persisted and resolvable through the workspace — read through the ONE candidate-set
+        // query location resolution uses ([`active_specs_for_workspace`]), never a newest-wins pick.
         assert_eq!(
-            spec_for_workspace(&mut conn, &root.id)
+            active_specs_for_workspace(&mut conn, &root.id)
                 .unwrap()
-                .map(|s| s.id),
-            Some(spec.id.clone()),
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![spec.id.clone()],
             "the Spec resolves from its anchor after the start transition"
+        );
+    }
+
+    /// THE CANDIDATE SET for resolving a Spec by location excludes the three kinds of Spec that
+    /// are OVER: `completed`, `cancelled` and soft-ARCHIVED. A workspace legitimately accumulates
+    /// the Specs it has shipped, so counting them would make a workspace with exactly one live Spec
+    /// read as ambiguous — or resolve onto dead work. Archived rows are excluded by the same query
+    /// (`archived_at IS NULL`) and this proves it explicitly, since archiving is a soft delete that
+    /// leaves `status` untouched.
+    #[test]
+    fn terminal_and_archived_specs_are_never_location_candidates() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let anchored = |conn: &mut SqliteConnection, title: &str| {
+            create_spec_with_workspace(conn, &project.id, &root.id, title, complete_sections())
+                .unwrap()
+                .0
+                .id
+        };
+
+        // COMPLETED — driven all the way to the terminal success state.
+        let completed = anchored(&mut conn, "Shipped");
+        transition_spec(&mut conn, &completed, SpecTransition::Ready, true).unwrap();
+        transition_spec(&mut conn, &completed, SpecTransition::Start, true).unwrap();
+        transition_spec(&mut conn, &completed, SpecTransition::Review, false).unwrap();
+        transition_spec(&mut conn, &completed, SpecTransition::Done, true).unwrap();
+        // CANCELLED — the terminal abandon state.
+        let cancelled = anchored(&mut conn, "Abandoned");
+        transition_spec(&mut conn, &cancelled, SpecTransition::Cancel, true).unwrap();
+        // ARCHIVED — a soft delete, so its `status` is still a live one.
+        let archived = anchored(&mut conn, "Archived");
+        diesel::update(specs::table.find(&archived))
+            .set(specs::archived_at.eq(Some(now_millis())))
+            .execute(&mut conn)
+            .unwrap();
+        assert_eq!(
+            get_spec(&mut conn, &archived).unwrap().unwrap().status,
+            SPEC_STATUS_DRAFT,
+            "archiving is a soft delete — the status stays live, so exclusion is on archived_at"
+        );
+        // …and ONE genuinely active Spec.
+        let live = anchored(&mut conn, "In flight");
+
+        assert_eq!(
+            active_specs_for_workspace(&mut conn, &root.id)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![live],
+            "only the live Spec is a candidate — completed, cancelled and archived never compete"
         );
     }
 
@@ -20809,6 +21203,8 @@ mod tests {
         // Peel every migration above v14 newest-first (v37 down to v15), then v14
         // (tasks/task_dependencies); all must succeed. Each revert drops the current last link.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -21269,6 +21665,8 @@ mod tests {
         // domain_events) then v11 (data backfill) then v10 (canonical structure). After
         // this, `workspaces.root_path` does NOT exist yet (`path` does), and `projects` has
         // no `key`/`primary_workspace_id`.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -22229,10 +22627,11 @@ mod tests {
     fn migration_v2_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the projects migration (dirs #51 → #3),
-        // then the projects migration (dir #2) itself — 49 reverts in reverse order
-        // (the repo has 50 migration dirs numbered #1..#51, #19 never existed, so reverting
-        // down to and including #2 is 50 - 1 = 49 steps;
+        // Peel every migration stacked above the projects migration (the TIMESTAMPED head
+        // dir → #51 → #3), then the projects migration (dir #2) itself — 50 reverts in
+        // reverse order (the repo has 51 migration dirs: #1..#51 with #19 never existed
+        // (= 50 dirs) plus the timestamped head 20260818130000, so reverting down to and
+        // including #2 is 51 - 1 = 50 steps;
         // v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14 the task
         // domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added dir #20
         // the agent_session_specs link table; v2.5.11 added dir #21 the tasks review-finding
@@ -22251,9 +22650,10 @@ mod tests {
         // sub-workflow vocabulary + parent_run_id + dir #44 the managed_commands env + dir #45 the
         // workflow_runs pending_consent + dir #46 the command_slots table + dir #47
         // workflows.forked_from_revision + dir #48 the human_turns ledger + dir #49 its consumed_by
-        // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form).
-        // projects must then be absent.
-        for _ in 0..49 {
+        // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form;
+        // the spec-anchor PRD added the TIMESTAMPED head dir 20260818130000
+        // `projects.worktrees_root` + the widened `nodes.type` CHECK). projects must then be absent.
+        for _ in 0..50 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -23097,10 +23497,11 @@ mod tests {
     fn migration_v3_down_then_up_recreates_working_schema() {
         let mut conn = open_in_memory();
 
-        // Peel every migration stacked above the managed_commands migration (dirs
-        // #51 → #4), then the managed_commands migration (dir #3) itself — 48 reverts in
-        // reverse order (the repo has 50 migration dirs numbered #1..#51, #19 never existed,
-        // so reverting down to and including #3 is 50 - 2 = 48 steps;
+        // Peel every migration stacked above the managed_commands migration (the TIMESTAMPED
+        // head dir → #51 → #4), then the managed_commands migration (dir #3) itself — 49
+        // reverts in reverse order (the repo has 51 migration dirs: #1..#51 with #19 never
+        // existed (= 50 dirs) plus the timestamped head 20260818130000, so reverting down to
+        // and including #3 is 51 - 2 = 49 steps;
         // v2.4 Phase 1 added dir #13 the Spec domain; Phase 2 added dir #14
         // the task domain; Phase 3 added dir #15 the specs.workspace_id index; v2.5.10 added
         // dir #20 the agent_session_specs link table; v2.5.11 added dir #21 the tasks
@@ -23119,9 +23520,11 @@ mod tests {
         // sub-workflow vocabulary + parent_run_id + dir #44 the managed_commands env + dir #45 the
         // workflow_runs pending_consent + dir #46 the command_slots table + dir #47
         // workflows.forked_from_revision + dir #48 the human_turns ledger + dir #49 its consumed_by
-        // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form).
-        // managed_commands must then be absent.
-        for _ in 0..48 {
+        // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form;
+        // the spec-anchor PRD added the TIMESTAMPED head dir 20260818130000
+        // `projects.worktrees_root` + the widened `nodes.type` CHECK). managed_commands must then
+        // be absent.
+        for _ in 0..49 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -23187,6 +23590,8 @@ mod tests {
         // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row + its v3
         // columns survive; the v4 columns are gone (a typed select of `unread` would now fail
         // to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -23431,6 +23836,8 @@ mod tests {
         // peels v15, v14, v13, v12, v11, v10, v9, v8, v7, then v5 (migrations revert in
         // reverse order). The instance row + its v3/v4 columns survive; the v5 columns are
         // gone (a typed select of `prev_scrollback` would now fail to run).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -24840,6 +25247,8 @@ mod tests {
         // domain_events) then v11 (v2.1 data backfill) then v10 (v2.1 canonical structure)
         // then v9 (#11 project order) then v8 → the resume_agent_sessions column is gone.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -25938,6 +26347,8 @@ mod tests {
 
         // Peel v47 then v46 → the table is gone, so v46 is the migration that creates it.
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -26030,6 +26441,8 @@ mod tests {
         // stacked above the engine one (v38 → v35) and `0034` itself — parking the DB with the
         // design-system `0030` still applied but NO workflow tables.
         let mut conn = open_in_memory();
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -26267,6 +26680,8 @@ mod tests {
         );
 
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -26291,6 +26706,122 @@ mod tests {
         let turn = last_human_turn(&mut conn, "term-v49").unwrap().unwrap();
         assert_eq!(turn.turn_id, "turn-A");
         assert_eq!(turn.consumed_by, None);
+    }
+
+    /// MIGRATION 20260818130000: the WHERE of a dev workspace (`projects.worktrees_root`) and the
+    /// `create_workspace` node type ship in ONE migration, so ONE revert must take BOTH away. A DB
+    /// migrated through the head carries the column and accepts the node type; reverted by ONE step
+    /// the column is GONE and the `nodes.type` CHECK REJECTS `create_workspace` again, while the
+    /// migrations BELOW are STILL standing — the chain is pinned at both ends, so one revert too
+    /// few, or one too many past the point where an over-peel becomes observable, fails instead of
+    /// passing on an unexercised `down.sql`. Re-applying restores both halves, and the row carried
+    /// through the two CHECK rebuilds comes back untouched.
+    ///
+    /// ON THE TIMESTAMP, AND WHY THE NEIGHBOUR BELOW MOVED. This migration is the only one here not
+    /// numbered sequentially: three parallel branches were all claiming `00000000000050` at once,
+    /// and a collision on that number makes diesel consider ours already applied and SKIP it — the
+    /// exact failure `workflow_engine_migration_applies_over_foreign_0030` exists to pin. The
+    /// timestamp keeps it LAST in diesel's lexicographic order whatever the other branches land, so
+    /// it is still the head after v50/v51 merged underneath it — but v49 is no longer what sits
+    /// directly below, which is why the lower guard below pins v50's index and not v49's column.
+    #[test]
+    fn migration_worktrees_root_adds_the_column_and_the_create_workspace_node() {
+        /// A node of `node_type` on `wf`, so the CHECK is probed on ONE short line per assertion.
+        fn add_node(
+            conn: &mut SqliteConnection,
+            wf: &str,
+            order: i32,
+            node_type: &str,
+        ) -> QueryResult<Node> {
+            create_node(conn, wf, None, order, node_type, "n", "{}")
+        }
+
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/wt-root", None).unwrap();
+        let wf = create_workflow(&mut conn, None, "wt-root", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
+
+        // The migrated schema carries BOTH halves: the column takes a value…
+        set_project_worktrees_root(&mut conn, &project.id, Some("D:/wt")).unwrap();
+        assert_eq!(
+            get_project(&mut conn, &project.id)
+                .unwrap()
+                .unwrap()
+                .worktrees_root
+                .as_deref(),
+            Some("D:/wt"),
+            "the migrated schema carries the column"
+        );
+        // …and the widened CHECK accepts the sixteenth type.
+        let carried = add_node(&mut conn, &wf.id, 0, NODE_TYPE_NOTE).expect("a plain note node");
+        add_node(&mut conn, &wf.id, 1, NODE_TYPE_CREATE_WORKSPACE)
+            .expect("the widened CHECK accepts 'create_workspace'");
+
+        // The down NARROWS the vocabulary back, so it is clean only once no row still speaks it —
+        // drop the one node that does, exactly as a real downgrade would have to.
+        diesel::sql_query("DELETE FROM nodes WHERE \"type\" = 'create_workspace'")
+            .execute(&mut conn)
+            .expect("no row may keep a vocabulary the down removes");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
+        assert!(
+            diesel::sql_query("SELECT worktrees_root FROM projects")
+                .execute(&mut conn)
+                .is_err(),
+            "after that revert the column must be gone — one revert too FEW and this passes blind"
+        );
+        assert!(
+            add_node(&mut conn, &wf.id, 1, NODE_TYPE_CREATE_WORKSPACE).is_err(),
+            "and the narrowed CHECK refuses 'create_workspace' again"
+        );
+        assert!(
+            add_node(&mut conn, &wf.id, 2, NODE_TYPE_TRANSITION_TASK).is_ok(),
+            "while the fifteen types it inherited are untouched by the rebuild"
+        );
+        // LOWER END. This migration was authored directly on top of v49, but v50 (the annexes url
+        // unique index) and v51 (the annexes url canonical form) landed underneath it before the
+        // merge, so v49 is no longer the neighbour below — asserting on it would no longer pin
+        // anything. v51's `down.sql` is moreover a DOCUMENTED NO-OP (it undoes DATA, and its `up`
+        // recreated v50's index identically), so NOTHING can distinguish "v51 applied" from "v51
+        // reverted": the closest observable neighbour below the head is v50's partial unique index.
+        // That is what the chain is pinned to here — the first over-peel that CAN be seen fails.
+        assert!(
+            index_exists(&mut conn, "idx_annexes_url_unique_per_spec"),
+            "the chain stops just under the head: v50's url unique index is still applied — one \
+             revert too many lands on v51's no-op down and is invisible by construction, one more \
+             drops this index and fails"
+        );
+        assert!(
+            diesel::sql_query("SELECT consumed_by FROM human_turns")
+                .execute(&mut conn)
+                .is_ok(),
+            "and v49's consumption mark, further down still, is untouched"
+        );
+
+        // The up restores both halves, and the note carried through both rebuilds is identical.
+        run_migrations(&mut conn).expect("re-apply the worktrees_root migration");
+        assert_eq!(get_node(&mut conn, &carried.id).unwrap().unwrap(), carried);
+        assert!(
+            add_node(&mut conn, &wf.id, 3, NODE_TYPE_CREATE_WORKSPACE).is_ok(),
+            "the re-applied CHECK accepts 'create_workspace' again"
+        );
+        assert_eq!(
+            get_project(&mut conn, &project.id)
+                .unwrap()
+                .unwrap()
+                .worktrees_root,
+            None,
+            "the column comes back NULLABLE — the down dropped it, value and all"
+        );
+        set_project_worktrees_root(&mut conn, &project.id, Some("D:/wt2")).unwrap();
+        assert_eq!(
+            get_project(&mut conn, &project.id)
+                .unwrap()
+                .unwrap()
+                .worktrees_root
+                .as_deref(),
+            Some("D:/wt2"),
+            "and it is writable again through the same setter"
+        );
     }
 
     // --- DESIGN-SYSTEM domain (v30) ----------------------------------------
@@ -26582,11 +27113,20 @@ mod tests {
     #[test]
     fn migration_v37_renames_the_interaction_prefix_without_losing_anything() {
         let mut conn = open_in_memory();
+        // The scaffolding project is created HERE, at the head schema, BEFORE the step-back: the
+        // worktrees_root migration added `projects.worktrees_root`, so the head `Project` model
+        // over-reads an older `projects` table just as the component model over-reads a pre-v38
+        // one. The row itself crosses the step-back untouched (its down is a plain DROP COLUMN)
+        // and v37 rewrites DESIGN CONTENT, never a project — so nothing this test proves depends
+        // on when it lands.
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/rename-ws", None).unwrap();
         // Step back BEFORE v37 so the seeded rows are what a pre-rename DB really holds. That also
         // steps back before v38 (`design_components.css_slot_json`), which sits on top of it — so at
         // this schema the Diesel MODEL of a component does not match the table, and every read and
         // write of that ONE table goes through raw SQL here. It is not a workaround: a migration test
         // that stepped back and then used the head model would only be testing today's schema.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -26664,7 +27204,6 @@ mod tests {
             (id, now)
         }
 
-        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/rename-ws", None).unwrap();
         // A template in the OLD vocabulary: a structural case, the generalized condition, the axis
         // marker, the nav/flip affordances — and a global, the way an inline snippet spells it.
         let legacy_template = "<button data-depot-state-case=\"default\" data-depot-axis=\"size\" \
@@ -26797,6 +27336,8 @@ mod tests {
         );
 
         // THE DOWN restores the pre-rename vocabulary byte for byte (a reverted binary reads it).
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)

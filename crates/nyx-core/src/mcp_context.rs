@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
-use crate::mcp_runtime::{internal_db, optional_str, require_str};
+use crate::mcp_runtime::{anchor_str, internal_db, optional_str, require_str};
 use crate::mcp_tools_core::ToolOutcome;
 
 /// `agent_context` — render an agent-role manual (spec | dev | coder | auditor | doc | prototype)
@@ -1086,7 +1086,16 @@ fn render_agent_context_with_rules(
 /// even zero), and an explicit "author a new Spec via spec_create with this project_id" step.
 /// `project = None` (cwd matched no workspace/project) renders a GRACEFUL manual that asks the
 /// human to select the project — still the authoring contract, never a hard error.
-fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<String, RpcError> {
+///
+/// `notice` is the case-0 line ([`UnanchoredSignal::notice`]): the SAME sentence the payload's
+/// `warnings` carries, rendered into the header so the author reads WHY no Spec is in scope
+/// (a location with none / no location at all) instead of inferring it from a `null` field. Empty
+/// for a caller that has nothing to signal.
+fn render_spec_authoring(
+    db: &Db,
+    project: Option<&db::Project>,
+    notice: &str,
+) -> Result<String, RpcError> {
     let mut out = String::new();
 
     // Header — the authoring variant of the context banner. No Spec yet; the SCOPE is the
@@ -1098,6 +1107,9 @@ fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<Strin
         None => out.push_str("Project : (not resolved — select the project to author in)\n"),
     }
     out.push_str("Spec    : (none yet — you are authoring a new one)\n\n");
+
+    // WHY there is none — beside the header that states it, never further down.
+    out.push_str(notice);
 
     // WHERE THE INSTRUCTIONS COME FROM, before any of them (N29).
     out.push_str(SOURCES_NOTE);
@@ -1216,50 +1228,95 @@ fn render_spec_authoring(db: &Db, project: Option<&db::Project>) -> Result<Strin
     Ok(out)
 }
 
-/// RESOLVE the Spec id for a context render from the tool args, in this order (PDR-0020):
-///   1. an explicit `spec_id`;
-///   2. the `run_id`'s own Spec — the anchor a SPAWNED sub-agent has, and the only one it needs.
-///      It STOPS at the run: bound ⇒ that Spec, unbound ⇒ none (see below);
-///   3. the Spec anchored on the `workspace_id` (its dev workspace);
-///   4. the Spec anchored on the workspace whose path matches `cwd` ("sans id → spec
-///      résolue via cwd").
+/// THE ANCHOR a context call actually used — and the ONE place the anchoring ORDER of a context
+/// render lives (PDR-0020): `spec_id` → `run_id` → `workspace_id` → `cwd`.
 ///
-/// Returns `Ok(None)` when none resolves (the caller maps it to `invalid_id`).
-fn resolve_spec_id(db: &Db, args: &Value) -> Result<Option<String>, RpcError> {
+/// WHY THIS TYPE EXISTS (standards finding `01M0813X53D1NRPAXYJGG6RJAV`). Two functions ask
+/// questions about that order: [`resolve_spec_id`], which RESOLVES the Spec, and
+/// [`unanchored_signal`], which DIAGNOSES the case where nothing resolved. They used to walk two
+/// hand-written copies of the same list, and two lists drift. This repo has already paid for that
+/// exact class of bug inside this very PRD: `best_workspace_for_cwd` had silently diverged from
+/// `crate::resolve::resolve_workspace` (it compared on a hard-coded `/`), so no nested cwd resolved
+/// on Windows at all — see the note on [`best_workspace_for_cwd`], which states the rule that two
+/// selectors answering the same question must not drift apart.
+///
+/// THE ARBITRATION, written down because the finding asked for it. The alternatives offered were a
+/// cross-comment or a test that reddens on divergence; FACTORING was chosen over both because it
+/// makes the failure IMPOSSIBLE rather than merely detectable, and because the mechanical part
+/// carries less risk than the duplication does: the order is read once, here, and each caller only
+/// says what it does with the anchor it is handed. The two `match` blocks below are also written
+/// WITHOUT a catch-all arm on purpose — adding a fifth anchor forces the compiler to stop at
+/// [`unanchored_signal`] too, so a new anchor cannot be added resolvable-but-undiagnosed, which is
+/// precisely the silent failure the finding described (a diagnosis naming the argument the caller
+/// did not use).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecAnchor<'a> {
+    /// An explicit `spec_id`. It always RESOLVES — an id naming no Spec is refused later, at the
+    /// render — so it is the one anchor [`unanchored_signal`] can never be asked about.
+    Explicit(&'a str),
+    /// A `run_id`: the anchor a SPAWNED sub-agent has, and the only one it needs. The walk STOPS
+    /// here — bound ⇒ that run's Spec, unbound ⇒ none.
+    Run(&'a str),
+    /// A `workspace_id`: the Spec anchored on that dev workspace.
+    Workspace(&'a str),
+    /// A `cwd`: the Spec anchored on the workspace whose path matches it ("sans id → spec résolue
+    /// via cwd").
+    Cwd(&'a str),
+}
+
+/// The FIRST anchor the caller passed, in [`SpecAnchor`]'s order; `None` when none was passed.
+/// THE ONLY WALK of that order in this module — both [`resolve_spec_id`] and [`unanchored_signal`]
+/// go through it.
+fn spec_anchor(args: &Value) -> Result<Option<SpecAnchor<'_>>, RpcError> {
     if let Some(spec_id) = optional_str(args, "spec_id")? {
-        return Ok(Some(spec_id.to_string()));
+        return Ok(Some(SpecAnchor::Explicit(spec_id)));
     }
     if let Some(run_id) = optional_str(args, "run_id")? {
-        let run = require_run(db, run_id)?;
-        if let Some(spec_id) = run.spec_id {
-            return Ok(Some(spec_id));
-        }
-        // AN UNBOUND RUN RESOLVES NO SPEC, and that is an ANSWER — not a reason to look further.
-        //
-        // Reaching past the run to its workspace would raise the ambiguity a real project always
-        // carries (several active Specs, so no location names one), which is exactly what `run_start`
-        // declines to raise for a flow that AUTHORS its own Spec (G2). The hook pulls this render to
-        // inject it (G6), so the refusal would land there and inject nothing — the two would cancel
-        // out in the very case that motivated them.
-        //
-        // It would also be wrong on its own merits: a run that drives no Spec would be handed the
-        // state of one it has nothing to do with.
-        return Ok(None);
+        return Ok(Some(SpecAnchor::Run(run_id)));
     }
     if let Some(workspace_id) = optional_str(args, "workspace_id")? {
-        return unique_spec_for_workspace(db, workspace_id);
+        return Ok(Some(SpecAnchor::Workspace(workspace_id)));
     }
     if let Some(cwd) = optional_str(args, "cwd")? {
-        let normalized = crate::pathnorm::normalize(cwd);
-        let ws = db
-            .with_conn(|c| best_workspace_for_cwd(c, &normalized))
-            .map_err(internal_db)?;
-        return match ws {
-            Some(ws) => unique_spec_for_workspace(db, &ws.id),
-            None => Ok(None),
-        };
+        return Ok(Some(SpecAnchor::Cwd(cwd)));
     }
     Ok(None)
+}
+
+/// RESOLVE the Spec id for a context render from the tool args, at the anchor [`spec_anchor`]
+/// stopped on — this function no longer decides the ORDER, it only says what each anchor resolves.
+///
+/// Returns `Ok(None)` when none resolves (the caller maps it to `invalid_id`, or — for the two
+/// roles allowed to work without a Spec — to [`unanchored_signal`]).
+fn resolve_spec_id(db: &Db, args: &Value) -> Result<Option<String>, RpcError> {
+    match spec_anchor(args)? {
+        Some(SpecAnchor::Explicit(spec_id)) => Ok(Some(spec_id.to_string())),
+        Some(SpecAnchor::Run(run_id)) => {
+            // AN UNBOUND RUN RESOLVES NO SPEC, and that is an ANSWER — not a reason to look further.
+            //
+            // Reaching past the run to its workspace would raise the ambiguity a real project always
+            // carries (several active Specs, so no location names one), which is exactly what
+            // `run_start` declines to raise for a flow that AUTHORS its own Spec (G2). The hook pulls
+            // this render to inject it (G6), so the refusal would land there and inject nothing — the
+            // two would cancel out in the very case that motivated them.
+            //
+            // It would also be wrong on its own merits: a run that drives no Spec would be handed the
+            // state of one it has nothing to do with.
+            Ok(require_run(db, run_id)?.spec_id)
+        }
+        Some(SpecAnchor::Workspace(workspace_id)) => unique_spec_for_workspace(db, workspace_id),
+        Some(SpecAnchor::Cwd(cwd)) => {
+            let normalized = crate::pathnorm::normalize(cwd);
+            let ws = db
+                .with_conn(|c| best_workspace_for_cwd(c, &normalized))
+                .map_err(internal_db)?;
+            match ws {
+                Some(ws) => unique_spec_for_workspace(db, &ws.id),
+                None => Ok(None),
+            }
+        }
+        None => Ok(None),
+    }
 }
 
 /// THE RUN ANCHOR — load the run `run_id` names, or refuse with `invalid_id`.
@@ -1292,8 +1349,17 @@ pub(crate) fn is_ambiguous_spec(e: &RpcError) -> bool {
 
 /// Resolve the ONE ACTIVE Spec anchored on `workspace_id`, REFUSING when several are — a workspace
 /// with more than one started Spec cannot resolve one by location alone, so picking the newest
-/// silently (as [`db::spec_for_workspace`] would) attributes work to an ARBITRARY Spec (v2.8 review
-/// N14(b)). The refusal LISTS the candidates so the caller can pass an explicit `spec_id`.
+/// silently would attribute work to an ARBITRARY Spec (v2.8 review N14(b)). The refusal LISTS the
+/// candidates so the caller can pass an explicit `spec_id`.
+///
+/// THE 0/1/N CONTRACT, and the only one: 0 candidates ⇒ `Ok(None)` (the caller decides whether an
+/// unbound flow is legitimate), 1 ⇒ `Ok(Some(id))`, N ⇒ `invalid_argument` carrying
+/// `reason = spec_ambiguous_for_workspace` and the candidate list. BOTH location paths of
+/// [`resolve_spec_id`] — an explicit `workspace_id` and a `cwd` (through
+/// [`best_workspace_for_cwd`]) — land HERE, so there is exactly one place where a location becomes
+/// a Spec and NO caller anywhere selects the most recent candidate. The db-side companion that
+/// returned "the newest anchored Spec" was DELETED for that reason (see the note where it used to
+/// live in `db.rs`).
 ///
 /// The candidate set is [`db::active_specs_for_workspace`]: the TERMINAL Specs a workspace
 /// accumulates as it ships (`completed` / `cancelled`) are NOT candidates, so a workspace whose only
@@ -1325,35 +1391,163 @@ fn unique_spec_for_workspace(db: &Db, workspace_id: &str) -> Result<Option<Strin
     }
 }
 
-/// Whether a normalized `cwd` is the workspace's `root_path` or nested under it (so a cwd
-/// deeper in the tree still resolves the workspace). A trailing separator is normalized so
-/// `/a/ws` matches `/a/ws/sub` but not `/a/wsX`.
-fn cwd_under_workspace(cwd: &str, workspace_root: &str) -> bool {
-    if cwd == workspace_root {
-        return true;
+/// The `agent_context` WARNING code for the case 0 where a location RESOLVED a workspace and that
+/// workspace anchors NO active Spec. A LEGITIMATE state — a project's first `/nspec` starts exactly
+/// there — so it is SIGNALLED, never refused (refusing would break the one entry point authoring
+/// has). A STABLE machine code, sibling of `run_start`'s `spec_ambiguous_started_unbound` /
+/// `gate_unconfigured` in the same `warnings` array; the human sentence beside it is free to change.
+const NO_SPEC_ON_LOCATION_WARNING_CODE: &str = "spec_none_on_location";
+
+/// The `agent_context` WARNING code for the OTHER case 0: NO workspace resolved at all — no
+/// anchoring argument was passed, or the `cwd` matches no workspace nyx knows. That one is an
+/// INVOCATION mistake (the observed symptom: an agent calling from the wrong folder and receiving a
+/// perfectly normal-looking context), which is exactly why it must not share a code with the
+/// legitimate case above.
+const NO_LOCATION_WARNING_CODE: &str = "spec_location_unresolved";
+
+/// The `agent_context` WARNING code for a `run_id` naming a run bound to NO Spec — the third shape
+/// of case 0, kept apart because the location resolved perfectly well: it is the RUN that carries no
+/// Spec (an authoring run has none until it creates one), and telling such a caller to "pass a cwd"
+/// would name the wrong fix.
+const RUN_UNBOUND_WARNING_CODE: &str = "spec_run_unbound";
+
+/// THE CASE-0 SIGNAL — the machine CODE and the human SENTENCE, emitted TOGETHER on the two
+/// surfaces that must agree: the `warnings` array of the payload (the dispatcher relays each entry
+/// to the human, see the `WARNINGS in that block` rule of the dispatcher preamble) and one explicit
+/// LINE inside the rendered manual (an agent reading the text must not have to notice a null field).
+/// ONE sentence, built once, so the two can never drift.
+struct UnanchoredSignal {
+    code: &'static str,
+    message: String,
+}
+
+impl UnanchoredSignal {
+    /// The `warnings` entry — `{ code, message }`, the shape `run_start` already publishes.
+    fn warning(&self) -> Value {
+        json!({ "code": self.code, "message": self.message })
     }
-    let prefix = if workspace_root.ends_with('/') {
-        workspace_root.to_string()
-    } else {
-        format!("{workspace_root}/")
+
+    /// The LINE rendered into the manual itself. A blockquote, like [`SOURCES_NOTE`], so it reads as
+    /// a note ABOUT the manual rather than as one of its instructions.
+    fn notice(&self) -> String {
+        format!("> NO SPEC ANCHORED — {}\n\n", self.message)
+    }
+}
+
+/// DIAGNOSE a case 0 of the 0/1/N contract: [`resolve_spec_id`] resolved NO Spec, and this says
+/// WHICH of the three very different situations that is.
+///
+/// It reads the anchor through [`spec_anchor`] — the SAME single walk the resolution used, not a
+/// second copy of the order — so the sentence can only ever name the argument the resolution
+/// actually stopped on. That shared walk is the whole point: a diagnosis with its own copy of the
+/// order keeps compiling after the order changes and starts naming an argument the caller never
+/// passed, which would make this signal WORSE than the silence it replaced.
+///
+/// It re-reads the workspace instead of threading the resolution's own findings back out, because
+/// the three code paths that produce `Ok(None)` (an unbound run, a workspace with zero active Specs,
+/// a cwd matching nothing) share no return channel — and a diagnosis is a READ, taken on the case
+/// that already lost. An UNKNOWN `workspace_id` lands in [`NO_LOCATION_WARNING_CODE`] on purpose: a
+/// location that names nothing is an invocation mistake, whatever argument carried it.
+fn unanchored_signal(db: &Db, args: &Value) -> Result<UnanchoredSignal, RpcError> {
+    let located = match spec_anchor(args)? {
+        Some(SpecAnchor::Run(run_id)) => {
+            // The run RESOLVED (a bad id was already refused upstream) and carries no Spec: the
+            // anchor is fine, the run is simply unbound — `resolve_spec_id` STOPS at the run.
+            return Ok(UnanchoredSignal {
+                code: RUN_UNBOUND_WARNING_CODE,
+                message: format!(
+                    "run {run_id} drives NO Spec — an authoring run has none until it creates one. \
+                     Nothing below is scoped to a Spec, and every Spec-scoped fact of this run \
+                     answers the empty value"
+                ),
+            });
+        }
+        Some(SpecAnchor::Workspace(workspace_id)) => db
+            .with_conn(|c| db::get_workspace(c, workspace_id))
+            .map_err(internal_db)?,
+        Some(SpecAnchor::Cwd(cwd)) => {
+            let normalized = crate::pathnorm::normalize(cwd);
+            db.with_conn(|c| best_workspace_for_cwd(c, &normalized))
+                .map_err(internal_db)?
+        }
+        // An explicit `spec_id` ALWAYS resolves, so it never reaches a case-0 diagnosis; no anchor
+        // at all is the same "located nothing" as a cwd matching nothing. Both are spelled out
+        // rather than folded into a `_` arm: a fifth anchor added to [`SpecAnchor`] must then break
+        // the build HERE, not silently fall through to the wrong sentence.
+        Some(SpecAnchor::Explicit(_)) | None => None,
     };
-    cwd.starts_with(&prefix)
+    Ok(match located {
+        Some(ws) => UnanchoredSignal {
+            code: NO_SPEC_ON_LOCATION_WARNING_CODE,
+            message: format!(
+                "workspace {} (\"{}\") carries no ACTIVE Spec — the location is a real workspace, it \
+                 just has none yet, which is the normal state of a project about to author its \
+                 first. Nothing below is scoped to a Spec: pass an explicit spec_id to work on one",
+                ws.id, ws.name
+            ),
+        },
+        None => UnanchoredSignal {
+            code: NO_LOCATION_WARNING_CODE,
+            message:
+                "this call resolved NO workspace at all: no workspace_id/cwd was passed, or the cwd \
+                 names a folder nyx tracks no workspace for. If you expected a Spec here, you are \
+                 calling from the wrong folder — pass a spec_id, or a cwd inside the Spec's dev \
+                 workspace"
+                    .to_string(),
+        },
+    })
 }
 
 /// The best workspace whose `root_path` matches a normalized `cwd`: the workspace that IS the
-/// cwd or an ancestor of it, the longest (deepest) `root_path` winning, newest workspace on a
-/// length tie. The single cwd→workspace selector shared by the three cwd resolvers
-/// ([`resolve_spec_id`], [`resolve_workspace_for_start`], [`resolve_project`]) — each then keeps
-/// the workspace itself, its Spec, or its project.
+/// cwd or an ancestor of it, the DEEPEST `root_path` winning. The single cwd→workspace selector
+/// shared by the three cwd resolvers ([`resolve_spec_id`], [`resolve_workspace_for_start`],
+/// [`resolve_project`]) — each then keeps the workspace itself, its Spec, or its project.
+///
+/// THE MATCHING AND THE TIE-BREAK ARE NOT RE-DERIVED HERE: this row-level wrapper delegates to
+/// [`crate::resolve::resolve_workspace`], the repo's canonical cwd→workspace selector (also driving
+/// terminal auto-attach), which matches through [`crate::pathnorm::is_ancestor_or_equal`] and ranks
+/// on [`crate::pathnorm::depth`]. `resolve.rs` is the SOURCE of the convention — "deepest ancestor
+/// wins, ties broken on the LOWEST id" is stated and tested there; this function only maps the
+/// winning id back to its `db::Workspace` row. Two selectors that answer the same question must not
+/// drift apart: this one used to compare with a hard-coded `/` while the canonical form uses `\` on
+/// Windows, so NO nested cwd resolved there at all — only an exact `cwd == root_path` hit.
+///
+/// WHY LOWEST-ID (the convention, restated once because this path is the one that anchors Specs):
+/// two matching workspaces can only tie on depth by having the very same `root_path` (both are
+/// ancestors of one cwd, so equal depth ⇒ equal string), and that is reachable — uniqueness is
+/// `UNIQUE(project_id, root_path)`, so two PROJECTS may register one folder. Ids are UUIDv7, hence
+/// time-ordered, so lowest-id is the INCUMBENT and the deliberate OPPOSITE of newest-wins: the
+/// ranking used to be `max_by` on path length, which returns the LAST maximum of a list ordered
+/// `(root_path, id)` and therefore handed the folder to whichever workspace was registered most
+/// recently — silently, and differently after every new registration. Lowest-id is STABLE:
+/// registering a second workspace on a folder never re-points the cwd of the first, and the answer
+/// for a given database never depends on when it is asked.
+///
+/// LIVENESS IS NOT PART OF THE RANKING — said here rather than left to be discovered. The candidate
+/// set is [`db::all_workspaces`], which filters NOTHING: an ARCHIVED workspace (`archived_at`), or
+/// one whose worktree folder was cleaned up at merge (`folder_removed_at` — the row is PERMANENT by
+/// PDR-0008), still competes. So on a shared `root_path` the incumbent wins even when it is archived
+/// and its folder is gone, ahead of a live registration. That is a deliberate LIMIT, not an
+/// oversight: [`crate::resolve::resolve_workspace`] ranks the very same unfiltered set for terminal
+/// auto-attach, and one cwd must not resolve to one workspace for a terminal and another for a Spec.
+/// Filtering the dead rows is therefore a change to make in BOTH selectors at once, never here
+/// alone. Pinned by `an_archived_workspace_still_wins_the_cwd_because_liveness_is_not_ranked`.
 fn best_workspace_for_cwd(
     conn: &mut diesel::SqliteConnection,
     normalized: &str,
 ) -> Result<Option<db::Workspace>, diesel::result::Error> {
     let workspaces = db::all_workspaces(conn)?;
-    Ok(workspaces
-        .into_iter()
-        .filter(|w| cwd_under_workspace(normalized, &w.root_path))
-        .max_by(|a, b| a.root_path.len().cmp(&b.root_path.len())))
+    let candidates: Vec<crate::resolve::WorkspaceMatch> = workspaces
+        .iter()
+        .map(|w| crate::resolve::WorkspaceMatch {
+            id: w.id.clone(),
+            path: w.root_path.clone(),
+        })
+        .collect();
+    let Some(winner) = crate::resolve::resolve_workspace(normalized, &candidates) else {
+        return Ok(None);
+    };
+    Ok(workspaces.into_iter().find(|w| w.id == winner))
 }
 
 /// Resolve the dev WORKSPACE to ANCHOR a Spec on at the `start` transition (review finding:
@@ -1363,11 +1557,37 @@ fn best_workspace_for_cwd(
 /// the cwd→workspace selection lives in a single place). `Ok(None)` when neither is given or
 /// resolves; the transition then poses no anchor. A pure READ — the caller
 /// ([`crate::mcp_tools_spec::spec_transition`]) does the atomic write.
+///
+/// HORS PERIMETRE ASSUME (2026-08-19) of PRD 01KYA475AX5JBGSS8WK5J8NM1S, on the user's decision —
+/// the FOURTH ANCHORING SURFACE, closed here. Review finding `01M080S6Y5CTWK53FYY9YJF1GY` had it
+/// out of scope: F2 bounded the empty-string hardening to THREE tools
+/// (`spec_set_workspace.workspace_id`, `workspace_add.spec_id`, `create_workspace.spec_id`) and
+/// recorded this one as an observation to arbitrate later. The arbitration came back "fix it", and
+/// it is the same defect on a WORSE tick: `""` here read as `None` fell through to the `cwd`, and
+/// then to no anchor at all, so a `spec_transition(start, workspace_id: "")` moved the Spec
+/// `ready → in_progress` UNANCHORED and said nothing — a Spec silently engaged in a build with no
+/// dev workspace, which the F2 cases at least left in a state nobody had committed.
+///
+/// It is [`anchor_str`] and not a local check, because that is where the other three read their
+/// anchor from, and a fourth spelling of the same rule is how the rule drifts. `optional_str`
+/// itself stays UNTOUCHED (122 call sites — its own subject, exactly as F2 said).
+///
+/// IT COVERS BOTH DOORS TO THIS ANCHOR, and deliberately so: `run_start` reaches this same resolver
+/// ([`crate::mcp_engine::run_start`], which poses the run's workspace and through it the Spec's at
+/// the graph's entry `start`). The argument, the anchor and the silence are the same on both roads,
+/// so hardening the resolver rather than one caller is what keeps them one rule. What is NOT changed
+/// is the meaning of ABSENCE: no `workspace_id` still falls through to `cwd`, and a `cwd` that
+/// resolves nothing still starts the Spec unanchored — only the empty STRING is refused.
 pub(crate) fn resolve_workspace_for_start(
     db: &Db,
     args: &Value,
 ) -> Result<Option<String>, RpcError> {
-    if let Some(workspace_id) = optional_str(args, "workspace_id")? {
+    if let Some(workspace_id) = anchor_str(
+        args,
+        "workspace_id",
+        "fall through to `cwd` — and, when that resolves nothing either, START THE SPEC WITH NO DEV \
+         WORKSPACE ANCHORED",
+    )? {
         return Ok(Some(workspace_id.to_string()));
     }
     if let Some(cwd) = optional_str(args, "cwd")? {
@@ -1557,6 +1777,9 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
                 // must pass to every design_* tool without parsing the header text.
                 "project_id": spec_project,
                 "context": context,
+                // ALWAYS present, empty here: a caller reads `warnings` unconditionally instead of
+                // branching on whether the key exists (same contract as `run_start`'s payload).
+                "warnings": [],
             })))
         }
         // No Spec resolves. For the SPEC AUTHOR (/nspec) this is the NORMAL entry point — a Spec
@@ -1568,14 +1791,29 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
         // Specs or an unresolved project (a graceful "select a project" manual then). Every
         // OTHER role keeps the invalid_id contract unchanged.
         None => {
+            // THE CASE 0 SPEAKS (review F1). It used to be the one branch of the 0/1/N contract that
+            // said nothing: 1 resolves, N refuses by name (`spec_ambiguous_for_workspace`), and 0
+            // handed back ~6 600 characters of perfectly normal-looking manual with `spec_id: null`
+            // and not one line about it — so an agent calling from the WRONG FOLDER could not tell
+            // its context apart from a scoped one. The two roles below are not refused (that is the
+            // arbitration: refusing role=dev/spec would break /nspec, whose whole point is that no
+            // Spec exists yet), they are made to SAY it — the same sentence, on both channels.
+            //
+            // DIAGNOSED INSIDE THE TWO BRANCHES THAT SPEAK IT, never before the role is read: the
+            // diagnosis is a second pass over `db::all_workspaces` (the cwd anchor re-runs
+            // [`best_workspace_for_cwd`], which loads and clones every workspace row), and the four
+            // Spec-scoped roles below throw it away to return `invalid_id`. A signal nobody reads is
+            // a table scan nobody asked for.
             if role == AgentRole::Dev {
+                let signal = unanchored_signal(db, args)?;
                 // The DISPATCHER owns no flow and binds no Spec itself — `run_start` resolves (or,
                 // for a fresh nspec, CREATES) the run. So it renders STANDALONE, with NO Spec
                 // required: this is what lets /nspec (which starts a brand-new Spec — none yet) and
                 // /ndoc drive the engine the SAME way /ndev does (v2.8 review N1). The `{{scope}}`
                 // marker carries the invoked flow into its `run_start` call.
                 let context = format!(
-                    "{SOURCES_NOTE}{}",
+                    "{SOURCES_NOTE}{}{}",
+                    signal.notice(),
                     inject_deferred_rules(AgentRole::Dev.preamble(), AgentRole::Dev)
                 )
                 .replace("{{scope}}", &scope);
@@ -1583,15 +1821,18 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
                     "role": role_name,
                     "spec_id": Value::Null,
                     "context": context,
+                    "warnings": [signal.warning()],
                 })))
             } else if role == AgentRole::Spec {
+                let signal = unanchored_signal(db, args)?;
                 let project = resolve_project(db, args)?;
-                let context = render_spec_authoring(db, project.as_ref())?;
+                let context = render_spec_authoring(db, project.as_ref(), &signal.notice())?;
                 Ok(ToolOutcome::read(json!({
                     "role": role_name,
                     "spec_id": Value::Null,
                     "project_id": project.as_ref().map(|p| p.id.as_str()),
                     "context": context,
+                    "warnings": [signal.warning()],
                 })))
             } else {
                 Err(RpcError::new(
@@ -1763,7 +2004,7 @@ mod tests {
             manuals.push(render_role_template(role));
         }
         // The two run-less entry points: the /nspec authoring manual and the standalone dispatcher.
-        manuals.push(render_spec_authoring(&db, None).unwrap());
+        manuals.push(render_spec_authoring(&db, None, "").unwrap());
         let dispatcher = agent_context(&db, &json!({ "role": "dev", "scope": "ndev" })).unwrap();
         manuals.push(dispatcher.result["context"].as_str().unwrap().to_string());
 
@@ -1837,7 +2078,7 @@ mod tests {
             ("the static template", render_role_template(AgentRole::Spec)),
             (
                 "the authoring manual",
-                render_spec_authoring(&db, None).unwrap(),
+                render_spec_authoring(&db, None, "").unwrap(),
             ),
         ] {
             assert!(
@@ -2458,7 +2699,7 @@ mod tests {
             .with_conn(|c| db::get_project(c, &project_id))
             .unwrap()
             .unwrap();
-        let authoring = render_spec_authoring(&db2, Some(&project)).unwrap();
+        let authoring = render_spec_authoring(&db2, Some(&project), "").unwrap();
         assert!(
             authoring.contains(&format!("idea_search(project_id=\"{project_id}\"")),
             "the authoring render wires the call with THIS project's id:\n{authoring}",
@@ -2790,6 +3031,187 @@ mod tests {
         assert_eq!(by_cwd.result["spec_id"], spec_id);
     }
 
+    /// THE 0/1/N LOCATION CONTRACT, and that the `workspace_id` anchor and the `cwd` anchor answer
+    /// IDENTICALLY — they funnel through the SAME [`unique_spec_for_workspace`], so there is one
+    /// place where a location becomes a Spec:
+    ///   * 0 active Specs anchored ⇒ `Ok(None)` — no Spec, never an arbitrary one;
+    ///   * 1 ⇒ its id;
+    ///   * N ⇒ `invalid_argument` carrying `reason = spec_ambiguous_for_workspace` (the machine
+    ///     handle) AND every candidate id, so the caller can pass an explicit `spec_id`.
+    ///
+    /// The N case is the one that matters: the most recently created Spec is emphatically NOT the
+    /// answer. (`cwd` is a path NESTED under the workspace root — the everyday shape of an agent's
+    /// cwd — so the ancestor match is exercised on every platform, not just the exact-root hit.)
+    #[test]
+    fn resolving_a_spec_by_location_answers_zero_one_or_a_listed_ambiguity() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project_id, workspace_id, cwd) = db.with_conn(|c| {
+            let (project, root) =
+                db::create_project(c, "Proj", "/tmp/nyx-zero-one-n", None).expect("project");
+            (project.id, root.id.clone(), root.root_path.clone())
+        });
+        let by_ws = json!({ "workspace_id": workspace_id });
+        let by_cwd = json!({ "cwd": format!("{cwd}/crates/api") });
+        let anchor = |title: &str| {
+            db.with_conn(|c| {
+                db::create_spec_with_workspace(
+                    c,
+                    &project_id,
+                    &workspace_id,
+                    title,
+                    db::SpecSections::empty(),
+                )
+                .expect("spec")
+                .0
+                .id
+            })
+        };
+
+        // ZERO — both anchors resolve NOTHING, and that is an answer rather than an error.
+        assert_eq!(resolve_spec_id(&db, &by_ws).unwrap(), None);
+        assert_eq!(resolve_spec_id(&db, &by_cwd).unwrap(), None);
+
+        // ONE — both anchors resolve THE one.
+        let first = anchor("First");
+        assert_eq!(
+            resolve_spec_id(&db, &by_ws).unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            resolve_spec_id(&db, &by_cwd).unwrap().as_deref(),
+            Some(first.as_str())
+        );
+
+        // N — both anchors REFUSE, with the machine-readable reason and the full candidate list.
+        let second = anchor("Second");
+        for args in [&by_ws, &by_cwd] {
+            let err = resolve_spec_id(&db, args).expect_err("N candidates cannot resolve one");
+            assert_eq!(err.code, RpcCode::InvalidArgument);
+            assert!(
+                is_ambiguous_spec(&err),
+                "the refusal carries the machine handle: {err:?}"
+            );
+            assert_eq!(
+                err.data
+                    .as_ref()
+                    .and_then(|d| d.get("reason"))
+                    .and_then(Value::as_str),
+                Some("spec_ambiguous_for_workspace"),
+                "the reason marker is the documented constant",
+            );
+            assert!(
+                err.message.contains(&first) && err.message.contains(&second),
+                "both candidates are listed: {}",
+                err.message
+            );
+        }
+    }
+
+    /// THE cwd→workspace TIE-BREAK, pinned. Two matching workspaces can only tie on `root_path`
+    /// LENGTH by sharing the very same `root_path` (both are prefixes of one cwd, so equal length
+    /// means equal string), and uniqueness ALLOWS that: it is `UNIQUE(project_id, root_path)`, so
+    /// two PROJECTS may be registered on one folder. The winner is the INCUMBENT — the lowest id,
+    /// hence (ids being UUIDv7) the OLDEST registration — never the newest: the ranking used to be
+    /// `max_by` on length alone, which returns the LAST maximum of a `(root_path, id)`-ordered list
+    /// and therefore silently re-pointed the folder at whatever workspace was created last.
+    #[test]
+    fn a_root_path_tie_is_broken_on_the_incumbent_workspace_never_the_newest() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (incumbent, latecomer, deeper, shared_path, deep_path) = db.with_conn(|c| {
+            let (_p1, w1) = db::create_project(c, "First", "/tmp/nyx-tie", None).expect("p1");
+            // A SECOND project on the SAME folder — allowed by UNIQUE(project_id, root_path).
+            let (_p2, w2) = db::create_project(c, "Second", "/tmp/nyx-tie", None).expect("p2");
+            let (_p3, w3) =
+                db::create_project(c, "Deeper", "/tmp/nyx-tie/inner", None).expect("p3");
+            let shared = w1.root_path.clone();
+            let deep = w3.root_path.clone();
+            (w1.id, w2.id, w3.id, shared, deep)
+        });
+        assert_eq!(
+            db.with_conn(|c| db::get_workspace(c, &latecomer))
+                .unwrap()
+                .unwrap()
+                .root_path,
+            shared_path,
+            "the two workspaces really do share one root_path — the tie is reachable"
+        );
+        assert!(
+            incumbent < latecomer,
+            "UUIDv7 ids are time-ordered, so the second registration sorts HIGHER: \
+             {incumbent} vs {latecomer}"
+        );
+
+        // THE TIE: the incumbent wins, deterministically — the newest never takes the folder.
+        let winner = db
+            .with_conn(|c| best_workspace_for_cwd(c, &shared_path))
+            .unwrap()
+            .expect("the folder resolves a workspace");
+        assert_eq!(
+            winner.id, incumbent,
+            "the incumbent (lowest id) wins the tie"
+        );
+        assert_ne!(
+            winner.id, latecomer,
+            "the most recent registration never wins silently"
+        );
+
+        // …and the tie-break NEVER overrides the depth rule: with a cwd nested under BOTH roots,
+        // the deeper one wins. The guard below keeps this assertion from going vacuous: the
+        // shallow root must really be a candidate for that cwd (it was not on Windows while the
+        // matcher compared with a hard-coded `/`, leaving a single workspace in the race).
+        let nested_cwd = crate::pathnorm::normalize(&format!("{deep_path}/src"));
+        assert!(
+            crate::pathnorm::is_ancestor_or_equal(&shared_path, &nested_cwd)
+                && crate::pathnorm::is_ancestor_or_equal(&deep_path, &nested_cwd),
+            "both roots match the nested cwd, so depth is what decides: \
+             {shared_path} / {deep_path} vs {nested_cwd}"
+        );
+        let deep = db
+            .with_conn(|c| best_workspace_for_cwd(c, &nested_cwd))
+            .unwrap()
+            .expect("the nested folder resolves a workspace");
+        assert_eq!(deep.id, deeper, "the deepest matching root_path still wins");
+    }
+
+    /// LIVENESS IS NOT IN THE RANKING, pinned so the limit is a DECISION and not an accident. The
+    /// candidate set of [`best_workspace_for_cwd`] is `db::all_workspaces`, which filters neither
+    /// `archived_at` nor `folder_removed_at`, so on a shared `root_path` the incumbent takes the cwd
+    /// even archived and folder-cleaned, ahead of a live registration. It is the same unfiltered set
+    /// [`crate::resolve::resolve_workspace`] ranks for terminal auto-attach: filtering dead rows must
+    /// happen in BOTH selectors (and change this test), or a cwd would answer one workspace for a
+    /// terminal and another for a Spec.
+    #[test]
+    fn an_archived_workspace_still_wins_the_cwd_because_liveness_is_not_ranked() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (dead, live, shared_path) = db.with_conn(|c| {
+            let (_p1, w1) =
+                db::create_project(c, "Archived", "/tmp/nyx-liveness", None).expect("p1");
+            // A SECOND project on the SAME folder — allowed by UNIQUE(project_id, root_path).
+            let (_p2, w2) = db::create_project(c, "Live", "/tmp/nyx-liveness", None).expect("p2");
+            // The incumbent is retired both ways: archived AND its worktree folder cleaned up.
+            db::archive_workspace(c, &w1.id).expect("archive");
+            db::mark_workspace_folder_removed(c, &w1.id).expect("folder cleanup");
+            (w1.id.clone(), w2.id, w1.root_path)
+        });
+        assert!(dead < live, "the archived row is the incumbent (lowest id)");
+
+        let winner = db
+            .with_conn(|c| best_workspace_for_cwd(c, &shared_path))
+            .unwrap()
+            .expect("the folder resolves a workspace");
+        assert_eq!(
+            winner.id, dead,
+            "the incumbent wins the cwd even archived — liveness is not a ranking key",
+        );
+        assert!(
+            winner.archived_at.is_some() && winner.folder_removed_at.is_some(),
+            "and the winner really is the retired row: {winner:?}",
+        );
+    }
+
     #[test]
     fn agent_context_unknown_role_is_invalid_argument() {
         let _g = db_guard();
@@ -3010,6 +3432,264 @@ mod tests {
         let err = agent_context(&db, &json!({ "role": "coder", "workspace_id": workspace_id }))
             .unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidId);
+    }
+
+    /// REVIEW F1 — THE CASE 0 SPEAKS, on BOTH channels and through BOTH location anchors.
+    ///
+    /// The bug this pins: `agent_context(role=dev|spec)` on a location anchoring no Spec used to
+    /// return `ok`, a full manual and `spec_id: null` with NOT ONE WORD about it — so a call made
+    /// from the wrong folder was indistinguishable from a properly scoped one. The contract now: the
+    /// render still succeeds (refusing would break /nspec, whose entry state is exactly this), and it
+    /// SAYS SO twice — a `warnings` entry carrying the STABLE machine code, and one explicit line in
+    /// the rendered text. The two carry the SAME sentence, asserted here, so a future edit cannot
+    /// silence one and leave the other.
+    ///
+    /// Both `resolve_spec_id` location paths are exercised — an explicit `workspace_id` and a NESTED
+    /// `cwd` — because the finding was reproduced through both.
+    #[test]
+    fn the_case_zero_speaks_on_both_channels_for_the_dispatcher_and_the_author() {
+        let _g = db_guard();
+        let (db, _project_id, workspace_id, cwd) = seeded_project_without_spec();
+        let nested = format!("{cwd}/crates/api");
+        for role in ["dev", "spec"] {
+            for anchor in [
+                json!({ "role": role, "workspace_id": workspace_id }),
+                json!({ "role": role, "cwd": nested }),
+            ] {
+                let out = agent_context(&db, &anchor).unwrap_or_else(|e| {
+                    panic!("case 0 is SIGNALLED, never refused ({anchor}): {e:?}")
+                });
+                assert!(out.effects.is_empty(), "still a pure read ({anchor})");
+                assert!(
+                    out.result["spec_id"].is_null(),
+                    "no Spec resolved ({anchor})"
+                );
+
+                // CHANNEL 1 — the machine one. A non-empty array, with the stable code.
+                let warnings = out.result["warnings"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("a warnings array ({anchor})"));
+                assert_eq!(warnings.len(), 1, "exactly one diagnosis ({anchor})");
+                assert_eq!(
+                    warnings[0]["code"], NO_SPEC_ON_LOCATION_WARNING_CODE,
+                    "the location RESOLVED a workspace; it simply anchors no active Spec ({anchor})",
+                );
+                let message = warnings[0]["message"].as_str().expect("a human sentence");
+                assert!(
+                    message.contains(&workspace_id),
+                    "the sentence NAMES the workspace it looked at ({anchor}): {message}",
+                );
+
+                // CHANNEL 2 — the human one, INSIDE the manual an agent actually reads.
+                let text = out.result["context"].as_str().expect("a rendered manual");
+                assert!(
+                    text.contains("NO SPEC ANCHORED"),
+                    "the rendered context carries an explicit line ({anchor})",
+                );
+                assert!(
+                    text.contains(message),
+                    "…and it is the SAME sentence as the warning, never a second wording ({anchor})",
+                );
+            }
+        }
+    }
+
+    /// REVIEW F1, criterion 2 — THE CASE 0s DO NOT SAY THE SAME THING, so they do not share a code.
+    ///
+    ///   * a location that RESOLVED a workspace carrying no active Spec is a LEGITIMATE state (the
+    ///     project about to author its first Spec);
+    ///   * a location that resolved NOTHING — a cwd matching no workspace, or no location argument at
+    ///     all — is an INVOCATION mistake, and the one the finding was filed on;
+    ///   * a `run_id` naming an UNBOUND run is a third thing again: the location is perfect, the RUN
+    ///     drives no Spec, and telling that caller to "pass a cwd" would name the wrong fix.
+    ///
+    /// A machine consumer (and the human the dispatcher relays to) must be able to tell them apart
+    /// without parsing prose, so the assertion is on the CODES.
+    #[test]
+    fn the_three_case_zeros_are_told_apart_by_their_warning_code() {
+        let _g = db_guard();
+        let (db, project_id, workspace_id, _cwd) = seeded_project_without_spec();
+        let code = |args: Value| -> String {
+            agent_context(&db, &args)
+                .unwrap_or_else(|e| panic!("case 0 is never refused for dev/spec: {e:?}"))
+                .result["warnings"][0]["code"]
+                .as_str()
+                .expect("a machine code")
+                .to_string()
+        };
+
+        let located = code(json!({ "role": "dev", "workspace_id": workspace_id }));
+        let unlocated = code(json!({ "role": "dev", "cwd": "/nowhere/nyx-knows-nothing" }));
+        assert_eq!(located, NO_SPEC_ON_LOCATION_WARNING_CODE);
+        assert_eq!(unlocated, NO_LOCATION_WARNING_CODE);
+        assert_ne!(
+            located, unlocated,
+            "a workspace with no Spec and a folder nyx never heard of are NOT the same diagnosis",
+        );
+        // No location argument at all is the SAME diagnosis as a cwd matching nothing…
+        assert_eq!(code(json!({ "role": "spec" })), NO_LOCATION_WARNING_CODE);
+        // …and an UNKNOWN workspace_id too: a location naming nothing is a location naming nothing,
+        // whichever argument carried it.
+        assert_eq!(
+            code(json!({ "role": "dev", "workspace_id": "01no-such-workspace" })),
+            NO_LOCATION_WARNING_CODE,
+        );
+
+        // THE RUN — resolved, and bound to no Spec (a /nspec that has not created one yet).
+        let run_id = db.with_conn(|c| {
+            let wf = db::create_workflow(c, Some(&project_id), "authoring", "nspec", None)
+                .expect("workflow");
+            db::create_workflow_run(c, &wf.id, None, None, "{}")
+                .expect("run")
+                .id
+        });
+        let unbound = code(json!({ "role": "dev", "run_id": run_id }));
+        assert_eq!(unbound, RUN_UNBOUND_WARNING_CODE);
+        assert_ne!(
+            unbound, unlocated,
+            "the run's location resolved fine — it is the RUN that drives no Spec",
+        );
+    }
+
+    /// STANDARDS FINDING `01M0813X53D1NRPAXYJGG6RJAV` — THE DIAGNOSIS AND THE RESOLUTION READ ONE
+    /// ORDER, AND IT IS OBSERVABLE FROM OUTSIDE.
+    ///
+    /// [`unanchored_signal`] used to re-walk its OWN copy of [`resolve_spec_id`]'s anchor order. Two
+    /// independent ordered lists drift: insert an anchor or permute two on one side only, and the
+    /// diagnosis keeps compiling while it names THE ARGUMENT THE CALLER DID NOT USE — a signal worse
+    /// than the silence review F1 replaced. The order now lives once, in [`spec_anchor`].
+    ///
+    /// The structural half of that guarantee is the compiler's: both `match` blocks are exhaustive
+    /// over [`SpecAnchor`], so a fifth anchor cannot be made resolvable without the build stopping
+    /// at the diagnosis too. THIS test pins the other half — the order's actual VALUE — from the
+    /// only place it is observable: every call below passes TWO anchors at once, chosen so that each
+    /// would yield a DIFFERENT code alone, and asserts the code of the EARLIER one. Permuting
+    /// `spec_anchor` reddens here.
+    #[test]
+    fn the_case_zero_diagnosis_names_the_anchor_the_resolution_stopped_on() {
+        let _g = db_guard();
+        let (db, project_id, workspace_id, cwd) = seeded_project_without_spec();
+        let code = |args: Value| -> String {
+            agent_context(&db, &args)
+                .unwrap_or_else(|e| panic!("case 0 is never refused for dev/spec: {e:?}"))
+                .result["warnings"][0]["code"]
+                .as_str()
+                .expect("a machine code")
+                .to_string()
+        };
+        let unbound_run = db.with_conn(|c| {
+            let wf = db::create_workflow(c, Some(&project_id), "authoring", "nspec", None)
+                .expect("workflow");
+            db::create_workflow_run(c, &wf.id, None, None, "{}")
+                .expect("run")
+                .id
+        });
+
+        // run_id BEFORE workspace_id, and BEFORE cwd. Both locations resolve a real workspace here,
+        // so a diagnosis reading them first would answer `spec_none_on_location` — the caller would
+        // be told to "pass an explicit spec_id" when what it actually holds is an authoring run.
+        assert_eq!(
+            code(json!({ "role": "dev", "run_id": unbound_run, "workspace_id": workspace_id })),
+            RUN_UNBOUND_WARNING_CODE,
+            "the run is read BEFORE the workspace_id, as the resolution reads it",
+        );
+        assert_eq!(
+            code(json!({ "role": "dev", "run_id": unbound_run, "cwd": cwd })),
+            RUN_UNBOUND_WARNING_CODE,
+            "the run is read BEFORE the cwd, as the resolution reads it",
+        );
+
+        // workspace_id BEFORE cwd — asserted in BOTH directions, because a single direction cannot
+        // tell a permutation from a coincidence. Real workspace + nowhere-cwd must answer on the
+        // workspace; unknown workspace + real cwd must answer on the (unknown) workspace.
+        assert_eq!(
+            code(json!({
+                "role": "dev",
+                "workspace_id": workspace_id,
+                "cwd": "/nowhere/nyx-knows-nothing",
+            })),
+            NO_SPEC_ON_LOCATION_WARNING_CODE,
+            "the workspace_id answers; the cwd behind it is never consulted",
+        );
+        assert_eq!(
+            code(json!({ "role": "dev", "workspace_id": "01no-such-workspace", "cwd": cwd })),
+            NO_LOCATION_WARNING_CODE,
+            "the workspace_id STILL answers even when it names nothing — the cwd does not rescue it",
+        );
+
+        // …and the head of the order: an explicit spec_id stops the walk before any location, so a
+        // case-0 diagnosis is never reached at all — an unknown id is `invalid_id` at the render.
+        let err = agent_context(
+            &db,
+            &json!({ "role": "dev", "spec_id": "01no-such-spec", "cwd": cwd }),
+        )
+        .expect_err("an explicit spec_id is the first anchor, and an unknown one is refused");
+        assert_eq!(
+            err.code,
+            RpcCode::InvalidId,
+            "spec_id precedes every location: no location gets to answer in its place",
+        );
+    }
+
+    /// REVIEW F1, criterion 3 — SIGNALLING THE 0 CHANGED NOTHING ABOUT THE 1 AND THE N.
+    ///
+    /// The finding asked for a WARNING on the case 0, explicitly NOT for a symmetric refusal, and
+    /// explicitly not at the cost of the branches that already behave. So this pins the whole
+    /// contract around the change: the four Spec-scoped roles still REFUSE the case 0 with
+    /// `invalid_id`, the N case still REFUSES with the machine reason `spec_ambiguous_for_workspace`
+    /// (a warning there would be a regression, not an improvement), and a resolved Spec — the case 1
+    /// — carries an EMPTY `warnings` array rather than no key at all.
+    #[test]
+    fn signalling_the_case_zero_left_the_other_branches_untouched() {
+        let _g = db_guard();
+        let (db, project_id, workspace_id, cwd) = seeded_project_without_spec();
+
+        // 0 — the four Spec-scoped roles are NOT part of the arbitration: they still refuse.
+        for role in ["coder", "auditor", "doc", "prototype"] {
+            for anchor in [
+                json!({ "role": role, "workspace_id": workspace_id }),
+                json!({ "role": role, "cwd": cwd }),
+            ] {
+                let err = agent_context(&db, &anchor)
+                    .expect_err("a Spec-scoped role without a Spec is refused, not warned");
+                assert_eq!(err.code, RpcCode::InvalidId, "role {role} ({anchor})");
+            }
+        }
+
+        // N — two active Specs on that same workspace: still a REFUSAL carrying the machine reason.
+        let anchor_spec = |title: &str| {
+            db.with_conn(|c| {
+                db::create_spec_with_workspace(
+                    c,
+                    &project_id,
+                    &workspace_id,
+                    title,
+                    db::SpecSections::empty(),
+                )
+                .expect("spec")
+                .0
+                .id
+            })
+        };
+        let _first = anchor_spec("First");
+        let _second = anchor_spec("Second");
+        let err = agent_context(&db, &json!({ "role": "dev", "workspace_id": workspace_id }))
+            .expect_err("N candidates are refused, never warned-and-rendered");
+        assert!(
+            is_ambiguous_spec(&err),
+            "the N refusal keeps its machine handle: {err:?}",
+        );
+
+        // 1 — a resolved Spec answers with an EMPTY warnings array (the key is unconditional, so a
+        // consumer never has to branch on its presence).
+        let (db1, spec_id, ws1, _cwd1) = seeded();
+        let ok = agent_context(&db1, &json!({ "role": "coder", "workspace_id": ws1 })).unwrap();
+        assert_eq!(ok.result["spec_id"], spec_id);
+        assert_eq!(
+            ok.result["warnings"],
+            json!([]),
+            "a scoped render warns about nothing — and still publishes the key",
+        );
     }
 
     /// THE PHASE-PLAN CONTRACT MOVED TO THE TOOL THAT TAKES IT. `task_add(phase="<name>")` and the

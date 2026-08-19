@@ -898,6 +898,440 @@ fn nspec_grills_a_draft_then_commits_it_to_ready() {
     );
 }
 
+/// A fresh, EMPTY folder under the OS temp dir — the stand-in for a real worktrees root.
+fn temp_root(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("nyx-seed-{tag}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// The workspace name the `create_workspace` effect DERIVES for `spec_id` — the Spec's human key,
+/// `<project key>-<number>`. Read back from the DB rather than spelled out, so a test asserting
+/// "under the root, in the Spec's own subfolder" cannot pass on a name that merely happens to match.
+fn derived_name(db: &Db, spec_id: &str) -> String {
+    db.with_conn(|c| {
+        let spec = db::get_spec(c, spec_id).unwrap().expect("the Spec exists");
+        let project = db::get_project(c, &spec.project_id)
+            .unwrap()
+            .expect("its project exists");
+        format!("{}-{}", project.key, spec.number)
+    })
+}
+
+/// HORS PERIMETRE ASSUME (2026-08-18) — THE YES-WITH-A-WORKSPACE ANSWER ('go') with the project's
+/// `worktrees_root` CONFIGURED: the Spec goes `ready` exactly as a plain 'yes' does — 'go' is an
+/// affirmative word of its own, so the B3 gate reads the WHOLE answer as HEAD does — the dev
+/// workspace is created UNDER that root with a derived name, ANCHORED to the Spec, and the human is
+/// asked NOTHING about the path. ONE question in the whole commit, and its three answers are the
+/// closed set: a second question here would mean the rider needed a turn of its own. The folder is
+/// EMPTY: this branch settles the WHERE, never the filling.
+#[test]
+fn nspec_yes_with_workspace_uses_the_configured_root_without_asking() {
+    let db = seeded_db();
+    let (wf, _n) = builtin(&db, "nspec");
+    let (project_id, spec_id) = draft_spec(&db);
+    let root = temp_root("root");
+    db.with_conn(|c| db::set_project_worktrees_root(c, &project_id, Some(&root.to_string_lossy())))
+        .unwrap();
+
+    let rt = EngineRuntime::new();
+    let mut last: Option<Value> = None;
+    let mut grills = 0;
+    let mut steps = 0;
+    let mut saw_the_three_options = false;
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, &wf.id, Some(&spec_id), None, "{}"))
+        .unwrap()
+        .id;
+    loop {
+        let out = tick(&db, &rt, &run_id, last.take());
+        match out["action"]["type"].as_str().unwrap() {
+            "done" => break,
+            "spawn_subagent" => last = Some(json!({ "diff": "d" })),
+            "judge" => {
+                grills += 1;
+                last = Some(json!({ "verdict": if grills < 1 { "more" } else { "complete" } }));
+            }
+            "ask_human" => {
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                assert!(
+                    !p.contains("Where should the dev workspace folder be created"),
+                    "a configured worktrees root must be USED, never asked about: {out}"
+                );
+                let ans = if p.contains("finalize") {
+                    "grill"
+                } else if p.contains("author's question") {
+                    "an answer"
+                } else {
+                    // THE COMMIT QUESTION — the three-answer consent this finding adds. Both
+                    // affirmatives are words the gate accepts WHOLE; the rider is WHICH one was
+                    // given, never text appended to one.
+                    assert_eq!(
+                        out["action"]["options"],
+                        json!(["yes", "go", "no"]),
+                        "the commit consent offers yes / go / no"
+                    );
+                    saw_the_three_options = true;
+                    "go"
+                };
+                last = answer(&db, &out, ans);
+            }
+            other => panic!("unexpected surfaced action '{other}': {out}"),
+        }
+        steps += 1;
+        assert!(steps < 40, "runaway nyx_next loop");
+    }
+
+    assert!(saw_the_three_options, "the commit question was reached");
+    assert_eq!(
+        spec_status(&db, &spec_id),
+        db::SPEC_STATUS_READY,
+        "'go' takes the SAME ready transition a plain 'yes' does"
+    );
+    // The registered `root_path` is the NORMALIZED one (nyx's canonical spelling), so compare there.
+    let want_root = crate::pathnorm::normalize(&root.to_string_lossy());
+    let ws = db
+        .with_conn(|c| db::list_workspaces(c, &project_id))
+        .unwrap()
+        .into_iter()
+        .find(|w| w.root_path.starts_with(&want_root) && w.root_path != want_root)
+        .expect(
+            "a dev workspace was created UNDER the configured worktrees root, with a derived name",
+        );
+    assert!(
+        std::path::Path::new(&ws.root_path).is_dir(),
+        "the folder really exists on disk: {}",
+        ws.root_path
+    );
+    assert_eq!(
+        std::fs::read_dir(&ws.root_path).unwrap().count(),
+        0,
+        "NOTHING fills it — no clone, no worktree (assumed; idea 01M04W3RZ333NC01R216MNXAFK)"
+    );
+    let spec = db
+        .with_conn(|c| db::get_spec(c, &spec_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        spec.workspace_id.as_deref(),
+        Some(ws.id.as_str()),
+        "the workspace is ANCHORED to the Spec — the spec_id of create_workspace, reused"
+    );
+    assert_eq!(
+        spec.status,
+        db::SPEC_STATUS_READY,
+        "and the anchor moved no status: the Spec is ready before and after"
+    );
+}
+
+/// HORS PERIMETRE ASSUME (2026-08-18) — THE YES-WITH-A-WORKSPACE ANSWER ('go') with NO
+/// `worktrees_root` configured: the graph ASKS, before creating anything, for a ROOT — and DERIVES the
+/// Spec's own subfolder under it, exactly as the configured-root branch does.
+///
+/// THE ASSERTION THIS TEST MAKES IS THE ONE FINDING `01M0B5AG0XR4BG6DSGEFGKW6C4` REVERSED. It used to
+/// answer the question with a folder and demand the workspace be registered EXACTLY there — which is
+/// what shipped: the question asked for a root ("Set it once with `worktrees_root`"), the user
+/// answered `d:\projects\_worktrees`, and nyx registered THE ROOT ITSELF as the Spec's workspace,
+/// silently (the folder already existed, so the mkdir had nothing to report) and permanently (every
+/// later `go` on that project then collided with the row). The two branches must derive the SAME
+/// subfolder from the SAME kind of value, so this one now asserts the derivation, not the echo.
+#[test]
+fn nspec_yes_with_workspace_asks_for_the_path_when_no_root_is_configured() {
+    let db = seeded_db();
+    let (wf, _n) = builtin(&db, "nspec");
+    let (project_id, spec_id) = draft_spec(&db);
+    // No `worktrees_root` on the project — the default.
+    let chosen = temp_root("asked").join("here");
+
+    let rt = EngineRuntime::new();
+    let mut last: Option<Value> = None;
+    let mut grills = 0;
+    let mut steps = 0;
+    let mut asked_for_a_root = false;
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, &wf.id, Some(&spec_id), None, "{}"))
+        .unwrap()
+        .id;
+    loop {
+        let out = tick(&db, &rt, &run_id, last.take());
+        match out["action"]["type"].as_str().unwrap() {
+            "done" => break,
+            "spawn_subagent" => last = Some(json!({ "diff": "d" })),
+            "judge" => {
+                grills += 1;
+                last = Some(json!({ "verdict": if grills < 1 { "more" } else { "complete" } }));
+            }
+            "ask_human" => {
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let ans = if p.contains("Under WHICH ROOT FOLDER") {
+                    asked_for_a_root = true;
+                    // The question must SAY it wants the parent, not the workspace folder: the
+                    // incident was a human answering the question as worded (finding
+                    // 01M0B5AG0XR4BG6DSGEFGKW6C4, done-criterion 2).
+                    assert!(
+                        p.contains("PARENT folder") && p.contains("subfolder named after the Spec"),
+                        "the question names the value it wants — a ROOT — and says what nyx does \
+                         with it: {p}"
+                    );
+                    assert!(
+                        !chosen.exists(),
+                        "nyx asks BEFORE it creates anything on disk"
+                    );
+                    chosen.to_string_lossy().into_owned()
+                } else if p.contains("finalize") {
+                    "grill".to_string()
+                } else if p.contains("author's question") {
+                    "an answer".to_string()
+                } else {
+                    "go".to_string()
+                };
+                last = answer(&db, &out, &ans);
+            }
+            other => panic!("unexpected surfaced action '{other}': {out}"),
+        }
+        steps += 1;
+        assert!(steps < 40, "runaway nyx_next loop");
+    }
+
+    assert!(
+        asked_for_a_root,
+        "with no configured root, the graph ASKS where the workspace goes"
+    );
+    let want =
+        crate::pathnorm::normalize(&chosen.join(derived_name(&db, &spec_id)).to_string_lossy());
+    let ws = db
+        .with_conn(|c| db::list_workspaces(c, &project_id))
+        .unwrap()
+        .into_iter()
+        .find(|w| w.root_path == want)
+        .expect("the workspace was created in the Spec's OWN subfolder under the answered root");
+    assert!(
+        !db.with_conn(|c| db::list_workspaces(c, &project_id))
+            .unwrap()
+            .iter()
+            .any(|w| w.root_path == crate::pathnorm::normalize(&chosen.to_string_lossy())),
+        "and NOT on the root itself — that is the row that blocked every later run"
+    );
+    assert!(
+        std::path::Path::new(&ws.root_path).is_dir(),
+        "and the folder was created on disk"
+    );
+    let spec = db
+        .with_conn(|c| db::get_spec(c, &spec_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        spec.workspace_id.as_deref(),
+        Some(ws.id.as_str()),
+        "anchored to the Spec, through the same create_workspace spec_id"
+    );
+}
+
+/// A SECOND draft Spec on an EXISTING project — what a project looks like when a human runs /nspec
+/// twice. Returns its id (its `number` is the project's next, which is what makes the derived
+/// workspace names differ).
+fn draft_spec_in(db: &Db, project_id: &str, title: &str) -> String {
+    db.with_conn(|c| {
+        let (spec, _rev) = db::create_spec(
+            c,
+            project_id,
+            title,
+            SpecSections {
+                problem: "p".into(),
+                solution: "s".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        spec.id
+    })
+}
+
+/// Drive a WHOLE /nspec run on `spec_id` to its `done` tick, answering the commit question with
+/// `commit` ("yes" / "go" / "no") and the workspace-root question — asked only when the project
+/// configured none — with `root`. Returns the final `done` action, whose `notes` carry what the walk
+/// had to say.
+fn drive_nspec(
+    db: &Db,
+    rt: &EngineRuntime,
+    wf_id: &str,
+    spec_id: &str,
+    commit: &str,
+    root: Option<&str>,
+) -> Value {
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, wf_id, Some(spec_id), None, "{}"))
+        .unwrap()
+        .id;
+    let mut last: Option<Value> = None;
+    let mut grills = 0;
+    let mut steps = 0;
+    loop {
+        let out = tick(db, rt, &run_id, last.take());
+        match out["action"]["type"].as_str().unwrap() {
+            "done" => return out,
+            "spawn_subagent" => last = Some(json!({ "diff": "d" })),
+            "judge" => {
+                grills += 1;
+                last = Some(json!({ "verdict": if grills < 1 { "more" } else { "complete" } }));
+            }
+            "ask_human" => {
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let ans = if p.contains("Under WHICH ROOT FOLDER") {
+                    root.expect("this run was not expected to ask where workspaces go")
+                        .to_string()
+                } else if p.contains("finalize") {
+                    "grill".to_string()
+                } else if p.contains("author's question") {
+                    "an answer".to_string()
+                } else {
+                    commit.to_string()
+                };
+                last = answer(db, &out, &ans);
+            }
+            other => panic!("unexpected surfaced action '{other}': {out}"),
+        }
+        steps += 1;
+        assert!(steps < 40, "runaway nyx_next loop");
+    }
+}
+
+/// FINDING `01M0B5AG0XR4BG6DSGEFGKW6C4`, done-criterion 4 — THE SCENARIO THAT MUST WORK: two `go` runs
+/// on the SAME project, both answering the SAME root, open TWO DISTINCT workspaces in two DIFFERENT
+/// derived subfolders. No collision, and neither of them is the root.
+///
+/// It is the déroulé that broke in production, verbatim. The first `go` registered the answered root
+/// ITSELF as the workspace (the answer was taken as the final path, no name joined); the second then
+/// died on `invalid_state` "a workspace with this path already exists in the project" — and so did
+/// every attempt after it, whatever the human answered, because the row occupying the root was never
+/// going to move. Deriving `<project key>-<number>` under the root on BOTH branches is what makes two
+/// runs on one root land in two folders.
+#[test]
+fn two_go_runs_under_one_root_open_two_distinct_workspaces() {
+    let db = seeded_db();
+    let (wf, _n) = builtin(&db, "nspec");
+    let (project_id, first) = draft_spec(&db);
+    let second = draft_spec_in(&db, &project_id, "S2");
+    // NO configured root: both runs are ASKED, and both answer the same root — the branch the
+    // incident took, and the one whose derivation was missing.
+    let root = temp_root("two-go");
+    let answered = root.to_string_lossy().into_owned();
+
+    let rt = EngineRuntime::new();
+    drive_nspec(&db, &rt, &wf.id, &first, "go", Some(&answered));
+    drive_nspec(&db, &rt, &wf.id, &second, "go", Some(&answered));
+
+    for spec_id in [&first, &second] {
+        assert_eq!(
+            spec_status(&db, spec_id),
+            db::SPEC_STATUS_READY,
+            "both 'go' runs committed their Spec — the second was not refused"
+        );
+    }
+    let normalized_root = crate::pathnorm::normalize(&answered);
+    let workspaces = db
+        .with_conn(|c| db::list_workspaces(c, &project_id))
+        .unwrap();
+    let anchored = |spec_id: &str| -> db::Workspace {
+        let spec = db
+            .with_conn(|c| db::get_spec(c, spec_id))
+            .unwrap()
+            .expect("the Spec exists");
+        let id = spec
+            .workspace_id
+            .expect("the 'go' run anchored a workspace on its Spec");
+        workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .cloned()
+            .expect("the anchored workspace belongs to the project")
+    };
+    let (w1, w2) = (anchored(&first), anchored(&second));
+    assert_ne!(
+        w1.root_path, w2.root_path,
+        "two Specs, two DIFFERENT folders under the one root"
+    );
+    for (spec_id, w) in [(&first, &w1), (&second, &w2)] {
+        assert_eq!(
+            w.root_path,
+            crate::pathnorm::normalize(&root.join(derived_name(&db, spec_id)).to_string_lossy()),
+            "each workspace is the Spec's OWN subfolder, derived from the answered root"
+        );
+        assert!(
+            std::path::Path::new(&w.root_path).is_dir(),
+            "and it really exists on disk: {}",
+            w.root_path
+        );
+    }
+    assert!(
+        !workspaces.iter().any(|w| w.root_path == normalized_root),
+        "and NOTHING was ever registered on the root itself — the row that froze the project"
+    );
+}
+
+/// FINDING `01M0B5AG0XR4BG6DSGEFGKW6C4`, done-criterion 5 — 'go' IS ALL-OR-NOTHING: when the workspace
+/// cannot be opened, the Spec does NOT come out `ready` without one.
+///
+/// The collision is set up the way a first `go` leaves it: a workspace of the project already occupies
+/// the very folder this run would derive. Under the old shape the sequence was
+/// `[transition "ready", …, create_workspace]`, so the transition was COMMITTED before the creation
+/// was even attempted, and the failure left the Spec `ready` with no workspace — half of "ready AND a
+/// workspace", which nobody asked for. The prevalidation now runs BEFORE the transition, so both
+/// halves are refused together, out loud.
+#[test]
+fn a_go_that_cannot_open_its_workspace_leaves_the_spec_a_draft() {
+    let db = seeded_db();
+    let (wf, _n) = builtin(&db, "nspec");
+    let (project_id, spec_id) = draft_spec(&db);
+    let root = temp_root("taken");
+    db.with_conn(|c| db::set_project_worktrees_root(c, &project_id, Some(&root.to_string_lossy())))
+        .unwrap();
+    // The folder this run WOULD derive is already this project's workspace.
+    let taken = root.join(derived_name(&db, &spec_id));
+    db.with_conn(|c| db::create_workspace(c, &project_id, "squatter", &taken.to_string_lossy()))
+        .unwrap();
+    let before = db
+        .with_conn(|c| db::list_workspaces(c, &project_id))
+        .unwrap()
+        .len();
+
+    let rt = EngineRuntime::new();
+    let out = drive_nspec(&db, &rt, &wf.id, &spec_id, "go", None);
+
+    assert_eq!(
+        spec_status(&db, &spec_id),
+        db::SPEC_STATUS_DRAFT,
+        "the transition did NOT fire: no workspace, no ready"
+    );
+    let spec = db
+        .with_conn(|c| db::get_spec(c, &spec_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.workspace_id, None, "and nothing was anchored to it");
+    let workspaces = db
+        .with_conn(|c| db::list_workspaces(c, &project_id))
+        .unwrap();
+    assert_eq!(
+        workspaces.len(),
+        before,
+        "no workspace row was written either — the project holds exactly what it held"
+    );
+    // AND IT SAID SO. A refusal nobody can read is the silent half-state under another name, so the
+    // fact's own reason rides the run's last word, naming the folder and what holds it.
+    let notes = out["action"]["notes"].to_string();
+    assert!(
+        notes.contains("is ALREADY the workspace") && notes.contains("squatter"),
+        "the run names the folder it refused and the workspace holding it: {notes}"
+    );
+    assert!(
+        notes.contains("still a draft"),
+        "and says what state the Spec is left in: {notes}"
+    );
+}
+
 /// N13(b) — nspec on a READY Spec takes the FORK branch: query → confirm revision → the `fork_spec`
 /// node actually FORKS it into a new editable draft → the grill reworks it → commit back to ready.
 /// The Spec ends `ready` with a BUMPED revision — proof the fork happened (not a cosmetic note).
@@ -1978,7 +2412,12 @@ fn no_builtin_branches_on_an_unconstrained_answer() {
 
 /// J2 — WHICH of the built-ins' questions the human alone may answer, read off the graphs by the
 /// derivation itself. The set is not a list anyone maintains: it is every ask whose answer disposes
-/// of something the session does not own — the Spec's lifecycle, or another round of sub-agent spend.
+/// of something the session does not own — a member of [`crate::engine::SensitiveEffect`] (the Spec's
+/// lifecycle, a new revision of it, a folder on the user's disk), or another round of sub-agent spend.
+///
+/// IT IS ALSO THE REGRESSION WITNESS for finding `01M0C3BZPWV832D802C0GZFTMC`: the set below is read
+/// off the SHIPPED graphs, so a sensitive node type that the runtime stops recognising shows up here
+/// as a question that quietly left the list.
 ///
 /// ndev's "rework or abandon" is the one J2 exists for: it commits no transition, so it used to be
 /// answerable by the session alone, and one live `/ndev` did exactly that — 3 h 35, $69.48, over
@@ -2026,6 +2465,22 @@ fn the_builtin_questions_a_human_alone_may_answer_are_the_ones_that_commit() {
             ("ndev", "rework or abandon".to_string(), HumanCommitment::AnotherRound),
             ("ndoc", "review".to_string(), HumanCommitment::AnotherRound),
             ("nspec", "confirm ready".to_string(), HumanCommitment::SpecTransition),
+            // FINDING `01M0C3BZPWV832D802C0GZFTMC` — THE SHIPPED HOLE, AND THE WITNESS THAT IT IS
+            // SHUT. "This Spec is already READY. Create a new revision to rework it?" writes
+            // `revise_ok`, and `seed.rs`'s `fork_spec {gate_on: "revise_ok"}` fires on it. Until the
+            // two layers shared [`crate::engine::SensitiveEffect`], the authoring rule certified that
+            // fork HUMAN-GATED while the runtime classified the question as ordinary: it rendered
+            // `None` here, carried no `human_turn_required`, opened no `PendingConsent` — so a
+            // session could answer "yes" by itself and fork a ready Spec.
+            //
+            // `CreateWorkspace` does NOT appear beside it, and that is correct rather than a second
+            // hole: the seeded `create_workspace` declares its own `gate_on`, and that key is
+            // `workspace_free` — a QUERY fact, not an answer, so no question governs it and none is
+            // classified by it. What stands between a human and that folder is the branch above it,
+            // `{ready_ok eq "go"}`, and `ready_ok` is already the SpecTransition entry three lines up:
+            // the run cannot reach the mkdir without that answer, and that answer already demands a
+            // human turn.
+            ("nspec", "confirm revision".to_string(), HumanCommitment::CreateRevision),
         ],
         "the questions the human alone answers, and what each of them commits",
     );

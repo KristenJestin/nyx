@@ -3,6 +3,7 @@ import {
   BotIcon,
   ClockIcon,
   FlagIcon,
+  FolderPlusIcon,
   GaugeIcon,
   GitForkIcon,
   LayersIcon,
@@ -21,7 +22,7 @@ import {
 
 /**
  * The behavior-tree node vocabulary the engine graph paints (v2.8 Phase 6). It mirrors the nyx-core
- * `db::NODE_TYPES` CHECK — the 3 COMPOSITES + the 8 LEAVES — PLUS the two SYNTHETIC pills the graph
+ * `db::NODE_TYPES` CHECK — the 3 COMPOSITES + the 13 LEAVES — PLUS the two SYNTHETIC pills the graph
  * adds for readability (`start` = the workflow entry, `terminal` = its end). The renderer maps each
  * to an icon + a semantic TONE (a design-system token, never a raw colour) and a rendering CATEGORY:
  *   - `flow`  — a custom leaf-style node (spawn / gate / judge / selector / transition / … ).
@@ -43,6 +44,7 @@ export type EngineNodeType =
   | "fork_spec"
   | "sub_workflow"
   | "transition_task"
+  | "create_workspace"
   | "wait"
   | "note"
   | "ask_human"
@@ -155,6 +157,16 @@ export const NODE_META: Record<EngineNodeType, NodeMeta> = {
     icon: ListChecksIcon,
     tone: "destructive",
     kindLabel: "transition_task",
+    category: "flow",
+  },
+  // Opens the Spec's DEV WORKSPACE — a folder on disk, a workspace row AND the Spec's anchor
+  // in one guarded write. Same `warning` tone as `fork_spec`: a sensitive Spec mutation a `gate_on`
+  // guards, and like `sub_workflow` before it, it must never fall back to the `note` default and read
+  // as an inert marker.
+  create_workspace: {
+    icon: FolderPlusIcon,
+    tone: "warning",
+    kindLabel: "create_workspace",
     category: "flow",
   },
   wait: { icon: ClockIcon, tone: "muted", kindLabel: "wait", category: "flow" },

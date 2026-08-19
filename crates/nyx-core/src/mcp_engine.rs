@@ -126,7 +126,11 @@ pub const RUN_START_TOOL: &str = "run_start";
 /// loop returns to the caller between the gate and the `transition`/`done` it must guard, so a
 /// call-local anchor would be dropped and the red gate would stop blocking anything. Each id is
 /// cleared only when ITS OWN gate runs GREEN (a set, so one green gate never clears another's red).
-const BLOCKING_GATE_RED_KEY: &str = "blocking_gate_red";
+///
+/// `pub(crate)` because it is a FIXED key the engine writes without any node declaring it, and rule
+/// (4)'s single-writer condition has to census it ([`crate::mcp_authoring`]'s
+/// `node_written_board_keys`).
+pub(crate) const BLOCKING_GATE_RED_KEY: &str = "blocking_gate_red";
 
 /// Hard cap on ONE `gate_check` command. nyx runs the gate itself over the PTY, ON the `nyx_next`
 /// dispatch path, so a managed command that never exits (a watcher, a dev server pointed at by
@@ -161,7 +165,10 @@ const GATE_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 /// run card / M6 tab can read WHY a gate was red after the fact) and rides the tick's
 /// `blackboard_delta` (so the dispatcher sees it live). Bounded by construction: each command keeps
 /// only a [`GATE_OUTPUT_TAIL_BYTES`] tail.
-const LAST_GATE_RESULT_KEY: &str = "last_gate_result";
+///
+/// `pub(crate)` for the same reason as [`BLOCKING_GATE_RED_KEY`]: a FIXED key no node declares, which
+/// rule (4)'s single-writer condition must still census.
+pub(crate) const LAST_GATE_RESULT_KEY: &str = "last_gate_result";
 
 // ============================================================================
 // The single-session engine registry
@@ -431,6 +438,18 @@ pub fn run_start(
 ) -> Result<ToolOutcome, RpcError> {
     let scope = optional_str(args, "scope")?.unwrap_or("ndev").to_string();
     let mut warnings = Vec::new();
+    // THE WORKSPACE ANCHOR IS RESOLVED HERE — BEFORE ANY WRITE — and only APPLIED further down.
+    //
+    // It is a pure READ (`db::all_workspaces` + the shared cwd→workspace selector), so hoisting it
+    // costs nothing; what it buys is that its REFUSAL costs nothing either. Since the empty-string
+    // hardening ([`crate::mcp_context::resolve_workspace_for_start`] reads `workspace_id` through
+    // `anchor_str`), this resolution can FAIL — and it used to fail AFTER `start_or_replace_run`,
+    // which drops a run whose graph changed and inserts a fresh one. A `run_start(workspace_id: "")`
+    // therefore destroyed a live run, opened another, and only then answered `invalid_argument`: the
+    // caller reads a refusal while the run pool has moved under it, the exact half-committed shape
+    // this PRD refuses everywhere else ("prevalidate, then mkdir"). Resolved here, refused here,
+    // nothing written.
+    let located = crate::mcp_context::resolve_workspace_for_start(db, args)?;
     // G2 — an AMBIGUOUS location must not cost an AUTHORING flow its `cwd`. Resolving the Spec from a
     // workspace holding SEVERAL active ones is refused (N14b: picking one silently attributes work to
     // an arbitrary Spec), and that refusal is right for a flow that works ON a Spec. For one that
@@ -561,9 +580,45 @@ pub fn run_start(
     // re-runs no effect. What must NOT happen is MOVING an anchor the run already carries — the
     // authority's own `WHERE workspace_id IS NULL` guard refuses that, so a second `run_start` from a
     // different cwd resumes the run without re-homing it.
-    if let Some(workspace_id) = crate::mcp_context::resolve_workspace_for_start(db, args)? {
-        db.with_conn(|c| db::set_run_workspace(c, &run.id, &workspace_id))
+    // `located` was RESOLVED at the top of this function (a pure read, so its refusal precedes every
+    // write — see the note there); only the WRITE lives here, after the stranded-run report that must
+    // not be rejuvenated by this `updated_at` bump.
+    if let Some(workspace_id) = &located {
+        db.with_conn(|c| db::set_run_workspace(c, &run.id, workspace_id))
             .map_err(internal_db)?;
+    }
+
+    // PARITY WITH `agent_context`'s case 0 (review F1) — RULED, half implemented and half declined,
+    // so the asymmetry between the two verbs is a decision on the record rather than an oversight.
+    //
+    // DECLINED — the "no Spec resolved" half. `run_start` already answers it in every branch, and
+    // more loudly than a warning: a SPEC-SCOPED flow REFUSES to start unbound (the guard above),
+    // which is precisely the answer `agent_context` may NOT give for role=dev/spec without breaking
+    // /nspec. `nspec` is the one flow DESIGNED to begin with no Spec — its first node queries
+    // `spec_status` and its second branches on the null to CREATE the Spec — so a systematic "no
+    // Spec" warning would fire on 100 % of authoring starts, exactly what the exclusion just below
+    // already declined for `query_without_spec_warnings`. And `custom` keeps that conditional
+    // warning, which fires when the empty answer can actually mislead a branch. `agent_context` has
+    // none of that structure to lean on: it RENDERS a manual that reads identically scoped or not,
+    // which is why ITS case 0 must speak every time and this one must not.
+    //
+    // IMPLEMENTED — the "wrong folder" half, F1's sub-case (b), the one thing `run_start` was
+    // genuinely silent about. A `cwd` matching no known workspace opens a run with NO workspace
+    // anchor: an effector with no repos (see the anchor note above), from a caller who believed they
+    // were running inside their dev workspace. Keyed on a `cwd` having been PASSED and the run
+    // ending up unanchored all the same — `run_start(spec_id=…)` names no folder on purpose and is
+    // never warned, and a RESUMED run that already carries an anchor has lost nothing.
+    if located.is_none() && run.workspace_id.is_none() {
+        if let Some(cwd) = optional_str(args, "cwd")? {
+            warnings.push(json!({
+                "code": RUN_LOCATION_UNRESOLVED_WARNING_CODE,
+                "message": format!(
+                    "cwd '{cwd}' matches no workspace nyx knows, so this run opens with NO workspace \
+                     anchor and its effectors resolve no repos. Run it from inside the dev \
+                     workspace's folder, or pass an explicit workspace_id"
+                ),
+            }));
+        }
     }
 
     // SIGNAL what is wrong with THE GRAPHS this run will walk — this flow and every flow it opens
@@ -608,6 +663,16 @@ pub fn run_start(
 /// none: the run starts UNBOUND rather than refusing (G2). A STABLE machine code, sibling of
 /// `gate_unconfigured` and `run_replaced_graph_changed` in the same `warnings` array.
 const SPEC_AMBIGUOUS_WARNING_CODE: &str = "spec_ambiguous_started_unbound";
+
+/// The `run_start` WARNING code for a `cwd` that matched NO workspace, leaving the run with no
+/// workspace anchor (review F1, sub-case (b) — the "wrong folder" half of the `agent_context`
+/// parity). A STABLE machine code, sibling of `run_replaced_graph_changed` / `run_blocked_stranded`
+/// in the same `warnings` array; it is deliberately NOT the same code as `agent_context`'s
+/// `spec_location_unresolved`, because what is lost here is the run's WORKSPACE, not a Spec scope.
+/// `pub(crate)` so `mcp::tests::the_spec_anchor_and_resolution_tools_document_the_contract_they_enforce`
+/// pins the DESCRIPTOR against the constant itself rather than against a re-typed literal: renaming
+/// the code without re-wording `run_start`'s description then turns that test red.
+pub(crate) const RUN_LOCATION_UNRESOLVED_WARNING_CODE: &str = "run_location_unresolved";
 
 /// The `run_start` WARNING code for a run DROPPED because its graph was replaced under it (M4). A
 /// STABLE machine code — the dispatcher / UI keys on it, the human sentence beside it is free to
@@ -1377,6 +1442,11 @@ fn build_engine(db: &Db, run: &db::WorkflowRun) -> Result<Engine, RpcError> {
 /// about the gate and nothing else. Attaching them HERE, on the one exit every refusal funnels
 /// through, is what makes "a note is never lost" a property of the tick rather than a habit to
 /// repeat at a dozen `return Err` sites.
+///
+/// OWNS THE TICK'S INVALIDATIONS TOO, for the same reason and by the same means. A tick is the one
+/// MCP call that mutates SEVERAL domains behind ONE return value: it walks the graph and runs nyx's
+/// own effects inline, so what it touched is known only to the walk, one arm at a time. See
+/// [`outcome`] for what the shell does with them and what it cost to hand it a constant instead.
 fn drive(
     db: &Db,
     runtime: &EngineRuntime,
@@ -1389,10 +1459,46 @@ fn drive(
     // The notes WALKED PAST during this tick, in graph order — they ride the next action this tick
     // hands back (G4, see [`with_notes`]), or the refusal that replaces it ([`refusal_with_notes`]).
     let mut notes: Vec<String> = Vec::new();
-    walk(
-        db, runtime, run, engine, last_result, provider, caller, &mut notes,
-    )
-    .map_err(|e| refusal_with_notes(e, &notes))
+    // The topics this tick INVALIDATED, in the order the walk touched them. Seeded with `Specs`
+    // because EVERY tick advances the run itself (cursor + blackboard), which is what the Specs
+    // board, the Spec detail and the engine visualiser all re-pull on; an arm that mutates another
+    // domain adds its own through [`note_effect`].
+    let mut effects: Vec<ChangedTopic> = vec![ChangedTopic::Specs];
+    let walked = walk(
+        db,
+        runtime,
+        run,
+        engine,
+        last_result,
+        provider,
+        caller,
+        &mut notes,
+        &mut effects,
+    );
+    match walked {
+        // ONE assembly point, the same one the notes use. [`outcome`] builds the success value from
+        // the action the tick STOPPED on and names the `Specs` floor every tick invalidates; it
+        // CANNOT know the rest, because the node that mutated is one the walk already left behind.
+        // So the accumulated set is attached here, where the walk is over and every arm has spoken.
+        Ok(mut out) => {
+            out.effects = effects;
+            Ok(out)
+        }
+        Err(e) => Err(refusal_with_notes(e, &notes)),
+    }
+}
+
+/// RECORD that this tick invalidated `topic`, once — the walk's half of the tick's `changed`
+/// contract ([`outcome`]).
+///
+/// Idempotent because a graph LOOPS: a body holding an effect node is walked once per pass, and the
+/// shell pushes one `*://changed` per entry ([`ToolOutcome::effects`]), so a naive `push` would ask
+/// the renderer to re-pull the same list once per iteration. The topic set is tiny and the order is
+/// the order the walk touched them, so a linear scan is the whole implementation.
+fn note_effect(effects: &mut Vec<ChangedTopic>, topic: ChangedTopic) {
+    if !effects.contains(&topic) {
+        effects.push(topic);
+    }
 }
 
 /// ATTACH the notes the walk went past to a REFUSAL, under `data.notes` — the same array
@@ -1415,7 +1521,8 @@ fn refusal_with_notes(mut err: RpcError, notes: &[String]) -> RpcError {
     }
 }
 
-/// The walk itself — see [`drive`], which owns the notes it fills and is the only caller.
+/// The walk itself — see [`drive`], which owns the notes and the effects it fills and is the only
+/// caller.
 #[allow(clippy::too_many_arguments)]
 fn walk(
     db: &Db,
@@ -1426,6 +1533,7 @@ fn walk(
     provider: &str,
     caller: CallerSession<'_>,
     notes: &mut Vec<String>,
+    effects: &mut Vec<ChangedTopic>,
 ) -> Result<ToolOutcome, RpcError> {
     // Decode the dispatcher's reported result for the leaf we were parked on (None on the first
     // tick, or when the parked leaf carries no payload).
@@ -1700,6 +1808,8 @@ fn walk(
                     write,
                     target,
                     task_key,
+                    root_key,
+                    name_key,
                 } => {
                     // The fact is resolved into a PAIR of board writes first, so a fact nyx cannot
                     // read parks the run on this node rather than erroring bare — an un-replayed
@@ -1737,6 +1847,55 @@ fn walk(
                             Ok(vec![
                                 (write.clone(), count),
                                 (format!("{write}_reason"), Value::from(listing)),
+                            ])
+                        } else if query == QUERY_PROJECT_WORKTREES_ROOT {
+                            // TWO writes for ONE fact, and the second one exists so a QUESTION can
+                            // fill the first. The graph must branch on "is a root configured?" AND
+                            // hand the root itself to the `create_workspace` below — but when nothing
+                            // is configured the ANSWER to the question takes that key over, and J1
+                            // forbids an `ask_human` writing a key a selector branches on (a folder
+                            // path has no closed answer set to declare). So the BRANCHABLE half is
+                            // folded out as `<write>_configured`, leaving `<write>` free to be
+                            // answered into. One key holds the root, whoever filled it.
+                            let root = resolve_query(db, run, &query)?;
+                            let configured =
+                                root.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                            Ok(vec![
+                                (write.clone(), root),
+                                (format!("{write}_configured"), Value::from(configured)),
+                            ])
+                        } else if query == QUERY_WORKSPACE_TARGET_FREE {
+                            // The WORKSPACE prevalidation, read over the SAME board keys the
+                            // `create_workspace` it guards reads — so the folder checked here and the
+                            // folder created there are one folder, not two derivations that can drift.
+                            //
+                            // SAME KEYS IS NOT ENOUGH: the RENDERING has to match too. The effect
+                            // resolves its keys through `engine::interpolate`, which renders a
+                            // NON-string board value as its JSON form (`123`, `true`), while an
+                            // `as_str()` read answers `None` for exactly those values. Reading them
+                            // differently is the drift this comment claims does not exist: the check
+                            // would answer about `""` (fail-closed "no root") while the effect built a
+                            // real path out of `123`. So the two spellings are ONE, here.
+                            let board = |key: Option<&str>, default: &str| -> String {
+                                match engine.blackboard().get(key.unwrap_or(default)) {
+                                    Some(Value::String(s)) => s.clone(),
+                                    Some(v) => v.to_string(),
+                                    None => String::new(),
+                                }
+                            };
+                            let root = board(
+                                root_key.as_deref(),
+                                crate::engine::DEFAULT_WORKTREES_ROOT_KEY,
+                            );
+                            let name = board(
+                                name_key.as_deref(),
+                                crate::engine::DEFAULT_WORKSPACE_NAME_KEY,
+                            );
+                            let (free, reason) =
+                                resolve_workspace_target_free(db, run, &root, &name)?;
+                            Ok(vec![
+                                (write.clone(), Value::from(free)),
+                                (format!("{write}_reason"), Value::from(reason)),
                             ])
                         } else {
                             Ok(vec![(write.clone(), resolve_query(db, run, &query)?)])
@@ -1873,6 +2032,42 @@ fn walk(
                                 ));
                             }
                         }
+                    }
+                    result = Some(NodeResult::Ack);
+                }
+                // nyx OPENS THE DEV WORKSPACE of the run's bound Spec — folder, workspace row and Spec
+                // ANCHOR in one guarded write, through the SAME `mcp_runtime::create_workspace` the
+                // MCP tool calls. UNGATED by default; with `gate_on` set it fires only on an
+                // affirmative board key, which is how the human answer that ASKED for a workspace is
+                // the thing that opens one. Never surfaced to the dispatcher.
+                //
+                // A REFUSAL (no Spec, no path, a folder that is a file, a duplicate path) BLOCKS and
+                // is re-attempted on the next call rather than walked past: the flow below is
+                // authored on the workspace existing, and a silent skip would leave the human
+                // believing they got one.
+                Action::CreateWorkspace {
+                    node_id,
+                    root,
+                    name,
+                    gate_on,
+                } => {
+                    let approved = gate_on
+                        .as_deref()
+                        .map(|k| board_value_is_affirmative(engine.blackboard().get(k)))
+                        .unwrap_or(true);
+                    if approved {
+                        if let Err(e) = create_run_workspace(db, run, &root, &name) {
+                            let blocked =
+                                block_on_effect_error(db, run, engine, &node_id, last_result, e);
+                            return Err(blocked);
+                        }
+                        // THE WORKSPACE POOL CHANGED — say so, or the row exists and nobody knows.
+                        // This is the ONE inline effect whose write lands OUTSIDE the Spec domain
+                        // the tick names by default, and the sidebar is the only view of it. See
+                        // [`outcome`] for the incident this line closes. Only on the APPROVED,
+                        // SUCCEEDED path: a gated-off node created nothing, and a refused one
+                        // compensated its own folder.
+                        note_effect(effects, ChangedTopic::Workspaces);
                     }
                     result = Some(NodeResult::Ack);
                 }
@@ -2215,7 +2410,11 @@ fn with_notes(mut action: Value, notes: &[String]) -> Value {
 /// The PARENT-board key a `sub_workflow` node records its CHILD run id under — keyed PER NODE so a
 /// tree may hold several sub_workflow leaves. Deliberately dot-free (a UUID node id carries no `.`),
 /// so [`Blackboard::get`]'s dot-path split reads it as one flat key (v2.8 lot 2).
-fn subworkflow_child_key(node_id: &str) -> String {
+///
+/// `pub(crate)` because rule (4)'s single-writer condition must census it: it is a write the engine
+/// performs that the node's config does not name ([`crate::mcp_authoring`]'s
+/// `node_written_board_keys`).
+pub(crate) fn subworkflow_child_key(node_id: &str) -> String {
     format!("__child_run_id__{node_id}")
 }
 
@@ -2594,6 +2793,16 @@ fn ask_human_json(
 ///
 /// Two things resolve on it and must never disagree: which workflow a `sub_workflow` node opens, and
 /// which command a gate's SLOT is bound to. Both are "what does THIS project do here".
+///
+/// IT IS DELIBERATELY NOT WIDENED TO `run.workspace_id`, even though a workspace resolves a project
+/// perfectly well ([`run_workspace_project_id`] does exactly that, for one caller). The two consumers
+/// above are WHY: widening here would change WHICH GRAPH a `sub_workflow` opens on a Spec-less run (a
+/// project-owned `coder` instead of the seeded built-in) and WHICH COMMANDS a slot gate runs on one (a
+/// blocking gate that today refuses to advance for want of commands would suddenly arm itself). Both
+/// are decisions about what a run is ALLOWED to do, taken from a weaker anchor than the one they were
+/// authored against — a behaviour change that owes its own consent discussion and its own tests, not a
+/// side effect of fixing a path lookup. A FACT that merely READS a project setting carries no such
+/// weight, so that one resolves the wider way, at its own site and nowhere else.
 fn run_project_id(db: &Db, run: &db::WorkflowRun) -> Result<Option<String>, RpcError> {
     let Some(spec_id) = run.spec_id.as_deref() else {
         return Ok(None);
@@ -2602,6 +2811,34 @@ fn run_project_id(db: &Db, run: &db::WorkflowRun) -> Result<Option<String>, RpcE
         .with_conn(|c| db::get_spec(c, spec_id))
         .map_err(internal_db)?
         .map(|s| s.project_id))
+}
+
+/// The PROJECT a run belongs to, read through its bound Spec AND — failing that — through the dev
+/// WORKSPACE it was opened against ([`db::WorkflowRun::workspace_id`]). `None` only when the run has
+/// neither.
+///
+/// A workspace belongs to exactly one project, so a run parked in one KNOWS its project whether or not
+/// a Spec exists yet. Reading the Spec alone made `project_worktrees_root` answer `""` for a `custom`
+/// run, and for a `/nspec` run before its Spec is created — so `worktrees_root_configured` came back
+/// false and the seeded selector routed to the ask_human that demands a root the project had ALREADY
+/// frozen in `projects.worktrees_root`. Asking again for a setting the user has set is the failure
+/// this closes.
+///
+/// SPEC FIRST, workspace second: the Spec is the run's declared anchor ([`run_project_id`]) and a
+/// workspace is where it happens to be running, so the two are ordered rather than merged — and they
+/// cannot contradict each other in practice, since a workspace anchored to a Spec is anchored to that
+/// Spec's project (`workspaces.spec_id`, this PRD's own invariant).
+fn run_workspace_project_id(db: &Db, run: &db::WorkflowRun) -> Result<Option<String>, RpcError> {
+    if let Some(project_id) = run_project_id(db, run)? {
+        return Ok(Some(project_id));
+    }
+    let Some(workspace_id) = run.workspace_id.as_deref() else {
+        return Ok(None);
+    };
+    Ok(db
+        .with_conn(|c| db::get_workspace(c, workspace_id))
+        .map_err(internal_db)?
+        .map(|w| w.project_id))
 }
 
 /// Resolve a `sub_workflow` node's CHILD workflow: an explicit `workflow_id` (must exist), else the
@@ -2910,7 +3147,23 @@ fn transition_is_engaging(t: db::SpecTransition) -> bool {
 /// Whether a blackboard value counts as an AFFIRMATIVE human approval for an engaging transition's
 /// gate: `true`, or an affirmative word (yes/y/ok/approve(d)/ready/go, case-insensitive). Absent /
 /// `false` / "no" / a structured value is NOT approval (B3).
-fn board_value_is_affirmative(v: Option<&Value>) -> bool {
+///
+/// `pub(crate)` because the AUTHORING guard reads it too — but ONLY for the arm where the runtime
+/// really calls this function, and that is worth stating precisely, because the two arms of rule (4)'s
+/// condition (ii) do NOT share a comparator:
+///
+///   * the `gate_on` ARM — the runtime gate of a sensitive node calls THIS on the live board value
+///     (`drive`'s transition / transition_task / fork_spec / create_workspace arms). One vocabulary of
+///     consent for the two layers there, so a word the authoring rule accepts as an approval and a
+///     word the gate honours at runtime cannot drift apart.
+///   * the SELECTOR ARM — the runtime does NOT call this at all. A branch is chosen by
+///     [`crate::engine::Condition::matches`], which compares by EXACT JSON equality: no `trim`, no
+///     case folding. So a literal this function alone would credit (`eq: "YES"`, `eq: " yes "`) is a
+///     branch that can never fire, and when no branch fires the selector kills the run with
+///     [`crate::engine::EngineError::SelectorNoBranch`]. The authoring polarity test therefore goes
+///     through [`eq_literal_is_affirmative`], which is this vocabulary NARROWED to the literals
+///     `matches` can actually match (finding `01M0C3FGCACXCZA1ZESRV73N0R`).
+pub(crate) fn board_value_is_affirmative(v: Option<&Value>) -> bool {
     match v {
         Some(Value::Bool(b)) => *b,
         Some(Value::String(s)) => matches!(
@@ -2918,6 +3171,29 @@ fn board_value_is_affirmative(v: Option<&Value>) -> bool {
             "yes" | "y" | "ok" | "approve" | "approved" | "ready" | "go" | "true"
         ),
         _ => false,
+    }
+}
+
+/// Whether a selector branch's `eq` LITERAL is an approval the RUNTIME can actually match — the
+/// polarity test of rule (4)'s SELECTOR arm ([`crate::engine::Condition::affirmative_key`]).
+///
+/// [`board_value_is_affirmative`] answers "does this VALUE count as a yes?", and it is generous on
+/// purpose: it trims and case-folds, because a human's typed answer may arrive as `" Yes "`. A branch
+/// LITERAL is the other side of that comparison, and [`crate::engine::Condition::matches`] compares it
+/// to the board value by EXACT JSON equality. A literal that only becomes affirmative AFTER trimming
+/// or lowering therefore describes a branch that never fires: authoring credited it as the consent,
+/// the run reached the selector, no branch matched, and `SelectorNoBranch` failed the run. So the
+/// literal must ALREADY be in the canonical form the vocabulary lists — `"yes"`, `"go"`, `true` pass;
+/// `"YES"` and `" yes "` do not.
+pub(crate) fn eq_literal_is_affirmative(v: &Value) -> bool {
+    match v {
+        // Canonical form or nothing: `s` must be the very string the vocabulary holds — trimmed and
+        // lowered ALREADY — since that is the only string `Condition::matches` can compare a board
+        // value to and win.
+        Value::String(s) => {
+            board_value_is_affirmative(Some(v)) && *s == s.trim().to_ascii_lowercase()
+        }
+        other => board_value_is_affirmative(Some(other)),
     }
 }
 
@@ -3007,6 +3283,208 @@ fn deferred_findings_note(
     }))
 }
 
+/// The dev workspace a `create_workspace` node WOULD open for `run` — the bound Spec, the NAME the
+/// folder carries and the FOLDER ITSELF. It is THE ONE derivation: the effect
+/// ([`create_run_workspace`]) creates exactly this, and the PREVALIDATION
+/// ([`resolve_workspace_target_free`]) checks exactly this, so a check and the write it guards can
+/// never be told about two different folders.
+///
+/// WHERE the folder goes: `root` JOINED with `name`, always — `root` is a ROOT, the folder workspaces
+/// land UNDER, whoever filled the board key it came from (a project's configured
+/// [`db::Project::worktrees_root`] read by a `query`, or a root a human answered). An EMPTY root is
+/// `invalid_argument`: a node that cannot say WHERE must not guess a folder on a user's disk.
+///
+/// THE DERIVATION IS NOT OPTIONAL, and that is the whole lesson of 2026-08-18. This function used to
+/// take a second source — an "explicit path" — that WON over the root and was registered AS the
+/// workspace, with no name joined. The graph's two branches therefore disagreed about what the same
+/// kind of value meant: the configured root got a subfolder, the ANSWERED one was taken whole. The
+/// question asked for a root, the human gave one (`d:\projects\_worktrees`), and nyx registered the
+/// common parent of every worktree as a workspace — silently, because the folder already existed, so
+/// the `mkdir` had nothing to report. Every later run then collided with that row. Merging the sources
+/// BEFORE the join is what makes the asymmetry unrepresentable: there is one base, and one `join`.
+///
+/// `name` empty → DERIVED as the Spec's human key (`<project key>-<number>`, e.g. `NYX-42`): the name
+/// the human already knows the Spec by, and one that is filesystem-safe by construction, unlike a
+/// title. The derivation lives here rather than in the engine because the engine is pure and the key
+/// is two DB rows away.
+fn resolve_workspace_target(
+    db: &Db,
+    run: &db::WorkflowRun,
+    root: &str,
+    name: &str,
+) -> Result<(db::Spec, String, String), RpcError> {
+    let Some(spec_id) = run.spec_id.as_deref() else {
+        return Err(RpcError::new(
+            RpcCode::InvalidState,
+            "create_workspace: this run carries no Spec, and the workspace this node opens is the \
+             Spec's — there is nothing to anchor it to",
+        ));
+    };
+    let spec = db
+        .with_conn(|c| db::get_spec(c, spec_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidId,
+                format!("create_workspace: unknown Spec {spec_id}"),
+            )
+        })?;
+    let project = db
+        .with_conn(|c| db::get_project(c, &spec.project_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidId,
+                format!("create_workspace: unknown project {}", spec.project_id),
+            )
+        })?;
+
+    let name = match name.trim() {
+        "" => format!("{}-{}", project.key, spec.number),
+        given => given.to_string(),
+    };
+    // THE NAME MUST STAY A NAME — one path SEGMENT, joined UNDER the root. `Path::join` silently
+    // REPLACES the base when the right-hand side is absolute (`join("D:/elsewhere")` → `D:/elsewhere`)
+    // and walks out of it on `..`, so a `name_key` fed by a human answer or a sub-workflow result
+    // could put the workspace anywhere on the disk — the SAME defect as the retired `path_key`
+    // (finding `01M0B5AG0XR4BG6DSGEFGKW6C4`), just entering by the other argument. The derived
+    // `<project key>-<number>` is safe by construction; a board-supplied one is not, so it is checked
+    // rather than trusted.
+    // ONE `Component::Normal` and nothing else: the count alone is not enough, since `..` and `.`
+    // are each a SINGLE component carrying no separator, and `C:` is a single Prefix — all three
+    // would pass a naive length check and still leave the root.
+    let mut segments = std::path::Path::new(&name).components();
+    let single_plain_segment = matches!(segments.next(), Some(std::path::Component::Normal(_)))
+        && segments.next().is_none()
+        && !name.contains('/')
+        && !name.contains('\\');
+    if !single_plain_segment {
+        return Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "create_workspace: the workspace name '{name}' is not a single folder name — it \
+                 carries a path separator, a `..`/`.` or a drive prefix, which would place the \
+                 workspace OUTSIDE the worktrees root instead of under it. The name is joined under \
+                 the root; give a plain name, or leave it empty to derive the Spec's own key"
+            ),
+        ));
+    }
+    let root = root.trim();
+    if root.is_empty() {
+        return Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            "create_workspace: no folder to create — the node got no worktrees root at all. Set the \
+             project's `worktrees_root` (set_project_settings), or author the graph to ask for one \
+             first",
+        ));
+    }
+    let path = std::path::Path::new(root)
+        .join(&name)
+        .to_string_lossy()
+        .into_owned();
+    Ok((spec, name, path))
+}
+
+/// Open the DEV WORKSPACE of `run`'s bound Spec — the effect behind a `create_workspace` node.
+///
+/// IT REUSES THE TOOL, IT DOES NOT REIMPLEMENT IT. Everything past "which folder, which name" —
+/// resolved by [`resolve_workspace_target`] — is [`crate::mcp_runtime::create_workspace`]: the
+/// `mkdir`, the Spec-anchor PREVALIDATION that happens before anything touches the disk, the shared
+/// transaction that makes registration + anchor atomic, and the leaf-only compensation of a folder
+/// this call created. The Spec ANCHOR is that tool's `spec_id` argument (the one this PRD delivered) —
+/// there is no second anchoring path here, and the anchor never moves the Spec's status.
+///
+/// THE SINK IS NULL HERE, ON PURPOSE, AND IT IS NOT WHERE THE REFRESH COMES FROM. The tool's
+/// `events` parameter is the POST-COMMIT [`crate::usecase::EventSink`] a SHELL injects: the sidecar
+/// hands `dispatch_workspace_tool` a `PushEventSink` (`nyx-sidecar/src/runtime/mcp.rs`), which turns
+/// the `workspace.created` domain event into the unsolicited `workspaces://changed` the sidebar
+/// re-pulls on. No shell sink reaches a `nyx_next` tick — `dispatch_extension_tool` takes none — so
+/// this call passes a [`crate::usecase::NullEventSink`] and the graph path carries the SAME
+/// invalidation on the tick's own `changed` topics instead ([`outcome`]). Nothing is lost by the
+/// null sink itself: the `domain_events` row is written INSIDE the use case's transaction, not by
+/// the sink, so only the real-time push ever depended on it.
+fn create_run_workspace(
+    db: &Db,
+    run: &db::WorkflowRun,
+    root: &str,
+    name: &str,
+) -> Result<Value, RpcError> {
+    let (spec, name, path) = resolve_workspace_target(db, run, root, name)?;
+    let spec_id = spec.id.clone();
+
+    // THE tool, unchanged: prevalidated anchor → mkdir → one transaction → compensation. The engine
+    // is not a second entry point into the workspace model, it is a caller of the first one.
+    crate::mcp_runtime::create_workspace(
+        db,
+        &crate::usecase::NullEventSink,
+        &json!({
+            "project_id": spec.project_id,
+            "name": name,
+            "path": path,
+            "spec_id": spec_id,
+        }),
+    )
+}
+
+/// Resolve `workspace_target_free`: whether the folder a `create_workspace` is ABOUT to open is still
+/// free of a workspace of this project — plus the sentence that says which folder, and why it is not
+/// (folded to `<write>_reason` by `drive`).
+///
+/// IT IS A PREVALIDATION, IN THE PRD'S OWN SENSE, MOVED ONE STEP EARLIER. The tool already prevalidates
+/// the Spec anchor before it touches the disk, so a refused link creates no folder. This fact carries
+/// the same idea up to the GRAPH, where the thing to protect is not the disk but the TRANSITION: the
+/// `go` answer means "mark it ready AND open a workspace", and the sequence used to commit the
+/// `ready` first, so a `create_workspace` that then failed left the Spec ready with NO workspace —
+/// half of what the human asked for, silently. A graph that reads this fact BEFORE its transition can
+/// route both or neither.
+///
+/// What it checks is exactly what the DB then refuses: `UNIQUE(project_id, root_path)`, compared over
+/// the SAME [`crate::pathnorm::normalize`]d spelling [`db::create_workspace`] stores. It does not
+/// pretend to cover every way the effect can fail (a permission error, a file where the folder goes,
+/// a racing writer between the check and the write): the collision is the one that BIT, it is the one
+/// a second `go` on a project hits by construction, and a check that cannot be complete is still worth
+/// having when the alternative is a Spec left half-committed.
+///
+/// FAIL-CLOSED: anything that stops the folder being NAMED at all (no Spec, no root) answers `false`
+/// carrying its own sentence, never an error — an erroring `query` parks the run, while `false` routes
+/// it to the branch that says so and leaves the Spec exactly as it was.
+fn resolve_workspace_target_free(
+    db: &Db,
+    run: &db::WorkflowRun,
+    root: &str,
+    name: &str,
+) -> Result<(bool, String), RpcError> {
+    let (spec, _name, path) = match resolve_workspace_target(db, run, root, name) {
+        Ok(target) => target,
+        Err(e) => return Ok((false, e.message)),
+    };
+    let normalized = crate::pathnorm::normalize(&path);
+    let taken = db
+        .with_conn(|c| db::list_workspaces(c, &spec.project_id))
+        .map_err(|e| {
+            RpcError::new(
+                RpcCode::Internal,
+                format!("query workspace_target_free: {e}"),
+            )
+        })?
+        .into_iter()
+        .find(|w| w.root_path == normalized);
+    Ok(match taken {
+        Some(w) => (
+            false,
+            format!(
+                "the folder '{normalized}' is ALREADY the workspace '{}' of this project — one path \
+                 holds one workspace, so opening a second one there is refused",
+                w.name
+            ),
+        ),
+        None => (
+            true,
+            format!("'{normalized}' is free — no workspace of this project occupies it"),
+        ),
+    })
+}
+
 /// The nyx fact a `query` node reads: the bound Spec's STATUS (`draft` / `in_review` / …). Extend
 /// this set as graphs need more verifiable state to branch on (v2.8 review B2).
 const QUERY_SPEC_STATUS: &str = "spec_status";
@@ -3077,6 +3555,21 @@ const QUERY_DESIGN_ROUND_PAGES: &str = "design_round_pages";
 /// every later tick, forever (H9). Its companion `<write>_reason` names the task and, when it is
 /// blocked, the coder's own reason. See [`resolve_task_close_route`] for the four answers.
 const QUERY_TASK_CLOSE_ROUTE: &str = "task_close_route";
+/// The PROJECT-level root folder this run's dev workspaces land under
+/// ([`db::Project::worktrees_root`]) — the WHERE of a workspace, read as a FACT so the graph can
+/// branch on "is it configured?" instead of asking a question it may not need. The project is
+/// resolved through the run's Spec OR its WORKSPACE ([`run_workspace_project_id`]), so a run that
+/// carries a workspace but no Spec yet still reads the root its project configured. Unset / no
+/// project at all → the EMPTY STRING, which is falsy for a `truthy: false` branch AND interpolates to
+/// nothing in a path (a `null` would interpolate to the literal text `null` and build a folder named
+/// after it — the one way this fact could do damage).
+const QUERY_PROJECT_WORKTREES_ROOT: &str = "project_worktrees_root";
+/// Whether the folder a `create_workspace` is ABOUT to open is still FREE — the prevalidation a graph
+/// reads BEFORE the transition that commits the Spec, so "mark it ready AND open a workspace" is not
+/// left half-done when the folder is taken ([`resolve_workspace_target_free`]). Parameterized by the
+/// board keys the guarded node itself reads (`root_key` / `name_key`), and its companion
+/// `<write>_reason` NAMES the folder and, when it is taken, the workspace already holding it.
+const QUERY_WORKSPACE_TARGET_FREE: &str = "workspace_target_free";
 
 /// WHY a `query` fact read on such a run can never move again — the sentence a dead loop's failure
 /// carries to the human ([`Engine::freeze_key`]).
@@ -3122,7 +3615,9 @@ fn resolve_query(db: &Db, run: &db::WorkflowRun, query: &str) -> Result<Value, R
             };
             let open = db
                 .with_conn(|c| db::list_tasks_for_spec(c, spec_id))
-                .map_err(|e| RpcError::new(RpcCode::Internal, format!("query spec_open_tasks: {e}")))?
+                .map_err(|e| {
+                    RpcError::new(RpcCode::Internal, format!("query spec_open_tasks: {e}"))
+                })?
                 .iter()
                 .filter(|t| db::reopens_the_build(t))
                 .count();
@@ -3198,17 +3693,48 @@ fn resolve_query(db: &Db, run: &db::WorkflowRun, query: &str) -> Result<Value, R
                     };
                     Ok(db::get_design_lock(c, &proto.id)?.is_some())
                 })
-                .map_err(|e| RpcError::new(RpcCode::Internal, format!("query design_locked: {e}")))?;
+                .map_err(|e| {
+                    RpcError::new(RpcCode::Internal, format!("query design_locked: {e}"))
+                })?;
             Ok(Value::from(locked))
         }
+        QUERY_PROJECT_WORKTREES_ROOT => {
+            // The project's configured worktrees root, or "" when unset / unbound. EMPTY STRING, not
+            // `null`, on purpose: this fact is read for TWO things at once — a `truthy: false` branch
+            // ("nothing configured — ask the human") and a `{{key}}` interpolation into the folder
+            // path — and `null` is falsy for the first while rendering as the literal `null` for the
+            // second. One spelling of "unset" that is safe on both readers (the F2 lesson: an absent
+            // value must have ONE spelling).
+            //
+            // THE PROJECT IS READ THE WIDE WAY HERE, and only here: the Spec if there is one, else the
+            // WORKSPACE the run was opened against ([`run_workspace_project_id`]). A `custom` run, and
+            // a `/nspec` run before its Spec exists, carry a workspace but no Spec — and answering ""
+            // for them made the seeded selector ask the human for a root the project had already
+            // frozen. The widening stays on this fact and does NOT move into `run_project_id`, whose
+            // two other consumers decide what a run may DO (see its doc).
+            let Some(project_id) = run_workspace_project_id(db, run)? else {
+                return Ok(Value::from(""));
+            };
+            let root = db
+                .with_conn(|c| db::get_project(c, &project_id))
+                .map_err(|e| {
+                    RpcError::new(
+                        RpcCode::Internal,
+                        format!("query project_worktrees_root: {e}"),
+                    )
+                })?
+                .and_then(|p| p.worktrees_root)
+                .unwrap_or_default();
+            Ok(Value::from(root))
+        }
+        // The RUNTIME's own refusal, and it reads [`QUERY_FACTS`] like the authoring one: a listing
+        // recopied by hand is a listing that drifts, and this sentence is reached precisely when
+        // somebody needs it to be complete.
         other => Err(RpcError::new(
             RpcCode::InvalidArgument,
             format!(
-                "unknown query '{other}' (expected '{QUERY_SPEC_STATUS}', \
-                 '{QUERY_SPEC_CAN_TRANSITION}', '{QUERY_SPEC_OPEN_TASKS}', \
-                 '{QUERY_SPEC_OPEN_FINDINGS}', '{QUERY_SPEC_DEFERRED_FINDINGS}', \
-                 '{QUERY_PHASE_OPEN_TASKS}', '{QUERY_PHASE_NEXT_TASK}', \
-                 '{QUERY_TASK_CLOSE_ROUTE}', '{QUERY_DESIGN_ROUND_PAGES}' or '{QUERY_DESIGN_LOCKED}')"
+                "unknown query '{other}' (expected one of: {})",
+                QUERY_FACTS.join(", ")
             ),
         )),
     }
@@ -3494,23 +4020,39 @@ fn resolve_can_transition(
     Ok((true, "ok".to_string()))
 }
 
+/// EVERY nyx fact a `query` node may name — THE accepted set, held ONCE, and the ORDER every listing
+/// prints (this array's own; the facts are NOT all resolved in one place, so no resolver can be their
+/// order). THREE readers, no fourth: the acceptance test ([`valid_query`]), the AUTHORING refusal
+/// ([`crate::mcp_authoring::validate_node_config`]) and the RUNTIME refusal ([`resolve_query`]'s
+/// `other` arm) — because a listing recopied by hand drifts from the set it describes, and both
+/// refusals are read exactly when somebody needs the list to be right.
+///
+/// It is written down because it happened INSIDE this PRD: `project_worktrees_root` reached the
+/// resolver while both refusal sentences still enumerated ten facts by hand, so an author who
+/// mistyped the eleventh was handed a list missing the very fact they wanted. Nothing shipped that
+/// way — the drift lived in a working tree — and the NEXT fact costs one line here and none anywhere
+/// else (deliberately un-numbered: a count in this comment is one more thing that goes stale, and
+/// `workspace_target_free` landed the day after and made the first one wrong).
+pub(crate) const QUERY_FACTS: &[&str] = &[
+    QUERY_SPEC_STATUS,
+    QUERY_SPEC_CAN_TRANSITION,
+    QUERY_SPEC_OPEN_TASKS,
+    QUERY_SPEC_OPEN_FINDINGS,
+    QUERY_SPEC_DEFERRED_FINDINGS,
+    QUERY_PHASE_OPEN_TASKS,
+    QUERY_PHASE_NEXT_TASK,
+    QUERY_TASK_CLOSE_ROUTE,
+    QUERY_DESIGN_ROUND_PAGES,
+    QUERY_PROJECT_WORKTREES_ROOT,
+    QUERY_WORKSPACE_TARGET_FREE,
+    QUERY_DESIGN_LOCKED,
+];
+
 /// Whether `query` names a fact a `query` node can read — the AUTHORING-side check (validate_node_config)
-/// behind the "query 'banane'" refusal. Shares the ONE accepted set with the runtime, so the two never
-/// drift (v2.8 review B2 + spec_can_transition).
+/// behind the "query 'banane'" refusal. Shares the ONE accepted set ([`QUERY_FACTS`]) with the runtime,
+/// so the two never drift (v2.8 review B2 + spec_can_transition).
 pub(crate) fn valid_query(query: &str) -> bool {
-    matches!(
-        query,
-        QUERY_SPEC_STATUS
-            | QUERY_SPEC_CAN_TRANSITION
-            | QUERY_SPEC_OPEN_TASKS
-            | QUERY_SPEC_OPEN_FINDINGS
-            | QUERY_SPEC_DEFERRED_FINDINGS
-            | QUERY_PHASE_OPEN_TASKS
-            | QUERY_PHASE_NEXT_TASK
-            | QUERY_TASK_CLOSE_ROUTE
-            | QUERY_DESIGN_ROUND_PAGES
-            | QUERY_DESIGN_LOCKED
-    )
+    QUERY_FACTS.contains(&query)
 }
 
 /// Whether `run_id` carries the HUMAN's authorization to write a section of `spec_id` while the Spec
@@ -3599,8 +4141,9 @@ pub(crate) fn valid_task_transition(transition: &str) -> bool {
 }
 
 /// Whether `target` names an ENGAGING transition (ready/done/cancel) — the AUTHORING layer uses this
-/// to require a `gate_on` field AND a preceding-sibling `ask_human` (validate_tree), sharing the
-/// classification with the runtime so the two never drift (v2.8 review B3, superseding M-a).
+/// to require a `gate_on` field AND a human gate REACHABLE on the branch that leads to the node
+/// ([`crate::mcp_authoring::sensitive_node_gate`]), sharing the classification with the runtime so the
+/// two never drift (v2.8 review B3, superseding M-a).
 pub(crate) fn transition_is_engaging_target(target: &str) -> bool {
     parse_target_transition(target)
         .map(transition_is_engaging)
@@ -3772,14 +4315,43 @@ fn action_json(action: &Action, provider: &str) -> Value {
         // `transition_task` is a nyx-own inline effect resolved in `drive` — it never reaches the
         // dispatcher; this arm only keeps the match total.
         Action::TransitionTask { .. } => json!({ "type": "transition_task" }),
+        // `create_workspace` is a nyx-own inline effect resolved in `drive` — it never reaches the
+        // dispatcher; this arm only keeps the match total.
+        Action::CreateWorkspace { .. } => json!({ "type": "create_workspace" }),
         // `sub_workflow` builds its OWN dispatcher-facing action in `drive` ([`subworkflow_wait_json`],
         // which carries the child run_id + context); this arm only keeps the match total.
         Action::SubWorkflow { .. } => json!({ "type": "sub_workflow" }),
     }
 }
 
-/// Build the verb's success [`ToolOutcome`] from the run's live state. The run drives a Spec, so a
-/// mutation names [`ChangedTopic::Specs`] (any open overlay re-pulls the run's live cursor).
+/// Build the verb's success [`ToolOutcome`] from the run's live state. The run drives a Spec, so
+/// this names [`ChangedTopic::Specs`] — the FLOOR every tick invalidates (any open Specs board, Spec
+/// detail or engine visualiser re-pulls the run's live cursor).
+///
+/// IT IS A FLOOR, NOT THE WHOLE SET, AND TREATING IT AS THE WHOLE SET COST A WORKSPACE. `nyx_next`
+/// is the one MCP verb that reaches SEVERAL domains behind one return value: it runs nyx's own
+/// effects INLINE (`transition`, `transition_task`, `fork_spec`, `create_workspace`) and surfaces
+/// only the action it STOPPED on, so the node that mutated and the action returned here are not the
+/// same node — this function cannot see the difference, which is why [`drive`] accumulates the topics
+/// during the walk ([`note_effect`]) and attaches them at its single exit. Three of the four inline
+/// effects write inside the Spec domain, so the constant was right by luck; `create_workspace`
+/// writes the WORKSPACE POOL, whose only view is the sidebar, and the sidebar re-pulls on
+/// `workspaces://changed` alone. Observed on 2026-08-18: an `nspec` answered `go` created DEPOT-6,
+/// anchored it, wrote the row and made the folder — and the sidebar stayed empty until the app was
+/// relaunched, which reads exactly like a flow that failed.
+///
+/// THE SHELL'S HALF, for the record: the sidecar drains `effects` into one unsolicited
+/// `Event::Changed` per topic (`emit_effects`, `nyx-sidecar/src/runtime/mcp.rs`), which the renderer
+/// receives as `<topic>://changed`. It is the SAME wire the workspace TOOLS reach by another road —
+/// they return a bare `Value`, so their push rides the post-commit `usecase::EventSink` the
+/// dispatcher injects (a `PushEventSink`) instead. The graph calls those tools with a
+/// [`crate::usecase::NullEventSink`] because no shell sink reaches that far down; this vec is the
+/// seam that carries the same invalidation for it. See [`create_run_workspace`].
+///
+/// WHAT IT STILL DOES NOT COVER: a tick that mutates and THEN refuses hands back an `RpcError`,
+/// which has no effects channel — the walk's invalidations die with it. Reachable only by authoring
+/// a refusing node BELOW an effect node (in the seeded graphs `create_workspace` is the last node of
+/// its sequence), and closing it would mean giving the error type a channel the shell reads.
 ///
 /// N22 — the tick returns a `blackboard_delta` (only the keys that CHANGED this tick), NOT the whole
 /// board every time. The full board is unbounded (a `last_diff` holds an effector's ENTIRE report),

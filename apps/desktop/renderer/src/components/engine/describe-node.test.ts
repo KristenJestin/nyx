@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { EngineNode } from "@/bridge";
 
 import { describeNode } from "./describe-node";
+import { metaFor, NODE_META } from "./node-meta";
 
 /** A raw config JSON string (what `EngineNode.config` carries on the wire). */
 const cfg = (config: Record<string, unknown>) => JSON.stringify(config);
@@ -231,5 +232,85 @@ describe("lot-2 node types are described (never the note fallback)", () => {
         JSON.stringify({ transition: "start", task_key: "t", gate_on: "ok" }),
       ),
     ).toContain("only if `ok` was approved");
+  });
+});
+
+/**
+ * `create_workspace` is the SIXTEENTH node type, and it arrived by exactly the road the lot-2
+ * block above describes: wired end to end in the engine and shipped in the seeded /nspec graph, while
+ * the visualiser knew nothing of it — so `metaFor` fell back to `note` and the node that creates a
+ * folder, registers a workspace and ANCHORS the Spec painted as an inert grey marker. Same precedent,
+ * same answer: the renderer knows the type, and says where the folder lands.
+ */
+describe("create_workspace is described (never the note fallback)", () => {
+  it("names the root the folder is derived under, plus the gate", () => {
+    expect(
+      describeNode(
+        "create_workspace",
+        JSON.stringify({ root_key: "worktrees_root", gate_on: "workspace_free" }),
+      ),
+    ).toBe(
+      "Creates the Spec's dev workspace under the root in `worktrees_root`, in a subfolder named " +
+        "after the Spec, and anchors the Spec to it, only if `workspace_free` was approved.",
+    );
+  });
+
+  it("says UNDER the root, never AT it, and drops the clause when ungated", () => {
+    // The wording is load-bearing (finding 01M0B5AG0XR4BG6DSGEFGKW6C4): the node used to take a
+    // second `path_key` source AS the folder, and a sentence that says "at the path in …" is the
+    // reading that put a workspace on the user's whole worktrees root.
+    const described = describeNode(
+      "create_workspace",
+      JSON.stringify({ root_key: "worktrees_root", name_key: "workspace_name" }),
+    );
+    expect(described).toBe(
+      "Creates the Spec's dev workspace under the root in `worktrees_root`, in a subfolder named " +
+        "after `workspace_name`, and anchors the Spec to it.",
+    );
+    expect(described).not.toContain("at the path");
+  });
+
+  it("says so when the node names no folder at all, rather than reading as configured", () => {
+    expect(describeNode("create_workspace", "{}")).toContain("nowhere");
+    expect(describeNode("create_workspace", "not json")).toContain("nowhere");
+    // The retired source names nothing any more — it must not read as a configured folder.
+    expect(
+      describeNode("create_workspace", JSON.stringify({ path_key: "workspace_path" })),
+    ).toContain("nowhere");
+  });
+});
+
+/**
+ * `metaFor` must resolve every DB node type to its OWN metadata — the `note` fallback exists for a
+ * FORWARD-compatible type the renderer has not met yet, never for one that already ships in the
+ * seeded graphs. This is the check that would have caught `sub_workflow`, `transition_task` and
+ * `create_workspace` on the day each reached the engine.
+ */
+describe("metaFor knows every node type the engine ships", () => {
+  it("resolves each DB type to its own metadata, never the note fallback", () => {
+    const dbNodeTypes = [
+      "sequence",
+      "loop",
+      "selector",
+      "spawn_subagent",
+      "gate_check",
+      "judge",
+      "transition",
+      "wait",
+      "note",
+      "query",
+      "fork_spec",
+      "transition_task",
+      "create_workspace",
+      "sub_workflow",
+      "ask_human",
+      "produce",
+    ];
+    for (const type of dbNodeTypes) {
+      if (type === "note") continue;
+      expect(metaFor(type), `${type} must not read as an inert note`).not.toBe(NODE_META.note);
+    }
+    // …and an unknown type STILL paints, on the muted note fallback (forward compatibility).
+    expect(metaFor("dragon")).toBe(NODE_META.note);
   });
 });

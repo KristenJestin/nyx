@@ -2869,6 +2869,106 @@ fn an_ambiguous_location_starts_an_authoring_run_unbound_but_anchored() {
     );
 }
 
+/// REVIEW F1, the `run_start` half of the case-0 PARITY ruling — the half that was IMPLEMENTED.
+///
+/// The finding required `run_start` to be aligned with `agent_context`'s case 0 or to state in code
+/// why it is not. The ruling (spelled out at the call site) declines the "no Spec" half — a
+/// Spec-scoped flow already REFUSES to start unbound, and `nspec` is DESIGNED to start without a
+/// Spec, so warning there would fire on every authoring start — and implements the "wrong folder"
+/// half, which nothing covered: a `cwd` matching no known workspace opens a run with NO workspace
+/// anchor, i.e. an effector with no repos, and used to say nothing at all.
+///
+/// The two negative halves are the point of the test as much as the positive one: a warning that
+/// also fires from the RIGHT folder, or on an id-only call that names no folder on purpose, is noise
+/// the dispatcher would have to relay to the human every single time.
+#[test]
+fn a_cwd_matching_no_workspace_says_the_run_opened_with_no_anchor() {
+    let _g = db_guard();
+    let sandbox = temp_dir("runstart-badcwd");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, ws_path) = seed_project(&db, sandbox.path());
+    let wf = db.with_conn(|c| {
+        db::create_workflow(c, Some(&project_id), "ndev", db::WORKFLOW_SCOPE_NDEV, None)
+            .expect("wf")
+            .id
+    });
+    add_node(
+        &db,
+        &wf,
+        None,
+        0,
+        db::NODE_TYPE_NOTE,
+        json!({ "text": "build" }),
+    );
+    let located = |result: &Value| -> Option<Value> {
+        result["warnings"]
+            .as_array()
+            .expect("a warnings array")
+            .iter()
+            .find(|w| w["code"] == "run_location_unresolved")
+            .cloned()
+    };
+
+    // THE MISTAKE — a cwd nyx tracks no workspace for. The run opens (nothing here is a refusal),
+    // unanchored, and SAYS so.
+    let wrong_folder = "/nowhere/nyx-tracks-no-workspace-here";
+    let stray = spec_in_progress(&db, &project_id, &workspace_id);
+    let opened = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "spec_id": stray, "workflow_id": wf, "cwd": wrong_folder }),
+    )
+    .expect("a bad cwd is signalled, not refused")
+    .result;
+    let run_id = opened["run_id"].as_str().expect("run_id").to_string();
+    assert!(
+        run_row(&db, &run_id).workspace_id.is_none(),
+        "the premise: nothing anchored the run"
+    );
+    let warned = located(&opened)
+        .unwrap_or_else(|| panic!("a run left with no workspace anchor must say so: {opened}"));
+    assert!(
+        warned["message"].as_str().unwrap().contains(wrong_folder),
+        "the sentence NAMES the folder that resolved nothing: {warned}"
+    );
+
+    // FROM THE RIGHT FOLDER — silence. The run is anchored, so there is nothing to report.
+    let good = spec_in_progress(&db, &project_id, &workspace_id);
+    let anchored = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "spec_id": good, "workflow_id": wf, "cwd": ws_path }),
+    )
+    .expect("run_start")
+    .result;
+    assert_eq!(
+        run_row(&db, anchored["run_id"].as_str().unwrap())
+            .workspace_id
+            .as_deref(),
+        Some(workspace_id.as_str()),
+        "the premise of the negative half: this cwd DID resolve its workspace"
+    );
+    assert!(
+        located(&anchored).is_none(),
+        "the nominal call must not carry the alarm: {anchored}"
+    );
+
+    // AND NAMING NO FOLDER AT ALL is not a mistake: `run_start(spec_id=…)` deliberately passes no
+    // location, so it is not told its location resolved nothing.
+    let by_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let idonly = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "spec_id": by_id, "workflow_id": wf }),
+    )
+    .expect("run_start")
+    .result;
+    assert!(
+        located(&idonly).is_none(),
+        "an id-only start names no folder — there is no wrong folder to report: {idonly}"
+    );
+}
+
 /// H11 — the gate warning REACHES THE GRAPH THAT HAS THE DEFECT. The seeded empty gate lives in the
 /// `coder` flow, which `run_start` NEVER opens: a `sub_workflow` node does, several ticks in. Scanning
 /// only the workflow it opens made `run_start(scope:"ndev")` answer `"warnings": []` on a nyx whose one
@@ -4690,6 +4790,13 @@ fn a_null_cursor_with_a_stale_traversal_is_refused_not_replayed() {
 /// the preceding ask_human approved (a nyx-own inline effect, never surfaced). An affirmative answer
 /// bumps the revision and reopens the Spec to `draft`; a decline is a NO-OP — the ready Spec is
 /// untouched. This makes "revise a ready Spec" an EXPLICIT graph step, not an implicit prompt hint.
+///
+/// DRIVEN FROM A REAL SESSION, with a real human turn behind each answer. It used to be driven from
+/// `no_session()`, and that passed — which was finding `01M0C3BZPWV832D802C0GZFTMC`: the answer that
+/// forks a Spec was one the session could give itself. See
+/// [`a_fork_spec_and_a_create_workspace_now_demand_a_human_turn_like_a_transition_does`] for the
+/// refusal that now stands in that path; this test is its other half — the guard must not become a
+/// WALL, so the effect still fires when a human really answered.
 #[test]
 fn a_fork_spec_node_forks_the_bound_spec_only_when_the_human_approves() {
     let _g = db_guard();
@@ -4717,13 +4824,21 @@ fn a_fork_spec_node_forks_the_bound_spec_only_when_the_human_approves() {
         );
     };
 
-    // (approved) the human confirms → the Spec is forked + reopened to draft.
+    // (approved) the human confirms — ON THEIR OWN TURN → the Spec is forked + reopened to draft.
     let spec_yes = spec_ready(&db, &project_id);
     let (_wf, run_yes) = workflow_run(&db, Some(&spec_yes), build);
     let before = spec_rev(&db, &spec_yes);
+    let session = Session::new("term-fork-yes");
     let rt = EngineRuntime::new();
-    assert_eq!(tick(&db, &rt, &run_yes, None)["action"]["type"], "ask_human");
-    let done = tick(&db, &rt, &run_yes, Some(json!({ "decision": "yes" })));
+    session.human_says(&db, "let us look at this ready spec again");
+    let asked = session.tick(&db, &rt, &run_yes, None);
+    assert_eq!(asked["action"]["type"], "ask_human");
+    assert_eq!(
+        asked["action"]["human_turn_required"], true,
+        "forking a Spec is a commitment, so the asking says the answer must be a human's"
+    );
+    session.human_says(&db, "yes, reopen it");
+    let done = session.tick(&db, &rt, &run_yes, Some(json!({ "decision": "yes" })));
     assert_eq!(done["action"]["type"], "done");
     assert_eq!(
         spec_status(&db, &spec_yes),
@@ -4739,9 +4854,12 @@ fn a_fork_spec_node_forks_the_bound_spec_only_when_the_human_approves() {
     let spec_no = spec_ready(&db, &project_id);
     let (_wf2, run_no) = workflow_run(&db, Some(&spec_no), build);
     let before_no = spec_rev(&db, &spec_no);
+    let session_no = Session::new("term-fork-no");
     let rt2 = EngineRuntime::new();
-    tick(&db, &rt2, &run_no, None);
-    let done_no = tick(&db, &rt2, &run_no, Some(json!({ "decision": "no" })));
+    session_no.human_says(&db, "what does nyx want");
+    session_no.tick(&db, &rt2, &run_no, None);
+    session_no.human_says(&db, "no, leave it alone");
+    let done_no = session_no.tick(&db, &rt2, &run_no, Some(json!({ "decision": "no" })));
     assert_eq!(done_no["action"]["type"], "done");
     assert_eq!(
         spec_status(&db, &spec_no),
@@ -4752,6 +4870,310 @@ fn a_fork_spec_node_forks_the_bound_spec_only_when_the_human_approves() {
         spec_rev(&db, &spec_no),
         before_no,
         "a declined fork does not bump the revision"
+    );
+}
+
+/// FINDING `01M0C3BZPWV832D802C0GZFTMC` — CONSENT WAS BYPASSABLE FOR TWO OF THE THREE SENSITIVE NODE
+/// TYPES, AND BOTH BYPASSES ARE REPRODUCED HERE, from the very shape the audit ran.
+///
+/// THE SEAM, not the rule. `mcp_authoring`'s rule (4) counted THREE sensitive nodes (an engaging
+/// `transition`, a `fork_spec`, a `create_workspace`) and certified each of the graphs below
+/// HUMAN-GATED — correctly, on its own terms: the question necessarily runs, its answer is what the
+/// `gate_on` reads, and nothing else writes that key. But its doc-comment says out loud that it does
+/// NOT check that the answer is a HUMAN's, and delegates that to `mcp_engine`'s
+/// `human_turn_required` / `accept_consent_answer`. And the runtime classification behind those
+/// (`Tree::ask_human_commitment`) recognised only the engaging `transition` and the spending `loop`.
+///
+/// So for these two graphs `awaiting_commitment` returned `None`, no `PendingConsent` was opened, the
+/// action carried no `human_turn_required` — and the SESSION DRIVING THE RUN answered "yes" for the
+/// human. Reproduced in execution: a folder really created on disk, a ready Spec really forked. Each
+/// layer was right alone; their INTERSECTION covered one node type out of three.
+///
+/// THE FIX IS ONE SET READ TWICE ([`crate::engine::SensitiveEffect`]), so what this test pins is that
+/// the two graphs now behave exactly like the `transition{ready}` one that was already safe: the
+/// question is refused AT THE ASKING with `consent_caller_unattributable` (the reference refusal, see
+/// [`a_tick_from_an_unattributable_caller_is_never_asked_and_leaves_no_receipt`]), and NOTHING
+/// happens.
+#[test]
+fn a_fork_spec_and_a_create_workspace_now_demand_a_human_turn_like_a_transition_does() {
+    let _g = db_guard();
+    let sandbox = temp_dir("consent-seam");
+    let db = Db::in_memory();
+    let (project_id, _wsid, root_path) = seed_project(&db, sandbox.path());
+    let roots = temp_dir("consent-seam-roots");
+
+    // (A) `sequence[ ask_human{ws_ok}, create_workspace{root_key, gate_on: ws_ok} ]` — the audit's
+    //     graph A. The board carries the worktrees root the `go` branch of /nspec resolves first.
+    let spec_ws = spec_ready(&db, &project_id);
+    let wf_ws = db.with_conn(|c| {
+        db::create_workflow(c, None, "seam-ws", db::WORKFLOW_SCOPE_CUSTOM, None)
+            .expect("workflow")
+            .id
+    });
+    let ws_root_node = add_node(&db, &wf_ws, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(
+        &db,
+        &wf_ws,
+        Some(&ws_root_node),
+        0,
+        db::NODE_TYPE_ASK_HUMAN,
+        json!({ "prompt": "open a dev workspace?", "output_key": "ws_ok", "options": ["yes", "no"] }),
+    );
+    add_node(
+        &db,
+        &wf_ws,
+        Some(&ws_root_node),
+        1,
+        db::NODE_TYPE_CREATE_WORKSPACE,
+        json!({ "root_key": "worktrees_root", "gate_on": "ws_ok" }),
+    );
+    // The AUTHORING rule accepts this graph — it always did, and it still must: the hole was never
+    // that rule (4) let a bad shape through, it was that the runtime asked nothing of a good one.
+    let ws_nodes = db
+        .with_conn(|c| db::list_nodes(c, &wf_ws))
+        .expect("the workspace graph's nodes");
+    assert!(
+        crate::mcp_authoring::validate_tree(&ws_nodes, Some(&ws_root_node)).is_ok(),
+        "rule (4) certifies this graph HUMAN-GATED — which is exactly why the runtime must ask"
+    );
+    let board =
+        json!({ crate::engine::DEFAULT_WORKTREES_ROOT_KEY: roots.path().to_string_lossy() })
+            .to_string();
+    let run_ws = db
+        .with_conn(|c| db::create_workflow_run(c, &wf_ws, Some(&spec_ws), None, &board))
+        .expect("run")
+        .id;
+
+    let rt = EngineRuntime::new();
+    let err = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_ws })).unwrap_err();
+    assert_eq!(
+        err.data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("consent_caller_unattributable"),
+        "a folder on the user's disk is a commitment: the question is refused at the ASKING, \
+         exactly as it already was for an engaging transition — {}",
+        err.message
+    );
+    // The bypass RELAYED the answer anyway — the exact call the audit made, `{"decision": "yes"}`
+    // from a session nobody witnessed. That road is shut too, on the answer this time.
+    let err = super::nyx_next(
+        &db,
+        &rt,
+        no_session(),
+        &json!({ "run_id": run_ws, "last_result": { "decision": "yes" } }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("human_consent_without_human_turn"),
+        "{}",
+        err.message
+    );
+    // AND NOTHING HAPPENED — the three effects the audit observed, each denied by name.
+    let after: Vec<db::Workspace> = db
+        .with_conn(|c| db::list_workspaces(c, &project_id))
+        .expect("workspaces");
+    assert_eq!(
+        after.len(),
+        1,
+        "no workspace ROW was written: only the project's own root workspace stands"
+    );
+    assert_eq!(
+        after[0].root_path,
+        crate::pathnorm::normalize(&root_path),
+        "…and it is the project root, not a workspace the run opened"
+    );
+    assert_eq!(
+        std::fs::read_dir(roots.path())
+            .expect("the worktrees root is readable")
+            .count(),
+        0,
+        "no FOLDER was created on the disk under the worktrees root"
+    );
+    assert_eq!(
+        db.with_conn(|c| db::get_spec(c, &spec_ws))
+            .unwrap()
+            .unwrap()
+            .workspace_id,
+        None,
+        "…and `specs.workspace_id` was not rewritten"
+    );
+
+    // (B) `sequence[ ask_human{fork_ok}, fork_spec{gate_on: fork_ok} ]` — the audit's graph B.
+    let spec_fork = spec_ready(&db, &project_id);
+    let (_wf_fork, run_fork) = workflow_run(&db, Some(&spec_fork), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_ASK_HUMAN,
+            json!({ "prompt": "fork it?", "output_key": "fork_ok", "options": ["yes", "no"] }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_FORK_SPEC,
+            json!({ "gate_on": "fork_ok" }),
+        );
+    });
+    let revision_before = spec_rev(&db, &spec_fork);
+    let rt2 = EngineRuntime::new();
+    // Refused at the ASKING (no receipt is posed to nobody), then refused again on the ANSWER the
+    // audit relayed anyway — the same two refusals an engaging transition already gave.
+    for (last, reason) in [
+        (None, "consent_caller_unattributable"),
+        (
+            Some(json!({ "decision": "yes" })),
+            "human_consent_without_human_turn",
+        ),
+    ] {
+        let mut args = json!({ "run_id": run_fork });
+        if let Some(last) = last {
+            args.as_object_mut()
+                .unwrap()
+                .insert("last_result".into(), last);
+        }
+        let err = super::nyx_next(&db, &rt2, no_session(), &args).unwrap_err();
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str),
+            Some(reason),
+            "reopening a ready Spec as a draft is a commitment too: {}",
+            err.message
+        );
+    }
+    assert_eq!(
+        pending_consent(&db, &run_fork),
+        None,
+        "and no receipt was written: a consent question posed to nobody must not exist"
+    );
+    assert_eq!(
+        spec_rev(&db, &spec_fork),
+        revision_before,
+        "the Spec's revision was NOT bumped"
+    );
+    assert_eq!(
+        spec_status(&db, &spec_fork),
+        db::SPEC_STATUS_READY,
+        "…and the ready Spec did not fall back to draft"
+    );
+
+    // (C) THE OTHER READING — a `create_workspace` with NO `gate_on` at all, reached only through a
+    //     `selector` branch that compares the answer to `go`. Rule (4)(ii) accepts that shape (the
+    //     BRANCH is the consent, and it is the shape /nspec's own `go` arm is built on), so the
+    //     runtime has to demand the human turn on it too — reading the node's `gate_on` alone would
+    //     have left a second, equally authorable route to the same mkdir.
+    let spec_branch = spec_ready(&db, &project_id);
+    let wf_branch = db.with_conn(|c| {
+        db::create_workflow(c, None, "seam-branch", db::WORKFLOW_SCOPE_CUSTOM, None)
+            .expect("workflow")
+            .id
+    });
+    let branch_root = add_node(&db, &wf_branch, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(
+        &db,
+        &wf_branch,
+        Some(&branch_root),
+        0,
+        db::NODE_TYPE_ASK_HUMAN,
+        json!({ "prompt": "ready, and a workspace?", "output_key": "ready_ok", "options": ["go", "no"] }),
+    );
+    let route = add_node(
+        &db,
+        &wf_branch,
+        Some(&branch_root),
+        1,
+        db::NODE_TYPE_SELECTOR,
+        json!({ "branches": [
+            { "cond": { "var": "ready_ok", "eq": "go" }, "child": 0 },
+            { "cond": { "always": true }, "child": 1 },
+        ] }),
+    );
+    add_node(
+        &db,
+        &wf_branch,
+        Some(&route),
+        0,
+        db::NODE_TYPE_CREATE_WORKSPACE,
+        json!({ "root_key": "worktrees_root" }),
+    );
+    add_node(
+        &db,
+        &wf_branch,
+        Some(&route),
+        1,
+        db::NODE_TYPE_NOTE,
+        json!({ "text": "left as a draft" }),
+    );
+    let branch_nodes = db
+        .with_conn(|c| db::list_nodes(c, &wf_branch))
+        .expect("the branch graph's nodes");
+    assert!(
+        crate::mcp_authoring::validate_tree(&branch_nodes, Some(&branch_root)).is_ok(),
+        "the branch-gated shape is authorable — it is the one /nspec ships"
+    );
+    let run_branch = db
+        .with_conn(|c| db::create_workflow_run(c, &wf_branch, Some(&spec_branch), None, &board))
+        .expect("run")
+        .id;
+    let err = super::nyx_next(
+        &db,
+        &EngineRuntime::new(),
+        no_session(),
+        &json!({ "run_id": run_branch }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("consent_caller_unattributable"),
+        "a consent carried by the BRANCH is a consent: {}",
+        err.message
+    );
+
+    // AND THE GUARD IS NOT A WALL: the very same graph, put to a session nyx can name, asks the
+    // question and takes the answer the moment a real human turn stands behind it.
+    let session = Session::new("term-seam-ws");
+    session.human_says(&db, "open the workspace for this spec");
+    let asked = session.tick(&db, &rt, &run_ws, None);
+    assert_eq!(asked["action"]["type"], "ask_human");
+    assert_eq!(
+        asked["action"]["human_turn_required"], true,
+        "the asking NAMES the demand instead of leaving the session to discover it"
+    );
+    assert!(
+        asked["action"]["context"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("folder"),
+        "…and it names what the answer commits — a FOLDER, not 'the Spec's lifecycle': {}",
+        asked["action"]["context"]
+    );
+    session.human_says(&db, "yes, go ahead");
+    let done = session.tick(&db, &rt, &run_ws, Some(json!({ "decision": "yes" })));
+    assert_eq!(done["action"]["type"], "done");
+    let opened = db
+        .with_conn(|c| db::list_workspaces(c, &project_id))
+        .expect("workspaces")
+        .into_iter()
+        .find(|w| w.root_path != crate::pathnorm::normalize(&root_path))
+        .expect("the human's yes really opened the dev workspace");
+    assert!(
+        std::path::Path::new(&opened.root_path).is_dir(),
+        "the folder exists on disk — the refusal above was about WHO answered, not about WHAT"
     );
 }
 
@@ -4871,6 +5293,349 @@ fn several_active_specs_still_refuse_even_beside_a_terminal_one() {
         "the shipped Spec is not even listed as a candidate: {}",
         err.message
     );
+}
+
+// ---------------------------------------------------------------------------
+// THE CALLER CONTRACTS over the ONE 0/1/N resolver: agent_context, run_start,
+// and the authoring flow that is allowed to proceed unbound
+// ---------------------------------------------------------------------------
+
+/// ONE ANCHOR, ONE SPEC. `agent_context` and `run_start` must never disagree about which Spec a
+/// location names — they are the two halves of the same session (the run drives the Spec, the
+/// manual describes it), so a divergence would have an agent working from the state of a Spec its
+/// run does not touch. Both read the SAME `resolve_spec_id`, and this pins the consequence on BOTH
+/// location anchors: an explicit `workspace_id` and a `cwd`.
+#[test]
+fn agent_context_and_run_start_target_the_same_spec_from_the_same_anchor() {
+    let _g = db_guard();
+    let sandbox = temp_dir("one-anchor");
+    let db = Db::in_memory();
+    let (project, ws, ws_path) = seed_project(&db, sandbox.path());
+    let spec = spec_in_progress(&db, &project, &ws);
+    let wf = spawn_workflow(&db, &project);
+
+    for anchor in [json!({ "workspace_id": ws }), json!({ "cwd": ws_path })] {
+        let mut run_args = anchor.clone();
+        run_args["workflow_id"] = json!(wf);
+        let run = super::run_start(&db, &EngineRuntime::new(), &run_args)
+            .expect("the anchor resolves the one active Spec")
+            .result;
+        assert_eq!(run["spec_id"], spec, "run_start binds THE Spec: {anchor}");
+
+        let mut ctx_args = anchor.clone();
+        ctx_args["role"] = json!("coder");
+        let ctx = crate::mcp_context::agent_context(&db, &ctx_args)
+            .expect("the same anchor renders the same Spec")
+            .result;
+        assert_eq!(
+            ctx["spec_id"], run["spec_id"],
+            "agent_context and run_start agree on the Spec for {anchor}"
+        );
+        // …and on its PROJECT, the other half of the target.
+        assert_eq!(ctx["project_id"], json!(project));
+    }
+}
+
+/// THE AMBIGUITY, per caller. One location, N active Specs — and three DELIBERATELY different
+/// answers, none of which is "the newest Spec":
+///   * `agent_context` REFUSES, whatever the role, listing the candidates: a manual rendered for an
+///     arbitrary Spec is worse than no manual;
+///   * a SPEC-SCOPED flow (`ndev`, and every scope that works ON a Spec) REFUSES the same way;
+///   * an AUTHORING flow (`nspec`) — which CREATES its own Spec and needs none — PROCEEDS, bound to
+///     NO Spec, keeping its `cwd` anchor, and relays the ambiguity as a WARNING.
+#[test]
+fn an_ambiguous_location_refuses_for_every_spec_consumer_but_only_warns_for_authoring() {
+    let _g = db_guard();
+    let sandbox = temp_dir("caller-ambiguity");
+    let db = Db::in_memory();
+    let (project, ws, ws_path) = seed_project(&db, sandbox.path());
+    let first = spec_in_progress(&db, &project, &ws);
+    let second = spec_in_progress(&db, &project, &ws);
+
+    // agent_context — REFUSED, with the machine handle AND both candidates, for the effector role
+    // that works on the Spec and for the dispatcher alike.
+    for role in ["coder", "dev"] {
+        let err =
+            crate::mcp_context::agent_context(&db, &json!({ "role": role, "workspace_id": ws }))
+                .expect_err("an ambiguous location renders no manual");
+        assert_eq!(err.code, "invalid_argument", "role {role}");
+        assert!(
+            crate::mcp_context::is_ambiguous_spec(&err),
+            "role {role}: the refusal carries reason=spec_ambiguous_for_workspace: {err:?}"
+        );
+        assert!(
+            err.message.contains(&first) && err.message.contains(&second),
+            "role {role}: both candidates are listed: {}",
+            err.message
+        );
+    }
+
+    // A SPEC-SCOPED flow — refused identically (the run would drive an arbitrary Spec).
+    let ndev = spawn_workflow(&db, &project);
+    let err = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "scope": "ndev", "workflow_id": ndev, "cwd": ws_path }),
+    )
+    .expect_err("a spec-scoped flow cannot start on an ambiguous location");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains(&first) && err.message.contains(&second),
+        "the candidates are listed: {}",
+        err.message
+    );
+
+    // The AUTHORING flow — proceeds UNBOUND, still anchored, and SAYS why.
+    let nspec = db.with_conn(|c| {
+        db::create_workflow(c, Some(&project), "nspec", db::WORKFLOW_SCOPE_NSPEC, None)
+            .expect("wf")
+            .id
+    });
+    add_node(
+        &db,
+        &nspec,
+        None,
+        0,
+        db::NODE_TYPE_NOTE,
+        json!({ "text": "author" }),
+    );
+    let opened = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "scope": "nspec", "cwd": ws_path }),
+    )
+    .expect("an authoring flow starts on an ambiguous location")
+    .result;
+    assert!(
+        opened["spec_id"].is_null(),
+        "NO Spec was chosen — not the newest, not any: {opened}"
+    );
+    assert_eq!(
+        run_row(&db, opened["run_id"].as_str().unwrap())
+            .workspace_id
+            .as_deref(),
+        Some(ws.as_str()),
+        "the cwd still anchors the run on its workspace"
+    );
+    assert!(
+        opened["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|w| w["code"] == "spec_ambiguous_started_unbound"),
+        "the ambiguity is relayed as a warning, never swallowed: {opened}"
+    );
+}
+
+/// THE AUTHOR IS NOT EXEMPT FROM THE AMBIGUITY — the one 0/1/N × caller cell the neighbours above
+/// and below leave uncovered, and the riskiest one, because the author IS granted an exception on
+/// the two adjacent cells: at ZERO candidates `agent_context(role="spec")` renders the
+/// project-scoped authoring manual instead of refusing (see
+/// [`zero_candidates_refuses_the_spec_scoped_callers_and_leaves_authoring_unbound`]), and on THIS
+/// very ambiguous location `run_start(scope="nspec")` is deliberately let through with a warning.
+/// Neither exception extends to N through `agent_context`: `resolve_spec_id` settles the location
+/// BEFORE `agent_context` ever looks at the role (`mcp_context.rs`, the `resolve_spec_id(db, args)?`
+/// at the head of the role match), so the author gets the SAME structured refusal as `coder` and
+/// `dev` — same code, same `reason`, same candidate list.
+///
+/// This pins the behaviour AS SHIPPED. Turning `role="spec"` into a graceful project-scoped render
+/// on N would be a product-contract change, not a bug fix; if that is ever wanted, this test is the
+/// one that must be rewritten deliberately rather than the assertion quietly relaxed.
+#[test]
+fn an_ambiguous_location_refuses_the_spec_author_exactly_like_every_other_role() {
+    let _g = db_guard();
+    let sandbox = temp_dir("author-ambiguity");
+    let db = Db::in_memory();
+    let (project, ws, ws_path) = seed_project(&db, sandbox.path());
+    let first = spec_in_progress(&db, &project, &ws);
+    let second = spec_in_progress(&db, &project, &ws);
+    assert_ne!(
+        first, second,
+        "two DISTINCT active Specs share the workspace"
+    );
+
+    // BOTH location anchors — an explicit workspace_id and a cwd — refuse for the author.
+    for (kind, anchor) in [
+        ("workspace_id", json!({ "workspace_id": ws })),
+        ("cwd", json!({ "cwd": ws_path })),
+    ] {
+        let mut args = anchor.clone();
+        args.as_object_mut()
+            .unwrap()
+            .insert("role".into(), json!("spec"));
+        let err = crate::mcp_context::agent_context(&db, &args)
+            .expect_err("the author is NOT exempt: N candidates render no manual");
+        assert_eq!(err.code, "invalid_argument", "{kind}");
+        assert!(
+            crate::mcp_context::is_ambiguous_spec(&err),
+            "{kind}: role=spec carries the SAME machine handle \
+             reason=spec_ambiguous_for_workspace: {err:?}"
+        );
+        assert!(
+            err.message.contains(&first) && err.message.contains(&second),
+            "{kind}: BOTH candidates are listed for the author too: {}",
+            err.message
+        );
+
+        // …and it is the SAME refusal as the effector's, byte for byte: the role plays NO part in
+        // it. A divergence here would mean an ambiguity branch was grafted per role.
+        let mut coder_args = anchor.clone();
+        coder_args
+            .as_object_mut()
+            .unwrap()
+            .insert("role".into(), json!("coder"));
+        let coder_err = crate::mcp_context::agent_context(&db, &coder_args)
+            .expect_err("the coder refuses on the same location");
+        assert_eq!(err.code, coder_err.code, "{kind}: same code as role=coder");
+        assert_eq!(
+            err.message, coder_err.message,
+            "{kind}: same message — the ambiguity is settled BEFORE the role is read"
+        );
+        assert_eq!(err.data, coder_err.data, "{kind}: same structured data");
+    }
+
+    // THE CONTRAST that makes the exception real elsewhere: the authoring RUN, on the SAME
+    // location, still goes through unbound with a warning. Refusing the manual is not the flow
+    // being closed — it is the manual having no Spec to honestly render.
+    let nspec = db.with_conn(|c| {
+        db::create_workflow(c, Some(&project), "nspec", db::WORKFLOW_SCOPE_NSPEC, None)
+            .expect("wf")
+            .id
+    });
+    add_node(
+        &db,
+        &nspec,
+        None,
+        0,
+        db::NODE_TYPE_NOTE,
+        json!({ "text": "author" }),
+    );
+    let opened = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "scope": "nspec", "cwd": ws_path }),
+    )
+    .expect("the authoring RUN is still let through on the same ambiguous location")
+    .result;
+    assert!(
+        opened["spec_id"].is_null(),
+        "…bound to NEITHER candidate: {opened}"
+    );
+}
+
+/// ZERO candidates — the other half of the contract, and the one that used to open ORPHAN runs. A
+/// location anchoring NO active Spec is not an error in itself; what happens next depends on what
+/// the caller needs:
+///   * a flow that works ON a Spec REFUSES (a run whose Spec queries apply to nothing is inert);
+///   * an AUTHORING flow starts, legitimately unbound — it is about to create the Spec;
+///   * `agent_context` refuses for a role that describes a Spec, and renders the project-scoped
+///     authoring manual for the role that WRITES one.
+#[test]
+fn zero_candidates_refuses_the_spec_scoped_callers_and_leaves_authoring_unbound() {
+    let _g = db_guard();
+    let sandbox = temp_dir("zero-candidates");
+    let db = Db::in_memory();
+    let (project, ws, ws_path) = seed_project(&db, sandbox.path());
+
+    // A SPEC-SCOPED flow on a workspace with no Spec: refused, and the refusal says how to fix it.
+    let ndev = spawn_workflow(&db, &project);
+    let err = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "workflow_id": ndev, "cwd": ws_path }),
+    )
+    .expect_err("a spec-scoped flow refuses to start unbound");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains("spec_id"),
+        "the refusal names the way through: {}",
+        err.message
+    );
+
+    // The AUTHORING flow starts unbound on the very same location.
+    let nspec = db.with_conn(|c| {
+        db::create_workflow(c, Some(&project), "nspec", db::WORKFLOW_SCOPE_NSPEC, None)
+            .expect("wf")
+            .id
+    });
+    add_node(
+        &db,
+        &nspec,
+        None,
+        0,
+        db::NODE_TYPE_NOTE,
+        json!({ "text": "author" }),
+    );
+    let opened = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "scope": "nspec", "cwd": ws_path }),
+    )
+    .expect("authoring starts with no Spec")
+    .result;
+    assert!(opened["spec_id"].is_null(), "and stays unbound: {opened}");
+
+    // agent_context: refused for the role that DESCRIBES a Spec…
+    let err =
+        crate::mcp_context::agent_context(&db, &json!({ "role": "coder", "workspace_id": ws }))
+            .expect_err("there is no Spec to render a coder manual from");
+    assert_eq!(err.code, "invalid_id");
+    // …and a project-scoped authoring manual for the role that WRITES one.
+    let authoring =
+        crate::mcp_context::agent_context(&db, &json!({ "role": "spec", "workspace_id": ws }))
+            .expect("the author is never refused for having no Spec yet")
+            .result;
+    assert!(authoring["spec_id"].is_null(), "no Spec was invented");
+    assert_eq!(authoring["project_id"], json!(project));
+}
+
+/// A CONTRADICTORY `project_id` is REFUSED by both callers, never silently dropped. A Spec's project
+/// is a fact OF the Spec: an argument naming another project decided nothing, so honouring it is
+/// impossible and ignoring it leaves the caller believing it scoped the call. `run_start` confronts
+/// it while resolving its target; `agent_context` confronts it beside the resolved Spec.
+#[test]
+fn a_project_id_that_contradicts_the_resolved_spec_is_refused_by_both_callers() {
+    let _g = db_guard();
+    let s1 = temp_dir("contradiction-1");
+    let s2 = temp_dir("contradiction-2");
+    let db = Db::in_memory();
+    let (p1, w1, _) = seed_project(&db, s1.path());
+    let (p2, _w2, _) = seed_project(&db, s2.path());
+    let spec_of_p1 = spec_in_progress(&db, &p1, &w1);
+
+    let err = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "spec_id": spec_of_p1, "project_id": p2 }),
+    )
+    .expect_err("run_start confronts the disagreement");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains(&p1) && err.message.contains(&p2),
+        "the refusal names both projects: {}",
+        err.message
+    );
+
+    let err = crate::mcp_context::agent_context(
+        &db,
+        &json!({ "role": "coder", "spec_id": spec_of_p1, "project_id": p2 }),
+    )
+    .expect_err("agent_context confronts the same disagreement");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains(&p1) && err.message.contains(&p2),
+        "the refusal names both projects: {}",
+        err.message
+    );
+
+    // The AGREEING project_id is a no-op, not a refusal — only the contradiction is refused.
+    let ok = crate::mcp_context::agent_context(
+        &db,
+        &json!({ "role": "coder", "spec_id": spec_of_p1, "project_id": p1 }),
+    )
+    .expect("naming the Spec's own project changes nothing")
+    .result;
+    assert_eq!(ok["spec_id"], spec_of_p1);
 }
 
 // ---------------------------------------------------------------------------
@@ -8065,6 +8830,8 @@ fn every_action() -> Vec<Action> {
             write: "status".into(),
             target: Some("ready".into()),
             task_key: Some("task".into()),
+            root_key: Some("worktrees_root".into()),
+            name_key: Some("workspace_name".into()),
         },
         Action::ForkSpec {
             node_id: "n".into(),
@@ -8075,6 +8842,12 @@ fn every_action() -> Vec<Action> {
             task_id: "t".into(),
             transition: "done".into(),
             reason: Some("shipped".into()),
+            gate_on: Some("approved".into()),
+        },
+        Action::CreateWorkspace {
+            node_id: "n".into(),
+            root: "D:/work".into(),
+            name: "NYX-42".into(),
             gate_on: Some("approved".into()),
         },
         Action::Wait {
@@ -8138,6 +8911,7 @@ fn wire_forms(action: &Action) -> Vec<Value> {
         | Action::Query { .. }
         | Action::ForkSpec { .. }
         | Action::TransitionTask { .. }
+        | Action::CreateWorkspace { .. }
         | Action::Note { .. } => vec![json!({ "type": action_json(action, "claude")["type"] })],
         Action::SpawnSubagent { .. } | Action::Judge { .. } | Action::Wait { .. } | Action::Produce { .. } => {
             vec![action_json(action, "claude")]
@@ -8782,4 +9556,409 @@ fn a_tick_whose_run_vanished_under_it_reports_it_instead_of_persisting_nothing()
         Some("run_vanished"),
     );
     assert!(err.message.contains(&run_id), "it names the run: {}", err.message);
+}
+
+/// B3 — THE GATE READS THE WHOLE ANSWER, and that is the only correct reading. `validate_tree`
+/// requires `options` only of an `ask_human` whose written key is read by a `selector` `cond` / a
+/// `loop` `until` (rule (5) / J1) — never of one read by a `gate_on` — so a gated question may
+/// legitimately take FREE HUMAN TEXT, where a first word is the opening of a sentence and not a
+/// vocabulary. An answer that opens with an affirmative and then takes it back approves NOTHING, and
+/// so does a rider the graph never authored: absent, `false`, a refusal, a structured value, a
+/// sentence. Widen this test to a first word again and the family below goes green on answers that
+/// say no.
+#[test]
+fn a_gate_reads_the_whole_answer_so_one_that_only_opens_with_yes_approves_nothing() {
+    for no in [
+        // A rider on a yes — the shape /nspec's third answer has. It is ROUTED by a selector
+        // comparing the whole answer, never read as an approval.
+        json!("yes with workspace"),
+        json!("yes, with a dev workspace"),
+        // A yes taken back, at every length.
+        json!("yes, but not before the tests pass"),
+        json!("ok, actually no"),
+        json!("go back"),
+        json!("go back, I changed my mind"),
+        json!("ready? not yet"),
+        json!("yes... no"),
+        json!("later yes"),
+        // Plain refusals, and everything that is not a word at all.
+        json!("no"),
+        json!("no with workspace"),
+        json!("workspace"),
+        json!(false),
+        json!(""),
+        json!({ "decision": "yes" }),
+    ] {
+        assert!(
+            !super::board_value_is_affirmative(Some(&no)),
+            "{no} approves nothing"
+        );
+    }
+    // The plain affirmatives approve — trimmed and case-folded, exactly as at HEAD.
+    for yes in [
+        json!("yes"),
+        json!("Yes"),
+        json!("  Yes "),
+        json!("ok"),
+        json!("go"),
+        json!("approve"),
+        json!(true),
+    ] {
+        assert!(
+            super::board_value_is_affirmative(Some(&yes)),
+            "{yes} is an approval"
+        );
+    }
+    assert!(
+        !super::board_value_is_affirmative(None),
+        "an absent answer approves nothing"
+    );
+}
+
+/// B3, END TO END — the graph the finding describes, run for real: `sequence[ ask_human (NO options)
+/// → approved, transition(ready, gate_on: approved) ]`. It passes `validate_tree`, so nyx must be
+/// right about it at RUNTIME: the human answers "ok, actually no", which folds onto the gate key, and
+/// the engaging transition is REFUSED — the Spec never leaves draft. Wire the first-word widening
+/// back onto free gates and this test goes red on the Spec's status.
+#[test]
+fn a_free_form_gate_refuses_a_transition_when_the_answer_only_starts_affirmative() {
+    let _g = db_guard();
+    let db = Db::in_memory();
+    let (project_id, _ws, _cwd) = seed_project(&db, temp_dir("free-form-gate").path());
+    let spec_id = spec_draft(&db, &project_id);
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_ASK_HUMAN,
+            // NO `options`: a question the graph leaves free, which authoring allows because only a
+            // `gate_on` reads the key it writes.
+            json!({ "prompt": "mark the Spec ready?", "output_key": "approved" }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_TRANSITION,
+            json!({ "target_state": "ready", "gate_on": "approved" }),
+        );
+    });
+    let session = Session::new("term-free-form");
+    let rt = EngineRuntime::new();
+
+    session.human_says(&db, "let us look at the spec");
+    assert_eq!(
+        session.tick(&db, &rt, &run_id, None)["action"]["type"],
+        "ask_human"
+    );
+    session.human_says(&db, "ok, actually no");
+
+    let err = session.tick_err(&db, &rt, &run_id, Some(json!("ok, actually no")));
+    assert_eq!(err.code, "invalid_state");
+    assert_eq!(
+        err.data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("engaging_transition_ungated"),
+        "an answer that opens with yes and then says no gates nothing: {}",
+        err.message
+    );
+    assert_eq!(
+        spec_status(&db, &spec_id),
+        db::SPEC_STATUS_DRAFT,
+        "the Spec never moved"
+    );
+}
+
+/// B3, END TO END — THE GRAPH A GATE MUST BE RIGHT ABOUT, and the one an author writes without
+/// meaning to: TWO `ask_human` with NO `output_key`, so both land on the SHARED default key
+/// (`engine::DEFAULT_ASK_HUMAN_OUTPUT_KEY` = `human`), the FIRST carrying `options` and the SECOND
+/// free, then `transition {ready, gate_on: "human"}`.
+///
+/// AUTHORING NOW REFUSES IT (finding `01M0C048HM5CWJBX0JB6K46D73`, condition (iii) of
+/// [`crate::mcp_authoring::sensitive_node_gate`]: the gated key must have exactly ONE writer). It used
+/// to be accepted, and this test asserted so — with reason, since nothing about the shape is exotic.
+/// What the rule now says out loud is what this very test demonstrated: with two writers on `human`,
+/// "the ask_human that gates this transition" has no answer. The old rule picked the FIRST question
+/// ("pick a mode"), while the value the gate actually reads is whatever the SECOND one left there.
+///
+/// THE RUNTIME HALF IS UNCHANGED AND STILL ASSERTED, because authoring is not the only door: rows
+/// predating the rule, a seeded tree, `db::create_node` under a test — all reach `drive` with this
+/// shape. So the run is walked anyway: the human picks `fast`, then answers the FREE question "ok,
+/// actually no", and the engaging transition is REFUSED. The `options` of the FIRST question
+/// constrain NOTHING the second one wrote, so a gate that tried to DERIVE "this key only ever holds
+/// words the graph authored" would read "ok" here and take the Spec `ready` on a NO. It derives
+/// nothing: it compares the whole answer.
+#[test]
+fn two_questions_on_the_default_key_do_not_lend_the_free_one_a_closed_vocabulary() {
+    let _g = db_guard();
+    let db = Db::in_memory();
+    let (project_id, _ws, _cwd) = seed_project(&db, temp_dir("shared-default-key").path());
+    let spec_id = spec_draft(&db, &project_id);
+    let (workflow_id, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_ASK_HUMAN,
+            // A CLOSED question — and NO `output_key`, so it writes `human`.
+            json!({ "prompt": "pick a mode", "options": ["fast", "careful"] }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_ASK_HUMAN,
+            // A FREE question — and NO `output_key` either, so it writes the SAME key.
+            json!({ "prompt": "mark the Spec ready?" }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            2,
+            db::NODE_TYPE_TRANSITION,
+            json!({ "target_state": "ready", "gate_on": "human" }),
+        );
+    });
+
+    // (a) AUTHORING REFUSES IT NOW — two writers on `human`, so no question owns the gated key. The
+    //     refusal NAMES that condition rather than merely failing.
+    let nodes = db.with_conn(|c| db::list_nodes(c, &workflow_id)).unwrap();
+    let refusal = crate::mcp_authoring::validate_tree(&nodes, None)
+        .expect_err("two ask_human sharing the default key no longer gate anything");
+    assert!(
+        refusal.contains("not HUMAN-GATED") && refusal.contains("NOTHING ELSE"),
+        "the refusal says the gated key has a second writer: {refusal}"
+    );
+
+    let session = Session::new("term-shared-default-key");
+    let rt = EngineRuntime::new();
+
+    session.human_says(&db, "let us look at the spec");
+    assert_eq!(
+        session.tick(&db, &rt, &run_id, None)["action"]["type"],
+        "ask_human"
+    );
+    // The CLOSED question is answered from its own vocabulary — nothing off-list is involved.
+    session.human_says(&db, "fast");
+    assert_eq!(
+        session.tick(&db, &rt, &run_id, Some(json!("fast")))["action"]["type"],
+        "ask_human",
+        "the second question is asked in turn"
+    );
+
+    // (b) The FREE question is answered NO, at length. The value now on `human` is free human text.
+    session.human_says(&db, "ok, actually no");
+    let err = session.tick_err(&db, &rt, &run_id, Some(json!("ok, actually no")));
+    assert_eq!(err.code, "invalid_state");
+    assert_eq!(
+        err.data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("engaging_transition_ungated"),
+        "the first question's `options` constrain nothing the SECOND one wrote: {}",
+        err.message
+    );
+    assert_eq!(
+        spec_status(&db, &spec_id),
+        db::SPEC_STATUS_DRAFT,
+        "the Spec never moved"
+    );
+}
+
+/// FINDING `01M0BN0R0Q0VXK9JM7TGXX9D7W` — A TICK THAT OPENS A WORKSPACE SAYS THE WORKSPACE POOL
+/// CHANGED. The pin is on the GRAPH path, which is the one that had no voice at all.
+///
+/// THE TWO ROADS TO THE SIDEBAR, AND WHY ONLY ONE WAS PAVED. The `create_workspace` MCP TOOL is
+/// reached by the sidecar through `mcp_runtime::dispatch_workspace_tool`, which injects the shell's
+/// `PushEventSink`; the use case emits `workspace.created` after its transaction commits, the sink
+/// turns it into the unsolicited `workspaces://changed`, and the sidebar re-pulls. A `create_workspace`
+/// NODE calls the very same tool — but from inside a `nyx_next` tick, where no shell sink reaches, so
+/// it passes a `NullEventSink` and that push never happens. The graph path's own channel to the shell
+/// is the tick's `ToolOutcome::effects`, which the sidecar drains into one `<topic>://changed` per
+/// entry — and it named `Specs` and only `Specs`, while the sidebar listens to `workspaces://changed`
+/// and to nothing else. Shipped on 2026-08-18: `go` created DEPOT-6, anchored it, wrote the row and
+/// made the folder, and the sidebar stayed empty until the app was relaunched. A workspace that is
+/// created and invisible is indistinguishable from one that was never created.
+///
+/// BOTH HALVES ARE ASSERTED HERE, because "the effects contain `Workspaces`" would also hold on a
+/// tick that named it unconditionally, which would be its own lie (every tick asking the sidebar to
+/// re-pull). So: the workspace tick names BOTH topics, and a tick of the SAME shape whose node
+/// mutates nothing outside the run names `Specs` ALONE.
+#[test]
+fn a_create_workspace_tick_names_the_workspaces_topic_the_sidebar_re_pulls_on() {
+    let _g = db_guard();
+    let sandbox = temp_dir("ws-effect-project");
+    let db = Db::in_memory();
+    let (project_id, _root_ws, _root_path) = seed_project(&db, sandbox.path());
+    let spec_id = spec_ready(&db, &project_id);
+
+    // (a) THE WORKSPACE TICK. One `create_workspace` node, UNGATED, reading the worktrees root the
+    //     board carries — the shape the `go` branch of `nspec` reaches with the root already resolved.
+    let roots = temp_dir("ws-effect-root");
+    let workflow_id = db.with_conn(|c| {
+        db::create_workflow(c, None, "ws-effect", db::WORKFLOW_SCOPE_CUSTOM, None)
+            .expect("workflow")
+            .id
+    });
+    add_node(
+        &db,
+        &workflow_id,
+        None,
+        0,
+        db::NODE_TYPE_CREATE_WORKSPACE,
+        json!({}),
+    );
+    let board =
+        json!({ crate::engine::DEFAULT_WORKTREES_ROOT_KEY: roots.path().to_string_lossy() })
+            .to_string();
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, &workflow_id, Some(&spec_id), None, &board))
+        .expect("run")
+        .id;
+
+    let out = super::nyx_next(
+        &db,
+        &EngineRuntime::new(),
+        no_session(),
+        &json!({ "run_id": run_id }),
+    )
+    .expect("nyx_next");
+
+    // The effect really landed — otherwise the topic below would be a claim about nothing.
+    let ws = db
+        .with_conn(|c| db::list_workspaces(c, &project_id))
+        .expect("workspaces")
+        .into_iter()
+        .find(|w| w.root_path != crate::pathnorm::normalize(&sandbox.path().to_string_lossy()))
+        .expect("the node opened the Spec's dev workspace");
+    assert_eq!(
+        db.with_conn(|c| db::get_spec(c, &spec_id))
+            .unwrap()
+            .unwrap()
+            .workspace_id
+            .as_deref(),
+        Some(ws.id.as_str()),
+        "and anchored it on the Spec, through the tool's own spec_id"
+    );
+
+    assert!(
+        out.effects.contains(&ChangedTopic::Workspaces),
+        "the tick that WROTE the workspace pool must name it — `workspaces://changed` is the only \
+         topic the sidebar re-pulls on, and without it the row exists and nothing on screen knows: \
+         {:?}",
+        out.effects
+    );
+    assert!(
+        out.effects.contains(&ChangedTopic::Specs),
+        "and it still names the run's own domain (the anchor moved onto the Spec): {:?}",
+        out.effects
+    );
+
+    // (b) THE CONTROL. A tick of the same shape whose node touches nothing outside the run keeps the
+    //     narrow topic — the assertion above is about what the tick DID, not a constant widened once.
+    let (_wf2, quiet_run) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        add_node(
+            db,
+            wf,
+            None,
+            0,
+            db::NODE_TYPE_NOTE,
+            json!({ "text": "nothing" }),
+        );
+    });
+    let quiet = super::nyx_next(
+        &db,
+        &EngineRuntime::new(),
+        no_session(),
+        &json!({ "run_id": quiet_run }),
+    )
+    .expect("nyx_next");
+    assert_eq!(
+        quiet.effects,
+        vec![ChangedTopic::Specs],
+        "a tick that opened no workspace does not ask the sidebar to re-pull"
+    );
+}
+
+/// FINDING `01M0BVZXM49HQ6N9H9V789HP5K` (defect 2) — `project_worktrees_root` RESOLVES THE PROJECT
+/// THROUGH THE RUN'S WORKSPACE WHEN THERE IS NO SPEC YET, so a run never asks the user for a path
+/// they have already frozen.
+///
+/// The fact used to read the project through the bound Spec ALONE ([`super::run_project_id`]), and
+/// answer `""` the moment `spec_id` was `None`. Two ordinary runs are in that state: a `custom` flow,
+/// and a `/nspec` run BEFORE its graph creates the Spec — `/nspec` legitimately starts unbound
+/// ([`db::bind_session_run_to_spec`]). Both are started from a cwd inside a registered workspace, and
+/// a workspace belongs to exactly one project, so the project was knowable all along. Reading `""`
+/// made `worktrees_root_configured` false and routed the seeded selector to the ask_human that
+/// demands a worktrees root — one the project had ALREADY set.
+///
+/// THE WIDENING IS ON THE FACT, NOT ON THE SHARED RESOLVER. `run_project_id` also decides which
+/// workflow a `sub_workflow` opens and which commands a slot gate runs; widening it there would have
+/// changed what a Spec-less run is ALLOWED TO DO (a project's own `coder` graph instead of the
+/// built-in; a blocking gate arming itself where it used to refuse). This fact only READS a project
+/// setting, so it resolves the wider way alone — see [`super::run_workspace_project_id`].
+#[test]
+fn the_worktrees_root_fact_reads_the_project_through_the_runs_workspace_when_no_spec_is_bound() {
+    let _g = db_guard();
+    let sandbox = temp_dir("worktrees-root-via-workspace");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _root_path) = seed_project(&db, sandbox.path());
+    // The project FROZE where its dev workspaces go — the setting the user is not to be asked twice.
+    db.with_conn(|c| db::set_project_worktrees_root(c, &project_id, Some("D:/work/_worktrees")))
+        .expect("the project's worktrees root is configured");
+
+    let build = |db: &Db, wf: &str| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_QUERY,
+            json!({ "query": "project_worktrees_root", "write": "worktrees_root" }),
+        );
+    };
+
+    // (a) NO SPEC, BUT A WORKSPACE — the case that was wrong. The run reads the configured root, and
+    //     the BRANCHABLE half says "configured", so the seeded selector takes the "no question
+    //     needed" branch instead of asking.
+    let (_wf, run_id) = workflow_run(&db, None, build);
+    db.with_conn(|c| db::set_run_workspace(c, &run_id, &workspace_id))
+        .expect("the run is parked in a workspace of the project");
+    let rt = EngineRuntime::new();
+    tick(&db, &rt, &run_id, None);
+    let board: Value = serde_json::from_str(&run_row(&db, &run_id).blackboard).unwrap();
+    assert_eq!(
+        board["worktrees_root"],
+        json!("D:/work/_worktrees"),
+        "a run with a workspace knows its project, Spec or no Spec"
+    );
+    assert_eq!(
+        board["worktrees_root_configured"],
+        json!(true),
+        "…so the graph does not ask for a root the project already set"
+    );
+
+    // (b) NEITHER SPEC NOR WORKSPACE — nothing resolves a project, and the fact keeps its ONE spelling
+    //     of "unset": the empty string (falsy for the branch, interpolating to nothing in a path).
+    let (_wf2, orphan_run) = workflow_run(&db, None, build);
+    tick(&db, &rt, &orphan_run, None);
+    let board: Value = serde_json::from_str(&run_row(&db, &orphan_run).blackboard).unwrap();
+    assert_eq!(
+        board["worktrees_root"],
+        json!(""),
+        "no anchor at all → \"\""
+    );
+    assert_eq!(board["worktrees_root_configured"], json!(false));
 }

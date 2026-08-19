@@ -819,10 +819,15 @@ impl Ctx<'_> {
                 let path = self.arg_str("path")?;
                 // Canonical registration flow via the SHARED use case: insert the workspace,
                 // auto-detect + persist the Git repos under its root_path (done_criterion
-                // #5), and emit `workspace.created` — the SAME `usecase::register_workspace`
-                // the MCP `workspace_add`/`create_workspace` tools reach. The push rides the
-                // committed DOMAIN event through the [`PushEventSink`] (task #10), so this
-                // command is NOT in the legacy broadcast.
+                // #5), and emit `workspace.created`. This UI bridge is the UNANCHORED entry
+                // point — `usecase::register_workspace`, i.e. `register_workspace_anchored`
+                // with `spec_id = None` and source `Ui`. It is a DISTINCT path from the MCP
+                // one: since v2.5 the `workspace_add`/`create_workspace` TOOLS call
+                // `usecase::register_workspace_anchored` themselves
+                // (`mcp_runtime::create_workspace_inner`) to carry their optional `spec_id`.
+                // The two entry points converge only INSIDE that anchored use case. The push
+                // rides the committed DOMAIN event through the [`PushEventSink`] (task #10),
+                // so this command is NOT in the legacy broadcast.
                 let push = self.push_sink();
                 self.db()
                     .with_conn(|c| {

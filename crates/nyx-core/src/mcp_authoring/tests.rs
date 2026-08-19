@@ -50,6 +50,24 @@ fn add_node(db: &Db, wf: &str, node_type: &str, parent: Option<&str>, label: &st
     id_of(&out, "node")
 }
 
+/// A root `sequence` whose first child is an `ask_human` writing `key` — the MINIMAL shape rule (4)
+/// accepts for a sensitive node ([`crate::mcp_authoring::sensitive_node_gate`]): the question
+/// necessarily runs first, and `key` is what the node's own `gate_on` then reads. Returns the root, so
+/// a test about something ELSE (a config field, a move) can author a sensitive node without
+/// re-spelling the gate each time. A test ABOUT the gate builds its shape by hand.
+fn gated_root(db: &Db, wf: &str, key: &str) -> String {
+    let root = add_node(db, wf, "sequence", None, "root");
+    node_add(
+        db,
+        &json!({
+            "workflow_id": wf, "type": "ask_human", "parent_id": root, "order_index": 0,
+            "label": "approve?", "config": { "prompt": "approve?", "output_key": key }
+        }),
+    )
+    .expect("the gate question is added");
+    root
+}
+
 // --- create / assign -------------------------------------------------------
 
 /// DONE-CRITERION ("create/fork/assign posent projects.workflow_id"): `workflow_create` with a
@@ -857,6 +875,966 @@ fn node_add_validates_transition_task_transition() {
     .expect("a valid transition_task is accepted");
 }
 
+/// A `create_workspace` node is AUTHORABLE like its fifteen neighbours: `known_config_fields`
+/// lists exactly the three fields `engine::CreateWorkspaceConfig` decodes, so a `node_add` carrying
+/// them is accepted, while an invented key is still refused and the refusal NAMES the accepted set.
+/// Before this the type fell to the catch-all `_ => &[]` ("takes no config"), so every real config
+/// was rejected as unknown and a FORK of /nspec could not touch the node at all.
+///
+/// `path_key` is GONE from that set (finding `01M0B5AG0XR4BG6DSGEFGKW6C4`) and is therefore refused
+/// like any other invented key — which is the point: it named a value the effect took AS the final
+/// folder, next to a `root_key` the effect derived a subfolder under, so one graph could mean two
+/// things by the same kind of answer.
+#[test]
+fn node_add_accepts_the_create_workspace_config_fields() {
+    let (db, project) = seeded();
+    let wf = make_workflow(&db, "wf", Some(&project));
+
+    // An invented key is refused, and the message lists the three accepted fields.
+    let err = node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "create_workspace", "config": { "root": "D:/wt" }
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains("unknown config field 'root'")
+            && err.message.contains("root_key, name_key, gate_on"),
+        "the refusal names the accepted set: {}",
+        err.message
+    );
+
+    // The RETIRED source is refused by that same rule — nothing quietly ignores it.
+    assert!(
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf,
+                "type": "create_workspace",
+                "config": { "path_key": "workspace_path", "root_key": "worktrees_root" }
+            }),
+        )
+        .unwrap_err()
+        .message
+        .contains("unknown config field 'path_key'"),
+        "the second, un-derived source cannot be authored back in"
+    );
+
+    // The keys the seeded /nspec node uses ARE accepted — under the human gate rule (4) demands of a
+    // `create_workspace` like of any other sensitive node (the shape itself is fixed by
+    // `a_create_workspace_needs_a_human_gate_on_the_branch_that_reaches_it`).
+    let root = gated_root(&db, &wf, "workspace_free");
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf,
+            "type": "create_workspace",
+            "parent_id": root, "order_index": 1,
+            "config": { "root_key": "worktrees_root", "gate_on": "workspace_free" }
+        }),
+    )
+    .expect("a create_workspace carrying root_key / gate_on is accepted");
+}
+
+/// …AND THE WRITE SIDE STILL REFUSES THE ONE CONFIG THAT CANNOT RUN. `CreateWorkspaceConfig`
+/// defaults `root_key` to `None`, so a `create_workspace {}` hands the effects layer an empty string
+/// and `create_run_workspace` answers invalid_argument on EVERY run — the node is inexecutable the
+/// moment it is written. That is exactly what `validate_node_config` exists to catch (the M1/M2
+/// lesson: `spawn` with no `agent_id`, `judge` with no prompt).
+#[test]
+fn node_add_refuses_a_create_workspace_with_no_root_key() {
+    let (db, project) = seeded();
+    let wf = make_workflow(&db, "wf", Some(&project));
+
+    // An EMPTY config: known fields, and nothing to build a folder from.
+    let err = node_add(
+        &db,
+        &json!({ "workflow_id": wf, "type": "create_workspace", "config": {} }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains("root_key"),
+        "the refusal names the way out: {}",
+        err.message
+    );
+
+    // A config carrying only the OPTIONAL fields is the same node: still nothing to create.
+    assert_eq!(
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf,
+                "type": "create_workspace",
+                "config": { "name_key": "workspace_name", "gate_on": "ready_ok" }
+            }),
+        )
+        .unwrap_err()
+        .code,
+        "invalid_argument",
+        "name_key/gate_on say WHAT to call it and WHEN — never WHERE"
+    );
+
+    // …and the ONE source resolves it — the shape the seeded /nspec graph uses. It lands in its OWN
+    // workflow, under the human gate rule (4) demands of every sensitive node (a parent-less
+    // `create_workspace` is refused as an UNGATED graph, which is that rule's business, not this
+    // one's).
+    let wf = make_workflow(&db, "cw-root", Some(&project));
+    let root = gated_root(&db, &wf, "go_ahead");
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf,
+            "type": "create_workspace",
+            "parent_id": root, "order_index": 1,
+            "config": { "root_key": "worktrees_root", "gate_on": "go_ahead" }
+        }),
+    )
+    .expect("a root_key alone resolves the folder");
+}
+
+/// A `create_workspace` IS A SENSITIVE NODE, and the shape rule (4) that says so is read on the
+/// BRANCH THAT REACHES IT — never on the tree at large. It MKDIRS on the user's disk, inserts a
+/// workspace row and rewrites `specs.workspace_id`; before this it passed both validators as a plain
+/// child of a sequence, so every tick that walked it created a folder with nobody ever asked, while
+/// `fork_spec` — a mutation that touches no disk — was gated on both counts.
+///
+/// The four cases below are the rule, and they are worth reading as a pair of pairs. The FIRST is the
+/// shape the seeded /nspec ships: the question sits TWO levels up ("mark it ready?"), the branch its
+/// answer selects is a whole sequence, and the node's own `gate_on` names a QUERY fact
+/// (`workspace_free`, the prevalidation) rather than the answer — so the consent is carried by the
+/// SELECTOR that routed the branch. Refusing to climb would have made that graph un-authorable; the
+/// three refusals are what stops the climb from becoming a rubber stamp.
+#[test]
+fn a_create_workspace_needs_a_human_gate_on_the_branch_that_reaches_it() {
+    let (db, project) = seeded();
+
+    // Build the /nspec skeleton, parameterized by what the selector branch that leads to the
+    // workspace sequence TESTS, and by where the question that writes `ready_ok` is put.
+    //   `route_cond` — the cond of the branch selecting the workspace sequence.
+    //   `ask_at_root` — true: the question is a preceding sibling of the selector (it necessarily
+    //                   runs); false: it is buried in the OTHER branch (it may never run at all).
+    let build = |name: &str, route_cond: Value, ask_at_root: bool| -> Result<(), RpcError> {
+        let wf = make_workflow(&db, name, Some(&project));
+        let root = add_node(&db, &wf, "sequence", None, "root");
+        let ask = json!({
+            "prompt": "Mark the Spec ready, and open a dev workspace for it?",
+            "output_key": "ready_ok",
+            // Closed, because a branch below compares the answer by equality (J1).
+            "options": ["go", "no"],
+        });
+        if ask_at_root {
+            node_add(
+                &db,
+                &json!({
+                    "workflow_id": wf, "type": "ask_human", "parent_id": root, "order_index": 0,
+                    "label": "confirm ready", "config": ask
+                }),
+            )?;
+        }
+        let route = node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "selector", "parent_id": root, "order_index": 1,
+                "label": "route the commitment",
+                "config": { "branches": [
+                    { "cond": route_cond, "child": 0 },
+                    { "cond": { "always": true }, "child": 1 },
+                ] }
+            }),
+        )?;
+        let route = id_of(&route, "node");
+        let workspace = id_of(
+            &node_add(
+                &db,
+                &json!({
+                    "workflow_id": wf, "type": "sequence", "parent_id": route, "order_index": 0,
+                    "label": "ready + a dev workspace"
+                }),
+            )?,
+            "node",
+        );
+        // The else branch: either the clean N16 exit, or (when the question is banished off-branch)
+        // the sequence that holds it.
+        let other = id_of(
+            &node_add(
+                &db,
+                &json!({
+                    "workflow_id": wf, "type": "sequence", "parent_id": route, "order_index": 1,
+                    "label": "left as draft"
+                }),
+            )?,
+            "node",
+        );
+        if !ask_at_root {
+            node_add(
+                &db,
+                &json!({
+                    "workflow_id": wf, "type": "ask_human", "parent_id": other, "order_index": 0,
+                    "label": "confirm ready", "config": ask
+                }),
+            )?;
+        }
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "query", "parent_id": workspace, "order_index": 0,
+                "label": "worktrees root",
+                "config": { "query": "project_worktrees_root", "write": "worktrees_root" }
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "query", "parent_id": workspace, "order_index": 1,
+                "label": "is the folder free?",
+                "config": { "query": "workspace_target_free", "write": "workspace_free" }
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "create_workspace", "parent_id": workspace, "order_index": 2,
+                "label": "dev workspace",
+                "config": { "root_key": "worktrees_root", "gate_on": "workspace_free" }
+            }),
+        )?;
+        Ok(())
+    };
+
+    // (a) ACCEPTED — the shipped shape. The question runs first (a preceding sibling of the selector,
+    //     in a sequence), and the branch that routes to the workspace TESTS the key it wrote: the
+    //     human's own answer is what puts the run on this branch at all.
+    build("gated", json!({ "var": "ready_ok", "eq": "go" }), true)
+        .expect("a consent read one selector higher is still a consent");
+
+    // (b) REFUSED — THE HOLE ITSELF: `node_add(create_workspace, {root_key})` as a plain child of a
+    //     sequence. Both validators used to wave it through, and every tick that walked it made a
+    //     folder.
+    let wf = make_workflow(&db, "ungated", Some(&project));
+    let root = add_node(&db, &wf, "sequence", None, "root");
+    let err = node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "create_workspace", "parent_id": root, "order_index": 0,
+            "config": { "root_key": "worktrees_root" }
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.code, "invalid_state",
+        "an ungated create_workspace is refused"
+    );
+    assert!(
+        err.message.contains("not HUMAN-GATED"),
+        "the refusal says WHAT is missing: {}",
+        err.message
+    );
+
+    // (c) REFUSED — AND THIS IS THE ONE THE CLIMB COULD HAVE FAKED. The question is exactly where (a)
+    //     puts it, on this very branch, necessarily answered before the mkdir — but the branch is
+    //     routed `always` and the node's `gate_on` reads a query fact, so NOTHING between the answer
+    //     and the folder reads that answer. A human was asked something; nobody was asked about THIS.
+    //     Chronology is not consent, and an ask_human anywhere above must not become a rubber stamp.
+    let err = build("asked-but-not-read", json!({ "always": true }), true).unwrap_err();
+    assert_eq!(err.code, "invalid_state");
+    assert!(
+        err.message.contains("not HUMAN-GATED"),
+        "a question nothing on the branch reads is not a gate: {}",
+        err.message
+    );
+
+    // (d) REFUSED — the answer IS read (the branch tests `ready_ok`), but the question that writes it
+    //     sits in the SIBLING branch: a selector picks ONE child, so this run may never have been
+    //     asked at all. The climb stays on the ancestor chain — the branch actually taken — and an
+    //     ask_human off it gates nothing.
+    let err = build(
+        "asked-elsewhere",
+        json!({ "var": "ready_ok", "eq": "go" }),
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_state");
+    assert!(
+        err.message.contains("not HUMAN-GATED"),
+        "a question in another branch is a question this run may never see: {}",
+        err.message
+    );
+}
+
+/// FINDING `01M0C048HM5CWJBX0JB6K46D73`, BYPASS 1 — A KEY A SECOND NODE CAN WRITE IS NOT A CONSENT.
+///
+/// The audit reproduced it end to end. The graph is three nodes long and nothing about it is exotic:
+///
+/// ```text
+/// sequence[ ask_human{output_key: "approved"},
+///           query{spec_can_transition(ready), write: "approved"},
+///           transition{ready, gate_on: "approved"} ]
+/// ```
+///
+/// `validate_tree` said Ok. The human answered "no" on a REAL human turn (so the `human_turn_required`
+/// check was satisfied — it is the KEY that was hijacked, not the turn), the `query` overwrote the
+/// answer with `true`, and the Spec went `draft → ready`. Condition (ii) compared a key NAME; the
+/// value the runtime gate reads is whatever wrote it LAST.
+///
+/// Condition (iii) — the gated key has exactly ONE writer in the workflow — is what closes it, and the
+/// test is built in the order that proves the guard is about THAT and not about the shape: question +
+/// transition alone is ACCEPTED, and each writer added afterwards is what flips it to refused. The
+/// FIVE writers of the vocabulary are exercised, plus a second `ask_human` (two questions, one key: no
+/// question owns the gate any more).
+#[test]
+fn a_second_writer_on_the_gated_key_is_not_consent() {
+    let (db, project) = seeded();
+
+    // The ACCEPTED baseline, returned as `(workflow, root)` so a writer can be slid in at order 1 —
+    // between the question and the gate, exactly where the audit put its `query`.
+    let gated = |name: &str| -> (String, String) {
+        let wf = make_workflow(&db, name, Some(&project));
+        let root = add_node(&db, &wf, "sequence", None, "root");
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "ask_human", "parent_id": root, "order_index": 0,
+                "label": "approve?",
+                "config": { "prompt": "Mark the Spec ready?", "output_key": "approved" }
+            }),
+        )
+        .expect("the question is added");
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "transition", "parent_id": root, "order_index": 2,
+                "label": "ready",
+                "config": { "target_state": "ready", "gate_on": "approved" }
+            }),
+        )
+        .expect("ONE writer on the gated key — the canonical shape stays accepted");
+        (wf, root)
+    };
+
+    // Every node type that can land a value on `approved`, each refused between the question and the
+    // gate. The engine writes all of them through `write_result` / `set_board`, so they are one class.
+    let writers = [
+        (
+            "query.write",
+            "query",
+            json!({ "query": "spec_can_transition", "target": "ready", "write": "approved" }),
+        ),
+        (
+            "judge.output_key",
+            "judge",
+            json!({ "prompt": "is it ready?", "output_key": "approved" }),
+        ),
+        (
+            "produce.output_key",
+            "produce",
+            json!({ "output_key": "approved" }),
+        ),
+        (
+            "sub_workflow.output_key",
+            "sub_workflow",
+            json!({ "scope": "coder", "output_key": "approved" }),
+        ),
+        (
+            // The WIDEST write in the vocabulary: a child board key folded FLAT onto the parent's.
+            "sub_workflow.retrieve[].to",
+            "sub_workflow",
+            json!({
+                "scope": "coder", "output_key": "child_result",
+                "retrieve": [{ "from": "verdict", "to": "approved" }]
+            }),
+        ),
+        (
+            "a second ask_human",
+            "ask_human",
+            json!({ "prompt": "sure?", "output_key": "approved" }),
+        ),
+    ];
+    for (what, node_type, config) in writers {
+        let (wf, root) = gated(&format!("second-writer-{node_type}-{what}"));
+        let err = node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": node_type, "parent_id": root, "order_index": 1,
+                "label": what, "config": config
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "invalid_state",
+            "{what} can replace the human's answer before the gate reads it"
+        );
+        assert!(
+            err.message.contains("not HUMAN-GATED") && err.message.contains("NOTHING ELSE"),
+            "the refusal names the second writer ({what}): {}",
+            err.message
+        );
+    }
+
+    // A writer on ANOTHER key changes nothing: the rule is about the gated key, not about queries.
+    let (wf, root) = gated("second-writer-elsewhere");
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "query", "parent_id": root, "order_index": 1,
+            "label": "can transition?",
+            "config": { "query": "spec_can_transition", "target": "ready", "write": "can_ready" }
+        }),
+    )
+    .expect("a query writing a DIFFERENT key leaves the consent intact");
+}
+
+/// FINDING `01M0C048HM5CWJBX0JB6K46D73`, BYPASS 2 — A BRANCH THAT DOES NOT TEST AN APPROVAL GATES
+/// NOTHING, and `create_workspace` is where that bit hardest: its `gate_on` is OPTIONAL
+/// (`unwrap_or(true)` at runtime = UNGATED), so the selector `cond` was the WHOLE guard — and the rule
+/// asked of that cond only that it NAME a variable.
+///
+/// The audit reproduced it physically: `selector[ {var: "ready_ok", eq: "no"} → create_workspace ]`
+/// validated, the human answered "no" on a real human turn, and nyx MKDIR'd on the disk, inserted the
+/// workspace row and rewrote `specs.workspace_id`. Answering NO fired the action.
+///
+/// The polarity condition ([`crate::mcp_authoring::branch_affirmative_key`]) is what closes it: a
+/// crediting branch must read `{var: K, eq: <an approval>}`, judged by the engine's OWN consent
+/// vocabulary (`board_value_is_affirmative`). The four refusals below are the four ways a cond names a
+/// key while deciding nothing — and `truthy: true` is the one worth naming twice: on the closed answer
+/// set J1 forces, `"no"` is a TRUTHY string, so it is the `always` branch wearing a var's name.
+#[test]
+fn a_branch_that_does_not_test_an_approval_gates_nothing() {
+    let (db, project) = seeded();
+
+    // /nspec's shape reduced to its bones, parameterized by the cond of the branch that routes the
+    // workspace sequence. The `create_workspace` carries NO `gate_on` — the branch IS the guard.
+    let build = |name: &str, route_cond: Value| -> Result<(), RpcError> {
+        let wf = make_workflow(&db, name, Some(&project));
+        let root = add_node(&db, &wf, "sequence", None, "root");
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "ask_human", "parent_id": root, "order_index": 0,
+                "label": "confirm ready",
+                "config": {
+                    "prompt": "Mark it ready and open a dev workspace?",
+                    "output_key": "ready_ok",
+                    "options": ["go", "no"],
+                }
+            }),
+        )?;
+        let route = id_of(
+            &node_add(
+                &db,
+                &json!({
+                    "workflow_id": wf, "type": "selector", "parent_id": root, "order_index": 1,
+                    "label": "route the commitment",
+                    "config": { "branches": [
+                        { "cond": route_cond, "child": 0 },
+                        { "cond": { "always": true }, "child": 1 },
+                    ] }
+                }),
+            )?,
+            "node",
+        );
+        let workspace = id_of(
+            &node_add(
+                &db,
+                &json!({
+                    "workflow_id": wf, "type": "sequence", "parent_id": route, "order_index": 0,
+                    "label": "ready + a dev workspace"
+                }),
+            )?,
+            "node",
+        );
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "note", "parent_id": route, "order_index": 1,
+                "label": "left as draft", "config": { "text": "left as a draft" }
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "query", "parent_id": workspace, "order_index": 0,
+                "label": "worktrees root",
+                "config": { "query": "project_worktrees_root", "write": "worktrees_root" }
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "create_workspace", "parent_id": workspace, "order_index": 1,
+                "label": "dev workspace",
+                // NO `gate_on`: nothing but the branch above stands between "no" and the mkdir.
+                "config": { "root_key": "worktrees_root" }
+            }),
+        )?;
+        Ok(())
+    };
+
+    // ACCEPTED — the shipped shape: only a human's `go` puts the run on this branch, and `go` is an
+    // approval in the engine's own vocabulary.
+    build("polarity-go", json!({ "var": "ready_ok", "eq": "go" }))
+        .expect("a branch that tests the answer for an APPROVAL is the consent");
+    // ACCEPTED — extra tests ANDed beside a qualifying `eq` only NARROW the branch: they can make it
+    // fire less often, never on a value the `eq` already refused.
+    build(
+        "polarity-go-narrowed",
+        json!({ "var": "ready_ok", "eq": "go", "ne": "no" }),
+    )
+    .expect("an extra AND beside an affirmative eq narrows the branch, it does not open it");
+
+    for (name, cond, why) in [
+        (
+            "polarity-eq-no",
+            json!({ "var": "ready_ok", "eq": "no" }),
+            "THE REPRODUCED BYPASS: answering no would fire the mkdir",
+        ),
+        (
+            "polarity-truthy",
+            json!({ "var": "ready_ok", "truthy": true }),
+            "on a closed answer set every answer is truthy — an `always` in disguise",
+        ),
+        (
+            "polarity-ne",
+            json!({ "var": "ready_ok", "ne": "no" }),
+            "not-a-refusal is the complement of a consent, not a consent",
+        ),
+        (
+            "polarity-bare",
+            json!({ "var": "ready_ok" }),
+            "a bare var is a truthiness test, so it is the truthy case again",
+        ),
+        (
+            "polarity-falsy",
+            json!({ "var": "ready_ok", "truthy": false }),
+            "a branch taken when the key is FALSY is the refusal branch",
+        ),
+    ] {
+        let err = build(name, cond).unwrap_err();
+        assert_eq!(err.code, "invalid_state", "{why}");
+        assert!(
+            err.message.contains("not HUMAN-GATED"),
+            "{why}: {}",
+            err.message
+        );
+    }
+}
+
+/// FINDING `01M0C3F7V89HJFDGWJEBP12P0N` — THE SINGLE-WRITER CENSUS WAS MISSING THREE ENGINE WRITES.
+///
+/// Condition (iii) asks that the gated key have exactly ONE writer in the workflow, and it reads the
+/// writers off [`crate::mcp_authoring::node_written_board_keys`], whose own doc-comment says "the list
+/// is the contract". Three fixed keys the engine writes on a node's behalf were absent from it:
+/// `last_gate_result` and `blocking_gate_red` (both written by the `gate_check` arm of `drive`) and
+/// `__child_run_id__<node>` (written and cleared by the `sub_workflow` arm). So a graph could name one
+/// of them as its consent key and satisfy (iii) with a second writer standing right beside it.
+///
+/// It was never a BYPASS — those three carry an object, an array and a UUID, and none is affirmative,
+/// so a second writer could only REVOKE a consent, never fabricate one. That is why it is minor. It is
+/// still a hole in a contract that is stated flatly, and the three forms below are the ones the audit
+/// found ACCEPTED.
+#[test]
+fn the_fixed_keys_the_engine_writes_itself_count_as_writers() {
+    let (db, project) = seeded();
+
+    // `sequence[ ask_human{output_key: K}, <the second writer>, create_workspace{gate_on: K} ]` —
+    // the exact three-node shape the single-writer condition exists for.
+    let build = |name: &str,
+                 key: &str,
+                 writer_type: &str,
+                 writer_config: Value|
+     -> Result<(), RpcError> {
+        let wf = make_workflow(&db, name, Some(&project));
+        let root = add_node(&db, &wf, "sequence", None, "root");
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "ask_human", "parent_id": root, "order_index": 0,
+                "label": "approve?",
+                "config": { "prompt": "open a workspace?", "output_key": key }
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": writer_type, "parent_id": root, "order_index": 1,
+                "label": "the second writer", "config": writer_config
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "create_workspace", "parent_id": root, "order_index": 2,
+                "label": "dev workspace",
+                "config": { "root_key": "worktrees_root", "gate_on": key }
+            }),
+        )?;
+        Ok(())
+    };
+
+    // A `sub_workflow`'s child-run handle is keyed by the NODE, so the colliding key can only be
+    // written once the node exists: author the graph in the order that lets the test name it.
+    let child_key_form = |name: &str| -> Result<(), RpcError> {
+        let wf = make_workflow(&db, name, Some(&project));
+        let root = add_node(&db, &wf, "sequence", None, "root");
+        // The sub_workflow FIRST, so its id (and therefore its child-run key) is known.
+        let sub = id_of(
+            &node_add(
+                &db,
+                &json!({
+                    "workflow_id": wf, "type": "sub_workflow", "parent_id": root, "order_index": 1,
+                    "label": "coder", "config": { "scope": "coder" }
+                }),
+            )?,
+            "node",
+        );
+        let key = crate::mcp_engine::subworkflow_child_key(&sub);
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "ask_human", "parent_id": root, "order_index": 0,
+                "label": "approve?",
+                "config": { "prompt": "open a workspace?", "output_key": key }
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "create_workspace", "parent_id": root, "order_index": 2,
+                "label": "dev workspace",
+                "config": { "root_key": "worktrees_root", "gate_on": key }
+            }),
+        )?;
+        Ok(())
+    };
+
+    // THE THREE OMISSIONS — accepted before, refused now, each by condition (iii).
+    for (name, key, writer_type, writer_config) in [
+        (
+            "census-last-gate-result",
+            crate::mcp_engine::LAST_GATE_RESULT_KEY,
+            "gate_check",
+            json!({ "command_ids": ["inst"] }),
+        ),
+        (
+            "census-blocking-gate-red",
+            crate::mcp_engine::BLOCKING_GATE_RED_KEY,
+            "gate_check",
+            json!({ "command_ids": ["inst"], "blocking": true }),
+        ),
+    ] {
+        let err = build(name, key, writer_type, writer_config).unwrap_err();
+        assert_eq!(err.code, "invalid_state", "'{key}' has a second writer");
+        assert!(
+            err.message.contains("not HUMAN-GATED") && err.message.contains(key),
+            "the refusal names the key the engine also writes: {}",
+            err.message
+        );
+    }
+    let err = child_key_form("census-child-run-id").unwrap_err();
+    assert_eq!(err.code, "invalid_state");
+    assert!(
+        err.message.contains("not HUMAN-GATED"),
+        "a sub_workflow's own child-run key is a write like any other: {}",
+        err.message
+    );
+
+    // THE CONTROLS — unchanged, so the refusals above are about the census and not about the shape.
+    // A key that was ALREADY censused is still refused…
+    for (name, key, writer_type, writer_config) in [
+        (
+            "census-control-gate-green",
+            "gate_green",
+            "gate_check",
+            json!({ "command_ids": ["inst"] }),
+        ),
+        (
+            "census-control-spawns",
+            "spawns",
+            "spawn_subagent",
+            json!({ "agent_id": "coder" }),
+        ),
+    ] {
+        let err = build(name, key, writer_type, writer_config).unwrap_err();
+        assert_eq!(err.code, "invalid_state", "'{key}' was already censused");
+        assert!(err.message.contains("not HUMAN-GATED"));
+    }
+    // …and a legitimate single-writer graph is still ACCEPTED — the second node writes elsewhere.
+    build(
+        "census-control-accepted",
+        "ws_ok",
+        "gate_check",
+        json!({ "command_ids": ["inst"] }),
+    )
+    .expect("one question, one writer, one gate: still authorable");
+}
+
+/// FINDING `01M0C3F7V89HJFDGWJEBP12P0N`, done-criterion 4 — THE LIST MAY NOT RE-DIVERGE. Every FIXED
+/// blackboard key the engine writes without a node's config naming it must be censused by
+/// [`crate::mcp_authoring::node_written_board_keys`] for at least one node type. A fixed key added
+/// later and not censused fails HERE, loudly, instead of quietly weakening condition (iii).
+///
+/// This is a census over CONSTANTS, not over strings retyped in a test: `LAST_GATE_RESULT_KEY`,
+/// `BLOCKING_GATE_RED_KEY`, `LOOP_ITER_KEY` and `subworkflow_child_key` are read from the engine
+/// itself, so renaming one on the engine side moves this test with it.
+#[test]
+fn every_fixed_engine_written_key_is_censused() {
+    let node_id = "01a00000-0000-7000-8000-000000000001";
+    // The census, taken over EVERY node type: what could this graph's nodes write, all told.
+    let mut censused: HashSet<String> = HashSet::new();
+    for node_type in db::NODE_TYPES {
+        let node = db::Node {
+            id: node_id.to_string(),
+            workflow_id: "wf".to_string(),
+            parent_id: None,
+            order_index: 0,
+            type_: node_type.to_string(),
+            label: node_type.to_string(),
+            config: "{}".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        censused.extend(super::node_written_board_keys(&node));
+    }
+
+    for key in [
+        crate::mcp_engine::LAST_GATE_RESULT_KEY.to_string(),
+        crate::mcp_engine::BLOCKING_GATE_RED_KEY.to_string(),
+        crate::engine::LOOP_ITER_KEY.to_string(),
+        crate::mcp_engine::subworkflow_child_key(node_id),
+        "gate_green".to_string(),
+        "last_diff".to_string(),
+        "spawns".to_string(),
+    ] {
+        assert!(
+            censused.contains(&key),
+            "the engine writes '{key}' on a node's behalf and no node type censuses it — rule (4)'s \
+             single-writer condition would accept a gated key that a second node also fills. Add it \
+             to `node_written_board_keys`. Censused today: {:?}",
+            {
+                let mut sorted: Vec<&String> = censused.iter().collect();
+                sorted.sort();
+                sorted
+            }
+        );
+    }
+}
+
+/// FINDING `01M0C3FGCACXCZA1ZESRV73N0R` — THE DEAD GATES: shapes rule (4) certified HUMAN-GATED that
+/// the RUNTIME can never satisfy. Safe (no consent is fabricated) and still wrong: the author leaves
+/// with a valid graph whose sensitive node will never fire, or whose run dies at the selector.
+///
+/// THE CHOICE MADE, written rather than implied: each of the three is REFUSED at authoring, because
+/// in each case the value the gate would read is provably not the answer.
+///
+///   (a) A DOTTED read — `gate_on: "ok.deep"`, or a branch on `{var: "ok.deep"}`. An `ask_human`'s
+///       answer is a SCALAR (`mcp_engine::human_answer` refuses an object or an array outright) and
+///       lands FLAT on its key, so `Blackboard::get("ok.deep")` descends into a scalar and resolves to
+///       nothing, forever. It is the READ side of the trap `validate_board_write_key` already refuses
+///       on the WRITE side, and it is refused only where it is claimed as a CONSENT — a `selector`
+///       may still branch on `proto_result.status`, because a `sub_workflow` writes an OBJECT there
+///       and `/nspec` ships exactly that.
+///   (b) An APPENDING question — `ask_human {append: true}` writes `["yes"]`, and an array is neither
+///       affirmative nor equal to any affirmative literal. An appending question is a transcript
+///       (`/nspec`'s "steer"), not a decision.
+///   (c) An `eq` LITERAL the runtime cannot match — `"YES"`, `" yes "`. `board_value_is_affirmative`
+///       trims and case-folds (it reads a HUMAN's typed value); `Condition::matches` compares by
+///       EXACT JSON equality. The authoring rule credited the branch and the run then matched NO
+///       branch — `SelectorNoBranch`, run dead. The polarity test now goes through
+///       `eq_literal_is_affirmative`, which is the same vocabulary narrowed to what `matches` can win.
+#[test]
+fn a_gate_the_runtime_can_never_satisfy_is_not_a_gate() {
+    let (db, project) = seeded();
+
+    // (a) + (b) — the `gate_on` arm: one question, one sensitive node, parameterized by the question's
+    //     config and by what the node's `gate_on` reads.
+    let gate_on_form = |name: &str, ask: Value, gate_on: &str| -> Result<(), RpcError> {
+        let wf = make_workflow(&db, name, Some(&project));
+        let root = add_node(&db, &wf, "sequence", None, "root");
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "ask_human", "parent_id": root, "order_index": 0,
+                "label": "approve?", "config": ask
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "create_workspace", "parent_id": root, "order_index": 1,
+                "label": "dev workspace",
+                "config": { "root_key": "worktrees_root", "gate_on": gate_on }
+            }),
+        )?;
+        Ok(())
+    };
+
+    // The BASELINE, so every refusal below is about the one thing it changes.
+    gate_on_form(
+        "dead-baseline",
+        json!({ "prompt": "open it?", "output_key": "ok" }),
+        "ok",
+    )
+    .expect("a plain question read by a plain gate_on is the shape that must keep working");
+
+    // …and the same shape inside a LOOP body, the OTHER ordered composite condition (i) accepts (a
+    // loop re-enters at cursor 0, so a left sibling ran in every pass). Listed with the acceptances
+    // because tightening (ii) must not have narrowed WHERE the question may stand.
+    let wf_loop = make_workflow(&db, "dead-baseline-loop", Some(&project));
+    let body = add_node(&db, &wf_loop, "loop", None, "body");
+    node_update(
+        &db,
+        &json!({ "node_id": body, "config": { "until": { "var": "done_flag", "truthy": true } } }),
+    )
+    .expect("the loop exits on a key no question writes");
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf_loop, "type": "ask_human", "parent_id": body, "order_index": 0,
+            "label": "approve?", "config": { "prompt": "open it?", "output_key": "ok" }
+        }),
+    )
+    .expect("the question stands in the loop body");
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf_loop, "type": "create_workspace", "parent_id": body, "order_index": 1,
+            "label": "dev workspace",
+            "config": { "root_key": "worktrees_root", "gate_on": "ok" }
+        }),
+    )
+    .expect("a loop body is an ordered composite: the left sibling necessarily ran");
+
+    let err = gate_on_form(
+        "dead-dotted-gate-on",
+        json!({ "prompt": "open it?", "output_key": "ok" }),
+        "ok.deep",
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_state");
+    assert!(
+        err.message.contains("not HUMAN-GATED") && err.message.contains("un-dotted"),
+        "a dotted gate_on reads a path a human's answer never fills, and the refusal says so: {}",
+        err.message
+    );
+
+    let err = gate_on_form(
+        "dead-append",
+        json!({ "prompt": "open it?", "output_key": "ok", "append": true }),
+        "ok",
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_state");
+    assert!(
+        err.message.contains("not HUMAN-GATED") && err.message.contains("append"),
+        "an appending question fills its key with an ARRAY, and the refusal says so: {}",
+        err.message
+    );
+
+    // (c) — the SELECTOR arm: the branch IS the consent, so the literal it compares must be one the
+    //     runtime's exact equality can actually match.
+    let branch_form = |name: &str, cond: Value| -> Result<(), RpcError> {
+        let wf = make_workflow(&db, name, Some(&project));
+        let root = add_node(&db, &wf, "sequence", None, "root");
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "ask_human", "parent_id": root, "order_index": 0,
+                "label": "confirm ready",
+                "config": {
+                    "prompt": "mark it ready and open a workspace?",
+                    "output_key": "ready_ok",
+                    "options": ["go", "no"],
+                }
+            }),
+        )?;
+        let route = id_of(
+            &node_add(
+                &db,
+                &json!({
+                    "workflow_id": wf, "type": "selector", "parent_id": root, "order_index": 1,
+                    "label": "route",
+                    "config": { "branches": [
+                        { "cond": cond, "child": 0 },
+                        { "cond": { "always": true }, "child": 1 },
+                    ] }
+                }),
+            )?,
+            "node",
+        );
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "create_workspace", "parent_id": route, "order_index": 0,
+                "label": "dev workspace", "config": { "root_key": "worktrees_root" }
+            }),
+        )?;
+        node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "note", "parent_id": route, "order_index": 1,
+                "label": "left as draft", "config": { "text": "left as a draft" }
+            }),
+        )?;
+        Ok(())
+    };
+
+    // ACCEPTED — the literals `Condition::matches` can win on, in the canonical form the vocabulary
+    // lists. `eq: true` is the BOOL case, which needs no canonicalisation at all.
+    for (name, cond, why) in [
+        (
+            "live-eq-yes",
+            json!({ "var": "ready_ok", "eq": "yes" }),
+            "yes",
+        ),
+        ("live-eq-go", json!({ "var": "ready_ok", "eq": "go" }), "go"),
+        (
+            "live-eq-true",
+            json!({ "var": "ready_ok", "eq": true }),
+            "true",
+        ),
+    ] {
+        branch_form(name, cond).unwrap_or_else(|e| {
+            panic!(
+                "`eq: {why}` is matchable and must stay accepted: {}",
+                e.message
+            )
+        });
+    }
+
+    // REFUSED — affirmative to the eye, unmatchable to `Condition::matches`.
+    for (name, cond, why) in [
+        (
+            "dead-eq-uppercase",
+            json!({ "var": "ready_ok", "eq": "YES" }),
+            "the runtime compares by exact equality — a board holding \"yes\" never equals \"YES\"",
+        ),
+        (
+            "dead-eq-padded",
+            json!({ "var": "ready_ok", "eq": " yes " }),
+            "…and never equals \" yes \" either: the trim is on the VALUE reader, not on the branch",
+        ),
+    ] {
+        let err = branch_form(name, cond).unwrap_err();
+        assert_eq!(err.code, "invalid_state", "{why}");
+        assert!(
+            err.message.contains("not HUMAN-GATED") && err.message.contains("exact equality"),
+            "{why}: {}",
+            err.message
+        );
+    }
+
+    // REFUSED — a DOTTED branch var, for the same reason as (a): the answer is flat.
+    let err = branch_form(
+        "dead-dotted-branch",
+        json!({ "var": "ready_ok.d", "eq": "yes" }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_state");
+    assert!(err.message.contains("not HUMAN-GATED"), "{}", err.message);
+}
+
 /// Lot 2 — a `sub_workflow` node needs a RESOLVABLE target (a non-empty `scope` OR an explicit
 /// `workflow_id`), and `inject`/`retrieve` must be arrays of well-formed `{from, to}` copies.
 #[test]
@@ -925,11 +1903,16 @@ fn query_node_needs_a_known_fact_and_a_write_key() {
     }))
     .unwrap_err();
     assert_eq!(err.code, "invalid_argument");
-    assert!(
-        err.message.contains("spec_status"),
-        "the error names the accepted fact(s): {}",
-        err.message
-    );
+    // The refusal names EVERY fact the runtime resolves — an author who mistyped is handed the whole
+    // set, not a list that has drifted behind the resolver (it once named ten facts of eleven, with
+    // `project_worktrees_root` missing exactly when a graph needed it). Both sides read one array.
+    for fact in crate::mcp_engine::QUERY_FACTS {
+        assert!(
+            err.message.contains(fact),
+            "the refusal names '{fact}': {}",
+            err.message
+        );
+    }
     // A well-formed query IS accepted (the tree's root here).
     node_add(&db, &json!({
         "workflow_id": wf, "type": "query",
@@ -1023,9 +2006,10 @@ fn unknown_node_type_lists_the_accepted_types() {
     );
 }
 
-/// B3 (superseding M-a) — an ENGAGING transition (ready/done/cancel) needs a `gate_on` AND a
-/// preceding-sibling ask_human; the ENTRY transition `start` (in_progress) and `in_review` need
-/// neither.
+/// B3 (superseding M-a) — an ENGAGING transition (ready/done/cancel) needs a `gate_on` AND an
+/// ask_human that runs before it AND WRITES THE KEY THAT `gate_on` READS; the ENTRY transition `start`
+/// (in_progress) and `in_review` need neither. A question on another key is not a gate — the human
+/// answers something, and the commit still hangs on a key nobody fills.
 #[test]
 fn engaging_transitions_require_a_gate_and_a_preceding_ask_human() {
     let (db, project) = seeded();
@@ -1059,10 +2043,23 @@ fn engaging_transitions_require_a_gate_and_a_preceding_ask_human() {
     .unwrap_err();
     assert_eq!(err.code, "invalid_state", "engaging without a preceding ask_human is incoherent");
 
-    // WITH a preceding ask_human in the same sequence → accepted.
+    // A preceding ask_human that writes a DIFFERENT key is NOT a gate: it writes the default key
+    // (`human`) while the transition fires on `approved`, so the question the human answers decides
+    // nothing about the commit — and the commit hangs on a key nobody fills. Chronology is not
+    // consent (rule (4), condition (ii)).
+    let wf4b = make_workflow(&db, "w4b", Some(&project));
+    let root4b = add_node(&db, &wf4b, "sequence", None, "root");
+    add_node(&db, &wf4b, "ask_human", Some(&root4b), "approve?");
+    let err = node_add(&db, &json!({
+        "workflow_id": wf4b, "type": "transition", "parent_id": root4b, "order_index": 1,
+        "config": { "target_state": "done", "gate_on": "approved" }
+    }))
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_state", "a question the gate does not read gates nothing");
+
+    // WITH a preceding ask_human in the same sequence, WRITING THE KEY THE GATE READS → accepted.
     let wf5 = make_workflow(&db, "w5", Some(&project));
-    let root5 = add_node(&db, &wf5, "sequence", None, "root");
-    add_node(&db, &wf5, "ask_human", Some(&root5), "approve?");
+    let root5 = gated_root(&db, &wf5, "approved");
     node_add(&db, &json!({
         "workflow_id": wf5, "type": "transition", "parent_id": root5, "order_index": 1,
         "config": { "target_state": "done", "gate_on": "approved" }
@@ -1070,9 +2067,9 @@ fn engaging_transitions_require_a_gate_and_a_preceding_ask_human() {
     .expect("engaging behind a preceding ask_human is accepted");
 }
 
-/// N13(b) — a `fork_spec` needs a `gate_on` AND a preceding-sibling ask_human (a fork is never
-/// implicit). No gate_on → invalid_argument; gate_on but no preceding ask_human → the tree guard
-/// refuses; with a preceding ask_human → accepted.
+/// N13(b) — a `fork_spec` needs a `gate_on` AND a preceding ask_human writing the key it reads (a
+/// fork is never implicit). No gate_on → invalid_argument; gate_on but no preceding ask_human → the
+/// tree guard refuses; with one that writes that key → accepted.
 #[test]
 fn fork_spec_needs_a_gate_and_a_preceding_ask_human() {
     let (db, project) = seeded();
@@ -1093,10 +2090,9 @@ fn fork_spec_needs_a_gate_and_a_preceding_ask_human() {
     .unwrap_err();
     assert_eq!(err.code, "invalid_state", "a fork without a preceding ask_human is incoherent");
 
-    // WITH a preceding ask_human in the same sequence → accepted.
+    // WITH a preceding ask_human in the same sequence, writing the key `gate_on` reads → accepted.
     let wf3 = make_workflow(&db, "w3", Some(&project));
-    let root3 = add_node(&db, &wf3, "sequence", None, "root");
-    add_node(&db, &wf3, "ask_human", Some(&root3), "revise?");
+    let root3 = gated_root(&db, &wf3, "revise_ok");
     node_add(&db, &json!({
         "workflow_id": wf3, "type": "fork_spec", "parent_id": root3, "order_index": 1,
         "config": { "gate_on": "revise_ok" }

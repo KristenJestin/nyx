@@ -99,6 +99,36 @@ function selectorFixture(): EngineNode[] {
   ];
 }
 
+/**
+ * The shared-child selector shape: THREE branches for TWO children — `ready_ok = yes` AND
+ * `ready_ok = go` both select child 0 (nyx-core's `pick_branch` takes the first that matches, and
+ * nothing requires a branch per child). It is what `/nspec`'s `route ready` shipped until revision 22
+ * split `go` onto its own branch; the renderer must keep reading it, since nyx-core still allows it
+ * and any fork may use it. The graph draws ONE edge per child, so that edge has to carry
+ * BOTH conditions: labelling it `ready_ok = yes` alone says `go` falls to the `ELSE` and leaves the
+ * spec a draft — the opposite of what the run does.
+ *
+ *   sequence "/route" (root)
+ *   └─ selector "route ready"   branches: ready_ok=yes→0, ready_ok=go→0, always→1
+ *      ├─ transition "ready"        (child 0)
+ *      └─ note "left as draft"      (child 1)
+ */
+function sharedChildSelectorFixture(): EngineNode[] {
+  const branches = {
+    branches: [
+      { cond: { var: "ready_ok", eq: "yes" }, child: 0 },
+      { cond: { var: "ready_ok", eq: "go" }, child: 0 },
+      { cond: { always: true }, child: 1 },
+    ],
+  };
+  return [
+    mk("root", null, 0, "sequence", "/route"),
+    mk("selector", "root", 0, "selector", "route ready", branches),
+    mk("ready", "selector", 0, "transition", "ready"),
+    mk("draft", "selector", 1, "note", "left as draft"),
+  ];
+}
+
 const flowData = (data: unknown) => data as EngineFlowData;
 const groupData = (data: unknown) => data as EngineGroupData;
 
@@ -238,6 +268,21 @@ describe("buildFlowGraph", () => {
     expect(cond("selector", "cancel")).toBe("review = cancel");
     expect(cond("selector", "hold")).toBe("review = hold");
     expect(cond("selector", "ok")).toBe("always");
+  });
+
+  // N branches → 1 child: the fan-out edge is per CHILD, so its label must name EVERY condition that
+  // reaches that child. Only the first one meant `go` read as falling into the `ELSE`.
+  it("labels the branch edge with EVERY condition routing to that child, not only the first", async () => {
+    const { edges } = await buildFlowGraph(sharedChildSelectorFixture(), "root");
+    const pairs = new Set(edges.map((e) => `${e.source}->${e.target}`));
+    // Still ONE edge per child — the shared child is not drawn twice.
+    expect(pairs.has("selector->ready")).toBe(true);
+    expect(pairs.has("selector->draft")).toBe(true);
+    expect(edges.filter((e) => e.source === "selector" && e.target === "ready")).toHaveLength(1);
+    const cond = (target: string) =>
+      edges.find((e) => e.source === "selector" && e.target === target)?.data?.branchCondition;
+    expect(cond("ready")).toBe("ready_ok = yes OR ready_ok = go");
+    expect(cond("draft")).toBe("always");
   });
 
   // finding #33 — every branch CONVERGES on the selector's next sibling (the join), so the flow

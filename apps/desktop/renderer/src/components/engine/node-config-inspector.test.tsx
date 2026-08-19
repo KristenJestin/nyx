@@ -157,6 +157,54 @@ describe("NodeConfigInspector — explains the node (finding #35)", () => {
     expect(arms[1]!.querySelector("button")).toBeTruthy();
   });
 
+  // `/nspec`'s `route ready` routes TWO conditions to the SAME child. The arm list is per CHILD, so a
+  // single arm has to name both: showing `ready_ok = yes` alone told the reader `go` fell to the
+  // `ELSE` and left the spec a draft, the exact opposite of the routing.
+  //
+  // THE FOURTH BRANCH IS HERE TO MAKE THE SECOND HALF SEPARATE THE TWO STATES (finding
+  // `01M0AE3PKCFT93J7ARESHS1FSK`). With `/nspec`'s literal three branches, child 1 was reached by the
+  // lone `{always: true}`, so `describeBranchCondition(config, 1)` answered `always` under the broken
+  // code AND under the fixed one — byte-identical arms, an assertion that could not fail, claiming a
+  // coverage it did not have (the test went red by the `OR` line above, never by that one). An
+  // explicit `ready_ok = no` arm BEFORE the catch-all — the shape an author writes when they want the
+  // refusal named and everything else caught — is what makes the difference visible: reading only the
+  // FIRST branch that targets child 1 prints `if ready_ok = no`, while COLLAPSING onto the default arm
+  // prints `else`. Both halves now fail on their own defect.
+  it("names EVERY condition of an arm several branches share, never just the first", () => {
+    renderInspector(
+      mk("sel", "selector", "route ready", {
+        branches: [
+          { cond: { var: "ready_ok", eq: "yes" }, child: 0 },
+          { cond: { var: "ready_ok", eq: "go" }, child: 0 },
+          { cond: { var: "ready_ok", eq: "no" }, child: 1 },
+          { cond: { always: true }, child: 1 },
+        ],
+      }),
+      [
+        mk("ready", "transition", "transition ready", {}, "sel", 0),
+        mk("draft", "note", "left as draft", {}, "sel", 1),
+      ],
+    );
+    const arms = Array.from(screen.getByTestId("selector-branches").querySelectorAll("li"));
+    // One arm per CHILD still (two children), the shared arm carrying BOTH of its conditions.
+    expect(arms).toHaveLength(2);
+    expect(arms[0]!.textContent).toContain("if");
+    expect(arms[0]!.textContent).toContain("ready_ok = yes OR ready_ok = go");
+    expect(arms[0]!.textContent).toContain("transition ready");
+    // …and the arm a branch makes UNCONDITIONAL names NONE of the conditions its other branches carry:
+    // child 1 is reached whatever `ready_ok` holds, so printing `ready_ok = no` on it would tell the
+    // reader that `no` — and nothing else — lands here. Asserted BEFORE the `else` below on purpose:
+    // an arm reads `else` exactly when it shows no condition, so the two are one state read twice, and
+    // this is the half that carries the claim. Proven by mutation: drop the collapse onto the default
+    // arm (accumulate `always` like any other condition) and THIS line is the one that goes red, with
+    // the `OR` assertion above still green. Break the whole loop back to first-branch-wins and the
+    // `OR` line goes first — the two halves fail on their own defect, which is what the finding asked
+    // for and what the three-branch fixture could not do.
+    expect(arms[1]!.textContent).not.toContain("ready_ok");
+    expect(arms[1]!.textContent).toContain("else");
+    expect(arms[1]!.textContent).toContain("left as draft");
+  });
+
   it("does NOT annotate non-selector composite children with conditions (only selectors)", () => {
     renderInspector(
       mk("loop", "loop", "phases", { until: { var: "phase_status", eq: "complete" } }),

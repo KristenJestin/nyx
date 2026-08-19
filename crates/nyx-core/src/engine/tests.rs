@@ -717,8 +717,10 @@ fn every_leaf_type_yields_its_action_and_updates_the_blackboard() {
             assert_eq!(gate_on.as_deref(), Some("revise_ok"));
             NodeResult::Ack
         }
-        // This tree carries no transition_task / sub_workflow leaf; the arms keep the match total.
+        // This tree carries no transition_task / create_workspace / sub_workflow leaf; the arms keep
+        // the match total.
         Action::TransitionTask { .. } => NodeResult::Ack,
+        Action::CreateWorkspace { .. } => NodeResult::Ack,
         Action::SubWorkflow { .. } => NodeResult::SubResult(json!({ "status": "done" })),
     });
 

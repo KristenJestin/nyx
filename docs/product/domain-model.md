@@ -79,7 +79,7 @@ Intention structurée et **ticket durable** appartenant au projet, indépendante
 
 Le Spec porte une **clé Linear** = préfixe projet (`projects.key`) + numéro incrémental par projet (`specs.number`), ex. `NYX-42` : c'est la référence humaine. Le **slug** descriptif est conservé pour l'URL (`NYX-42/workspace-pivot`). La **priorité** (`urgent/high/med/low`) est stockée sur le Spec. Le Spec porte une **catégorie unique** (`specs.category_id`, axe de classification du projet ; set curé par l'humain, l'agent assigne et peut en proposer une nouvelle, non bloquant — PDR-0017).
 
-Au lancement du développement, le Spec pointe vers son workspace de dev par la colonne `specs.workspace_id` : un pointeur unique, posé à ce moment, écrasable si le développement migre, jamais perdu (la ligne workspace survit au worktree). L'historique du Spec ne dépend donc d'aucune entité mutable : il vit sur le ticket (review, branche et commit de merge, ligne workspace conservée).
+Le Spec pointe vers son workspace de dev par la colonne `specs.workspace_id` : un pointeur unique, posable **dès que le Spec est `ready`** (le workspace existe souvent avant que le dev démarre — l'ancrer ne transitionne jamais le Spec) et au plus tard au lancement du développement, écrasable si le développement migre, jamais perdu (la ligne workspace survit au worktree). L'historique du Spec ne dépend donc d'aucune entité mutable : il vit sur le ticket (review, branche et commit de merge, ligne workspace conservée).
 
 **Validé :** le domaine Spec/tâches utile de Depot doit devenir natif dans nyx. L'unité s'appelle **Spec** (renommée depuis « PRD » par PDR-0018 ; ferme Q-005). Alternatives `Work Item` / `Change` écartées.
 
