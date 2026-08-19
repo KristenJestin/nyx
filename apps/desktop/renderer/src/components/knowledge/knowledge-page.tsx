@@ -197,9 +197,9 @@ export function KnowledgePage() {
     // close — making the page/shell-level scrollbar flash STRUCTURALLY impossible (it used to escape
     // the old Motion width:auto over-measure up to the shell's Outlet wrapper and onto the document).
     // We keep the clip anyway (harmless): `clip` clips the X axis WITHOUT a scroll container, leaves
-    // `overflow-y` VISIBLE (no coercion to `auto`) and establishes no BFC, so the `h-svh` vertical
+    // `overflow-y` VISIBLE (no coercion to `auto`) and establishes no BFC, so the `h-app` vertical
     // flow is untouched — a cheap guard against any unrelated future horizontal overshoot.
-    <div className="flex h-svh flex-col overflow-x-clip bg-background px-6 pb-6 pt-10">
+    <div className="flex h-app flex-col overflow-x-clip bg-background px-6 pb-6 pt-10">
       <header className="mb-4 shrink-0">
         <Breadcrumb className="mb-2">
           <BreadcrumbCurrent>Knowledge</BreadcrumbCurrent>

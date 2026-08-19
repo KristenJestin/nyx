@@ -46,7 +46,7 @@ export function EnginePage() {
   );
 
   return (
-    <div className="flex h-svh flex-col overflow-hidden bg-background px-6 pb-6 pt-10">
+    <div className="flex h-app flex-col overflow-hidden bg-background px-6 pb-6 pt-10">
       <header className="mb-4 shrink-0">
         <Breadcrumb className="mb-2">
           {selectedWorkflowId ? (

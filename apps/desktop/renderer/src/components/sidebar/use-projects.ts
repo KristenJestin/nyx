@@ -69,6 +69,12 @@ export interface WorkspaceRecord {
   updated_at: number;
 }
 
+// A `ROOT_WORKSPACE_REMOVE_REASON` used to live here: the sentence explaining why a root
+// workspace's Remove entry was rendered DISABLED. Both menus that carried it now render NO
+// lifecycle trigger at all on a root (review `01M0A7QGBK43MZB10RF51QR6TS`) — no kebab in
+// `terminals/workspace-accordion.tsx`, no per-workspace group in `terminals/base-layout.tsx` —
+// so there is no disabled row left to explain, and the constant went with it.
+
 /** Payload returned by `create_project`: the project + its named root workspace. */
 export interface ProjectWithRoot {
   project: ProjectRecord;
@@ -139,12 +145,16 @@ export interface UseProjects {
    */
   deleteProject: (id: string) => Promise<void>;
   /**
-   * Delete a SINGLE (non-root) workspace by id. The backend REFUSES the project's
-   * root (delete the whole project instead) and refuses while one of the
-   * workspace's commands is running; the rejection PROPAGATES so the caller can
-   * toast the real reason. Its command instances cascade-delete, its terminals are
-   * detached (workspace_id → null) and survive loose. The workspace is dropped from
-   * the in-memory tree only on success.
+   * Delete a SINGLE (non-root) workspace by id. The backend REFUSES exactly two
+   * cases — the project's root (delete the whole project instead) and an unknown
+   * id; a RUNNING command is NOT one of them, the bridge STOPS it first (review
+   * `01KWEX11`, "tout supprimer + tuer les vivants"). The rejection PROPAGATES so
+   * the caller can toast the real reason. The delete DESTROYS the workspace's
+   * runtime: its command instances cascade-delete, its terminal PTYs are closed,
+   * and `usecase::remove_workspace` DELETES its terminal records + agent sessions
+   * in the removal transaction — nothing survives detached here (that is
+   * `deleteProject`'s contract, not this one). The workspace is dropped from the
+   * in-memory tree only on success.
    */
   deleteWorkspace: (id: string) => Promise<void>;
   /**
@@ -304,12 +314,15 @@ export function useProjects(): UseProjects {
 
   const deleteProject = useCallback(async (id: string) => {
     // Await the backend FIRST, then drop the project from the tree only on success.
-    // `delete_project` REFUSES (Err) when the project still has a running command,
-    // so an optimistic-remove-then-swallow would desync the sidebar from the DB —
-    // the project would vanish locally while it (and its live process) survive, and
-    // its terminals would be detached for nothing. The rejection now PROPAGATES so
-    // the caller skips the terminal detach and the confirm modal surfaces the
-    // message. The backend detaches bound terminals (workspace_id → null);
+    // `delete_project` can still fail (Err) — an optimistic-remove-then-swallow would
+    // desync the sidebar from the DB, the project vanishing locally while it (and its
+    // live processes) survive, and its terminals being detached for nothing. The
+    // rejection PROPAGATES so the caller skips the terminal detach and the confirm
+    // modal surfaces the message. A RUNNING managed command is not one of those
+    // failures any more: the sidecar bridge STOPS every instance of the project before
+    // the delete (review `01M0AJ4F6RMS4CHWQ5B6DB47RC`), because the FK cascade erases
+    // the `command_instances` rows that are the only handles on those processes.
+    // The backend detaches bound terminals (workspace_id → null);
     // `useTerminals` reflects that via its own list/auto-attach passes; here we only
     // own the project/workspace tree. The delete sits behind a confirm dialog with a
     // submitting spinner, so awaiting first costs no perceptible snappiness.
@@ -319,14 +332,21 @@ export function useProjects(): UseProjects {
 
   const deleteWorkspace = useCallback(async (id: string) => {
     // Await the backend FIRST, then drop the workspace from its project's tree only on
-    // success. `workspace_delete` REFUSES (Err) the root workspace and a workspace with
-    // a running command, so an optimistic-remove-then-swallow would desync the sidebar
-    // from the DB (the workspace would vanish locally while it — and its live process —
-    // survive). The rejection PROPAGATES so the confirm modal surfaces the real reason.
-    // The backend detaches bound terminals (workspace_id → null); `useTerminals`
-    // reflects that via its own list/auto-attach passes — here we only own the tree. The
-    // delete sits behind a confirm dialog with a submitting spinner, so awaiting first
-    // costs no perceptible snappiness.
+    // success. `workspace_delete` still REFUSES (Err) the root workspace and an unknown
+    // id — a RUNNING command is NOT a refusal any more, the bridge stops it — so an
+    // optimistic-remove-then-swallow would desync the sidebar from the DB (the workspace
+    // would vanish locally while it survives). The rejection PROPAGATES so the confirm
+    // modal surfaces the real reason.
+    // The backend DESTROYS the workspace's runtime rather than detaching it: the bridge stops
+    // every running command instance and closes every terminal PTY of the workspace, and
+    // `usecase::remove_workspace` deletes its terminal records + agent sessions inside the
+    // removal transaction (review `01KWEX11`, "tout supprimer + tuer les vivants") — it does
+    // NOT leave them behind as loose terminals the way `delete_project` does. Here we own
+    // only the tree; `terminal-manager.tsx`'s `deleteWorkspaceAndDetach` owns what the
+    // terminal list does with the now dangling `workspace_id` (this command pushes
+    // `workspaces://changed`, not `terminals://changed`, so `useTerminals` does not re-list
+    // on it). The delete sits behind a confirm dialog with a submitting spinner, so awaiting
+    // first costs no perceptible snappiness.
     await nyxBridge.invoke("workspace_delete", { id });
     setProjects((prev) =>
       prev.map((t) => ({ ...t, workspaces: t.workspaces.filter((w) => w.id !== id) })),
@@ -334,14 +354,20 @@ export function useProjects(): UseProjects {
   }, []);
 
   const renameWorkspace = useCallback(async (id: string, name: string) => {
-    // Optimistically reflect the new workspace name across the tree, then persist.
+    // Optimistically reflect the new workspace name across the tree, then persist. The rejection
+    // PROPAGATES, exactly like `updateProject`'s just above and for the same reason: the caller is
+    // a confirm dialog that SURFACES the real reason inline and toasts a failure. This used to be
+    // `.catch(() => {})`, which was inert while `rename_workspace` had no UI caller and became a
+    // LIE the day one arrived — the dialog closed on a "Workspace renamed" toast the backend had
+    // never granted, leaving the sidebar showing a name the DB refused. A `workspaces://changed`
+    // re-list (or the next load) reconciles the optimistic label on failure.
     setProjects((prev) =>
       prev.map((t) => ({
         ...t,
         workspaces: t.workspaces.map((w) => (w.id === id ? { ...w, name } : w)),
       })),
     );
-    await nyxBridge.invoke("rename_workspace", { id, name }).catch(() => {});
+    await nyxBridge.invoke("rename_workspace", { id, name });
   }, []);
 
   const reorderProjects = useCallback(async (ids: string[]) => {

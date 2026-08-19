@@ -126,8 +126,11 @@ function installBackend(
 }
 
 /**
- * Mount `<BaseLayout>` inside a real router (memory history) with stub pages for the 3
- * routes, so the section-nav `<Link>`s and the `<Outlet/>` behave exactly as in the app.
+ * Mount `<BaseLayout>` inside a real router (memory history) with stub pages for the routes,
+ * so the section-nav `<Link>`s and the `<Outlet/>` behave exactly as in the app. A Spec-detail
+ * stub (`/work/$specId`) is part of the tree so a test can start on a PROJECT-SCOPED page (the
+ * situation the project switch is about) — the ROUTER is returned alongside the render result so
+ * the assertion can read the real `pathname`, not just the rail's `aria-current`.
  */
 function renderLayout(initialEntry = "/") {
   const rootRoute = createRootRoute({
@@ -142,13 +145,14 @@ function renderLayout(initialEntry = "/") {
   const routeTree = rootRoute.addChildren([
     mk("/", "TERMINALS PAGE"),
     mk("/work", "WORK PAGE"),
+    mk("/work/$specId", "SPEC PAGE"),
     mk("/knowledge", "KNOWLEDGE PAGE"),
   ]);
   const router = createRouter({
     routeTree,
     history: createMemoryHistory({ initialEntries: [initialEntry] }),
   });
-  return render(<RouterProvider router={router} />);
+  return { ...render(<RouterProvider router={router} />), router };
 }
 
 describe("BaseLayout", () => {
@@ -184,6 +188,35 @@ describe("BaseLayout", () => {
     expect(screen.getByRole("button", { name: "Project Alpha" }).getAttribute("aria-current")).toBe(
       "false",
     );
+  });
+
+  /**
+   * ENTERING A PROJECT IS A NAVIGATION, NOT ONLY A SELECTION (PRD fix 2).
+   *
+   * The bug: from a page SCOPED to project A (here a Spec detail, `/work/s1`), entering project B
+   * from the rail moved the active indicator but LEFT THE VIEW on A's page — one ends up looking
+   * at a page that does not belong to the entered project. The cause is `<BaseLayout>`'s tile
+   * `onEnter` callback, which only called `setActiveProjectId` and never navigated.
+   *
+   * So this test asserts the two things SEPARATELY — the selection moved (`aria-current`) AND the
+   * ROUTE left the old project's page for the entered project's default page (`/`, already scoped
+   * to the active project and restoring its last terminal). Only the second assertion is red
+   * before the fix, which is exactly the defect.
+   */
+  it("entering another project LEAVES the previous project's page for `/` (route, not just selection)", async () => {
+    const { router } = renderLayout("/work/s1");
+    const beta = await screen.findByRole("button", { name: "Project Beta" });
+    // Starting point: a project-scoped page (a Spec of the project one is currently in).
+    expect(router.state.location.pathname).toBe("/work/s1");
+    expect(await screen.findByText("SPEC PAGE")).toBeTruthy();
+
+    fireEvent.click(beta);
+
+    // The SELECTION follows the click (this half already worked)…
+    await waitFor(() => expect(beta.getAttribute("aria-current")).toBe("true"));
+    // …and so does the ROUTE: the view lands on the entered project's default page.
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(await screen.findByText("TERMINALS PAGE")).toBeTruthy();
   });
 
   it("renders the section-nav (Terminals / Work / Knowledge) and the index page in the Outlet", async () => {
@@ -745,5 +778,51 @@ describe("BaseLayout — project right-click CRUD", () => {
     fireEvent.click(confirm);
     await waitFor(() => expect(calls.some((c) => c.cmd === "workspace_delete")).toBe(true));
     expect(calls.find((c) => c.cmd === "workspace_delete")?.args.id).toBe("api-p1");
+  });
+
+  it("right-click → Rename workspace renames it via rename_workspace", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    installCrudBackend(calls);
+    renderLayout();
+
+    await openActions();
+    // The workspace's line in the rail menu now carries its OWN rename — the command existed in
+    // the bridge and had NO UI caller before this (review 01M04WQEQDDPH7NQEK9MPYCXKS).
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename workspace api in Alpha" }));
+
+    const nameField = await screen.findByRole("textbox", { name: "Workspace name" });
+    expect((nameField as HTMLInputElement).value).toBe("api");
+    fireEvent.change(nameField, { target: { value: "api-v2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(calls.some((c) => c.cmd === "rename_workspace")).toBe(true));
+    const call = calls.find((c) => c.cmd === "rename_workspace");
+    expect(call?.args.id).toBe("api-p1");
+    expect(call?.args.name).toBe("api-v2");
+  });
+
+  it("the ROOT workspace gets NO group at all: no Rename, no Remove, not even its label", async () => {
+    // Review `01M0A7QGBK43MZB10RF51QR6TS`. The root briefly HAD a group here — an active Rename
+    // over a DISABLED Remove carrying "the root workspace leaves with its project". The user's
+    // verdict: on the root, show nothing. A section whose only content is one greyed row and an
+    // explanation costs a read to discover there is nothing to do in it. Its rename goes with it.
+    installCrudBackend([]);
+    renderLayout();
+
+    await openActions();
+    // The non-root workspace's group is the proof the menu opened and still carries the actions.
+    expect(
+      await screen.findByRole("menuitem", { name: "Rename workspace api in Alpha" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Remove workspace api from Alpha" })).toBeTruthy();
+
+    // The ROOT ("main") contributes NOTHING — not a disabled row, not a group label.
+    expect(screen.queryByRole("menuitem", { name: "Rename workspace main in Alpha" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Remove workspace main from Alpha" })).toBeNull();
+    expect(screen.queryByText("main")).toBeNull();
+    // …and no leftover disabled lifecycle row anywhere in the menu.
+    expect(
+      screen.queryAllByRole("menuitem").filter((i) => i.getAttribute("aria-disabled") === "true"),
+    ).toHaveLength(0);
   });
 });

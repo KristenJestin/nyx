@@ -223,7 +223,7 @@ function RouteErrorFallback({ error }: { error: Error }) {
   // the one path that knows the difference, or the screen quotes `[object Object]` at the user.
   const message = errorText(error, "");
   return (
-    <div className="flex h-svh flex-col items-center justify-center gap-3 bg-background p-6 text-center">
+    <div className="flex h-app flex-col items-center justify-center gap-3 bg-background p-6 text-center">
       <p className="text-sm text-muted-foreground">Something went wrong on this screen.</p>
       {message ? (
         <p className="max-w-md font-mono text-2xs text-muted-foreground/70">{message}</p>

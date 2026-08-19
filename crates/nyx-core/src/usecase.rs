@@ -869,8 +869,11 @@ pub fn remove_workspace(
         // which already ON DELETE CASCADE). Order: sessions first (covers those anchored to the
         // workspace even on a loose host terminal), then terminals (whose delete cascades any
         // remaining session on a workspace-owned terminal). We do NOT emit per-row events: the
-        // single `workspace.removed` event below is the coarse signal both adapters push on
-        // (the UI re-pulls the terminals/sessions on that invalidation). The KILL of any LIVE
+        // single `workspace.removed` event below is the coarse signal both adapters push on.
+        // That event alone does NOT refresh the terminal list: the renderer re-pulls terminals on
+        // `terminals://changed`, a DIFFERENT topic, so an adapter that deletes a workspace must ALSO
+        // announce the terminal mutation or the deleted rows stay on screen until something else
+        // triggers a re-list (bridge: `mutates_terminals`). The KILL of any LIVE
         // PTY / running command is an adapter concern (it needs the sidecar runner, unreachable
         // from `&mut SqliteConnection`) and runs BEFORE this use case — see the bridge/MCP route.
         db::delete_agent_sessions_for_workspace(conn, id)?;

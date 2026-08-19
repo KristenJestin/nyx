@@ -1,5 +1,5 @@
 // The REAL app CSS must be loaded so the Idées layout paints with its true Tailwind
-// utilities (grid tracks, `min-w-[clamp(...)]`, `overflow-*`, `h-svh`). In browser mode
+// utilities (grid tracks, `min-w-[clamp(...)]`, `overflow-*`, `h-app`). In browser mode
 // only CSS a spec imports is applied (see `terminal.browser.test.tsx` importing xterm.css);
 // `vitest.config.ts` wires `@tailwindcss/vite` so this `@import "tailwindcss"` truly compiles.
 import "@/globals.css";

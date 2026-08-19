@@ -872,6 +872,20 @@ diesel::table! {
     }
 }
 
+// - the app-level preference store adds `app_settings`: ONE row per global preference of the
+//   installation, keyed by its stable `key` (a constant in `db.rs`, never a literal at a call
+//   site). `value` is the serialized preference — a scalar verbatim, a structured one as JSON —
+//   and `updated_at` is epoch ms. NO `joinable!` and no FK: an app preference is scoped to the
+//   installation, so it references nothing and nothing cascades it away. The ABSENCE of a row is
+//   the meaningful "user expressed nothing" state, so clearing a preference deletes its row.
+diesel::table! {
+    app_settings (key) {
+        key -> Text,
+        value -> Text,
+        updated_at -> BigInt,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
 diesel::joinable!(managed_commands -> projects (project_id));
@@ -931,6 +945,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     agent_sessions,
     annex_blobs,
     annexes,
+    app_settings,
     command_instances,
     command_slots,
     design,

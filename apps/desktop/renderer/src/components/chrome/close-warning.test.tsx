@@ -6,9 +6,13 @@ import { WindowControls } from "./window-controls";
 import type { CloseWarning } from "./close-warning";
 
 /**
- * Stub `agent_close_warnings` with a configurable result + count the window `close`
- * ops. The close goes through `nyxBridge.window.close()` (shell-agnostic), which the
- * fake records into `windowCalls` — we count those (no Tauri-internals plumbing).
+ * Stub `agent_close_warnings` with a configurable result + count the window close ops.
+ *
+ * The close goes through `nyxBridge.window.confirmClose()` (shell-agnostic), which the
+ * fake records into `windowCalls` — we count those (no Tauri-internals plumbing). It is
+ * `confirmClose` and not `close` ON PURPOSE: this component has just run the very check
+ * the shell's close guard would run, and a plain `close()` re-enters that guard, which
+ * would ask the user the same question a second time (see `doClose`).
  */
 function installIpc(warnings: CloseWarning[]): { closeCalls: () => number } {
   mockIPC((cmd) => {
@@ -16,7 +20,7 @@ function installIpc(warnings: CloseWarning[]): { closeCalls: () => number } {
     return null;
   });
   const fake = bridgeFake();
-  return { closeCalls: () => fake.windowCalls.filter((c) => c === "close").length };
+  return { closeCalls: () => fake.windowCalls.filter((c) => c === "confirmClose").length };
 }
 
 const warn = (id: string, message: string): CloseWarning => ({

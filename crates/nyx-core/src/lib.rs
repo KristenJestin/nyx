@@ -88,6 +88,7 @@ pub mod review_comment;
 pub mod schema;
 pub mod seed;
 pub mod shellinteg;
+pub mod shells;
 pub mod spec_activity;
 pub mod subfolder;
 pub mod usecase;

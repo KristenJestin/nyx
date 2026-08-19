@@ -3,12 +3,14 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
+  Outlet,
   RouterProvider,
 } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { bridgeFake, mockIPC } from "@/bridge/test-harness";
+import { ActiveProjectProvider } from "@/components/terminals/active-project";
 
 import { PrototypePage } from "./prototype-page";
 import type { ProtoTree, RoundManifestPage } from "./proto-types";
@@ -297,9 +299,19 @@ function installBackend(
   });
 }
 
-/** Render the page under a memory router carrying the real route path (+ its back targets). */
+/**
+ * Render the page under a memory router carrying the real route path (+ its back targets), inside
+ * the `<ActiveProjectProvider>` the app's ROOT route wraps every page in (`router.tsx`) — the page
+ * now enters the Spec's owner project on load, and the provider is where that selection lives.
+ */
 function renderPage(search = "") {
-  const root = createRootRoute();
+  const root = createRootRoute({
+    component: () => (
+      <ActiveProjectProvider>
+        <Outlet />
+      </ActiveProjectProvider>
+    ),
+  });
   const proto = createRoute({
     getParentRoute: () => root,
     path: "/work/$specId/prototype",
@@ -339,15 +351,15 @@ describe("PrototypePage — the dedicated prototype route", () => {
 
   /**
    * DONE-CRITERION — THE ROUTE EXISTS AND CARRIES THE REVIEW'S CHASSIS. A prototype stands for a real
-   * web page; in the tab its stage measured 486 × 489. The page is `h-svh`, flanked by the two
+   * web page; in the tab its stage measured 486 × 489. The page is `h-app`, flanked by the two
    * `SidebarShell` rails, exactly like the code-review page it is in parity with.
    */
-  it("lays the review chassis out: h-svh between a left pages rail and a right panel", async () => {
+  it("lays the review chassis out: h-app between a left pages rail and a right panel", async () => {
     installBackend(protoTree());
     renderPage();
 
     const page = await screen.findByTestId("prototype-page");
-    expect(page.className).toContain("h-svh");
+    expect(page.className).toContain("h-app");
     expect(screen.getByLabelText("Prototype pages")).toBeTruthy();
     expect(screen.getByLabelText("Comments and node params")).toBeTruthy();
     // The breadcrumb is the review's: Work / <specKey> / Prototype.

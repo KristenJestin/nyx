@@ -36,7 +36,7 @@ export default defineConfig({
   // unresolved virtual module. Same compiler/jsx as `vite.config.ts`.
   // `tailwindcss()` compiles the REAL utility CSS from `globals.css` — matching the app build —
   // so a BROWSER-mode spec that imports `@/globals.css` gets the true Tailwind layout (grid
-  // tracks, `min-w-[clamp(...)]`, `overflow-*`, `h-svh`). Without it the utilities never emit and
+  // tracks, `min-w-[clamp(...)]`, `overflow-*`, `h-app`). Without it the utilities never emit and
   // a layout/overflow regression cannot be reproduced in the real browser. Only CSS that pulls in
   // `@import "tailwindcss"` (i.e. `globals.css`) is affected, so the other browser specs (which
   // never import it) render exactly as before.

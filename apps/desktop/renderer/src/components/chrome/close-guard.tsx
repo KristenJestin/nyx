@@ -7,8 +7,11 @@ import { fetchCloseWarnings, type CloseWarning } from "./close-warning";
 /**
  * `<CloseGuard>` — the OS-close interception for LIVE agent sessions (PRD v2.5.6 #1).
  *
- * nyx's window is frameless and its min/max/close controls belong to the user's WM —
- * so the CLOSE gesture arrives as an OS "close requested" signal, not an in-app button.
+ * This guard covers the closes that do NOT come from the app's own chrome: Alt-F4, the
+ * taskbar, a quit — anything that reaches the window as an OS "close requested" signal.
+ * (The chrome bar's own X is handled where it is clicked, by `<WindowControls>`, which
+ * runs the SAME check and then proceeds via `confirmClose` so this guard does not ask a
+ * second time.)
  * The Electron shell WITHHOLDS that close and relays it here (`window.onCloseRequested`);
  * this guard then asks the backend whether any LIVE agent session would be dropped (a
  * project that does NOT auto-resume, via `agent_close_warnings`). When none, it proceeds

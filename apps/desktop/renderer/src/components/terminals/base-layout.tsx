@@ -5,6 +5,7 @@ import {
   BriefcaseIcon,
   ComponentIcon,
   FolderPlusIcon,
+  PencilIcon,
   PlusIcon,
   SettingsIcon,
   SlidersHorizontalIcon,
@@ -23,7 +24,7 @@ import { reorderSensors, sameOrder } from "./reorder-dnd";
 import { startNavTransition } from "@/lib/nav-transition";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
-import { MenuItem, MenuSeparator } from "@/components/ui/menu";
+import { MenuGroup, MenuGroupLabel, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import {
   useProjects,
   type ProjectTree,
@@ -34,6 +35,7 @@ import { useAgentSessions } from "@/components/sidebar/use-agent-sessions";
 import { useReconcileTerminals } from "@/components/terminal/use-reconcile-terminals";
 import { SettingsDialog, type SettingsDialogHandle } from "@/components/sidebar/settings-dialog";
 import { ProjectSettingsDialog } from "@/components/sidebar/project-settings-dialog";
+import { ChromeBar } from "@/components/chrome/chrome-bar";
 import { CloseGuard } from "@/components/chrome/close-guard";
 import { isQuietState, StatusDot } from "./status-dot";
 import { projectRunState } from "./runtime-state";
@@ -148,6 +150,8 @@ interface ProjectRailActions {
   onOpenSettings: () => void;
   /** Add a (non-root) workspace to the project (folder picker → name dialog). */
   onAddWorkspace: () => void;
+  /** Open the RENAME dialog for a single workspace (`rename_workspace`), root included. */
+  onRenameWorkspace: (workspace: WorkspaceRecord) => void;
   /** Open the destructive-confirm flow for a single (non-root) workspace. */
   onRemoveWorkspace: (workspace: WorkspaceRecord) => void;
   /** Open the destructive-confirm flow for the whole project. */
@@ -162,26 +166,35 @@ interface ProjectRailActions {
  *  - **Project settings** → the modal whose Global pane owns the project RENAME
  *    (`update_project`) + the resume toggle;
  *  - **Add workspace** → the folder-picker/name flow (`create_workspace`);
- *  - one **Remove <workspace>** per NON-root workspace (the backend rejects removing a
- *    root; the whole-project delete removes it instead) → `workspace_delete`;
+ *  - one GROUP per NON-ROOT workspace, labelled with its name, carrying that workspace's own
+ *    **Rename workspace** (`rename_workspace`) and **Remove workspace**
+ *    (`workspace_delete`);
  *  - **Delete project** → `delete_project`.
  *
- * The two DESTRUCTIVE actions (remove workspace, delete project) are tinted
- * `destructive` and route through `useManualAdd`'s confirm dialogs, so nothing is
- * dropped without an explicit confirmation step.
+ * The per-workspace group replaces the former flat "Remove <workspace>" list (review
+ * `01M04WQEQDDPH7NQEK9MPYCXKS`): the workspace LINE is where the user looks for what to do to
+ * that workspace, and rename had no UI caller at all — `rename_workspace` existed in the bridge
+ * and in `use-projects`, and nothing ever invoked it.
+ *
+ * The ROOT workspace has NO group (review `01M0A7QGBK43MZB10RF51QR6TS`). It briefly got one, on
+ * the reasoning that renaming it is legitimate, with its Remove shown disabled and explained —
+ * but a section whose only content is one greyed row plus an explanation is a dead end that costs
+ * a read to discover. The root's lifecycle is the project's, and Delete project is the entry that
+ * reaches it. Its rename goes with the group, by the user's explicit call.
+ *
+ * The DESTRUCTIVE actions (remove workspace, delete project) are tinted `destructive` and route
+ * through `useManualAdd`'s confirm dialogs, so nothing is dropped without an explicit
+ * confirmation step.
  */
 function ProjectRailMenuItems({
   tree,
   onOpenSettings,
   onAddWorkspace,
+  onRenameWorkspace,
   onRemoveWorkspace,
   onDeleteProject,
 }: { tree: ProjectTree } & ProjectRailActions) {
   const name = tree.project.name;
-  // Only NON-root workspaces can be removed on their own; the root leaves with the
-  // whole project. Filtering here keeps a mono-root project's menu clean (no stray
-  // "Remove root" that the backend would reject).
-  const removable = tree.workspaces.filter((w) => !w.is_root);
   return (
     <>
       <MenuItem
@@ -198,22 +211,35 @@ function ProjectRailMenuItems({
       >
         Add workspace
       </MenuItem>
-      {removable.length > 0 && (
-        <>
-          <MenuSeparator />
-          {removable.map((ws) => (
+      {/* THE ROOT WORKSPACE GETS NO GROUP AT ALL (review `01M0A7QGBK43MZB10RF51QR6TS`). It used
+          to be listed with an active Rename and a DISABLED Remove carrying the backend's reason
+          — a section that cost a read to learn there was nothing to do in it. The root's whole
+          lifecycle is the project's: it is created with it, removed with it, and Delete project
+          (below) is the action that reaches it. Its rename goes with it, by the user's explicit
+          call. Non-root workspaces keep both entries, live. */}
+      {tree.workspaces
+        .filter((ws) => !ws.is_root)
+        .map((ws) => (
+          <MenuGroup key={ws.id}>
+            <MenuSeparator />
+            <MenuGroupLabel>{ws.name}</MenuGroupLabel>
             <MenuItem
-              key={ws.id}
+              icon={<PencilIcon className="size-4" />}
+              onClick={() => onRenameWorkspace(ws)}
+              aria-label={`Rename workspace ${ws.name} in ${name}`}
+            >
+              Rename workspace
+            </MenuItem>
+            <MenuItem
               destructive
               icon={<Trash2Icon className="size-4" />}
               onClick={() => onRemoveWorkspace(ws)}
               aria-label={`Remove workspace ${ws.name} from ${name}`}
             >
-              Remove {ws.name}
+              Remove workspace
             </MenuItem>
-          ))}
-        </>
-      )}
+          </MenuGroup>
+        ))}
       <MenuSeparator />
       <MenuItem
         destructive
@@ -362,6 +388,8 @@ function SortableProjectTile({
  * `<BaseLayout>` — the navigation SHELL, ported clean from the prototype against the
  * real design system:
  *
+ *  - the window's own CHROME BAR (`<ChromeBar>`) as the top strip, ABOVE the rail: the
+ *    window is frameless, so that bar is what moves / minimizes / maximizes / closes it;
  *  - a vertical RAIL on the left (~60px) listing the PROJECTS (`list_projects`): a
  *    letter tile + an AGGREGATED run-state dot (the project's whole runtime folded to
  *    one state, hidden when idle) when not entered, replaced by an animated active
@@ -377,16 +405,28 @@ function SortableProjectTile({
 export function BaseLayout() {
   const {
     projects,
+    loading: projectsLoading,
     createProject,
     createWorkspace,
     updateProject,
     deleteProject,
     deleteWorkspace,
+    renameWorkspace,
     reorderProjects,
     setProjectResumeAgentSessions,
   } = useProjects();
   const { activeProjectId, setActiveProjectId } = useActiveProject();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  // Does the CURRENT url carry one of the `/` route's RUNTIME deep-links (`?terminal=<id>` /
+  // `?command=<id>`, written by a Spec's Runtime tab)? Those target a precise runtime object of
+  // the project one is currently IN, so they go stale the instant another project is entered —
+  // see `enterProject`. Selected to a boolean so the shell re-renders only on the edge.
+  const hasRuntimeDeepLink = useRouterState({
+    select: (s) => {
+      const search = s.location.search as { terminal?: unknown; command?: unknown };
+      return search.terminal != null || search.command != null;
+    },
+  });
   const navigate = useNavigate();
 
   // APP-WIDE terminal-store reconciliation, mounted ONCE on the always-mounted shell. It disposes
@@ -405,16 +445,26 @@ export function BaseLayout() {
   //   - `addWorkspace` opens the picker then the add-workspace name dialog (`create_workspace`);
   //   - `removeProject` / `removeWorkspace` open the DESTRUCTIVE-confirm dialog before dropping a
   //     project (`delete_project`) or a single non-root workspace (`workspace_delete`) — so the
-  //     kebab's destructive actions always route through an explicit confirmation.
-  // `dialog` is the mounted modal set (create/edit/delete project + add workspace), rendered once
-  // below. Rename is NOT taken from here — the kebab opens the project-settings modal for that.
+  //     kebab's destructive actions always route through an explicit confirmation;
+  //   - `editWorkspace` opens the workspace RENAME dialog (`rename_workspace`) — the same
+  //     `<ProjectDialog>` shell with `entity="workspace"`, no second modal.
+  // `dialog` is the mounted modal set (create/edit/delete project + add/rename/remove workspace),
+  // rendered once below. The PROJECT rename is NOT taken from here — the context menu opens the
+  // project-settings modal for that.
   const {
     addProject,
     addWorkspace,
+    editWorkspace,
     removeProject,
     removeWorkspace,
     dialog: manualAddDialog,
-  } = useManualAdd({ createProject, createWorkspace, deleteProject, deleteWorkspace });
+  } = useManualAdd({
+    createProject,
+    createWorkspace,
+    deleteProject,
+    deleteWorkspace,
+    renameWorkspace,
+  });
 
   // The global Settings modal (gear at the foot of the rail → Integrations). The dialog
   // stays mounted (Motion animates its exit); we pull a fresh provider list ON THE OPEN
@@ -444,14 +494,74 @@ export function BaseLayout() {
     projectSettingsGen.current += 1;
   projectSettingsWasOpen.current = projectSettingsTree !== null;
 
+  /**
+   * ENTER a project — the ONE path the rail (and its recovery effect) goes through, because
+   * entering a project is a NAVIGATION, not only a selection (PRD fix 2).
+   *
+   * The defect: `onEnter` used to call `setActiveProjectId` alone, so switching project from a
+   * page SCOPED to the previous one (a Spec detail, a review, a prototype) left the view on that
+   * page — one ended up reading a page that does not belong to the entered project and had to
+   * re-navigate by hand.
+   *
+   * The landing page is `/` (Terminals) — NOT a new target: it is already scoped to the active
+   * project and already RESTORES that project's last terminal (`loadLastTerminalId(projectId)` in
+   * `<TerminalsPage>`), falling back to its existing empty state when the project has none. The
+   * change is routed through the SAME `startNavTransition` the section-nav uses, so the screen
+   * cross-fades instead of snapping (and it no-ops cleanly under reduced motion / jsdom).
+   *
+   * NO STACKING: when the route is ALREADY `/` there is nothing to navigate to — the page simply
+   * re-scopes to the newly entered project — so we skip the navigation entirely rather than push
+   * a second identical history entry.
+   *
+   * THE STALE DEEP-LINK (review `01M069MWRNR1PEZZW7YTPAHSKK`): "already on `/`" is NOT always
+   * "nothing to do". A Spec's Runtime tab opens a precise terminal/command by navigating to
+   * `/?terminal=<id>` (resp. `?command=`), and nothing clears that search afterwards. Those ids
+   * belong to the project one is LEAVING, so after the switch `<TerminalsPage>` waits forever for
+   * a target that will never appear in the entered project's runtime — and that pending deep-link
+   * SUPPRESSES its last-terminal restore, landing the user on an EMPTY deck. So when the url still
+   * carries one, we drop the search. `replace` keeps the no-stacking guarantee (and never leaves a
+   * back step pointing at another project's runtime object). The landing search is `{}` in the
+   * cross-route case too, so a stale deep-link can never ride along.
+   */
+  const enterProject = useCallback(
+    (projectId: string) => {
+      setActiveProjectId(projectId);
+      if (pathname === "/") {
+        if (hasRuntimeDeepLink) void navigate({ to: "/", search: {}, replace: true });
+        return;
+      }
+      startNavTransition(() => {
+        void navigate({ to: "/", search: {} });
+      });
+    },
+    [hasRuntimeDeepLink, navigate, pathname, setActiveProjectId],
+  );
+
   // Enter a project once the list loads (and recover when the entered project disappears, e.g.
   // it was deleted). RESTORE the LAST entered project (persisted, across relaunch) when it still
   // exists, else fall back to the FIRST — so a relaunch reopens where the user left off rather
   // than snapping to the first project. A no-op while a valid project is already entered, so the
-  // user's own selection is never overridden; and it never wipes the selection during the brief
-  // pre-load window (empty list + already-null id ⇒ nothing to do), which would otherwise drop
-  // the persisted id before the tree arrives.
+  // user's own selection is never overridden; and it stays SILENT for the whole pre-load window
+  // (the `loading` guard below), which would otherwise drop the persisted id — and any selection
+  // a deep-linked page made meanwhile — before the tree arrives.
+  //
+  // RECOVERY FROM A VANISHED PROJECT (PRD fix 2): when the project the user was INSIDE disappears
+  // (deleted), the current route may still be one of ITS pages, so the recovery goes through the
+  // same `enterProject` as an explicit switch — the fallback project is entered AND the view
+  // leaves the dead project's route. The FIRST entry (nothing entered yet, `activeProjectId ===
+  // null`) only SELECTS: at that point no route belongs to a previous project, and navigating
+  // would hijack a legitimate deep-link (a Spec opened directly) as the tree lands.
   useEffect(() => {
+    // AN EMPTY TREE MEANS "NO PROJECT" ONLY ONCE THE TREE HAS ACTUALLY LOADED. `projects` is also
+    // empty for the whole initial-load window (two IPC hops: `list_projects` then `list_workspaces`
+    // per project), and a Spec page deep-linked at that same moment ALREADY writes the entered
+    // project as soon as its `spec_detail` lands — one hop, so it can easily win the race. Without
+    // this guard the reset below then wiped that fresh selection AND its persisted hint
+    // (`setActiveProjectId(null)` → `saveLastProjectId(null)`), and nothing ever put it back: the
+    // Spec sync is once-per-loaded-Spec by design (`useSpecProjectSync`'s `applied` ref, which is
+    // what keeps a rail click from being undone by the page it left), so the user stayed in the
+    // WRONG project on the right Spec. While `loading`, the tree has no opinion yet — say nothing.
+    if (projectsLoading) return;
     if (projects.length === 0) {
       if (activeProjectId !== null) setActiveProjectId(null);
       return;
@@ -463,9 +573,10 @@ export function BaseLayout() {
         remembered != null && projects.some((p) => p.project.id === remembered)
           ? remembered
           : projects[0]!.project.id;
-      setActiveProjectId(restore);
+      if (activeProjectId === null) setActiveProjectId(restore);
+      else enterProject(restore);
     }
-  }, [projects, activeProjectId, setActiveProjectId]);
+  }, [projectsLoading, projects, activeProjectId, setActiveProjectId, enterProject]);
 
   // INERT e2e seam (`window.__nyxWork`), GATED behind the build-time `VITE_NYX_E2E=1` flag —
   // published ONLY by the `build:e2e` renderer build, tree-shaken out of a real production
@@ -557,94 +668,112 @@ export function BaseLayout() {
   };
 
   return (
-    <div className="grid h-svh grid-cols-[60px_1fr] bg-background text-foreground">
-      <aside className="flex h-svh flex-col items-center border-r border-border/60 bg-muted/40 py-3">
-        {/* DRAG-REORDER the rail's PROJECTS (v2.5.6): one `DragDropProvider` around the project
+    // The SHELL ROOT is the one box that spans the FULL window — hence `h-[100svh]` and not
+    // `h-app`, the project utility (globals.css) that means "the app's USABLE height", i.e.
+    // the viewport MINUS the chrome bar, which is what every routed page below claims. The
+    // bar is drawn INSIDE this box, so this one has to include it.
+    <div className="flex h-[100svh] flex-col bg-background text-foreground">
+      {/* THE WINDOW'S OWN TITLE BAR, above everything — the rail included. The window is
+          frameless (`frame: false`, src/main/window.ts), so this strip is the ONLY thing
+          that lets a mouse move, minimize, maximize or close it: under Windows an
+          undecorated window gets nothing from the OS, and a shell that never mounted this
+          left the user with a window they could not even close (review finding
+          `01M04Z5GCYA3S0T0K6XE125KZS`). It is mounted HERE, on the always-mounted
+          navigation shell, so the chrome is present on every route. `controlsVisible` is
+          left unset on purpose: the bar resolves it at runtime from the OS env
+          (`NYX_WINDOW_CONTROLS`, permissive default) rather than from a hard-coded prop. */}
+      <ChromeBar />
+
+      <div className="grid min-h-0 flex-1 grid-cols-[60px_1fr]">
+        <aside className="flex h-full flex-col items-center border-r border-border/60 bg-muted/40 py-3">
+          {/* DRAG-REORDER the rail's PROJECTS (v2.5.6): one `DragDropProvider` around the project
             tiles (the "+ add project" tile is not sortable). A drop reorders the tree
             optimistically and persists via `projects_reorder` (`reorderProjects`), so the order
             survives a reload. Reuses the SAME dnd-kit setup as the terminal rows. */}
-        <DragDropProvider
-          sensors={reorderSensors}
-          onDragEnd={(event) => {
-            if (event.canceled) return;
-            const ids = projects.map((p) => p.project.id);
-            const next = move(ids, event);
-            if (!sameOrder(next, ids)) void reorderProjects(next);
-          }}
-        >
-          <ul className="flex flex-col items-center gap-1.5">
-            {projects.map((tree, index) => {
-              const active = tree.project.id === activeProjectId;
-              // The project CRUD actions, threaded into the right-click context menu (the sole
-              // entry point — finding #24). Rename opens the project-settings modal (its Global
-              // pane owns `update_project`); the destructive actions route through `useManualAdd`'s
-              // confirm dialogs (`removeProject` / `removeWorkspace`).
-              const railActions = {
-                onOpenSettings: () => setProjectSettingsTree(tree),
-                onAddWorkspace: () => void addWorkspace(tree),
-                onRemoveWorkspace: (ws: WorkspaceRecord) => removeWorkspace(ws),
-                onDeleteProject: () => removeProject(tree),
-              };
-              return (
-                <SortableProjectTile
-                  key={tree.project.id}
-                  tree={tree}
-                  index={index}
-                  active={active}
-                  railActions={railActions}
-                  onEnter={() => setActiveProjectId(tree.project.id)}
-                />
-              );
-            })}
-            <li>
-              <button
-                type="button"
-                onClick={() => void addProject()}
-                className="flex size-9 items-center justify-center rounded-lg border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-                aria-label="Add project"
-                title="Add project"
-              >
-                <PlusIcon className="size-4" />
-              </button>
-            </li>
+          <DragDropProvider
+            sensors={reorderSensors}
+            onDragEnd={(event) => {
+              if (event.canceled) return;
+              const ids = projects.map((p) => p.project.id);
+              const next = move(ids, event);
+              if (!sameOrder(next, ids)) void reorderProjects(next);
+            }}
+          >
+            <ul className="flex flex-col items-center gap-1.5">
+              {projects.map((tree, index) => {
+                const active = tree.project.id === activeProjectId;
+                // The project CRUD actions, threaded into the right-click context menu (the sole
+                // entry point — finding #24). Rename opens the project-settings modal (its Global
+                // pane owns `update_project`); the destructive actions route through `useManualAdd`'s
+                // confirm dialogs (`removeProject` / `removeWorkspace`).
+                const railActions = {
+                  onOpenSettings: () => setProjectSettingsTree(tree),
+                  onAddWorkspace: () => void addWorkspace(tree),
+                  onRenameWorkspace: (ws: WorkspaceRecord) => editWorkspace(ws),
+                  onRemoveWorkspace: (ws: WorkspaceRecord) => removeWorkspace(ws),
+                  onDeleteProject: () => removeProject(tree),
+                };
+                return (
+                  <SortableProjectTile
+                    key={tree.project.id}
+                    tree={tree}
+                    index={index}
+                    active={active}
+                    railActions={railActions}
+                    onEnter={() => enterProject(tree.project.id)}
+                  />
+                );
+              })}
+              <li>
+                <button
+                  type="button"
+                  onClick={() => void addProject()}
+                  className="flex size-9 items-center justify-center rounded-lg border border-dashed border-border/70 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                  aria-label="Add project"
+                  title="Add project"
+                >
+                  <PlusIcon className="size-4" />
+                </button>
+              </li>
+            </ul>
+          </DragDropProvider>
+
+          <div className="my-4 h-px w-7 bg-border/60" />
+
+          <ul className="flex flex-1 flex-col items-center gap-1">
+            {NAV.map((item) => renderNavItem(item))}
           </ul>
-        </DragDropProvider>
 
-        <div className="my-4 h-px w-7 bg-border/60" />
-
-        <ul className="flex flex-1 flex-col items-center gap-1">
-          {NAV.map((item) => renderNavItem(item))}
-        </ul>
-
-        {/* THE REFERENCE ENTRIES, at the foot — see [`FOOT_NAV`]. Same element, same active
+          {/* THE REFERENCE ENTRIES, at the foot — see [`FOOT_NAV`]. Same element, same active
             indicator, same transition as the work entries above; only the place differs, because
             what they are differs. */}
-        <ul className="flex flex-col items-center gap-1">
-          {FOOT_NAV.map((item) => renderNavItem(item))}
-        </ul>
+          <ul className="flex flex-col items-center gap-1">
+            {FOOT_NAV.map((item) => renderNavItem(item))}
+          </ul>
 
-        {/* The global Settings entry point (rebranched from the removed sidebar head). It
+          {/* The global Settings entry point (rebranched from the removed sidebar head). It
             sits at the FOOT of the rail — the section-nav `<ul>` above is `flex-1`, so this
             is pushed to the bottom. Opening it pulls a fresh integration list (via the
             dialog's imperative `reload`) so the Integrations tab can install/uninstall the
             Claude plugin. */}
-        <Tooltip label="Settings">
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Settings"
-            onClick={openSettings}
-            className="mt-1"
-          >
-            <SettingsIcon />
-          </Button>
-        </Tooltip>
-      </aside>
+          <Tooltip label="Settings">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Settings"
+              onClick={openSettings}
+              className="mt-1"
+            >
+              <SettingsIcon />
+            </Button>
+          </Tooltip>
+        </aside>
 
-      {/* min-w-0 lets the 1fr cell follow the track, not its content (else a wide page
-          forces horizontal scroll). The routed page fills this column. */}
-      <div className="min-w-0">
-        <Outlet />
+        {/* min-w-0 lets the 1fr cell follow the track, not its content (else a wide page
+            forces horizontal scroll). The routed page fills this column. */}
+        <div className="min-w-0">
+          <Outlet />
+        </div>
       </div>
 
       {/* The OS close-warning guard: intercepts the WM close / quit and confirms before

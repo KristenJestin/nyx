@@ -741,9 +741,71 @@ impl Ctx<'_> {
             }
             "delete_project" => {
                 let id = self.arg_str("id")?;
+                // RUNTIME kill owned by the bridge — the SAME pattern as `workspace_delete`
+                // below, restricted to the ONE authority a project delete strands: STOP every
+                // command instance of the project BEFORE delegating.
+                //
+                // WHY IT MUST HAPPEN HERE. The delete cascades through the FKs
+                // (`workspaces.project_id`, then `command_instances.workspace_id` and
+                // `managed_commands.project_id`, all ON DELETE CASCADE), so the
+                // `command_instances` row that IS the stop handle is erased WHILE the process
+                // still runs: after the commit nothing in the DB can name it, and the managed
+                // command survives the project it belonged to. The live-process authority (the
+                // runner) is the sidecar's, not reachable from the nyx-core use case's
+                // `&mut SqliteConnection` — so the kill runs at the bridge, before delegation.
+                //
+                // ONE bulk `stop_many`, not a loop of `stop` — the SAME two-phase reasoning as
+                // `close_records` below, applied to managed commands. A loop pays its two WAITS
+                // serially (`TERM_GRACE` 750 ms + `PUMP_JOIN_TIMEOUT` 500 ms = up to 1.25 s per
+                // LIVE instance) on this single request-serving thread, against the supervisor's
+                // 5 s per-request deadline: from four live commands the delete timed out, the
+                // renderer skipped its detach and the sidebar kept showing a deleted project.
+                // `stop_many` SIGTERMs every tree first and only then waits, so the WAIT is ~one
+                // grace + one join window for the whole project, whatever N is. A project spans
+                // every workspace, so N is exactly where this bites hardest.
+                //
+                // It also FILTERS ON LIVENESS, which a loop of `stop` did not: `stop` force-emits
+                // `idle` for an ABSENT entry to reconcile a phantom dot, which here would write a
+                // `command.stopped` domain event (audit rows outlive the cascade, by design) plus
+                // two frames for every instance that NEVER ran. `stop_many` skips those silently
+                // — the rows are about to be deleted, there is no dot left to reconcile.
+                //
+                // WHAT IS DELIBERATELY *NOT* DONE. The project's TERMINALS are NOT closed. Unlike
+                // `workspace_delete` (which closes them because their rows are deleted),
+                // `terminals.workspace_id` is ON DELETE SET NULL here: the terminals SURVIVE,
+                // DETACHED and still running, which is what the delete dialog promises and what
+                // `delete_project_removes_workspaces_and_detaches_but_keeps_terminals`
+                // (nyx-core `db.rs`) attests. Adding a `close_record` loop here would break both.
+                let instance_ids = self
+                    .db()
+                    .with_conn(|c| db::instance_ids_for_project(c, &id))
+                    .map_err(Self::db_err)?;
+                // The runner handle is CLONED OUT of the cell and the guard dropped BEFORE the
+                // stop: `stop_many` sleeps `TERM_GRACE` and joins pumps for up to
+                // `PUMP_JOIN_TIMEOUT`, and holding the cell's mutex across a second of pure
+                // waiting would block every other reader of it (the template running-guard, the
+                // run-state overlay every workspace-runtime read pulls) for exactly that long.
+                // The cell only ever guards the `Option<Arc<…>>` slot, never the runner's own
+                // state, so a clone is the whole handle.
+                let runner = self.runtime.runner_cell().lock().unwrap().clone();
+                if let Some(runner) = runner {
+                    runner.stop_many(&instance_ids);
+                }
                 self.db()
                     .with_conn(|c| db::delete_project(c, &id))
                     .map_err(Self::db_err)?;
+                // `delete_project` DETACHES every terminal of the project
+                // (`terminals.workspace_id` ON DELETE SET NULL) — a TERMINAL mutation, so the
+                // terminal read models have to hear about it or they keep a `workspace_id`
+                // pointing at a workspace that no longer exists (the row is then filed under a
+                // project the sidebar no longer renders, i.e. it vanishes until a relaunch).
+                // Emitted HERE and not through `mutates_terminals`: that list is an `else if`
+                // arm of the broadcast chain, so an entry there would REPLACE the
+                // `workspaces://changed` push this command gets from
+                // `pushes_workspace_tree_legacy` — and the project tree needs both.
+                self.events.emit(Event::Changed {
+                    topic: "terminals".to_string(),
+                });
                 Ok("null".to_string())
             }
             "set_project_collapsed" => {
@@ -875,8 +937,11 @@ impl Ctx<'_> {
                 // so the kill runs HERE — the same pattern as `create_workspace`'s FS
                 // precondition. This REPLACES the former "refuse while a command runs" guard
                 // (review 01KWEX11 — "Tout supprimer + tuer les vivants": the user wants the
-                // workspace's runtime cleared, not to be blocked). `stop`/`close_record` are
-                // idempotent, so passing the full membership lists (no live-filter) is safe.
+                // workspace's runtime cleared, not to be blocked). The full membership lists are
+                // passed as-is: the two bulk teardowns do their OWN filtering — `stop_many` acts
+                // only on instances the runner backs as RUNNING, `close_records` only on live
+                // PTYs — so an unknown id is skipped silently rather than reconciled into a
+                // `command.stopped` audit row for a command that never ran.
                 let instance_ids = self
                     .db()
                     .with_conn(|c| db::instance_ids_for_workspace(c, &id))
@@ -885,17 +950,25 @@ impl Ctx<'_> {
                     .db()
                     .with_conn(|c| db::terminal_ids_for_workspace(c, &id))
                     .map_err(Self::db_err)?;
-                {
-                    let guard = self.runtime.runner_cell().lock().unwrap();
-                    if let Some(runner) = guard.as_ref() {
-                        for instance_id in &instance_ids {
-                            let _ = runner.stop(instance_id);
-                        }
-                    }
+                // ONE bulk stop, not a loop of `stop`: `stop_many` SIGTERMs every live tree
+                // BEFORE waiting on the first grace, so a workspace with N running commands
+                // pays ~one `TERM_GRACE` + one `PUMP_JOIN_TIMEOUT` instead of N × 1.25 s on
+                // the sidecar's single request-serving thread — the same reasoning as the
+                // `close_records` below, and the same 5 s supervisor deadline at stake.
+                //
+                // The handle is CLONED OUT and the cell's guard dropped BEFORE that wait: the
+                // mutex guards the `Option<Arc<…>>` slot, never the runner's own state, so
+                // holding it across a second of sleeping would block every other reader of the
+                // cell (the template running-guard, the run-state overlay) for nothing.
+                let runner = self.runtime.runner_cell().lock().unwrap().clone();
+                if let Some(runner) = runner {
+                    runner.stop_many(&instance_ids);
                 }
-                for terminal_id in &terminal_ids {
-                    self.runtime.pty().close_record(terminal_id);
-                }
+                // ONE bulk close, not a loop of `close_record`: `close_records` raises every
+                // terminal's `closing` flag before joining the first pump, so a workspace with
+                // N terminals pays ~one `PUMP_CLOSE_POLL` window instead of N (50 ms vs N × 50
+                // ms on the sidecar's single request-serving thread).
+                self.runtime.pty().close_records(&terminal_ids);
                 // The DB-expressible business decision (root invariant + runtime-row delete +
                 // the `workspace.removed` domain event) is the SINGLE `usecase::remove_workspace`,
                 // shared with the MCP route — no invariant is duplicated in this bridge. The
@@ -1851,6 +1924,63 @@ impl Ctx<'_> {
                 let provider = self.arg_str("provider")?;
                 self.integration_remove(&provider)
                     .and_then(|s| Self::json(&s))
+            }
+            // --- Settings -> Terminal: the DEFAULT-SHELL preference (`nyx_core::shells`) --------
+            //
+            // Three commands, one authority. `shell_list` DISCOVERS what the machine offers (a
+            // filesystem/`PATH`/WSL probe, no DB); `app_settings_get` / `set_default_shell` read
+            // and write the app-level preference store (`app_settings`). The RESOLUTION that
+            // consumes the preference lives on the spawn path
+            // ([`PtyManager::spawn_pty`](super::pty::PtyManager)), not here — this dispatch only
+            // records the choice.
+            //
+            // No `changed` broadcast: the preference is read at the NEXT terminal spawn, so there
+            // is no surface to invalidate — the terminals on screen are deliberately untouched.
+            //
+            // `shell_list` DOES NOT WAIT (review `01M0BT262WB7VZQKHQZHEP281T`). This arm runs on
+            // the single dispatch thread, so a probe waited on here is a probe every other command
+            // waits on — a keystroke's `pty_write` included. `detect` therefore answers the WSL
+            // half from a cache refreshed on its own worker (`nyx_core::shells`), warmed once at
+            // boot by the binary's `run` (`main.rs`, before the loop starts serving); what is left
+            // inline is filesystem/`PATH` existence checks.
+            "shell_list" => Self::json(&nyx_core::shells::detect()),
+            "app_settings_get" => {
+                /// The global-preferences snapshot the Settings modal reads. One field today; a
+                /// STRUCT rather than a bare value so a second preference is an added field on a
+                /// shape the renderer already pulls, not a second command.
+                #[derive(serde::Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct AppSettings {
+                    /// The user's chosen shell, or `null` for "Auto" (nothing expressed → the
+                    /// historical `$SHELL` / per-OS resolution).
+                    default_shell: Option<nyx_core::shells::ShellChoice>,
+                }
+                self.db()
+                    .with_conn(nyx_core::shells::preference)
+                    .map_err(Self::db_err)
+                    .and_then(|default_shell| Self::json(&AppSettings { default_shell }))
+            }
+            "set_default_shell" => {
+                // `path` ABSENT or null is the "Auto" pick — it CLEARS the preference rather than
+                // storing an empty one, so the reader can tell "the user chose Auto" from "the
+                // user chose a shell" without a second convention (see `db::set_app_setting`).
+                let choice = self.arg_opt_str("path").map(|path| {
+                    let args = self
+                        .args
+                        .get("args")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    nyx_core::shells::ShellChoice { path, args }
+                });
+                self.db()
+                    .with_conn(|c| nyx_core::shells::set_preference(c, choice.as_ref()))
+                    .map_err(Self::db_err)?;
+                Ok("null".to_string())
             }
             // --- v2.6 KNOWLEDGE READ models (Phase 4 — the Idées view + the Spec-detail
             //     annexes/dependency badges). Pure reads over the SAME `nyx_core::db` / `nyx_core::idea`
@@ -3184,10 +3314,15 @@ fn mutates_review_findings(command: &str) -> bool {
 /// (`reorder` drives the tree's optimistic order; a re-pull would clobber it). `auto_attach_terminal`
 /// is INCLUDED but emits only when it actually re-bound (`changed == true`); it is handled at its
 /// call-site, not by this list, because the emission is conditional on the resolver's decision.
+/// INCLUDED although it is a TREE op and not a terminal op: `workspace_delete` DELETES the
+/// workspace's terminal records inside `usecase::remove_workspace`'s transaction. Its own
+/// `workspaces://changed` push does NOT refresh the terminal list (a different topic), so without
+/// this entry the deleted rows stayed on screen — reclassified as loose terminals by the
+/// renderer's optimistic detach — until an unrelated action happened to trigger a re-list.
 fn mutates_terminals(command: &str) -> bool {
     matches!(
         command,
-        "create_terminal" | "close_terminal" | "attach_terminal" | "rename"
+        "create_terminal" | "close_terminal" | "attach_terminal" | "rename" | "workspace_delete"
     )
 }
 
@@ -3445,6 +3580,272 @@ mod tests {
                 .iter()
                 .any(|e| e.event_type == "workspace.renamed" && e.source == "ui"),
             "the UI rename emitted a workspace.renamed domain_event (source=ui)"
+        );
+    }
+
+    /// A long-lived managed command for the delete-project runtime test, expressed for the
+    /// shell the command runtime will REALLY use: [`nyx_core::pty::resolve_shell`] is the SAME
+    /// resolution `CommandPty::spawn` performs, so the test never guesses which interpreter
+    /// gets the line. The bool says whether the line prints `PID:<pid>` first — `cmd.exe` (the
+    /// last-resort Windows shell) has no portable idiom for its own pid, so there the OS-level
+    /// half of the assertion is skipped and the runner's verdict carries it alone.
+    ///
+    /// 120 s is the depot's ceiling for a long test command (nyx-core `command.rs` uses 30 /
+    /// 60 / 120 s), and it is a CEILING, not a duration the green path ever waits out: the
+    /// test kills the process itself within a couple of seconds. It only has to outlive the
+    /// test, which the ReapOnDrop guard below then bounds on the red path too.
+    fn long_running_command() -> (&'static str, bool) {
+        let shell = nyx_core::pty::resolve_shell();
+        let stem = std::path::Path::new(&shell)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        match stem.as_str() {
+            // `$PID` is the PowerShell process itself — the direct child of the spawn, i.e. the
+            // pid `kill_tree_windows` hands to `taskkill /T /F`.
+            "pwsh" | "powershell" => (
+                "Write-Output ('PID:' + $PID); Start-Sleep -Seconds 120",
+                true,
+            ),
+            "cmd" => ("ping -n 120 127.0.0.1", false),
+            // POSIX: `$$` is the shell's own pid — which `setsid` also made the pgid, i.e. the
+            // `kill(-pgid, …)` target. EXCEPT under an msys/Cygwin bash on Windows, where `$$`
+            // is the emulator's private pid and means nothing to `tasklist`/`taskkill`; there
+            // `/proc/$$/winpid` holds the real Windows pid of the very `bash.exe` the spawn
+            // started. Probing for that file keeps ONE line correct on both.
+            //
+            // WHEN this branch is really taken on Windows — the honest version, after review
+            // `01M0BT18YDV1PN2G39JCDD5WYZ` corrected the claim that used to stand here. It is
+            // NOT "whenever the dev box runs Git Bash": the `SHELL=/bin/bash.exe` such a shell
+            // exports is a POSIX path that Windows resolves against the current drive root, so
+            // `resolve_shell` now REJECTS it (it is not spawnable) and this test runs the
+            // PowerShell branch above — the case that used to make it die at `runner.start`
+            // with `CreateProcessW … The system cannot find the path specified`. The branch is
+            // reached on Windows only when `$SHELL` names a bash the OS can actually start (an
+            // absolute Windows path, e.g. `C:\Program Files\Git\bin\bash.exe`), and on Unix
+            // always. All three configurations are green, and all three were measured.
+            _ => (
+                "if [ -r /proc/$$/winpid ]; then echo PID:$(cat /proc/$$/winpid); \
+                 else echo PID:$$; fi; sleep 120",
+                true,
+            ),
+        }
+    }
+
+    /// Is `pid` still in the OS process table? The sidecar-side twin of the probes nyx-core's
+    /// `tree_kill_reaps_grandchild` tests use.
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    fn pid_alive(pid: u32) -> bool {
+        match nyx_core::proc_util::command("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+
+    /// Review `01M0AJ4F6RMS4CHWQ5B6DB47RC` — DELETING A PROJECT STOPS ITS MANAGED COMMANDS.
+    ///
+    /// `delete_project` was a bare `db::delete_project`. The delete cascades through
+    /// `workspaces.project_id` → `command_instances.workspace_id` (and
+    /// `managed_commands.project_id`), so the row that IS the stop handle was erased WHILE the
+    /// process ran: the command outlived the project it belonged to, with nothing left in the
+    /// DB able to name it. The bridge now stops every instance of the project FIRST, the way
+    /// `workspace_delete` already did for a workspace.
+    ///
+    /// Proven at the OS level, not merely in the runner's bookkeeping: the command prints its
+    /// own pid, and after the delete that pid must LEAVE the process table.
+    ///
+    /// The other half of the contract is asserted in the same pass, because it is exactly what
+    /// a careless copy of `workspace_delete` would break: the project's TERMINAL records are
+    /// NOT deleted and NOT closed — they survive DETACHED (`terminals.workspace_id` is
+    /// `ON DELETE SET NULL`), which is what the delete dialog promises.
+    #[test]
+    fn delete_project_stops_its_running_managed_commands_but_keeps_terminals() {
+        let h = Harness::new();
+        // Wire a REAL managed-command runner into the runtime's shared cell, exactly as
+        // `Runtime::attach_events` does at boot — the cell the `delete_project` arm reads.
+        let commands = crate::runtime::command::CommandRuntime::new(
+            Arc::clone(h.runtime.db()),
+            h.events.clone(),
+        );
+        let runner = commands.runner();
+        *h.runtime.runner_cell().lock().unwrap() = Some(Arc::clone(&runner));
+
+        // REAP ON UNWIND. Nothing in the test's own machinery kills this managed command when
+        // an assertion fails BEFORE the delete: `CommandPty::drop` belongs to the pump thread
+        // — detached, so it never runs when the test binary exits — and the Windows job object
+        // that reaps the sidecar's children in PRODUCTION (`nyx-sidecar` `Cargo.toml`, the
+        // `cfg(windows)` section) does not exist in a test binary. What is left is
+        // PLATFORM-DEPENDENT, which is precisely why the guard is explicit rather than assumed:
+        // on Windows the ConPTY master closes with the process and the shell does die with it
+        // (MEASURED — a forced panic here with the guard removed left no pid behind), but on
+        // Unix the shell is a `setsid` SESSION LEADER whose lifetime is not tied to its
+        // parent's, so it and its `sleep` outlive a red run. `kill_all_running` is the right
+        // primitive here: hard tree-kill, no grace, no join, no state emit — and a no-op on the
+        // green path, where the delete under test already stopped everything.
+        struct ReapOnDrop(
+            Arc<nyx_core::command::CommandRunner<crate::runtime::command::SidecarRunnerSink>>,
+        );
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                self.0.kill_all_running();
+            }
+        }
+        let _reap = ReapOnDrop(Arc::clone(&runner));
+
+        // A project rooted at the harness's temp dir (a real, existing cwd for the spawn).
+        let root = h.runtime.data_dir().to_string_lossy().to_string();
+        let created: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "create_project",
+                serde_json::json!({ "name": "Doomed", "rootPath": root }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let project_id = created["project"]["id"].as_str().unwrap().to_string();
+        let root_ws_id = created["root"]["id"].as_str().unwrap().to_string();
+
+        // A terminal RECORD attached to the project's root workspace: the survivor.
+        let terminal: serde_json::Value = serde_json::from_str(
+            &h.run("create_terminal", serde_json::json!({ "cwd": root }))
+                .unwrap(),
+        )
+        .unwrap();
+        let record_id = terminal["id"].as_str().unwrap().to_string();
+        h.run(
+            "attach_terminal",
+            serde_json::json!({ "terminalId": record_id, "workspaceId": root_ws_id, "mode": "manual" }),
+        )
+        .unwrap();
+
+        // A managed-command TEMPLATE materializes one instance in the root workspace.
+        let (cmdline, prints_pid) = long_running_command();
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                db::create_template(
+                    c,
+                    &project_id,
+                    "dev",
+                    cmdline,
+                    None,
+                    db::CommandSource::default(),
+                )
+            })
+            .unwrap();
+        let instance_id = h
+            .runtime
+            .db()
+            .with_conn(|c| db::instance_ids_for_project(c, &project_id))
+            .unwrap()
+            .pop()
+            .expect("the template materialized one instance in the root workspace");
+
+        // START it for real, and wait until it has PRINTED its pid — proof the process is up,
+        // not a delay we granted it.
+        runner
+            .start(&instance_id, cmdline, Some(&root))
+            .expect("the managed command starts");
+        // The marker lands MID-LINE: a shell's first bytes are its terminal-setup escapes
+        // (`ESC[6n`, the OSC 0 title, …), so the pid is scanned for as a SUBSTRING, never
+        // anchored on a line start. A trailing delimiter must have arrived too, otherwise a
+        // half-streamed `PID:60` would parse as the pid 60.
+        fn parse_pid(out: &str) -> Option<u32> {
+            let at = out.find("PID:")? + "PID:".len();
+            let digits: String = out[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if digits.is_empty() || out.len() <= at + digits.len() {
+                return None;
+            }
+            digits.parse().ok()
+        }
+        let mut pid: Option<u32> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while prints_pid && std::time::Instant::now() < deadline {
+            if let Some(found) = runner
+                .live_output(&instance_id)
+                .as_deref()
+                .and_then(parse_pid)
+            {
+                pid = Some(found);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !prints_pid || pid.is_some(),
+            "the managed command must have printed its pid before the delete"
+        );
+        if let Some(pid) = pid {
+            assert!(
+                pid_alive(pid),
+                "the command process ({pid}) is alive before the delete"
+            );
+        }
+        assert!(
+            runner.is_running(&instance_id),
+            "the managed command is running before the delete"
+        );
+
+        // DELETE THE PROJECT — the whole point: this must not strand the live process.
+        h.run("delete_project", serde_json::json!({ "id": project_id }))
+            .unwrap();
+
+        // The runner no longer backs it, and it went to `Idle` — the state only `stop` produces
+        // (a natural exit would have yielded `Success`/`Error`).
+        assert!(
+            !runner.is_running(&instance_id),
+            "delete_project must stop the project's running command instances"
+        );
+        assert_eq!(
+            runner.state_of(&instance_id),
+            nyx_core::command::RunState::Idle,
+            "the instance was STOPPED (idle), not left running nor merely observed exiting"
+        );
+        // …and NO PROCESS SURVIVES: the pid must leave the OS process table.
+        if let Some(pid) = pid {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut reaped = false;
+            while std::time::Instant::now() < deadline {
+                if !pid_alive(pid) {
+                    reaped = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(
+                reaped,
+                "no process may survive the project delete — pid {pid} is still in the process table"
+            );
+        }
+
+        // The project (and its cascade) is really gone.
+        let projects = h.runtime.db().with_conn(db::list_projects).unwrap();
+        assert!(
+            projects.iter().all(|p| p.id != project_id),
+            "the project row is deleted"
+        );
+
+        // The terminal RECORD survives, DETACHED — unchanged behaviour, and the half that a
+        // copy of `workspace_delete` would destroy.
+        let survivor = h
+            .runtime
+            .db()
+            .with_conn(|c| db::get_terminal(c, &record_id))
+            .unwrap()
+            .expect("the project's terminal record survives the delete");
+        assert_eq!(
+            survivor.workspace_id, None,
+            "the terminal is DETACHED (workspace_id → NULL), never deleted nor closed"
         );
     }
 

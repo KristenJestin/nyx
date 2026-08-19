@@ -375,14 +375,14 @@ export function ComponentDetailPage() {
 
   if (loading) {
     return (
-      <div className="flex h-svh items-center justify-center bg-background">
+      <div className="flex h-app items-center justify-center bg-background">
         <Spinner className="text-muted-foreground/50" />
       </div>
     );
   }
   if (error || !component) {
     return (
-      <div className="flex h-svh flex-col bg-background px-6 pb-6 pt-10">
+      <div className="flex h-app flex-col bg-background px-6 pb-6 pt-10">
         <Breadcrumb className="mb-2">
           <Link to="/design" className={breadcrumbLinkClass}>
             Catalogue
@@ -396,7 +396,7 @@ export function ComponentDetailPage() {
 
   const nature = componentNature(component);
   return (
-    <div className="flex h-svh flex-col bg-background px-6 pb-6 pt-10">
+    <div className="flex h-app flex-col bg-background px-6 pb-6 pt-10">
       {/* THE NAME, ONCE (finding `01KZ3JW5A63TJWX83V8ZKX62CN`). It used to sit in the breadcrumb,
           in the title and in the preview's caption — three times inside 200 px, on a page whose
           whole subject is that one component. The TITLE keeps it; the breadcrumb is reduced to what

@@ -13,12 +13,47 @@ import type { Transition, Variants } from "motion/react";
  */
 
 /**
- * The OPEN panel's fixed width (px). The rail (A) / tiroir (B) both dock a `w-[380px]` panel to the
- * terminal's right edge; the width-animated SHELL (sidebar-shell idiom) animates its outer width
- * between `0` (closed) and this value (open), so the languette column to its LEFT "suit" the panel
- * as it opens/closes. Shared so the animate target and the fixed inner width never drift apart.
+ * The OPEN panel's MAXIMUM width (px) — the width it was FIXED at before the a11y review measured
+ * what it costs: on an 800px window (a ~480px pane) a fixed 380px panel hides 79% of the terminal,
+ * 50% on a 1080px one. The panel stays SUPERPOSED (no pane reflow, no xterm refit, no SIGWINCH —
+ * decided), only its width is now BOUNDED: see {@link overlayPanelWidth}.
  */
-export const OVERLAY_PANEL_WIDTH = 380;
+export const OVERLAY_PANEL_MAX_WIDTH = 380;
+/**
+ * The OPEN panel's MINIMUM width (px). The panel's content is calibrated for
+ * {@link OVERLAY_PANEL_MAX_WIDTH} (`<SpecTab>`/`<TasksTab>` are clamped to it in `spec-live-panel`),
+ * and below this floor it stops being readable — so a narrow pane keeps a 260px panel (still ~54% of
+ * a 480px pane, against 79% before) rather than an unreadable sliver.
+ */
+export const OVERLAY_PANEL_MIN_WIDTH = 260;
+/**
+ * Share of the HOST PANE the panel may take before the floor/ceiling bite. Exported like its two
+ * siblings because `overlay-panel-width.test.tsx` anchors the SLOPE on it (`pane × ratio`, between
+ * the knees) rather than on literal widths — the module's rule is "export only what someone
+ * consumes", and this is the consumer.
+ */
+export const OVERLAY_PANEL_PANE_RATIO = 0.45;
+
+/**
+ * The OPEN panel's width (px) for a host pane of `paneWidth` px:
+ * `min(380, max(0.45 × pane, 260))`.
+ *
+ * Bounded on the PANE — the box the overlay is anchored over — and NOT on the viewport: the pane is
+ * what the panel actually covers (the sidebar is not the panel's to hide), and it is the base of the
+ * measurements the review was written from.
+ *
+ * Resolved to a NUMBER on purpose. The width feeds both the shell's `animate={{ width }}` and the
+ * fixed width of the inner box it clips; Motion interpolates a CSS `min()`/`max()` value poorly, and
+ * the "no reflow, no horizontal overflow mid-animation" guarantee both overlays document depends on
+ * the inner being a settled pixel width. Rounded so the inner never lands on a sub-pixel.
+ */
+export function overlayPanelWidth(paneWidth: number): number {
+  const bounded = Math.min(
+    OVERLAY_PANEL_MAX_WIDTH,
+    Math.max(paneWidth * OVERLAY_PANEL_PANE_RATIO, OVERLAY_PANEL_MIN_WIDTH),
+  );
+  return Math.round(bounded);
+}
 
 /** Horizontal travel (px) the surface slides in from the terminal's right edge. */
 const SURFACE_SLIDE = 24;
@@ -39,7 +74,8 @@ export const overlaySurfaceVariants: Variants = {
 /**
  * The OPEN PANEL of the rail (A) / tiroir (B) — the wide Spec panel revealed when the languette is
  * CLICKED. It is OPACITY-ONLY: the panel's MOVEMENT (open/close collapse-expand) is driven ENTIRELY
- * by the width-animated SHELL (`0↔380`, sidebar-shell idiom), so the panel content stays FLUSH to the
+ * by the width-animated SHELL (`0 ↔ {@link overlayPanelWidth}`, sidebar-shell idiom), so the panel
+ * content stays FLUSH to the
  * shell's left edge for the whole animation and the fused active languette "suit" it and stays COLLÉE
  * (no horizontal `x` slide that would decouple the content from the shell's edge and open a hole /
  * read as a "pop" on close — the regression this fix removes). This shares the SAME sidebar spring as
@@ -49,7 +85,7 @@ export const overlaySurfaceVariants: Variants = {
  * arrival ring/pulse.
  *
  * SWITCH OVERLAP (review finding — "frame VIDE au switch"): on a Spec→Spec switch the shell width
- * stays `380` (a Spec remains open) and the panel's `<AnimatePresence>` runs in its default (sync)
+ * is UNCHANGED (a Spec remains open) and the panel's `<AnimatePresence>` runs in its default (sync)
  * mode — NOT `mode="wait"` — so the exiting and entering panels CHEVAUCHENT in the same
  * `absolute inset-0` slot instead of serializing. The `zIndex` keeps the ENTERING panel ABOVE the
  * exiting one (`initial`/`animate` = 1, `exit` = 0), so the incoming opaque `bg-card/95` surface rises

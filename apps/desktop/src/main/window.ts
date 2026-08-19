@@ -13,8 +13,11 @@
  *     `_blank` popups (the renderer can never spawn an uncontrolled BrowserWindow).
  *
  * Frameless: `frame: false` (cross-platform — same on Linux & Windows). The custom
- * chrome (drag region + min/max/close) is drawn by the React front and driven
- * through the `nyx:window/*` IPC channels (see `./ipc.ts`).
+ * chrome (drag region + min/max/close) is drawn by the React front — `<ChromeBar>`,
+ * mounted at the top of the navigation shell — and driven through the `nyx:window/*`
+ * IPC channels (see `./window-ipc.ts`). That bar is NOT decoration: under Windows the
+ * OS gives an undecorated window no controls at all, so it is the only thing standing
+ * between the user and a window they cannot move or close.
  */
 import { join } from "node:path";
 import { BrowserWindow, shell, type App } from "electron";
@@ -61,7 +64,9 @@ export function createMainWindow(app: App): BrowserWindow {
     show: false,
     backgroundColor: "#000000",
     webPreferences: {
-      // The ONLY bridge into the renderer — built from the allowlist in ./ipc.ts.
+      // The ONLY bridge into the renderer — built from the channel allowlist in
+      // ../shared/ipc.ts (`WINDOW_CHANNELS` + `CORE_CHANNELS`), whose main-side
+      // handlers live in ./window-ipc.ts and ./core-ipc.ts.
       preload: join(__dirname, "..", "preload", "index.js"),
       // Hardened renderer (these are the modern defaults; pinned explicitly so a
       // future Electron default-flip can't silently weaken the shell).
@@ -80,9 +85,10 @@ export function createMainWindow(app: App): BrowserWindow {
   });
 
   // --- Close guard: agent close-warning before the window is destroyed --------
-  // The frameless window is closed by the user's WM (its close button / Alt-F4 /
-  // quit) — nyx draws no close control of its own (they are the WM's job). WITHHOLD
-  // that OS close and ask the RENDERER first: it runs the agent close-warning flow
+  // A close can arrive from the OS (Alt-F4, taskbar, quit) or from the app's own chrome
+  // bar — whose X runs the warning itself and then comes back through
+  // `nyx:window/confirm-close`, so it does not trip this guard twice. WITHHOLD any other
+  // close and ask the RENDERER first: it runs the agent close-warning flow
   // (`agent_close_warnings`) and, only when clear or the user confirms, calls back
   // `confirmWindowClose` (the `confirm-close` IPC) which re-enters here having set the
   // confirmed flag, so the window actually closes. Fail-safe: if the webContents is

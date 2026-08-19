@@ -15,7 +15,7 @@ describe("<SidebarShell> (shared left sidebar chassis)", () => {
     // full height, muted surface.
     expect(aside.className).toContain("w-[260px]");
     expect(aside.className).toContain("border-r");
-    expect(aside.className).toContain("h-svh");
+    expect(aside.className).toContain("h-app");
     expect(aside.className).toContain("bg-muted/40");
     expect(aside.className).toContain("shrink-0");
     // No left border (it is a LEFT rail, not a right one).

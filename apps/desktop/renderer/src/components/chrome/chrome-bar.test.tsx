@@ -27,9 +27,32 @@ describe("<ChromeBar>", () => {
     // clearMocks runs in vitest.setup.ts afterEach.
   });
 
-  it("renders a drag region (data-tauri-drag-region)", () => {
+  /**
+   * The bar IS the drag strip, via the `drag-region` class → `-webkit-app-region: drag`
+   * (globals.css), the only protocol that moves a frameless Electron window. It used to
+   * claim `data-tauri-drag-region`, which nothing has interpreted since Tauri left
+   * (PDR-0006) — a bar that looked draggable and moved nothing. jsdom applies no
+   * stylesheet, so the class is what we can assert here; the attribute must be GONE.
+   */
+  it("marks the whole bar as an Electron drag region (and no Tauri leftover)", () => {
     const { container } = render(<ChromeBar />);
-    expect(container.querySelector("[data-tauri-drag-region]")).toBeInTheDocument();
+    const bar = container.querySelector(".drag-region");
+    expect(bar).toBeInTheDocument();
+    expect(container.querySelector("[data-tauri-drag-region]")).toBeNull();
+  });
+
+  /**
+   * …and the controls cut themselves back OUT of it (`no-drag-region` →
+   * `-webkit-app-region: no-drag`). Without that opt-out the drag region swallows the
+   * pointer and the three buttons never fire — the window would look controlled and be
+   * just as stuck as with no bar at all.
+   */
+  it("keeps the controls cluster out of the drag region", () => {
+    const { container } = render(<ChromeBar controlsVisible />);
+    const cluster = container.querySelector(".no-drag-region");
+    expect(cluster).toBeInTheDocument();
+    // The opt-out is the ancestor of the three buttons, not a stray empty box.
+    expect(cluster!.querySelectorAll("button").length).toBe(3);
   });
 
   it("renders the window controls when enabled (default)", () => {

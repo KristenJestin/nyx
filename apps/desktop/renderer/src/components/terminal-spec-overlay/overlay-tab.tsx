@@ -37,10 +37,19 @@ import {
  *  - INACTIVE (closed): a DIMMED, fully-bordered languette (`bg-muted/80`, visible right border,
  *    greyed `text-foreground/70`, no accent bar) that clearly reads "fermée" — the cue for WHICH
  *    Spec is currently open in a stack.
+ *
+ * SEMANTICS — DISCLOSURE, not toggle button (review finding `01M06QRFNDV49NM8Y5VHCJQ1PZ`): the
+ * languette REVEALS a panel, so it carries `aria-expanded` (open/closed) + `aria-controls` (the
+ * panel it reveals, {@link overlayPanelId}), the ARIA APG disclosure pair. It deliberately does NOT
+ * carry `aria-pressed`: that describes a two-state action button (bold/italic), and stacking both on
+ * one button gives a screen reader a double, contradictory semantic. `aria-controls` points at an
+ * id that is only MOUNTED while the panel is open — that is the pattern's normal state and the
+ * attribute stays unconditional, so the relationship is announced from the closed state too.
  */
 export function OverlayTab({
   onClick,
   label,
+  panelId,
   active = false,
   className,
   children,
@@ -48,7 +57,14 @@ export function OverlayTab({
   onClick: () => void;
   /** Accessible label (the tab has no visible text on the rail). */
   label: string;
-  /** Whether this tab's panel is currently open (a pressed/selected state). */
+  /**
+   * Id of the panel this languette reveals — the `aria-controls` target (`overlayPanelId`). It is
+   * ALSO how focus finds its way back here on dismissal: `use-overlay-panel` resolves the
+   * controlling languette from this very attribute, so the disclosure relation is the single source
+   * of truth for both the announcement and the focus restoration.
+   */
+  panelId: string;
+  /** Whether this tab's panel is currently open (the `aria-expanded` state). */
   active?: boolean;
   className?: string;
   children: ReactNode;
@@ -75,7 +91,8 @@ export function OverlayTab({
       type="button"
       onClick={onClick}
       aria-label={label}
-      aria-pressed={active}
+      aria-expanded={active}
+      aria-controls={panelId}
       data-overlay-tab=""
       variants={overlayTabVariants}
       initial="initial"

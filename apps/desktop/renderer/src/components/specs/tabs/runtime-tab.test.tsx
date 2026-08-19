@@ -152,7 +152,9 @@ describe("RuntimeTab", () => {
     expect(screen.queryByText("/tmp/wt")).toBeNull();
   });
 
-  it("navigates to the clicked terminal (`/?terminal=<id>`) and enters its project", async () => {
+  // Entering the project is NOT this tab's job any more: the Spec page hosting it is already synced
+  // to the Spec's owner project (`useSpecProjectSync`), so the row is a pure deep-link.
+  it("navigates to the clicked terminal (`/?terminal=<id>`)", async () => {
     const router = renderRuntimeTab();
     // Exact "dev" (the terminal label) — the managed-command row is also a role=button
     // ("dev server"), so match the terminal precisely.
@@ -171,7 +173,7 @@ describe("RuntimeTab", () => {
     expect(screen.getByRole("button", { name: "Relaunch command" })).toBeTruthy();
   });
 
-  it("navigates to the clicked managed command's detail (`/?command=<id>`) and enters its project", async () => {
+  it("navigates to the clicked managed command's detail (`/?command=<id>`)", async () => {
     const router = renderRuntimeTab();
     // The row is a `div role="button"` around the command name; click its body (not a control).
     const row = (await screen.findByText("dev server")).closest('[role="button"]');

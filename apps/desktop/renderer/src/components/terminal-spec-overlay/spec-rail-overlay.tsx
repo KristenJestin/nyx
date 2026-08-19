@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 
@@ -15,11 +15,16 @@ import { OverlayPanelActions } from "./overlay-panel-actions";
 import { OverlayPrototypes } from "./overlay-prototypes";
 import { OverlayTab } from "./overlay-tab";
 import {
-  OVERLAY_PANEL_WIDTH,
   overlayMotionTransition,
   overlayPanelVariants,
+  overlayPanelWidth,
   overlaySurfaceVariants,
 } from "./overlay-motion";
+import {
+  overlayPanelId,
+  useOverlayPaneWidth,
+  useOverlayPanelDisclosure,
+} from "./use-overlay-panel";
 import {
   RAIL_DOT_TONE,
   RAIL_HATCH_STYLE,
@@ -201,9 +206,10 @@ function RailSegmentCell({
  *
  *  - CLOSED: the FROZEN languette ({@link RailTabContent}) — grey dots for past/future phases (with
  *    rework rings), a coloured glued bar for the current phase. No name/stacking (one Spec in dev).
- *  - OPEN: a fixed-width right panel — a header (human key + title + status badge) then the task
- *    decomposition rendered FIDÈLE by REUSING `<TasksTab>` (roll-up + reprises, nested rounds with
- *    provenance/severity).
+ *  - OPEN: a right panel BOUNDED on the host pane (`min(380, max(45% of pane, 260))`,
+ *    `overlayPanelWidth` — same rule and same shell as the tiroir) — a header (human key + title +
+ *    status badge) then the task decomposition rendered FIDÈLE by REUSING `<TasksTab>` (roll-up +
+ *    reprises, nested rounds with provenance/severity).
  *
  * The Spec detail (tasks + dependencies + workspace context) is pulled live via `useSpecDetail`
  * (`specs://changed`); the review comments — the source of the panel's provenance — via
@@ -218,9 +224,42 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
 
   const model: RailModel = detail ? railModel(detail) : { phases: [] };
   const title = spec.title || `#${spec.number}`;
+  // The DISCLOSURE pair: the languette announces this id through `aria-controls`, the panel carries
+  // it as its own `id`. Derived from the Spec id, so the two can never drift (`use-overlay-panel`).
+  const panelId = overlayPanelId(spec.id);
+
+  // The NON-MODAL disclosure behaviour, shared with the tiroir (`use-overlay-panel`): focus INTO the
+  // panel on open, focus RESTORED to the languette on every dismissal, panel-scoped Escape and
+  // outside-click dismissal. `open` alone is not enough — the panel only mounts once `detail` has
+  // loaded, so the focus-in must key off the state in which it is actually on screen.
+  //
+  // `panelOpen` is THE disclosure state of this overlay, and everything the user or a screen reader
+  // perceives as "open" derives from it: the panel's mount, the shell's width, and the languette's
+  // `aria-expanded` + fused styling. `open` alone would announce "expanded" during the `spec_detail`
+  // load, while `aria-controls` still points at an id NOTHING has mounted (a screen reader says
+  // "développé" and finds nothing to explore) and the shell to the languette's right is still 0px
+  // wide (a languette fused to nothing). The RAIL is the only one of the two overlays that can split
+  // the two states: the tiroir mounts its panel from the same state its languette is active from.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  const panelOpen = open && detail !== null;
+  const { dismiss, onPanelKeyDown } = useOverlayPanelDisclosure({
+    open: panelOpen,
+    panelId: panelOpen ? panelId : null,
+    rootRef,
+    panelRef,
+    onDismiss: () => setOpen(false),
+  });
+
+  // The panel's width is BOUNDED on the host pane (`min(380, max(45% of pane, 260))`), remeasured on
+  // a pane resize and resolved to a NUMBER here — Motion animates the shell to it and the inner box
+  // is frozen at it (`overlay-motion`). The pane itself is never reflowed: the panel stays
+  // superposed, so no xterm refit / SIGWINCH is triggered by opening or closing it.
+  const panelWidth = overlayPanelWidth(useOverlayPaneWidth(rootRef));
 
   return (
     <motion.div
+      ref={rootRef}
       data-overlay-surface=""
       variants={overlaySurfaceVariants}
       initial="initial"
@@ -230,12 +269,32 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
       className="pointer-events-none absolute inset-y-0 right-0 z-20 flex items-stretch justify-end"
     >
       {/* The closed languette sits to the LEFT of the panel and STAYS mounted when open — it FUSES
-          with the panel (shared surface, no shared border) and becomes its close HANDLE. */}
-      <div className="pointer-events-auto flex max-h-full min-h-0 flex-col justify-center">
+          with the panel (shared surface, no shared border) and becomes its close HANDLE.
+          `pointer-events-none` on the COLUMN: `items-stretch` on the `inset-y-0` root stretches this
+          wrapper over the FULL pane height while `justify-center` parks the languette in the middle,
+          so an interactive column swallowed every click in the 36px right-edge band — including the
+          empty zones above/below the languette, which cover the TERMINAL's own scroll-to-bottom
+          button (`terminal.tsx`, `right-3 bottom-3 z-10`) and the global 0.5rem scrollbar gutter
+          (`globals.css`, `*`). None of that belongs to the overlay, so the column must be
+          click-through; `<OverlayTab>` re-arms itself with its own `pointer-events-auto` (and its
+          content inherits it as children of the button), so the languette stays clickable.
+          ONE box here, where `spec-drawer-overlay` nests TWO: the rail holds a SINGLE languette and
+          is not a scroll container, so it has no scrollbar of its own to re-arm — nothing needs
+          `pointer-events-auto` back except the tab itself. Do NOT "align" the two files: the
+          tiroir's inner box exists to keep ITS scrollbar hittable (see the comment there), and a box
+          added here would only re-capture the 36px band this `pointer-events-none` just freed. */}
+      <div className="pointer-events-none flex max-h-full min-h-0 flex-col justify-center">
         <OverlayTab
           label={`Open ${title} progress`}
-          active={open}
-          onClick={() => setOpen(!open)}
+          panelId={panelId}
+          // The DISCLOSURE state — `panelOpen`, never `open`: `aria-expanded` may only say "true"
+          // while the panel `aria-controls` names is actually mounted (see the note above).
+          active={panelOpen}
+          // Re-clicking the ACTIVE languette closes its panel — routed through `dismiss` so the
+          // close half also restores focus here, exactly like the chevron / Escape / outside click.
+          // Keyed on `open` and NOT on `panelOpen` on purpose: a click during the `spec_detail` load
+          // CANCELS that load instead of being swallowed as a no-op re-open.
+          onClick={() => (open ? dismiss() : setOpen(true))}
           // Content-driven height: the languette grows with the phase count, capped to the pane so a
           // very large count scrolls instead of overflowing.
           className="max-h-full min-h-0"
@@ -247,22 +306,30 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
           )}
         </OverlayTab>
       </div>
-      {/* WIDTH-ANIMATED SHELL (sidebar-shell idiom, same as the tiroir): outer width springs 0↔380 so
-          the languette "suit" the panel; `overflow-hidden` over a FIXED-width inner ⇒ no reflow. */}
+      {/* WIDTH-ANIMATED SHELL (sidebar-shell idiom, same as the tiroir): outer width springs between
+          0 and the BOUNDED panel width so the languette "suit" the panel; `overflow-hidden` over an
+          inner FROZEN at that same pixel width ⇒ no reflow, no horizontal overflow mid-animation. */}
       <motion.div
+        data-overlay-panel-shell=""
         initial={false}
-        animate={{ width: open && detail ? OVERLAY_PANEL_WIDTH : 0 }}
+        animate={{ width: panelOpen ? panelWidth : 0 }}
         transition={overlayMotionTransition(reduced)}
         className={cn(
           "pointer-events-none flex h-full justify-end overflow-hidden",
-          open && detail && "shadow-xl",
+          panelOpen && "shadow-xl",
         )}
       >
-        <div className="relative h-full shrink-0" style={{ width: OVERLAY_PANEL_WIDTH }}>
+        <div
+          data-overlay-panel-inner=""
+          className="relative h-full shrink-0"
+          style={{ width: panelWidth }}
+        >
           <AnimatePresence mode="wait">
-            {open && detail ? (
+            {panelOpen && detail ? (
               <motion.section
                 key={spec.id}
+                id={panelId}
+                ref={panelRef}
                 data-overlay-panel=""
                 data-overlay-panel-spec={spec.id}
                 variants={overlayPanelVariants}
@@ -270,8 +337,17 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
                 animate="animate"
                 exit="exit"
                 transition={overlayMotionTransition(reduced)}
-                className="pointer-events-auto absolute inset-0 flex flex-col bg-card/95 backdrop-blur"
+                className="pointer-events-auto absolute inset-0 flex flex-col bg-card/95 backdrop-blur focus:outline-none"
+                // NON-MODAL dialog (decided): a `dialog` role + a name so the panel is ANNOUNCED,
+                // `tabIndex={-1}` so the focus lands on the CONTAINER (never on the first command,
+                // which navigates away) — but deliberately NO `aria-modal` and NO focus trap, so Tab
+                // walks out and the terminal stays keyboard-usable while the Spec is on screen.
+                role="dialog"
                 aria-label={`${title} progress`}
+                tabIndex={-1}
+                // Escape is PANEL-SCOPED — handled here, never on `document`, so the key keeps
+                // working in the terminal (`use-overlay-panel`).
+                onKeyDown={onPanelKeyDown}
               >
                 {/* Header: human key + title + status badge, with a chevron to close. */}
                 <header className="flex shrink-0 items-center gap-2 border-b border-border/60 px-4 py-3">
@@ -289,7 +365,7 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
                   <OverlayPanelActions spec={spec} />
                   <button
                     type="button"
-                    onClick={() => setOpen(false)}
+                    onClick={() => dismiss()}
                     aria-label="Close progress panel"
                     className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
                   >
@@ -298,7 +374,7 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
                 </header>
                 {/* FIDÈLE task rendering — the real `<TasksTab>` component, fed the review comments'
                     author map so its nested rounds derive provenance. `overflow-x-hidden` clamps the
-                    reused content to the 380px panel (no horizontal scrollbar / clipped text).
+                    reused content to the panel's bounded width (no horizontal scrollbar / clipped text).
                     Above it, the Spec's PROTOTYPE PAGES (finding `01KYW342EE5DN6F70YB8VSTJR8`): each
                     row opens the workbench ON that page. It renders nothing for a Spec that has no
                     prototype, so a dev rail is never taxed by a block about an absence. */}

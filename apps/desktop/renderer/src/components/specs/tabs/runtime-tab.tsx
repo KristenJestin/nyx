@@ -4,7 +4,6 @@ import { ServerCogIcon, SquareTerminalIcon } from "lucide-react";
 
 import { nyxBridge } from "@/bridge";
 import { CommandControls } from "@/components/command/command-controls";
-import { useActiveProject } from "@/components/terminals/active-project";
 import type { WorkspaceRuntimeSnapshot } from "@/components/terminals/use-workspace-runtime";
 
 import { Dot } from "../spec-primitives";
@@ -145,10 +144,8 @@ function CommandRow({
  */
 export function RuntimeTab({ detail }: { detail: SpecDetail }) {
   const ws = detail.workspace_context?.workspace ?? null;
-  const projectId = detail.workspace_context?.project.id ?? null;
   const workspaceId = ws?.id ?? null;
   const navigate = useNavigate();
-  const { setActiveProjectId } = useActiveProject();
   const [snapshot, setSnapshot] = useState<WorkspaceRuntimeSnapshot | null>(null);
   const [loading, setLoading] = useState<boolean>(workspaceId !== null);
 
@@ -178,16 +175,22 @@ export function RuntimeTab({ detail }: { detail: SpecDetail }) {
     };
   }, [workspaceId]);
 
-  /** Open a specific terminal on the Terminals page: enter its project, then deep-link to it. */
+  /**
+   * Open a specific terminal on the Terminals page — a plain deep-link, NO project selection here.
+   *
+   * These two handlers used to enter the workspace's project themselves. That is now redundant AND a
+   * second definition of "which project a Spec puts you in": the Spec page hosting this tab is
+   * already synced to the Spec's owner project by `useSpecProjectSync`, so by the time a row can be
+   * clicked the shell is in the right project and `/` resolves to it. Entering the project stays the
+   * ONE responsibility of that shared hook (PRD fix 2).
+   */
   function openTerminal(terminalId: string) {
-    if (projectId != null) setActiveProjectId(projectId);
     void navigate({ to: "/", search: { terminal: terminalId } });
   }
 
-  /** Open a managed command's DETAIL on the Terminals page: enter its project, then deep-link to
-   *  the command (its live output pane is selected by id) — mirrors `openTerminal`. */
+  /** Open a managed command's DETAIL on the Terminals page — mirrors `openTerminal` (its live
+   *  output pane is selected by id), likewise relying on the page-level project sync. */
   function openCommand(serviceId: string) {
-    if (projectId != null) setActiveProjectId(projectId);
     void navigate({ to: "/", search: { command: serviceId } });
   }
 

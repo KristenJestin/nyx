@@ -278,11 +278,11 @@ describe("KnowledgePage (Idées view)", () => {
     renderPage();
     const heading = await screen.findByRole("heading", { name: "Ideas" });
     // The grid split already makes horizontal overflow impossible; the page root keeps `overflow-x-
-    // clip` anyway as a cheap guard — no scroll container, `overflow-y` stays visible so the `h-svh`
+    // clip` anyway as a cheap guard — no scroll container, `overflow-y` stays visible so the `h-app`
     // layout is untouched, so no ancestor can ever receive a stray horizontal overflow.
     const pageRoot = heading.closest(".overflow-x-clip");
     expect(pageRoot).not.toBeNull();
-    expect(pageRoot?.className).toContain("h-svh");
+    expect(pageRoot?.className).toContain("h-app");
   });
 
   it("clips the list column horizontally so a narrowed column never shows its own scrollbar", async () => {

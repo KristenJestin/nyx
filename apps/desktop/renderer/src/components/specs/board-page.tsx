@@ -54,7 +54,7 @@ export function BoardPage() {
   const inProgress = specs.filter((s) => s.status === "in_progress").length;
 
   return (
-    <div className="flex h-svh flex-col bg-background px-6 pb-6 pt-10">
+    <div className="flex h-app flex-col bg-background px-6 pb-6 pt-10">
       {/* Header — the SHARED breadcrumb (Finding 47: `Work` — the board IS the Work root), the
           title + subtitle, and the kanban/list view toggle. The breadcrumb harmonises this header
           with the Spec detail (`Work / <specKey>`) and the review (`Work / <specKey> / Review`). */}

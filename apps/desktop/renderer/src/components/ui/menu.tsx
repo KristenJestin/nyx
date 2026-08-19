@@ -138,6 +138,45 @@ export function MenuItem({
   );
 }
 
+/**
+ * A titled GROUP of items inside a menu — the Base UI `Menu.Group`, which is what makes the label
+ * name its rows for a screen reader (`role="group"` + `aria-labelledby`) instead of floating as
+ * unattached text.
+ *
+ * Lives HERE, not in the feature that first needed it (the per-workspace grouping of the project
+ * rail menu): the group's look is menu chrome, and a second menu needing one must share it rather
+ * than copy a class string across files.
+ */
+export function MenuGroup({
+  className,
+  children,
+}: {
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return <BaseMenu.Group className={cn(className)}>{children}</BaseMenu.Group>;
+}
+
+/** The heading of a `<MenuGroup>`: a small, muted, uppercase caption over the group's rows. */
+export function MenuGroupLabel({
+  className,
+  children,
+}: {
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <BaseMenu.GroupLabel
+      className={cn(
+        "px-2 py-1 text-2xs font-semibold tracking-wider text-muted-foreground uppercase",
+        className,
+      )}
+    >
+      {children}
+    </BaseMenu.GroupLabel>
+  );
+}
+
 /** A thin separator between groups of menu items. */
 export function MenuSeparator({ className }: { className?: string }) {
   return <BaseMenu.Separator className={cn("my-1 h-px bg-border", className)} />;

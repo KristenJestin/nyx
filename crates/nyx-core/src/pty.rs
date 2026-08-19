@@ -146,8 +146,8 @@ fn next_id() -> u64 {
 
 /// Resolve the shell to spawn.
 ///
-/// `$SHELL` is honored first on every platform when set and non-empty (the
-/// user's chosen shell; also how the e2e suite forces a POSIX bash). Otherwise
+/// `$SHELL` is honored first on every platform when set, non-empty AND SPAWNABLE
+/// (the user's chosen shell; also how the e2e suite forces a POSIX bash). Otherwise
 /// the default is per-OS:
 /// - **Unix:** `bash`, then `sh` (POSIX-guaranteed).
 /// - **Windows:** `pwsh.exe`, then `powershell.exe` (the Windows Terminal
@@ -156,17 +156,40 @@ fn next_id() -> u64 {
 ///   WSL launcher, which needs an installed distro), so doing so would spawn a
 ///   missing program and the terminal would come up blank.
 ///
-/// TODO(idea): make the default shell user-selectable in settings (see AGENTS.md
-/// §9 "Différé v1.1+"). The chosen name is returned so callers/tests can assert.
+/// This is the DEFAULT half of the resolution, not the whole of it, and `pub` because BOTH spawn
+/// paths rest on it — at different depths, which is the part to get right:
+/// - a TERMINAL goes through [`crate::shells::resolve`], which reads the user's stored preference
+///   FIRST and falls back here when none is expressed (or when the chosen binary is gone);
+/// - the managed-command runtime ([`crate::command`]) calls THIS function directly, so its
+///   read-only command PTYs run under the platform shell and DELIBERATELY ignore the preference —
+///   a command's shell is an execution detail of a project's script, not the interactive shell the
+///   user chose to work in (rationale in [`crate::shells`]'s "What this module does NOT do").
 ///
-/// `pub` so the managed-command runtime ([`crate::command`]) spawns its
-/// read-only command PTYs under the SAME shell as the terminals (honors `$SHELL`
-/// identically), instead of duplicating the resolution.
+/// So: the same DEFAULT for both, one extra step for terminals only. Keeping this function
+/// untouched is what makes "no preference expressed" behave exactly as it always did — and it is
+/// why a managed command no longer necessarily runs under the same shell as the terminals.
+///
+/// # Why `$SHELL` is CHECKED, not merely read (review `01M0BT18YDV1PN2G39JCDD5WYZ`)
+///
+/// This function is the BASE of [`crate::shells`]'s resolution chain, whose whole guarantee is that
+/// it never hands a spawn a program that is not there — [`crate::shells::resolve`] already drops a
+/// stored preference whose binary has been uninstalled. That guarantee did not hold at its own
+/// base: `$SHELL` was returned VERBATIM, unchecked. On Windows that is not a corner case, it is the
+/// NORM — every MSYS / Cygwin / Git-Bash environment exports `SHELL=/bin/bash.exe`, a POSIX path
+/// Windows resolves against the CURRENT DRIVE ROOT (`D:\bin\bash.exe`), where nothing exists. nyx
+/// launched from such a shell inherited it and then failed every managed-command spawn
+/// (`CreateProcessW … The system cannot find the path specified`) and opened blank terminals, on a
+/// value the user never chose and cannot see.
+///
+/// So `$SHELL` is held to the SAME test as a stored preference,
+/// [`crate::shells::program_exists`] — one implementation of "can this be spawned", shared by
+/// detection, by the preference and by this fallback. On UNIX the check changes nothing
+/// observable: `$SHELL` there is the existing absolute path the password database gave the login
+/// shell, so it passes; a value that did NOT pass would have failed the spawn anyway, and falling
+/// through to `bash`/`sh` is strictly better than a terminal that never opens.
 pub fn resolve_shell() -> String {
-    if let Ok(s) = std::env::var("SHELL") {
-        if !s.is_empty() {
-            return s;
-        }
+    if let Some(shell) = shell_env_override(std::env::var("SHELL").ok().as_deref()) {
+        return shell;
     }
 
     #[cfg(windows)]
@@ -194,15 +217,33 @@ pub fn resolve_shell() -> String {
     }
 }
 
+/// The `$SHELL` step of [`resolve_shell`], as a PURE function of the raw variable: `Some(value)`
+/// when the environment names a shell nyx can really spawn, `None` when the caller must fall
+/// through to the per-OS default.
+///
+/// Taking the raw value as an argument rather than reading the environment here is what makes the
+/// rule testable: `std::env::set_var` is process-global, so a test that mutated `SHELL` would race
+/// every other test in the same binary (and is `unsafe` from edition 2024 on). Both verdicts — the
+/// Unix values that must keep winning, and the MSYS value that must now lose — are asserted against
+/// this function instead.
+fn shell_env_override(raw: Option<&str>) -> Option<String> {
+    let value = raw?;
+    // Non-empty is NOT enough: it must be spawnable. See [`resolve_shell`]'s "Why `$SHELL` is
+    // CHECKED" section — `crate::shells::program_exists` is the same test a stored preference
+    // faces, so the whole chain answers "can this be spawned" one way.
+    if value.is_empty() || !crate::shells::program_exists(value) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// Cheap PATH lookup for a bare program name (used only by the shell fallback).
+///
+/// Delegates to [`crate::shells::on_path`] so the "is this program installed" question has ONE
+/// implementation: the Settings list and this fallback must agree, or the list could offer a shell
+/// the spawn then fails to find.
 fn which_exists(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file()
-    })
+    crate::shells::on_path(program).is_some()
 }
 
 /// A spawned PTY: child process, master side (for write/resize), reader thread,
@@ -242,8 +283,37 @@ pub struct Pty {
     pause_gate: PauseGate,
 }
 
+/// Compose the final argument line of an interactive shell spawn: the shell's OWN arguments
+/// (`shell_args`, from [`crate::shells::ShellChoice`]) are moved IN FRONT of the OSC 133
+/// integration plan's `plan_args`, in place.
+///
+/// The ORDER is the whole point. A shell's own arguments are what make the program that shell at
+/// all (`wsl.exe -d Ubuntu`), so an integration argument inserted ahead of them would be read as
+/// an argument to the wrong thing. In practice the two never meet today — the only shell carrying
+/// args is WSL, which classifies as `Shell::Unsupported` and therefore gets an EMPTY plan — but
+/// this is the order that stays correct if that ever stops being true.
+///
+/// Split out of [`Pty::spawn`] as a pure, side-effect-free function precisely so that contract is
+/// testable without a real spawn (review `01M069JEPR8JSWWYCG9NPR3SJX`): `spawn` itself needs a
+/// live shell and a PTY, which no test can assume on every OS.
+fn prepend_shell_args(shell_args: &[String], plan_args: &mut Vec<std::ffi::OsString>) {
+    if shell_args.is_empty() {
+        return;
+    }
+    let mut args: Vec<std::ffi::OsString> =
+        shell_args.iter().map(std::ffi::OsString::from).collect();
+    args.append(plan_args);
+    *plan_args = args;
+}
+
 impl Pty {
-    /// Spawn the default shell inside a fresh PTY of the given size.
+    /// Spawn an interactive `shell` inside a fresh PTY of the given size.
+    ///
+    /// `shell` is the ALREADY-RESOLVED choice — [`crate::shells::resolve_for_spawn`] is what turns
+    /// the user's stored preference (or its absence) into it. The resolution is the caller's
+    /// because it needs the DB, and doing it HERE, at each spawn, is what scopes the setting to
+    /// NEW terminals: a shell that is already running was resolved when it started and is never
+    /// disturbed.
     ///
     /// `cwd` sets the child's working directory when `Some`; otherwise the
     /// child inherits nyx's cwd. The environment is inherited from the current
@@ -265,22 +335,22 @@ impl Pty {
     /// bytes as the reader thread reads them. The receiver completes (the
     /// sender is dropped) when the PTY reaches EOF — i.e. the child has exited.
     pub fn spawn(
+        shell: &crate::shells::ShellChoice,
         size: PtySize,
         cwd: Option<&str>,
         terminal_id: Option<&str>,
         mcp_port: u16,
     ) -> anyhow::Result<(Self, Receiver<Vec<u8>>)> {
-        // Resolve the shell, then build its OSC 133 shell-integration plan
-        // (PRD-2.1 task #5): a NON-DESTRUCTIVE per-spawn snippet that makes the
-        // shell emit `133;C`/`133;D` so the bridge can derive exec-state. An
-        // Unsupported shell (sh/cmd/fish/…) or a disabled/failed injection yields an
-        // EMPTY plan → the shell is spawned plain (idle-only degradation; no false
-        // running/success/error). Injection applies ONLY here, on the production
-        // interactive-shell path — never to `spawn_program` (tests / the managed
-        // command runner, which spawn arbitrary non-interactive programs).
-        let shell = resolve_shell();
-        let plan = crate::shellinteg::build(&shell);
-        Self::spawn_program_with_integration(&shell, size, cwd, &plan, terminal_id, mcp_port)
+        // Build the shell's OSC 133 shell-integration plan (PRD-2.1 task #5): a
+        // NON-DESTRUCTIVE per-spawn snippet that makes the shell emit `133;C`/`133;D` so the
+        // bridge can derive exec-state. An Unsupported shell (sh/cmd/fish/…) or a
+        // disabled/failed injection yields an EMPTY plan → the shell is spawned plain
+        // (idle-only degradation; no false running/success/error). Injection applies ONLY
+        // here, on the production interactive-shell path — never to `spawn_program` (tests /
+        // the managed command runner, which spawn arbitrary non-interactive programs).
+        let mut plan = crate::shellinteg::build(&shell.path);
+        prepend_shell_args(&shell.args, &mut plan.args);
+        Self::spawn_program_with_integration(&shell.path, size, cwd, &plan, terminal_id, mcp_port)
     }
 
     /// Spawn an arbitrary program with NO shell integration (used by tests and the
@@ -620,13 +690,41 @@ impl Pty {
     /// sequence lives HERE and `Drop` reuses it: kill, resume the pause-gate (a reader parked on
     /// the condvar would never reach `read()` to see EOF), then escalate to `SIGKILL` after
     /// `grace`.
+    ///
+    /// It is the ONE-SHELL composition of its two halves, [`signal_kill`](Self::signal_kill) and
+    /// [`reap_by`](Self::reap_by). A caller closing SEVERAL shells must not use it in a loop — that
+    /// pays `grace` once per shell — and reaches for those halves instead (see
+    /// `PtyManager::close_many` in `nyx-sidecar`).
     pub fn kill_and_reap(&mut self, grace: std::time::Duration) {
+        self.signal_kill();
+        self.reap_by(std::time::Instant::now() + grace);
+    }
+
+    /// FIRST half of [`kill_and_reap`]: the acts that cannot be undone or shared — send the kill
+    /// and release the pause-gate. Returns immediately; it waits for nothing.
+    ///
+    /// Resuming the gate is part of the KILL, not of the reap: a reader parked on the condvar never
+    /// reaches `read()`, so it would never see the EOF the kill is about to produce, and the shell
+    /// would then block on a PTY buffer nobody drains — alive despite the signal.
+    pub fn signal_kill(&mut self) {
         let _ = self.killer.kill();
         self.pause_gate.set_paused(false);
+    }
+
+    /// SECOND half of [`kill_and_reap`]: wait — until `deadline`, not for a duration — for the
+    /// shell to honour the signal on its own, then escalate past what it can survive.
+    ///
+    /// The parameter is an ABSOLUTE deadline precisely so a group of shells can share ONE
+    /// (review `01M0BT27BRT240HTYY0W4RTTBN`). Closing N terminals with a per-shell grace costs
+    /// N × grace — about 5 s for ten shells that ignore `SIGHUP`, against the 3 s budget of the
+    /// ordered shutdown; signalling all of them first and then reaping each against a single
+    /// shared deadline costs ONE grace for the whole group, because the windows overlap instead of
+    /// queueing. Once the deadline has passed, every remaining shell is escalated at once.
+    pub fn reap_by(&self, deadline: std::time::Instant) {
         #[cfg(unix)]
-        self.ensure_child_dead(grace);
+        self.ensure_child_dead(deadline);
         #[cfg(not(unix))]
-        let _ = grace;
+        let _ = deadline;
     }
 
     /// Make sure the child is really gone, escalating past a signal it can survive.
@@ -642,13 +740,15 @@ impl Pty {
     /// thread closed the terminal — the same class of freeze the Windows note below
     /// describes.
     ///
-    /// So: wait a short grace for the child to honour the `SIGHUP` on its own — polling
+    /// So: wait until `deadline` for the child to honour the `SIGHUP` on its own — polling
     /// the exit code the waiter records, i.e. the real condition — then send `SIGKILL`,
     /// which no process can catch, block or defer.
+    ///
+    /// The bound is an absolute deadline rather than a duration so N shells can be reaped against
+    /// ONE of them — see [`reap_by`](Self::reap_by).
     #[cfg(unix)]
-    fn ensure_child_dead(&self, grace: std::time::Duration) {
+    fn ensure_child_dead(&self, deadline: std::time::Instant) {
         let Some(pid) = self.shell_pid else { return };
-        let deadline = std::time::Instant::now() + grace;
         loop {
             if self.exit_code().is_some() {
                 return;
@@ -708,7 +808,180 @@ impl Drop for Pty {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::time::{Duration, Instant};
+
+    /// A WSL-shaped choice: the ONLY detected shell that carries its own arguments.
+    fn wsl_choice() -> crate::shells::ShellChoice {
+        crate::shells::ShellChoice {
+            path: "wsl.exe".to_string(),
+            args: vec!["-d".to_string(), "Ubuntu".to_string()],
+        }
+    }
+
+    /// A non-empty OSC 133 plan, shaped like what `shellinteg::build` produces for a supported
+    /// shell (an rc/init file pointing at the per-spawn snippet).
+    fn integration_plan() -> crate::shellinteg::IntegrationPlan {
+        crate::shellinteg::IntegrationPlan {
+            args: vec![
+                OsString::from("--rcfile"),
+                OsString::from("/tmp/nyx-133.sh"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// THE ORDER CONTRACT of [`Pty::spawn`]'s command line: a shell's OWN arguments — the ones
+    /// that make the program that shell at all (`wsl.exe -d Ubuntu`) — come FIRST, before the OSC
+    /// 133 integration plan's, otherwise an integration argument is read as an argument to the
+    /// wrong program. Asserted on the extracted pure composition, so it holds identically on
+    /// Windows and Linux with no real shell, no PTY and no spawn.
+    #[test]
+    fn shell_args_precede_integration_args() {
+        let shell = wsl_choice();
+        let mut plan = integration_plan();
+        prepend_shell_args(&shell.args, &mut plan.args);
+        assert_eq!(
+            plan.args,
+            vec![
+                OsString::from("-d"),
+                OsString::from("Ubuntu"),
+                OsString::from("--rcfile"),
+                OsString::from("/tmp/nyx-133.sh"),
+            ],
+            "the shell's own args must lead, in their own order, then the plan's"
+        );
+    }
+
+    /// A plain shell executable (`ShellChoice::program` — the shape of EVERY fallback and of every
+    /// detected entry except WSL) contributes nothing: the integration plan is handed through
+    /// untouched, which is the production path on every machine today.
+    #[test]
+    fn plain_shell_leaves_the_integration_args_untouched() {
+        let shell = crate::shells::ShellChoice::program("/bin/bash");
+        let mut plan = integration_plan();
+        prepend_shell_args(&shell.args, &mut plan.args);
+        assert_eq!(
+            plan.args,
+            vec![
+                OsString::from("--rcfile"),
+                OsString::from("/tmp/nyx-133.sh")
+            ]
+        );
+    }
+
+    /// The live combination today: WSL classifies as `Shell::Unsupported`, so its plan is EMPTY —
+    /// the composition must still yield exactly the shell's own args (a plain `wsl.exe -d Ubuntu`
+    /// spawn), never drop them.
+    #[test]
+    fn shell_args_survive_an_empty_integration_plan() {
+        let shell = wsl_choice();
+        let mut plan = crate::shellinteg::IntegrationPlan::default();
+        prepend_shell_args(&shell.args, &mut plan.args);
+        assert_eq!(
+            plan.args,
+            vec![OsString::from("-d"), OsString::from("Ubuntu")]
+        );
+    }
+
+    /// Review `01M0BT18YDV1PN2G39JCDD5WYZ` — `$SHELL` MUST BE SPAWNABLE TO WIN.
+    ///
+    /// The value every MSYS / Cygwin / Git-Bash environment exports is a POSIX path, and on
+    /// Windows a POSIX path is resolved against the current drive root, where no `bin\bash.exe`
+    /// exists. Returned verbatim it made every managed-command spawn fail with
+    /// `CreateProcessW … The system cannot find the path specified` — so it must now lose to the
+    /// per-OS default. The assertion is written so it holds on BOTH platforms: `/bin/bash.exe` is
+    /// absent from a Unix filesystem too (`.exe`), so it is rejected there for the same reason.
+    #[test]
+    fn an_unspawnable_shell_env_loses_to_the_per_os_default() {
+        assert_eq!(
+            shell_env_override(Some("/bin/bash.exe")),
+            None,
+            "the MSYS `$SHELL` names nothing Windows can start"
+        );
+        assert_eq!(
+            shell_env_override(Some(if cfg!(windows) {
+                "C:\\nyx-does-not-exist\\ghost-shell.exe"
+            } else {
+                "/nyx-does-not-exist/ghost-shell"
+            })),
+            None,
+            "a shell that is not on disk is not a shell"
+        );
+        assert_eq!(
+            shell_env_override(Some("nyx-not-a-program-on-path")),
+            None,
+            "a bare name that is on no PATH entry cannot be spawned"
+        );
+        // Unset and empty were ALREADY ignored before the check existed; they still are.
+        assert_eq!(shell_env_override(None), None);
+        assert_eq!(shell_env_override(Some("")), None);
+    }
+
+    /// The other half of the same rule: a `$SHELL` that IS spawnable still wins, unchanged — the
+    /// check filters, it does not disable the variable. Held to the test binary's own path, a real
+    /// absolute file on every OS, so the assertion does not depend on which shells the machine has.
+    #[test]
+    fn a_spawnable_shell_env_still_wins() {
+        let real = std::env::current_exe().expect("the test binary is a real file");
+        let real = real.to_string_lossy().into_owned();
+        assert_eq!(
+            shell_env_override(Some(&real)),
+            Some(real.clone()),
+            "an existing program is returned verbatim, as it always was"
+        );
+    }
+
+    /// UNIX BEHAVIOUR IS UNCHANGED — the done criterion of review
+    /// `01M0BT18YDV1PN2G39JCDD5WYZ`, asserted rather than argued in prose.
+    ///
+    /// The corpus is the machine's OWN shells, [`crate::shells::detect`] — which on Unix IS
+    /// `/etc/shells`, the platform's registry of login shells (what `chsh` validates a `$SHELL`
+    /// against), and on Windows the real PowerShell / cmd / Git Bash installs. Held to what the
+    /// machine actually has rather than to a hard-coded guess, and PORTABLE: the same assertion
+    /// runs on every OS, so a Windows-only dev box still compiles and executes the Unix half
+    /// instead of shipping it unbuilt. On Unix it is exactly the "nothing changed" statement —
+    /// every value `$SHELL` can legitimately hold there passes the new check.
+    #[test]
+    fn a_real_login_shell_of_this_machine_still_wins() {
+        for shell in crate::shells::detect() {
+            assert_eq!(
+                shell_env_override(Some(&shell.path)),
+                Some(shell.path.clone()),
+                "a shell this machine really has must remain a valid $SHELL: {shell:?}"
+            );
+        }
+        if cfg!(unix) {
+            // POSIX guarantees `/bin/sh`, so the check must never cost Unix its last-resort
+            // shell — including on an image that carries no `/etc/shells` at all.
+            assert_eq!(
+                shell_env_override(Some("/bin/sh")),
+                Some("/bin/sh".to_string()),
+                "POSIX guarantees /bin/sh: the check must not cost Unix its shell"
+            );
+        }
+    }
+
+    /// The check is the SAME one a stored preference faces — one implementation of "can this be
+    /// spawned" for detection, preference and `$SHELL` alike ([`crate::shells::program_exists`]).
+    /// Asserted so a future divergence (a second, laxer probe growing here) fails a test rather
+    /// than quietly reopening the hole at the base of the chain.
+    #[test]
+    fn the_shell_env_check_is_the_shared_spawnability_test() {
+        for candidate in [
+            "/bin/bash.exe",
+            "nyx-not-a-program-on-path",
+            "/etc/hosts",
+            "sh",
+            "cmd.exe",
+        ] {
+            assert_eq!(
+                shell_env_override(Some(candidate)).is_some(),
+                crate::shells::program_exists(candidate),
+                "{candidate}: $SHELL must be admitted exactly when program_exists says so"
+            );
+        }
+    }
 
     fn small_size() -> PtySize {
         PtySize {

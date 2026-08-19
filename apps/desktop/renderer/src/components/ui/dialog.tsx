@@ -112,9 +112,20 @@ function DialogRoot(
  * leak content). The popup is instead kept mounted JUST through the exit by the
  * `actionsRef` deferral in `DialogRoot` (Motion animates the exit, then
  * `onAnimationComplete` calls `actions.unmount()` to drop it).
+ *
+ * `data-portal-layer` is our OWN explicit marker, stamped on the container Base UI
+ * appends to `document.body` (both the backdrop and the popup are its children).
+ * It says "this subtree is a LAYER that was portalled out of the app root", which
+ * a caller cannot otherwise tell from the DOM position alone — and outside-press
+ * logic elsewhere needs exactly that: the terminal↔Spec overlay
+ * (`use-overlay-panel`) dismisses its non-modal panel on any mousedown outside
+ * itself, and a dialog OPENED FROM that panel (the orchestration run modal) must
+ * not read as "outside" and tear the panel — and with it the dialog — down under
+ * the user's cursor. The marker is deliberately not `role="dialog"`: that panel
+ * carries the role too, so it would discriminate nothing.
  */
 function DialogPortal(props: BaseDialog.Portal.Props) {
-  return <BaseDialog.Portal {...props} />;
+  return <BaseDialog.Portal data-portal-layer="" {...props} />;
 }
 
 /**

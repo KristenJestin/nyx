@@ -236,6 +236,62 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// The correlation `id` this request carries — the SAME number the supervisor's
+    /// `request id=NNN timed out` names, so a timeout can always be tied back to the
+    /// request that produced it.
+    pub fn id(&self) -> u64 {
+        match self {
+            Request::Handshake { id, .. }
+            | Request::Ping { id, .. }
+            | Request::Shutdown { id }
+            | Request::PtySpawn { id, .. }
+            | Request::PtyWrite { id, .. }
+            | Request::PtyResize { id, .. }
+            | Request::PtyClose { id, .. }
+            | Request::PtyAck { id, .. }
+            | Request::CommandStart { id, .. }
+            | Request::CommandStop { id, .. }
+            | Request::CommandRelaunch { id, .. }
+            | Request::McpStart { id }
+            | Request::DbCommand { id, .. } => *id,
+        }
+    }
+
+    /// A short, human-readable NAME for this request — the label `main::dispatch` publishes
+    /// BEFORE serving it (where the stuck-request watchdog reads it) and stamps on the timing
+    /// line after it returns.
+    ///
+    /// The sidecar answers ONE request at a time on its framed control loop, so a single
+    /// command that does not hand the thread back freezes every later request — and the
+    /// supervisor's only trace of it is `request id=NNN timed out`, which names no command.
+    /// This label is what turns that anonymous timeout into a named culprit (review
+    /// `01M0A7QGBK43MZB10RF51QR6TS`: 46 consecutive timeouts whose blocking command could
+    /// not be identified from any log). It reaches the log on BOTH sides of the call —
+    /// published up front, so a request that never returns is still named — see
+    /// `main::IN_FLIGHT` (review `01M0AB3R53M22DJ2KJ3022DDG4`).
+    ///
+    /// A `DbCommand` reports its ROUTED command name (`workspace_delete`, …) rather than
+    /// the transport name, because `db_command` alone would name 100+ authorities.
+    pub fn label(&self) -> &str {
+        match self {
+            Request::Handshake { .. } => "handshake",
+            Request::Ping { .. } => "ping",
+            Request::Shutdown { .. } => "shutdown",
+            Request::PtySpawn { .. } => "pty_spawn",
+            Request::PtyWrite { .. } => "pty_write",
+            Request::PtyResize { .. } => "pty_resize",
+            Request::PtyClose { .. } => "pty_close",
+            Request::PtyAck { .. } => "pty_ack",
+            Request::CommandStart { .. } => "command_start",
+            Request::CommandStop { .. } => "command_stop",
+            Request::CommandRelaunch { .. } => "command_relaunch",
+            Request::McpStart { .. } => "mcp_start",
+            Request::DbCommand { command, .. } => command,
+        }
+    }
+}
+
 /// A response (sidecar -> supervisor), echoing the request `id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {

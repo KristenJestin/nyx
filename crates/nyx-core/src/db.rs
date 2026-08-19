@@ -47,8 +47,8 @@ const POOL_MAX_SIZE: u32 = 8;
 use crate::pathnorm;
 use crate::schema::{
     agent_session_prototypes, agent_session_specs, agent_sessions, annex_blobs, annexes,
-    command_instances, command_slots, design, design_components, domain_events, human_turns,
-    idea_specs, ideas, managed_commands, nodes, projects, prototype_design_lock,
+    app_settings, command_instances, command_slots, design, design_components, domain_events,
+    human_turns, idea_specs, ideas, managed_commands, nodes, projects, prototype_design_lock,
     prototype_feedback, prototype_page_versions, prototype_pages, prototype_round_pages,
     prototype_rounds, prototype_variants, prototypes, repositories, review_comments, review_reads,
     review_tasks, spec_depends_on, spec_revisions, specs, task_dependencies, tasks, terminals,
@@ -5518,6 +5518,13 @@ pub fn update_project(conn: &mut SqliteConnection, id: &str, name: &str) -> Quer
 /// become loose/unattached. The two cascades require `PRAGMA foreign_keys = ON`
 /// (enabled in [`Db::open`] / [`open_in_memory`]). Returns rows deleted from
 /// `projects` (0 if the id is unknown).
+///
+/// The workspace cascade also reaches `command_instances` (and `managed_commands` via
+/// `project_id`), i.e. the rows that ARE the stop handles of the project's managed
+/// commands. So — exactly as for [`delete_workspace`] — the caller is responsible for
+/// KILLING any live process FIRST (see [`instance_ids_for_project`]) from the adapter
+/// that owns the runner; this call only removes rows. Interactive TERMINALS are the
+/// deliberate exception: they are detached, never closed.
 pub fn delete_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
     diesel::delete(projects::table.find(id)).execute(conn)
 }
@@ -6730,8 +6737,11 @@ pub fn instance_ids_for_template(
 }
 
 /// The ids of every command instance belonging to `project_id` (across all its
-/// templates and workspaces). Used by the `delete_project` guard: a project cannot
-/// be deleted while ANY of its command instances is running.
+/// templates and workspaces). Used by the sidecar's `delete_project` bridge to STOP
+/// every live instance BEFORE the delete cascades: the `command_instances` rows are
+/// the only handles on those processes, and they are erased by the cascade, so a
+/// project delete that did not kill first would strand a running command with no way
+/// left to reach it (see [`delete_project`]).
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn instance_ids_for_project(
     conn: &mut SqliteConnection,
@@ -6744,9 +6754,14 @@ pub fn instance_ids_for_project(
         .load(conn)
 }
 
-/// The ids of every command instance belonging to `workspace_id`. Used by the
-/// `remove_workspace` guard (A2): a workspace cannot be deleted while ANY of its
-/// command instances is running, same as the project-level guard.
+/// The ids of every command instance belonging to `workspace_id`. Used — symmetrically to
+/// [`instance_ids_for_project`] — by the adapters that own the live processes (the sidecar's
+/// `workspace_delete` bridge and the MCP `workspace_delete` route) to STOP every live instance
+/// BEFORE the delete cascades: the `command_instances` rows are the only handles on those
+/// processes and `delete_workspace`'s ON DELETE CASCADE erases them, so a workspace delete that
+/// did not kill first would strand a running command with no way left to reach it. This
+/// REPLACED the former "refuse while a command runs" guard (review 01KWEX11 — the user wants a
+/// workspace's runtime cleared, not to be blocked), so the list is a kill-list, never a veto.
 pub fn instance_ids_for_workspace(
     conn: &mut SqliteConnection,
     workspace_id: &str,
@@ -14176,6 +14191,79 @@ pub fn prototypes_for_terminal(
     prototypes_for_session(conn, &session.id)
 }
 
+// ---------------------------------------------------------------------------
+// App-level preferences (`app_settings`)
+// ---------------------------------------------------------------------------
+
+/// The key of the DEFAULT-SHELL preference: which program a terminal nyx opens runs.
+///
+/// A constant rather than a literal at the call sites, for the reason every stored key is one: the
+/// key IS the join between the writer (the Settings section) and the reader (the PTY spawn path),
+/// and a typo in either would not fail — it would silently read "no preference" and fall back,
+/// which is indistinguishable from the user never having chosen. Its value is the JSON form of a
+/// [`crate::shells::ShellChoice`] (a program plus its fixed arguments), not a bare path: a WSL
+/// distribution cannot be named by a path alone.
+pub const SETTING_DEFAULT_SHELL: &str = "default_shell";
+
+/// One global preference of the installation (`app_settings`). The row's PRESENCE is the fact
+/// that the user expressed something; its `value` is the serialized preference.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, Insertable)]
+#[diesel(table_name = app_settings)]
+pub struct AppSetting {
+    /// The preference's stable name — always one of the `SETTING_*` constants above.
+    pub key: String,
+    /// The serialized value: a scalar verbatim, a structured preference as JSON.
+    pub value: String,
+    pub updated_at: i64,
+}
+
+/// READ a global preference, or `None` when the user has expressed none.
+///
+/// `None` is a VERDICT ("nothing chosen"), not a missing value: it is what every caller turns into
+/// its own historical default, so an install that never opened the setting behaves exactly as it
+/// did before the preference existed.
+pub fn get_app_setting(conn: &mut SqliteConnection, key: &str) -> QueryResult<Option<String>> {
+    app_settings::table
+        .find(key)
+        .select(app_settings::value)
+        .first::<String>(conn)
+        .optional()
+}
+
+/// WRITE a global preference (upsert), or CLEAR it when `value` is `None`.
+///
+/// Clearing DELETES the row instead of storing an empty string, because the absence of the row is
+/// the only way to express "the user expressed nothing" — an empty value would be a value, and the
+/// reader would have to invent a second convention to tell the two apart.
+pub fn set_app_setting(
+    conn: &mut SqliteConnection,
+    key: &str,
+    value: Option<&str>,
+) -> QueryResult<()> {
+    match value {
+        None => {
+            diesel::delete(app_settings::table.find(key)).execute(conn)?;
+        }
+        Some(value) => {
+            let row = AppSetting {
+                key: key.to_string(),
+                value: value.to_string(),
+                updated_at: now_millis(),
+            };
+            diesel::insert_into(app_settings::table)
+                .values(&row)
+                .on_conflict(app_settings::key)
+                .do_update()
+                .set((
+                    app_settings::value.eq(&row.value),
+                    app_settings::updated_at.eq(row.updated_at),
+                ))
+                .execute(conn)?;
+        }
+    }
+    Ok(())
+}
+
 /// Open an in-memory SQLite database with migrations applied — used by tests so
 /// they never touch the real `app_data_dir` DB.
 #[cfg(test)]
@@ -15107,6 +15195,8 @@ mod tests {
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -15644,6 +15734,8 @@ mod tests {
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -15705,6 +15797,8 @@ mod tests {
         // reverts — the TIMESTAMPED head `20260818130000` and v51 both sit above v50.
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -15846,6 +15940,8 @@ mod tests {
         // and reverting v51 must not take it with it.
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         assert!(
@@ -17146,6 +17242,8 @@ mod tests {
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -17859,7 +17957,8 @@ mod tests {
         // TIMESTAMPED head dir 20260818130000 `projects.worktrees_root` + the widened
         // `nodes.type` CHECK).
         // Count: dirs #4..#18 (15) + #20..#51 (32) + the timestamped head (1) = 48.
-        for _ in 0..48 {
+        // Plus the TIMESTAMPED dir 20260818020000 `app_settings` (the app-level preference store).
+        for _ in 0..49 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) exec_state");
         }
@@ -21205,6 +21304,8 @@ mod tests {
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -21667,6 +21768,8 @@ mod tests {
         // no `key`/`primary_workspace_id`.
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -22653,7 +22756,8 @@ mod tests {
         // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form;
         // the spec-anchor PRD added the TIMESTAMPED head dir 20260818130000
         // `projects.worktrees_root` + the widened `nodes.type` CHECK). projects must then be absent.
-        for _ in 0..50 {
+        // Plus the TIMESTAMPED dir 20260818020000 `app_settings` (the app-level preference store).
+        for _ in 0..51 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) projects");
         }
@@ -23524,7 +23628,8 @@ mod tests {
         // the spec-anchor PRD added the TIMESTAMPED head dir 20260818130000
         // `projects.worktrees_root` + the widened `nodes.type` CHECK). managed_commands must then
         // be absent.
-        for _ in 0..49 {
+        // Plus the TIMESTAMPED dir 20260818020000 `app_settings` (the app-level preference store).
+        for _ in 0..50 {
             conn.revert_last_migration(MIGRATIONS)
                 .expect("revert migration cleanly down to (and including) managed_commands");
         }
@@ -23592,6 +23697,8 @@ mod tests {
         // to run).
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -23838,6 +23945,8 @@ mod tests {
         // gone (a typed select of `prev_scrollback` would now fail to run).
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -25249,6 +25358,8 @@ mod tests {
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -26349,6 +26460,8 @@ mod tests {
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -26443,6 +26556,8 @@ mod tests {
         let mut conn = open_in_memory();
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -26682,6 +26797,8 @@ mod tests {
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -26706,6 +26823,155 @@ mod tests {
         let turn = last_human_turn(&mut conn, "term-v49").unwrap().unwrap();
         assert_eq!(turn.turn_id, "turn-A");
         assert_eq!(turn.consumed_by, None);
+    }
+
+    /// MIGRATION app_settings: `app_settings` is the app-level preference store — the first table scoped to
+    /// the INSTALLATION rather than to a project/workspace/terminal. A DB migrated through the head
+    /// carries it and accepts a write; reverted ONCE it is GONE (a select on it fails) while v49's
+    /// consumption mark is still there — the chain is pinned at both ends, so one revert too few or
+    /// one too many fails instead of passing on an unexercised `down.sql`. Re-applying restores an
+    /// EMPTY store: `down.sql` drops the table, so nothing written before the revert survives it.
+    #[test]
+    fn migration_app_settings_adds_the_app_level_preference_store() {
+        let mut conn = open_in_memory();
+        set_app_setting(
+            &mut conn,
+            SETTING_DEFAULT_SHELL,
+            Some("{\"path\":\"/bin/zsh\",\"args\":[]}"),
+        )
+        .expect("the migrated schema accepts a preference");
+        assert!(
+            diesel::sql_query("SELECT key, value, updated_at FROM app_settings")
+                .execute(&mut conn)
+                .is_ok(),
+            "the migrated schema carries the store, with its three columns"
+        );
+
+        // The head of the chain is v2's timestamped `projects.worktrees_root` (20260818130000),
+        // applied AFTER this one (20260818020000): it has to come off first.
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        assert!(
+            diesel::sql_query("SELECT key FROM app_settings")
+                .execute(&mut conn)
+                .is_err(),
+            "after reverting the app_settings migration the table must be gone — one revert too FEW and this passes blind"
+        );
+        assert!(
+            diesel::sql_query("SELECT consumed_by FROM human_turns")
+                .execute(&mut conn)
+                .is_ok(),
+            "the chain stops AT app_settings: v49's consumption mark must still be applied"
+        );
+
+        run_migrations(&mut conn).expect("re-apply the app_settings migration");
+        assert_eq!(
+            get_app_setting(&mut conn, SETTING_DEFAULT_SHELL).unwrap(),
+            None,
+            "the store comes back EMPTY — the drop took the preference with it"
+        );
+        set_app_setting(
+            &mut conn,
+            SETTING_DEFAULT_SHELL,
+            Some("{\"path\":\"pwsh.exe\"}"),
+        )
+        .unwrap();
+        assert_eq!(
+            get_app_setting(&mut conn, SETTING_DEFAULT_SHELL)
+                .unwrap()
+                .as_deref(),
+            Some("{\"path\":\"pwsh.exe\"}"),
+            "and it is writable again after the round trip"
+        );
+    }
+
+    /// The app-preference accessors, which are the ONLY door to `app_settings`: a write then a read
+    /// (round trip), a SECOND write on the same key (an UPSERT — one row, replaced value, re-stamped
+    /// `updated_at`), an unrelated key living alongside it, and a CLEAR.
+    ///
+    /// The clear is the point. It DELETES the row instead of storing an empty string, because the
+    /// absence of the row is the only way to express "the user expressed nothing" — the fact every
+    /// reader turns into its own historical default. That is asserted against the TABLE, not only
+    /// through [`get_app_setting`], since a stored `""` would still make the accessor answer
+    /// `Some("")` and only a row count tells the two designs apart.
+    ///
+    /// Loading the rows as [`AppSetting`] is also what exercises its `Queryable`/`Selectable`
+    /// derives — the write path needs `Insertable` alone.
+    #[test]
+    fn app_settings_round_trip_upsert_and_clear() {
+        let mut conn = open_in_memory();
+        fn rows(conn: &mut SqliteConnection) -> Vec<AppSetting> {
+            app_settings::table
+                .select(AppSetting::as_select())
+                .load(conn)
+                .expect("load app_settings")
+        }
+
+        // NOTHING expressed: the read is a VERDICT ("nothing chosen"), not an error.
+        assert_eq!(
+            get_app_setting(&mut conn, SETTING_DEFAULT_SHELL).unwrap(),
+            None
+        );
+        assert!(rows(&mut conn).is_empty());
+
+        // WRITE, then READ it back verbatim.
+        set_app_setting(
+            &mut conn,
+            SETTING_DEFAULT_SHELL,
+            Some("{\"path\":\"/bin/zsh\"}"),
+        )
+        .unwrap();
+        assert_eq!(
+            get_app_setting(&mut conn, SETTING_DEFAULT_SHELL)
+                .unwrap()
+                .as_deref(),
+            Some("{\"path\":\"/bin/zsh\"}")
+        );
+
+        // A SECOND write on the SAME key UPSERTS. The stamp is pinned to 0 first because two writes
+        // can land in the same millisecond: the assertion must prove the column was WRITTEN, not
+        // that the clock happened to move between them.
+        diesel::update(app_settings::table.find(SETTING_DEFAULT_SHELL))
+            .set(app_settings::updated_at.eq(0))
+            .execute(&mut conn)
+            .unwrap();
+        set_app_setting(
+            &mut conn,
+            SETTING_DEFAULT_SHELL,
+            Some("{\"path\":\"/bin/bash\"}"),
+        )
+        .unwrap();
+        let after = rows(&mut conn);
+        assert_eq!(
+            after.len(),
+            1,
+            "an upsert, not a second row for the same key"
+        );
+        assert_eq!(after[0].key, SETTING_DEFAULT_SHELL);
+        assert_eq!(after[0].value, "{\"path\":\"/bin/bash\"}", "value replaced");
+        assert!(after[0].updated_at > 0, "and `updated_at` re-stamped");
+
+        // The store is KEYED, not a singleton: another preference lives beside it untouched.
+        set_app_setting(&mut conn, "some_other_preference", Some("42")).unwrap();
+        assert_eq!(rows(&mut conn).len(), 2);
+
+        // CLEARING DELETES the row — an empty string would be a value, and "nothing expressed" is
+        // not a value.
+        set_app_setting(&mut conn, SETTING_DEFAULT_SHELL, None).unwrap();
+        assert_eq!(
+            get_app_setting(&mut conn, SETTING_DEFAULT_SHELL).unwrap(),
+            None
+        );
+        let left = rows(&mut conn);
+        assert_eq!(left.len(), 1, "the row is GONE, not blanked");
+        assert_eq!(left[0].key, "some_other_preference", "and only that one is");
+
+        // Clearing a key that was never written is a no-op, not an error.
+        set_app_setting(&mut conn, "never_written", None)
+            .expect("clearing an absent preference is a no-op");
+        assert_eq!(rows(&mut conn).len(), 1);
     }
 
     /// MIGRATION 20260818130000: the WHERE of a dev workspace (`projects.worktrees_root`) and the
@@ -26763,6 +27029,8 @@ mod tests {
             .expect("no row may keep a vocabulary the down removes");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
         assert!(
             diesel::sql_query("SELECT worktrees_root FROM projects")
                 .execute(&mut conn)
@@ -27128,6 +27396,8 @@ mod tests {
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v50 (annexes url unique index) cleanly");
@@ -27338,6 +27608,8 @@ mod tests {
         // THE DOWN restores the pre-rename vocabulary byte for byte (a reverted binary reads it).
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert the worktrees_root + create_workspace migration cleanly");
+        conn.revert_last_migration(MIGRATIONS)
+            .expect("revert the app_settings migration cleanly");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v51 (annexes url canonical form) cleanly");
         conn.revert_last_migration(MIGRATIONS)

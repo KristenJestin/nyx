@@ -281,7 +281,7 @@
   }
 
   /* DEFINITIVE horizontal-overflow guard for the whole cockpit window (v2.6).
-     nyx is a fixed desktop shell (`h-svh`, internal scroll surfaces): the DOCUMENT must
+     nyx is a fixed desktop shell (`h-app`, internal scroll surfaces): the DOCUMENT must
      NEVER scroll horizontally. A stray page/drawer overflow used to escape all the way up
      and scroll the WHOLE window — the LEFT RAIL included (user-confirmed). This clips the
      X axis at the document root (and `#root`, the app mount) so no descendant — including
@@ -333,20 +333,73 @@
   }
 }
 
-/*
- * Electron frameless-window DRAG region (phase 3, task #11). Under the Electron
- * shell (marked `data-shell="electron"` on <html> in main.tsx), the SAME
- * `data-tauri-drag-region` attribute the chrome markup already carries is mapped to
- * Chromium's `-webkit-app-region: drag` so the user can move the window by the
- * chrome bar — the cross-shell equivalent of WRY's native handling of that
- * attribute under Tauri. Interactive controls inside the bar opt OUT with
- * `app-region: no-drag` so their clicks are not swallowed. Tauri runs have no
- * `data-shell` tag, so these rules do not apply and WRY handles the attribute.
+/* ==========================================================================
+ * THE FRAMELESS WINDOW'S OWN CHROME
+ * ==========================================================================
+ * The window is created `frame: false` (apps/desktop/src/main/window.ts), so it has
+ * NO OS title bar: the strip at the top of the app — drag region + minimize /
+ * maximize / close — is drawn by `<ChromeBar>` (components/chrome/chrome-bar.tsx),
+ * mounted at the top of the navigation shell (`<BaseLayout>`). Three CSS concerns
+ * follow from that, and all three live here so the bar's geometry has ONE source of
+ * truth.
  */
-:root[data-shell="electron"] [data-tauri-drag-region] {
+
+/* 1. THE BAR'S HEIGHT. `<ChromeBar>` sizes itself with `h-[var(--chrome-bar-h,2.25rem)]`
+      (the literal fallback is for the component tests, which mount it without this
+      stylesheet) and every full-height surface below it subtracts the SAME token (see
+      2.), so the bar and the space reserved for it can never drift. */
+:root {
+  --chrome-bar-h: 2.25rem; /* = Tailwind's h-9 (9 × 0.25rem) */
+}
+
+/* 2. WHAT "FULL HEIGHT" MEANS NOW — `h-app`, THE APP'S USABLE HEIGHT. The routed pages —
+      and the panes inside them — claim the whole height a page may occupy, which now that
+      the window draws its own chrome strip is the viewport MINUS the bar: sized to the full
+      viewport, every page would be exactly one bar too tall and the WHOLE document would
+      gain a vertical scroll (nyx is a fixed desktop frame with internal scroll surfaces —
+      see the overflow guard above), pushing each page's last rows below the fold.
+
+      IT IS ITS OWN UTILITY, NOT A REDEFINITION OF TAILWIND'S `h-svh` (review finding
+      `01M0524Q2DFWKNDC6HQQ2BGFDE`). Re-defining `.h-svh` in an unlayered rule did work —
+      unlayered beats `@layer utilities` at any specificity — but it changed the meaning of a
+      third-party utility for the whole repo: its VARIANTS (`md:h-svh`, `group-hover:h-svh`,
+      emitted under their own selectors) and the rest of its FAMILY (`min-h-svh`, `h-dvh`,
+      `h-screen`) kept the old meaning, so one name would have stood for two heights, and
+      nothing at the ~20 call-sites said which. `@utility` is Tailwind v4's own extension
+      point: `h-app` lands in `@layer utilities` like any other utility, its variants
+      (`md:h-app`, `group-hover:h-app`) are generated FROM THIS declaration, and nothing
+      depends on layer order surviving a Tailwind upgrade. The name also carries the meaning
+      to the call-site, which `h-svh` never could.
+      Need `min-h-app` / `max-h-app` one day? Declare them right here, next to this one.
+
+      The ONE box that spans the FULL window is the shell root, and it says so explicitly
+      with `h-[100svh]` (base-layout.tsx) — bar included.
+      `src/app-height.guard.test.ts` fails the day a surface under the shell goes back to a
+      viewport-height utility (`h-svh` / `h-dvh` / `h-screen` / `min-h-*`) instead of this. */
+@utility h-app {
+  height: calc(100svh - var(--chrome-bar-h));
+}
+
+/* 3. THE DRAG REGION. Under Electron a frameless window is moved by grabbing an
+      element whose computed `-webkit-app-region` is `drag` — Chromium's own protocol,
+      no JS and no IPC involved. `drag-region` marks the strip; `no-drag-region` cuts
+      an interactive island back OUT of it, because a drag region SWALLOWS pointer
+      events: a button left inside one never fires.
+      This replaces the `data-tauri-drag-region` attribute the chrome markup carried
+      while the shell was Tauri/WRY (which interpreted that attribute natively). Tauri
+      is gone (PDR-0006), and the attribute went with it. */
+@utility drag-region {
   -webkit-app-region: drag;
   app-region: drag;
 }
+@utility no-drag-region {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+/* The blanket safety net under the Electron shell (`data-shell="electron"` is set on
+   <html> in main.tsx): EVERY interactive element is cut out of whatever drag region it
+   sits in, so a control added to the bar later is never silently swallowed. Unlayered,
+   so it also wins over the `drag-region` utility above on such an element. */
 :root[data-shell="electron"] button,
 :root[data-shell="electron"] a,
 :root[data-shell="electron"] input,

@@ -41,12 +41,17 @@ export function SpecLivePanel({ spec, onClose }: { spec: Spec; onClose: () => vo
   const footer = `${status.label} · ${phaseCount || 1} ${phaseCount === 1 ? "phase" : "phases"} · ${taskCount} ${taskCount === 1 ? "task" : "tasks"}`;
 
   return (
-    <section
+    <div
       // Docks flush to the terminal's right edge inside the width-animated shell. NO left border /
       // own shadow: the shell casts the left-edge shadow, so the ACTIVE languette fused to this
       // panel's left edge reads seamless (no shared border). `bg-card/95` is the shared fused surface.
+      //
+      // A PLAIN box, deliberately: the panel's `role="dialog"` + its accessible name live on the
+      // container `spec-drawer-overlay` mounts around this one (the element carrying
+      // `data-overlay-panel` and the id the languette's `aria-controls` points at). This used to be a
+      // named `<section>`, i.e. a second named region nested inside the panel for the same content —
+      // the double naming the a11y review removed. Do NOT re-add a role or a label here.
       className="pointer-events-auto flex h-full w-full flex-col bg-card/95 backdrop-blur"
-      aria-label={`${title} live spec`}
     >
       {/* 1. Header: doc icon + key/title + REAL status badge (+ a chevron to close). */}
       <header className="flex shrink-0 items-center gap-2 border-b border-border/60 px-4 py-3">
@@ -73,14 +78,17 @@ export function SpecLivePanel({ spec, onClose }: { spec: Spec; onClose: () => vo
         </button>
       </header>
 
-      {/* `overflow-x-hidden` + `min-w-0` clamp the reused `<SpecTab>`/`<TasksTab>` to the 380px
-          panel: no horizontal scrollbar, no clipped text, no empty gutter. */}
+      {/* `overflow-x-hidden` + `min-w-0` clamp the reused `<SpecTab>`/`<TasksTab>` to the panel's
+          width — bounded on the host pane, `min(380, max(45% of pane, 260))` (`overlay-motion`), the
+          260px floor being exactly the point below which this reused content stops being readable:
+          no horizontal scrollbar, no clipped text, no empty gutter. */}
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-4">
         {detail ? (
           <div className="flex min-w-0 flex-col gap-6">
             {/* 2. Real sections, filling in live (reused `<SpecTab>`). The drawer header already
                 carries the key/title/status, so the SpecTab banner is suppressed here (no duplicate
-                banner, no per-word title staircase at 380px). */}
+                banner, and no per-word title staircase — a risk that only grows as the bounded
+                width narrows towards its 260px floor). */}
             <SpecTab detail={detail} showBanner={false} />
             {/* 2 bis. The Spec's PROTOTYPE PAGES (finding `01KYW342EE5DN6F70YB8VSTJR8`) — the proto
                 is an annexe of the Spec, proposed WHILE it is authored, so it belongs on this live
@@ -106,6 +114,6 @@ export function SpecLivePanel({ spec, onClose }: { spec: Spec; onClose: () => vo
       <footer className="shrink-0 border-t border-border/60 px-4 py-2.5">
         <MicroLabel>{footer}</MicroLabel>
       </footer>
-    </section>
+    </div>
   );
 }

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { getRouteApi } from "@tanstack/react-router";
 import { FolderPlusIcon, SettingsIcon, SquareTerminalIcon } from "lucide-react";
 
-import { useProjects } from "@/components/sidebar/use-projects";
+import { useProjects, type WorkspaceRecord } from "@/components/sidebar/use-projects";
 import { useManualAdd } from "@/components/sidebar/use-manual-add";
 import { SidebarShell } from "@/components/ui/sidebar-shell";
 import { ProjectCommandsDialog } from "@/components/command/project-commands-dialog";
@@ -41,8 +41,15 @@ const terminalsRouteApi = getRouteApi("/");
  */
 export function TerminalsPage() {
   const { activeProjectId } = useActiveProject();
-  const { projects, createProject, createWorkspace, setProjectResumeAgentSessions, updateProject } =
-    useProjects();
+  const {
+    projects,
+    createProject,
+    createWorkspace,
+    setProjectResumeAgentSessions,
+    updateProject,
+    deleteWorkspace,
+    renameWorkspace,
+  } = useProjects();
   // The optional `?terminal=<id>` / `?command=<id>` deep-links (the Runtime tab opens a precise
   // terminal or managed command here).
   const { terminal: deepLinkTerminalId, command: deepLinkCommandId } =
@@ -54,9 +61,21 @@ export function TerminalsPage() {
   // "Add project". PDR-0025's shell only surfaced project-add (the rail); this re-exposes the
   // existing add-workspace capability where it belongs — the Terminals sidebar (its header, next
   // to the entered project). `dialog` is the mounted modal set, rendered once below.
-  const { addWorkspace, dialog: manualAddDialog } = useManualAdd({
+  // The SAME hook also owns the per-workspace lifecycle flows the accordion headers now expose —
+  // rename (`rename_workspace`) and remove (`workspace_delete` behind the existing destructive
+  // confirm). Before this, both were reachable ONLY from the project's rail menu, so a worktree
+  // offered no way to act on itself (review `01M04WQEQDDPH7NQEK9MPYCXKS`). No new backend command
+  // and no second confirm dialog: the capability existed, it just had no entry point here.
+  const {
+    addWorkspace,
+    editWorkspace,
+    removeWorkspace,
+    dialog: manualAddDialog,
+  } = useManualAdd({
     createProject,
     createWorkspace,
+    deleteWorkspace,
+    renameWorkspace,
   });
 
   // The per-project settings modal opened by the header's VISIBLE gear (the discoverable
@@ -136,6 +155,8 @@ export function TerminalsPage() {
             deepLinkTerminalId={deepLinkTerminalId ?? null}
             deepLinkCommandId={deepLinkCommandId ?? null}
             onAddWorkspace={() => void addWorkspace(activeTree)}
+            onRenameWorkspace={editWorkspace}
+            onRemoveWorkspace={removeWorkspace}
             onOpenProjectSettings={() => setProjectSettingsOpen(true)}
           />
         </ConsumedNotificationsProvider>
@@ -182,6 +203,8 @@ function TerminalsBody({
   deepLinkTerminalId,
   deepLinkCommandId,
   onAddWorkspace,
+  onRenameWorkspace,
+  onRemoveWorkspace,
   onOpenProjectSettings,
 }: {
   projectId: string;
@@ -196,6 +219,10 @@ function TerminalsBody({
   deepLinkCommandId: string | null;
   /** Open the add-workspace flow (folder picker → name dialog) for the entered project. */
   onAddWorkspace: () => void;
+  /** Open the RENAME dialog for ONE workspace of this project (`rename_workspace`). */
+  onRenameWorkspace: (workspace: WorkspaceRecord) => void;
+  /** Open the destructive-confirm flow for ONE workspace of this project (`workspace_delete`). */
+  onRemoveWorkspace: (workspace: WorkspaceRecord) => void;
   /** Open the project-settings modal (Global pane → resume toggle) for the entered project. */
   onOpenProjectSettings: () => void;
 }) {
@@ -335,7 +362,7 @@ function TerminalsBody({
           reorderTerminals={reorderTerminals}
           orderedIds={orderedTerminalIds}
         >
-          <div className="flex h-svh bg-background text-foreground">
+          <div className="flex h-app bg-background text-foreground">
             <SidebarShell
               aria-label="Workspaces"
               header={
@@ -404,6 +431,11 @@ function TerminalsBody({
                         onNewCommand={() =>
                           setCommandsFor({ id: workspace.id, path: workspace.path })
                         }
+                        // The workspace's OWN lifecycle, on its own line: rename any workspace,
+                        // remove a non-root one (the header's kebab disables it on the root with
+                        // its reason — the backend refuses that removal).
+                        onRename={onRenameWorkspace}
+                        onRemove={onRemoveWorkspace}
                       />
                     ))
                   )}

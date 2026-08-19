@@ -14,11 +14,17 @@
 //! are ever captured. No user keystroke is ever forwarded: the read-only,
 //! no-user-input invariant holds.
 //!
-//! The command runs under the platform shell ([`crate::pty::resolve_shell`], the
-//! same resolution the terminals use, honoring `$SHELL`) so a shell command line
-//! (`npm run dev`, `cargo watch -x test`, ...) is interpreted exactly as the user
-//! would type it. [`command_invocation`] maps the shell family to its
-//! run-this-string flag (POSIX `-c`, PowerShell `-Command`, cmd.exe `/C`).
+//! The command runs under the PLATFORM shell ([`crate::pty::resolve_shell`] — `$SHELL`, else the
+//! per-OS default) so a shell command line (`npm run dev`, `cargo watch -x test`, ...) is
+//! interpreted exactly as the user would type it. [`command_invocation`] maps the shell family to
+//! its run-this-string flag (POSIX `-c`, PowerShell `-Command`, cmd.exe `/C`).
+//!
+//! That is DELIBERATELY not the whole resolution a TERMINAL goes through: since the default-shell
+//! preference ([`crate::shells`], v2.5.7) an interactive terminal reads the user's stored choice
+//! FIRST ([`crate::shells::resolve`]), and a managed command ignores it. A command's shell is an
+//! execution detail of a project's script — the string was written against the platform shell and
+//! must keep being interpreted by it — not the interactive shell the user chose to work in
+//! (rationale stated once, in [`crate::shells`]'s "What this module does NOT do").
 //!
 //! Bytes read from the PTY master are pushed, unmodified and un-throttled, onto an
 //! [`std::sync::mpsc`] channel; coalescing/throttling is the bridge's job (mirrors
@@ -823,6 +829,31 @@ struct RunnerEntry {
     live_scrollback: Arc<Mutex<String>>,
 }
 
+/// One instance taken OUT of the runner map by phase 1 of a stop: the entry is already
+/// marked idle and its generation already bumped, so what remains is only the killing and
+/// the waiting, which happen OUTSIDE the entries lock.
+struct DetachedRun {
+    instance_id: String,
+    /// Tree-kill handle of the (still live) process, `None` if the process had already
+    /// exited between the pump's reap and this stop.
+    kill: Option<KillHandle>,
+    /// Pump thread to join (bounded), taken so the entry no longer owns it.
+    pump: Option<JoinHandle<()>>,
+}
+
+/// What phase 1 of a stop found in the runner map for one instance.
+enum DetachOutcome {
+    /// The entry was RUNNING: it is now evicted, idle, and its process is ours to kill.
+    Detached(DetachedRun),
+    /// A genuine non-running entry (idle/success/error) — nothing to kill, and its state
+    /// must be KEPT (we never overwrite a success/error dot with idle).
+    NotRunning(RunState),
+    /// No entry at all: there is NO live process. Either the instance never ran this
+    /// session, or a stale `running` dot survives with nothing behind it (the phantom).
+    /// The two are indistinguishable from here — the caller decides what that means.
+    Absent,
+}
+
 /// Managed state: the live command runners keyed by `command_instances.id`.
 ///
 /// The single `Mutex<HashMap>` serializes all lifecycle ops on a given instance,
@@ -917,8 +948,10 @@ impl<S: RunnerSink> CommandRunner<S> {
     }
 
     /// Whether ANY of `instance_ids` is currently running in the runner. Used by the
-    /// guards: a template update/delete (or a `delete_project`) is refused if any of
-    /// the affected instances has a live process.
+    /// template-mutation guard: a template update/delete is refused if any of its
+    /// instances has a live process. Destructive CONTAINER deletes (a workspace, a
+    /// project) do not consult this — they no longer refuse, they STOP every instance
+    /// first (see the sidecar's `workspace_delete` / `delete_project` bridge).
     pub fn any_running(&self, instance_ids: &[String]) -> bool {
         let entries = self.entries.lock().unwrap();
         instance_ids.iter().any(|id| {
@@ -1073,47 +1106,152 @@ impl<S: RunnerSink> CommandRunner<S> {
     /// Returns the state after the call.
     pub fn stop(&self, instance_id: &str) -> anyhow::Result<RunState> {
         // Snapshot + evict under the lock; do the (possibly blocking) kill outside.
-        let (kill, pump) = {
-            let mut entries = self.entries.lock().unwrap();
-            match entries.get_mut(instance_id) {
-                Some(entry) if entry.state == RunState::Running => {
-                    // Bump generation so the about-to-die pump's natural-exit
-                    // transition is ignored (it would otherwise race us to set
-                    // success/error after we set idle).
-                    entry.generation = entry.generation.wrapping_add(1);
-                    let kill = entry.kill.take();
-                    let pump = entry.pump.take();
-                    entry.state = RunState::Idle;
-                    (kill, pump)
-                }
-                // A genuine non-running runner entry (idle/success/error): no-op,
-                // keep its state. Read it from THIS guard — never re-lock
-                // `self.entries` while held (non-reentrant mutex deadlock).
-                Some(entry) => return Ok(entry.state),
-                // Absent entry: there is NO live process. This is the phantom-running
-                // path (a stale `running` dot the runner does not back). Force idle
-                // and emit so the dot reconciles instead of staying frozen.
-                None => {
-                    self.sink.on_state(instance_id, RunState::Idle, None);
-                    return Ok(RunState::Idle);
-                }
+        let detached = match self.detach_running(instance_id) {
+            DetachOutcome::Detached(run) => run,
+            // A genuine non-running runner entry (idle/success/error): no-op, keep its
+            // state.
+            DetachOutcome::NotRunning(state) => return Ok(state),
+            // Absent entry: there is NO live process. This is the phantom-running path (a
+            // stale `running` dot the runner does not back). Force idle and emit so the
+            // dot reconciles instead of staying frozen.
+            DetachOutcome::Absent => {
+                self.sink.on_state(instance_id, RunState::Idle, None);
+                return Ok(RunState::Idle);
             }
         };
 
-        if let Some(kill) = kill {
-            kill_tree_graceful(&kill);
+        if let Some(kill) = &detached.kill {
+            kill_tree_graceful(kill);
         }
         // Tear down the pump WITHOUT blocking stop indefinitely: join with a bounded
         // timeout, detach if it lingers. A lingering ConPTY host can keep the reader
         // (and thus the pump) alive past the kill; we must still return + emit idle.
         // The generation bump above makes a detached pump's late transition a no-op.
-        if let Some(pump) = pump {
-            join_pump_bounded(pump, PUMP_JOIN_TIMEOUT);
-        }
+        join_pumps_bounded(detached.pump.into_iter().collect(), PUMP_JOIN_TIMEOUT);
 
         // The entry is now idle with no live process. Persist + emit.
         self.sink.on_state(instance_id, RunState::Idle, None);
         Ok(RunState::Idle)
+    }
+
+    /// PHASE 1 of a stop — everything that happens UNDER the entries lock and BEFORE any
+    /// wait: bump the generation (so the about-to-die pump's natural-exit transition is
+    /// ignored — it would otherwise race us to set success/error after we set idle), take
+    /// the kill handle and the pump out of the entry, and mark it idle. Nothing here
+    /// blocks.
+    ///
+    /// Split out of [`stop`](Self::stop) so a BULK teardown can run this phase — and the
+    /// SIGTERM that immediately follows it — over EVERY instance before waiting on the
+    /// first grace window (see [`stop_many`](Self::stop_many)).
+    fn detach_running(&self, instance_id: &str) -> DetachOutcome {
+        let mut entries = self.entries.lock().unwrap();
+        match entries.get_mut(instance_id) {
+            Some(entry) if entry.state == RunState::Running => {
+                // Bump generation so the about-to-die pump's natural-exit transition is
+                // ignored (it would otherwise race us to set success/error after we set
+                // idle).
+                entry.generation = entry.generation.wrapping_add(1);
+                let kill = entry.kill.take();
+                let pump = entry.pump.take();
+                entry.state = RunState::Idle;
+                DetachOutcome::Detached(DetachedRun {
+                    instance_id: instance_id.to_string(),
+                    kill,
+                    pump,
+                })
+            }
+            // Read the state from THIS guard — never re-lock `self.entries` while held
+            // (non-reentrant mutex deadlock).
+            Some(entry) => DetachOutcome::NotRunning(entry.state),
+            None => DetachOutcome::Absent,
+        }
+    }
+
+    /// Stop SEVERAL instances for the price of ~ONE grace window instead of N — the bulk
+    /// twin of [`stop`](Self::stop), used by the `delete_project` / `workspace_delete`
+    /// teardowns. Returns the ids actually stopped (the live subset), in call order.
+    ///
+    /// WHY. A loop of [`stop`](Self::stop) pays its two WAITS serially: [`TERM_GRACE`]
+    /// (750 ms) then [`PUMP_JOIN_TIMEOUT`] (500 ms) — up to 1.25 s per LIVE instance, on
+    /// the sidecar's single request-serving thread, against the supervisor's 5 s
+    /// per-request deadline. Four live commands in one project already blew that budget:
+    /// the request timed out, the renderer skipped its detach and kept showing a project
+    /// the sidecar had deleted.
+    ///
+    /// WHAT IS SEPARABLE, AND WHAT IS NOT. Per instance the ORDER of the irreversible acts
+    /// is UNCHANGED — evict + bump generation, SIGTERM the group, (grace), SIGKILL, join,
+    /// emit idle. Only the WAITING is hoisted:
+    ///   - phase 1 evicts and SIGTERMs EVERY target first, so the single [`TERM_GRACE`]
+    ///     that follows is served CONCURRENTLY by all the trees instead of queueing. Each
+    ///     tree still gets AT LEAST its full grace between SIGTERM and SIGKILL — an
+    ///     earlier one simply gets more, and a grace is a minimum, never a maximum.
+    ///   - phase 2 joins every pump against ONE shared [`PUMP_JOIN_TIMEOUT`] deadline (see
+    ///     [`join_pumps_bounded`]) — the same overlap the PTY manager's bulk close buys for
+    ///     interactive terminals.
+    ///
+    /// The bounded part is therefore the WAIT: ~one `TERM_GRACE` + one `PUMP_JOIN_TIMEOUT`
+    /// for the whole batch, whatever N is. What stays serial is the SIGNALLING itself —
+    /// notably the `taskkill /T /F` process spawn Windows uses as its tree kill, which
+    /// costs a process spawn per instance. That residual is small next to the two windows
+    /// it replaces, but it is not zero.
+    ///
+    /// LIVENESS FILTER — the ONE contract that differs from [`stop`](Self::stop). Only
+    /// instances the runner backs as RUNNING are touched. A genuine non-running entry AND
+    /// an absent one are both skipped SILENTLY: no kill, no join, and NO `on_state` — where
+    /// [`stop`](Self::stop) force-emits idle on an absent entry to reconcile a phantom dot.
+    /// That reconcile earns its state write when a user presses Stop on a frozen dot; on a
+    /// bulk delete it would write a `command.stopped` audit row (plus two frames) for every
+    /// instance that NEVER ran, against rows the caller is about to delete.
+    ///
+    /// NOT the shutdown reap: [`kill_all_running`](Self::kill_all_running) is the
+    /// no-grace / no-join / no-emit path for a process that is itself dying.
+    pub fn stop_many(&self, instance_ids: &[String]) -> Vec<String> {
+        // PHASE 1 — evict + SIGTERM every target, in call order. Nothing here waits.
+        let mut detached: Vec<DetachedRun> = Vec::new();
+        let mut termed = false;
+        for instance_id in instance_ids {
+            if let DetachOutcome::Detached(run) = self.detach_running(instance_id) {
+                if let Some(kill) = &run.kill {
+                    termed |= kill.term_tree();
+                }
+                detached.push(run);
+            }
+        }
+        if detached.is_empty() {
+            return Vec::new();
+        }
+
+        // PHASE 2 — the WAITS, paid ONCE for the whole batch. The grace exists only to let
+        // a SIGTERMed group drain, so it is skipped when no group signal was delivered at
+        // all (Windows has none: `term_tree` is always false there and the hard kill is
+        // `taskkill /T /F`). The flag is a platform property, so a batch is uniform in
+        // practice; were it mixed, a tree that got no SIGTERM is merely hard-killed one
+        // grace later than a serial `stop` would have — later, never weaker.
+        if termed {
+            std::thread::sleep(TERM_GRACE);
+        }
+        for run in &detached {
+            if let Some(kill) = &run.kill {
+                kill.kill_tree();
+            }
+        }
+        join_pumps_bounded(
+            detached
+                .iter_mut()
+                .filter_map(|run| run.pump.take())
+                .collect(),
+            PUMP_JOIN_TIMEOUT,
+        );
+
+        // Every entry is idle with no live process. Persist + emit — one transition per
+        // REAL stop, none for an instance that was not running.
+        detached
+            .into_iter()
+            .map(|run| {
+                self.sink.on_state(&run.instance_id, RunState::Idle, None);
+                run.instance_id
+            })
+            .collect()
     }
 
     /// Relaunch an instance — the back-compat wrapper returning just the resulting
@@ -1486,27 +1624,49 @@ fn kill_tree_graceful(kill: &KillHandle) {
     kill.kill_tree();
 }
 
-/// Join a pump thread, but NEVER block longer than `timeout`: a watcher thread
-/// performs the actual `join()` and signals completion over a channel; if the
-/// signal does not arrive in time the pump is DETACHED (the watcher keeps it,
+/// Join pump threads, but NEVER block longer than `timeout` IN TOTAL: one watcher thread
+/// per pump performs the actual `join()` and signals completion over a SHARED channel;
+/// whatever has not signalled by the deadline is DETACHED (its watcher keeps the handle,
 /// finishes the join in the background, and is itself detached). This is what makes
 /// [`CommandRunner::stop`] always return: a ConPTY host that fails to EOF can keep
 /// the reader (and pump) alive past the tree-kill, and an unconditional join would
-/// hang the Stop button. Detaching is safe because `stop` bumped the entry's
+/// hang the Stop button. Detaching is safe because the caller bumped the entry's
 /// generation, so a detached pump's late natural-exit transition is suppressed.
-fn join_pump_bounded(pump: JoinHandle<()>, timeout: Duration) {
+///
+/// The deadline is SHARED, not per pump: every watcher is spawned before the first wait, so
+/// N pumps spend their last window CONCURRENTLY and a bulk stop
+/// ([`CommandRunner::stop_many`]) stays bounded by ONE `timeout` rather than N.
+fn join_pumps_bounded(pumps: Vec<JoinHandle<()>>, timeout: Duration) {
+    let pending = pumps.len();
+    if pending == 0 {
+        return;
+    }
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    // The watcher OWNS the JoinHandle; it joins then signals. If we time out we drop
-    // our receiver end and leave the watcher running (it cannot block us).
-    std::thread::Builder::new()
-        .name("nyx-cmd-pump-join".into())
-        .spawn(move || {
-            let _ = pump.join();
-            let _ = done_tx.send(());
-        })
-        .ok();
-    // Wait at most `timeout` for the join to complete; on timeout, detach.
-    let _ = done_rx.recv_timeout(timeout);
+    // Each watcher OWNS one JoinHandle; it joins then signals. If we time out we drop
+    // our receiver end and leave the watchers running (they cannot block us). A watcher we
+    // FAILED to spawn drops its sender right away, so the channel disconnects instead of
+    // making us wait out the whole deadline for a signal that can never come.
+    for pump in pumps {
+        let done_tx = done_tx.clone();
+        std::thread::Builder::new()
+            .name("nyx-cmd-pump-join".into())
+            .spawn(move || {
+                let _ = pump.join();
+                let _ = done_tx.send(());
+            })
+            .ok();
+    }
+    drop(done_tx);
+    // Wait at most `timeout` for ALL the joins to complete; on timeout, detach the rest.
+    let deadline = Instant::now() + timeout;
+    for _ in 0..pending {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if done_rx.recv_timeout(remaining).is_err() {
+            break;
+        }
+    }
 }
 
 /// Spawn the pump thread for one running command: coalesces output into
@@ -2758,6 +2918,106 @@ mod tests {
             sink.state_log().len(),
             before,
             "stop on a genuine non-running entry must emit no new transition (keeps success)"
+        );
+    }
+
+    /// The BULK stop's LIVENESS FILTER — the one contract `stop_many` does NOT share with
+    /// `stop`. An instance that never ran this session has no runner entry, and `stop`
+    /// force-emits a reconciling `idle` for it (the phantom-dot path asserted above). On a
+    /// project/workspace delete that wrote a `command.stopped` audit row — which outlives
+    /// the FK cascade, by design — plus two frames, for a command that never started, on
+    /// rows the caller is about to delete. `stop_many` skips them SILENTLY.
+    ///
+    /// Shell-free and deterministic (it only exercises the runner map), so it runs on every
+    /// platform, unlike the process-backed stop tests around it.
+    #[test]
+    fn stop_many_skips_instances_the_runner_does_not_back() {
+        let sink = Arc::new(MockSink::default());
+        let runner = CommandRunner::new(Arc::clone(&sink), small_size());
+
+        let stopped = runner.stop_many(&["never-ran".to_string(), "nor-this".to_string()]);
+        assert!(
+            stopped.is_empty(),
+            "stop_many reports only the instances it really stopped, got {stopped:?}"
+        );
+        assert!(
+            sink.state_log().is_empty(),
+            "a bulk stop must emit NO transition for an instance that never ran — got {:?}",
+            sink.state_log()
+        );
+
+        // …while the single-instance `stop` keeps the OPPOSITE contract on the very same
+        // input: a user pressing Stop on a frozen dot still gets it reconciled.
+        let st = runner.stop("never-ran").expect("stop");
+        assert_eq!(st, RunState::Idle);
+        assert_eq!(
+            sink.state_log(),
+            vec![("never-ran".to_string(), RunState::Idle, None)],
+            "`stop` still reconciles a phantom-running dot with an explicit idle"
+        );
+    }
+
+    /// The bulk join spends ONE deadline for the whole batch, not one PER pump — the half of
+    /// `stop_many`'s budget that is deterministic to assert. Four pumps that all outlive the
+    /// timeout must cost ~one timeout; the serial `join_pump_bounded` this replaced would
+    /// have cost four. Each fake pump parks on a channel the test holds, so it is guaranteed
+    /// to linger past the deadline (no sleep-based flakiness) and is released the moment the
+    /// test drops the senders (nothing survives the test).
+    ///
+    /// TIMING HYGIENE (review `01M0BBY4KW9AY498ST1VF8M0DE`): the measured window cannot exclude
+    /// the `PUMPS` watcher `spawn`s `join_pumps_bounded` performs BEFORE it arms its deadline,
+    /// so every sample is `one deadline + thread-creation cost` — and that second term is
+    /// unbounded on a loaded machine (the auditor measured 4 overshoots in 23 runs, up to
+    /// 852 ms against a 200 ms deadline). Two facts restore determinism without weakening the
+    /// claim: that cost is ONE-SIDED (it can only make the join look SLOWER, never faster), so
+    /// the BEST of a few samples is the honest estimate of the deadline itself; and the ceiling
+    /// stays strictly below the serial cost `PUMPS × timeout`, which no sample of a serial join
+    /// can ever duck under. The deadline is also long enough that spawning `PUMPS` threads is a
+    /// small fraction of it, so the first sample is the only one taken in practice.
+    #[test]
+    fn join_pumps_bounded_shares_one_deadline_across_pumps() {
+        const PUMPS: usize = 4;
+        // Samples are retried only on overshoot, so a healthy run pays exactly ONE deadline.
+        const SAMPLES: usize = 3;
+        let timeout = Duration::from_millis(400);
+        // Strictly below the serial cost (`PUMPS × timeout` = 1600 ms): a join that stopped
+        // sharing its deadline stays red on every sample.
+        let ceiling = 3 * timeout;
+
+        let mut best = Duration::MAX;
+        for _ in 0..SAMPLES {
+            let mut releases = Vec::new();
+            let pumps: Vec<JoinHandle<()>> = (0..PUMPS)
+                .map(|_| {
+                    let (release_tx, release_rx) = mpsc::channel::<()>();
+                    releases.push(release_tx);
+                    std::thread::spawn(move || {
+                        // Blocks until the test drops its sender — i.e. well past the deadline.
+                        let _ = release_rx.recv();
+                    })
+                })
+                .collect();
+
+            let started = Instant::now();
+            join_pumps_bounded(pumps, timeout);
+            let elapsed = started.elapsed();
+            drop(releases);
+
+            assert!(
+                elapsed >= timeout,
+                "the bounded join must actually wait its deadline out, took {elapsed:?}"
+            );
+            best = best.min(elapsed);
+            if best < ceiling {
+                break;
+            }
+        }
+
+        assert!(
+            best < ceiling,
+            "{PUMPS} lingering pumps must SHARE one {timeout:?} deadline (serial would be \
+             {PUMPS} × it, i.e. ≥ {:?}), best of {SAMPLES} samples took {best:?}",
+            PUMPS as u32 * timeout
         );
     }
 

@@ -11,7 +11,7 @@ vi.mock("@tanstack/react-router", async (importActual) => ({
   useNavigate: () => () => Promise.resolve(),
 }));
 
-import type { Spec, SpecDetail, SpecRevision, Task } from "../specs/types";
+import type { Spec } from "../specs/types";
 import * as overlayMotion from "./overlay-motion";
 import {
   OVERLAY_ACTIVE_INDICATOR_LAYOUT_ID,
@@ -23,88 +23,7 @@ import {
   overlayTabVariants,
 } from "./overlay-motion";
 import { SpecOverlay } from "./spec-overlay";
-
-/** A `nyx_core::db::Spec` fixture (the shape `terminal_specs` returns per Spec). */
-function spec(overrides: Partial<Spec>): Spec {
-  return {
-    id: "s1",
-    project_id: "p1",
-    workspace_id: null,
-    title: "Untitled spec",
-    slug: null,
-    number: 1,
-    priority: "med",
-    status: "in_progress",
-    mode: "stepped",
-    phases: "[]",
-    current_revision_number: 1,
-    position: 0,
-    created_at: 0,
-    updated_at: 0,
-    completed_at: null,
-    archived_at: null,
-    ...overrides,
-  };
-}
-
-/** A `tasks` row fixture. */
-function task(overrides: Partial<Task>): Task {
-  return {
-    id: "t1",
-    project_id: "p1",
-    spec_id: "s1",
-    parent_task_id: null,
-    kind: "spec",
-    executor: "agent",
-    type_: "",
-    status: "todo",
-    priority: "med",
-    severity: null,
-    title: "A task",
-    description: null,
-    acceptance_criteria: null,
-    verification_command: null,
-    phase: null,
-    position: 0,
-    blocked_reason: null,
-    skip_reason: null,
-    created_at: 0,
-    updated_at: 0,
-    completed_at: null,
-    from_comment_id: null,
-    grill_state: null,
-    round: null,
-    ...overrides,
-  };
-}
-
-/** A `spec_detail` read-model fixture; `revision` overrides let a test set section bodies. */
-function detail(s: Spec, tasks: Task[], revision: Partial<SpecRevision> = {}): SpecDetail {
-  return {
-    spec: s,
-    revision: {
-      id: "r1",
-      spec_id: s.id,
-      revision_number: 1,
-      revision_status: "active",
-      title: s.title,
-      problem: "",
-      solution: "",
-      implementation_decisions: "",
-      testing_decisions: "",
-      user_stories: "",
-      out_of_scope: "",
-      change_reason: null,
-      created_at: 0,
-      ...revision,
-    },
-    tasks,
-    dependencies: [],
-    workspace_context: null,
-  };
-}
-
-const ACTIVE_SESSION = { id: "sess1", agent_kind: "claude_code", state: "active" };
+import { ACTIVE_SESSION, detail, spec, task } from "./test-fixtures";
 
 describe("<SpecOverlay> — rail A (dev advancement)", () => {
   it("renders NOTHING when the terminal has no active session (non-regression)", async () => {
@@ -308,7 +227,7 @@ describe("<SpecOverlay> — multi-Spec stacking (tiroir only)", () => {
     // the 2nd — its languette is now the ACTIVE fused handle, not dropped).
     fireEvent.click(t2);
     expect(
-      await screen.findByRole("region", { name: /transform spec live spec/i }, { timeout: 3000 }),
+      await screen.findByRole("dialog", { name: /transform spec live spec/i }, { timeout: 3000 }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /open ingest spec live spec/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /open export spec live spec/i })).toBeInTheDocument();
@@ -318,12 +237,12 @@ describe("<SpecOverlay> — multi-Spec stacking (tiroir only)", () => {
     // "never shows an empty shell" test.)
     fireEvent.click(t3);
     expect(
-      await screen.findByRole("region", { name: /export spec live spec/i }, { timeout: 3000 }),
+      await screen.findByRole("dialog", { name: /export spec live spec/i }, { timeout: 3000 }),
     ).toBeInTheDocument();
     await waitFor(
       () =>
         expect(
-          screen.queryByRole("region", { name: /transform spec live spec/i }),
+          screen.queryByRole("dialog", { name: /transform spec live spec/i }),
         ).not.toBeInTheDocument(),
       { timeout: 3000 },
     );
@@ -334,11 +253,11 @@ describe("<SpecOverlay> — multi-Spec stacking (tiroir only)", () => {
 
     // Open the first Spec's panel.
     fireEvent.click(await screen.findByRole("button", { name: /open ingest spec live spec/i }));
-    await screen.findByRole("region", { name: /ingest spec live spec/i });
+    await screen.findByRole("dialog", { name: /ingest spec live spec/i });
     expect(document.querySelectorAll("[data-overlay-panel]")).toHaveLength(1);
 
     // Switch to the third Spec. With `mode="wait"` the new panel would only mount AFTER the old one
-    // finished exiting — leaving the 380px shell EMPTY (zero panels) for that gap. Without it, the
+    // finished exiting — leaving the shell EMPTY (zero panels) for that gap. Without it, the
     // new panel is in the DOM IMMEDIATELY (enter overlaps exit), so a panel is ALWAYS present.
     fireEvent.click(screen.getByRole("button", { name: /open export spec live spec/i }));
     // Synchronously after the switch: the NEW Spec's panel is already mounted (overlap, not deferred)
@@ -391,15 +310,18 @@ describe("<SpecOverlay> — model A (languette-poignée fusionnée + switch anim
     // CLOSED: the languette is dimmed (bg-muted) with its full border — not fused.
     expect(tab.className).toMatch(/bg-muted/);
     expect(tab.className).not.toMatch(/border-r-0/);
-    expect(tab).toHaveAttribute("aria-pressed", "false");
+    // DISCLOSURE semantics (not a pressed toggle) — the state pair lives in `overlay-a11y.test`.
+    expect(tab).toHaveAttribute("aria-expanded", "false");
+    expect(tab).not.toHaveAttribute("aria-pressed");
 
     // Open: the languette STAYS mounted (it is NOT dropped) and FUSES with the panel — it shares the
     // panel's surface (bg-card/95) and drops the border on the shared (right) edge (border-r-0).
     fireEvent.click(tab);
-    await screen.findByRole("region", { name: /lonely spec live spec/i });
+    await screen.findByRole("dialog", { name: /lonely spec live spec/i });
     const activeTab = screen.getByRole("button", { name: /open lonely spec live spec/i });
     expect(activeTab).toBeInTheDocument();
-    expect(activeTab).toHaveAttribute("aria-pressed", "true");
+    expect(activeTab).toHaveAttribute("aria-expanded", "true");
+    expect(activeTab).not.toHaveAttribute("aria-pressed");
     expect(activeTab.className).toMatch(/bg-card\/95/);
     expect(activeTab.className).toMatch(/border-r-0/);
 
@@ -407,7 +329,7 @@ describe("<SpecOverlay> — model A (languette-poignée fusionnée + switch anim
     fireEvent.click(activeTab);
     await waitFor(() =>
       expect(
-        screen.queryByRole("region", { name: /lonely spec live spec/i }),
+        screen.queryByRole("dialog", { name: /lonely spec live spec/i }),
       ).not.toBeInTheDocument(),
     );
   });
@@ -428,7 +350,7 @@ describe("<SpecOverlay> — model A (languette-poignée fusionnée + switch anim
     render(<SpecOverlay terminalId="term-1" />);
     const alpha = await screen.findByRole("button", { name: /open alpha spec live spec/i });
     fireEvent.click(alpha);
-    await screen.findByRole("region", { name: /alpha spec live spec/i });
+    await screen.findByRole("dialog", { name: /alpha spec live spec/i });
 
     // Alpha is the ACTIVE fused languette; Beta stays a dimmed, fully-bordered closed languette.
     const activeAlpha = screen.getByRole("button", { name: /open alpha spec live spec/i });
@@ -465,7 +387,7 @@ describe("<SpecOverlay> — model A (languette-poignée fusionnée + switch anim
     // Open Alpha: it gains a `bg-primary` accent bar carrying the shared layoutId + bold vivid text;
     // Beta (inactive) has NO accent bar.
     fireEvent.click(alpha);
-    await screen.findByRole("region", { name: /alpha spec live spec/i });
+    await screen.findByRole("dialog", { name: /alpha spec live spec/i });
     const activeAlpha = screen.getByRole("button", { name: /open alpha spec live spec/i });
     const inactiveBeta = screen.getByRole("button", { name: /open beta spec live spec/i });
     const bar = activeAlpha.querySelector("[data-overlay-active-indicator]");
@@ -495,14 +417,14 @@ describe("<SpecOverlay> — model A (languette-poignée fusionnée + switch anim
     });
     render(<SpecOverlay terminalId="term-1" />);
     fireEvent.click(await screen.findByRole("button", { name: /open alpha spec live spec/i }));
-    await screen.findByRole("region", { name: /alpha spec live spec/i });
+    await screen.findByRole("dialog", { name: /alpha spec live spec/i });
     // The bar lives on Alpha.
     let alpha = screen.getByRole("button", { name: /open alpha spec live spec/i });
     expect(alpha.querySelector("[data-overlay-active-indicator]")).not.toBeNull();
 
     // Switch to Beta: still exactly ONE bar, now on Beta and gone from Alpha (it moved, not duplicated).
     fireEvent.click(screen.getByRole("button", { name: /open beta spec live spec/i }));
-    await screen.findByRole("region", { name: /beta spec live spec/i }, { timeout: 3000 });
+    await screen.findByRole("dialog", { name: /beta spec live spec/i }, { timeout: 3000 });
     await waitFor(() => {
       const beta = screen.getByRole("button", { name: /open beta spec live spec/i });
       expect(beta.querySelector("[data-overlay-active-indicator]")).not.toBeNull();
@@ -543,14 +465,14 @@ describe("<SpecOverlay> — model A (languette-poignée fusionnée + switch anim
 
     // Open ingest: the panel wrapper is identified/keyed by its spec.id.
     fireEvent.click(await screen.findByRole("button", { name: /open ingest spec live spec/i }));
-    await screen.findByRole("region", { name: /ingest spec live spec/i });
+    await screen.findByRole("dialog", { name: /ingest spec live spec/i });
     const panel1 = document.querySelector("[data-overlay-panel]");
     expect(panel1?.getAttribute("data-overlay-panel-spec")).toBe("s1");
 
     // Switch to transform: keyed by spec.id ⇒ the old panel EXITS and a NEW node ENTERS (a stable
     // key would keep the SAME node + only swap content). Assert the panel is a fresh node for s2.
     fireEvent.click(screen.getByRole("button", { name: /open transform spec live spec/i }));
-    await screen.findByRole("region", { name: /transform spec live spec/i }, { timeout: 3000 });
+    await screen.findByRole("dialog", { name: /transform spec live spec/i }, { timeout: 3000 });
     await waitFor(
       () => {
         const panel2 = document.querySelector("[data-overlay-panel]");
@@ -647,8 +569,9 @@ describe("overlay-motion (variants + reduced-motion resolvers) — pure", () => 
     expect(overlayPanelVariants.animate).toMatchObject({ opacity: 1 });
     expect((overlayPanelVariants.exit as { opacity: number }).opacity).toBe(0);
     // NO horizontal slide on the panel content: the open/close movement is driven by the width-
-    // animated shell (0↔380), so the content stays flush to the left edge and the fused languette
-    // stays collée (regression fix — a content `x` slide decoupled it and read as a pop on close).
+    // animated shell (0↔`overlayPanelWidth(pane)`), so the content stays flush to the left edge and
+    // the fused languette stays collée (regression fix — a content `x` slide decoupled it and read
+    // as a pop on close).
     expect((overlayPanelVariants.initial as { x?: number }).x).toBeUndefined();
     expect((overlayPanelVariants.animate as { x?: number }).x).toBeUndefined();
     expect((overlayPanelVariants.exit as { x?: number }).x).toBeUndefined();

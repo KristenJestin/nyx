@@ -50,6 +50,47 @@ use crate::pipe::wire::Event;
 /// flood (`yes`) never fans out one event per chunk/line.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 
+/// How long an IDLE pump parks on its channel before re-checking the EXPLICIT close signal
+/// ([`LiveTerminal::closing`]).
+///
+/// WHY THE PUMP NEEDS A SECOND EXIT CONDITION AT ALL (review `01M0A7QGBK43MZB10RF51QR6TS`,
+/// finding `01M0A7S2DJQ9020C9JM74SEBTT`). The pump's only other way out is the core reader
+/// dropping its `Sender`, i.e. the reader thread returning from `read()` on the PTY master.
+/// On **Windows that read never returns**: the reader owns a CLONE of the ConPTY master
+/// (`try_clone_reader`) and `ClosePseudoConsole` does not reliably unblock the clone — the
+/// exact hazard [`nyx_core::pty::Pty`]'s `Drop` already documents and sidesteps by DETACHING
+/// the reader instead of joining it. [`PtyManager::close`] re-introduced it one level up by
+/// joining the PUMP, whose exit was gated on that same reader.
+///
+/// MEASURED on Windows 11 through the real sidecar binary (`tests/dispatch_never_wedges.rs`, a
+/// bare `cmd.exe` with no child at all): the shell was killed, the waiter reaped it and closed
+/// the master — and then `pty_close` never answered (> 30 s, and the follow-up `ping` never
+/// answered either). Because the sidecar serves ONE request at a time on its framed control
+/// loop, that single `pty_close` froze the whole pipe: the sidecar stayed `ready`, logged
+/// nothing, and every later request died on the supervisor's 5 s deadline as
+/// `request id=NNN timed out`.
+///
+/// So the pump exits on `closing` OR on reader-disconnect, whichever comes first, and the
+/// poll bounds how long `close` can wait on the join. 50 ms is imperceptible on a close and
+/// costs an idle terminal 20 no-op wakeups per second (a flag read; the flush + save it
+/// guards both early-return when there is nothing pending / nothing dirty).
+///
+/// PER CLOSE, NOT PER TERMINAL — and this window is only HALF of what a close waits on, which
+/// is the part an earlier version of this comment got wrong (review `01M0BT27BRT240HTYY0W4RTTBN`).
+/// A close waits on two things, and BOTH are per-close:
+///
+/// - this 50 ms poll, paid once per JOIN;
+/// - the kill grace ([`nyx_core::pty::SHELL_KILL_GRACE`], 500 ms), paid once per REAP — and it
+///   is the expensive one, ten times this window, elapsing for every Unix shell that ignores
+///   `SIGHUP`.
+///
+/// A naive loop of single closes pays both N times in a row: ~5.5 s to tear down ten terminals,
+/// against the supervisor's 3 s budget for the whole `stop()`. [`PtyManager::close_many`] — which
+/// EVERY close goes through, single ones included — therefore mutualises both: it signals every
+/// shell, reaps them all against ONE shared deadline, then raises every flag and joins every pump.
+/// The N graces overlap and the N wake-ups overlap, so the total stays ~one grace + ~50 ms.
+const PUMP_CLOSE_POLL: Duration = Duration::from_millis(50);
+
 /// Max bytes per emitted [`Event::TerminalOutput`] frame. A coalesced flood chunk is
 /// split into pieces no larger than this before crossing the pipe, so the backlog is
 /// bounded to `HIGH_WATER + CHUNK_BYTES` and one frame never carries a multi-MiB
@@ -221,6 +262,12 @@ struct LiveTerminal {
     pty: Arc<Mutex<Pty>>,
     pause_gate: PauseGate,
     flow: Arc<Mutex<FlowState>>,
+    /// The EXPLICIT close signal, shared with the pump thread. [`PtyManager::close`] raises it
+    /// BEFORE joining the pump, so the pump's exit no longer depends on the core reader
+    /// releasing its `Sender` — the Windows `ReadFile` that never returns (see
+    /// [`PUMP_CLOSE_POLL`]). This is what keeps a close bounded on the sidecar's single
+    /// request-serving thread.
+    closing: Arc<AtomicBool>,
     /// The pump thread handle, joined on close so the thread never leaks.
     pump: Option<JoinHandle<()>>,
     /// The headless-VT feeder thread handle, joined on close so it never leaks.
@@ -490,7 +537,16 @@ impl PtyManager {
         };
         let cwd_opt = (!cwd.is_empty()).then_some(cwd);
         let record_opt = (!record_id.is_empty()).then_some(record_id);
-        let (pty, rx) = Pty::spawn(size, cwd_opt, record_opt, mcp_port)?;
+        // WHICH shell this terminal opens on, resolved HERE — at the spawn — from the user's
+        // stored preference (`nyx_core::shells`: preference → `$SHELL` → per-OS default). Reading
+        // it per spawn rather than caching it at boot is what gives the setting its documented
+        // scope: a terminal opened AFTER the choice runs the chosen shell, and the ones already
+        // running are never disturbed (they resolved their own shell when they started). A DB
+        // problem or a preference whose binary has since been uninstalled resolves to the
+        // historical default rather than failing — a terminal that will not open is a worse
+        // outcome than one that opens on the wrong shell.
+        let shell = self.db.with_conn(nyx_core::shells::resolve_for_spawn);
+        let (pty, rx) = Pty::spawn(&shell, size, cwd_opt, record_opt, mcp_port)?;
         let terminal_id = pty.id() as u32;
         let pause_gate = pty.pause_gate();
         let flow = Arc::new(Mutex::new(FlowState {
@@ -541,6 +597,8 @@ impl PtyManager {
         let pump_feed_tx = feed_tx.clone();
         let pump_last_io = Arc::clone(&last_io);
         let pump_scrollback = scrollback.clone();
+        let closing = Arc::new(AtomicBool::new(false));
+        let pump_closing = Arc::clone(&closing);
         let pump = std::thread::Builder::new()
             .name(format!("nyx-sidecar-pty-pump-{terminal_id}"))
             .spawn(move || {
@@ -554,6 +612,7 @@ impl PtyManager {
                     feed_tx: pump_feed_tx,
                     last_io: pump_last_io,
                     scrollback: pump_scrollback,
+                    closing: pump_closing,
                 });
             })?;
 
@@ -563,6 +622,7 @@ impl PtyManager {
                 pty,
                 pause_gate,
                 flow,
+                closing,
                 pump: Some(pump),
                 feeder: Some(feeder),
                 record_id: (!record_id.is_empty()).then(|| record_id.to_string()),
@@ -854,33 +914,143 @@ impl PtyManager {
     /// PTY session hangup. This is NOT the explicit negative-pgid tree kill — that
     /// `kill(-pgid, SIGTERM/SIGKILL)` path is reserved for MANAGED commands
     /// (`nyx-core` `command.rs`), not interactive terminals.
+    ///
+    /// A close of ONE is a close of a group of one ([`close_many`](Self::close_many)) — same
+    /// phases, same per-terminal order, one implementation.
     pub fn close(&self, terminal_id: u32) {
+        self.close_many(&[terminal_id]);
+    }
+
+    /// PHASE 1a of a close — DETACH and SIGNAL, the acts that are irreversible and cannot be
+    /// shared: take the terminal out of the registry, retract its record → live-pty join (so the
+    /// MCP tools see it go offline), and send the kill. Returns the detached [`LiveTerminal`], or
+    /// `None` for an unknown / already-closed terminal (idempotence).
+    ///
+    /// It WAITS FOR NOTHING. Everything that waits — the reap's grace, the pump's join — is a
+    /// later phase, run over the whole group at once ([`close_many`](Self::close_many)).
+    ///
+    /// `signal_kill` is the first half of `nyx_core`'s `kill_and_reap`: the killer's SIGHUP plus
+    /// the pause-gate resume, so a reader parked on the condvar can loop round and hit EOF. The
+    /// escalation to SIGKILL is the second half and belongs to phase 1b.
+    fn detach_and_kill(&self, terminal_id: u32) -> Option<LiveTerminal> {
         let live = self.terminals.lock().unwrap().remove(&terminal_id);
-        if let Some(mut live) = live {
-            // Retract the record -> live-pty join (so the MCP tools see it go offline).
-            if let Some(rec) = &live.record_id {
-                self.live_records.lock().unwrap().remove(rec);
-            }
-            // Kill the session-leader shell and make the kill STICK (`kill_and_reap`: SIGHUP,
-            // resume the gate so a paused reader can loop and hit EOF, then SIGKILL after the
-            // grace) BEFORE joining the pump. A bare `kill` is one SIGHUP an interactive shell
-            // may not honour — and the pump only exits when the master EOFs, i.e. when the shell
-            // dies, so the join below would block FOREVER on the sidecar's REQUEST LOOP: the pipe
-            // stops answering and the whole app freezes. `Drop for Pty` runs the same escalation,
-            // but it can never rescue us here — the `Pty` is behind an `Arc` the pump thread we
-            // are joining also holds, so `Drop` cannot run until that join returns.
-            live.pty.lock().unwrap().kill_and_reap(SHELL_KILL_GRACE);
-            if let Some(handle) = live.pump.take() {
-                let _ = handle.join();
-            }
-            // Drop the feeder's sender so its channel disconnects, then join it (the pump also
-            // held a sender clone, but it dropped when the pump thread exited above). The feeder
-            // drains any remaining chunks and exits — it never leaks past close.
-            drop(live.feed_tx.take());
-            if let Some(handle) = live.feeder.take() {
-                let _ = handle.join();
+        let live = live?;
+        if let Some(rec) = &live.record_id {
+            self.live_records.lock().unwrap().remove(rec);
+        }
+        live.pty.lock().unwrap().signal_kill();
+        Some(live)
+    }
+
+    /// PHASE 1b — make every kill STICK, against ONE shared deadline.
+    ///
+    /// A bare `kill` is a single SIGHUP an interactive shell may not honour, and the pump only
+    /// exits when the master EOFs, i.e. when the shell dies — so a join that ran before this
+    /// would block FOREVER on the sidecar's REQUEST LOOP: the pipe stops answering and the whole
+    /// app freezes. (`Drop for Pty` runs the same escalation but can never rescue us: the `Pty` is
+    /// behind an `Arc` the pump thread we are joining also holds, so `Drop` cannot run until that
+    /// join returns.)
+    ///
+    /// ONE DEADLINE FOR THE GROUP (review `01M0BT27BRT240HTYY0W4RTTBN`). `kill_and_reap` charges
+    /// its grace per shell, so running it in a loop cost N × [`SHELL_KILL_GRACE`] — about 5 s for
+    /// ten Unix shells that ignore SIGHUP, against the 3 s the ordered shutdown has for ALL of
+    /// `stop()`. Every shell was signalled in phase 1a, so their graces can run CONCURRENTLY:
+    /// one deadline, taken now, against which each is reaped in turn. The total is one grace.
+    fn reap_all(signalled: &[LiveTerminal]) {
+        reap_against_one_deadline(signalled, SHELL_KILL_GRACE, |live, deadline| {
+            live.pty.lock().unwrap().reap_by(deadline)
+        });
+    }
+
+    /// PHASE 1c — RAISE the explicit close signal, after the shell is dead.
+    ///
+    /// Killing the shell is NOT enough to release the pump on Windows: its `rx` only disconnects
+    /// when the core reader thread returns from `read()` on a CLONE of the ConPTY master, which
+    /// `ClosePseudoConsole` does not reliably unblock (the very hazard `Drop for Pty` sidesteps by
+    /// detaching that reader instead of joining it). MEASURED: without this flag a `pty_close` on
+    /// a bare `cmd.exe` never answered (> 30 s) and took the whole control loop with it — the
+    /// sidecar stayed `ready` while every later request died on the supervisor's 5 s deadline.
+    /// With it the pump leaves within one [`PUMP_CLOSE_POLL`], whatever the reader does, so the
+    /// join is bounded on EVERY platform — the flag is read at the TOP of the pump's loop, so
+    /// neither silence nor an unending flood can starve it (see [`run_pump`]).
+    ///
+    /// It stays BEHIND the reap on every path, bulk included: the pump reads `pty.exit_code()` on
+    /// an explicit close, so raising the flag before the shell has actually died would report an
+    /// `exit: None` for a shell that was still on its way out.
+    fn signal_closing(signalled: &[LiveTerminal]) {
+        for live in signalled {
+            live.closing.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// PHASE 2 of a close — the JOINS, which are what a close actually WAITS on: the pump
+    /// (bounded by [`PUMP_CLOSE_POLL`] thanks to the flag phase 1 raised), then the feeder.
+    /// Dropping the stored `feed_tx` disconnects the feeder's channel (the pump held the only
+    /// other sender and released it on exit), so it drains its queue and exits — never leaking
+    /// past a close.
+    fn join_teardown(mut live: LiveTerminal) {
+        if let Some(handle) = live.pump.take() {
+            let _ = handle.join();
+        }
+        drop(live.feed_tx.take());
+        if let Some(handle) = live.feeder.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Close SEVERAL live PTYs for the price of ONE kill grace and ONE [`PUMP_CLOSE_POLL`]
+    /// window, instead of N of each.
+    ///
+    /// A loop of single closes pays BOTH waits serially:
+    /// - the KILL GRACE ([`SHELL_KILL_GRACE`], 500 ms): a Unix shell that ignores `SIGHUP` is
+    ///   polled for the whole grace before the `SIGKILL` — ten of them, one after the other, is
+    ///   ~5 s, against the 3 s the supervisor gives the entire `stop()`;
+    /// - the PUMP POLL ([`PUMP_CLOSE_POLL`], 50 ms): an idle pump is parked on
+    ///   `rx.recv_timeout(PUMP_CLOSE_POLL)` and only notices the close flag when it wakes.
+    ///
+    /// So the close is split into phases that run OVER THE WHOLE GROUP, in this order:
+    ///
+    /// 1. [`detach_and_kill`](Self::detach_and_kill) — per terminal, waiting for nothing;
+    /// 2. [`reap_all`](Self::reap_all) — every shell reaped against ONE shared deadline;
+    /// 3. [`signal_closing`](Self::signal_closing) — every close flag raised;
+    /// 4. [`join_teardown`](Self::join_teardown) — every pump/feeder joined.
+    ///
+    /// The N graces overlap, and so do the N wake-ups: the total is one grace plus one poll
+    /// window, whatever N is. Per terminal the ORDER of the irreversible acts is UNCHANGED
+    /// (detach, kill, reap, flag, join) — which is what keeps the reported exit codes and the
+    /// teardown semantics identical to a one-by-one close.
+    fn close_many(&self, terminal_ids: &[u32]) {
+        let signalled: Vec<LiveTerminal> = terminal_ids
+            .iter()
+            .filter_map(|id| self.detach_and_kill(*id))
+            .collect();
+        Self::reap_all(&signalled);
+        Self::signal_closing(&signalled);
+        for live in signalled {
+            Self::join_teardown(live);
+        }
+    }
+
+    /// Close SEVERAL terminals by RECORD id — the bulk twin of
+    /// [`close_record`](Self::close_record), used by the `workspace_delete` teardown so a
+    /// workspace holding N terminals does not pay N × [`PUMP_CLOSE_POLL`] (see
+    /// [`close_many`](Self::close_many)). Also drops each record's pending opening command,
+    /// exactly as the single-record close does. Unknown / record-less ids are skipped.
+    pub fn close_records(&self, record_ids: &[String]) {
+        {
+            let mut opening = self.opening_commands.lock().unwrap();
+            for record_id in record_ids {
+                opening.remove(record_id);
             }
         }
+        let ids: Vec<u32> = {
+            let live_records = self.live_records.lock().unwrap();
+            record_ids
+                .iter()
+                .filter_map(|r| live_records.get(r).copied())
+                .collect()
+        };
+        self.close_many(&ids);
     }
 
     /// FLOW-CONTROL ACK: the renderer consumed `bytes` of `terminal_id`'s output. Free
@@ -920,11 +1090,30 @@ impl PtyManager {
     /// Close every live terminal (shutdown). Kills each session-leader shell (the
     /// interactive killer, as in [`close`](Self::close)) and joins its pump so nothing
     /// is orphaned past exit.
+    ///
+    /// Goes through [`close_many`](Self::close_many), NOT a loop of `close`: every shell is
+    /// killed and every `closing` flag is raised BEFORE the first pump is joined, so the N idle
+    /// pumps spend their last [`PUMP_CLOSE_POLL`] window CONCURRENTLY. The ordered shutdown
+    /// therefore pays ~one poll window, not one per terminal.
     pub fn close_all(&self) {
         let ids: Vec<u32> = self.terminals.lock().unwrap().keys().copied().collect();
-        for id in ids {
-            self.close(id);
-        }
+        self.close_many(&ids);
+    }
+}
+
+/// Run a per-target wait over a WHOLE GROUP against ONE deadline, taken once, now.
+///
+/// This is the shape that makes a bulk close cost ONE grace instead of N (review
+/// `01M0BT27BRT240HTYY0W4RTTBN`), extracted from [`PtyManager::reap_all`] so the property can be
+/// held to a test that neither spawns a shell nor depends on a platform: the sharing is in the
+/// deadline, not in what a target happens to be.
+///
+/// The targets are visited IN ORDER — the group shares the deadline, it does not reorder the acts
+/// performed against each terminal.
+fn reap_against_one_deadline<T>(targets: &[T], grace: Duration, reap: impl Fn(&T, Instant)) {
+    let deadline = Instant::now() + grace;
+    for target in targets {
+        reap(target, deadline);
     }
 }
 
@@ -988,6 +1177,9 @@ struct PumpParams {
     /// `has_view` is read at each flush, so a pane that attaches mid-stream starts receiving from
     /// its next flush on.
     scrollback: ScrollbackOwner,
+    /// The EXPLICIT close signal ([`LiveTerminal::closing`]) — the pump's second, reader-
+    /// independent exit condition. See [`PUMP_CLOSE_POLL`].
+    closing: Arc<AtomicBool>,
 }
 
 /// The pump body (ported from the v1 napi `run_pump`): leading-edge coalescing, the
@@ -1005,24 +1197,62 @@ fn run_pump(params: PumpParams) {
         feed_tx,
         last_io,
         scrollback,
+        closing,
     } = params;
     let mut pending: Vec<u8> = Vec::new();
     let mut last_flush = Instant::now();
     let mut last_save = Instant::now();
     let mut osc133_tail: Vec<u8> = Vec::new();
     let mut exec_sm = osc133::ExecStateMachine::new();
+    // WHICH exit we took, read by the teardown below: an EXPLICIT close (the flag) or the
+    // child's own EOF (the reader disconnecting).
+    let mut closed = false;
 
     loop {
+        // THE EXPLICIT CLOSE SIGNAL, read at the TOP of the loop — on the one path no amount of
+        // OUTPUT can starve — rather than inside a single `recv` arm.
+        //
+        // WHY NOT IN THE `Timeout` ARM ALONE (review `01M0AB3R53M22DJ2KJ3022DDG4`, finding
+        // `01M0AB898M30GPR7PKRKDTYPBW`). That arm is only reached when the channel stays SILENT
+        // for a whole wait, so a terminal that keeps producing never evaluates the exit
+        // condition at all: with a chunk always ready, `recv_timeout` answers `Ok` every time —
+        // immediately on the 50ms idle park, and immediately again on the coalescing wait, which
+        // saturates to ~0 once `pending` is non-empty. The pump would then live entirely in `Ok`
+        // and [`PtyManager::close`]'s join would be unbounded again, which is the whole defect
+        // this flag exists to remove.
+        //
+        // The case is REAL for a terminal with NO view, and only for those: with a pane attached,
+        // [`flush`] reserves quota and pauses the reader at [`HIGH_WATER`], so a flood runs dry on
+        // its own and the silent arm is reached (measured: `pty_close` under a continuous flood
+        // answers in 15.4ms). Without a pane, `flush` DROPS the buffer and returns before
+        // reserving anything — the pause-gate is never armed, nothing throttles the child, and the
+        // stream never runs dry. Those are exactly the terminals [`PtyManager::spawn_headless`]
+        // opens for MCP agents and the ones `workspace_delete` closes.
+        //
+        // The cost of moving the check here is that a close landing mid-flood leaves whatever the
+        // reader has already QUEUED unread (the teardown below still flushes and saves what the
+        // pump itself holds). That is the intended trade: draining until the channel is empty is
+        // precisely the unbounded wait being removed, and by this point `close` has already killed
+        // the shell — those bytes belong to a terminal the user is throwing away.
+        if closing.load(Ordering::Relaxed) {
+            closed = true;
+            break;
+        }
         // LEADING-EDGE coalescing, identical strategy to the v1 napi pump:
-        //   - `pending` EMPTY: BLOCK on `recv()` so the next byte flushes immediately.
+        //   - `pending` EMPTY: park until the next byte, so it flushes immediately.
         //   - `pending` NON-EMPTY: wait at most until the next scheduled flush so a
         //     steady flood coalesces on the 16ms cadence.
+        //
+        // The idle park is a `recv_timeout`, not a `recv`: it must also wake to notice the
+        // EXPLICIT close signal, which is the pump's only reader-independent way out (see
+        // [`PUMP_CLOSE_POLL`]). A chunk still wakes it instantly, so the coalescing strategy
+        // is untouched — only the ceiling on an idle park changed from "forever" to 50 ms.
         let recv = if pending.is_empty() {
-            // About to block until the shell prints again: save its scrollback NOW if it is
+            // About to park until the shell prints again: save its scrollback NOW if it is
             // behind, so a one-shot output (the usual case an agent reads back) is in the record
             // immediately instead of waiting for a chunk that may never come.
             save_headless(&scrollback, &mut last_save, true);
-            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            rx.recv_timeout(PUMP_CLOSE_POLL)
         } else {
             let wait = FLUSH_INTERVAL.saturating_sub(last_flush.elapsed());
             rx.recv_timeout(wait)
@@ -1057,7 +1287,14 @@ fn run_pump(params: PumpParams) {
 
                 pending.extend_from_slice(&chunk);
                 if last_flush.elapsed() >= FLUSH_INTERVAL {
-                    flush(terminal_id, &mut pending, &events, &flow, &gate, &scrollback);
+                    flush(
+                        terminal_id,
+                        &mut pending,
+                        &events,
+                        &flow,
+                        &gate,
+                        &scrollback,
+                    );
                     last_flush = Instant::now();
                 }
                 // A shell that never stops printing never reaches the trailing save above, so
@@ -1065,23 +1302,51 @@ fn run_pump(params: PumpParams) {
                 save_headless(&scrollback, &mut last_save, false);
             }
             Err(RecvTimeoutError::Timeout) => {
-                flush(terminal_id, &mut pending, &events, &flow, &gate, &scrollback);
+                // Nothing came in time: emit what was coalesced and let the loop re-read the
+                // close flag at the top.
+                flush(
+                    terminal_id,
+                    &mut pending,
+                    &events,
+                    &flow,
+                    &gate,
+                    &scrollback,
+                );
                 last_flush = Instant::now();
                 save_headless(&scrollback, &mut last_save, false);
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                // Child exited / master closed: flush the tail, save what it last printed (the
-                // record is all that is left of it), reap the code, emit `pty-exit`, exit the
-                // pump. The `feed_tx` clone drops here, so once close also drops the stored
-                // sender the feeder disconnects and exits.
-                flush(terminal_id, &mut pending, &events, &flow, &gate, &scrollback);
-                save_headless(&scrollback, &mut last_save, true);
-                let code = pty.lock().unwrap().wait();
-                events.emit(Event::PtyExit { terminal_id, code });
-                break;
-            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    // ONE teardown for BOTH exits (the child's own EOF and an explicit close): flush the tail,
+    // save what the shell last printed (the record is all that is left of it), report the exit
+    // code and emit `pty-exit`. The `feed_tx` clone drops here, so once close also drops the
+    // stored sender the feeder disconnects and exits.
+    flush(
+        terminal_id,
+        &mut pending,
+        &events,
+        &flow,
+        &gate,
+        &scrollback,
+    );
+    save_headless(&scrollback, &mut last_save, true);
+    // On a DISCONNECT the child is already gone, so `wait` (which joins the core waiter thread)
+    // returns at once and yields the true code. On an EXPLICIT CLOSE we must NOT join anything:
+    // `close` is joining THIS thread from the sidecar's single request-serving loop, so blocking
+    // here would only move the freeze one frame down. We read the code the waiter has already
+    // recorded instead — `None` while it has not landed yet, which is the same "unknown code"
+    // the event already carries for a PTY whose status could not be read.
+    let code = {
+        let mut pty = pty.lock().unwrap();
+        if closed {
+            pty.exit_code()
+        } else {
+            pty.wait()
+        }
+    };
+    events.emit(Event::PtyExit { terminal_id, code });
 }
 
 /// Save a VIEW-LESS terminal's accumulated scrollback into its record, at most once per
@@ -1610,6 +1875,251 @@ mod tests {
         assert!(!mgr.is_live(id), "the closed terminal left the registry");
     }
 
+    /// The shell each `spawn_program` below opens on. Pinned so the test never inherits whatever
+    /// the developer's `$SHELL` happens to be — the process is a PROP here (the pump's teardown
+    /// reads its exit code), never the subject.
+    #[cfg(windows)]
+    const PROP_SHELL: &str = "cmd.exe";
+    #[cfg(not(windows))]
+    const PROP_SHELL: &str = "/bin/sh";
+
+    /// A close must release the pump even while output NEVER RUNS DRY — the case a check placed
+    /// only in the `Timeout` arm cannot serve (review `01M0AB3R53M22DJ2KJ3022DDG4`, finding
+    /// `01M0AB898M30GPR7PKRKDTYPBW`).
+    ///
+    /// The terminal here has NO VIEW and no record, which is the shape that makes the case
+    /// reachable: [`flush`] drops a view-less buffer and returns BEFORE reserving quota, so the
+    /// pause-gate never arms, nothing throttles the producer, and the channel is never silent for
+    /// a whole wait. Those are the terminals [`PtyManager::spawn_headless`] opens for MCP agents
+    /// and the ones `workspace_delete` closes.
+    ///
+    /// WHY [`run_pump`] DIRECTLY instead of a `PtyManager::close` on a real shell: `close` kills
+    /// the shell BEFORE it raises the flag, so through a shell the flood stops first, the channel
+    /// runs dry, the `Timeout` arm is reached and the defect hides. The producer must be one
+    /// `close` cannot silence — a plain thread here, a grandchild still writing to an unpaused
+    /// master in production. The channel is BOUNDED, so it stays full (a chunk always ready, which
+    /// is what keeps the pump in `Ok`) with memory capped instead of a queue that grows.
+    #[test]
+    fn close_releases_a_view_less_pump_whose_output_never_runs_dry() {
+        // A real `Pty` only as the teardown's exit-code handle; its own reader channel is dropped
+        // and this test's producer IS the flood. The `Arc` is moved into the pump, so the prop
+        // process is killed by `Drop for Pty` the moment the pump returns.
+        let (pty, _core_rx) = Pty::spawn_program(
+            PROP_SHELL,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            None,
+        )
+        .expect("a pty to hang the pump's teardown on");
+        let gate = pty.pause_gate();
+
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(64);
+        let (feed_tx, feed_rx) = mpsc::channel::<Vec<u8>>();
+        // Stand in for the feeder thread: the pump hands it every chunk, so it has to be drained
+        // or the flood piles up in a channel nobody reads.
+        let feeder = std::thread::spawn(move || while feed_rx.recv().is_ok() {});
+
+        let closing = Arc::new(AtomicBool::new(false));
+        // The pump stamps this on EVERY chunk — the observable signal that it really is in the
+        // `Ok` arm, so the close below lands on a flooding pump rather than after a fixed delay.
+        let last_io = Arc::new(Mutex::new(Instant::now()));
+        let started = *last_io.lock().unwrap();
+        let params = PumpParams {
+            terminal_id: 1,
+            rx,
+            events: discard_sink(),
+            flow: Arc::new(Mutex::new(FlowState {
+                in_flight: 0,
+                paused: false,
+                seq: 0,
+            })),
+            gate,
+            pty: Arc::new(Mutex::new(pty)),
+            feed_tx,
+            last_io: Arc::clone(&last_io),
+            scrollback: ScrollbackOwner {
+                has_view: Arc::new(AtomicBool::new(false)),
+                dirty: Arc::new(AtomicBool::new(false)),
+                sidecar: None,
+            },
+            closing: Arc::clone(&closing),
+        };
+
+        // Blocks once the bounded channel is full, so the pump always finds a chunk ready and the
+        // producer never outruns it. It ends on its own when the pump drops the receiver.
+        let producer =
+            std::thread::spawn(move || while tx.send(b"FLOOD_CHUNK\r\n".to_vec()).is_ok() {});
+        let pump = std::thread::spawn(move || run_pump(params));
+
+        // Wait for the flood to be OBSERVED (not for a duration): the pump has consumed a chunk.
+        let settle = Instant::now() + Duration::from_secs(5);
+        while *last_io.lock().unwrap() == started {
+            assert!(
+                Instant::now() < settle,
+                "the pump never consumed a chunk — the flood never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        closing.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pump.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            pump.is_finished(),
+            "the pump must leave on the close flag while output is still arriving — a close that \
+             waits for the stream to run dry blocks the sidecar's single request-serving loop"
+        );
+        pump.join().expect("the pump thread must not panic");
+        producer.join().expect("the producer thread must not panic");
+        feeder.join().expect("the feeder drain must not panic");
+    }
+
+    /// Review `01M0AEQB1633XBVCVD0VW58J50` — A BULK CLOSE RAISES EVERY `closing` FLAG BEFORE
+    /// JOINING THE FIRST PUMP.
+    ///
+    /// [`PtyManager::close`] raises one terminal's flag and IMMEDIATELY joins its pump, and an
+    /// idle pump only reads that flag when it wakes from `rx.recv_timeout(PUMP_CLOSE_POLL)`. A
+    /// LOOP of `close` therefore serialises those wake-ups: N × 50 ms on the ordered shutdown
+    /// (`close_all`) and on `workspace_delete`'s per-record teardown — half a second for ten
+    /// terminals, against the supervisor's 3 s budget for the whole `stop()`, while
+    /// [`PUMP_CLOSE_POLL`]'s own comment reads as a flat 50 ms.
+    ///
+    /// Proven WITHOUT a stopwatch, by making the JOIN expensive and the FLAG cheap: each live
+    /// terminal's pump handle is swapped for a thread that sleeps far longer than the
+    /// observation window (the real pumps are detached and still leave on their own flag, which
+    /// is the very thing being observed). A serial close could not raise the SECOND flag until
+    /// the FIRST join returned, so seeing every flag up while the bulk close is still running is
+    /// exactly the property at stake.
+    fn assert_bulk_close_signals_every_terminal(
+        tag: &str,
+        bulk: impl FnOnce(Arc<PtyManager>, Vec<String>) + Send + 'static,
+    ) {
+        const N: usize = 4;
+        /// Far longer than `SETTLE`, so a serial close provably could not have reached the
+        /// second terminal inside the observation window.
+        const FAKE_JOIN: Duration = Duration::from_secs(3);
+        /// The observation window: ample for N flag-raises (a shell kill each), far below
+        /// `FAKE_JOIN`.
+        const SETTLE: Duration = Duration::from_millis(1200);
+
+        let mgr = Arc::new(manager());
+        let records: Vec<String> = (0..N).map(|i| format!("rec-{tag}-{i}")).collect();
+        for record in &records {
+            mgr.spawn_headless("", record, 0, discard_sink())
+                .expect("a headless shell");
+        }
+        assert_eq!(mgr.live_count(), N, "N live terminals to tear down");
+
+        // Swap every pump handle for a deliberately slow join, keeping a handle on the flag the
+        // REAL pump is watching. Dropping the real handle detaches that thread — it still exits
+        // on its own flag, which is what makes the flag observable independently of the join.
+        let flags: Vec<Arc<AtomicBool>> = {
+            let mut terms = mgr.terminals.lock().unwrap();
+            terms
+                .values_mut()
+                .map(|t| {
+                    let slow = std::thread::spawn(|| std::thread::sleep(FAKE_JOIN));
+                    drop(t.pump.replace(slow));
+                    Arc::clone(&t.closing)
+                })
+                .collect()
+        };
+
+        let closer = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || bulk(mgr, records))
+        };
+
+        let deadline = Instant::now() + SETTLE;
+        while flags.iter().any(|f| !f.load(Ordering::Relaxed)) {
+            assert!(
+                Instant::now() < deadline,
+                "{tag}: a bulk close must raise EVERY terminal's closing flag before joining the \
+                 first pump — {} of {N} were still down after {SETTLE:?}, i.e. the teardown is \
+                 paying PUMP_CLOSE_POLL once per terminal",
+                flags.iter().filter(|f| !f.load(Ordering::Relaxed)).count()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        closer.join().expect("the bulk close must not panic");
+        assert_eq!(mgr.live_count(), 0, "{tag}: every terminal is closed");
+    }
+
+    /// Review `01M0BT27BRT240HTYY0W4RTTBN` — N TERMINALS PAY ONE KILL GRACE, NOT N.
+    ///
+    /// The previous split hoisted the JOIN out of the per-terminal loop but left the REAP in it,
+    /// so [`nyx_core::pty::SHELL_KILL_GRACE`] was still charged once per shell: ten Unix shells
+    /// that ignore `SIGHUP` cost ~5 s in phase 1 alone, against the 3 s the supervisor gives the
+    /// whole `stop()` — and that is ten times the 50 ms window the hoisted half saved.
+    ///
+    /// Held to [`reap_against_one_deadline`], which is the sharing itself, with a `reap` standing
+    /// in for the worst case the grace exists for: a shell that honours nothing and has to be
+    /// waited out in full. TEN of them, and the assertion is the one that DISTINGUISHES THE GROUP
+    /// FROM THE SERIAL — the total must land near ONE grace, and provably under the N × grace a
+    /// per-terminal deadline would cost. No shell, no PTY, no platform: the grace only ever
+    /// elapses on Unix, so a test that spawned real shells could not run this on Windows at all.
+    #[test]
+    fn a_group_reap_pays_one_grace_for_all_of_them_not_one_each() {
+        /// Small enough to keep the test quick, large enough that ten of them (2 s) are
+        /// unmistakably distinct from one (200 ms) on any machine.
+        const GRACE: Duration = Duration::from_millis(200);
+        const N: usize = 10;
+
+        let targets: Vec<usize> = (0..N).collect();
+        let waited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let started = Instant::now();
+        {
+            let waited = Arc::clone(&waited);
+            reap_against_one_deadline(&targets, GRACE, move |_target, deadline| {
+                // The worst case the grace is FOR: a shell that never honours the signal, so the
+                // wait runs to the deadline every time. Once the shared deadline has passed, this
+                // returns at once — which is exactly why the group costs one grace.
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                waited.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            waited.load(Ordering::Relaxed),
+            N,
+            "every terminal is still reaped — sharing the deadline must not skip any"
+        );
+        assert!(
+            elapsed < GRACE * 3,
+            "a group of {N} must cost about ONE grace ({GRACE:?}), took {elapsed:?}"
+        );
+        assert!(
+            elapsed < GRACE * N as u32 / 2,
+            "…and provably not the {:?} of a serial reap, one deadline per terminal",
+            GRACE * N as u32
+        );
+    }
+
+    /// The ordered SHUTDOWN path (`Runtime::shutdown` → `PtyManager::close_all`).
+    #[test]
+    fn close_all_signals_every_terminal_before_joining_the_first_pump() {
+        assert_bulk_close_signals_every_terminal("closeall", |mgr, _records| mgr.close_all());
+    }
+
+    /// The `workspace_delete` path: the per-record loop is now ONE `close_records`.
+    #[test]
+    fn close_records_signals_every_terminal_before_joining_the_first_pump() {
+        assert_bulk_close_signals_every_terminal("closerecs", |mgr, records| {
+            mgr.close_records(&records)
+        });
+    }
+
     // --- a shell with no pane behind it (H1) ----------------------------------------------
 
     /// A sink that KEEPS the framed bytes, so a test can ask what actually crossed the pipe.
@@ -1687,7 +2197,8 @@ mod tests {
             .expect("the MCP-opened shell");
 
         // The shell PRINTS while nothing is watching: the marker reaches the VT screen…
-        mgr.write(id, b"printf 'NOVIEW_%s' MARKER\n").expect("write");
+        mgr.write(id, b"printf 'NOVIEW_%s' MARKER\n")
+            .expect("write");
         snapshot_until(&mgr, id, Duration::from_secs(5), |s| {
             (0..s.main.rows).any(|r| s.main.row_text(r).contains("NOVIEW_MARKER"))
         })

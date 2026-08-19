@@ -305,11 +305,9 @@ const windowControls: WindowControls = {
       .catch((e) => {
         throw toBridgeError("ipc", e, "window.close");
       }),
-  // Electron drags the window from any element carrying this attribute via a CSS
-  // `-webkit-app-region: drag` rule the renderer ships (so the SAME chrome markup
-  // works on both shells — the rule maps `[data-tauri-drag-region]` to a drag region
-  // under Electron). Returning the same key keeps the chrome component shell-agnostic.
-  dragRegionProps: () => ({ "data-tauri-drag-region": true }),
+  // No `dragRegionProps` here: the drag region is CSS, not IPC. `<ChromeBar>` carries the
+  // `drag-region` utility (`-webkit-app-region: drag`, globals.css) and Chromium moves the
+  // frameless window from it on its own — see the note in contract.ts.
   async onCloseRequested(handler: () => void): Promise<Unsubscribe> {
     // The OS close button / Alt-F4 / quit routes through the MAIN process, which
     // WITHHOLDS the real close and relays the `nyx:window/close-requested` push. Prefer
@@ -335,10 +333,16 @@ const windowControls: WindowControls = {
       window.removeEventListener("pagehide", onHide);
     };
   },
-  confirmClose: () =>
-    (windowApi().confirmClose?.() ?? Promise.resolve()).catch((e) => {
+  confirmClose: () => {
+    const api = windowApi();
+    // No confirm-close channel (a preload predating it) means no close-WITHHOLD guard
+    // either — the two ship together. So degrade to a plain close instead of resolving
+    // into the void: the chrome bar's X routes through here, and a silent no-op would
+    // leave the user with a window that cannot be closed at all.
+    return (api.confirmClose ? api.confirmClose() : api.close()).catch((e) => {
       throw toBridgeError("ipc", e, "window.confirmClose");
-    }),
+    });
+  },
 };
 
 // ---------------------------------------------------------------------------

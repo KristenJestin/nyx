@@ -19,6 +19,8 @@ export interface UseManualAddDeps {
   deleteProject?: (id: string) => Promise<void>;
   /** Delete a single (non-root) workspace (its instances cascade, terminals detached). */
   deleteWorkspace?: (id: string) => Promise<void>;
+  /** Rename a single workspace's display label (backend `rename_workspace`). */
+  renameWorkspace?: (id: string, name: string) => Promise<void>;
   /** Folder picker; injectable so tests stub it instead of the Tauri plugin. */
   pick?: (title?: string) => Promise<string | null>;
 }
@@ -30,6 +32,12 @@ export interface UseManualAdd {
   addWorkspace: (tree: ProjectTree) => Promise<void>;
   /** Open the project EDIT (rename) modal for `tree`'s project. */
   editProject: (tree: ProjectTree) => void;
+  /**
+   * Open the workspace RENAME modal for a single `workspace`, pre-filled with its current name.
+   * Allowed on EVERY workspace including the root: renaming a root is a pure label change the
+   * backend accepts (unlike removing one, which it refuses).
+   */
+  editWorkspace: (workspace: WorkspaceRecord) => void;
   /** Open the project DELETE confirmation modal for `tree`'s project. */
   removeProject: (tree: ProjectTree) => void;
   /**
@@ -54,16 +62,16 @@ interface WorkspaceDialogState {
 interface ProjectDialogState {
   mode: ProjectDialogMode;
   /**
-   * The entity the `delete` flow targets (default `"project"`). `"workspace"`
-   * reuses the same destructive-confirm dialog but removes a single workspace via
-   * `deleteWorkspace`; create/edit are always projects.
+   * The entity the flow targets (default `"project"`). `"workspace"` reuses the same dialog for
+   * the two single-workspace flows — `delete` removes it via `deleteWorkspace`, `edit` renames it
+   * via `renameWorkspace`. `create` is always a project.
    */
   entity?: "project" | "workspace";
   /** Present for `create`: the picked folder path. */
   path?: string;
-  /** Present for `edit`/project-`delete`: the target project's id. */
+  /** Present for project `edit`/`delete`: the target project's id. */
   projectId?: string;
-  /** Present for workspace-`delete`: the target workspace's id. */
+  /** Present for workspace `edit`/`delete`: the target workspace's id. */
   workspaceId?: string;
   defaultName: string;
   /** Present for `edit`: the project's current resume-agent-sessions opt-in. */
@@ -93,6 +101,7 @@ export function useManualAdd({
   setProjectResumeAgentSessions,
   deleteProject,
   deleteWorkspace,
+  renameWorkspace,
   pick = pickDirectory,
 }: UseManualAddDeps): UseManualAdd {
   const [wsDialog, setWsDialog] = useState<WorkspaceDialogState | null>(null);
@@ -159,6 +168,19 @@ export function useManualAdd({
     });
   }, []);
 
+  const editWorkspace = useCallback((workspace: WorkspaceRecord) => {
+    // No root guard here, unlike `removeWorkspace`: a rename is a label change the backend
+    // accepts on every workspace — the root included — so refusing it would invent a rule the
+    // domain does not have.
+    setError(null);
+    setProjDialog({
+      mode: "edit",
+      entity: "workspace",
+      workspaceId: workspace.id,
+      defaultName: workspace.name,
+    });
+  }, []);
+
   const removeWorkspace = useCallback((workspace: WorkspaceRecord) => {
     // The root workspace can NEVER be removed on its own (the backend rejects it and
     // the sidebar hides the action there); guard so a stray call is inert.
@@ -184,6 +206,16 @@ export function useManualAdd({
           // Image-3/4 duplication). Both are editable afterwards.
           await createProject(name, projDialog.path, DEFAULT_ROOT_LABEL);
           toast.success(`Project “${name}” created`);
+        } else if (
+          projDialog.mode === "edit" &&
+          projDialog.entity === "workspace" &&
+          projDialog.workspaceId
+        ) {
+          // The workspace RENAME. `rename_workspace` pushes `workspaces://changed` from its
+          // committed domain event, so every surface re-pulls the new label on its own — nothing
+          // here reloads a list by hand.
+          await renameWorkspace?.(projDialog.workspaceId, name);
+          toast.success(`Workspace renamed to “${name}”`);
         } else if (projDialog.mode === "edit" && projDialog.projectId) {
           await updateProject?.(projDialog.projectId, name);
           toast.success("Project renamed");
@@ -210,7 +242,7 @@ export function useManualAdd({
         setSubmitting(false);
       }
     },
-    [projDialog, createProject, updateProject, deleteProject, deleteWorkspace],
+    [projDialog, createProject, updateProject, deleteProject, deleteWorkspace, renameWorkspace],
   );
 
   // --- Workspace add --------------------------------------------------------
@@ -320,5 +352,13 @@ export function useManualAdd({
     </>
   );
 
-  return { addProject, addWorkspace, editProject, removeProject, removeWorkspace, dialog };
+  return {
+    addProject,
+    addWorkspace,
+    editProject,
+    editWorkspace,
+    removeProject,
+    removeWorkspace,
+    dialog,
+  };
 }

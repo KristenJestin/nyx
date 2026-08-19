@@ -1,4 +1,4 @@
-// The REAL app CSS: the detail's pane is laid out by TRUE Tailwind utilities (`h-svh`, the
+// The REAL app CSS: the detail's pane is laid out by TRUE Tailwind utilities (`h-app`, the
 // `grid-cols-[minmax(18rem,22rem)_1fr]` track, `min-h-0 flex-1`, `h-full`). Without them the pane
 // has no height and "does the preview fill it and centre in it?" cannot even be asked.
 // `vitest.config.ts` wires `@tailwindcss/vite`, so this `@import "tailwindcss"` genuinely compiles.

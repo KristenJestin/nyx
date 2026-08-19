@@ -47,11 +47,20 @@ function snapshot(terminals: WorkspaceRuntimeTerminal[]): WorkspaceRuntimeSnapsh
 }
 
 /** Mount the accordion with the runtime-selection + consumed-notifications providers it needs. */
-function renderAccordion(snap: WorkspaceRuntimeSnapshot | null, defaultOpen = false) {
+function renderAccordion(
+  snap: WorkspaceRuntimeSnapshot | null,
+  defaultOpen = false,
+  props: Partial<React.ComponentProps<typeof WorkspaceAccordion>> = {},
+) {
   return render(
     <RuntimeSelectionProvider initialSelection={null}>
       <ConsumedNotificationsProvider>
-        <WorkspaceAccordion workspace={workspace()} snapshot={snap} defaultOpen={defaultOpen} />
+        <WorkspaceAccordion
+          workspace={workspace()}
+          snapshot={snap}
+          defaultOpen={defaultOpen}
+          {...props}
+        />
       </ConsumedNotificationsProvider>
     </RuntimeSelectionProvider>,
   );
@@ -127,5 +136,59 @@ describe("WorkspaceAccordion — notification-aware rollup (finding: consumed le
     const { container } = renderAccordion(snap, false);
     await waitFor(() => expect(screen.getByText("root")).toBeTruthy());
     expect(headerDot(container)).toBeNull();
+  });
+});
+
+/**
+ * The lifecycle KEBAB, one of the two entry points to a workspace's rename/remove (the other is
+ * the project rail's per-workspace group in `base-layout.tsx`, guarded in its own suite).
+ *
+ * On a ROOT workspace the trigger itself must not exist (review `01M0A7QGBK43MZB10RF51QR6TS`).
+ * It used to open onto an active Rename and a DISABLED Remove explaining that the root leaves
+ * with its project — a dead end costing a click to learn there was nothing to do. The user asked
+ * for nothing at all there, rename included.
+ */
+describe("WorkspaceAccordion — lifecycle kebab (root shows none)", () => {
+  beforeEach(() => {
+    mockIPC((cmd) => {
+      if (cmd === "agent_active_sessions") return [];
+      if (cmd === "agent_activity_snapshot") return [];
+      return undefined;
+    });
+  });
+
+  const actions = { onRename: () => {}, onRemove: () => {} };
+
+  it("ROOT workspace: no kebab trigger, and therefore no Rename / Remove entry", async () => {
+    renderAccordion(snapshot([]), false, { workspace: workspace({ is_root: true }), ...actions });
+    await waitFor(() => expect(screen.getByText("root")).toBeTruthy());
+    // Not the three dots…
+    expect(screen.queryByRole("button", { name: "Workspace actions for root" })).toBeNull();
+    // …and nothing behind them either.
+    expect(screen.queryByRole("menuitem", { name: /Rename workspace/ })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /Remove workspace/ })).toBeNull();
+  });
+
+  it("NON-root workspace: the kebab opens on a live Rename + Remove that fire their handlers", async () => {
+    const renamed: string[] = [];
+    const removed: string[] = [];
+    renderAccordion(snapshot([]), false, {
+      workspace: workspace({ id: "ws2", name: "api", is_root: false }),
+      onRename: (w) => renamed.push(w.id),
+      onRemove: (w) => removed.push(w.id),
+    });
+
+    const trigger = await screen.findByRole("button", { name: "Workspace actions for api" });
+    fireEvent.click(trigger);
+
+    const remove = await screen.findByRole("menuitem", { name: "Remove workspace api" });
+    // Live, not a greyed placeholder — the root's disabled row has no equivalent here.
+    expect(remove).not.toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(remove);
+    expect(removed).toEqual(["ws2"]);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Workspace actions for api" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename workspace api" }));
+    expect(renamed).toEqual(["ws2"]);
   });
 });

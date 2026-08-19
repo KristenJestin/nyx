@@ -145,9 +145,8 @@ function runBridgeContract(name: string, makeHarness: () => Harness): void {
 
     it("exposes window controls", async () => {
       h = makeHarness();
-      expect(h.bridge.window.dragRegionProps()).toMatchObject({
-        "data-tauri-drag-region": true,
-      });
+      // The drag region is NOT part of this surface: it is CSS the chrome carries
+      // (`-webkit-app-region: drag`), never a bridge call — see contract.ts.
       if (!h.windowTestable) return;
       await h.bridge.window.minimize();
       await h.bridge.window.toggleMaximize();

@@ -109,7 +109,7 @@ export function SidebarShell({
         // the 260 default sets no inline style so those rails render byte-identically to before.
         style={width === 260 ? undefined : { width }}
         className={cn(
-          "flex h-svh w-[260px] shrink-0 flex-col bg-muted/40",
+          "flex h-app w-[260px] shrink-0 flex-col bg-muted/40",
           `${borderClass} border-border/60`,
           className,
         )}
@@ -140,7 +140,7 @@ export function SidebarShell({
       animate={{ width: open ? width : collapsedWidth }}
       transition={T}
       className={cn(
-        "h-svh shrink-0 overflow-hidden bg-muted/40",
+        "h-app shrink-0 overflow-hidden bg-muted/40",
         `${borderClass} border-border/60`,
         className,
       )}

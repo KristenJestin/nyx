@@ -189,7 +189,6 @@ export class FakeNyxBridge implements NyxBridge {
       this.windowCalls.push("confirmClose");
       return Promise.resolve();
     },
-    dragRegionProps: () => ({ "data-tauri-drag-region": true }),
     onCloseRequested: (handler: () => void) => {
       this.closeRequestedHandlers.push(handler);
       return Promise.resolve(() => {

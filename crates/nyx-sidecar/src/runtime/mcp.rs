@@ -113,6 +113,14 @@ impl TerminalHost for SidecarTerminalHost {
         self.pty.close_record(terminal_id);
     }
 
+    fn close_terminal_ptys(&self, terminal_ids: &[String]) {
+        // The BULK close, overriding the trait's default loop: `close_records` raises every
+        // terminal's `closing` flag BEFORE joining the first pump, so a workspace holding N
+        // terminals pays ~one `PUMP_CLOSE_POLL` window instead of N. Same primitive, and the
+        // same per-terminal ordering, as the UI bridge's `workspace_delete` route.
+        self.pty.close_records(terminal_ids);
+    }
+
     fn terminal_liveness(&self, terminal_id: &str) -> (bool, Option<bool>) {
         // `live` = a PTY is registered for this record. `busy` stays `None` (the OS
         // foreground bit is served from the DB exec-state by list_terminals), exactly as

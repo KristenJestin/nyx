@@ -13,10 +13,10 @@ import ReactDOM from "react-dom/client";
 import App from "./app";
 
 // Mark the shell on <html> so the shell-specific CSS applies. Under Electron the
-// frameless-window DRAG region is a CSS concern (`-webkit-app-region: drag`): we tag the
-// document `data-shell="electron"` (detected via the allowlisted `window.nyxCore` preload
-// bridge) and a CSS rule in globals.css maps the drag-region attribute the chrome markup
-// carries to the Electron drag region.
+// frameless-window DRAG region is a CSS concern (`-webkit-app-region: drag`, carried by the
+// `drag-region` utility on `<ChromeBar>`): we tag the document `data-shell="electron"`
+// (detected via the allowlisted `window.nyxCore` preload bridge) so globals.css can add the
+// shell-specific safety net that cuts every interactive element back OUT of a drag region.
 if (typeof window !== "undefined" && (window as { nyxCore?: unknown }).nyxCore) {
   document.documentElement.setAttribute("data-shell", "electron");
 }

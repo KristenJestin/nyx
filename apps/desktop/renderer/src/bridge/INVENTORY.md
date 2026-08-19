@@ -1,18 +1,29 @@
 # nyxBridge inventory — every `@tauri-apps/*` call-site → contract surface
 
-This is the exhaustive map the `nyxBridge` contract (`./contract.ts`) was derived
-from. Every PRODUCTION (`src`, non-`.test.`) use of `@tauri-apps/api` or
-`@tauri-apps/plugin-*` is listed with the contract method/event that covers it.
-Test files use the same surface through the test fake (`./fake.ts`, phase 1
-follow-on) / the shared contract suite.
+This is the map the `nyxBridge` contract (`./contract.ts`) was derived from: every
+PRODUCTION (`src`, non-`.test.`) use of `@tauri-apps/api` or `@tauri-apps/plugin-*`
+listed with the contract method/event that covers it. Test files use the same
+surface through the test fake (`./fake.ts`, phase 1 follow-on) / the shared
+contract suite. It was EXHAUSTIVE when it was generated; where it stands today is
+stated in the status note under the first table.
 
 Generated against `apps/frontend/src` at PRD electron-migration phase 1.
 
 ## Request/response — `invoke("<command>")` → `NyxBridge`
 
-44 distinct backend commands are invoked. Each is a member of the
-`BackendCommand` union and is reachable via `bridge.invoke<R>(name, args)`; the
-hot terminal ones also have dedicated typed methods.
+52 backend commands are listed below (count the table's rows — the two must
+match). Each is a member of the `BackendCommand` union and is reachable via
+`bridge.invoke<R>(name, args)`; the hot terminal ones also have dedicated typed
+methods.
+
+> **Status, stated honestly (v2.5.7).** This table is the phase-1 map kept up to
+> date by hand, and the product has outgrown it: re-derived with
+> `grep -rhoE 'invoke(<[^>]*>)?\("[a-z_0-9]+"' src --include=*.ts --include=*.tsx`
+> (production files only), the renderer invokes ~98 distinct commands today —
+> the design / spec / review / engine / proto / repo surfaces landed after this
+> file was written and were never added. The `BackendCommand` union in
+> `./contract.ts` is the authoritative list; this table is a reading aid, and
+> filling the gap is its own chore, not this PRD's.
 
 | Backend command                     | Call-site(s)                                               | Contract method                               |
 | ----------------------------------- | ---------------------------------------------------------- | --------------------------------------------- |
@@ -42,6 +53,7 @@ hot terminal ones also have dedicated typed methods.
 | `list_workspaces`                   | `sidebar/use-projects.ts`                                  | `invoke("list_workspaces")`                   |
 | `create_workspace`                  | `sidebar/use-projects.ts`                                  | `invoke("create_workspace")`                  |
 | `rename_workspace`                  | `sidebar/use-projects.ts`                                  | `invoke("rename_workspace")`                  |
+| `workspace_delete`                  | `sidebar/use-projects.ts`                                  | `invoke("workspace_delete")`                  |
 | `set_workspace_collapsed`           | `sidebar/use-projects.ts`                                  | `invoke("set_workspace_collapsed")`           |
 | `command_list`                      | `command/use-commands.ts`                                  | `invoke("command_list")`                      |
 | `command_create`                    | `command/use-commands.ts`                                  | `invoke("command_create")`                    |
@@ -63,6 +75,9 @@ hot terminal ones also have dedicated typed methods.
 | `integration_list`                  | `sidebar/settings-dialog.tsx`                              | `invoke("integration_list")`                  |
 | `integration_install`               | `sidebar/settings-dialog.tsx` (dynamic `cmd`)              | `invoke("integration_install")`               |
 | `integration_remove`                | `sidebar/settings-dialog.tsx` (dynamic `cmd`)              | `invoke("integration_remove")`                |
+| `shell_list`                        | `sidebar/settings-dialog.tsx`                              | `invoke("shell_list")`                        |
+| `app_settings_get`                  | `sidebar/settings-dialog.tsx`                              | `invoke("app_settings_get")`                  |
+| `set_default_shell`                 | `sidebar/settings-dialog.tsx`                              | `invoke("set_default_shell")`                 |
 | `window_controls_visible`           | `chrome/window-controls.tsx`                               | `invoke("window_controls_visible")`           |
 
 ## Subscriptions — `listen("<event>")` → `subscribe*` (with `Unsubscribe`)
@@ -89,7 +104,13 @@ contract wraps it in an `Unsubscribe` the caller MUST run on teardown.
 | `getCurrentWindow().close()`          | `chrome/window-controls.tsx` | `window.close()`            |
 | — (no Tauri-API equivalent)           | `chrome/close-guard.tsx`     | `window.onCloseRequested()` |
 | — (no Tauri-API equivalent)           | `chrome/close-guard.tsx`     | `window.confirmClose()`     |
-| `data-tauri-drag-region` (DOM attr)   | `chrome/chrome-bar.tsx`      | `window.dragRegionProps()`  |
+| `data-tauri-drag-region` (DOM attr)   | `chrome/chrome-bar.tsx`      | — (pure CSS, see below)     |
+
+**Drag region**: it has NO bridge method. Under Tauri, WRY moved the window from any
+element carrying `data-tauri-drag-region`; under Electron the drag region is pure CSS —
+`<ChromeBar>` carries the `drag-region` utility (`-webkit-app-region: drag`, globals.css)
+and Chromium reads it off the computed style. The `window.dragRegionProps()` seam that
+used to hand the attribute out was dropped with Tauri (PDR-0006); it never had a caller.
 
 **Close interception**: the agent close-warning is centralized in the MAIN process
 (no longer a caller concern). The Electron shell WITHHOLDS every OS window close (WM
@@ -100,9 +121,11 @@ runs `agent_close_warnings` (via `chrome/close-warning.ts`), and proceeds with
 `window.confirmClose()` only when there are no live sessions to drop / the user confirms
 — which clears the guard so the real close goes through. Consequently `close()` is NO
 longer an unconditional action: under the Electron shell it re-enters this same
-main-process guard. (`window-controls.tsx`'s custom X button additionally runs a
-caller-side warning check before it calls `close()`.) The `onCloseRequested`/`confirmClose`
-pair are Electron-shell close-guard seams with no direct `@tauri-apps/api/window` mapping.
+main-process guard. (`window-controls.tsx`'s X button in the chrome bar runs that SAME
+warning check itself and then proceeds through `window.confirmClose()`, precisely so the
+main-process guard does not ask the user the identical question a second time.) The
+`onCloseRequested`/`confirmClose` pair are Electron-shell close-guard seams with no
+direct `@tauri-apps/api/window` mapping.
 
 ## Folder picker — `@tauri-apps/plugin-dialog` → `pickDirectory`
 

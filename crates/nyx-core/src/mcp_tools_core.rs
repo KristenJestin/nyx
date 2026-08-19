@@ -190,6 +190,23 @@ pub trait TerminalHost: Send + Sync {
     /// and drop any parked opening command. Idempotent — a no-op when nothing is live.
     fn close_terminal_pty(&self, terminal_id: &str);
 
+    /// Close SEVERAL terminals' live PTYs — the BULK twin of [`Self::close_terminal_pty`],
+    /// used by the `remove_workspace` teardown.
+    ///
+    /// It exists because a close is not free: the sidecar host raises each pump's explicit
+    /// close flag and then JOINS that pump, and an idle pump only reads the flag when it wakes
+    /// from its poll — so a LOOP of `close_terminal_pty` pays that window once per terminal,
+    /// serially. A host that can signal every terminal BEFORE joining the first pump overrides
+    /// this to pay it once for the whole set (the sidecar's `PtyManager::close_records`).
+    ///
+    /// The default is the loop, so a host with no bulk path (and every test double) keeps
+    /// working unchanged — and the semantics are identical either way, only the waiting differs.
+    fn close_terminal_ptys(&self, terminal_ids: &[String]) {
+        for id in terminal_ids {
+            self.close_terminal_pty(id);
+        }
+    }
+
     /// The live `(live, busy)` bits for a terminal record: `live` = a PTY is registered
     /// (its shell started), `busy` = a command is running in the foreground (the OS dot
     /// authority), or `None` when it cannot be derived. A record with no live PTY → `(false,
@@ -1488,15 +1505,20 @@ pub fn kill_workspace_runtime<S: RunnerSink>(
     instance_ids: &[String],
     terminal_ids: &[String],
 ) {
-    for id in instance_ids {
-        // Best-effort tree-kill; a stop failure must not abort the removal (the user asked to
-        // clear everything). `stop` is a no-op on an already-idle instance.
-        let _ = runner.stop(id);
-    }
-    for id in terminal_ids {
-        // Kill the interactive shell if a PTY is live; no-op otherwise.
-        host.close_terminal_pty(id);
-    }
+    // Bulk stop: SIGTERM every target, then ONE grace and ONE join window for the whole set
+    // (`stop_many`), instead of paying `TERM_GRACE + PUMP_JOIN_TIMEOUT` per instance in a loop.
+    // Same split as the bridge route: this runs on the caller thread, so a workspace holding
+    // several live commands would otherwise serialise seconds of pure waiting before the delete.
+    // Best-effort by contract — a stop failure must not abort the removal (the user asked to
+    // clear everything), and an instance the runner does not back is skipped rather than forced
+    // through a phantom idle transition.
+    runner.stop_many(instance_ids);
+    // …and the SAME split for the interactive shells: one bulk close, not a loop. A host that
+    // can signal every pump before joining the first one pays ONE poll window for the whole
+    // workspace instead of N (`TerminalHost::close_terminal_ptys`); a host that cannot falls
+    // back to the loop this replaced. Idempotent either way — a terminal with no live PTY is a
+    // no-op, which is what lets the full membership list be passed with no live-filter.
+    host.close_terminal_ptys(terminal_ids);
 }
 
 /// `remove_workspace` — `{ workspace_id }` → `{ removed, removed_instances }`. Refused on

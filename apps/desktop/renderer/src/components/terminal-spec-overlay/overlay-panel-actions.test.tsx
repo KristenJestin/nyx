@@ -3,8 +3,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { mockIPC } from "@/bridge/test-harness";
 
-import type { Spec, SpecStatus } from "../specs/types";
+import type { SpecStatus } from "../specs/types";
 import { OverlayPanelActions } from "./overlay-panel-actions";
+import { spec } from "./test-fixtures";
 
 // `useNavigate` is stubbed to a shared spy (via `vi.hoisted`, so the factory can reference it) —
 // clicking an action must call THIS with the right typed target, and never touch a real router.
@@ -12,29 +13,6 @@ const { navigate } = vi.hoisted(() => ({ navigate: vi.fn() }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => navigate,
 }));
-
-/** A minimal `Spec` fixture (only `id` + `status` matter for the actions). */
-function spec(overrides: Partial<Spec>): Spec {
-  return {
-    id: "s1",
-    project_id: "p1",
-    workspace_id: null,
-    title: "A spec",
-    slug: null,
-    number: 1,
-    priority: "med",
-    status: "in_progress",
-    mode: "stepped",
-    phases: "[]",
-    current_revision_number: 1,
-    position: 0,
-    created_at: 0,
-    updated_at: 0,
-    completed_at: null,
-    archived_at: null,
-    ...overrides,
-  };
-}
 
 /** The ORCHESTRATION RUN the header's Run action opens, served by the mocked bridge. */
 const ENGINE_WORKFLOW = {

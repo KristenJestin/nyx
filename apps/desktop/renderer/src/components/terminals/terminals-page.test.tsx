@@ -170,8 +170,10 @@ describe("TerminalsPage", () => {
     // The entered project name heads the sidebar.
     expect(await screen.findByText("Alpha")).toBeTruthy();
     // Both workspaces appear as accordion headers.
-    expect(await screen.findByRole("button", { name: /root/ })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /feat/ })).toBeTruthy();
+    // Queried by the toggle's EXACT name: each header now also carries an actions kebab, so a
+    // loose /root/ would match two buttons.
+    expect(await screen.findByRole("button", { name: "Toggle workspace root" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Toggle workspace feat" })).toBeTruthy();
   });
 
   it("renders the first workspace's runtime tree (terminals + commands) open by default", async () => {
@@ -370,7 +372,7 @@ describe("TerminalsPage — Add workspace (surfaced in the current shell)", () =
     await waitFor(() => expect(created.length).toBe(1));
     expect(created[0]!.path).toBe("/home/kris/feature");
     expect(created[0]!.projectId).toBe("p1");
-    expect(await screen.findByRole("button", { name: /feature/ })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Toggle workspace feature" })).toBeTruthy();
   });
 
   it("does nothing when the folder picker is cancelled (no dialog, no create)", async () => {
@@ -506,5 +508,101 @@ describe("TerminalsPage — Project settings (visible gear entry point)", () => 
     // The optimistic tree update flows back to the live `resumeAgentSessions` prop, so the toggle
     // reflects the persisted ON state (proving the setting sticks, not just fires-and-forgets).
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+  });
+});
+
+/**
+ * The WORKSPACE LIFECYCLE, reachable from the workspace's OWN line (review
+ * `01M04WQEQDDPH7NQEK9MPYCXKS`). Before this, `rename_workspace` had no UI caller at all and
+ * `workspace_delete` was reachable only from the PROJECT's rail menu — so from a worktree there
+ * was no way to rename or drop it. These tests hold the line's kebab to the four things that
+ * matter: the rename really calls `rename_workspace`, the removal is CONFIRMED before it calls
+ * `workspace_delete`, cancelling the confirmation calls NOTHING, and a ROOT workspace shows no
+ * kebab at all (review `01M0A7QGBK43MZB10RF51QR6TS` — not a disabled row, not the three dots).
+ */
+describe("TerminalsPage — workspace lifecycle from its own line", () => {
+  /** Open the kebab of the workspace line named `name`. */
+  async function openWorkspaceActions(name: string): Promise<void> {
+    fireEvent.click(await screen.findByRole("button", { name: `Workspace actions for ${name}` }));
+  }
+
+  it("offers Rename + Remove on a non-root workspace line, without the project menu", async () => {
+    installBackend();
+    renderPage();
+
+    await openWorkspaceActions("feat");
+    expect(await screen.findByRole("menuitem", { name: "Rename workspace feat" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Remove workspace feat" })).toBeTruthy();
+  });
+
+  it("renames the workspace through rename_workspace, pre-filled with its current name", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    installBackend(calls);
+    renderPage();
+
+    await openWorkspaceActions("feat");
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename workspace feat" }));
+
+    // The rename dialog is the SHARED one, worded for a workspace and seeded with the current name.
+    const field = await screen.findByRole("textbox", { name: "Workspace name" });
+    expect((field as HTMLInputElement).value).toBe("feat");
+    fireEvent.change(field, { target: { value: "feature-x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(calls.some((c) => c.cmd === "rename_workspace")).toBe(true));
+    const call = calls.find((c) => c.cmd === "rename_workspace");
+    expect(call?.args.id).toBe("ws-feat");
+    expect(call?.args.name).toBe("feature-x");
+  });
+
+  it("removes the workspace only AFTER the destructive confirmation, which says the folder stays", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    installBackend(calls);
+    renderPage();
+
+    await openWorkspaceActions("feat");
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove workspace feat" }));
+
+    // The confirmation is explicit about what a removal is NOT: nyx forgets the entry, Git and the
+    // folder are untouched.
+    expect(await screen.findByText(/folder on disk is not deleted/i)).toBeTruthy();
+    const confirm = screen.getByRole("button", { name: "Remove workspace" });
+    expect(calls.some((c) => c.cmd === "workspace_delete")).toBe(false);
+
+    fireEvent.click(confirm);
+    await waitFor(() => expect(calls.some((c) => c.cmd === "workspace_delete")).toBe(true));
+    expect(calls.find((c) => c.cmd === "workspace_delete")?.args.id).toBe("ws-feat");
+  });
+
+  it("cancelling the confirmation removes NOTHING (no backend call at all)", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    installBackend(calls);
+    renderPage();
+
+    await openWorkspaceActions("feat");
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove workspace feat" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    // Nothing was dropped — and nothing was even attempted.
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Remove workspace" })).toBeNull(),
+    );
+    expect(calls.some((c) => c.cmd === "workspace_delete")).toBe(false);
+  });
+
+  it("a ROOT workspace line has NO kebab at all — no trigger, no Rename, no Remove", async () => {
+    // Review `01M0A7QGBK43MZB10RF51QR6TS`. The root line used to carry a kebab opening on an
+    // active Rename and a DISABLED Remove with its reason — a click spent to learn there was
+    // nothing to do. The user asked for nothing on the root, its rename included: the root's
+    // lifecycle is the project's. The trigger itself is gone, so nothing behind it can leak.
+    installBackend();
+    renderPage();
+
+    // The non-root line still has its kebab (so the page really rendered both workspaces).
+    expect(await screen.findByRole("button", { name: "Workspace actions for feat" })).toBeTruthy();
+    // The root line has none — and therefore no lifecycle entry for it anywhere.
+    expect(screen.queryByRole("button", { name: "Workspace actions for root" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Rename workspace root" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Remove workspace root" })).toBeNull();
   });
 });

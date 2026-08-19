@@ -559,6 +559,80 @@ export interface TerminalSpecs {
 }
 
 // ---------------------------------------------------------------------------
+// Settings → Integrations: the provider registry (`integration_list` /
+// `integration_install` / `integration_remove`, served by `nyx_core::integrations`).
+// ---------------------------------------------------------------------------
+
+/**
+ * One provider row of the Settings → Integrations list, as returned by `integration_list` (and by
+ * `integration_install` / `integration_remove`, which each answer the single row they changed).
+ *
+ * Mirror of `nyx_core::integrations::IntegrationStatus` — `#[serde(rename_all = "camelCase")]` over
+ * four single-word fields, so the wire keys are the field names as written here — served straight,
+ * with no envelope around it.
+ */
+export interface IntegrationStatus {
+  /** Provider key (`"claude_code"`, `"codex"`, `"opencode"`, `"custom"`) — the `provider` argument
+   *  `integration_install` / `integration_remove` take back. */
+  readonly provider: string;
+  /** The display name, in the provider's own vocabulary. */
+  readonly label: string;
+  /**
+   * Whether the nyx integration — the ONE bundled plugin (MCP server + session-capture hooks) — is
+   * installed for this provider. A single flag, no split MCP/plugin state to desync. It is derived
+   * by the backend from the provider's REAL config rather than from a nyx-side cache, so a plugin
+   * removed outside nyx reads as uninstalled on the next `integration_list`.
+   */
+  readonly installed: boolean;
+  /** `true` when the provider is fully functional; `false` = coming soon, no actions available. */
+  readonly available: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Settings → Terminal: the DEFAULT-SHELL preference (`shell_list` /
+// `app_settings_get` / `set_default_shell`, served by `nyx_core::shells`).
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT a terminal spawn runs: a program plus the fixed arguments that make it that shell.
+ *
+ * `args` is empty for every shell that is a plain executable (PowerShell, cmd, bash, zsh…) and
+ * non-empty only where the shell has no executable of its own — a WSL distribution, which is
+ * `wsl.exe -d <distro>`. Both halves travel together so the renderer never has to compose (or
+ * parse) a command line: it hands back what {@link DetectedShell} gave it.
+ */
+export interface ShellChoice {
+  readonly path: string;
+  readonly args: readonly string[];
+}
+
+/**
+ * One shell the HOST really has, as returned by `shell_list` — the picker's options.
+ *
+ * The backend verifies every entry against the disk before returning it, so this list never
+ * offers a shell that would fail to spawn. `id` is the stable identity the picker keys its
+ * options on (`windows-powershell`, `pwsh`, `cmd`, `git-bash`, `wsl:<distro>`, or the absolute
+ * path of a `/etc/shells` entry); `label` is the name in the platform's own vocabulary.
+ */
+export interface DetectedShell extends ShellChoice {
+  readonly id: string;
+  readonly label: string;
+}
+
+/**
+ * The app-level preferences of this install (`app_settings_get`).
+ *
+ * `defaultShell: null` is the "Auto" state — the user has expressed NOTHING, which is a different
+ * fact from any shell that could be named here: it is what keeps the historical spawn resolution
+ * (`$SHELL`, then the per-OS default) in force. A stored preference whose binary has since been
+ * uninstalled is still reported here (so the picker can say so) but is NOT what a spawn uses — the
+ * backend falls back to the same historical chain rather than failing to open a terminal.
+ */
+export interface AppSettings {
+  readonly defaultShell: ShellChoice | null;
+}
+
+// ---------------------------------------------------------------------------
 // v2.8 orchestration ENGINE — the behavior-tree graph read models (Phase 6). These mirror, on the
 // wire, the `nyx_core::db` `Workflow` / `Node` / `WorkflowRun` serde shapes (snake_case) the sidecar
 // engine read-commands return. The graph is DATA (PRD "Orchestration = donnée"); the renderer
@@ -723,10 +797,13 @@ export interface WindowControls {
    *  So `close()` is NOT an unconditional escape hatch — it proceeds only once the guard
    *  clears (no live session) or the user confirms via {@link confirmClose}. */
   close(): Promise<void>;
-  /** Props to spread on the draggable chrome element so the shell can move the
-   *  window by it. The Tauri adapter returns `{ "data-tauri-drag-region": true }`;
-   *  an Electron adapter returns the CSS `-webkit-app-region: drag` equivalent. */
-  dragRegionProps(): Record<string, unknown>;
+  /* NB: there is no `dragRegionProps()` seam any more. It existed to hand the chrome the
+   * shell-specific way to mark its drag strip — `{ "data-tauri-drag-region": true }` under
+   * Tauri/WRY. Tauri is gone (PDR-0006) and under Electron the drag region is PURE CSS
+   * (`-webkit-app-region: drag`, the `drag-region` utility in globals.css): Chromium reads
+   * it off the computed style, no bridge call involved. The seam never had a caller — the
+   * chrome hard-coded the attribute — so it was a Tauri leftover advertising a capability
+   * nothing used. */
   /** Subscribe to the OS "window close requested" signal (the user clicked the OS
    *  close button / Alt-F4 / quit). The handler runs BEFORE the window is destroyed —
    *  the shell WITHHOLDS the real close until the caller proceeds via {@link
@@ -1201,10 +1278,39 @@ export type BackendCommand =
   // `proto_round_rebase` ({ prototypeId, sourceRoundId, label, summary? }) → `{ round }` — ROLLBACK
   // onto an earlier round (opens a new round cloning its manifest). Emits `prototypes://changed`.
   | "proto_round_rebase"
-  // integrations
+  // Settings → Integrations: the provider registry (`nyx_core::integrations`).
+  //
+  // `integration_list` (no args) → {@link IntegrationStatus}[] — the four registry providers with
+  // their available / coming-soon flags, each `installed` derived from the provider's REAL config
+  // (Claude Code's `enabledPlugins`) rather than from a nyx-side cache. A pure read.
   | "integration_list"
+  // `integration_install` ({ provider }) → {@link IntegrationStatus} — install the ONE bundled nyx
+  // plugin (MCP server + session-capture hooks) for that provider, and answer its refreshed row.
+  // Shells out to the provider's CLI, so it takes seconds and can fail with its message verbatim.
   | "integration_install"
+  // `integration_remove` ({ provider }) → {@link IntegrationStatus} — the mirror gesture: remove the
+  // bundled plugin and all nyx residue, and answer the refreshed row.
   | "integration_remove"
+  // Settings → Terminal: the DEFAULT-SHELL preference (`nyx_core::shells`).
+  //
+  // `shell_list` (no args) → {@link DetectedShell}[] — the shells REALLY installed on the host,
+  // discovered from the machine the way Windows Terminal discovers its profiles (Windows: Windows
+  // PowerShell, PowerShell 7, Command Prompt, Git Bash, one entry per installed WSL distribution;
+  // Unix: the `/etc/shells` registry). Every entry is verified against the disk, so nothing the
+  // picker offers can fail at spawn. A pure probe — no DB, no mutation.
+  | "shell_list"
+  // `app_settings_get` (no args) → {@link AppSettings} — the app-level preferences of this
+  // install, read from the `app_settings` store. `defaultShell: null` means the user has
+  // expressed nothing ("Auto"), which is a DIFFERENT fact from any shell we could name: it is what
+  // keeps the historical resolution (`$SHELL` → per-OS default) in force.
+  | "app_settings_get"
+  // `set_default_shell` ({ path: string | null, args?: string[] }) → void — RECORD the chosen
+  // shell, or CLEAR the preference back to "Auto" with `path: null`. `path`/`args` are taken
+  // verbatim from the picked {@link DetectedShell} (the renderer never composes a command line).
+  // Applies to the NEXT terminal spawned: the sidecar resolves the preference at spawn time, so
+  // terminals already on screen are deliberately left running their own shell. Emits NO `changed`
+  // topic for that reason — there is no surface to invalidate.
+  | "set_default_shell"
   // misc
   | "window_controls_visible";
 

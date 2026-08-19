@@ -23,6 +23,7 @@ import { useReviewComments } from "./use-review-comments";
 import { useReviewTasks } from "./use-review-tasks";
 import { useSpecReviewRepos } from "./use-review-repos";
 import { useSpecDetail } from "@/components/specs/use-spec-detail";
+import { useSpecProjectSync } from "@/components/specs/use-spec-project-sync";
 import { specKey } from "@/components/specs/spec-meta";
 
 /**
@@ -49,6 +50,9 @@ const routeApi = getRouteApi("/work/$specId/review");
 export function ReviewPage() {
   const { specId } = routeApi.useParams();
   const { detail, loading: detailLoading, error: detailError } = useSpecDetail(specId);
+  // A review opened directly (deep-link / back-forward) ENTERS the reviewed Spec's owner project —
+  // same one-way, URL-silent sync as the Spec detail and the prototype.
+  useSpecProjectSync(detail);
   const workspaceContext = detail?.workspace_context ?? null;
 
   const { repos, loading: reposLoading } = useSpecReviewRepos(workspaceContext);
@@ -194,7 +198,7 @@ export function ReviewPage() {
   // The detail is still loading — a full-screen spinner (the page owns the whole viewport).
   if (detailLoading && detail === null) {
     return (
-      <div className="flex h-svh items-center justify-center bg-background text-muted-foreground">
+      <div className="flex h-app items-center justify-center bg-background text-muted-foreground">
         <Spinner />
       </div>
     );
@@ -205,7 +209,7 @@ export function ReviewPage() {
   // hook so the hook order is stable.
   if (detailError || detail === null || workspaceContext === null) {
     return (
-      <div className="flex h-svh flex-col items-center justify-center gap-3 bg-background">
+      <div className="flex h-app flex-col items-center justify-center gap-3 bg-background">
         <p className="text-sm text-muted-foreground">
           {detailError || detail === null
             ? "This Spec could not be loaded."
@@ -232,7 +236,7 @@ export function ReviewPage() {
   return (
     <div
       data-testid="review-page"
-      className="flex h-svh w-full overflow-hidden bg-background text-foreground"
+      className="flex h-app w-full overflow-hidden bg-background text-foreground"
     >
       {/* LEFT: changed-files tree (@pierre/trees), an ALWAYS-OPEN left rail (Finding 59 — no collapse
           toggle). Widened to 300px (Finding 58) so deep, compacted folder paths stay readable. The

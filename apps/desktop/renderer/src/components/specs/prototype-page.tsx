@@ -49,6 +49,7 @@ import { useProtoActions } from "./use-proto-actions";
 import { useProtoTree } from "./use-proto-tree";
 import { useRoundManifest } from "./use-round-manifest";
 import { useSpecDetail } from "./use-spec-detail";
+import { useSpecProjectSync } from "./use-spec-project-sync";
 
 /**
  * `<PrototypePage>` — the Spec's prototype WORKBENCH, on a route of its own
@@ -65,7 +66,7 @@ import { useSpecDetail } from "./use-spec-detail";
  *
  * # The screen
  *
- * Same chassis as the review: `flex h-svh` between two [`SidebarShell`] flanks.
+ * Same chassis as the review: `flex h-app` between two [`SidebarShell`] flanks.
  *
  *  - LEFT — the PAGES rail ([`PagesRail`]) with the ROUND selector pinned at its FOOT, the whole
  *    thing foldable to a 52 px strip ([`PagesRailStub`]) that still carries both. It navigates PAGES
@@ -297,6 +298,10 @@ export function PrototypePage() {
   const { specId } = routeApi.useParams();
   const { page: requestedSlug } = routeApi.useSearch();
   const { detail, loading: detailLoading } = useSpecDetail(specId);
+  // A prototype opened directly (deep-link / back-forward) ENTERS the Spec's owner project — the
+  // SAME `spec.project_id` this page already scopes its design system to, so the rail can no longer
+  // disagree with the workbench about which project one is looking at.
+  useSpecProjectSync(detail);
 
   /**
    * THE PROJECT the design system is scoped to — the SPEC's own (`spec.project_id`), never the
@@ -504,7 +509,7 @@ export function PrototypePage() {
 
   if (loading || (detailLoading && detail === null)) {
     return (
-      <div className="flex h-svh items-center justify-center bg-background text-muted-foreground">
+      <div className="flex h-app items-center justify-center bg-background text-muted-foreground">
         <Spinner />
       </div>
     );
@@ -515,7 +520,7 @@ export function PrototypePage() {
   // the same one the header carries: back to the current round.
   if (consulting && activePage === null) {
     return (
-      <div className="flex h-svh flex-col items-center justify-center gap-3 bg-background px-6 text-center">
+      <div className="flex h-app flex-col items-center justify-center gap-3 bg-background px-6 text-center">
         <span className="grid size-12 place-items-center rounded-full bg-muted text-muted-foreground">
           <HistoryIcon className="size-5" />
         </span>
@@ -539,7 +544,7 @@ export function PrototypePage() {
   // a Spec with no prototype: a valid state, not a failure.
   if (error || tree === null || activePage === null) {
     return (
-      <div className="flex h-svh flex-col items-center justify-center gap-3 bg-background px-6 text-center">
+      <div className="flex h-app flex-col items-center justify-center gap-3 bg-background px-6 text-center">
         <span className="grid size-12 place-items-center rounded-full bg-muted text-muted-foreground">
           <LayoutTemplateIcon className="size-5" />
         </span>
@@ -714,7 +719,7 @@ export function PrototypePage() {
       // The mode, on the root — so a test (and a screenshot) reads it off the page itself rather
       // than off one of the several things it changes.
       data-consulting={consulting ? (consultedRound?.id ?? "") : undefined}
-      className="flex h-svh w-full overflow-hidden bg-background text-foreground"
+      className="flex h-app w-full overflow-hidden bg-background text-foreground"
     >
       {/* LEFT — the pages rail. Folded, it keeps navigating (the miniatures stay clickable). */}
       <SidebarShell

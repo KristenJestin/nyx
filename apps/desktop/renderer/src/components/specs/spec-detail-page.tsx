@@ -21,6 +21,7 @@ import { SpecSidebar } from "./spec-sidebar";
 import { specKey } from "./spec-meta";
 import { useSpecDependencies } from "./use-spec-dependencies";
 import { useSpecDetail } from "./use-spec-detail";
+import { useSpecProjectSync } from "./use-spec-project-sync";
 import { useSpecReviewComments } from "./use-spec-review-comments";
 import { ActivityTab } from "./tabs/activity-tab";
 import { AnnexesTab } from "./tabs/annexes-tab";
@@ -82,6 +83,10 @@ function tabCount(key: SpecTabKey, detail: SpecDetail): number | null {
 export function SpecDetailPage() {
   const { specId } = routeApi.useParams();
   const { detail, loading, error } = useSpecDetail(specId);
+  // Opening a Spec ENTERS its owner project (deep-link, back/forward between two projects' Specs):
+  // the route wins, the rail's selection follows, the URL is untouched. Called before the early
+  // returns (rules of hooks); a null/failed detail leaves the active project alone.
+  useSpecProjectSync(detail);
   // The review comments' author map — the source a finding's provenance is derived from on the
   // Tasks tab (an OPEN human comment also drives the panel's provenance). Called before the early
   // returns (rules of hooks); a null workspace context fetches nothing.
@@ -91,7 +96,7 @@ export function SpecDetailPage() {
 
   if (loading) {
     return (
-      <div className="flex h-svh items-center justify-center bg-background text-muted-foreground">
+      <div className="flex h-app items-center justify-center bg-background text-muted-foreground">
         <Spinner />
       </div>
     );
@@ -99,7 +104,7 @@ export function SpecDetailPage() {
 
   if (error || detail === null) {
     return (
-      <div className="flex h-svh flex-col items-center justify-center gap-3 bg-background">
+      <div className="flex h-app flex-col items-center justify-center gap-3 bg-background">
         <p className="text-sm text-muted-foreground">This Spec could not be loaded.</p>
         <Link to="/work" className="text-sm text-foreground underline-offset-4 hover:underline">
           Back to the board
@@ -111,7 +116,7 @@ export function SpecDetailPage() {
   const { spec } = detail;
 
   return (
-    <div className="flex h-svh bg-background">
+    <div className="flex h-app bg-background">
       {/* The context rail on the LEFT (shared `<SidebarShell>`, same as the Terminals cockpit);
           the header + tabs + tab content occupy the column to its RIGHT. */}
       <SpecSidebar detail={detail} />

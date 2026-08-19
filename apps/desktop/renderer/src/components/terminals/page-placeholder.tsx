@@ -24,7 +24,7 @@ export function PagePlaceholder({
   return (
     <div
       className={cn(
-        "flex h-svh w-full flex-col items-center justify-center gap-3 bg-background px-6 text-center",
+        "flex h-app w-full flex-col items-center justify-center gap-3 bg-background px-6 text-center",
         className,
       )}
     >

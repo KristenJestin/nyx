@@ -210,7 +210,7 @@ export function CataloguePage() {
   );
 
   return (
-    <div className="flex h-svh flex-col overflow-x-clip bg-background px-6 pb-6 pt-10">
+    <div className="flex h-app flex-col overflow-x-clip bg-background px-6 pb-6 pt-10">
       <header className="mb-4 flex shrink-0 items-start gap-4">
         <div className="min-w-0">
           <Breadcrumb className="mb-2">

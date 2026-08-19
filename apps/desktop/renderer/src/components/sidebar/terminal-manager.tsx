@@ -348,37 +348,45 @@ export function TerminalManager() {
 
   // Delete a project AND reconcile its terminals: the backend cascades the
   // project's workspaces and SET-NULLs the bound terminals' workspace_id, but
-  // `useTerminals` re-lists only at mount — so without mirroring the detach those
-  // terminals keep a stale `workspace_id` and the sidebar files them under a
-  // now-deleted workspace (rendered by no project) AND excludes them from the
-  // loose section, making a live terminal vanish from the UI until relaunch. We
-  // capture the project's workspace ids BEFORE the delete, then detach locally.
+  // `useTerminals` re-lists at mount AND on `terminals://changed` — and
+  // `delete_project` emits NEITHER (it pushes `workspaces://changed`), so no
+  // re-list is coming. Without mirroring the detach those terminals keep a stale
+  // `workspace_id` and the sidebar files them under a now-deleted workspace
+  // (rendered by no project) AND excludes them from the loose section, making a
+  // live terminal vanish from the UI until relaunch. We capture the project's
+  // workspace ids BEFORE the delete, then detach locally.
   const deleteProjectAndDetach = useCallback(
     async (id: string) => {
       const tree = projects.find((p) => p.project.id === id);
       const workspaceIds = tree ? tree.workspaces.map((w) => w.id) : [];
-      // Detach ONLY after a successful delete: `deleteProject` now rejects when the
-      // backend refuses (e.g. a running command), so the throw skips the detach and
-      // propagates to the confirm modal — never detaching terminals of a project
-      // that still exists.
+      // Detach ONLY after a successful delete: `deleteProject` rejects when the backend
+      // fails, so the throw skips the detach and propagates to the confirm modal — never
+      // detaching terminals of a project that still exists. (A running managed command is
+      // no longer a refusal: the sidecar STOPS the project's instances before deleting —
+      // review `01M0AJ4F6RMS4CHWQ5B6DB47RC`.)
       await deleteProject(id);
       detachFromWorkspaces(workspaceIds);
     },
     [projects, deleteProject, detachFromWorkspaces],
   );
 
-  // Same detach-after-success contract for a SINGLE workspace delete: the backend
-  // detaches the workspace's terminals (workspace_id → NULL) so they survive loose,
-  // but the local tree would keep showing them under the now-deleted workspace until
-  // a relaunch. Detach the workspace's terminals locally ONLY after the backend
-  // confirms the delete (a rejection — root / running command — throws and skips the
-  // detach, leaving the workspace and its terminals intact).
+  // NOT the same backend semantics as `deleteProjectAndDetach` above, and therefore not the
+  // same local contract. `workspace_delete` DESTROYS the workspace's runtime: the bridge stops
+  // its commands and closes its terminal PTYs, and `usecase::remove_workspace` DELETES the terminal
+  // records + agent sessions inside the removal transaction (review `01KWEX11`). Nothing survives
+  // detached on this path — so there is NOTHING to detach here.
+  //
+  // No optimistic detach on purpose: it would PROMOTE rows the backend just deleted into the
+  // sidebar's loose section, which is worse than the wait it was meant to cover. The command is
+  // now declared a terminal mutation on the bridge (`mutates_terminals`), so it announces
+  // `terminals://changed` and `useTerminals` re-lists — the deleted rows leave the screen instead of
+  // reappearing loose. A rejection (root workspace or unknown id, never a running command) throws,
+  // leaving the workspace and its terminals intact.
   const deleteWorkspaceAndDetach = useCallback(
     async (id: string) => {
       await deleteWorkspace(id);
-      detachFromWorkspaces([id]);
     },
-    [deleteWorkspace, detachFromWorkspaces],
+    [deleteWorkspace],
   );
 
   // Manual add / edit / delete flows (folder-picker-driven).
@@ -620,7 +628,11 @@ export function TerminalManager() {
     activeIndex === -1 ? undefined : resolveDisplayName(terminals[activeIndex], activeIndex, null);
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-background">
+    // Like the navigation shell's root (`terminals/base-layout.tsx`), this box DRAWS the chrome
+    // bar, so it spans the FULL window — `h-[100svh]`, bar included, not the `h-app` usable
+    // height its own children claim. It was `h-screen` (100vh), which the rest of the app no
+    // longer uses at all (review `01M0524Q2DFWKNDC6HQQ2BGFDE`: one full-height vocabulary).
+    <div className="flex h-[100svh] w-screen flex-col overflow-hidden bg-background">
       <ChromeBar title={title} />
       <div className="flex min-h-0 flex-1">
         <AppSidebar
