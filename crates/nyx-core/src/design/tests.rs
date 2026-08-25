@@ -774,7 +774,7 @@ fn homonymous_bundles_in_different_directories_are_two_components_and_stop_pendi
     let names: Vec<&str> = first.bundles.iter().map(|b| b.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["list/data-table", "data-table"],
+        vec!["data-table", "list/data-table"],
         "the second claimant is qualified by the shortest distinguishing directory"
     );
     // Each catalogue row points at its OWN source (neither clobbered the other).
