@@ -20,3 +20,4 @@ prototype/
 .vitest-screenshots/
 .vitest-attachments/
 **/__screenshots__/
+.shots/
