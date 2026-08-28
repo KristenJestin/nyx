@@ -6,7 +6,10 @@ import type { WorkspaceRecord } from "@/components/sidebar/use-projects";
 import { RuntimeSelectionProvider } from "./runtime-selection";
 import { ConsumedNotificationsProvider } from "./use-consumed-notifications";
 import { WorkspaceAccordion } from "./workspace-accordion";
-import type { WorkspaceRuntimeSnapshot, WorkspaceRuntimeTerminal } from "./use-workspace-runtime";
+import type {
+  WorkspaceRuntimeSnapshot,
+  WorkspaceRuntimeTerminal,
+} from "@/components/runtime/use-workspace-runtime";
 
 function workspace(overrides: Partial<WorkspaceRecord> = {}): WorkspaceRecord {
   return {

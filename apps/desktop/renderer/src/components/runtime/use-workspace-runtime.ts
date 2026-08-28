@@ -70,6 +70,14 @@ export interface WorkspaceRuntimeSession {
 export interface WorkspaceRuntimeService {
   /** `command_instances.id` — the launchable id. */
   readonly id: string;
+  /**
+   * `managed_commands.id` — the TEMPLATE this instance materializes, i.e. the project-level
+   * identity of the command. The instance id is per-workspace and cannot be it: a command GROUP
+   * (`managed_command_groups`) holds template ids, because the grouping belongs to the project,
+   * not to whichever workspace happens to be open. Carried by the wire already
+   * (`InstanceWithTemplate.command_id`, flattened into `WorkspaceService`).
+   */
+  readonly command_id: string;
   readonly workspace_id: string;
   readonly name: string;
   readonly command: string;

@@ -6,14 +6,14 @@ import {
   createRouter,
   RouterProvider,
 } from "@tanstack/react-router";
-import { bridgeFake, mockIPC } from "@/bridge/test-harness";
+import { bridgeFake, emit, mockIPC } from "@/bridge/test-harness";
 import { describe, expect, it } from "vitest";
 
 import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-projects";
 import { ActiveProjectProvider } from "./active-project";
 import { TerminalsPage } from "./terminals-page";
 import { loadLastTerminalId, saveLastTerminalId } from "./ui-persistence";
-import type { WorkspaceRuntimeSnapshot } from "./use-workspace-runtime";
+import type { WorkspaceRuntimeSnapshot } from "@/components/runtime/use-workspace-runtime";
 
 /**
  * Mount `<TerminalsPage>` at `/` under a memory router so its `?terminal=<id>` deep-link search
@@ -74,25 +74,28 @@ function workspace(id: string, projectId: string, name: string, isRoot: boolean)
   };
 }
 
-function snapshot(wsId: string): WorkspaceRuntimeSnapshot {
+function snapshot(
+  wsId: string,
+  extraTerminalIds: readonly string[] = [],
+): WorkspaceRuntimeSnapshot {
+  const runtimeTerminal = (id: string) => ({
+    id,
+    cwd: `/${wsId}`,
+    label: `${wsId}-shell`,
+    workspace_id: wsId,
+    status: "alive" as const,
+    exec_state: "idle" as const,
+    exec_state_unread: false,
+    sessions: [],
+  });
   return {
     workspace: { id: wsId, name: wsId, path: `/${wsId}` },
-    terminals: [
-      {
-        id: `${wsId}-term`,
-        cwd: `/${wsId}`,
-        label: `${wsId}-shell`,
-        workspace_id: wsId,
-        status: "alive",
-        exec_state: "idle",
-        exec_state_unread: false,
-        sessions: [],
-      },
-    ],
+    terminals: [runtimeTerminal(`${wsId}-term`), ...extraTerminalIds.map(runtimeTerminal)],
     agent_sessions: [],
     services: [
       {
         id: `${wsId}-svc`,
+        command_id: `${wsId}-cmd`,
         workspace_id: wsId,
         name: `${wsId}-dev`,
         command: "npm run dev",
@@ -109,9 +112,16 @@ function snapshot(wsId: string): WorkspaceRuntimeSnapshot {
  * CRUD commands `useTerminals` drives (`list_terminals`/`create_terminal`/`attach_terminal`/
  * `close_terminal`). `calls` records every command so a test can assert the create/close path
  * ran. Terminal ids are minted deterministically per create.
+ *
+ * A created terminal LANDS IN ITS WORKSPACE'S SNAPSHOT once it is attached, and the attach pushes
+ * `terminals://changed` — the real backend's own sequence. Without it the page could never SHOW a
+ * terminal it just created, so a split's new pane would be invisible for reasons that have nothing
+ * to do with the product.
  */
 function installBackend(calls: Array<{ cmd: string; args: Record<string, unknown> }> = []) {
   let createSeq = 0;
+  /** Terminals created + attached during the test, per workspace id. */
+  const attached = new Map<string, string[]>();
   mockIPC(
     (cmd, args) => {
       const a = (args ?? {}) as Record<string, unknown>;
@@ -125,7 +135,7 @@ function installBackend(calls: Array<{ cmd: string; args: Record<string, unknown
             workspace("ws-feat", "p1", "feat", false),
           ];
         case "workspace_runtime_snapshot":
-          return snapshot(a.workspaceId as string);
+          return snapshot(a.workspaceId as string, attached.get(a.workspaceId as string) ?? []);
         case "pty_spawn":
           return 100;
         case "list_terminals":
@@ -148,7 +158,15 @@ function installBackend(calls: Array<{ cmd: string; args: Record<string, unknown
             workspace_id: null,
           };
         }
-        case "attach_terminal":
+        case "attach_terminal": {
+          const workspaceId = a.workspaceId as string;
+          const id = a.terminalId as string;
+          const list = attached.get(workspaceId) ?? [];
+          if (!list.includes(id)) attached.set(workspaceId, [...list, id]);
+          // The real backend pushes this on the attach; the page re-pulls its snapshot on it.
+          setTimeout(() => void emit("terminals://changed"), 0);
+          return undefined;
+        }
         case "close_terminal":
           return undefined;
         default:
@@ -188,12 +206,13 @@ describe("TerminalsPage", () => {
     expect(screen.queryByText("Agents")).toBeNull();
   });
 
-  it("mounts the REAL terminal deck for the pane (reuses the shell's xterm, no duplication)", async () => {
+  it("mounts the REAL tiling host for the pane (reuses the shell's xterm, no duplication)", async () => {
     installBackend();
     const { container } = renderPage();
-    // The auto-selected first terminal mounts a live deck pane keyed by record id — the real
-    // `<TerminalDeck>` the shell uses, not a second terminal implementation.
+    // The auto-selected first terminal mounts a live pane keyed by record id, inside the tiling
+    // host — the same `<Terminal>`/store the shell uses, not a second terminal implementation.
     await waitFor(() => expect(container.querySelector("[data-terminal-id]")).not.toBeNull());
+    expect(container.querySelector("[data-pane-host]"), "the page tiles").not.toBeNull();
   });
 
   it("shows a placeholder when no project is entered", async () => {
@@ -206,13 +225,17 @@ describe("TerminalsPage", () => {
     installBackend();
     // Deep-link to the SECOND workspace's terminal — the Runtime tab's open-terminal seam.
     const { container } = mountTerminalsPage({ initialProjectId: "p1", terminal: "ws-feat-term" });
-    // The deep-linked terminal's deck pane is the ACTIVE one (not the auto-first ws-root-term).
+    // The deep-linked terminal's pane is the FOCUSED one (not the auto-first ws-root-term). With
+    // the tiling, "focused" is the ONE pane that takes the keyboard — the distinction the deck's
+    // single `data-active` could not express.
     await waitFor(() => {
       const pane = container.querySelector('[data-terminal-id="ws-feat-term"]');
-      expect(pane?.getAttribute("data-active")).toBe("true");
+      expect(pane?.getAttribute("data-focused")).toBe("true");
     });
     const first = container.querySelector('[data-terminal-id="ws-root-term"]');
-    expect(first?.getAttribute("data-active")).toBe("false");
+    expect(first?.getAttribute("data-focused")).toBe("false");
+    // …and it is not even tiled: nothing was split, so the shown terminal is alone on screen.
+    expect(first?.getAttribute("data-visible")).toBe("false");
   });
 
   it("restores this project's LAST active terminal (persisted) instead of the first", async () => {
@@ -223,10 +246,10 @@ describe("TerminalsPage", () => {
     const { container } = renderPage();
     await waitFor(() => {
       const pane = container.querySelector('[data-terminal-id="ws-feat-term"]');
-      expect(pane?.getAttribute("data-active")).toBe("true");
+      expect(pane?.getAttribute("data-focused")).toBe("true");
     });
     const first = container.querySelector('[data-terminal-id="ws-root-term"]');
-    expect(first?.getAttribute("data-active")).toBe("false");
+    expect(first?.getAttribute("data-focused")).toBe("false");
   });
 
   it("falls back to the first terminal when the persisted one no longer exists", async () => {
@@ -237,7 +260,7 @@ describe("TerminalsPage", () => {
     const { container } = renderPage();
     await waitFor(() => {
       const pane = container.querySelector('[data-terminal-id="ws-root-term"]');
-      expect(pane?.getAttribute("data-active")).toBe("true");
+      expect(pane?.getAttribute("data-focused")).toBe("true");
     });
   });
 
@@ -249,12 +272,12 @@ describe("TerminalsPage", () => {
     await waitFor(() => expect(loadLastTerminalId("p1")).toBe("ws-root-term"));
   });
 
-  it("opens the managed command named by the `?command=<id>` deep-link (its pane, deck hidden)", async () => {
+  it("opens the managed command named by the `?command=<id>` deep-link (its pane, tiling hidden)", async () => {
     installBackend();
     // Deep-link to the SECOND workspace's service — the Runtime tab's open-command seam.
     const { container } = mountTerminalsPage({ initialProjectId: "p1", command: "ws-feat-svc" });
-    // A selected SERVICE hides the terminal deck and shows the command's own pane, so the
-    // auto-first terminal is never the active surface (the deck region is hidden).
+    // A selected SERVICE hides the TILING and shows the command's own pane, so no terminal is the
+    // active surface (the whole tiling region is hidden — its terminals stay alive underneath).
     await waitFor(() => {
       const pane = container.querySelector('[data-terminal-id="ws-root-term"]');
       expect(pane).not.toBeNull();
@@ -292,14 +315,70 @@ describe("TerminalsPage — restored terminal/command affordances (finding 50)",
     await waitFor(() => expect(calls.some((c) => c.cmd === "create_terminal")).toBe(true));
   });
 
-  it("the Commands-section gear opens the command manager (reused ProjectCommandsDialog)", async () => {
+  /**
+   * ONE MODAL, TWO ENTRY POINTS (finding 01M132YSBKJ5J22VG60P5GN7W0). The COMMANDS gear used to open
+   * `<ProjectCommandsDialog>` — a 44rem standalone modal whose body was the very same
+   * `<CommandsSection>` the project settings show. One body, two useful widths, two chromes: the
+   * same duplication as the two lists inside it, one level up. The standalone modal is deleted and
+   * the gear opens the settings ON THE COMMANDS SECTION, which they already knew how to do.
+   */
+  it("the Commands-section gear opens the project settings ON the Commands section", async () => {
     installBackend();
     renderPage();
     const gear = await screen.findByRole("button", { name: "New command" });
     fireEvent.click(gear);
-    // The shared command manager modal opens, scoped to the project.
-    expect(await screen.findByText(/Commands — Alpha/)).toBeTruthy();
-    expect(screen.getByText(/Define named commands/)).toBeTruthy();
+
+    // The shared settings modal, on Commands: its rail marks the section as current and the
+    // catalogue is mounted.
+    const commands = await screen.findByRole("button", { name: "Commands" });
+    expect(commands).toHaveAttribute("aria-current", "page");
+    // The dialog is PORTALLED, so the catalogue lives outside the render container.
+    await waitFor(() => expect(document.querySelector("[data-command-list]")).not.toBeNull());
+    // …and the deleted modal's own chrome is nowhere.
+    expect(screen.queryByText(/Commands — Alpha/)).toBeNull();
+    expect(screen.queryByText(/Define named commands/)).toBeNull();
+  });
+
+  it("…and the header gear still opens the SAME modal on Global", async () => {
+    installBackend();
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Project settings" }));
+    expect(await screen.findByRole("switch", { name: /resume agent sessions/i })).toBeTruthy();
+    // ONE dialog mounted, whichever gear opened it.
+    expect(document.querySelectorAll("[role='dialog']").length).toBeLessThanOrEqual(1);
+  });
+
+  it("Mod+Shift+→ SPLITS the focused pane: one new terminal, in the focused pane's workspace", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    installBackend(calls);
+    const { container } = renderPage();
+    // The tiling is up and one pane holds the keyboard before the chord is fired.
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-focused="true"]')?.getAttribute("data-terminal-id"),
+      ).toBe("ws-root-term"),
+    );
+
+    fireEvent.keyDown(document, { key: "ArrowRight", ctrlKey: true, shiftKey: true });
+
+    // The split creates its terminal through the SAME sidebar CRUD as the "+" — create at the
+    // focused pane's workspace path, then attach it to that workspace. The LEAF only lands after
+    // that succeeds, so a chord that reaches nothing would show here as no `create_terminal`.
+    await waitFor(() => expect(calls.some((c) => c.cmd === "create_terminal")).toBe(true));
+    const create = calls.find((c) => c.cmd === "create_terminal");
+    expect(create!.args.cwd, "the focused pane's own workspace").toBe("/ws-root");
+    await waitFor(() => {
+      const attach = calls.find((c) => c.cmd === "attach_terminal");
+      expect(attach?.args.workspaceId).toBe("ws-root");
+    });
+    // …and the tiling now shows TWO panes — the leaf was placed, not just a terminal created.
+    await waitFor(() =>
+      expect(
+        container.querySelectorAll('[data-visible="true"]'),
+        "the pane was added",
+      ).toHaveLength(2),
+    );
+    expect(container.querySelectorAll('[data-focused="true"]'), "still ONE focus").toHaveLength(1);
   });
 
   it("Ctrl+W closes the selected terminal (restored close shortcut)", async () => {

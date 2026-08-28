@@ -189,6 +189,26 @@
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
+  /* THE CATEGORICAL GROUP PALETTE — the tint a GROUP may carry, and nothing but a group.
+     TWO notions of group share it: terminal groups (arranged in the deck, persisted in the
+     renderer's localStorage) and COMMAND groups (`managed_command_groups`, persisted in SQLite,
+     whose `color` column is CHECKed to 1..=6 — the 1-based index of a `--group-N` token). They
+     have neither the same storage nor the same lifecycle; they share this vocabulary so a group
+     reads the same wherever it is drawn. Nothing OTHER than a group may take these tokens.
+     It had to be created: every semantic token is RESERVED (a red group would read as an error)
+     and `--chart-1..5` above are greyscale, so they cannot tell two groups apart. One lightness
+     and one chroma across the six — only the HUE varies — so no group ever looks more important
+     than another, and the chroma is HALF the least saturated semantic token so a group can never
+     be mistaken for an alert. Declared ONCE (not per theme): the tone is chosen to read on both.
+     `--group-0` is the DEFAULT — the design system's existing neutral, deliberately NOT a colour:
+     an uncoloured group is a delimited block, not a coloured one. */
+  --group-0: oklch(0.556 0 0);
+  --group-1: oklch(0.76 0.09 322);
+  --group-2: oklch(0.76 0.09 232);
+  --group-3: oklch(0.76 0.09 152);
+  --group-4: oklch(0.76 0.09 62);
+  --group-5: oklch(0.76 0.09 12);
+  --group-6: oklch(0.76 0.09 272);
   --radius: 0.625rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);

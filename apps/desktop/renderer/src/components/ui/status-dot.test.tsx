@@ -1,7 +1,7 @@
 import { render, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
-import { aggregateState, isQuietState, type RunState, StatusDot } from "./status-dot";
+import { aggregateState, isQuietState, type RunState, StatusDot } from "@/components/ui/status-dot";
 
 describe("StatusDot", () => {
   it("reflects the state on the host via data-state", () => {

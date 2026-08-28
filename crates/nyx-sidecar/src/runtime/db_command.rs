@@ -31,6 +31,7 @@
 //! core-command router) so every sidebar/command surface re-pulls — including one that did
 //! not refresh locally.
 
+use nyx_core::command::CommandGroupAction;
 use nyx_core::db;
 use serde_json::Value;
 
@@ -230,6 +231,26 @@ impl Ctx<'_> {
         self.args.get(name).and_then(|v| v.as_bool())
     }
 
+    /// Read a THREE-STATE optional arg: `None` = the key is ABSENT (leave the field alone),
+    /// `Some(None)` = an explicit `null` (CLEAR it), `Some(Some(v))` = set it. The distinction is
+    /// the whole contract of a partial label update — not touching a name and deleting it are two
+    /// different edits, and [`Self::arg_opt_str`] folds them into one. A present key whose value
+    /// is neither `null` nor the expected type is a readable error, never a silent clear.
+    fn arg_tristate<T>(
+        &self,
+        name: &str,
+        read: impl Fn(&serde_json::Value) -> Option<T>,
+    ) -> Result<Option<Option<T>>, String> {
+        match self.args.get(name) {
+            None => Ok(None),
+            Some(serde_json::Value::Null) => Ok(Some(None)),
+            Some(value) => match read(value) {
+                Some(v) => Ok(Some(Some(v))),
+                None => Err(format!("{}: malformed arg '{name}'", self.command)),
+            },
+        }
+    }
+
     /// Read a required `string[]` arg, or a readable error.
     fn arg_str_vec(&self, name: &str) -> Result<Vec<String>, String> {
         self.args
@@ -303,6 +324,34 @@ impl Ctx<'_> {
             ),
             nyx_core::db::ContentWriteError::Db(d) => Self::db_err(d),
         }
+    }
+
+    /// Drive a GROUP-WIDE lifecycle gesture (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+    /// 01M11XVEFEQ524XRT9ARPQFGSV) through the SHARED `nyx_core::command::run_command_group` — the
+    /// one place the rule "play only starts what is not started" is written. The MCP tools call
+    /// the SAME function, which is what makes a click and an agent call indistinguishable.
+    ///
+    /// The runner Arc is cloned out of the runtime and the lock released before anything spawns,
+    /// so a group of four does not hold the runner cell for the duration of four starts.
+    fn run_command_group(
+        &self,
+        group_id: &str,
+        workspace_id: &str,
+        action: CommandGroupAction,
+    ) -> Result<String, String> {
+        let cmd = self
+            .runtime
+            .command()
+            .ok_or_else(|| "managed-command runtime not started".to_string())?;
+        let run = nyx_core::command::run_command_group(
+            cmd.db(),
+            &cmd.runner(),
+            group_id,
+            workspace_id,
+            action,
+        )
+        .map_err(|e| e.to_string())?;
+        Self::json(&run)
     }
 
     /// Refuse a template mutation while any of its instances is running (parity with the v1
@@ -1686,6 +1735,143 @@ impl Ctx<'_> {
                     .with_conn(|c| db::delete_template(c, &id))
                     .map_err(Self::db_err)?;
                 Ok("null".to_string())
+            }
+            // The ORDER OF THE COMMAND LIST (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+            // 01M11XTRXVVPZ9XMDW5ARWKWHA). Nothing could write it before — the list simply kept
+            // creation order — which is why a drag that takes a command OUT of a group could not
+            // leave it where it was dropped: it fell back to its "natural" position. `{ ids }`, the
+            // project's commands in their new order, exactly like the terminals' `reorder` and
+            // `projects_reorder`. Same `db::reorder_templates` the MCP `reorder_commands` calls.
+            "command_reorder" => {
+                let ids = self.arg_str_vec("ids")?;
+                self.db()
+                    .with_conn(|c| db::reorder_templates(c, &ids))
+                    .map_err(Self::db_err)?;
+                Ok("null".to_string())
+            }
+            // --- managed-command GROUPS (the multi-pane grouping). Every route delegates to the
+            //     SHARED `nyx_core::db` authority the MCP `manage_command_group` tool calls, so a
+            //     hand gesture and an agent call produce EXACTLY the same state. All seven ride
+            //     `mutates_command_templates` below (except the read), so a mutation broadcasts
+            //     `commands://changed` and both surfaces repaint without polling. ------------
+            "command_group_list" => {
+                let project_id = self.arg_str("projectId")?;
+                self.db()
+                    .with_conn(|c| db::list_command_groups(c, &project_id))
+                    .map_err(Self::db_err)
+                    .and_then(|rows| Self::json(&rows))
+            }
+            "command_group_create" => {
+                let project_id = self.arg_str("projectId")?;
+                let command_ids = self.arg_str_vec("commandIds")?;
+                self.db()
+                    .with_conn(|c| db::create_command_group(c, &project_id, &command_ids))
+                    .map_err(|e| e.to_string())
+                    .and_then(|group| Self::json(&group))
+            }
+            "command_group_add" => {
+                let group_id = self.arg_str("groupId")?;
+                let command_id = self.arg_str("commandId")?;
+                self.db()
+                    .with_conn(|c| db::add_to_command_group(c, &group_id, &command_id))
+                    .map_err(|e| e.to_string())
+                    .and_then(|group| Self::json(&group))
+            }
+            "command_group_remove" => {
+                let command_id = self.arg_str("commandId")?;
+                // The transition now hands back the SURVIVING group (review finding
+                // `01M11XKKFVQWSHZQ4TGT3P3Z06`); the renderer re-reads the whole list off the
+                // `commands://changed` push it already listens to, so this route keeps its `null`
+                // reply and the contract is untouched.
+                let _survivor = self
+                    .db()
+                    .with_conn(|c| db::remove_from_command_group(c, &command_id))
+                    .map_err(|e| e.to_string())?;
+                Ok("null".to_string())
+            }
+            "command_group_dissolve" => {
+                let group_id = self.arg_str("groupId")?;
+                self.db()
+                    .with_conn(|c| db::dissolve_command_group(c, &group_id))
+                    .map_err(|e| e.to_string())?;
+                Ok("null".to_string())
+            }
+            "command_group_labels" => {
+                let group_id = self.arg_str("groupId")?;
+                // THREE STATES, and the difference matters: an ABSENT key leaves the label alone,
+                // an explicit `null` CLEARS it. `arg_opt_str` cannot express that (it folds both
+                // to `None`), so the raw JSON is read here.
+                let name = self.arg_tristate("name", |v| v.as_str().map(str::to_string))?;
+                // `try_from`, NOT `as i32`: the cast WRAPS, so `4294967297` came out as `1` and
+                // was then happily accepted by the 1..=6 check downstream — the boundary that
+                // exists to refuse an out-of-palette index would have invented a valid one.
+                let color =
+                    self.arg_tristate("color", |v| v.as_i64().and_then(|n| i32::try_from(n).ok()))?;
+                self.db()
+                    .with_conn(|c| {
+                        db::set_command_group_labels(
+                            c,
+                            &group_id,
+                            name.as_ref().map(|n| n.as_deref()),
+                            color,
+                        )
+                    })
+                    .map_err(|e| e.to_string())
+                    .and_then(|group| Self::json(&group))
+            }
+            "command_group_layout" => {
+                let group_id = self.arg_str("groupId")?;
+                let command_ids = self.arg_str_vec("commandIds")?;
+                self.db()
+                    .with_conn(|c| db::set_command_group_layout(c, &group_id, &command_ids))
+                    .map_err(|e| e.to_string())
+                    .and_then(|group| Self::json(&group))
+            }
+            // The TILING SHAPE (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XTRXVVPZ9XMDW5ARWKWHA).
+            // Deliberately NOT folded into `command_group_layout`: that one says WHICH member goes
+            // where, this one says what the grid looks like, and a single route could not tell a
+            // re-order from a re-shape. Same `db::` authority as the MCP `action=shape`.
+            "command_group_shape" => {
+                let group_id = self.arg_str("groupId")?;
+                let shape = self.arg_str("shape")?;
+                self.db()
+                    .with_conn(|c| db::set_command_group_shape(c, &group_id, &shape))
+                    .map_err(|e| e.to_string())
+                    .and_then(|group| Self::json(&group))
+            }
+            // --- the GROUP-WIDE LIFECYCLE (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+            //     01M11XVEFEQ524XRT9ARPQFGSV) — play / stop / restart on every member at once.
+            //
+            //     `{ groupId, workspaceId }`, and the pair is the point: a group holds command
+            //     TEMPLATES (project-scoped) while running them drives `command_instances`
+            //     (workspace-scoped), which is why these controls live in the SIDEBAR and not in
+            //     the project-settings modal, which knows no workspace.
+            //
+            //     The RULE — play starts only the members that are not started, stop stops
+            //     everyone, restart re-spawns the active AND starts the inactive — is
+            //     `nyx_core::command::run_command_group` and is CALLED here, never re-implemented:
+            //     the MCP side (`start_command`/`stop_command`/`relaunch_command` given a
+            //     `group_id`) calls the very same function, so a click and an agent call cannot
+            //     drift. Each replies the group shape
+            //     `{ group_id, workspace_id, action, members[], running, total }`.
+            //     The three stay THREE ARMS and are not folded into one `a | b | c` pattern: the
+            //     `command_group_*` wire contract is DERIVED from this source by
+            //     `command-group-ipc-contract.test.ts`, which reads one arm per route, and a
+            //     merged pattern would hide them from it.
+            "command_group_start" => {
+                let group_id = self.arg_str("groupId")?;
+                let workspace_id = self.arg_str("workspaceId")?;
+                self.run_command_group(&group_id, &workspace_id, CommandGroupAction::Start)
+            }
+            "command_group_stop" => {
+                let group_id = self.arg_str("groupId")?;
+                let workspace_id = self.arg_str("workspaceId")?;
+                self.run_command_group(&group_id, &workspace_id, CommandGroupAction::Stop)
+            }
+            "command_group_relaunch" => {
+                let group_id = self.arg_str("groupId")?;
+                let workspace_id = self.arg_str("workspaceId")?;
+                self.run_command_group(&group_id, &workspace_id, CommandGroupAction::Relaunch)
             }
             "command_source_refresh" => {
                 let id = self.arg_str("id")?;
@@ -3254,10 +3440,40 @@ fn mutates_command_templates(command: &str) -> bool {
         "command_create"
             | "command_update"
             | "command_delete"
+            // The list ORDER is a template mutation like any other: every surface that draws the
+            // commands (sidebar, settings screen, an agent's `list_commands`) reads it.
+            | "command_reorder"
             | "command_resync_source"
             | "command_unlink_source"
             | "command_import_create"
+            // The GROUP mutations, for the same reason and on the same topic: the sidebar's
+            // COMMANDS list and the settings screen both re-read their grouping on
+            // `commands://changed`, and so does an agent's edit coming back the other way (the
+            // MCP `manage_command_group` tool raises `ChangedTopic::Commands`). `command_group_list`
+            // is deliberately absent — a read invalidates nothing.
+            | "command_group_create"
+            | "command_group_add"
+            | "command_group_remove"
+            | "command_group_dissolve"
+            | "command_group_labels"
+            | "command_group_layout"
+            | "command_group_shape"
     )
+}
+
+/// The GROUP-WIDE lifecycle DB commands (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+/// 01M11XVEFEQ524XRT9ARPQFGSV). They are deliberately NOT in [`mutates_command_templates`]: they
+/// change no template and no grouping — only run state — and the runner's own sink already
+/// broadcasts `commands://changed` once per member transition (`SidecarRunnerSink::on_state`), so
+/// adding a second invalidation here would only make every group start push one extra repaint.
+/// They are listed here so the omission reads as a decision and not as a forgotten line.
+#[cfg(test)]
+fn group_lifecycle_commands() -> [&'static str; 3] {
+    [
+        "command_group_start",
+        "command_group_stop",
+        "command_group_relaunch",
+    ]
 }
 
 /// The review-MUTATING DB commands (v2.4) — each broadcasts `repos://changed` on success so an
@@ -7802,5 +8018,138 @@ mod tests {
         );
 
         h.runtime.pty().close(pty_id);
+    }
+
+    // --- The command-group ROUTES added by review 01M11WE6H9E5D5FCS6RT0ZXAXN ------------------
+
+    /// Seed a project with `n` command templates, all in one group. Returns
+    /// `(project_id, group_id, command_ids in disposition order)`.
+    fn seed_command_group(h: &Harness, n: usize) -> (String, String, Vec<String>) {
+        h.runtime.db().with_conn(|c| {
+            let (project, _root) =
+                nyx_core::db::create_project(c, "P", "/tmp/dbcmd-groups", None).unwrap();
+            let ids: Vec<String> = (0..n)
+                .map(|i| {
+                    nyx_core::db::create_template(
+                        c,
+                        &project.id,
+                        &format!("svc{i}"),
+                        "echo hi",
+                        None,
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .id
+                })
+                .collect();
+            let group = nyx_core::db::create_command_group(c, &project.id, &ids).unwrap();
+            (project.id, group.id, ids)
+        })
+    }
+
+    /// `command_group_shape` — the TILING SHAPE over the wire (finding 01M11XTRXVVPZ9XMDW5ARWKWHA).
+    /// It persists, it answers the whole group (so the caller needs no re-read to repaint), it
+    /// leaves the members alone, and an unknown shape is a readable refusal rather than a raw SQL
+    /// CHECK violation.
+    #[test]
+    fn command_group_shape_route_persists_and_refuses_an_unknown_shape() {
+        let h = Harness::new();
+        let (project_id, group_id, ids) = seed_command_group(&h, 3);
+
+        let shaped: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "command_group_shape",
+                serde_json::json!({ "groupId": group_id, "shape": "main-top" }),
+            )
+            .expect("the route answers"),
+        )
+        .unwrap();
+        assert_eq!(shaped["layout_shape"], serde_json::json!("main-top"));
+        assert_eq!(
+            shaped["command_ids"],
+            serde_json::json!(ids),
+            "a re-shape is not a re-order"
+        );
+
+        // It persisted: the list route — the one the renderer re-reads on `commands://changed` —
+        // agrees.
+        let listed: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "command_group_list",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed[0]["layout_shape"], serde_json::json!("main-top"));
+
+        let refused = h
+            .run(
+                "command_group_shape",
+                serde_json::json!({ "groupId": group_id, "shape": "diagonal" }),
+            )
+            .expect_err("an unknown shape is refused");
+        assert!(refused.contains("main-top"), "{refused}");
+        // …and nothing moved.
+        let after: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "command_group_list",
+                serde_json::json!({ "projectId": project_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after[0]["layout_shape"], serde_json::json!("main-top"));
+    }
+
+    /// `command_reorder` — the ORDER OF THE COMMAND LIST, which nothing outside the DB layer could
+    /// write before (finding 01M11XTRXVVPZ9XMDW5ARWKWHA). It is what lets a command dragged OUT of
+    /// a group stay where it was dropped instead of falling back to its natural position.
+    #[test]
+    fn command_reorder_route_permutes_the_command_list() {
+        let h = Harness::new();
+        let (project_id, _group_id, ids) = seed_command_group(&h, 3);
+        let order = |h: &Harness| -> Vec<String> {
+            h.runtime
+                .db()
+                .with_conn(|c| nyx_core::db::list_templates(c, &project_id))
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect()
+        };
+        assert_eq!(order(&h), ids, "creation order to begin with");
+
+        let wanted = vec![ids[2].clone(), ids[0].clone(), ids[1].clone()];
+        h.run("command_reorder", serde_json::json!({ "ids": wanted }))
+            .expect("the route answers");
+        assert_eq!(order(&h), wanted, "the list took the asked order");
+
+        // It is a TEMPLATE mutation, so it broadcasts `commands://changed` — every surface that
+        // draws the commands reads this order.
+        assert!(
+            changed_count(&h.buf, "commands") >= 1,
+            "a reorder repaints the surfaces that draw the list"
+        );
+    }
+
+    /// THE INVALIDATION MAP IS A DECISION, NOT AN OVERSIGHT. `command_group_shape` changes the
+    /// GROUPING, so it rides `commands://changed` with the other group mutations. The three
+    /// group-wide LIFECYCLE routes deliberately do NOT: they change no template and no grouping,
+    /// and the runner's own sink already pushes `commands://changed` once per member transition —
+    /// a second invalidation here would only add a repaint per group start.
+    #[test]
+    fn the_group_routes_invalidate_exactly_what_they_change() {
+        assert!(
+            mutates_command_templates("command_group_shape"),
+            "a re-shape changes the grouping and must repaint it"
+        );
+        for lifecycle in group_lifecycle_commands() {
+            assert!(
+                !mutates_command_templates(lifecycle),
+                "{lifecycle} changes run state, not templates — the runner sink already pushes it"
+            );
+        }
+        assert!(mutates_command_templates("command_reorder"));
     }
 }

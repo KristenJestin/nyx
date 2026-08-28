@@ -1,4 +1,9 @@
-import { PointerSensor, type PointerSensorOptions } from "@dnd-kit/dom";
+import {
+  KeyboardSensor,
+  PointerSensor,
+  type KeyboardSensorOptions,
+  type PointerSensorOptions,
+} from "@dnd-kit/dom";
 import { describe, expect, it } from "vitest";
 
 import { reorderSensors, sameOrder } from "./reorder-dnd";
@@ -32,6 +37,21 @@ function pointerOptions(): PointerSensorOptions {
   if (!descriptor) throw new Error("reorderSensors must include a configured PointerSensor");
   return (descriptor as { options?: PointerSensorOptions }).options ?? {};
 }
+
+/** Same reading for the KEYBOARD descriptor — a BARE `KeyboardSensor` has no options at all. */
+function keyboardOptions(): KeyboardSensorOptions {
+  const descriptor = reorderSensors.find(
+    (s) =>
+      typeof s === "object" &&
+      s != null &&
+      "plugin" in s &&
+      (s as { plugin: unknown }).plugin === KeyboardSensor,
+  );
+  if (!descriptor) throw new Error("reorderSensors must include a configured KeyboardSensor");
+  return (descriptor as { options?: KeyboardSensorOptions }).options ?? {};
+}
+
+type KeyboardPreventActivation = NonNullable<KeyboardSensorOptions["preventActivation"]>;
 
 /**
  * The bug scenario as dnd-kit sees it: a `pointerdown` whose `target` is the `<button>` that COVERS
@@ -68,6 +88,37 @@ describe("reorderSensors — preventActivation override (finding #23)", () => {
     // Proves the covered-button case is exactly what the default cancels (the observed bug), so the
     // override is load-bearing, not cosmetic.
     expect(defaultPredicate(event, source)).toBe(true);
+  });
+});
+
+/**
+ * THE SAME OVERRIDE ON THE KEYBOARD SENSOR — the half that was missing.
+ *
+ * The pointer half above was found and fixed in v2.5.6; the keyboard sensor was added BARE next to
+ * it and kept dnd-kit's default guard, which is the identical predicate: the keydown must land on
+ * `source.handle ?? source.element`. A terminal row has no handle and its sortable element is the
+ * row wrapper, which is not focusable — the only thing a user can Tab to is the covering `<button>`
+ * — so Space never started a drag and three of the four gestures were unreachable without a mouse.
+ * (A group's block escaped it: its grip IS the handle AND the focusable element, which is why the
+ * one keyboard gesture that worked was "move the whole block".) A real Chromium spec drives the
+ * gesture end to end; this locks the predicate itself, next to its pointer twin.
+ */
+describe("reorderSensors — the KeyboardSensor carries the same override", () => {
+  it("configures a preventActivation predicate on the KeyboardSensor", () => {
+    expect(typeof keyboardOptions().preventActivation).toBe("function");
+  });
+
+  it("does NOT block a Space pressed on the button that covers the sortable element", () => {
+    const preventActivation = keyboardOptions().preventActivation as KeyboardPreventActivation;
+    const { event, source } = coveredButtonGesture();
+    expect(preventActivation(event as unknown as KeyboardEvent, source)).toBe(false);
+  });
+
+  it("is the OVERRIDE that unblocks it — dnd-kit's default WOULD have blocked the same gesture", () => {
+    const { event, source } = coveredButtonGesture();
+    const defaultPredicate = KeyboardSensor.defaults.preventActivation as KeyboardPreventActivation;
+    expect(typeof defaultPredicate).toBe("function");
+    expect(defaultPredicate(event as unknown as KeyboardEvent, source)).toBe(true);
   });
 });
 

@@ -20,7 +20,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::command::{
-    poll_until, CommandRunner, RunState, RunnerSink, WAIT_MAX_TIMEOUT, WAIT_POLL_INTERVAL,
+    poll_until, run_command_group, CommandGroupAction, CommandGroupRun, CommandGroupRunError,
+    CommandRunner, RunState, RunnerSink, WAIT_MAX_TIMEOUT, WAIT_POLL_INTERVAL,
 };
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
@@ -726,6 +727,118 @@ fn status_result(instance_id: &str, status: Value) -> Value {
     obj
 }
 
+// --- The WHOLE-GROUP target of the three lifecycle tools ------------------------------------
+//
+// Review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XVEFEQ524XRT9ARPQFGSV. The user gained a
+// play / stop / restart that drives a whole multi-pane command group; the symmetry rule (#90)
+// then obliges the agent to have it too. NOT a fourth tool: `group_id` + `workspace_id` is a
+// second way of NAMING the target on the three tools that already exist — exactly the mechanism
+// `name` + `workspace_id` already is for `start_command` — so the runner, this dispatch and
+// [`status_result`] are reused rather than duplicated. The RULE itself (play only starts what is
+// not started) lives in `command::run_command_group` and is called, not re-implemented.
+
+/// Read the group target of a lifecycle call, refusing the AMBIGUOUS forms outright.
+///
+/// `Ok(None)` = no `group_id`, so this is the ordinary single-instance call. `Ok(Some(ws))` = a
+/// group call in workspace `ws`. Naming a group AND an instance (or a name) is refused rather than
+/// silently resolved to one of them: a caller who sends both does not know which it wants, and
+/// picking for them is how a stop hits the wrong thing.
+fn group_target<'a>(args: &'a Value, group_id: &str) -> Result<&'a str, RpcError> {
+    for exclusive in ["instance_id", "name"] {
+        if optional_str(args, exclusive)?.is_some() {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "'group_id' and '{exclusive}' name two different targets — pass one or the \
+                     other, not both"
+                ),
+            ));
+        }
+    }
+    if args.get("env").is_some_and(|v| !v.is_null()) {
+        return Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            "'env' is a per-RUN override for a single instance and has no meaning on a whole \
+             group; start the members individually if one of them needs it",
+        ));
+    }
+    optional_str(args, "workspace_id")?.ok_or_else(|| {
+        RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "acting on command group {group_id} requires workspace_id: a group holds command \
+                 TEMPLATES (project-scoped) and running them is workspace-scoped"
+            ),
+        )
+    })
+}
+
+/// Map a group-wide refusal to the D8 vocabulary. A per-MEMBER failure is NOT one of these — it
+/// rides inside the result, on its own row.
+fn group_run_err(e: CommandGroupRunError) -> RpcError {
+    match e {
+        CommandGroupRunError::GroupNotFound { .. }
+        | CommandGroupRunError::WorkspaceNotFound { .. } => {
+            RpcError::new(RpcCode::InvalidId, e.to_string())
+        }
+        CommandGroupRunError::WorkspaceOutsideProject { .. } => {
+            RpcError::new(RpcCode::InvalidArgument, e.to_string())
+        }
+        CommandGroupRunError::Db(_) => RpcError::new(RpcCode::Internal, e.to_string()),
+    }
+}
+
+/// `{ group_id, workspace_id, action, members[], running, total }` — the group answer of the three
+/// lifecycle tools. Each member entry is the SAME `{ instance_id, …status }` a single-instance call
+/// returns (built by [`status_result`] over [`status_json`], so the two shapes cannot drift), plus
+/// what only a group call can say: `command_id`, `name`, `was_running`, `acted` (false on a member
+/// a `play` deliberately skipped), and a per-member `error`.
+fn group_run_result(run: CommandGroupRun) -> Value {
+    let members: Vec<Value> = run
+        .members
+        .iter()
+        .map(|m| {
+            let state = RunState::from_db_str(&m.state);
+            let mut entry =
+                status_result(&m.instance_id, status_json(state, m.exit_code, m.unread));
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("command_id".to_string(), json!(m.command_id));
+                map.insert("name".to_string(), json!(m.name));
+                map.insert("was_running".to_string(), json!(m.was_running));
+                map.insert("acted".to_string(), json!(m.acted));
+                map.insert("error".to_string(), json!(m.error));
+            }
+            entry
+        })
+        .collect();
+    json!({
+        "group_id": run.group_id,
+        "workspace_id": run.workspace_id,
+        "action": run.action,
+        "members": members,
+        // The AGGREGATE the group's head reads: `running` of `total` members are up. It is what
+        // makes a divergent group legible (one running, one exited, one idle) without inventing a
+        // fifth run state.
+        "running": run.running,
+        "total": run.total,
+    })
+}
+
+/// Run `action` over a whole group and shape the answer. The shared tail of the three tools' group
+/// branch — one place, so the three cannot answer three different shapes.
+fn group_lifecycle<S: RunnerSink>(
+    db: &Db,
+    runner: &CommandRunner<S>,
+    args: &Value,
+    group_id: &str,
+    action: CommandGroupAction,
+) -> Result<Value, RpcError> {
+    let workspace_id = group_target(args, group_id)?;
+    let run =
+        run_command_group(db, runner, group_id, workspace_id, action).map_err(group_run_err)?;
+    Ok(group_run_result(run))
+}
+
 // --- The four runtime command tools ----------------------------------------
 
 /// `start_command` — `{ instance_id | (name, workspace_id), env? }` → `{ instance_id,
@@ -747,6 +860,12 @@ pub fn start_command<S: RunnerSink>(
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<Value, RpcError> {
+    // WHOLE GROUP (finding 01M11XVEFEQ524XRT9ARPQFGSV): `group_id` + `workspace_id` names a
+    // multi-pane group instead of one instance, and the RULE — start only the members that are not
+    // already running — is the shared `command::run_command_group`, never a loop written here.
+    if let Some(group_id) = optional_str(args, "group_id")? {
+        return group_lifecycle(db, runner, args, group_id, CommandGroupAction::Start);
+    }
     let instance_id = resolve_instance_id(db, args)?;
     let per_run_env = optional_env_map(args, "env")?;
     let (command, cwd, persisted_env) = resolve_command_and_cwd(db, &instance_id)?;
@@ -771,6 +890,10 @@ pub fn stop_command<S: RunnerSink>(
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<Value, RpcError> {
+    // WHOLE GROUP — every member is stopped, idempotently on the ones already idle.
+    if let Some(group_id) = optional_str(args, "group_id")? {
+        return group_lifecycle(db, runner, args, group_id, CommandGroupAction::Stop);
+    }
     let instance_id = require_str(args, "instance_id")?;
     assert_instance_exists(db, instance_id)?;
     let was_running = runner.is_running(instance_id);
@@ -798,6 +921,11 @@ pub fn relaunch_command<S: RunnerSink>(
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<Value, RpcError> {
+    // WHOLE GROUP — the active members are re-spawned and the inactive ones started, from ONE
+    // snapshot taken before anything runs (simultaneous, not one-after-another).
+    if let Some(group_id) = optional_str(args, "group_id")? {
+        return group_lifecycle(db, runner, args, group_id, CommandGroupAction::Relaunch);
+    }
     let instance_id = require_str(args, "instance_id")?;
     let per_run_env = optional_env_map(args, "env")?;
     let (command, cwd, persisted_env) = resolve_command_and_cwd(db, instance_id)?;
@@ -3012,6 +3140,193 @@ mod tests {
             !err.message.contains("s3cr3t"),
             "the VALUE is never echoed in the refusal: {:?}",
             err.message
+        );
+    }
+
+    // --- The WHOLE-GROUP target of the three lifecycle tools -------------------------------
+    //
+    // Finding 01M11XVEFEQ524XRT9ARPQFGSV: `group_id` + `workspace_id` is a second way of NAMING
+    // the target, not a fourth tool. These pin the two things that are THIS layer's own — the
+    // argument contract and the answer shape — while the semantics of play/stop/restart live with
+    // the rule, in `command::tests`.
+
+    /// A no-op sink: enough for a group call whose members are all idle (nothing spawns).
+    struct GroupNoopSink;
+    impl RunnerSink for GroupNoopSink {
+        fn on_state(&self, _: &str, _: RunState, _: Option<i32>) {}
+        fn on_acknowledge(&self, _: &str) {}
+        fn on_output(&self, _: &str, _: &[u8]) {}
+        fn persist_scrollback(&self, _: &str, _: &str) {}
+        fn archive_previous_run(&self, _: &str) {}
+        fn clear_output(&self, _: &str) {}
+    }
+
+    /// A `Db` with one project, its root workspace, and a group of two commands. Returns
+    /// `(db, workspace_id, group_id, command_ids)`.
+    fn db_with_command_group() -> (Db, String, String, Vec<String>) {
+        let db = Db::in_memory();
+        let (workspace_id, group_id, command_ids) = db.with_conn(|c| {
+            let (project, workspace) =
+                db::create_project(c, "P", "/tmp/mcp-group", None).expect("project");
+            let ids: Vec<String> = (0..2)
+                .map(|i| {
+                    db::create_template(
+                        c,
+                        &project.id,
+                        &format!("svc{i}"),
+                        "echo hi",
+                        None,
+                        db::CommandSource::default(),
+                    )
+                    .expect("template")
+                    .id
+                })
+                .collect();
+            let group = db::create_command_group(c, &project.id, &ids).expect("group");
+            (workspace.id, group.id, ids)
+        });
+        (db, workspace_id, group_id, command_ids)
+    }
+
+    /// THE GROUP ANSWER SHAPE, on the three tools. Each member entry is the SAME
+    /// `{ instance_id, state, running, finished, exit_code, unread }` a single-instance call
+    /// returns — the group form reuses `status_result`, it does not invent a second status — plus
+    /// the four fields only a group can carry, and the `running`/`total` aggregate the group's
+    /// head reads. `stop` is used so nothing spawns: the shape is the subject here.
+    #[test]
+    fn a_group_call_answers_the_group_shape_on_all_three_tools() {
+        let _g = db_guard();
+        let (db, workspace_id, group_id, command_ids) = db_with_command_group();
+        let runner = CommandRunner::new(
+            GroupNoopSink,
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+
+        let args = json!({ "group_id": group_id, "workspace_id": workspace_id });
+        let stopped = stop_command(&db, &runner, &args).expect("stop the group");
+        assert_eq!(stopped["group_id"], json!(group_id));
+        assert_eq!(stopped["workspace_id"], json!(workspace_id));
+        assert_eq!(stopped["action"], json!("stop"));
+        assert_eq!(stopped["total"], json!(2));
+        assert_eq!(stopped["running"], json!(0));
+
+        let members = stopped["members"].as_array().expect("one row per member");
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members
+                .iter()
+                .map(|m| m["command_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            command_ids,
+            "the members are listed in DISPOSITION order"
+        );
+        for member in members {
+            // The single-instance status fields, verbatim.
+            for key in [
+                "instance_id",
+                "state",
+                "running",
+                "finished",
+                "exit_code",
+                "unread",
+            ] {
+                assert!(
+                    member.get(key).is_some(),
+                    "a member entry carries the single-instance field '{key}': {member}"
+                );
+            }
+            // …plus what only a group call can say.
+            assert!(member["name"].is_string());
+            assert_eq!(member["was_running"], json!(false));
+            assert_eq!(member["error"], Value::Null);
+        }
+
+        // The two other tools answer the SAME shape, with their own verb. Their members may or may
+        // not actually spawn here (the seeded workspace path need not exist on the test machine) —
+        // and that is the point of the second half of each assertion: a member that fails is
+        // REPORTED on its own row, it never aborts the call nor the other members.
+        for (result, verb) in [
+            (start_command(&db, &runner, &args), "start"),
+            (relaunch_command(&db, &runner, &args), "relaunch"),
+        ] {
+            let run = result.expect("a per-member failure never fails the group call");
+            assert_eq!(run["action"], json!(verb));
+            assert_eq!(run["total"], json!(2));
+            assert_eq!(
+                run["members"].as_array().map(Vec::len),
+                Some(2),
+                "every member is accounted for, whatever happened to it"
+            );
+        }
+    }
+
+    /// THE ARGUMENT CONTRACT IS REFUSED, NOT GUESSED. A group needs a workspace (it holds
+    /// project-scoped templates); naming a group AND an instance is two targets, and picking one
+    /// for the caller is how a stop hits the wrong thing; `env` is a per-RUN override for a single
+    /// process and has no meaning over a group, so it is refused rather than silently dropped.
+    #[test]
+    fn a_group_call_refuses_the_ambiguous_and_meaningless_argument_forms() {
+        let _g = db_guard();
+        let (db, workspace_id, group_id, _ids) = db_with_command_group();
+        let runner = CommandRunner::new(
+            GroupNoopSink,
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+
+        let no_workspace = stop_command(&db, &runner, &json!({ "group_id": group_id }))
+            .expect_err("a group without a workspace is refused");
+        assert_eq!(no_workspace.code, RpcCode::InvalidArgument);
+        assert!(no_workspace.message.contains("workspace_id"));
+
+        let both = stop_command(
+            &db,
+            &runner,
+            &json!({ "group_id": group_id, "workspace_id": workspace_id, "instance_id": "i1" }),
+        )
+        .expect_err("a group AND an instance is two targets");
+        assert_eq!(both.code, RpcCode::InvalidArgument);
+
+        let with_name = start_command(
+            &db,
+            &runner,
+            &json!({ "group_id": group_id, "workspace_id": workspace_id, "name": "svc0" }),
+        )
+        .expect_err("a group AND a name is two targets");
+        assert_eq!(with_name.code, RpcCode::InvalidArgument);
+
+        let with_env = start_command(
+            &db,
+            &runner,
+            &json!({ "group_id": group_id, "workspace_id": workspace_id, "env": { "A": "1" } }),
+        )
+        .expect_err("a per-run env has no meaning over a whole group");
+        assert_eq!(with_env.code, RpcCode::InvalidArgument);
+
+        // An unknown group is `invalid_id`, distinct from a malformed call.
+        let unknown = stop_command(
+            &db,
+            &runner,
+            &json!({ "group_id": "nope", "workspace_id": workspace_id }),
+        )
+        .expect_err("an unknown group is refused");
+        assert_eq!(unknown.code, RpcCode::InvalidId);
+
+        // …and a single-instance call is untouched by all of this.
+        assert_eq!(
+            stop_command(&db, &runner, &json!({}))
+                .expect_err("no target at all")
+                .code,
+            RpcCode::InvalidArgument
         );
     }
 }

@@ -48,11 +48,11 @@ use crate::pathnorm;
 use crate::schema::{
     agent_session_prototypes, agent_session_specs, agent_sessions, annex_blobs, annexes,
     app_settings, command_instances, command_slots, design, design_components, domain_events,
-    human_turns, idea_specs, ideas, managed_commands, nodes, projects, prototype_design_lock,
-    prototype_feedback, prototype_page_versions, prototype_pages, prototype_round_pages,
-    prototype_rounds, prototype_variants, prototypes, repositories, review_comments, review_reads,
-    review_tasks, spec_depends_on, spec_revisions, specs, task_dependencies, tasks, terminals,
-    workflow_runs, workflows, workspaces,
+    human_turns, idea_specs, ideas, managed_command_groups, managed_commands, nodes, projects,
+    prototype_design_lock, prototype_feedback, prototype_page_versions, prototype_pages,
+    prototype_round_pages, prototype_rounds, prototype_variants, prototypes, repositories,
+    review_comments, review_reads, review_tasks, spec_depends_on, spec_revisions, specs,
+    task_dependencies, tasks, terminals, workflow_runs, workflows, workspaces,
 };
 
 /// The migrations baked into the binary at compile time from `migrations/`.
@@ -4705,6 +4705,14 @@ pub struct ManagedCommand {
     /// EMPTY env rather than an error: a bad env must never make a command
     /// unresolvable. Write it with [`set_template_env`].
     pub env: Option<String>,
+    /// The `managed_command_groups` row this command belongs to, or `None` when it is SOLO.
+    /// A command belongs to ZERO OR ONE group — that is a fact of the schema (a nullable FK,
+    /// not a join table), so there is no invariant to police here.
+    pub group_id: Option<String>,
+    /// This command's position INSIDE its group — the whole DISPOSITION model: the pane tree is
+    /// DERIVED from the ordered member list, so re-ordering the members IS re-arranging the
+    /// panes. Meaningless (and left at 0) for a command with no group.
+    pub group_order: i32,
 }
 
 /// Optional package.json provenance for a template — passed as a group to
@@ -5003,6 +5011,120 @@ pub fn schema_health(conn: &mut SqliteConnection) -> SchemaHealth {
             up_to_date: false,
             pending_count: None, // the check itself failed (can't read the migration table)
         },
+    }
+}
+
+/// The versions recorded in `__diesel_schema_migrations` that THIS BUILD DOES NOT EMBED.
+///
+/// WHY THIS IS THE SIGNAL THAT MATTERS. Diesel identifies an applied migration by the numeric
+/// prefix of its directory and nothing else. A sibling worktree that minted "the next"
+/// `00000000000050_*` against the SAME `%APPDATA%/nyx-v2/nyx.db` therefore writes the row `50`,
+/// and from then on THIS build's own `50` is reported as already applied and never runs —
+/// `pending_migrations()` comes back EMPTY, the boot claims success, and the tables that migration
+/// should have created simply do not exist. That is not a hypothesis: it is the measured cause of
+/// `no such table: managed_command_groups` (human review 01M0CY3F075ACP4TFBK1KJ49X8), and it is
+/// invisible to [`schema_health`] by construction.
+///
+/// A foreign version is not by itself a fault — dated prefixes make the collision impossible going
+/// forward, and an old sibling row is harmless history. It IS the one thing worth naming at boot,
+/// because it is the only way to recognise this failure mode from a log.
+///
+/// Best-effort: an unreadable ledger yields an empty list rather than a panic (the pending check
+/// already degrades to `up_to_date = false` in that case).
+pub fn foreign_ledger_versions(conn: &mut SqliteConnection) -> Vec<String> {
+    use diesel::migration::MigrationSource;
+    let embedded: std::collections::HashSet<String> =
+        MigrationSource::<diesel::sqlite::Sqlite>::migrations(&MIGRATIONS)
+            .map(|list| {
+                list.iter()
+                    .map(|migration| migration.name().version().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+    let mut foreign: Vec<String> = conn
+        .applied_migrations()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|version| version.to_string())
+        .filter(|version| !embedded.contains(version))
+        .collect();
+    foreign.sort();
+    foreign
+}
+
+/// THE VERDICT THE BOOT IS ALLOWED TO PRINT — see [`SchemaHealth::boot_report`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaBootReport {
+    /// `true` ONLY when every embedded migration is applied AND the ledger holds nothing this
+    /// build does not embed. A boot may claim success on this and on nothing else.
+    pub healthy: bool,
+    /// `true` when the schema is BEHIND the binary — a migration did not apply. Serving on it
+    /// means `no such column` at the first query, so the caller must refuse rather than serve.
+    pub fatal: bool,
+    /// The single line the boot prints: the success sentence, or the refusal and its reason.
+    pub line: String,
+}
+
+impl SchemaHealth {
+    /// THE ONE SENTENCE THE BOOT IS ALLOWED TO SAY ABOUT THE SCHEMA.
+    ///
+    /// Before this existed, `main.rs` printed "runtime booted (SQLite migrated, runtime tables
+    /// ready)" the moment `Runtime::boot()` returned `Ok` — unconditionally, without ever asking
+    /// the schema anything. That claim was FALSE in the exact case that produced the bug this
+    /// guard was written for: migrations "ran" (there was nothing pending, as far as Diesel knew),
+    /// the boot announced success, and the first command read failed with `no such table`.
+    ///
+    /// So the sentence is DERIVED, never assumed:
+    ///
+    ///  - a PENDING migration is fatal: the schema is behind the binary and every query written
+    ///    against the new columns will fail. The caller refuses to serve (`fatal`).
+    ///  - a ledger version this build does not embed is NAMED (`foreign`), because it is the only
+    ///    trace of a sibling-worktree collision and it is invisible otherwise. It does not stop
+    ///    the boot; it stops the boot from claiming an unqualified success.
+    ///  - a check that could not run at all (`pending_count == None`) is reported as such rather
+    ///    than silently treated as healthy.
+    pub fn boot_report(&self, foreign: &[String]) -> SchemaBootReport {
+        match (self.up_to_date, self.pending_count) {
+            (false, Some(pending)) => SchemaBootReport {
+                healthy: false,
+                fatal: true,
+                line: format!(
+                    "SCHEMA BEHIND THE BINARY: {pending} migration(s) still pending after boot — \
+                     refusing to serve a broken schema{}",
+                    foreign_suffix(foreign)
+                ),
+            },
+            (false, None) => SchemaBootReport {
+                healthy: false,
+                fatal: true,
+                line: "SCHEMA UNVERIFIABLE: the migration ledger could not be read — refusing to \
+                       serve a schema we cannot vouch for"
+                    .to_string(),
+            },
+            (true, _) if !foreign.is_empty() => SchemaBootReport {
+                healthy: false,
+                fatal: false,
+                line: format!(
+                    "schema migrated, but the ledger carries version(s) this build does not embed \
+                     ({}) — another nyx worktree has written to this DB; a migration of OURS may \
+                     have been skipped as already-applied",
+                    foreign.join(", ")
+                ),
+            },
+            (true, _) => SchemaBootReport {
+                healthy: true,
+                fatal: false,
+                line: "SQLite migrated, runtime tables ready".to_string(),
+            },
+        }
+    }
+}
+
+fn foreign_suffix(foreign: &[String]) -> String {
+    if foreign.is_empty() {
+        String::new()
+    } else {
+        format!(" (ledger also carries foreign version(s): {})", foreign.join(", "))
     }
 }
 
@@ -6330,7 +6452,11 @@ pub fn delete_template(conn: &mut SqliteConnection, id: &str) -> QueryResult<usi
 /// `updated_at`. Ids absent from the table are silently skipped. Runs in a single
 /// transaction so the order is never observed half-applied. The caller passes the
 /// ids of ONE project's templates in their new order.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// The authority BOTH surfaces call since the list order was opened (review
+/// 01M11WE6H9E5D5FCS6RT0ZXAXN): the UI's `command_reorder` IPC route and the MCP `reorder_commands`
+/// tool. The "ids of ONE project, all of them" precondition is checked by those callers, not here —
+/// this stays the primitive.
 pub fn reorder_templates(conn: &mut SqliteConnection, ids: &[String]) -> QueryResult<()> {
     let now = now_millis();
     conn.transaction(|conn| {
@@ -6413,6 +6539,640 @@ pub fn get_template(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option
         .select(ManagedCommand::as_select())
         .first(conn)
         .optional()
+}
+
+// --- Command GROUPS: the multi-pane grouping of managed commands (v50) ----
+//
+// The AUTHORITY both surfaces call. The UI reaches it through the sidecar's `command_group_*`
+// routes and an agent through the MCP `manage_command_group` tool: same functions, same
+// transitions, so a hand gesture and an agent call produce EXACTLY the same state (the review
+// condition — `01M0ABR6V501D0SPR2BYBVZC4A` #90 — and the reason the grouping is DB state rather
+// than a renderer preference like the terminals' one).
+//
+// THE MODEL, in one paragraph. A command belongs to ZERO OR ONE group (a nullable FK on
+// `managed_commands`, not a join table). A group holds AT LEAST TWO members: removing the
+// second-to-last DISSOLVES it and leaves the survivor solo, which is why `remove_from_command_group`
+// is not a plain UPDATE. `name`/`color` are optional and independent — a group is born grey and
+// nameless and stays usable that way. The DISPOSITION is the ordered member list (`group_order`)
+// PLUS the `layout_shape` label, from which the pane tree is DERIVED: still no second layout
+// record to keep in sync — a shape is a word, not a set of rectangles (see
+// `20260827120000_command_groups_layout_shape/up.sql`).
+
+/// The lowest `managed_command_groups.color` the SQL CHECK accepts (1-based `--group-N` index).
+pub const COMMAND_GROUP_COLOR_MIN: i32 = 1;
+/// The highest one — the six design tokens that exist; anything else is refused at the boundary.
+pub const COMMAND_GROUP_COLOR_MAX: i32 = 6;
+/// The number of members below which a group cannot exist (it dissolves instead).
+const COMMAND_GROUP_MIN_MEMBERS: usize = 2;
+
+/// THE CLOSED VOCABULARY OF TILING SHAPES — the six values `managed_command_groups.layout_shape`
+/// accepts, in the order the chooser offers them (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+/// 01M11XTRXVVPZ9XMDW5ARWKWHA).
+///
+/// A shape is a LABEL, never a second layout record: the pane tree is still DERIVED, from the
+/// ordered member list plus this word. [`COMMAND_GROUP_SHAPE_AUTO`] reproduces exactly the
+/// behaviour that existed before the column, which is why it is the DB default and why no existing
+/// group moved when it landed.
+///
+/// This constant is one of THREE spellings of the same list — the SQL `CHECK` of
+/// `20260827120000_command_groups_layout_shape` and the MCP `shape` enum are the other two — and
+/// `the_shape_vocabulary_is_the_same_list_on_all_three_layers` exercises them against each other so
+/// they cannot drift.
+pub const COMMAND_GROUP_SHAPES: [&str; 6] =
+    ["auto", "row", "column", "grid", "main-left", "main-top"];
+
+/// The DEFAULT shape: the disposition derived from the member list alone — the behaviour of before
+/// the column, and the value every pre-existing row was given by the migration.
+pub const COMMAND_GROUP_SHAPE_AUTO: &str = "auto";
+
+/// A `managed_command_groups` row, WITH its ordered members — the shape both the IPC route and
+/// the MCP tool serve. `command_ids` is the DISPOSITION, not a set: it is read back in
+/// `group_order` order and the pane tree is derived from it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CommandGroup {
+    pub id: String,
+    pub project_id: String,
+    /// `None` = unnamed — the default, which renders no words at all. A blank string is
+    /// normalised to `None` on write, so "  " never becomes a name.
+    pub name: Option<String>,
+    /// `None` = uncoloured (the neutral default, NOT a seventh colour); else 1..=6.
+    pub color: Option<i32>,
+    /// The TILING SHAPE — one of [`COMMAND_GROUP_SHAPES`], defaulting to
+    /// [`COMMAND_GROUP_SHAPE_AUTO`]. A label the renderer derives the tree from, alongside
+    /// `command_ids`; never a set of rectangles.
+    pub layout_shape: String,
+    /// The member TEMPLATE ids, in DISPOSITION order.
+    pub command_ids: Vec<String>,
+}
+
+/// The `managed_command_groups` columns, without the members (the row as Diesel decodes it).
+#[derive(Debug, Clone, Queryable, Selectable)]
+#[diesel(table_name = managed_command_groups)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+struct CommandGroupRow {
+    id: String,
+    project_id: String,
+    name: Option<String>,
+    color: Option<i32>,
+    /// Read but not exposed on [`CommandGroup`] — the list is ordered by it, and nothing on the
+    /// wire needs the timestamps.
+    #[allow(dead_code)]
+    created_at: i64,
+    #[allow(dead_code)]
+    updated_at: i64,
+    layout_shape: String,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = managed_command_groups)]
+struct NewCommandGroup {
+    id: String,
+    project_id: String,
+    name: Option<String>,
+    color: Option<i32>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+/// Why a command-group write was refused. Distinct from a DB error so a caller (route or MCP
+/// tool) can map each refusal to its own user-facing message instead of a generic failure.
+#[derive(Debug)]
+pub enum CommandGroupError {
+    /// The group id does not resolve.
+    GroupNotFound {
+        id: String,
+    },
+    /// A command id does not resolve to a template (of the group's project).
+    CommandNotFound {
+        id: String,
+    },
+    /// A group needs at least two members — creating one with fewer is refused outright.
+    TooFewMembers {
+        given: usize,
+    },
+    /// The colour is outside the six `--group-N` tokens that exist.
+    ColorOutOfRange {
+        color: i32,
+    },
+    /// The tiling shape is not one of [`COMMAND_GROUP_SHAPES`]. Refused BEFORE the write so the
+    /// caller gets the vocabulary back instead of a raw SQL `CHECK` violation.
+    UnknownShape {
+        shape: String,
+    },
+    /// The layout was given a member set that is not EXACTLY the group's current members.
+    LayoutMismatch,
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for CommandGroupError {
+    fn from(e: diesel::result::Error) -> Self {
+        CommandGroupError::Db(e)
+    }
+}
+
+impl std::fmt::Display for CommandGroupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandGroupError::GroupNotFound { id } => write!(f, "unknown command group {id}"),
+            CommandGroupError::CommandNotFound { id } => write!(f, "unknown command {id}"),
+            CommandGroupError::TooFewMembers { given } => write!(
+                f,
+                "a command group needs at least {COMMAND_GROUP_MIN_MEMBERS} commands (got {given})"
+            ),
+            CommandGroupError::ColorOutOfRange { color } => write!(
+                f,
+                "colour {color} is outside {COMMAND_GROUP_COLOR_MIN}..={COMMAND_GROUP_COLOR_MAX}"
+            ),
+            CommandGroupError::UnknownShape { shape } => write!(
+                f,
+                "unknown tiling shape '{shape}' — expected one of {}",
+                COMMAND_GROUP_SHAPES.join(" | ")
+            ),
+            CommandGroupError::LayoutMismatch => {
+                write!(
+                    f,
+                    "the layout must list exactly the group's current members"
+                )
+            }
+            CommandGroupError::Db(e) => write!(f, "db error: {e}"),
+        }
+    }
+}
+
+/// Blank-to-`None`: a name of spaces is NOT a name (the head would show words nobody wrote).
+fn normalize_group_name(name: Option<&str>) -> Option<String> {
+    name.map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+/// The member ids of `group_id`, in DISPOSITION order (`group_order`, then id as a stable
+/// tiebreaker so two members that were never re-ordered keep a deterministic sequence).
+fn command_group_member_ids(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+) -> QueryResult<Vec<String>> {
+    managed_commands::table
+        .filter(managed_commands::group_id.eq(group_id))
+        .order((
+            managed_commands::group_order.asc(),
+            managed_commands::id.asc(),
+        ))
+        .select(managed_commands::id)
+        .load::<String>(conn)
+}
+
+/// Read one group WITH its members, or `None` when the id does not resolve.
+pub fn get_command_group(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+) -> QueryResult<Option<CommandGroup>> {
+    let row = managed_command_groups::table
+        .find(group_id)
+        .select(CommandGroupRow::as_select())
+        .first::<CommandGroupRow>(conn)
+        .optional()?;
+    let Some(row) = row else { return Ok(None) };
+    let command_ids = command_group_member_ids(conn, group_id)?;
+    Ok(Some(CommandGroup {
+        id: row.id,
+        project_id: row.project_id,
+        name: row.name,
+        color: row.color,
+        layout_shape: row.layout_shape,
+        command_ids,
+    }))
+}
+
+/// Every group of `project_id`, oldest first, each with its members in disposition order.
+pub fn list_command_groups(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<Vec<CommandGroup>> {
+    let rows = managed_command_groups::table
+        .filter(managed_command_groups::project_id.eq(project_id))
+        .order((
+            managed_command_groups::created_at.asc(),
+            managed_command_groups::id.asc(),
+        ))
+        .select(CommandGroupRow::as_select())
+        .load::<CommandGroupRow>(conn)?;
+    let mut groups = Vec::with_capacity(rows.len());
+    for row in rows {
+        let command_ids = command_group_member_ids(conn, &row.id)?;
+        groups.push(CommandGroup {
+            id: row.id,
+            project_id: row.project_id,
+            name: row.name,
+            color: row.color,
+            layout_shape: row.layout_shape,
+            command_ids,
+        });
+    }
+    Ok(groups)
+}
+
+/// WHAT A DETACH DID — the group the command LEFT, and whether that group died of it.
+///
+/// It carries both halves because the caller cannot re-derive either one afterwards: the row that
+/// pointed at the group is exactly what the write cleared, and reading it back outside the
+/// transaction would race another writer. [`remove_from_command_group`] used to take its own
+/// `group_id` snapshot before calling the detach, i.e. two reads of one column and two sources for
+/// the same fact.
+struct DetachedFromGroup {
+    /// The group `command_id` was in before the detach.
+    group_id: String,
+    /// Whether that group dropped under [`COMMAND_GROUP_MIN_MEMBERS`] and was dissolved.
+    dissolved: bool,
+}
+
+/// Detach `command_id` from whatever group holds it, and DISSOLVE that group when it is left
+/// with fewer than two members. Returns what it did (`None` when the command was already solo).
+/// The shared tail of every membership change — entering a group, leaving one, and being pulled
+/// into another.
+fn detach_from_group(
+    conn: &mut SqliteConnection,
+    command_id: &str,
+) -> QueryResult<Option<DetachedFromGroup>> {
+    let current = managed_commands::table
+        .find(command_id)
+        .select(managed_commands::group_id)
+        .first::<Option<String>>(conn)?;
+    let Some(group_id) = current else {
+        return Ok(None);
+    };
+    diesel::update(managed_commands::table.find(command_id))
+        .set((
+            managed_commands::group_id.eq(None::<String>),
+            managed_commands::group_order.eq(0),
+            managed_commands::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)?;
+    let left = command_group_member_ids(conn, &group_id)?;
+    if left.len() >= COMMAND_GROUP_MIN_MEMBERS {
+        return Ok(Some(DetachedFromGroup {
+            group_id,
+            dissolved: false,
+        }));
+    }
+    // The survivor is RELEASED, never deleted (the FK is ON DELETE SET NULL, and we mirror it
+    // explicitly so the row's `updated_at` reflects the change).
+    dissolve_command_group_rows(conn, &group_id)?;
+    Ok(Some(DetachedFromGroup {
+        group_id,
+        dissolved: true,
+    }))
+}
+
+/// Release every member of `group_id` and delete the group row.
+fn dissolve_command_group_rows(conn: &mut SqliteConnection, group_id: &str) -> QueryResult<()> {
+    diesel::update(managed_commands::table.filter(managed_commands::group_id.eq(group_id)))
+        .set((
+            managed_commands::group_id.eq(None::<String>),
+            managed_commands::group_order.eq(0),
+            managed_commands::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)?;
+    diesel::delete(managed_command_groups::table.find(group_id)).execute(conn)?;
+    Ok(())
+}
+
+/// Write `command_ids` as the group's members, in the given order (`group_order` = position).
+fn set_group_members(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+    command_ids: &[String],
+) -> QueryResult<()> {
+    let now = now_millis();
+    for (position, command_id) in command_ids.iter().enumerate() {
+        diesel::update(managed_commands::table.find(command_id))
+            .set((
+                managed_commands::group_id.eq(group_id),
+                managed_commands::group_order.eq(position as i32),
+                managed_commands::updated_at.eq(now),
+            ))
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+/// CREATE a group from at least two commands, in the order they should be laid out.
+///
+/// A member that already belongs to another group is DETACHED first (and that group dissolves if
+/// it drops to one member) — "a command belongs to zero or one group" is enforced by the write,
+/// not left to the caller.
+pub fn create_command_group(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    command_ids: &[String],
+) -> Result<CommandGroup, CommandGroupError> {
+    // DEDUPE first: the same command listed twice is one member, and it must not make the
+    // "at least two" check pass on its own.
+    let mut members: Vec<String> = Vec::new();
+    for id in command_ids {
+        if !members.iter().any(|m| m == id) {
+            members.push(id.clone());
+        }
+    }
+    if members.len() < COMMAND_GROUP_MIN_MEMBERS {
+        return Err(CommandGroupError::TooFewMembers {
+            given: members.len(),
+        });
+    }
+    conn.transaction(|conn| {
+        for id in &members {
+            let exists = managed_commands::table
+                .find(id)
+                .filter(managed_commands::project_id.eq(project_id))
+                .select(managed_commands::id)
+                .first::<String>(conn)
+                .optional()?;
+            if exists.is_none() {
+                return Err(CommandGroupError::CommandNotFound { id: id.clone() });
+            }
+        }
+        for id in &members {
+            detach_from_group(conn, id)?;
+        }
+        let now = now_millis();
+        let id = Uuid::now_v7().to_string();
+        diesel::insert_into(managed_command_groups::table)
+            .values(NewCommandGroup {
+                id: id.clone(),
+                project_id: project_id.to_string(),
+                name: None,
+                color: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .execute(conn)?;
+        set_group_members(conn, &id, &members)?;
+        get_command_group(conn, &id)?.ok_or(CommandGroupError::GroupNotFound { id })
+    })
+}
+
+/// ADD a command to a group, at the END of its disposition (the automatic position).
+pub fn add_to_command_group(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+    command_id: &str,
+) -> Result<CommandGroup, CommandGroupError> {
+    conn.transaction(|conn| {
+        let group =
+            get_command_group(conn, group_id)?.ok_or_else(|| CommandGroupError::GroupNotFound {
+                id: group_id.to_string(),
+            })?;
+        // THE COMMAND MUST BE ONE OF THE GROUP'S OWN PROJECT — the same filter
+        // `create_command_group` applies to every founding member, and it was missing here.
+        // Without it a template of ANOTHER project could be pulled into this group: the write
+        // succeeds, the foreign command is detached from its own project's group (dissolving it if
+        // it was a pair), and `list_command_groups` then serves a `command_ids` entry that project
+        // does not own. A group is project-scoped, so a member from elsewhere is simply not one of
+        // its commands — hence `CommandNotFound`, the same answer creation gives.
+        let exists = managed_commands::table
+            .find(command_id)
+            .filter(managed_commands::project_id.eq(&group.project_id))
+            .select(managed_commands::id)
+            .first::<String>(conn)
+            .optional()?;
+        if exists.is_none() {
+            return Err(CommandGroupError::CommandNotFound {
+                id: command_id.to_string(),
+            });
+        }
+        if group.command_ids.iter().any(|id| id == command_id) {
+            return Ok(group);
+        }
+        // Leaving its previous group may DISSOLVE it — including, in the degenerate case, the
+        // very group we are adding to; re-reading after the detach is what keeps that honest.
+        detach_from_group(conn, command_id)?;
+        let Some(group) = get_command_group(conn, group_id)? else {
+            return Err(CommandGroupError::GroupNotFound {
+                id: group_id.to_string(),
+            });
+        };
+        let mut members = group.command_ids;
+        members.push(command_id.to_string());
+        set_group_members(conn, group_id, &members)?;
+        touch_command_group(conn, group_id)?;
+        get_command_group(conn, group_id)?.ok_or_else(|| CommandGroupError::GroupNotFound {
+            id: group_id.to_string(),
+        })
+    })
+}
+
+/// REMOVE a command from its group — it becomes solo. The group DISSOLVES when it is left with a
+/// single member (the survivor is released, never deleted). A command with no group is a no-op.
+///
+/// Returns the group AS IT SURVIVES the removal — with its remaining members, in order — and
+/// `None` in the two cases where there is no group left to describe: the removal DISSOLVED it, or
+/// the command was solo to begin with. That distinction is the whole point of the return value
+/// (review finding `01M11XKKFVQWSHZQ4TGT3P3Z06`): the caller could not re-derive it afterwards,
+/// since the row that pointed at the group is exactly what the write cleared, and re-reading
+/// outside the transaction would race another writer. It is decided HERE, inside it.
+pub fn remove_from_command_group(
+    conn: &mut SqliteConnection,
+    command_id: &str,
+) -> Result<Option<CommandGroup>, CommandGroupError> {
+    conn.transaction(|conn| {
+        let exists = managed_commands::table
+            .find(command_id)
+            .select(managed_commands::id)
+            .first::<String>(conn)
+            .optional()?;
+        if exists.is_none() {
+            return Err(CommandGroupError::CommandNotFound {
+                id: command_id.to_string(),
+            });
+        }
+        // ONE read of "which group held it": the detach already had to look it up, and it hands
+        // back both that id and whether the group survived — so this branch is decided on the
+        // very state the write observed rather than on a second, independently-taken snapshot.
+        let Some(detached) = detach_from_group(conn, command_id)? else {
+            return Ok(None);
+        };
+        if detached.dissolved {
+            return Ok(None);
+        }
+        Ok(get_command_group(conn, &detached.group_id)?)
+    })
+}
+
+/// DISSOLVE a group — every member becomes solo ("Ungroup all"). Idempotent on an unknown id.
+pub fn dissolve_command_group(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+) -> Result<(), CommandGroupError> {
+    conn.transaction(|conn| {
+        dissolve_command_group_rows(conn, group_id)?;
+        Ok(())
+    })
+}
+
+/// Bump a group's `updated_at` (the members live on another table, so a membership change is
+/// invisible to the group row otherwise).
+fn touch_command_group(conn: &mut SqliteConnection, group_id: &str) -> QueryResult<()> {
+    diesel::update(managed_command_groups::table.find(group_id))
+        .set(managed_command_groups::updated_at.eq(now_millis()))
+        .execute(conn)?;
+    Ok(())
+}
+
+/// SET a group's optional labels. Each argument is a THREE-STATE value: `None` = leave it alone,
+/// `Some(None)` = CLEAR it, `Some(Some(v))` = set it. That difference is the whole point — not
+/// touching the name and deleting it are not the same edit.
+pub fn set_command_group_labels(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+    name: Option<Option<&str>>,
+    color: Option<Option<i32>>,
+) -> Result<CommandGroup, CommandGroupError> {
+    if let Some(Some(value)) = color {
+        if !(COMMAND_GROUP_COLOR_MIN..=COMMAND_GROUP_COLOR_MAX).contains(&value) {
+            return Err(CommandGroupError::ColorOutOfRange { color: value });
+        }
+    }
+    conn.transaction(|conn| {
+        if get_command_group(conn, group_id)?.is_none() {
+            return Err(CommandGroupError::GroupNotFound {
+                id: group_id.to_string(),
+            });
+        }
+        if let Some(name) = name {
+            diesel::update(managed_command_groups::table.find(group_id))
+                .set(managed_command_groups::name.eq(normalize_group_name(name)))
+                .execute(conn)?;
+        }
+        if let Some(color) = color {
+            diesel::update(managed_command_groups::table.find(group_id))
+                .set(managed_command_groups::color.eq(color))
+                .execute(conn)?;
+        }
+        touch_command_group(conn, group_id)?;
+        get_command_group(conn, group_id)?.ok_or_else(|| CommandGroupError::GroupNotFound {
+            id: group_id.to_string(),
+        })
+    })
+}
+
+/// SET the DISPOSITION: exactly the group's current members, in the wanted order. A list that is
+/// not the same SET is refused ([`CommandGroupError::LayoutMismatch`]) — re-arranging is not a
+/// membership edit, and silently adding or dropping a member here would make the two
+/// indistinguishable.
+pub fn set_command_group_layout(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+    command_ids: &[String],
+) -> Result<CommandGroup, CommandGroupError> {
+    conn.transaction(|conn| {
+        let group =
+            get_command_group(conn, group_id)?.ok_or_else(|| CommandGroupError::GroupNotFound {
+                id: group_id.to_string(),
+            })?;
+        let mut wanted = command_ids.to_vec();
+        let mut current = group.command_ids.clone();
+        wanted.sort();
+        wanted.dedup();
+        current.sort();
+        if wanted != current || command_ids.len() != group.command_ids.len() {
+            return Err(CommandGroupError::LayoutMismatch);
+        }
+        set_group_members(conn, group_id, command_ids)?;
+        touch_command_group(conn, group_id)?;
+        get_command_group(conn, group_id)?.ok_or_else(|| CommandGroupError::GroupNotFound {
+            id: group_id.to_string(),
+        })
+    })
+}
+
+/// SET the TILING SHAPE — the sibling of [`set_command_group_layout`], and deliberately a
+/// SEPARATE transition: the order of the members and the shape they are poured into are two
+/// different edits, and folding them into one would make "re-arrange" and "re-shape" impossible to
+/// tell apart on the wire (the same reason `name` and `color` are two arguments and not one patch).
+///
+/// `shape` must be one of [`COMMAND_GROUP_SHAPES`]; anything else is refused HERE, with the
+/// vocabulary in the message, rather than reaching SQL and coming back as a raw `CHECK` violation.
+/// The members are untouched — a shape is a label, and the tree is re-derived from (members +
+/// label) on the next render.
+pub fn set_command_group_shape(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+    shape: &str,
+) -> Result<CommandGroup, CommandGroupError> {
+    if !COMMAND_GROUP_SHAPES.contains(&shape) {
+        return Err(CommandGroupError::UnknownShape {
+            shape: shape.to_string(),
+        });
+    }
+    conn.transaction(|conn| {
+        if get_command_group(conn, group_id)?.is_none() {
+            return Err(CommandGroupError::GroupNotFound {
+                id: group_id.to_string(),
+            });
+        }
+        diesel::update(managed_command_groups::table.find(group_id))
+            .set(managed_command_groups::layout_shape.eq(shape))
+            .execute(conn)?;
+        touch_command_group(conn, group_id)?;
+        get_command_group(conn, group_id)?.ok_or_else(|| CommandGroupError::GroupNotFound {
+            id: group_id.to_string(),
+        })
+    })
+}
+
+/// One member of a group, RESOLVED for a workspace: its template id, its display name, and the
+/// LAUNCHABLE `command_instances` id for that workspace.
+///
+/// This is the join the group-wide lifecycle needs and that nothing else provided: a group is
+/// PROJECT-scoped (it holds templates) while starting and stopping is WORKSPACE-scoped (it drives
+/// instances), so "start this group" only means something once the pair `(group, workspace)` has
+/// been turned into a list of instance ids.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CommandGroupMember {
+    /// The member TEMPLATE id (`managed_commands.id`).
+    pub command_id: String,
+    /// The LAUNCHABLE instance for the asked workspace (`command_instances.id`).
+    pub instance_id: String,
+    /// The template's display name — what a per-member result has to be readable by.
+    pub name: String,
+}
+
+/// The members of `group_id` RESOLVED against `workspace_id`, in DISPOSITION order.
+///
+/// An INNER JOIN on `command_instances`: a member with no instance in that workspace is simply
+/// absent from the list rather than an error, because it is not something a caller can act on and
+/// not something a caller can fix. (Materialization is idempotent and runs on both workspace and
+/// template creation, so the case is a data anomaly, not a workflow.) An unknown group, or a group
+/// whose project is not the workspace's, yields an EMPTY list — the caller validates the pair
+/// before calling; see `command::run_command_group`.
+pub fn command_group_members_for_workspace(
+    conn: &mut SqliteConnection,
+    group_id: &str,
+    workspace_id: &str,
+) -> QueryResult<Vec<CommandGroupMember>> {
+    command_instances::table
+        .inner_join(managed_commands::table)
+        .filter(managed_commands::group_id.eq(group_id))
+        .filter(command_instances::workspace_id.eq(workspace_id))
+        .order((
+            managed_commands::group_order.asc(),
+            managed_commands::id.asc(),
+        ))
+        .select((
+            managed_commands::id,
+            command_instances::id,
+            managed_commands::name,
+        ))
+        .load::<(String, String, String)>(conn)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|(command_id, instance_id, name)| CommandGroupMember {
+                    command_id,
+                    instance_id,
+                    name,
+                })
+                .collect()
+        })
 }
 
 // --- Command instance helpers (PRD-3 v3) ---------------------------------
@@ -14276,6 +15036,58 @@ pub fn open_in_memory() -> SqliteConnection {
     conn
 }
 
+/// Peel every migration applied ABOVE `version` — newest first — leaving `version` itself applied.
+/// Returns how many were peeled.
+///
+/// WHY THIS EXISTS. The revert chains in the tests below walk DOWN from the head, one
+/// `revert_last_migration` per migration they mean to undo, each link NAMED in its `.expect`. That
+/// spelling is only true while the head really is the migration the first link names. A migration
+/// whose directory sorts ABOVE the `000000000000NN` lineage — any dated prefix does, and
+/// `20260819140000_create_command_groups` is one — becomes the new head and shifts every chain
+/// down by one: each chain then stops one migration TOO EARLY, and its closing assertion passes or
+/// fails for the wrong reason. That is exactly what the command-groups migration did to twelve
+/// chains here.
+///
+/// Calling this FIRST gives a chain a NAMED floor instead of an implicit one. The floor is read
+/// back from the ledger, never counted, so ANY migration added on top — dated prefix or next
+/// number — costs nothing here and nothing in the chains below.
+#[cfg(test)]
+fn peel_migrations_above<C>(conn: &mut C, version: &str) -> usize
+where
+    C: MigrationHarness<diesel::sqlite::Sqlite>,
+{
+    let mut peeled = 0usize;
+    loop {
+        let head = conn
+            .applied_migrations()
+            .expect("read the applied-migration ledger")
+            .into_iter()
+            .map(|v| v.to_string())
+            .max()
+            .expect("at least one migration is applied");
+        if head.as_str() <= version {
+            return peeled;
+        }
+        conn.revert_last_migration(MIGRATIONS)
+            .unwrap_or_else(|e| panic!("peel migration {head} (above {version}) cleanly: {e}"));
+        peeled += 1;
+    }
+}
+
+/// Peel from the head down to AND INCLUDING `version`, leaving the schema at the state just BELOW
+/// it. The NAMED form of "revert N times" — see [`peel_migrations_above`] for why the count is a
+/// trap: every migration added afterwards silently invalidates it.
+#[cfg(test)]
+fn revert_down_through<C>(conn: &mut C, version: &str) -> usize
+where
+    C: MigrationHarness<diesel::sqlite::Sqlite>,
+{
+    let peeled = peel_migrations_above(conn, version);
+    conn.revert_last_migration(MIGRATIONS)
+        .unwrap_or_else(|e| panic!("revert migration {version} cleanly: {e}"));
+    peeled + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -15192,14 +16004,9 @@ mod tests {
 
         // Peel the migrations stacked above v29 first (v38 → v30, incl. our v34), then revert v29
         // → the CHECK narrows back; setting `closed` must now FAIL.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -15712,10 +16519,10 @@ mod tests {
     /// `annexes` table (v27) must still be there, so one revert too many fails instead of passing
     /// on an unexercised `down.sql` — and re-applying restores the refusal.
     ///
-    /// THREE reverts, since two migrations now sit on top of v50: the TIMESTAMPED head
-    /// `20260818130000` (`projects.worktrees_root` + the widened `nodes.type` CHECK) and v51 (the
-    /// canonical form), whose `down` is a no-op on the schema by design — so peeling both changes
-    /// nothing here beyond reaching v50.
+    /// NAMED, not counted ([`revert_down_through`]): several migrations sit on top of v50 — v51
+    /// (the canonical form, whose `down` is a no-op on the schema by design) and every TIMESTAMPED
+    /// head above it — and a hard-coded count silently stops short the day one more lands, leaving
+    /// the index in place and the assertion below reading a state it never reached.
     #[test]
     fn migration_v50_adds_the_partial_unique_index_on_url_annexes() {
         let mut conn = open_in_memory();
@@ -15731,14 +16538,7 @@ mod tests {
             "at head the index refuses the second attachment of the same url"
         );
 
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        revert_down_through(&mut conn, "00000000000050");
         assert!(
             diesel::sql_query("SELECT id FROM annexes")
                 .execute(&mut conn)
@@ -15793,16 +16593,10 @@ mod tests {
         let url = "https://jira.example.test/BROWSE-1";
         let other = "https://github.test/o/r/pull/7";
 
-        // Back to the v27 world: no index, so the base can rot exactly as a real one did. Three
-        // reverts — the TIMESTAMPED head `20260818130000` and v51 both sit above v50.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // Back to the v27 world: no index, so the base can rot exactly as a real one did. NAMED,
+        // not counted — v51 and every TIMESTAMPED head sit above v50, and one more of either would
+        // silently make a hard-coded count stop short of the state this test needs.
+        revert_down_through(&mut conn, "00000000000050");
 
         // Three attachments of the SAME url on spec_a, plus an untouched neighbourhood: the same
         // url on spec_b (a distinct link), another url on spec_a, and a doc attached twice (the
@@ -15935,15 +16729,10 @@ mod tests {
         let pr = "https://github.test/nyx/pull/1";
         let pr_slash = "https://github.test/nyx/pull/1/";
 
-        // Back to the pre-v51 world — peeling the TIMESTAMPED head `20260818130000` first, since it
-        // sits above v51. The v51 `down` is a no-op on the schema BY DESIGN — v50's index is v50's,
-        // and reverting v51 must not take it with it.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
+        // Back to the pre-v51 world — NAMED, not counted, so every TIMESTAMPED head sitting above
+        // v51 is peeled first however many there are. The v51 `down` is a no-op on the schema BY
+        // DESIGN — v50's index is v50's, and reverting v51 must not take it with it.
+        revert_down_through(&mut conn, "00000000000051");
         assert!(
             index_exists(&mut conn, "idx_annexes_url_unique_per_spec"),
             "reverting v51 leaves v50's index alone — it is not v51's to drop"
@@ -17239,14 +18028,9 @@ mod tests {
         let mut conn = open_in_memory();
         // Peel every migration above v13 newest-first (v37 down to v14), then v13
         // (specs/spec_revisions); all must succeed. Each revert drops the current last link.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -17952,16 +18736,12 @@ mod tests {
         // dir #39 traversal + query node, #40 builtin_revision, #41 fork_spec, #42 workspace, and
         // #43 the sub-workflow vocabulary + parent_run_id, #44 the managed_commands env, #45
         // the workflow_runs pending_consent, #46 the command_slots table, #47
-        // workflows.forked_from_revision, #48 the human_turns ledger, #49 its consumed_by mark and
-        // #50 the annexes url unique index, #51 the annexes url canonical form and the
-        // TIMESTAMPED head dir 20260818130000 `projects.worktrees_root` + the widened
-        // `nodes.type` CHECK).
-        // Count: dirs #4..#18 (15) + #20..#51 (32) + the timestamped head (1) = 48.
-        // Plus the TIMESTAMPED dir 20260818020000 `app_settings` (the app-level preference store).
-        for _ in 0..49 {
-            conn.revert_last_migration(MIGRATIONS)
-                .expect("revert migration cleanly down to (and including) exec_state");
-        }
+        // workflows.forked_from_revision, #48 the human_turns ledger, #49 its consumed_by mark, the
+        // annexes url unique index + canonical form, and the TIMESTAMPED heads — `app_settings`,
+        // `projects.worktrees_root` + the widened `nodes.type` CHECK, and the command groups).
+        // NAMED, not counted: peel from the head down to and including v4 (`terminals.exec_state`). A hard-coded
+        // count re-breaks the day ANY migration is added on top — see `revert_down_through`.
+        revert_down_through(&mut conn, "00000000000004");
         // Sanity: the column really is absent now — referencing it must error.
         let exec_col_present: QueryResult<usize> =
             sql_query("SELECT exec_state FROM terminals").execute(&mut conn);
@@ -21301,14 +22081,9 @@ mod tests {
         let mut conn = open_in_memory();
         // Peel every migration above v14 newest-first (v37 down to v15), then v14
         // (tasks/task_dependencies); all must succeed. Each revert drops the current last link.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -21766,14 +22541,9 @@ mod tests {
         // domain_events) then v11 (data backfill) then v10 (canonical structure). After
         // this, `workspaces.root_path` does NOT exist yet (`path` does), and `projects` has
         // no `key`/`primary_workspace_id`.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -22753,14 +23523,12 @@ mod tests {
         // sub-workflow vocabulary + parent_run_id + dir #44 the managed_commands env + dir #45 the
         // workflow_runs pending_consent + dir #46 the command_slots table + dir #47
         // workflows.forked_from_revision + dir #48 the human_turns ledger + dir #49 its consumed_by
-        // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form;
-        // the spec-anchor PRD added the TIMESTAMPED head dir 20260818130000
-        // `projects.worktrees_root` + the widened `nodes.type` CHECK). projects must then be absent.
-        // Plus the TIMESTAMPED dir 20260818020000 `app_settings` (the app-level preference store).
-        for _ in 0..51 {
-            conn.revert_last_migration(MIGRATIONS)
-                .expect("revert migration cleanly down to (and including) projects");
-        }
+        // mark; then the annexes url unique index + canonical form and the TIMESTAMPED heads —
+        // `app_settings`, `projects.worktrees_root` + the widened `nodes.type` CHECK, and the
+        // command groups). projects must then be absent.
+        // NAMED, not counted: peel from the head down to and including v2 (`projects`). A hard-coded
+        // count re-breaks the day ANY migration is added on top — see `revert_down_through`.
+        revert_down_through(&mut conn, "00000000000002");
         let after_down: QueryResult<i64> = projects::table.count().get_result(&mut conn);
         assert!(
             after_down.is_err(),
@@ -23624,15 +24392,12 @@ mod tests {
         // sub-workflow vocabulary + parent_run_id + dir #44 the managed_commands env + dir #45 the
         // workflow_runs pending_consent + dir #46 the command_slots table + dir #47
         // workflows.forked_from_revision + dir #48 the human_turns ledger + dir #49 its consumed_by
-        // mark + dir #50 the annexes url unique index + dir #51 the annexes url canonical form;
-        // the spec-anchor PRD added the TIMESTAMPED head dir 20260818130000
-        // `projects.worktrees_root` + the widened `nodes.type` CHECK). managed_commands must then
-        // be absent.
-        // Plus the TIMESTAMPED dir 20260818020000 `app_settings` (the app-level preference store).
-        for _ in 0..50 {
-            conn.revert_last_migration(MIGRATIONS)
-                .expect("revert migration cleanly down to (and including) managed_commands");
-        }
+        // mark; then the annexes url unique index + canonical form and the TIMESTAMPED heads —
+        // `app_settings`, `projects.worktrees_root` + the widened `nodes.type` CHECK, and the
+        // command groups). managed_commands must then be absent.
+        // NAMED, not counted: peel from the head down to and including v3 (`managed_commands`). A hard-coded
+        // count re-breaks the day ANY migration is added on top — see `revert_down_through`.
+        revert_down_through(&mut conn, "00000000000003");
         let after_down: QueryResult<i64> = managed_commands::table.count().get_result(&mut conn);
         assert!(
             after_down.is_err(),
@@ -23695,14 +24460,9 @@ mod tests {
         // v8, v7, v5, then v4 (migrations revert in reverse order). The instance row + its v3
         // columns survive; the v4 columns are gone (a typed select of `unread` would now fail
         // to run).
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -23943,14 +24703,9 @@ mod tests {
         // peels v15, v14, v13, v12, v11, v10, v9, v8, v7, then v5 (migrations revert in
         // reverse order). The instance row + its v3/v4 columns survive; the v5 columns are
         // gone (a typed select of `prev_scrollback` would now fail to run).
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -25355,14 +26110,9 @@ mod tests {
         // task domain) then v13 (v2.4 Phase 1 Spec domain) then v12 (v2.1 Phase 4
         // domain_events) then v11 (v2.1 data backfill) then v10 (v2.1 canonical structure)
         // then v9 (#11 project order) then v8 → the resume_agent_sessions column is gone.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -26457,14 +27207,9 @@ mod tests {
         assert!(list_command_slots(&mut conn, &other.id).unwrap().is_empty());
 
         // Peel v47 then v46 → the table is gone, so v46 is the migration that creates it.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -26554,14 +27299,9 @@ mod tests {
         // stacked above the engine one (v38 → v35) and `0034` itself — parking the DB with the
         // design-system `0030` still applied but NO workflow tables.
         let mut conn = open_in_memory();
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -26794,14 +27534,9 @@ mod tests {
             "the migrated schema carries the mark"
         );
 
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         assert!(
@@ -26847,12 +27582,11 @@ mod tests {
             "the migrated schema carries the store, with its three columns"
         );
 
-        // The head of the chain is v2's timestamped `projects.worktrees_root` (20260818130000),
-        // applied AFTER this one (20260818020000): it has to come off first.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
+        // Every TIMESTAMPED migration applied AFTER this one — `projects.worktrees_root`
+        // (20260818130000) and the command groups above it — has to come off first. NAMED, not
+        // counted: a hard-coded number stops short the day one more dated head lands, and the
+        // assertion below would then read a table that was never dropped.
+        revert_down_through(&mut conn, "20260818020000");
         assert!(
             diesel::sql_query("SELECT key FROM app_settings")
                 .execute(&mut conn)
@@ -27027,10 +27761,10 @@ mod tests {
         diesel::sql_query("DELETE FROM nodes WHERE \"type\" = 'create_workspace'")
             .execute(&mut conn)
             .expect("no row may keep a vocabulary the down removes");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
+        // NAMED, not counted: peel every dated head above `app_settings` — `worktrees_root` itself
+        // and the command groups stacked on it — so the chain lands where the assertions below say
+        // it does however many migrations get added on top.
+        revert_down_through(&mut conn, "20260818020000");
         assert!(
             diesel::sql_query("SELECT worktrees_root FROM projects")
                 .execute(&mut conn)
@@ -27393,14 +28127,9 @@ mod tests {
         // this schema the Diesel MODEL of a component does not match the table, and every read and
         // write of that ONE table goes through raw SQL here. It is not a workaround: a migration test
         // that stepped back and then used the head model would only be testing today's schema.
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -27606,14 +28335,9 @@ mod tests {
         );
 
         // THE DOWN restores the pre-rename vocabulary byte for byte (a reverted binary reads it).
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the worktrees_root + create_workspace migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert the app_settings migration cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v51 (annexes url canonical form) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v50 (annexes url unique index) cleanly");
+        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
+        // is peeled first, so the NAMED chain below still starts where its first link says.
+        peel_migrations_above(&mut conn, "00000000000049");
         conn.revert_last_migration(MIGRATIONS)
             .expect("revert v49 (human_turns consumed_by) cleanly");
         conn.revert_last_migration(MIGRATIONS)
@@ -29123,5 +29847,814 @@ mod tests {
         assert!(prototypes_for_session(&mut conn, &session.id)
             .unwrap()
             .is_empty());
+    }
+
+    // --- Command GROUPS (`managed_command_groups`) -------------------------
+    //
+    // These live HERE, in `mod tests`, and not in a module of their own: CLAUDE.md fixes one
+    // shape for unit tests — they sit in the module they cover, in a `mod tests`. `db.rs` has
+    // exactly one, and this is it.
+    /// A project with `count` command templates, named `c0..c{n-1}`. Returns their ids in
+    /// creation order.
+    fn project_with_commands(conn: &mut SqliteConnection, count: usize) -> (String, Vec<String>) {
+        let (project, _root) = create_project(conn, "proj", "/repo", None).expect("project");
+        let ids = (0..count)
+            .map(|i| {
+                create_template(
+                    conn,
+                    &project.id,
+                    &format!("c{i}"),
+                    &format!("run {i}"),
+                    None,
+                    CommandSource::default(),
+                )
+                .expect("template")
+                .id
+            })
+            .collect();
+        (project.id, ids)
+    }
+
+    /// The migration, the `schema.rs` columns and the model agree: a group round-trips with its
+    /// ordered members, and `list_command_groups` scopes to the project.
+    #[test]
+    fn a_group_round_trips_with_its_ordered_members() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 3);
+
+        let created = create_command_group(&mut conn, &project_id, &ids[0..2].to_vec())
+            .expect("create the group");
+        assert_eq!(created.command_ids, vec![ids[0].clone(), ids[1].clone()]);
+        // Born GREY and NAMELESS — both labels are optional and neither conditions existence.
+        assert_eq!(created.name, None);
+        assert_eq!(created.color, None);
+
+        let listed = list_command_groups(&mut conn, &project_id).expect("list");
+        assert_eq!(listed, vec![created.clone()]);
+        // The third command stayed SOLO.
+        let solo = get_template(&mut conn, &ids[2])
+            .expect("get")
+            .expect("some");
+        assert_eq!(solo.group_id, None);
+    }
+
+    /// Fewer than two members is refused OUTRIGHT — including when the caller repeats the same id
+    /// twice, which is one member and not two.
+    #[test]
+    fn a_group_of_fewer_than_two_is_refused() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 2);
+
+        let one = create_command_group(&mut conn, &project_id, &[ids[0].clone()]);
+        assert!(matches!(
+            one,
+            Err(CommandGroupError::TooFewMembers { given: 1 })
+        ));
+        let duplicated =
+            create_command_group(&mut conn, &project_id, &[ids[0].clone(), ids[0].clone()]);
+        assert!(matches!(
+            duplicated,
+            Err(CommandGroupError::TooFewMembers { given: 1 })
+        ));
+        assert!(list_command_groups(&mut conn, &project_id)
+            .expect("list")
+            .is_empty());
+    }
+
+    /// ADD appends at the end of the disposition; REMOVE of the second-to-last DISSOLVES the
+    /// group and RELEASES the survivor rather than deleting it.
+    #[test]
+    fn add_appends_and_the_second_to_last_removal_dissolves() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 3);
+        let group = create_command_group(&mut conn, &project_id, &ids[0..2].to_vec())
+            .expect("create the group");
+
+        let grown = add_to_command_group(&mut conn, &group.id, &ids[2]).expect("add");
+        assert_eq!(grown.command_ids, ids);
+
+        let survivor = remove_from_command_group(&mut conn, &ids[2]).expect("remove the third");
+        let two = get_command_group(&mut conn, &group.id)
+            .expect("read")
+            .expect("still there");
+        assert_eq!(two.command_ids, vec![ids[0].clone(), ids[1].clone()]);
+        // The transition REPORTS the survivor rather than leaving the caller to guess whether the
+        // group is still there (review finding `01M11XKKFVQWSHZQ4TGT3P3Z06`).
+        assert_eq!(
+            survivor,
+            Some(two.clone()),
+            "the surviving group is returned"
+        );
+
+        // …and the one that takes it under two takes the GROUP with it — reported as `None`.
+        let dissolved = remove_from_command_group(&mut conn, &ids[1]).expect("remove the second");
+        assert_eq!(dissolved, None, "a dissolution reports no surviving group");
+        assert_eq!(get_command_group(&mut conn, &group.id).expect("read"), None);
+        for id in &ids {
+            let template = get_template(&mut conn, id).expect("get").expect("alive");
+            assert_eq!(
+                template.group_id, None,
+                "every member is RELEASED, not deleted"
+            );
+        }
+    }
+
+    /// A member pulled into a SECOND group leaves the first — and the first dissolves when that
+    /// takes it under two. "A command belongs to zero or one group" is enforced by the write.
+    #[test]
+    fn a_member_pulled_into_another_group_leaves_the_first() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 4);
+        let first =
+            create_command_group(&mut conn, &project_id, &ids[0..2].to_vec()).expect("first");
+        let second =
+            create_command_group(&mut conn, &project_id, &ids[2..4].to_vec()).expect("second");
+
+        add_to_command_group(&mut conn, &second.id, &ids[0]).expect("pull the member across");
+        let moved = get_command_group(&mut conn, &second.id)
+            .expect("read")
+            .expect("some");
+        assert_eq!(
+            moved.command_ids,
+            vec![ids[2].clone(), ids[3].clone(), ids[0].clone()]
+        );
+        // The first group had exactly two members: losing one dissolved it.
+        assert_eq!(get_command_group(&mut conn, &first.id).expect("read"), None);
+    }
+
+    /// The labels are INDEPENDENT and THREE-STATE: an absent key leaves one alone, an explicit
+    /// `None` clears it. A blank name is not a name, and a colour outside 1..=6 is refused.
+    #[test]
+    fn labels_are_independent_three_state_edits() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 2);
+        let group = create_command_group(&mut conn, &project_id, &ids).expect("group");
+
+        let named = set_command_group_labels(&mut conn, &group.id, Some(Some("checks")), None)
+            .expect("name it");
+        assert_eq!(named.name.as_deref(), Some("checks"));
+        assert_eq!(named.color, None, "naming must not colour it");
+
+        let coloured =
+            set_command_group_labels(&mut conn, &group.id, None, Some(Some(3))).expect("colour it");
+        assert_eq!(coloured.color, Some(3));
+        assert_eq!(
+            coloured.name.as_deref(),
+            Some("checks"),
+            "an absent key leaves it alone"
+        );
+
+        let cleared =
+            set_command_group_labels(&mut conn, &group.id, Some(None), None).expect("clear it");
+        assert_eq!(cleared.name, None);
+        assert_eq!(
+            cleared.color,
+            Some(3),
+            "clearing the name is not clearing the colour"
+        );
+
+        // Spaces are not a name.
+        let blank = set_command_group_labels(&mut conn, &group.id, Some(Some("   ")), None)
+            .expect("blank name");
+        assert_eq!(blank.name, None);
+
+        assert!(matches!(
+            set_command_group_labels(&mut conn, &group.id, None, Some(Some(9))),
+            Err(CommandGroupError::ColorOutOfRange { color: 9 })
+        ));
+        assert!(matches!(
+            set_command_group_labels(&mut conn, "nope", None, None),
+            Err(CommandGroupError::GroupNotFound { .. })
+        ));
+    }
+
+    /// The LAYOUT re-orders and nothing else: the same set in another order is accepted, a
+    /// different set is refused.
+    #[test]
+    fn the_layout_reorders_exactly_the_current_members() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 4);
+        let group =
+            create_command_group(&mut conn, &project_id, &ids[0..3].to_vec()).expect("group");
+
+        let swapped = set_command_group_layout(
+            &mut conn,
+            &group.id,
+            &[ids[1].clone(), ids[0].clone(), ids[2].clone()],
+        )
+        .expect("re-order");
+        assert_eq!(
+            swapped.command_ids,
+            vec![ids[1].clone(), ids[0].clone(), ids[2].clone()]
+        );
+
+        // Adding a member through the layout is NOT a layout edit.
+        assert!(matches!(
+            set_command_group_layout(
+                &mut conn,
+                &group.id,
+                &[
+                    ids[0].clone(),
+                    ids[1].clone(),
+                    ids[2].clone(),
+                    ids[3].clone()
+                ],
+            ),
+            Err(CommandGroupError::LayoutMismatch)
+        ));
+        // Neither is dropping one.
+        assert!(matches!(
+            set_command_group_layout(&mut conn, &group.id, &[ids[0].clone(), ids[1].clone()]),
+            Err(CommandGroupError::LayoutMismatch)
+        ));
+    }
+
+    /// DISSOLVE releases every member and removes the group; an unknown id is a no-op.
+    #[test]
+    fn dissolve_releases_every_member() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 3);
+        let group = create_command_group(&mut conn, &project_id, &ids).expect("group");
+
+        dissolve_command_group(&mut conn, &group.id).expect("dissolve");
+        assert!(list_command_groups(&mut conn, &project_id)
+            .expect("list")
+            .is_empty());
+        for id in &ids {
+            let template = get_template(&mut conn, id).expect("get").expect("alive");
+            assert_eq!(template.group_id, None);
+        }
+        dissolve_command_group(&mut conn, "nope").expect("an unknown id is a no-op");
+    }
+
+    /// A DB AT THE PRE-GROUPS SCHEMA, PUT THROUGH THE REAL BOOT PATH (human review
+    /// 01M0CY4Q1A9CS1BRK10F8S3BC5, criteria 2 and 3). Every other command-groups test starts from
+    /// `open_in_memory()` — a VIRGIN database, which the review called out as structurally blind:
+    /// a virgin DB is migrated by definition, so it can never catch a migration that does not
+    /// apply on an EXISTING one. That is precisely the failure the user hit (`no such table:
+    /// managed_command_groups` on a live DB).
+    ///
+    /// So: open a file-backed DB through `Db::open` — the boot path itself, migrations included —
+    /// REVERT the head migration so the file on disk is a real pre-groups database, assert the
+    /// group surface is genuinely ABSENT (this is the half that fails on the code of before), then
+    /// RE-OPEN through `Db::open` again and assert the table and BOTH membership columns are there.
+    #[test]
+    fn a_pre_groups_database_gains_the_group_surface_on_the_real_boot_path() {
+        let dir = std::env::temp_dir().join(format!("nyx-db-pregroups-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("create temp db dir");
+        let path = dir.join("nyx.db");
+
+        let group_surface = |conn: &mut SqliteConnection| {
+            (
+                diesel::sql_query("SELECT id FROM managed_command_groups")
+                    .execute(conn)
+                    .is_ok(),
+                diesel::sql_query("SELECT group_id, group_order FROM managed_commands")
+                    .execute(conn)
+                    .is_ok(),
+            )
+        };
+
+        // 1. The boot path on a fresh file: the surface exists.
+        {
+            let db = Db::open(&path).expect("boot a fresh db");
+            assert_eq!(
+                db.with_conn(group_surface),
+                (true, true),
+                "a fresh boot creates the group table and both membership columns"
+            );
+
+            // 2. Step the FILE back to the pre-groups schema — the state a user's live DB was in.
+            db.with_conn(|conn| {
+                revert_down_through(conn, "20260819140000");
+            });
+            assert_eq!(
+                db.with_conn(group_surface),
+                (false, false),
+                "the pre-groups schema has neither the table nor the columns — this is the state \
+                 the code of before left in place, and the half of this test that must fail there"
+            );
+        }
+
+        // 3. THE REAL BOOT PATH, on that existing DB: the migration applies over it.
+        let db = Db::open(&path).expect("re-boot the pre-groups db");
+        assert_eq!(
+            db.with_conn(group_surface),
+            (true, true),
+            "booting a PRE-GROUPS database creates managed_command_groups and adds group_id + \
+             group_order to managed_commands"
+        );
+        // …and the boot is entitled to say so: nothing pending, no foreign ledger row.
+        let report = db.with_conn(|conn| {
+            let health = schema_health(conn);
+            health.boot_report(&foreign_ledger_versions(conn))
+        });
+        assert!(report.healthy, "got: {}", report.line);
+        assert!(!report.fatal);
+
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE MIGRATION NAMING RULE, MADE SELF-ENFORCING (review finding 01M0ZSM0KDZ0FRFATG2JT1SZR1).
+    ///
+    /// Diesel identifies an applied migration by the NUMERIC PREFIX of its directory alone — the
+    /// label after the `_` is never stored. Two SIBLING WORKTREES that each mint "the next"
+    /// migration `00000000000050_*` and boot against the SAME `%APPDATA%/nyx-v2/nyx.db` therefore
+    /// COLLIDE silently: whichever ran first writes the ledger row, the other is reported as
+    /// ALREADY APPLIED and never executes — `pending_migrations()` empty, a boot that claims
+    /// success, and tables that simply do not exist. That was paid for once on a user's live DB;
+    /// the measured incident is written up in
+    /// `migrations/20260819140000_create_command_groups/up.sql`.
+    ///
+    /// The cure is a version that CANNOT collide with a sequence: a UTC timestamp — Diesel's own
+    /// `diesel migration generate` convention. The rule for contributors is written in
+    /// `docs/product/technical-architecture.md` ("Migrations SQLite"); THIS TEST is what makes it
+    /// binding. The `000000000000NN` lineage is FROZEN at `00000000000051`: anything sorting above
+    /// it must be a 14-digit timestamp at or after `20260818020000`. Minting `00000000000052_*`
+    /// fails here, by name, before it can ever reach a shared DB.
+    ///
+    /// # Why the head is 51 and not the 49 this test was written against
+    ///
+    /// The rule was authored on `feature/tiling-panes`, which froze the lineage at its own head,
+    /// `00000000000049`. The `v2` line had meanwhile minted `00000000000050_annexes_url_unique` and
+    /// `00000000000051_annexes_url_canonical` and APPLIED them to live databases. Renaming those two
+    /// to dated prefixes is the destructive option, not the safe one: their ledger rows would become
+    /// foreign, the renamed directories would be PENDING, and `00000000000050/up.sql` would re-run
+    /// its non-idempotent `CREATE UNIQUE INDEX idx_annexes_url_unique_per_spec` — which fails on a DB
+    /// that already has the index, and a failing migration propagates out of [`Db::open`] and stops
+    /// nyx from starting. The two numbers are moreover UNCONTESTED: `00000000000050`/`51` name the
+    /// same two migrations on every live branch, so grandfathering them collides with nothing.
+    ///
+    /// So the head MOVED, the rule did not: it still refuses the next sequence number
+    /// (`00000000000052`), which is the collision that was actually paid for. And `FIRST_DATED` moves
+    /// back to `20260818020000` (`create_app_settings`) because that is the truth of the merged tree
+    /// — `v2` reached the dated convention a day BEFORE the branch that wrote this test down.
+    ///
+    /// It also names the OTHER half of the trap the numbering hid: a dated prefix sorts ABOVE the
+    /// whole `000000000000NN` lineage, so it becomes the migration HEAD — which is why the revert
+    /// chains in this module take a NAMED floor (`peel_migrations_above`) instead of a count.
+    #[test]
+    fn every_migration_added_after_the_frozen_lineage_is_dated_not_numbered() {
+        // The last migration of the historical lineage. Nothing may extend it: the next sequence
+        // number is exactly the collision this test refuses.
+        const FROZEN_LINEAGE_HEAD: &str = "00000000000051";
+        // The first dated migration — the one that established the convention.
+        const FIRST_DATED: &str = "20260818020000";
+
+        let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut prefixes: Vec<String> = std::fs::read_dir(&migrations)
+            .expect("read crates/nyx-core/migrations")
+            .map(|entry| entry.expect("read a migrations/ entry"))
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .map(|name| match name.split_once('_') {
+                Some((prefix, _)) => prefix.to_string(),
+                None => name,
+            })
+            .collect();
+        prefixes.sort();
+
+        // Non-vacuous: the whole historical lineage plus the dated one that started the rule.
+        assert!(
+            prefixes.len() >= 49,
+            "expected the full migrations/ directory, read only {} entries from {}",
+            prefixes.len(),
+            migrations.display()
+        );
+        assert!(
+            prefixes.iter().any(|p| p == FIRST_DATED),
+            "the migration that established the dated convention is missing from migrations/"
+        );
+
+        for prefix in &prefixes {
+            if prefix.as_str() <= FROZEN_LINEAGE_HEAD {
+                continue; // The frozen historical lineage, grandfathered.
+            }
+            assert!(
+                prefix.as_str() >= FIRST_DATED,
+                "migration `{prefix}` extends the FROZEN `000000000000NN` lineage. That number \
+                 collides silently with any sibling worktree minting the same one against the \
+                 shared %APPDATA%/nyx-v2/nyx.db — the second migration is never run and the boot \
+                 still claims success. Name it with a UTC timestamp instead (`diesel migration \
+                 generate` does it for you); see docs/product/technical-architecture.md."
+            );
+            assert!(
+                prefix.len() == 14 && prefix.chars().all(|c| c.is_ascii_digit()),
+                "migration `{prefix}` is neither part of the frozen lineage nor a 14-digit UTC \
+                 timestamp (`YYYYMMDDHHMMSS`); see docs/product/technical-architecture.md."
+            );
+            let field = |from: usize, to: usize| {
+                prefix[from..to]
+                    .parse::<u32>()
+                    .expect("a 14-digit prefix parses field by field")
+            };
+            assert!(
+                (2026..=2999).contains(&field(0, 4))
+                    && (1..=12).contains(&field(4, 6))
+                    && (1..=31).contains(&field(6, 8))
+                    && field(8, 10) <= 23
+                    && field(10, 12) <= 59
+                    && field(12, 14) <= 59,
+                "migration `{prefix}` is 14 digits but not a readable UTC timestamp \
+                 (`YYYYMMDDHHMMSS`); see docs/product/technical-architecture.md."
+            );
+        }
+    }
+
+    /// THE BOOT SENTENCE IS DERIVED, NOT ASSERTED (human review 01M0CY4Q1A9CS1BRK10F8S3BC5,
+    /// criterion 4). Each verdict, in the state that produces it.
+    #[test]
+    fn boot_report_refuses_to_claim_success_unless_the_ledger_says_so() {
+        let healthy = SchemaHealth {
+            up_to_date: true,
+            pending_count: Some(0),
+        };
+        let ok = healthy.boot_report(&[]);
+        assert!(ok.healthy && !ok.fatal);
+        assert_eq!(ok.line, "SQLite migrated, runtime tables ready");
+
+        // A PENDING migration is fatal: the schema is behind the binary, so the caller refuses to
+        // serve rather than failing at the first query.
+        let behind = SchemaHealth {
+            up_to_date: false,
+            pending_count: Some(2),
+        };
+        let late = behind.boot_report(&[]);
+        assert!(!late.healthy && late.fatal);
+        assert!(late.line.contains("2 migration(s) still pending"));
+
+        // A ledger the check could not read at all is NOT a success either.
+        let blind = SchemaHealth {
+            up_to_date: false,
+            pending_count: None,
+        };
+        assert!(blind.boot_report(&[]).fatal);
+
+        // THE SILENT CASE — nothing pending, yet the ledger carries a version this build does not
+        // embed. That is the sibling-worktree collision: it does not stop the boot, but the boot
+        // must NOT claim an unqualified success, and it must NAME the version.
+        let colliding = healthy.boot_report(&["00000000000052".to_string()]);
+        assert!(!colliding.healthy, "a foreign ledger row is not a clean boot");
+        assert!(!colliding.fatal, "…but it does not stop the sidecar");
+        assert!(colliding.line.contains("00000000000052"));
+    }
+
+    /// `foreign_ledger_versions` reads the LEDGER, not our directory listing: a version written by
+    /// another build shows up, and everything we embed does not.
+    #[test]
+    fn foreign_ledger_versions_names_what_this_build_does_not_embed() {
+        let mut conn = open_in_memory();
+        assert!(
+            foreign_ledger_versions(&mut conn).is_empty(),
+            "a DB migrated by THIS build carries nothing foreign"
+        );
+
+        // A sibling worktree's row, exactly as Diesel would have written it. `00000000000052` is the
+        // NEXT sequence number — the very one a sibling would mint — and it is guaranteed never to
+        // be embedded here, because `every_migration_added_after_the_frozen_lineage_is_dated_not_
+        // numbered` refuses it. (It used to be `00000000000050`; that number is now a REAL migration
+        // of this build — `annexes_url_unique` — so inserting it collided with its own ledger row.)
+        diesel::sql_query(
+            "INSERT INTO __diesel_schema_migrations (version, run_on) VALUES ('00000000000052', '2026-08-16 10:49:30')",
+        )
+        .execute(&mut conn)
+        .expect("write a foreign ledger row");
+        assert_eq!(
+            foreign_ledger_versions(&mut conn),
+            vec!["00000000000052".to_string()]
+        );
+        // …and `schema_health` alone still says everything is fine — which is the whole point.
+        assert!(schema_health(&mut conn).up_to_date);
+    }
+
+    /// THE PALETTE SIZE IS ONE NUMBER, WRITTEN ON FOUR LAYERS, AND NOTHING DERIVES ONE FROM
+    /// ANOTHER ACROSS THE LANGUAGE BOUNDARY — so this test IS the derivation. It reads all four
+    /// and refuses any disagreement:
+    ///
+    ///  1. the `--group-N` design tokens in `apps/desktop/renderer/src/globals.css` (`--group-0`
+    ///     is the NEUTRAL default, not a palette colour, so the count starts at 1);
+    ///  2. `GROUP_COLOR_COUNT` in `apps/desktop/renderer/src/components/panes/pane-groups.ts` —
+    ///     the renderer's single spelling of the number, from which its `GroupColor` union is
+    ///     derived;
+    ///  3. `COMMAND_GROUP_COLOR_MIN..=COMMAND_GROUP_COLOR_MAX` here, checked against the LIVE SQL
+    ///     `CHECK` from `20260819140000_create_command_groups` rather than against the text of
+    ///     `up.sql` — the boundary that actually refuses a write;
+    ///  4. the `manage_command_group` MCP schema's `color` bounds, read off the descriptor the
+    ///     agent is really served, not off this source.
+    ///
+    /// Without this, adding a seventh token paints `var(--group-7)` on a value the write path then
+    /// rejects — the colour shows, the save fails, and nothing says why.
+    #[test]
+    fn the_palette_size_is_the_same_number_on_all_four_layers() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the repo root is two levels above crates/nyx-core");
+
+        // LAYER 1 — the design tokens.
+        let css = std::fs::read_to_string(repo.join("apps/desktop/renderer/src/globals.css"))
+            .expect("read globals.css");
+        let css_count = (1i32..)
+            .take_while(|n| css.contains(&format!("--group-{n}:")))
+            .last()
+            .expect("globals.css declares at least --group-1");
+        assert!(
+            css.contains("--group-0:"),
+            "the neutral default token must exist alongside the palette"
+        );
+
+        // LAYER 2 — the renderer's constant.
+        let ts = std::fs::read_to_string(
+            repo.join("apps/desktop/renderer/src/components/panes/pane-groups.ts"),
+        )
+        .expect("read pane-groups.ts");
+        let ts_count: i32 = ts
+            .split("export const GROUP_COLOR_COUNT = ")
+            .nth(1)
+            .expect("pane-groups.ts declares GROUP_COLOR_COUNT")
+            .split(';')
+            .next()
+            .expect("the declaration ends with a semicolon")
+            .trim()
+            .parse()
+            .expect("GROUP_COLOR_COUNT is a literal number");
+        assert_eq!(
+            ts_count, css_count,
+            "GROUP_COLOR_COUNT ({ts_count}) and the --group-N tokens ({css_count}) disagree"
+        );
+
+        // LAYER 3 — the SQL CHECK, exercised rather than read: the highest colour INSERTs, the
+        // next one is refused by the schema itself.
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "palette", "/repo", None).expect("project");
+        let insert = |conn: &mut SqliteConnection, id: &str, color: i32| {
+            diesel::sql_query(format!(
+                "INSERT INTO managed_command_groups (id, project_id, color) VALUES ('{id}', '{}', {color})",
+                project.id
+            ))
+            .execute(conn)
+        };
+        assert!(
+            insert(&mut conn, "g-max", COMMAND_GROUP_COLOR_MAX).is_ok(),
+            "the highest palette colour must be storable"
+        );
+        assert!(
+            insert(&mut conn, "g-min", COMMAND_GROUP_COLOR_MIN).is_ok(),
+            "the lowest palette colour must be storable"
+        );
+        assert!(
+            insert(&mut conn, "g-over", COMMAND_GROUP_COLOR_MAX + 1).is_err(),
+            "the SQL CHECK must refuse a colour above the palette"
+        );
+        assert!(
+            insert(&mut conn, "g-under", COMMAND_GROUP_COLOR_MIN - 1).is_err(),
+            "the SQL CHECK must refuse a colour below the palette"
+        );
+        assert_eq!(
+            COMMAND_GROUP_COLOR_MAX, css_count,
+            "COMMAND_GROUP_COLOR_MAX and the --group-N tokens disagree"
+        );
+
+        // LAYER 4 — the MCP schema the agent is served.
+        let descriptor = crate::mcp::tool_descriptors()
+            .into_iter()
+            .find(|d| d["name"] == crate::mcp::MANAGE_COMMAND_GROUP_TOOL)
+            .expect("manage_command_group is advertised");
+        let color = descriptor["inputSchema"]["properties"]["color"].clone();
+        assert_eq!(
+            color["minimum"].as_i64(),
+            Some(i64::from(COMMAND_GROUP_COLOR_MIN)),
+            "the MCP schema's colour floor drifted from COMMAND_GROUP_COLOR_MIN"
+        );
+        assert_eq!(
+            color["maximum"].as_i64(),
+            Some(i64::from(COMMAND_GROUP_COLOR_MAX)),
+            "the MCP schema's colour ceiling drifted from COMMAND_GROUP_COLOR_MAX"
+        );
+    }
+
+    /// THE TILING-SHAPE VOCABULARY IS ONE LIST, WRITTEN ON THREE LAYERS, AND THIS TEST IS THE
+    /// DERIVATION — the same discipline the palette size gets above (review
+    /// 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XTRXVVPZ9XMDW5ARWKWHA):
+    ///
+    ///  1. [`COMMAND_GROUP_SHAPES`] — what the Rust transition validates against;
+    ///  2. the SQL `CHECK` of `20260827120000_command_groups_layout_shape`, EXERCISED (each value
+    ///     really stores, and one outside really is refused) rather than read as text — the
+    ///     boundary that actually refuses a write;
+    ///  3. the `shape` enum of the `manage_command_group` MCP descriptor, read off the descriptor
+    ///     the agent is really served.
+    ///
+    /// Without it, a seventh shape could be offered to an agent that the write path then rejects,
+    /// or accepted in Rust and refused by SQL — the shape shows, the save fails, and nothing says
+    /// why.
+    #[test]
+    fn the_shape_vocabulary_is_the_same_list_on_all_three_layers() {
+        // Non-vacuous, and the DEFAULT is part of the list.
+        assert_eq!(COMMAND_GROUP_SHAPES.len(), 6);
+        assert!(COMMAND_GROUP_SHAPES.contains(&COMMAND_GROUP_SHAPE_AUTO));
+
+        // LAYER 2 — the SQL CHECK, exercised value by value.
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "shapes", "/repo", None).expect("project");
+        let insert = |conn: &mut SqliteConnection, id: &str, shape: &str| {
+            diesel::sql_query(format!(
+                "INSERT INTO managed_command_groups (id, project_id, layout_shape) \
+                 VALUES ('{id}', '{}', '{shape}')",
+                project.id
+            ))
+            .execute(conn)
+        };
+        for shape in COMMAND_GROUP_SHAPES {
+            assert!(
+                insert(&mut conn, &format!("g-{shape}"), shape).is_ok(),
+                "the SQL CHECK must accept the advertised shape '{shape}'"
+            );
+        }
+        assert!(
+            insert(&mut conn, "g-nope", "diagonal").is_err(),
+            "the SQL CHECK must refuse a shape outside the closed vocabulary"
+        );
+        // …and the column DEFAULT is `auto`, which is what kept every pre-existing group where it
+        // was when the migration ran.
+        diesel::sql_query(format!(
+            "INSERT INTO managed_command_groups (id, project_id) VALUES ('g-default', '{}')",
+            project.id
+        ))
+        .execute(&mut conn)
+        .expect("a group can be written without naming a shape");
+        assert_eq!(
+            get_command_group(&mut conn, "g-default")
+                .expect("read")
+                .expect("the row exists")
+                .layout_shape,
+            COMMAND_GROUP_SHAPE_AUTO
+        );
+
+        // LAYER 3 — the MCP schema the agent is served.
+        let descriptor = crate::mcp::tool_descriptors()
+            .into_iter()
+            .find(|d| d["name"] == crate::mcp::MANAGE_COMMAND_GROUP_TOOL)
+            .expect("manage_command_group is advertised");
+        let advertised: Vec<String> = descriptor["inputSchema"]["properties"]["shape"]["enum"]
+            .as_array()
+            .expect("the MCP schema advertises a closed `shape` enum")
+            .iter()
+            .map(|v| v.as_str().expect("each shape is a string").to_string())
+            .collect();
+        assert_eq!(
+            advertised,
+            COMMAND_GROUP_SHAPES.to_vec(),
+            "the MCP `shape` enum drifted from COMMAND_GROUP_SHAPES"
+        );
+        // …and `shape` is one of the tool's actions, not an argument nothing can use.
+        let actions: Vec<String> = descriptor["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("the action enum")
+            .iter()
+            .map(|v| v.as_str().expect("each action is a string").to_string())
+            .collect();
+        assert!(
+            actions.contains(&"shape".to_string()),
+            "the eighth action `shape` must be advertised: {actions:?}"
+        );
+    }
+
+    /// A group is born `auto`; the shape is set by NAME and an unknown one is refused BEFORE the
+    /// write, with the vocabulary in the message. Setting it touches NOTHING else — the members
+    /// and their order are the other half of the disposition and are edited by their own
+    /// transition.
+    #[test]
+    fn setting_a_group_shape_leaves_the_members_alone_and_refuses_an_unknown_name() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 3);
+        let group = create_command_group(&mut conn, &project_id, &ids).expect("group");
+        assert_eq!(
+            group.layout_shape, COMMAND_GROUP_SHAPE_AUTO,
+            "a group is born with the DERIVED shape — the behaviour of before the column"
+        );
+
+        let shaped =
+            set_command_group_shape(&mut conn, &group.id, "main-left").expect("set the shape");
+        assert_eq!(shaped.layout_shape, "main-left");
+        assert_eq!(
+            shaped.command_ids, group.command_ids,
+            "a re-shape is not a re-order: the members and their order are untouched"
+        );
+        assert_eq!(shaped.name, None, "…and neither label was touched either");
+        assert_eq!(shaped.color, None);
+
+        // It really persisted (the read path carries it, not just the write's return value).
+        assert_eq!(
+            get_command_group(&mut conn, &group.id)
+                .expect("read")
+                .expect("alive")
+                .layout_shape,
+            "main-left"
+        );
+        assert_eq!(
+            list_command_groups(&mut conn, &project_id).expect("list")[0].layout_shape,
+            "main-left"
+        );
+
+        // An unknown shape is refused HERE, by name, and the group is left as it was.
+        let refused = set_command_group_shape(&mut conn, &group.id, "diagonal");
+        assert!(matches!(
+            refused,
+            Err(CommandGroupError::UnknownShape { ref shape }) if shape == "diagonal"
+        ));
+        assert!(
+            refused.unwrap_err().to_string().contains("main-top"),
+            "the refusal names the vocabulary instead of leaking a SQL CHECK violation"
+        );
+        assert_eq!(
+            get_command_group(&mut conn, &group.id)
+                .expect("read")
+                .expect("alive")
+                .layout_shape,
+            "main-left",
+            "a refused shape changed nothing"
+        );
+
+        // An unknown GROUP is refused too, and before any write.
+        assert!(matches!(
+            set_command_group_shape(&mut conn, "nope", "row"),
+            Err(CommandGroupError::GroupNotFound { .. })
+        ));
+    }
+
+    /// THE PAIR `(group, workspace)` HAS A JOIN, and it hands back the LAUNCHABLE ids in
+    /// DISPOSITION order — the resolution the group-wide lifecycle stands on (a group holds
+    /// project-scoped TEMPLATES; running them drives workspace-scoped INSTANCES).
+    #[test]
+    fn command_group_members_resolve_to_workspace_instances_in_disposition_order() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "proj", "/repo", None).expect("project");
+        let ids: Vec<String> = (0..3)
+            .map(|i| {
+                create_template(
+                    &mut conn,
+                    &project.id,
+                    &format!("c{i}"),
+                    &format!("run {i}"),
+                    None,
+                    CommandSource::default(),
+                )
+                .expect("template")
+                .id
+            })
+            .collect();
+        // A DISPOSITION that is not the creation order, so "in order" is a real claim.
+        let group = create_command_group(&mut conn, &project.id, &[ids[2].clone(), ids[0].clone()])
+            .expect("group");
+
+        let members = command_group_members_for_workspace(&mut conn, &group.id, &root.id)
+            .expect("resolve the members");
+        assert_eq!(
+            members.iter().map(|m| &m.command_id).collect::<Vec<_>>(),
+            vec![&ids[2], &ids[0]],
+            "the members come back in DISPOSITION order"
+        );
+        assert_eq!(
+            members.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+            vec!["c2".to_string(), "c0".to_string()],
+            "each carries its display name, so a per-member result reads without a second query"
+        );
+        // Each instance id is the LAUNCHABLE one of that (template, workspace) pair.
+        let live = list_instances_for_workspace(&mut conn, &root.id).expect("instances");
+        for member in &members {
+            assert!(
+                live.iter()
+                    .any(|i| i.id == member.instance_id && i.command_id == member.command_id),
+                "the resolved instance belongs to this workspace and this template"
+            );
+        }
+        // The command left OUT of the group is not a member.
+        assert!(members.iter().all(|m| m.command_id != ids[1]));
+
+        // Another workspace of the same project resolves its OWN instances — a group is
+        // project-scoped, the run is not.
+        let other = create_workspace(&mut conn, &project.id, "other", "/repo/other")
+            .expect("second workspace");
+        let there = command_group_members_for_workspace(&mut conn, &group.id, &other.id)
+            .expect("resolve there too");
+        assert_eq!(
+            there.iter().map(|m| &m.command_id).collect::<Vec<_>>(),
+            vec![&ids[2], &ids[0]],
+            "the same members…"
+        );
+        assert!(
+            there
+                .iter()
+                .all(|m| members.iter().all(|here| here.instance_id != m.instance_id)),
+            "…but NOT the same instances"
+        );
+
+        // An unknown group simply has no members here (the pair is validated by the caller).
+        assert!(
+            command_group_members_for_workspace(&mut conn, "nope", &root.id)
+                .expect("query")
+                .is_empty()
+        );
     }
 }

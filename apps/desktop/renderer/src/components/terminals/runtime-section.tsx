@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
-import { CountBadge, EmptyHint, MicroLabel } from "./tree-primitives";
+import { CountBadge, EmptyHint, MicroLabel } from "@/components/ui/tree-primitives";
 
 /**
  * `<RuntimeSection>` — one always-open group of a workspace's runtime tree (Terminals,

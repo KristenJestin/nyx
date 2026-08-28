@@ -71,6 +71,31 @@ export default defineConfig({
             enabled: true,
             headless: true,
             provider: playwright(),
+            // DO NOT DELETE AS AN ARBITRARY VALUE — this pin is what keeps the browser suite
+            // runnable on Windows.
+            //
+            // Vitest's default browser-API port is 63315. On Windows, Hyper-V / WSL / Docker
+            // reserve blocks of TCP ports at boot, and those blocks land INSIDE the dynamic
+            // port range (49152–65535 here). 63315 fell inside a reserved block, so the API
+            // server died on `listen EACCES: permission denied ::1:63315` before a single test
+            // ran. The blocks are assigned dynamically, so this appears and disappears across
+            // reboots — the suite ran an hour earlier and then did not.
+            //
+            // See the reserved blocks for yourself:
+            //   netsh interface ipv4 show excludedportrange protocol=tcp
+            //   netsh interface ipv4 show dynamicport tcp      # start 49152, 16384 ports
+            //
+            // 5310 is chosen because it sits BELOW the dynamic port range, where Windows never
+            // carves a reservation, so it is immune to that whole class of failure rather than
+            // merely free today. It also stays clear of the app's own ports (1420 dev, 1421 HMR)
+            // and of Vite's defaults (5173, 4173).
+            //
+            // `strictPort` is deliberately left at its default (`false`): Vite then walks to the
+            // next free port if some other service already holds 5310, which is the closest
+            // thing to the "fallback range" this needs. Note that this walk only triggers on
+            // EADDRINUSE — an EACCES from a reserved block is fatal and is never retried — which
+            // is exactly why the starting port has to be outside the dynamic range.
+            api: { port: 5310 },
             // A single Chromium instance is enough for the render/visual check.
             instances: [{ browser: "chromium" }],
             expect: {

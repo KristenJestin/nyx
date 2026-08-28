@@ -1,10 +1,10 @@
 import { Fragment, useCallback, useMemo, useState } from "react";
-import { WorkflowIcon, XIcon } from "lucide-react";
+import { WorkflowIcon } from "lucide-react";
 
 import type { EngineWorkflowRun } from "@/bridge";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogBackdrop, DialogPopup } from "@/components/ui/dialog";
+import { Dialog, DialogBackdrop, DialogCloseX, DialogPopup } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
 
@@ -136,20 +136,10 @@ export function SpecRunModal({
                 sub-run {children.length > 1 ? i + 1 : ""} · {c.status}
               </button>
             ))}
-            {/* An icon close, like the node inspector's — a labelled "Close" button read as a primary
-                action next to the title instead of the dismissal it is. */}
-            <Dialog.Close
-              render={
-                <button
-                  type="button"
-                  aria-label="Close"
-                  className="ml-auto rounded-md p-1 text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  <XIcon className="size-4" />
-                </button>
-              }
-              onClick={onClose}
-            />
+            {/* An icon close, not a labelled "Close" button that would read as a primary action
+                next to the title instead of the dismissal it is. It is the SHARED one since human
+                review 01M140VQ4S434P2DMCJSTDR4VM — this header used to hand-write it. */}
+            <DialogCloseX label="Close run" onClick={onClose} />
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col" data-testid="spec-run-modal-body">
@@ -177,7 +167,7 @@ export function SpecRunModal({
                 run={shown}
                 onWorkflowName={handleName}
                 onEnterSubWorkflow={enterSubWorkflow}
-                enterSubWorkflowLabel="Open the child run" 
+                enterSubWorkflowLabel="Open the child run"
                 showRuntimePanel
               />
             )}

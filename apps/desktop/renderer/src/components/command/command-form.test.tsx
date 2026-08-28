@@ -176,18 +176,24 @@ describe("<CommandForm> restart_on_startup toggle", () => {
   });
 });
 
-describe("<CommandForm> consolidated source actions (review T2)", () => {
-  it("renders Resync + Unlink ONLY when editing a sourced command", () => {
+/**
+ * THE PROVENANCE IS THE SHARED PANEL NOW (finding 01M132XFZ5KY8QMJ79HZZSBV3J) — the form used to
+ * draw a third rendering of the same three facts and strand Unlink in its action row, away from the
+ * link it detaches. It mounts `<CommandSourcePanel>` instead, so there is ONE provenance block with
+ * BOTH of its answers attached.
+ */
+describe("<CommandForm> — the package.json provenance it delegates", () => {
+  it("shows the provenance ONLY when editing a sourced command", () => {
     // Hand-authored create: no source controls.
-    const { unmount } = render(<CommandForm onSubmit={vi.fn()} onCancel={vi.fn()} />);
+    const { unmount, container } = render(<CommandForm onSubmit={vi.fn()} onCancel={vi.fn()} />);
+    expect(container.querySelector("[data-command-source]")).toBeNull();
     expect(screen.queryByRole("button", { name: /resync/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /unlink/i })).toBeNull();
     unmount();
 
-    // Editing a sourced command: both appear.
+    // Editing a sourced command: the shared panel, with both answers on the link.
     render(<CommandForm editing={sourced()} onSubmit={vi.fn()} onCancel={vi.fn()} />);
-    expect(screen.getByRole("button", { name: /resync from package\.json/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /unlink from package\.json/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /resync from package.json/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^unlink$/i })).toBeInTheDocument();
     // No "reset to script runner" anywhere.
     expect(screen.queryByText(/reset to script runner/i)).toBeNull();
   });
@@ -197,7 +203,7 @@ describe("<CommandForm> consolidated source actions (review T2)", () => {
     render(
       <CommandForm editing={sourced()} onSubmit={vi.fn()} onCancel={vi.fn()} onResync={onResync} />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /resync from package\.json/i }));
+    fireEvent.click(screen.getByRole("button", { name: /resync from package.json/i }));
     await waitFor(() => expect(onResync).toHaveBeenCalledWith("c1"));
   });
 
@@ -206,11 +212,11 @@ describe("<CommandForm> consolidated source actions (review T2)", () => {
     render(
       <CommandForm editing={sourced()} onSubmit={vi.fn()} onCancel={vi.fn()} onUnlink={onUnlink} />,
     );
-    fireEvent.click(screen.getByRole("button", { name: /unlink from package\.json/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^unlink$/i }));
     await waitFor(() => expect(onUnlink).toHaveBeenCalledWith("c1"));
   });
 
-  it("shows the passive 'changed in package.json' drift line with the resync target", () => {
+  it("shows the drift as TWO values side by side, with the adopt action", () => {
     render(
       <CommandForm
         editing={sourced()}
@@ -219,17 +225,69 @@ describe("<CommandForm> consolidated source actions (review T2)", () => {
         onCancel={vi.fn()}
       />,
     );
-    expect(screen.getByTestId("drift-line")).toHaveTextContent(/changed in package\.json/i);
-    expect(screen.getByText("tsc -b --watch")).toBeInTheDocument();
+    expect(screen.getByTestId("drift-imported").textContent).toContain("tsc -b");
+    expect(screen.getByTestId("drift-line").textContent).toContain("tsc -b --watch");
+    expect(screen.getByRole("button", { name: /take the disk version/i })).toBeInTheDocument();
   });
+});
 
-  it("editing the command then Save submits the new command (the backend detaches)", async () => {
+/**
+ * THE TWO COMMIT MODES (finding 01M132XFZ5KY8QMJ79HZZSBV3J). A creation has a Create button because
+ * nothing exists yet; an EDITION commits on leaving a field and has no Save at all — the decision
+ * taken with the user, and the one `group-panel.tsx` already takes for a group's name and colour.
+ */
+describe("<CommandForm> commit modes", () => {
+  it("submit mode: the action row exists, and Save submits the edited values", async () => {
     const onSubmit = vi.fn<(v: CommandFormValues) => void>();
     render(<CommandForm editing={sourced()} onSubmit={onSubmit} onCancel={vi.fn()} />);
     fireEvent.change(screen.getByLabelText("Command line"), { target: { value: "node build.js" } });
     fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ command: "node build.js" })),
+    );
+  });
+
+  it("blur mode: NO Save and NO Cancel — there is nothing left to press", () => {
+    render(<CommandForm editing={sourced()} commit="blur" onSubmit={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /^save$/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^cancel$/i })).toBeNull();
+  });
+
+  it("blur mode: leaving a CHANGED field commits it", async () => {
+    const onSubmit = vi.fn<(v: CommandFormValues) => void>();
+    render(<CommandForm editing={sourced()} commit="blur" onSubmit={onSubmit} />);
+    const field = screen.getByLabelText("Command line");
+    fireEvent.change(field, { target: { value: "node build.js" } });
+    fireEvent.blur(field);
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ command: "node build.js" })),
+    );
+  });
+
+  it("blur mode: merely TABBING THROUGH writes nothing", () => {
+    const onSubmit = vi.fn<(v: CommandFormValues) => void>();
+    render(<CommandForm editing={sourced()} commit="blur" onSubmit={onSubmit} />);
+    fireEvent.blur(screen.getByLabelText("Command name"));
+    fireEvent.blur(screen.getByLabelText("Command line"));
+    fireEvent.blur(screen.getByLabelText("Run subfolder"));
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("blur mode: an INVALID field is not pushed to a backend that would reject it", () => {
+    const onSubmit = vi.fn<(v: CommandFormValues) => void>();
+    render(<CommandForm editing={sourced()} commit="blur" onSubmit={onSubmit} />);
+    const field = screen.getByLabelText("Command name");
+    fireEvent.change(field, { target: { value: "   " } });
+    fireEvent.blur(field);
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("blur mode: the switch has no blur to wait for — the flip IS the commit", async () => {
+    const onSubmit = vi.fn<(v: CommandFormValues) => void>();
+    render(<CommandForm editing={sourced()} commit="blur" onSubmit={onSubmit} />);
+    fireEvent.click(screen.getByLabelText("Restart on startup"));
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ restart_on_startup: true })),
     );
   });
 });

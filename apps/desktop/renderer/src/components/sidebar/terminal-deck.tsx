@@ -1,7 +1,5 @@
-import { useEffect } from "react";
-
 import { Terminal } from "@/components/terminal/terminal";
-import { getTerminal } from "@/components/terminal/terminal-store";
+import { useDeckSeam } from "@/components/terminal/deck-seam";
 import type { TerminalRecord } from "./use-terminals";
 
 export interface TerminalDeckProps {
@@ -37,29 +35,12 @@ export interface TerminalDeckProps {
  * styles. The active pane is the only one without `display:none`.
  */
 export function TerminalDeck({ terminals, activeId, onPtyId }: TerminalDeckProps) {
-  // Publish per-terminal test/e2e seams on window, backed by the STORE (so they
-  // address any terminal by record id, including hidden or navigated-away ones):
-  //   - `__nyxDeck[id]()`       → that terminal's buffer text (screen + scrollback);
-  //   - `__nyxDeckInput[id](s)` → feed `s` as input (routes through the PTY).
-  // Both are inert in production (nothing reads them).
-  useEffect(() => {
-    const win = window as unknown as {
-      __nyxDeck?: Record<string, () => string>;
-      __nyxDeckInput?: Record<string, (data: string) => void>;
-    };
-    win.__nyxDeck = new Proxy(
-      {},
-      { get: (_t, id: string) => () => getTerminal(id)?.readScreenText() ?? "" },
-    ) as Record<string, () => string>;
-    win.__nyxDeckInput = new Proxy(
-      {},
-      { get: (_t, id: string) => (data: string) => getTerminal(id)?.sendInput(data) },
-    ) as Record<string, (data: string) => void>;
-    return () => {
-      delete win.__nyxDeck;
-      delete win.__nyxDeckInput;
-    };
-  }, []);
+  // Publish the per-terminal test/e2e seams (`__nyxDeck` / `__nyxDeckInput`) through their SHARED
+  // owner: the deck is no longer the only host — `<PaneTreeHost>` publishes the same seam and the
+  // two can be mounted together, so a copy here would have deleted the globals the tiling was
+  // still publishing on the deck's unmount. See `deck-seam.ts` for the refcount and the e2e
+  // reader inventory.
+  useDeckSeam();
 
   // NO reconciliation here: the deck only ever receives the CURRENT project's terminals, so it
   // must never dispose store instances (that killed the other projects' terminals on a switch).

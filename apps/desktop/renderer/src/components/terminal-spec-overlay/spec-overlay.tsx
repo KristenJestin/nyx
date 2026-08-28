@@ -1,5 +1,6 @@
-import { AnimatePresence } from "motion/react";
+import { AnimatePresence, LayoutGroup } from "motion/react";
 
+import { useSharedTerminalSpecs } from "./terminal-specs-provider";
 import { useTerminalSpecs } from "./use-terminal-specs";
 import { creationSpecs, devSpecs, overlayMode } from "./overlay-status";
 import { SpecDrawerOverlay } from "./spec-drawer-overlay";
@@ -25,12 +26,31 @@ import { SpecRailOverlay } from "./spec-rail-overlay";
  * leaves nothing behind (non-regression: a terminal with no mapped Spec renders no overlay).
  */
 export function SpecOverlay({ terminalId }: { terminalId: string }) {
-  const { session, specs } = useTerminalSpecs(terminalId);
+  // WHERE THE DATA COMES FROM (review finding 01M11WF11C0H8G2MG515FBT6RD). Under a
+  // `<TerminalSpecsProvider>` — which is how the tiling mounts it — the resolution is SHARED: one
+  // resolver, one `specs://changed` and one `agent-sessions://changed` subscription for every pane
+  // on screen, so N languettes cost exactly the subscriptions ONE used to. Without a provider the
+  // component resolves its own terminal, exactly as it always did (that is the shape its own specs
+  // drive). The `own` hook is called unconditionally — DISABLED with a `null` id under a provider,
+  // which is already its documented "no session, no subscription" mode.
+  const shared = useSharedTerminalSpecs();
+  const own = useTerminalSpecs(shared == null ? terminalId : null);
+  const { session, specs } = shared?.get(terminalId) ?? own;
 
   // Resolve the sub-overlay (or `null` for none). `null` ⇒ AnimatePresence exits the previous one.
   const content = resolveOverlay(session, specs);
 
-  return <AnimatePresence>{content}</AnimatePresence>;
+  // ONE `<LayoutGroup>` PER TERMINAL. The active languette's accent bar travels on a SHARED
+  // `layoutId` (`OVERLAY_ACTIVE_INDICATOR_LAYOUT_ID`), which is global unless it is scoped: with
+  // several overlays on screen at once — the whole point of this finding — two open panels would
+  // otherwise claim the SAME layout id and Motion would glide one bar between two panes. Namespacing
+  // by terminal keeps the FLIP animation exactly as designed *inside* a pane and independent across
+  // panes.
+  return (
+    <LayoutGroup id={terminalId}>
+      <AnimatePresence>{content}</AnimatePresence>
+    </LayoutGroup>
+  );
 }
 
 /** Pick the sub-overlay for a terminal's session + Spec set, keyed for AnimatePresence tracking. */

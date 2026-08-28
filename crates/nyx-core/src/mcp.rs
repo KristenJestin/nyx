@@ -127,6 +127,48 @@ pub const LIST_IMPORTABLE_SCRIPTS_TOOL: &str = "list_importable_scripts";
 /// `tools/list`, kept out of [`V1_TOOLS`] (same pattern as the other extension tools).
 pub const REMOVE_COMMANDS_TOOL: &str = "remove_commands";
 
+/// The `reorder_commands` tool name (review `01M11WE6H9E5D5FCS6RT0ZXAXN`, finding
+/// `01M11XTRXVVPZ9XMDW5ARWKWHA`). Sets the ORDER OF THE COMMAND LIST itself — `managed_commands`'
+/// `order` column — which until now nothing outside the DB layer could write: there was no IPC
+/// route and no MCP tool, so the list's order was whatever creation order left behind.
+///
+/// WHY IT LANDED WITH THE GROUPS WORK. Composing a group became a DRAG, and a drag that takes a
+/// command OUT of a group has to leave it WHERE IT WAS DROPPED. Without a writable list order it
+/// would fall back to its "natural" position instead — a gesture that half works, which is worse
+/// than one that does not exist. So the order is opened, on both surfaces at once: the UI's
+/// `command_reorder` IPC route and this tool, over the SAME `db::reorder_templates`.
+///
+/// It is a TOOL and not a ninth `manage_command_group` action on purpose: the order of the
+/// project's command LIST is not a property of any group (a solo command has one too), and folding
+/// it in would make the group tool the owner of something that outlives every group.
+/// Advertised in `tools/list`, kept out of [`V1_TOOLS`] (same pattern as the other extension tools).
+pub const REORDER_COMMANDS_TOOL: &str = "reorder_commands";
+
+/// The `manage_command_group` tool name (review `01M0ABR6V501D0SPR2BYBVZC4A` #90 — « Commandes
+/// multi-panes … plus pilotage MCP »). The AGENT's half of the multi-pane grouping of managed
+/// commands: create a group, move a command in or out, dissolve it, name it, colour it, fix its
+/// disposition. It is ONE tool with an `action` discriminant rather than eight, because the eight
+/// operations share their target vocabulary and an agent picking a verb from a closed enum cannot
+/// reach for a tool that does not exist.
+///
+/// WHY IT EXISTS AT ALL. The review's condition is SYMMETRY — nothing the agent can do that the
+/// hand cannot undo, nor the reverse — so both sides drive the SAME `nyx_core::db` transitions
+/// (`create_command_group`, `add_to_command_group`, …), the ones the UI's `command_group_*` IPC
+/// routes call. That is also why the grouping is DB state (`managed_command_groups`) and not a
+/// renderer preference like the TERMINAL groups: MCP is served by the sidecar, which cannot see
+/// the renderer's `localStorage`. Mutating → carries a `Commands` changed effect, so an agent's
+/// grouping repaints the open sidebar with no polling.
+///
+/// The `action` enum in the descriptor is READ BACK by the renderer's
+/// `command-groups.test.tsx`, which compares it name-for-name against the gestures the settings
+/// screen really performs — so a NINTH action added here turns that spec red instead of letting
+/// the two surfaces drift. The eighth, `shape`, arrived that way: review
+/// `01M11WE6H9E5D5FCS6RT0ZXAXN` (finding `01M11XTRXVVPZ9XMDW5ARWKWHA`) made the tiling shape
+/// CHOSEN instead of derived, and the symmetry rule then obliges the agent to be able to choose it
+/// too. Advertised in `tools/list`, kept out of [`V1_TOOLS`] (same pattern as the other extension
+/// tools).
+pub const MANAGE_COMMAND_GROUP_TOOL: &str = "manage_command_group";
+
 /// The `create_terminal` tool name (PRD-4 review R-TERM). Creates an INTERACTIVE terminal:
 /// a terminal record (the front mounts an xterm + spawns the PTY on the `terminals://changed`
 /// reconciliation), optionally auto-attached to a workspace via a `cwd`, and optionally
@@ -1012,6 +1054,20 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                             process this call spawns; on a no-op start (already running) it is ignored.",
         })
     };
+    // The WHOLE-GROUP target (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XVEFEQ524XRT9ARPQFGSV):
+    // `group_id` + `workspace_id` name a multi-pane command group instead of one instance, on the
+    // three lifecycle tools. One wording, parameterised by the verb, so an agent learns the
+    // mechanism once and it reads the same on all three.
+    let group_target_prop = |done: &str| {
+        str_prop(&format!(
+            "act on a WHOLE multi-pane command group instead of one instance: the group id from \
+             list_commands(project_id=…) `groups`. Requires `workspace_id` (a group holds command \
+             TEMPLATES, which are project-scoped; running them is workspace-scoped), and is \
+             mutually exclusive with instance_id/name. Every member of the group is {done} in that \
+             workspace, and the result is the group shape `{{ group_id, workspace_id, action, \
+             members[], running, total }}` instead of a single instance status.",
+        ))
+    };
     // The PERSISTED `env` of a command TEMPLATE (v2.8 review N31): the environment stored WITH the
     // command, applied on EVERY path that runs it — including a gate_check nyx runs itself, which
     // the per-run `env` of start_command deliberately never reaches.
@@ -1036,10 +1092,10 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         match name {
             "list_projects" => "List the user's projects in nyx. Start here to discover what the user is working on; each project groups one or more workspaces (folders on disk).",
             "list_workspaces" => "List the workspaces (on-disk folders) inside a project. Use after list_projects to find the workspace you want to inspect or run commands in.",
-            "list_commands" => "List the development commands for a workspace (or the command templates for a project). Use the workspace form to get each command's `instance_id` — the id you pass to start/stop/relaunch/get_command_output. The project form returns reusable templates that are NOT launchable on their own.",
-            "start_command" => "Start a managed command (e.g. a dev server, build watcher, or test run) so nyx supervises it and captures its output. Identify it by `instance_id` from list_commands, or by `name` within a `workspace_id`. Starting an already-running command is a no-op (it does NOT launch a second process): the result reports `was_running:true, restarted:false` so you can tell — use relaunch_command to actually restart. Pass an optional `env` map (KEY→VALUE strings, e.g. {\"VAULT_ENV\":\"dev\"}) to add environment variables for this run, merged onto the inherited environment. After starting, read its output with get_command_output to see logs, errors, or a server URL.",
-            "stop_command" => "Stop a running managed command. Identify it by its `instance_id` from list_commands. The result reports `changed` (whether a live process was actually stopped) and `was_running`, so a stop on an already-idle command is a clear no-op rather than a false success.",
-            "relaunch_command" => "Restart a managed command in place (stop then start the same instance) — useful after a config or code change. This ALWAYS restarts (unlike start_command, which no-ops on a running command); the result reports `restarted:true`. Identify it by its `instance_id` from list_commands. Pass an optional `env` map (KEY→VALUE strings) to set environment variables for the fresh run, merged onto the inherited environment.",
+            "list_commands" => "List the development commands for a workspace (or the command templates for a project). Use the workspace form to get each command's `instance_id` — the id you pass to start/stop/relaunch/get_command_output. The project form returns reusable templates that are NOT launchable on their own, PLUS the project's command `groups` (id, name, color, `layout_shape`, and `command_ids` in disposition order); every command carries its `group_id` (null = solo). A `group_id` + a `workspace_id` is also what start/stop/relaunch_command take to drive a WHOLE group at once. This is the read-only way to inspect the grouping manage_command_group edits — no write needed.",
+            "start_command" => "Start a managed command (e.g. a dev server, build watcher, or test run) so nyx supervises it and captures its output. Identify it by `instance_id` from list_commands, or by `name` within a `workspace_id`. Starting an already-running command is a no-op (it does NOT launch a second process): the result reports `was_running:true, restarted:false` so you can tell — use relaunch_command to actually restart. Pass an optional `env` map (KEY→VALUE strings, e.g. {\"VAULT_ENV\":\"dev\"}) to add environment variables for this run, merged onto the inherited environment. After starting, read its output with get_command_output to see logs, errors, or a server URL. WHOLE GROUP: pass `group_id` (from list_commands(project_id=…) `groups`) together with `workspace_id` INSTEAD of an instance, and every member of that multi-pane group is started in that workspace — but ONLY the members that are not already running; a member already up is left strictly alone, neither restarted nor interrupted. The result is then `{ group_id, workspace_id, action, members[], running, total }`, one entry per member with its own status plus `was_running`/`acted`/`error`, and `running`/`total` as the group's aggregate. This is the exact same operation the user performs with the group's play button.",
+            "stop_command" => "Stop a running managed command. Identify it by its `instance_id` from list_commands. The result reports `changed` (whether a live process was actually stopped) and `was_running`, so a stop on an already-idle command is a clear no-op rather than a false success. WHOLE GROUP: pass `group_id` together with `workspace_id` INSTEAD of `instance_id` to stop EVERY member of a multi-pane command group in that workspace (idempotent on the members already idle); the result is then the group shape `{ group_id, workspace_id, action, members[], running, total }`.",
+            "relaunch_command" => "Restart a managed command in place (stop then start the same instance) — useful after a config or code change. This ALWAYS restarts (unlike start_command, which no-ops on a running command); the result reports `restarted:true`. Identify it by its `instance_id` from list_commands. Pass an optional `env` map (KEY→VALUE strings) to set environment variables for the fresh run, merged onto the inherited environment. WHOLE GROUP: pass `group_id` together with `workspace_id` INSTEAD of `instance_id` to restart a whole multi-pane command group in that workspace — the ACTIVE members are re-spawned and the INACTIVE ones are started, so the group ends fully active. All members are decided from one snapshot taken before anything runs (simultaneous, not one-after-another); the result is the group shape `{ group_id, workspace_id, action, members[], running, total }`.",
             "get_command_output" => "Read a managed command's captured output (logs, errors, a dev server's URL, test results). Identify the command by `instance_id`, or by `name` within a `workspace_id`. Returns a token-safe tail by default, with terminal color/control codes already stripped (set strip_ansi:false for raw bytes). Use `grep` to return only matching lines (e.g. errors) or `tail_lines` for the last N lines. Reads are incremental: the result includes a `cursor` you can pass back as `since` to fetch only new output on the next read. Oversize handling: a request whose window exceeds the 1 MiB ceiling fails with a structured error carrying `error.data.code=\"output_too_large\"` plus `error.data.requested`/`error.data.limit` (bytes) — detect that code and retry with a smaller `tail_bytes` rather than guessing.",
             "workspace_add" => "Register an EXISTING on-disk folder as a workspace under a project, so nyx tracks it and can run commands in it. The folder must already exist — a non-existent path or a file (not a directory) is rejected. Use create_workspace instead when nyx should CREATE the folder. Pass spec_id to ANCHOR a ready/in_progress Spec on the workspace in the same operation (the Spec's status is never changed). The result then carries the anchored Spec under `spec` next to `workspace`, so you do not need a second call to read it back; without spec_id the result is `{workspace}` alone.",
             "create_workspace" => "CREATE a new folder on disk (mkdir -p, including any missing parents) and register it as a workspace under a project. Use when the folder does not exist yet and the user wants nyx to start tracking a brand-new working folder. To register a folder that already exists, use workspace_add (which does NOT create anything). Pass spec_id to ANCHOR a ready/in_progress Spec on the workspace in the same operation (validated before the folder is created; the Spec's status is never changed). The result then carries the anchored Spec under `spec` next to `workspace`, so you do not need a second call to read it back; without spec_id the result is `{workspace}` alone.",
@@ -1069,27 +1125,43 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                     vec![],
                 ),
                 // start_command also accepts { name, workspace_id } to resolve the
-                // instance by name (#16); stop/relaunch keep the instance_id-only form.
+                // instance by name (#16). All three ALSO accept { group_id, workspace_id } to act
+                // on a WHOLE multi-pane command group (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+                // 01M11XVEFEQ524XRT9ARPQFGSV): rather than a fourth tool, the group is a second way
+                // of NAMING the target — the same mechanism `name` + `workspace_id` already is —
+                // so the runner, the dispatch and the status shape are reused untouched. Their
+                // `required` is therefore empty: the tool itself validates that exactly one target
+                // form was given.
                 "start_command" => (
                     json!({
                         "instance_id": str_prop("LAUNCHABLE command instance id (from list_commands(workspace_id=…)), NOT a template command_id"),
                         "name": str_prop("command name to resolve within workspace_id (alternative to instance_id; needs workspace_id; ambiguous/unknown → error)"),
-                        "workspace_id": str_prop("workspace to resolve `name` in (required when using `name`)"),
+                        "group_id": group_target_prop("started (only the members that are not already running)"),
+                        "workspace_id": str_prop("workspace to resolve `name` in (required when using `name`), or the workspace to act in (required when using `group_id`)"),
                         "env": env_prop(),
                     }),
-                    // instance_id OR (name + workspace_id); the tool validates.
+                    // instance_id OR (name + workspace_id) OR (group_id + workspace_id); the tool
+                    // validates.
                     vec![],
                 ),
                 "stop_command" => (
-                    json!({ "instance_id": str_prop("LAUNCHABLE command instance id (from list_commands(workspace_id=…)), NOT a template command_id") }),
-                    vec!["instance_id"],
+                    json!({
+                        "instance_id": str_prop("LAUNCHABLE command instance id (from list_commands(workspace_id=…)), NOT a template command_id"),
+                        "group_id": group_target_prop("stopped"),
+                        "workspace_id": str_prop("the workspace to act in (required when using `group_id`)"),
+                    }),
+                    // instance_id OR (group_id + workspace_id); the tool validates.
+                    vec![],
                 ),
                 "relaunch_command" => (
                     json!({
                         "instance_id": str_prop("LAUNCHABLE command instance id (from list_commands(workspace_id=…)), NOT a template command_id"),
+                        "group_id": group_target_prop("restarted — active members re-spawned, inactive ones started"),
+                        "workspace_id": str_prop("the workspace to act in (required when using `group_id`)"),
                         "env": env_prop(),
                     }),
-                    vec!["instance_id"],
+                    // instance_id OR (group_id + workspace_id); the tool validates.
+                    vec![],
                 ),
                 "get_command_output" => (
                     json!({
@@ -1473,6 +1545,123 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 }),
             },
             "required": ["command_ids"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": REORDER_COMMANDS_TOOL,
+        "description": "Set the ORDER of a project's command list — the order the commands are \
+                        listed in everywhere in nyx, and the one the user re-arranges by dragging \
+                        a row. Pass `project_id` and `command_ids`: EXACTLY the project's command \
+                        template ids (the command_id from list_commands(project_id=…), NOT \
+                        instance_ids), in the order they should appear. A list that is not the \
+                        same SET is refused — this re-orders, it never adds, drops or renames one \
+                        — so read the current list first and send it back permuted. Nothing else \
+                        changes: membership of a group, names, commands and run state are all \
+                        untouched. Returns the project's commands in their NEW order. (A \
+                        command's position INSIDE a group is a different thing: use \
+                        manage_command_group(action=layout) for that.)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("the project whose command list to re-order"),
+                "command_ids": json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "EXACTLY the project's command TEMPLATE ids, in the wanted order \
+                                   (each a command_id from list_commands(project_id=…), NOT an \
+                                   instance_id).",
+                }),
+            },
+            "required": ["project_id", "command_ids"],
+        },
+    }));
+    // The MULTI-PANE GROUPING of managed commands, agent side (review 01M0ABR6V501D0SPR2BYBVZC4A
+    // #90). ONE tool with an `action` discriminant over the eight operations the settings screen
+    // offers the hand — and it delegates to the very same `nyx_core::db` transitions the UI's
+    // `command_group_*` IPC routes call, which is what makes the two surfaces produce identical
+    // state. The `action` enum below is compared name-for-name against the screen's gestures by
+    // `command-groups.test.tsx`, which reads the FIRST inline `"enum": [ … ]` after the tool name
+    // straight out of this source: keep `action` first in the properties, and keep its enum the
+    // only INLINE array literal here (`shape`'s enum is the `COMMAND_GROUP_SHAPES` constant, not a
+    // literal, precisely so the two cannot be confused). (`shape` is the
+    // eighth, from review 01M11WE6H9E5D5FCS6RT0ZXAXN / finding 01M11XTRXVVPZ9XMDW5ARWKWHA: the
+    // tiling shape became CHOSEN instead of derived, and the symmetry rule then requires the agent
+    // to be able to choose it too.)
+    descriptors.push(json!({
+        "name": MANAGE_COMMAND_GROUP_TOOL,
+        "description": "Compose and arrange a GROUP of managed commands — nyx's multi-pane \
+                        grouping for commands, the exact counterpart of what the user does by \
+                        hand in the commands settings screen (same DB transitions, so your edit \
+                        and theirs are indistinguishable, in both directions). A command belongs \
+                        to ZERO OR ONE group; a group holds AT LEAST TWO commands — taking it \
+                        down to one DISSOLVES it and leaves the survivor solo. A group is born \
+                        GREY and NAMELESS and stays perfectly usable that way: `name` and \
+                        `color` are optional, independent, and clearing one never clears the \
+                        other. The DISPOSITION has two halves and they are edited separately: the \
+                        ordered member list (action=layout — WHICH member goes where) and the \
+                        tiling SHAPE they are poured into (action=shape — auto | row | column | \
+                        grid | main-left | main-top, `auto` being the shape derived from the member \
+                        count: 2 side by side, the 3rd underneath, the 4th in a quadrant). The pane \
+                        tree is derived from the two together, so re-ordering IS re-arranging. READ \
+                        the current grouping WITHOUT writing anything: list_commands(project_id=…) \
+                        returns the project's `groups` (id, name, color, layout_shape, command_ids \
+                        in disposition order) and gives every command its `group_id` (null = solo). \
+                        Returns the affected `group` \
+                        — for action=remove that is the group AS IT SURVIVES, with its remaining \
+                        members, and null ONLY when it really ceased to exist (dissolved, or the \
+                        command was already solo) — plus the project's `groups` after the change.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": json!({
+                    "type": "string",
+                    "enum": ["create", "add", "remove", "dissolve", "name", "color", "layout", "shape"],
+                    "description": "create: a NEW group from >=2 commands (project_id + command_ids, in layout order). \
+                                   add: put a command INTO a group, at the END of its disposition (group_id + command_id; \
+                                   a command already in another group leaves it first). \
+                                   remove: take a command OUT of its group — it becomes solo (command_id; the group \
+                                   dissolves if it is left with one member). \
+                                   dissolve: ungroup ALL — every member becomes solo, none is deleted (group_id). \
+                                   name: set or CLEAR the optional name (group_id + name; omit name or pass null to clear). \
+                                   color: set or CLEAR the optional colour (group_id + color 1..6; omit or null to clear). \
+                                   layout: fix the DISPOSITION (group_id + command_ids listing EXACTLY the current \
+                                   members, in the wanted order — it re-arranges, it never adds or drops one). \
+                                   shape: fix the TILING SHAPE the members are poured into (group_id + shape). \
+                                   layout and shape are the two halves of the disposition and are deliberately \
+                                   separate: layout is WHICH member goes where, shape is WHAT the grid looks like.",
+                }),
+                "project_id": str_prop("the project the group belongs to (required for action=create)"),
+                "group_id": str_prop("the group to act on (required for add/dissolve/name/color/layout)"),
+                "command_id": str_prop("the TEMPLATE id to move in or out (required for add/remove; a command_id from list_commands, NOT an instance_id)"),
+                "command_ids": json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "the TEMPLATE ids, IN LAYOUT ORDER: the founding members for action=create \
+                                   (at least two), or exactly the current members for action=layout.",
+                }),
+                "shape": json!({
+                    "type": "string",
+                    // ONE spelling in Rust: the vocabulary comes from the same constant the DB
+                    // transition validates against, so the schema an agent reads and the boundary
+                    // that refuses a write can never disagree.
+                    "enum": crate::db::COMMAND_GROUP_SHAPES,
+                    "description": "action=shape only: the TILING SHAPE the members are poured into. \
+                                   auto = the shape derived from the member count (2 side by side, the 3rd \
+                                   underneath, the 4th in a quadrant) — the default, and what every group had \
+                                   before shapes existed. row = all members side by side. column = all stacked. \
+                                   grid = two columns filled row-major. main-left = the FIRST member takes the \
+                                   full-height left half, the others stack on the right. main-top = the first \
+                                   takes the full-width top half, the others sit in a row underneath.",
+                }),
+                "name": str_prop("action=name only: the group's new name; omit it (or pass null) to CLEAR the name — a blank string clears it too"),
+                "color": json!({
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 6,
+                    "description": "action=color only: the 1-based index of one of the six group colours; omit it (or pass null) to CLEAR the colour and go back to the neutral default.",
+                }),
+            },
+            "required": ["action"],
         },
     }));
     // Append the interactive-terminal extension (PRD-4 review R-TERM): create / write to /
@@ -3859,15 +4048,18 @@ mod tests {
 
     /// Read a whole HTTP response off `stream` and return its `(status_line, body)`.
     ///
-    /// ON BYTES, NEVER THROUGH A `String`. A chunked response INTERLEAVES its
-    /// `\r\n<size>\r\n` framing at arbitrary byte offsets of the payload, so the RAW stream can
-    /// carry a multi-byte UTF-8 character CUT IN HALF by a chunk header even though the DECODED
-    /// body is perfectly valid text. Reading the raw stream with `read_to_string` therefore failed
-    /// with "stream did not contain valid UTF-8" as soon as the catalog's byte length happened to
-    /// land a chunk boundary inside one of the `—` these descriptions are full of: a test that
-    /// reddens on the LENGTH of a tool description, saying nothing whatever about the code (and
+    /// ON BYTES, NEVER THROUGH A `String`. This client used to `read_to_string` the whole
+    /// exchange, which asks the RAW STREAM — headers, chunk-size lines and payload interleaved —
+    /// to be valid UTF-8 on its own. It is not, as soon as the response is chunked and a chunk
+    /// boundary lands INSIDE a multi-byte character: the two halves end up separated by a
+    /// `\r\n<hex>\r\n` frame and the stream stops being decodable. Nothing in the catalogue's
+    /// content is at fault — a descriptor added anywhere shifts every later boundary — so the test
+    /// went red on the LENGTH of a tool description, saying nothing whatever about the code (and
     /// `dechunk` would then have panicked slicing at a non-char boundary anyway). Framing is
     /// decoded on bytes; UTF-8 is asserted ONCE, on the reassembled body, where it is real.
+    ///
+    /// ONE reader, shared by `http_request` and `http_post_mcp`: the two hand-rolled clients differ
+    /// only in the request they write, so the response side has a single definition to keep right.
     fn read_http_response(stream: &mut TcpStream) -> (String, String) {
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).unwrap();
@@ -3875,6 +4067,8 @@ mod tests {
             Some(i) => (&raw[..i], &raw[i + 4..]),
             None => (&raw[..], &[][..]),
         };
+        // The head is ASCII by protocol; `from_utf8_lossy` keeps a malformed one readable
+        // in a failure message rather than panicking on it.
         let head = String::from_utf8_lossy(head).into_owned();
         let status_line = head.lines().next().unwrap_or("").to_string();
         // tiny_http streams a large response with `Transfer-Encoding: chunked` (no
@@ -3886,33 +4080,38 @@ mod tests {
             let l = l.to_ascii_lowercase();
             l.starts_with("transfer-encoding:") && l.contains("chunked")
         });
-        let body = if is_chunked {
+        let payload = if is_chunked {
             dechunk(body)
         } else {
             body.to_vec()
         };
         (
             status_line,
-            String::from_utf8(body).expect("the DECODED body is valid UTF-8"),
+            String::from_utf8(payload).expect("the DECODED body is valid UTF-8"),
         )
     }
 
     /// Decode an HTTP/1.1 `Transfer-Encoding: chunked` body into its payload: repeatedly
-    /// read a hex chunk-size line, then that many bytes, until the terminating `0` chunk.
+    /// read a hex chunk-size line, then that many BYTES, until the terminating `0` chunk.
     /// A tiny decoder (the test bodies are small JSON) so the test HTTP client needs no
-    /// HTTP crate. Byte-oriented on purpose — see [`read_http_response`].
+    /// HTTP crate.
+    ///
+    /// It works on `&[u8]` and not on `&str` for the reason spelled out in
+    /// [`read_http_response`]: a chunk boundary is a BYTE boundary, not a character one, so
+    /// slicing the frames out of a `&str` would either panic (`&s[..n]` off a char
+    /// boundary) or never get there (the stream would not decode in the first place).
     fn dechunk(mut s: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
         // The loop ends the moment the remaining input no longer starts with a
         // `size-line CRLF` header — the same exit the previous `let-else break`
         // expressed — while the inner `break`s (terminating `0` chunk, truncated
         // body) still short-circuit before the next iteration.
         while let Some(i) = s.windows(2).position(|w| w == b"\r\n") {
-            let (size_line, rest) = (&s[..i], &s[i + 2..]);
             // The chunk-size line may carry `;ext` extensions — take the hex prefix only.
-            let size_line = String::from_utf8_lossy(size_line);
+            let size_line = String::from_utf8_lossy(&s[..i]).into_owned();
             let hex = size_line.split(';').next().unwrap_or("").trim();
             let n = usize::from_str_radix(hex, 16).unwrap_or(0);
+            let rest = &s[i + 2..];
             if n == 0 {
                 break;
             }
@@ -3964,6 +4163,7 @@ mod tests {
             body
         );
         stream.write_all(req.as_bytes()).unwrap();
+        // Bytes, and the SAME reader as `http_request` — see [`read_http_response`].
         read_http_response(&mut stream)
     }
 
@@ -4745,6 +4945,16 @@ mod tests {
             names.contains(&REMOVE_COMMANDS_TOOL),
             "remove_commands tool must be listed"
         );
+        // Review 01M0ABR6V501D0SPR2BYBVZC4A #90: the multi-pane GROUPING of commands, agent side.
+        assert!(
+            names.contains(&MANAGE_COMMAND_GROUP_TOOL),
+            "manage_command_group tool must be listed"
+        );
+        // Review 01M11WE6H9E5D5FCS6RT0ZXAXN: the command LIST order, agent side.
+        assert!(
+            names.contains(&REORDER_COMMANDS_TOOL),
+            "reorder_commands tool must be listed"
+        );
         // R-TERM: the interactive-terminal tools advertised alongside, kept OUT of V1_TOOLS.
         assert!(
             names.contains(&CREATE_TERMINAL_TOOL),
@@ -4922,7 +5132,9 @@ mod tests {
         assert_eq!(
             names.len(),
             V1_TOOLS.len()
-                + 24
+                // 26 since the command-LIST order was opened (reorder_commands); it was 25 when
+                // the multi-pane grouping landed (manage_command_group).
+                + 26
                 + 9
                 + 2
                 + crate::mcp_tools_spec::SPEC_TOOLS.len()
@@ -4934,6 +5146,7 @@ mod tests {
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
+             manage_command_group + reorder_commands + \
              create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
              agent_session_event + set_project_settings + project_set_repos + workspace_runtime + \
              workspace_git + workspace_timeline + the spec authoring/transition tools \

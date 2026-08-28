@@ -4,7 +4,7 @@ import { ServerCogIcon, SquareTerminalIcon } from "lucide-react";
 
 import { nyxBridge } from "@/bridge";
 import { CommandControls } from "@/components/command/command-controls";
-import type { WorkspaceRuntimeSnapshot } from "@/components/terminals/use-workspace-runtime";
+import type { WorkspaceRuntimeSnapshot } from "@/components/runtime/use-workspace-runtime";
 
 import { Dot } from "../spec-primitives";
 import type { SpecDetail } from "../types";

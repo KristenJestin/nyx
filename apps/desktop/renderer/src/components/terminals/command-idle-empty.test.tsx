@@ -2,11 +2,12 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { CommandIdleEmpty } from "./command-idle-empty";
-import type { WorkspaceRuntimeService } from "./use-workspace-runtime";
+import type { WorkspaceRuntimeService } from "@/components/runtime/use-workspace-runtime";
 
 function service(overrides: Partial<WorkspaceRuntimeService> = {}): WorkspaceRuntimeService {
   return {
     id: "s1",
+    command_id: "c1",
     workspace_id: "ws1",
     name: "preview",
     command: "npm run preview",

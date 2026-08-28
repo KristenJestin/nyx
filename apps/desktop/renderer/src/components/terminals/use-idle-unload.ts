@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 
 import { nyxBridge } from "@/bridge";
+import { recordIdleUnloadSweep, useIdleUnloadSeam } from "./idle-unload-seam";
 
 /** Default cadence of the idle-unload sweep — once a minute is plenty (the threshold is minutes). */
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
@@ -38,13 +39,29 @@ const DEFAULT_THRESHOLD_SECS = 15 * 60;
  * The sweep is fire-and-forget: a failed invoke (sidecar busy / not ready) just means no unload
  * this tick — a later tick retries. It never surfaces an error to the page. The latest `visited`
  * set is read from a ref so a focus change never re-arms the timer.
+ *
+ * ## VISITED IS EVERY VISIBLE PANE
+ * `visitedTerminalIds` is a POLICY INPUT and its meaning is "on screen", not "selected". With the
+ * tiling, several terminals are visible at once (`usePaneLayout().visibleTerminalIds` — every leaf
+ * of the pane tree), and handing only the focused one would let the sidecar unload the sessions of
+ * panes the user is LOOKING AT. That is a correctness condition of the tiling, not an
+ * optimisation, and it is why the caller must pass the visible set.
+ *
+ * Because the invoke is fire-and-forget, that claim is otherwise unobservable — so every sweep is
+ * recorded on the read seam (`idle-unload-seam.ts`, `window.__nyxIdleUnload`), which is inert in
+ * production and is the only vantage point a piloted session has on these arguments.
  */
 export function useIdleUnload(
+  /** The terminals to declare VISITED — every VISIBLE pane, not the focused one (see above). */
   visitedTerminalIds: readonly string[],
   options?: { readonly intervalMs?: number; readonly thresholdSecs?: number },
 ): void {
   const intervalMs = options?.intervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
   const thresholdSecs = options?.thresholdSecs ?? DEFAULT_THRESHOLD_SECS;
+
+  // Publish the read seam for as long as this hook is mounted (refcounted — several surfaces may
+  // sweep at once, and the first unmount must not take the global away from the others).
+  useIdleUnloadSeam();
 
   // Keep the CURRENT visited set in a ref so the interval callback always reads the live focus
   // without re-arming the timer on every selection change (which would reset the sweep clock).
@@ -53,14 +70,13 @@ export function useIdleUnload(
 
   useEffect(() => {
     const sweep = () => {
-      void nyxBridge
-        .invoke("unload_idle_sessions", {
-          thresholdSecs,
-          visited: visitedRef.current,
-        })
-        .catch(() => {
-          // Best-effort: a failed sweep means no unload this tick; a later tick retries.
-        });
+      const visited = visitedRef.current;
+      // Recorded at the instant of the invoke, with the very arguments sent — the seam must report
+      // what the sidecar received, not what the state looked like when the promise settled.
+      recordIdleUnloadSweep({ at: Date.now(), thresholdSecs, visited });
+      void nyxBridge.invoke("unload_idle_sessions", { thresholdSecs, visited }).catch(() => {
+        // Best-effort: a failed sweep means no unload this tick; a later tick retries.
+      });
     };
     const timer = setInterval(sweep, intervalMs);
     return () => clearInterval(timer);

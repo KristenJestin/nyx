@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { nyxBridge } from "@/bridge";
 
 import { useRuntimeChangeSubscription } from "./use-runtime-live";
-import type { WorkspaceRuntimeSnapshot } from "./use-workspace-runtime";
+import type { WorkspaceRuntimeSnapshot } from "@/components/runtime/use-workspace-runtime";
 
 /**
  * `use-project-runtime` — the LIVE runtime read model for a whole PROJECT: the runtime

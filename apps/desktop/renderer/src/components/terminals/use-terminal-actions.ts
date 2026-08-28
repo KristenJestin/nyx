@@ -2,11 +2,14 @@ import { useCallback, useMemo, useRef } from "react";
 
 import { useProjects } from "@/components/sidebar/use-projects";
 import { useTerminals } from "@/components/sidebar/use-terminals";
-import { useTerminalShortcuts } from "@/components/sidebar/use-terminal-shortcuts";
+import {
+  useTerminalShortcuts,
+  type ShortcutHandlers,
+} from "@/components/sidebar/use-terminal-shortcuts";
 import { resolveNewTerminalWorkspace } from "@/components/sidebar/resolve-new-terminal-workspace";
 import { spliceWorkspaceOrder, type ReorderGroup } from "@/components/sidebar/reorder-utils";
 import { useRuntimeSelection } from "./runtime-selection";
-import type { WorkspaceRuntimeTerminal } from "./use-workspace-runtime";
+import type { WorkspaceRuntimeTerminal } from "@/components/runtime/use-workspace-runtime";
 
 /**
  * `use-terminal-actions` — the RESTORED terminal-management affordances of the OLD shell,
@@ -27,9 +30,32 @@ import type { WorkspaceRuntimeTerminal } from "./use-workspace-runtime";
  * snapshot order the tree shows). Creating a terminal selects it once it lands in the snapshot
  * (handled by the page's auto-select-first effect + `select` here).
  */
+/** The PANE chords `useTerminalActions` forwards to the one shortcut registration it owns. */
+export type PaneShortcutHandlers = Pick<
+  ShortcutHandlers,
+  | "onSplitRight"
+  | "onSplitDown"
+  | "onFocusLeft"
+  | "onFocusRight"
+  | "onFocusUp"
+  | "onFocusDown"
+  | "onClosePane"
+>;
+
 export interface UseTerminalActions {
   /** Open a NEW terminal in `workspaceId` (bound + spawned at `path`), then select it. */
   newTerminalInWorkspace: (workspaceId: string, path: string) => Promise<void>;
+  /**
+   * Create a terminal in `workspaceId` (bound + spawned at `path`) and resolve to its RECORD ID,
+   * WITHOUT selecting it — the seam the pane SPLIT creates through.
+   *
+   * The split owns the selection itself: it places the new leaf and focuses that pane, and a
+   * `select` fired here would race that (the tiling would briefly show the new terminal SOLO
+   * before the leaf lands). Everything else — `create` + `attach`, the SAME sidebar CRUD, the same
+   * `terminals://changed` push — is identical to {@link newTerminalInWorkspace}, which is now a
+   * thin "…and select it" over this.
+   */
+  createTerminalInWorkspace: (workspaceId: string, path: string) => Promise<string>;
   /** Close the currently-selected terminal (a no-op when a service/nothing is selected). */
   closeSelected: () => Promise<void>;
   /** Close a SPECIFIC terminal by id (the per-row "×"); re-targets the selection if it was it. */
@@ -62,6 +88,13 @@ export function useTerminalActions(
    * (e.g. a project with no workspaces) falls back to a loose terminal as a last resort.
    */
   fallbackWorkspace?: { id: string; path: string } | null,
+  /**
+   * The PANE chords (split / move focus / close pane) of the surface that TILES. They are
+   * registered HERE, by the one `useTerminalShortcuts` call this hook owns: a second registration
+   * would double-bind Ctrl+T / Ctrl+W and fire them twice. Omitted by any surface without a
+   * tiling — the chords then exist but do nothing.
+   */
+  paneShortcuts?: PaneShortcutHandlers,
 ): UseTerminalActions {
   const { projects } = useProjects();
   // Borrow the sidebar CRUD surface ONLY — the page's terminal set is driven by the runtime
@@ -88,13 +121,21 @@ export function useTerminalActions(
   // right workspace), and select it. Reuses the sidebar `create` + `attach` — the SAME path the
   // old per-workspace "+" used — so the new record persists and `terminals://changed` re-pulls
   // the page snapshot, surfacing the terminal in the tree and mounting its live pane.
-  const newTerminalInWorkspace = useCallback(
+  const createTerminalInWorkspace = useCallback(
     async (workspaceId: string, path: string) => {
       const row = await create(path);
       await attach(row.id, workspaceId, "manual");
-      select({ kind: "terminal", id: row.id });
+      return row.id;
     },
-    [create, attach, select],
+    [create, attach],
+  );
+
+  const newTerminalInWorkspace = useCallback(
+    async (workspaceId: string, path: string) => {
+      const id = await createTerminalInWorkspace(workspaceId, path);
+      select({ kind: "terminal", id });
+    },
+    [createTerminalInWorkspace, select],
   );
 
   // Open a LOOSE (unattached) terminal — the ABSOLUTE last-resort Ctrl+T fallback when no workspace
@@ -211,13 +252,15 @@ export function useTerminalActions(
       onClose: () => void closeSelected(),
       onNext: () => cycle(1),
       onPrev: () => cycle(-1),
+      ...paneShortcuts,
     }),
-    [newTerminalSmart, closeSelected, cycle],
+    [newTerminalSmart, closeSelected, cycle, paneShortcuts],
   );
   useTerminalShortcuts(handlers);
 
   return {
     newTerminalInWorkspace,
+    createTerminalInWorkspace,
     closeSelected,
     closeTerminal,
     renameTerminal,

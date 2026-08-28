@@ -2,11 +2,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
-import {
-  DOT_PRESENCE,
-  dotAppearTransition,
-  dotExitTransition,
-} from "@/components/sidebar/dot-motion";
+import { DOT_PRESENCE, dotAppearTransition, dotExitTransition } from "@/components/ui/dot-motion";
 
 /**
  * The presentational run-state a dot renders — a VISUAL projection of the distinct

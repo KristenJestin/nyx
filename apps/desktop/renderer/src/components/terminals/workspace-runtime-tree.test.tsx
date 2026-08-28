@@ -13,7 +13,7 @@ import type {
   WorkspaceRuntimeSession,
   WorkspaceRuntimeSnapshot,
   WorkspaceRuntimeTerminal,
-} from "./use-workspace-runtime";
+} from "@/components/runtime/use-workspace-runtime";
 
 function terminal(overrides: Partial<WorkspaceRuntimeTerminal> = {}): WorkspaceRuntimeTerminal {
   return {
@@ -128,6 +128,7 @@ describe("WorkspaceRuntimeTree", () => {
         services: [
           {
             id: "s1",
+            command_id: "c1",
             workspace_id: "ws1",
             name: "dev-server",
             command: "npm run dev",
@@ -221,6 +222,7 @@ describe("WorkspaceRuntimeTree — notification dots (finding 53)", () => {
         services: [
           {
             id: "s1",
+            command_id: "c1",
             workspace_id: "ws1",
             name: "build",
             command: "npm run build",

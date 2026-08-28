@@ -65,11 +65,11 @@ methods.
 | `command_acknowledge`               | `command/use-command-instances.ts`                         | `invoke("command_acknowledge")`               |
 | `command_output`                    | `command/use-command-output.ts`                            | `invoke("command_output")`                    |
 | `command_instance_list`             | `command/use-command-instances.ts`                         | `invoke("command_instance_list")`             |
-| `command_import_scripts`            | `command/project-commands-dialog.tsx`                      | `invoke("command_import_scripts")`            |
-| `command_import_create`             | `command/project-commands-dialog.tsx`                      | `invoke("command_import_create")`             |
-| `command_source_refresh`            | `command/project-commands-dialog.tsx`                      | `invoke("command_source_refresh")`            |
-| `command_resync_source`             | `command/project-commands-dialog.tsx`                      | `invoke("command_resync_source")`             |
-| `command_unlink_source`             | `command/project-commands-dialog.tsx`                      | `invoke("command_unlink_source")`             |
+| `command_import_scripts`            | `command/commands-section.tsx`                             | `invoke("command_import_scripts")`            |
+| `command_import_create`             | `command/commands-section.tsx`                             | `invoke("command_import_create")`             |
+| `command_source_refresh`            | `command/use-commands.ts`                                  | `invoke("command_source_refresh")`            |
+| `command_resync_source`             | `command/use-commands.ts`                                  | `invoke("command_resync_source")`             |
+| `command_unlink_source`             | `command/use-commands.ts`                                  | `invoke("command_unlink_source")`             |
 | `agent_active_sessions`             | `sidebar/use-agent-sessions.tsx`                           | `invoke("agent_active_sessions")`             |
 | `agent_close_warnings`              | `chrome/close-warning.ts`                                  | `invoke("agent_close_warnings")`              |
 | `integration_list`                  | `sidebar/settings-dialog.tsx`                              | `invoke("integration_list")`                  |

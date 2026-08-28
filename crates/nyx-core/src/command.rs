@@ -1611,6 +1611,294 @@ pub fn resolve_command_and_cwd(db: &Db, instance_id: &str) -> Result<ResolvedCom
     Ok((ctx.command, cwd, decode_command_env(ctx.env.as_deref())))
 }
 
+// --- THE GROUP-WIDE LIFECYCLE (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+//     01M11XVEFEQ524XRT9ARPQFGSV) ------------------------------------------------------------
+//
+// « les boutons play pause restart doivent pouvoir s'afficher pour le groupe entier en plus, pour
+// tout faire d'un coup ». A group of commands is an ensemble one starts, stops and restarts
+// TOGETHER; before this, nothing in nyx acted on more than one command at a time — not the IPC
+// (`command_start`/`_stop`/`_relaunch` each take one `instance_id`) and not MCP.
+//
+// WHY THE RULE IS HERE AND NOWHERE ELSE. The obvious implementation is a loop, and there are two
+// callers who could each write one: the renderer's sidebar and the agent's MCP tool. Written twice,
+// "play only starts what is not started" is two pieces of code that can disagree — and the day one
+// is fixed the other still ships the old semantics, silently, to whichever surface calls it. So the
+// loop is written ONCE, here, over `(group_id, workspace_id)`, and both surfaces call it:
+// `db_command.rs`'s `command_group_start`/`_stop`/`_relaunch` and `mcp_runtime`'s
+// `start_command`/`stop_command`/`relaunch_command` when they are given a group instead of an
+// instance.
+//
+// WHY THE PAIR. A group is PROJECT-scoped (it holds command TEMPLATES) while running is
+// WORKSPACE-scoped (it drives `command_instances`). "Start the group" is therefore only a question
+// once a workspace is named — which is also why the controls live in the sidebar and not in the
+// project-settings modal, which knows no workspace.
+
+/// Which group-wide gesture to perform. The three the user named, and no fourth: nyx has no
+/// `pause` — `command_stop` is the only arrest that exists, and the user's own description
+/// ("stop ça stop tout le monde") is a stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandGroupAction {
+    /// PLAY — start ONLY the members that are not running; leave the running ones strictly alone
+    /// (not stopped, not restarted).
+    Start,
+    /// STOP — arrest every member. Idempotent on the ones already idle.
+    Stop,
+    /// RESTART — re-spawn the active members AND start the inactive ones, so the whole group ends
+    /// up active.
+    Relaunch,
+}
+
+impl CommandGroupAction {
+    /// The wire word for this gesture (`start` | `stop` | `relaunch`) — the same one the IPC route
+    /// and the MCP result echo, so a log line reads the same on both surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandGroupAction::Start => "start",
+            CommandGroupAction::Stop => "stop",
+            CommandGroupAction::Relaunch => "relaunch",
+        }
+    }
+}
+
+/// THE RULE, written once: which members a group-wide `action` TOUCHES, given a snapshot of which
+/// ones were running when the call began.
+///
+/// `running[i]` is member `i`'s state BEFORE the call; the returned vec is parallel to it and says,
+/// for each member, whether the gesture acts on it.
+///
+///   * `Start` → only the members that are NOT running. This is the whole content of "play ne
+///     démarre que ceux qui ne sont pas démarrés": a member already up is not restarted and not
+///     interrupted, it is skipped.
+///   * `Stop` → every member. `CommandRunner::stop` is idempotent on an idle one, and the intent
+///     ("stop ça stop tout le monde") is about the state the group ends in, not about picking
+///     targets.
+///   * `Relaunch` → every member. `CommandRunner::relaunch_with_env` always spawns, so an active
+///     member is re-spawned and an inactive one is started; the group ends fully active.
+///
+/// SIMULTANEOUS, NOT SEQUENTIAL — and this signature is what makes that true rather than a comment.
+/// The whole selection is computed from ONE snapshot taken before anything runs, so no member's
+/// fate depends on the effect of an earlier member's start: a play over `[running, idle]` decides
+/// "skip, start" up front and cannot observe its own first start on the way to the second. A
+/// sequential loop that re-read `is_running` at each step would be a different function.
+pub fn command_group_selection(action: CommandGroupAction, running: &[bool]) -> Vec<bool> {
+    running
+        .iter()
+        .map(|was_running| match action {
+            CommandGroupAction::Start => !*was_running,
+            CommandGroupAction::Stop | CommandGroupAction::Relaunch => true,
+        })
+        .collect()
+}
+
+/// One member's share of a group-wide call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CommandGroupMemberRun {
+    /// The member TEMPLATE id.
+    pub command_id: String,
+    /// The instance the gesture addressed in the asked workspace.
+    pub instance_id: String,
+    /// The template's display name — so a result is readable without a second lookup.
+    pub name: String,
+    /// Was this member running when the call began? (The snapshot the selection was made on.)
+    pub was_running: bool,
+    /// Did the gesture TOUCH this member? `false` is the interesting one: a `play` that skipped an
+    /// already-running member reports `acted: false, was_running: true`.
+    pub acted: bool,
+    /// The member's run state AFTER the call.
+    pub state: String,
+    /// Its exit code, when the run is FINISHED (`None` otherwise).
+    pub exit_code: Option<i32>,
+    /// Its unseen-result flag.
+    pub unread: bool,
+    /// A per-member failure. It is REPORTED, never propagated: one member whose cwd no longer
+    /// exists must not stop the other three from starting.
+    pub error: Option<String>,
+}
+
+/// The result of a group-wide call: what happened to each member, plus the aggregate the head of a
+/// group block reads (`running` out of `total` — the `n/m` that makes "divergent" legible without
+/// inventing a fifth run state).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CommandGroupRun {
+    pub group_id: String,
+    pub workspace_id: String,
+    /// `start` | `stop` | `relaunch`.
+    pub action: String,
+    /// One entry per member, in DISPOSITION order.
+    pub members: Vec<CommandGroupMemberRun>,
+    /// How many members are running AFTER the call.
+    pub running: usize,
+    /// How many members the group has in this workspace.
+    pub total: usize,
+}
+
+/// Why a group-wide call was refused OUTRIGHT (as opposed to a per-member failure, which is
+/// reported inside [`CommandGroupRun`] and never aborts the others).
+#[derive(Debug)]
+pub enum CommandGroupRunError {
+    /// The group id does not resolve.
+    GroupNotFound {
+        group_id: String,
+    },
+    /// The workspace id does not resolve.
+    WorkspaceNotFound {
+        workspace_id: String,
+    },
+    /// The workspace exists but belongs to another project than the group — the pair is
+    /// meaningless, and answering "0 members" would hide a caller mistake behind a no-op.
+    WorkspaceOutsideProject {
+        group_id: String,
+        workspace_id: String,
+    },
+    Db(String),
+}
+
+impl std::fmt::Display for CommandGroupRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandGroupRunError::GroupNotFound { group_id } => {
+                write!(f, "unknown command group {group_id}")
+            }
+            CommandGroupRunError::WorkspaceNotFound { workspace_id } => {
+                write!(f, "unknown workspace {workspace_id}")
+            }
+            CommandGroupRunError::WorkspaceOutsideProject {
+                group_id,
+                workspace_id,
+            } => write!(
+                f,
+                "workspace {workspace_id} does not belong to the project of command group \
+                 {group_id}"
+            ),
+            CommandGroupRunError::Db(e) => write!(f, "db error: {e}"),
+        }
+    }
+}
+
+/// Resolve `(group_id, workspace_id)` to the group's members IN DISPOSITION ORDER, refusing the
+/// pair when it does not name one thing. Shared by [`run_command_group`] and by the read the
+/// aggregate `n/m` is built from.
+pub fn resolve_command_group_members(
+    db: &Db,
+    group_id: &str,
+    workspace_id: &str,
+) -> Result<Vec<db::CommandGroupMember>, CommandGroupRunError> {
+    // ONE connection for the three reads, not three. They are the resolution of a SINGLE pair, so
+    // taking (and releasing) the pooled connection between them bought nothing and let a
+    // concurrent `dissolve_command_group` land between the check and the member read — the
+    // validation would then have vouched for a group the last query no longer sees.
+    let (group, workspace, members) = db
+        .with_conn(|c| -> diesel::QueryResult<_> {
+            let group = db::get_command_group(c, group_id)?;
+            let workspace = db::get_workspace(c, workspace_id)?;
+            let members = db::command_group_members_for_workspace(c, group_id, workspace_id)?;
+            Ok((group, workspace, members))
+        })
+        .map_err(|e| CommandGroupRunError::Db(e.to_string()))?;
+    let group = group.ok_or_else(|| CommandGroupRunError::GroupNotFound {
+        group_id: group_id.to_string(),
+    })?;
+    let workspace = workspace.ok_or_else(|| CommandGroupRunError::WorkspaceNotFound {
+        workspace_id: workspace_id.to_string(),
+    })?;
+    if workspace.project_id != group.project_id {
+        return Err(CommandGroupRunError::WorkspaceOutsideProject {
+            group_id: group_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+        });
+    }
+    Ok(members)
+}
+
+/// RUN a group-wide gesture over `(group_id, workspace_id)` — the ONE implementation of
+/// play / stop / restart on a whole group, called by the IPC routes and by the MCP tools alike.
+///
+/// The order of operations is what carries the semantics:
+///  1. resolve the members (disposition order) — a bad pair is refused HERE, before anything runs;
+///  2. take ONE snapshot of `is_running` for all of them;
+///  3. ask [`command_group_selection`] which ones the gesture touches — the rule, in one place;
+///  4. act, member by member, each failure captured on its own row rather than aborting the batch.
+///
+/// Step 2 is what makes a restart SIMULTANEOUS rather than sequential: the plan is fixed before the
+/// first spawn, so no member waits on, or reacts to, another. The per-run environment is the
+/// command's own PERSISTED env (N31) — a group call carries no transient override, exactly like the
+/// pipe lifecycle request it generalises.
+pub fn run_command_group<S: RunnerSink>(
+    db: &Db,
+    runner: &CommandRunner<S>,
+    group_id: &str,
+    workspace_id: &str,
+    action: CommandGroupAction,
+) -> Result<CommandGroupRun, CommandGroupRunError> {
+    let members = resolve_command_group_members(db, group_id, workspace_id)?;
+
+    // ONE snapshot, before anything moves (see the doc comment): the plan cannot observe its own
+    // effects.
+    let before: Vec<bool> = members
+        .iter()
+        .map(|m| runner.is_running(&m.instance_id))
+        .collect();
+    let selected = command_group_selection(action, &before);
+
+    let mut rows = Vec::with_capacity(members.len());
+    for ((member, was_running), acted) in members.iter().zip(&before).zip(&selected) {
+        let mut error = None;
+        if *acted {
+            let outcome = match action {
+                CommandGroupAction::Start => resolve_command_and_cwd(db, &member.instance_id)
+                    .and_then(|(command, cwd, env)| {
+                        runner
+                            .start_with_env(&member.instance_id, &command, Some(&cwd), &env)
+                            .map(|_| ())
+                            .map_err(|e| format!("start failed: {e}"))
+                    }),
+                CommandGroupAction::Stop => runner
+                    .stop(&member.instance_id)
+                    .map(|_| ())
+                    .map_err(|e| format!("stop failed: {e}")),
+                CommandGroupAction::Relaunch => resolve_command_and_cwd(db, &member.instance_id)
+                    .and_then(|(command, cwd, env)| {
+                        runner
+                            .relaunch_with_env(&member.instance_id, &command, Some(&cwd), &env)
+                            .map(|_| ())
+                            .map_err(|e| format!("relaunch failed: {e}"))
+                    }),
+            };
+            if let Err(e) = outcome {
+                error = Some(e);
+            }
+        }
+        let outcome = runner.outcome(&member.instance_id);
+        let (state, exit_code, unread) = outcome.unwrap_or((RunState::Idle, None, false));
+        rows.push(CommandGroupMemberRun {
+            command_id: member.command_id.clone(),
+            instance_id: member.instance_id.clone(),
+            name: member.name.clone(),
+            was_running: *was_running,
+            acted: *acted,
+            state: state.as_db_str().to_string(),
+            exit_code: if matches!(state, RunState::Success | RunState::Error) {
+                exit_code
+            } else {
+                None
+            },
+            unread,
+            error,
+        });
+    }
+
+    let running = rows.iter().filter(|r| r.state == "running").count();
+    let total = rows.len();
+    Ok(CommandGroupRun {
+        group_id: group_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        action: action.as_str().to_string(),
+        members: rows,
+        running,
+        total,
+    })
+}
+
 /// Best-effort graceful tree kill: SIGTERM the group, wait up to [`TERM_GRACE`]
 /// for it to drain, then SIGKILL. On platforms without a group signal this
 /// degrades to the parent-only killer inside [`KillHandle::kill_tree`].
@@ -3870,5 +4158,293 @@ mod tests {
             !runner.begin_shutdown(),
             "begin_shutdown latches: the destroy event must not re-run the reap"
         );
+    }
+
+    // --- THE GROUP-WIDE LIFECYCLE (finding 01M11XVEFEQ524XRT9ARPQFGSV) ---------------------
+    //
+    // The rule is written ONCE (`command_group_selection`) and driven once
+    // (`run_command_group`); these tests hold both halves. The pure rule is asserted on every OS —
+    // it is arithmetic over a snapshot, not a process — while the two tests that need a real
+    // process are `not(windows)` like every other spawning test in this module.
+
+    /// Seed a project rooted at `ws_path` with one template per entry of `commands`, group ALL of
+    /// them, and return `(workspace_id, group_id, instance_ids in DISPOSITION order)`.
+    fn seed_command_group(
+        db: &Db,
+        ws_path: &str,
+        commands: &[&str],
+    ) -> (String, String, Vec<String>) {
+        db.with_conn(|c| {
+            let (project, workspace) = db::create_project(c, "p", ws_path, None).unwrap();
+            let template_ids: Vec<String> = commands
+                .iter()
+                .enumerate()
+                .map(|(i, cmdline)| {
+                    db::create_template(
+                        c,
+                        &project.id,
+                        &format!("svc{i}"),
+                        cmdline,
+                        None,
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .id
+                })
+                .collect();
+            let group = db::create_command_group(c, &project.id, &template_ids).unwrap();
+            let instances = db::list_instances_for_workspace(c, &workspace.id).unwrap();
+            let instance_ids = group
+                .command_ids
+                .iter()
+                .map(|command_id| {
+                    instances
+                        .iter()
+                        .find(|i| &i.command_id == command_id)
+                        .unwrap()
+                        .id
+                        .clone()
+                })
+                .collect();
+            (workspace.id, group.id, instance_ids)
+        })
+    }
+
+    /// THE RULE, ASSERTED WHERE IT IS WRITTEN. `play` skips the members that are already up —
+    /// that single line is the whole of « play … ne démarre que ceux qui ne sont pas démarrés » —
+    /// while `stop` and `restart` address every member. Written here and nowhere else, so the
+    /// renderer's sidebar and the agent's MCP call cannot ship two different semantics.
+    #[test]
+    fn command_group_selection_is_the_rule_and_it_is_written_once() {
+        let divergent = [true, false, true, false];
+
+        assert_eq!(
+            command_group_selection(CommandGroupAction::Start, &divergent),
+            vec![false, true, false, true],
+            "play acts ONLY on the members that are not running"
+        );
+        assert_eq!(
+            command_group_selection(CommandGroupAction::Stop, &divergent),
+            vec![true, true, true, true],
+            "stop addresses every member (it is idempotent on the idle ones)"
+        );
+        assert_eq!(
+            command_group_selection(CommandGroupAction::Relaunch, &divergent),
+            vec![true, true, true, true],
+            "restart re-spawns the active AND starts the inactive: everyone is addressed"
+        );
+
+        // A group where everything is already up: play has nothing to do at all. This is the
+        // state in which the button is disabled — the availability rule and the effect rule are
+        // the SAME predicate, read twice.
+        assert_eq!(
+            command_group_selection(CommandGroupAction::Start, &[true, true]),
+            vec![false, false]
+        );
+        // …and one where nothing is: play starts all of them.
+        assert_eq!(
+            command_group_selection(CommandGroupAction::Start, &[false, false]),
+            vec![true, true]
+        );
+    }
+
+    /// THE PAIR `(group, workspace)` IS RESOLVED, AND A MEANINGLESS ONE IS REFUSED rather than
+    /// silently answering "0 members". Also pins the answer shape the two surfaces both serve:
+    /// one row per member in DISPOSITION order, plus the `running`/`total` aggregate the group's
+    /// head reads. Uses `Stop` so nothing is spawned — the resolution is the subject here.
+    #[test]
+    fn run_command_group_resolves_the_pair_and_refuses_a_meaningless_one() {
+        let db = Db::in_memory();
+        let sink = Arc::new(MockSink::default());
+        let runner = CommandRunner::new(Arc::clone(&sink), small_size());
+        let (workspace_id, group_id, instance_ids) =
+            seed_command_group(&db, ".", &["sleep 30", "sleep 30", "sleep 30"]);
+
+        let run = run_command_group(
+            &db,
+            &runner,
+            &group_id,
+            &workspace_id,
+            CommandGroupAction::Stop,
+        )
+        .expect("the pair resolves");
+        assert_eq!(run.action, "stop");
+        assert_eq!(run.total, 3);
+        assert_eq!(run.running, 0, "nothing was started, so nothing is running");
+        assert_eq!(
+            run.members
+                .iter()
+                .map(|m| m.instance_id.clone())
+                .collect::<Vec<_>>(),
+            instance_ids,
+            "the members come back in DISPOSITION order, not in id order"
+        );
+        assert!(
+            run.members.iter().all(|m| m.error.is_none()),
+            "a stop on idle members is a clean no-op: {:?}",
+            run.members
+        );
+        assert!(run.members.iter().all(|m| !m.was_running));
+
+        // An unknown group, and an unknown workspace, are REFUSED by name.
+        assert!(matches!(
+            run_command_group(
+                &db,
+                &runner,
+                "nope",
+                &workspace_id,
+                CommandGroupAction::Stop
+            ),
+            Err(CommandGroupRunError::GroupNotFound { .. })
+        ));
+        assert!(matches!(
+            run_command_group(&db, &runner, &group_id, "nope", CommandGroupAction::Stop),
+            Err(CommandGroupRunError::WorkspaceNotFound { .. })
+        ));
+
+        // A REAL workspace of ANOTHER project is the interesting refusal: the members resolve to
+        // nothing, and answering "0 members, all good" would hide the caller's mistake.
+        let other_ws = db.with_conn(|c| {
+            db::create_project(c, "other", "./other-project", None)
+                .unwrap()
+                .1
+                .id
+        });
+        assert!(matches!(
+            run_command_group(&db, &runner, &group_id, &other_ws, CommandGroupAction::Stop),
+            Err(CommandGroupRunError::WorkspaceOutsideProject { .. })
+        ));
+    }
+
+    /// PLAY DOES NOT TOUCH WHAT IS ALREADY RUNNING — the criterion, on real processes.
+    ///
+    /// The assertion is not just `acted == false`: the already-running member's LIVE OUTPUT is
+    /// read before and after the group play and must be UNCHANGED. A restart would have archived
+    /// and cleared that buffer and re-emitted the marker, so this catches a "play that quietly
+    /// relaunches" that an `acted` flag alone would not.
+    #[test]
+    #[cfg(not(windows))]
+    fn play_starts_only_the_members_that_are_not_running() {
+        with_posix_shell();
+        let db = Db::in_memory();
+        let sink = Arc::new(MockSink::default());
+        let runner = CommandRunner::new(Arc::clone(&sink), small_size());
+        let (workspace_id, group_id, ids) = seed_command_group(
+            &db,
+            ".",
+            &["echo MARK_A; sleep 30", "echo MARK_B; sleep 30"],
+        );
+
+        // The FIRST member is already up when the group play arrives — the divergent state the
+        // criterion asks for.
+        runner
+            .start(&ids[0], "echo MARK_A; sleep 30", Some("."))
+            .expect("pre-start the first member");
+        assert!(wait_state(
+            &runner,
+            &ids[0],
+            RunState::Running,
+            Duration::from_secs(4)
+        ));
+        let before = sink.output_of(&ids[0]);
+        assert!(before.contains("MARK_A"), "the first member really ran");
+
+        let run = run_command_group(
+            &db,
+            &runner,
+            &group_id,
+            &workspace_id,
+            CommandGroupAction::Start,
+        )
+        .expect("play the group");
+
+        assert!(
+            run.members[0].was_running && !run.members[0].acted,
+            "the running member was SKIPPED, not restarted: {:?}",
+            run.members[0]
+        );
+        assert!(
+            !run.members[1].was_running && run.members[1].acted,
+            "the idle member was started: {:?}",
+            run.members[1]
+        );
+        assert!(wait_state(
+            &runner,
+            &ids[1],
+            RunState::Running,
+            Duration::from_secs(4)
+        ));
+        assert_eq!(
+            runner.state_of(&ids[0]),
+            RunState::Running,
+            "the member that was already up is STILL up — not interrupted"
+        );
+        assert_eq!(
+            sink.output_of(&ids[0]),
+            before,
+            "…and its output buffer was neither cleared nor re-emitted, which a relaunch would do"
+        );
+
+        runner.stop(&ids[0]).ok();
+        runner.stop(&ids[1]).ok();
+    }
+
+    /// RESTART ENDS WITH EVERYTHING ACTIVE: the running member is re-spawned and the idle one is
+    /// started. The re-spawn is visible in the OUTPUT — the buffer is archived and the marker is
+    /// printed by a FRESH process — which is what tells a restart apart from a play.
+    #[test]
+    #[cfg(not(windows))]
+    fn restart_respawns_the_active_and_starts_the_inactive() {
+        with_posix_shell();
+        let db = Db::in_memory();
+        let sink = Arc::new(MockSink::default());
+        let runner = CommandRunner::new(Arc::clone(&sink), small_size());
+        let (workspace_id, group_id, ids) = seed_command_group(
+            &db,
+            ".",
+            &["echo MARK_A; sleep 30", "echo MARK_B; sleep 30"],
+        );
+
+        runner
+            .start(&ids[0], "echo MARK_A; sleep 30", Some("."))
+            .expect("pre-start the first member");
+        assert!(wait_state(
+            &runner,
+            &ids[0],
+            RunState::Running,
+            Duration::from_secs(4)
+        ));
+
+        let run = run_command_group(
+            &db,
+            &runner,
+            &group_id,
+            &workspace_id,
+            CommandGroupAction::Relaunch,
+        )
+        .expect("restart the group");
+        assert!(
+            run.members.iter().all(|m| m.acted),
+            "restart addresses EVERY member: {:?}",
+            run.members
+        );
+        assert!(
+            run.members[0].was_running && !run.members[1].was_running,
+            "the snapshot recorded the divergent state it started from"
+        );
+
+        for id in &ids {
+            assert!(
+                wait_state(&runner, id, RunState::Running, Duration::from_secs(4)),
+                "after a restart every member is active"
+            );
+        }
+        // The re-spawn is factual: the marker was printed AGAIN, by a new process, after the
+        // archive cleared the buffer.
+        assert!(sink.output_of(&ids[0]).contains("MARK_A"));
+        assert!(sink.output_of(&ids[1]).contains("MARK_B"));
+
+        runner.stop(&ids[0]).ok();
+        runner.stop(&ids[1]).ok();
     }
 }

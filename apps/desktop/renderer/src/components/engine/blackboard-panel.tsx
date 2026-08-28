@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { LayersIcon } from "lucide-react";
 
-import { StatusDot, type RunState } from "@/components/terminals/status-dot";
+import { StatusDot, type RunState } from "@/components/ui/status-dot";
 import { SectionPanel } from "@/components/ui/section-panel";
 import type { EngineWorkflowRun } from "@/bridge";
 

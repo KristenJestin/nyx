@@ -932,6 +932,80 @@ export type BackendCommand =
   | "command_source_refresh"
   | "command_resync_source"
   | "command_unlink_source"
+  // The ORDER OF THE COMMAND LIST — `{ ids }`, the project's command template ids in their new
+  // order, exactly like the terminals' `reorder` and `projects_reorder` (review
+  // 01M11WE6H9E5D5FCS6RT0ZXAXN). Nothing could write it before: the list simply kept creation
+  // order, which is why a drag that takes a command OUT of a group could not leave it where it
+  // was dropped — it fell back to its "natural" position. Broadcasts `commands://changed`; the
+  // agent's half is the MCP `reorder_commands` tool, over the same `db::reorder_templates`.
+  | "command_reorder"
+  // managed-command GROUPS (the multi-pane grouping of commands). Unlike a TERMINAL group — a
+  // per-machine view preference that lives in the renderer's `localStorage` — a command group is
+  // DB state (`managed_command_groups`): the review that asked for it also requires an AGENT to
+  // drive the very same operations over MCP (`manage_command_group`), and the sidecar cannot see
+  // `localStorage`. Both surfaces therefore call the SAME `db::` transitions, and every mutation
+  // broadcasts `commands://changed` so a hand edit and an agent edit repaint identically.
+  //   `command_group_list`     `{ projectId }`               → the project's groups, members in
+  //                                                            DISPOSITION order.
+  //   `command_group_create`   `{ projectId, commandIds }`   → a group from ≥2 commands.
+  //   `command_group_add`      `{ groupId, commandId }`      → append a member.
+  //   `command_group_remove`   `{ commandId }`               → take a command out (its group
+  //                                                            DISSOLVES if one member is left).
+  //   `command_group_dissolve` `{ groupId }`                 → every member becomes solo.
+  //   `command_group_labels`   `{ groupId, name?, color? }`  → an ABSENT key leaves the label
+  //                                                            alone; an explicit `null` clears it.
+  //   `command_group_layout`   `{ groupId, commandIds }`     → the ordered member list — WHICH
+  //                                                            member goes where.
+  //   `command_group_shape`    `{ groupId, shape }`          → the TILING SHAPE the members are
+  //                                                            poured into — WHAT the grid looks
+  //                                                            like. `auto` | `row` | `column` |
+  //                                                            `grid` | `main-left` | `main-top`,
+  //                                                            `auto` being the shape derived from
+  //                                                            the member count (the behaviour of
+  //                                                            before, and the default). It is a
+  //                                                            LABEL, not a second layout record:
+  //                                                            the pane tree is still DERIVED, now
+  //                                                            from (ordered members + shape).
+  //                                                            Separate from `command_group_layout`
+  //                                                            because a re-order and a re-shape
+  //                                                            are two edits, and one route could
+  //                                                            not tell them apart.
+  // Each of the seven above returns the affected group (or `null` where there is none left) and
+  // broadcasts `commands://changed`.
+  | "command_group_list"
+  | "command_group_create"
+  | "command_group_add"
+  | "command_group_remove"
+  | "command_group_dissolve"
+  | "command_group_labels"
+  | "command_group_layout"
+  | "command_group_shape"
+  // The GROUP-WIDE LIFECYCLE (review 01M11WE6H9E5D5FCS6RT0ZXAXN): play / stop / restart on every
+  // member of a command group at once. `{ groupId, workspaceId }` — and the PAIR is the point: a
+  // group holds command TEMPLATES (project-scoped) while running them drives `command_instances`
+  // (workspace-scoped), which is why these controls belong to the SIDEBAR and not to the
+  // project-settings modal, which knows no workspace.
+  //   `command_group_start`    → starts ONLY the members that are not already running; a member
+  //                              already up is left strictly alone, neither restarted nor
+  //                              interrupted.
+  //   `command_group_stop`     → stops every member (idempotent on the idle ones).
+  //   `command_group_relaunch` → re-spawns the active members AND starts the inactive ones, so the
+  //                              group ends fully active. The plan is computed from ONE snapshot
+  //                              taken before anything runs — simultaneous, not one-after-another.
+  // Each returns `{ group_id, workspace_id, action, members[], running, total }`: one entry per
+  // member in disposition order carrying the SAME `{ instance_id, state, running, finished,
+  // exit_code, unread }` a single-command call returns, plus `command_id`, `name`, `was_running`,
+  // `acted` (false on a member a play deliberately skipped) and a per-member `error` — a member
+  // that fails is reported on its own row and never aborts the others. `running`/`total` is the
+  // `n/m` aggregate the group's head reads.
+  //
+  // The RULE lives in `nyx_core::command::run_command_group` and is written ONCE: the MCP tools
+  // (`start_command`/`stop_command`/`relaunch_command` given `group_id` + `workspace_id`) call the
+  // very same function, so a click and an agent call cannot drift. These routes broadcast nothing
+  // of their own — the runner's sink already pushes `commands://changed` per member transition.
+  | "command_group_start"
+  | "command_group_stop"
+  | "command_group_relaunch"
   // agents
   | "agent_active_sessions"
   | "agent_close_warnings"

@@ -67,6 +67,18 @@ Ordre d'arrêt : bloquer les nouvelles mutations, snapshotter l'état restaurabl
 
 Le sidecar n'est pas un daemon : il est lié à la durée de vie de l'application. La fermeture du pipe parent déclenche son arrêt. Sur Windows, les processus sont placés dans un Job Object ; sur Linux, parent-death signal et process groups ; sur macOS, surveillance du parent et process groups. Le sidecar reste responsable de tuer et récolter ses descendants.
 
+## Migrations SQLite
+
+**Toute nouvelle migration de `crates/nyx-core/migrations/` porte un préfixe horodaté UTC** — `YYYYMMDDHHMMSS_nom`, la convention de `diesel migration generate` — et **jamais** le numéro suivant de la lignée historique `000000000000NN`, gelée à `00000000000051`.
+
+> La lignée a été gelée à `00000000000049` par `feature/tiling-panes`, puis rouverte de deux crans au merge : `v2` avait déjà miné et **appliqué sur des bases réelles** `00000000000050_annexes_url_unique` et `00000000000051_annexes_url_canonical`. Les renommer aurait rendu leurs lignes de ledger étrangères et fait **rejouer** un `CREATE UNIQUE INDEX` non idempotent — donc un `Db::open` en échec et un nyx qui refuse de démarrer. Ces deux numéros ne sont revendiqués par aucune autre branche : les grand-pérenniser ne collisionne avec rien, et la règle continue de refuser `00000000000052_*`.
+
+**Pourquoi.** Diesel identifie une migration appliquée par le **seul préfixe numérique** de son répertoire ; le libellé qui suit n'est jamais stocké. Deux worktrees frères du dépôt qui minent chacun « la migration suivante » `00000000000052_*` et bootent contre la **même** base `%APPDATA%/nyx-v2/nyx.db` produisent donc une **collision silencieuse** : le premier à s'exécuter écrit la ligne du ledger, le second est déclaré déjà appliqué et n'est jamais exécuté — `pending_migrations()` vide, boot qui se déclare vert, tables absentes. Le cas a été payé une fois sur la base réelle d'un utilisateur (`no such table: managed_command_groups`). Un horodatage ne peut pas entrer en collision avec une lignée séquentielle et trie après elle : il devient la tête, et aucune branche sœur ne peut le dupliquer.
+
+**Conséquence à connaître.** Un préfixe daté trie **au-dessus** de toute la lignée `000000000000NN` : il devient la tête des migrations. Un test qui remonte le schéma « N fois » compte donc faux dès la migration suivante — les chaînes de revert de `crates/nyx-core/src/db.rs` prennent un plancher **nommé** (`peel_migrations_above` / `revert_down_through`), jamais un compte.
+
+**Où c'est écrit et tenu.** Le détail de l'incident mesuré est dans `crates/nyx-core/migrations/20260819140000_create_command_groups/up.sql`. La règle est **exécutoire** : `db::tests::every_migration_added_after_the_frozen_lineage_is_dated_not_numbered` refuse tout répertoire qui prolonge la lignée numérotée. Au boot, `SchemaHealth::boot_report` refuse de conclure au succès quand une migration est en attente et **nomme** les versions du ledger que ce build n'embarque pas (`foreign_ledger_versions`), seule trace que cette panne laisse derrière elle.
+
 ## Crash et reprise
 
 Un crash backend ne déclenche jamais une relance aveugle des services. Electron peut redémarrer le sidecar une fois, rouvrir SQLite et reconstruire l'état persisté. Les opérations mutantes portent une clé d'idempotence ; les états `running` devenus invérifiables passent à `unknown` ou `interrupted`. L'utilisateur choisit ensuite ce qui doit être repris.

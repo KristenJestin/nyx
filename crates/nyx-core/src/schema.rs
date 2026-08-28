@@ -235,6 +235,43 @@ diesel::table! {
         source_script_command_snapshot -> Nullable<Text>,
         package_manager -> Nullable<Text>,
         env -> Nullable<Text>,
+        // MEMBERSHIP + POSITION in a `managed_command_groups` row (migration
+        // `20260819140000_create_command_groups`). `group_id` NULL = the command is SOLO; the FK
+        // is ON DELETE SET NULL, so dissolving a group RELEASES its members instead of deleting
+        // them. `group_order` is the member's position INSIDE its group and is the whole
+        // DISPOSITION model — the pane tree is DERIVED from the ordered member list, so
+        // re-ordering the members IS re-arranging the panes. Meaningless (and left at its 0
+        // default) for a command with no group. Appended LAST, after `env`, to match the ALTER
+        // order of the migration.
+        group_id -> Nullable<Text>,
+        group_order -> Integer,
+    }
+}
+
+diesel::table! {
+    /// The multi-pane GROUPING of managed commands (migration
+    /// `20260819140000_create_command_groups`). A group is an IDENTITY plus two OPTIONAL labels:
+    /// `name` NULL = unnamed, `color` NULL = uncoloured — both are the DEFAULT and neither
+    /// conditions the group's existence. `color` is the 1-based index of a `--group-N` design
+    /// token, CHECKed to 1..=6 in SQL so an out-of-range value is refused at the boundary.
+    ///
+    /// It is DB state and not a renderer preference — unlike a TERMINAL group, which lives in
+    /// `localStorage` — because the review that asked for it requires an AGENT to drive the same
+    /// operations over MCP, and the sidecar cannot see `localStorage`.
+    managed_command_groups (id) {
+        id -> Text,
+        project_id -> Text,
+        name -> Nullable<Text>,
+        color -> Nullable<Integer>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+        /// The group's TILING SHAPE (migration
+        /// `20260827120000_command_groups_layout_shape`): a LABEL, not a second layout record —
+        /// the pane tree stays DERIVED, now from (ordered members + this label). Six closed
+        /// values, CHECKed in SQL: `auto` (the derived shape of before, and the DEFAULT), `row`,
+        /// `column`, `grid`, `main-left`, `main-top`. Appended LAST, after `updated_at`, to match
+        /// the ALTER order of the migration.
+        layout_shape -> Text,
     }
 }
 
@@ -954,6 +991,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     human_turns,
     idea_specs,
     ideas,
+    managed_command_groups,
     managed_commands,
     nodes,
     projects,

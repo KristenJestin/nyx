@@ -3,6 +3,7 @@ import { ChevronRightIcon } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
+import { OVERLAY_SURFACE_Z } from "@/components/panes/pane-geometry";
 import { Badge } from "@/components/ui/badge";
 import { Spinner } from "@/components/ui/spinner";
 
@@ -266,7 +267,11 @@ export function SpecRailOverlay({ spec }: { spec: Spec }) {
       animate="animate"
       exit="exit"
       transition={overlayMotionTransition(reduced)}
-      className="pointer-events-none absolute inset-y-0 right-0 z-20 flex items-stretch justify-end"
+      // The stack order is {@link OVERLAY_SURFACE_Z}, not a literal — same three-way contract as
+      // the tiroir's surface: above the separator band it overlaps at the pane's right edge, below
+      // the pane control cluster.
+      style={{ zIndex: OVERLAY_SURFACE_Z }}
+      className="pointer-events-none absolute inset-y-0 right-0 flex items-stretch justify-end"
     >
       {/* The closed languette sits to the LEFT of the panel and STAYS mounted when open — it FUSES
           with the panel (shared surface, no shared border) and becomes its close HANDLE.

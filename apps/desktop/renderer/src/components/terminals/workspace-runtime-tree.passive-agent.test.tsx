@@ -8,7 +8,7 @@ import type {
   WorkspaceRuntimeSession,
   WorkspaceRuntimeSnapshot,
   WorkspaceRuntimeTerminal,
-} from "./use-workspace-runtime";
+} from "@/components/runtime/use-workspace-runtime";
 
 /**
  * PROVIDER-AGNOSTIC passive adoption (v2.5.5 review T3). We mock `agent-providers` with a GENERIC

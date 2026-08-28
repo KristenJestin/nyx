@@ -15,7 +15,7 @@ import type {
   WorkspaceRuntimeSession,
   WorkspaceRuntimeSnapshot,
   WorkspaceRuntimeTerminal,
-} from "./use-workspace-runtime";
+} from "@/components/runtime/use-workspace-runtime";
 
 function session(id: string, state: string): WorkspaceRuntimeSession {
   return {
@@ -45,6 +45,7 @@ function terminal(overrides: Partial<WorkspaceRuntimeTerminal> = {}): WorkspaceR
 function service(overrides: Partial<WorkspaceRuntimeService> = {}): WorkspaceRuntimeService {
   return {
     id: "s1",
+    command_id: "c1",
     workspace_id: "ws1",
     name: "dev",
     command: "npm run dev",

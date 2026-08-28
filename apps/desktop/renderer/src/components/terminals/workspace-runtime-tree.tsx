@@ -1,17 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import {
-  PencilIcon,
-  PlusIcon,
-  ServerCogIcon,
-  Settings2Icon,
-  SquareTerminalIcon,
-  XIcon,
-} from "lucide-react";
+import { PencilIcon, PlusIcon, Settings2Icon, XIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip } from "@/components/ui/tooltip";
 import { CommandControls } from "@/components/command/command-controls";
+import { CommandGroupControls } from "@/components/command/command-group-controls";
+import { commandGroupTally } from "@/components/command/use-command-group-run";
+import { useCommandGroupsContext } from "@/components/command/command-groups-context";
+import type { CommandGroup } from "@/components/command/use-command-groups";
 import { agentProviderFor } from "@/components/sidebar/agent-providers";
 import type { AgentActivity } from "@/components/sidebar/use-agent-sessions";
 import { useRenameTerminal } from "@/components/sidebar/use-terminal-rename";
@@ -20,6 +17,8 @@ import {
   formatCpuPct,
   useTerminalStatsFor,
 } from "@/components/sidebar/use-terminal-stats";
+import { GroupBlock } from "@/components/panes/group-block";
+import { groupLabel } from "@/components/panes/pane-groups";
 import { RuntimeRow } from "./runtime-row";
 import { useCloseTerminal } from "./use-terminal-close";
 import { SortableTerminalRows } from "./sortable-terminal-rows";
@@ -27,9 +26,19 @@ import { RuntimeSection, RuntimeSectionList } from "./runtime-section";
 import {
   activeAgentSession,
   notifiedRunState,
+  serviceRollupState,
   serviceRunState,
   terminalLineState,
+  terminalRollupState,
 } from "./runtime-state";
+import {
+  LINE_FAMILY_ICON,
+  LINE_GLYPH_SIZE,
+  SidebarLineFamilyGlyph,
+} from "@/components/ui/sidebar-line";
+import { useGroupFolds } from "@/components/panes/use-group-folds";
+import { aggregateState } from "@/components/ui/status-dot";
+import { loadGroupOpen, saveGroupOpen } from "./ui-persistence";
 import { useRuntimeSelection } from "./runtime-selection";
 import { useConsumedNotifications } from "./use-consumed-notifications";
 import { useMarkReadOnActive } from "./use-mark-read";
@@ -37,7 +46,7 @@ import type {
   WorkspaceRuntimeService,
   WorkspaceRuntimeSnapshot,
   WorkspaceRuntimeTerminal,
-} from "./use-workspace-runtime";
+} from "@/components/runtime/use-workspace-runtime";
 
 /**
  * `<WorkspaceRuntimeTree>` — a single workspace's runtime tree: its live terminals and its
@@ -77,6 +86,12 @@ export function WorkspaceRuntimeTree({
   agentActivity?: (terminalId: string) => AgentActivity | undefined;
 }) {
   const { terminals, services } = snapshot;
+  // A CLOSED FOLDER HIDES ITS MEMBERS' DOTS, so it has to carry their aggregate — and the aggregate
+  // has to be the one the workspace accordion already computes over the very same terminals, or the
+  // two dots on screen would disagree. `terminalRollupState` is that projection, exported for this
+  // (human review 01M12MW1DV1V455EWBMV048TE6); the list aggregates it per block with the shared
+  // `aggregateState`, so there is no second rollup rule anywhere.
+  const { isConsumed } = useConsumedNotifications();
   return (
     <div className="flex flex-col py-2">
       {/* (v2.5.8: the post-crash "Interrupted — Resume/Ignore" restore panel was reverted. A crash
@@ -111,6 +126,9 @@ export function WorkspaceRuntimeTree({
           renderRow={(terminal) => (
             <TerminalRow terminal={terminal} activity={agentActivity?.(terminal.id)} />
           )}
+          memberState={(terminal) =>
+            terminalRollupState(terminal, agentActivity?.(terminal.id), isConsumed)
+          }
         />
       </RuntimeSection>
 
@@ -132,14 +150,188 @@ export function WorkspaceRuntimeTree({
           ) : null
         }
       >
-        <RuntimeSectionList
-          empty="No managed commands."
-          rows={services.map((service) => (
-            <ServiceRow key={service.id} service={service} />
-          ))}
-        />
+        <CommandRows services={services} workspaceId={snapshot.workspace.id} />
       </RuntimeSection>
     </div>
+  );
+}
+
+/**
+ * THE COMMANDS LIST, WITH ITS GROUPS — the same single-list treatment the terminals get.
+ *
+ * A command that belongs to a group is drawn inside a {@link GroupBlock}, at the position of the
+ * group's first member; every other command stays a bare row. The membership is read from the
+ * project's command groups (`useCommandGroupsContext`, backed by `managed_command_groups`), and
+ * the block is the very component the terminals' list paints — same head, same colour, same name.
+ *
+ * THE SIDEBAR SHOWS A COMMAND GROUP; IT DOES NOT EDIT ONE (review finding
+ * 01M11XMQA3M852JDD7R3MDG88X). Verbatim: « pour le groupement des commandes … le 3 petits points
+ * pour les commandes c'est non. c'est ok pour les terminaux que je maîtrise, mais pour les
+ * commandes, tout se passe dans le modal pas ici. » So this block passes NEITHER `handleRef` (no
+ * grip: a block that cannot be moved must not draw a handle promising it) NOR `onOpenPanel` (no
+ * `…`, and no `<GroupPanel>` mounted behind it). WHO is in a command group, WHERE each member sits,
+ * and what the group is called or coloured are all settled in Project settings ▸ Commands
+ * (`command-catalog.tsx`), which keeps the full head.
+ *
+ * ## …AND IT PILOTS ONE (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XVEFEQ524XRT9ARPQFGSV)
+ *
+ * That finding chased COMPOSITION out of the sidebar, not the LIFECYCLE — and the lifecycle can
+ * live nowhere else. A group holds command TEMPLATES (project-scoped) while starting one drives
+ * `command_instances` (workspace-scoped): the settings modal knows no workspace, so it structurally
+ * cannot start anything. The sidebar pilots, the modal composes. The head of a command group
+ * therefore carries what the modal cannot offer — an aggregate dot, an `n/m` counter and
+ * play / stop / restart over every member at once — and still offers no way to change the grouping.
+ *
+ * The TERMINAL blocks of `sortable-terminal-rows.tsx` are the other family, and the two heads are
+ * each other's inverse ON PURPOSE: grip + `…` there (composition, which happens at the pointer in
+ * this very sidebar), dot + `n/m` + controls here (piloting, which happens per workspace and only
+ * here). Neither half is decoration — each is the operation that has nowhere else to go.
+ */
+function CommandRows({
+  services,
+  workspaceId,
+}: {
+  services: readonly WorkspaceRuntimeService[];
+  /** The workspace these instances belong to — a group's lifecycle has no meaning without it. */
+  workspaceId: string;
+}) {
+  const controller = useCommandGroupsContext();
+
+  // The block partition, by the SAME rule as the terminals': a group takes the place of its first
+  // member and gathers the others; a group with a single member here stays a bare row.
+  const placed = new Set<string>();
+  const blocks: Array<{ group: CommandGroup | null; items: WorkspaceRuntimeService[] }> = [];
+  for (const service of services) {
+    if (placed.has(service.id)) continue;
+    const group = controller.groupOf(service.command_id);
+    if (group == null) {
+      placed.add(service.id);
+      blocks.push({ group: null, items: [service] });
+      continue;
+    }
+    const members = services.filter(
+      (candidate) =>
+        !placed.has(candidate.id) && controller.groupOf(candidate.command_id)?.id === group.id,
+    );
+    for (const member of members) placed.add(member.id);
+    if (members.length < 2) {
+      for (const member of members) blocks.push({ group: null, items: [member] });
+      continue;
+    }
+    blocks.push({ group, items: members });
+  }
+
+  return (
+    <>
+      <RuntimeSectionList
+        empty="No managed commands."
+        rows={blocks.map((block) =>
+          block.group == null ? (
+            <ServiceRow key={block.items[0].id} service={block.items[0]} />
+          ) : (
+            <CommandGroupBlock
+              key={block.group.id}
+              group={block.group}
+              index={controller.groups.findIndex((g) => g.id === block.group!.id)}
+              members={block.items}
+              workspaceId={workspaceId}
+            />
+          ),
+        )}
+      />
+    </>
+  );
+}
+
+/**
+ * ONE COMMAND GROUP IN THE SIDEBAR — the shared {@link GroupBlock} with a PILOTING head.
+ *
+ * NO `handleRef` and NO `onOpenPanel`: composing a command group is the modal's job (finding
+ * 01M11XMQA3M852JDD7R3MDG88X). What the head gets instead is the half that only exists here — the
+ * aggregate over THIS workspace's instances, and the three controls acting on all of them at once.
+ *
+ * The `n/m` is a CLIENT-SIDE JOIN and needs no route of its own: the runtime snapshot's services
+ * each carry their `command_id` and their `run_state`, and the group carries its member template
+ * ids, so the aggregate is `commandGroupTally` over the members actually materialised in this
+ * workspace. `total` is therefore what is RUNNABLE here, which is exactly what the buttons act on —
+ * a member with no instance in this workspace is not a member the play could start.
+ *
+ * ## THE COUNTER LEFT THE HEAD; THE TALLY DID NOT LEAVE THE CODE
+ *
+ * Human review 01M12MW1DV1V455EWBMV048TE6: « la tête porte un état, jamais un nombre ». So the
+ * `n/m` badge is gone from the sidebar — and `commandGroupTally` is still called on every render,
+ * because the three buttons read `canStart`/`canStop`/`canRelaunch` off it. Only its DISPLAY fell.
+ *
+ * What the counter was doing that a dot cannot — making a DIVERGENT group legible without inventing
+ * a fifth `ExecState` — comes back as the folder's hover SUMMARY. It is the assumed trade: "2 of 3
+ * running" moved from a glance to a hover, and it costs the head zero pixels.
+ *
+ * THE DOT ITSELF IS NOT `tally.state`. The rollup is `aggregateState` over the members' own
+ * notification-aware row states — the SAME function and the SAME per-leaf projection the workspace
+ * accordion and the terminal folders use. That matters here rather than being tidy: `tally.state`
+ * lets anything running dominate, so a group with one member running and one FAILED would show blue
+ * and the mockup's own promise for a closed folder (« le dot rouge dit qu'il y a un problème sans
+ * qu'on l'ouvre ») would be false. Going through `aggregateState` also gives the folder
+ * `isQuietState` for free, which is what makes an idle group draw no dot at all.
+ */
+function CommandGroupBlock({
+  group,
+  index,
+  members,
+  workspaceId,
+}: {
+  group: CommandGroup;
+  /** The group's rank in the project's list — how an UNNAMED group is designated. */
+  index: number;
+  members: readonly WorkspaceRuntimeService[];
+  workspaceId: string;
+}) {
+  const { isConsumed } = useConsumedNotifications();
+  const { select, isSelected } = useRuntimeSelection();
+  const tally = commandGroupTally(members.map((service) => serviceRunState(service)));
+  const label = groupLabel(group, Math.max(index, 0));
+  // CLOSED BY DEFAULT, and only the first time (`useGroupFolds` persists the group's own choice from
+  // its first fold on): a group of commands is a launcher you press, not a workspace you watch —
+  // four commands cost ONE line folded where they cost five unfolded.
+  const folds = useGroupFolds({ defaultOpen: false, load: loadGroupOpen, save: saveGroupOpen });
+  const rollup = aggregateState(members.map((service) => serviceRollupState(service, isConsumed)));
+  /**
+   * THE FOLDER IS THE SELECTION (human review 01M14112THEB4094B2G614SXR5) — « pour les commandes y a
+   * pas de notion de focus, c'est trop chelou que je doive cliquer que un des 3 pour avoir le 3 ».
+   * The group is selected AS A GROUP, so `<RuntimePaneHost>` shows the whole disposition without any
+   * member having to be the viewed one. And because folding closes nothing, a folder can be CLOSED
+   * and ACTIVE at once: it then wears its selected fill and its rollup dot together.
+   */
+  const selection = { kind: "command-group", id: group.id, workspaceId } as const;
+  const groupViewed = isSelected(selection);
+  return (
+    <GroupBlock
+      groupId={group.id}
+      color={group.color}
+      name={group.name}
+      open={folds.isOpen(group.id)}
+      onToggle={() => folds.toggle(group.id)}
+      onSelect={() => select(selection)}
+      selected={groupViewed}
+      rollup={rollup}
+      summary={`${tally.running} of ${tally.total} running in ${label}`}
+      actions={
+        <CommandGroupControls
+          groupId={group.id}
+          workspaceId={workspaceId}
+          groupLabel={label}
+          tally={tally}
+        />
+      }
+    >
+      {members.map((service) => (
+        // A MEMBER IS VIEWED WHEN ITS GROUP IS. The panes of the whole group are on screen, so the
+        // Attention Inbox has been answered for each of them — without this a command could be
+        // watched running and keep its unread dot forever, since the folder is now a way to look at
+        // it that never selects it.
+        <ServiceRow key={service.id} service={service} viewedByGroup={groupViewed} />
+      ))}
+    </GroupBlock>
   );
 }
 
@@ -186,7 +378,7 @@ export function TerminalRow({
   // through the SAME provider-agnostic `agentProviderFor` resolver — no `claude` hardcode.
   const providerKind = liveSession?.agent_kind ?? terminal.detected_agent_kind ?? undefined;
   const provider = agentProviderFor(providerKind);
-  const Icon = provider?.icon ?? SquareTerminalIcon;
+  const Icon = provider?.icon ?? LINE_FAMILY_ICON.terminal;
   const label = terminal.label ?? terminal.cwd;
 
   // AGENT MODE as soon as the line CARRIES an agent glyph — i.e. `providerKind` is defined (a live
@@ -259,7 +451,7 @@ export function TerminalRow({
   return (
     <RuntimeRow
       selection={selection}
-      icon={<Icon className="size-4" />}
+      icon={<Icon className={LINE_GLYPH_SIZE} />}
       label={label}
       state={dotState}
       tooltip={statsTooltip}
@@ -341,7 +533,18 @@ export function TerminalRow({
 }
 
 /** A managed-command service row, with the shared start/stop/relaunch controls. */
-function ServiceRow({ service }: { service: WorkspaceRuntimeService }) {
+function ServiceRow({
+  service,
+  viewedByGroup = false,
+}: {
+  service: WorkspaceRuntimeService;
+  /**
+   * Whether this row's GROUP is the selected one — its pane is then on screen even though the row
+   * itself is not the selection (human review 01M14112THEB4094B2G614SXR5). It answers the Attention
+   * Inbox, and nothing else: the row's own selected fill still belongs to the row's own selection.
+   */
+  viewedByGroup?: boolean;
+}) {
   const { isSelected } = useRuntimeSelection();
   const { isConsumed, consume } = useConsumedNotifications();
   const selection = { kind: "service", id: service.id } as const;
@@ -352,16 +555,15 @@ function ServiceRow({ service }: { service: WorkspaceRuntimeService }) {
   // unread AND not viewed; selecting the service acknowledges it (`command_acknowledge`) + records
   // it locally. The CONTROLS keep the FACTUAL state (their own `showDot={false}`), so this only
   // governs the row's notification dot.
+  const viewed = selected || viewedByGroup;
   const unread = service.unread && !isConsumed("service", service.id);
-  useMarkReadOnActive("service", service.id, selected, unread, () =>
-    consume("service", service.id),
-  );
-  const dotState = notifiedRunState(state, unread, selected);
+  useMarkReadOnActive("service", service.id, viewed, unread, () => consume("service", service.id));
+  const dotState = notifiedRunState(state, unread, viewed);
 
   return (
     <RuntimeRow
       selection={selection}
-      icon={<ServerCogIcon className="size-4" />}
+      icon={<SidebarLineFamilyGlyph family="command" />}
       label={service.name}
       state={dotState}
       actions={

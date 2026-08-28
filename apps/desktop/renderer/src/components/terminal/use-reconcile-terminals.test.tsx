@@ -11,6 +11,13 @@ import { useReconcileTerminals } from "./use-reconcile-terminals";
  * on a mere project switch (which does not change `list_terminals`). These tests drive the store +
  * a mocked `list_terminals` and assert the dispose (`pty_close`) happens for a truly-gone terminal
  * and NOT for a terminal that merely belongs to another (still-alive) project.
+ *
+ * EVERY `waitFor` HERE MUST CARRY A REAL MATCHER. `expect(cond)` with no matcher never throws, so
+ * a `waitFor` wrapped around it returns on the FIRST poll having waited for nothing. That is how
+ * this file became intermittent: the preconditions below wait for a record's PTY to exist, the
+ * spawn defers a few macrotasks behind `awaitMeasuredBox` (see `xterm-instance.ts`), and a
+ * matcherless guard let the reconcile mount BEFORE the `ptyId` was known — `dispose()` then emitted
+ * no `pty_close` and `closes` stayed empty. Write `.toBe(true)`, never a bare `expect(...)`.
  */
 
 interface TermRow {
@@ -63,7 +70,9 @@ describe("useReconcileTerminals (app-wide global reconcile)", () => {
     // Two terminals in DIFFERENT projects, both mounted (their PTYs spawned) and both ALIVE.
     ensureTerminal({ recordId: "pA" }); // project A (the deck on screen)
     ensureTerminal({ recordId: "pB" }); // project B (its pane not currently mounted)
-    await waitFor(() => expect(getTerminal("pA")?.pty != null && getTerminal("pB")?.pty != null));
+    await waitFor(() =>
+      expect(getTerminal("pA")?.pty != null && getTerminal("pB")?.pty != null).toBe(true),
+    );
     liveRows = [
       { id: "pA", status: "alive" },
       { id: "pB", status: "alive" },
@@ -83,7 +92,9 @@ describe("useReconcileTerminals (app-wide global reconcile)", () => {
   it("disposes a terminal once it leaves the global set (closed by an agent over MCP)", async () => {
     ensureTerminal({ recordId: "pA" });
     ensureTerminal({ recordId: "pB" });
-    await waitFor(() => expect(getTerminal("pA")?.pty != null && getTerminal("pB")?.pty != null));
+    await waitFor(() =>
+      expect(getTerminal("pA")?.pty != null && getTerminal("pB")?.pty != null).toBe(true),
+    );
     liveRows = [
       { id: "pA", status: "alive" },
       { id: "pB", status: "alive" },
@@ -109,7 +120,7 @@ describe("useReconcileTerminals (app-wide global reconcile)", () => {
     // A record flipped to `closed` (the normal UI close persists `closed`) is NOT alive, so it must
     // be pruned exactly like an MCP close — the normal open/close path still frees the PTY.
     ensureTerminal({ recordId: "t1" });
-    await waitFor(() => expect(getTerminal("t1")?.pty != null));
+    await waitFor(() => expect(getTerminal("t1")?.pty != null).toBe(true));
     liveRows = [{ id: "t1", status: "alive" }];
     render(<Harness />);
     await waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(1));
@@ -124,7 +135,7 @@ describe("useReconcileTerminals (app-wide global reconcile)", () => {
 
   it("never disposes when list_terminals is unreliable (null result)", async () => {
     ensureTerminal({ recordId: "pA" });
-    await waitFor(() => expect(getTerminal("pA")?.pty != null));
+    await waitFor(() => expect(getTerminal("pA")?.pty != null).toBe(true));
     // A null (non-array) result is NOT a reliable "these are all the terminals" signal — the hook
     // must skip the reconcile rather than treat it as "everything is gone".
     liveRows = null;

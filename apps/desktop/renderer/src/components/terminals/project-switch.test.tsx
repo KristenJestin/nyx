@@ -155,7 +155,15 @@ function mountShell(initialEntry: string, initialProjectId: string | null = "p1"
   return { ...render(<RouterProvider router={router} />), router };
 }
 
-/** The deck pane of `terminalId`, once it exists. */
+/**
+ * The pane of `terminalId`, once it exists.
+ *
+ * The MAIN surface is `<PaneTreeHost>` (the tiling), not the mono-visible `<TerminalDeck>` it
+ * replaced, so "the terminal the user landed on" is spelled `data-focused="true"` — the ONE pane
+ * that takes the keyboard — where the deck had a single `data-active`. `data-visible` says whether
+ * a pane is in the tiling at all. That is the vocabulary `terminals-page.test.tsx` already reads;
+ * these tests assert the SAME landing behaviour through it.
+ */
 function pane(container: HTMLElement, terminalId: string): Element | null {
   return container.querySelector(`[data-terminal-id="${terminalId}"]`);
 }
@@ -179,9 +187,9 @@ describe("Project switch — entering a project lands on its own page", () => {
     // terminal as the ACTIVE pane — not the first one, and not anything of Alpha's.
     expect(await screen.findByText("Beta")).toBeTruthy();
     await waitFor(() =>
-      expect(pane(container, "p2-term-b")?.getAttribute("data-active")).toBe("true"),
+      expect(pane(container, "p2-term-b")?.getAttribute("data-focused")).toBe("true"),
     );
-    expect(pane(container, "p2-term-a")?.getAttribute("data-active")).toBe("false");
+    expect(pane(container, "p2-term-a")?.getAttribute("data-focused")).toBe("false");
     expect(pane(container, "p1-term")).toBeNull();
   });
 
@@ -227,9 +235,9 @@ describe("Project switch — entering a project lands on its own page", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/"));
     // Beta's remembered terminal is ACTIVE — the deck is not empty…
     await waitFor(() =>
-      expect(pane(container, "p2-term-b")?.getAttribute("data-active")).toBe("true"),
+      expect(pane(container, "p2-term-b")?.getAttribute("data-focused")).toBe("true"),
     );
-    expect(pane(container, "p2-term-a")?.getAttribute("data-active")).toBe("false");
+    expect(pane(container, "p2-term-a")?.getAttribute("data-focused")).toBe("false");
     // …and the stale deep-link of the project one left is gone from the URL.
     expect(router.state.location.search).toEqual({});
   });
@@ -247,7 +255,7 @@ describe("Project switch — entering a project lands on its own page", () => {
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/"));
     await waitFor(() =>
-      expect(pane(container, "p2-term-a")?.getAttribute("data-active")).toBe("true"),
+      expect(pane(container, "p2-term-a")?.getAttribute("data-focused")).toBe("true"),
     );
     expect(router.state.location.search).toEqual({});
   });

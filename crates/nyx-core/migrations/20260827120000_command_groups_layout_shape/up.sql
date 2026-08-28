@@ -1,0 +1,38 @@
+-- `managed_command_groups.layout_shape` — the group's TILING SHAPE, CHOSEN instead of derived from
+-- the member count alone (human review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XTRXVVPZ9XMDW5ARWKWHA).
+--
+-- ## What this reverses, and why the invariant survives
+--
+-- `20260819140000_create_command_groups/up.sql` closed on a sentence this column contradicts:
+-- "the pane tree is DERIVED from the ordered member list … There is no second layout record to
+-- keep in sync". That comment has been CORRECTED in place — read it there, not here, for the
+-- current statement. The user reopened the question because a shape derived from the member COUNT
+-- offers no "4 in a column" and no "1 big + 3 small", which is exactly what they asked for.
+--
+-- The reversal is narrow, and it is what makes it acceptable: what lands here is a LABEL, not a
+-- second layout record. No rectangle, no ratio, no per-member coordinate — nothing that could
+-- disagree with the member list, and therefore nothing to re-synchronise. The tree stays DERIVED,
+-- from (ordered members + this label) instead of (ordered members) alone. Removing or re-ordering
+-- a member re-derives the whole tree under the same label, and improving a shape's rule still
+-- migrates nothing.
+--
+-- ## The vocabulary is CLOSED, and closed in SQL
+--
+-- Six values, fixed by the user and complete: `auto` (the derived shape of before — the DEFAULT,
+-- so every existing group keeps exactly the disposition it had), `row`, `column`, `grid`,
+-- `main-left`, `main-top`. The CHECK is the boundary that refuses a seventh, the same way
+-- `color`'s CHECK refuses a seventh palette index: an unknown shape can never reach the renderer
+-- as a tree nobody knows how to build. `db.rs` mirrors the list in `COMMAND_GROUP_SHAPES`, and a
+-- test exercises that constant against this live CHECK and against the MCP `shape` enum, so the
+-- three spellings cannot drift.
+--
+-- ## Why the prefix is DATED
+--
+-- The `000000000000NN` lineage is FROZEN at `00000000000049` — two sibling worktrees each minting
+-- "the next" number against the same `%APPDATA%/nyx-v2/nyx.db` collide silently, and that was paid
+-- for once on a live DB (the incident is written up in `20260819140000_create_command_groups/up.sql`).
+-- The rule is in `docs/product/technical-architecture.md` and is enforced by
+-- `db.rs::every_migration_added_after_the_frozen_lineage_is_dated_not_numbered`.
+ALTER TABLE managed_command_groups
+    ADD COLUMN layout_shape TEXT NOT NULL DEFAULT 'auto'
+    CHECK (layout_shape IN ('auto', 'row', 'column', 'grid', 'main-left', 'main-top'));

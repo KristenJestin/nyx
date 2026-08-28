@@ -6,7 +6,7 @@ import {
   dotAppearTransition,
   dotCrossfadeTransition,
   dotExitTransition,
-} from "./dot-motion";
+} from "@/components/ui/dot-motion";
 import type { ExecState } from "./use-terminals";
 
 /**

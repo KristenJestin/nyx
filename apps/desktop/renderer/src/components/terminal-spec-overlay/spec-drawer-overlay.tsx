@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
+import { OVERLAY_SURFACE_Z } from "@/components/panes/pane-geometry";
 
 import type { Spec } from "../specs/types";
 import { OverlayTab } from "./overlay-tab";
@@ -141,7 +142,11 @@ export function SpecDrawerOverlay({ specs, live }: { specs: readonly Spec[]; liv
       animate="animate"
       exit="exit"
       transition={overlayMotionTransition(reduced)}
-      className="pointer-events-none absolute inset-y-0 right-0 z-20 flex items-stretch justify-end"
+      // The stack order is {@link OVERLAY_SURFACE_Z}, not a literal: this surface is pinned to the
+      // pane's RIGHT EDGE, which for any pane that is not the rightmost IS a separator band, and
+      // the languette has to win that overlap while still losing to the control cluster.
+      style={{ zIndex: OVERLAY_SURFACE_Z }}
+      className="pointer-events-none absolute inset-y-0 right-0 flex items-stretch justify-end"
     >
       {/* The STACK of sober tabs sits to the LEFT of the panel and STAYS as N Specs are mapped/opened
           (the open one becomes the ACTIVE fused languette — it is NOT dropped). Fixed-size tiles,

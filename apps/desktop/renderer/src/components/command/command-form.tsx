@@ -3,24 +3,42 @@ import { useId, useState } from "react";
 import { errorText } from "@/bridge";
 import { useForm } from "@tanstack/react-form";
 import { z } from "zod";
-import {
-  AlertTriangleIcon,
-  FolderIcon,
-  Link2Icon,
-  Link2OffIcon,
-  RefreshCwIcon,
-} from "lucide-react";
+import { FolderIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { pickDirectory, relativeToWorkspace } from "@/components/sidebar/folder-picker";
+import { CommandSourcePanel } from "./command-source-panel";
+import { DetailSeparator } from "./command-detail-chrome";
 import type { CommandFormValues, ManagedCommand } from "./use-commands";
+
+/**
+ * WHEN THE FIELDS ARE WRITTEN BACK.
+ *
+ *  - `submit` — the CREATION form: nothing exists yet, so there is a Create button and a Cancel.
+ *  - `blur` — the EDITION panel: every field is committed as it LOSES FOCUS, and there is no Save
+ *    button at all.
+ *
+ * The blur commit is the decision taken with the user, and it is the one `group-panel.tsx` already
+ * takes for a group's name and colour (« every edit is committed as it is made »). The reason is
+ * structural rather than stylistic: in a master/detail, a dirty form makes CHANGING THE SELECTION a
+ * trap — either the edit is silently dropped or the user is stopped by a dialog for a field they
+ * meant to abandon.
+ *
+ * THE ACCEPTED COST, stated so nobody re-litigates it: the backend REFUSES to edit a command that is
+ * running in a workspace, so a committed field can come BACK to its previous value with an error
+ * toast. The panel re-seeds from the stored template on failure, so what is on screen is always what
+ * is stored — which is the property a Save button would have bought at the price above.
+ */
+export type CommandFormCommit = "submit" | "blur";
 
 export interface CommandFormProps {
   /** When editing, the template being edited (pre-fills the fields). */
   editing?: ManagedCommand | null;
+  /** See {@link CommandFormCommit}. Defaults to `submit` (the creation form). */
+  commit?: CommandFormCommit;
   /**
    * Absolute path of the workspace the command runs in. Used to relativize the
    * folder-picker's absolute result into a workspace-relative `subfolder` (the
@@ -35,24 +53,20 @@ export interface CommandFormProps {
   /**
    * When editing a package.json-sourced command, the live on-disk script value
    * if it DRIFTED from what this command was last synced to (else `null`). Drives
-   * the passive "changed in package.json" line + the Resync target — purely
-   * informational, never an implicit rewrite.
+   * the provenance panel's warning register — purely informational, never an implicit rewrite.
    */
   driftValue?: string | null;
   /** Submit the (validated) form values. */
   onSubmit: (values: CommandFormValues) => void;
-  /** Cancel the edit/create (collapses the inline form). */
-  onCancel: () => void;
+  /** Cancel the create (collapses the form). Not offered in `blur` mode — there is nothing to cancel. */
+  onCancel?: () => void;
   /**
    * RESYNC the command to the source script's current raw body, KEEPING the link.
    * Present (rendered) only when editing a sourced command. Resolves after the
    * backend rewrite + re-list; the form is then re-seeded by the parent.
    */
   onResync?: (id: string) => Promise<void>;
-  /**
-   * UNLINK the package.json source (detach). Present only when editing a sourced
-   * command. Sits on the LEFT of the action row.
-   */
+  /** UNLINK the package.json source (detach). Present only when editing a sourced command. */
   onUnlink?: (id: string) => Promise<void>;
   /** Injectable folder picker (tests stub it instead of the Tauri plugin). */
   pick?: (title?: string) => Promise<string | null>;
@@ -75,34 +89,27 @@ const commandSchema = z.object({
 type CommandFormFields = z.input<typeof commandSchema>;
 
 /**
- * `<CommandForm>` — the create / edit body for a project command template, shown
- * INLINE IN PLACE inside the command card (no floating card above the list).
- * Fields: `name`, `command`, an OPTIONAL `subfolder` (run path relative to the
- * workspace) with a native FOLDER PICKER, and a `restart_on_startup` toggle.
+ * `<CommandForm>` — the create / edit body for a project command template, and the ONE placement
+ * of both since the master/detail refonte (finding 01M132XFZ5KY8QMJ79HZZSBV3J): the creation used
+ * to open at the top of the list and push everything down, the edition inside the card. They open
+ * in the same panel now, so the difference between them is a `commit` mode and not a second layout.
  *
- * Built on **@tanstack/react-form** with a **Zod v4** schema (`commandSchema`) as
- * the validator (review T2): the form store owns the field state + submit gate
- * (`canSubmit`), replacing the manual `useState` mirrors + the hand-rolled
- * `canSubmit` boolean. Each field is scaffolded by our `ui/field` `Field` (the
- * label/control/error wrapper, stacked or inline-split) and rendered through our
- * `ui/input` + `ui/switch` wrappers (never `@base-ui/react/*` directly). The folder
- * picker still relativizes its absolute result against the workspace and writes the
- * field via the form store.
+ * Fields: `name`, `command`, an OPTIONAL `subfolder` (run path relative to the workspace) with a
+ * native FOLDER PICKER, and a `restart_on_startup` toggle.
  *
- * SOURCE ACTIONS LIVE HERE (review T2): when editing a package.json-sourced
- * command, the form shows a source-control block — the link reference, a passive
- * "changed in package.json" drift line when the script moved, and a single
- * **Resync** button that adopts the current raw script value while KEEPING the
- * link. The action row puts **Unlink from package.json** on the LEFT and
- * Cancel / Save on the RIGHT. There is no "reset to script runner". Manually
- * editing the command and saving DETACHES the source (handled by the backend
- * `command_update`); Resync does not.
+ * Built on **@tanstack/react-form** with a **Zod v4** schema (`commandSchema`) as the validator: the
+ * form store owns the field state + the submit gate (`canSubmit`). Each field is scaffolded by our
+ * `ui/field` `Field` and rendered through our `ui/input` + `ui/switch` wrappers (never
+ * `@base-ui/react/*` directly). The folder picker relativizes its absolute result against the
+ * workspace and writes the field through the form store.
  *
- * The Save button is contextual ("Create" / "Save") and disabled until the schema
- * validates (name + command non-empty).
+ * THE PROVENANCE IS NOT DRAWN HERE any more — `<CommandSourcePanel>` is, once, with BOTH of its
+ * answers attached to the link they act on. This file used to render a third rendering of the same
+ * three facts and strand Unlink in its action row.
  */
 export function CommandForm({
   editing,
+  commit = "submit",
   workspacePath,
   submitting = false,
   error,
@@ -134,13 +141,15 @@ export function CommandForm({
   // stable accessible name the tests/screen-readers query by.
   const restartId = useId();
 
+  const seeded: CommandFormFields = {
+    name: editing?.name ?? "",
+    command: editing?.command ?? "",
+    subfolder: editing?.subfolder ?? "",
+    restart_on_startup: editing?.restart_on_startup ?? false,
+  };
+
   const form = useForm({
-    defaultValues: {
-      name: editing?.name ?? "",
-      command: editing?.command ?? "",
-      subfolder: editing?.subfolder ?? "",
-      restart_on_startup: editing?.restart_on_startup ?? false,
-    } satisfies CommandFormFields,
+    defaultValues: seeded,
     // `onMount` seeds the validity (so an EMPTY create form starts with the submit
     // button disabled — the old `canSubmit` gate); `onChange` re-validates live.
     validators: { onMount: commandSchema, onChange: commandSchema },
@@ -153,6 +162,35 @@ export function CommandForm({
       });
     },
   });
+
+  /**
+   * COMMIT ON LEAVING A FIELD — the `blur` mode's whole behaviour.
+   *
+   * Two guards, and each removes a real misfire. The schema must PASS, or an emptied name would be
+   * pushed to a backend that will reject it (and the field would then bounce back for a reason the
+   * user did not cause). And the values must have CHANGED against what was seeded, so merely
+   * TABBING THROUGH a panel writes nothing — which matters here more than usual, since a write on
+   * a running command is refused and would raise an error toast for a field nobody touched.
+   */
+  const commitOnBlur = () => {
+    if (commit !== "blur") return;
+    const value = form.state.values;
+    const parsed = commandSchema.safeParse(value);
+    if (!parsed.success) return;
+    const next: CommandFormValues = {
+      name: value.name.trim(),
+      command: value.command.trim(),
+      subfolder: value.subfolder.trim(),
+      restart_on_startup: value.restart_on_startup,
+    };
+    const unchanged =
+      next.name === seeded.name.trim() &&
+      next.command === seeded.command.trim() &&
+      next.subfolder === seeded.subfolder.trim() &&
+      next.restart_on_startup === seeded.restart_on_startup;
+    if (unchanged) return;
+    onSubmit(next);
+  };
 
   const hasSource = Boolean(editing?.source_script_name && editing?.source_package_json_path);
   const submitLabel = editing ? "Save" : "Create";
@@ -178,6 +216,8 @@ export function CommandForm({
     }
     setPickError(null);
     form.setFieldValue("subfolder", relative);
+    // A pick is a deliberate edit that never blurs a field — it must commit on its own.
+    commitOnBlur();
   };
 
   const runSource = async (action: "resync" | "unlink", fn: () => Promise<void>) => {
@@ -186,7 +226,7 @@ export function CommandForm({
     try {
       await fn();
       // The parent re-lists + re-seeds the form on success (resync rewrites the
-      // command; unlink turns the card hand-authored).
+      // command; unlink turns the command hand-authored).
     } catch (e) {
       // The backend's OWN sentence when it has one (a pinned source, a missing script): it is
       // the only text that says what to do about it.
@@ -205,37 +245,41 @@ export function CommandForm({
       }}
       className="flex flex-col gap-3"
     >
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <form.Field name="name">
-          {(field) => (
-            <Field htmlFor={nameId} label="Name">
-              <Input
-                id={nameId}
-                autoFocus
-                value={field.state.value}
-                onChange={(e) => field.handleChange(e.target.value)}
-                onBlur={field.handleBlur}
-                aria-label="Command name"
-              />
-            </Field>
-          )}
-        </form.Field>
+      <form.Field name="name">
+        {(field) => (
+          <Field htmlFor={nameId} label="Name">
+            <Input
+              id={nameId}
+              autoFocus
+              value={field.state.value}
+              onChange={(e) => field.handleChange(e.target.value)}
+              onBlur={() => {
+                field.handleBlur();
+                commitOnBlur();
+              }}
+              aria-label="Command name"
+            />
+          </Field>
+        )}
+      </form.Field>
 
-        <form.Field name="command">
-          {(field) => (
-            <Field htmlFor={commandId} label="Command">
-              <Input
-                id={commandId}
-                value={field.state.value}
-                onChange={(e) => field.handleChange(e.target.value)}
-                onBlur={field.handleBlur}
-                aria-label="Command line"
-                className="font-mono"
-              />
-            </Field>
-          )}
-        </form.Field>
-      </div>
+      <form.Field name="command">
+        {(field) => (
+          <Field htmlFor={commandId} label="Command">
+            <Input
+              id={commandId}
+              value={field.state.value}
+              onChange={(e) => field.handleChange(e.target.value)}
+              onBlur={() => {
+                field.handleBlur();
+                commitOnBlur();
+              }}
+              aria-label="Command line"
+              className="font-mono"
+            />
+          </Field>
+        )}
+      </form.Field>
 
       <form.Field name="subfolder">
         {(field) => (
@@ -249,6 +293,7 @@ export function CommandForm({
                   // A manual edit clears any prior out-of-workspace picker error.
                   setPickError(null);
                 }}
+                onBlur={commitOnBlur}
                 aria-label="Run subfolder"
                 placeholder="Run from the workspace root"
                 className="flex-1 font-mono"
@@ -278,60 +323,24 @@ export function CommandForm({
             <Switch
               id={restartId}
               checked={field.state.value}
-              onCheckedChange={(checked) => field.handleChange(checked)}
+              onCheckedChange={(checked) => {
+                field.handleChange(checked);
+                // A switch has no blur to wait for — the flip IS the decision.
+                if (commit === "blur") {
+                  const value = form.state.values;
+                  onSubmit({
+                    name: value.name.trim(),
+                    command: value.command.trim(),
+                    subfolder: value.subfolder.trim(),
+                    restart_on_startup: checked,
+                  });
+                }
+              }}
               aria-label="Restart on startup"
             />
           </Field>
         )}
       </form.Field>
-
-      {/* Source-control block — only when editing a package.json-sourced command.
-          Read-only link reference + a passive drift line + the Resync action. */}
-      {hasSource && editing && (
-        <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/50 p-2.5">
-          <div className="flex items-center gap-2">
-            <Link2Icon className="size-3 shrink-0 text-muted-foreground" />
-            <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground/80">
-              Linked to package.json · scripts.{editing.source_script_name}
-            </span>
-          </div>
-
-          {driftValue != null && (
-            <p
-              data-testid="drift-line"
-              className="flex items-start gap-1.5 text-xs leading-snug text-warning"
-            >
-              <AlertTriangleIcon className="mt-px size-3 shrink-0" />
-              <span>
-                Changed in package.json — now <code className="font-mono">{driftValue}</code>.
-                Resync to adopt it; the link is kept.
-              </span>
-            </p>
-          )}
-
-          {sourceError && (
-            <p role="alert" className="text-xs text-destructive">
-              {sourceError}
-            </p>
-          )}
-
-          <div>
-            <Button
-              type="button"
-              variant="outline"
-              size="xs"
-              loading={sourceBusy === "resync"}
-              disabled={sourceBusy !== null}
-              onClick={() =>
-                void runSource("resync", () => onResync?.(editing.id) ?? Promise.resolve())
-              }
-            >
-              <RefreshCwIcon />
-              Resync from package.json
-            </Button>
-          </div>
-        </div>
-      )}
 
       {error && (
         <p role="alert" className="text-sm text-destructive">
@@ -339,29 +348,33 @@ export function CommandForm({
         </p>
       )}
 
-      {/* Action row: Unlink on the LEFT (sourced only), Cancel / Save on the RIGHT. */}
-      <div className="mt-1 flex items-center justify-between gap-2">
-        <div className="flex items-center">
-          {hasSource && editing && (
-            <Button
-              type="button"
-              variant="ghost-destructive"
-              size="xs"
-              loading={sourceBusy === "unlink"}
-              disabled={sourceBusy !== null}
-              onClick={() =>
-                void runSource("unlink", () => onUnlink?.(editing.id) ?? Promise.resolve())
-              }
-            >
-              <Link2OffIcon />
-              Unlink from package.json
+      {/* THE PROVENANCE — the shared panel, with BOTH answers to a drift on the link they act on. */}
+      {hasSource && editing && (
+        <>
+          <DetailSeparator className="my-1" />
+          <CommandSourcePanel
+            command={editing}
+            driftValue={driftValue}
+            busy={sourceBusy}
+            error={sourceError}
+            onResync={() =>
+              void runSource("resync", () => onResync?.(editing.id) ?? Promise.resolve())
+            }
+            onUnlink={() =>
+              void runSource("unlink", () => onUnlink?.(editing.id) ?? Promise.resolve())
+            }
+          />
+        </>
+      )}
+
+      {/* The action row exists only where there is something to submit — see `CommandFormCommit`. */}
+      {commit === "submit" && (
+        <div className="mt-1 flex items-center justify-end gap-2">
+          {onCancel && (
+            <Button type="button" variant="outline" size="sm" onClick={onCancel}>
+              Cancel
             </Button>
           )}
-        </div>
-        <div className="flex gap-2">
-          <Button type="button" variant="outline" size="sm" onClick={onCancel}>
-            Cancel
-          </Button>
           <form.Subscribe selector={(state) => state.canSubmit}>
             {(canSubmit) => (
               <Button
@@ -375,7 +388,7 @@ export function CommandForm({
             )}
           </form.Subscribe>
         </div>
-      </div>
+      )}
     </form>
   );
 }

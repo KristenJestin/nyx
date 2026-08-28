@@ -28,9 +28,10 @@ export interface WorkspaceSubsectionsProps {
   /** Select a command row (rail glides to it; no create here). */
   onSelectCommand?: (id: string) => void;
   /**
-   * Open the "Manage commands" modal (the COMMANDS band's hover gear). Wired to the
-   * EXISTING `project-commands-dialog` (its internals are out of scope — redesigned
-   * separately). Optional so the subsections still render without the wiring.
+   * Open the project settings ON THE COMMANDS SECTION (the COMMANDS band's hover gear). The
+   * standalone `project-commands-dialog` it used to open is gone — one body, one useful width,
+   * one chrome (finding 01M132YSBKJ5J22VG60P5GN7W0). Optional so the subsections still render
+   * without the wiring.
    */
   onManageCommands?: () => void;
   /** Launch a new terminal scoped to THIS workspace (cwd = workspace.path). */
@@ -56,8 +57,8 @@ export interface WorkspaceSubsectionsProps {
  *    Empty → a muted hint.
  *  - **COMMANDS**: rendered ONLY when commands exist. It NO LONGER carries a chevron
  *    / collapse — it is the SAME non-collapsible band as TERMINALS now. Its hover
- *    action is a GEAR that opens the manage-commands modal (the existing
- *    `project-commands-dialog`). Each row is a `<CommandRow>` carrying a lead
+ *    action is a GEAR that opens the project settings on their own section. Each row is a
+ *    `<CommandRow>` carrying a lead
  *    `<StatusDot>` (run-state) + the shared selection rail.
  *
  * (Project and workspace bands keep their own collapse — the typed Terminals/

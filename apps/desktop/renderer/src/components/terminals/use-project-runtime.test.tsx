@@ -3,7 +3,7 @@ import { emit, mockIPC } from "@/bridge/test-harness";
 import { describe, expect, it } from "vitest";
 
 import { useProjectRuntime } from "./use-project-runtime";
-import type { WorkspaceRuntimeSnapshot } from "./use-workspace-runtime";
+import type { WorkspaceRuntimeSnapshot } from "@/components/runtime/use-workspace-runtime";
 
 function snapshot(wsId: string, terminalCount: number): WorkspaceRuntimeSnapshot {
   return {

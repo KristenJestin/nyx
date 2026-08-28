@@ -14,16 +14,25 @@ import { Menu, MenuItem } from "@/components/ui/menu";
 import { CollapsibleSection } from "@/components/sidebar/collapsible-section";
 import { itemTransition } from "@/components/sidebar/item-motion";
 import { useAgentSessions } from "@/components/sidebar/use-agent-sessions";
-import { type WorkspaceRecord } from "@/components/sidebar/use-projects";
-import { StatusDot } from "./status-dot";
+import type { WorkspaceRecord } from "@/components/sidebar/use-projects";
+import {
+  LINE_GLYPH_SIZE,
+  rollupState,
+  SidebarLine,
+  SidebarLineActions,
+  SidebarLineBand,
+  SidebarLineGlyph,
+  SidebarLineLabel,
+} from "@/components/ui/sidebar-line";
 import { workspaceRunState } from "./runtime-state";
 import { useConsumedNotifications } from "./use-consumed-notifications";
 import { WorkspaceRuntimeTree } from "./workspace-runtime-tree";
-import type { WorkspaceRuntimeSnapshot } from "./use-workspace-runtime";
+import type { WorkspaceRuntimeSnapshot } from "@/components/runtime/use-workspace-runtime";
 
 /**
  * `<WorkspaceAccordion>` — one workspace of the entered project, as an accordion item: a
- * header (chevron + icon + name + rollup run-state dot) over its runtime tree body. The
+ * header — the SHARED `<SidebarLine>`: chevron, icon, name, and the rollup run-state pastille in
+ * the icon's corner — over its runtime tree body. The
  * workspace is the runtime PIVOT in the DB (PDR-0008) but not a screen — here it is a
  * grouping INSIDE the project's Terminals page.
  *
@@ -103,18 +112,73 @@ export function WorkspaceAccordion({
 
   return (
     <div className="flex flex-col border-b border-border/60">
-      {/* The header ROW: the toggle and the kebab are SIBLINGS inside it (a button cannot nest a
-          button), so the toggle keeps `aria-expanded` and the kebab keeps its own label. */}
-      <div className="group flex items-center bg-muted/50 transition-colors hover:bg-muted">
-        <button
-          type="button"
-          aria-expanded={open}
-          // NAMED explicitly (mirroring the old sidebar's workspace band): with a kebab now
-          // sitting next to it, "the button whose text is the workspace name" no longer
-          // identifies one element — the toggle and its actions menu would both answer to it.
-          aria-label={`Toggle workspace ${workspace.name}`}
-          onClick={() => setOpen((v) => !v)}
-          className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-sm font-medium text-foreground"
+      {/* THE WORKTREE IS A LINE TOO (human review 01M12MW1DV1V455EWBMV048TE6). It keeps its own
+          SURFACE — the `bg-muted/50` band and the bottom rule that separate one workspace from the
+          next — and takes its GEOMETRY from `<SidebarLine>` like every other family: same glyph
+          size, same insets, same gap, same height, same corner pastille. It used to hand-roll
+          `gap-2 px-3 py-2` and hang a larger dot at the far END of the band, which is the kind of
+          near-miss that made the parity worth making structural.
+          The band is a `<button>` (nothing inside it is interactive), so the header still toggles
+          as one tab stop; the lifecycle kebab rides the line's own trailing slot
+          (`<SidebarLineActions>`) — a SIBLING of the band, never nested in it, since a button
+          cannot contain a button. */}
+      <SidebarLine
+        className="rounded-none bg-muted/50 pr-2 font-medium text-foreground hover:bg-muted"
+        actions={
+          hasActions ? (
+            <SidebarLineActions>
+              <Menu
+                tooltip="Workspace actions"
+                trigger={
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label={`Workspace actions for ${workspace.name}`}
+                    className="size-6"
+                  >
+                    <MoreVerticalIcon />
+                  </Button>
+                }
+              >
+                {onRename && (
+                  <MenuItem
+                    icon={<PencilIcon className="size-4" />}
+                    onClick={() => onRename(workspace)}
+                    aria-label={`Rename workspace ${workspace.name}`}
+                  >
+                    Rename workspace
+                  </MenuItem>
+                )}
+                {/* No root special-casing left: `hasActions` already keeps the whole kebab off a
+                    root workspace, so every workspace that reaches here can really be removed. */}
+                {onRemove && (
+                  <MenuItem
+                    destructive
+                    icon={<Trash2Icon className="size-4" />}
+                    onClick={() => onRemove(workspace)}
+                    aria-label={`Remove workspace ${workspace.name}`}
+                  >
+                    Remove workspace
+                  </MenuItem>
+                )}
+              </Menu>
+            </SidebarLineActions>
+          ) : null
+        }
+      >
+        <SidebarLineBand
+          render={
+            <button
+              type="button"
+              aria-expanded={open}
+              // NAMED explicitly (mirroring the old sidebar's workspace band): with a kebab now
+              // sitting next to it, "the button whose text is the workspace name" no longer
+              // identifies one element — the toggle and its actions menu would both answer to it.
+              aria-label={`Toggle workspace ${workspace.name}`}
+              onClick={() => setOpen((v) => !v)}
+              className="text-left"
+            />
+          }
         >
           <motion.span
             aria-hidden
@@ -124,55 +188,17 @@ export function WorkspaceAccordion({
           >
             <ChevronRightIcon className="size-3.5" />
           </motion.span>
-          <Icon className="size-4 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 flex-1 truncate">{workspace.name}</span>
-          {/* The rollup dot is a SUMMARY for a COLLAPSED workspace: once the accordion is OPEN
-              (deployed) its rows are visible and each carries its own dot, so the aggregate would
-              be redundant — masked while open, shown only when replied/collapsed (finding). It is
-              still subject to `isQuietState` (StatusDot renders nothing when idle). */}
-          <StatusDot state={open ? "idle" : rollup} size="sm" className="shrink-0" />
-        </button>
-
-        {hasActions && (
-          <div className="shrink-0 pr-2 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100 data-popup-open:opacity-100">
-            <Menu
-              tooltip="Workspace actions"
-              trigger={
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={`Workspace actions for ${workspace.name}`}
-                  className="size-6"
-                >
-                  <MoreVerticalIcon />
-                </Button>
-              }
-            >
-              {onRename && (
-                <MenuItem
-                  icon={<PencilIcon className="size-4" />}
-                  onClick={() => onRename(workspace)}
-                  aria-label={`Rename workspace ${workspace.name}`}
-                >
-                  Rename workspace
-                </MenuItem>
-              )}
-              {/* No root special-casing left: `hasActions` already keeps the whole kebab off a
-                  root workspace, so every workspace that reaches here can really be removed. */}
-              {onRemove && (
-                <MenuItem
-                  destructive
-                  icon={<Trash2Icon className="size-4" />}
-                  onClick={() => onRemove(workspace)}
-                  aria-label={`Remove workspace ${workspace.name}`}
-                >
-                  Remove workspace
-                </MenuItem>
-              )}
-            </Menu>
-          </div>
-        )}
-      </div>
+          {/* The rollup pastille is a SUMMARY for a COLLAPSED workspace: once the accordion is OPEN
+              its rows are visible and each carries its own dot, so the aggregate would be redundant.
+              That rule is `rollupState`, shared with the group folders rather than restated here,
+              and it still rides `isQuietState` (an idle workspace shows nothing at all). */}
+          <SidebarLineGlyph
+            icon={<Icon className={LINE_GLYPH_SIZE} />}
+            state={rollupState(open, rollup)}
+          />
+          <SidebarLineLabel>{workspace.name}</SidebarLineLabel>
+        </SidebarLineBand>
+      </SidebarLine>
 
       <CollapsibleSection open={open}>
         {snapshot ? (

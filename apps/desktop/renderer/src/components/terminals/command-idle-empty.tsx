@@ -1,6 +1,6 @@
 import { cn } from "@/lib/utils";
-import type { RunState } from "./status-dot";
-import type { WorkspaceRuntimeService } from "./use-workspace-runtime";
+import type { RunState } from "@/components/ui/status-dot";
+import type { WorkspaceRuntimeService } from "@/components/runtime/use-workspace-runtime";
 
 /**
  * `<CommandIdleEmpty>` — the EMPTY-STATE of a managed command's pane. When a command is idle

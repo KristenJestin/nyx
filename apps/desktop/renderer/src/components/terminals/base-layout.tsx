@@ -20,7 +20,7 @@ import { useSortable } from "@dnd-kit/react/sortable";
 import { move } from "@dnd-kit/helpers";
 
 import { cn } from "@/lib/utils";
-import { reorderSensors, sameOrder } from "./reorder-dnd";
+import { reorderSensors, sameOrder } from "@/components/panes/reorder-dnd";
 import { startNavTransition } from "@/lib/nav-transition";
 import { Button } from "@/components/ui/button";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -37,7 +37,7 @@ import { SettingsDialog, type SettingsDialogHandle } from "@/components/sidebar/
 import { ProjectSettingsDialog } from "@/components/sidebar/project-settings-dialog";
 import { ChromeBar } from "@/components/chrome/chrome-bar";
 import { CloseGuard } from "@/components/chrome/close-guard";
-import { isQuietState, StatusDot } from "./status-dot";
+import { isQuietState, StatusDot } from "@/components/ui/status-dot";
 import { projectRunState } from "./runtime-state";
 import { useConsumedNotifications } from "./use-consumed-notifications";
 import { useProjectRuntime } from "./use-project-runtime";

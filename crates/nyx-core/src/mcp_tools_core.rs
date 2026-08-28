@@ -453,6 +453,11 @@ fn template_json(t: &db::ManagedCommand) -> Value {
         "source_kind": t.source_kind,
         "package_manager": t.package_manager,
         "env_keys": env_keys,
+        // The group this command belongs to, or `null` when it is SOLO — the READ side of
+        // `manage_command_group` (review finding `01M11XM66VTB30VCZRA0RMPMRP`). Without it the only
+        // way to observe the grouping was to MUTATE it and read the `groups` of the reply, which is
+        // no way for an agent to inspect before acting.
+        "group_id": t.group_id,
     })
 }
 
@@ -536,6 +541,19 @@ pub fn list_workspaces(db: &Db, args: &Value) -> Result<Value, RpcError> {
 /// state overlaid from the runner) OR `{ project_id }` (templates) → `{ commands }`.
 /// THIS is the routing the Electron dispatcher got wrong (it returned terminals). Parity
 /// with the Tauri `list_commands`.
+///
+/// THE GROUPING IS READABLE HERE (review finding `01M11XM66VTB30VCZRA0RMPMRP`). Every command entry
+/// carries its `group_id` (`null` = solo), and the `{ project_id }` form additionally returns the
+/// project's `groups` — the SAME `db::CommandGroup` rows, from the SAME `db::list_command_groups`
+/// reader, that `manage_command_group` echoes after a mutation, so the read surface and the write
+/// surface cannot describe two different worlds. Before this, `manage_command_group`'s description
+/// pointed agents HERE to inspect the state and neither this tool nor `workspace_runtime` carried a
+/// single byte of membership: the only way to observe the grouping was to provoke a WRITE and read
+/// the `groups` of its reply.
+///
+/// The `{ workspace_id }` form lists INSTANCES, which are per workspace while a group is project
+/// data; each instance still names its `command_id`, so an agent that started there resolves the
+/// grouping with one `{ project_id }` call.
 pub fn list_commands<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
@@ -594,7 +612,13 @@ pub fn list_commands<S: RunnerSink>(
             .with_conn(|c| db::list_templates(c, project_id))
             .map_err(internal_db)?;
         let commands: Vec<Value> = templates.iter().map(template_json).collect();
-        return Ok(json!({ "commands": commands }));
+        // The project's command GROUPS, each with its id, name, colour and its member ids in
+        // DISPOSITION order — the read half of `manage_command_group`, from the very reader that
+        // tool echoes after a mutation.
+        let groups = db
+            .with_conn(|c| db::list_command_groups(c, project_id))
+            .map_err(internal_db)?;
+        return Ok(json!({ "commands": commands, "groups": groups }));
     }
     Err(RpcError::new(
         RpcCode::InvalidArgument,
@@ -1670,6 +1694,234 @@ pub fn remove_commands<S: RunnerSink>(
     })
 }
 
+/// `reorder_commands` — `{ project_id, command_ids }` → `{ project_id, commands }`.
+///
+/// The AGENT's half of the command LIST order (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+/// 01M11XTRXVVPZ9XMDW5ARWKWHA), over the SAME `db::reorder_templates` the UI's `command_reorder`
+/// IPC route calls.
+///
+/// `command_ids` must be EXACTLY the project's templates, as a set. A partial list is refused for
+/// the reason `set_command_group_layout` refuses one: positions are absolute (`order` = index), so
+/// re-numbering three of five commands leaves the other two on indices that now collide, and the
+/// resulting order is neither the old one nor the asked one. Refusing names the mistake; accepting
+/// would silently scramble the list.
+pub fn reorder_commands(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let project_id = require_str(args, "project_id")?.to_string();
+    let command_ids = require_str_vec(args, "command_ids")?;
+    let current = db
+        .with_conn(|c| db::list_templates(c, &project_id))
+        .map_err(internal_db)?;
+
+    let mut wanted: Vec<&str> = command_ids.iter().map(String::as_str).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut have: Vec<&str> = current.iter().map(|t| t.id.as_str()).collect();
+    have.sort_unstable();
+    if wanted != have || command_ids.len() != current.len() {
+        return Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "command_ids must list EXACTLY the {} command(s) of project {project_id}, in the \
+                 wanted order (got {}); read them with list_commands(project_id=…) and send them \
+                 back permuted",
+                current.len(),
+                command_ids.len()
+            ),
+        ));
+    }
+
+    db.with_conn(|c| db::reorder_templates(c, &command_ids))
+        .map_err(internal_db)?;
+    let commands = db
+        .with_conn(|c| db::list_templates(c, &project_id))
+        .map_err(internal_db)?;
+    Ok(ToolOutcome::changed(
+        json!({
+            "project_id": project_id,
+            "commands": commands
+                .iter()
+                .map(|t| json!({
+                    "command_id": t.id,
+                    "name": t.name,
+                    "group_id": t.group_id,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        ChangedTopic::Commands,
+    ))
+}
+
+/// Map a [`db::CommandGroupError`] onto the D8 error vocabulary: a bad ID is `invalid_id`, a
+/// refused SHAPE (too few members, a colour out of range, a layout that is not a re-order) is
+/// `invalid_argument`, and only a real DB failure is `internal`. The agent can therefore tell
+/// "you named something that does not exist" from "what you asked for is not a legal group".
+fn command_group_err(e: db::CommandGroupError) -> RpcError {
+    match e {
+        db::CommandGroupError::GroupNotFound { .. }
+        | db::CommandGroupError::CommandNotFound { .. } => {
+            RpcError::new(RpcCode::InvalidId, e.to_string())
+        }
+        db::CommandGroupError::TooFewMembers { .. }
+        | db::CommandGroupError::ColorOutOfRange { .. }
+        | db::CommandGroupError::UnknownShape { .. }
+        | db::CommandGroupError::LayoutMismatch => {
+            RpcError::new(RpcCode::InvalidArgument, e.to_string())
+        }
+        db::CommandGroupError::Db(err) => internal_db(err),
+    }
+}
+
+/// `manage_command_group` — `{ action, … }` → `{ action, group, groups }`.
+///
+/// The AGENT's half of the multi-pane grouping of managed commands (review
+/// `01M0ABR6V501D0SPR2BYBVZC4A` #90). Every branch delegates to the SHARED `nyx_core::db`
+/// transitions the UI's `command_group_*` IPC routes call — one mutation path, so an agent's
+/// grouping and a hand gesture are the same write and produce the same state. Mutating actions
+/// carry a `Commands` changed effect so an open sidebar/settings screen repaints without polling;
+/// nothing here polls or reads `localStorage` (which is precisely why this model lives in the DB).
+///
+/// The reply always carries the project's `groups` AFTER the change, so an agent that chains
+/// several actions never has to re-list between them.
+pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let action = require_str(args, "action")?;
+
+    /// The project a group (or a command) belongs to — needed to return the post-change list even
+    /// when the action's own target has just ceased to exist.
+    fn project_of_group(db: &Db, group_id: &str) -> Result<String, RpcError> {
+        db.with_conn(|c| db::get_command_group(c, group_id))
+            .map_err(internal_db)?
+            .map(|g| g.project_id)
+            .ok_or_else(|| {
+                RpcError::new(
+                    RpcCode::InvalidId,
+                    format!("unknown command group {group_id}"),
+                )
+            })
+    }
+    fn project_of_command(db: &Db, command_id: &str) -> Result<String, RpcError> {
+        db.with_conn(|c| db::get_template(c, command_id))
+            .map_err(internal_db)?
+            .map(|t| t.project_id)
+            .ok_or_else(|| {
+                RpcError::new(RpcCode::InvalidId, format!("unknown command {command_id}"))
+            })
+    }
+
+    // `(the group after the action — None once it is gone, the project to list)`.
+    let (group, project_id): (Option<db::CommandGroup>, String) = match action {
+        "create" => {
+            let project_id = require_str(args, "project_id")?.to_string();
+            let command_ids = require_str_vec(args, "command_ids")?;
+            let group = db
+                .with_conn(|c| db::create_command_group(c, &project_id, &command_ids))
+                .map_err(command_group_err)?;
+            (Some(group), project_id)
+        }
+        "add" => {
+            let group_id = require_str(args, "group_id")?.to_string();
+            let command_id = require_str(args, "command_id")?.to_string();
+            let project_id = project_of_group(db, &group_id)?;
+            let group = db
+                .with_conn(|c| db::add_to_command_group(c, &group_id, &command_id))
+                .map_err(command_group_err)?;
+            (Some(group), project_id)
+        }
+        "remove" => {
+            let command_id = require_str(args, "command_id")?.to_string();
+            let project_id = project_of_command(db, &command_id)?;
+            // The group SURVIVES most removals — it only dissolves when the removal takes it under
+            // two members — and the reply must say which happened. It used to answer `group: null`
+            // in BOTH cases (review finding `01M11XKKFVQWSHZQ4TGT3P3Z06`), so a caller reading
+            // `group === null` as "the group is gone" concluded a dissolution while the group was
+            // alive with its remaining members, listed two fields away in `groups`. The DB
+            // transition now returns the survivor (or `None` on a real dissolution) from INSIDE its
+            // own transaction, which is the only place the two can be told apart without a race.
+            let survivor = db
+                .with_conn(|c| db::remove_from_command_group(c, &command_id))
+                .map_err(command_group_err)?;
+            (survivor, project_id)
+        }
+        "dissolve" => {
+            let group_id = require_str(args, "group_id")?.to_string();
+            let project_id = project_of_group(db, &group_id)?;
+            db.with_conn(|c| db::dissolve_command_group(c, &group_id))
+                .map_err(command_group_err)?;
+            (None, project_id)
+        }
+        "name" | "color" => {
+            let group_id = require_str(args, "group_id")?.to_string();
+            let project_id = project_of_group(db, &group_id)?;
+            // An OMITTED value CLEARS the label — the tool has one action per label, so "name
+            // without a name" can only mean "remove the name". (The DB layer's third state,
+            // "leave it alone", is what the OTHER action uses on this same call.)
+            let group = if action == "name" {
+                let name = optional_str(args, "name")?.map(str::to_string);
+                db.with_conn(|c| {
+                    db::set_command_group_labels(c, &group_id, Some(name.as_deref()), None)
+                })
+                .map_err(command_group_err)?
+            } else {
+                let color = match args.get("color") {
+                    None | Some(Value::Null) => None,
+                    // `try_from`, NOT `as i32`: the cast WRAPS, so `4294967297` came out as `1`
+                    // and passed the 1..=6 check downstream — the boundary that exists to refuse
+                    // an out-of-palette index would have invented a valid one instead.
+                    Some(v) => Some(v.as_i64().and_then(|n| i32::try_from(n).ok()).ok_or_else(
+                        || {
+                            RpcError::new(
+                                RpcCode::InvalidArgument,
+                                "argument 'color' must be a 32-bit integer",
+                            )
+                        },
+                    )?),
+                };
+                db.with_conn(|c| db::set_command_group_labels(c, &group_id, None, Some(color)))
+                    .map_err(command_group_err)?
+            };
+            (Some(group), project_id)
+        }
+        "layout" => {
+            let group_id = require_str(args, "group_id")?.to_string();
+            let command_ids = require_str_vec(args, "command_ids")?;
+            let project_id = project_of_group(db, &group_id)?;
+            let group = db
+                .with_conn(|c| db::set_command_group_layout(c, &group_id, &command_ids))
+                .map_err(command_group_err)?;
+            (Some(group), project_id)
+        }
+        // The EIGHTH action (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XTRXVVPZ9XMDW5ARWKWHA).
+        // Separate from `layout` on purpose: `layout` says WHICH member goes where, `shape` says
+        // what the grid looks like. Folding them would make "re-order" and "re-shape"
+        // indistinguishable on the wire, exactly as folding `name` and `color` would.
+        "shape" => {
+            let group_id = require_str(args, "group_id")?.to_string();
+            let shape = require_str(args, "shape")?.to_string();
+            let project_id = project_of_group(db, &group_id)?;
+            let group = db
+                .with_conn(|c| db::set_command_group_shape(c, &group_id, &shape))
+                .map_err(command_group_err)?;
+            (Some(group), project_id)
+        }
+        other => {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "unknown action '{other}' — expected one of create | add | remove | dissolve \
+                     | name | color | layout | shape"
+                ),
+            ))
+        }
+    };
+
+    let groups = db
+        .with_conn(|c| db::list_command_groups(c, &project_id))
+        .map_err(internal_db)?;
+    Ok(ToolOutcome::changed(
+        json!({ "action": action, "group": group, "groups": groups }),
+        ChangedTopic::Commands,
+    ))
+}
+
 /// `clear_command_output` — `{ instance_id }` → `{ instance_id, cleared: true }`. Parity
 /// with the Tauri `clear_command_output` (validates the id, then clears the runner buffer).
 pub fn clear_command_output<S: RunnerSink>(
@@ -2572,6 +2824,12 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         crate::mcp::REMOVE_WORKSPACE_TOOL => Some(remove_workspace(db, runner, host, args)),
         crate::mcp::REMOVE_COMMAND_TOOL => Some(remove_command(db, runner, args)),
         crate::mcp::REMOVE_COMMANDS_TOOL => Some(remove_commands(db, runner, args)),
+        // The multi-pane GROUPING of commands (review #90): one tool, eight actions, delegating
+        // to the SAME `db::` transitions the UI's `command_group_*` routes call.
+        crate::mcp::MANAGE_COMMAND_GROUP_TOOL => Some(manage_command_group(db, args)),
+        // The ORDER of the command LIST — the agent's half of `command_reorder`, over the same
+        // `db::reorder_templates` (review 01M11WE6H9E5D5FCS6RT0ZXAXN).
+        crate::mcp::REORDER_COMMANDS_TOOL => Some(reorder_commands(db, args)),
         crate::mcp::CLEAR_COMMAND_OUTPUT_TOOL => Some(clear_command_output(db, runner, args)),
         // Agent-session channel (session lifecycle + runtime activity).
         crate::mcp::AGENT_SESSION_EVENT_TOOL => Some(agent_session_event(db, activity, args)),
@@ -5662,5 +5920,335 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidArgument);
+    }
+
+    /* ───────── COMMAND GROUPS — the MCP surface (review 01M11WE6H9E5D5FCS6RT0ZXAXN) ───────── */
+
+    /// A project with `n` command templates, ready to be grouped.
+    fn project_with_commands(db: &Db, n: usize, path: &str) -> (String, Vec<String>) {
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", path, None))
+            .unwrap();
+        let ids = (0..n)
+            .map(|i| {
+                db.with_conn(|c| {
+                    db::create_template(
+                        c,
+                        &project.id,
+                        &format!("cmd{i}"),
+                        "echo hi",
+                        None,
+                        db::CommandSource::default(),
+                    )
+                })
+                .unwrap()
+                .id
+            })
+            .collect();
+        (project.id, ids)
+    }
+
+    /// REMOVE MUST DISTINGUISH "the group survived" FROM "the group is gone" (review finding
+    /// `01M11XKKFVQWSHZQ4TGT3P3Z06`).
+    ///
+    /// The contract says `group` is null "once the group is gone". The code returned null for
+    /// EVERY removal, so a caller that trusted it concluded a dissolution while the group was
+    /// alive — and listed, with its remaining members, two fields away in the same reply. Both
+    /// halves are asserted here; the first one fails on the previous code.
+    #[test]
+    fn command_group_remove_returns_the_survivor_and_null_only_on_dissolution() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project_id, ids) = project_with_commands(&db, 4, "/tmp/cg-remove");
+
+        let created = manage_command_group(
+            &db,
+            &json!({ "action": "create", "project_id": project_id, "command_ids": ids }),
+        )
+        .unwrap();
+        let group_id = created.result["group"]["id"].as_str().unwrap().to_string();
+
+        // A group of FOUR losing one SURVIVES: the reply carries it, with its three remaining
+        // members in disposition order.
+        let removed =
+            manage_command_group(&db, &json!({ "action": "remove", "command_id": ids[3] }))
+                .unwrap();
+        assert_eq!(
+            removed.result["group"]["id"],
+            json!(group_id),
+            "the surviving group is named, not nulled"
+        );
+        assert_eq!(
+            removed.result["group"]["command_ids"],
+            json!([ids[0], ids[1], ids[2]]),
+            "with its remaining members, in order"
+        );
+        // …and it agrees with the project's list in the very same reply.
+        assert_eq!(removed.result["groups"], json!([removed.result["group"]]));
+
+        // Down to two, still alive.
+        let two = manage_command_group(&db, &json!({ "action": "remove", "command_id": ids[2] }))
+            .unwrap();
+        assert_eq!(two.result["group"]["command_ids"], json!([ids[0], ids[1]]));
+
+        // The SECOND-TO-LAST removal dissolves it — THAT is when `group` is null.
+        let gone = manage_command_group(&db, &json!({ "action": "remove", "command_id": ids[1] }))
+            .unwrap();
+        assert_eq!(
+            gone.result["group"],
+            Value::Null,
+            "the group really is gone"
+        );
+        assert_eq!(gone.result["groups"], json!([]));
+
+        // A command that was already SOLO has no group to report either.
+        let solo = manage_command_group(&db, &json!({ "action": "remove", "command_id": ids[0] }))
+            .unwrap();
+        assert_eq!(solo.result["group"], Value::Null);
+    }
+
+    /// NON-REGRESSION: the five other actions still answer with their group, unchanged.
+    #[test]
+    fn the_other_command_group_actions_still_return_their_group() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project_id, ids) = project_with_commands(&db, 3, "/tmp/cg-others");
+
+        let created = manage_command_group(
+            &db,
+            &json!({ "action": "create", "project_id": project_id, "command_ids": [ids[0], ids[1]] }),
+        )
+        .unwrap();
+        let group_id = created.result["group"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            created.result["group"]["command_ids"],
+            json!([ids[0], ids[1]])
+        );
+
+        let added = manage_command_group(
+            &db,
+            &json!({ "action": "add", "group_id": group_id, "command_id": ids[2] }),
+        )
+        .unwrap();
+        assert_eq!(added.result["group"]["command_ids"], json!(ids));
+
+        let named = manage_command_group(
+            &db,
+            &json!({ "action": "name", "group_id": group_id, "name": "build" }),
+        )
+        .unwrap();
+        assert_eq!(named.result["group"]["name"], json!("build"));
+
+        let coloured = manage_command_group(
+            &db,
+            &json!({ "action": "color", "group_id": group_id, "color": 3 }),
+        )
+        .unwrap();
+        assert_eq!(coloured.result["group"]["color"], json!(3));
+
+        let laid_out = manage_command_group(
+            &db,
+            &json!({ "action": "layout", "group_id": group_id, "command_ids": [ids[2], ids[0], ids[1]] }),
+        )
+        .unwrap();
+        assert_eq!(
+            laid_out.result["group"]["command_ids"],
+            json!([ids[2], ids[0], ids[1]])
+        );
+
+        let dissolved =
+            manage_command_group(&db, &json!({ "action": "dissolve", "group_id": group_id }))
+                .unwrap();
+        assert_eq!(dissolved.result["group"], Value::Null);
+        assert_eq!(dissolved.result["groups"], json!([]));
+    }
+
+    /// THE GROUPING IS READABLE WITHOUT WRITING (review finding `01M11XM66VTB30VCZRA0RMPMRP`).
+    ///
+    /// `manage_command_group`'s description sends agents to `list_commands(project_id=…)` to
+    /// inspect the state; that surface carried no membership at all, so the only way to observe
+    /// the grouping was to provoke a mutation and read the `groups` of its reply. This asserts the
+    /// read surface exists, carries everything the criterion names, and AGREES field-for-field
+    /// with what a mutation returns.
+    #[test]
+    fn list_commands_exposes_the_grouping_without_a_write() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let (project_id, ids) = project_with_commands(&db, 3, "/tmp/cg-read");
+
+        // BEFORE any grouping: the surface already answers — an empty list, and solo commands.
+        let bare = list_commands(&db, &runner, &json!({ "project_id": project_id })).unwrap();
+        assert_eq!(bare["groups"], json!([]));
+        for entry in bare["commands"].as_array().unwrap() {
+            assert_eq!(
+                entry["group_id"],
+                Value::Null,
+                "every command reads as solo"
+            );
+        }
+
+        let created = manage_command_group(
+            &db,
+            &json!({ "action": "create", "project_id": project_id, "command_ids": [ids[0], ids[1]] }),
+        )
+        .unwrap();
+        manage_command_group(
+            &db,
+            &json!({ "action": "name", "group_id": created.result["group"]["id"], "name": "build" }),
+        )
+        .unwrap();
+        let mutated = manage_command_group(
+            &db,
+            &json!({ "action": "color", "group_id": created.result["group"]["id"], "color": 4 }),
+        )
+        .unwrap();
+
+        // THE READ, with no write of its own.
+        let read = list_commands(&db, &runner, &json!({ "project_id": project_id })).unwrap();
+        // Id, name, colour and the members IN DISPOSITION ORDER — the whole criterion, in one row.
+        let group = &read["groups"][0];
+        assert_eq!(group["id"], mutated.result["group"]["id"]);
+        assert_eq!(group["name"], json!("build"));
+        assert_eq!(group["color"], json!(4));
+        assert_eq!(group["command_ids"], json!([ids[0], ids[1]]));
+        // …and the two surfaces cannot describe two different worlds: same rows, same reader.
+        assert_eq!(read["groups"], mutated.result["groups"]);
+
+        // Membership is readable per command too — `null` is SOLO, never "unknown".
+        let by_id: std::collections::HashMap<&str, &Value> = read["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["command_id"].as_str().unwrap(), c))
+            .collect();
+        assert_eq!(by_id[ids[0].as_str()]["group_id"], group["id"]);
+        assert_eq!(by_id[ids[1].as_str()]["group_id"], group["id"]);
+        assert_eq!(by_id[ids[2].as_str()]["group_id"], Value::Null);
+
+        // NOTHING MOVED: reading twice leaves the state exactly where it was.
+        let again = list_commands(&db, &runner, &json!({ "project_id": project_id })).unwrap();
+        assert_eq!(again, read);
+    }
+
+    /// THE EIGHTH ACTION, END TO END (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
+    /// 01M11XTRXVVPZ9XMDW5ARWKWHA). The agent can CHOOSE the tiling shape — the symmetry rule
+    /// (#90) requires it the moment the hand can — and the read surface reports it back without a
+    /// write, so an agent inspecting a project sees the shape a user picked.
+    #[test]
+    fn the_shape_action_persists_and_the_read_surface_reports_it() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let (project_id, ids) = project_with_commands(&db, 3, "/tmp/cg-shape");
+
+        let created = manage_command_group(
+            &db,
+            &json!({ "action": "create", "project_id": project_id, "command_ids": ids }),
+        )
+        .unwrap();
+        let group_id = created.result["group"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            created.result["group"]["layout_shape"],
+            json!("auto"),
+            "a group is born with the DERIVED shape"
+        );
+
+        let shaped = manage_command_group(
+            &db,
+            &json!({ "action": "shape", "group_id": group_id, "shape": "column" }),
+        )
+        .unwrap();
+        assert_eq!(shaped.result["group"]["layout_shape"], json!("column"));
+        assert_eq!(
+            shaped.result["group"]["command_ids"],
+            json!(ids),
+            "a re-shape is not a re-order"
+        );
+        // Mutating → the sidebar/settings repaint on `commands://changed`, like every other action.
+        assert_eq!(shaped.effects, vec![ChangedTopic::Commands]);
+
+        // The READ surface carries it, from the very reader the mutation echoes.
+        let read = list_commands(&db, &runner, &json!({ "project_id": project_id })).unwrap();
+        assert_eq!(read["groups"][0]["layout_shape"], json!("column"));
+        assert_eq!(read["groups"], shaped.result["groups"]);
+
+        // A shape outside the closed vocabulary is `invalid_argument`, and names the vocabulary.
+        let refused = manage_command_group(
+            &db,
+            &json!({ "action": "shape", "group_id": group_id, "shape": "diagonal" }),
+        )
+        .expect_err("an unknown shape is refused");
+        assert_eq!(refused.code, RpcCode::InvalidArgument);
+        assert!(refused.message.contains("main-top"), "{}", refused.message);
+        // …and it changed nothing.
+        let after = list_commands(&db, &runner, &json!({ "project_id": project_id })).unwrap();
+        assert_eq!(after["groups"][0]["layout_shape"], json!("column"));
+    }
+
+    /// THE ORDER OF THE COMMAND LIST IS WRITABLE BY THE AGENT TOO (finding
+    /// 01M11XTRXVVPZ9XMDW5ARWKWHA). It is the half that made a drag "work only halfway": with no
+    /// writable order, a command taken out of a group fell back to its natural position instead of
+    /// staying where it was dropped. A partial list is REFUSED — positions are absolute, so
+    /// re-numbering a subset scrambles the rest.
+    #[test]
+    fn reorder_commands_permutes_the_whole_list_and_refuses_a_partial_one() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let (project_id, ids) = project_with_commands(&db, 3, "/tmp/cg-reorder");
+
+        let names = |v: &Value| -> Vec<String> {
+            v["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["command_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let listed = list_commands(&db, &runner, &json!({ "project_id": project_id })).unwrap();
+        assert_eq!(names(&listed), ids, "creation order to begin with");
+
+        let wanted = vec![ids[2].clone(), ids[0].clone(), ids[1].clone()];
+        let reordered = reorder_commands(
+            &db,
+            &json!({ "project_id": project_id, "command_ids": wanted }),
+        )
+        .unwrap();
+        assert_eq!(
+            reordered.result["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["command_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            wanted,
+            "the reply echoes the NEW order"
+        );
+        assert_eq!(reordered.effects, vec![ChangedTopic::Commands]);
+        // …and it persisted: the read surface every other caller uses agrees.
+        let after = list_commands(&db, &runner, &json!({ "project_id": project_id })).unwrap();
+        assert_eq!(names(&after), wanted);
+
+        // A PARTIAL list is refused by name rather than silently scrambling the rest.
+        let refused = reorder_commands(
+            &db,
+            &json!({ "project_id": project_id, "command_ids": [ids[0]] }),
+        )
+        .expect_err("a partial list is refused");
+        assert_eq!(refused.code, RpcCode::InvalidArgument);
+        // A list holding a STRANGER is refused too (it is not the same set).
+        assert_eq!(
+            reorder_commands(
+                &db,
+                &json!({ "project_id": project_id, "command_ids": [ids[0], ids[1], "not-mine"] }),
+            )
+            .expect_err("a foreign id is refused")
+            .code,
+            RpcCode::InvalidArgument
+        );
+        // Neither refusal moved anything.
+        let still = list_commands(&db, &runner, &json!({ "project_id": project_id })).unwrap();
+        assert_eq!(names(&still), wanted);
     }
 }

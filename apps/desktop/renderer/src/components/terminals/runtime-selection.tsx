@@ -11,7 +11,21 @@ import { createContext, type ReactNode, useContext, useMemo, useState } from "re
 /** A selectable runtime element, tagged by kind so the pane host knows what to render. */
 export type RuntimeSelection =
   | { readonly kind: "terminal"; readonly id: string }
-  | { readonly kind: "service"; readonly id: string };
+  | { readonly kind: "service"; readonly id: string }
+  /**
+   * A COMMAND GROUP, selected AS A GROUP (human review 01M14112THEB4094B2G614SXR5).
+   *
+   * A terminal group is activated through one of its members — one pane holds the keyboard, and the
+   * tiling already remembers which. A command group has no such thing: « pour les commandes y a pas
+   * de notion de focus, c'est trop chelou que je doive cliquer que un des 3 pour avoir le 3 ». So
+   * the FOLDER itself is what gets selected here, and `<CommandPaneHost>` shows the whole
+   * disposition without any member being the viewed one.
+   *
+   * `workspaceId` rides along because a group is PROJECT data while its instances are per WORKSPACE:
+   * the sidebar draws one folder per workspace the group is materialised in, and the panes must be
+   * that workspace's runs rather than another's.
+   */
+  | { readonly kind: "command-group"; readonly id: string; readonly workspaceId: string };
 
 interface RuntimeSelectionContextValue {
   readonly selected: RuntimeSelection | null;

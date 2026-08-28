@@ -136,6 +136,27 @@ pub fn open_database(data_dir: &Path) -> anyhow::Result<Db> {
         .map_err(|e| anyhow::anyhow!("failed to open database at {}: {e}", db_path.display()))
 }
 
+/// THE SCHEMA VERDICT THE BOOT PRINTS — the seam `main.rs` consults instead of asserting.
+///
+/// The boot used to announce "SQLite migrated, runtime tables ready" the moment [`Runtime::boot`]
+/// returned `Ok`, without asking the schema anything. That sentence was measurably false in the
+/// one case it mattered (human review 01M0CY3F075ACP4TFBK1KJ49X8): a sibling worktree's ledger row
+/// made Diesel skip one of OUR migrations, nothing was pending, boot claimed success, and the
+/// first command read failed with `no such table: managed_command_groups`.
+///
+/// So the sentence is now derived from the ledger — see [`nyx_core::db::SchemaHealth::boot_report`]
+/// for what each verdict means. This function is the runtime-side entry point, so the decision is
+/// testable without spawning the binary.
+///
+/// [`Runtime::boot`]: crate::runtime::Runtime::boot
+pub fn schema_boot_report(db: &Db) -> nyx_core::db::SchemaBootReport {
+    db.with_conn(|conn| {
+        let health = nyx_core::db::schema_health(conn);
+        let foreign = nyx_core::db::foreign_ledger_versions(conn);
+        health.boot_report(&foreign)
+    })
+}
+
 /// The v2 OWNERSHIP MARKER file written in the data dir. Its presence means "this dir is a
 /// nyx-v2 data dir, safe to open/migrate". Its ABSENCE next to a `nyx.db` means the dir
 /// belongs to another nyx (a v1 install) — we MUST NOT touch it (review #38).
@@ -311,6 +332,69 @@ mod tests {
         let health = db.with_conn(nyx_core::db::schema_health);
         assert!(health.up_to_date, "schema migrated on the claimed dir");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE BOOT READS THE LEDGER INSTEAD OF ASSERTING (human review 01M0CY4Q1A9CS1BRK10F8S3BC5,
+    /// criterion 4). A clean boot is entitled to say "migrated"; a boot whose ledger carries a
+    /// version this build does not embed is NOT — even though nothing is pending, which is exactly
+    /// what made the original failure silent.
+    #[test]
+    fn schema_boot_report_is_read_off_the_ledger_not_assumed() {
+        use diesel::RunQueryDsl;
+        let dir = temp_dir("boot-report");
+        guard_data_dir_ownership(&dir).expect("claim the fresh dir");
+        let db = open_database(&dir).expect("open + migrate");
+
+        let clean = schema_boot_report(&db);
+        assert!(clean.healthy, "a freshly migrated DB is clean: {}", clean.line);
+        assert!(!clean.fatal);
+
+        // A sibling worktree's row, exactly as Diesel writes it. Nothing becomes pending — and yet
+        // the boot must stop claiming an unqualified success and NAME the version. `00000000000052`
+        // is the NEXT sequence number and can never be embedded here: `nyx-core`'s
+        // `every_migration_added_after_the_frozen_lineage_is_dated_not_numbered` refuses it. (It was
+        // `00000000000050` until that number became a REAL migration of this build —
+        // `annexes_url_unique` — at which point the insert collided with its own ledger row.)
+        db.with_conn(|conn| {
+            diesel::sql_query(
+                "INSERT INTO __diesel_schema_migrations (version, run_on) \
+                 VALUES ('00000000000052', '2026-08-16 10:49:30')",
+            )
+            .execute(conn)
+            .expect("write a foreign ledger row");
+        });
+        let flagged = schema_boot_report(&db);
+        assert!(!flagged.healthy, "a foreign ledger row is not a clean boot");
+        assert!(!flagged.fatal, "…but it does not stop the sidecar");
+        assert!(flagged.line.contains("00000000000052"), "got: {}", flagged.line);
+
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// …AND `main.rs` ACTS ON THAT VERDICT. The boot line cannot be exercised from a unit test
+    /// (it is `main`), so what is pinned here is the WIRING: that the entry point consults
+    /// [`schema_boot_report`] and refuses to serve on a `fatal` one, instead of printing the old
+    /// unconditional "SQLite migrated" sentence.
+    #[test]
+    fn main_consults_the_schema_verdict_and_refuses_to_serve_a_fatal_one() {
+        let main_rs = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("main.rs"),
+        )
+        .expect("read the sidecar entry point");
+        assert!(
+            main_rs.contains("runtime::db::schema_boot_report(runtime.db())"),
+            "the boot must ASK the schema"
+        );
+        assert!(
+            main_rs.contains("if schema.fatal"),
+            "a schema behind the binary must be refused, not served"
+        );
+        assert!(
+            !main_rs.contains("runtime booted (SQLite migrated, runtime tables ready)"),
+            "the unconditional success sentence must be gone — it was false in the one case it \
+             mattered"
+        );
     }
 
     /// Review #38: a dir that has BOTH our marker AND a `nyx.db` (the normal steady state after

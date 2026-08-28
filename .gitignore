@@ -20,4 +20,7 @@ prototype/
 .vitest-screenshots/
 .vitest-attachments/
 **/__screenshots__/
+
+# CDP verification evidence (captures, JSON traces, driver scripts) — produced by
+# the verif-app passes, regenerated on demand, never committed.
 .shots/

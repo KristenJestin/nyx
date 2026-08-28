@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useMemo, useRef } from "react";
 import { Dialog as BaseDialog } from "@base-ui/react/dialog";
+import { XIcon } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
@@ -141,6 +142,59 @@ export const Dialog = {
   Description: BaseDialog.Description,
   Close: BaseDialog.Close,
 };
+
+/**
+ * `<DialogCloseX>` — THE dismissal of a dialog: a labelled icon cross at the END of its header.
+ *
+ * ## Why it is here and not written a third time (human review 01M140VQ4S434P2DMCJSTDR4VM)
+ *
+ * Verbatim: « le close en bas est quand même très chelou, est-ce qu'on peut virer le footer, et
+ * juste avoir une croix dans le header à droite ? ». The motif already existed — the Spec run modal
+ * and the engine's inspectors each drew one — but as MARKUP, copied, so a fourth screen would have
+ * copied it again and the four would have drifted apart at the first restyle. It is one component
+ * now, and `run-modal.tsx` reads it too rather than keeping its own.
+ *
+ * ## What it must not take away
+ *
+ * It ADDS a path, it replaces none: `<Dialog.Root>` still closes on Escape and on an outside press
+ * (Base UI owns both), and this is a real `<button>` with an accessible name, so it is a tab stop
+ * inside the dialog's focus trap. `onClick` is optional and only for a CONTROLLED dialog that also
+ * wants its own callback — Base UI's `Close` already asks the root to close.
+ */
+export function DialogCloseX({
+  label = "Close",
+  className,
+  onClick,
+}: {
+  /** The accessible name. Say WHAT closes when a screen has more than one dismissible surface. */
+  label?: string;
+  className?: string;
+  onClick?: () => void;
+}) {
+  return (
+    <BaseDialog.Close
+      render={
+        <button
+          type="button"
+          aria-label={label}
+          data-dialog-close
+          className={cn(
+            // The run modal's own values, lifted verbatim rather than re-picked — the point of
+            // extracting a motif is that nothing about it changes on the way. `ml-auto` is what puts
+            // it AT THE END of the header band, whatever else the header holds.
+            "ml-auto shrink-0 rounded-md p-1 text-muted-foreground",
+            "outline-none transition-colors hover:text-foreground",
+            "focus-visible:ring-2 focus-visible:ring-ring",
+            className,
+          )}
+        >
+          <XIcon className="size-4" />
+        </button>
+      }
+      onClick={onClick}
+    />
+  );
+}
 
 /** Animated scrim: Motion fades it in on open, out on close. */
 export function DialogBackdrop({ className, ...props }: BaseDialog.Backdrop.Props) {

@@ -106,6 +106,92 @@ export function chooseSpawnDimensions(
   return { cols: dims?.cols ?? fallback.cols, rows: dims?.rows ?? fallback.rows };
 }
 
+/** How many MACROTASKS the spawn waits for a first non-zero box before giving up on measuring. */
+const MEASURE_TICK_BUDGET = 3;
+
+/**
+ * The default clock of {@link awaitMeasuredBox} — a MACROTASK, deliberately not `requestAnimationFrame`.
+ *
+ * Reading `clientWidth` FORCES a synchronous layout, so a pane that the browser has already been
+ * told about measures correctly without waiting for a paint: one turn of the event loop is enough
+ * for React's commit to be visible to layout. Waiting on frames instead would cost EVERY terminal
+ * that can never be measured (a `display:none` pane, a detached node, jsdom) a real ~50ms before
+ * its `pty_spawn` — a delay in front of the shell itself, paid by the majority for the minority.
+ *
+ * WHY THE BUDGET IS 3 AND NOT 1. "One turn is enough" is about the COMMIT that is already
+ * scheduled: once React has flushed the layout that gives the pane its rectangle, the very next
+ * macrotask sees it. It is NOT a promise that the commit has been flushed by the time
+ * `awaitMeasuredBox` is called — a split mounts the leaf and its terminal in the SAME pass, and
+ * the effect that spawns can run before the layout effect that sizes the box, or one microtask
+ * queue drain ahead of it. Three turns is that slack, small enough to stay invisible (~0–3ms of
+ * timer granularity, not ~50ms of frames) and bounded so a genuinely unmeasurable terminal pays
+ * a couple of ticks and no more.
+ */
+function nextTick(cb: () => void): void {
+  setTimeout(cb, 0);
+}
+
+/**
+ * WAIT for `element` to have a real box — the other half of the spawn-size gate, and what makes a
+ * pane BORN BY A SPLIT spawn at its own size.
+ *
+ * {@link chooseSpawnDimensions} is a pure verdict on ONE instant, and it is deliberately
+ * pessimistic: no box ⇒ the 80×24 fallback. That is right for a pane that is genuinely hidden, and
+ * wrong for a pane that simply has not been LAID OUT YET — which is exactly the split's case, since
+ * the new leaf's rectangle is created in the same commit that mounts its terminal. Reading the box
+ * in that instant yields 0×0, and the shell would start at 80×24 in a pane that is nothing like
+ * 80×24 — a resumed agent's first turn is then hard-wrapped at the wrong width, frozen in the
+ * scrollback forever (the very defect FEEDBACK #24 was about).
+ *
+ * So the spawn is DEFERRED — a few ticks at most — until the first measurable box:
+ *  - already measurable ⇒ resolves `true` IMMEDIATELY, without yielding at all;
+ *  - measurable within the budget ⇒ `true` (the split case);
+ *  - never measurable (a `display:none` pane, a detached node, a headless DOM) ⇒ `false` after
+ *    {@link MEASURE_TICK_BUDGET} macrotasks, and the caller keeps the sane fallback.
+ *
+ * THE CLOCK IS A MACROTASK, NOT A FRAME — and the names say so. An earlier revision called the
+ * budget `frames` and its clock `nextFrame` while feeding both from {@link nextTick}, so a caller
+ * writing `{ frames: 5 }` believed it was asking for 5 paints (~80ms) and was asking for 5 turns of
+ * the event loop (~5ms). The option is `ticks` / `scheduleTick` for that reason: the unit in the
+ * signature is the unit that is actually spent.
+ *
+ * The budget is BOUNDED and small on purpose: this sits in front of `pty_spawn`, so it must cost a
+ * hidden terminal a couple of ticks, never a stall. `scheduleTick` is injectable so the wait is
+ * testable without a layout engine.
+ */
+export function awaitMeasuredBox(
+  element: { clientWidth: number; clientHeight: number } | null | undefined,
+  options?: { ticks?: number; scheduleTick?: (cb: () => void) => void },
+): Promise<boolean> {
+  const measurable = () => !!element && element.clientWidth > 0 && element.clientHeight > 0;
+  if (measurable()) return Promise.resolve(true);
+  const budget = options?.ticks ?? MEASURE_TICK_BUDGET;
+  const scheduleTick = options?.scheduleTick ?? nextTick;
+  return new Promise<boolean>((resolve) => {
+    // `left` counts the ticks STILL TO SPEND, and one is spent by the very `scheduleTick` below —
+    // so it starts one short of the budget. Decrementing after the exhaustion test instead made
+    // the wait cost `budget + 1` macrotasks, and `{ ticks: 0 }` ("do not wait") still yielded one.
+    let left = budget - 1;
+    const tick = () => {
+      if (measurable()) {
+        resolve(true);
+        return;
+      }
+      if (left <= 0) {
+        resolve(false);
+        return;
+      }
+      left -= 1;
+      scheduleTick(tick);
+    };
+    if (budget <= 0) {
+      resolve(false);
+      return;
+    }
+    scheduleTick(tick);
+  });
+}
+
 /**
  * One LIVE xterm terminal, held IMPERATIVELY outside React — the unit the
  * module-level {@link ./terminal-store store} keeps alive across navigation.
@@ -242,6 +328,17 @@ export class XtermInstance {
       return;
     }
 
+    // Give a pane that is being laid out RIGHT NOW its few macrotasks before judging its box: a leaf
+    // born from a split is mounted in the same commit as its rectangle, so the box is 0×0 at this
+    // instant and would send the shell to the 80×24 fallback in a pane that is nothing like it
+    // (see `awaitMeasuredBox`). A genuinely hidden pane simply spends the budget and falls back,
+    // exactly as before.
+    await awaitMeasuredBox(this.term.element);
+    if (this.disposed) {
+      this.safeUnlisten();
+      return;
+    }
+
     // Size the PTY from the current fit — but ONLY when the pane has a real box
     // (see `chooseSpawnDimensions`), else spawn at the sane 80×24 fallback.
     const { cols, rows } = chooseSpawnDimensions(
@@ -297,10 +394,9 @@ export class XtermInstance {
   private async rehydrateScreen(): Promise<void> {
     if (this.hasDeadHistory) return;
     try {
-      const { bytes } = await nyxBridge.invoke<{ bytes: number[] }>(
-        "terminal_screen_rehydration",
-        { recordId: this.recordId },
-      );
+      const { bytes } = await nyxBridge.invoke<{ bytes: number[] }>("terminal_screen_rehydration", {
+        recordId: this.recordId,
+      });
       if (!this.disposed && bytes && bytes.length > 0) this.term.write(Uint8Array.from(bytes));
     } catch {
       // Nothing to re-hydrate is the normal case for a brand-new terminal, and a failure here

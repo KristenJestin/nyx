@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use nyx_sidecar::lifecycle;
 use nyx_sidecar::pipe::{self, codec::FrameDecoder, wire};
 use nyx_sidecar::runtime::events::EventSink;
-use nyx_sidecar::runtime::Runtime;
+use nyx_sidecar::runtime::{self, Runtime};
 
 /// How long the bounded shutdown waits for the descendant group to drain on
 /// `SIGTERM` before escalating to `SIGKILL`.
@@ -69,16 +69,32 @@ fn main() {
     //    boot failure (bad data dir / migration error) is FATAL — we must not serve a
     //    broken schema — so we reap the group and exit non-zero with a readable log.
     let runtime = match Runtime::boot() {
-        Ok(rt) => {
-            eprintln!("[nyx-sidecar] runtime booted (SQLite migrated, runtime tables ready)");
-            rt
-        }
+        Ok(rt) => rt,
         Err(e) => {
             eprintln!("[nyx-sidecar] FATAL: runtime boot failed: {e}");
             lifecycle::reap_group(pgid, SHUTDOWN_GRACE);
             std::process::exit(1);
         }
     };
+
+    // 4b. THE BOOT DOES NOT GET TO CLAIM SUCCESS ON ITS OWN WORD (human review
+    //     01M0CY3F075ACP4TFBK1KJ49X8). `Runtime::boot()` returning `Ok` only means the migration
+    //     RUN did not error — not that the schema this binary expects is the schema on disk. It
+    //     was not, once: a sibling worktree's ledger row made Diesel skip one of our migrations,
+    //     nothing was pending, this line printed "SQLite migrated", and every command read then
+    //     failed with `no such table`. So the sentence is READ OFF the ledger, and a schema behind
+    //     the binary is refused rather than served.
+    let schema = runtime::db::schema_boot_report(runtime.db());
+    if schema.fatal {
+        eprintln!("[nyx-sidecar] FATAL: {}", schema.line);
+        lifecycle::reap_group(pgid, SHUTDOWN_GRACE);
+        std::process::exit(1);
+    }
+    if schema.healthy {
+        eprintln!("[nyx-sidecar] runtime booted ({})", schema.line);
+    } else {
+        eprintln!("[nyx-sidecar] runtime booted, WITH A SCHEMA WARNING: {}", schema.line);
+    }
 
     let exit_code = run(pgid, runtime);
     std::process::exit(exit_code);

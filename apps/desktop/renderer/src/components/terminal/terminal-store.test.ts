@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { emit, mockIPC } from "@/bridge/test-harness";
-import { chooseSpawnDimensions } from "./xterm-instance";
+import { awaitMeasuredBox, chooseSpawnDimensions } from "./xterm-instance";
 import {
   __resetTerminalStore,
   attachTerminal,
@@ -256,5 +256,99 @@ describe("chooseSpawnDimensions (spawn-size gate)", () => {
     const el = { clientWidth: 100, clientHeight: 100 };
     const dims = chooseSpawnDimensions(el, () => undefined, { cols: 80, rows: 24 });
     expect(dims).toEqual({ cols: 80, rows: 24 });
+  });
+});
+
+/**
+ * THE OTHER HALF OF THE SPAWN-SIZE GATE — the wait, with its clock injected.
+ *
+ * `chooseSpawnDimensions` above judges ONE instant and is right to be pessimistic. A pane BORN BY
+ * A SPLIT, however, is mounted in the same commit that creates its rectangle: read at that instant
+ * its box is 0×0, and the shell would start at 80×24 inside a pane that is nothing like 80×24.
+ * `awaitMeasuredBox` gives that pane its few MACROTASKS — and gives a genuinely hidden one nothing
+ * but a bounded, cheap refusal.
+ *
+ * The tick clock is injected, so what is pinned here is the POLICY (immediate / within budget /
+ * exhausted), never a real layout engine. The OUTCOME in a real browser — one grid per pane, never
+ * 80×24 — is pinned in `../terminals/pane-tree-host.browser.test.tsx`.
+ */
+describe("awaitMeasuredBox (a split pane never spawns at the 80×24 fallback)", () => {
+  /** A TICK clock (macrotasks, not frames) that runs the queued callbacks on demand, counting
+   *  how many it served. */
+  function ticks() {
+    const queue: Array<() => void> = [];
+    let served = 0;
+    return {
+      get served() {
+        return served;
+      },
+      scheduleTick: (cb: () => void) => {
+        queue.push(cb);
+      },
+      /** Run every callback queued so far (a callback may queue the next tick). */
+      async flush(times = 1) {
+        for (let i = 0; i < times; i++) {
+          const due = queue.splice(0, queue.length);
+          for (const cb of due) {
+            served += 1;
+            cb();
+          }
+          await Promise.resolve();
+        }
+      },
+    };
+  }
+
+  it("resolves at once — WITHOUT burning a tick — when the box is already measurable", async () => {
+    const clock = ticks();
+    const el = { clientWidth: 640, clientHeight: 360 };
+    await expect(
+      awaitMeasuredBox(el, { ticks: 5, scheduleTick: clock.scheduleTick }),
+    ).resolves.toBe(true);
+    expect(clock.served, "a laid-out pane must not delay its own spawn").toBe(0);
+  });
+
+  it("WAITS for the pane the split just created, and reports the box once it lands", async () => {
+    const clock = ticks();
+    // The split's pane: mounted with its rectangle, but not laid out yet.
+    const el = { clientWidth: 0, clientHeight: 0 };
+    const measured = awaitMeasuredBox(el, { ticks: 5, scheduleTick: clock.scheduleTick });
+    await clock.flush();
+    // Still nothing on the first tick — the wait must not have given up.
+    el.clientWidth = 600;
+    el.clientHeight = 350;
+    await clock.flush(2);
+    await expect(measured).resolves.toBe(true);
+  });
+
+  it("gives up after its BUDGET on a pane that never gets a box (display:none)", async () => {
+    const clock = ticks();
+    const el = { clientWidth: 0, clientHeight: 0 };
+    const measured = awaitMeasuredBox(el, { ticks: 3, scheduleTick: clock.scheduleTick });
+    await clock.flush(6);
+    await expect(measured).resolves.toBe(false);
+    // Bounded: a hidden pane costs a couple of ticks, never a stall.
+    expect(clock.served).toBeLessThanOrEqual(4);
+  });
+
+  it("gives up on an absent element instead of waiting forever", async () => {
+    const clock = ticks();
+    const measured = awaitMeasuredBox(null, { ticks: 2, scheduleTick: clock.scheduleTick });
+    await clock.flush(4);
+    await expect(measured).resolves.toBe(false);
+  });
+
+  it("and the verdict it enables is the real one: the measured box wins over the fallback", async () => {
+    const clock = ticks();
+    const el = { clientWidth: 0, clientHeight: 0 };
+    const measured = awaitMeasuredBox(el, { ticks: 5, scheduleTick: clock.scheduleTick });
+    el.clientWidth = 600;
+    el.clientHeight = 350;
+    await clock.flush(2);
+    expect(await measured).toBe(true);
+    // What the spawn does with it — the split pane's own grid, not 80×24.
+    expect(
+      chooseSpawnDimensions(el, () => ({ cols: 66, rows: 20 }), { cols: 80, rows: 24 }),
+    ).toEqual({ cols: 66, rows: 20 });
   });
 });

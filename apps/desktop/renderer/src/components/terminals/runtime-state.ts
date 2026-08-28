@@ -1,12 +1,12 @@
 import type { AgentActivity } from "@/components/sidebar/use-agent-sessions";
 import type { ExecState } from "@/components/sidebar/use-terminals";
-import type { RunState } from "./status-dot";
-import { aggregateState } from "./status-dot";
+import type { RunState } from "@/components/ui/status-dot";
+import { aggregateState } from "@/components/ui/status-dot";
 import type {
   WorkspaceRuntimeService,
   WorkspaceRuntimeSnapshot,
   WorkspaceRuntimeTerminal,
-} from "./use-workspace-runtime";
+} from "@/components/runtime/use-workspace-runtime";
 
 /**
  * Pure run-state derivations for the Terminals page — the ONLY place the renderer reduces the
@@ -149,8 +149,13 @@ export type ConsumedLookup = (kind: "terminal" | "service", id: string) => boole
  *
  * `selected` is `false` here: a rollup is not a viewed row, so a settled result is cleared only by
  * being read (its own `readyUnread`/`errorUnread` / `exec_state_unread` flag), never by focus.
+ *
+ * EXPORTED since the group folders got a rollup dot of their own (human review
+ * 01M12MW1DV1V455EWBMV048TE6): a closed folder hides its members' dots, so it has to carry their
+ * aggregate — and it must be the SAME aggregate the workspace accordion carries, over the same
+ * per-leaf projection, or the two dots on screen would disagree about the same terminals.
  */
-function terminalRollupState(
+export function terminalRollupState(
   terminal: WorkspaceRuntimeTerminal,
   activity: AgentActivity | undefined,
   consumed?: ConsumedLookup,
@@ -165,7 +170,10 @@ function terminalRollupState(
  * A settled `success`/`error` contributes ONLY while unread (`service.unread`) AND not locally
  * consumed. `running` always contributes; `selected` is `false` (a rollup is not a viewed row).
  */
-function serviceRollupState(service: WorkspaceRuntimeService, consumed?: ConsumedLookup): RunState {
+export function serviceRollupState(
+  service: WorkspaceRuntimeService,
+  consumed?: ConsumedLookup,
+): RunState {
   const unread = service.unread && !(consumed?.("service", service.id) ?? false);
   return notifiedRunState(serviceRunState(service), unread, false);
 }

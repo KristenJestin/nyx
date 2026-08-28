@@ -1,16 +1,28 @@
 import type { ReactNode } from "react";
 
-import { cn } from "@/lib/utils";
 import { Tooltip } from "@/components/ui/tooltip";
-import { StatusDot, type RunState } from "./status-dot";
+import {
+  SidebarLine,
+  SidebarLineActions,
+  SidebarLineBand,
+  SidebarLineGlyph,
+  SidebarLineLabel,
+} from "@/components/ui/sidebar-line";
+import type { RunState } from "@/components/ui/status-dot";
 import { useRuntimeSelection, type RuntimeSelection } from "./runtime-selection";
 
 /**
- * `<RuntimeRow>` — one selectable element of the runtime tree (a terminal or a service). The
- * lead glyph carries a corner run-state dot, then the label, then an optional trailing action
- * cluster (a service's start/stop/relaunch, a terminal's rename/close). Clicking the row makes
- * it the shared page selection so the main pane swaps to the matching surface; the row highlights
- * when selected.
+ * `<RuntimeRow>` — the SELECTABLE families of the runtime tree: a terminal, an agent (the same
+ * line, wearing its provider's glyph and its activity pastille) and a managed command. Clicking it
+ * makes it the shared page selection so the main pane swaps to the matching surface.
+ *
+ * ## It no longer OWNS a geometry (human review 01M12MW1DV1V455EWBMV048TE6)
+ *
+ * The band, the glyph size, the insets, the hover tint and the corner pastille are
+ * `<SidebarLine>`'s — the one component every family of the tree composes, folders included. This
+ * file is now what makes a line SELECTABLE (its band is a `<button>` that selects) and nothing
+ * else. That is the point: the folder head's parity with a terminal row is not maintained here or
+ * there, it is structural — there is one line, and these are two of its compositions.
  *
  * ## Non-inline hover meta (`tooltip`) — v2.5.6 FEEDBACK #28
  * An optional `tooltip` surfaces per-row meta (a terminal's live CPU%/RAM) ONLY on hover/focus,
@@ -19,13 +31,11 @@ import { useRuntimeSelection, type RuntimeSelection } from "./runtime-selection"
  * the meta appears above the row as a tooltip.
  *
  * ## Inline rename (`editing`/`editor`) — v2.5.6
- * When `editing` is set the row swaps its select-button label for `editor` (an `<Input>`), rendered
+ * When `editing` is set the row swaps its select-button band for `editor` (an `<Input>`), rendered
  * OUTSIDE any `<button>` so the field is a valid, focusable control (interactive content may not
  * nest in a button). `onLabelDoubleClick` lets a double-click on the name begin the rename.
  *
  * Presentation only — the run state is projected upstream (`runtime-state`) and handed in.
- * Every colour/size is a design-system token (`bg-muted`, `text-foreground`, `ring-background`,
- * the `size-*` scale): no raw hex, no magic px.
  */
 export function RuntimeRow({
   selection,
@@ -45,7 +55,11 @@ export function RuntimeRow({
   label: ReactNode;
   /** The row's run-state dot. */
   state: RunState;
-  /** Optional trailing actions (revealed on hover / while selected). */
+  /**
+   * Optional trailing actions. WHEN they show is not this file's decision any more — the reveal
+   * (hover, selection, focus-visible) belongs to `<SidebarLineActions>`, once, for every family
+   * (human review 01M13118SE5M04J4M9SJGZYAAT).
+   */
   actions?: ReactNode;
   /**
    * Optional hover/focus tooltip content (v2.5.6, non-inline meta): a terminal's live CPU%/RAM.
@@ -62,59 +76,41 @@ export function RuntimeRow({
   const { select, isSelected } = useRuntimeSelection();
   const selected = isSelected(selection);
 
-  // The lead glyph + its corner run-state dot, shared by the normal select-button branch and the
-  // editing branch (so the row keeps a stable left edge while renaming).
-  const glyph = (
-    <span className="relative inline-flex shrink-0 text-muted-foreground">
-      {icon}
-      <StatusDot
-        state={state}
-        size="xs"
-        className="-right-0.5 -bottom-0.5 absolute rounded-full ring-2 ring-background"
-      />
-    </span>
-  );
+  // The lead glyph + its corner run-state pastille — the SHARED one, so an agent's yellow "waiting"
+  // dot and a closed folder's rollup are the same object at the same offsets. Built once here so
+  // the line keeps a stable left edge between the normal and the renaming branch.
+  const glyph = <SidebarLineGlyph icon={icon} state={state} />;
 
-  // The clickable select button (normal, non-editing state). Wrapped in a `<Tooltip>` when
-  // `tooltip` is supplied so the hover meta reads WITHOUT ever occupying row width (non-inline).
-  const selectButton = (
-    <button
-      type="button"
-      onClick={() => select(selection)}
-      className="flex min-w-0 flex-1 items-center gap-2.5 px-2 py-1.5 text-left"
+  // The clickable select band (normal, non-editing state). Wrapped in a `<Tooltip>` when `tooltip`
+  // is supplied so the hover meta reads WITHOUT ever occupying row width (non-inline).
+  const selectBand = (
+    <SidebarLineBand
+      render={<button type="button" onClick={() => select(selection)} className="text-left" />}
     >
       {glyph}
-      <span className="min-w-0 flex-1 truncate text-foreground" onDoubleClick={onLabelDoubleClick}>
+      <SidebarLineLabel className="text-foreground" onDoubleClick={onLabelDoubleClick}>
         {label}
-      </span>
-    </button>
+      </SidebarLineLabel>
+    </SidebarLineBand>
   );
 
   return (
-    <div
-      data-selected={selected}
-      className={cn(
-        "group flex items-center gap-1 rounded-md pr-1 text-sm transition-colors",
-        selected ? "bg-muted" : "hover:bg-muted/60",
-      )}
+    <SidebarLine
+      selected={selected}
+      actions={actions != null ? <SidebarLineActions>{actions}</SidebarLineActions> : undefined}
     >
       {editing && editor != null ? (
-        <div className="flex min-w-0 flex-1 items-center gap-2.5 px-2 py-1.5">
+        <SidebarLineBand>
           {glyph}
           {editor}
-        </div>
+        </SidebarLineBand>
       ) : tooltip != null ? (
         <Tooltip label={tooltip} side="top">
-          {selectButton}
+          {selectBand}
         </Tooltip>
       ) : (
-        selectButton
+        selectBand
       )}
-      {actions != null ? (
-        <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-data-[selected=true]:opacity-100">
-          {actions}
-        </span>
-      ) : null}
-    </div>
+    </SidebarLine>
   );
 }
