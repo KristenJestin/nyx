@@ -48,7 +48,9 @@
 //! than by ticking. It depends on NO Claude binary and NO LLM — nothing here reaches a model. And it
 //! freezes NO wording: a resume is asserted by its machine code and its `outcome` tag, a refusal by
 //! its typed [`RpcCode`] and by the VALUES it hands back (the accepted forms, read from the
-//! grammar's own constant; the id of the nearest candidate Spec), never by a sentence.
+//! grammar's own constant; the id of the nearest candidate Spec), never by a sentence — and the
+//! block the hook injects in a refused manual's place by what it CARRIES (the server's own sentence,
+//! relayed; no `run_id`), never by its own prose.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -910,7 +912,17 @@ fn replaying_nspec_3_on_a_spec_with_a_live_run_authors_no_second_spec_and_opens_
 /// the accepted forms come from the grammar's own constant, and the nearest candidate is named BY
 /// ITS ID — the value the next call is formed from. That the refusal then TRAVELS is asserted
 /// against the message the verb itself produced (so a re-wording follows rather than breaks), on
-/// both channels: the hook's stderr trace, and the `agent_session_event` filing that puts it in nyx.
+/// the THREE channels it has to reach: the block the hook injects (the only one the MODEL is ever
+/// shown), the hook's stderr trace, and the `agent_session_event` filing that puts it in nyx.
+///
+/// THAT FIRST CHANNEL IS A REVERSAL OF WHAT THIS GATE ORIGINALLY FROZE. It asserted that a refused
+/// `run_start` injects NOTHING — true of the hook the day this file was written, and wrong as a
+/// requirement: Claude Code never feeds stderr to the model, so swallowing the refusal is nyx
+/// saying nothing at all about a command it has just refused, leaving the session to improvise at
+/// the exact spot where improvising authored the duplicate. `refusedReferenceBlock` relays it
+/// instead. What must not be injected is a MANUAL (asserted here through `agent_context` never
+/// being called) or a header naming a run that does not exist — and THAT is the half of the old
+/// assertion that was load-bearing, kept below as the `run_id` guard.
 #[test]
 fn nspec_99_designates_nothing_so_it_opens_no_run_authors_no_spec_and_names_what_to_send() {
     if !node_available() {
@@ -930,13 +942,14 @@ fn nspec_99_designates_nothing_so_it_opens_no_run_authors_no_spec_and_names_what
     let hook = run_hook("/nspec 99 reprends la spec", &scene.cwd, sidecar.port);
     assert_eq!(hook.code, 0, "the hook always exits 0");
 
-    // The session takes its turn on whatever it was handed — nothing at all, when the refusal held.
-    // When it did NOT hold, what reaches the session is a run carrying no Spec, and the modelled
-    // session authors: that is what makes the Spec assertion below a lock on this leg too, and not
-    // merely a restatement of "run_start does not create Specs".
+    // The session takes its turn on whatever RUN it was handed — none, when the refusal held: the
+    // block injected in that case names no run (asserted below), so there is nothing to take a turn
+    // on. When the refusal did NOT hold, what reaches the session is a run carrying no Spec, and the
+    // modelled session authors: that is what makes the Spec assertion below a lock on this leg too,
+    // and not merely a restatement of "run_start does not create Specs".
     let injected = hook.injected();
-    if let Some(injected) = &injected {
-        an_nspec_session_authors_when_its_run_carries_no_spec(&scene, &run_id_of(injected));
+    if let Some(run_id) = injected.as_deref().and_then(run_id_in) {
+        an_nspec_session_authors_when_its_run_carries_no_spec(&scene, &run_id);
     }
 
     // Nothing was created, on either axis.
@@ -955,10 +968,6 @@ fn nspec_99_designates_nothing_so_it_opens_no_run_authors_no_spec_and_names_what
         live_before,
         "…and it left the run that was already live UNTOUCHED — every column of it, cursor and \
          updated_at included",
-    );
-    assert_eq!(
-        injected, None,
-        "a refused run_start injects NOTHING — never a manual over a run that does not exist",
     );
 
     // The refusal itself, read off the verb that produced it.
@@ -994,9 +1003,26 @@ fn nspec_99_designates_nothing_so_it_opens_no_run_authors_no_spec_and_names_what
         sidecar.tool_names(),
     );
 
-    // …and that refusal reaches the two channels a human (or nyx) can read it on, VERBATIM — the
+    // NO MANUAL IS NOT NOTHING. The refusal reaches the three channels it has to, VERBATIM — the
     // server's own sentence, whatever it says, not a wording restated by the hook. Asserted against
-    // the message the verb ACTUALLY produced above, so re-wording the refusal re-words this too.
+    // the message the verb ACTUALLY produced above, so re-wording the refusal re-words these too.
+    //
+    // FIRST, THE ONLY ONE THE MODEL IS SHOWN: a block IS injected, and it is REQUIRED, not merely
+    // tolerated (see this test's doc for the reversal). Two facts lock it — it relays the server's
+    // sentence, and it names no run: `run_id_in` is the very reader a session uses to learn the id
+    // it ticks, so a `None` here is that session finding nothing to hunt for, and the literal guard
+    // beside it forbids even an empty header field.
+    let injected = injected
+        .expect("a refused reference is RELAYED to the session — the model is never shown stderr");
+    assert!(
+        injected.contains(&refusal.message),
+        "the injected block carries the SERVER's sentence, not a hook-side paraphrase: {injected}",
+    );
+    assert!(
+        run_id_in(&injected).is_none() && !injected.contains("run_id"),
+        "…and names NO run: there is no run to tick, and an id-less header is exactly what sends a \
+         session hunting for one: {injected}",
+    );
     assert!(
         hook.stderr.contains(&refusal.message),
         "the trace carries the SERVER's sentence, not a hook-side paraphrase: {:?}",
@@ -1040,12 +1066,20 @@ fn the_harness_removes_its_temp_dir_when_the_scene_drops() {
 // ============================================================================
 
 /// The `run_id` out of the block the hook injected — read from the line the hook writes it on, which
-/// is the only place the session ever learns it.
-fn run_id_of(injected: &str) -> String {
+/// is the only place the session ever learns it. `None` when the block names no run at all, which is
+/// a REAL shape and not a parse failure: a refused `run_start` gets a block relaying the refusal, and
+/// it deliberately carries no id (`refusedReferenceBlock`).
+fn run_id_in(injected: &str) -> Option<String> {
     injected
         .lines()
         .find_map(|l| l.trim().strip_prefix("run_id:"))
         .map(|v| v.trim().to_string())
+}
+
+/// [`run_id_in`] where a run is the POINT of the injection — the replay leg, whose block is a run
+/// header by definition, so an absent id is a failure of the thing under test and not a shape.
+fn run_id_of(injected: &str) -> String {
+    run_id_in(injected)
         .unwrap_or_else(|| panic!("the injected block names the run to tick: {injected}"))
 }
 
