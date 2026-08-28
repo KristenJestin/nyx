@@ -128,7 +128,9 @@ fn annexe_err(e: AnnexeError) -> RpcError {
 /// URL itself as the title (`annexes.title` stays NOT NULL). Every other kind still REQUIRES a
 /// title, exactly as before.
 pub fn annexe_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let kind = parse_kind(args)?;
     let title = if kind == db::ANNEX_KIND_URL {
         optional_str(args, "title")?.unwrap_or("")
@@ -164,7 +166,9 @@ pub fn annexe_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// nothing else, which is why the link surface needed NO new tool. Omitting it leaves the read
 /// exactly as it was — same rows, same order.
 pub fn annexe_list(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let kind = parse_kind_filter(args)?;
     let annexes = db
         .with_conn(|c| db::list_annexes(c, spec_id, kind))

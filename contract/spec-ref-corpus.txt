@@ -1,0 +1,70 @@
+// SPEC-REF TOKEN CORPUS — the token set the Spec-reference grammar is pinned on.
+//
+// WHO READS IT: BOTH halves of the grammar, and that is the point.
+//   * Rust — `spec_ref.rs` (`tests::the_witnesses_never_leave_the_shared_corpus` and
+//     `tests::every_corpus_token_answers_as_its_section_says`). The first proves that every form
+//     `ACCEPTED_FORM_WITNESSES` enumerates rides in this file — so a form added to
+//     `spec_ref::parse` forces a witness, and the witness forces a line here. The second REPLAYS
+//     every line below through `parse` and requires the answer its section header claims, so the
+//     classification is a test and not a comment.
+//   * JS — the session hook (`nyx-session-hook.cjs`), through
+//     `spec_ref.rs`'s `tests::the_shared_corpus_pins_the_hook_recogniser_to_this_grammar`, which
+//     runs the REAL hook under `node` and feeds each token below to its REAL `specIdFromPrompt`
+//     (the hook exports it; the test holds no copy of the regex). The hook opens the run before
+//     the agent speaks, so a form it cannot see is a form that never reaches the core on that path.
+//
+// WHY IT LIVES IN `contract/`: this is the repo's home for a fixture read from BOTH sides of the
+// Rust <-> JS line — `contract/README.md` says exactly that in its own first sentence, and lists
+// this file among the three contracts it holds (see also `contract/design-fixtures.json`, read by
+// `mcp_tools_design.rs` through the same `include_str!(CARGO_MANIFEST_DIR)` idiom).
+//
+// RULES OF THE FILE: one WHOLE token per line — no internal whitespace (a recogniser reads one
+// token; multi-word input is split before it, so `3 4` is not a grammar question), `//` comments,
+// and NO empty-token line ("" is covered by the inline prose tests). Every token must sit UNDER
+// one of the three section headers below: a line above them all is pinned to no verdict, and the
+// replay tests refuse it.
+//
+// THE KEY EXAMPLE IS A PLACEHOLDER. `KEY-3` mirrors `spec_ref::ACCEPTED_FORMS`, which is diffused
+// to every agent on every project: nyx's own project key has no business being the example the
+// domain shows a human working on some other project.
+//
+// WHY THERE ARE THREE SECTIONS AND NOT TWO — THE ASYMMETRY IS THE CONTRACT. The hook recognises a
+// SHAPE and forwards the token RAW; the core decides a VALUE. `spec_ref::parse` refuses a number
+// outside an `i64` (`digits.parse::<i64>()` fails -> prose, so `NotAReference`) and `spec_ref::
+// lookup` refuses one outside the 32-bit `specs.number` column (a reference that designates
+// nothing, so `Unresolved`): two VALUE decisions, taken where the Spec is actually looked up, and
+// they do not even land on the same verdict. A shape-only recogniser is not to mirror them — a
+// hook accepting `9223372036854775808` is the correct division of labour, not a divergence to
+// close. So the tokens the core refuses are split by WHY: the third section holds the ones whose
+// SHAPE is one of the four, and it is the section on which the two readers deliberately answer
+// differently. The second holds the ones NO form recognises, where they must agree.
+//
+// --- accepted by spec_ref::parse: the four forms (and their documented tolerances) ---
+decafbad-cafe-babe-f00d-0123456789ab
+019FF517-0000-7000-8000-0000000000AB
+KEY-3
+key-3
+feature-42
+#3
+3
+007
+9223372036854775807
+// --- refused by spec_ref::parse: prose and partials, which no form recognises ---
+#
+#3a
+#key-3
+-3
+3-
+key-
+key-3a
+a-b-c
+3abc
+v3
+3.1
+abc
+٣
+#٣
+// --- a recognised SHAPE the core refuses on its VALUE bound alone (the hook forwards it) ---
+99999999999999999999
+9223372036854775808
+KEY-99999999999999999999

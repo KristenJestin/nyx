@@ -62,7 +62,15 @@ export function createMainWindow(app: App): BrowserWindow {
     frame: false,
     // Avoid a white flash: stay hidden until the renderer's first paint.
     show: false,
-    backgroundColor: "#000000",
+    // The DARK THEME's `--background` — `oklch(0.145 0 0)` in `renderer/src/globals.css` — as
+    // sRGB hex. Electron reads this option when it creates the native window, long before any
+    // renderer CSS exists, so it CANNOT read the token: the value is a KNOWING DUPLICATE of it,
+    // and of the same literal in `renderer/index.html`'s boot splash. The three have to agree —
+    // the window chrome, the splash and the first React screen paint one continuous surface, and
+    // any drift between them shows up as a flash at the moment the window appears. It used to be
+    // `#000000`, a colour the theme uses nowhere. `renderer/src/boot-splash.guard.test.ts`
+    // converts the oklch token itself and fails on the day one of the three moves.
+    backgroundColor: "#0a0a0a",
     webPreferences: {
       // The ONLY bridge into the renderer — built from the channel allowlist in
       // ../shared/ipc.ts (`WINDOW_CHANNELS` + `CORE_CHANNELS`), whose main-side
@@ -132,8 +140,8 @@ export function createMainWindow(app: App): BrowserWindow {
     void win.loadURL(devUrl);
     win.webContents.openDevTools({ mode: "detach" });
   } else {
-    // Packaged: the frontend's static build is copied next to the compiled main
-    // (see package.json `build` — `apps/frontend/dist` → `dist/renderer`). Loading
+    // Packaged: the renderer's static build is copied next to the compiled main
+    // (see package.json `copy:renderer` — `renderer/dist` → `dist/renderer`). Loading
     // a file path keeps the renderer at the `file://` origin the nav-guard pins.
     void win.loadFile(join(__dirname, "..", "renderer", "index.html"));
   }

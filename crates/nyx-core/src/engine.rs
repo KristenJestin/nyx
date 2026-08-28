@@ -100,6 +100,61 @@ pub const DEFAULT_WORKTREES_ROOT_KEY: &str = "worktrees_root";
 /// `output_key`.
 pub const SPEC_WRITE_GRANT_KEY: &str = "__spec_write_granted__";
 
+/// The RESERVED blackboard key under which the board keeps its own PROVENANCE — for each top-level key
+/// it holds, WHICH NODE last wrote it and of WHAT TYPE ([`NodeOrigin`]).
+///
+/// # Why the board carries it at all
+///
+/// Every consent guard nyx has had to write so far asks the same question — "did a human decide this?"
+/// — and, having no record of who wrote what, answers it by STATIC ANALYSIS of the graph: which
+/// question could have filled this key, does anything else write it, does a branch route through it.
+/// Six guards were written that way and each closed one shape. The engine, at the instant it crosses a
+/// sensitive node, does not have to reason about shapes: it holds the value. All it lacked was the one
+/// fact recorded here.
+///
+/// # The shape, and why it is this one
+///
+/// It follows [`SPEC_WRITE_GRANT_KEY`] deliberately, field for field: dot-free with a double
+/// underscore, so [`Blackboard::get`]'s dot-path split reads it as ONE flat key; written by the ENGINE
+/// ALONE, never by a node's `output_key` / `write` / `retrieve.to` (authoring REFUSES it —
+/// [`crate::mcp_authoring`] — because a graph that can name this key can forge its own provenance,
+/// which is precisely the bypass provenance exists to close); and it lives INSIDE the board's JSON
+/// object, so `workflow_runs.blackboard` stays the same TEXT column and NO migration is involved.
+///
+/// The value is an object keyed by TOP-LEVEL board key — ONE entry per key, overwritten in place — so
+/// its size is bounded by the number of distinct keys a graph writes, never by the number of ticks.
+/// It is a record of the LAST writer, not a history: what a consent gate needs to know is who put
+/// there the value it is about to read.
+///
+/// # A board WITHOUT it reads normally
+///
+/// [`Blackboard::from_json_str`] returns whatever object it parses, so a run already in flight when
+/// this shipped carries a board with no such key and every read of it answers `None`
+/// ([`Blackboard::origin_of`]). "Unknown" is a first-class answer here, and its handling — degrade,
+/// warn, never block — belongs to the consumer.
+pub const PROVENANCE_KEY: &str = "__written_by__";
+
+/// Whether `key` is a board key that NO WRITE may land on — [`PROVENANCE_KEY`] is the only one, and
+/// this is the predicate the four write paths ask before inserting anything.
+///
+/// It is reserved for the reason it exists. Every other key holds a value the run computed; this one
+/// holds the board's record of WHO computed each value, so a write naming it does not add an entry
+/// beside the others — it REPLACES the whole record with whatever object the writer chose. That is a
+/// forgery, not a collision: `output_key: "__written_by__"` on any node, with
+/// `{"approved": {"node": "…", "type": "ask_human"}}` for its value, makes the runtime consent check
+/// ([`crate::mcp_engine`]) read "a human authorized this" for a key no human ever touched, and the
+/// node it names need not even exist.
+///
+/// The authoring guard (`mcp_authoring::validate_board_write_key`) already refuses such a
+/// declaration, and it is NOT enough on its own: it only sees graphs authored THROUGH it, while a
+/// seeded, forked, imported or hand-inserted graph reaches the interpreter without ever passing it —
+/// and those are exactly the graphs the runtime consent check was added to cover. A layer whose
+/// point is to CONSTATE instead of INFER cannot rest its integrity on a static analysis of the
+/// authoring path, so the refusal is also here, on the one place every write goes through.
+fn is_reserved_board_key(key: &str) -> bool {
+    key == PROVENANCE_KEY
+}
+
 /// The blackboard key a `loop` records its completed-pass count under — as an OBJECT keyed by the
 /// loop's NODE ID (`loop_iter.<node id>`, read back by dot-path), never one number for the whole run:
 /// a graph nests loops (ndev runs an audit/rework loop inside its phases loop) and siblings run one
@@ -604,6 +659,19 @@ impl Condition {
     /// Extra tests ANDed beside a qualifying `eq` (a `ne`, a `truthy`) only NARROW the branch, so they
     /// are left alone: they can make it fire less often, never on a value the `eq` already refused.
     pub fn affirmative_key(&self) -> Option<&str> {
+        self.affirmative_path().map(board_key_root)
+    }
+
+    /// [`Self::affirmative_key`] BEFORE the rooting — the WHOLE dot-path the branch tests.
+    ///
+    /// The two readers want different halves of one fact. A CLASSIFICATION ([`Tree::answer_decides`],
+    /// the authoring rule) asks "which QUESTION fills this?", and a question fills a top-level key,
+    /// so it reads the ROOT. A RUNTIME check ([`Tree::consent_keys`], read by
+    /// [`crate::mcp_engine`]'s consent verdict) asks "is that value affirmative RIGHT NOW?", and
+    /// [`Blackboard::get`] answers that on the FULL path: the root of `answer.decision` is an
+    /// OBJECT, affirmative under no reading, so a rooted key would leave every dotted gate
+    /// unanswerable and silently degrade the refusal into a warning.
+    pub fn affirmative_path(&self) -> Option<&str> {
         // `always` wins over every other field (it is the else branch), so a cond carrying it tests
         // nothing whatever else it names.
         if self.always == Some(true) {
@@ -614,7 +682,7 @@ impl Condition {
         if !crate::mcp_engine::eq_literal_is_affirmative(expected) {
             return None;
         }
-        Some(board_key_root(var))
+        Some(var)
     }
 }
 
@@ -686,15 +754,63 @@ impl Blackboard {
         cur
     }
 
+    /// WHO last wrote the TOP-LEVEL key `key`, as the board recorded it AT THE WRITE — never inferred
+    /// from the graph. `None` has exactly one meaning and it is not "nobody": the board holds no
+    /// provenance for that key, either because it predates [`PROVENANCE_KEY`] (a run already in flight)
+    /// or because the write came through a path that could not name its author. A consumer that treats
+    /// `None` as a refusal freezes live runs; see [`crate::mcp_engine`]'s consent check for the
+    /// degrade-and-warn this is meant to feed.
+    ///
+    /// Reads the ROOT of a dot-path, since that is the key the board actually holds: the origin of
+    /// `answer.decision` is the origin of `answer`.
+    pub fn origin_of(&self, key: &str) -> Option<NodeOrigin> {
+        let entry = self
+            .map
+            .get(PROVENANCE_KEY)?
+            .as_object()?
+            .get(board_key_root(key))?;
+        NodeOrigin::from_json(entry)
+    }
+
+    /// A WRITER's view of this board — every write made through it RECORDS `origin` under
+    /// [`PROVENANCE_KEY`]. The ONE way provenance is produced: `board.written_by(&origin).set(…)`.
+    ///
+    /// It exists as a separate handle rather than as an extra argument on each of the four write
+    /// methods because the alternative — a "current writer" field on the board — is the shape that
+    /// mis-attributes. A field left set by one node stamps the NEXT node's writes with the previous
+    /// author, and a provenance that names the wrong node is worse than no provenance at all: it is a
+    /// false one, and a consent check believes it. Here the origin cannot outlive the statement.
+    pub fn written_by<'b>(&'b mut self, origin: &'b NodeOrigin) -> BoardWriter<'b> {
+        BoardWriter {
+            board: self,
+            origin,
+        }
+    }
+
     /// Set a TOP-LEVEL key (the interpreter's convenience keys are all top-level).
+    ///
+    /// UNATTRIBUTED, and that is a WRITE to the provenance too: it DROPS whatever origin the key
+    /// carried. Leaving the old one would let a write nyx cannot attribute inherit the credibility of
+    /// the one before it — the runtime twin of the single-writer bypass the authoring rule's condition
+    /// (iii) exists for (`ask_human` fills `approved`, something else overwrites it, the gate still
+    /// reads "a human said yes"). Use [`Blackboard::written_by`] when the author is known.
     pub fn set(&mut self, key: &str, value: Value) {
-        self.map.insert(key.to_string(), value);
+        self.write(None, key, value);
     }
 
     /// Remove a TOP-LEVEL key (the mirror of [`Blackboard::set`]), so a cleared flag leaves no
-    /// residue on the persisted board.
+    /// residue on the persisted board — its PROVENANCE included, since a record of who wrote a key
+    /// that is no longer there is residue of exactly the kind this method exists to avoid.
+    ///
+    /// Refuses [`PROVENANCE_KEY`] on the same footing as the write paths: erasing the record is the
+    /// denial half of forging it, and it would turn every later consent check on this run into the
+    /// "nothing recorded" verdict, which crosses.
     pub fn remove(&mut self, key: &str) {
+        if is_reserved_board_key(key) {
+            return;
+        }
         self.map.remove(key);
+        self.forget_origin(key);
     }
 
     /// Write `value` under `scope` INSIDE the object at a top-level `key`, creating that object when
@@ -706,7 +822,60 @@ impl Blackboard {
     /// inner audit/rework loop overwrote it on every pass, the outer phases loop overwrote it again
     /// when its body finished, and the number a condition (or a human reading the board) saw was right
     /// for none of them but the last to complete a pass.
+    ///
+    /// The provenance recorded is that of the TOP-LEVEL key, not of the scope inside it: two loops
+    /// writing `loop_iter.<their own id>` share one origin entry and the later one wins. That is a
+    /// real coarseness and it is stated rather than hidden — it costs nothing today because a consent
+    /// gate reads a ROOT key ([`board_key_root`]) and no sensitive node gates on a scoped one, but a
+    /// gate that ever did would be reading an origin about a sibling's write.
     pub fn set_scoped(&mut self, key: &str, scope: &str, value: Value) {
+        self.write_scoped(None, key, scope, value);
+    }
+
+    /// Increment a top-level integer counter (0 when absent), returning the new value.
+    pub fn increment(&mut self, key: &str) -> i64 {
+        self.bump(None, key)
+    }
+
+    /// APPEND `value` to the JSON array at a TOP-LEVEL `key`, creating `[value]` when the key is
+    /// absent (or holds a non-array). This is what lets a LOOP ACCUMULATE its results — a grill's Q&A
+    /// history, successive artifacts — instead of each turn overwriting the last (v2.8 review N9).
+    pub fn append(&mut self, key: &str, value: Value) {
+        self.push(None, key, value);
+    }
+
+    /// The underlying JSON object (read-only). It CARRIES [`PROVENANCE_KEY`] like any other reserved
+    /// key ([`SPEC_WRITE_GRANT_KEY`], `__child_run_id__…`): the board is one object and this is the
+    /// object.
+    pub fn as_map(&self) -> &Map<String, Value> {
+        &self.map
+    }
+
+    // --- the four write paths, each in ONE implementation ------------------
+    //
+    // `set` / `set_scoped` / `increment` / `append` and their [`BoardWriter`] twins funnel through
+    // these four, so a write that records no provenance is not a path someone forgot — there is no
+    // other path. The `origin` argument is the whole difference between the two families.
+    //
+    // All four open on the SAME refusal ([`is_reserved_board_key`]): a write naming
+    // [`PROVENANCE_KEY`] is DROPPED — key and provenance both — so the record of who wrote what is
+    // the only thing on this board that the graph cannot write. It is dropped rather than reported
+    // because these are the interpreter's own insert points, called from a dozen sites with no error
+    // channel between them; the loud refusal is the authoring guard's job, and the two together are
+    // what make "only the engine writes it" true of a graph nyx did not author.
+
+    fn write(&mut self, origin: Option<&NodeOrigin>, key: &str, value: Value) {
+        if is_reserved_board_key(key) {
+            return;
+        }
+        self.map.insert(key.to_string(), value);
+        self.note_origin(key, origin);
+    }
+
+    fn write_scoped(&mut self, origin: Option<&NodeOrigin>, key: &str, scope: &str, value: Value) {
+        if is_reserved_board_key(key) {
+            return;
+        }
         match self.map.get_mut(key) {
             Some(Value::Object(obj)) => {
                 obj.insert(scope.to_string(), value);
@@ -717,30 +886,169 @@ impl Blackboard {
                 self.map.insert(key.to_string(), Value::Object(obj));
             }
         }
+        self.note_origin(key, origin);
     }
 
-    /// Increment a top-level integer counter (0 when absent), returning the new value.
-    pub fn increment(&mut self, key: &str) -> i64 {
+    /// Guarded BEFORE it computes, not by delegating to [`Blackboard::write`]: a refused write there
+    /// would still return `next`, i.e. a count the board does not hold. `0` is what "this counter was
+    /// not incremented" reads as.
+    fn bump(&mut self, origin: Option<&NodeOrigin>, key: &str) -> i64 {
+        if is_reserved_board_key(key) {
+            return 0;
+        }
         let next = self.get(key).and_then(|v| v.as_i64()).unwrap_or(0) + 1;
-        self.set(key, Value::from(next));
+        self.write(origin, key, Value::from(next));
         next
     }
 
-    /// APPEND `value` to the JSON array at a TOP-LEVEL `key`, creating `[value]` when the key is
-    /// absent (or holds a non-array). This is what lets a LOOP ACCUMULATE its results — a grill's Q&A
-    /// history, successive artifacts — instead of each turn overwriting the last (v2.8 review N9).
-    pub fn append(&mut self, key: &str, value: Value) {
+    fn push(&mut self, origin: Option<&NodeOrigin>, key: &str, value: Value) {
+        if is_reserved_board_key(key) {
+            return;
+        }
         match self.map.get_mut(key) {
             Some(Value::Array(arr)) => arr.push(value),
             _ => {
                 self.map.insert(key.to_string(), Value::Array(vec![value]));
             }
         }
+        self.note_origin(key, origin);
     }
 
-    /// The underlying JSON object (read-only).
-    pub fn as_map(&self) -> &Map<String, Value> {
-        &self.map
+    /// Record (or DROP — `origin: None`) the author of a top-level key. The drop is not an omission:
+    /// see [`Blackboard::set`] for why an unattributed write must not inherit the previous author.
+    ///
+    /// [`PROVENANCE_KEY`] is not itself provenanced — the board does not record who recorded — and it
+    /// cannot arrive here at all: the four write paths refuse it before they insert anything
+    /// ([`is_reserved_board_key`]), which is what keeps this record a fact the engine observes rather
+    /// than a value the graph can name.
+    fn note_origin(&mut self, key: &str, origin: Option<&NodeOrigin>) {
+        debug_assert!(
+            !is_reserved_board_key(key),
+            "a write to a reserved board key must be refused by the write path, never provenanced",
+        );
+        match origin {
+            Some(origin) => {
+                let entry = origin.to_json();
+                match self.map.get_mut(PROVENANCE_KEY) {
+                    Some(Value::Object(obj)) => {
+                        obj.insert(key.to_string(), entry);
+                    }
+                    _ => {
+                        let mut obj = Map::new();
+                        obj.insert(key.to_string(), entry);
+                        self.map
+                            .insert(PROVENANCE_KEY.to_string(), Value::Object(obj));
+                    }
+                }
+            }
+            None => self.forget_origin(key),
+        }
+    }
+
+    /// Drop the provenance entry of a top-level key, and the whole record with it once it is empty —
+    /// so a board that never had an attributed write is byte-identical to one from before
+    /// [`PROVENANCE_KEY`] existed.
+    fn forget_origin(&mut self, key: &str) {
+        let empty = match self.map.get_mut(PROVENANCE_KEY) {
+            Some(Value::Object(obj)) => {
+                obj.remove(key);
+                obj.is_empty()
+            }
+            _ => return,
+        };
+        if empty {
+            self.map.remove(PROVENANCE_KEY);
+        }
+    }
+}
+
+/// The NODE a blackboard write is attributed to — its identity and its TYPE, which is the half that
+/// decides anything: what a consent check asks is whether a value came from an `ask_human`, and the
+/// node id is what lets a refusal NAME the node that actually wrote it.
+///
+/// Serialized as `{"node": <id>, "type": <db type string>}` under [`PROVENANCE_KEY`]. The type travels
+/// as its DB spelling ([`NodeType::as_db`]) rather than as an ordinal, so a persisted board stays
+/// readable when the enum's order changes, and an unknown type read back is `None` rather than a
+/// silently wrong variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeOrigin {
+    pub node_id: String,
+    pub node_type: NodeType,
+}
+
+impl NodeOrigin {
+    /// The origin of a node, by id and type.
+    pub fn new(node_id: impl Into<String>, node_type: NodeType) -> Self {
+        NodeOrigin {
+            node_id: node_id.into(),
+            node_type,
+        }
+    }
+
+    /// Whether this write came from a question PUT TO A HUMAN. The whole point of the record: an
+    /// `ask_human` is the only node type whose value a human authored, so it is the only one a
+    /// consent gate may cross on.
+    pub fn is_human_answer(&self) -> bool {
+        self.node_type == NodeType::AskHuman
+    }
+
+    fn to_json(&self) -> Value {
+        json_object(&self.node_id, self.node_type.as_db())
+    }
+
+    fn from_json(v: &Value) -> Option<NodeOrigin> {
+        let node_id = v.get("node")?.as_str()?.to_string();
+        let node_type = NodeType::from_db(v.get("type")?.as_str()?)?;
+        Some(NodeOrigin { node_id, node_type })
+    }
+}
+
+/// The two-field provenance entry, built in one place so the reader ([`NodeOrigin::from_json`]) and
+/// the writer cannot spell it differently.
+fn json_object(node_id: &str, node_type: &str) -> Value {
+    let mut obj = Map::new();
+    obj.insert("node".to_string(), Value::from(node_id));
+    obj.insert("type".to_string(), Value::from(node_type));
+    Value::Object(obj)
+}
+
+/// A [`Blackboard`] handle that STAMPS every write with the node that made it — obtained from
+/// [`Blackboard::written_by`] and never held across statements, so an origin cannot leak onto the next
+/// node's writes.
+///
+/// It offers the same four writes as the board itself and nothing else: the point is that the FOUR
+/// PATHS are covered, since a provenance with a blind spot is not a weaker guarantee but a false one
+/// — a key filled through the uncovered path would keep whatever author it had before.
+///
+/// The origin is NOT an `Option`. The four private write paths take one because the UNATTRIBUTED
+/// family ([`Blackboard::set`] & co.) passes `None`; a handle obtained from
+/// [`Blackboard::written_by`] always has an author, and modelling it as "maybe" would let a future
+/// constructor hand back a writer that attributes nothing — a `written_by` that does not.
+pub struct BoardWriter<'b> {
+    board: &'b mut Blackboard,
+    origin: &'b NodeOrigin,
+}
+
+impl BoardWriter<'_> {
+    /// [`Blackboard::set`], attributed.
+    pub fn set(&mut self, key: &str, value: Value) {
+        self.board.write(Some(self.origin), key, value);
+    }
+
+    /// [`Blackboard::set_scoped`], attributed (the origin lands on the TOP-LEVEL key — see there).
+    pub fn set_scoped(&mut self, key: &str, scope: &str, value: Value) {
+        self.board
+            .write_scoped(Some(self.origin), key, scope, value);
+    }
+
+    /// [`Blackboard::increment`], attributed.
+    pub fn increment(&mut self, key: &str) -> i64 {
+        self.board.bump(Some(self.origin), key)
+    }
+
+    /// [`Blackboard::append`], attributed.
+    pub fn append(&mut self, key: &str, value: Value) {
+        self.board.push(Some(self.origin), key, value);
     }
 }
 
@@ -945,9 +1253,13 @@ impl Tree {
     ///
     /// Two readings, the same two the authoring rule's condition (ii) uses ([`Self::answer_decides`]):
     /// the sensitive node's own `gate_on`, or a `selector` branch on the way DOWN to it that tests the
-    /// key affirmatively ([`Condition::affirmative_key`]). The second is not optional — rule (4)
-    /// explicitly accepts a `create_workspace` with NO `gate_on` when the branch routing to it IS the
-    /// consent, and that is the shape shipped in `/nspec`'s `go` arm.
+    /// key affirmatively ([`Condition::affirmative_key`]). The second is not optional, and it is not
+    /// a fallback either — rule (4) accepts the branch routing to a sensitive node AS the consent, and
+    /// the shape shipped in `/nspec`'s `go` arm needs BOTH readings at once: its `create_workspace`
+    /// DOES declare a `gate_on`, and that `gate_on` names the PREVALIDATION `workspace_free` (a
+    /// `query` fact — `seed.rs`'s "is the folder free?"), never the answer. The consent for it is the
+    /// selector above comparing `ready_ok` to `"go"`. A reading that stopped at the `gate_on` reported
+    /// that no question governs the folder; see [`Self::answer_decides`] for what that cost.
     ///
     /// What this does NOT re-check is the authoring rule's conditions (i) "the question necessarily
     /// ran" and (iii) "nothing else writes the key". They make a graph AUTHORABLE; here they would only
@@ -1004,22 +1316,37 @@ impl Tree {
     /// Whether an answer landing on the blackboard key `key` DECIDES whether the sensitive node at
     /// `idx` fires — the runtime half of the authoring rule's condition (ii).
     ///
-    /// Two readings, and only two:
+    /// Two readings, and only two — a genuine OR, both of them evaluated:
     ///
     ///   * the node's OWN `gate_on` ([`SensitiveEffect::gate_key_root`]) — the runtime gate fires the
     ///     effect only when that key holds an affirmative. Read at its ROOT, because
     ///     [`Blackboard::get`] splits on dots: comparing the whole path let a
     ///     `gate_on: "answer.decision"` slip the classification, and with it the human-turn check;
-    ///   * FAILING THAT — a node with NO `gate_on` at all — a `selector` branch the ANCESTOR CHAIN
-    ///     descends through, testing the key affirmatively ([`Condition::affirmative_key`]). Rule
-    ///     (4)(ii) accepts that shape as the consent precisely because nothing else stands between the
-    ///     answer and the effect, so the runtime has to demand the human turn there too.
+    ///   * a `selector` branch the ANCESTOR CHAIN descends through, testing the key affirmatively
+    ///     ([`Condition::affirmative_key`]). Rule (4)(ii) accepts that shape as the consent because
+    ///     the routing IS the decision, so the runtime has to demand the human turn there too.
     ///
-    /// The two readings are ordered, not summed, and that is deliberate. A node that DECLARES a
-    /// `gate_on` names the key its effect fires on; the branch above it only decides whether the run
-    /// gets as far as asking. Counting both would classify ndev's "review" — which routes to a
-    /// `guarded_commit` whose OWN `confirm` question gates the transition — as committing the Spec,
-    /// and the question that actually commits it would no longer be the one nearest the effect.
+    /// # Why it is an OR and not an ordered pair
+    ///
+    /// It USED to short-circuit: `if let Some(gate) = … { return gate == key }` — so the moment a
+    /// sensitive node declared ANY `gate_on`, the climb was abandoned, even when that `gate_on` named
+    /// a key no question writes. The shipped `/nspec` `go` arm falls exactly there: its
+    /// `create_workspace` declares `gate_on: "workspace_free"`, a key a `query` fills
+    /// ([`crate::seed`]'s `workspace_target_free` PREVALIDATION), while the consent for that branch is
+    /// the `selector` one level up comparing `ready_ok` to `"go"`. The early return read the
+    /// prevalidation, saw it was not the answer, and reported that NO question governs the folder —
+    /// the human turn survived only because a SIBLING `transition` in the same branch gates on
+    /// `ready_ok`. Remove that neighbour and the mkdir needs no human at all.
+    ///
+    /// The two readings are not in competition: a `gate_on` says "the effect fires on THIS key", a
+    /// routing branch says "the run only gets here on THAT answer", and BOTH are conditions the answer
+    /// decides. Summing them can only ADD questions to the set nyx demands a human turn for, which is
+    /// the safe direction the [`Tree::ask_human_commitment`] doc names: a question wrongly classified
+    /// as committing costs one human turn; a question wrongly classified as ordinary is the hole this
+    /// closed. What it costs is precision in the OTHER direction — ndev's "review", which routes to a
+    /// `guarded_commit` whose own `confirm` gates the transition, is now classified as committing the
+    /// Spec too. That is the price, paid deliberately: the review answer really is what routes the run
+    /// to the commit, and demanding a human turn for it commits nothing extra.
     ///
     /// The climb walks the ancestor chain and never leaves it — a selector in a SIBLING branch decides
     /// nothing about this node. Where the authoring rule requires EVERY branch naming a child to agree,
@@ -1027,8 +1354,8 @@ impl Tree {
     /// whether to DEMAND a human turn, and the conservative side of those two questions is not the
     /// same side.
     fn answer_decides(&self, idx: usize, parents: &[Option<usize>], key: &str) -> bool {
-        if let Some(gate) = SensitiveEffect::gate_key_root(&self.nodes[idx].config) {
-            return gate == key;
+        if SensitiveEffect::gate_key_root(&self.nodes[idx].config) == Some(key) {
+            return true;
         }
         let mut cursor = idx;
         while let Some(parent) = parents[cursor] {
@@ -1040,6 +1367,90 @@ impl Tree {
             cursor = parent;
         }
         false
+    }
+
+    /// The blackboard keys whose AFFIRMATIVE value stands between the run and the SENSITIVE node
+    /// `node_id` — the reading the RUNTIME consent check asks the provenance about
+    /// ([`crate::mcp_engine`]), in the order the answer to "who authorized this?" should be looked for:
+    /// the node's OWN `gate_on` first (the key its effect literally fires on), then the routing
+    /// decisions of the `selector`s on its ancestor chain, nearest first.
+    ///
+    /// # Why this is not [`Self::answer_decides`] with the arguments turned round
+    ///
+    /// The two questions differ in what a wrong answer costs, so they read a selector differently.
+    /// `answer_decides` asks "should nyx DEMAND a human turn for this question?", and over-answering
+    /// costs one human turn — so it credits a branch when ANY route to the child tests the key.
+    /// This asks "may the run CROSS this node?", and over-answering means firing an effect nobody
+    /// approved — so a selector contributes a key only when EVERY branch that names the child tests
+    /// THAT SAME key affirmatively ([`Self::selector_routing_key`]). A child also reachable through an
+    /// `always` branch may have been reached that way, and then no answer routed anything.
+    ///
+    /// EMPTY is a real answer, and it means "nothing on the graph gates this node": an ungated
+    /// sensitive node with no routing selector above it. The caller must not read that as a refusal —
+    /// it is the same "cannot tell" as a board with no provenance.
+    ///
+    /// THE KEYS COME BACK AS DECLARED, DOTS INCLUDED ([`SensitiveEffect::gate_key`],
+    /// [`Condition::affirmative_path`]) — NOT rooted. The caller READS each one's value to decide
+    /// whether it is affirmative, and [`Blackboard::get`] resolves a dot-path: rooted, a
+    /// `gate_on: "answer.decision"` would hand back the key `answer`, whose value is an OBJECT and
+    /// therefore affirmative under no reading — so every dotted gate would contribute NO key, the
+    /// verdict would fall through to "nothing recorded", and the refusal would silently become a
+    /// warning on exactly the shape [`SensitiveEffect::gate_key_root`]'s own doc names. Provenance
+    /// is still recorded per TOP-LEVEL key, and [`Blackboard::origin_of`] roots what it is given.
+    pub fn consent_keys(&self, node_id: &str) -> Vec<String> {
+        let Some(idx) = self.index_of(node_id) else {
+            return Vec::new();
+        };
+        let mut keys: Vec<String> = Vec::new();
+        let mut push = |key: String| {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        };
+        if let Some(gate) = SensitiveEffect::gate_key(&self.nodes[idx].config) {
+            push(gate.to_string());
+        }
+        let parents = self.parent_indices();
+        let mut cursor = idx;
+        while let Some(parent) = parents[cursor] {
+            if self.nodes[parent].node_type == NodeType::Selector {
+                if let Some(key) = self.selector_routing_key(parent, cursor) {
+                    push(key);
+                }
+            }
+            cursor = parent;
+        }
+        keys
+    }
+
+    /// The key EVERY branch of the `selector` naming `child` tests affirmatively — `None` as soon as
+    /// one such branch tests something else, tests nothing (`always`), or tests a different key. The
+    /// UNANIMITY is the point: it is what makes "the run is here, therefore that key was affirmative"
+    /// true rather than merely possible.
+    ///
+    /// The path is compared and returned UNROOTED ([`Condition::affirmative_path`]) — see
+    /// [`Self::consent_keys`] for why the caller needs the whole path. Two branches testing two
+    /// different fields of one object therefore DISAGREE here where a rooted read would have called
+    /// them unanimous, which is the conservative side of this reading.
+    fn selector_routing_key(&self, selector: usize, child: usize) -> Option<String> {
+        let cfg =
+            serde_json::from_value::<SelectorConfig>(self.nodes[selector].config.clone()).ok()?;
+        let position = self.nodes[selector]
+            .children
+            .iter()
+            .position(|&c| c == child)?;
+        let mut agreed: Option<String> = None;
+        for (i, branch) in cfg.branches.iter().enumerate() {
+            if branch.child.unwrap_or(i) != position {
+                continue;
+            }
+            let key = branch.cond.as_ref().and_then(Condition::affirmative_path)?;
+            match &agreed {
+                Some(previous) if previous != key => return None,
+                _ => agreed = Some(key.to_string()),
+            }
+        }
+        agreed
     }
 
     /// Whether any branch of the `selector` at `selector` that selects the child at `child` tests
@@ -1221,10 +1632,17 @@ impl SensitiveEffect {
     /// or `None` when it declares none. Reading the ROOT is what a `gate_on: "answer.decision"` needs:
     /// [`Blackboard::get`] splits on dots, so that gate hangs on the key `answer`.
     pub fn gate_key_root(config: &Value) -> Option<&str> {
-        config
-            .get(Self::GATE_FIELD)
-            .and_then(Value::as_str)
-            .map(board_key_root)
+        Self::gate_key(config).map(board_key_root)
+    }
+
+    /// The gate's key AS DECLARED — the whole dot-path, unrooted. The runtime READS the value on
+    /// this path (`walk`'s `gate_satisfied` passes `gate_on` to [`Blackboard::get`] verbatim), so
+    /// anything that has to agree with the gate about whether it is satisfied must read it here and
+    /// not through [`Self::gate_key_root`]: the root of `answer.decision` is an OBJECT, and an
+    /// object is affirmative under no reading. Same split, and the same reason, as
+    /// [`Condition::affirmative_path`] beside [`Condition::affirmative_key`].
+    pub fn gate_key(config: &Value) -> Option<&str> {
+        config.get(Self::GATE_FIELD).and_then(Value::as_str)
     }
 
     /// Which commitment a single answer is TOLD about when it governs several — the graver one. A
@@ -1750,11 +2168,43 @@ impl Engine {
     /// Write a TOP-LEVEL blackboard key from OUTSIDE the graph walk. The `nyx_next` handler uses it
     /// to record its own inline-effect state (the id of the blocking gate it just ran RED) on the
     /// board that gets PERSISTED, so the refusal survives across calls of the dispatcher loop.
+    ///
+    /// UNATTRIBUTED: it drops the key's provenance rather than leaving a stale one
+    /// ([`Blackboard::set`]). Where the effect belongs to a NODE — a `query`'s fact, a gate's verdict,
+    /// a `sub_workflow`'s retrieved key — use [`Engine::set_board_as`] instead, so the runtime consent
+    /// check reads the real author rather than "unknown".
     pub fn set_board(&mut self, key: &str, value: Value) {
         self.board.set(key, value);
     }
 
-    /// Drop a top-level blackboard key written by [`Engine::set_board`] (the flag no longer holds).
+    /// Write a TOP-LEVEL blackboard key ON BEHALF OF the node `node_id` — the attributed twin of
+    /// [`Engine::set_board`], for the effects `nyx_next` performs FOR a leaf it is executing (a
+    /// `query`'s fact and its `_reason`, a `gate_check`'s verdict and red anchor, a `sub_workflow`'s
+    /// child handle and its `retrieve` fold).
+    ///
+    /// The TYPE is looked up in the LIVE TREE, never taken from the caller: `nyx_next` hands a node
+    /// id it is already executing, and the engine says what that node is. A caller therefore cannot
+    /// declare a write to be an `ask_human`'s — which is the one claim the consent check acts on. An
+    /// id the tree does not hold degrades to an UNATTRIBUTED write (the provenance is dropped), never
+    /// to a guess.
+    pub fn set_board_as(&mut self, node_id: &str, key: &str, value: Value) {
+        match self.node_origin(node_id) {
+            Some(by) => self.board.written_by(&by).set(key, value),
+            None => self.board.set(key, value),
+        }
+    }
+
+    /// The [`NodeOrigin`] of a node of the live tree, or `None` when the tree holds no such node.
+    fn node_origin(&self, node_id: &str) -> Option<NodeOrigin> {
+        let idx = self.tree.index_of(node_id)?;
+        Some(NodeOrigin::new(
+            self.tree.nodes[idx].id.clone(),
+            self.tree.nodes[idx].node_type,
+        ))
+    }
+
+    /// Drop a top-level blackboard key written by [`Engine::set_board`] (the flag no longer holds) —
+    /// its provenance entry included ([`Blackboard::remove`]).
     pub fn clear_board(&mut self, key: &str) {
         self.board.remove(key);
     }
@@ -2044,8 +2494,12 @@ impl Engine {
                         // overwrite each other — whoever completed a pass last owned the number, and
                         // nothing reading it could tell WHICH loop it described.
                         let loop_id = self.tree.nodes[node].id.clone();
-                        self.board
-                            .set_scoped(LOOP_ITER_KEY, &loop_id, Value::from(iter));
+                        let by = NodeOrigin::new(loop_id.clone(), NodeType::Loop);
+                        self.board.written_by(&by).set_scoped(
+                            LOOP_ITER_KEY,
+                            &loop_id,
+                            Value::from(iter),
+                        );
                         if exit {
                             self.stack.pop();
                         } else {
@@ -2291,13 +2745,21 @@ impl Engine {
     fn apply_result(&mut self, leaf_idx: usize, result: NodeResult) {
         let node_type = self.tree.nodes[leaf_idx].node_type;
         let node_id = self.tree.nodes[leaf_idx].id.clone();
+        // WHO is writing, taken from the TREE and not from a caller's word: this is the only place an
+        // `ask_human` provenance can be minted, and it is minted from a node the engine itself just
+        // executed as an `ask_human`. No string a graph or a dispatcher supplies reaches it.
+        let by = NodeOrigin::new(node_id.clone(), node_type);
         match (node_type, result) {
             (NodeType::SpawnSubagent, NodeResult::Diff(diff)) => {
-                self.board.set("last_diff", Value::from(diff));
-                self.board.increment("spawns");
+                self.board
+                    .written_by(&by)
+                    .set("last_diff", Value::from(diff));
+                self.board.written_by(&by).increment("spawns");
             }
             (NodeType::GateCheck, NodeResult::Gate(green)) => {
-                self.board.set("gate_green", Value::from(green));
+                self.board
+                    .written_by(&by)
+                    .set("gate_green", Value::from(green));
             }
             (NodeType::Judge, NodeResult::Verdict(verdict)) => {
                 self.write_result(leaf_idx, DEFAULT_JUDGE_OUTPUT_KEY, verdict);
@@ -2312,7 +2774,9 @@ impl Engine {
                     (cfg.grant_spec_write_on.as_deref(), decision.as_str())
                 {
                     if granting == answer {
-                        self.board.set(SPEC_WRITE_GRANT_KEY, Value::Bool(true));
+                        self.board
+                            .written_by(&by)
+                            .set(SPEC_WRITE_GRANT_KEY, Value::Bool(true));
                     }
                 }
                 self.write_result(leaf_idx, DEFAULT_ASK_HUMAN_OUTPUT_KEY, decision);
@@ -2336,10 +2800,14 @@ impl Engine {
     fn write_result(&mut self, leaf_idx: usize, default_key: &str, value: Value) {
         let oc: OutputConfig = self.parse_config(leaf_idx).unwrap_or_default();
         let key = oc.output_key.unwrap_or_else(|| default_key.to_string());
+        let by = NodeOrigin::new(
+            self.tree.nodes[leaf_idx].id.clone(),
+            self.tree.nodes[leaf_idx].node_type,
+        );
         if oc.append {
-            self.board.append(&key, value);
+            self.board.written_by(&by).append(&key, value);
         } else {
-            self.board.set(&key, value);
+            self.board.written_by(&by).set(&key, value);
         }
     }
 

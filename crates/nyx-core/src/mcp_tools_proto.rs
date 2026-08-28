@@ -313,7 +313,9 @@ const MAX_LIST_LIMIT: usize = 200;
 /// row [`bounded_row`]-capped, and what did not fit is NAMED (`total` vs `returned`) with the offset
 /// to ask for next. The agent never has to remember to paginate; it only has to READ `truncated`.
 pub fn proto_get(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let section = optional_str(args, "section")?;
     if let Some(name) = section {
         if !PROTO_GET_SECTIONS.contains(&name) {
@@ -1246,7 +1248,9 @@ fn reduced_elected_page(page: &db::ElectedPage, bytes: usize) -> Value {
 /// Spec must exist (`invalid_id`) and must NOT already have a prototype (`invalid_state` — the
 /// "1 proto/Spec" invariant). Mutating → `Prototypes` changed (`prototypes://changed`).
 pub fn proto_create(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let description = optional_str(args, "description")?;
     let result = db
         .with_conn(

@@ -150,13 +150,24 @@ fn unknown_idea(id: &str) -> RpcError {
 /// linked_specs }`. Captures an `open` idea and, when `spec_ids` are given, links each as
 /// `addresses`. The Spec existence is VALIDATED up front (a bad id → `invalid_id`), and the
 /// create+links run in ONE transaction so a half-linked idea is never persisted.
+///
+/// THE ONE PLURAL FIELD OF THE SPEC-REFERENCE SURFACE, and it reaches the SAME entry point as the
+/// twenty-two singular ones ([`crate::mcp_context::resolve_spec_ref_in`]). It used to loop over the
+/// RAW tokens and answer `unknown spec 3` — the exact sentence this grammar exists to retire — on a
+/// call whose `project_id` is REQUIRED and therefore had the project to count the number in sitting
+/// in its own arguments (finding `01M0ZMGJG9VXD4GCY6Y6TN3RYS`). The project is already in hand, so
+/// `resolve_spec_ref_in` is what `workspace_add` uses for the same reason: no second walk of anchors
+/// this call never had. A token that designates nothing keeps its existing refusal, unchanged.
 pub fn idea_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let title = require_str(args, "title")?;
     let body = optional_str(args, "body")?.unwrap_or("");
     let theme = optional_str(args, "theme")?;
     let source = parse_source(args)?;
-    let spec_ids = optional_str_array(args, "spec_ids")?;
+    let spec_ids = optional_str_array(args, "spec_ids")?
+        .iter()
+        .map(|token| crate::mcp_context::resolve_spec_ref_in(db, Some(project_id), token))
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Validate the Spec links up front so a bad id is a clean invalid_id (not a FK failure).
     for spec_id in &spec_ids {
@@ -332,7 +343,9 @@ pub fn idea_merge(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// ids are VALIDATED (a bad id → `invalid_id`).
 pub fn idea_link(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let idea_id = require_str(args, "idea_id")?;
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let kind = parse_kind(args)?;
 
     if db
@@ -378,7 +391,9 @@ pub fn idea_link(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// (idempotent: `unlinked` is `false` when the pair was not linked).
 pub fn idea_unlink(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let idea_id = require_str(args, "idea_id")?;
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let removed = db
         .with_conn(|c| db::unlink_idea_spec(c, idea_id, spec_id))
         .map_err(internal_db)?;
@@ -520,6 +535,53 @@ mod tests {
             &json!({ "project_id": project_id, "title": "x", "spec_ids": ["nope"] }),
         )
         .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+    }
+
+    /// THE 23rd FIELD OF THE SPEC-REFERENCE SURFACE, and the only PLURAL one — it now reaches the
+    /// shared entry point like the twenty-two others (finding `01M0ZMGJG9VXD4GCY6Y6TN3RYS`).
+    ///
+    /// `idea_add` REQUIRES a `project_id`, so a `#N` here always has a project to be counted in; it
+    /// nonetheless used to be looped over RAW and answered `unknown spec 3` — the exact sentence
+    /// this grammar exists to retire — on a call that already held the answer in its own arguments.
+    /// The four forms are asserted TOGETHER, so no one of them can be widened alone, and the
+    /// existing refusal for a token that designates nothing is asserted unchanged beside them.
+    #[test]
+    fn idea_add_accepts_every_spec_reference_form_in_its_plural_field() {
+        let _g = db_guard();
+        let (db, project_id, spec_id) = seeded();
+        let (key, number) = db.with_conn(|c| {
+            let spec = db::get_spec(c, &spec_id).unwrap().expect("spec");
+            let project = db::get_project(c, &spec.project_id)
+                .unwrap()
+                .expect("project");
+            (project.key, spec.number)
+        });
+
+        for token in [
+            spec_id.clone(),
+            format!("{key}-{number}"),
+            format!("#{number}"),
+            number.to_string(),
+        ] {
+            let out = idea_add(
+                &db,
+                &json!({ "project_id": project_id, "title": "t", "spec_ids": [token.clone()] }),
+            )
+            .unwrap_or_else(|e| panic!("form '{token}' was refused: {e:?}"));
+            assert_eq!(
+                out.result["linked_specs"][0]["spec_id"],
+                json!(spec_id),
+                "form '{token}' must link the idea to the Spec it names"
+            );
+        }
+
+        // A reference that designates NOTHING keeps the refusal it already had.
+        let err = idea_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "spec_ids": ["#9999"] }),
+        )
+        .expect_err("#9999 designates no Spec of this project");
         assert_eq!(err.code, RpcCode::InvalidId);
     }
 

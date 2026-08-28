@@ -697,17 +697,23 @@ fn a_failed_injection_is_reported_to_nyx_and_a_successful_one_is_not() {
     );
 }
 
-/// THE SPEC ID THE HUMAN TYPED REACHES `run_start` (H8).
+/// THE SPEC REFERENCE THE HUMAN TYPED REACHES `run_start` (H8), IN ALL FOUR FORMS.
 ///
-/// `/ndev` and `/ndoc` work ON an existing Spec and their stubs advertise "an optional Spec id
-/// selects the Spec to work on". The `cwd` alone cannot honour that: a real project holds several
-/// active Specs, so resolving one by location is REFUSED as ambiguous
-/// (`spec_ambiguous_for_workspace`) and the run never opens — replayed live on a workspace with
-/// three. The typed id is the only anchor that disambiguates, and the hook was not reading it: a
-/// session had to work out on its own that "the UUID in your command IS the spec_id" and open the
-/// run itself, which is the two-call sequence G6 exists to remove.
+/// The three nyx commands advertise a leading Spec reference. The `cwd` alone cannot honour that:
+/// a real project holds several active Specs, so resolving one by location is REFUSED as ambiguous
+/// (`spec_ambiguous_for_workspace`) and, for `/ndev` and `/ndoc`, the run never opens — replayed
+/// live on a workspace with three. The typed reference is the only anchor that disambiguates, and
+/// the hook was not reading it: a session had to work out on its own that "the UUID in your command
+/// IS the spec_id" and open the run itself, which is the two-call sequence G6 exists to remove.
 ///
-/// The id rides BESIDE the `cwd`, never instead of it — the id says WHICH Spec, the cwd still
+/// AND THE UUID WAS THE ONLY FORM IT COULD SEE — the one shape a human never encounters, since
+/// every render, warning and list speaks in `#3`. So the fix landed on the form nobody types while
+/// `/nspec 3` still opened an unanchored run. The hook recognises the four SHAPES now and forwards
+/// the token RAW: the byte equality below is the whole contract on this side, because the
+/// TRANSLATION is `spec_ref`'s and the hook must not own a second copy of it (the grammar itself is
+/// pinned token by token against the real hook in `spec_ref`'s own corpus test).
+///
+/// The reference rides BESIDE the `cwd`, never instead of it — it says WHICH Spec, the cwd still
 /// anchors the run's dev workspace.
 #[test]
 fn the_spec_id_the_human_typed_is_what_the_hook_opens_the_run_on() {
@@ -715,47 +721,126 @@ fn the_spec_id_the_human_typed_is_what_the_hook_opens_the_run_on() {
         eprintln!("node unavailable: skipped (node-agnostic by contract)");
         return;
     }
-    let spec_id = "019ff517-3c1a-7b40-9f21-6d5e0a4c8b73";
     let cwd = "/tmp/nyx-push-test-workspace";
-    let mock = MockSidecar::start();
-    let run = run_hook(
-        &format!("/ndev {spec_id} corrige la sonde de santé"),
-        cwd,
-        mock.port,
-    );
+    // Every form, on every nyx command: the recogniser is the same one for the three, so a form
+    // that only worked on one would be a table the stubs do not describe.
+    for command in ["nspec", "ndev", "ndoc"] {
+        for reference in [
+            // The canonical id — the form the hook already knew.
+            "019ff517-3c1a-7b40-9f21-6d5e0a4c8b73",
+            // The human key, the sigil'd number and the bare number — the forms a human actually
+            // reads off a nyx render, and the ones that used to be dropped on the floor.
+            "NYX-3",
+            "#3",
+            "3",
+        ] {
+            let mock = MockSidecar::start();
+            let run = run_hook(
+                &format!("/{command} {reference} corrige la sonde de santé"),
+                cwd,
+                mock.port,
+            );
 
-    assert_eq!(run.code, 0, "the hook always exits 0");
-    let args = mock
-        .args_for("run_start")
-        .expect("the hook opens the run itself");
+            assert_eq!(run.code, 0, "the hook always exits 0");
+            let args = mock
+                .args_for("run_start")
+                .expect("the hook opens the run itself");
+            assert_eq!(
+                args["spec_id"],
+                json!(reference),
+                "/{command}: '{reference}' reaches run_start EXACTLY as typed — the hook resolves \
+                 nothing: {args}",
+            );
+            assert_eq!(
+                args["cwd"],
+                json!(cwd),
+                "…and the cwd still anchors the workspace — the reference says WHICH Spec, not WHERE",
+            );
+            assert!(
+                run.injected().is_some(),
+                "so the injection happens: stdout {:?} stderr {:?}",
+                run.stdout,
+                run.stderr,
+            );
+        }
+    }
+
+    // The human's TEXT is never mistaken for an anchor: prose in first position resolves NO
+    // reference, and the run falls back to the `cwd` exactly as before. Widening the grammar did
+    // not widen what is READ — still the first token, still only when it is a whole reference.
+    for prose_prompt in [
+        "/ndev corrige la sonde de santé",
+        "/nspec ajoute le retry sur la Spec 3",
+    ] {
+        let mock2 = MockSidecar::start();
+        let prose = run_hook(prose_prompt, cwd, mock2.port);
+        let args2 = mock2.args_for("run_start").expect("the run still opens");
+        assert_eq!(
+            args2.get("spec_id"),
+            None,
+            "'{prose_prompt}' carries no Spec reference, and none is invented: {args2}",
+        );
+        assert_eq!(prose.code, 0);
+    }
+}
+
+/// A REFERENCE THAT DESIGNATES NOTHING IS RELAYED, NOT SWALLOWED — the failure mode widening the
+/// grammar CREATES, and the one that must not cost the human their prompt OR their context.
+///
+/// Before, an unrecognised first token simply left `spec_id` unset and `run_start` resolved from
+/// the `cwd`. Now `/ndev 999` names a Spec, and a Spec that does not exist earns an `invalid_id`
+/// from the core — by design, since opening an unanchored run on a named Spec is exactly what
+/// ordered a duplicate. What the hook must NOT do is take that on the mute degradation path: the
+/// trace goes to stderr, which Claude Code never feeds to the model, so the session would see nyx
+/// say nothing at all about a command it just refused. Any first token that merely LOOKS like a
+/// reference reaches here — a branch name, a ticket id, `/ndev 3 fois plus rapide` — so this is the
+/// common case, not a corner.
+///
+/// So: NO run and NO manual (a manual with no `run_id` would send the session hunting for one), but
+/// an injected INSTRUCTION carrying the core's own sentence and the stubs' own rule — stop, ask,
+/// never author a second Spec. Exit 0, and the human's prompt reaches Claude untouched.
+#[test]
+fn a_reference_the_core_refuses_is_relayed_to_the_session() {
+    if !node_available() {
+        eprintln!("node unavailable: skipped (node-agnostic by contract)");
+        return;
+    }
+    let mock = MockSidecar::start_with(Reply::RunStartRefused);
+    let run = run_hook("/ndev 999 corrige la sonde", "/tmp/x", mock.port);
+
+    assert_eq!(run.code, 0, "a refused reference never breaks the prompt");
     assert_eq!(
-        args["spec_id"],
-        json!(spec_id),
-        "the id the human typed is the Spec the run opens on: {args}",
+        mock.args_for("run_start").expect("run_start was tried")["spec_id"],
+        json!("999"),
+        "the token still travelled raw — the refusal is the CORE's verdict, not the hook's",
     );
-    assert_eq!(
-        args["cwd"],
-        json!(cwd),
-        "…and the cwd still anchors the workspace — the id says WHICH Spec, not WHERE",
+    let injected = run
+        .injected()
+        .expect("the refusal is relayed: stderr is not read by the model");
+    assert!(
+        injected.contains("999"),
+        "the block quotes the token as typed, so the human is asked about THEIR word: {injected}",
     );
     assert!(
-        run.injected().is_some(),
-        "so the injection happens: stdout {:?} stderr {:?}",
-        run.stdout,
+        !injected.contains("run_id"),
+        "…and carries NO run_id: there is no run, and an empty one sends the session hunting: \
+         {injected}",
+    );
+    assert!(
+        injected.contains("STOP and ASK the human which Spec they meant")
+            && injected.contains("never author a new one"),
+        "…and gives the SAME instruction the command stubs do: {injected}",
+    );
+    assert!(
+        !mock.tool_names().iter().any(|n| n == "agent_context"),
+        "…and the manual is not even fetched: {:?}",
+        mock.tool_names(),
+    );
+    assert!(
+        run.stderr.contains("run_start refused"),
+        "the degradation SAYS why, on stderr too, as every other one does: {:?}",
         run.stderr,
     );
-
-    // The human's TEXT is never mistaken for an anchor: prose in first position resolves NO id, and
-    // the run falls back to the `cwd` exactly as before.
-    let mock2 = MockSidecar::start();
-    let prose = run_hook("/ndev corrige la sonde de santé", cwd, mock2.port);
-    let args2 = mock2.args_for("run_start").expect("the run still opens");
-    assert_eq!(
-        args2.get("spec_id"),
-        None,
-        "a sentence carries no Spec id, and none is invented: {args2}",
-    );
-    assert_eq!(prose.code, 0);
 }
 
 /// `run_start`'s WARNINGS ride into the same injected block, told to be relayed to the user.
@@ -799,13 +884,21 @@ fn run_start_warnings_reach_the_injection_to_be_relayed() {
     mock.stop();
 }
 
-/// `run_start` REFUSES (the real message for a `/ndev` whose location anchors no Spec): the hook
-/// injects NOTHING and traces the server's own reason.
+/// `run_start` REFUSES a command that NAMED NO SPEC (the real message for a `/ndev` whose location
+/// anchors no Spec): the hook injects NOTHING and traces the server's own reason.
 ///
 /// The refusal is the failure mode the hook GAINED by opening the run, and its handling is the
 /// point: no run means no `agent_context` call at all. Injecting the manual anyway would hand the
 /// session a dispatcher contract whose every step needs a `run_id` it does not have — sending it
 /// back to the pre-tick scramble this whole change removes.
+///
+/// THE PROMPT CARRIES NO REFERENCE, and that is now load-bearing rather than incidental. It used to
+/// read `/ndev feature-7`, chosen when the recogniser knew only the canonical id and any other
+/// first token was inert; `feature-7` is a `KEY-N` under the widened grammar, so that prompt now
+/// exercises the OTHER branch — the one
+/// [`a_reference_the_core_refuses_is_relayed_to_the_session`] owns, where the refusal IS relayed.
+/// The two are complementary and neither may borrow the other's prompt: nothing at all when nyx
+/// was told no Spec, nyx's own sentence when it was told one it could not resolve.
 #[test]
 fn a_refused_run_start_injects_nothing_and_never_falls_back_to_a_run_less_manual() {
     if !node_available() {
@@ -813,8 +906,13 @@ fn a_refused_run_start_injects_nothing_and_never_falls_back_to_a_run_less_manual
         return;
     }
     let mock = MockSidecar::start_with(Reply::RunStartRefused);
-    let run = run_hook("/ndev feature-7", "/tmp/x", mock.port);
+    let run = run_hook("/ndev corrige la sonde de santé", "/tmp/x", mock.port);
     assert_eq!(run.code, 0, "a refused run_start → the hook still exits 0");
+    assert_eq!(
+        mock.args_for("run_start").expect("run_start was tried")["spec_id"],
+        json!(null),
+        "the prompt names no Spec — this is the branch where there is nothing to relay",
+    );
     assert!(
         run.injected().is_none(),
         "no run → nothing injected at all (stdout: {:?})",

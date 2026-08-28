@@ -129,6 +129,17 @@ export function TerminalsPage() {
   // LAZY agent-session resume (v2.5.5): consume each workspace's `workspace_restore_plan` and hand
   // the sidecar the resumable `claude --resume <id>` lines to inject once at each terminal's PTY
   // open. Honours the project resume toggle (a toggle-OFF workspace yields no resumable entry).
+  //
+  // THIS CALL SITE IS THE ONLY ONE — and that is load-bearing, so it is COUNTED rather than merely
+  // stated: `use-lazy-resume.test.tsx` scans the renderer sources and fails on a second caller (the
+  // race that would double every injection). The resume is driven from HERE and nowhere else: no
+  // boot hook, no main-process step. It therefore requires (a) this page to be mounted — it is the `/` index route, which the
+  // app does open at launch (`router.tsx`: memory history on `/`, no last-route persistence), but
+  // which UNMOUNTS as soon as one navigates to `/work`, `/knowledge`, `/engine` or `/design`; and
+  // (b) `workspaceIds` to be non-empty, i.e. a project ENTERED and carrying workspaces — it is `[]`
+  // until `<BaseLayout>`'s last-project restore lands, and stays `[]` if none is entered. Neither
+  // condition is a defect to fix here; both are why a boot log can legitimately show no resume at
+  // all. `use-lazy-resume.ts` carries the same statement next to the traces that report it.
   useLazyResume(workspaceIds);
 
   // The FLAT list of every workspace's terminals — the deck spans the whole project so a

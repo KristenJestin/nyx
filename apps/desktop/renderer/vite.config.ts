@@ -1,8 +1,35 @@
+import { createRequire } from "node:module";
+
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import Icons from "unplugin-icons/vite";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
+
+// The dev-server port, the identity route and the identity payload come from the SAME module
+// `scripts/dev.cjs` reads, so the launcher and the server can never disagree about either. It is
+// plain CJS (dev.cjs is a `require`-only node script), hence `createRequire` rather than an import.
+const requireCjs = createRequire(import.meta.url);
+const { DEV_SERVER_PORT, DEV_IDENTITY_PATH, identityPayload } = requireCjs(
+  "../scripts/dev-server-identity.cjs",
+);
+
+/**
+ * Publish WHICH renderer root this dev server serves, so `scripts/dev.cjs` can tell our server
+ * from another worktree's before pointing Electron at it. The port is fixed and every worktree
+ * uses it, so a response on 1420 says only that SOMETHING is listening.
+ *
+ * Dev only (`configureServer`): a production build carries no trace of this.
+ */
+const devServerIdentity: Plugin = {
+  name: "nyx-dev-server-identity",
+  configureServer(server) {
+    server.middlewares.use(DEV_IDENTITY_PATH, (_req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(identityPayload(server.config.root)));
+    });
+  },
+};
 
 // Optional explicit dev-server host (for an over-the-network HMR setup). Read from the
 // environment; unset → bind localhost only (the normal local Electron dev run).
@@ -35,6 +62,7 @@ export default defineConfig(async () => ({
     // `~icons/<collection>/<slug>` imports become real React components (jsx compiler).
     // We keep lucide for the rest of the UI — this is only the agent-provider logos.
     Icons({ compiler: "jsx", jsx: "react" }),
+    devServerIdentity,
   ],
 
   // The @pierre/diffs syntax-highlight worker (the `?worker` import in
@@ -57,9 +85,12 @@ export default defineConfig(async () => ({
   //
   // 1. don't clear the screen so build/runtime errors stay visible.
   clearScreen: false,
-  // 2. a fixed port the Electron dev launcher expects; fail if it is taken.
+  // 2. the fixed port the Electron dev launcher expects — ONE definition, in
+  //    `scripts/dev-server-identity.cjs`, which is also where `dev.cjs` reads it. `strictPort`
+  //    makes a taken port a LOUD exit rather than a silent slide to 1421 (and `dev.cjs` now
+  //    aborts on that exit instead of ignoring it).
   server: {
-    port: 1420,
+    port: DEV_SERVER_PORT,
     strictPort: true,
     host: host || false,
     hmr: host

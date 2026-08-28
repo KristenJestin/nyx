@@ -1435,11 +1435,11 @@ fn create_workspace_inner(
 /// work. An unknown Spec, a `draft`/terminal one, or one belonging to another project is
 /// refused HERE, so `create_workspace` never `mkdir`s a folder for a link it was always going
 /// to reject. Returns the `spec_id` (borrowed) when present.
-fn prevalidate_spec_anchor<'a>(
+fn prevalidate_spec_anchor(
     db: &Db,
-    args: &'a Value,
+    args: &Value,
     project_id: &str,
-) -> Result<Option<&'a str>, RpcError> {
+) -> Result<Option<String>, RpcError> {
     // [`anchor_str`], not `optional_str`: on THIS argument the empty string would mean "register the
     // workspace unlinked" — the exact opposite of what a caller passing a `spec_id` is asking for
     // (review F2). And it is read HERE, in the read-only prevalidation, which is what puts the
@@ -1453,7 +1453,12 @@ fn prevalidate_spec_anchor<'a>(
     else {
         return Ok(None);
     };
-    db.with_conn(|c| crate::db::check_spec_anchorable(c, spec_id, project_id))
+    // THE SHORT REFERENCE IS ADMITTED HERE TOO, and for free: `workspace_add` / `create_workspace`
+    // read their anchor through the SAME grammar as every other `spec_id`, so `NYX-3` (or `#3`,
+    // counted in the project this very call names) anchors a workspace without a line of dedicated
+    // work. The project is already an argument, so the anchors are not walked a second time.
+    let spec_id = crate::mcp_context::resolve_spec_ref_in(db, Some(project_id), spec_id)?;
+    db.with_conn(|c| crate::db::check_spec_anchorable(c, &spec_id, project_id))
         .map_err(crate::mcp_tools_spec::map_set_workspace_err)?;
     Ok(Some(spec_id))
 }
@@ -1502,7 +1507,7 @@ pub fn workspace_add(
     // The Spec anchor is prevalidated FIRST: a doomed link never reaches the filesystem.
     let spec_id = prevalidate_spec_anchor(db, args, project_id)?;
     validate_existing_dir(path)?;
-    create_workspace_inner(db, events, project_id, &name, path, spec_id)
+    create_workspace_inner(db, events, project_id, &name, path, spec_id.as_deref())
 }
 
 /// `create_workspace` — `{ project_id, name, path, spec_id? }` → `{ workspace, spec? }`. The
@@ -1584,10 +1589,12 @@ pub fn create_workspace(
     // "FUTURE FILL STRATEGIES" section on this function for the five decisions of 2026-08-18, and
     // [`compensate_created_dir`] for the compensation trap: a filled folder is NOT cleaned by the
     // rollback below, so a strategy that fills MUST bring its own compensation here.
-    create_workspace_inner(db, events, project_id, name, path, spec_id).inspect_err(|_| {
-        // The DB half failed: undo the folder we just created (only if still empty).
-        compensate_created_dir(path, created);
-    })
+    create_workspace_inner(db, events, project_id, name, path, spec_id.as_deref()).inspect_err(
+        |_| {
+            // The DB half failed: undo the folder we just created (only if still empty).
+            compensate_created_dir(path, created);
+        },
+    )
 }
 
 /// The single entry point a shell's MCP dispatcher calls for the workspace registration
@@ -2348,6 +2355,59 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+
+    /// THE ANCHOR ARGUMENT INHERITS THE SHORT-REFERENCE GRAMMAR, at no cost to this tool. Both
+    /// workspace tools read their `spec_id` through the SAME entry point as `agent_context` and
+    /// `run_start` ([`crate::mcp_context::resolve_spec_ref_in`]), so anchoring a workspace on the
+    /// human key — or on the `#N` the render prints, counted in the project this very call names —
+    /// works WITHOUT a line of dedicated work here. That is the whole argument for one entry point,
+    /// asserted rather than assumed.
+    #[test]
+    fn the_workspace_anchor_accepts_a_short_spec_reference() {
+        let _g = db_guard();
+        let (db, project_id, spec_id) = seeded_project_with_spec(db::SPEC_STATUS_READY);
+        let (key, number) = db.with_conn(|c| {
+            let spec = db::get_spec(c, &spec_id).unwrap().unwrap();
+            let project = db::get_project(c, &project_id).unwrap().unwrap();
+            (project.key, spec.number)
+        });
+        let base = temp_subdir("short-ref-anchor");
+
+        for (i, token) in [format!("{key}-{number}"), format!("#{number}")]
+            .into_iter()
+            .enumerate()
+        {
+            let folder = base.join(format!("ws{i}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            let res = dispatch_workspace_tool(
+                &db,
+                &crate::usecase::NullEventSink,
+                "workspace_add",
+                &json!({
+                    "project_id": project_id,
+                    "path": folder.to_string_lossy(),
+                    "spec_id": token,
+                }),
+            )
+            .expect("dispatched")
+            .unwrap_or_else(|e| panic!("form '{token}' was refused: {e:?}"));
+            let ws_id = res["workspace"]["id"].as_str().unwrap().to_string();
+            assert_eq!(
+                res["spec"]["id"],
+                json!(spec_id),
+                "form '{token}' must anchor the Spec it names"
+            );
+            let stored = db.with_conn(|c| db::get_spec(c, &spec_id)).unwrap().unwrap();
+            assert_eq!(stored.workspace_id.as_deref(), Some(ws_id.as_str()));
+            assert_eq!(
+                stored.status,
+                db::SPEC_STATUS_READY,
+                "anchoring by short reference transitions nothing either"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// DONE-CRITERION: "draft, état terminal, Spec inconnue ou autre projet échouent avant

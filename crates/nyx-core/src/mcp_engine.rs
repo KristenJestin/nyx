@@ -431,6 +431,122 @@ fn scope_requires_spec(scope: &str) -> bool {
     )
 }
 
+/// THE REFUSAL A `spec_id` NAMING NO SPEC EARNS — `invalid_id`, and ACTIONABLE.
+///
+/// `unknown spec '3'` said neither why nor what to send instead, and the agent that met it had no
+/// way forward but to guess (observed: four MCP calls to recover an id nyx already knew). So when
+/// the token IS a recognised reference carrying a number, the sentence names the accepted forms —
+/// from [`crate::spec_ref::ACCEPTED_FORMS`], the same string the parser is written beside — and
+/// the project's most probable candidate, id included, so the next call can be formed from the
+/// answer.
+///
+/// TWO SHAPES ARE LEFT EXACTLY AS THEY WERE. Prose is not a reference and keeps the bare sentence
+/// (nyx never claimed to read it), and so does a canonical id: it carries no number to be near,
+/// and dressing its refusal up would change the behaviour of the calls that already pass one.
+///
+/// THE ANCHORLESS TRAILER IS THE CALLER'S, because what a call can do about having no project is
+/// not the same on every verb. `run_start` takes a `cwd` / `workspace_id` / `project_id` and can
+/// honestly offer them — honestly meaning ADVERTISED, all three named in its `inputSchema`, since a
+/// caller reading `tools/list` cannot act on an argument the schema omits (`project_id` was
+/// honoured there but unnamed until finding `01M1008NHM9RRA1ZAS4V7K1PM4`); `run_bind_spec` takes
+/// NONE of the three, so offering them there sent an agent hunting for arguments the schema does
+/// not have — half a refusal that cannot be acted on (finding `01M0ZWAH9EQDAZR66AFS1YJFPY`). Each
+/// caller writes its own, punctuation included, and it is appended to the one thing that is always
+/// true: send a form that carries its own project.
+///
+/// A `KEY-N` IS ANSWERED ABOUT ITS OWN PROJECT, never about the caller's. The key CARRIES a
+/// project ([`crate::spec_ref`]), so counting its number inside the project the call happens to
+/// anchor would answer a question nobody asked: an `ACME-3` refused under a `cwd` of `NYX` used to
+/// come back "project nyx (NYX) has no Spec 3; its nearest is #2 …" — a suggestion pointing at
+/// ANOTHER project's Spec, on the one refusal whose whole job is to stop a session substituting a
+/// Spec of its own. And with no anchor at all it advised sending "the canonical id or the human
+/// key", which is precisely the form that had just been sent. So the key is resolved to ITS project
+/// first, and a key no project carries is told so by name instead of being counted anywhere.
+///
+/// The outer `Err` is a database failure, never a refusal — the refusal is the `Ok` value.
+fn unknown_spec_refusal(
+    db: &Db,
+    project_id: Option<&str>,
+    token: &str,
+    anchorless_trailer: Option<&str>,
+) -> Result<RpcError, RpcError> {
+    let bare = || RpcError::new(RpcCode::InvalidId, format!("unknown spec '{token}'"));
+    let forms = || {
+        format!(
+            "unknown spec '{token}' — nyx accepts {}",
+            crate::spec_ref::ACCEPTED_FORMS
+        )
+    };
+    // WHERE the number is counted, and WHICH number it is. A `KEY-N` names its own project; a
+    // `#N` / `N` is counted in the caller's, when the caller has one.
+    let (number, project_id) = match crate::spec_ref::parse(token) {
+        Some(crate::spec_ref::SpecRef::Key { key, number }) => {
+            let found = db
+                .with_conn(|c| db::project_by_key(c, &key))
+                .map_err(internal_db)?;
+            let db::ProjectByKey::Found(project) = found else {
+                // The key designates no ONE project — absent, or ambiguous once case is folded.
+                // Nothing about the caller's project would answer that.
+                return Ok(RpcError::new(
+                    RpcCode::InvalidId,
+                    format!(
+                        "{}. No project of this nyx carries the key '{key}', so '{token}' names \
+                         nothing — check the key against the project the Spec belongs to \
+                         (list_projects), or send its canonical id",
+                        forms()
+                    ),
+                ));
+            };
+            (number, Some(project.id))
+        }
+        Some(crate::spec_ref::SpecRef::Number(number)) => {
+            (number, project_id.map(str::to_string))
+        }
+        // Not a reference at all, or a canonical id: unchanged.
+        _ => return Ok(bare()),
+    };
+    let mut message = forms();
+    match project_id.as_deref() {
+        // A number is counted INSIDE a project, and there is none here. Naming the forms that
+        // carry their own is the half of this refusal that is always actionable; the other half —
+        // how to give the call a project — is only offered when this caller actually has one.
+        None => {
+            message.push_str(&format!(
+                ". A '#N' or a bare number is counted inside a project and this call anchors none \
+                 — send {}",
+                crate::spec_ref::ANCHORLESS_FORMS
+            ));
+            if let Some(trailer) = anchorless_trailer {
+                message.push_str(trailer);
+            }
+        }
+        Some(project_id) => {
+            let (project, candidate) = db
+                .with_conn(|c| -> diesel::QueryResult<_> {
+                    Ok((
+                        db::get_project(c, project_id)?,
+                        crate::spec_ref::likely_candidate(c, project_id, number)?,
+                    ))
+                })
+                .map_err(internal_db)?;
+            let named = project
+                .as_ref()
+                .map(|p| format!("project {} ({})", p.name, p.key))
+                .unwrap_or_else(|| format!("project {project_id}"));
+            match candidate {
+                Some(spec) => message.push_str(&format!(
+                    ". {named} has no Spec {number}; its nearest is #{} \"{}\" (spec_id {})",
+                    spec.number, spec.title, spec.id
+                )),
+                None => message.push_str(&format!(
+                    ". {named} holds no Spec yet — author one rather than guessing an id"
+                )),
+            }
+        }
+    }
+    Ok(RpcError::new(RpcCode::InvalidId, message))
+}
+
 pub fn run_start(
     db: &Db,
     runtime: &EngineRuntime,
@@ -481,16 +597,29 @@ pub fn run_start(
     };
     // A bound Spec must EXIST: an explicit bad `spec_id` would otherwise surface as an opaque FK
     // error from create_workflow_run rather than a clean `invalid_id` (v2.8 review L-a).
+    //
+    // THIS IS THE LINK THAT PRODUCED THE DUPLICATE, and its POSITION is the fix. A designated
+    // reference that resolves nothing (`3`, `NYX-99`) reaches here as the token the caller typed —
+    // [`crate::mcp_context::resolve_spec_arg`] hands back what it could not resolve — and is
+    // refused HERE, BEFORE `start_or_replace_run` writes anything. Opening a run anyway is what the
+    // observed session did: unbound, `spec_status` resolved nothing, the entry gate fell through to
+    // "No Spec yet — author a NEW one from scratch", and the flow ordered a duplicate of the very
+    // Spec the human had named. A run that never opens cannot do that; and a refusal that left a
+    // run behind would be worse than the bug, so nothing above this point writes.
     if let Some(sid) = spec_id.as_deref() {
         if db
             .with_conn(|c| db::get_spec(c, sid))
             .map_err(internal_db)?
             .is_none()
         {
-            return Err(RpcError::new(
-                RpcCode::InvalidId,
-                format!("unknown spec '{sid}'"),
-            ));
+            // `run_start` DOES take the three AND advertises the three, so it is honest here to
+            // offer them: what this sentence names, `tools/list` names too.
+            return Err(unknown_spec_refusal(
+                db,
+                project_id.as_deref(),
+                sid,
+                Some(RUN_START_ANCHOR_TRAILER),
+            )?);
         }
     }
     let workflow = match optional_str(args, "workflow_id")? {
@@ -550,9 +679,23 @@ pub fn run_start(
     // been destroyed, so a session that had walked half the flow silently restarted from the top and
     // the human was told nothing (observed live). The dropped run is therefore reported as a
     // `warnings` entry — never an error, since replacing IS the correct move.
-    let (run, replaced) = start_or_replace_run(db, runtime, &workflow.id, spec_id.as_deref(), "{}")?;
-    if let Some(replaced) = replaced {
-        warnings.push(run_replaced_warning(&replaced.dropped, &replaced.why));
+    //
+    // AND SO DOES THE RESUME, which is the third of the three things this call can do. Created and
+    // replaced each had their sentence; resumed had none, so it was told apart from a fresh start by
+    // nothing at all — while it is the one outcome that lands the caller in the MIDDLE of a flow
+    // somebody else (or they, days ago) left running. Announced on the same channel and, like the
+    // replacement, as a WARNING rather than an error: resuming is the correct behaviour, N20 is
+    // untouched, and nothing here creates or destroys a run.
+    //
+    // READ BEFORE THE WORKSPACE ANCHOR further down, for the reason the stranded report is: that
+    // write bumps `updated_at`, and an age taken after it would report every resumed run as fresh.
+    let (run, outcome) = start_or_replace_run(db, runtime, &workflow.id, spec_id.as_deref(), "{}")?;
+    match &outcome {
+        RunStartOutcome::Replaced(replaced) => {
+            warnings.push(run_replaced_warning(&replaced.dropped, &replaced.why));
+        }
+        RunStartOutcome::Resumed => warnings.push(run_resumed_warning(db, &run)?),
+        RunStartOutcome::Created => {}
     }
 
     // SIGNAL the runs left for dead. Nothing in nyx surfaces a `blocked` run, so they pile up in
@@ -653,11 +796,325 @@ pub fn run_start(
             "workflow_name": workflow.name,
             "spec_id": run.spec_id,
             "scope": workflow.scope,
+            // WHICH OF THE THREE THINGS THIS CALL DID — `created` | `resumed` | `replaced`. A
+            // caller must not have to infer it from which warnings happen to be present: two of the
+            // three used to publish one and the third published nothing, so "no warning" meant
+            // either "brand new" or "you have just walked into somebody's half-finished session".
+            "outcome": outcome.tag(),
             "warnings": warnings,
         }),
         ChangedTopic::Specs,
     ))
 }
+
+/// `run_bind_spec` — the tool name. Advertised in `tools/list` and routed from
+/// [`crate::mcp_tools_core::dispatch_extension_tool`], like its two siblings above.
+pub const RUN_BIND_SPEC_TOOL: &str = "run_bind_spec";
+
+/// The MACHINE HANDLE of each `run_bind_spec` refusal, carried under `error.data.reason`. One
+/// constant per precondition, because "the bind was refused" is not an answer a caller can act on:
+/// the whole point of exposing this recovery is that its `no` says WHICH condition failed.
+///
+/// STABLE STRINGS — a caller (and the tests) key on them; the human sentence beside each is free to
+/// be re-worded.
+///
+/// `pub(crate)` FOR THE SAME REASON AS [`RUN_LOCATION_UNRESOLVED_WARNING_CODE`]: the
+/// `run_bind_spec` DESCRIPTOR names these codes to a caller, and it used to name them as re-typed
+/// literals `mcp.rs` had no way to reach. Renaming a VALUE here would then have left the
+/// advertisement lying in silence. The test
+/// `mcp::tests::run_bind_spec_advertises_its_refusal_codes_by_constant` now confronts the
+/// descriptor with THIS module: every code declared here is either named there, or is
+/// `AUTHORITY_REFUSED`, whose omission is deliberate (a race is not something a caller can rule out
+/// BEFORE calling) and therefore ASSERTED rather than assumed. The scan reads the module's own
+/// declarations WHATEVER THEIR VISIBILITY — `pub const` and `pub(crate) const` reach equally far
+/// inside a `pub(crate)` module, so neither may be the spelling that hides a code from the scan —
+/// and it fails on a declaration it cannot parse rather than skipping it. A code added HERE mute
+/// therefore fails instead of shipping unadvertised (findings `01M10063H5B65Q81V4HRW94W71`,
+/// `01M10YD9QZYJJDAQQ1S8TGWSKH`). A `reason` that never becomes a constant of this module is
+/// outside its reach: every call site passes one of these.
+pub(crate) mod bind_refusal {
+    /// The `run_id` is not one THIS session drives.
+    pub const FOREIGN_RUN: &str = "run_not_in_this_session";
+    /// The run already carries a Spec.
+    pub const ALREADY_BOUND: &str = "run_already_bound";
+    /// The run is a `sub_workflow` child; it inherits its Spec from its parent.
+    pub const CHILD_RUN: &str = "run_is_a_child";
+    /// The run is finished (`done` / `failed`).
+    pub const TERMINAL_RUN: &str = "run_is_terminal";
+    /// The target Spec already carries a live run of the same workflow (N20).
+    pub const SPEC_HAS_A_LIVE_RUN: &str = "spec_already_has_a_live_run";
+    /// The Spec belongs to another project than the run's workspace does.
+    pub const PROJECT_DISAGREEMENT: &str = "spec_project_disagrees_with_run";
+    /// The DB authority's own WHERE refused the write (a race, or a condition re-checked there).
+    pub const AUTHORITY_REFUSED: &str = "bind_refused_by_the_authority";
+}
+
+/// The refusal shape every precondition of [`run_bind_spec`] answers with — `invalid_state` plus
+/// the `reason` that NAMES which one failed. Written once so they cannot drift apart.
+fn bind_refusal(reason: &str, run_id: &str, message: String) -> RpcError {
+    RpcError::new(RpcCode::InvalidState, message)
+        .with_data(json!({ "reason": reason, "run_id": run_id }))
+}
+
+/// `run_bind_spec` — `{ run_id, spec_id }` → `{ run_id, spec_id, workflow_id }`.
+/// ATTACH an already-open run to the Spec it turned out to be about.
+///
+/// THIS IS A RECOVERY, NOT THE WAY TO ANCHOR A RUN. The normal way is to open the run ALREADY
+/// anchored — `run_start` with the Spec named, which is what the command hook does when the human
+/// typed a reference. This verb exists for the session that started WRONG: a run opened with no
+/// Spec (the human named none, or their reference was not read), work already done inside it, and
+/// no way out but to throw the session away. It is worth exposing precisely because throwing it
+/// away is the alternative — so nothing here relaxes a guard to make the recovery easier.
+///
+/// THE PRECONDITIONS ARE [`bind_session_run_to_spec`]'s — NOT ONE IS RELAXED, and the ones that
+/// read differently are said here rather than left for a reader to spot, because binding the wrong
+/// run is worse than binding none. The callee states the same set (mcp_engine.rs, `The CANDIDATE is
+/// deliberately narrow`); this verb states them as the guards it evaluates, in the order it
+/// evaluates them:
+///   * the run is NOT TERMINAL. This EXPLICITS the callee's "still LIVE" rather than adding to it,
+///     and it is evaluated FIRST for a reason the callee never faced: the session registry evicts a
+///     run when it finishes, so on a finished run "is it in the registry?" no longer answers "is it
+///     yours?" — see the comment on the guard itself;
+///   * the run is one THIS session drives ([`EngineRuntime::session_run_ids`]). Handing the verb an
+///     explicit `run_id` does NOT retire that guard, it relocates the guess: `/nspec` runs on the
+///     BUILT-IN workflow (`project_id IS NULL`, shared by the whole installation), `run_list` on it
+///     enumerates every session's and every project's runs with no filter, and the tool descriptor
+///     points an agent straight at that list. Two worktrees of one project — the ordinary case —
+///     are enough for a session to anchor another's run. The registry is the only session ↔ run
+///     mapping there is, so it is what says "yours";
+///   * the run carries NO Spec — a bound run is never re-bound and never stolen (the authority
+///     [`db::set_run_spec`] re-checks that in its own WHERE, and this call does not bypass it);
+///   * the run is TOP-LEVEL (no `parent_run_id`): a `sub_workflow` child INHERITS its Spec from its
+///     parent at creation, so binding one would contradict its parent rather than repair anything;
+///   * and the callee's UNIQUENESS condition — EXACTLY ONE such candidate — is REPLACED, not
+///     dropped: it exists because `spec_create` must GUESS which run authored the Spec, and two
+///     live candidates make that a coin toss. Here the caller NAMES the run, so the guess it
+///     guards against cannot happen; what replaces it is the session rule above, which is what
+///     keeps the named run from being someone else's.
+///
+/// AND THE GUARDS ON THE SPEC, which [`bind_session_run_to_spec`] never needed because the Spec it
+/// is handed was just CREATED and can carry nothing, while the Spec here is one the human names:
+///   * the Spec must belong to the project the run is anchored in. A `KEY-N` carries its OWN
+///     project, so the short grammar is precisely the form that can name a Spec of somewhere else;
+///   * the Spec must not ALREADY carry a live run of this workflow. N20 ("at most one live run per
+///     (workflow, Spec)") is upheld by `run_start` ALONE, inside
+///     [`db::start_or_resume_workflow_run`], which converges the pair by DELETING every run but the
+///     most recent. So a bind that looked only at its source run could compose the very state
+///     `run_start` refuses to open — and the next `run_start` on that Spec would silently destroy
+///     the other run, with everything it had walked. A recovery that recreates the damage it exists
+///     to repair is not one.
+///
+/// AND THE WRITE ITSELF CAN STILL REFUSE: the authority [`db::set_run_spec`] re-checks
+/// `spec_id IS NULL` in its own WHERE, so 0 rows means a condition held at read time no longer does
+/// — a refusal (`bind_refused_by_the_authority`), never a silent success.
+///
+/// EVERY refusal above answers under its own [`bind_refusal`] code, and that module — not this list
+/// — is the enumeration to read: it is where a code is added, so a summary that re-counted them
+/// here would be a second statement free to fall behind (finding `01M0ZW802X47JFC8977EKD9YAN`).
+///
+/// The Spec reference accepts the four forms like every other `spec_id` field, through the one
+/// entry point ([`crate::mcp_context::require_spec_arg`]). The `run_id` is the anchor a `#N` / `N`
+/// is counted in — and it is an anchor that can END ON NOTHING: a run's project comes from its
+/// WORKSPACE, and `run_start` deliberately opens a run without one when its `cwd` matched nothing
+/// (warning [`RUN_LOCATION_UNRESOLVED_WARNING_CODE`]) — which is the very session this verb repairs.
+/// So the short forms are advertised CONDITIONALLY here, and the refusal on that path names the
+/// forms that carry their own project instead of arguments this verb does not take.
+pub fn run_bind_spec(
+    db: &Db,
+    runtime: &EngineRuntime,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
+    let run_id = require_str(args, "run_id")?.to_string();
+    let run = db
+        .with_conn(|c| db::get_workflow_run(c, &run_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| RpcError::new(RpcCode::InvalidId, format!("unknown run '{run_id}'")))?;
+
+    // THE RUN'S OWN PRECONDITIONS FIRST, before the Spec is even looked up: a run this call may not
+    // touch is the answer, whatever Spec was named.
+    //
+    // TERMINALITY IS READ BEFORE OWNERSHIP, and that order is the whole point. The session registry
+    // EVICTS a run the moment it finishes (`nyx_next` calls [`EngineRuntime::forget`]), so "absent
+    // from the registry" answers two different questions at once, and only one of them is "not
+    // yours": a run THIS session drove to its end is absent exactly like a stranger's. Asking the
+    // status first is what stops the commonest case of all — bind the run I just finished — from
+    // being told the one thing that is false about it. Nothing is relaxed by the order: a LIVE run
+    // outside the registry still earns `FOREIGN_RUN`, and a terminal one is refused either way.
+    if db::run_status_is_terminal(&run.status) {
+        return Err(bind_refusal(
+            bind_refusal::TERMINAL_RUN,
+            &run.id,
+            format!(
+                "run '{run_id}' is '{}' — it is over, and anchoring a finished run rewrites history \
+                 rather than repairing a session. Open a new run on the Spec",
+                run.status
+            ),
+        ));
+    }
+    if !runtime.session_run_ids().iter().any(|id| *id == run.id) {
+        return Err(bind_refusal(
+            bind_refusal::FOREIGN_RUN,
+            &run.id,
+            format!(
+                "run '{run_id}' is not one this session is driving, so this session cannot say what \
+                 it is about. run_list enumerates the runs of EVERY session and project on a \
+                 built-in workflow, so an id read there may well be someone else's. Bind a run you \
+                 opened (its id rides in the NYX RUN block, or comes back from run_start)"
+            ),
+        ));
+    }
+    if let Some(bound) = run.spec_id.as_deref() {
+        return Err(bind_refusal(
+            bind_refusal::ALREADY_BOUND,
+            &run.id,
+            format!(
+                "run '{run_id}' already drives spec {bound}: a run's Spec is never re-written, only \
+                 ever posed on a run that carries none. Open a run on the other Spec instead"
+            ),
+        ));
+    }
+    if let Some(parent) = run.parent_run_id.as_deref() {
+        return Err(bind_refusal(
+            bind_refusal::CHILD_RUN,
+            &run.id,
+            format!(
+                "run '{run_id}' is a child of run {parent} and INHERITS its Spec from it at \
+                 creation — binding the child would contradict its parent. Bind the parent, if it \
+                 is what carries none"
+            ),
+        ));
+    }
+
+    // THE PROJECT THE RUN IS ANCHORED IN — its workspace's, since a run reaching this point carries
+    // no Spec to name one. It is what a `#N` counts inside, and what the Spec's own project is
+    // confronted with below.
+    let run_project = match run.workspace_id.as_deref() {
+        Some(ws) => db
+            .with_conn(|c| -> diesel::QueryResult<Option<String>> {
+                Ok(db::get_workspace(c, ws)?.map(|w| w.project_id))
+            })
+            .map_err(internal_db)?,
+        None => None,
+    };
+    // THE ANCHORS ARE WALKED ONCE. `require_spec_arg` would re-derive the project from `args` —
+    // `require_run` + `get_workspace` + `get_project` on the very `run_id` this call already
+    // loaded, for the same answer `run_project` above is holding. So the project is HANDED to the
+    // grammar instead, exactly as `mcp_context::resolve_spec_arg_project_relative_refused` does for
+    // the same reason (finding `01M0ZMA20NRB2WDSTSHE63YYX5`). Every form is unchanged: a canonical
+    // id and prose come straight back, a `KEY-N` still resolves in the project ITS key names, and a
+    // `#N` / `N` counts in the run's project — which is what the descriptor promises.
+    let spec_id = crate::mcp_context::resolve_spec_ref_in(
+        db,
+        run_project.as_deref(),
+        require_str(args, "spec_id")?,
+    )?;
+    let spec = db
+        .with_conn(|c| db::get_spec(c, &spec_id))
+        .map_err(internal_db)?;
+    let Some(spec) = spec else {
+        // The SAME actionable refusal `run_start` gives a reference that designates nothing — the
+        // forms, and what the run's project actually holds.
+        //
+        // WITH ONE DIFFERENCE, and it is the point: when the run anchors NO project, this verb has
+        // no `cwd` / `workspace_id` / `project_id` to offer (its schema carries neither), so it says
+        // what IS true of this call — the anchor is the run, and the run carries no workspace.
+        let trailer = format!(
+            ". run_bind_spec takes no cwd / workspace_id / project_id: its only project anchor is \
+             the run, and run '{run_id}' carries no workspace to name one"
+        );
+        return Err(unknown_spec_refusal(
+            db,
+            run_project.as_deref(),
+            &spec_id,
+            Some(&trailer),
+        )?);
+    };
+
+    // THE CROSS-PROJECT GUARD, on the RESOLVED id exactly as `resolve_run_target` applies it to
+    // `run_start`: a `KEY-N` carries its own project, so a key of another one must not become the
+    // back door through which a foreign Spec is anchored on this run.
+    if let Some(anchor) = run_project.as_deref() {
+        if anchor != spec.project_id {
+            return Err(bind_refusal(
+                bind_refusal::PROJECT_DISAGREEMENT,
+                &run.id,
+                format!(
+                    "spec {} belongs to project {}, but run '{run_id}' is anchored on a workspace \
+                     of project {anchor} — they disagree. Name a Spec of project {anchor}",
+                    spec.id, spec.project_id
+                ),
+            ));
+        }
+    }
+
+    // N20 ON THE TARGET — see the note above: the pair must not end up carrying two live runs.
+    let rival = db
+        .with_conn(|c| db::find_runs_for_spec(c, &run.workflow_id, Some(&spec.id)))
+        .map_err(internal_db)?
+        .into_iter()
+        .find(|r| !db::run_status_is_terminal(&r.status));
+    if let Some(rival) = rival {
+        // THE GESTURES ARE ORDERED, AND THE DELETABLE RUN IS NAMED. "Resume, or delete the one you
+        // do not want" was true and dangerously readable the wrong way: from inside THIS run, "the
+        // one you do not want" is the rival — the parked run that has already walked the flow, whose
+        // loss this very refusal exists to prevent, and which the caller has not read. So the
+        // recovery is said first, and the run that is SAFE to delete is the one the caller can see:
+        // its own (finding `01M0ZWC64WXFCGM5H0P36PNSV6`).
+        let rival_id = &rival.id;
+        let target = &spec.id;
+        return Err(bind_refusal(
+            bind_refusal::SPEC_HAS_A_LIVE_RUN,
+            &run.id,
+            format!(
+                "spec {target} already carries the live run {rival_id} on this workflow, and nyx \
+                 holds AT MOST ONE live run per (workflow, Spec) — binding '{run_id}' too would \
+                 make the next run_start on that Spec DELETE one of them, with everything it had \
+                 walked. RESUME {rival_id} FIRST: it is the run that has already walked this flow, \
+                 and picking it up loses nothing. If one of the two must then go, the safe one to \
+                 run_delete is '{run_id}' — this call's own run, whose work you can see; \
+                 {rival_id} is the one whose loss this refusal exists to prevent, so delete it \
+                 only after reading it"
+            ),
+        ));
+    }
+
+    // The authority re-checks `spec_id IS NULL` in its own WHERE. It is not bypassed and not
+    // trusted blindly either: 0 rows means a condition held at read time no longer does (a
+    // concurrent bind), and that is a refusal, never a silent success.
+    let written = db
+        .with_conn(|c| db::set_run_spec(c, &run.id, &spec.id))
+        .map_err(internal_db)?;
+    if written == 0 {
+        return Err(bind_refusal(
+            bind_refusal::AUTHORITY_REFUSED,
+            &run.id,
+            format!(
+                "run '{run_id}' was not bound: it no longer carries no Spec — something bound it \
+                 between this call's checks and its write. Read it back (run_list) before deciding \
+                 what to do"
+            ),
+        ));
+    }
+    Ok(ToolOutcome::changed(
+        json!({
+            "run_id": run.id,
+            "spec_id": spec.id,
+            "workflow_id": run.workflow_id,
+        }),
+        ChangedTopic::Specs,
+    ))
+}
+
+/// THE ANCHORLESS TRAILER `run_start` APPENDS to [`unknown_spec_refusal`] — the arguments it tells
+/// a caller to ADD when a `#N` found no project to be counted in. A refusal's advice is only advice
+/// if the verb emitting it advertises what it names, and this sentence spent a release naming a
+/// `project_id` absent from `run_start`'s own `inputSchema` (finding `01M1008NHM9RRA1ZAS4V7K1PM4`).
+///
+/// `pub(crate)` for the same reason as [`RUN_LOCATION_UNRESOLVED_WARNING_CODE`] below:
+/// `mcp::tests::run_start_advises_only_anchors_its_own_schema_advertises` confronts THIS constant
+/// with the descriptor's `properties`, rather than a re-typed literal — so re-wording the advice
+/// without adding the argument turns that test red.
+pub(crate) const RUN_START_ANCHOR_TRAILER: &str = ", or add a cwd / workspace_id / project_id";
 
 /// The `run_start` WARNING code for a location that anchors SEVERAL active Specs on a flow that needs
 /// none: the run starts UNBOUND rather than refusing (G2). A STABLE machine code, sibling of
@@ -679,11 +1136,144 @@ pub(crate) const RUN_LOCATION_UNRESOLVED_WARNING_CODE: &str = "run_location_unre
 /// change. Sibling of `gate_unconfigured` (N26a) in the same `warnings` array.
 const RUN_REPLACED_WARNING_CODE: &str = "run_replaced_graph_changed";
 
+/// The `run_start` WARNING code for a run RESUMED rather than opened. A STABLE machine code, sibling
+/// of [`RUN_REPLACED_WARNING_CODE`] in the same `warnings` array — and its counterpart: one says the
+/// flow restarts from the top, the other that it does not.
+///
+/// `pub(crate)` for the same reason as [`RUN_LOCATION_UNRESOLVED_WARNING_CODE`]: `run_start`'s
+/// DESCRIPTOR names it to a caller, and `mcp::tests` pins the descriptor against this constant
+/// rather than a re-typed literal.
+pub(crate) const RUN_RESUMED_WARNING_CODE: &str = "run_resumed";
+
+/// Build the warning for the run `run_start` RESUMED — the third outcome, and the one that used to
+/// say nothing at all.
+///
+/// WHY IT IS WORTH A SENTENCE. The replacement warning exists because a session that had walked half
+/// the flow was silently restarted from the top and nobody was told (observed live). Resuming is the
+/// same silence with the sign flipped: the human invokes a command believing they start at the
+/// beginning, and the very first tick answers from wherever a run — theirs from last week, or a
+/// parallel session's — happened to stop. Nothing is wrong; they simply have to KNOW, because it
+/// decides whether they carry on or clear the run and start again.
+///
+/// TWO FACTS, and they are the two the task named: WHERE it lands (the node, by label and id) and
+/// HOW LONG it has been sitting there (since `updated_at`, which the resume path leaves untouched —
+/// this is read before the workspace anchor's write for exactly that reason). The duration is
+/// spelled by [`crate::mcp_context::human_span`], the same function the context render's `Run` line
+/// uses, so the two surfaces cannot describe one run's age in two different vocabularies.
+///
+/// THE WAY OUT IS NAMED FROM THE VERB'S OWN CONSTANT, never re-typed here — the rule
+/// `mcp_context::unanchored_signal` states for its own remedy, and the one this repo already paid
+/// for on a refusal naming an argument its schema did not carry (`01M1008NHM9RRA1ZAS4V7K1PM4`).
+/// Advice naming a tool that does not exist is worse than no advice; renaming `run_delete` re-words
+/// this sentence with it.
+///
+/// A WARNING, never an error: N20's convergence is the correct behaviour and this does not touch it.
+fn run_resumed_warning(db: &Db, run: &db::WorkflowRun) -> Result<Value, RpcError> {
+    let idle_ms = (db::now_millis() - run.updated_at).max(0);
+    let landing = match run.current_node_id.as_deref() {
+        Some(node_id) => db
+            .with_conn(|c| db::get_node(c, node_id))
+            .map_err(internal_db)?
+            .map_or_else(
+                // The node is gone from under the cursor: say the id, which is still true.
+                || format!("parked on node {node_id}"),
+                |n| format!("parked on \"{}\" (node_id={})", n.label, n.id),
+            ),
+        None => "still at the flow's START — it was opened but never ticked".to_string(),
+    };
+    Ok(json!({
+        "code": RUN_RESUMED_WARNING_CODE,
+        "run_id": run.id,
+        "node_id": run.current_node_id,
+        "status": run.status,
+        "idle_ms": idle_ms,
+        "message": format!(
+            "run {} was RESUMED, not opened: it already existed for this (workflow, Spec) and is {landing}, \
+             '{}', with nothing having touched it for {}. You are picking a session up MID-FLOW — the \
+             next nyx_next answers from where it stopped, not from the top. Say so before you tick; if \
+             that run is not the work you meant to continue, clear it with {} run_id='{}' rather \
+             than driving it",
+            run.id,
+            run.status,
+            crate::mcp_context::human_span(idle_ms),
+            crate::mcp_authoring::RUN_DELETE_TOOL,
+            run.id
+        ),
+    }))
+}
+
 /// The corpse [`start_or_replace_run`] DROPPED, and [`build_engine`]'s own refusal naming how it
 /// died — everything a caller needs to SAY what it just did.
 struct ReplacedRun {
     dropped: db::WorkflowRun,
     why: RpcError,
+}
+
+/// WHICH of the three things [`start_or_replace_run`] did — the answer `run_start` reports, and the
+/// reason this is an enum rather than the `Option<ReplacedRun>` it used to hand back.
+///
+/// TWO OF THE THREE ALREADY SPOKE and the third did not, which made the SILENT one ambiguous:
+/// "created" and "resumed" were both "no replacement", so a caller could not tell a run it had just
+/// opened from one it had walked into halfway through. That asymmetry is the same defect the
+/// replacement warning was written for, in the other direction — there, a session that had walked
+/// half the flow silently restarted from the top; here, a human who believes they are starting from
+/// the top lands in the middle.
+enum RunStartOutcome {
+    /// No live run of the pair: a fresh row, parked at the flow's start.
+    Created,
+    /// The pair's live run was handed back AS IS — same id, no new row, and parked wherever the last
+    /// session left it.
+    Resumed,
+    /// The pair's live run could never tick again, so it was dropped and replaced by a fresh one.
+    Replaced(ReplacedRun),
+}
+
+/// The THREE stable machine tags [`RunStartOutcome::tag`] publishes under `outcome`. A caller keys
+/// on these strings, and `run_start`'s DESCRIPTOR spells all three out to say what `outcome` can
+/// hold — so they are CONSTANTS, not literals typed once here and once in `tools/list`.
+///
+/// `pub(crate)` for that second surface. A tag renamed on the enum alone would leave the descriptor
+/// announcing a value no run ever returns, which is the same defect as advice naming a verb that
+/// does not exist (finding `01M1008NHM9RRA1ZAS4V7K1PM4`) — with nothing to catch it, since the
+/// engine's own tests would simply follow the rename.
+pub(crate) const RUN_START_OUTCOME_CREATED: &str = "created";
+pub(crate) const RUN_START_OUTCOME_RESUMED: &str = "resumed";
+pub(crate) const RUN_START_OUTCOME_REPLACED: &str = "replaced";
+
+/// The three, as ONE list — what `run_start`'s description must name, walked by
+/// `mcp::tests::run_start_advertises_every_listed_outcome_tag`.
+///
+/// WHAT THAT WALK HOLDS, EXACTLY: every tag ON THIS LIST is spelled out in `tools/list`. It is NOT
+/// "every tag [`RunStartOutcome`] can publish", and this list cannot be made to hold that. Nothing
+/// ties it to the enum: [`RunStartOutcome::tag`] is exhaustive, so the COMPILER does force a fourth
+/// variant to be given a tag — but adding `Self::Cancelled => RUN_START_OUTCOME_CANCELLED` while
+/// leaving this array alone compiles, passes, and ships the new tag undocumented.
+///
+/// WHAT CLOSES IT AS FAR AS IT CAN BE CLOSED IS A VISIT, NOT A DERIVATION. Rust has no way to
+/// enumerate a variant set (`Replaced` carries a payload, so there is no value list to walk, and
+/// `variant_count` is unstable), so DERIVING this list would take a declarative macro generating the
+/// enum and the list from one declaration — machinery this crate has nowhere else, for a lock on
+/// PROSE. A second exhaustive match costs nothing, though, and buys the next best thing:
+/// `tests::every_run_start_outcome_carries_a_listed_tag` matches on [`RunStartOutcome`] and asserts
+/// membership in THIS array, so a fourth variant stops that file compiling and its author reads the
+/// rule before they can go green. The rule, in words, because a visit cannot state it: A FOURTH
+/// OUTCOME IS ADDED TO THIS LIST TOO, and then the walk makes the descriptor state it.
+pub(crate) const RUN_START_OUTCOME_TAGS: [&str; 3] = [
+    RUN_START_OUTCOME_CREATED,
+    RUN_START_OUTCOME_RESUMED,
+    RUN_START_OUTCOME_REPLACED,
+];
+
+impl RunStartOutcome {
+    /// The STABLE machine tag `run_start` publishes under `outcome` — read off the constants above,
+    /// so the value a caller receives and the value `tools/list` advertises are ONE fact.
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Created => RUN_START_OUTCOME_CREATED,
+            Self::Resumed => RUN_START_OUTCOME_RESUMED,
+            Self::Replaced(_) => RUN_START_OUTCOME_REPLACED,
+        }
+    }
 }
 
 /// Resolve the ONE live run of a `(workflow, spec)` pair — N20's idempotency — and VERIFY it can
@@ -726,16 +1316,18 @@ fn start_or_replace_run(
     workflow_id: &str,
     spec_id: Option<&str>,
     blackboard: &str,
-) -> Result<(db::WorkflowRun, Option<ReplacedRun>), RpcError> {
+) -> Result<(db::WorkflowRun, RunStartOutcome), RpcError> {
     // `created` marks WHICH path the resolution took — only a RESUMED run has a corpse to check.
     let (run, created) = db
         .with_conn(|c| db::start_or_resume_workflow_run(c, workflow_id, spec_id, None, blackboard))
         .map_err(internal_db)?;
     if created {
-        return Ok((run, None));
+        return Ok((run, RunStartOutcome::Created));
     }
     let Err(why) = build_engine(db, &run) else {
-        return Ok((run, None));
+        // The pair's live run rebuilt fine and is handed back untouched — including its
+        // `updated_at`, which is what lets the caller say how long it had been sitting.
+        return Ok((run, RunStartOutcome::Resumed));
     };
     // DROPPING a run is the SECOND way to delete one, and it takes the same tick guard as the first
     // ([`crate::mcp_authoring::run_delete`]) — L1 is about the row, not about which verb removes it.
@@ -760,7 +1352,10 @@ fn start_or_replace_run(
         .with_conn(|c| db::start_or_resume_workflow_run(c, workflow_id, spec_id, None, blackboard))
         .map_err(internal_db)?
         .0;
-    Ok((fresh, Some(ReplacedRun { dropped: run, why })))
+    Ok((
+        fresh,
+        RunStartOutcome::Replaced(ReplacedRun { dropped: run, why }),
+    ))
 }
 
 /// The machine `reason` [`build_engine`] refused with — the STABLE code naming WHICH way a run died.
@@ -1098,6 +1693,33 @@ fn query_without_spec_warnings(db: &Db, workflow_id: &str) -> Result<Vec<Value>,
     Ok(warnings)
 }
 
+/// WHAT a run is ABOUT, as one clause a human reads: the Spec it drives — human key, title AND
+/// `spec_id` — or the fact that it drives none.
+///
+/// THE `spec_id` IS IN THE SENTENCE, and that is a change of mind this PRD made explicit. The
+/// warnings below used to name the Spec by its human key ALONE, on the argument that `#3` is what
+/// the human reads and the id is what they would then have to resolve. Two things undo it. These
+/// warnings are MACHINE-WIDE — [`stranded_run_warnings`] enumerates the blocked runs of every
+/// project on the installation — so a `#N`, which is only ever counted INSIDE a project, does not
+/// designate a Spec at all in a sentence that names no project. And the id is now the thing the
+/// reader ACTS with: the remedy each of these warnings prescribes is a call taking a `spec_id`.
+/// The `#N` and the title stay; nothing is removed, the id is added.
+///
+/// ONE function for both warnings, because they said the same thing in two copies.
+fn run_subject(db: &Db, run: &db::WorkflowRun) -> Result<String, RpcError> {
+    let Some(spec_id) = run.spec_id.as_deref() else {
+        return Ok("no Spec (an authoring run)".to_string());
+    };
+    Ok(db
+        .with_conn(|c| db::get_spec(c, spec_id))
+        .map_err(internal_db)?
+        .map_or_else(
+            // The row is gone under the run: the id is then the only true thing left to say.
+            || format!("spec '{spec_id}'"),
+            |s| format!("Spec #{} '{}' (spec_id {})", s.number, s.title, s.id),
+        ))
+}
+
 /// The `run_start` WARNING code for a `blocked` run nobody has come back to. A STABLE machine code,
 /// sibling of `gate_unconfigured` / `run_replaced_graph_changed` in the same `warnings` array.
 const RUN_STRANDED_WARNING_CODE: &str = "run_blocked_stranded";
@@ -1111,7 +1733,21 @@ const RUN_STRANDED_WARNING_CODE: &str = "run_blocked_stranded";
 /// left on a Friday evening and picked up on Monday morning has been still for ~63 h and is perfectly
 /// alive. 3 days sits just past that weekend; the corpses that motivated this had been still for a
 /// week (three `nspec` runs and one `coder` run, blocked since 5–6 August, surfaced by nothing).
-const STRANDED_BLOCKED_RUN_AFTER_MS: i64 = 3 * 24 * 60 * 60 * 1000;
+/// `pub(crate)` because the CONTEXT RENDER marks a run STALE off THIS constant
+/// ([`crate::mcp_context::run_state_line`]) and "how long is too long" must be ONE number: a second
+/// copy of that answer would let a render call a run fresh while this warning reports it stranded,
+/// the two-truths failure this repo has already paid for on the anchor order.
+///
+/// THE THRESHOLD IS SHARED; THE POPULATION IS NOT — and reading the first as the second is how a
+/// doc-comment starts promising an equivalence the code never had. This warning strands `blocked`
+/// runs ONLY ([`crate::db::blocked_runs_untouched_since`]): `blocked` is the state a gate parks a run
+/// in, and how long it has been parked is the whole question. The render marks EVERY live run,
+/// `running` included, because a header answering "is someone already on this?" must also say that a
+/// `running` run nothing has touched for a week is not a session in progress. So a stale `running`
+/// run shows up in the render and in NO `run_start` warning, by design; what the shared constant
+/// rules out is the two surfaces disagreeing about a run they BOTH look at. The POLICY stays here,
+/// with the warning that motivated it.
+pub(crate) const STRANDED_BLOCKED_RUN_AFTER_MS: i64 = 3 * 24 * 60 * 60 * 1000;
 
 /// One `run_start` warning per run that has been `blocked` longer than
 /// [`STRANDED_BLOCKED_RUN_AFTER_MS`] — machine-wide, because what the human needs is the list of
@@ -1137,18 +1773,7 @@ fn stranded_run_warnings(db: &Db, opened: &db::WorkflowRun) -> Result<Vec<Value>
             .with_conn(|c| db::get_workflow(c, &run.workflow_id))
             .map_err(internal_db)?
             .map_or_else(|| run.workflow_id.clone(), |w| w.name);
-        // WHICH Spec is stranded — by its human key (#number + title), not the id the human would
-        // then have to resolve themselves.
-        let subject = match run.spec_id.as_deref() {
-            Some(spec_id) => db
-                .with_conn(|c| db::get_spec(c, spec_id))
-                .map_err(internal_db)?
-                .map_or_else(
-                    || format!("spec '{spec_id}'"),
-                    |s| format!("Spec #{} '{}'", s.number, s.title),
-                ),
-            None => "no Spec (an authoring run)".to_string(),
-        };
+        let subject = run_subject(db, &run)?;
         let resumed_here = run.id == opened.id;
         let fate = if resumed_here {
             "and it is the run THIS CALL just handed back: what you are about to drive is that run, \
@@ -1203,16 +1828,7 @@ fn unanswerable_consent_warning(db: &Db, run: &db::WorkflowRun) -> Result<Vec<Va
         .with_conn(|c| db::get_workflow(c, &run.workflow_id))
         .map_err(internal_db)?
         .map_or_else(|| run.workflow_id.clone(), |w| w.name);
-    let subject = match run.spec_id.as_deref() {
-        Some(spec_id) => db
-            .with_conn(|c| db::get_spec(c, spec_id))
-            .map_err(internal_db)?
-            .map_or_else(
-                || format!("spec '{spec_id}'"),
-                |s| format!("Spec #{} '{}'", s.number, s.title),
-            ),
-        None => "no Spec (an authoring run)".to_string(),
-    };
+    let subject = run_subject(db, run)?;
     Ok(vec![json!({
         "code": CONSENT_UNANSWERABLE_WARNING_CODE,
         "run_id": run.id,
@@ -1740,7 +2356,11 @@ fn walk(
                     // can see WHY a gate is the colour it is. Only a gate with REAL commands writes it —
                     // an empty (vacuously green) gate has nothing to explain, so it leaves no residue.
                     if !gate.commands.is_empty() {
-                        engine.set_board(LAST_GATE_RESULT_KEY, gate_result_json(&node_id, gate));
+                        engine.set_board_as(
+                            &node_id,
+                            LAST_GATE_RESULT_KEY,
+                            gate_result_json(&node_id, gate),
+                        );
                     }
                     // A GREEN gate clears ONLY ITS OWN red anchor; a RED BLOCKING gate raises its own.
                     // A red NON-blocking gate, and a green NON-blocking gate that was never anchored,
@@ -1775,6 +2395,35 @@ fn walk(
                         .as_deref()
                         .map(|k| board_value_is_affirmative(engine.blackboard().get(k)))
                         .unwrap_or(false);
+                    // AND the gate's affirmative must be a HUMAN's. The static gate answers "is this
+                    // key saying yes"; the provenance answers "who put that yes there", which is the
+                    // question a `gate_on` pointing at a `query` fact never had to face. Asked only
+                    // when the transition is ENGAGING and about to fire, so a non-sensitive move
+                    // (`start`, `in_review`) and a gate already refusing are untouched.
+                    //
+                    // AND ONLY ON A RUN THAT HAS A SPEC. `apply_transition` returns early for a
+                    // Spec-less run: there is no lifecycle to move, so the node commits nothing, and
+                    // refusing it would park a run over an effect that never happens (M2).
+                    if gate_satisfied
+                        && run.spec_id.is_some()
+                        && transition_is_engaging_target(&target_state)
+                    {
+                        if let Err(e) = crossing_is_authorized(
+                            engine,
+                            &node_id,
+                            crate::engine::SensitiveEffect::SpecTransition,
+                            notes,
+                        ) {
+                            return Err(block_on_effect_error(
+                                db,
+                                run,
+                                engine,
+                                &node_id,
+                                last_result,
+                                e,
+                            ));
+                        }
+                    }
                     if let Err(e) = apply_transition(db, run, &target_state, gate_satisfied) {
                         // The transition was REFUSED (illegal source / a confirmation-gated target),
                         // so it must be RE-ATTEMPTED on the next call, never skipped: without the
@@ -1915,7 +2564,10 @@ fn walk(
                         }
                     };
                     for (key, value) in folded {
-                        engine.set_board(&key, value);
+                        // ATTRIBUTED to the `query` node: this is a FACT nyx read, not an answer a
+                        // human gave, and the board must say so — a consent gate that fires on this
+                        // key is gating on machinery, whatever the graph's shape suggests.
+                        engine.set_board_as(&node_id, &key, value);
                     }
                     // H3 — a fact this run can never change is a CONSTANT, and a loop gated on it can
                     // never exit. Say so on the board NOW, so the engine kills such a loop on its
@@ -2013,6 +2665,27 @@ fn walk(
                         .as_deref()
                         .map(|k| board_value_is_affirmative(engine.blackboard().get(k)))
                         .unwrap_or(false);
+                    // The fork is a member of the sensitive census, so the affirmative that opens it
+                    // must be a HUMAN's — see [`crossing_is_authorized`]. Asked INSIDE the Spec
+                    // binding, like the fork itself: an unbound run forks nothing, so there is
+                    // nothing to demand a human for.
+                    if approved && run.spec_id.is_some() {
+                        if let Err(e) = crossing_is_authorized(
+                            engine,
+                            &node_id,
+                            crate::engine::SensitiveEffect::CreateRevision,
+                            notes,
+                        ) {
+                            return Err(block_on_effect_error(
+                                db,
+                                run,
+                                engine,
+                                &node_id,
+                                last_result,
+                                e,
+                            ));
+                        }
+                    }
                     if approved {
                         if let Some(spec_id) = run.spec_id.as_deref() {
                             // A fork the authority refused must be RE-ATTEMPTED, never walked past:
@@ -2056,6 +2729,24 @@ fn walk(
                         .map(|k| board_value_is_affirmative(engine.blackboard().get(k)))
                         .unwrap_or(true);
                     if approved {
+                        // The MOST PHYSICAL of the three sensitive effects, and the one whose seeded
+                        // gate reads a `query` fact: the human's consent for `/nspec`'s `go` arm is
+                        // the selector above, which is exactly what `consent_keys` climbs to.
+                        if let Err(e) = crossing_is_authorized(
+                            engine,
+                            &node_id,
+                            crate::engine::SensitiveEffect::CreateWorkspace,
+                            notes,
+                        ) {
+                            return Err(block_on_effect_error(
+                                db,
+                                run,
+                                engine,
+                                &node_id,
+                                last_result,
+                                e,
+                            ));
+                        }
                         if let Err(e) = create_run_workspace(db, run, &root, &name) {
                             let blocked =
                                 block_on_effect_error(db, run, engine, &node_id, last_result, e);
@@ -2112,7 +2803,15 @@ fn walk(
                                     let mut retrieved = serde_json::Map::new();
                                     for copy in &retrieve {
                                         if let Some(v) = child_board.get(&copy.from) {
-                                            engine.set_board(&copy.to, v.clone());
+                                            // The widest write in the vocabulary, and it is attributed
+                                            // to THIS `sub_workflow` node — NOT to whoever wrote the
+                                            // key on the CHILD board. A human answered the child's
+                                            // question, on the child's run, to the child's graph; what
+                                            // lands here is a value a node copied. Carrying the
+                                            // child's `ask_human` provenance across would let a parent
+                                            // gate cross on a consent given to another question, which
+                                            // is the H6 failure with one extra hop.
+                                            engine.set_board_as(&node_id, &copy.to, v.clone());
                                             retrieved.insert(copy.to.clone(), v.clone());
                                         }
                                     }
@@ -2211,19 +2910,38 @@ fn walk(
                             let child_wf =
                                 resolve_child_workflow(db, run, workflow_id.as_deref(), &scope)?;
                             let mut child_board = Blackboard::new();
+                            // INJECTED keys are attributed, on the CHILD board, to the PARENT's
+                            // `sub_workflow` node — the node that put them there. The id names a node
+                            // of the parent's graph, which is exactly what happened; what matters to
+                            // the child's consent checks is the TYPE, and `sub_workflow` is not
+                            // `ask_human`, so an injected value can never authorize a sensitive node
+                            // down there however affirmative it looks.
+                            let injected_by = crate::engine::NodeOrigin::new(
+                                node_id.clone(),
+                                NodeType::SubWorkflow,
+                            );
                             for copy in &inject {
                                 if let Some(v) = engine.blackboard().get(&copy.from) {
-                                    child_board.set(&copy.to, v.clone());
+                                    child_board
+                                        .written_by(&injected_by)
+                                        .set(&copy.to, v.clone());
                                 }
                             }
-                            let (child_run, replaced) = start_or_replace_run(
+                            let (child_run, child_outcome) = start_or_replace_run(
                                 db,
                                 runtime,
                                 &child_wf.id,
                                 run.spec_id.as_deref(),
                                 &child_board.to_json_string(),
                             )?;
-                            if let Some(replaced) = replaced {
+                            // ONLY the REPLACEMENT is noted here. `run_start` also announces a
+                            // RESUME, because there the caller is a human who believes they are
+                            // starting a flow; a `sub_workflow` node is the graph opening its own
+                            // child and its `Created`/`Resumed` are the SAME event from the
+                            // parent's side — the child key was absent, so this node is handing the
+                            // parent a child either way. A replacement is not: the child the parent
+                            // gets starts from the top of ITS graph.
+                            if let RunStartOutcome::Replaced(replaced) = child_outcome {
                                 notes.push(child_replaced_note(&replaced, &child_run.id));
                             }
                             db.with_conn(|c| db::set_run_parent(c, &child_run.id, &run.id))
@@ -2232,7 +2950,11 @@ fn walk(
                                 db.with_conn(|c| db::set_run_workspace(c, &child_run.id, workspace_id))
                                     .map_err(internal_db)?;
                             }
-                            engine.set_board(&child_key, Value::from(child_run.id.clone()));
+                            engine.set_board_as(
+                                &node_id,
+                                &child_key,
+                                Value::from(child_run.id.clone()),
+                            );
                             let _ = &output_key; // routing honored via write_result on SubResult.
                             let json = with_notes(subworkflow_wait_json(&child_run.id), notes.as_slice());
                             let trace = tick_trace(action_type(&json), last_result);
@@ -2502,9 +3224,135 @@ fn child_ask_human_bubble(db: &Db, child: &db::WorkflowRun) -> Result<Option<Val
     )))
 }
 
+/// WHO actually authorized a SENSITIVE node the run is about to cross — read from the board's
+/// PROVENANCE ([`crate::engine::Blackboard::origin_of`]), which is a record of the run that happened
+/// and not an analysis of the graph that might.
+///
+/// This is the answer the six static guards each approximate. They ask "does this graph LOOK like a
+/// human decides here?" before anything runs; a live run holds the value AND the name of whoever wrote
+/// it. The keys consulted are the ones the graph puts between the run and the effect
+/// ([`crate::engine::Tree::consent_keys`]) — the node's own `gate_on`, and the unanimous routing key of
+/// each `selector` above it — and only those currently holding an AFFIRMATIVE, since a key saying "no"
+/// authorizes nothing whoever wrote it.
+enum ConsentOrigin {
+    /// An `ask_human` wrote the value that opens this node. The one verdict that crosses.
+    Human,
+    /// Every key that could open it has a KNOWN author and NONE of them is a question put to a human:
+    /// a `query`'s fact, a `judge`'s verdict, a `spawn_subagent`'s report. Carries the nearest such
+    /// key and its author, because a refusal that names neither cannot be acted on.
+    NotHuman {
+        key: String,
+        origin: crate::engine::NodeOrigin,
+    },
+    /// The board says nothing about who wrote what could open this node — a run already in flight when
+    /// provenance shipped, a key filled through a path that could not name its author, or a node
+    /// nothing gates at all. NOT a refusal: see [`crossing_is_authorized`].
+    Unrecorded,
+}
+
+/// The runtime consent verdict for the sensitive node `node_id`, given the live board.
+///
+/// The ORDER is [`crate::engine::Tree::consent_keys`]'s: the node's own gate is asked first, the
+/// selectors above it next. A single human answer anywhere on that list is enough — the `/nspec` `go`
+/// arm gates its `create_workspace` on the `workspace_free` PREVALIDATION (a `query` fact) and puts the
+/// human's consent in the selector one level up, so a check that stopped at the gate would refuse the
+/// shipped flow.
+fn consent_origin(engine: &Engine, node_id: &str) -> ConsentOrigin {
+    let board = engine.blackboard();
+    let mut known: Option<(String, crate::engine::NodeOrigin)> = None;
+    for key in engine.tree().consent_keys(node_id) {
+        if !board_value_is_affirmative(board.get(&key)) {
+            continue;
+        }
+        match board.origin_of(&key) {
+            Some(origin) if origin.is_human_answer() => return ConsentOrigin::Human,
+            Some(origin) => {
+                if known.is_none() {
+                    known = Some((key, origin));
+                }
+            }
+            None => {}
+        }
+    }
+    match known {
+        Some((key, origin)) => ConsentOrigin::NotHuman { key, origin },
+        None => ConsentOrigin::Unrecorded,
+    }
+}
+
+/// Whether a SENSITIVE node whose static gate is already satisfied may actually be CROSSED — `Ok(())`
+/// to cross, `Err` to refuse. Consulted ONLY where the node was about to fire anyway, so it can turn a
+/// crossing into a refusal and never the reverse: nothing here can make a run advance further than it
+/// would have without it.
+///
+/// # The three verdicts, and why the third is not a refusal
+///
+///   * a HUMAN's answer authorizes it — cross, exactly as before.
+///   * a KNOWN, non-human author — REFUSE, naming the key, what actually wrote it, and what was
+///     expected. This is the class the six static guards each closed one member of: a `query`'s fact,
+///     a `judge`'s verdict or a `spawn_subagent`'s report standing in for a human's decision. The
+///     graph does not have to be re-authored for this to hold — the check reads the run, so a graph
+///     written before any of this gains it untouched.
+///   * NOTHING RECORDED — cross, and WARN. A run already in flight when provenance shipped carries a
+///     board without it, and so does a node nothing gates. Refusing there would freeze every live run
+///     at deployment, for a guarantee that fills itself in as runs renew; the warning is what keeps
+///     the degradation visible instead of silent. The static guards are still standing underneath,
+///     which is what makes this a safe place to be generous.
+fn crossing_is_authorized(
+    engine: &Engine,
+    node_id: &str,
+    effect: crate::engine::SensitiveEffect,
+    notes: &mut Vec<String>,
+) -> Result<(), RpcError> {
+    match consent_origin(engine, node_id) {
+        ConsentOrigin::Human => Ok(()),
+        ConsentOrigin::Unrecorded => {
+            notes.push(format!(
+                "nyx cannot tell WHO authorized this step ({}): its blackboard holds no record of \
+                 which node wrote the key it fires on, so it is being allowed on the graph's shape \
+                 alone, as before. A run opened before nyx began recording that carries no such \
+                 record — the next run of this flow will. Tell the human, and check that one of them \
+                 really approved it.",
+                crate::engine::HumanCommitment::from(effect).what_it_commits(),
+            ));
+            Ok(())
+        }
+        ConsentOrigin::NotHuman { key, origin } => Err(RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "this step {}, and nyx refuses it: the value that opens it — blackboard key '{}' — \
+                 was written by the '{}' node '{}', which is a fact nyx read and not an answer a \
+                 human gave. Only an 'ask_human' answer opens a step like this one. nyx knows it \
+                 because it records WHO writes each blackboard key as the run goes, so the shape of \
+                 the graph cannot stand in for what actually happened. What makes progress is a \
+                 question put to the human whose answer lands on '{}' — not a retry, and not another \
+                 value under the same key.",
+                crate::engine::HumanCommitment::from(effect).what_it_commits(),
+                key,
+                origin.node_type.as_db(),
+                origin.node_id,
+                key,
+            ),
+        )
+        .with_data(json!({
+            "reason": "sensitive_step_without_human_provenance",
+            "node_id": node_id,
+            "gate_key": key,
+            "written_by_node": origin.node_id,
+            "written_by_type": origin.node_type.as_db(),
+            "expected": db::NODE_TYPE_ASK_HUMAN,
+        }))),
+    }
+}
+
 /// WHAT the leaf the run is PARKED on commits, when it is an `ask_human` whose answer disposes of
 /// something the session does not own (H6, then J2). DERIVED from the LIVE tree
 /// ([`crate::engine::Tree::ask_human_commitment`]), so it follows an edited graph.
+///
+/// STILL STATIC, and deliberately so: it answers "what do I WARN the human about, and whose turn do I
+/// demand, BEFORE this question is answered?", and at that instant no value exists to have a
+/// provenance. The provenance decides the OTHER question — "may this effect fire, given what was
+/// actually written?" ([`crossing_is_authorized`]) — one step later, where the value exists.
 fn awaiting_commitment(engine: &Engine) -> Option<crate::engine::HumanCommitment> {
     if engine.awaiting_node_type() != Some(NodeType::AskHuman) {
         return None;
@@ -4378,10 +5226,18 @@ fn outcome(run: &db::WorkflowRun, engine: &Engine, action: Value, status: &str) 
 /// delta the `nyx_next` outcome returns (N22). A key that was REMOVED is reported BESIDE it by
 /// [`blackboard_removed`] and never in here: a `null` in the delta could not be told apart from a key
 /// deliberately set to `null`.
+///
+/// [`crate::engine::PROVENANCE_KEY`] is EXCLUDED from both directions, and it is the one key that is.
+/// It is nyx's own record of who wrote what, read by nyx's own consent check and by nothing the
+/// dispatcher does; it changes on nearly every write, and it holds one entry per board key, so
+/// shipping it in the delta would re-send a growing object on almost every tick — the exact cost N22
+/// exists to remove, paid for a value no caller acts on. It IS persisted in full with the board, and a
+/// refusal that turns on it NAMES the origin in its message, so nothing about it is hidden from anyone
+/// who needs it.
 fn blackboard_delta(pre: &Blackboard, post: &Blackboard) -> Value {
     let mut delta = serde_json::Map::new();
     for (k, v) in post.as_map() {
-        if pre.get(k) != Some(v) {
+        if k != crate::engine::PROVENANCE_KEY && pre.get(k) != Some(v) {
             delta.insert(k.clone(), v.clone());
         }
     }
@@ -4403,7 +5259,7 @@ fn blackboard_removed(pre: &Blackboard, post: &Blackboard) -> Value {
         .as_map()
         .keys()
         .map(String::as_str)
-        .filter(|k| !post.as_map().contains_key(*k))
+        .filter(|k| *k != crate::engine::PROVENANCE_KEY && !post.as_map().contains_key(*k))
         .collect();
     gone.sort_unstable();
     Value::Array(gone.into_iter().map(Value::from).collect())
@@ -4552,7 +5408,11 @@ fn reeval_red_gates(
         let green = outcome.passed;
         // Keep M6's surfaced result fresh on every re-run (only a gate with REAL commands writes it).
         if !outcome.commands.is_empty() {
-            engine.set_board(LAST_GATE_RESULT_KEY, gate_result_json(&node_id, outcome));
+            engine.set_board_as(
+                &node_id,
+                LAST_GATE_RESULT_KEY,
+                gate_result_json(&node_id, outcome),
+            );
         }
         if green {
             blocking.remove(&node_id);

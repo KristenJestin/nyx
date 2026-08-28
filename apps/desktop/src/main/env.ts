@@ -5,7 +5,7 @@
  *   - **dev** — load the renderer from the running Vite dev server
  *     (`http://localhost:1420`), open DevTools, no ASAR.
  *   - **prod** — load the renderer from the packaged static build
- *     (`apps/frontend/dist/index.html`) shipped inside the app.
+ *     (`dist/renderer/index.html`, relative to this package) shipped inside the app.
  *
  * Detection prefers the explicit `NYX_DEV_SERVER_URL` (set by the `dev` script),
  * falling back to Electron's `app.isPackaged` so a packaged binary is always prod
@@ -15,7 +15,12 @@
 /**
  * The Vite dev-server URL, when running in dev. Unset in a packaged build.
  * The `dev` npm script sets this so the main process knows to load the live server
- * instead of the on-disk build. Mirrors the Tauri `devUrl` (`http://localhost:1420`).
+ * instead of the on-disk build.
+ *
+ * The value is NOT decided here: `scripts/dev-server-identity.cjs` holds the one definition of
+ * the port, `vite.config.ts` binds it and `scripts/dev.cjs` hands it over — and only after it has
+ * checked that the server answering there is THIS worktree's. The shell reads whatever it was
+ * given, which is why the check has to happen before Electron is spawned rather than here.
  */
 export function devServerUrl(): string | undefined {
   const url = process.env.NYX_DEV_SERVER_URL;

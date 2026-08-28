@@ -1164,3 +1164,548 @@ fn prompts_interpolate_from_the_blackboard() {
         other => panic!("expected ask_human, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// ask_human_commitment / answer_decides — the two readings, both evaluated
+// ---------------------------------------------------------------------------
+
+/// The `/nspec` `go` shape, reduced to its minimum: an `ask_human` whose answer ROUTES (through a
+/// `selector` branch comparing it to an affirmative literal) to a `create_workspace` whose OWN
+/// `gate_on` names a key a `query` writes — the PREVALIDATION, not the answer.
+///
+/// This is the graph `answer_decides` used to misread. Its early return fired on the `gate_on`
+/// (`workspace_free`), compared it to the answer key (`ready_ok`), found no match, and reported that
+/// NOTHING a human answers governs the folder — abandoning the climb to the selector that is the
+/// actual consent. There is deliberately NO engaging `transition` beside the `create_workspace` here:
+/// in the shipped `/nspec` the human turn survives only because such a neighbour gates on `ready_ok`,
+/// and that neighbour is a coincidence of that graph, not a property of the shape.
+#[test]
+fn an_answer_routing_to_a_workspace_gated_on_a_query_fact_still_commits_it() {
+    let rows = vec![
+        node("root", None, 0, db::NODE_TYPE_SEQUENCE, "{}"),
+        node(
+            "confirm",
+            Some("root"),
+            0,
+            db::NODE_TYPE_ASK_HUMAN,
+            r#"{"prompt":"open a workspace?","output_key":"ready_ok","options":["go","no"]}"#,
+        ),
+        node(
+            "route",
+            Some("root"),
+            1,
+            db::NODE_TYPE_SELECTOR,
+            r#"{"branches":[{"cond":{"var":"ready_ok","eq":"go"},"child":0},
+                            {"cond":{"always":true},"child":1}]}"#,
+        ),
+        node("go", Some("route"), 0, db::NODE_TYPE_SEQUENCE, "{}"),
+        // The PREVALIDATION: a `query` fills `workspace_free`. No human ever writes it.
+        node(
+            "free?",
+            Some("go"),
+            0,
+            db::NODE_TYPE_QUERY,
+            r#"{"query":"workspace_target_free","write":"workspace_free"}"#,
+        ),
+        node(
+            "workspace",
+            Some("go"),
+            1,
+            db::NODE_TYPE_CREATE_WORKSPACE,
+            r#"{"root_key":"worktrees_root","gate_on":"workspace_free"}"#,
+        ),
+        node(
+            "left",
+            Some("route"),
+            1,
+            db::NODE_TYPE_NOTE,
+            r#"{"text":"nothing done"}"#,
+        ),
+    ];
+    let tree = Tree::from_rows(&rows, Some("root")).unwrap();
+    assert_eq!(
+        tree.ask_human_commitment("confirm"),
+        Some(HumanCommitment::CreateWorkspace),
+        "the answer routes to a create_workspace: it commits a folder on the user's disk, whatever \
+         key that node's own gate_on happens to name",
+    );
+}
+
+/// The OTHER arm of the same OR, locked in its own right: a sensitive node whose `gate_on` IS the
+/// answer key, reached with NO selector anywhere. Nothing routes here — the `gate_on` alone is the
+/// consent — so a "fix" that dropped the `gate_on` reading in favour of the climb turns this red.
+#[test]
+fn an_answer_a_sensitive_nodes_gate_on_names_commits_it_with_no_selector_above() {
+    let rows = vec![
+        node("root", None, 0, db::NODE_TYPE_SEQUENCE, "{}"),
+        node(
+            "confirm",
+            Some("root"),
+            0,
+            db::NODE_TYPE_ASK_HUMAN,
+            r#"{"prompt":"ready?","output_key":"ready_ok","options":["yes","no"]}"#,
+        ),
+        node(
+            "ready",
+            Some("root"),
+            1,
+            db::NODE_TYPE_TRANSITION,
+            r#"{"target_state":"ready","gate_on":"ready_ok"}"#,
+        ),
+    ];
+    let tree = Tree::from_rows(&rows, Some("root")).unwrap();
+    assert_eq!(
+        tree.ask_human_commitment("confirm"),
+        Some(HumanCommitment::SpecTransition),
+        "the gate_on names the answer key: the reading that has always worked must keep working",
+    );
+}
+
+/// The climb stays ON THE ANCESTOR CHAIN, and the widening does not relax that: a `selector` that
+/// routes a SIBLING branch on the answer decides nothing about a sensitive node sitting in ANOTHER
+/// branch, whose own `gate_on` names an unrelated key. Without this, "evaluate both readings" would
+/// slide into "any affirmative selector anywhere in the graph credits any sensitive node".
+#[test]
+fn a_selector_on_a_sibling_branch_does_not_decide_a_foreign_sensitive_node() {
+    let rows = vec![
+        node("root", None, 0, db::NODE_TYPE_SEQUENCE, "{}"),
+        node(
+            "confirm",
+            Some("root"),
+            0,
+            db::NODE_TYPE_ASK_HUMAN,
+            r#"{"prompt":"?","output_key":"ready_ok","options":["yes","no"]}"#,
+        ),
+        node(
+            "route",
+            Some("root"),
+            1,
+            db::NODE_TYPE_SELECTOR,
+            r#"{"branches":[{"cond":{"var":"ready_ok","eq":"yes"},"child":0},
+                            {"cond":{"always":true},"child":1}]}"#,
+        ),
+        node(
+            "noted",
+            Some("route"),
+            0,
+            db::NODE_TYPE_NOTE,
+            r#"{"text":"ok"}"#,
+        ),
+        node(
+            "else",
+            Some("route"),
+            1,
+            db::NODE_TYPE_NOTE,
+            r#"{"text":"no"}"#,
+        ),
+        // A SIBLING of the selector, not a descendant of its approving branch.
+        node(
+            "fork",
+            Some("root"),
+            2,
+            db::NODE_TYPE_FORK_SPEC,
+            r#"{"gate_on":"some_query_fact"}"#,
+        ),
+    ];
+    let tree = Tree::from_rows(&rows, Some("root")).unwrap();
+    assert_eq!(
+        tree.ask_human_commitment("confirm"),
+        None,
+        "the fork sits outside the branch the answer routes to, and its gate_on is not the answer",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// blackboard PROVENANCE — who wrote which key
+// ---------------------------------------------------------------------------
+
+/// THE FOUR WRITE PATHS, each covered. `set` / `set_scoped` / `increment` / `append` are the whole of
+/// what a node can do to the board, and a provenance blind on ONE of them is not a weaker guarantee
+/// but a false one: a key filled through the uncovered path would keep whatever author it had before,
+/// which is a consent check reading a name that no longer applies.
+#[test]
+fn every_blackboard_write_path_records_who_wrote_the_key() {
+    let human = NodeOrigin::new("ask-1", NodeType::AskHuman);
+    let fact = NodeOrigin::new("q-1", NodeType::Query);
+    let mut board = Blackboard::new();
+
+    board.written_by(&human).set("answer", json!("go"));
+    board
+        .written_by(&fact)
+        .set_scoped("loop_iter", "loop-1", json!(3));
+    board.written_by(&fact).increment("spawns");
+    board.written_by(&human).append("log", json!("first"));
+
+    assert_eq!(board.origin_of("answer"), Some(human.clone()), "set");
+    assert_eq!(
+        board.origin_of("loop_iter"),
+        Some(fact.clone()),
+        "set_scoped"
+    );
+    assert_eq!(board.origin_of("spawns"), Some(fact), "increment");
+    assert_eq!(board.origin_of("log"), Some(human.clone()), "append");
+
+    // The values themselves are untouched by the bookkeeping.
+    assert_eq!(board.get("answer"), Some(&json!("go")));
+    assert_eq!(board.get("loop_iter.loop-1"), Some(&json!(3)));
+    assert_eq!(board.get("spawns"), Some(&json!(1)));
+    assert_eq!(board.get("log"), Some(&json!(["first"])));
+
+    // A dot-path resolves its ROOT's origin: `answer.decision` is written by whoever wrote `answer`.
+    assert_eq!(board.origin_of("answer.decision"), Some(human));
+    // Only an `ask_human` is a human's answer — the one distinction anything downstream acts on.
+    assert!(board.origin_of("answer").unwrap().is_human_answer());
+    assert!(!board.origin_of("spawns").unwrap().is_human_answer());
+}
+
+/// AN UNATTRIBUTED WRITE DROPS THE OLD AUTHOR, it does not inherit it. This is the runtime twin of the
+/// authoring rule's single-writer condition (iii), whose reproduced bypass is three nodes long:
+/// `ask_human` fills `approved`, something else overwrites it, and the gate still reads "a human said
+/// yes". If an unattributed overwrite left the previous provenance standing, the record would say
+/// `ask_human` about a value the human never gave — a FALSE provenance, which is worse than none,
+/// because the check believes it.
+#[test]
+fn an_unattributed_write_drops_the_previous_author_instead_of_inheriting_it() {
+    let human = NodeOrigin::new("ask-1", NodeType::AskHuman);
+    let mut board = Blackboard::new();
+    board.written_by(&human).set("approved", json!("yes"));
+    assert_eq!(board.origin_of("approved"), Some(human.clone()));
+
+    board.set("approved", json!(true));
+    assert_eq!(
+        board.origin_of("approved"),
+        None,
+        "the human's name must not survive onto a value the human did not write"
+    );
+
+    // The same on each of the other three paths.
+    board.written_by(&human).set("n", json!(0));
+    board.increment("n");
+    assert_eq!(board.origin_of("n"), None, "increment");
+
+    board.written_by(&human).set("acc", json!(["a"]));
+    board.append("acc", json!("b"));
+    assert_eq!(board.origin_of("acc"), None, "append");
+
+    board.written_by(&human).set("scoped", json!({}));
+    board.set_scoped("scoped", "k", json!(1));
+    assert_eq!(board.origin_of("scoped"), None, "set_scoped");
+}
+
+/// BOUNDED, and bounded by the number of KEYS rather than by the number of ticks — the board is
+/// persisted on every tick, so a provenance that grew per write would be a per-tick cost that
+/// compounds for the life of a run. One entry per top-level key, overwritten in place; and a key that
+/// is REMOVED takes its entry with it, so a finished child run or a revoked grant leaves no record of
+/// an author for a key that is no longer there.
+#[test]
+fn provenance_is_one_entry_per_key_and_leaves_with_the_key() {
+    let by = NodeOrigin::new("j-1", NodeType::Judge);
+    let mut board = Blackboard::new();
+    for i in 0..500 {
+        board.written_by(&by).set("verdict", json!(i));
+    }
+    let record = board
+        .as_map()
+        .get(PROVENANCE_KEY)
+        .and_then(Value::as_object)
+        .expect("the provenance record");
+    assert_eq!(record.len(), 1, "500 writes of one key leave ONE entry");
+
+    board.remove("verdict");
+    assert_eq!(board.origin_of("verdict"), None);
+    assert!(
+        board.as_map().get(PROVENANCE_KEY).is_none(),
+        "the empty record is dropped entirely, so a board with no attributed write is \
+         indistinguishable from one written before provenance existed"
+    );
+}
+
+/// THE RECORD IS NOT WRITABLE BY WHAT IT RECORDS. A write naming [`PROVENANCE_KEY`] does not add a
+/// key beside the others — it would REPLACE the whole record with an object of the writer's choosing,
+/// which is a forged answer to the one question the runtime consent check asks. The four write paths
+/// (and [`Blackboard::remove`], the denial half) refuse it, so the record survives every attempt
+/// naming the real author.
+///
+/// MEASURED before the refusal existed, through the public API alone: `origin_of("ready_ok")` went
+/// from `NodeOrigin { node_id: "q-1", node_type: Query }` to
+/// `NodeOrigin { node_id: "totally-a-human", node_type: AskHuman }`, and `is_human_answer()` from
+/// `false` to `true`.
+#[test]
+fn a_write_naming_the_provenance_key_cannot_forge_an_author() {
+    let real = NodeOrigin::new("q-1", NodeType::Query);
+    let forged = json!({"ready_ok": {"node": "totally-a-human", "type": "ask_human"}});
+
+    // Every one of the four attributed paths, plus their unattributed twins, plus the removal.
+    let attempts: Vec<(&str, fn(&mut Blackboard, &NodeOrigin, &Value))> = vec![
+        ("written_by().set", |b, by, v| {
+            b.written_by(by).set(PROVENANCE_KEY, v.clone())
+        }),
+        ("written_by().set_scoped", |b, by, _| {
+            b.written_by(by).set_scoped(
+                PROVENANCE_KEY,
+                "ready_ok",
+                json!({"node":"x","type":"ask_human"}),
+            )
+        }),
+        ("written_by().increment", |b, by, _| {
+            assert_eq!(
+                b.written_by(by).increment(PROVENANCE_KEY),
+                0,
+                "a refused increment must report the count the board holds, not the one it wanted",
+            )
+        }),
+        ("written_by().append", |b, by, v| {
+            b.written_by(by).append(PROVENANCE_KEY, v.clone())
+        }),
+        ("set", |b, _, v| b.set(PROVENANCE_KEY, v.clone())),
+        ("set_scoped", |b, _, _| {
+            b.set_scoped(PROVENANCE_KEY, "ready_ok", json!(1))
+        }),
+        ("increment", |b, _, _| {
+            b.increment(PROVENANCE_KEY);
+        }),
+        ("append", |b, _, v| b.append(PROVENANCE_KEY, v.clone())),
+        ("remove", |b, _, _| b.remove(PROVENANCE_KEY)),
+    ];
+
+    for (path, attempt) in attempts {
+        let mut board = Blackboard::new();
+        board.written_by(&real).set("ready_ok", json!("yes"));
+        attempt(&mut board, &real, &forged);
+
+        assert_eq!(
+            board.origin_of("ready_ok"),
+            Some(real.clone()),
+            "`{path}` rewrote the board's record of who authored `ready_ok`",
+        );
+        assert!(
+            !board
+                .origin_of("ready_ok")
+                .expect("the real author")
+                .is_human_answer(),
+            "`{path}` turned a query's fact into a human's answer — the one claim a consent gate acts on",
+        );
+        assert_eq!(
+            board.get(PROVENANCE_KEY),
+            Some(&json!({"ready_ok": {"node": "q-1", "type": "query"}})),
+            "`{path}` left something other than the record the engine minted",
+        );
+    }
+}
+
+/// The same refusal on the path a GRAPH actually reaches it by: a node's `output_key`
+/// (`Executor::write_result` → `written_by(&by).set(&key, value)`). The authoring guard refuses this
+/// config, but only for graphs authored THROUGH it — a seeded, forked or hand-inserted one arrives
+/// here unchecked, and that is the population the runtime consent check exists for.
+#[test]
+fn a_node_whose_output_key_names_the_provenance_key_writes_nothing() {
+    let rows = vec![
+        node("root", None, 0, db::NODE_TYPE_SEQUENCE, "{}"),
+        node(
+            "ask",
+            Some("root"),
+            0,
+            db::NODE_TYPE_ASK_HUMAN,
+            r#"{"prompt":"?","output_key":"ready_ok"}"#,
+        ),
+        node(
+            "forger",
+            Some("root"),
+            1,
+            db::NODE_TYPE_JUDGE,
+            r#"{"output_key":"__written_by__"}"#,
+        ),
+    ];
+    let tree = Tree::from_rows(&rows, Some("root")).unwrap();
+    let mut engine = Engine::start(tree);
+    drive(&mut engine, |a| match a {
+        Action::AskHuman { .. } => NodeResult::Human(json!("yes")),
+        Action::Judge { .. } => {
+            NodeResult::Verdict(json!({"ready_ok": {"node": "forger", "type": "ask_human"}}))
+        }
+        _ => NodeResult::Ack,
+    });
+
+    let board = engine.blackboard();
+    assert_eq!(
+        board.origin_of("ready_ok"),
+        Some(NodeOrigin::new("ask", NodeType::AskHuman)),
+        "the judge's verdict replaced the board's record of who answered the question",
+    );
+    assert_eq!(
+        board.get(PROVENANCE_KEY),
+        Some(&json!({"ready_ok": {"node": "ask", "type": "ask_human"}})),
+        "the forged object landed on the board",
+    );
+}
+
+/// RETRO-COMPATIBILITY, in the only shape that matters at deployment: a board PERSISTED before the
+/// provenance key existed. It parses, every value reads back, and every origin is `None` — "unknown",
+/// which is a first-class answer and not an error. A run in flight must not so much as notice.
+#[test]
+fn a_legacy_board_without_provenance_reads_normally_with_unknown_origins() {
+    let legacy = r#"{"ready_ok":"yes","spawns":3,"loop_iter":{"l1":2}}"#;
+    let board = Blackboard::from_json_str(legacy);
+
+    assert_eq!(board.get("ready_ok"), Some(&json!("yes")));
+    assert_eq!(board.get("spawns"), Some(&json!(3)));
+    assert_eq!(board.get("loop_iter.l1"), Some(&json!(2)));
+    assert_eq!(board.origin_of("ready_ok"), None);
+    assert_eq!(board.origin_of("spawns"), None);
+    assert_eq!(board.origin_of("nothing_here"), None);
+}
+
+/// The record SURVIVES the round trip through `workflow_runs.blackboard` — a TEXT column holding
+/// [`Blackboard::to_json_string`], so provenance rides it with NO schema change and no migration. A
+/// record that did not persist would answer "unknown" on the very tick that matters: the question is
+/// asked on a LATER tick than the write.
+#[test]
+fn provenance_survives_the_json_round_trip_that_persists_the_board() {
+    let human = NodeOrigin::new("ask-1", NodeType::AskHuman);
+    let mut board = Blackboard::new();
+    board.written_by(&human).set("ready_ok", json!("yes"));
+
+    let restored = Blackboard::from_json_str(&board.to_json_string());
+    assert_eq!(restored.origin_of("ready_ok"), Some(human));
+    assert_eq!(restored.get("ready_ok"), Some(&json!("yes")));
+}
+
+/// The engine MINTS the provenance itself, from the node it just executed — the property that makes
+/// the record a fact rather than a claim. A run of one `ask_human` and one `spawn_subagent` leaves the
+/// board naming each writer, with the answer marked as a human's and the diff not.
+#[test]
+fn a_walk_records_the_node_type_behind_each_key_it_writes() {
+    let rows = vec![
+        node("root", None, 0, db::NODE_TYPE_SEQUENCE, "{}"),
+        node(
+            "ask",
+            Some("root"),
+            0,
+            db::NODE_TYPE_ASK_HUMAN,
+            r#"{"prompt":"?","output_key":"ready_ok"}"#,
+        ),
+        node(
+            "spawn",
+            Some("root"),
+            1,
+            db::NODE_TYPE_SPAWN_SUBAGENT,
+            r#"{"agent_id":"coder"}"#,
+        ),
+    ];
+    let tree = Tree::from_rows(&rows, Some("root")).unwrap();
+    let mut engine = Engine::start(tree);
+    drive(&mut engine, |a| match a {
+        Action::AskHuman { .. } => NodeResult::Human(json!("yes")),
+        Action::SpawnSubagent { .. } => NodeResult::Diff("d".to_string()),
+        _ => NodeResult::Ack,
+    });
+
+    let board = engine.blackboard();
+    assert_eq!(
+        board.origin_of("ready_ok"),
+        Some(NodeOrigin::new("ask", NodeType::AskHuman)),
+        "the answer names the question that asked it",
+    );
+    assert_eq!(
+        board.origin_of("last_diff"),
+        Some(NodeOrigin::new("spawn", NodeType::SpawnSubagent)),
+        "the diff names the spawn",
+    );
+    assert_eq!(
+        board.origin_of("spawns"),
+        Some(NodeOrigin::new("spawn", NodeType::SpawnSubagent)),
+        "the `increment` path is minted by the engine too",
+    );
+}
+
+/// `consent_keys` reads a `selector` UNANIMOUSLY: a sensitive node a branch routes to on an
+/// affirmative, but that ANOTHER branch of the same selector also reaches (an `always` fall-through,
+/// a `ne`, an `eq` on a refusal), is a node the run may have reached WITHOUT that answer. So the
+/// selector contributes nothing, and only the node's own `gate_on` remains.
+///
+/// This is where it parts company with [`Tree::ask_human_commitment`]'s reading, which credits ANY
+/// route: over-crediting there costs one human turn, over-crediting here fires an effect nobody
+/// approved. Same graph, two questions, two different conservative sides.
+#[test]
+fn a_sensitive_node_reachable_on_a_second_branch_takes_no_consent_from_that_selector() {
+    let branches = |extra: &str| {
+        format!(r#"{{"branches":[{{"cond":{{"var":"ready_ok","eq":"yes"}},"child":0}}{extra}]}}"#)
+    };
+    let rows = |selector_config: String| {
+        vec![
+            node("root", None, 0, db::NODE_TYPE_SEQUENCE, "{}"),
+            node(
+                "ask",
+                Some("root"),
+                0,
+                db::NODE_TYPE_ASK_HUMAN,
+                r#"{"prompt":"?","output_key":"ready_ok","options":["yes","no"]}"#,
+            ),
+            node(
+                "route",
+                Some("root"),
+                1,
+                db::NODE_TYPE_SELECTOR,
+                &selector_config,
+            ),
+            node(
+                "fork",
+                Some("route"),
+                0,
+                db::NODE_TYPE_FORK_SPEC,
+                r#"{"gate_on":"can_fork"}"#,
+            ),
+            node(
+                "else",
+                Some("route"),
+                1,
+                db::NODE_TYPE_NOTE,
+                r#"{"text":"no"}"#,
+            ),
+        ]
+    };
+
+    // ONE branch names the fork, and it tests the answer affirmatively: the routing IS the consent.
+    let unanimous = Tree::from_rows(
+        &rows(branches(r#",{"cond":{"always":true},"child":1}"#)),
+        Some("root"),
+    )
+    .unwrap();
+    assert_eq!(
+        unanimous.consent_keys("fork"),
+        vec!["can_fork".to_string(), "ready_ok".to_string()],
+    );
+
+    // A SECOND branch also names the fork, and this one routes there on ANY value: the run can be
+    // standing on the fork with `ready_ok` never affirmative, so nothing about that answer is
+    // accountable for it.
+    let ambiguous = Tree::from_rows(
+        &rows(branches(r#",{"cond":{"always":true},"child":0}"#)),
+        Some("root"),
+    )
+    .unwrap();
+    assert_eq!(
+        ambiguous.consent_keys("fork"),
+        vec!["can_fork".to_string()],
+        "the selector decides nothing when a second route reaches the same child",
+    );
+
+    // The OTHER shape of the same ambiguity, and the one the `always` case does not cover: the
+    // second route to the fork tests a key AFFIRMATIVELY too — a DIFFERENT one. Both branches
+    // "consent", so neither answer is accountable: the run standing on the fork proves that ONE of
+    // them was affirmative and says nothing about which. Crediting either would let an approval of
+    // `other_ok` authorize an effect the graph shows `ready_ok` deciding.
+    let two_keys = Tree::from_rows(
+        &rows(branches(
+            r#",{"cond":{"var":"other_ok","eq":"yes"},"child":0}"#,
+        )),
+        Some("root"),
+    )
+    .unwrap();
+    assert_eq!(
+        two_keys.consent_keys("fork"),
+        vec!["can_fork".to_string()],
+        "two routes to the same child testing two different keys agree on nothing — the selector \
+         contributes no consent key at all",
+    );
+}

@@ -5,10 +5,97 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>nyx</title>
+
+    <!--
+      BOOT SPLASH — what the window paints BEFORE the bundle runs.
+
+      The window is created hidden and shown on `ready-to-show`
+      (`apps/desktop/src/main/window.ts` — the SHELL's package, not this one), so what
+      the user sees at that instant is THIS document: the head, the body, and nothing that the
+      JS bundle has produced yet — React does not exist during that interval, so no component
+      can cover it. Left to itself the document was `<div id="root"></div>` over Electron's
+      `backgroundColor`, i.e. a blank window for the whole load.
+
+      SELF-CONTAINED ON PURPOSE: markup + inline style only, no `<link>`, no `<img>`, no font,
+      no stylesheet. An extra request would lengthen exactly the wait this markup exists to
+      cover, and would arrive after the first paint anyway.
+
+      The colours below are LITERALS of the dark theme's tokens (see the note on
+      `--nyx-boot-*`), and the SAME literal is Electron's window `backgroundColor` — three
+      surfaces (window chrome, this splash, the first React screen) painting one colour is what
+      makes the hand-over invisible. `src/boot-splash.guard.test.ts` derives the expected
+      literals from `src/globals.css` and fails the day any of the three drifts.
+    -->
+    <!-- nyx:boot-splash -->
+    <style>
+      /*
+        The dark theme's `--background` / `--muted-foreground`, converted to sRGB hex.
+        DUPLICATED, KNOWINGLY: this stylesheet is parsed before `globals.css` is even
+        requested, so the real tokens are not defined yet and `var(--background)` would
+        resolve to nothing. Kept in sync by `src/boot-splash.guard.test.ts`, which converts
+        the oklch tokens itself and compares.
+      */
+      html.dark {
+        --nyx-boot-background: #0a0a0a; /* oklch(0.145 0 0) */
+        --nyx-boot-foreground: #a1a1a1; /* oklch(0.708 0 0) */
+        background-color: var(--nyx-boot-background);
+      }
+
+      /*
+        Fixed to the viewport rather than laid out in the flow: at this point `globals.css`
+        has not sized anything, so a block in normal flow would be the height of its content
+        and the splash would paint a strip instead of the window.
+      */
+      #nyx-boot-splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: var(--nyx-boot-background);
+        color: var(--nyx-boot-foreground);
+      }
+
+      /* The design system's `<Spinner>` is a lucide `loader-circle` under Tailwind's
+         `animate-spin` (1s linear). Same glyph, same motion, same colour — so the swap to the
+         router's pending component is a continuation, not a cut. */
+      #nyx-boot-splash svg {
+        width: 1.5rem;
+        height: 1.5rem;
+        animation: nyx-boot-spin 1s linear infinite;
+      }
+
+      @keyframes nyx-boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+    <!-- /nyx:boot-splash -->
   </head>
 
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- Inside `#root`, NOT beside it: `ReactDOM.createRoot(...).render(...)` clears its
+           container in the same commit that inserts the first React tree, so the splash is
+           replaced without an intermediate empty frame and without a line of teardown code. -->
+      <!-- nyx:boot-splash -->
+      <div id="nyx-boot-splash">
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          role="status"
+          aria-label="Loading"
+        >
+          <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+        </svg>
+      </div>
+      <!-- /nyx:boot-splash -->
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

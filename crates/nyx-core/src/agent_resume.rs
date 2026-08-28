@@ -939,4 +939,61 @@ mod tests {
         let plan = plan_with_registry(&[]);
         assert!(plan.is_empty());
     }
+
+    /// EVERY [`ResumeSkipReason`] carries its OWN stable tag — the single reason vocabulary the
+    /// whole app reads. [`workspace_resume_plan`] puts it in [`WorkspaceResumeEntry::skip_reason`],
+    /// the sidecar's `workspace_restore_plan` db-command serialises it into
+    /// `resume_sessions[].skip_reason`, and the renderer's `use-lazy-resume` prints it VERBATIM
+    /// into the console. That chain is what turns "it never resumes" into a named branch — so two
+    /// reasons sharing a tag, or a tag drifting, would silently un-name a skip everywhere at once.
+    ///
+    /// `ALL` cannot fall behind the enum without the compiler saying so: the `match` below has NO
+    /// wildcard arm (the same property [`skip_reason_tag`] itself relies on), so an eighth variant
+    /// fails to COMPILE here. With the tags asserted pairwise distinct, `ALL` therefore holds seven
+    /// distinct variants of an enum that has no variant outside them — i.e. exactly the enum.
+    #[test]
+    fn skip_reason_tag_is_stable_and_distinct_for_every_variant() {
+        const ALL: [ResumeSkipReason; 7] = [
+            ResumeSkipReason::OptionOff,
+            ResumeSkipReason::ClosedVoluntarily,
+            ResumeSkipReason::SessionEnded,
+            ResumeSkipReason::AlreadyResumeFailed,
+            ResumeSkipReason::NoConversation,
+            ResumeSkipReason::UnsupportedTarget,
+            ResumeSkipReason::NoResumeCommand,
+        ];
+        for reason in ALL {
+            match reason {
+                ResumeSkipReason::OptionOff
+                | ResumeSkipReason::ClosedVoluntarily
+                | ResumeSkipReason::SessionEnded
+                | ResumeSkipReason::AlreadyResumeFailed
+                | ResumeSkipReason::NoConversation
+                | ResumeSkipReason::UnsupportedTarget
+                | ResumeSkipReason::NoResumeCommand => {}
+            }
+        }
+        let tags: Vec<&'static str> = ALL.iter().copied().map(skip_reason_tag).collect();
+        assert_eq!(
+            tags,
+            vec![
+                "option_off",
+                "closed_voluntarily",
+                "session_ended",
+                "already_resume_failed",
+                "no_conversation",
+                "unsupported_target",
+                "no_resume_command",
+            ],
+            "the skip tags are a published vocabulary — the plan, the wire and the renderer log \
+             all read these exact strings"
+        );
+        let distinct: std::collections::BTreeSet<&'static str> = tags.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            tags.len(),
+            "two skip reasons sharing a tag would make their two branches indistinguishable in \
+             the log"
+        );
+    }
 }

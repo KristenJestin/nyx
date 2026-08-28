@@ -1857,6 +1857,18 @@ fn build_nspec(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
     // that routed it (it compared the WHOLE answer to 'go'), and what this gate adds is the OTHER half
     // of the pair — the node fires exactly when the transition above did, so `go` is all-or-nothing.
     //
+    // THAT SENTENCE ONLY BECAME TRUE OF THE CODE LATER. `Tree::answer_decides` used to stop at the
+    // `gate_on` it found here, compare `workspace_free` to the answer key, and conclude that no
+    // question governs this folder — the climb to the selector this comment names was never made. The
+    // human turn survived by the `transition` in the same branch gating on `ready_ok`, which is a
+    // coincidence of THIS graph and not of the shape. Both readings are evaluated now, so the consent
+    // this comment points at is the consent the runtime actually reads
+    // ([`crate::engine::Tree::answer_decides`], and the census in `seed::tests`'s
+    // `only_one_seeded_sensitive_gate_hangs_on_something_no_question_writes`, which names this node as
+    // the one exception). The key stays `workspace_free`: it is the FEASIBILITY half, it is what makes
+    // the pair all-or-nothing, and moving it onto `ready_ok` would fire the mkdir on a folder the
+    // prevalidation had just refused.
+    //
     // NOTHING FILLS THE FOLDER, and that is assumed: no clone, no `git worktree add`. The workspace
     // lands EMPTY. Putting something in it is the subject of the next PRD (depot idea
     // 01M04W3RZ333NC01R216MNXAFK); the decisions already taken for it — including the compensation

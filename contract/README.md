@@ -5,11 +5,23 @@ TypeScript, this directory holds the **shared cases** that make the two halves
 fail *together*. The fixtures are plain data files read by both suites at test
 time: nothing here is a build step, and neither side builds the other.
 
-Two contracts live here today:
+Three contracts live here today:
 
 1. **the pipe protocol** (`fixtures.json`, PDR-0007, task 523) — below;
 2. **the design half** (`design-fixtures.json`, finding
-   `01KYSNQWQD1324E0NA0172M66J`) — see the last section.
+   `01KYSNQWQD1324E0NA0172M66J`) — see the last section;
+3. **the Spec-reference grammar** (`spec-ref-corpus.txt`, finding
+   `01M0ZGBRZNAJTD5XQCW43STXZA`) — the token set the grammar is pinned on, read
+   from BOTH sides by `crates/nyx-core/src/spec_ref.rs`: every token is replayed
+   through `spec_ref::parse`, and every token is replayed through the session
+   hook's real `specIdFromPrompt` (`nyx-session-hook.cjs`, run under `node`; the
+   hook exports the function, so no copy of its regex exists in the test). The
+   file is sorted into THREE sections because there are two ways to be refused:
+   what no form recognises — where the two readers must agree — and what IS one
+   of the four shapes but dies on the core's `i64` bound, where the hook
+   deliberately forwards what `parse` refuses. That asymmetry is the division of
+   labour: the hook recognises a SHAPE and forwards the token raw, the core
+   decides a VALUE.
 
 ## The pipe protocol
 

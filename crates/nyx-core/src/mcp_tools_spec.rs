@@ -390,7 +390,9 @@ pub fn spec_create(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// ([`crate::mcp_engine::spec_section_write_is_authorized`]). A `run_id` on a WRITABLE Spec changes
 /// nothing — that write needed no exception.
 pub fn spec_update_section(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let section = parse_section(require_str(args, "section")?)?;
     let run_id = optional_str(args, "run_id")?;
     // `value` is REQUIRED but may legitimately be an empty string (clearing a section);
@@ -434,7 +436,9 @@ pub fn spec_update_section(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
 /// active revision (the prior one superseded), snapshotting the current sections, via the
 /// SHARED `db::fork_spec`. An unknown Spec → `invalid_id`.
 pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let change_reason = optional_str(args, "change_reason")?;
     let revision = db
         .with_conn(|c| db::fork_spec(c, spec_id, change_reason))
@@ -467,7 +471,8 @@ pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// with the reasoning; here it matters that it happens BEFORE the write, so a refused anchor
 /// leaves the Spec's status exactly where it was.
 pub fn spec_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id = crate::mcp_context::require_spec_arg(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let transition = parse_spec_transition(require_str(args, "transition")?)?;
     let user_confirmed = optional_bool(args, "user_confirmed")?.unwrap_or(false);
     // Resolve the anchor ONLY for `start` — the one transition that binds the Spec to a dev
@@ -502,8 +507,17 @@ pub fn spec_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// An EMPTY `workspace_id` is REFUSED (review F2), through [`anchor_str`]: here `None` is not
 /// "nothing was said", it is the DETACH, so absorbing `""` into it turned an uninitialized caller
 /// variable into a silent un-anchoring. Absent and null keep their meaning exactly — detach.
+///
+/// THE ONE PROJECT ANCHOR IS THE ONE THE DETACH OMITS, which is what makes this call's `#N` a
+/// CONDITIONAL form rather than an unconditional one: with a `workspace_id` the number is counted in
+/// that workspace's project, and without it there is no project at all — so the reference is refused
+/// BY NAME at the entry point instead of travelling down to `db::set_spec_workspace` and coming back
+/// as a bare `unknown spec` that did not even quote the token sent (finding
+/// `01M0ZKWXS353TABS0WCT3XXB81`). The description states the same condition.
 pub fn spec_set_workspace(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let workspace_id = anchor_str(
         args,
         "workspace_id",
@@ -548,7 +562,7 @@ pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     input.description = optional_str(args, "description")?.map(str::to_string);
     input.acceptance_criteria = optional_str(args, "acceptance_criteria")?.map(str::to_string);
     input.verification_command = optional_str(args, "verification_command")?.map(str::to_string);
-    input.spec_id = optional_str(args, "spec_id")?.map(str::to_string);
+    input.spec_id = crate::mcp_context::optional_spec_arg(db, args, "spec_id")?;
     input.parent_task_id = optional_str(args, "parent_task_id")?.map(str::to_string);
     // ROUND (v2.5.11): the rework sub-phase a finding is rattached to (PER-PHASE, so it reads "2.1",
     // "4.1"…). OMITTED IS THE NORMAL CASE for a `kind=review` finding: `db::create_task` then fills
@@ -654,8 +668,11 @@ pub fn task_delete(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// `blocks` (default) / `after` (directional) or `related` (context only); `note` is an optional
 /// rationale. Re-linking a pair UPSERTS the kind/note. A cycle → `invalid_state`.
 pub fn spec_link(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let from_spec_id = require_str(args, "from_spec_id")?;
-    let to_spec_id = require_str(args, "to_spec_id")?;
+    let from_spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "from_spec_id")?;
+    let to_spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "to_spec_id")?;
+    let (from_spec_id, to_spec_id) = (from_spec_id.as_str(), to_spec_id.as_str());
     let kind = parse_spec_dep_kind(args)?;
     let note = optional_str(args, "note")?;
     let dependency = db
@@ -671,8 +688,11 @@ pub fn spec_link(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// edge via the SHARED `db::remove_spec_dependency`. Idempotent (`unlinked` is `false` when the
 /// pair was not linked).
 pub fn spec_unlink(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let from_spec_id = require_str(args, "from_spec_id")?;
-    let to_spec_id = require_str(args, "to_spec_id")?;
+    let from_spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "from_spec_id")?;
+    let to_spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "to_spec_id")?;
+    let (from_spec_id, to_spec_id) = (from_spec_id.as_str(), to_spec_id.as_str());
     let removed = db
         .with_conn(|c| db::remove_spec_dependency(c, from_spec_id, to_spec_id))
         .map_err(internal_db)?;
@@ -687,7 +707,9 @@ pub fn spec_unlink(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// plus the COMPUTABLE badge counts `blocked_by_count` ("bloquée par N") and `unblocks_count`
 /// ("débloque M"). The read behind the board / Spec-detail badges (the UI is Phase 4). Read-only.
 pub fn spec_deps(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let view = db
         .with_conn(|c| db::spec_dependency_view(c, spec_id))
         .map_err(internal_db)?;
@@ -746,6 +768,11 @@ pub fn worked_spec_id(name: &str, result: &Value) -> Option<String> {
         // OPENING a run on a Spec is the work signal that re-establishes the link EXPLICITLY, from the
         // run, at the moment it opens — not inferred from a mutation that no longer happens agent-side.
         crate::mcp_engine::RUN_START_TOOL => str_at(result, &["spec_id"]),
+        // …and its RECOVERY twin, for the same reason: a run that opened UNBOUND wrote no link at
+        // all, so the session ↔ Spec link is established exactly when the run finally learns which
+        // Spec it drives. Leaving it out would make the repaired session the ONE case where the
+        // overlay stays empty — the very session that already went wrong once.
+        crate::mcp_engine::RUN_BIND_SPEC_TOOL => str_at(result, &["spec_id"]),
         // Reads, non-Spec tools, and the non-work Spec tools never map.
         _ => None,
     }
@@ -901,6 +928,234 @@ mod tests {
             worked_spec_id(SPEC_DEPS_TOOL, &json!({ "blocked_by": [] })),
             None
         );
+        // THE TWO RUN-LIFECYCLE SIGNALS. `run_start` maps the Spec it opened on; `run_bind_spec`
+        // maps the Spec a run that opened UNBOUND was finally attached to — the repaired session is
+        // exactly the one whose link was never written, so leaving it out would keep the terminal's
+        // Spec overlay empty for the session that already went wrong once.
+        assert_eq!(
+            worked_spec_id(
+                crate::mcp_engine::RUN_START_TOOL,
+                &json!({ "run_id": "R1", "spec_id": "S8" })
+            )
+            .as_deref(),
+            Some("S8")
+        );
+        assert_eq!(
+            worked_spec_id(
+                crate::mcp_engine::RUN_BIND_SPEC_TOOL,
+                &json!({ "run_id": "R2", "spec_id": "S9" })
+            )
+            .as_deref(),
+            Some("S9")
+        );
+        // An UNBOUND `run_start` (a /nspec with no Spec yet) maps nothing — null is not a Spec.
+        assert_eq!(
+            worked_spec_id(
+                crate::mcp_engine::RUN_START_TOOL,
+                &json!({ "run_id": "R3", "spec_id": null })
+            ),
+            None
+        );
+    }
+
+    /// THE `spec_*` TOOLS INHERIT THE SHORT-REFERENCE GRAMMAR, and not one of them implements it:
+    /// each reads its argument through [`crate::mcp_context::require_spec_arg`], the SAME entry
+    /// point `agent_context` and `run_start` go through. Driven on the HUMAN KEY (which names its
+    /// own project, so it resolves on a call carrying no anchor at all) in either case, and on the
+    /// `#N` / bare `N` where the call carries a project — the discipline the module states: a
+    /// number counts in a project, so it needs one to count in.
+    #[test]
+    fn the_spec_tools_accept_a_short_spec_reference() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let (spec_id, other_id, key, number) = db.with_conn(|c| {
+            let mut make = |title: &str| {
+                db::create_spec(
+                    c,
+                    &project_id,
+                    title,
+                    db::SpecSections {
+                        problem: "p".into(),
+                        solution: "s".into(),
+                        ..db::SpecSections::empty()
+                    },
+                )
+                .expect("spec")
+                .0
+            };
+            let spec = make("Referenced");
+            let other = make("Dependent");
+            let project = db::get_project(c, &project_id).unwrap().unwrap();
+            (spec.id, other.id, project.key, spec.number)
+        });
+
+        // The TWO-ENDPOINT tool reads BOTH its arguments through the grammar…
+        spec_link(
+            &db,
+            &json!({
+                "from_spec_id": format!("{key}-{}", number + 1),
+                "to_spec_id": format!("{key}-{number}"),
+            }),
+        )
+        .expect("spec_link by human key");
+        // …and the READ sees the edge those keys created.
+        let deps = spec_deps(&db, &json!({ "spec_id": format!("{key}-{}", number + 1) }))
+            .expect("spec_deps by human key");
+        assert_eq!(
+            deps.result["blocked_by"][0]["spec_id"],
+            json!(spec_id),
+            "the edge links the two Specs the keys named"
+        );
+        // Read from the OTHER end, by key too: the edge points back at the Spec `KEY-(N+1)` names.
+        let back = spec_deps(&db, &json!({ "spec_id": format!("{key}-{number}") }))
+            .expect("spec_deps by human key");
+        assert_eq!(back.result["unblocks"][0]["spec_id"], json!(other_id));
+        spec_update_section(
+            &db,
+            &json!({
+                "spec_id": format!("{}-{number}", key.to_lowercase()),
+                "section": "problem",
+                "value": "rewritten through the grammar",
+            }),
+        )
+        .expect("spec_update_section by lower-cased human key");
+        spec_fork(&db, &json!({ "spec_id": format!("{key}-{number}") })).expect("spec_fork");
+
+        // `#N` and the bare `N` on a call that DOES carry its project.
+        for token in [format!("#{number}"), number.to_string()] {
+            let out = task_add(
+                &db,
+                &json!({ "project_id": project_id, "title": "t", "spec_id": token }),
+            )
+            .unwrap_or_else(|e| panic!("form '{token}' was refused: {e:?}"));
+            assert_eq!(
+                out.result["task"]["spec_id"],
+                json!(spec_id),
+                "form '{token}' must attach the task to the Spec it names"
+            );
+        }
+    }
+
+    /// THE OTHER HALF OF "WHAT NYX ADVERTISES, NYX ACCEPTS": what a tool CANNOT resolve, it
+    /// refuses BY NAME. `spec_fork`, `spec_deps`, `spec_link` and their siblings — more `spec_id`
+    /// FIELDS than tools, since `spec_link` and `spec_unlink` take two each — take none of the four
+    /// project anchors, so a `#N` / bare `N` has nothing to be counted in. It used
+    /// to travel down as a literal and come back as `unknown spec 3` — the exact opaque sentence
+    /// this PRD exists to retire, on a field that had just PROMISED the form (finding
+    /// `01M0ZGCCSQ2F25HPBS6NX5JAFS`). Now the refusal is raised at the entry point, says WHY, and
+    /// names what to send instead — and the forms that DO work on these tools still work, which is
+    /// the half that makes the refusal honest rather than a wall.
+    #[test]
+    fn an_anchorless_spec_tool_refuses_a_project_relative_reference_by_name() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let (spec_id, key, number) = db.with_conn(|c| {
+            let spec = db::create_spec(c, &project_id, "Referenced", db::SpecSections::empty())
+                .expect("spec")
+                .0;
+            let project = db::get_project(c, &project_id).unwrap().unwrap();
+            (spec.id, project.key, spec.number)
+        });
+
+        for token in [format!("#{number}"), number.to_string()] {
+            for (tool, args) in [
+                ("spec_fork", json!({ "spec_id": token })),
+                ("spec_deps", json!({ "spec_id": token })),
+                (
+                    "spec_link",
+                    json!({ "from_spec_id": token, "to_spec_id": spec_id }),
+                ),
+            ] {
+                let err = match tool {
+                    "spec_fork" => spec_fork(&db, &args),
+                    "spec_deps" => spec_deps(&db, &args),
+                    _ => spec_link(&db, &args),
+                }
+                .expect_err("a project-relative reference cannot resolve here");
+                assert_eq!(
+                    err.code,
+                    RpcCode::InvalidArgument,
+                    "{tool}: the Spec is not unknown, the FORM is unusable here — {}",
+                    err.message
+                );
+                assert!(
+                    err.message.contains(&token)
+                        && err.message.contains(crate::spec_ref::ANCHORLESS_FORMS),
+                    "{tool}: the refusal names what was sent AND what to send instead — {}",
+                    err.message
+                );
+                assert!(
+                    !err.message.starts_with("unknown spec"),
+                    "{tool}: the opaque sentence is exactly what this replaces — {}",
+                    err.message
+                );
+            }
+        }
+        // …and the self-anchored forms the description DOES advertise still resolve on the very
+        // same tool: the refusal narrows nothing that ever worked.
+        spec_deps(&db, &json!({ "spec_id": format!("{key}-{number}") }))
+            .expect("the human key carries its own project");
+        spec_deps(&db, &json!({ "spec_id": spec_id })).expect("the canonical id is untouched");
+    }
+
+    /// THE CONDITIONAL THIRTEENTH FIELD. `spec_update_section`'s only project anchor is its
+    /// OPTIONAL `run_id`, so `#N` resolves with one and cannot without — and its description now
+    /// says exactly that (`mcp::tests::spec_update_section_states_the_condition_its_short_forms_
+    /// depend_on`). Both branches are pinned here, because a form that works or not depending on an
+    /// unrelated argument is the kind of thing a test must fix in place (finding
+    /// `01M0ZGHD137MDXFGS2PBG6GS68`): silence on the nominal path was what made it undiagnosable.
+    #[test]
+    fn spec_update_section_honours_a_short_reference_only_with_the_run_id_it_advertises() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let (spec_id, number) = db.with_conn(|c| {
+            let spec = db::create_spec(c, &project_id, "Edited", db::SpecSections::empty())
+                .expect("spec")
+                .0;
+            (spec.id, spec.number)
+        });
+        let edit = |token: &str, run_id: Option<&str>| {
+            let mut args = json!({
+                "spec_id": token,
+                "section": "problem",
+                "value": "rewritten",
+            });
+            if let Some(run_id) = run_id {
+                args["run_id"] = json!(run_id);
+            }
+            spec_update_section(&db, &args)
+        };
+
+        // NOMINAL PATH — editing a draft, no run_id: there is no project, and the refusal says so.
+        let err = edit(&format!("#{number}"), None).expect_err("no project to count #N in");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains(crate::spec_ref::ANCHORLESS_FORMS),
+            "the refusal names the forms that work without a run_id: {}",
+            err.message
+        );
+
+        // WITH THE RUN THE DESCRIPTION NAMES, the same reference resolves — the run carries the
+        // Spec, the Spec carries the project, and the number finally has something to count in.
+        let run_id = db.with_conn(|c| {
+            let wf = db::create_workflow(
+                c,
+                Some(&project_id),
+                "nspec",
+                db::WORKFLOW_SCOPE_NSPEC,
+                None,
+            )
+            .expect("workflow");
+            db::create_workflow_run(c, &wf.id, Some(&spec_id), None, "{}")
+                .expect("run")
+                .id
+        });
+        let out = edit(&format!("#{number}"), Some(&run_id)).expect("a run_id anchors the project");
+        assert_eq!(
+            out.result["spec_id"],
+            json!(spec_id),
+            "the short reference must have resolved to the Spec it names"
+        );
     }
 
     #[test]
@@ -992,6 +1247,66 @@ mod tests {
         )
         .unwrap();
         let ok = spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap();
+        assert_eq!(ok.result["spec"]["workspace_id"], ws);
+    }
+
+    /// THE TWO BRANCHES OF `spec_set_workspace`'s CONDITIONAL `#N`, pinned together because it is
+    /// their DIFFERENCE that the description now promises (finding `01M0ZKWXS353TABS0WCT3XXB81`).
+    ///
+    /// This call's only project anchor is `workspace_id`, and it is optional BECAUSE omitting it IS
+    /// the detach — so on the detach path a number can never be counted, and it used to travel down
+    /// to `db::set_spec_workspace` and come back as a bare `unknown spec` that did not even quote
+    /// the token that was sent. Now the refusal is raised at the entry point, says WHY, and names
+    /// what to send instead; and the ANCHORING path, which does carry a project, resolves the same
+    /// reference — which is the half that makes the refusal honest rather than a wall.
+    #[test]
+    fn spec_set_workspace_honours_a_short_reference_only_with_the_workspace_id_it_advertises() {
+        let _g = db_guard();
+        let (db, project_id, ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        let number = db
+            .with_conn(|c| db::get_spec(c, &sid))
+            .unwrap()
+            .expect("spec")
+            .number;
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+
+        // THE DETACH PATH — no workspace_id, so no project, so nothing to count `#N` in. The
+        // refusal names the form AND the way out, instead of the opaque `unknown spec`.
+        let err = spec_set_workspace(&db, &json!({ "spec_id": format!("#{number}") }))
+            .expect_err("a detach anchors no project, so #N cannot resolve");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains(crate::spec_ref::ANCHORLESS_FORMS),
+            "the refusal names the forms that work without a workspace_id: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(&format!("#{number}")),
+            "and it quotes the token that was actually sent: {}",
+            err.message
+        );
+
+        // THE ANCHORING PATH — the workspace names the project, and the same reference resolves.
+        let ok = spec_set_workspace(
+            &db,
+            &json!({ "spec_id": format!("#{number}"), "workspace_id": ws }),
+        )
+        .expect("a workspace_id anchors the project");
+        assert_eq!(
+            ok.result["spec"]["id"],
+            json!(sid),
+            "the short reference must have resolved to the Spec it names"
+        );
         assert_eq!(ok.result["spec"]["workspace_id"], ws);
     }
 

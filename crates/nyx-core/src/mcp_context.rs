@@ -216,6 +216,13 @@ make NO call to obtain it, and you never invent one.
   `run_start(scope: "{{scope}}", cwd: …)`. It is IDEMPOTENT — at most ONE live run per (workflow,
   Spec) — so a call made when you already hold a `run_id` RESUMES that very run instead of opening
   a second; it simply buys you nothing.
+- The human's command may OPEN WITH A SPEC REFERENCE — the canonical id, the human key (e.g. KEY-3),
+  '#3', or the bare number 3 — and that reference is the Spec they want worked on. Pass it to
+  `run_start` as `spec_id`, VERBATIM: nyx owns the grammar, so you neither translate the token nor
+  drop it. If nyx REFUSES it, STOP and ASK the human which Spec they meant, quoting the refusal (it
+  names what the project actually holds). Never substitute a Spec of your own choosing, and never
+  author a new one to get past a refused reference — that is how a duplicate of the very Spec they
+  named gets ordered.
 
 ## The loop (all you do)
 
@@ -696,6 +703,195 @@ fn revision_section(revision: &db::SpecRevision, section: db::SpecSection) -> &s
     }
 }
 
+/// Render one SIBLING Spec of the project as a compact bullet — the anti-duplication lists of BOTH
+/// context renders (the anchored one and the /nspec authoring one) go through here, so the two
+/// cannot say the Spec's identity differently.
+///
+/// IT CARRIES THE `spec_id`, beside the `#N` and on the model of the idea list fifty lines below
+/// (`- <id> · <title> · theme=…`). `#N` is the only name these lists used to give, and it is the one
+/// form nyx displayed everywhere while accepting none of it — the agent that met it had to spend
+/// four MCP calls recovering an id nyx already held. The `#N` is KEPT: it is what the human reads
+/// and now also what they may type.
+fn spec_line(spec: &db::Spec) -> String {
+    format!(
+        "- #{} · {} · {} · spec_id={}\n",
+        spec.number, spec.title, spec.status, spec.id
+    )
+}
+
+/// The live state of ONE run driving a Spec, as the context header states it.
+///
+/// It is a snapshot, resolved inside the render's own `with_conn`, because the render must not hold
+/// a connection while it formats.
+struct SpecRunState {
+    run_id: String,
+    /// The flow's NAME and SCOPE — `#3 has a live run` is not actionable until you know whether it
+    /// is the `nspec` run that authored it or the `ndev` run building it.
+    flow: String,
+    scope: String,
+    /// `running` | `blocked` (a terminal run is not live and never reaches here).
+    status: String,
+    /// The node the run is PARKED on — its label and id — or `None` before the first tick.
+    node: Option<(String, String)>,
+    /// Milliseconds since `updated_at`: the run's last activity.
+    idle_ms: i64,
+    /// A `sub_workflow` child (it inherits this Spec from its parent), not a run someone opened on
+    /// the Spec directly.
+    child: bool,
+}
+
+/// The live runs of a Spec as the header needs them: the ones it will LIST, and how many there are
+/// IN ALL. Two fields because the block says both things and they are not the same number —
+/// [`SPEC_RUN_LINES_MAX`] bounds the first, nothing bounds the second.
+struct SpecLiveRuns {
+    /// The runs that get a line, most recently active first — at most [`SPEC_RUN_LINES_MAX`].
+    listed: Vec<SpecRunState>,
+    /// How many live runs the Spec carries, listed or not: what the "… and N more" line counts.
+    total: usize,
+}
+
+/// THE LIVE RUNS OF A SPEC — non-terminal runs, MOST RECENTLY ACTIVE FIRST, each resolved to what a
+/// reader needs.
+///
+/// ONLY THE ONES THAT GET A LINE ARE RESOLVED. The cap is applied to the RUN ROWS, before the
+/// per-run `get_workflow` / `get_node` reads, so the accumulation case this header exists to
+/// surface — a Spec carrying a dozen live runs — no longer pays two queries per run to print three
+/// of them. The COUNT still covers them all: it is taken from the filtered rows, which is the one
+/// thing the cap must not truncate.
+///
+/// THE QUERY IS [`db::list_runs_for_spec`], the read the Spec-side runtime view (`/work/$specId`'s
+/// run modal, the dev overlay) already uses. A third "runs of this Spec" query is exactly what the
+/// task forbade, and rightly: `run_start`'s stranded report and the (workflow, spec) convergence
+/// each read these rows for their own purpose, and a fourth reader with its own filter is how two
+/// surfaces start disagreeing about whether a Spec is being driven.
+///
+/// LIVE = NOT TERMINAL, through [`db::run_status_is_terminal`] — the same predicate the convergence
+/// judges resumability with, so "the render says there is a live run" and "`run_start` will resume
+/// a run" cannot come apart. `blocked` IS live: a blocked run re-runs its gate on the next tick.
+///
+/// THE ORDER IS RE-DECIDED HERE, and not left to the query's, because the two lists answer two
+/// questions. The runtime view lists a Spec's runs INCLUDING the finished ones, where `started_at`
+/// desc is the stable chronology a human scrolls; this list is LIVE runs under a CAP
+/// ([`SPEC_RUN_LINES_MAX`]), where the question is "who is driving this?" and the answer is the run
+/// somebody touched last. Sorting on `started_at` there drops precisely the wrong row: a top-level
+/// ndev flow STARTS BEFORE every `sub_workflow` child it opens and before every later run on the
+/// Spec, so at four live runs it is the ndev line — the one this header exists to state — that
+/// falls off the end and is merely counted. So the sort is `updated_at` desc, spelled as `idle_ms`
+/// ascending: the SAME field the STALE mark reads, so "listed first" and "not abandoned" cannot
+/// disagree. The sort is STABLE, so runs touched in the same millisecond keep the query's
+/// `started_at` desc order and the render stays deterministic.
+fn spec_live_runs(
+    conn: &mut diesel::SqliteConnection,
+    spec_id: &str,
+    now: i64,
+) -> diesel::QueryResult<SpecLiveRuns> {
+    let mut live: Vec<db::WorkflowRun> = db::list_runs_for_spec(conn, spec_id)?
+        .into_iter()
+        .filter(|run| !db::run_status_is_terminal(&run.status))
+        .collect();
+    let total = live.len();
+    live.sort_by_key(|run| (now - run.updated_at).max(0));
+    live.truncate(SPEC_RUN_LINES_MAX);
+
+    let mut listed = Vec::with_capacity(live.len());
+    for run in live {
+        let (flow, scope) = db::get_workflow(conn, &run.workflow_id)?.map_or_else(
+            || (run.workflow_id.clone(), "?".to_string()),
+            |w| (w.name, w.scope),
+        );
+        let node = match run.current_node_id.as_deref() {
+            Some(node_id) => db::get_node(conn, node_id)?.map(|n| (n.label, n.id)),
+            None => None,
+        };
+        listed.push(SpecRunState {
+            run_id: run.id,
+            flow,
+            scope,
+            status: run.status,
+            node,
+            idle_ms: (now - run.updated_at).max(0),
+            child: run.parent_run_id.is_some(),
+        });
+    }
+    Ok(SpecLiveRuns { listed, total })
+}
+
+/// A millisecond span as a coarse human duration — the "last activity" of a run.
+///
+/// COARSE ON PURPOSE: the reader's question is "is anyone still on this?", which days and hours
+/// answer and milliseconds do not. The largest unit that is ≥ 1 wins, so nothing ever reads
+/// "0 day(s)".
+///
+/// `pub(crate)` because [`crate::mcp_engine`]'s resume announcement states the SAME fact about the
+/// SAME field (`workflow_runs.updated_at`) on the other surface — the run a `run_start` just picked
+/// up. One vocabulary for one quantity: "3 day(s)" in the render and "3 days ago" in the warning
+/// would be two spellings a reader has to reconcile for nothing.
+pub(crate) fn human_span(ms: i64) -> String {
+    const MINUTE: i64 = 60 * 1000;
+    const HOUR: i64 = 60 * MINUTE;
+    const DAY: i64 = 24 * HOUR;
+    match ms {
+        d if d >= DAY => format!("{} day(s)", d / DAY),
+        h if h >= HOUR => format!("{} h", h / HOUR),
+        m if m >= MINUTE => format!("{} min", m / MINUTE),
+        _ => "less than a minute".to_string(),
+    }
+}
+
+/// How many live runs the `Run     :` block LISTS before it stops listing and starts COUNTING.
+///
+/// THE BLOCK IS ONE LINE PER LIVE RUN, so its size is a function of state — and of exactly the
+/// state [`crate::mcp_engine::stranded_run_warnings`] describes as accumulating in silence:
+/// non-terminal runs nobody ever came back to. Left unbounded, a Spec that has collected a dozen of
+/// them puts a dozen lines at the top of EVERY render of EVERY pass — the header eating the manual
+/// it exists to introduce, on the one input the reader cannot bound.
+///
+/// THREE, because a Spec holds at most ONE live run per (workflow, Spec) pair (N20), and the set
+/// that is actually driving it is the flow itself, the `sub_workflow` child that flow has open, and
+/// one more beside them (an authoring run left live). Past that, a fourth line tells the reader
+/// nothing a COUNT does not — and the count says "this is accumulation, not a session" out loud,
+/// which is the answer they came for.
+///
+/// WHAT THE CAP BOUNDS IS THE LINE COUNT, NOT THE BYTES. A line's width follows what it has to say
+/// — the label of the node its run is parked on, the lineage clause, the STALE sentence — so three
+/// lines plus a count is not one number of characters. That is why the render's size is asserted
+/// TWICE in [`crate::mcp_context::tests`]: tightly on a one-run Spec, and again at THIS cap, which
+/// is the assertion that makes the number above a bound rather than a decoration.
+const SPEC_RUN_LINES_MAX: usize = 3;
+
+/// One `Run     :` header line — the state of one live run, and what it means for the reader.
+///
+/// A run PARKED for longer than [`crate::mcp_engine::STRANDED_BLOCKED_RUN_AFTER_MS`] is marked
+/// STALE, with the same threshold `run_start` strands one by: the observed corpses had sat for a
+/// week while nothing anywhere surfaced them, and "running, last activity 8 day(s)" read exactly
+/// like a colleague's session in progress.
+fn run_state_line(state: &SpecRunState) -> String {
+    let node = match &state.node {
+        Some((label, id)) => format!("parked on \"{label}\" (node_id={id})"),
+        None => "not ticked yet (parked at the flow's start)".to_string(),
+    };
+    let lineage = if state.child {
+        " · a sub_workflow CHILD (it inherits this Spec from its parent)"
+    } else {
+        ""
+    };
+    let stale = if state.idle_ms >= crate::mcp_engine::STRANDED_BLOCKED_RUN_AFTER_MS {
+        " — STALE: nobody has touched it since, so treat it as abandoned work rather than a \
+         session in progress"
+    } else {
+        ""
+    };
+    format!(
+        "Run     : {} ({} · {}) · {} · {} · last activity {} ago{lineage}{stale}\n",
+        state.run_id,
+        state.flow,
+        state.scope,
+        state.status,
+        node,
+        human_span(state.idle_ms),
+    )
+}
+
 /// Render one task as a compact bullet: status, kind, phase, title, and (when set) its
 /// severity / blocked reason — the live execution signal a coder/auditor reads.
 fn task_line(task: &db::Task) -> String {
@@ -886,6 +1082,11 @@ fn render_agent_context_with_rules(
             } else {
                 Vec::new()
             };
+            // WHAT IS ALREADY DRIVING THIS SPEC — for EVERY role, not just the author. "Does this
+            // Spec have a run in progress?" cost the observed session four MCP calls for a fact nyx
+            // holds in one join, and the answer it never got is what let a second run open beside a
+            // live one.
+            let live_runs = spec_live_runs(c, spec_id, db::now_millis())?;
             Ok(Some((
                 spec,
                 revision,
@@ -894,10 +1095,12 @@ fn render_agent_context_with_rules(
                 project,
                 repos,
                 sibling_specs,
+                live_runs,
             )))
         })
         .map_err(internal_db)?;
-    let Some((spec, revision, tasks, workspace_context, project, repos, sibling_specs)) = bundle
+    let Some((spec, revision, tasks, workspace_context, project, repos, sibling_specs, live_runs)) =
+        bundle
     else {
         return Ok(None);
     };
@@ -906,9 +1109,13 @@ fn render_agent_context_with_rules(
 
     // Header line (native equivalent of depot's `=== DEPOT CONTEXT — <ROLE> ===`).
     out.push_str(&format!("=== NYX CONTEXT — {} ===\n", role.label()));
+    // THE `spec_id` IS ON THIS LINE, beside the `#N` — the same reason the project line below carries
+    // `project_id=…`: it is the value the tools take, and a header that names the Spec only by the key
+    // the human reads leaves the agent to go and find it. It cost four MCP calls in the observed
+    // session. The `#N` STAYS: it is what the human reads back.
     out.push_str(&format!(
-        "Spec    : {} (#{} · {})\n",
-        spec.title, spec.number, spec.status
+        "Spec    : {} (#{} · {} · spec_id={})\n",
+        spec.title, spec.number, spec.status, spec.id
     ));
     // THE PROJECT LINE IS UNCONDITIONAL (finding `01KZ3JQYRN95EETZ0JBQXED13T`): it is read off the
     // Spec's own `project_id`, so it is there whether or not a dev workspace is anchored. Every
@@ -934,6 +1141,53 @@ fn render_agent_context_with_rules(
              needs one, and every design_* call takes the project_id above)\n",
         );
     }
+    // WHAT IS ALREADY DRIVING THIS SPEC — in the header, beside the Spec it is about, because the
+    // question it answers ("is someone already on this?") is asked BEFORE any of the manual below.
+    //
+    // AND THE ABSENCE IS WRITTEN OUT. "No line" and "no run" must not look alike: that confusion IS
+    // the defect this whole PRD is about, and here it is the one that decides between resuming a
+    // session and opening a second one beside it.
+    //
+    // EVERY live run, not just the first: a Spec is driven by its top-level flow AND by the
+    // `sub_workflow` children that flow opens, and hiding the children would make "one run" a claim
+    // the data does not support.
+    if live_runs.total == 0 {
+        out.push_str(
+            "Run     : (none live — no flow is currently driving this Spec; a finished or deleted \
+             run is not a live one)\n",
+        );
+    } else {
+        // …AND THE BLOCK IS BOUNDED ([`SPEC_RUN_LINES_MAX`]), then a COUNT. [`spec_live_runs`] has
+        // already applied the cap, ordered by LAST ACTIVITY, so what it dropped is what nobody has
+        // touched in longest — never the run that is driving the Spec, which is by definition the
+        // one moving.
+        for state in &live_runs.listed {
+            out.push_str(&run_state_line(state));
+        }
+        let hidden = live_runs.total.saturating_sub(live_runs.listed.len());
+        if hidden > 0 {
+            // WHAT THIS LINE MAY ADVISE IS BOUNDED BY WHAT IT LEAVES THE READER HOLDING. The hidden
+            // runs' `run_id`s are exactly what the cap withheld, and they sit on as many DIFFERENT
+            // workflows as there are runs (N20: one live run per (workflow, Spec) pair) — so
+            // `run_list`, which takes a `workflow_id` and answers for ONE flow, cannot be pointed at
+            // this set at all, and `run_delete` needs an id this line does not carry. Saying
+            // otherwise would send the reader on the very `workflow_list` + N × `run_list` + filter
+            // detour this header exists to spare them, which is the "advice naming a verb that does
+            // not exist" defect (`01M1008NHM9RRA1ZAS4V7K1PM4`) in its subtler form: a verb that
+            // exists and does not do this. So the line ADVISES NOTHING about the hidden set, states
+            // that no verb is Spec-scoped, and points `run_delete` at the ids that ARE above it.
+            out.push_str(&format!(
+                "Run     : … and {hidden} more live run(s) not listed — the ones nothing has \
+                 touched in longest ({} live on this Spec in all). That many at once is accumulated \
+                 work, not sessions in progress. No verb lists a Spec's runs across flows ({} takes \
+                 one workflow_id, and these sit on that many flows); {} clears one by the run_id \
+                 the lines above carry.\n",
+                live_runs.total,
+                crate::mcp_authoring::RUN_LIST_TOOL,
+                crate::mcp_authoring::RUN_DELETE_TOOL,
+            ));
+        }
+    }
     out.push('\n');
 
     // WHERE THE INSTRUCTIONS COME FROM, before any of them (N29): the project's ambient `CLAUDE.md`
@@ -954,7 +1208,7 @@ fn render_agent_context_with_rules(
             out.push_str("_No other Specs in this project yet._\n\n");
         } else {
             for s in siblings {
-                out.push_str(&format!("- #{} · {} · {}\n", s.number, s.title, s.status));
+                out.push_str(&spec_line(s));
             }
             out.push('\n');
         }
@@ -1132,7 +1386,7 @@ fn render_spec_authoring(
                 );
             } else {
                 for s in &specs {
-                    out.push_str(&format!("- #{} · {} · {}\n", s.number, s.title, s.status));
+                    out.push_str(&spec_line(s));
                 }
                 out.push('\n');
             }
@@ -1283,14 +1537,44 @@ fn spec_anchor(args: &Value) -> Result<Option<SpecAnchor<'_>>, RpcError> {
     Ok(None)
 }
 
+/// WHO REFUSES a project-relative `spec_id` (`#N` / bare `N`) that the call anchors no project for.
+/// Both callers of [`resolve_spec_id`] expose ONLY optional anchors, so both can be reached without
+/// a project — they differ in WHERE the refusal that says so is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectRelative {
+    /// REFUSED HERE, by name, before anything is read — `agent_context`, which otherwise answered
+    /// the literal `unknown spec 3` this grammar exists to retire, on a field whose description had
+    /// just promised the form (finding `01M0ZKWXS353TABS0WCT3XXB81`).
+    RefusedHere,
+    /// LEFT TO TRAVEL, because the caller owns a refusal that says MORE — `run_start`, whose
+    /// [`crate::mcp_engine`] refusal always names the accepted forms, then says what THIS call makes
+    /// actionable — the two are exclusive: anchoring no project, the anchors to add and the forms
+    /// that carry their own; anchoring one, what that project actually holds (its nearest Spec, or
+    /// that it holds none yet). Raising a poorer refusal one layer earlier would be a downgrade,
+    /// not a fix.
+    RefusedByTheCaller,
+}
+
 /// RESOLVE the Spec id for a context render from the tool args, at the anchor [`spec_anchor`]
 /// stopped on — this function no longer decides the ORDER, it only says what each anchor resolves.
 ///
 /// Returns `Ok(None)` when none resolves (the caller maps it to `invalid_id`, or — for the two
 /// roles allowed to work without a Spec — to [`unanchored_signal`]).
-fn resolve_spec_id(db: &Db, args: &Value) -> Result<Option<String>, RpcError> {
+fn resolve_spec_id(
+    db: &Db,
+    args: &Value,
+    project_relative: ProjectRelative,
+) -> Result<Option<String>, RpcError> {
     match spec_anchor(args)? {
-        Some(SpecAnchor::Explicit(spec_id)) => Ok(Some(spec_id.to_string())),
+        // THE ONE PLACE THE SHORT-REFERENCE GRAMMAR ENTERS a context render. Widening it HERE is
+        // what makes `#3` / `KEY-3` / `3` work for `agent_context`, `run_start` and every `spec_*`
+        // tool at once, with no caller re-implementing the forms — see [`resolve_spec_arg`].
+        Some(SpecAnchor::Explicit(spec_id)) => Ok(Some(match project_relative {
+            ProjectRelative::RefusedHere => {
+                resolve_spec_arg_project_relative_refused(db, args, "spec_id", spec_id)?
+            }
+            ProjectRelative::RefusedByTheCaller => resolve_spec_arg(db, args, spec_id)?,
+        })),
         Some(SpecAnchor::Run(run_id)) => {
             // AN UNBOUND RUN RESOLVES NO SPEC, and that is an ANSWER — not a reason to look further.
             //
@@ -1315,6 +1599,165 @@ fn resolve_spec_id(db: &Db, args: &Value) -> Result<Option<String>, RpcError> {
                 None => Ok(None),
             }
         }
+        None => Ok(None),
+    }
+}
+
+/// TRANSLATE a `spec_id` ARGUMENT through the shared grammar — THE ONE ENTRY POINT, and the only
+/// place in the repo where a typed token becomes a Spec id ([`crate::spec_ref`] owns the forms).
+///
+/// A reference that RESOLVES comes back as the canonical id; ANYTHING ELSE comes back exactly as it
+/// was sent — a canonical id (untouched, no lookup, so a caller passing one is affected by nothing
+/// here), prose, or a reference designating no Spec. The caller's own refusal therefore still sees
+/// the token the caller was given, and still names it: widening the grammar adds resolution
+/// WITHOUT taking any existing refusal away.
+///
+/// THE PROJECT IS THE CALL'S OWN, never one this function goes looking for. `#N` and the bare `N`
+/// carry no project, so they resolve in the one [`resolve_project`] already derives from the
+/// anchors every tool passes (`project_id` | `run_id` | `workspace_id` | `cwd`) — the SAME
+/// resolution `run_start` uses, not a second one. No anchor ⇒ nothing to count in ⇒ the token
+/// stands (and the caller refuses it, naming [`crate::spec_ref::ANCHORLESS_FORMS`]). The canonical
+/// id and `KEY-N` describe themselves, so they never pay for that resolution.
+///
+/// THE CROSS-PROJECT GUARD IS UNTOUCHED, and that is the point of resolving to an id and stopping:
+/// a `NYX-3` under a `cwd` of another project resolves to the Spec `NYX-3` names, then meets
+/// [`resolve_run_target`]'s existing disagreement refusal exactly as a hand-typed id would. A short
+/// reference must not become the back door through which another project's Spec enters.
+pub(crate) fn resolve_spec_arg(db: &Db, args: &Value, token: &str) -> Result<String, RpcError> {
+    let project_id = match crate::spec_ref::parse(token) {
+        // Not a reference, or a canonical id: no project, no query, no change.
+        None | Some(crate::spec_ref::SpecRef::Uuid(_)) => return Ok(token.to_string()),
+        // `KEY-N` names its own project; asking for the call's would only decide whether to report a
+        // disagreement, and the callers confront that on the RESOLVED id anyway.
+        Some(crate::spec_ref::SpecRef::Key { .. }) => None,
+        Some(crate::spec_ref::SpecRef::Number(_)) => resolve_project(db, args)?.map(|p| p.id),
+    };
+    resolve_spec_ref_in(db, project_id.as_deref(), token)
+}
+
+/// [`resolve_spec_arg`] for a caller that ALREADY knows the project (it took one as an argument),
+/// so the anchors need not be walked a second time.
+pub(crate) fn resolve_spec_ref_in(
+    db: &Db,
+    project_id: Option<&str>,
+    token: &str,
+) -> Result<String, RpcError> {
+    let resolution = db
+        .with_conn(|c| crate::spec_ref::resolve(c, project_id, token))
+        .map_err(internal_db)?;
+    match resolution {
+        crate::spec_ref::SpecRefResolution::Resolved(r) => Ok(r.spec_id),
+        // Canonical / NotAReference / Unresolved — the token stands as sent (see the note above).
+        _ => Ok(token.to_string()),
+    }
+}
+
+/// A REQUIRED Spec-reference argument: [`crate::mcp_runtime::require_str`] then the grammar. The
+/// shape every tool taking a mandatory `spec_id` reads its argument through, so none of them ever
+/// learns the forms.
+pub(crate) fn require_spec_arg(db: &Db, args: &Value, key: &str) -> Result<String, RpcError> {
+    let token = require_str(args, key)?;
+    resolve_spec_arg(db, args, token)
+}
+
+/// [`require_spec_arg`] PLUS THE REFUSAL A PROJECT-RELATIVE FORM EARNS on a call that resolves no
+/// project — what nyx advertises, nyx accepts, in BOTH directions.
+///
+/// `#N` and the bare `N` are counted INSIDE a project ([`crate::spec_ref`] never looks past the one
+/// it is given). The advertised `spec_id` FIELDS of `spec_fork`, `spec_link`, `spec_unlink`,
+/// `spec_deps`, `idea_link`, `idea_unlink`, `annexe_add`, `annexe_list`, `proto_get` and
+/// `proto_create` — `spec_link` and `spec_unlink` carry two each — take NONE of the four anchors
+/// [`resolve_project`] reads, so on them a number can never be counted. Left to
+/// [`resolve_spec_arg`] alone the token simply stood, travelled down to the row read, and came back
+/// as `unknown spec 3`: the exact sentence this grammar exists to retire, this time on a field whose
+/// description had just PROMISED the form (finding `01M0ZGCCSQ2F25HPBS6NX5JAFS`, and the arbitrage
+/// recorded out-of-scope `01M0D95TFHNMGZ9ES20Z68R395` — those fields stop announcing the four forms
+/// AND refuse explicitly).
+///
+/// The refusal is raised HERE, before any read or write, and it is ACTIONABLE: it says why a number
+/// cannot resolve on this call and names [`crate::spec_ref::ANCHORLESS_FORMS`] — what to send
+/// instead. `invalid_argument`, not `invalid_id`: the Spec is not unknown, the FORM is unusable here.
+///
+/// THE CONDITION IS THE CALL'S, NOT THE TOOL'S, which is what makes one function serve two families.
+/// A field whose anchor is OPTIONAL can reach this very guard too, and it then decides per CALL:
+/// `spec_update_section` (an optional `run_id`, the human-gated correction path) and
+/// `spec_set_workspace` (an optional `workspace_id` whose ABSENCE is the detach, so a number can
+/// never resolve while detaching) are refused by name when the anchor is missing and resolve when it
+/// is there (findings `01M0ZGHD137MDXFGS2PBG6GS68`, `01M0ZKWXS353TABS0WCT3XXB81`). Their
+/// descriptions state that condition, so the two halves still say the same thing. `agent_context`
+/// meets the same guard body through the other entry point below, on the token [`SpecAnchor`] handed
+/// it ([`ProjectRelative::RefusedHere`]).
+///
+/// AN OPTIONAL ANCHOR IS NOT A PROMISE OF THIS GUARD: `run_start` is routed AROUND it, on to
+/// [`resolve_spec_arg`], because its own refusal says more — see
+/// [`ProjectRelative::RefusedByTheCaller`], which owns that arbitrage.
+///
+/// Everything else is unchanged: a canonical id, a `KEY-N` and prose never reach the guard (only
+/// [`crate::spec_ref::SpecRef::Number`] does), and the resolution that follows is the SAME one every
+/// other `spec_id` argument goes through.
+pub(crate) fn require_spec_arg_project_relative_refused(
+    db: &Db,
+    args: &Value,
+    key: &str,
+) -> Result<String, RpcError> {
+    let token = require_str(args, key)?.to_string();
+    resolve_spec_arg_project_relative_refused(db, args, key, &token)
+}
+
+/// [`require_spec_arg_project_relative_refused`] on a token the caller ALREADY holds — what
+/// `require_…` itself delegates to once it has read the key, and what a caller that reached the
+/// token through [`SpecAnchor`] rather than by reading the key calls directly (`agent_context`).
+/// Those two are its whole readership.
+///
+/// THE ANCHORS ARE WALKED AT MOST ONCE. The guard needs the project to decide whether to refuse, and
+/// the resolution needs the same project to count the number in — so the project the guard resolved
+/// is HANDED to [`resolve_spec_ref_in`] instead of being recomputed by [`resolve_spec_arg`], which
+/// would call [`resolve_project`] a second time on the same arguments. On `spec_update_section` with
+/// a `run_id` that second walk was a whole `require_run` + `get_spec` + `get_project` replayed for
+/// nothing (finding `01M0ZMA20NRB2WDSTSHE63YYX5`). Behaviour is unchanged in every branch: the same
+/// refusal, the same codes, the same resolution.
+pub(crate) fn resolve_spec_arg_project_relative_refused(
+    db: &Db,
+    args: &Value,
+    key: &str,
+    token: &str,
+) -> Result<String, RpcError> {
+    if matches!(
+        crate::spec_ref::parse(token),
+        Some(crate::spec_ref::SpecRef::Number(_))
+    ) {
+        let Some(project) = resolve_project(db, args)? else {
+            return Err(project_relative_refusal(token, key));
+        };
+        return resolve_spec_ref_in(db, Some(&project.id), token);
+    }
+    resolve_spec_arg(db, args, token)
+}
+
+/// THE REFUSAL A PROJECT-RELATIVE FORM EARNS when the call resolves no project — written once, so
+/// the two entry points that raise it cannot word it differently.
+fn project_relative_refusal(token: &str, key: &str) -> RpcError {
+    RpcError::new(
+        RpcCode::InvalidArgument,
+        format!(
+            "'{token}' is a PROJECT-RELATIVE reference: a '#N' or a bare number is counted inside \
+             a project, and this call resolves none — it carries no project_id / workspace_id / \
+             cwd / run_id to read one from. Send {} in '{key}' instead; both carry their own \
+             project",
+            crate::spec_ref::ANCHORLESS_FORMS
+        ),
+    )
+}
+
+/// The OPTIONAL twin of [`require_spec_arg`] — absent / null / empty stays `None`, exactly as
+/// [`crate::mcp_runtime::optional_str`] decides it.
+pub(crate) fn optional_spec_arg(
+    db: &Db,
+    args: &Value,
+    key: &str,
+) -> Result<Option<String>, RpcError> {
+    match optional_str(args, key)? {
+        Some(token) => Ok(Some(resolve_spec_arg(db, args, token)?)),
         None => Ok(None),
     }
 }
@@ -1453,12 +1896,29 @@ fn unanchored_signal(db: &Db, args: &Value) -> Result<UnanchoredSignal, RpcError
         Some(SpecAnchor::Run(run_id)) => {
             // The run RESOLVED (a bad id was already refused upstream) and carries no Spec: the
             // anchor is fine, the run is simply unbound — `resolve_spec_id` STOPS at the run.
+            // IT NAMES THE REMEDY, not only the state. The observed session read this warning,
+            // relayed it verbatim to the human — the only thing it could do with it — and went on
+            // to be told "No Spec yet, author a NEW one from scratch" about a Spec the human had
+            // just named. What was missing was never the diagnosis; it was that the way OUT went
+            // unsaid while the way DEEPER IN was written in the very manual this line rides on.
+            // `run_bind_spec` (the recovery this PRD exposed) repairs the run in place; it is
+            // pointed at BY NAME, with this run's own id already in the call.
+            //
+            // THE NAME COMES FROM THE VERB'S OWN CONSTANT, never re-typed here: advice naming a
+            // tool that does not exist is worse than no advice, and this repo has already paid for
+            // a refusal that named an argument its schema did not carry (finding
+            // `01M1008NHM9RRA1ZAS4V7K1PM4`). Renaming the verb re-words this sentence with it.
             return Ok(UnanchoredSignal {
                 code: RUN_UNBOUND_WARNING_CODE,
                 message: format!(
                     "run {run_id} drives NO Spec — an authoring run has none until it creates one. \
                      Nothing below is scoped to a Spec, and every Spec-scoped fact of this run \
-                     answers the empty value"
+                     answers the empty value. IF THE HUMAN NAMED AN EXISTING SPEC, this run missed \
+                     it: do NOT author a second one — anchor THIS run on theirs with \
+                     {}(run_id=\"{run_id}\", spec_id=…), which keeps the session and everything it \
+                     has already walked, then re-read this manual. Ask the human which Spec they \
+                     meant rather than guessing",
+                    crate::mcp_engine::RUN_BIND_SPEC_TOOL
                 ),
             });
         }
@@ -1683,7 +2143,7 @@ pub(crate) fn resolve_run_target(
     db: &Db,
     args: &Value,
 ) -> Result<(Option<String>, Option<String>), RpcError> {
-    let spec_id = resolve_spec_id(db, args)?;
+    let spec_id = resolve_spec_id(db, args, ProjectRelative::RefusedByTheCaller)?;
     // The project resolved from the RUN's OWN anchors (project_id | workspace_id | cwd), independent
     // of the Spec.
     let anchor_project = resolve_project(db, args)?.map(|p| p.id);
@@ -1739,7 +2199,7 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     // The spawn's per-node FOCUS, when the caller is re-fetching an effector manual it was handed
     // narrowed (F6). Absent = the whole Spec, as before.
     let subject = optional_str(args, "subject")?.map(str::to_string);
-    match resolve_spec_id(db, args)? {
+    match resolve_spec_id(db, args, ProjectRelative::RefusedHere)? {
         // An anchored Spec resolves (a dev in progress, or an explicit spec_id): render its
         // LIVE manual — UNCHANGED for every role, including a spec author refining an existing
         // Spec.
@@ -2324,6 +2784,147 @@ mod tests {
         );
         assert!(!ctx.contains("{{scope}}"), "the scope marker is resolved");
         assert_eq!(out["spec_id"], serde_json::Value::Null);
+    }
+
+    /// THE STUB AND THE MANUAL SAY THE SAME THING ABOUT THE NAMED SPEC — the divergence that cost a
+    /// session. `nspec.md` advertised "an optional Spec id selects the Spec to work on" three lines
+    /// under a fallback `run_start` that passed no `spec_id` at all, so an agent handed `/nspec 3`
+    /// saw the `3`, found no instruction for it, opened an unanchored run and let the flow order a
+    /// DUPLICATE of the Spec the human had named. Two texts an agent reads in the same breath —
+    /// the command stub Claude Code expands, and the dispatcher manual `agent_context` renders —
+    /// must therefore each carry the WHOLE instruction about the named Spec, and this guard holds
+    /// every one of them to that.
+    ///
+    /// THE CLAUSES ARE THE TABLE THE LOOP READS, held on EVERY text at once — the manual and every
+    /// stub `USER_COMMAND_STUBS` carries, however many that is — each the half of an instruction
+    /// that is inert without the others: the accepted FORMS (from
+    /// [`crate::spec_ref::ACCEPTED_FORMS`], so the advertisement and the parser stay one fact), the
+    /// ARGUMENT the reference rides in, that it rides VERBATIM (nyx translates, the agent does not),
+    /// what to do when nyx refuses it — ASK — and that asking is never to be papered over with a
+    /// Spec of one's own. Their NUMBER is the table's and is not restated here: a count in a comment
+    /// is a second statement of the list, and it fell behind the first clause added (finding
+    /// `01M0ZW8MT6C62JGD5Q0QN2J41Y`).
+    ///
+    /// AN OMISSION IS WHAT GOES RED, NOT A CONTRADICTION (finding `01M1103CJXFN794TJ9BK1NCV5Q`).
+    /// Each clause is looked for by PRESENCE, so a text that drops one fails — and that IS the
+    /// shape the incident took: the stub went SILENT on the reference its own hint advertised.
+    /// This note used to say the two texts "cannot disagree on this point"; they can. A text that
+    /// carries every clause and then says the opposite of one, two lines below, passes here, and
+    /// no presence check can do better — judging prose the table does not name would take a second
+    /// table, of forbidden phrasings, hand-kept and stale on the first wording nobody foresaw. The
+    /// one divergence held as an EQUIVALENCE, both halves or neither and either alone red, is the
+    /// hint against the body, next door in
+    /// [`tests::the_command_stubs_announce_the_named_spec_in_their_argument_hint`](mod@tests).
+    #[test]
+    fn the_command_stubs_and_the_dispatcher_manual_each_carry_the_named_spec_instruction() {
+        let _g = db_guard();
+        let (db, _spec_id, _ws, _cwd) = seeded();
+        let manual = agent_context(&db, &json!({ "role": "dev", "scope": "nspec" }))
+            .expect("agent_context ok")
+            .result["context"]
+            .as_str()
+            .expect("a rendered context")
+            .to_string();
+        // Both sides are HARD-WRAPPED prose, so a clause routinely straddles a line break: the
+        // comparison is on whitespace-collapsed text, which is the same sentence as read.
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut texts: Vec<(&str, &str)> = vec![("the dispatcher manual", manual.as_str())];
+        texts.extend(
+            crate::plugin::USER_COMMAND_STUBS
+                .iter()
+                .map(|(name, body)| (*name, *body)),
+        );
+        for (name, text) in texts {
+            let text = flat(text);
+            for clause in [
+                crate::spec_ref::ACCEPTED_FORMS,
+                "spec_id",
+                "VERBATIM",
+                "STOP and ASK the human which Spec they meant",
+                "Never substitute a Spec of your own choosing, and never author a new one to get \
+                 past a refused reference",
+            ] {
+                assert!(
+                    text.contains(&flat(clause)),
+                    "{name} must carry `{clause}` — the stub and the manual are read together, and \
+                     a clause only one of them carries is the silence that let a typed reference \
+                     go unused",
+                );
+            }
+        }
+    }
+
+    /// …AND THE HINT AGREES WITH THE BODY. The contradiction this PRD closes was between the two
+    /// halves of ONE stub: `argument-hint: "[spec-id] <free instruction>"` announced a Spec
+    /// reference in first position while the procedure below it did nothing with one, so `/nspec 3`
+    /// reached an agent that saw the `3`, found no instruction for it, and opened an unanchored run.
+    /// The guard above closes that in one direction (the body now names the grammar); this one
+    /// closes it in the other — a hint that stopped announcing the reference while the body still
+    /// instructed to forward one would recreate the same disagreement, wearing the other hat, with
+    /// nothing turning red (PRD testing decision, finding `01M0ZWAH9TMFHX534TXMAPZRK3`).
+    ///
+    /// THE TWO SIDES ARE READ, NEVER RESTATED: the hint from the stub's own frontmatter, the body's
+    /// promise from [`crate::spec_ref::ACCEPTED_FORMS`] — the same constant the parser is written
+    /// beside. So the assertion is an EQUIVALENCE, and either half going missing alone is what
+    /// fails.
+    #[test]
+    fn the_command_stubs_announce_the_named_spec_in_their_argument_hint() {
+        // The token the hint announces the reference with. It is what Claude Code shows the human
+        // as they type the command, which is why it must lead: the reference is the FIRST argument
+        // or it is not one at all — `specIdFromPrompt` reads no other position.
+        const SPEC_REF_HINT: &str = "[spec-id]";
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (name, body) in crate::plugin::USER_COMMAND_STUBS {
+            let hint = frontmatter_value(body, "argument-hint")
+                .unwrap_or_else(|| panic!("{name} declares an argument-hint in its frontmatter"));
+            let hint = hint.trim().trim_matches('"');
+            let body_names_the_grammar =
+                flat(body).contains(&flat(crate::spec_ref::ACCEPTED_FORMS));
+            assert_eq!(
+                hint.contains(SPEC_REF_HINT),
+                body_names_the_grammar,
+                "{name}: the hint says `{hint}` while its body {} the accepted forms — the hint and \
+                 the procedure are read in the same breath, and this is the exact disagreement that \
+                 let a typed reference go unused",
+                if body_names_the_grammar {
+                    "DOES name"
+                } else {
+                    "does NOT name"
+                }
+            );
+            assert!(
+                body_names_the_grammar,
+                "{name} must still instruct on the reference — this guard holds the two halves \
+                 together, it is not a licence to drop both"
+            );
+            assert!(
+                hint.starts_with(SPEC_REF_HINT),
+                "{name}: the reference is the FIRST argument or none — the recogniser reads no \
+                 other position, but the hint says `{hint}`"
+            );
+        }
+    }
+
+    /// One frontmatter scalar of a command stub, read from the `---`-delimited block the file opens
+    /// with. Deliberately minimal, and the shape is what licenses it: the stubs open on a `---`
+    /// block of FLAT `key: value` scalars — no nesting, no lists, no block strings — so a YAML
+    /// dependency to read them would be a second parser to keep true. Nothing here counts those
+    /// lines: a number in this sentence would be one nothing checks, and a stub gaining a key is a
+    /// change this parser absorbs without a word (finding `01M1005MPE7GAD9FN1CE0AS2X7`).
+    fn frontmatter_value(body: &str, key: &str) -> Option<String> {
+        let mut lines = body.lines();
+        if lines.next()?.trim() != "---" {
+            return None;
+        }
+        for line in lines {
+            if line.trim() == "---" {
+                return None;
+            }
+            if let Some(value) = line.trim().strip_prefix(&format!("{key}:")) {
+                return Some(value.trim().to_string());
+            }
+        }
+        None
     }
 
     /// The dispatcher's `{{rules}}` marker resolves to the ALWAYS scope ONLY — no `role:dev` (it
@@ -3010,6 +3611,385 @@ mod tests {
         );
     }
 
+    /// WHAT NYX DISPLAYS, NYX ALSO ACCEPTS — and the reverse: the `spec_id` rides beside the `#N` on
+    /// every surface that NAMES a Spec, so an agent never has to go and find an id nyx already holds.
+    /// The observed session spent four MCP calls doing exactly that, on a render that listed the
+    /// Specs `- #3 · titre · statut` while the idea list fifty lines below carried full ids.
+    ///
+    /// Three surfaces, one test, because they are one decision: the anchored render's HEADER line,
+    /// its sibling-Specs list, and the /nspec AUTHORING render's list of the project's Specs.
+    ///
+    /// IT ASSERTS PRESENCE, AND NOTHING OF THE LAYOUT *BETWEEN THE TWO NAMES* (the task says so):
+    /// each check looks for the id and for the `#N` inside the SAME line, and pins no separator, no
+    /// order and no punctuation between them — that is what a render is free to re-format. It is
+    /// NOT layout-free beyond that, and claiming so would be a promise the needles do not keep, and
+    /// they do not all pin the same thing. The header needle `Spec    : My Feature (#N` freezes the
+    /// column padding, the opening parenthesis and title-BEFORE-`#N`. The two list needles are the
+    /// other way round: `#N · A Sibling Feature` freezes the separator AND the title after it, in
+    /// the order `#N`-before-title, while the authoring one, `#N ·`, freezes the separator alone.
+    /// What is UNDER TEST is that the two names travel together; the little that surrounds them is
+    /// incidentally pinned, and a render that re-shapes it re-words these needles with it.
+    ///
+    /// The `#N` half is not decoration — it is the guard against "fixing" this by swapping the human
+    /// key for the id, which would take away the only name the human reads.
+    #[test]
+    fn every_render_that_names_a_spec_carries_its_id_beside_the_human_key() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let (project_id, number, sibling_id, sibling_number) = db.with_conn(|c| {
+            let spec = db::get_spec(c, &spec_id).expect("read").expect("the Spec");
+            let (sibling, _rev) = db::create_spec(
+                c,
+                &spec.project_id,
+                "A Sibling Feature",
+                db::SpecSections::default(),
+            )
+            .expect("sibling");
+            (spec.project_id, spec.number, sibling.id, sibling.number)
+        });
+
+        // Every line of a render that mentions `#N` must mention the id too — asserted per LINE, so
+        // an id landing somewhere else in the manual cannot stand in for one that is missing here.
+        let names_both = |text: &str, needle: &str, id: &str| {
+            text.lines()
+                .any(|line| line.contains(needle) && line.contains(id))
+        };
+
+        // 1 + 2 — the ANCHORED render: the `Spec    :` header, and the sibling list the /nspec author
+        // reads for anti-duplication (rendered for the `spec` role).
+        let anchored = render_agent_context(&db, AgentRole::Spec, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            names_both(
+                &anchored,
+                &format!("Spec    : My Feature (#{number}"),
+                &spec_id
+            ),
+            "the header line names the Spec by #N AND by spec_id, like the project line \
+             below it names project_id:\n{anchored}",
+        );
+        assert!(
+            names_both(
+                &anchored,
+                &format!("#{sibling_number} · A Sibling Feature"),
+                &sibling_id
+            ),
+            "the sibling-Specs list carries the id beside the #N:\n{anchored}",
+        );
+
+        // 3 — the AUTHORING render (/nspec with no Spec resolved): the SAME list, of the SAME
+        // project, and it must not have been left behind.
+        let authoring = agent_context(&db, &json!({ "role": "spec", "project_id": project_id }))
+            .expect("authoring render")
+            .result["context"]
+            .as_str()
+            .expect("a manual")
+            .to_string();
+        for (n, id) in [(number, &spec_id), (sibling_number, &sibling_id)] {
+            assert!(
+                names_both(&authoring, &format!("#{n} ·"), id),
+                "the authoring render lists Spec #{n} with its id:\n{authoring}",
+            );
+        }
+    }
+
+    /// "DOES THIS SPEC ALREADY HAVE A RUN?" — ANSWERED IN THE RENDER, NEVER ASKED AGAIN.
+    ///
+    /// It cost the observed session four MCP calls, and the answer it never got is what let a
+    /// SECOND run open beside a live one: run `01a011d0` was `running`, parked on a node, and
+    /// nothing anywhere connected it to the Spec the human had named.
+    ///
+    /// FOUR STATES, and the point of the test is that they READ DIFFERENTLY:
+    ///   * NOTHING live — written out, because "no line" and "no run" looking alike is the exact
+    ///     confusion this PRD exists to end;
+    ///   * a RUNNING run — id, flow, status, the node it is parked on, and how long since it moved;
+    ///   * the SAME run left BLOCKED for a week — still live, and marked STALE, so abandoned work
+    ///     cannot be mistaken for a colleague's session in progress;
+    ///   * a TERMINAL run — not live, and back to the explicit "none".
+    #[test]
+    fn the_render_says_what_drives_the_spec_and_says_so_when_nothing_does() {
+        use diesel::prelude::*;
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let render = || {
+            render_agent_context(&db, AgentRole::Coder, &spec_id, None)
+                .expect("render")
+                .expect("a manual")
+        };
+        // WHAT IS ASSERTED IS THE RUN LINE ITSELF, not "somewhere in the manual" — the same reason
+        // the sibling test above checks its two names per LINE. `running`, `last activity` and a
+        // flow's name are ordinary words: a `contains` over the whole render would go green on a
+        // needle the run line had dropped, as long as the manual said it anywhere at all.
+        let run_line = |text: &str| -> String {
+            text.lines()
+                .find(|l| l.starts_with("Run     : "))
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // 1 — NOTHING LIVE. The absence is a sentence, not a missing line.
+        let idle = render();
+        assert!(
+            idle.contains("Run     : (none live"),
+            "an undriven Spec SAYS it is undriven:\n{idle}",
+        );
+
+        // 2 — A RUNNING RUN parked on a node.
+        let (node_id, run_id) = db.with_conn(|c| {
+            let project_id = db::get_spec(c, &spec_id).unwrap().unwrap().project_id;
+            let wf = db::create_workflow(
+                c,
+                Some(&project_id),
+                "authoring",
+                db::WORKFLOW_SCOPE_NSPEC,
+                None,
+            )
+            .expect("workflow");
+            let node = db::create_node(
+                c,
+                &wf.id,
+                None,
+                0,
+                db::NODE_TYPE_NOTE,
+                "Grill the intent",
+                "{}",
+            )
+            .expect("node");
+            let run = db::create_workflow_run(c, &wf.id, Some(&spec_id), Some(&node.id), "{}")
+                .expect("run");
+            (node.id, run.id)
+        });
+        let live = render();
+        assert!(
+            !live.contains("(none live"),
+            "a Spec with a live run must not read as undriven:\n{live}",
+        );
+        let live_line = run_line(&live);
+        for needle in [
+            run_id.as_str(),
+            "authoring",
+            db::RUN_STATUS_RUNNING,
+            "Grill the intent",
+            node_id.as_str(),
+            "last activity",
+        ] {
+            assert!(
+                live_line.contains(needle),
+                "the run line carries '{needle}' — its id, its flow, its status, the node it landed \
+                 on (label AND id) and how long since it moved are what the caller would otherwise \
+                 go and fetch:\n{live}",
+            );
+        }
+
+        // 3 — THE SAME RUN, BLOCKED and untouched for a week. Still live (a blocked run re-runs its
+        // gate on the next tick), and no longer presentable as work in progress.
+        let a_week_ago = db::now_millis() - 7 * 24 * 60 * 60 * 1000;
+        db.with_conn(|c| {
+            db::update_workflow_run(
+                c,
+                &run_id,
+                Some(&node_id),
+                "{}",
+                db::RUN_STATUS_BLOCKED,
+                None,
+            )
+            .expect("block it");
+            diesel::update(crate::schema::workflow_runs::table.find(&run_id))
+                .set(crate::schema::workflow_runs::updated_at.eq(a_week_ago))
+                .execute(c)
+        })
+        .expect("age the run");
+        let stranded = render();
+        let stranded_line = run_line(&stranded);
+        assert!(
+            stranded_line.contains(db::RUN_STATUS_BLOCKED) && stranded_line.contains("7 day(s)"),
+            "a blocked run says so, and says how long it has sat:\n{stranded}",
+        );
+        assert!(
+            stranded_line.contains("STALE"),
+            "…and past the threshold run_start strands one by, it is marked as abandoned work \
+             rather than a session in progress:\n{stranded}",
+        );
+
+        // 4 — TERMINAL is not live: the render goes back to the explicit absence.
+        db.with_conn(|c| {
+            db::update_workflow_run(c, &run_id, None, "{}", db::RUN_STATUS_DONE, None)
+        })
+        .expect("finish it");
+        assert!(
+            render().contains("Run     : (none live"),
+            "a finished run is not a live one",
+        );
+    }
+
+    /// THE STALENESS THRESHOLD IS ONE NUMBER, shared with the warning that motivated it.
+    ///
+    /// `run_start` calls a run STRANDED past [`crate::mcp_engine::STRANDED_BLOCKED_RUN_AFTER_MS`]
+    /// while this render calls it STALE; two copies of "how long is too long" would let one surface
+    /// report abandoned work while the other still showed a healthy session — the two-truths failure
+    /// this module has already paid for on the anchor order. The line is built FROM the constant, so
+    /// there is nothing to keep in step; this pins the boundary either side of it.
+    #[test]
+    fn the_render_marks_a_run_stale_on_the_same_threshold_run_start_strands_one() {
+        let threshold = crate::mcp_engine::STRANDED_BLOCKED_RUN_AFTER_MS;
+        let state = |idle_ms: i64| SpecRunState {
+            run_id: "01run".to_string(),
+            flow: "ndev".to_string(),
+            scope: db::WORKFLOW_SCOPE_NDEV.to_string(),
+            status: db::RUN_STATUS_BLOCKED.to_string(),
+            node: None,
+            idle_ms,
+            child: false,
+        };
+        assert!(
+            !run_state_line(&state(threshold - 1)).contains("STALE"),
+            "one millisecond short of the threshold is not stale",
+        );
+        assert!(
+            run_state_line(&state(threshold)).contains("STALE"),
+            "the threshold itself is",
+        );
+    }
+
+    /// THE RUN BLOCK IS THE ONE PIECE OF THIS HEADER WHOSE SIZE IS A FUNCTION OF STATE — one line
+    /// per live run — and the state it reads is the very one `run_start`'s stranded warning
+    /// describes as accumulating in silence. Unbounded, a Spec that collected non-terminal runs
+    /// would put a line per corpse at the top of every render of every pass, and the measured budget
+    /// of [`a_role_render_stays_inside_its_measured_budget`] would be a bound on nothing.
+    ///
+    /// SO IT IS CAPPED, AND THE CAP STILL ANSWERS THE QUESTION: [`SPEC_RUN_LINES_MAX`] lines MOST
+    /// RECENTLY ACTIVE FIRST, then ONE line counting the rest — the reader still learns how many are
+    /// live and which verb clears one. What a cap must NOT become is a way to stop saying "this is
+    /// abandoned work", so a STALE run among the listed ones is still marked as such.
+    ///
+    /// AND WHAT IT DROPS IS THE POINT OF THE ORDER. The fixture below makes the run that STARTED
+    /// FIRST the one touched LAST — the shape of every ndev cycle, whose top-level flow opens before
+    /// each `sub_workflow` child it spawns and keeps ticking after them — and asserts that this run
+    /// is LISTED. Ordered by `started_at`, it is the first line a cap of three drops at four live
+    /// runs: the header would count the run it exists to name.
+    #[test]
+    fn the_run_block_lists_the_moving_runs_and_counts_the_rest() {
+        use diesel::prelude::*;
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+
+        // Two more live runs than the header will list. One workflow each: nyx holds at most ONE
+        // live run per (workflow, Spec), so this is what accumulation actually looks like.
+        let total = SPEC_RUN_LINES_MAX + 2;
+        let mut ids: Vec<String> = Vec::new();
+        for i in 0..total {
+            ids.push(db.with_conn(|c| {
+                let project_id = db::get_spec(c, &spec_id).unwrap().unwrap().project_id;
+                let wf = db::create_workflow(
+                    c,
+                    Some(&project_id),
+                    &format!("flow-{i}"),
+                    db::WORKFLOW_SCOPE_CUSTOM,
+                    None,
+                )
+                .expect("workflow");
+                db::create_workflow_run(c, &wf.id, Some(&spec_id), None, "{}")
+                    .expect("run")
+                    .id
+            }));
+        }
+        // LAST ACTIVITY RUNS AGAINST START ORDER — the ndev shape. `ids[0]` opened first and is the
+        // one still moving; every run opened after it has been sitting longer, `ids[1]` onwards past
+        // the staleness threshold. So the block's three lines are `ids[0..3]`, two of them STALE,
+        // and `started_at` desc would have listed `ids[2..5]` and merely counted the driver.
+        let week = 7 * 24 * 60 * 60 * 1000;
+        for (i, id) in ids.iter().enumerate() {
+            db.with_conn(|c| {
+                diesel::update(crate::schema::workflow_runs::table.find(id))
+                    .set(
+                        crate::schema::workflow_runs::updated_at
+                            .eq(db::now_millis() - (i as i64) * week),
+                    )
+                    .execute(c)
+            })
+            .expect("age it");
+        }
+
+        let text = render_agent_context(&db, AgentRole::Coder, &spec_id, None)
+            .expect("render")
+            .expect("a manual");
+        let block: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("Run     : "))
+            .collect();
+        assert_eq!(
+            block.len(),
+            SPEC_RUN_LINES_MAX + 1,
+            "{total} live runs render as {SPEC_RUN_LINES_MAX} lines plus ONE counting the rest, \
+             whatever the state has accumulated:\n{text}",
+        );
+
+        // MOST RECENTLY ACTIVE FIRST is what a cap drops the least recently active of.
+        for id in ids.iter().take(SPEC_RUN_LINES_MAX) {
+            assert!(
+                block.iter().any(|l| l.contains(id.as_str())),
+                "the {SPEC_RUN_LINES_MAX} most recently touched live runs are the ones listed; \
+                 {id} is not:\n{text}",
+            );
+        }
+        for id in ids.iter().skip(SPEC_RUN_LINES_MAX) {
+            assert!(
+                !text.contains(id.as_str()),
+                "the ones nothing has touched in longest are counted, not listed; {id} is still \
+                 there:\n{text}",
+            );
+        }
+
+        // THE DRIVER SURVIVES THE CAP. `ids[0]` is the OLDEST run by `started_at` and the one still
+        // moving. What that STANDS IN FOR is an ndev flow still ticking among the `sub_workflow`
+        // children it opened — but the property is about the ORDER, not about lineage, so the
+        // fixture holds only what the property needs: five top-level runs on five flows, none of
+        // them anyone's child, aged so that start order runs against last activity. Under the
+        // previous `started_at` order `ids[0]` was the first line dropped; here it is the first
+        // line printed.
+        assert!(
+            block[0].contains(ids[0].as_str()),
+            "the run that started first but is still moving heads the block — that is the one the \
+             header exists to name:\n{text}",
+        );
+
+        // The COUNT says how many are hidden, how many are live in all, and — because the hidden
+        // ids are exactly what it withheld — what a reader can and cannot do about them: `run_list`
+        // is named ONLY beside the `workflow_id` it takes, `run_delete` only beside the ids above.
+        let counted = block.last().expect("the counting line");
+        for needle in [
+            format!("{}", total - SPEC_RUN_LINES_MAX),
+            format!("{total} live"),
+            crate::mcp_authoring::RUN_DELETE_TOOL.to_string(),
+            "workflow_id".to_string(),
+            "run_id".to_string(),
+        ] {
+            assert!(
+                counted.contains(&needle),
+                "the counting line must carry '{needle}', got: {counted}",
+            );
+        }
+        assert!(
+            counted.contains(crate::mcp_authoring::RUN_LIST_TOOL)
+                && counted.contains("No verb lists a Spec's runs across flows"),
+            "the counting line may name {} only to say it does NOT answer for this set — the \
+             hidden runs are on as many flows as there are runs (N20), got: {counted}",
+            crate::mcp_authoring::RUN_LIST_TOOL,
+        );
+
+        assert!(
+            block
+                .iter()
+                .any(|l| l.contains(ids[1].as_str()) && l.contains("STALE")),
+            "a listed run past the staleness threshold is still marked abandoned:\n{text}",
+        );
+        assert!(
+            !block[0].contains("STALE"),
+            "…and the one still moving is not:\n{text}",
+        );
+    }
+
     #[test]
     fn agent_context_tool_resolves_by_spec_id_workspace_id_and_cwd() {
         let _g = db_guard();
@@ -3029,6 +4009,59 @@ mod tests {
         let nested = format!("{cwd}/crates/api");
         let by_cwd = agent_context(&db, &json!({ "role": "auditor", "cwd": nested })).unwrap();
         assert_eq!(by_cwd.result["spec_id"], spec_id);
+    }
+
+    /// THE TWO BRANCHES OF `agent_context`'s CONDITIONAL `#N` (finding `01M0ZKWXS353TABS0WCT3XXB81`).
+    ///
+    /// `role` is this call's ONLY required argument, so every project anchor it could read is
+    /// optional — and `agent_context(role="dev", spec_id="#3")` alone used to answer the literal
+    /// `unknown spec 3` this PRD exists to retire, on a field whose description had just promised
+    /// the form. The refusal is now raised at the entry point, before the render, and it is
+    /// actionable; and the same reference resolves as soon as ONE anchor is passed, which is what
+    /// makes the condition a condition rather than a wall.
+    #[test]
+    fn agent_context_honours_a_short_reference_only_with_the_anchor_it_advertises() {
+        let _g = db_guard();
+        let (db, spec_id, workspace_id, cwd) = seeded();
+        let (project_id, number) = db.with_conn(|c| {
+            let spec = db::get_spec(c, &spec_id).unwrap().expect("spec");
+            (spec.project_id, spec.number)
+        });
+        let token = format!("#{number}");
+
+        // NO ANCHOR — the number has no project to be counted in, and the refusal says so by name.
+        let err = agent_context(&db, &json!({ "role": "dev", "spec_id": token }))
+            .expect_err("a bare #N anchors no project here");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            !err.message.contains("unknown spec"),
+            "the opaque sentence this PRD retires must not be what an agent gets: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(crate::spec_ref::ANCHORLESS_FORMS) && err.message.contains(&token),
+            "the refusal quotes the token and names what to send instead: {}",
+            err.message
+        );
+
+        // ANY ONE OF THE FOUR ANCHORS — the same reference resolves to the Spec it names.
+        for anchor in [
+            json!({ "project_id": project_id }),
+            json!({ "workspace_id": workspace_id }),
+            json!({ "cwd": format!("{cwd}/crates/api") }),
+        ] {
+            let mut args = json!({ "role": "dev", "spec_id": token });
+            for (k, v) in anchor.as_object().expect("anchor object") {
+                args[k] = v.clone();
+            }
+            let out = agent_context(&db, &args)
+                .unwrap_or_else(|e| panic!("anchor {anchor} should let '{token}' resolve: {e:?}"));
+            assert_eq!(
+                out.result["spec_id"],
+                json!(spec_id),
+                "anchor {anchor}: the short reference must resolve to the Spec it names"
+            );
+        }
     }
 
     /// THE 0/1/N LOCATION CONTRACT, and that the `workspace_id` anchor and the `cwd` anchor answer
@@ -3068,25 +4101,34 @@ mod tests {
             })
         };
 
+        // These anchors are LOCATIONS, never an explicit `spec_id`, so the project-relative policy
+        // is never consulted on this path — either value would drive the same assertions.
+        const BY_LOCATION: ProjectRelative = ProjectRelative::RefusedHere;
+
         // ZERO — both anchors resolve NOTHING, and that is an answer rather than an error.
-        assert_eq!(resolve_spec_id(&db, &by_ws).unwrap(), None);
-        assert_eq!(resolve_spec_id(&db, &by_cwd).unwrap(), None);
+        assert_eq!(resolve_spec_id(&db, &by_ws, BY_LOCATION).unwrap(), None);
+        assert_eq!(resolve_spec_id(&db, &by_cwd, BY_LOCATION).unwrap(), None);
 
         // ONE — both anchors resolve THE one.
         let first = anchor("First");
         assert_eq!(
-            resolve_spec_id(&db, &by_ws).unwrap().as_deref(),
+            resolve_spec_id(&db, &by_ws, BY_LOCATION)
+                .unwrap()
+                .as_deref(),
             Some(first.as_str())
         );
         assert_eq!(
-            resolve_spec_id(&db, &by_cwd).unwrap().as_deref(),
+            resolve_spec_id(&db, &by_cwd, BY_LOCATION)
+                .unwrap()
+                .as_deref(),
             Some(first.as_str())
         );
 
         // N — both anchors REFUSE, with the machine-readable reason and the full candidate list.
         let second = anchor("Second");
         for args in [&by_ws, &by_cwd] {
-            let err = resolve_spec_id(&db, args).expect_err("N candidates cannot resolve one");
+            let err = resolve_spec_id(&db, args, BY_LOCATION)
+                .expect_err("N candidates cannot resolve one");
             assert_eq!(err.code, RpcCode::InvalidArgument);
             assert!(
                 is_ambiguous_spec(&err),
@@ -3106,6 +4148,112 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    /// THE FOUR FORMS REACH THE RENDER, through the ONE entry point. `agent_context` is asked for
+    /// the same Spec four ways — the canonical id no human ever sees, the human key, the `#N` the
+    /// renders print, and the bare `N` a human actually types — and answers the same Spec every
+    /// time. Nothing in `agent_context` knows the grammar: widening [`resolve_spec_arg`] is what
+    /// serves it, and with it `run_start` and every `spec_*` tool.
+    #[test]
+    fn agent_context_accepts_the_four_forms_of_a_spec_reference() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, cwd) = seeded();
+        let (key, number) = db.with_conn(|c| {
+            let spec = db::get_spec(c, &spec_id).expect("read").expect("seeded");
+            let project = db::get_project(c, &spec.project_id)
+                .expect("read")
+                .expect("seeded");
+            (project.key, spec.number)
+        });
+
+        for token in [
+            spec_id.clone(),
+            format!("{key}-{number}"),
+            format!("#{number}"),
+            number.to_string(),
+        ] {
+            // The `cwd` is what a `#N` / `N` counts in — the SAME anchor the call already carried.
+            let out = agent_context(
+                &db,
+                &json!({ "role": "coder", "spec_id": token, "cwd": cwd }),
+            )
+            .unwrap_or_else(|e| panic!("form '{token}' was refused: {e:?}"));
+            assert_eq!(
+                out.result["spec_id"], spec_id,
+                "form '{token}' must render the SAME Spec"
+            );
+        }
+    }
+
+    /// A CALL PASSING A CANONICAL ID IS UNTOUCHED — the property that makes widening the grammar
+    /// safe for the 30-odd `spec_id` fields that inherit it. A well-formed id naming NO Spec is
+    /// never re-read as a key or a number: it keeps its own refusal, at the render, where it
+    /// always was.
+    #[test]
+    fn a_canonical_id_argument_keeps_its_own_refusal() {
+        let _g = db_guard();
+        let (db, _spec_id, _ws, cwd) = seeded();
+        let unknown = "019ff517-0000-7000-8000-0000000000ab";
+
+        // The grammar hands the id straight back — no lookup, no project, no reinterpretation.
+        assert_eq!(
+            resolve_spec_arg(&db, &json!({ "cwd": cwd }), unknown).unwrap(),
+            unknown
+        );
+        let err = agent_context(&db, &json!({ "role": "coder", "spec_id": unknown }))
+            .expect_err("an id naming no Spec is still refused");
+        assert_eq!(err.code, RpcCode::InvalidId);
+        assert!(
+            err.message.contains(unknown),
+            "the refusal names the id the caller sent: {}",
+            err.message
+        );
+    }
+
+    /// A REFERENCE THAT DESIGNATES NOTHING COMES BACK AS SENT, so the caller's own refusal still
+    /// names what the human typed (`unknown spec '99'`, not `unknown spec ''`) and can still tell
+    /// it apart from prose. Resolution is ADDED here; no refusal is taken away.
+    #[test]
+    fn an_unresolvable_reference_is_handed_back_verbatim() {
+        let _g = db_guard();
+        let (db, _spec_id, _ws, cwd) = seeded();
+        let anchored = json!({ "cwd": cwd });
+        for token in ["99", "#99", "NOSUCH-1", "some prose"] {
+            assert_eq!(
+                resolve_spec_arg(&db, &anchored, token).unwrap(),
+                token,
+                "'{token}' designates nothing, so it must reach the caller unchanged"
+            );
+        }
+    }
+
+    /// WITHOUT AN ANCHOR THERE IS NO PROJECT TO COUNT IN, and `#N` / `N` resolve nothing rather
+    /// than being hunted across the database — the cross-project leak the grammar exists to keep
+    /// shut. The two self-describing forms still work, anchor or no anchor.
+    #[test]
+    fn a_bare_number_needs_an_anchor_while_the_key_carries_its_own() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let (key, number) = db.with_conn(|c| {
+            let spec = db::get_spec(c, &spec_id).expect("read").expect("seeded");
+            let project = db::get_project(c, &spec.project_id)
+                .expect("read")
+                .expect("seeded");
+            (project.key, spec.number)
+        });
+        let no_anchor = json!({});
+
+        assert_eq!(
+            resolve_spec_arg(&db, &no_anchor, &number.to_string()).unwrap(),
+            number.to_string(),
+            "a bare number with nothing to count in resolves nothing"
+        );
+        assert_eq!(
+            resolve_spec_arg(&db, &no_anchor, &format!("{key}-{number}")).unwrap(),
+            spec_id,
+            "the human key names its own project, so it needs no anchor"
+        );
     }
 
     /// THE cwd→workspace TIE-BREAK, pinned. Two matching workspaces can only tie on `root_path`
@@ -3492,6 +4640,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE UNBOUND-RUN DIAGNOSIS NAMES THE WAY OUT, and the way out EXISTS.
+    ///
+    /// This is the warning the observed session read and could do nothing with. It was exact and
+    /// inert: it described a state ("this run drives no Spec") to an agent whose next instruction,
+    /// in the very manual this line rides on, was to author a Spec from scratch — so the only
+    /// documented move was the wrong one, and a duplicate of the Spec the human had named was
+    /// ordered. What it lacked was the sentence saying the session is repairable.
+    ///
+    /// FOUR THINGS ARE PINNED, and the last is the one that keeps the advice honest:
+    ///   * it stays a WARNING — `agent_context` still answers `Ok`, still renders the manual;
+    ///   * it names the run, so the remedy can be pasted;
+    ///   * it names the REMEDY verb, and by the verb's OWN constant — a re-typed literal would let
+    ///     the verb be renamed while this sentence kept pointing at a tool that no longer exists;
+    ///   * that verb is ADVERTISED in `tools/list`. An agent cannot call what `tools/list` omits, so
+    ///     advice naming an unadvertised verb is exactly the half-remedy this task exists to end.
+    #[test]
+    fn the_unbound_run_warning_names_the_verb_that_repairs_the_session() {
+        let _g = db_guard();
+        let (db, project_id, _ws, _cwd) = seeded_project_without_spec();
+        let run_id = db.with_conn(|c| {
+            let wf =
+                db::create_workflow(c, Some(&project_id), "authoring", "nspec", None).expect("wf");
+            db::create_workflow_run(c, &wf.id, None, None, "{}")
+                .expect("run")
+                .id
+        });
+
+        let out = agent_context(&db, &json!({ "role": "dev", "run_id": run_id }))
+            .expect("an unbound run is DIAGNOSED, never refused");
+        let warning = &out.result["warnings"][0];
+        assert_eq!(warning["code"], RUN_UNBOUND_WARNING_CODE);
+        let message = warning["message"].as_str().expect("a human sentence");
+        assert!(
+            message.contains(&run_id),
+            "the remedy carries the run's own id, ready to paste: {message}",
+        );
+        assert!(
+            message.contains(crate::mcp_engine::RUN_BIND_SPEC_TOOL),
+            "it names the verb that anchors this very run instead of only describing the state: \
+             {message}",
+        );
+        // The manual an agent READS says the same thing — the two channels never drift.
+        assert!(
+            out.result["context"]
+                .as_str()
+                .expect("a manual")
+                .contains(message),
+            "the notice inside the manual is the SAME sentence as the warning",
+        );
+        // …and the verb it sends the caller to is one `tools/list` actually offers.
+        assert!(
+            crate::mcp::tool_descriptors()
+                .iter()
+                .any(|d| d["name"] == crate::mcp_engine::RUN_BIND_SPEC_TOOL),
+            "the advice points at an ADVERTISED tool, not one an agent has no way to call",
+        );
     }
 
     /// REVIEW F1, criterion 2 — THE CASE 0s DO NOT SAY THE SAME THING, so they do not share a code.
@@ -3979,24 +5185,106 @@ mod tests {
     /// guard, not a straitjacket.
     ///
     ///   * ROLE MANUAL — the STATIC preamble, the only part a manual edit can inflate. Measured
-    ///     after the dissolution: prototype 1 638 (was 71 356), spec 1 074 (was 5 770), coder 1 230,
-    ///     auditor 1 066, doc 530. The bound is per role and deliberately tight: the whole point of
-    ///     the item is that a role manual is a preamble and a list of prohibitions, so a manual that
-    ///     grows past 2 500 has started narrating a process again.
-    ///   * PROTOTYPE RENDER, measured 17 070 — was 86 766, and the 69 696 that went is the design
-    ///     procedure now carried by the `design_*` tool descriptors. What is LEFT is almost entirely
-    ///     the Spec's own six sections, which is what a render is supposed to be.
-    ///   * AUDITOR PASS, measured 4 694 – 6 203 depending on the section (whole-Spec: 16 823) —
-    ///     the `subject` narrowing, which survives as a parameter of the `agent_context` call the
+    ///     after the dissolution: prototype 1 638, spec 2 019, auditor 1 603, coder 1 230, doc 530.
+    ///     The bound is per role and deliberately tight: the whole point of the item is that a role
+    ///     manual is a preamble and a list of prohibitions, so a manual that grows past 2 500 has
+    ///     started narrating a process again.
+    ///   * PROTOTYPE RENDER, measured 17 317 — the design procedure it used to carry now lives in
+    ///     the `design_*` tool descriptors. What is LEFT is almost entirely the Spec's own six
+    ///     sections, which is what a render is supposed to be.
+    ///   * AUDITOR PASS, measured 5 478 – 6 987 depending on the section (whole-Spec: 17 607) — the
+    ///     `subject` narrowing, which survives as a parameter of the `agent_context` call the
     ///     sub-agent now makes itself.
+    ///
+    /// THE CYCLE BOUND WAS RAISED, DELIBERATELY, and this is the record of it. The identity header
+    /// gained the Spec's own `spec_id` (` · spec_id=<uuid>`, 48 bytes on the `Spec    :` line) and a
+    /// `Run     :` BLOCK saying what drives the Spec — the whole subject of the PRD that added it
+    /// (the agent that lacked it spent four MCP calls fetching what the render already knew).
+    ///
+    /// THAT BLOCK IS NOT A FIXED-SIZE LINE, and treating it as one is how a bound gets set on a
+    /// render nobody performs. It is ONE LINE PER LIVE RUN — `render_agent_context` emits it for
+    /// EVERY live run, top-level and `sub_workflow` child alike — so it grows with the run COUNT,
+    /// and each line grows with what it has to say: the label of the node it is parked on, the
+    /// ` · a sub_workflow CHILD …` lineage (+64 bytes), the ` — STALE: …` sentence (+104). Its
+    /// CHEAPEST shape is the one an audit cycle never has — no live run at all, the 110 bytes of
+    /// "(none live …)".
+    ///
+    /// SO THERE ARE TWO BOUNDS, BECAUSE ONE NUMBER CANNOT BE BOTH. A single figure asked to be a
+    /// tight regression guard AND a capacity bound on a render whose size follows STATE is neither:
+    /// set tight it fails on the second live run, set wide it stops catching the inflation it exists
+    /// for. They are separated here.
+    ///
+    /// EVERY LINE FIGURE BELOW INCLUDES ITS TRAILING NEWLINE — that is what the render pays for a
+    /// line, and one convention throughout is what lets the two budgets be compared at all.
+    ///
+    ///   * TIGHT, ON ONE LIVE RUN — [`AUDIT_CYCLE_CONTEXT_MAX`] / [`AUDIT_PASS_CONTEXT_MAX`].
+    ///     [`seeded_realistic`] renders the shape the cycle ACTUALLY has: a live `ndev` run parked
+    ///     on an audit node, which the test asserts BY ITS ID in every pass, so these numbers cannot
+    ///     quietly go back to pricing the empty case. MEASURED THERE: the run line is 199 bytes
+    ///     against the 110 of "(none live …)", and the four-pass cycle is 24 481. The SAME cycle on
+    ///     an undriven Spec is 24 481 − 4 × (199 − 110) = 24 125, so a bound sized on THAT shape and
+    ///     given a few hundred bytes of slack sits UNDER the shape the cycle actually has. The bound
+    ///     is 25 000 — 519 over the driven number, about 130 per pass. What that catches is a manual
+    ///     or a section growing under it; what it does NOT do is bound the block, and it never
+    ///     could: a SECOND live run alone carries the cycle past 25 000.
+    ///   * AT THE CAP — [`AUDIT_CYCLE_AT_RUN_CAP_MAX`] / [`AUDIT_PASS_AT_RUN_CAP_MAX`], measured on
+    ///     [`seeded_realistic_at_run_cap`]: the block at [`SPEC_RUN_LINES_MAX`] lines plus its
+    ///     counting line, EVERY listed line carrying EVERY optional clause the block has (STALE,
+    ///     +104; the `sub_workflow` lineage, +64) and the dearest node label nyx itself ships
+    ///     ([`LONGEST_SEEDED_NODE_LABEL`], 61). MEASURED THERE: a driver line of 395 bytes, two
+    ///     child lines of 405, a counting line of 355, a pass of 6 839 – 8 348 — over
+    ///     [`AUDIT_PASS_CONTEXT_MAX`] on its own, which is the whole reason these are two budgets —
+    ///     and a cycle of 29 925. The bounds are 8 500 (152 of slack) and 30 500 (575, about 144 per
+    ///     pass — deliberately no tighter per pass than the bound above, so the wider fixture is not
+    ///     the more sensitive of the two).
+    ///
+    /// WHAT 30 500 IS, EXACTLY, SO IT IS NOT READ AS MORE. It is what THIS render costs on THAT
+    /// fixture, and nothing else: a lock against a clause added to a run line, against
+    /// [`SPEC_RUN_LINES_MAX`] being lifted, against a manual or a section inflating underneath. A
+    /// new clause on the listed lines costs 12 bytes per character of it across the cycle (3 lines ×
+    /// 4 passes), so anything longer than ~48 characters goes red here, and the clauses that exist
+    /// are 64 and 104; a cap of 4 adds a whole ~405-byte line to every pass.
+    ///
+    /// IT IS NOT A CAPACITY BOUND ON THE STATE, AND NO NUMBER HERE COULD BE. What the cap bounds is
+    /// the LINE COUNT, not the bytes, and two of the things a line prints are FREE-FORM USER DATA
+    /// that this fixture can only pick a plausible value for:
+    ///
+    ///   * THE FLOW NAME — `workflow_create` takes an arbitrary `name`. The fixture's are `ndev` (4)
+    ///     and `child-flow-N` (12), and each extra character costs 12 across the cycle, as above.
+    ///     MEASURED: the same fixture with a 38-character name on all three flows renders a 30 269
+    ///     cycle; at 58 it passes 30 500.
+    ///   * THE NODE LABEL past 61 — `node_create` takes an arbitrary label too, and 61 is only where
+    ///     nyx's OWN seeded graphs top out. Same rate.
+    ///
+    /// So a red here means the CODE grew, not that a user did something unusual — and a Spec whose
+    /// flows are named at length can exceed 30 500 with nothing wrong. That is the honest reading,
+    /// and it is why the block is capped in LINES: the bytes have no bound to assert.
+    ///
+    /// Every figure in THIS comment is one of three things: a size a render in this file produces
+    /// TODAY, a bound declared just below, or an arithmetic step shown with its terms. None of them
+    /// is a remembered "before".
+    ///
+    /// WHAT THE GUARD STILL GUARDS IS INTACT: [`ROLE_MANUAL_MAX`] and [`AUDIT_PASS_CONTEXT_MAX`]
+    /// were NOT re-widened and still pass, so no manual re-inflated and no pass was re-widened —
+    /// which is what this test was written to catch. A header that grows again shows up here.
     const ROLE_MANUAL_MAX: usize = 2_500;
     const PROTOTYPE_CONTEXT_MAX: usize = 25_000;
     const AUDIT_PASS_CONTEXT_MAX: usize = 8_000;
-    const AUDIT_CYCLE_CONTEXT_MAX: usize = 24_000;
+    const AUDIT_CYCLE_CONTEXT_MAX: usize = 25_000;
+    const AUDIT_PASS_AT_RUN_CAP_MAX: usize = 8_500;
+    const AUDIT_CYCLE_AT_RUN_CAP_MAX: usize = 30_500;
 
-    /// A Spec of REALISTIC weight: six written sections and ten tasks — what a live run renders
-    /// against, and what the F6 measurements were taken on. Returns `(db, spec_id)`.
-    fn seeded_realistic() -> (Db, String) {
+    /// A Spec of REALISTIC weight: six written sections, ten tasks — and A LIVE `ndev` RUN PARKED ON
+    /// THE AUDIT NODE, which is what the F6 measurements are taken on. Returns
+    /// `(db, spec_id, run_id)` — the run's id because the assertions below check that the render
+    /// states THIS run, not merely that some `Run     :` line is non-empty.
+    ///
+    /// THE LIVE RUN IS NOT DECORATION. An ndev audit cycle is BY CONSTRUCTION driven by a live run
+    /// bound to the Spec — the four passes below are the four `spawn_subagent` children of that
+    /// run's own `audit` sequence, and the `Run     :` block states it in every one of them. A
+    /// fixture with no run measures the ONE shape the cycle never has, and prices the header at its
+    /// cheapest line ("(none live)") instead of the line the cycle actually pays for.
+    fn seeded_realistic() -> (Db, String, String) {
         let db = Db::in_memory();
         let body = |label: &str, lines: usize| {
             (0..lines)
@@ -4008,7 +5296,7 @@ mod tests {
                 })
                 .collect::<String>()
         };
-        let spec_id = db.with_conn(|c| {
+        let (spec_id, run_id) = db.with_conn(|c| {
             let (project, root) =
                 db::create_project(c, "Proj", "/tmp/nyx-ctx-size", None).expect("project");
             db::create_repository(c, &project.id, "api", ".", false).expect("repo");
@@ -4040,9 +5328,138 @@ mod tests {
                 )
                 .expect("task");
             }
-            spec.id
+            // The run that is driving it, parked where an audit cycle parks: the `audit` sequence's
+            // own spawn node, whose labels the built-in ndev tree writes as "audit <section>".
+            let wf =
+                db::create_workflow(c, Some(&project.id), "ndev", db::WORKFLOW_SCOPE_NDEV, None)
+                    .expect("workflow");
+            let node = db::create_node(
+                c,
+                &wf.id,
+                None,
+                0,
+                db::NODE_TYPE_SPAWN_SUBAGENT,
+                "audit testing decisions",
+                "{}",
+            )
+            .expect("node");
+            let run = db::create_workflow_run(c, &wf.id, Some(&spec.id), Some(&node.id), "{}")
+                .expect("run");
+            (spec.id, run.id)
         });
-        (db, spec_id)
+        (db, spec_id, run_id)
+    }
+
+    /// The LONGEST node label any of nyx's OWN seeded graphs carries (`seed.rs`, the `defer` branch
+    /// of `escalate_blocked_task`, 61 chars) — copied here because a line's width follows the label
+    /// of the node its run is parked on, and a worst case priced on a short label is not one.
+    ///
+    /// A COPY, and knowingly so: it is not read from the seeder, so a LONGER built-in label added
+    /// later would not travel here. That is one of the un-priced components the budget's own doc
+    /// names, and the slack it carries is sized for them.
+    const LONGEST_SEEDED_NODE_LABEL: &str = "record this blocked task as a backlog idea linked to \
+                                             the Spec";
+
+    /// THE SAME SPEC WITH ITS `Run     :` BLOCK AT THE CAP — the fixture the capacity bound is
+    /// priced on. `the_run_block_lists_the_moving_runs_and_counts_the_rest` renders that shape too
+    /// and asserts its FORM (which runs are listed, which are counted); this one is where its SIZE
+    /// is asserted, which is why it is built to be dear rather than merely to be at the cap.
+    ///
+    /// IT IS BUILT TO BE EXPENSIVE, not to be typical: a capacity bound prices what the render CAN
+    /// print, so EVERY listed line here carries EVERY optional clause the block has and the dearest
+    /// label nyx itself ships. All the runs are STALE (+104 each — a stranded ndev flow is exactly
+    /// what `stranded_run_warnings` reports); ALL of them, the driver included, are `sub_workflow`
+    /// CHILDREN (+64 each); all are parked on a node wearing [`LONGEST_SEEDED_NODE_LABEL`]; and
+    /// there are two more than the cap so the counting line is rendered too.
+    ///
+    /// THE DRIVER IS A CHILD TOO, which is the correction that made this fixture a worst case: line
+    /// 0 was assumed to be a top-level flow, and a top-level flow cannot have the lineage clause —
+    /// but nothing makes line 0 top-level. The block is ordered by LAST ACTIVITY, so its head is
+    /// whichever live run moved most recently, and a `sub_workflow` child whose parent has finished
+    /// is exactly that: the parent is terminal, so [`spec_live_runs`] skips it and it costs no line,
+    /// while the child still carries `parent_run_id` and pays the +64.
+    ///
+    /// THE DRIVER IS STILL FIRST. It is the least stale of them, so the cap keeps it: the fixture
+    /// prices the worst case WITHOUT quietly dropping the run the header exists to name.
+    fn seeded_realistic_at_run_cap() -> (Db, String, String) {
+        use diesel::prelude::*;
+        let (db, spec_id, run_id) = seeded_realistic();
+        let day = 24 * 60 * 60 * 1000;
+        let stale_at = |days: i64| {
+            db::now_millis() - crate::mcp_engine::STRANDED_BLOCKED_RUN_AFTER_MS - days * day
+        };
+        db.with_conn(|c| {
+            let project_id = db::get_spec(c, &spec_id).unwrap().unwrap().project_id;
+            // The driver, stranded — listed first because it is the least stale of the set — and a
+            // CHILD like the rest, so no listed line is cheaper than any other. Its parent is a run
+            // that has FINISHED: `spec_live_runs` skips terminal runs, so the parent costs no line
+            // while the driver keeps its `parent_run_id` and pays the lineage clause. (A DELETED
+            // parent would not do: the self-FK is ON DELETE SET NULL, v43 — an orphan of a deleted
+            // parent renders as top-level.)
+            let outer = db::create_workflow(
+                c,
+                Some(&project_id),
+                "outer",
+                db::WORKFLOW_SCOPE_CUSTOM,
+                None,
+            )
+            .expect("outer workflow");
+            let parent = db::create_workflow_run(c, &outer.id, Some(&spec_id), None, "{}")
+                .expect("parent run");
+            diesel::update(crate::schema::workflow_runs::table.find(&parent.id))
+                .set(crate::schema::workflow_runs::status.eq(db::RUN_STATUS_DONE))
+                .execute(c)
+                .expect("finish the parent");
+            diesel::update(crate::schema::workflow_runs::table.find(&run_id))
+                .set((
+                    crate::schema::workflow_runs::parent_run_id.eq(&parent.id),
+                    crate::schema::workflow_runs::updated_at.eq(stale_at(0)),
+                ))
+                .execute(c)
+                .expect("strand the driver");
+            // …and the driver's own node wears the dearest label a SEEDED graph carries, like the
+            // children below.
+            let driver_node = db::get_workflow_run(c, &run_id)
+                .unwrap()
+                .unwrap()
+                .current_node_id
+                .expect("the driver is parked");
+            diesel::update(crate::schema::nodes::table.find(&driver_node))
+                .set(crate::schema::nodes::label.eq(LONGEST_SEEDED_NODE_LABEL))
+                .execute(c)
+                .expect("relabel the driver's node");
+            for i in 0..(SPEC_RUN_LINES_MAX + 1) {
+                let wf = db::create_workflow(
+                    c,
+                    Some(&project_id),
+                    &format!("child-flow-{i}"),
+                    db::WORKFLOW_SCOPE_CUSTOM,
+                    None,
+                )
+                .expect("workflow");
+                let node = db::create_node(
+                    c,
+                    &wf.id,
+                    None,
+                    0,
+                    db::NODE_TYPE_SPAWN_SUBAGENT,
+                    LONGEST_SEEDED_NODE_LABEL,
+                    "{}",
+                )
+                .expect("node");
+                let child =
+                    db::create_workflow_run(c, &wf.id, Some(&spec_id), Some(&node.id), "{}")
+                        .expect("run");
+                diesel::update(crate::schema::workflow_runs::table.find(&child.id))
+                    .set((
+                        crate::schema::workflow_runs::parent_run_id.eq(&run_id),
+                        crate::schema::workflow_runs::updated_at.eq(stale_at(i as i64 + 1)),
+                    ))
+                    .execute(c)
+                    .expect("age the child");
+            }
+        });
+        (db, spec_id, run_id)
     }
 
     /// THE RENDER HAS A MEASURED BUDGET. A single tick returning a spawn used to ship 73 547
@@ -4054,7 +5471,7 @@ mod tests {
     #[test]
     fn a_role_render_stays_inside_its_measured_budget() {
         let _g = db_guard();
-        let (db, spec_id) = seeded_realistic();
+        let (db, spec_id, run_id) = seeded_realistic();
 
         // EVERY role manual is a preamble + prohibitions. This is the guard against a process
         // creeping back into one of them.
@@ -4100,6 +5517,18 @@ mod tests {
                 "the '{subject}' audit pass is {} chars, over the {AUDIT_PASS_CONTEXT_MAX} budget",
                 pass.len(),
             );
+            // THE BUDGET IS PRICED ON THE DRIVEN SHAPE. An audit cycle is run BY a live run bound to
+            // the Spec, so every pass carries THAT run's `Run     :` line — asserted by the run's
+            // own id, not by "some line that is not the empty phrase", which the COUNTING line
+            // satisfies too. A fixture that lost the run would otherwise silently re-measure the
+            // whole budget on the one shape the cycle never has, at the cheapest line the header
+            // can print.
+            assert!(
+                pass.lines()
+                    .any(|l| l.starts_with("Run     : ") && l.contains(run_id.as_str())),
+                "the '{subject}' pass must state the live run {run_id} driving the Spec — that \
+                 line is part of what this cycle costs:\n{pass}",
+            );
             cycle += pass.len();
         }
         assert!(
@@ -4118,4 +5547,77 @@ mod tests {
         );
     }
 
+    /// WHAT MAKES [`SPEC_RUN_LINES_MAX`] A BOUND AND NOT A DECORATION. The budget above is priced on
+    /// ONE live run, which is what a healthy cycle has and what makes that number tight enough to
+    /// catch a manual or a section inflating under it — but a tight number on a render whose size
+    /// follows STATE bounds nothing: a SECOND live run alone carries the same cycle past it. The cap
+    /// is what turns "one line per live run" back into a finite quantity, and a cap nothing renders
+    /// is a claim, so here it is rendered.
+    ///
+    /// AT THE CAP, IN THE DEAREST SHAPE THE BLOCK HAS ([`seeded_realistic_at_run_cap`]): the three
+    /// listed lines all STALE, all three `sub_workflow` children, all three on the longest label a
+    /// seeded graph carries, and the counting line under them. Whatever a Spec accumulates past
+    /// that, the block does not grow by a LINE — which is the property this asserts.
+    ///
+    /// THE NUMBER IS NOT "WHAT AN AUDIT CYCLE CAN COST". It is what this render costs on THIS
+    /// fixture: two of the things a line prints (the flow name, the node label) are free-form user
+    /// data with no ceiling, so no byte figure bounds the state — see the budget's own doc for the
+    /// rate and the measurements. What a red here means is that the CODE grew: the cap was lifted, a
+    /// line was given a new clause, or a manual or a section inflated underneath.
+    #[test]
+    fn the_run_block_at_its_cap_stays_inside_its_own_budget() {
+        let _g = db_guard();
+        let (db, spec_id, run_id) = seeded_realistic_at_run_cap();
+
+        let mut cycle = 0usize;
+        for subject in [
+            "user_stories",
+            "testing_decisions",
+            "implementation_decisions",
+            "out_of_scope",
+        ] {
+            let pass = render_effector_context(&db, "auditor", Some(&spec_id), Some(subject))
+                .unwrap()
+                .unwrap();
+            // THE FIXTURE IS THE ONE CLAIMED, checked on the render rather than on the seeding: the
+            // block is AT the cap (its lines plus the counting one), it still names the driver, and
+            // the expensive sentences are actually printed. A fixture that quietly stopped being
+            // the worst case would leave this budget priced on something cheaper.
+            let block: Vec<&str> = pass
+                .lines()
+                .filter(|l| l.starts_with("Run     : "))
+                .collect();
+            assert_eq!(
+                block.len(),
+                SPEC_RUN_LINES_MAX + 1,
+                "the '{subject}' pass must render the block AT its cap — that is the shape this \
+                 budget prices:\n{pass}",
+            );
+            assert!(
+                block[0].contains(run_id.as_str()),
+                "…still headed by the driver:\n{pass}",
+            );
+            assert!(
+                block[..SPEC_RUN_LINES_MAX]
+                    .iter()
+                    .all(|l| l.contains("STALE")
+                        && l.contains("sub_workflow CHILD")
+                        && l.contains(LONGEST_SEEDED_NODE_LABEL)),
+                "…with EVERY listed line paying for EVERY clause that makes it expensive, on the \
+                 dearest label a seeded graph carries:\n{pass}",
+            );
+            assert!(
+                pass.len() <= AUDIT_PASS_AT_RUN_CAP_MAX,
+                "the '{subject}' audit pass at the run cap is {} chars, over the \
+                 {AUDIT_PASS_AT_RUN_CAP_MAX} budget",
+                pass.len(),
+            );
+            cycle += pass.len();
+        }
+        assert!(
+            cycle <= AUDIT_CYCLE_AT_RUN_CAP_MAX,
+            "a 4-pass audit cycle at the run cap is {cycle} chars, over the \
+             {AUDIT_CYCLE_AT_RUN_CAP_MAX} budget",
+        );
+    }
 }

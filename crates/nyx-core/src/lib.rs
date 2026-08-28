@@ -90,6 +90,7 @@ pub mod seed;
 pub mod shellinteg;
 pub mod shells;
 pub mod spec_activity;
+pub mod spec_ref;
 pub mod subfolder;
 pub mod usecase;
 pub mod vt_screen;

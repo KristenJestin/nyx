@@ -638,6 +638,13 @@ fn validate_board_copies(field: &str, value: &Value) -> Result<(), RpcError> {
 ///   * the RESERVED [`crate::engine::SPEC_WRITE_GRANT_KEY`] (H12) — a node that writes it hands
 ///     ITSELF the authorization to correct a Spec that has left draft, which is the human's answer to
 ///     give and nobody else's. Refusing it here is what makes "only the engine writes it" a property.
+///   * the RESERVED [`crate::engine::PROVENANCE_KEY`] — the board's record of WHICH NODE wrote each
+///     key, which the runtime consent check reads to decide whether a value came from a human. A node
+///     that can name it as an `output_key` (or a `write`, or a `retrieve.to`) writes its own answer to
+///     that question: `output_key: "__written_by__"` with the right object under it makes every gate
+///     in the graph read "an ask_human filled this". The refusal is what keeps provenance a FACT the
+///     engine observes rather than a claim the graph makes about itself — the same reasoning, for the
+///     same reason, as the grant key above.
 ///   * a DOTTED key. The board WRITES flat ([`crate::engine::Blackboard::set`] inserts one top-level
 ///     key, `append` likewise) and READS by dot-path ([`crate::engine::Blackboard::get`] splits on
 ///     '.'), so `write: "spec.status"` inserts a literal `"spec.status"` entry that every later read
@@ -654,6 +661,18 @@ fn validate_board_write_key(what: &str, key: &str) -> Result<(), RpcError> {
                  (an ask_human's 'grant_spec_write_on'), and no node may write it — it is what \
                  authorizes a Spec-section correction on a Spec that has left draft",
                 crate::engine::SPEC_WRITE_GRANT_KEY
+            ),
+        ));
+    }
+    if key == crate::engine::PROVENANCE_KEY {
+        return Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "{what} writes '{}', which is RESERVED: it is the board's own record of WHICH NODE \
+                 wrote each key, kept by the engine at every write and read by nyx to tell a human's \
+                 answer from a fact a query produced. A node that writes it would be declaring its \
+                 own provenance — name a top-level key of your own",
+                crate::engine::PROVENANCE_KEY
             ),
         ));
     }

@@ -21,10 +21,12 @@
 //! so the pool is a drop-in for the old `Mutex` — the only change is that a checkout
 //! can come from any of several live connections.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
 use diesel::connection::SimpleConnection;
+use diesel::migration::MigrationSource;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, CustomizeConnection, Pool, PooledConnection};
 use diesel::sqlite::SqliteConnection;
@@ -67,10 +69,19 @@ use crate::schema::{
 /// columns it was supposed to create — every read of the affected table then fails at runtime.
 /// This exact collision happened once (v2.7 and `feature/v2.8-engine` both wrote a 34; v2.8's
 /// `create_workflow_engine` landed first on the user's DB, so v2.7's `design_components_scan_state`
-/// was silently skipped), and the fix was to renumber the v2.7 one to 35. When adding a migration,
-/// pick a number free across ALL live branches, not just the checked-out one. Note the series
-/// carries holes (no directory 19; 34 belongs to v2.8) — the directory COUNT is NOT the highest
-/// number.
+/// was silently skipped), and the fix was to renumber the v2.7 one to 35. It then happened again,
+/// worse: five worktrees numbering in parallel made `00000000000050` designate three different
+/// migrations, and the shared database carried the version WITHOUT the table.
+///
+/// # The convention: `AAAAMMJJhhmmss`, not a counter
+///
+/// The counter era ENDED at `00000000000051_annexes_url_canonical`. Every migration created after
+/// it is named with its UTC creation instant — `20260818020000_create_app_settings` — which two
+/// worktrees cannot collide on unless they generate within the same second. The heritage is never
+/// renamed (a rename makes an applied migration pending again, and Diesel REPLAYS it on every
+/// database in service), so the series keeps its holes: no directory 19, and the directory COUNT
+/// is NOT the highest number. `tests::migration_naming_convention` is the guard that keeps this
+/// true, and `crates/nyx-core/migrations/README.md` says it where a migration is created.
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 /// A terminal status. Stored as TEXT (`'alive'` | `'closed'`) — see the CHECK
@@ -1702,6 +1713,89 @@ pub fn list_specs(conn: &mut SqliteConnection, project_id: &str) -> QueryResult<
         .order((specs::position.asc(), specs::number.asc()))
         .select(Spec::as_select())
         .load(conn)
+}
+
+/// Fetch the Spec `number` names INSIDE `project_id` — the read behind the human key (`#3`,
+/// `NYX-3`, the bare `3`), resolved through the UNIQUE `idx_specs_project_number` index so the
+/// answer is 0 or 1 Spec and never a choice. The grammar that produces `(project, number)` lives in
+/// [`crate::spec_ref`]; this is the only query it makes.
+///
+/// ARCHIVED Specs answer too, deliberately: a reference is an IDENTITY question ("which Spec is
+/// #3?"), and the number stays taken after archiving. Refusing here would answer "no such Spec" for
+/// one that exists, and the callers that care about liveness already have their own guards.
+pub fn spec_by_project_number(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    number: i32,
+) -> QueryResult<Option<Spec>> {
+    specs::table
+        .filter(specs::project_id.eq(project_id))
+        .filter(specs::number.eq(number))
+        .select(Spec::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// What a `projects.key` lookup found — see [`project_by_key`]. Three answers, not two, because a
+/// CASE-INSENSITIVE read of a case-SENSITIVE unique index can legitimately match several rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectByKey {
+    /// Exactly one project carries the key.
+    Found(Project),
+    /// No project carries it.
+    Absent,
+    /// SEVERAL do, once case is folded (`NYX` and `nyx` are two distinct rows for
+    /// `idx_projects_key`). Resolving one would be a coin toss, so the caller is TOLD rather than
+    /// served — which is the whole of what this variant carries, and deliberately so.
+    ///
+    /// IT USED TO CARRY THE MATCHED KEYS, "so a refusal can name them" (finding
+    /// `01M0ZGBRYH2D576VM1YMRGZW4S`). No refusal ever did: the one caller
+    /// ([`crate::spec_ref::resolve`]) folds `Ambiguous` and [`Self::Absent`] into the same "this
+    /// reference designates nothing", because a `KEY-N` whose key is ambiguous designates nothing
+    /// either way and this grammar has no ambiguity contract to state. A payload nothing reads is
+    /// a promise nothing keeps, so the payload went.
+    ///
+    /// AND THE DISTINCTION HAS NO READER EITHER — say it plainly, because claiming one it does not
+    /// have is the same defect one notch up (finding `01M0ZM7MQ0D2XJQMVPZP8WYAB9`). What this
+    /// variant is, exactly: a fact [`project_by_key`] COMPUTES and no caller consumes yet. It stays
+    /// because the query has to count the matches anyway, so distinguishing them costs nothing,
+    /// while FOLDING it into [`Self::Absent`] would throw away the one thing that separates "no
+    /// project carries this key" from "several do, and picking one would be a coin toss" — a
+    /// distinction the day someone phrases a refusal, not before. That is the whole of the claim;
+    /// the caller's own note ([`crate::spec_ref::resolve`], "none does today") says the same thing
+    /// about the same fact. Give the keys back to this variant the day a caller writes the sentence
+    /// that names them.
+    Ambiguous,
+}
+
+/// Find the project whose canonical `key` is `key`, IGNORING CASE — the human types the key the
+/// render printed, and `nyx-3` must name the same project as `NYX-3` exactly as an id in either
+/// case names the same Spec.
+///
+/// `idx_projects_key` is UNIQUE but CASE-SENSITIVE, so folding case can match more than one row.
+/// That case is REPORTED ([`ProjectByKey::Ambiguous`]) rather than settled here: picking one would
+/// resolve a human's `nyx-3` to a project they never named.
+pub fn project_by_key(conn: &mut SqliteConnection, key: &str) -> QueryResult<ProjectByKey> {
+    let mut matches = projects::table
+        .filter(projects::key.eq(key))
+        .select(Project::as_select())
+        .load(conn)?;
+    if matches.is_empty() {
+        // The exact hit is the common path (the render prints the stored case); fold only when it
+        // misses, so the scan is paid for by the caller who needs it.
+        let folded = key.to_ascii_lowercase();
+        matches = projects::table
+            .select(Project::as_select())
+            .load(conn)?
+            .into_iter()
+            .filter(|p| p.key.to_ascii_lowercase() == folded)
+            .collect();
+    }
+    match matches.len() {
+        0 => Ok(ProjectByKey::Absent),
+        1 => Ok(ProjectByKey::Found(matches.remove(0))),
+        _ => Ok(ProjectByKey::Ambiguous),
+    }
 }
 
 // NO `spec_for_workspace` LIVES HERE — deliberately. A "the most recent LIVE Spec anchored on this
@@ -4866,6 +4960,13 @@ impl Db {
             .get()
             .map_err(|e| anyhow::anyhow!("failed to check out a connection for migrations: {e}"))?;
         run_migrations(&mut conn)?;
+        // Migrations "succeeded" — which only means the REGISTRY is current. Confront it with the
+        // real schema before anything is served: a version recorded as applied whose table does
+        // not exist leaves `run_migrations` perfectly happy (Diesel never replays a recorded
+        // version) and breaks at the first query instead. Refuse to start on that gap (D1).
+        if let Some(refusal) = schema_health(&mut conn).drift_refusal() {
+            return Err(anyhow::anyhow!(refusal));
+        }
         // Seed the built-in default workflows (ndev / nspec / ndoc) once the schema is ready, so a
         // brand-new project has the clé-en-main flows to run (v2.8 Phase 4). IDEMPOTENT — a re-boot
         // finds them present and leaves them untouched.
@@ -4984,34 +5085,805 @@ pub fn run_migrations(conn: &mut SqliteConnection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The schema the embedded migration chain produces, as [`schema_fingerprint`] reads it: every
+/// object it leaves behind, and every column of every table it leaves behind.
+///
+/// This is what turns [`schema_health`] from a reading of the REGISTRY into a reading of the
+/// SCHEMA. The registry alone cannot see the failure it is supposed to catch: a version recorded
+/// as applied whose table does not exist — the shape a shared database takes when two worktrees
+/// write different migrations under one number. Confronting the registry with this list costs two
+/// queries.
+///
+/// It is NOT maintained by hand-editing and hoping: `schema_drift::the_expected_schema_is_exactly
+/// _what_the_migration_chain_produces` migrates an empty database and compares, so a migration
+/// that adds a table or a column and forgets this list fails the suite — and the failure prints
+/// the corrected list, ready to paste back.
+const EXPECTED_SCHEMA: &[&str] = &[
+    "__diesel_schema_migrations",
+    "__diesel_schema_migrations.run_on",
+    "__diesel_schema_migrations.version",
+    "agent_session_prototypes",
+    "agent_session_prototypes.created_at",
+    "agent_session_prototypes.prototype_id",
+    "agent_session_prototypes.session_id",
+    "agent_session_specs",
+    "agent_session_specs.created_at",
+    "agent_session_specs.session_id",
+    "agent_session_specs.spec_id",
+    "agent_sessions",
+    "agent_sessions.agent_kind",
+    "agent_sessions.cwd",
+    "agent_sessions.ended_at",
+    "agent_sessions.external_session_id",
+    "agent_sessions.id",
+    "agent_sessions.last_seen_at",
+    "agent_sessions.metadata_json",
+    "agent_sessions.started_at",
+    "agent_sessions.state",
+    "agent_sessions.terminal_id",
+    "agent_sessions.transcript_path",
+    "agent_sessions.workspace_id",
+    "annex_blobs",
+    "annex_blobs.byte_len",
+    "annex_blobs.content",
+    "annex_blobs.content_hash",
+    "annex_blobs.created_at",
+    "annexes",
+    "annexes.content_hash",
+    "annexes.created_at",
+    "annexes.id",
+    "annexes.kind",
+    "annexes.spec_id",
+    "annexes.title",
+    "app_settings",
+    "app_settings.key",
+    "app_settings.updated_at",
+    "app_settings.value",
+    "command_instances",
+    "command_instances.command_id",
+    "command_instances.created_at",
+    "command_instances.ended_at",
+    "command_instances.id",
+    "command_instances.last_exit_code",
+    "command_instances.last_state",
+    "command_instances.prev_ended_at",
+    "command_instances.prev_exit_code",
+    "command_instances.prev_last_state",
+    "command_instances.prev_scrollback",
+    "command_instances.scrollback",
+    "command_instances.unread",
+    "command_instances.updated_at",
+    "command_instances.was_running_on_shutdown",
+    "command_instances.workspace_id",
+    "command_slots",
+    "command_slots.command_ids",
+    "command_slots.created_at",
+    "command_slots.id",
+    "command_slots.project_id",
+    "command_slots.slot",
+    "command_slots.updated_at",
+    "design",
+    "design.bundle_recipe_json",
+    "design.content",
+    "design.created_at",
+    "design.id",
+    "design.inventory_globs_json",
+    "design.project_id",
+    "design.theme_tokens_json",
+    "design.updated_at",
+    "design_components",
+    "design_components.created_at",
+    "design_components.css_slot_json",
+    "design_components.id",
+    "design_components.name",
+    "design_components.orphaned_at",
+    "design_components.params_json",
+    "design_components.project_id",
+    "design_components.scanned_input_hash",
+    "design_components.source_path",
+    "design_components.source_repository_id",
+    "design_components.states_json",
+    "design_components.template",
+    "design_components.updated_at",
+    "design_components.visual_hash",
+    "domain_events",
+    "domain_events.actor",
+    "domain_events.aggregate",
+    "domain_events.created_at",
+    "domain_events.event_type",
+    "domain_events.payload",
+    "domain_events.project_id",
+    "domain_events.sequence",
+    "domain_events.source",
+    "domain_events.workspace_id",
+    "human_turns",
+    "human_turns.consumed_by",
+    "human_turns.prompt",
+    "human_turns.submitted_at",
+    "human_turns.terminal_id",
+    "human_turns.turn_id",
+    "idea_specs",
+    "idea_specs.created_at",
+    "idea_specs.idea_id",
+    "idea_specs.kind",
+    "idea_specs.spec_id",
+    "ideas",
+    "ideas.body",
+    "ideas.closed_at",
+    "ideas.closed_reason",
+    "ideas.created_at",
+    "ideas.id",
+    "ideas.project_id",
+    "ideas.source",
+    "ideas.status",
+    "ideas.theme",
+    "ideas.title",
+    "ideas.updated_at",
+    "ideas_fts",
+    "ideas_fts_ad",
+    "ideas_fts_ai",
+    "ideas_fts_au",
+    "idx_agent_session_prototypes_prototype",
+    "idx_agent_session_specs_spec",
+    "idx_agent_sessions_terminal",
+    "idx_agent_sessions_workspace",
+    "idx_annexes_content_hash",
+    "idx_annexes_spec",
+    "idx_annexes_url_unique_per_spec",
+    "idx_command_instances_command",
+    "idx_command_instances_workspace",
+    "idx_command_slots_project_slot",
+    "idx_design_components_project_name",
+    "idx_design_project",
+    "idx_domain_events_project",
+    "idx_domain_events_workspace",
+    "idx_idea_specs_spec",
+    "idx_ideas_project_status",
+    "idx_ideas_project_theme",
+    "idx_managed_command_groups_project",
+    "idx_managed_commands_group",
+    "idx_managed_commands_project",
+    "idx_nodes_parent",
+    "idx_nodes_workflow",
+    "idx_one_active_revision_per_spec",
+    "idx_one_active_session_per_terminal_agent",
+    "idx_one_root_per_project",
+    "idx_projects_key",
+    "idx_prototype_feedback_prototype",
+    "idx_prototype_feedback_prototype_status",
+    "idx_prototype_page_versions_page",
+    "idx_prototype_page_versions_page_label",
+    "idx_prototype_pages_prototype",
+    "idx_prototype_pages_prototype_slug",
+    "idx_prototype_round_pages_page",
+    "idx_prototype_round_pages_round",
+    "idx_prototype_round_pages_round_page",
+    "idx_prototype_rounds_prototype",
+    "idx_prototype_rounds_prototype_label",
+    "idx_prototype_variants_page_version",
+    "idx_prototype_variants_page_version_label",
+    "idx_prototypes_spec",
+    "idx_repositories_project",
+    "idx_review_comments_parent",
+    "idx_review_comments_repo",
+    "idx_review_tasks_comment",
+    "idx_review_tasks_repo",
+    "idx_review_tasks_repo_spec",
+    "idx_spec_depends_on_to",
+    "idx_spec_revisions_spec",
+    "idx_spec_revisions_spec_number",
+    "idx_specs_project_number",
+    "idx_specs_project_slug",
+    "idx_specs_project_status",
+    "idx_specs_workspace",
+    "idx_task_dependencies_depends_on",
+    "idx_tasks_from_comment",
+    "idx_tasks_parent",
+    "idx_tasks_project_status",
+    "idx_tasks_spec_phase_round",
+    "idx_tasks_spec_position",
+    "idx_workflow_runs_spec",
+    "idx_workflow_runs_workflow",
+    "idx_workflows_project",
+    "idx_workflows_scope",
+    "idx_workspaces_project",
+    "idx_workspaces_project_name",
+    "managed_command_groups",
+    "managed_command_groups.color",
+    "managed_command_groups.created_at",
+    "managed_command_groups.id",
+    "managed_command_groups.layout_shape",
+    "managed_command_groups.name",
+    "managed_command_groups.project_id",
+    "managed_command_groups.updated_at",
+    "managed_commands",
+    "managed_commands.command",
+    "managed_commands.created_at",
+    "managed_commands.env",
+    "managed_commands.group_id",
+    "managed_commands.group_order",
+    "managed_commands.id",
+    "managed_commands.name",
+    "managed_commands.order",
+    "managed_commands.package_manager",
+    "managed_commands.project_id",
+    "managed_commands.restart_on_startup",
+    "managed_commands.source_kind",
+    "managed_commands.source_package_json_path",
+    "managed_commands.source_script_command_snapshot",
+    "managed_commands.source_script_name",
+    "managed_commands.subfolder",
+    "managed_commands.updated_at",
+    "nodes",
+    "nodes.config",
+    "nodes.created_at",
+    "nodes.id",
+    "nodes.label",
+    "nodes.order_index",
+    "nodes.parent_id",
+    "nodes.type",
+    "nodes.updated_at",
+    "nodes.workflow_id",
+    "projects",
+    "projects.archived_at",
+    "projects.collapsed",
+    "projects.created_at",
+    "projects.id",
+    "projects.key",
+    "projects.name",
+    "projects.order",
+    "projects.primary_workspace_id",
+    "projects.resume_agent_sessions",
+    "projects.updated_at",
+    "projects.worktrees_root",
+    "prototype_design_lock",
+    "prototype_design_lock.decided_by",
+    "prototype_design_lock.locked_at",
+    "prototype_design_lock.locked_round_id",
+    "prototype_design_lock.prototype_id",
+    "prototype_feedback",
+    "prototype_feedback.anchor_status",
+    "prototype_feedback.author_kind",
+    "prototype_feedback.author_ref",
+    "prototype_feedback.body",
+    "prototype_feedback.created_at",
+    "prototype_feedback.id",
+    "prototype_feedback.ignored_at",
+    "prototype_feedback.ignored_reason",
+    "prototype_feedback.node_key",
+    "prototype_feedback.origin_variant_id",
+    "prototype_feedback.prototype_id",
+    "prototype_feedback.resolution_note",
+    "prototype_feedback.resolution_via_variant_id",
+    "prototype_feedback.resolved_at",
+    "prototype_feedback.status",
+    "prototype_feedback.updated_at",
+    "prototype_page_versions",
+    "prototype_page_versions.archived_at",
+    "prototype_page_versions.created_at",
+    "prototype_page_versions.id",
+    "prototype_page_versions.label",
+    "prototype_page_versions.page_id",
+    "prototype_page_versions.summary",
+    "prototype_pages",
+    "prototype_pages.created_at",
+    "prototype_pages.id",
+    "prototype_pages.position",
+    "prototype_pages.prototype_id",
+    "prototype_pages.slug",
+    "prototype_pages.title",
+    "prototype_round_pages",
+    "prototype_round_pages.chosen_variant_id",
+    "prototype_round_pages.created_at",
+    "prototype_round_pages.decided_at",
+    "prototype_round_pages.decided_by",
+    "prototype_round_pages.decision_rationale",
+    "prototype_round_pages.id",
+    "prototype_round_pages.page_id",
+    "prototype_round_pages.page_version_id",
+    "prototype_round_pages.position",
+    "prototype_round_pages.round_id",
+    "prototype_rounds",
+    "prototype_rounds.created_at",
+    "prototype_rounds.id",
+    "prototype_rounds.label",
+    "prototype_rounds.position",
+    "prototype_rounds.presented_at",
+    "prototype_rounds.prototype_id",
+    "prototype_rounds.summary",
+    "prototype_variants",
+    "prototype_variants.composition_json",
+    "prototype_variants.created_at",
+    "prototype_variants.id",
+    "prototype_variants.is_main",
+    "prototype_variants.label",
+    "prototype_variants.page_version_id",
+    "prototype_variants.position",
+    "prototype_variants.states_json",
+    "prototype_variants.title",
+    "prototypes",
+    "prototypes.archived_at",
+    "prototypes.created_at",
+    "prototypes.description",
+    "prototypes.id",
+    "prototypes.spec_id",
+    "prototypes.updated_at",
+    "repositories",
+    "repositories.archived_at",
+    "repositories.created_at",
+    "repositories.id",
+    "repositories.name",
+    "repositories.optional",
+    "repositories.project_id",
+    "repositories.relative_path",
+    "repositories.updated_at",
+    "review_comments",
+    "review_comments.author_name",
+    "review_comments.author_type",
+    "review_comments.blob",
+    "review_comments.body",
+    "review_comments.context",
+    "review_comments.created_at",
+    "review_comments.file_path",
+    "review_comments.id",
+    "review_comments.line_end",
+    "review_comments.line_start",
+    "review_comments.outdated",
+    "review_comments.parent_id",
+    "review_comments.repository_id",
+    "review_comments.resolved_by_type",
+    "review_comments.side",
+    "review_comments.snippet",
+    "review_comments.spec_id",
+    "review_comments.status",
+    "review_comments.workspace_id",
+    "review_reads",
+    "review_reads.last_read_at",
+    "review_reads.repository_id",
+    "review_reads.workspace_id",
+    "review_tasks",
+    "review_tasks.created_at",
+    "review_tasks.details",
+    "review_tasks.from_comment_id",
+    "review_tasks.grill_state",
+    "review_tasks.id",
+    "review_tasks.repository_id",
+    "review_tasks.severity",
+    "review_tasks.spec_id",
+    "review_tasks.title",
+    "review_tasks.updated_at",
+    "review_tasks.workspace_id",
+    "spec_depends_on",
+    "spec_depends_on.created_at",
+    "spec_depends_on.from_spec_id",
+    "spec_depends_on.kind",
+    "spec_depends_on.note",
+    "spec_depends_on.to_spec_id",
+    "spec_revisions",
+    "spec_revisions.change_reason",
+    "spec_revisions.created_at",
+    "spec_revisions.id",
+    "spec_revisions.implementation_decisions",
+    "spec_revisions.out_of_scope",
+    "spec_revisions.problem",
+    "spec_revisions.revision_number",
+    "spec_revisions.revision_status",
+    "spec_revisions.solution",
+    "spec_revisions.spec_id",
+    "spec_revisions.testing_decisions",
+    "spec_revisions.title",
+    "spec_revisions.user_stories",
+    "specs",
+    "specs.archived_at",
+    "specs.completed_at",
+    "specs.created_at",
+    "specs.current_revision_number",
+    "specs.id",
+    "specs.mode",
+    "specs.number",
+    "specs.phases",
+    "specs.position",
+    "specs.priority",
+    "specs.project_id",
+    "specs.reviewing_phase",
+    "specs.slug",
+    "specs.status",
+    "specs.title",
+    "specs.updated_at",
+    "specs.workspace_id",
+    "task_dependencies",
+    "task_dependencies.created_at",
+    "task_dependencies.depends_on_task_id",
+    "task_dependencies.task_id",
+    "task_dependencies.type",
+    "tasks",
+    "tasks.acceptance_criteria",
+    "tasks.blocked_reason",
+    "tasks.completed_at",
+    "tasks.created_at",
+    "tasks.description",
+    "tasks.executor",
+    "tasks.from_comment_id",
+    "tasks.grill_state",
+    "tasks.id",
+    "tasks.kind",
+    "tasks.parent_task_id",
+    "tasks.phase",
+    "tasks.position",
+    "tasks.priority",
+    "tasks.project_id",
+    "tasks.round",
+    "tasks.severity",
+    "tasks.skip_reason",
+    "tasks.spec_id",
+    "tasks.status",
+    "tasks.title",
+    "tasks.type",
+    "tasks.updated_at",
+    "tasks.verification_command",
+    "terminals",
+    "terminals.closed_at",
+    "terminals.created_at",
+    "terminals.cwd",
+    "terminals.exec_exit_code",
+    "terminals.exec_state",
+    "terminals.exec_state_unread",
+    "terminals.exec_state_updated_at",
+    "terminals.id",
+    "terminals.label",
+    "terminals.last_active_at",
+    "terminals.order",
+    "terminals.scrollback",
+    "terminals.status",
+    "terminals.updated_at",
+    "terminals.workspace_binding_mode",
+    "terminals.workspace_id",
+    "workflow_runs",
+    "workflow_runs.blackboard",
+    "workflow_runs.current_node_id",
+    "workflow_runs.id",
+    "workflow_runs.parent_run_id",
+    "workflow_runs.pending_consent",
+    "workflow_runs.spec_id",
+    "workflow_runs.started_at",
+    "workflow_runs.status",
+    "workflow_runs.traversal",
+    "workflow_runs.updated_at",
+    "workflow_runs.workflow_id",
+    "workflow_runs.workspace_id",
+    "workflows",
+    "workflows.builtin_revision",
+    "workflows.created_at",
+    "workflows.forked_from",
+    "workflows.forked_from_revision",
+    "workflows.id",
+    "workflows.name",
+    "workflows.project_id",
+    "workflows.root_node_id",
+    "workflows.scope",
+    "workflows.updated_at",
+    "workspaces",
+    "workspaces.archived_at",
+    "workspaces.branch",
+    "workspaces.collapsed",
+    "workspaces.created_at",
+    "workspaces.folder_removed_at",
+    "workspaces.id",
+    "workspaces.is_root",
+    "workspaces.name",
+    "workspaces.project_id",
+    "workspaces.root_path",
+    "workspaces.updated_at",
+];
+
+/// One row of `sqlite_master`: the NAME of a schema object, its `type`, and the DDL that created
+/// it — `NULL` for the objects SQLite creates for itself.
+#[derive(diesel::QueryableByName)]
+struct SchemaObjectRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    kind: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    sql: Option<String>,
+}
+
+/// One `(table, column)` pair, as `pragma_table_info` reports it.
+#[derive(diesel::QueryableByName)]
+struct TableColumnRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    table_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    column_name: String,
+}
+
+/// What a database actually carries, as a set of comparable names — the SCHEMA side of
+/// [`schema_health`], to be confronted with the registry. Two kinds of entry, both readable as-is
+/// in a refusal message:
+///
+///   * `annexes` — a `sqlite_master` object (table, index, view, trigger);
+///   * `projects.worktrees_root` — a column of a table.
+///
+/// Columns are in because half the recent migrations create no object at all: `20260818130000`
+/// only ADDS COLUMNS, so a collision on its number would leave an object-only probe blind.
+///
+/// Two families are excluded, because SQLite wrote them, not our migrations — and a reference
+/// that promises them would REFUSE a sound database the day SQLite changes its mind:
+///   * SQLite's own internals (`sqlite_autoindex_*`, `sqlite_sequence`), created implicitly by
+///     constraints;
+///   * the STORAGE of a virtual table — the `ideas_fts_data` / `_idx` / `_docsize` / `_config`
+///     SHADOW TABLES the FTS5 implementation creates behind `ideas_fts`, plus the FTS5 table's
+///     own column layout. Which shadow tables exist, and which columns they carry, is an FTS5
+///     version detail: a database migrated by an older SQLite may legitimately carry a different
+///     set. `ideas_fts` ITSELF is still checked — migration `00000000000026` creates it — and so
+///     are the triggers `ideas_fts_ai` / `_ad` / `_au`, which that migration also writes.
+fn schema_fingerprint(conn: &mut SqliteConnection) -> QueryResult<BTreeSet<String>> {
+    let objects = diesel::sql_query(
+        "SELECT name AS name, type AS kind, sql AS sql FROM sqlite_master ORDER BY rowid",
+    )
+    .load::<SchemaObjectRow>(conn)?;
+
+    let virtual_tables: Vec<String> = objects
+        .iter()
+        .filter(|row| {
+            row.sql.as_deref().is_some_and(|sql| {
+                sql.trim_start()
+                    .to_uppercase()
+                    .starts_with("CREATE VIRTUAL")
+            })
+        })
+        .map(|row| row.name.clone())
+        .collect();
+    // A SHADOW table: a `table` named after a virtual table but not the virtual table itself. A
+    // TRIGGER whose name shares that prefix (`ideas_fts_ai`) is ours, not FTS5's.
+    let is_shadow_table = |name: &str, kind: &str| {
+        kind == "table"
+            && virtual_tables
+                .iter()
+                .any(|vtab| name != vtab && name.starts_with(&format!("{vtab}_")))
+    };
+
+    let mut fingerprint: BTreeSet<String> = objects
+        .iter()
+        .filter(|row| !row.name.starts_with("sqlite_") && !is_shadow_table(&row.name, &row.kind))
+        .map(|row| row.name.clone())
+        .collect();
+
+    let columns = diesel::sql_query(
+        "SELECT m.name AS table_name, p.name AS column_name \
+         FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type = 'table'",
+    )
+    .load::<TableColumnRow>(conn)?;
+    for column in columns {
+        let table = &column.table_name;
+        if table.starts_with("sqlite_")
+            || is_shadow_table(table, "table")
+            || virtual_tables.iter().any(|vtab| vtab == table)
+        {
+            continue;
+        }
+        fingerprint.insert(format!("{table}.{}", column.column_name));
+    }
+    Ok(fingerprint)
+}
+
+/// ONE object (or column) the REGISTRY claims is in place and the schema does not carry — the
+/// contradiction this whole probe exists for.
+///
+/// An object whose migration has simply not run yet is NOT one of these: it is absent because
+/// nothing claimed it, which is a schema behind the binary, not a schema diverged from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSchemaObject {
+    /// The `sqlite_master` object (`app_settings`) or table column (`projects.worktrees_root`)
+    /// the embedded migration chain creates and the database lacks.
+    pub object: String,
+    /// The migration version that creates it — recorded as applied by this very database. `None`
+    /// only when the attribution itself failed; the object is missing either way, and a missing
+    /// object on a fully migrated database is a divergence whether or not we can name its author.
+    pub created_by: Option<String>,
+}
+
 /// Schema health snapshot (D1 probe check).
 #[derive(Debug, Clone)]
 pub struct SchemaHealth {
-    /// `true` when every embedded migration has been applied; `false` if any
-    /// pending migration was not applied (schema is behind the binary).
+    /// `true` when every embedded migration has been applied AND every object that chain creates
+    /// is present. `false` when the schema is behind the binary, when it diverges from it, or
+    /// when the check itself could not run.
     pub up_to_date: bool,
-    /// The number of migrations that are still pending (`Some(0)` when `up_to_date`),
+    /// The number of migrations that are still pending (`Some(0)` when the registry is current),
     /// or `None` when the check itself failed (the migration table could not be read).
     /// Modelled as an explicit `Option` rather than a magic sentinel so a failed check
     /// can never leak an absurd count (e.g. `usize::MAX`) onto the probe wire.
     pub pending_count: Option<usize>,
+    /// Objects the migration chain creates that the database does not carry. NON-EMPTY only when
+    /// we actually looked and found a gap — a probe that could not run reports `pending_count:
+    /// None` and leaves this empty, so "the check failed" never masquerades as "the schema is
+    /// broken".
+    pub missing_objects: Vec<MissingSchemaObject>,
 }
 
-/// Check whether the DB schema matches the embedded migrations. Returns a
-/// [`SchemaHealth`] snapshot. Best-effort: any error reading the migration
-/// table degrades to `up_to_date = false` with a note that the check itself
-/// failed, rather than panicking.
-pub fn schema_health(conn: &mut SqliteConnection) -> SchemaHealth {
-    match conn.pending_migrations(MIGRATIONS) {
-        Ok(pending) => SchemaHealth {
-            pending_count: Some(pending.len()),
-            up_to_date: pending.is_empty(),
-        },
-        Err(_) => SchemaHealth {
-            up_to_date: false,
-            pending_count: None, // the check itself failed (can't read the migration table)
-        },
+impl SchemaHealth {
+    /// The refusal to hand to the boot path when the registry and the real schema DISAGREE, or
+    /// `None` when there is no such disagreement (a healthy schema, a schema merely behind, or a
+    /// probe that could not run — none of those is a divergence, and none of them stops a boot
+    /// here).
+    ///
+    /// Nothing is repaired: a migration Diesel considers applied is never replayed, so guessing
+    /// which statements to re-run would be inventing a schema rather than restoring one.
+    pub fn drift_refusal(&self) -> Option<String> {
+        if self.missing_objects.is_empty() {
+            return None;
+        }
+        let mut message = String::from(
+            "database schema drift — refusing to start rather than serve a broken schema.\n",
+        );
+        for missing in &self.missing_objects {
+            let object = &missing.object;
+            match &missing.created_by {
+                Some(version) => message.push_str(&format!(
+                    "  - migration {version} is RECORDED AS APPLIED, but `{object}` — the object \
+                     it creates — is MISSING from this database.\n"
+                )),
+                None => message.push_str(&format!(
+                    "  - `{object}` is MISSING (the migration that creates it could not be \
+                     identified).\n"
+                )),
+            }
+        }
+        message.push_str(
+            "Most likely cause: this database file is SHARED with another worktree that applied a \
+             DIFFERENT migration under the same version number — Diesel identifies a migration by \
+             its number alone, so the one this build carries was reported as already applied and \
+             its `up.sql` never ran. See crates/nyx-core/migrations/README.md.\n\
+             Nothing was repaired automatically: a migration recorded as applied is never \
+             replayed, so the schema can only be restored deliberately.",
+        );
+        Some(message)
     }
+}
+
+/// Check whether the DB schema matches the embedded migrations — the REGISTRY (are any migrations
+/// pending?) confronted with the SCHEMA (is every object those migrations create actually there?).
+/// Returns a [`SchemaHealth`] snapshot.
+///
+/// Best-effort: any error reading the migration table or `sqlite_master` degrades to
+/// `up_to_date = false` with `pending_count: None` — the marker that the CHECK failed — and an
+/// empty [`SchemaHealth::missing_objects`], so a probe that could not run is never mistaken for a
+/// database that is actually broken.
+///
+/// The steady-state cost is the two reads [`schema_fingerprint`] makes. The expensive part —
+/// replaying the embedded chain into a scratch in-memory database to attribute each missing object
+/// to the version that creates it — runs ONLY once a gap has been found, i.e. on a boot that is
+/// about to be refused. `schema_drift::a_healthy_probe_costs_a_fraction_of_a_migration_run` is the
+/// assertion that keeps it that way.
+pub fn schema_health(conn: &mut SqliteConnection) -> SchemaHealth {
+    let failed_check = SchemaHealth {
+        up_to_date: false,
+        pending_count: None, // the check itself failed (can't read the migration table)
+        missing_objects: Vec::new(),
+    };
+    let Ok(pending) = conn.pending_migrations(MIGRATIONS) else {
+        return failed_check;
+    };
+    let Ok(present) = schema_fingerprint(conn) else {
+        return failed_check;
+    };
+    let missing = missing_from(&present);
+    let missing_objects = if missing.is_empty() {
+        Vec::new()
+    } else {
+        describe_missing_objects(conn, &missing)
+    };
+    SchemaHealth {
+        up_to_date: pending.is_empty() && missing_objects.is_empty(),
+        pending_count: Some(pending.len()),
+        missing_objects,
+    }
+}
+
+/// What [`EXPECTED_SCHEMA`] promises and `present` does not carry.
+///
+/// A column entry whose TABLE is itself absent is dropped: naming ten missing columns of a table
+/// that does not exist buries the one fact that matters under nine restatements of it.
+fn missing_from(present: &BTreeSet<String>) -> BTreeSet<String> {
+    let absent: BTreeSet<String> = EXPECTED_SCHEMA
+        .iter()
+        .map(|name| (*name).to_string())
+        .filter(|name| !present.contains(name))
+        .collect();
+    absent
+        .iter()
+        .filter(|name| match name.split_once('.') {
+            Some((table, _)) => !absent.contains(table),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Turn the raw set of absent names into the CONTRADICTIONS: those whose migration this database
+/// records as applied. An absent object whose migration is still pending is dropped here — the
+/// registry never claimed it, so its absence is a schema behind the binary, not a diverged one.
+///
+/// The attribution replays the EMBEDDED chain one migration at a time into a scratch in-memory
+/// database, diffing the fingerprint after each step — so it needs no hand-written map of
+/// version → objects, and cannot drift from the migrations themselves. An object created and
+/// re-created later is attributed to the LAST version that created it, which is the one whose
+/// absence the registry contradicts.
+///
+/// Error path only, and best-effort within it: if the replay cannot run, the objects are still
+/// reported, without a version — a fully migrated database that lacks them is diverged whether or
+/// not we can name the author.
+fn describe_missing_objects(
+    conn: &mut SqliteConnection,
+    missing: &BTreeSet<String>,
+) -> Vec<MissingSchemaObject> {
+    let creators = attribute_objects_to_migrations(missing);
+    let applied: BTreeSet<String> = conn
+        .applied_migrations()
+        .map(|versions| versions.iter().map(|v| v.to_string()).collect())
+        .unwrap_or_default();
+    missing
+        .iter()
+        .filter_map(|object| {
+            let created_by = creators.get(object).cloned();
+            match &created_by {
+                // The registry does not claim this migration ran — nothing to contradict.
+                Some(version) if !applied.contains(version) => None,
+                _ => Some(MissingSchemaObject {
+                    created_by,
+                    object: object.clone(),
+                }),
+            }
+        })
+        .collect()
+}
+
+/// Replay the embedded migrations one by one into a scratch `:memory:` database and record, for
+/// each object of `wanted`, the version after which it appears. Returns an empty map if the
+/// scratch replay cannot be performed at all.
+fn attribute_objects_to_migrations(wanted: &BTreeSet<String>) -> BTreeMap<String, String> {
+    let mut creators = BTreeMap::new();
+    let Ok(mut scratch) = SqliteConnection::establish(":memory:") else {
+        return creators;
+    };
+    // Same pragma the pool's customizer sets on the connection that runs the real chain, so the
+    // replay applies the migrations under the conditions they were written for.
+    if scratch.batch_execute("PRAGMA foreign_keys = ON;").is_err() {
+        return creators;
+    }
+    if register_migration_functions(&mut scratch).is_err() {
+        return creators;
+    }
+    // `run_migration` RECORDS the version it ran, so the registry table has to exist first —
+    // only `run_pending_migrations` creates it on the way in, and we drive the chain by hand.
+    if diesel::migration::MigrationConnection::setup(&mut scratch).is_err() {
+        return creators;
+    }
+    let Ok(mut migrations) = MIGRATIONS.migrations() else {
+        return creators;
+    };
+    // Fixed-width numeric versions, so lexicographic order IS chronological order.
+    migrations.sort_by_key(|migration| migration.name().version().to_string());
+    let Ok(mut before) = schema_fingerprint(&mut scratch) else {
+        return creators;
+    };
+    for migration in &migrations {
+        if scratch.run_migration(migration.as_ref()).is_err() {
+            break;
+        }
+        let Ok(after) = schema_fingerprint(&mut scratch) else {
+            break;
+        };
+        let version = migration.name().version().to_string();
+        for object in after.difference(&before) {
+            if wanted.contains(object) {
+                creators.insert(object.clone(), version.clone());
+            }
+        }
+        before = after;
+    }
+    creators
 }
 
 /// The versions recorded in `__diesel_schema_migrations` that THIS BUILD DOES NOT EMBED.
@@ -13401,6 +14273,11 @@ pub fn list_workflow_runs(
 /// neither answers "the runs of THIS Spec" — what the Spec-side runtime view (the run modal opened
 /// from `/work/$specId` and the dev overlay) needs, since a Spec is driven by an ndev run AND by the
 /// coder/judge CHILD workflow runs it spawns. Unknown Spec ⇒ an empty list (never an error).
+///
+/// NEWEST-FIRST IS BY `started_at`, AND NOT EVERY CALLER KEEPS IT: `mcp_context::spec_live_runs`
+/// drops the terminal rows and RE-SORTS what is left by LAST ACTIVITY, because the `Run     :`
+/// header's question is "who is still moving?" and its cap must drop the runs nobody has touched in
+/// longest. This order is the one the UI reads; that one is the header's.
 pub fn list_runs_for_spec(
     conn: &mut SqliteConnection,
     spec_id: &str,
@@ -30269,6 +31146,7 @@ mod tests {
         let healthy = SchemaHealth {
             up_to_date: true,
             pending_count: Some(0),
+            missing_objects: Vec::new(),
         };
         let ok = healthy.boot_report(&[]);
         assert!(ok.healthy && !ok.fatal);
@@ -30279,6 +31157,7 @@ mod tests {
         let behind = SchemaHealth {
             up_to_date: false,
             pending_count: Some(2),
+            missing_objects: Vec::new(),
         };
         let late = behind.boot_report(&[]);
         assert!(!late.healthy && late.fatal);
@@ -30288,6 +31167,7 @@ mod tests {
         let blind = SchemaHealth {
             up_to_date: false,
             pending_count: None,
+            missing_objects: Vec::new(),
         };
         assert!(blind.boot_report(&[]).fatal);
 
@@ -30656,5 +31536,613 @@ mod tests {
                 .expect("query")
                 .is_empty()
         );
+    }
+
+    /// The naming convention of `crates/nyx-core/migrations/`, and the guard that keeps it.
+    ///
+    /// Diesel identifies an applied migration by the NUMBER of its directory alone
+    /// (`__diesel_schema_migrations` stores nothing else — see the [`MIGRATIONS`] doc). Five
+    /// worktrees numbering in parallel from the same point made `00000000000050` designate three
+    /// different migrations, and a database then carried the version WITHOUT the table. The
+    /// counter era therefore ended at [`LAST_COUNTER_VERSION`]: every migration created after it
+    /// is named `AAAAMMJJhhmmss` (UTC creation instant), which two worktrees cannot collide on
+    /// unless they generate within the same second.
+    ///
+    /// The heritage is NOT renamed and NOT deleted — the stored number is the identity of an
+    /// applied migration, so a rename would make it pending again and Diesel would REPLAY it on
+    /// every database in service. [`heritage_counter_versions_are_frozen`] locks that.
+    /// [`schema_health`] confronting the REGISTRY with the real SCHEMA.
+    ///
+    /// The defect these close: `schema_health` used to read `pending_migrations` and nothing else,
+    /// so a database whose registry recorded `00000000000050` as applied while the table that
+    /// migration creates was absent reported `up_to_date: true`. The app declared itself healthy
+    /// and broke at the first query. That is not a hypothesis — it is what five worktrees sharing
+    /// one `nyx.db` produced.
+    mod schema_drift {
+        use super::*;
+
+        /// The version of the migration that creates `app_settings` — the table that actually
+        /// went missing. Named here once so a test that asserts the refusal quotes THE version,
+        /// not a version.
+        const APP_SETTINGS_VERSION: &str = "20260818020000";
+
+        /// A file-backed database in a fresh temp dir, and its path. `Db::open` (not
+        /// `open_in_memory`) is the boot path under test, so the drift has to survive a close.
+        fn temp_db_path(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("nyx-{tag}-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("create temp db dir");
+            dir.join("nyx.db")
+        }
+
+        /// Open a raw connection on a file-backed database, outside any pool.
+        fn raw(path: &std::path::Path) -> SqliteConnection {
+            SqliteConnection::establish(path.to_str().expect("utf-8 temp path"))
+                .expect("open the database directly")
+        }
+
+        /// [`EXPECTED_SCHEMA`] is the migration chain's own output, never a list someone
+        /// remembered to update. A migration that adds a table or a column and leaves the list
+        /// behind fails HERE, with the corrected list printed — so the reference cannot silently
+        /// promise less than the chain delivers (which would blind the probe) nor more (which
+        /// would refuse a healthy boot).
+        #[test]
+        fn the_expected_schema_is_exactly_what_the_migration_chain_produces() {
+            let mut conn = open_in_memory();
+            let actual = schema_fingerprint(&mut conn).expect("read the migrated schema");
+            let expected: BTreeSet<String> =
+                EXPECTED_SCHEMA.iter().map(|n| (*n).to_string()).collect();
+            if actual != expected {
+                let listing = actual
+                    .iter()
+                    .map(|name| format!("    \"{name}\","))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                panic!(
+                    "EXPECTED_SCHEMA no longer matches the migration chain.\n\
+                     produced by the chain but absent from the const: {:?}\n\
+                     promised by the const but not produced: {:?}\n\
+                     paste this back into EXPECTED_SCHEMA:\n{listing}",
+                    actual.difference(&expected).collect::<Vec<_>>(),
+                    expected.difference(&actual).collect::<Vec<_>>(),
+                );
+            }
+        }
+
+        /// What the reference deliberately does NOT promise: FTS5's own storage. Which shadow
+        /// tables `CREATE VIRTUAL TABLE ... USING fts5` leaves behind, and what columns they
+        /// carry, is a SQLite version detail — a database migrated by an older SQLite may
+        /// legitimately differ, and promising them would refuse that sound database. What
+        /// migration `00000000000026` writes ITSELF stays promised: the virtual table and its
+        /// three triggers.
+        ///
+        /// Read from the FINGERPRINT of a real migrated database, not from the const: the rule
+        /// under test is the exclusion in [`schema_fingerprint`], and a version of this test that
+        /// only read `EXPECTED_SCHEMA` stayed green while that rule was mutated to swallow the
+        /// triggers.
+        #[test]
+        fn the_probe_reads_our_fts_objects_and_not_sqlites_own_storage() {
+            let mut conn = open_in_memory();
+            let promised = schema_fingerprint(&mut conn).expect("read the migrated schema");
+            for ours in ["ideas_fts", "ideas_fts_ai", "ideas_fts_ad", "ideas_fts_au"] {
+                assert!(
+                    promised.contains(ours),
+                    "`{ours}` is written by migration 00000000000026, so it must be checked"
+                );
+            }
+            for shadow in [
+                "ideas_fts_data",
+                "ideas_fts_idx",
+                "ideas_fts_docsize",
+                "ideas_fts_config",
+            ] {
+                assert!(
+                    !promised.contains(shadow),
+                    "`{shadow}` belongs to FTS5, not to us — promising it risks refusing a sound \
+                     database migrated by another SQLite build"
+                );
+            }
+            assert!(
+                !promised.iter().any(|name| name.starts_with("ideas_fts.")),
+                "the FTS5 table's column layout is FTS5's business, got {:?}",
+                promised
+                    .iter()
+                    .filter(|name| name.starts_with("ideas_fts."))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        /// A freshly migrated database is healthy, and healthy means NO refusal — a guard that
+        /// refuses a sound boot is worse than the blindness it replaces.
+        #[test]
+        fn a_freshly_migrated_database_is_healthy_and_refuses_nothing() {
+            let mut conn = open_in_memory();
+            let health = schema_health(&mut conn);
+            assert!(health.up_to_date, "a migrated database is up to date");
+            assert_eq!(health.pending_count, Some(0));
+            assert!(health.missing_objects.is_empty());
+            assert!(
+                health.drift_refusal().is_none(),
+                "a healthy schema produces no refusal"
+            );
+        }
+
+        /// THE case. The registry still records the version; the table it creates is gone. The
+        /// old probe called this `up_to_date: true`.
+        #[test]
+        fn a_version_recorded_as_applied_whose_table_is_gone_is_not_healthy() {
+            let mut conn = open_in_memory();
+            diesel::sql_query("DROP TABLE app_settings")
+                .execute(&mut conn)
+                .expect("drop the table the recorded migration created");
+
+            let health = schema_health(&mut conn);
+            assert!(
+                !health.up_to_date,
+                "a recorded version whose table is absent is NOT a healthy schema"
+            );
+            assert_eq!(
+                health.pending_count,
+                Some(0),
+                "the registry is still current — that is precisely what made this invisible"
+            );
+            assert_eq!(
+                health
+                    .missing_objects
+                    .iter()
+                    .map(|m| m.object.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["app_settings"],
+                "the missing table is named, and its columns are not restated one by one"
+            );
+            assert_eq!(
+                health.missing_objects[0].created_by.as_deref(),
+                Some(APP_SETTINGS_VERSION),
+                "the object is attributed to the migration that creates it — and that migration \
+                 is recorded as applied, which is the contradiction"
+            );
+        }
+
+        /// A migration that creates no object at all — `20260818130000` only ADDS COLUMNS — is
+        /// covered too: without this, a collision on its number would leave the probe blind for
+        /// half the recent chain.
+        #[test]
+        fn a_column_added_by_a_recorded_migration_is_checked_like_a_table() {
+            let mut conn = open_in_memory();
+            diesel::sql_query("ALTER TABLE projects DROP COLUMN worktrees_root")
+                .execute(&mut conn)
+                .expect("drop the column the recorded migration added");
+
+            let health = schema_health(&mut conn);
+            assert!(
+                !health.up_to_date,
+                "a missing column is a broken schema too"
+            );
+            assert_eq!(
+                health
+                    .missing_objects
+                    .iter()
+                    .map(|m| m.object.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["projects.worktrees_root"]
+            );
+            assert_eq!(
+                health.missing_objects[0].created_by.as_deref(),
+                Some("20260818130000"),
+                "attributed to the column-only migration that adds it"
+            );
+        }
+
+        /// The refusal names the recorded VERSION, the missing OBJECT, and the inter-worktree
+        /// collision that is the real cause — a refusal that says only "broken schema" would
+        /// reproduce the original defect one layer up.
+        #[test]
+        fn the_refusal_names_the_version_the_object_and_the_worktree_collision() {
+            let mut conn = open_in_memory();
+            diesel::sql_query("DROP TABLE app_settings")
+                .execute(&mut conn)
+                .expect("drop app_settings");
+
+            let refusal = schema_health(&mut conn)
+                .drift_refusal()
+                .expect("a divergence refuses the boot");
+            for expected in [
+                APP_SETTINGS_VERSION,
+                "app_settings",
+                "RECORDED AS APPLIED",
+                "worktree",
+            ] {
+                assert!(
+                    refusal.contains(expected),
+                    "the refusal must contain {expected:?}, got:\n{refusal}"
+                );
+            }
+        }
+
+        /// A schema merely BEHIND the binary is not a divergence: the migrations simply have to
+        /// run. It must not refuse a boot — `Db::open` applies them a few lines earlier.
+        #[test]
+        fn a_schema_merely_behind_the_binary_is_pending_not_drift() {
+            let mut conn = open_in_memory();
+            conn.revert_last_migration(MIGRATIONS)
+                .expect("revert the last migration");
+
+            let health = schema_health(&mut conn);
+            assert!(!health.up_to_date, "a pending migration is not up to date");
+            assert_eq!(health.pending_count, Some(1));
+            assert!(
+                health.missing_objects.is_empty(),
+                "a migration that has not run yet is not a divergence, got {:?}",
+                health.missing_objects
+            );
+            assert!(
+                health.drift_refusal().is_none(),
+                "being behind is fixed by migrating, not by refusing to start"
+            );
+        }
+
+        /// A probe that could not RUN stays distinct from a schema that is broken: `pending_count:
+        /// None` says "we could not look", and nothing is claimed about the schema — so a
+        /// transient read failure can never masquerade as a divergence and stop a boot.
+        ///
+        /// The registry is REPLACED by a table of the same name with the wrong shape, not merely
+        /// dropped: Diesel re-creates a missing registry on its way into `pending_migrations`, so
+        /// a plain `DROP TABLE` reports 52 pending migrations instead of a failed read.
+        #[test]
+        fn a_probe_that_cannot_read_the_registry_is_not_a_broken_schema() {
+            let mut conn = open_in_memory();
+            for statement in [
+                "DROP TABLE __diesel_schema_migrations",
+                "CREATE TABLE __diesel_schema_migrations (not_a_version TEXT)",
+            ] {
+                diesel::sql_query(statement)
+                    .execute(&mut conn)
+                    .expect("replace the registry with an unreadable one");
+            }
+
+            let health = schema_health(&mut conn);
+            assert!(!health.up_to_date);
+            assert_eq!(
+                health.pending_count, None,
+                "None is the marker that the CHECK itself failed"
+            );
+            assert!(
+                health.missing_objects.is_empty(),
+                "we never got to look at the schema, so we claim nothing about it"
+            );
+            assert!(
+                health.drift_refusal().is_none(),
+                "a probe that could not run must not refuse a boot"
+            );
+        }
+
+        /// The boot itself: `Db::open` REFUSES a diverged database, says why, and repairs
+        /// nothing — a migration Diesel records as applied is never replayed, so a repair would
+        /// be an invention.
+        #[test]
+        fn db_open_refuses_a_diverged_database_and_repairs_nothing() {
+            let path = temp_db_path("schema-drift");
+            drop(Db::open(&path).expect("the first open migrates a fresh database"));
+            {
+                let mut conn = raw(&path);
+                diesel::sql_query("DROP TABLE app_settings")
+                    .execute(&mut conn)
+                    .expect("simulate the collision: the version stays, the table goes");
+            }
+
+            let Err(err) = Db::open(&path) else {
+                panic!("a diverged database must not open");
+            };
+            let message = err.to_string();
+            for expected in [APP_SETTINGS_VERSION, "app_settings", "worktree"] {
+                assert!(
+                    message.contains(expected),
+                    "the refusal must contain {expected:?}, got:\n{message}"
+                );
+            }
+
+            let mut conn = raw(&path);
+            assert!(
+                !schema_fingerprint(&mut conn)
+                    .expect("re-read the schema")
+                    .contains("app_settings"),
+                "the refusal must not have re-created the table it refused over"
+            );
+            drop(conn);
+            std::fs::remove_dir_all(path.parent().expect("temp dir")).ok();
+        }
+
+        /// The healthy path pays for what it uses. The probe reads the schema; it does NOT replay
+        /// the migration chain — the replay that attributes an object to a version happens only
+        /// once a gap is found, i.e. on a boot that is about to be refused.
+        ///
+        /// The bound is RELATIVE — a fraction of one full chain run measured on the same machine
+        /// in the same test — so it stays meaningful on a fast box and does not turn red on a
+        /// loaded one.
+        #[test]
+        fn a_healthy_probe_costs_a_fraction_of_a_migration_run() {
+            let mut conn = open_in_memory();
+            let started = std::time::Instant::now();
+            let health = schema_health(&mut conn);
+            let probe = started.elapsed();
+            assert!(
+                health.up_to_date,
+                "the calibration runs on a healthy schema"
+            );
+
+            let started = std::time::Instant::now();
+            let mut scratch =
+                SqliteConnection::establish(":memory:").expect("open a scratch database");
+            run_migrations(&mut scratch).expect("run the whole chain once");
+            let whole_chain = started.elapsed();
+
+            assert!(
+                probe * 10 < whole_chain,
+                "the healthy probe must cost a fraction of a chain run, got {probe:?} against {whole_chain:?}"
+            );
+        }
+    }
+
+    mod migration_naming_convention {
+        use std::collections::BTreeMap;
+
+        /// The LAST migration of the counter era: `00000000000051_annexes_url_canonical`.
+        /// Everything created after it is timestamped. This threshold is the whole rule, so it
+        /// lives here — in the value the assertions read — and not in a sentence.
+        const LAST_COUNTER_VERSION: u64 = 51;
+
+        /// A migration directory name, once parsed.
+        #[derive(Debug, PartialEq, Eq)]
+        enum MigrationName {
+            /// `00000000000001` … `00000000000051` — the frozen heritage.
+            Counter(u64),
+            /// `AAAAMMJJhhmmss` — the convention in force since the counter era ended.
+            Timestamped(u64),
+        }
+
+        impl MigrationName {
+            /// The numeric version, whichever era the name belongs to.
+            fn version(&self) -> u64 {
+                match self {
+                    MigrationName::Counter(v) | MigrationName::Timestamped(v) => *v,
+                }
+            }
+        }
+
+        /// Read ONE migration directory name, or say why it violates the convention. The error
+        /// string is what a contributor reads when the guard fires, so it names the rule AND the
+        /// reason the rule exists.
+        fn classify_migration_name(name: &str) -> Result<MigrationName, String> {
+            let (version, slug) = name.split_once('_').ok_or_else(|| {
+                format!("`{name}`: expected `<14 digits>_<slug>`, found no `_` separator")
+            })?;
+            if version.len() != 14 || !version.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!(
+                    "`{name}`: the version prefix must be exactly 14 digits, found `{version}`"
+                ));
+            }
+            if slug.is_empty() {
+                return Err(format!(
+                    "`{name}`: the descriptive name after the version prefix is empty"
+                ));
+            }
+            let value: u64 = version.parse().expect("14 ASCII digits fit in a u64");
+            if value <= LAST_COUNTER_VERSION {
+                return Ok(MigrationName::Counter(value));
+            }
+            if reads_as_timestamp(value) {
+                return Ok(MigrationName::Timestamped(value));
+            }
+            Err(format!(
+                "`{name}`: the counter era ended at {LAST_COUNTER_VERSION:014} — a migration \
+                 created after it must be named `AAAAMMJJhhmmss` (UTC creation instant), so that \
+                 two worktrees numbering in parallel cannot claim the same version"
+            ))
+        }
+
+        /// Whether a 14-digit version reads as `AAAAMMJJhhmmss`. Deliberately a RANGE check and
+        /// not a calendar: it has to reject a counter (`00000000000052` → year 0) and a typo
+        /// (month 13), not validate that 2026-02-30 exists.
+        fn reads_as_timestamp(value: u64) -> bool {
+            let year = value / 10_000_000_000;
+            let month = (value / 100_000_000) % 100;
+            let day = (value / 1_000_000) % 100;
+            let hour = (value / 10_000) % 100;
+            let minute = (value / 100) % 100;
+            let second = value % 100;
+            (2000..=9999).contains(&year)
+                && (1..=12).contains(&month)
+                && (1..=31).contains(&day)
+                && hour <= 23
+                && minute <= 59
+                && second <= 59
+        }
+
+        /// Audit a whole listing: every name follows the convention, and no two names claim the
+        /// same version. Returns EVERY violation so one run names them all.
+        fn audit_migration_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+            let mut violations = Vec::new();
+            let mut seen: BTreeMap<u64, &str> = BTreeMap::new();
+            for name in names {
+                match classify_migration_name(name) {
+                    Ok(parsed) => {
+                        if let Some(previous) = seen.insert(parsed.version(), name) {
+                            violations.push(format!(
+                                "version {:014} is claimed twice, by `{previous}` and by `{name}` \
+                                 — Diesel records the version alone, so the second is reported as \
+                                 already applied and its `up.sql` never runs",
+                                parsed.version()
+                            ));
+                        }
+                    }
+                    Err(violation) => violations.push(violation),
+                }
+            }
+            violations
+        }
+
+        /// The migration directories actually on disk, sorted. Files (this module's `README.md`)
+        /// are skipped, exactly as Diesel's own directory scan skips them.
+        fn migration_directory_names() -> Vec<String> {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("list {}: {e}", dir.display()))
+                .map(|entry| entry.expect("read an entry of migrations/"))
+                .filter(|entry| {
+                    entry
+                        .file_type()
+                        .expect("stat an entry of migrations/")
+                        .is_dir()
+                })
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// The guard on the real directory: every migration shipped by this crate obeys the
+        /// convention, and no two claim the same version. Adding `00000000000052_whatever`
+        /// fails HERE, before it can reach a shared database.
+        #[test]
+        fn every_migration_on_disk_obeys_the_naming_convention() {
+            let names = migration_directory_names();
+            let violations = audit_migration_names(names.iter().map(String::as_str)).join("\n  - ");
+            assert!(
+                violations.is_empty(),
+                "crates/nyx-core/migrations/ violates the naming convention:\n  - {violations}"
+            );
+        }
+
+        /// The heritage is FROZEN, NUMBER BY NUMBER: the counter-era versions are exactly this
+        /// series, hole included (no `00000000000019` was ever created). RENUMBERING or deleting
+        /// one would make it pending again and Diesel would replay it on every database in
+        /// service, so this asserts the set rather than trusting a prohibition in prose.
+        ///
+        /// What it deliberately does NOT hold is the DESCRIPTION after the number, and that is not
+        /// a gap: `__diesel_schema_migrations` stores the version and nothing else, so re-wording
+        /// `00000000000034_<description>` changes the identity of nothing. `migrations/README.md`
+        /// says the same, in the same words.
+        #[test]
+        fn heritage_counter_versions_are_frozen() {
+            let on_disk: Vec<u64> = migration_directory_names()
+                .iter()
+                .filter_map(|name| match classify_migration_name(name) {
+                    Ok(MigrationName::Counter(v)) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            let expected: Vec<u64> = (1..=18).chain(20..=LAST_COUNTER_VERSION).collect();
+            assert_eq!(
+                on_disk, expected,
+                "the counter-era migrations must stay exactly as they were applied"
+            );
+        }
+
+        /// The convention is LIVE, not aspirational: the two migrations that opened the
+        /// timestamped era are on disk and parse as timestamps.
+        ///
+        /// What this does NOT hold: a contributor who RAISES `LAST_COUNTER_VERSION` and adds the
+        /// matching counter directory passes every assertion in this module. Nothing here can
+        /// stop that, and pretending otherwise would be the defect this phase repairs — a guard
+        /// stops the accident, not the deliberate bypass.
+        #[test]
+        fn the_timestamped_era_is_already_populated() {
+            let timestamped: Vec<u64> = migration_directory_names()
+                .iter()
+                .filter_map(|name| match classify_migration_name(name) {
+                    Ok(MigrationName::Timestamped(v)) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                timestamped.len() >= 2,
+                "the two migrations that opened the timestamped era must still be there, got {timestamped:?}"
+            );
+            assert!(
+                timestamped.iter().all(|v| *v > LAST_COUNTER_VERSION),
+                "a timestamped version always sorts after the whole counter era, got {timestamped:?}"
+            );
+        }
+
+        /// The mutation this guard exists for: the next migration restarts the counter.
+        #[test]
+        fn a_counter_named_migration_created_after_the_heritage_is_refused() {
+            let violations = audit_migration_names(["00000000000052_next_thing"]);
+            assert_eq!(
+                violations.len(),
+                1,
+                "one name, one violation, got {violations:?}"
+            );
+            assert!(
+                violations[0].contains("AAAAMMJJhhmmss"),
+                "the refusal names the convention to follow, got: {}",
+                violations[0]
+            );
+        }
+
+        /// The last counter migration is still accepted — a guard that refuses the heritage is
+        /// unusable and ends up disabled.
+        #[test]
+        fn the_last_counter_migration_is_still_accepted() {
+            assert_eq!(
+                classify_migration_name("00000000000051_annexes_url_canonical"),
+                Ok(MigrationName::Counter(51))
+            );
+            assert!(audit_migration_names(["00000000000001_create_terminals"]).is_empty());
+        }
+
+        /// A timestamped name is accepted; a 14-digit name that is NOT a timestamp is not.
+        #[test]
+        fn a_timestamped_name_is_accepted_and_an_impossible_date_is_not() {
+            assert_eq!(
+                classify_migration_name("20260818020000_create_app_settings"),
+                Ok(MigrationName::Timestamped(20_260_818_020_000))
+            );
+            assert!(
+                classify_migration_name("20261318020000_month_thirteen").is_err(),
+                "month 13 is not a timestamp"
+            );
+            assert!(
+                classify_migration_name("20260818250000_hour_twenty_five").is_err(),
+                "hour 25 is not a timestamp"
+            );
+        }
+
+        /// Two directories claiming one version is the collision that started all this: the
+        /// second is reported as already applied and its `up.sql` never runs.
+        #[test]
+        fn two_migrations_claiming_the_same_version_are_refused() {
+            let violations = audit_migration_names([
+                "20260818020000_create_app_settings",
+                "20260818020000_something_else",
+            ]);
+            assert_eq!(
+                violations.len(),
+                1,
+                "one collision, one violation, got {violations:?}"
+            );
+            assert!(
+                violations[0].contains("claimed twice"),
+                "the refusal says the version is claimed twice, got: {}",
+                violations[0]
+            );
+        }
+
+        /// A name that is not `<14 digits>_<slug>` at all is refused, whichever way it is
+        /// malformed — a shorter counter, a missing separator, an empty description.
+        #[test]
+        fn a_malformed_directory_name_is_refused() {
+            for name in [
+                "0000000000051_short_prefix",
+                "000000000000512_long_prefix",
+                "20260818020000",
+                "20260818020000_",
+                "create_app_settings",
+            ] {
+                assert!(
+                    classify_migration_name(name).is_err(),
+                    "`{name}` must be refused"
+                );
+            }
+        }
     }
 }

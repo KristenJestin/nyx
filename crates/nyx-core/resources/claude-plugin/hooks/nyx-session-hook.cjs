@@ -45,15 +45,18 @@
  * act is `nyx_next(run_id)`. WHY THE HOOK AND NOT THE SESSION: an agent that fetched its own manual
  * and opened its own run spent two calls before the first tick, resolved anchors the hook already
  * receives (`cwd`), and left "who opens the run" to whichever agent got there first.
- * IT READS THE COMMAND NAME AND, AT MOST, ONE TOKEN: the Spec id, when the first argument IS a
- * whole canonical one (`specIdFromPrompt`). `/ndev` and `/ndoc` work ON an existing Spec and their
- * stubs offer to name it, and a `cwd` cannot honour that in a project holding several active Specs
- * — a location resolves none of them and the run never opens. Everything else in the prompt is the
- * human's instruction and stays untouched for the agent to read. Fully
- * best-effort — a prompt that is not a nyx command, a sidecar that is down, a REFUSED `run_start`
- * (no run ⇒ NOTHING is injected: a manual without a `run_id` would send the session hunting for
- * one) or a refused `agent_context` injects nothing, but each of those says WHY on stderr (see
- * `trace`) instead of failing mute.
+ * IT READS THE COMMAND NAME AND, AT MOST, ONE TOKEN: the Spec REFERENCE, when the first argument IS
+ * a whole one (`specIdFromPrompt` — it recognises a shape and forwards the token RAW; nyx resolves
+ * it). The three stubs offer to name a Spec, and a `cwd` cannot honour that in a project holding
+ * several active Specs — a location resolves none of them, and for `/ndev` and `/ndoc` the run
+ * never opens. Everything else in the prompt is the human's instruction and stays untouched for
+ * the agent to read. Fully best-effort — a prompt that is not a nyx command, a sidecar that is
+ * down, a REFUSED `run_start` (no run ⇒ no MANUAL: one without a `run_id` would send the session
+ * hunting for one) or a refused `agent_context` injects no manual, but each of those says WHY on
+ * stderr (see `trace`) instead of failing mute. And when the refusal is about the REFERENCE the
+ * human typed, nyx's own sentence is injected in the manual's place
+ * (`refusedReferenceBlock`) — stderr is not read by the model, so swallowing it would make a
+ * refused `/ndev 3 fois plus rapide` look like nyx saying nothing.
  *
  * GUARANTEES: best-effort, BOUNDED (~1s per call, and `RUN_OPEN_TIMEOUT_MS` for the two calls
  * that open a run — they do real server-side work before answering), NEVER throws, ALWAYS exits
@@ -131,7 +134,7 @@ const PORT = resolvePort();
  * with it (`agent_context {role}`).
  *
  * The TRIGGER is the command NAME because that is ALL a `UserPromptSubmit` hook ever sees:
- * Claude Code hands the hook the prompt the human TYPED (`prompt: "/nspec feature-42 …"`) and
+ * Claude Code hands the hook the prompt the human TYPED (`prompt: "/nspec KEY-3 …"`) and
  * expands the stub body only afterwards, so the `<!-- NYX-AGENT-CONTEXT role=… scope=… -->`
  * sentinel a stub declares NEVER reaches this hook — keying on it injected nothing, ever.
  * The stub's sentinel stays the DECLARATION of what its command triggers; the push-injection
@@ -147,10 +150,11 @@ const NYX_COMMANDS = {
 const SLASH_COMMAND = /^\s*\/([a-z][a-z0-9:_-]*)(?=\s|$)/i;
 
 /**
- * The slash command a prompt INVOKES (`"/nspec feature-42 go"` → `"nspec"`), or "" when the
+ * The slash command a prompt INVOKES (`"/nspec KEY-3 go"` → `"nspec"`), or "" when the
  * prompt is not a command invocation. Pure + defensive: a non-string / missing prompt yields
- * "". ZERO argument parsing — only the command name is read; the human's free text is never
- * inspected.
+ * "". ZERO argument parsing HERE — only the command name is read. The FIRST token is read by
+ * `specIdFromPrompt` alone, and only as a SHAPE; everything after it is the human's free text and
+ * is never inspected by anything in this file.
  */
 function commandFromPrompt(prompt) {
   if (typeof prompt !== "string" || prompt.length === 0) return "";
@@ -159,33 +163,57 @@ function commandFromPrompt(prompt) {
 }
 
 /**
- * A Spec id, and nothing that merely resembles one: the CANONICAL uuid shape nyx mints its ids in,
- * anchored so a token is either the whole id or not an id at all.
+ * THE SHAPES OF A SPEC REFERENCE — the four forms `spec_ref::parse` (Rust) accepts, expressed as
+ * the SHAPE test a recogniser can make. Each is anchored, so a token is either a whole reference or
+ * not one at all.
+ *
+ * They are pinned against the Rust grammar by `contract/spec-ref-corpus.txt`, which both sides
+ * replay: `spec_ref.rs` feeds every token to `parse`, and its
+ * `the_shared_corpus_pins_the_hook_recogniser_to_this_grammar` feeds the same tokens to THIS
+ * file's `specIdFromPrompt`, under node. A form added on one side and not the other goes red.
  */
-const SPEC_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SPEC_REF = {
+  /** The CANONICAL id nyx mints (`8-4-4-4-12` hex), tried first so it is never re-read as a key. */
+  uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+  /** The human key `KEY-N`: a project-key head (letter then alphanumerics), one `-`, all digits. */
+  key: /^[a-z][a-z0-9]*-[0-9]+$/i,
+  /** `#N` and the bare `N` — one form, with and without the sigil every render prints. */
+  number: /^#?[0-9]+$/,
+};
 
 /**
- * The Spec id the human NAMED, when the command's first argument is one (`"/ndev 019ff517-… fix
- * the probe"` → `"019ff517-…"`), else "".
+ * The Spec reference the human NAMED, when the command's first argument is one (`"/ndev 3 fix the
+ * probe"` → `"3"`; `"/ndev 019ff517-… fix the probe"` → `"019ff517-…"`), else "".
  *
- * WHY the hook reads this ONE token when its rule is to parse nothing: `/ndev` and `/ndoc` work ON
- * an existing Spec, and their stubs advertise "an optional Spec id selects the Spec to work on".
- * The `cwd` alone cannot honour that — a real project holds several active Specs, so resolving one
- * by location is REFUSED as ambiguous, and the run never opens. The typed id is the only anchor
- * that disambiguates, and it was going unread: a live session had to notice on its own that "the
- * UUID in your command IS the spec_id" and open the run itself.
+ * WHY the hook reads this ONE token when its rule is to parse nothing: the three nyx commands
+ * advertise a leading Spec reference, and the `cwd` alone cannot honour it — a real project holds
+ * several active Specs, so resolving one by location is ambiguous, and for `/ndev` and `/ndoc` the
+ * run then never opens. The typed reference is the only anchor that disambiguates. The hook opens
+ * the run BEFORE the agent says anything, so a form it cannot SEE is a form that never reaches the
+ * core on this path: recognising only the canonical id — the one shape a human never sees, since
+ * every render speaks in `#3` — is what sent a `/nspec 3` into an unanchored run.
  *
- * Still zero interpretation of the human's TEXT: only the first token, only when it is a whole
- * canonical id. Anything else — a slug, a sentence, a partial id — leaves this empty and the run
- * resolves from the `cwd` exactly as before, so a human writing prose can never have a word of it
- * mistaken for an anchor.
+ * IT RECOGNISES A SHAPE AND FORWARDS THE TOKEN RAW, byte for byte as typed. It resolves NOTHING:
+ * translating `#3` into an id, and refusing a reference that designates no Spec, belong to
+ * `spec_ref.rs` and to it alone — a hook that resolved would be a second truth to keep aligned with
+ * the first, which is how this regex and the core drifted apart to begin with. It follows that the
+ * two do not answer identically on every token, BY DESIGN: the core also bounds a reference by
+ * VALUE (a number outside an `i64` is read as prose), and a shape-only recogniser has no business
+ * restating a bound it cannot act on. `contract/spec-ref-corpus.txt` sorts the tokens accordingly.
+ *
+ * The original discipline is untouched: only the FIRST token, only when it is a WHOLE reference.
+ * Anything else — a slug, a sentence, a partial id — leaves this empty and the run resolves from
+ * the `cwd` exactly as before, so a human writing prose can never have a word of it mistaken for an
+ * anchor.
  */
 function specIdFromPrompt(prompt) {
   if (typeof prompt !== "string") return "";
   const rest = prompt.replace(SLASH_COMMAND, "").trim();
   if (!rest) return "";
   const first = rest.split(/\s+/, 1)[0];
-  return SPEC_ID.test(first) ? first : "";
+  const recognised =
+    SPEC_REF.uuid.test(first) || SPEC_REF.key.test(first) || SPEC_REF.number.test(first);
+  return recognised ? first : "";
 }
 
 /**
@@ -194,6 +222,15 @@ function specIdFromPrompt(prompt) {
  * already funnels through `trace`, and duplicating the wording is how the two ends drift apart.
  */
 let lastTraced = "";
+
+/**
+ * The SERVER's own sentence when `run_start` REFUSED, kept apart from [`lastTraced`] because it is
+ * the only failure whose text is worth showing the MODEL: nyx wrote it for a reader (it names the
+ * accepted forms and what the project actually holds), and it is the one the session can act on.
+ * Empty for every other failure mode — a sidecar that is down, a timeout, a malformed body — where
+ * there is no server sentence to relay.
+ */
+let lastRunStartRefusal = "";
 
 /**
  * Say WHY no manual was injected. A hook must never break the prompt, so this branch stays
@@ -287,10 +324,17 @@ function manualFromResponse(resp) {
  * what went wrong — failure mode for failure mode, like [`manualFromResponse`].
  *
  * A REFUSAL is the mode that matters here (`/ndev` on a location anchoring no Spec, or several):
- * it must NOT degrade into injecting a manual with no run. The session's first act is
+ * it must NOT degrade into injecting a MANUAL with no run. The session's first act is
  * `nyx_next(run_id)`, so a context carrying no id sends it hunting for one — the very pre-tick
- * scramble the hook took over. No run ⇒ nothing injected, and the SERVER's own sentence is what
- * the trace carries, because it is the one that names which anchor was missing.
+ * scramble the hook took over. No run ⇒ no manual, and the SERVER's own sentence is what the trace
+ * carries, because it is the one that names which anchor was missing. (The block `main` injects in
+ * its place carries no run id at all — see [`refusedReferenceBlock`].)
+ *
+ * THE REFUSAL SENTENCE IS ALSO KEPT ([`lastRunStartRefusal`]), because since the recogniser widened
+ * to `KEY-N` / `#N` / `N` a refusal is no longer only a bad workspace: a first token that merely
+ * LOOKS like a reference (`feature-42`, `3`) is now forwarded, refused, and used to cost the
+ * session its whole nyx context in silence — stderr is not read by the model. `main` turns it into
+ * an injected instruction instead (see there).
  */
 function runFromResponse(resp) {
   if (!resp || resp.error) {
@@ -317,7 +361,8 @@ function runFromResponse(resp) {
     return null;
   }
   if (parsed && parsed.error) {
-    trace(`run_start refused: ${parsed.error.message || JSON.stringify(parsed.error)}`);
+    lastRunStartRefusal = parsed.error.message || JSON.stringify(parsed.error);
+    trace(`run_start refused: ${lastRunStartRefusal}`);
     return null;
   }
   const opened = parsed?.result?.structuredContent;
@@ -352,6 +397,53 @@ function runBlock(run) {
     }
   }
   return `${block}\n`;
+}
+
+/**
+ * WHAT IS INJECTED WHEN THE REFERENCE THE HUMAN TYPED WAS REFUSED — no run, no manual, one
+ * instruction.
+ *
+ * THE FAILURE THIS CLOSES IS ONE THE WIDENED RECOGNISER CREATED. While `specIdFromPrompt` knew only
+ * the canonical id, a first token it did not recognise left `spec_id` unset and the run opened off
+ * the `cwd`. Now `KEY-N` / `#N` / `N` are shapes, so a branch name (`feature-42`), a ticket
+ * (`JIRA-123`) or a plain number (`/ndev 3 fois plus rapide`) is forwarded, `run_start` refuses it —
+ * rightly, opening an unanchored run on a named Spec is what ordered a duplicate — and the whole
+ * injection used to be dropped. The session then got NO run and NO manual, and the reason went to
+ * stderr, which Claude Code never feeds to the model: from inside the session, nyx had simply said
+ * nothing.
+ *
+ * So the refusal is relayed instead of swallowed. It carries NO `run_id`, deliberately: there is no
+ * run, and inventing a header with an empty one is the "session hunting for an id" this hook exists
+ * to prevent. What it carries is the token as typed, nyx's own sentence (it names the accepted forms
+ * and what the project actually holds) and the SAME instruction the three command stubs give — stop,
+ * ask, never author a second Spec — so the two texts an agent reads in one breath agree.
+ *
+ * IT DOES NOT CLAIM TO KNOW WHICH CONDITION FAILED, and it used to. `lastRunStartRefusal` is set on
+ * EVERY `run_start` refusal, and this branch fires whenever one arrives beside a forwarded token —
+ * so a location anchoring several Specs, a project with no `ndev` workflow, or a cross-project
+ * disagreement all reached a header asserting "THE SPEC REFERENCE YOU TYPED WAS REFUSED" and an
+ * instruction to go and ask which Spec was meant. The hook cannot tell those apart (the verdict is
+ * the core's, and matching on its prose would be a second copy of it), so it states what it DOES
+ * know — the run was refused, here is nyx's sentence — and makes the "ask which Spec" move
+ * conditional on that sentence being about the reference. The refusal itself is the discriminator,
+ * and it is right there to be read.
+ */
+function refusedReferenceBlock(command, specId, refusal) {
+  return (
+    `=== NYX REFUSED TO OPEN THE RUN (no run was opened) ===\n` +
+    `You invoked /${command} with the Spec reference "${specId}". nyx refused:\n` +
+    `${refusal}\n` +
+    `\n` +
+    `There is NO run and NO dispatcher manual for this turn — do not call nyx_next, and do not go ` +
+    `looking for a run to tick.\n` +
+    `READ the refusal above: it names the condition that failed. If it is about the reference ` +
+    `"${specId}" (nyx could not resolve it to a Spec), STOP and ASK the human which Spec they ` +
+    `meant, quoting the refusal. If it is about something else — a workspace anchoring several ` +
+    `Specs, a missing workflow — relay THAT to the human instead of asking about the reference. ` +
+    `Either way: never substitute a Spec of your own choosing, and never author a new one to get ` +
+    `past a refusal — that is how a duplicate of the very Spec they named gets ordered. Once the ` +
+    `human answers, re-invoke /${command}.\n\n`
+  );
 }
 
 /**
@@ -539,8 +631,9 @@ async function main() {
   // (`agent_context { role, scope, run_id }`), then relay BOTH in ONE `additionalContext` — the
   // mirror of the SessionStart relay above. The hook anchors the run on the `cwd` Claude Code hands
   // it, so nothing here parses the human's text and no agent resolves an anchor a second time.
-  // Best-effort and NEVER throws: a sidecar that is down, a refused `run_start` or a refused
-  // `agent_context` injects nothing — but it TRACES why on stderr.
+  // Best-effort and NEVER throws: a sidecar that is down or a refused `agent_context` injects
+  // nothing — but it TRACES why on stderr. A `run_start` REFUSED on the reference the human typed
+  // injects nyx's own sentence instead of nothing (`refusedReferenceBlock`).
   if (args.hook_event_name === "UserPromptSubmit") {
     const command = commandFromPrompt(args.prompt);
     const trigger = command ? NYX_COMMANDS[command] : null;
@@ -591,6 +684,25 @@ async function main() {
             );
             injected = true;
           }
+        } else if (specId && lastRunStartRefusal) {
+          // `run_start` REFUSED a command that NAMED a Spec — relay the refusal instead of going
+          // silent. No run means no manual, but it does not mean nothing to say: this is the one
+          // failure mode whose sentence nyx wrote for a reader, and the one the session can act on.
+          // The condition is deliberately BROAD (a token was forwarded and the server said no), and
+          // the block does NOT claim the reference is what failed — the hook cannot know that, so
+          // it hands the server's sentence over and lets it discriminate. See
+          // [`refusedReferenceBlock`], for that and for why it carries no `run_id`.
+          process.stdout.write(
+            JSON.stringify({
+              hookSpecificOutput: {
+                hookEventName: "UserPromptSubmit",
+                additionalContext: refusedReferenceBlock(command, specId, lastRunStartRefusal),
+              },
+            }),
+          );
+          // NOT `injected = true`: no manual was injected, and the failure is still FILED in nyx
+          // below with the sentence already traced. What changed is that the session is no longer
+          // the only party left in the dark.
         }
       } catch (e) {
         trace(`unexpected hook error: ${reason(e)}`);
@@ -612,9 +724,24 @@ async function main() {
   }
 }
 
-// Top-level guard: under no circumstances do we throw or exit non-zero.
-main()
-  .catch(() => {})
-  .finally(() => {
-    process.exit(0);
-  });
+// THE RECOGNISER IS EXPORTED so the shared corpus can be replayed against THIS function rather than
+// against a copy of it (`contract/spec-ref-corpus.txt`, read from Rust by `spec_ref.rs`'s
+// `the_shared_corpus_pins_the_hook_recogniser_to_this_grammar`). A second spelling of the grammar —
+// even one living in a test — is the very drift the corpus exists to close.
+//
+// AND NOTHING ELSE. This file is a surface a third-party agent runtime loads, so every name on it is
+// a contract someone can come to depend on; `commandFromPrompt` rode out here with no reader at all,
+// which is how an internal helper becomes an unintended anchor point. One reader, one export — add a
+// name when a reader arrives, not before.
+module.exports = { specIdFromPrompt };
+
+// Top-level guard: under no circumstances do we throw or exit non-zero. Claude Code runs this file
+// AS a script (`node <path> <Event>`, see `hooks.json`), so the hook behaves exactly as before;
+// requiring it — which only a test does — loads the functions without running the hook.
+if (require.main === module) {
+  main()
+    .catch(() => {})
+    .finally(() => {
+      process.exit(0);
+    });
+}

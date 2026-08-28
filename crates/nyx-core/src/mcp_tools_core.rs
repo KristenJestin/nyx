@@ -489,10 +489,13 @@ pub fn probe(db: &Db) -> Result<Value, RpcError> {
     });
     if !schema_ok {
         if let Some(map) = result.as_object_mut() {
-            map.insert(
-                "schema_warning".to_string(),
-                json!("schema has pending migrations — restart nyx to apply them"),
-            );
+            // A DIVERGENCE and a schema merely BEHIND need different words: "restart nyx to apply
+            // them" is actionable for the second and misleading for the first — nothing will be
+            // applied, because the registry already records the migration whose object is gone.
+            let warning = health.drift_refusal().unwrap_or_else(|| {
+                "schema has pending migrations — restart nyx to apply them".to_string()
+            });
+            map.insert("schema_warning".to_string(), json!(warning));
             match health.pending_count {
                 Some(count) => {
                     map.insert("pending_migrations".to_string(), json!(count));
@@ -500,6 +503,16 @@ pub fn probe(db: &Db) -> Result<Value, RpcError> {
                 None => {
                     map.insert("schema_check_failed".to_string(), json!(true));
                 }
+            }
+            if !health.missing_objects.is_empty() {
+                map.insert(
+                    "missing_schema_objects".to_string(),
+                    json!(health
+                        .missing_objects
+                        .iter()
+                        .map(|missing| missing.object.clone())
+                        .collect::<Vec<_>>()),
+                );
             }
         }
     }
@@ -798,7 +811,8 @@ pub fn repo_git_view(db: &Db, args: &Value) -> Result<Value, RpcError> {
 pub fn review_comment_list(db: &Db, args: &Value) -> Result<Value, RpcError> {
     let workspace_id = require_str(args, "workspace_id")?;
     let repository_id = require_str(args, "repository_id")?;
-    let spec_id = optional_str(args, "spec_id")?;
+    let spec_id = crate::mcp_context::optional_spec_arg(db, args, "spec_id")?;
+    let spec_id = spec_id.as_deref();
     let comments = db
         .with_conn(|c| crate::db::list_review_comments(c, workspace_id, repository_id, spec_id))
         .map_err(internal_db)?;
@@ -818,7 +832,8 @@ pub fn review_comment_post(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
     let workspace_id = require_str(args, "workspace_id")?;
     let repository_id = require_str(args, "repository_id")?;
     let body = require_str(args, "body")?;
-    let spec_id = optional_str(args, "spec_id")?;
+    let spec_id = crate::mcp_context::optional_spec_arg(db, args, "spec_id")?;
+    let spec_id = spec_id.as_deref();
     let parent_id = optional_str(args, "parent_id")?;
     let file_path = optional_str(args, "file_path")?;
     let side = optional_str(args, "side")?;
@@ -908,7 +923,8 @@ pub fn review_comment_resolve(db: &Db, args: &Value) -> Result<ToolOutcome, RpcE
 pub fn review_task_list(db: &Db, args: &Value) -> Result<Value, RpcError> {
     let workspace_id = require_str(args, "workspace_id")?;
     let repository_id = require_str(args, "repository_id")?;
-    let spec_id = optional_str(args, "spec_id")?;
+    let spec_id = crate::mcp_context::optional_spec_arg(db, args, "spec_id")?;
+    let spec_id = spec_id.as_deref();
     let tasks: Vec<crate::db::ReviewFinding> = match spec_id {
         Some(sid) => db
             .with_conn(|c| crate::db::list_grilled_findings_for_spec(c, sid))
@@ -975,7 +991,8 @@ pub fn review_task_structure(db: &Db, args: &Value) -> Result<ToolOutcome, RpcEr
 pub fn review_submit_feedback(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let workspace_id = require_str(args, "workspace_id")?;
     let repository_id = require_str(args, "repository_id")?;
-    let spec_id = require_str(args, "spec_id")?;
+    let spec_id = crate::mcp_context::require_spec_arg(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
     let body = require_str(args, "body")?;
     let title = optional_str(args, "title")?;
     let severity = optional_str(args, "severity")?;
@@ -2838,6 +2855,14 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         // reaches the SAME process-global engine registry the tick below does, because opening a run
         // can REPLACE a dead one and deleting that row takes the very tick guard a live tick holds.
         crate::mcp_engine::RUN_START_TOOL => Some(crate::mcp_engine::run_start(
+            db,
+            crate::mcp_engine::shared_runtime(),
+            args,
+        )),
+        // The RECOVERY twin of the entry above: a run already open, and no Spec on it. It reaches
+        // the SAME process-global registry because "is this run yours?" is a question only that
+        // registry answers — `run_list` enumerates the whole installation's runs.
+        crate::mcp_engine::RUN_BIND_SPEC_TOOL => Some(crate::mcp_engine::run_bind_spec(
             db,
             crate::mcp_engine::shared_runtime(),
             args,

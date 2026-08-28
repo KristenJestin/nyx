@@ -448,12 +448,30 @@ impl Runtime {
     /// a later drain. Only a terminal with NO live agent (a bare/relaunch shell, or an unloaded one
     /// whose PTY is closed) is parked/offered. Keyed on the real process tree, so a live-idle Claude
     /// (Idle BETWEEN turns) is filtered exactly like a Working one.
+    ///
+    /// WHEN THIS RUNS — the answer to "why is there no resume in my BOOT log". Never at boot: the
+    /// resume is LAZY. Nothing is parked until the RENDERER pushes a plan, and it pushes one only
+    /// when its `use-lazy-resume` hook is mounted — i.e. when the Terminals page is up AND a project
+    /// with workspaces is entered (see `apps/desktop/renderer/src/components/terminals/
+    /// use-lazy-resume.ts`, which states the two conditions). A startup that shows no
+    /// `[nyx-sidecar] resume …` line is therefore not evidence of a broken resume; it is a log taken
+    /// before the resume was asked for.
+    ///
+    /// WHAT IT SAYS — the refusal below is a DECISION, not an absence, so it is written down HERE,
+    /// where it is taken. It used to be a bare `continue`: a resume protected by the #28 gate and a
+    /// resume that never existed produced the same empty log, which is precisely what makes every
+    /// failed relaunch look like the previous one.
     pub fn park_resumes(&self, parks: &[(String, String, String)], events: &EventSink) {
         let registry = nyx_core::agent::AgentRegistry::default();
         for (record_id, session_id, command) in parks {
             // Skip a terminal that is ALREADY loaded (its PTY hosts a live agent process): offering
             // it a resume would only risk typing a stale session id into the running agent.
             if self.pty.agent_alive_in_record(record_id, &registry) {
+                eprintln!(
+                    "[nyx-sidecar] resume NOT parked for terminal {record_id} (session \
+                     {session_id}): a live agent process already occupies it — the #28 gate \
+                     protects the running session. This is a REFUSAL, not a failure."
+                );
                 continue;
             }
             self.resume_parks.park(
@@ -522,24 +540,44 @@ impl Runtime {
             .pty
             .agent_alive_in_record(record_id, &nyx_core::agent::AgentRegistry::default())
         {
+            // Same REFUSAL as in `park_resumes`, taken at the other moment (the park was made
+            // against a bare terminal that has since become occupied). Said here for the same
+            // reason: a deferred resume and a lost one are indistinguishable from silence.
+            eprintln!(
+                "[nyx-sidecar] resume HELD BACK for terminal {record_id}: a live agent process \
+                 occupies it — the #28 gate protects the running session. The park stays pending \
+                 for a later bare spawn; nothing is lost."
+            );
             return;
         }
         let Some(park) = self.resume_parks.take_for_inject(record_id) else {
             return;
         };
+        let session_id = park.session_id.clone();
         let mut bytes = park.command.into_bytes();
         bytes.push(b'\r');
         // `write_to_record` returns false when no live PTY backs the record OR the write errored.
         // We only reach here for a live record (spawn just registered it, or `park_resumes`
         // checked liveness), so a false is a genuine injection failure → mark the session failed.
         if !self.pty.write_to_record(record_id, &bytes) {
+            // A genuine FAILURE — the third fact, distinct from "nothing to resume" (which the
+            // renderer reports over its own plan) and from the refusals above.
+            eprintln!(
+                "[nyx-sidecar] resume INJECTION FAILED for terminal {record_id} (session \
+                 {session_id}): the PTY write did not go through; the session is marked \
+                 resume_failed and is not retried automatically."
+            );
             let _ = self
                 .db
-                .with_conn(|c| nyx_core::db::mark_session_resume_failed(c, &park.session_id));
+                .with_conn(|c| nyx_core::db::mark_session_resume_failed(c, &session_id));
             events.emit(crate::pipe::wire::Event::Changed {
                 topic: "agent-sessions".to_string(),
             });
+            return;
         }
+        eprintln!(
+            "[nyx-sidecar] resume INJECTED into terminal {record_id} (session {session_id})."
+        );
     }
 
     /// UNLOAD the idle agent sessions (v2.5.5 — task `01KX8Z6T1J2AC65DHHZTCQ26Z4`): close the PTY

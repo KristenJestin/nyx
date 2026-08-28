@@ -2503,6 +2503,12 @@ fn run_start_reports_the_runs_left_blocked_for_days_and_deletes_none_of_them() {
         message.contains(&format!("Spec #{spec_number}")),
         "it names WHICH Spec is stranded, by its human key: {message}"
     );
+    // AND BY ITS ID. This report spans every project of the installation, so a `#N` — counted
+    // INSIDE a project — designates nothing on its own here; the id is also what the remedy takes.
+    assert!(
+        message.contains(&stranded_spec),
+        "…and by the spec_id, which is what designates it across projects: {message}"
+    );
     assert!(
         message.contains(&format!("run_delete run_id='{dead}'")),
         "…and the verb that clears it: {message}"
@@ -2590,8 +2596,9 @@ fn run_start_says_when_the_run_it_hands_back_is_parked_on_a_question_posed_to_no
     let message = warning["message"].as_str().expect("a sentence for the human");
     assert!(
         message.contains(&format!("Spec #{spec_number}"))
+            && message.contains(&spec_id)
             && message.contains("Mark the Spec ready for build?"),
-        "…by its human key, quoting the question it is stuck on: {message}"
+        "…by its human key AND its spec_id, quoting the question it is stuck on: {message}"
     );
     assert!(
         message.contains("nyx terminal") && message.contains("nyx_next"),
@@ -3811,6 +3818,162 @@ fn run_start_rejects_an_unknown_spec_id() {
 }
 
 // ---------------------------------------------------------------------------
+// A DESIGNATED reference that resolves NOTHING opens NO run (the duplicate defect)
+// ---------------------------------------------------------------------------
+
+/// THE DAMAGE THIS REFUSAL EXISTS TO PREVENT, asserted where it happened. A `/nspec 3` on a project
+/// whose Specs stop at 1 used to open an UNBOUND run: `spec_status` then resolved nothing, the entry
+/// gate fell through to "No Spec yet — author a NEW one from scratch", and the flow ordered a
+/// DUPLICATE of the Spec the human had named. A reference that designates nothing is now refused
+/// (`invalid_id`) and — the half that matters as much — leaves NO `workflow_runs` row behind: a
+/// refusal that abandoned a run would be worse than the bug it replaces.
+#[test]
+fn run_start_refuses_a_designated_reference_that_resolves_nothing_and_opens_no_run() {
+    use diesel::prelude::*;
+    let _g = db_guard();
+    let sandbox = temp_dir("ref-refusal");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _p) = seed_project(&db, sandbox.path());
+    let spec_id = spec_ready(&db, &project_id);
+    let key = db.with_conn(|c| db::get_project(c, &project_id).unwrap().unwrap().key);
+    // An `nspec` workflow EXISTS, so nothing else can be the reason the call fails.
+    db.with_conn(|c| {
+        db::create_workflow(c, Some(&project_id), "nspec", db::WORKFLOW_SCOPE_NSPEC, None)
+            .expect("workflow")
+    });
+    let runs = || {
+        db.with_conn(|c| {
+            crate::schema::workflow_runs::table
+                .count()
+                .get_result::<i64>(c)
+        })
+        .expect("count the runs")
+    };
+    assert_eq!(runs(), 0, "nothing is open before the refusals");
+
+    for token in [
+        "99".to_string(),
+        "#99".to_string(),
+        format!("{key}-99"),
+        format!("{}-99", key.to_lowercase()),
+    ] {
+        let err = match super::run_start(
+            &db,
+            &EngineRuntime::new(),
+            &json!({
+                "scope": db::WORKFLOW_SCOPE_NSPEC,
+                "spec_id": token,
+                "workspace_id": workspace_id,
+            }),
+        ) {
+            Ok(out) => panic!(
+                "'{token}' designates no Spec and must be refused, got {:?}",
+                out.result
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, "invalid_id", "form '{token}'");
+        assert_eq!(
+            runs(),
+            0,
+            "form '{token}' was refused — it must not have opened a run"
+        );
+    }
+
+    // …while the Spec that DOES exist is untouched by any of it.
+    let stored = db.with_conn(|c| db::get_spec(c, &spec_id)).unwrap().unwrap();
+    assert_eq!(stored.id, spec_id);
+}
+
+/// The refusal above, read as a SENTENCE: it names the accepted forms and the project's most
+/// probable candidate — id included — so the next call can be formed from the answer instead of
+/// guessing. `unknown spec '3'` said neither, and the agent that met it burned four MCP calls
+/// recovering an id nyx already knew.
+#[test]
+fn the_unresolved_reference_refusal_names_the_forms_and_the_likely_candidate() {
+    let _g = db_guard();
+    let sandbox = temp_dir("ref-message");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _p) = seed_project(&db, sandbox.path());
+    let spec_id = spec_ready(&db, &project_id);
+    let number = db.with_conn(|c| db::get_spec(c, &spec_id).unwrap().unwrap().number);
+    db.with_conn(|c| {
+        db::create_workflow(c, Some(&project_id), "nspec", db::WORKFLOW_SCOPE_NSPEC, None)
+            .expect("workflow")
+    });
+
+    let err = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "scope": db::WORKFLOW_SCOPE_NSPEC, "spec_id": "99", "workspace_id": workspace_id }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_id");
+    assert!(
+        err.message.contains(crate::spec_ref::ACCEPTED_FORMS),
+        "the refusal teaches the grammar: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains(&spec_id) && err.message.contains(&format!("#{number}")),
+        "the refusal names the project's likely candidate AND its id: {}",
+        err.message
+    );
+
+    // With NO project to count in, a bare number cannot be resolved at all — so the refusal names
+    // the forms that carry their own project instead of the one it just turned away.
+    let err = super::run_start(&db, &EngineRuntime::new(), &json!({ "spec_id": "99" })).unwrap_err();
+    assert_eq!(err.code, "invalid_id");
+    assert!(
+        err.message.contains(crate::spec_ref::ANCHORLESS_FORMS),
+        "an anchorless call is told what to send INSTEAD: {}",
+        err.message
+    );
+}
+
+/// THE OTHER HALF OF THE CONTRACT: a reference that DOES designate a Spec anchors the run on it,
+/// whichever of the four forms was typed. Refusing the empty reference is only useful if the
+/// resolvable one works.
+#[test]
+fn run_start_anchors_the_run_on_a_resolvable_short_reference() {
+    let _g = db_guard();
+    let sandbox = temp_dir("ref-resolves");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _p) = seed_project(&db, sandbox.path());
+    let spec_id = spec_ready(&db, &project_id);
+    let wf = spawn_workflow(&db, &project_id);
+    let (key, number) = db.with_conn(|c| {
+        let spec = db::get_spec(c, &spec_id).unwrap().unwrap();
+        let project = db::get_project(c, &project_id).unwrap().unwrap();
+        (project.key, spec.number)
+    });
+
+    for token in [
+        spec_id.clone(),
+        format!("{key}-{number}"),
+        format!("#{number}"),
+        number.to_string(),
+    ] {
+        let out = super::run_start(
+            &db,
+            &EngineRuntime::new(),
+            &json!({
+                "scope": db::WORKFLOW_SCOPE_NDEV,
+                "spec_id": token,
+                "workflow_id": wf,
+                "workspace_id": workspace_id,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("form '{token}' was refused: {e:?}"));
+        assert_eq!(
+            out.result["spec_id"],
+            json!(spec_id),
+            "form '{token}' must anchor the run on the Spec it names"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A SPEC-SCOPED flow refuses to start UNBOUND (the orphan-run defect)
 // ---------------------------------------------------------------------------
 
@@ -4361,6 +4524,137 @@ fn run_start_warns_that_it_replaced_a_run_whose_graph_changed() {
     assert!(
         message.contains(&dropped) && message.contains("graph changed under it"),
         "the sentence says WHICH run was dropped and WHY: {message}"
+    );
+}
+
+/// THE THIRD OUTCOME LEARNS TO SPEAK — and the three become tellable apart.
+///
+/// `run_start` can do three things and only two of them said so: a REPLACEMENT announced itself
+/// (M4) because a session that had walked half the flow used to restart from the top in silence,
+/// and a CREATION is what a caller assumes. RESUMING said nothing — so "no warning" meant either
+/// "brand-new run" or "you have just walked into the middle of somebody's half-finished session",
+/// which is the same silence as M4 with the sign flipped: there the human lost progress they had,
+/// here they inherit progress they did not make.
+///
+/// FOUR THINGS ARE PINNED:
+///   * `outcome` tells the three apart POSITIVELY — not by which warnings happen to be absent;
+///   * the resume announcement names the LANDING NODE and the AGE, the two facts the human needs
+///     to decide whether to carry on;
+///   * it is a WARNING and the call still succeeds — resuming is correct behaviour;
+///   * and the CONVERGENCE IS UNTOUCHED: resuming still creates no row (N20).
+#[test]
+fn run_start_tells_created_resumed_and_replaced_apart_and_announces_the_resume() {
+    use diesel::prelude::*;
+    let _g = db_guard();
+    let db = Db::in_memory();
+    let (project_id, _ws, _p) = seed_project(&db, temp_dir("resume-warn").path());
+    let spec_id = spec_ready(&db, &project_id);
+    let wf = spawn_workflow(&db, &project_id);
+    let start = || {
+        super::run_start(
+            &db,
+            &EngineRuntime::new(),
+            &json!({ "spec_id": spec_id, "workflow_id": wf }),
+        )
+        .expect("run_start")
+        .result
+    };
+    let resume_warning = |out: &Value| -> Option<Value> {
+        out["warnings"]
+            .as_array()
+            .expect("a warnings array")
+            .iter()
+            .find(|w| w["code"] == super::RUN_RESUMED_WARNING_CODE)
+            .cloned()
+    };
+
+    // 1 — CREATED. A fresh run says so, and announces no resume.
+    let first = start();
+    let run_id = first["run_id"].as_str().expect("run_id").to_string();
+    assert_eq!(
+        first["outcome"], "created",
+        "a fresh run is reported as one"
+    );
+    assert!(
+        resume_warning(&first).is_none(),
+        "nothing was resumed: {:?}",
+        first["warnings"]
+    );
+
+    // Drive it onto a node and leave it there for five days — a real landing point, and a real age.
+    tick(&db, &EngineRuntime::new(), &run_id, None);
+    let parked = run_row(&db, &run_id)
+        .current_node_id
+        .expect("the tick parked the run on a node");
+    let node_label = db
+        .with_conn(|c| db::get_node(c, &parked))
+        .expect("read")
+        .expect("the node")
+        .label;
+    let five_days_ago = db::now_millis() - 5 * 24 * 60 * 60 * 1000;
+    db.with_conn(|c| {
+        diesel::update(crate::schema::workflow_runs::table.find(&run_id))
+            .set(crate::schema::workflow_runs::updated_at.eq(five_days_ago))
+            .execute(c)
+    })
+    .expect("age the run");
+
+    // 2 — RESUMED. The same run comes back, and the caller is TOLD where it lands and how long it
+    // has been sitting there.
+    let second = start();
+    assert_eq!(
+        second["run_id"],
+        json!(run_id),
+        "N20 handed the same run back"
+    );
+    assert_eq!(second["outcome"], "resumed", "and reports it as a RESUME");
+    assert_eq!(
+        runs_for(&db, &wf, &spec_id).len(),
+        1,
+        "resuming still creates no row — the convergence is untouched",
+    );
+    let warning = resume_warning(&second)
+        .unwrap_or_else(|| panic!("the resume is announced: {:?}", second["warnings"]));
+    assert_eq!(warning["run_id"], json!(run_id), "it names the run");
+    assert_eq!(
+        warning["node_id"],
+        json!(parked),
+        "…and the node it landed on, as a field a machine can read",
+    );
+    let message = warning["message"].as_str().expect("a human sentence");
+    assert!(
+        message.contains(&node_label) && message.contains(&parked),
+        "the sentence names the LANDING NODE, by label and id: {message}",
+    );
+    assert!(
+        message.contains("5 day(s)"),
+        "…and the run's AGE, so the human can judge whether to carry on: {message}",
+    );
+
+    // 3 — REPLACED. The graph changes under the run: a DIFFERENT outcome, a different announcement,
+    // and no resume claimed for a run that is in fact starting from the top.
+    db.with_conn(|c| db::delete_nodes_for_workflow(c, &wf))
+        .expect("wipe");
+    let root = add_node(&db, &wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(
+        &db,
+        &wf,
+        Some(&root),
+        0,
+        db::NODE_TYPE_SPAWN_SUBAGENT,
+        json!({ "agent_id": "coder" }),
+    );
+    let third = start();
+    assert_eq!(third["outcome"], "replaced");
+    assert_ne!(
+        third["run_id"],
+        json!(run_id),
+        "a fresh run replaced the corpse"
+    );
+    assert!(
+        resume_warning(&third).is_none(),
+        "a replaced run is NOT a resumed one — the flow restarts from the top: {:?}",
+        third["warnings"]
     );
 }
 
@@ -5198,6 +5492,46 @@ fn run_start_refuses_a_spec_from_a_project_that_disagrees_with_the_anchor() {
     assert!(
         err.message.contains("disagree") || err.message.contains("belongs"),
         "the refusal names the disagreement: {}",
+        err.message
+    );
+}
+
+/// N14(a), REACHED THROUGH THE SHORT REFERENCE. Widening the `spec_id` grammar must not become the
+/// back door the guard above exists to close: a human key naming ANOTHER project, passed under this
+/// one's `workspace_id`, is refused with the SAME code and the same sentence as the hand-typed id.
+/// The order is what makes that true — the reference resolves to an id FIRST, and the existing
+/// guard then confronts that id, untouched.
+#[test]
+fn run_start_refuses_a_short_reference_from_a_project_that_disagrees_with_the_anchor() {
+    let _g = db_guard();
+    let s1 = temp_dir("n14a-ref-1");
+    let s2 = temp_dir("n14a-ref-2");
+    let db = Db::in_memory();
+    let (p1, _w1, _) = seed_project(&db, s1.path());
+    let (_p2, w2, _) = seed_project(&db, s2.path());
+    let spec_p1 = spec_ready(&db, &p1);
+    let (key, number) = db.with_conn(|c| {
+        let spec = db::get_spec(c, &spec_p1).unwrap().unwrap();
+        let project = db::get_project(c, &p1).unwrap().unwrap();
+        (project.key, spec.number)
+    });
+
+    let err = super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "spec_id": format!("{key}-{number}"), "workspace_id": w2 }),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains("disagree") || err.message.contains("belongs"),
+        "the refusal names the disagreement, exactly as for a canonical id: {}",
+        err.message
+    );
+    // The refusal names the RESOLVED Spec, so the human reads which Spec the key designated.
+    assert!(
+        err.message.contains(&spec_p1),
+        "the refusal names the Spec the key resolved to: {}",
         err.message
     );
 }
@@ -6089,6 +6423,480 @@ fn a_child_opened_after_a_late_binding_inherits_the_parents_spec() {
     let child_done = tick(&db, &rt, &child_run_id, None);
     assert_eq!(child_done["action"]["type"], "done");
     assert_eq!(child_done["blackboard_delta"]["child_status"], "draft");
+}
+
+// ---------------------------------------------------------------------------
+// `run_bind_spec` — the SAME rattachement, exposed as a RECOVERY verb
+// ---------------------------------------------------------------------------
+
+/// The `data.reason` of a refusal, or `None` — the machine handle the verb promises, read the way a
+/// caller reads it.
+fn refusal_reason(err: &RpcError) -> Option<String> {
+    err.data
+        .as_ref()
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Call the verb, expecting a refusal.
+fn bind_err(db: &Db, rt: &EngineRuntime, run_id: &str, spec_ref: &str) -> RpcError {
+    super::run_bind_spec(db, rt, &json!({ "run_id": run_id, "spec_id": spec_ref }))
+        .expect_err("run_bind_spec refuses")
+}
+
+/// THE RECOVERY WORKS, AND IT IS THE POINT OF THE VERB: a run opened with no Spec — the exact shape
+/// a `/nspec` takes when the human's reference went unread — is attached to the Spec it was about,
+/// and the Spec facts its graph reads go from answering NOTHING to answering.
+///
+/// Before this verb the only way out of that session was to throw it away: `bind_session_run_to_spec`
+/// knew how to do the repair but fired from `spec_create` alone.
+#[test]
+fn run_bind_spec_anchors_an_open_unbound_run_and_arms_its_spec_facts() {
+    let _g = db_guard();
+    let sandbox = temp_dir("bindverb-ok");
+    let db = Db::in_memory();
+    let (project_id, _ws, _p) = seed_project(&db, sandbox.path());
+    let rt = EngineRuntime::new();
+    let run_id = parked_run(&db, &rt, None);
+    let spec_id = draft_spec(&db, &project_id, "The Spec the run was really about");
+
+    assert_eq!(
+        super::resolve_query(&db, &run_row(&db, &run_id), "spec_status").expect("resolve"),
+        Value::Null,
+        "the starting state: an unbound run's Spec facts answer nothing"
+    );
+
+    let out = super::run_bind_spec(&db, &rt, &json!({ "run_id": run_id, "spec_id": spec_id }))
+        .expect("the bind is accepted")
+        .result;
+    assert_eq!(out["run_id"], json!(run_id));
+    assert_eq!(out["spec_id"], json!(spec_id));
+    assert_eq!(
+        run_row(&db, &run_id).spec_id.as_deref(),
+        Some(spec_id.as_str())
+    );
+    assert_eq!(
+        super::resolve_query(&db, &run_row(&db, &run_id), "spec_status").expect("resolve"),
+        json!("draft"),
+        "…and the run's Spec facts RESOLVE — the session is repaired, not replaced"
+    );
+}
+
+/// EVERY REFUSAL NAMES THE PRECONDITION IT BROKE. An opaque "no" relaunches exactly the hunt this
+/// PRD removes, so the four conditions on the RUN each answer with their own `data.reason` — and
+/// with `invalid_state`, because none of them is a malformed argument: the argument is fine, the
+/// run is not in a state where this may happen.
+///
+/// THE OWNERSHIP GUARD — the run must be one THIS session drives, case (a) below — is the one that
+/// survives receiving an explicit `run_id`, and the one it is most tempting to declare redundant. It
+/// is not: `/nspec` runs on the BUILT-IN workflow (`project_id IS NULL`), `run_list` on it
+/// enumerates every session and every project with no filter, and the descriptor sends the agent to
+/// that list. The session registry is the only thing that says "yours", so a run driven by ANOTHER
+/// runtime is refused here even though every other condition on it holds. (It is named, not ranked:
+/// the guards are ordered by what each can truthfully answer, and an ordinal in this comment would
+/// be a second statement of that order, free to fall behind it — finding
+/// `01M0ZW92A790T7TTX7G3QAXR6M`.)
+#[test]
+fn run_bind_spec_names_the_precondition_each_refusal_broke() {
+    let _g = db_guard();
+    let sandbox = temp_dir("bindverb-refusals");
+    let db = Db::in_memory();
+    let (project_id, _ws, _p) = seed_project(&db, sandbox.path());
+    let rt = EngineRuntime::new();
+    let spec_id = draft_spec(&db, &project_id, "Target");
+
+    // (a) A run of ANOTHER session: unbound, top-level, live — and not ours.
+    let other_session = EngineRuntime::new();
+    let foreign = parked_run(&db, &other_session, None);
+    let err = bind_err(&db, &rt, &foreign, &spec_id);
+    assert_eq!(err.code, RpcCode::InvalidState, "{}", err.message);
+    assert_eq!(
+        refusal_reason(&err).as_deref(),
+        Some(super::bind_refusal::FOREIGN_RUN),
+        "{}",
+        err.message
+    );
+    assert!(
+        run_row(&db, &foreign).spec_id.is_none(),
+        "and the other session's run was not touched"
+    );
+
+    // (b) A run that ALREADY drives a Spec — never re-written, never stolen.
+    let own = draft_spec(&db, &project_id, "Its own Spec");
+    let bound = parked_run(&db, &rt, Some(&own));
+    let err = bind_err(&db, &rt, &bound, &spec_id);
+    assert_eq!(err.code, RpcCode::InvalidState, "{}", err.message);
+    assert_eq!(
+        refusal_reason(&err).as_deref(),
+        Some(super::bind_refusal::ALREADY_BOUND)
+    );
+    assert_eq!(
+        run_row(&db, &bound).spec_id.as_deref(),
+        Some(own.as_str()),
+        "…and it still drives the Spec it did"
+    );
+
+    // (c) A CHILD run: it inherits its Spec from its parent, so anchoring it contradicts the parent.
+    let parent = parked_run(&db, &rt, None);
+    let child = parked_run(&db, &rt, None);
+    db.with_conn(|c| db::set_run_parent(c, &child, &parent))
+        .expect("set_run_parent");
+    let err = bind_err(&db, &rt, &child, &spec_id);
+    assert_eq!(err.code, RpcCode::InvalidState, "{}", err.message);
+    assert_eq!(
+        refusal_reason(&err).as_deref(),
+        Some(super::bind_refusal::CHILD_RUN)
+    );
+    assert!(run_row(&db, &child).spec_id.is_none());
+
+    // (d) A TERMINAL run: nothing left to drive, so anchoring it only rewrites history.
+    //
+    // DRIVEN TO ITS END BY THE ENGINE, which is what makes this case the production path and not a
+    // fabrication. Writing `done` straight into the row would leave the run in the session registry
+    // and let the ownership guard pass — while in production `nyx_next` FORGETS a run the moment it
+    // finishes, so the commonest call of all ("bind the run I just finished") arrives on a run the
+    // registry no longer holds. Under a fabricated terminal run this assertion held for a reason
+    // production does not have, and the refusal it hid said `run_not_in_this_session` — the one
+    // thing that is false about that run (finding `01M0ZWAHAF2PXRFVSW0WQH8FQB`).
+    let finished = parked_run(&db, &rt, None);
+    assert_eq!(
+        tick(&db, &rt, &finished, Some(json!({ "answer": "over" })))["action"]["type"],
+        "done",
+        "the engine walks this run to its end, and drops its slot doing so"
+    );
+    assert_eq!(run_row(&db, &finished).status, db::RUN_STATUS_DONE);
+    assert!(
+        !rt.session_run_ids().contains(&finished),
+        "…so the run is gone from the registry, exactly as in production"
+    );
+    let err = bind_err(&db, &rt, &finished, &spec_id);
+    assert_eq!(err.code, RpcCode::InvalidState, "{}", err.message);
+    assert_eq!(
+        refusal_reason(&err).as_deref(),
+        Some(super::bind_refusal::TERMINAL_RUN),
+        "a run THIS session finished is refused for being OVER, not for being someone else's: {}",
+        err.message
+    );
+    assert!(run_row(&db, &finished).spec_id.is_none());
+
+    // …and an id naming no run at all is `invalid_id`, as everywhere else in nyx.
+    let err = bind_err(&db, &rt, "no-such-run", &spec_id);
+    assert_eq!(err.code, RpcCode::InvalidId, "{}", err.message);
+}
+
+/// N20 IS THE SPEC'S INVARIANT, SO THE SPEC IS LOOKED AT TOO — the guard `bind_session_run_to_spec`
+/// never needed and this verb cannot do without.
+///
+/// "At most ONE live run per (workflow, Spec)" is upheld by `run_start` alone, inside
+/// `db::start_or_resume_workflow_run`, which converges the pair by KEEPING the most recent live run
+/// and DELETING the others. A bind that inspected only its source run could therefore compose the
+/// exact state `run_start` refuses to open — and it is the PRD's own scenario that composes it: a
+/// Spec already carries a parked `/nspec` run, the human opens a second one without a reference, it
+/// starts unbound, and the repair verb is asked to anchor it. Both live on the pair, and the next
+/// `run_start` on that Spec destroys one of them with everything it had walked.
+///
+/// So the refusal names the rival run, which is what makes it actionable — and it ORDERS the two
+/// gestures: resume the rival first (it is the run that walked the flow, and picking it up loses
+/// nothing), and if one of the two must go, the run it says is safe to delete is THIS call's own,
+/// the one whose work the caller can see. Naming no run left "delete the one you do not want" to be
+/// read from inside the caller's run as "delete the rival" — the very loss the guard just prevented.
+#[test]
+fn run_bind_spec_refuses_a_spec_that_already_carries_a_live_run_of_the_workflow() {
+    let _g = db_guard();
+    let sandbox = temp_dir("bindverb-n20");
+    let db = Db::in_memory();
+    let (project_id, _ws, _p) = seed_project(&db, sandbox.path());
+    let rt = EngineRuntime::new();
+    let spec_id = draft_spec(&db, &project_id, "Already being driven");
+
+    // R1 — the parked run the Spec already carries, on some workflow.
+    let first = parked_run(&db, &rt, Some(&spec_id));
+    let workflow_id = run_row(&db, &first).workflow_id;
+    // R2 — a SECOND run of that SAME workflow, opened unbound (the run the human wants rescued).
+    let second = db
+        .with_conn(|c| db::create_workflow_run(c, &workflow_id, None, None, "{}"))
+        .expect("run")
+        .id;
+    // It is genuinely this session's and genuinely bindable on every other count.
+    assert_eq!(
+        tick(&db, &rt, &second, None)["action"]["type"],
+        "ask_human",
+        "R2 is live, parked and in this session's registry"
+    );
+
+    let err = bind_err(&db, &rt, &second, &spec_id);
+    assert_eq!(err.code, RpcCode::InvalidState, "{}", err.message);
+    assert_eq!(
+        refusal_reason(&err).as_deref(),
+        Some(super::bind_refusal::SPEC_HAS_A_LIVE_RUN),
+        "{}",
+        err.message
+    );
+    assert!(
+        err.message.contains(&format!("RESUME {first}")),
+        "the refusal NAMES the rival run, and the RECOVERY is the first gesture it offers: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains(&format!("run_delete is '{second}'")),
+        "…and the run it says is safe to delete is the CALLER'S OWN, never the rival that walked \
+         the flow: {}",
+        err.message
+    );
+    assert!(run_row(&db, &second).spec_id.is_none());
+    assert_eq!(
+        run_row(&db, &first).spec_id.as_deref(),
+        Some(spec_id.as_str()),
+        "and R1 — the run that had walked the flow — is untouched"
+    );
+
+    // THE GUARD IS NOT A WALL: once the rival is over, the pair carries no live run and the repair
+    // goes through.
+    db.with_conn(|c| db::update_workflow_run(c, &first, None, "{}", db::RUN_STATUS_DONE, None))
+        .expect("finish R1");
+    super::run_bind_spec(&db, &rt, &json!({ "run_id": second, "spec_id": spec_id }))
+        .expect("the bind is accepted once no live run remains on the pair");
+    assert_eq!(
+        run_row(&db, &second).spec_id.as_deref(),
+        Some(spec_id.as_str())
+    );
+}
+
+/// THE CROSS-PROJECT GUARD, ON THE RESOLVED ID. A `KEY-N` carries its OWN project, so the short
+/// grammar is precisely the form that can name a Spec of somewhere else — and this verb must not
+/// become the back door through which a foreign Spec is anchored on a run whose workspace says
+/// otherwise. The disagreement is NAMED, never silently resolved either way.
+#[test]
+fn run_bind_spec_refuses_a_spec_of_another_project() {
+    let _g = db_guard();
+    let mine = temp_dir("bindverb-mine");
+    let theirs = temp_dir("bindverb-theirs");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _p) = seed_project(&db, mine.path());
+    let (other_project, _other_ws, _op) = db.with_conn(|c| {
+        let (project, root) =
+            db::create_project(c, "Other", theirs.path().to_str().unwrap(), None).expect("project");
+        (project.id, root.id.clone(), root.root_path)
+    });
+    let other_key = db
+        .with_conn(|c| db::get_project(c, &other_project))
+        .expect("project")
+        .expect("row")
+        .key;
+    let foreign_spec = draft_spec(&db, &other_project, "Someone else's Spec");
+    let foreign_number = db
+        .with_conn(|c| db::get_spec(c, &foreign_spec))
+        .expect("spec")
+        .expect("row")
+        .number;
+
+    let rt = EngineRuntime::new();
+    let run_id = parked_run(&db, &rt, None);
+    db.with_conn(|c| db::set_run_workspace(c, &run_id, &workspace_id))
+        .expect("anchor the run on my workspace");
+
+    // Named by its canonical id, and named by the KEY that carries the other project: the same
+    // refusal, because the guard reads the RESOLVED Spec's project and nothing else.
+    for reference in [
+        foreign_spec.clone(),
+        format!("{other_key}-{foreign_number}"),
+    ] {
+        let err = bind_err(&db, &rt, &run_id, &reference);
+        assert_eq!(err.code, RpcCode::InvalidState, "{}", err.message);
+        assert_eq!(
+            refusal_reason(&err).as_deref(),
+            Some(super::bind_refusal::PROJECT_DISAGREEMENT),
+            "'{reference}': {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(&project_id) && err.message.contains(&other_project),
+            "the refusal names BOTH projects: {}",
+            err.message
+        );
+    }
+    assert!(run_row(&db, &run_id).spec_id.is_none());
+}
+
+/// THE FOUR FORMS REACH THIS VERB LIKE EVERY OTHER `spec_id` FIELD — through the one entry point,
+/// with the `run_id` as the anchor a `#N` is counted in. The human types what their renders showed
+/// them, and a recovery verb they cannot address is no recovery.
+///
+/// A reference that designates NOTHING earns the same actionable refusal `run_start` gives, from
+/// the same function: the forms, and what the project actually holds.
+#[test]
+fn run_bind_spec_accepts_the_four_forms_and_refuses_a_reference_that_designates_nothing() {
+    let _g = db_guard();
+    let sandbox = temp_dir("bindverb-forms");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _p) = seed_project(&db, sandbox.path());
+    let key = db
+        .with_conn(|c| db::get_project(c, &project_id))
+        .expect("project")
+        .expect("row")
+        .key;
+    let spec_id = draft_spec(&db, &project_id, "Reachable by any of its names");
+    let number = db
+        .with_conn(|c| db::get_spec(c, &spec_id))
+        .expect("spec")
+        .expect("row")
+        .number;
+    let rt = EngineRuntime::new();
+
+    for reference in [
+        spec_id.clone(),
+        format!("{key}-{number}"),
+        format!("#{number}"),
+        number.to_string(),
+    ] {
+        // A FRESH run per form — the pair (workflow, Spec) may carry only one live run, which is
+        // the guard this test must not fight.
+        let run_id = parked_run(&db, &rt, None);
+        db.with_conn(|c| db::set_run_workspace(c, &run_id, &workspace_id))
+            .expect("anchor the run, so a bare number has a project to be counted in");
+        let args = json!({ "run_id": run_id, "spec_id": reference });
+        let out = super::run_bind_spec(&db, &rt, &args)
+            .unwrap_or_else(|e| panic!("'{reference}' must resolve: {}", e.message))
+            .result;
+        assert_eq!(
+            out["spec_id"],
+            json!(spec_id),
+            "'{reference}' names the same Spec as its canonical id"
+        );
+    }
+
+    // …and a number the project does not hold is refused with the forms and the nearest candidate.
+    let orphan = parked_run(&db, &rt, None);
+    db.with_conn(|c| db::set_run_workspace(c, &orphan, &workspace_id))
+        .expect("anchor");
+    let err = bind_err(&db, &rt, &orphan, "9999");
+    assert_eq!(err.code, RpcCode::InvalidId, "{}", err.message);
+    assert!(
+        err.message.contains(crate::spec_ref::ACCEPTED_FORMS) && err.message.contains(&spec_id),
+        "the refusal teaches the grammar and names what the project holds: {}",
+        err.message
+    );
+    assert!(run_row(&db, &orphan).spec_id.is_none());
+}
+
+/// THE ANCHOR OF THIS VERB CAN END ON NOTHING — the one thing that separates it from every other
+/// field whose project anchor is REQUIRED. A `run_id` is required here, but a run's project is its
+/// WORKSPACE's, and `run_start` deliberately opens a run without one when its `cwd` matched none
+/// (warning `run_location_unresolved`) — which is precisely the "session that started wrong" this
+/// verb exists to repair. So on that run `#N` / `N` cannot be counted, and the refusal must say what
+/// is TRUE HERE: send a form that carries its own project. What it must NOT do is send the agent
+/// after a `cwd` / `workspace_id` / `project_id`, because this verb's schema has none of the three —
+/// advice that cannot be followed is the shape of the original defect, not its fix (finding
+/// `01M0ZWAH9EQDAZR66AFS1YJFPY`).
+#[test]
+fn run_bind_spec_refuses_a_short_form_on_a_run_that_anchors_no_project() {
+    let _g = db_guard();
+    let sandbox = temp_dir("bindverb-noanchor");
+    let db = Db::in_memory();
+    let (project_id, _ws, _p) = seed_project(&db, sandbox.path());
+    let spec_id = draft_spec(&db, &project_id, "Nameable only by a self-anchored form");
+    let number = db
+        .with_conn(|c| db::get_spec(c, &spec_id))
+        .expect("spec")
+        .expect("row")
+        .number;
+    let rt = EngineRuntime::new();
+
+    // The run of a session that started wrong: live, this session's, unbound — and with NO
+    // workspace, so nothing about it names a project.
+    let orphan = parked_run(&db, &rt, None);
+    assert!(
+        run_row(&db, &orphan).workspace_id.is_none(),
+        "the premise: this run anchors no workspace, hence no project"
+    );
+
+    for reference in [format!("#{number}"), number.to_string()] {
+        let err = bind_err(&db, &rt, &orphan, &reference);
+        assert_eq!(
+            err.code,
+            RpcCode::InvalidId,
+            "'{reference}': {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(crate::spec_ref::ANCHORLESS_FORMS),
+            "'{reference}': the refusal names the forms that CAN resolve here: {}",
+            err.message
+        );
+        // THE CONSTANT, NOT A FRAGMENT RETYPED FROM IT. This is a NEGATIVE assertion, the kind that
+        // goes vacuous without ever going red: re-word `RUN_START_ANCHOR_TRAILER` and a literal
+        // copy of its old wording would keep passing while `run_bind_spec` happily appended the new
+        // one. Read against the constant, it always denies whatever `run_start` currently advises
+        // (finding `01M10Y9HCPV8BKWV5HDQG506R9`).
+        assert!(
+            !err.message
+                .contains(crate::mcp_engine::RUN_START_ANCHOR_TRAILER),
+            "'{reference}': and it never offers arguments run_bind_spec does not accept — \
+             `run_start`'s trailer ('{}') has no place in this verb's refusal: {}",
+            crate::mcp_engine::RUN_START_ANCHOR_TRAILER,
+            err.message
+        );
+        assert!(
+            err.message.contains("carries no workspace"),
+            "'{reference}': it says WHY no number can be counted: {}",
+            err.message
+        );
+        assert!(run_row(&db, &orphan).spec_id.is_none());
+    }
+
+    // …and the SELF-ANCHORED forms still work on a run like this one, which is what makes the
+    // refusal above a redirection rather than a dead end. BOTH are EXERCISED rather than announced:
+    // they are not one path said twice — the canonical id short-circuits inside
+    // `mcp_context::resolve_spec_arg`, while `KEY-N` travels on through `spec_ref::resolve` with NO
+    // project, which is exactly the condition this run creates. A comment claiming the second works
+    // would have claimed it of an assertion that never ran.
+    //
+    // A FRESH Spec AND a fresh orphan run per form — the same discipline as
+    // `run_bind_spec_accepts_the_four_forms_…`: binding CONSUMES the run (a second bind on it
+    // meets `run_already_bound`), so the second form cannot be shown on the first run.
+    let key = db
+        .with_conn(|c| db::get_project(c, &project_id))
+        .expect("project")
+        .expect("row")
+        .key;
+    for by_key in [false, true] {
+        let target = draft_spec(&db, &project_id, "Nameable only by a self-anchored form");
+        let reference = if by_key {
+            let number = db
+                .with_conn(|c| db::get_spec(c, &target))
+                .expect("spec")
+                .expect("row")
+                .number;
+            format!("{key}-{number}")
+        } else {
+            target.clone()
+        };
+        // The first form reuses the run the refusals were shown on — still unbound, since a
+        // refusal writes nothing; the second needs its own, for the reason above.
+        let run = if by_key {
+            parked_run(&db, &rt, None)
+        } else {
+            orphan.clone()
+        };
+        assert!(
+            run_row(&db, &run).workspace_id.is_none(),
+            "'{reference}': the premise holds on this run too — no workspace, hence no project"
+        );
+        let out = super::run_bind_spec(&db, &rt, &json!({ "run_id": run, "spec_id": reference }))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "'{reference}' carries its own project, workspace or no workspace: {}",
+                    e.message
+                )
+            })
+            .result;
+        assert_eq!(
+            out["spec_id"],
+            json!(target),
+            "'{reference}' resolves to the Spec it names, on a run that anchors nothing"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9961,4 +10769,559 @@ fn the_worktrees_root_fact_reads_the_project_through_the_runs_workspace_when_no_
         "no anchor at all → \"\""
     );
     assert_eq!(board["worktrees_root_configured"], json!(false));
+}
+
+// ---------------------------------------------------------------------------
+// The outcome vocabulary
+// ---------------------------------------------------------------------------
+
+/// A COMPILER-ENFORCED VISIT, which is the strongest lock the language gives this list.
+///
+/// [`RUN_START_OUTCOME_TAGS`] is a hand-kept mirror of [`RunStartOutcome`]'s variants, and
+/// `mcp::tests::run_start_advertises_every_listed_outcome_tag` walks the LIST against `tools/list`
+/// — so a tag that never reaches the list is advertised nowhere and caught by nothing. Rust cannot
+/// DERIVE the list (`Replaced` carries a payload, so there is no value set to enumerate, and
+/// `variant_count` is unstable), but it can make the gap impossible to walk past: the match below
+/// is exhaustive, so a FOURTH variant stops this file compiling, and whoever adds it reads the
+/// assertion underneath before they can go green.
+///
+/// WHAT IT DOES NOT DO: it does not prove the list is complete — it forces the author HERE, where
+/// the completion is spelled out. That is a visit, not a derivation, and the difference is why the
+/// list's own doc still carries the instruction in words.
+#[test]
+fn every_run_start_outcome_carries_a_listed_tag() {
+    fn tag_of(outcome: &RunStartOutcome) -> &'static str {
+        match outcome {
+            RunStartOutcome::Created => RUN_START_OUTCOME_CREATED,
+            RunStartOutcome::Resumed => RUN_START_OUTCOME_RESUMED,
+            RunStartOutcome::Replaced(_) => RUN_START_OUTCOME_REPLACED,
+        }
+    }
+    // The payload-free variants can be VALUED here, so for those the walk is a real check and not
+    // only a compile-time one. `Replaced` is covered by the match arm above.
+    for outcome in [RunStartOutcome::Created, RunStartOutcome::Resumed] {
+        let tag = tag_of(&outcome);
+        assert!(
+            RUN_START_OUTCOME_TAGS.contains(&tag),
+            "'{tag}' is an outcome run_start can return, so it belongs on \
+             RUN_START_OUTCOME_TAGS — which is what tools/list is walked against",
+        );
+        assert_eq!(
+            tag,
+            outcome.tag(),
+            "the witness and the published tag must be ONE fact",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The RUNTIME consent check — a sensitive node reads the board's PROVENANCE
+// ---------------------------------------------------------------------------
+
+/// Build `sequence[ <writer>, transition{ready, gate_on: <key>} ]` on a fresh workflow bound to a
+/// ready-able `draft` Spec, and return `(run_id, spec_id)`. The shape is the reproduced bypass in its
+/// smallest form: something fills the key, the engaging transition fires on it.
+fn engaging_transition_gated_on(
+    db: &Db,
+    project_id: &str,
+    tag: &str,
+    writer_type: &str,
+    writer_config: Value,
+    gate_key: &str,
+) -> (String, String) {
+    let spec_id = spec_draft(db, project_id);
+    let wf = db.with_conn(|c| {
+        db::create_workflow(c, None, tag, db::WORKFLOW_SCOPE_CUSTOM, None)
+            .expect("workflow")
+            .id
+    });
+    let root = add_node(db, &wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(db, &wf, Some(&root), 0, writer_type, writer_config);
+    add_node(
+        db,
+        &wf,
+        Some(&root),
+        1,
+        db::NODE_TYPE_TRANSITION,
+        json!({ "target_state": "ready", "gate_on": gate_key }),
+    );
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, &wf, Some(&spec_id), None, "{}"))
+        .expect("run")
+        .id;
+    (run_id, spec_id)
+}
+
+/// THE BYPASS THIS VOLET EXISTS TO CLOSE, reproduced at its smallest: an ENGAGING `transition` whose
+/// `gate_on` names a key a **query** fills. The gate is satisfied — `spec_can_transition` writes
+/// `true`, and `true` is an affirmative — so nyx moved the Spec's lifecycle with no human anywhere in
+/// the run, and nothing on any layer noticed: there is no `ask_human` node, so
+/// `Tree::ask_human_commitment` classifies nothing, no `PendingConsent` is opened, and
+/// `accept_consent_answer` is never reached.
+///
+/// The static guard DOES refuse to AUTHOR this graph (rule (4) wants a question above the sensitive
+/// node), and that guard is untouched — asserted below. What it cannot do is refuse to RUN a graph it
+/// never saw: one seeded, forked, hand-inserted, or authored before the rule existed. The provenance
+/// closes that, and closes it from the run rather than from the shape.
+#[test]
+fn an_engaging_transition_gated_on_a_query_fact_is_refused_for_want_of_a_human() {
+    let _g = db_guard();
+    let sandbox = temp_dir("prov-query-gate");
+    let db = Db::in_memory();
+    let (project_id, _wsid, _root) = seed_project(&db, sandbox.path());
+    let (run_id, spec_id) = engaging_transition_gated_on(
+        &db,
+        &project_id,
+        "prov-query",
+        db::NODE_TYPE_QUERY,
+        json!({ "query": "spec_can_transition", "target": "ready", "write": "approved" }),
+        "approved",
+    );
+
+    // THE STATIC GUARD IS STILL THERE, and still refuses this shape at authoring time. The two are
+    // complementary: the guard stops the graph being written, the provenance stops it being run.
+    let workflow_id = run_row(&db, &run_id).workflow_id;
+    let nodes = db
+        .with_conn(|c| db::list_nodes(c, &workflow_id))
+        .expect("nodes");
+    assert!(
+        crate::mcp_authoring::validate_tree(&nodes, None).is_err(),
+        "rule (4) refuses a sensitive node with no question above it — that has not changed"
+    );
+
+    let rt = EngineRuntime::new();
+    let err = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id })).unwrap_err();
+    let data = err.data.clone().unwrap_or(Value::Null);
+    assert_eq!(
+        data["reason"], "sensitive_step_without_human_provenance",
+        "the refusal is the provenance one, not the old ungated-gate one: {}",
+        err.message
+    );
+    // IT NAMES THE THREE THINGS A CALLER NEEDS: the key, what really wrote it, and what was expected.
+    assert_eq!(data["gate_key"], "approved");
+    assert_eq!(data["written_by_type"], db::NODE_TYPE_QUERY);
+    assert_eq!(data["expected"], db::NODE_TYPE_ASK_HUMAN);
+    assert!(
+        err.message.contains("approved") && err.message.contains("ask_human"),
+        "the sentence names the key and what would have opened it: {}",
+        err.message
+    );
+    assert_eq!(
+        spec_status(&db, &spec_id),
+        db::SPEC_STATUS_DRAFT,
+        "and the Spec did NOT move"
+    );
+    // The run is PARKED on the transition, not failed: the exit is a human's answer, and the leaf is
+    // replayed so it can be taken.
+    assert_eq!(run_row(&db, &run_id).status, db::RUN_STATUS_BLOCKED);
+}
+
+/// THE WHOLE CLASS, not just the `query` case: of the four node types that can put an affirmative
+/// under a gate key, exactly ONE opens a sensitive node. A `judge`'s verdict and a `spawn_subagent`'s
+/// report are as machine-made as a `query`'s fact, and the board now says which is which — this is
+/// the property that makes the six static guards redundant, so it is proved on every origin rather
+/// than on the one that was observed.
+#[test]
+fn only_an_ask_human_write_opens_an_engaging_transition_never_a_judge_or_a_spawn() {
+    let _g = db_guard();
+    let sandbox = temp_dir("prov-origins");
+    let db = Db::in_memory();
+    let (project_id, _wsid, _root) = seed_project(&db, sandbox.path());
+    let rt = EngineRuntime::new();
+
+    // Each case: (tag, writer type, writer config, gate key, the result the dispatcher reports).
+    let cases: Vec<(&str, &str, Value, &str, Option<Value>)> = vec![
+        (
+            "judge",
+            db::NODE_TYPE_JUDGE,
+            json!({ "prompt": "ready?", "output_key": "approved" }),
+            "approved",
+            Some(json!({ "verdict": "yes" })),
+        ),
+        (
+            "spawn",
+            db::NODE_TYPE_SPAWN_SUBAGENT,
+            json!({ "agent_id": "coder" }),
+            // A `spawn_subagent` names no key: it writes the FIXED `last_diff`, so that is what a
+            // graph would have to gate on — and a report reading "yes" is an affirmative.
+            "last_diff",
+            Some(json!({ "diff": "yes" })),
+        ),
+    ];
+    for (tag, writer_type, writer_config, gate_key, reported) in cases {
+        let (run_id, spec_id) = engaging_transition_gated_on(
+            &db,
+            &project_id,
+            tag,
+            writer_type,
+            writer_config,
+            gate_key,
+        );
+        // Tick once to reach the writer leaf, then report its result — the next walk hits the gate.
+        tick(&db, &rt, &run_id, None);
+        let err = super::nyx_next(
+            &db,
+            &rt,
+            no_session(),
+            &json!({ "run_id": run_id, "last_result": reported }),
+        )
+        .unwrap_err();
+        let data = err.data.clone().unwrap_or(Value::Null);
+        assert_eq!(
+            data["reason"], "sensitive_step_without_human_provenance",
+            "a '{writer_type}' write is not a human's answer: {}",
+            err.message
+        );
+        assert_eq!(data["written_by_type"], writer_type, "and it is NAMED");
+        assert_eq!(
+            spec_status(&db, &spec_id),
+            db::SPEC_STATUS_DRAFT,
+            "the Spec did not move on a '{writer_type}' write"
+        );
+    }
+}
+
+/// THE FOURTH ORIGIN — the one that DOES open it. The same shape, with an `ask_human` filling the gate
+/// key and a real human turn behind the answer: the Spec moves. Without this the check would be
+/// indistinguishable from a guard that simply refuses everything, and a consent gate nobody can pass
+/// is not a consent gate.
+#[test]
+fn an_ask_human_write_with_a_human_turn_behind_it_opens_the_transition() {
+    let _g = db_guard();
+    let sandbox = temp_dir("prov-human");
+    let db = Db::in_memory();
+    let (project_id, _wsid, _root) = seed_project(&db, sandbox.path());
+    let (run_id, spec_id) = engaging_transition_gated_on(
+        &db,
+        &project_id,
+        "prov-ask",
+        db::NODE_TYPE_ASK_HUMAN,
+        json!({ "prompt": "mark it ready?", "output_key": "approved", "options": ["yes", "no"] }),
+        "approved",
+    );
+
+    let rt = EngineRuntime::new();
+    let session = Session::new("term-prov-human");
+    session.human_says(&db, "let's start");
+    let asked = session.tick(&db, &rt, &run_id, None);
+    assert_eq!(
+        asked["action"]["human_turn_required"], true,
+        "the question still declares that it takes a human turn — unchanged by the provenance"
+    );
+    // THE HUMAN SPEAKS, then the session relays what they said.
+    session.human_says(&db, "yes, mark it ready");
+    session.tick(&db, &rt, &run_id, Some(json!({ "decision": "yes" })));
+
+    assert_eq!(
+        spec_status(&db, &spec_id),
+        db::SPEC_STATUS_READY,
+        "an answer a human actually gave opens the transition"
+    );
+    let board = crate::engine::Blackboard::from_json_str(&run_row(&db, &run_id).blackboard);
+    assert!(
+        board
+            .origin_of("approved")
+            .expect("the answer's origin is recorded")
+            .is_human_answer(),
+        "and the board says WHY it was allowed"
+    );
+}
+
+/// RETRO-COMPATIBILITY, in the shape a deployment actually produces: a run whose board was written
+/// before nyx recorded provenance. The key holds an affirmative and NOTHING says who wrote it.
+///
+/// It must NOT block. Refusing "cannot tell" would freeze every run in flight the moment this ships —
+/// a self-inflicted outage, for a guarantee that fills itself in as runs renew. So the crossing goes
+/// through on the old terms and the tick SAYS SO, in the notes channel that rides the action: the
+/// degradation is explicit rather than silent, which is the whole difference between a documented
+/// fallback and a hole.
+#[test]
+fn a_board_with_no_provenance_still_crosses_and_says_it_could_not_tell() {
+    let _g = db_guard();
+    let sandbox = temp_dir("prov-legacy");
+    let db = Db::in_memory();
+    let (project_id, _wsid, _root) = seed_project(&db, sandbox.path());
+    let spec_id = spec_draft(&db, &project_id);
+    let wf = db.with_conn(|c| {
+        db::create_workflow(c, None, "prov-legacy", db::WORKFLOW_SCOPE_CUSTOM, None)
+            .expect("workflow")
+            .id
+    });
+    let root = add_node(&db, &wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(
+        &db,
+        &wf,
+        Some(&root),
+        0,
+        db::NODE_TYPE_TRANSITION,
+        json!({ "target_state": "ready", "gate_on": "approved" }),
+    );
+    // THE LEGACY BOARD: a value, and no `__written_by__` — exactly what a run in flight carries.
+    let legacy = json!({ "approved": "yes" }).to_string();
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, &wf, Some(&spec_id), None, &legacy))
+        .expect("run")
+        .id;
+
+    let rt = EngineRuntime::new();
+    let out = tick(&db, &rt, &run_id, None);
+    assert_eq!(
+        spec_status(&db, &spec_id),
+        db::SPEC_STATUS_READY,
+        "a run already in flight is not frozen by a record it could not have"
+    );
+    let notes = out["action"]["notes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|n| n.contains("cannot tell WHO authorized")),
+        "and the tick says it could not tell: {out}"
+    );
+}
+
+/// THE SEEDED GRAPHS GAIN THE GUARANTEE WITHOUT BEING TOUCHED — the argument the whole volet rests on,
+/// demonstrated on the shipped `/nspec` tree rather than assumed.
+///
+/// Two halves, both over the SAME unmodified seeded nodes:
+///
+///   * WHAT THE CHECK READS. The `go` arm's `create_workspace` declares `gate_on: "workspace_free"`,
+///     a key the PREVALIDATION query fills; its consent is the `selector` one level up comparing
+///     `ready_ok` to `"go"`. `consent_keys` returns both, in that order, so a check that stopped at
+///     the gate would refuse the shipped flow and one that ignored the gate would miss the
+///     prevalidation. (`seed::tests` names this node as the one seeded gate hanging on a query fact.)
+///   * WHAT IT DECIDES. Handed a board where `ready_ok` was written by the seeded QUERY node instead
+///     of by the seeded question, the crossing is REFUSED — and the refusal names that query. Handed
+///     the same board with the seeded `ask_human` as the author, it is allowed. Nothing in the graph
+///     differs between the two runs; only what actually happened does.
+#[test]
+fn the_seeded_nspec_graph_gains_the_provenance_guarantee_untouched() {
+    let _g = db_guard();
+    let db = Db::in_memory();
+    db.with_conn(crate::seed::seed_builtin_workflows)
+        .expect("seed");
+    let (wf, nodes) = db.with_conn(|c| {
+        let wf = db::list_workflows(c, None)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.scope == db::WORKFLOW_SCOPE_NSPEC)
+            .expect("the seeded nspec");
+        let nodes = db::list_nodes(c, &wf.id).unwrap();
+        (wf, nodes)
+    });
+    let tree = crate::engine::Tree::from_rows(&nodes, wf.root_node_id.as_deref()).expect("tree");
+
+    let workspace_node = nodes
+        .iter()
+        .find(|n| n.type_ == db::NODE_TYPE_CREATE_WORKSPACE)
+        .expect("the seeded create_workspace");
+    assert_eq!(
+        tree.consent_keys(&workspace_node.id),
+        vec!["workspace_free".to_string(), "ready_ok".to_string()],
+        "the gate's own key FIRST, then the answer the selector above routes on",
+    );
+
+    // The two seeded nodes the forged boards will name as authors.
+    let question = nodes
+        .iter()
+        .find(|n| n.type_ == db::NODE_TYPE_ASK_HUMAN && n.label == "confirm ready")
+        .expect("the seeded 'confirm ready' question");
+    let prevalidation = nodes
+        .iter()
+        .find(|n| {
+            n.type_ == db::NODE_TYPE_QUERY && n.config.contains(super::QUERY_WORKSPACE_TARGET_FREE)
+        })
+        .expect("the seeded prevalidation query");
+
+    // A board at the instant the run reaches the mkdir: the prevalidation said free, and `ready_ok`
+    // holds 'go'. ONLY its author changes between the two cases.
+    let board_written_by = |author: &db::Node| {
+        let mut board = crate::engine::Blackboard::new();
+        let by = crate::engine::NodeOrigin::new(
+            author.id.clone(),
+            crate::engine::NodeType::from_db(&author.type_).unwrap(),
+        );
+        let prevalidated = crate::engine::NodeOrigin::new(
+            prevalidation.id.clone(),
+            crate::engine::NodeType::Query,
+        );
+        board
+            .written_by(&prevalidated)
+            .set("workspace_free", json!(true));
+        board.written_by(&by).set("ready_ok", json!("go"));
+        board
+    };
+
+    let refused = crate::engine::Engine::new(tree.clone(), board_written_by(prevalidation));
+    let mut notes = Vec::new();
+    let err = super::crossing_is_authorized(
+        &refused,
+        &workspace_node.id,
+        crate::engine::SensitiveEffect::CreateWorkspace,
+        &mut notes,
+    )
+    .expect_err("a 'go' nobody answered does not open a folder on the user's disk");
+    assert_eq!(
+        err.data.clone().unwrap_or(Value::Null)["written_by_node"],
+        Value::from(prevalidation.id.clone()),
+        "the refusal names the seeded node that really wrote it: {}",
+        err.message
+    );
+
+    let allowed = crate::engine::Engine::new(tree, board_written_by(question));
+    let mut notes = Vec::new();
+    super::crossing_is_authorized(
+        &allowed,
+        &workspace_node.id,
+        crate::engine::SensitiveEffect::CreateWorkspace,
+        &mut notes,
+    )
+    .expect("the seeded question's own answer opens it, through the selector above the gate");
+    assert!(
+        notes.is_empty(),
+        "a known human author needs no degradation warning: {notes:?}"
+    );
+}
+
+/// A KEY HOLDING A REFUSAL AUTHORIZES NOTHING, WHOEVER WROTE IT. `consent_origin` walks
+/// `consent_keys` and skips every key that is not currently AFFIRMATIVE
+/// ([`super::board_value_is_affirmative`]) — the filter is what stops the walk from stopping at the
+/// FIRST key an `ask_human` happens to have written, regardless of what it says.
+///
+/// Same seeded graph as above, same two seeded authors, one difference: the key the question wrote
+/// says `false`. Drop the filter and that `false` is read as "a human authorized this" and the mkdir
+/// crosses — a human's NO standing in for a human's YES, which is the exact inversion this layer
+/// exists to prevent. With it, the walk moves on to the affirmative `ready_ok`, finds the query
+/// behind it, and refuses NAMING the query.
+#[test]
+fn a_consent_key_that_says_no_is_not_read_as_the_human_who_wrote_it_saying_yes() {
+    let _g = db_guard();
+    let db = Db::in_memory();
+    db.with_conn(crate::seed::seed_builtin_workflows)
+        .expect("seed");
+    let (wf, nodes) = db.with_conn(|c| {
+        let wf = db::list_workflows(c, None)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.scope == db::WORKFLOW_SCOPE_NSPEC)
+            .expect("the seeded nspec");
+        let nodes = db::list_nodes(c, &wf.id).unwrap();
+        (wf, nodes)
+    });
+    let tree = crate::engine::Tree::from_rows(&nodes, wf.root_node_id.as_deref()).expect("tree");
+    let workspace_node = nodes
+        .iter()
+        .find(|n| n.type_ == db::NODE_TYPE_CREATE_WORKSPACE)
+        .expect("the seeded create_workspace");
+    let question = nodes
+        .iter()
+        .find(|n| n.type_ == db::NODE_TYPE_ASK_HUMAN && n.label == "confirm ready")
+        .expect("the seeded 'confirm ready' question");
+    let prevalidation = nodes
+        .iter()
+        .find(|n| {
+            n.type_ == db::NODE_TYPE_QUERY && n.config.contains(super::QUERY_WORKSPACE_TARGET_FREE)
+        })
+        .expect("the seeded prevalidation query");
+
+    let mut board = crate::engine::Blackboard::new();
+    // The key the check reads FIRST, written by the seeded question — and holding a REFUSAL.
+    board
+        .written_by(&crate::engine::NodeOrigin::new(
+            question.id.clone(),
+            crate::engine::NodeType::AskHuman,
+        ))
+        .set("workspace_free", json!(false));
+    // The key that IS affirmative — and no human is behind it.
+    board
+        .written_by(&crate::engine::NodeOrigin::new(
+            prevalidation.id.clone(),
+            crate::engine::NodeType::Query,
+        ))
+        .set("ready_ok", json!("go"));
+
+    let engine = crate::engine::Engine::new(tree, board);
+    let mut notes = Vec::new();
+    let err = super::crossing_is_authorized(
+        &engine,
+        &workspace_node.id,
+        crate::engine::SensitiveEffect::CreateWorkspace,
+        &mut notes,
+    )
+    .expect_err(
+        "a human's `false` is not a human's approval — the walk must skip it and judge the key that \
+         actually opens the node",
+    );
+    let data = err.data.clone().unwrap_or(Value::Null);
+    assert_eq!(
+        data["written_by_node"],
+        Value::from(prevalidation.id.clone()),
+        "the refusal names the author of the AFFIRMATIVE key, not of the refused one: {}",
+        err.message
+    );
+    assert_eq!(
+        data["gate_key"],
+        json!("ready_ok"),
+        "…and names that key: {}",
+        err.message
+    );
+}
+
+/// THE LEGITIMATE CASE THE CHECK MUST NOT REFUSE: a run bound to NO SPEC. `apply_transition` returns
+/// early for one — there is no lifecycle to move — so the engaging `transition` commits nothing, and a
+/// `fork_spec` forks nothing. Demanding a human for an effect that does not happen would park a
+/// perfectly ordinary authoring run (M2) on a node that was always a no-op.
+///
+/// Written because the check was, for a moment, asked BEFORE that binding was consulted. Nothing in
+/// the suite caught it: no test drives an engaging transition on an unbound run, and the refusal only
+/// fires on a non-human gate. So the case is pinned here rather than left to be rediscovered.
+#[test]
+fn a_run_bound_to_no_spec_is_not_refused_for_an_effect_it_cannot_have() {
+    let _g = db_guard();
+    let sandbox = temp_dir("prov-unbound");
+    let db = Db::in_memory();
+    let (project_id, _wsid, _root) = seed_project(&db, sandbox.path());
+    let _ = project_id;
+
+    let wf = db.with_conn(|c| {
+        db::create_workflow(c, None, "prov-unbound", db::WORKFLOW_SCOPE_CUSTOM, None)
+            .expect("workflow")
+            .id
+    });
+    let root = add_node(&db, &wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(
+        &db,
+        &wf,
+        Some(&root),
+        0,
+        db::NODE_TYPE_TRANSITION,
+        json!({ "target_state": "ready", "gate_on": "approved" }),
+    );
+    add_node(
+        &db,
+        &wf,
+        Some(&root),
+        1,
+        db::NODE_TYPE_FORK_SPEC,
+        json!({ "gate_on": "approved" }),
+    );
+    // `approved` holds a MACHINE-written affirmative — the very thing the check refuses on a bound
+    // run. The board is crafted directly, provenance and all, because the point is the SPEC binding.
+    let mut board = crate::engine::Blackboard::new();
+    let by = crate::engine::NodeOrigin::new("some-query", crate::engine::NodeType::Query);
+    board.written_by(&by).set("approved", json!(true));
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, &wf, None, None, &board.to_json_string()))
+        .expect("run")
+        .id;
+
+    let rt = EngineRuntime::new();
+    let out = tick(&db, &rt, &run_id, None);
+    assert_eq!(
+        out["action"]["type"], "done",
+        "an unbound run walks past both nodes exactly as it always did: {out}"
+    );
 }

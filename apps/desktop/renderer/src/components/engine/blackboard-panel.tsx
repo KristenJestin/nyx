@@ -11,6 +11,19 @@ interface BoardRow {
   readonly value: string;
 }
 
+/**
+ * The board's own PROVENANCE record (`engine::PROVENANCE_KEY`) — who wrote each key, kept by the
+ * engine at every write and read by nyx's runtime consent check. Not a value the run computed, so
+ * not a row: it holds ONE entry per board key, which makes it the widest thing on the board and a
+ * restatement of the very list it sits in. The Rust side excludes it from the `nyx_next` delta for
+ * the same reason ("read by nyx's own consent check and by nothing the dispatcher does"); this
+ * panel is the human's half of that.
+ *
+ * A KNOWING DUPLICATE of the Rust constant — a renderer cannot read one. If provenance is ever
+ * wanted here, it belongs BESIDE its row, not as a row.
+ */
+const PROVENANCE_KEY = "__written_by__";
+
 /** Parse a `workflow_runs.blackboard` JSON-object string into display rows (a malformed / non-object
  *  blob yields no rows). Scalars render bare; objects/arrays are compact-JSON. */
 export function parseBlackboard(blackboard: string): BoardRow[] {
@@ -21,10 +34,12 @@ export function parseBlackboard(blackboard: string): BoardRow[] {
     return [];
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
-  return Object.entries(parsed as Record<string, unknown>).map(([key, value]) => ({
-    key,
-    value: typeof value === "string" ? value : JSON.stringify(value),
-  }));
+  return Object.entries(parsed as Record<string, unknown>)
+    .filter(([key]) => key !== PROVENANCE_KEY)
+    .map(([key, value]) => ({
+      key,
+      value: typeof value === "string" ? value : JSON.stringify(value),
+    }));
 }
 
 /** Project a workflow run status onto the shared {@link RunState} the `StatusDot` paints. An absent
@@ -94,7 +109,12 @@ export function BlackboardPanel({
                   <dt className="w-28 shrink-0 text-2xs uppercase tracking-wide text-muted-foreground">
                     current node
                   </dt>
-                  <dd className="min-w-0 flex-1 truncate font-mono text-2xs font-semibold text-primary">
+                  {/* `truncate` needs a `title`: this is the field that says WHERE the run is, and
+                      a node label long enough to be cut is exactly the one worth reading. */}
+                  <dd
+                    className="min-w-0 flex-1 truncate font-mono text-2xs font-semibold text-primary"
+                    title={currentNodeLabel ?? undefined}
+                  >
                     {currentNodeLabel ?? "—"}
                   </dd>
                 </div>
@@ -106,10 +126,18 @@ export function BlackboardPanel({
                       key={row.key}
                       className="flex items-center gap-2 border-b border-dashed border-border py-1.5 last:border-b-0"
                     >
-                      <dt className="w-28 shrink-0 truncate text-2xs uppercase tracking-wide text-muted-foreground">
+                      <dt
+                        className="w-28 shrink-0 truncate text-2xs uppercase tracking-wide text-muted-foreground"
+                        title={row.key}
+                      >
                         {row.key}
                       </dt>
-                      <dd className="min-w-0 flex-1 truncate font-mono text-2xs font-semibold text-foreground">
+                      {/* Same reason as `current node` above, and it bites harder here: a blackboard
+                          value is what a gate reads to decide, and the column is 28 characters. */}
+                      <dd
+                        className="min-w-0 flex-1 truncate font-mono text-2xs font-semibold text-foreground"
+                        title={row.value}
+                      >
                         {row.value}
                       </dd>
                     </div>

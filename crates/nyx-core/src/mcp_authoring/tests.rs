@@ -2571,3 +2571,67 @@ fn node_update_is_allowed_under_a_walking_run_but_says_so() {
     assert_eq!(row.current_node_id.as_deref(), Some(gate_id.as_str()));
     assert!(row.traversal.is_some(), "its walk is untouched");
 }
+
+/// The PROVENANCE key is nyx's own record of WHICH NODE wrote each board key — the fact the runtime
+/// consent check reads to tell a human's answer from a query's fact. A node able to name it as an
+/// `output_key` (or a `write`, or a `retrieve.to`) would be writing its own answer to that question:
+/// one node, one object, and every gate in the graph reads "a human filled this". So naming it is an
+/// authoring ERROR, exactly like `__spec_write_granted__` and for the same reason — it is what makes
+/// "only the engine writes it" a property rather than a habit.
+#[test]
+fn no_node_may_write_its_own_provenance() {
+    let (db, project) = seeded();
+    let wf = make_workflow(&db, "wf", Some(&project));
+    let key = crate::engine::PROVENANCE_KEY;
+
+    for (node_type, config) in [
+        ("ask_human", json!({ "prompt": "?", "output_key": key })),
+        ("query", json!({ "query": "spec_status", "write": key })),
+        ("judge", json!({ "prompt": "?", "output_key": key })),
+        ("produce", json!({ "output_key": key })),
+    ] {
+        let err = node_add(
+            &db,
+            &json!({ "workflow_id": wf, "type": node_type, "config": config }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.code, "invalid_argument",
+            "a '{node_type}' may not write the provenance record"
+        );
+        assert!(
+            err.message.contains("RESERVED") && err.message.contains(key),
+            "the refusal names the reserved key: {}",
+            err.message
+        );
+    }
+
+    // The SAME rule over a `sub_workflow`'s board copies — the widest write in the vocabulary, and the
+    // one that lands on the PARENT board straight from a child run's own blackboard.
+    for field in ["inject", "retrieve"] {
+        let err = node_add(
+            &db,
+            &json!({
+                "workflow_id": wf, "type": "sub_workflow",
+                "config": { "scope": "coder", field: [{ "from": "anything", "to": key }] }
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("RESERVED") && err.message.contains(key),
+            "a '{field}' copy may not land on the provenance either: {}",
+            err.message
+        );
+    }
+
+    // A key that merely LOOKS like it — the guard is an equality on the reserved name, not a ban on
+    // underscores, and refusing a graph's own `__notes__` would be a rule nobody asked for.
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "judge",
+            "config": { "prompt": "?", "output_key": "written_by" }
+        }),
+    )
+    .expect("an ordinary key that resembles the reserved one is not the reserved one");
+}

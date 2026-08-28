@@ -2458,10 +2458,20 @@ fn the_builtin_questions_a_human_alone_may_answer_are_the_ones_that_commit() {
             // effector, so answering it buys another sub-agent pass.
             ("ndev", "coder blocked".to_string(), HumanCommitment::AnotherRound),
             // The Spec's LIFECYCLE (H6) — ndev's two `guarded_commit` confirms, one per terminal
-            // commit (cancel / done). The "review" ask that routes to them commits nothing by itself:
-            // it selects a branch, and the branch asks again before it moves anything.
+            // commit (cancel / done).
             ("ndev", "confirm".to_string(), HumanCommitment::SpecTransition),
             ("ndev", "confirm".to_string(), HumanCommitment::SpecTransition),
+            // AND "review" BESIDE THEM — the price of [`crate::engine::Tree::answer_decides`] now
+            // evaluating BOTH of its readings instead of short-circuiting on `gate_on`. `review`
+            // answers 'approve', and that answer is what routes the run into the `done`
+            // `guarded_commit`; the transition down there gates on its own `done_ok`, so the old
+            // early return said "review decides nothing" and stopped. It decides whether the run ever
+            // reaches the question that commits, which is a decision, so it is in — and being in
+            // costs exactly one human turn while committing nothing extra. The direction is the safe
+            // one the widening was made for; the ordinary-vs-committing line moved on purpose here,
+            // and NOWHERE ELSE in the five built-ins (this list is the proof of that: `review` is the
+            // only addition, and nothing left).
+            ("ndev", "review".to_string(), HumanCommitment::SpecTransition),
             ("ndev", "rework or abandon".to_string(), HumanCommitment::AnotherRound),
             ("ndoc", "review".to_string(), HumanCommitment::AnotherRound),
             ("nspec", "confirm ready".to_string(), HumanCommitment::SpecTransition),
@@ -2473,13 +2483,14 @@ fn the_builtin_questions_a_human_alone_may_answer_are_the_ones_that_commit() {
             // `None` here, carried no `human_turn_required`, opened no `PendingConsent` — so a
             // session could answer "yes" by itself and fork a ready Spec.
             //
-            // `CreateWorkspace` does NOT appear beside it, and that is correct rather than a second
-            // hole: the seeded `create_workspace` declares its own `gate_on`, and that key is
-            // `workspace_free` — a QUERY fact, not an answer, so no question governs it and none is
-            // classified by it. What stands between a human and that folder is the branch above it,
-            // `{ready_ok eq "go"}`, and `ready_ok` is already the SpecTransition entry three lines up:
-            // the run cannot reach the mkdir without that answer, and that answer already demands a
-            // human turn.
+            // `CreateWorkspace` does NOT appear beside "confirm ready", and that is now for the
+            // RIGHT reason. The seeded `create_workspace` declares `gate_on: "workspace_free"` — a
+            // QUERY fact, not an answer — and `answer_decides` used to stop there and report that no
+            // question governs the folder; the human turn survived only because the `transition`
+            // sharing that branch gates on `ready_ok`, a coincidence of THIS graph. Both readings are
+            // evaluated now, so `ready_ok` genuinely governs the mkdir too; `CreateWorkspace` is
+            // absent only because [`crate::engine::SensitiveEffect::gravity`] tells the human about
+            // the GRAVER of the two, and a Spec move outranks a folder.
             ("nspec", "confirm revision".to_string(), HumanCommitment::CreateRevision),
         ],
         "the questions the human alone answers, and what each of them commits",
@@ -2754,5 +2765,83 @@ fn upgrading_a_built_in_records_the_graph_replacement_on_its_live_runs() {
     assert!(
         board(&finished)[db::RUN_GRAPH_REPLACED_KEY].is_null(),
         "a terminal run is already over — not marked"
+    );
+}
+
+/// THE SWEEP the `answer_decides` correction called for, turned into an assertion instead of a
+/// once-read: every SENSITIVE node of the five built-ins, the `gate_on` key it fires on, and WHICH
+/// node types in that graph can put a value under that key.
+///
+/// The shape this pins is `seed.rs`'s `create_workspace {gate_on: "workspace_free"}` — a gate hanging
+/// on a key a `query` fills, not on an answer. It is legal and INTENTIONAL there (the prevalidation
+/// and the `ready` transition beside it are the all-or-nothing pair `/nspec`'s `go` needs), but it is
+/// exactly the shape the short-circuiting `answer_decides` misread, and the one whose consent lives in
+/// the SELECTOR above rather than in the gate. So the exception is named here, once: a SECOND
+/// sensitive node acquiring a non-answer gate must be a deliberate act, visible in this list, and not
+/// a line slipped into a graph builder.
+#[test]
+fn only_one_seeded_sensitive_gate_hangs_on_something_no_question_writes() {
+    use crate::engine::{board_key_root, NodeType, SensitiveEffect};
+
+    let db = seeded_db();
+    let mut gates: Vec<(String, String, String, String)> = Vec::new();
+    for scope in ["ndev", "nspec", "ndoc", "coder", "prototyper"] {
+        let (_, nodes) = builtin(&db, scope);
+        for n in &nodes {
+            let Some(node_type) = NodeType::from_db(&n.type_) else {
+                continue;
+            };
+            let cfg: Value = serde_json::from_str(&n.config).unwrap_or_else(|_| json!({}));
+            if SensitiveEffect::of(node_type, &cfg).is_none() {
+                continue;
+            }
+            let gate = SensitiveEffect::gate_key_root(&cfg)
+                .map(str::to_string)
+                .unwrap_or_else(|| "<UNGATED>".to_string());
+            // WHO can fill that key: the node types whose `output_key` / `write` names it.
+            let mut by: Vec<String> = nodes
+                .iter()
+                .filter(|w| {
+                    let wcfg: Value = serde_json::from_str(&w.config).unwrap_or_else(|_| json!({}));
+                    ["output_key", "write"].iter().any(|field| {
+                        wcfg.get(field)
+                            .and_then(Value::as_str)
+                            .map(|s| board_key_root(s) == gate)
+                            .unwrap_or(false)
+                    })
+                })
+                .map(|w| w.type_.clone())
+                .collect();
+            by.sort();
+            by.dedup();
+            gates.push((scope.to_string(), n.label.clone(), gate, by.join("+")));
+        }
+    }
+    gates.sort();
+
+    let ask = db::NODE_TYPE_ASK_HUMAN;
+    let query = db::NODE_TYPE_QUERY;
+    assert_eq!(
+        gates,
+        vec![
+            // ndev's two terminal commits — each gated on the answer of the `confirm` question
+            // standing right above it in its own `guarded_commit` sequence.
+            ("ndev", "cancel", "cancel_ok", ask),
+            ("ndev", "done", "done_ok", ask),
+            // THE ONE EXCEPTION, and it is a `query`: `/nspec`'s `go` arm gates the mkdir on the
+            // FEASIBILITY fact, and puts the human's consent in the selector one level up
+            // (`ready_ok eq "go"`). Both readings of `answer_decides` are needed to see it.
+            ("nspec", "dev workspace", "workspace_free", query),
+            ("nspec", "fork", "revise_ok", ask),
+            // The two `ready` transitions — the plain 'yes' arm and the one inside the 'go' sequence.
+            ("nspec", "ready", "ready_ok", ask),
+            ("nspec", "ready", "ready_ok", ask),
+        ]
+        .into_iter()
+        .map(|(s, l, g, w): (&str, &str, &str, &str)| {
+            (s.to_string(), l.to_string(), g.to_string(), w.to_string())
+        })
+        .collect::<Vec<_>>(),
+        "every sensitive gate of the built-ins, and what fills the key it reads",
     );
 }

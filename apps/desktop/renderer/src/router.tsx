@@ -20,6 +20,7 @@ import { KnowledgePage } from "@/components/knowledge/knowledge-page";
 import { EnginePage } from "@/components/engine/engine-page";
 import { CataloguePage } from "@/components/design/catalogue-page";
 import { ComponentDetailPage } from "@/components/design/component-detail-page";
+import { Spinner } from "@/components/ui/spinner";
 
 /**
  * The renderer's ROUTER — introduced in this pass to carry the multi-page navigation
@@ -233,6 +234,46 @@ function RouteErrorFallback({ error }: { error: Error }) {
 }
 
 /**
+ * The router-wide fallback for a route whose data is not there YET — the missing counterpart of
+ * `RouteErrorFallback` above. The pair was asymmetric: a page that FAILED had a screen, a page that
+ * was merely LOADING had none, so the interval between "React mounted" and "first routed screen"
+ * painted nothing at all — the same silence the static boot splash in `index.html` was added to
+ * break, one layer higher up.
+ *
+ * Setting it is also what CREATES the suspense boundary, exactly as `defaultErrorComponent` creates
+ * the error one: `<Match>` only wraps a route in `React.Suspense` when a pending component exists
+ * (`wrapInSuspense ?? PendingComponent ?? …`), and `<Matches>` uses it as the fallback of the
+ * top-level boundary that covers the router's INITIAL load. Without it, a suspended match has
+ * nothing to show and the slot stays empty.
+ *
+ * It carries `bg-background` — the token whose dark value the boot splash duplicates as a literal —
+ * so the hand-over from the static markup to this screen changes nothing the eye can catch, and
+ * `<Spinner>` (the design system's lucide `loader-circle` under `animate-spin`), which is the glyph
+ * the splash inlines. Same box as `RouteErrorFallback`: it renders in the route's slot, inside
+ * `<BaseLayout>`'s `<Outlet/>`, so the navigation shell stays up while a page loads.
+ *
+ * TIMING IS THE LIBRARY'S, UNTOUCHED — and it is worth knowing what it does, because it is not
+ * "immediately". `defaultPendingMs` (1 s) is a GRACE: the router holds the previous screen — and,
+ * on the very first load, an empty slot — for that long before showing this component, so a loader
+ * that answers in 40 ms never makes it flash. `defaultPendingMinMs` (500 ms) is the other half: once
+ * shown, it stays that long even if the data has landed. Neither is set here; both are what TanStack
+ * fills in, and `router-pending.test.tsx` fails if the app ever starts overriding them — adding
+ * waiting time of our own is the one thing this correction must not do.
+ *
+ * SO THIS SCREEN IS NOT WHAT COVERS THE START-UP. Today no app route declares a loader, so the
+ * first routed screen commits as soon as the matches resolve; what covers the interval before that
+ * is the static splash in `index.html`. This component covers the LOADS THAT COME AFTER — and the
+ * day a route takes PDR-0029 up on `ensureQueryData`, the second and following seconds of its wait.
+ */
+function RoutePendingFallback() {
+  return (
+    <div className="flex h-app items-center justify-center bg-background">
+      <Spinner className="size-6 text-muted-foreground" />
+    </div>
+  );
+}
+
+/**
  * Build a router over the route tree. Exposed as a factory so tests can spin up an
  * isolated router (with their own memory history / initial entry) without the app's
  * module-level singleton. The default entry is the Terminals index (`/`).
@@ -242,6 +283,7 @@ export function createAppRouter(initialEntries: string[] = ["/"]) {
     routeTree,
     history: createMemoryHistory({ initialEntries }),
     defaultErrorComponent: RouteErrorFallback,
+    defaultPendingComponent: RoutePendingFallback,
     // The review data layer's TanStack Query client, made available to every route's loader
     // (PDR-0029). Tests pass the module singleton implicitly via this factory.
     context: { queryClient },

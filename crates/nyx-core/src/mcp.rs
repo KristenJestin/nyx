@@ -306,11 +306,17 @@ pub const REPO_WATCH_TOOL: &str = "repo_watch";
 pub const REPO_UNWATCH_TOOL: &str = "repo_unwatch";
 
 /// The v2.4 review COMMENT LIST tool (task `01KX0F6HEBPK34CV49EREHK3Y9`, PDR-0012/0015):
-/// `{ workspace_id, repository_id }` → `{ comments }`, the whole auto-threaded feed of a
+/// `{ workspace_id, repository_id, spec_id? }` → `{ comments }`, the whole auto-threaded feed of a
 /// `(workspace, repository)` review (roots + replies, anchored + global, with `outdated`
 /// state). Routes through the SHARED `db::list_review_comments`, the SAME model the UI bridge's
 /// `review_comment_list` db-command reads (PDR-0005). Advertised in `tools/list`, kept OUT of
 /// [`V1_TOOLS`]. Read-only.
+///
+/// `spec_id` WAS HONOURED AND UNADVERTISED — the `01M1008NHM9RRA1ZAS4V7K1PM4` defect on a read.
+/// [`crate::mcp_tools_core::review_comment_list`] has always narrowed the feed by it, and the
+/// `inputSchema` named neither the argument nor, once the short grammar reached it, the forms it
+/// accepts. An argument `tools/list` omits cannot be discovered — and the guard that holds the
+/// Spec-reference advertisement reads the SCHEMA, so it could not see this field at all.
 pub const REVIEW_COMMENT_LIST_TOOL: &str = "review_comment_list";
 
 /// The v2.4 review COMMENT POST tool (task `01KX0F6HEBPK34CV49EREHK3Y9`):
@@ -993,6 +999,15 @@ fn authority_is_loopback(authority: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// The clause that marks a `spec_id` description as belonging to the CONDITIONAL-ANCHOR family —
+/// the one whose short forms depend on something the call cannot guarantee. ONE string, written by
+/// the descriptor builder in [`tool_descriptors`] and read by the guard test, so "this field states
+/// its condition" is a fact the two halves share instead of a phrase a reader has to recognise by
+/// eye. It stops at `ONLY when` so the condition itself can be about an ARGUMENT ("you also pass
+/// workspace_id") or about what a required argument RESOLVES TO ("the run_id you pass names a run
+/// anchored on a workspace") — the two shapes the family actually has.
+const CONDITIONAL_ANCHOR_CLAUSE: &str = "ONLY when";
+
 /// The `tools/list` descriptors for the frozen v1 surface (ADR-0003). Phase-2 fills
 /// the per-tool argument schemas from the ADR's tool surface so a client can form
 /// valid calls; the call bodies live in [`crate::mcp_tools`]. Every descriptor's
@@ -1004,6 +1019,69 @@ fn authority_is_loopback(authority: &str) -> bool {
 pub(crate) fn tool_descriptors() -> Vec<Value> {
     // Reusable JSON-Schema fragments for the common id/string arguments.
     let str_prop = |desc: &str| json!({ "type": "string", "description": desc });
+    // A `spec_id` FIELD BELONGS TO ONE OF THREE FAMILIES, and each has its own sentence. The
+    // family is a property of the CALL — of which of the four anchors its schema exposes, and of
+    // whether one of them is REQUIRED — never of the tool's name. The three builders below are the
+    // only way a `spec_id` description is written, and the guard test
+    // `every_spec_id_argument_advertises_the_forms_it_accepts` reads the same three families off
+    // the schema, so a field cannot enter with the sentence of another family.
+    //
+    // 1. A CERTAIN ANCHOR — one that is REQUIRED and carries a project by construction, so the call
+    // ALWAYS names a project and `#N` / `N` always count. The grammar
+    // is announced from the SAME constant the parser and the refusals read
+    // ([`crate::spec_ref::ACCEPTED_FORMS`]). An agent learns what to send from these descriptions —
+    // nyx used to DISPLAY `#3` everywhere and accept only the canonical id, and the description said
+    // nothing either way. Building the sentence from the constant is what keeps the advertised forms
+    // and the accepted forms one fact.
+    let spec_ref_desc = |desc: &str| {
+        format!(
+            "{desc}. Accepts {} — a '#N' or bare 'N' resolves in the project this call's own \
+             anchors already determine (project_id / workspace_id / cwd / run_id); the canonical \
+             id and the key carry their own project",
+            crate::spec_ref::ACCEPTED_FORMS
+        )
+    };
+    let spec_ref_prop = |desc: &str| str_prop(&spec_ref_desc(desc));
+    // 2. AN ANCHOR THAT MAY BE ABSENT — the SAME call honours `#N` when a project is there and
+    // cannot when it is not. A form that works or not depending on something that has nothing to do
+    // with it is HARDER to diagnose than one that never works, so the CONDITION is part of the
+    // advertisement and the refusal names itself (findings 01M0ZGHD137MDXFGS2PBG6GS68 for
+    // `spec_update_section`, 01M0ZKWXS353TABS0WCT3XXB81 for `spec_set_workspace`, `agent_context`
+    // and `run_start`, 01M0ZWAH9EQDAZR66AFS1YJFPY for `run_bind_spec`). TWO SHAPES OF ABSENCE sit
+    // here: an anchor that may be OMITTED — `spec_set_workspace` is the sharpest, its only anchor is
+    // optional BECAUSE omitting it IS the detach — and an anchor that is REQUIRED yet resolves
+    // through a chain that can end on nothing, which is `run_bind_spec`'s `run_id`: a run's project
+    // is its workspace's, and a run can carry no workspace.
+    let conditional_spec_ref_prop = |desc: &str, condition: &str| {
+        str_prop(&format!(
+            "{desc}. Accepts {} — but a '#N' or bare 'N' {CONDITIONAL_ANCHOR_CLAUSE} {condition}; \
+             otherwise there is no project to count a number in and the reference is REFUSED by \
+             name, so send {} instead",
+            crate::spec_ref::ACCEPTED_FORMS,
+            crate::spec_ref::ANCHORLESS_FORMS
+        ))
+    };
+    // 3. NO ANCHOR AT ALL — and the fields that cannot count a number SAY SO, which is the same rule
+    // read backwards. A whole family of advertised `spec_id` FIELDS — fewer tools than fields,
+    // since `spec_link` and `spec_unlink` carry two each — takes NONE of the four anchors, so
+    // `#N` / `N` have no project to be counted in there (how many, and which, is asserted by
+    // `tests::every_spec_id_argument_advertises_the_forms_it_accepts`, never counted in prose here)
+    // — and a field that announced them anyway promised a resolution that could
+    // not happen, which surfaced as the very `unknown spec 3` this grammar exists to retire
+    // (finding 01M0ZGCCSQ2F25HPBS6NX5JAFS; arbitrage out-of-scope 01M0D95TFHNMGZ9ES20Z68R395).
+    // They announce the SELF-ANCHORED subset instead ([`crate::spec_ref::ANCHORLESS_FORMS`]), say
+    // WHY, and the two other forms are refused BY NAME at the entry point
+    // ([`crate::mcp_context::require_spec_arg_project_relative_refused`]) rather than dying opaque
+    // three layers down. Same constant on both sides, so the advertised and the accepted stay one
+    // fact here too.
+    let anchorless_spec_ref_prop = |desc: &str| {
+        str_prop(&format!(
+            "{desc}. Accepts {} — both carry their own project. A '#N' or bare 'N' is REFUSED \
+             here, by name: this call takes no project_id / workspace_id / cwd / run_id, so there \
+             is no project to count a number in",
+            crate::spec_ref::ANCHORLESS_FORMS
+        ))
+    };
     // The SCOPED CSS SLOT, described IDENTICALLY on the two write paths that accept it
     // (`design_refresh_component` and `proto_author_component`) — one contract, one wording, so an
     // agent can never learn two different rules for one mechanism (finding
@@ -1191,7 +1269,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         "project_id": str_prop("project to register the workspace in"),
                         "path": str_prop("path to an EXISTING on-disk folder (must already exist and be a directory; not created)"),
                         "name": str_prop("optional display name (defaults to the path's basename)"),
-                        "spec_id": str_prop("optional Spec to ANCHOR on this workspace in the same operation, so later calls resolve the Spec from the workspace instead of needing its id. The Spec must be ready or in_progress and belong to the same project; anchoring never changes its status. An EMPTY string is refused rather than read as 'no Spec' — omit the argument to register the workspace unlinked"),
+                        "spec_id": spec_ref_prop("optional Spec to ANCHOR on this workspace in the same operation, so later calls resolve the Spec from the workspace instead of needing its id. The Spec must be ready or in_progress and belong to the same project; anchoring never changes its status. An EMPTY string is refused rather than read as 'no Spec' — omit the argument to register the workspace unlinked"),
                     }),
                     vec!["project_id", "path"],
                 ),
@@ -1200,7 +1278,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         "project_id": str_prop("project to create the workspace in"),
                         "name": str_prop("workspace display name"),
                         "path": str_prop("folder path to CREATE (mkdir -p, including missing parents) then register; use workspace_add if the folder already exists"),
-                        "spec_id": str_prop("optional Spec to ANCHOR on this workspace in the same operation, so later calls resolve the Spec from the workspace instead of needing its id. The Spec must be ready or in_progress and belong to the same project; anchoring never changes its status. It is validated BEFORE the folder is created — an EMPTY string is refused there too, so a mistyped anchor leaves no folder behind; omit the argument to create the workspace unlinked"),
+                        "spec_id": spec_ref_prop("optional Spec to ANCHOR on this workspace in the same operation, so later calls resolve the Spec from the workspace instead of needing its id. The Spec must be ready or in_progress and belong to the same project; anchoring never changes its status. It is validated BEFORE the folder is created — an EMPTY string is refused there too, so a mistyped anchor leaves no folder behind; omit the argument to create the workspace unlinked"),
                     }),
                     vec!["project_id", "name", "path"],
                 ),
@@ -1981,7 +2059,15 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the Spec whose active revision to edit"),
+                // THE CONDITIONAL CASE, stated instead of left to be discovered. This tool's ONLY
+                // project anchor is its OPTIONAL `run_id`, so `#N` / `N` resolve with one and
+                // cannot without — on the nominal path (editing a draft, no run_id) they used to
+                // die as `unknown spec 3` although the field announced them unconditionally
+                // (finding 01M0ZGHD137MDXFGS2PBG6GS68).
+                "spec_id": conditional_spec_ref_prop(
+                    "the Spec whose active revision to edit",
+                    "you also pass run_id, the one project anchor this call carries",
+                ),
                 "section": str_prop("which section: problem | solution | implementation_decisions | testing_decisions | user_stories | out_of_scope"),
                 "value": str_prop("the section's new markdown content (empty string clears it)"),
                 "run_id": str_prop("the run whose human authorized this correction on a Spec that has left draft (the run_id of your spawn); ignored while the Spec is still a draft"),
@@ -1999,7 +2085,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the Spec to fork"),
+                "spec_id": anchorless_spec_ref_prop("the Spec to fork"),
                 "change_reason": str_prop("optional reason recorded on the new revision (why it supersedes the prior one)"),
             },
             "required": ["spec_id"],
@@ -2019,7 +2105,15 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the ready or in_progress Spec to anchor/re-anchor/detach"),
+                // THE SHARPEST OF THE CONDITIONAL FIELDS. This call's ONLY project anchor is
+                // `workspace_id`, and it is optional BECAUSE omitting it IS the detach — so on the
+                // detach path a `#N` can never resolve, and it used to die as a bare `unknown spec`
+                // that did not even quote the token sent (finding 01M0ZKWXS353TABS0WCT3XXB81).
+                "spec_id": conditional_spec_ref_prop(
+                    "the ready or in_progress Spec to anchor/re-anchor/detach",
+                    "you also pass workspace_id, this call's only project anchor — which the DETACH \
+                     path omits by definition, so a number never resolves while detaching",
+                ),
                 "workspace_id": str_prop("the dev workspace to anchor on (from list_workspaces); omit or null to detach. An EMPTY string is refused, never read as a detach — detaching is an act you ask for by omitting the argument, not something an uninitialized variable should trigger"),
             },
             "required": ["spec_id"],
@@ -2037,7 +2131,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "properties": {
                 "project_id": str_prop("project the task belongs to (from list_projects)"),
                 "title": str_prop("the task's title"),
-                "spec_id": str_prop("optional Spec to attach the task to"),
+                "spec_id": spec_ref_prop("optional Spec to attach the task to"),
                 "kind": str_prop("slice (default) | human | review"),
                 "type": str_prop("optional task type (defaults to implementation)"),
                 "priority": str_prop("optional priority (urgent | high | med | low; defaults to med)"),
@@ -2120,8 +2214,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "from_spec_id": str_prop("the dependent Spec (the one that comes after / is blocked)"),
-                "to_spec_id": str_prop("the prerequisite Spec (the one that must land first)"),
+                "from_spec_id": anchorless_spec_ref_prop("the dependent Spec (the one that comes after / is blocked)"),
+                "to_spec_id": anchorless_spec_ref_prop("the prerequisite Spec (the one that must land first)"),
                 "kind": str_prop("blocks (default) | after (both directional) | related (context only)"),
                 "note": str_prop("optional rationale for the constraint"),
             },
@@ -2135,8 +2229,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "from_spec_id": str_prop("the dependent Spec of the edge to remove"),
-                "to_spec_id": str_prop("the prerequisite Spec of the edge to remove"),
+                "from_spec_id": anchorless_spec_ref_prop("the dependent Spec of the edge to remove"),
+                "to_spec_id": anchorless_spec_ref_prop("the prerequisite Spec of the edge to remove"),
             },
             "required": ["from_spec_id", "to_spec_id"],
         },
@@ -2150,7 +2244,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         blocked_by_count / unblocks_count. Read-only.",
         "inputSchema": {
             "type": "object",
-            "properties": { "spec_id": str_prop("the Spec whose dependencies + badges to read") },
+            "properties": { "spec_id": anchorless_spec_ref_prop("the Spec whose dependencies + badges to read") },
             "required": ["spec_id"],
         },
     }));
@@ -2204,7 +2298,15 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "properties": {
                 "role": str_prop("spec | dev | coder | auditor | doc | prototype — which manual to render"),
                 "run_id": str_prop("the run you were spawned for — the ONE anchor a sub-agent needs: it carries the Spec the run drives and, before there is one, the workspace it opened against. Pass the run_id the spawn action was ticking; an unknown one is refused rather than rendered empty"),
-                "spec_id": str_prop("the Spec to render the context for (preferred)"),
+                // CONDITIONAL: `role` is the only REQUIRED argument here, so every project anchor
+                // this call could read is optional. `agent_context(role=…, spec_id="#3")` alone
+                // resolves no project and used to answer the literal `unknown spec 3` this grammar
+                // exists to retire (finding 01M0ZKWXS353TABS0WCT3XXB81).
+                "spec_id": conditional_spec_ref_prop(
+                    "the Spec to render the context for (preferred)",
+                    "you also pass one of run_id / workspace_id / cwd / project_id — all optional \
+                     here, since `role` is this call's only required argument",
+                ),
                 "workspace_id": str_prop("optional: resolve the Spec via its anchored dev workspace when spec_id is absent — exactly one active Spec must be anchored there (several is refused with the candidates listed, none resolves nothing)"),
                 "cwd": str_prop("optional: resolve the Spec (or, for role=spec authoring, the project) via the workspace whose path matches this cwd when spec_id/workspace_id are absent. The deepest matching workspace root wins; then the same one-active-Spec rule as workspace_id applies"),
                 "project_id": str_prop("optional: for role=spec authoring with no Spec yet, the project to author in (else resolved from cwd/workspace_id). When a Spec DOES resolve it is only checked, never applied — a Spec's project is a fact of the Spec, and naming another one is refused rather than ignored; read the project_id the answer returns instead"),
@@ -2316,6 +2418,12 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "properties": {
                 "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
                 "repository_id": str_prop("the repository whose review comments to list (from workspace_git(workspace_id=…))"),
+                // HONOURED SINCE v2.4, NAMED ONLY NOW: the call has always narrowed the feed by
+                // `spec_id` and the schema said nothing, so no caller reading `tools/list` could
+                // use it — the same defect `run_start`'s `project_id` was just repaired for
+                // (`01M1008NHM9RRA1ZAS4V7K1PM4`). `workspace_id` is REQUIRED here and carries a
+                // project, so the four forms always resolve.
+                "spec_id": spec_ref_prop("optional: keep only the comments bound to this Spec (omit for the repository's whole feed)"),
             },
             "required": ["workspace_id", "repository_id"],
         },
@@ -2336,7 +2444,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
                 "repository_id": str_prop("the repository to comment on (from workspace_git(workspace_id=…))"),
                 "body": str_prop("the comment text"),
-                "spec_id": str_prop("optional spec the review is bound to (omit for a generic review)"),
+                "spec_id": spec_ref_prop("optional spec the review is bound to (omit for a generic review)"),
                 "parent_id": str_prop("optional: the id of the comment to REPLY to (from review_comment_list) — omit for a new thread"),
                 "file_path": str_prop("optional: for an ANCHORED comment, the changed-file path to hang it on (omit for a global comment)"),
                 "side": str_prop("optional: the diff side the anchor is on: old | new"),
@@ -2381,7 +2489,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "properties": {
                 "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
                 "repository_id": str_prop("the repository whose tasks to list (from workspace_git(workspace_id=…))"),
-                "spec_id": str_prop("the Spec whose findings to list (findings are Spec-scoped; omit for none)"),
+                "spec_id": spec_ref_prop("the Spec whose findings to list (findings are Spec-scoped; omit for none)"),
             },
             "required": ["workspace_id", "repository_id"],
         },
@@ -2429,7 +2537,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "properties": {
                 "workspace_id": str_prop("the workspace the repository belongs to (from list_workspaces(project_id=…))"),
                 "repository_id": str_prop("the repository under review (from workspace_git(workspace_id=…))"),
-                "spec_id": str_prop("the Spec under review — the finding lives on it (required)"),
+                "spec_id": spec_ref_prop("the Spec under review — the finding lives on it (required)"),
                 "body": str_prop("the human's feedback, verbatim from the chat"),
                 "title": str_prop("optional: a short title for the finding (defaults to the feedback body)"),
                 "severity": str_prop("optional: info | low | medium | high | critical"),
@@ -2468,7 +2576,16 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "body": str_prop("optional longer description (markdown)"),
                 "theme": str_prop("optional grouping theme (e.g. 'auth', 'perf')"),
                 "source": str_prop("optional capture source: session (default) | spec | manual"),
-                "spec_ids": json!({ "type": "array", "items": { "type": "string" }, "description": "optional Spec ids to link the idea to (each as kind='addresses')" }),
+                // THE ONE PLURAL FIELD OF THE SURFACE, and it announces the SAME grammar as the
+                // singular ones: `project_id` is REQUIRED here, so every entry has a project to be
+                // counted in and a `#N` resolves exactly as it does on `task_add` (finding
+                // 01M0ZMGJG9VXD4GCY6Y6TN3RYS). The description is built from `spec_ref_desc`, not
+                // paraphrased, so the plural cannot drift from the singular.
+                "spec_ids": json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": spec_ref_desc("optional Spec references to link the idea to (each as kind='addresses')"),
+                }),
             },
             "required": ["project_id", "title"],
         },
@@ -2591,7 +2708,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "type": "object",
             "properties": {
                 "idea_id": str_prop("the idea to link"),
-                "spec_id": str_prop("the Spec to link it to"),
+                "spec_id": anchorless_spec_ref_prop("the Spec to link it to"),
                 "kind": str_prop("addresses (default) | related"),
             },
             "required": ["idea_id", "spec_id"],
@@ -2605,7 +2722,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "type": "object",
             "properties": {
                 "idea_id": str_prop("the idea"),
-                "spec_id": str_prop("the Spec to unlink from it"),
+                "spec_id": anchorless_spec_ref_prop("the Spec to unlink from it"),
             },
             "required": ["idea_id", "spec_id"],
         },
@@ -2677,7 +2794,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the Spec to attach the annexe to"),
+                "spec_id": anchorless_spec_ref_prop("the Spec to attach the annexe to"),
                 "kind": str_prop("annexe type: doc | artefact | url | prototype"),
                 "title": str_prop("the annexe's title (the LABEL of a link). REQUIRED for kind=doc|artefact|prototype, where it is refused ABSENT or EMPTY. For kind=url it is OPTIONAL and the three ways to give no label are the SAME case: absent, empty ('') and blank ('   ') all store the URL itself as the title"),
                 "content": str_prop("the annexe's content (the document/artefact text, or the absolute http(s) URL string for kind=url) — stored internally"),
@@ -2708,7 +2825,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the Spec whose annexes to list"),
+                "spec_id": anchorless_spec_ref_prop("the Spec whose annexes to list"),
                 "kind": str_prop("optional: keep only this annexe type (doc | artefact | url | prototype) — omit for all of them"),
             },
             "required": ["spec_id"],
@@ -2953,8 +3070,16 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         workflow_id, else the resolved project's active workflow of `scope` (default \
                         'ndev') — and binds the run to the resolved Spec (from spec_id, workspace_id, \
                         or cwd) when there is one. Returns { run_id, workflow_id, spec_id, scope, \
-                        warnings }: RELAY every warnings[].message to the human — each names \
-                        something they must act on (a run DROPPED because its graph changed, a gate \
+                        outcome, warnings }. `outcome` says WHICH of three things happened — \
+                        'created' (a fresh run at the top of the flow), 'resumed' (the pair's live \
+                        run handed back, so the next nyx_next answers from where IT stopped, not \
+                        from the top) or 'replaced' (the live run could never tick again and was \
+                        dropped for a fresh one): read it rather than assuming a run_id is a new \
+                        run. \
+                        RELAY every warnings[].message to the human — each names \
+                        something they must act on (a run RESUMED mid-flow — code 'run_resumed', \
+                        which names the node it is parked on and how long it has sat there; a run \
+                        DROPPED because its graph changed, a gate \
                         that verifies nothing, a run started bound to no Spec, or a cwd that \
                         matched NO workspace — code 'run_location_unresolved', the run then opens \
                         with no workspace anchor at all and its effectors resolve no repos, which \
@@ -2974,12 +3099,83 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("optional: the Spec to bind the run to (its lifecycle transitions then apply); resolved from workspace_id/cwd when omitted"),
+                // CONDITIONAL: every argument of `run_start` is optional, so a `#N` passed alone
+                // anchors nothing. The refusal it meets is the engine's own
+                // ([`crate::mcp_engine`]'s `unknown_spec_refusal`, which on that anchorless path
+                // adds the anchors to name a project with — and, once the call DOES anchor one,
+                // names what that project holds instead) rather than the entry point's — the
+                // sentence below states the condition either way, so the advertisement matches on
+                // both paths.
+                "spec_id": conditional_spec_ref_prop(
+                    "optional: the Spec to bind the run to (its lifecycle transitions then apply); \
+                     resolved from workspace_id/cwd when omitted",
+                    "you also pass project_id, workspace_id or cwd — all optional here, since this \
+                     call requires no argument at all",
+                ),
+                // ADVERTISED BECAUSE IT IS HONOURED: `mcp_context::resolve_project` reads
+                // `project_id` FIRST, and `run_start`'s own refusal for an unresolvable `#N` tells
+                // the caller to add one. A tool that accepts an argument its `tools/list` does not
+                // name cannot be discovered — and an agent sent after an argument the schema omits
+                // is exactly the half-refusal `run_bind_spec` was just repaired for (findings
+                // `01M0ZWAH9EQDAZR66AFS1YJFPY`, `01M1008NHM9RRA1ZAS4V7K1PM4`).
+                "project_id": str_prop("optional: the PROJECT this call anchors — what a '#N' or a bare number is counted in, and which project's active workflow the run uses. It resolves NO Spec by itself (workspace_id / cwd do that, or name the spec_id): it is the anchor to add when a short reference has no project to resolve against. Passed BESIDE a spec_id of another project, the disagreement is refused, never silently overridden"),
                 "workspace_id": str_prop("optional: resolve the Spec + project from this workspace — exactly one active Spec must be anchored there for the run to bind one"),
                 "cwd": str_prop("optional: resolve the Spec + project from the workspace whose path matches this cwd (deepest matching root wins), then the same one-active-Spec rule as workspace_id"),
                 "workflow_id": str_prop("optional: run THIS workflow explicitly, bypassing scope resolution"),
                 "scope": str_prop("optional: which workflow family to run (ndev | nspec | ndoc); defaults to ndev. coder/prototyper are SUB-WORKFLOW-ONLY (opened by a sub_workflow node), not started here"),
             },
+        },
+    }));
+    // The RECOVERY twin of `run_start`: a run already open and carrying no Spec. Advertised because
+    // an un-advertised tool is undispatchable (N17) — and because the session that needs it is by
+    // definition one that already went wrong once, so it must be able to find the way out.
+    //
+    // THE `data.reason` CODES BELOW ARE A CONTRACT, NOT PROSE: they are written here as literals
+    // for readability, and `tests::run_bind_spec_advertises_its_refusal_codes_by_constant`
+    // confronts every one of them with `mcp_engine`'s `bind_refusal` module — so renaming a code,
+    // or adding one to that module (at any visibility), fails a test instead of leaving this
+    // sentence quietly wrong.
+    descriptors.push(json!({
+        "name": crate::mcp_engine::RUN_BIND_SPEC_TOOL,
+        "description": "RECOVERY, not the normal way to anchor a run: attach an ALREADY-OPEN run to \
+                        the Spec it turned out to be about. The normal way is to open the run \
+                        already anchored — run_start with the Spec named. Use this when a run is \
+                        open, work has been done in it, and it carries no Spec (its spec_id is \
+                        null): binding it arms the Spec facts the graph reads (spec_status, \
+                        spec_open_tasks) and the transitions it applies, without throwing the \
+                        session away. EVERY refusal NAMES the condition it broke, under \
+                        data.reason — what follows is what you can rule out BEFORE calling, not a \
+                        closed list of codes. ON THE RUN: it must not be finished \
+                        ('run_is_terminal' — read FIRST, because a run this session drove to its \
+                        end has already left the session registry), it must be a run THIS session \
+                        opened ('run_not_in_this_session' — run_list shows every session's and \
+                        every project's runs, so an id read there is not yours by default), it must \
+                        carry NO Spec ('run_already_bound' — a run's Spec is never re-written), and \
+                        it must be TOP-LEVEL ('run_is_a_child' — a sub-workflow child inherits its \
+                        parent's Spec). ON THE SPEC: it must belong to the project the run's \
+                        workspace anchors ('spec_project_disagrees_with_run' — a KEY-N carries its \
+                        own project, so the short grammar is exactly the form that can name a Spec \
+                        of somewhere else), and it must not already carry a live run of this \
+                        workflow ('spec_already_has_a_live_run') — nyx holds at most ONE live run \
+                        per (workflow, Spec), and a second would be destroyed by the next run_start \
+                        on that Spec. Returns { run_id, spec_id, workflow_id }.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": str_prop("the OPEN run to attach — one this session drives (its id rides in your NYX RUN block, or came back from run_start)"),
+                // REQUIRED, YET CONDITIONAL — the one member of the family whose anchor is a run.
+                // A run's project comes from its WORKSPACE, and `run_start` deliberately opens a
+                // run without one when its cwd matched nothing (`run_location_unresolved`), which
+                // is precisely the session this verb repairs. So the short forms are promised with
+                // their condition rather than unconditionally, and the anchorless way out is named.
+                "spec_id": conditional_spec_ref_prop(
+                    "the Spec the run is really about",
+                    "the run_id you pass names a run anchored on a WORKSPACE (that workspace's \
+                     project is what a number is counted in, and run_start opens a run WITHOUT one \
+                     when its cwd matched nothing — the very session this verb exists to repair)",
+                ),
+            },
+            "required": ["run_id", "spec_id"],
         },
     }));
     // The v2.8 ENGINE runtime tick. The session is a THIN dispatcher: call nyx_next in a loop,
@@ -3090,7 +3286,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the Spec whose prototype to read"),
+                "spec_id": anchorless_spec_ref_prop("the Spec whose prototype to read"),
                 "section": str_prop("read ONE list as a page instead of the overview: rounds | current_round_manifest | pages | versions | variants | open_feedback"),
                 "offset": int_prop("where to resume inside `section` (follow the next_offset the previous page returned)"),
                 "limit": int_prop("how many rows to ask for (default 25, max 200 — the byte cap may still return fewer)"),
@@ -3290,7 +3486,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "spec_id": str_prop("the Spec to attach the prototype to"),
+                "spec_id": anchorless_spec_ref_prop("the Spec to attach the prototype to"),
                 "description": str_prop("optional brief describing what the prototype covers"),
             },
             "required": ["spec_id"],
@@ -4349,10 +4545,249 @@ mod tests {
         }
     }
 
+    /// WHAT NYX ACCEPTS, NYX ADVERTISES — AND WHAT IT REFUSES, IT ADVERTISES TOO. An agent forms
+    /// its call from these descriptions and from nothing else, and the defect this closes is
+    /// exactly a surface that DISPLAYED `#3` while accepting only the canonical id — silently. So
+    /// EVERY `spec_id`-shaped property (whatever tool, whatever the argument is called) must name
+    /// the forms it takes, and must name them with a CONSTANT of [`crate::spec_ref`] rather than a
+    /// hand-written paraphrase: a paraphrase is a second statement of the grammar, free to drift
+    /// from the parser the day a form is added.
+    ///
+    /// THREE FAMILIES, AND THE SCHEMA ITSELF DECIDES WHICH. A `#N` / bare `N` is counted inside a
+    /// project, and the project comes from the call's OWN anchors — so the family is decided by TWO
+    /// facts the schema already carries: WHICH of `project_id` / `workspace_id` / `cwd` / `run_id`
+    /// the tool exposes, and whether one of them is REQUIRED **and carries a project by
+    /// construction**.
+    ///   * A CERTAIN ANCHOR → the full [`crate::spec_ref::ACCEPTED_FORMS`] sentence, unconditional,
+    ///     because the call can never arrive without a project.
+    ///   * AN ANCHOR THAT MAY BE ABSENT → the four forms AND the condition, named
+    ///     ([`CONDITIONAL_ANCHOR_CLAUSE`]), AND [`crate::spec_ref::ANCHORLESS_FORMS`] as the way
+    ///     out. The same call honours `#N` with the anchor and cannot without it, and a form that
+    ///     works or not depending on an unrelated argument is harder to diagnose than one that
+    ///     never works. TWO WAYS TO BE ABSENT, and they land in the same family: the anchor may be
+    ///     omitted, OR it may be required and still RESOLVE TO NOTHING. `run_bind_spec` is the
+    ///     second shape — its required `run_id` names a run whose project comes from its WORKSPACE,
+    ///     and `run_start` opens a run without one when its `cwd` matched none, which is the very
+    ///     session that verb repairs. A required `cwd` would be that shape too: it resolves by
+    ///     longest-prefix match over the workspace roots, and a valid path under none of them names
+    ///     no project. Reading "required" as "certain" is what let it promise the four forms
+    ///     unconditionally on a call that could not always keep them (finding
+    ///     `01M0ZWAH9EQDAZR66AFS1YJFPY`; `01M1005GAY94XZ7BNKY4ASFTR5` for the `cwd` half).
+    ///   * NO ANCHOR → `ANCHORLESS_FORMS`, and NOT the four-form sentence, because announcing a
+    ///     form this tool must refuse is the original defect wearing another hat (finding
+    ///     `01M0ZGCCSQ2F25HPBS6NX5JAFS`).
+    ///
+    /// READING THE FAMILY ON THE MERE PRESENCE OF AN ANCHOR IS WHAT LET TWO FIELDS THROUGH. That is
+    /// how this test used to work, and under it `spec_set_workspace` and `agent_context` — whose
+    /// only anchors are OPTIONAL — counted as anchored, so the test DEMANDED of them the very
+    /// unconditional promise they could not keep (finding `01M0ZKWXS353TABS0WCT3XXB81`). Requiring
+    /// the `required` array to name the anchor is what separates the two, and it is why the third
+    /// family exists here rather than as a hand-kept exception beside a two-way test.
+    ///
+    /// Make one of the anchorless fields take a `cwd` and it moves to the CONDITIONAL family under
+    /// this test, which then demands the condition; give it a REQUIRED `workspace_id` and it moves
+    /// again, to the unconditional one — the advertisement follows the capability by construction,
+    /// in all three directions. Marking that same `cwd` `required` does NOT make the last move, and
+    /// that is the rule working: what promotes a field is an anchor that NAMES its project, not a
+    /// schema keyword.
+    ///
+    /// THE SCAN ALSO SEES PLURAL FIELDS (`idea_add.spec_ids`): a field holding an ARRAY of
+    /// references is a `spec_id` field with an `s`, and filtering on the singular alone left the
+    /// 23rd field of the surface invisible to both halves of the lock (finding
+    /// `01M0ZMGJG9VXD4GCY6Y6TN3RYS`).
+    #[test]
+    fn every_spec_id_argument_advertises_the_forms_it_accepts() {
+        // The anchors `mcp_context::resolve_project` reads — the ONLY way a call can name a
+        // project for a bare number to be counted in.
+        const ANCHORS: [&str; 4] = ["project_id", "workspace_id", "cwd", "run_id"];
+        // …and the subset that cannot END ON NOTHING — those that name their project
+        // DIRECTLY. `project_id` IS a project; a `workspace_id` names a row that carries its
+        // project in a column. The other two are LOOKUPS that can legitimately answer nothing, and
+        // being REQUIRED does not change that:
+        //   * a `cwd` resolves through `best_workspace_for_cwd`, a longest-prefix match over the
+        //     workspace roots (`mcp_context.rs`, `resolve_project`) — a perfectly VALID path that
+        //     sits under no workspace root resolves NO project, which is the very case `run_start`
+        //     reports as `run_location_unresolved`;
+        //   * a `run_id` names a run whose project is its WORKSPACE's, and `run_start` deliberately
+        //     opens a run with no workspace when its `cwd` matched none — the session
+        //     `run_bind_spec` exists to repair.
+        // So requiring either leaves the project UNCERTAIN, and a field anchored on one alone
+        // belongs to the CONDITIONAL family — the family rule read on what the anchor IS, not
+        // merely on whether it is required (findings `01M0ZWAH9EQDAZR66AFS1YJFPY` for `run_id`,
+        // `01M1005GAY94XZ7BNKY4ASFTR5` for `cwd`). This set and the `required_anchor` assertion
+        // message below name the SAME anchors; when they disagreed, the message was the one telling
+        // the truth.
+        const ANCHORS_THAT_CARRY_A_PROJECT: [&str; 2] = ["project_id", "workspace_id"];
+        let mut required_anchor = 0usize;
+        let mut optional_anchor = 0usize;
+        let mut anchorless = 0usize;
+        for tool in tool_descriptors() {
+            let name = tool["name"].as_str().unwrap_or_default().to_string();
+            let Some(props) = tool["inputSchema"]["properties"].as_object() else {
+                continue;
+            };
+            // A tool with no `required` array requires nothing — `run_start` is exactly that.
+            let required: Vec<&str> = tool["inputSchema"]["required"]
+                .as_array()
+                .map(|r| r.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let anchors_exposed: Vec<&str> = props
+                .keys()
+                .map(String::as_str)
+                .filter(|k| ANCHORS.contains(k))
+                .collect();
+            let anchor_is_certain = anchors_exposed
+                .iter()
+                .any(|a| required.contains(a) && ANCHORS_THAT_CARRY_A_PROJECT.contains(a));
+            for (arg, schema) in props {
+                // Singular AND plural: `spec_id`, `from_spec_id`, `to_spec_id`, `spec_ids`.
+                if !(arg.ends_with("spec_id") || arg.ends_with("spec_ids")) {
+                    continue;
+                }
+                let desc = schema["description"].as_str().unwrap_or_default();
+                if anchors_exposed.is_empty() {
+                    assert!(
+                        desc.contains(crate::spec_ref::ANCHORLESS_FORMS),
+                        "{name}.{arg} anchors no project, so it must name the self-anchored forms \
+                         it CAN resolve: {desc}"
+                    );
+                    assert!(
+                        !desc.contains(crate::spec_ref::ACCEPTED_FORMS),
+                        "{name}.{arg} advertises '#N' / 'N' on a call that can never count them — \
+                         that promise is the defect, not the fix: {desc}"
+                    );
+                    assert!(
+                        desc.contains("REFUSED"),
+                        "{name}.{arg} must say the two other forms are refused, not leave an agent \
+                         to discover it: {desc}"
+                    );
+                    anchorless += 1;
+                } else if anchor_is_certain {
+                    assert!(
+                        desc.contains(crate::spec_ref::ACCEPTED_FORMS),
+                        "{name}.{arg} always anchors a project, so it must name the four forms: \
+                         {desc}"
+                    );
+                    assert!(
+                        !desc.contains(CONDITIONAL_ANCHOR_CLAUSE),
+                        "{name}.{arg} states a condition it does not have — one of {anchors_exposed:?} \
+                         is REQUIRED and carries a project by construction, so the four forms \
+                         always resolve here: {desc}"
+                    );
+                    required_anchor += 1;
+                } else {
+                    assert!(
+                        desc.contains(crate::spec_ref::ACCEPTED_FORMS),
+                        "{name}.{arg} CAN anchor a project, so it must name the four forms: {desc}"
+                    );
+                    assert!(
+                        desc.contains(CONDITIONAL_ANCHOR_CLAUSE),
+                        "{name}.{arg} announces '#N' / 'N' while no anchor it reads \
+                         ({anchors_exposed:?}) is both REQUIRED and project-bearing — the CONDITION \
+                         is part of the promise, or the promise is one the call cannot always \
+                         keep: {desc}"
+                    );
+                    assert!(
+                        desc.contains(crate::spec_ref::ANCHORLESS_FORMS)
+                            && desc.contains("REFUSED"),
+                        "{name}.{arg} must say what happens when the condition does not hold, and \
+                         what to send instead: {desc}"
+                    );
+                    assert!(
+                        anchors_exposed.iter().any(|a| desc.contains(a)),
+                        "{name}.{arg} must NAME the anchor its short forms depend on (one of \
+                         {anchors_exposed:?}) — a condition an agent cannot act on is not one: \
+                         {desc}"
+                    );
+                    optional_anchor += 1;
+                }
+            }
+        }
+        assert_eq!(
+            anchorless, 12,
+            "the twelve anchorless `spec_id` FIELDS (fewer tools than fields — `spec_link` and \
+             `spec_unlink` carry two each) are the ones the finding enumerates — a change in that \
+             count is a change of contract, not a detail"
+        );
+        assert_eq!(
+            optional_anchor, 5,
+            "the CONDITIONAL fields — every one whose project can be absent at call time, whether \
+             because its anchor may be omitted (`spec_update_section`, `spec_set_workspace`, \
+             `agent_context`, `run_start`) or because the anchor it REQUIRES may itself resolve to \
+             nothing (`run_bind_spec`, whose `run_id` names a run that may carry no workspace). One \
+             arriving here without its condition is exactly what this family exists to catch"
+        );
+        assert_eq!(
+            required_anchor, 8,
+            "the fields whose call REQUIRES an anchor that carries a project BY CONSTRUCTION — a \
+             `project_id`, or a `workspace_id` that has one in a column — so a number always has a \
+             project to be counted in there. The singular ones plus `idea_add.spec_ids`; the scan \
+             must actually reach the plural too. It went from 7 to 8 when \
+             `review_comment_list.spec_id` was finally ADVERTISED: the call had honoured it since \
+             v2.4 while the schema named it nowhere, so this very scan — which reads the schema — \
+             could not see it (`01M1008NHM9RRA1ZAS4V7K1PM4` on a read)"
+        );
+    }
+
+    /// ONE MEMBER OF THE CONDITIONAL FAMILY, pinned on its own because the BEHAVIOUR its sentence
+    /// promises is pinned right next to it (`mcp_tools_spec::tests`), and the two halves are worth
+    /// reading together. HOW MANY members that family has is not said here and never should be: the
+    /// count lives in the assertion that fails when it drifts
+    /// ([`tests::every_spec_id_argument_advertises_the_forms_it_accepts`](mod@tests)'s
+    /// `optional_anchor`), and a number repeated in prose beside it is a number nothing checks —
+    /// which is how "the four conditional fields" survived the commit that made them five (finding
+    /// `01M10059A8ZKK4961GYPNERT07`).
+    ///
+    /// `spec_update_section` carries exactly one project anchor and it is OPTIONAL (`run_id`, the
+    /// human-gated correction path), so the same call honours `#N` with one and refuses it without.
+    /// That is a form which works or not depending on an argument unrelated to it — harder to
+    /// diagnose than one that never works — so the CONDITION itself is part of the advertisement
+    /// (finding `01M0ZGHD137MDXFGS2PBG6GS68`). The family as a whole is held by
+    /// [`tests::every_spec_id_argument_advertises_the_forms_it_accepts`](mod@tests).
+    #[test]
+    fn spec_update_section_states_the_condition_its_short_forms_depend_on() {
+        let tools = tool_descriptors();
+        let desc = tools
+            .iter()
+            .find(|t| t["name"] == crate::mcp_tools_spec::SPEC_UPDATE_SECTION_TOOL)
+            .map(|t| t["inputSchema"]["properties"]["spec_id"]["description"].clone())
+            .expect("spec_update_section is advertised");
+        let desc = desc.as_str().unwrap_or_default();
+        assert!(
+            desc.contains("run_id"),
+            "the condition is NAMED, not left to be discovered: {desc}"
+        );
+        assert!(
+            desc.contains(crate::spec_ref::ANCHORLESS_FORMS),
+            "and the sentence says what to send when the condition does not hold: {desc}"
+        );
+    }
+
+    /// THE ONE WAY THIS MODULE'S SOURCE SCANS READ A `const` DECLARATION. Several guards here pin a
+    /// descriptor against the constants a sibling module declares, by reading that module's own
+    /// source — and every one of them must agree on what a declaration LOOKS like.
+    ///
+    /// NEITHER VISIBILITY NOR INDENTATION IS PART OF THE PATTERN: `const`, `pub const` and
+    /// `pub(crate) const` all read the same. Promoting a code to `pub(crate)` so a test can pin it
+    /// by name — precisely what `mcp_engine.rs`'s `RUN_LOCATION_UNRESOLVED_WARNING_CODE` was put
+    /// through, and what `mod bind_refusal` was put through right after — must not be the move that
+    /// drops it out of a scan. `mcp_engine.rs` already mixes the two forms on one family of
+    /// constants, so a pattern keyed on `"pub const "` is not a hypothetical gap (finding
+    /// `01M10YD9QZYJJDAQQ1S8TGWSKH`).
+    ///
+    /// Returns what FOLLOWS the keyword — the name, type and initialiser — leaving each caller to
+    /// say which declarations it is after and how their literal is spelled.
+    fn const_declaration(line: &str) -> Option<&str> {
+        let (vis, rest) = line.trim_start().split_once("const ")?;
+        let vis = vis.trim_end();
+        (vis.is_empty() || vis == "pub" || (vis.starts_with("pub(") && vis.ends_with(')')))
+            .then_some(rest)
+    }
+
     /// DONE-CRITERION (task `01KYA4D8ZWDK8D0H28PVRE5PGJ`): the surfaces an agent reads BEFORE it
     /// calls anything — the tool descriptors — must state the resolution contract EXACTLY, because
     /// a descriptor that leaves it implicit is how "nyx probably picks the one I mean" gets
-    /// believed. Three things are asserted, on the four tools concerned:
+    /// believed. What is asserted, on the tools concerned:
     ///   * the ANCHORING tools bound the link to `ready`/`in_progress` and promise NO status change
     ///     (and the corrective `spec_set_workspace` says a draft is refused);
     ///   * the RESOLVING tools spell out 0/1/N — the ambiguity `reason`, the candidate list, and
@@ -4426,28 +4861,17 @@ mod tests {
         // one an agent meets on its nominal path (a first `/nspec` has no Spec yet).
         //
         // The list is NOT hand-kept here. It is SCANNED out of `mcp_context.rs`, whose
-        // `*_WARNING_CODE` constants ARE that channel — so a FOURTH code declared there without a
+        // `*_WARNING_CODE` constants ARE that channel — so a NEW code declared there without a
         // word in the descriptor turns this test red, which is exactly the failure being closed: an
-        // enumeration that names 2 of its 3 codes reads as EXHAUSTIVE, and an agent meeting the
-        // missing one concludes nyx is broken rather than that its run is simply unbound.
+        // enumeration that names all but one of its codes reads as EXHAUSTIVE, and an agent meeting
+        // the missing one concludes nyx is broken rather than that its run is simply unbound.
         //
-        // NEITHER VISIBILITY NOR INDENTATION IS PART OF THE PATTERN: `const`, `pub const` and
-        // `pub(crate) const` all read the same. Promoting a code to `pub(crate)` so a test can pin
-        // it by name — precisely what `mcp_engine.rs`'s `RUN_LOCATION_UNRESOLVED_WARNING_CODE` was
-        // just put through — must not be the move that drops it out of the scan. And the scan now
-        // AUDITS ITS OWN READING: every line declaring a `*_WARNING_CODE` must also yield a
-        // literal, so a declaration this pattern cannot parse (wrapped onto two lines, say) fails
-        // the count instead of vanishing from it in silence.
+        // The reading is [`const_declaration`]'s — whatever the visibility, whatever the
+        // indentation. And the scan AUDITS ITS OWN READING: every line declaring a
+        // `*_WARNING_CODE` must also yield a literal, so a declaration this pattern cannot parse
+        // (wrapped onto two lines, say) fails the count instead of vanishing from it in silence.
         const CONTEXT_SRC: &str =
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_context.rs"));
-        // `const NAME…` whatever its indentation and whatever visibility precedes it — the
-        // declaration keyword identifies the line, never the column it happens to start in.
-        fn const_declaration(line: &str) -> Option<&str> {
-            let (vis, rest) = line.trim_start().split_once("const ")?;
-            let vis = vis.trim_end();
-            (vis.is_empty() || vis == "pub" || (vis.starts_with("pub(") && vis.ends_with(')')))
-                .then_some(rest)
-        }
         let agent_ctx = desc_of(crate::mcp_context::AGENT_CONTEXT_TOOL);
         let mut declared = 0usize;
         let mut scanned: Vec<&str> = Vec::new();
@@ -4487,15 +4911,248 @@ mod tests {
         // run_start's OWN location code — the run-side half of the same review finding: a `cwd`
         // matching no workspace opens a run with no anchor and effectors with no repos.
         //
-        // Pinned by NAME only, not by the same scan: `mcp_engine.rs` declares seven warning codes,
-        // and several are covered by the descriptor as a CATEGORY rather than by their code (a
+        // Pinned by NAME only, not by the same scan: `mcp_engine.rs` declares warning codes of its
+        // own, and several are covered by the descriptor as a CATEGORY rather than by their code (a
         // stale graph fork, a query on an unbound run). Widening the rule to that module is a
         // separate decision from this PRD's.
         assert!(
             run_start.contains(crate::mcp_engine::RUN_LOCATION_UNRESOLVED_WARNING_CODE),
-            "run_start names '{}' among the warnings it tells the caller to relay, got: \
-             {run_start}",
+            "run_start's description must NAME the code '{}' — this pins the code's PRESENCE in the \
+             description, not the section of it that carries the code, got: {run_start}",
             crate::mcp_engine::RUN_LOCATION_UNRESOLVED_WARNING_CODE
+        );
+        // …and the RESUME code, pinned the same way and for the same reason: renaming the constant
+        // without re-wording the description would leave `tools/list` naming a code no warning
+        // carries. This pins THE CODE'S PRESENCE in the description — nothing about the sentence
+        // around it, which is free to be re-written.
+        assert!(
+            run_start.contains(crate::mcp_engine::RUN_RESUMED_WARNING_CODE),
+            "run_start's description must NAME the code '{}' — same pin, same reserve: the sentence \
+             around it is free to be re-written, got: {run_start}",
+            crate::mcp_engine::RUN_RESUMED_WARNING_CODE
+        );
+    }
+
+    /// `outcome` IS A CONTRACT, and `tools/list` is where a caller reads what it may hold.
+    /// `run_start` returns one of [`crate::mcp_engine::RUN_START_OUTCOME_TAGS`] and its description
+    /// spells all three out — two spellings of the same three strings, with nothing but this test
+    /// between them. Renaming a tag on the enum alone would leave the descriptor announcing values
+    /// no run ever returns, which is the `01M1008NHM9RRA1ZAS4V7K1PM4` defect on the return side.
+    ///
+    /// THE LITERALS STAY IN THE DESCRIPTION, on the model of `run_bind_spec`'s refusal codes just
+    /// above: they read as prose there, and what keeps them honest is a lock, not a `format!` over a
+    /// paragraph. What is walked is the CONSTANT LIST against the rendered text — so a tag added to
+    /// [`crate::mcp_engine::RUN_START_OUTCOME_TAGS`], or renamed on it, fails here rather than
+    /// shipping with a descriptor that names something else.
+    ///
+    /// AND NO FURTHER, which is why the name says "listed". Nothing binds that list to the enum: a
+    /// fourth VARIANT given a tag but not a slot on the list compiles and passes HERE. What stands
+    /// in the way is a second, exhaustive match —
+    /// `mcp_engine::tests::every_run_start_outcome_carries_a_listed_tag` — which stops COMPILING on
+    /// a fourth variant and states the rule where its author lands. The array's own doc carries why
+    /// that is a visit rather than a derivation.
+    #[test]
+    fn run_start_advertises_every_listed_outcome_tag() {
+        let tools = tool_descriptors();
+        let run_start = tools
+            .iter()
+            .find(|t| t["name"] == crate::mcp_engine::RUN_START_TOOL)
+            .and_then(|t| t["description"].as_str())
+            .expect("run_start is advertised");
+        for tag in crate::mcp_engine::RUN_START_OUTCOME_TAGS {
+            assert!(
+                run_start.contains(&format!("'{tag}'")),
+                "run_start's description must name the outcome tag '{tag}' it can return, got: \
+                 {run_start}",
+            );
+        }
+    }
+
+    /// A REFUSAL MAY ONLY ADVISE AN ARGUMENT THE VERB ADVERTISES (finding
+    /// `01M1008NHM9RRA1ZAS4V7K1PM4`). When a `#N` resolves no project, `run_start` tells the caller
+    /// to ADD an anchor — and the entire value of that sentence is that the caller can act on it.
+    /// What a caller reads is `tools/list`, not `mcp_context::resolve_project`: `project_id` was
+    /// honoured at runtime and named in the trailer while ABSENT from the schema, which is the very
+    /// defect `run_bind_spec` had just been repaired for — on the verb that repair cited as the
+    /// honest one.
+    ///
+    /// THE LOCK READS THE CONSTANT, NOT A COPY OF IT
+    /// ([`crate::mcp_engine::RUN_START_ANCHOR_TRAILER`]), and it DERIVES the names the trailer
+    /// carries instead of testing it against names this test already knows: a hand-kept vocabulary
+    /// only catches a re-wording that stays inside it, so `"…a cwd / workspace_id / project_key"`
+    /// would have passed green while sending an agent after an argument `run_start` does not take
+    /// (finding `01M10YE1HTXTA76CFJMW1G4XHZ`). The domain carries both words — `project_id`, and
+    /// the KEY of a `KEY-N` — so that confusion is not hypothetical.
+    ///
+    /// THE DERIVATION HAS A SHAPE, AND THE SHAPE IS ASSERTED FIRST. The advice is a slash-separated
+    /// list of argument names, one per segment; re-write it as prose and the shape assertion goes
+    /// red rather than the derivation quietly reading nothing. That is the whole reach of this
+    /// guard, stated so it is not read as more: every name the trailer advertises IN THAT SHAPE
+    /// must be a key of `run_start`'s own `inputSchema.properties`, and any other shape has to come
+    /// back through this test.
+    #[test]
+    fn run_start_advises_only_anchors_its_own_schema_advertises() {
+        let tools = tool_descriptors();
+        let props = tools
+            .iter()
+            .find(|t| t["name"] == crate::mcp_engine::RUN_START_TOOL)
+            .and_then(|t| t["inputSchema"]["properties"].as_object().cloned())
+            .expect("run_start is advertised, with a schema");
+        let trailer = crate::mcp_engine::RUN_START_ANCHOR_TRAILER;
+        // ", or add a cwd / workspace_id / project_id" — slash-separated segments, the argument
+        // being the LAST word of each. Read that way, EVERY name the sentence carries is checked,
+        // including one no test anticipated; a list written out here would only check the ones it
+        // already contained.
+        let advised: Vec<&str> = trailer
+            .split('/')
+            .map(|segment| {
+                segment
+                    .split_whitespace()
+                    .next_back()
+                    .unwrap_or_default()
+                    .trim_end_matches(['.', ',', ';'])
+            })
+            .collect();
+        // THE SHAPE THE DERIVATION ASSUMES, ASSERTED BEFORE IT IS USED — the same discipline as the
+        // scans that audit their own reading. A trailer re-written as prose would leave the loop
+        // below matching empty strings and the guard vacuous; it fails HERE instead, so whoever
+        // changes the shape says how the new one is to be read.
+        assert!(
+            trailer.contains('/') && advised.iter().all(|name| !name.is_empty()),
+            "the advice must stay a SLASH-SEPARATED LIST of argument names — that shape is what \
+             this guard derives them from, and without it it would assert nothing while the \
+             refusal it guards says nothing actionable: {trailer}"
+        );
+        for anchor in advised {
+            assert!(
+                props.contains_key(anchor),
+                "run_start's refusal tells the caller to add '{anchor}', which its own inputSchema \
+                 does not advertise — advice a tools/list reader cannot act on is half a refusal: \
+                 {trailer}"
+            );
+        }
+    }
+
+    /// THE `data.reason` CODES `run_bind_spec` ADVERTISES ARE THE CONSTANTS IT EMITS (finding
+    /// `01M10063H5B65Q81V4HRW94W71`). Its descriptor tells a caller which condition each refusal
+    /// names, so those codes are a CONTRACT — and they were re-typed literals, exact but bound to
+    /// nothing: renaming a value in `mcp_engine`'s `bind_refusal` would have left the descriptor
+    /// mistaken in silence. The repository had already settled this the other way for
+    /// `RUN_LOCATION_UNRESOLVED_WARNING_CODE`, promoted to `pub(crate)` so its descriptor is pinned
+    /// "against the constant itself rather than against a re-typed literal"; this is the same move
+    /// on the same kind of surface.
+    ///
+    /// TWO HALVES, AND THE SECOND IS THE ONE A HAND-KEPT LIST WOULD LOSE. Each advertised code is
+    /// checked against its constant — that catches a RENAME. And the module's declarations are
+    /// SCANNED out of the source and confronted with the codes this test knows about — that catches
+    /// an ADDITION, i.e. a new refusal shipped without a word to the caller. The one code
+    /// deliberately NOT advertised is `AUTHORITY_REFUSED`: the descriptor's own sentence promises
+    /// "what you can rule out BEFORE calling, not a closed list of codes", and a race lost inside
+    /// the authority's `WHERE` is precisely what no caller can pre-check. Its ABSENCE is asserted,
+    /// so the exception stays a decision instead of becoming an oversight.
+    ///
+    /// WHAT THE ADDITION HALF REACHES, EXACTLY — because a guard that overstates its reach is worse
+    /// than none. It reads the `const` declarations of `mod bind_refusal`, at ANY visibility and
+    /// any indentation ([`const_declaration`]), and it fails on a declaration it could not parse
+    /// rather than skipping it. So: a code added there in any form is either advertised, or red.
+    /// What it does NOT reach is a `data.reason` that never becomes a constant of that module — a
+    /// bare literal handed straight to `mcp_engine::bind_refusal`. Every call site passes a
+    /// constant today, and that is the convention this guard assumes rather than enforces.
+    #[test]
+    fn run_bind_spec_advertises_its_refusal_codes_by_constant() {
+        use crate::mcp_engine::bind_refusal;
+
+        let tools = tool_descriptors();
+        let desc = tools
+            .iter()
+            .find(|t| t["name"] == crate::mcp_engine::RUN_BIND_SPEC_TOOL)
+            .and_then(|t| t["description"].as_str())
+            .expect("run_bind_spec is advertised")
+            .to_string();
+
+        // The preconditions a caller CAN rule out before calling — every one named in the
+        // descriptor, by the constant the engine answers with.
+        let advertised = [
+            bind_refusal::TERMINAL_RUN,
+            bind_refusal::FOREIGN_RUN,
+            bind_refusal::ALREADY_BOUND,
+            bind_refusal::CHILD_RUN,
+            bind_refusal::PROJECT_DISAGREEMENT,
+            bind_refusal::SPEC_HAS_A_LIVE_RUN,
+        ];
+        for code in advertised {
+            assert!(
+                desc.contains(code),
+                "run_bind_spec must name the refusal code '{code}' it can answer with — a caller \
+                 keys on data.reason, and a code taught nowhere is one it meets as a surprise: \
+                 {desc}"
+            );
+        }
+        assert!(
+            !desc.contains(bind_refusal::AUTHORITY_REFUSED),
+            "'{}' is the ONE code deliberately left out: it is a race lost inside the authority's \
+             WHERE, and the descriptor offers what can be ruled out BEFORE calling. Advertising it \
+             would invite a pre-check that cannot exist: {desc}",
+            bind_refusal::AUTHORITY_REFUSED
+        );
+
+        // …AND NOTHING MAY BE DECLARED THERE MUTE. The module's own source is the list: a new
+        // precondition added to `bind_refusal` without a word in the descriptor (and without a line
+        // above) fails here rather than reaching a caller as an unexplained `data.reason`.
+        const ENGINE_SRC: &str =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_engine.rs"));
+        let block = ENGINE_SRC
+            .split_once("mod bind_refusal {")
+            .expect("the refusal codes are declared in a module of that name")
+            .1
+            .split_once("\n}")
+            .expect("…which closes at column zero, being a top-level item")
+            .0;
+        // THE READING IS [`const_declaration`]'s, and for the reason written there: a pattern keyed
+        // on `"pub const "` would make a VISIBILITY into an escape hatch. The module is `pub(crate)`
+        // — `pub const` and `pub(crate) const` reach exactly as far inside it — so a code declared
+        // either way must be seen, and `mcp_engine.rs` already mixes the two forms on one family of
+        // constants.
+        //
+        // AND THE SCAN AUDITS ITS OWN READING: every line that declares a `const` here must also
+        // yield a literal, so a declaration this pattern cannot parse — a value rustfmt wrapped
+        // onto a second line, a type spelled otherwise than `&str` — fails the COUNT rather than
+        // dropping out of the comparison below unseen. Without that audit, "unreadable" and
+        // "absent" were the same thing to this test, and a new code could ship mute by being merely
+        // unreadable (finding `01M10YD9QZYJJDAQQ1S8TGWSKH`).
+        //
+        // `line.trim()`, both ends: the block's LAST line keeps its `\r` on a CRLF checkout (it is
+        // not followed by the `\n` that would let `lines()` strip it), and a code carrying an
+        // invisible carriage return would match nothing and fail as a mystery.
+        let mut declarations = 0usize;
+        let mut declared: Vec<&str> = Vec::new();
+        for line in block.lines() {
+            let Some(rest) = const_declaration(line.trim()) else {
+                continue;
+            };
+            declarations += 1;
+            let Some((_, literal)) = rest.split_once("&str = \"") else {
+                continue;
+            };
+            declared.push(literal.trim_end_matches("\";").trim_end_matches('"'));
+        }
+        assert_eq!(
+            declared.len(),
+            declarations,
+            "every `const` DECLARED in `bind_refusal` was actually read by the scan — a declaration \
+             whose literal this pattern cannot reach must fail here rather than slip through \
+             unconfronted; {declarations} declared, read {declared:?}"
+        );
+        let mut known: Vec<&str> = advertised.to_vec();
+        known.push(bind_refusal::AUTHORITY_REFUSED);
+        declared.sort_unstable();
+        known.sort_unstable();
+        assert_eq!(
+            declared, known,
+            "every code `bind_refusal` declares is accounted for here — one this test does not \
+             know about is a refusal that would reach a caller as an unexplained `data.reason`. \
+             (A declaration the scan could NOT read has already failed the count above; what is \
+             left to this comparison is the codes it did read.)"
         );
     }
 
@@ -5104,6 +5761,12 @@ mod tests {
             names.contains(&crate::mcp_engine::NYX_NEXT_TOOL),
             "v2.8 nyx_next engine tool must be listed"
         );
+        // …and the run-lifecycle RECOVERY beside the entry: an un-advertised tool is
+        // undispatchable (N17), and a session that opened its run unbound has no other way out.
+        assert!(
+            names.contains(&crate::mcp_engine::RUN_BIND_SPEC_TOOL),
+            "run_bind_spec must be listed"
+        );
         // The v2.8 GRAPH-AUTHORING tools (workflow_create/fork/assign + node CRUD + the v2.8-review
         // reads workflow_list/workflow_get/run_list + workflow_delete) advertised alongside, kept
         // OUT of V1_TOOLS (a new v2.8 surface).
@@ -5136,7 +5799,7 @@ mod tests {
                 // the multi-pane grouping landed (manage_command_group).
                 + 26
                 + 9
-                + 2
+                + 3
                 + crate::mcp_tools_spec::SPEC_TOOLS.len()
                 + crate::mcp_tools_idea::IDEA_TOOLS.len()
                 + crate::mcp_tools_annexe::ANNEXE_TOOLS.len()
@@ -5154,7 +5817,8 @@ mod tests {
              agent_context + repo_diff + repo_git_view + repo_watch + repo_unwatch + \
              review_comment_list + review_comment_post + review_comment_resolve + review_task_list + \
              review_task_structure + review_submit_feedback + the 12 v2.6 idea tools + \
-             the 4 v2.6 annexe tools + the 2 v2.8 engine runtime tools (run_start + nyx_next) + \
+             the 4 v2.6 annexe tools + the 3 v2.8 engine runtime tools (run_start + its \
+             recovery twin run_bind_spec + nyx_next) + \
              the 13 v2.8 graph-authoring tools (7 mutations + slot_bind + \
              workflow_list/workflow_get/run_list reads + workflow_delete/run_delete) + the 16 v2.7 proto tools (9 read/lifecycle, \
              incl. the agent recommendation proto_recommend_variant, + 7 creation/amorçage) + \
