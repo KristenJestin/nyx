@@ -45,6 +45,7 @@ function instance(overrides: Partial<InstanceWithTemplate>): InstanceWithTemplat
     source_package_json_path: null,
     source_script_name: null,
     package_manager: null,
+    group_id: null,
     workspace_path: "/p",
     cwd: "/p",
     ...overrides,

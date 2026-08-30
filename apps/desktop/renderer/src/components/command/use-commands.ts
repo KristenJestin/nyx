@@ -67,6 +67,8 @@ export interface InstanceWithTemplate {
   source_package_json_path: string | null;
   source_script_name: string | null;
   package_manager: string | null;
+  /** The template's multi-pane group (`null` = solo), joined from `managed_commands`. */
+  group_id: string | null;
   /** The instance's workspace path (the run-dir base). */
   workspace_path: string;
   /** Resolved run directory (workspace + subfolder), filled by the bridge. */

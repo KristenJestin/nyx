@@ -38,6 +38,7 @@
 
 use serde_json::{json, Value};
 
+use crate::command::RunState;
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
 use crate::mcp_runtime::{anchor_str, internal_db, optional_str, require_str};
@@ -306,7 +307,11 @@ You never:
   a REPORT, never a state change;
 - do a `kind=human` task — that action is reserved for the user: task_transition block, say why,
   and hand back;
-- run a command outside the nyx tools (an unobserved launch);
+- run a command outside the nyx tools (an unobserved launch). The workspace's own commands — its dev
+  server, its build, its test run — are managed: `list_commands` says which exist and which are
+  already up, `start_command` runs one THROUGH nyx (supervised, output captured, visible to the user
+  as to you), and it is a NO-OP on one already running, so there is never a reason to relaunch "just
+  in case" nor to spawn the same server a second time in a raw shell;
 - re-invent a rendering — for any UI you COMPOSE from the project's design-system
   (design_inventory), never an ad-hoc look;
 - capture a follow-up yourself (no idea_add): tech debt, an edge case, an out-of-task improvement
@@ -2317,6 +2322,164 @@ pub fn dispatch_context_tool(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The WORKSPACE COMMANDS block of the AMBIENT session context.
+// ---------------------------------------------------------------------------
+//
+// It renders HERE, next to the role manuals, and not in `mcp_tools_core` — this is the module that
+// renders agent-facing TEXT, and the one place the wording of what an agent reads is reviewable in
+// one pass. `mcp_tools_core::session_context_line` calls it with the workspace's instances and an
+// overlay closure over its runner.
+
+/// How many command lines the ambient block renders before it stops counting them one by one. Past
+/// it the block says HOW MANY are left and names the tool that lists them all — the point of the
+/// block is orientation, not an exhaustive dump into every session's first tokens.
+const MAX_COMMAND_LINES: usize = 12;
+
+/// The widest a rendered command line is, ellipsis INCLUDED. A managed command can be a whole shell
+/// pipeline; the agent needs to RECOGNIZE it (and it has `list_commands` for the exact text), not to
+/// re-type it from the block.
+const MAX_COMMAND_CHARS: usize = 160;
+
+/// WHAT TO DO WITH THE LIST — the two directives that hold for every workspace that has one.
+///
+/// The FIRST is the whole point of the block: these commands exist, and a run started through nyx is
+/// supervised and visible to the user AND to the agent, where the same run in a raw shell is an
+/// invisible process nobody can read back. The SECOND is what stops the duplicate launch: an agent
+/// that cannot tell whether something is up relaunches it "just in case", and `start_command` is
+/// already a no-op on a running command — so the block states the ack it gets back rather than
+/// leaving it to be discovered.
+///
+/// ADVISORY, not a lock (PDR-0011): nothing here prevents a shell, and nyx does not try to.
+const DIRECTIVE_LINES: &[&str] = &[
+    "Prefer start_command over launching these in a raw shell: nyx then supervises the run and \
+     captures its output, and the user sees it as you do.",
+    "start_command is a NO-OP on a command already running (it answers was_running:true, \
+     restarted:false) — never relaunch one \"just in case\"; relaunch_command is the real restart.",
+];
+
+/// The GROUP directive, rendered ONLY when a rendered line actually carries a `group_id` — a
+/// workspace with no multi-pane group would be told about a call it cannot make.
+const GROUP_DIRECTIVE_LINE: &str =
+    "A command carrying a group_id belongs to a multi-pane group: start_command {group_id, \
+     workspace_id} starts every member that is not already up, in ONE call — not one call per \
+     instance.";
+
+/// The FRESHNESS directive. The FACT is load-bearing: the plugin's `hooks.json` matches
+/// `startup|resume|clear|compact`, so this block IS re-taken after a `/clear` and after a
+/// `/compact` — but never between two, which is the failure mode an agent must plan for. Saying "at
+/// session open" alone would be false on both counts.
+///
+/// AND SO IS THE SHAPE OF THE SENTENCE (finding `01M1A4J8W87R23ZRJ7QVVS6B3S`). Naming `/clear` and
+/// `/compact` is NOT enough. The first wording opened on "re-taken every time a session opens" and
+/// carried them in an em-dash aside; a real session, asked what it had in context, read the whole
+/// thing back as "a snapshot taken at session open". An aside is the first thing a model drops when
+/// it compresses, and the tests — which assert the substrings are PRESENT — could not catch it: the
+/// letter held, the intent did not.
+///
+/// So the RULE for anyone rewriting this line: the carrying fact never sits in an aside, `/clear`
+/// and `/compact` hold the main clause, and nothing frames the snapshot as taken "at session open"
+/// (the block is being read at one — that half needs no words). A reader who keeps ONE thing out of
+/// this sentence must keep that those two commands are what re-takes it.
+const SNAPSHOT_DIRECTIVE_LINE: &str =
+    "This list is a SNAPSHOT. A /clear or a /compact re-takes it; nothing in between does, so it \
+     goes stale as commands start and stop. For the current state call list_commands, for what a \
+     command printed call get_command_output.";
+
+/// The command text as the block shows it: newlines flattened (one command, one line) and the whole
+/// thing capped at [`MAX_COMMAND_CHARS`] — the ellipsis counts INSIDE the cap, so a rendered command
+/// is never longer than the bound. Counts CHARS, not bytes, so a truncation never splits a
+/// multi-byte character.
+fn render_command_text(command: &str) -> String {
+    let flattened = command.replace(['\r', '\n'], " ");
+    if flattened.chars().count() <= MAX_COMMAND_CHARS {
+        return flattened;
+    }
+    let mut out: String = flattened.chars().take(MAX_COMMAND_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Render the workspace's MANAGED COMMANDS as the block the ambient session context carries after
+/// the `You're in nyx — …` orientation line, so an agent knows what this workspace already defines
+/// and WHAT IS ALREADY UP without a single discovery call.
+///
+/// One line per instance — `name · command · state · instance_id=…`, plus `· group_id=…` on a
+/// command that belongs to a multi-pane group and NOTHING more on a solo one. `command_id` is
+/// deliberately absent: no tool takes it, and it would cost an ULID per line in every session's
+/// first tokens.
+///
+/// `instances` is rendered in the order it arrives — [`db::list_command_lines_for_workspace`]
+/// already orders by the template's `order_index` then `id`, which is the order of the project's
+/// sidebar, so re-sorting here would make the block disagree with what the user sees.
+///
+/// THE STATE IS FACTUAL, and `overlay` is why: it is the runner's live outcome for an instance id
+/// (`None` when no live entry backs it), so a command running THIS session reads `running` even
+/// when its persisted `last_state` is stale — the same fallback `list_commands` applies. Taking it
+/// as a CLOSURE rather than a `&CommandRunner<S>` is what makes this renderer testable without
+/// spawning a single process. The vocabulary is the domain's own ([`RunState::as_db_str`]):
+/// `idle | running | success | error`.
+///
+/// The list is followed by the DIRECTIVE — [`DIRECTIVE_LINES`], the group line when a rendered
+/// command carries a `group_id`, then [`SNAPSHOT_DIRECTIVE_LINE`] — because a list with no
+/// instruction is what nyx already had: an agent that knows the commands exist and launches them in
+/// a raw shell anyway.
+///
+/// An EMPTY `instances` renders an EMPTY string — a workspace with no managed command, or a loose
+/// terminal, gets no block at all (and, therefore, no directive either).
+///
+/// No environment value can leak here: [`db::WorkspaceCommandLine`] carries none (`env` is a column
+/// of `managed_commands`, which its reader does not select), and the block renders nothing it is
+/// not handed.
+///
+/// THE ROW IS THE LEAN ONE, ON PURPOSE (review finding `01M152NMXPWKD59QFK95CMSZWQ`). This takes
+/// [`db::WorkspaceCommandLine`], not [`db::InstanceWithTemplate`]: the latter carries each
+/// instance's `scrollback` (up to 256 KiB apiece, so up to 3 MiB on a full workspace) which this
+/// renderer never reads, and it renders on the SessionStart hook's hard 1000 ms budget — where a
+/// timeout costs the whole injected context.
+pub(crate) fn workspace_commands_block<F>(
+    instances: &[db::WorkspaceCommandLine],
+    overlay: F,
+) -> String
+where
+    F: Fn(&str) -> Option<RunState>,
+{
+    if instances.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Managed commands of this workspace:");
+    let mut rendered_a_group = false;
+    for row in instances.iter().take(MAX_COMMAND_LINES) {
+        let state = overlay(&row.id).unwrap_or_else(|| RunState::from_db_str(&row.last_state));
+        out.push_str(&format!(
+            "\n- {} · {} · {} · instance_id={}",
+            row.name,
+            render_command_text(&row.command),
+            state.as_db_str(),
+            row.id,
+        ));
+        if let Some(group_id) = row.group_id.as_deref().filter(|g| !g.is_empty()) {
+            out.push_str(&format!(" · group_id={group_id}"));
+            rendered_a_group = true;
+        }
+    }
+    let overflow = instances.len().saturating_sub(MAX_COMMAND_LINES);
+    if overflow > 0 {
+        out.push_str(&format!("\n+{overflow} more commands (list_commands)"));
+    }
+    for line in DIRECTIVE_LINES {
+        out.push('\n');
+        out.push_str(line);
+    }
+    if rendered_a_group {
+        out.push('\n');
+        out.push_str(GROUP_DIRECTIVE_LINE);
+    }
+    out.push('\n');
+    out.push_str(SNAPSHOT_DIRECTIVE_LINE);
+    out
+}
+
 /// THE STALE FORMULATIONS — wordings the variance model stopped accepting, forbidden on EVERY
 /// agent-facing surface, with the reason each one is dead.
 ///
@@ -3024,6 +3187,53 @@ mod tests {
             assert!(
                 !text.contains(gone),
                 "the narrated process `{gone}` belongs to the graph, not to the manual",
+            );
+        }
+    }
+
+    /// The unobserved-launch prohibition NAMES the tools (task 01M14TJ97MW647Q4PV6V5N80D7). The
+    /// generic rule was already there and was not enough: an agent told not to launch outside nyx,
+    /// without the two tool names and without the no-op-if-running semantics, still reaches for a raw
+    /// shell — it has no reason to believe nyx has an answer.
+    ///
+    /// The preamble stays STATIC: it renders NO command list. It has neither a workspace nor a runner
+    /// in hand; the LIVE list is the ambient session context's job
+    /// ([`workspace_commands_block`]), and only that one has the state to render.
+    #[test]
+    fn coder_preamble_names_the_command_tools_without_rendering_any_list() {
+        let _g = db_guard();
+        let (db, spec_id, _ws, _cwd) = seeded();
+        let text = render_agent_context(&db, AgentRole::Coder, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            text.contains("run a command outside the nyx tools (an unobserved launch)"),
+            "the existing prohibition is still the anchor of the bullet: {text}",
+        );
+        assert!(
+            text.contains("`list_commands`") && text.contains("`start_command`"),
+            "…and it now names the two tools that make it actionable",
+        );
+        assert!(
+            text.contains("NO-OP on one already running"),
+            "…and the reason there is never a need to relaunch blind",
+        );
+        assert!(
+            !text.contains("Managed commands of this workspace:"),
+            "the preamble is STATIC: it renders no command list (that is the ambient context's job)",
+        );
+        // Not propagated: the other roles keep the manuals they had.
+        for role in [
+            AgentRole::Dev,
+            AgentRole::Auditor,
+            AgentRole::Doc,
+            AgentRole::Prototype,
+        ] {
+            assert!(
+                !role.preamble().contains("`start_command`"),
+                "{:?} is deliberately untouched — the coder is the one that executes, and the \
+                 ambient context covers everyone else",
+                role.label(),
             );
         }
     }
@@ -5619,5 +5829,357 @@ mod tests {
             "a 4-pass audit cycle at the run cap is {cycle} chars, over the \
              {AUDIT_CYCLE_AT_RUN_CAP_MAX} budget",
         );
+    }
+
+    /// THE AMBIENT WORKSPACE-COMMANDS BLOCK (task 01M14TJ97MW647Q4PV6V5N80D8) — a NESTED submodule
+    /// of `tests`, the house idiom for a thematic batch (see `db::tests::schema_drift`), so a
+    /// `cargo test mcp_context::tests::` filter reaches these and a reader opening `mod tests` finds
+    /// them.
+    ///
+    /// The renderer takes its run-state overlay as a CLOSURE, so EVERY case below is exercised
+    /// without a `CommandRunner` and without spawning one process — which matters twice over: there
+    /// is no API to mark an instance `running` in a runner short of launching a real process, and
+    /// such a test would land squarely in the Windows PTY/kill failure family `CLAUDE.md` documents.
+    mod workspace_commands_block_tests {
+        use super::*;
+
+        /// One `WorkspaceCommandLine` row, with the fields the block reads spelled out. Built by hand
+        /// (not read back from SQLite) precisely because the renderer's contract is
+        /// `(rows, overlay) -> String`: the DB reader has its own tests.
+        fn row(id: &str, name: &str, command: &str, last_state: &str) -> db::WorkspaceCommandLine {
+            db::WorkspaceCommandLine {
+                id: id.to_string(),
+                name: name.to_string(),
+                command: command.to_string(),
+                last_state: last_state.to_string(),
+                group_id: None,
+                order_index: 0,
+            }
+        }
+
+        /// The overlay that knows nothing: every row falls back to its persisted `last_state`.
+        fn no_overlay(_: &str) -> Option<RunState> {
+            None
+        }
+
+        /// A workspace WITH managed commands renders the block: a header, then one line per command
+        /// carrying `name · command · state · instance_id=…` — the id being the whole point (it is what
+        /// `start_command` takes, so the agent needs no discovery call at all).
+        #[test]
+        fn a_workspace_with_commands_renders_one_line_per_command() {
+            let rows = vec![
+                row("inst-dev", "dev", "bun run dev", db::STATE_RUNNING),
+                row("inst-build", "build", "bun run build", db::STATE_IDLE),
+            ];
+            let out = workspace_commands_block(&rows, no_overlay);
+            assert!(
+                out.starts_with("Managed commands of this workspace:"),
+                "the block opens with its header: {out}"
+            );
+            assert!(
+                out.contains("\n- dev · bun run dev · running · instance_id=inst-dev\n"),
+                "the running command's line is rendered verbatim: {out}"
+            );
+            assert!(
+                out.contains("\n- build · bun run build · idle · instance_id=inst-build\n"),
+                "…and so is the idle one: {out}"
+            );
+        }
+
+        /// A workspace with NO managed command renders NOTHING — no header, no directive. The ambient
+        /// context of such a session is exactly the orientation line it always was.
+        #[test]
+        fn no_command_renders_no_block_and_no_directive() {
+            let out = workspace_commands_block(&[], no_overlay);
+            assert!(out.is_empty(), "an empty workspace renders nothing: {out:?}");
+        }
+
+        /// The FOUR domain states are rendered distinctly, in the domain's OWN vocabulary
+        /// (`RunState::as_db_str`) — no invented label an agent would have to map back.
+        #[test]
+        fn the_four_run_states_are_rendered_with_the_domain_vocabulary() {
+            let rows = vec![
+                row("i-idle", "a", "c", db::STATE_IDLE),
+                row("i-run", "b", "c", db::STATE_RUNNING),
+                row("i-ok", "c", "c", db::STATE_SUCCESS),
+                row("i-ko", "d", "c", db::STATE_ERROR),
+            ];
+            let out = workspace_commands_block(&rows, no_overlay);
+            for (id, state) in [
+                ("i-idle", "idle"),
+                ("i-run", "running"),
+                ("i-ok", "success"),
+                ("i-ko", "error"),
+            ] {
+                assert!(
+                    out.contains(&format!("· {state} · instance_id={id}")),
+                    "{id} renders as `{state}`: {out}"
+                );
+            }
+        }
+
+        /// THE OVERLAY WINS. A row persisted `idle` whose instance the runner backs as `Running` renders
+        /// `running` — this is the whole reason the block reads the runner instead of the row, and the
+        /// same precedence `list_commands` applies. A row the overlay does not know keeps its persisted
+        /// state, in the same render.
+        #[test]
+        fn the_runner_overlay_takes_precedence_over_a_stale_persisted_state() {
+            let rows = vec![
+                row("i-live", "dev", "bun run dev", db::STATE_IDLE),
+                row("i-cold", "build", "bun run build", db::STATE_SUCCESS),
+            ];
+            let out = workspace_commands_block(&rows, |id: &str| {
+                (id == "i-live").then_some(RunState::Running)
+            });
+            assert!(
+                out.contains("· running · instance_id=i-live"),
+                "the live instance reads `running` despite its stale `idle` row: {out}"
+            );
+            assert!(
+                out.contains("· success · instance_id=i-cold"),
+                "the instance the runner does not back keeps its persisted state: {out}"
+            );
+        }
+
+        /// The block renders rows in the order it RECEIVES them —
+        /// `db::list_command_lines_for_workspace` already orders by `order_index` then `id`, which is
+        /// the order of the project's sidebar, so any re-sort here would make the block disagree with
+        /// what the user is looking at.
+        #[test]
+        fn the_native_order_is_preserved_and_never_re_sorted() {
+            let rows = vec![
+                row("i-3", "zulu", "c", db::STATE_IDLE),
+                row("i-1", "alpha", "c", db::STATE_IDLE),
+                row("i-2", "mike", "c", db::STATE_IDLE),
+            ];
+            let out = workspace_commands_block(&rows, no_overlay);
+            let order: Vec<&str> = out
+                .lines()
+                .filter(|l| l.starts_with("- "))
+                .map(|l| l.split(" · ").next().unwrap_or_default())
+                .collect();
+            assert_eq!(
+                order,
+                vec!["- zulu", "- alpha", "- mike"],
+                "the block is the reader's order, not an alphabetical one: {out}"
+            );
+        }
+
+        /// Past twelve commands the block STOPS listing and COUNTS: twelve lines, then one
+        /// `+N more commands (list_commands)` line naming the tool that has the rest. The block is
+        /// orientation, not a dump into every session's first tokens.
+        #[test]
+        fn beyond_twelve_commands_the_surplus_is_counted_not_listed() {
+            let rows: Vec<db::WorkspaceCommandLine> = (0..15)
+                .map(|i| row(&format!("i-{i}"), &format!("cmd-{i}"), "c", db::STATE_IDLE))
+                .collect();
+            let out = workspace_commands_block(&rows, no_overlay);
+            assert_eq!(
+                out.lines().filter(|l| l.starts_with("- ")).count(),
+                MAX_COMMAND_LINES,
+                "at most twelve command lines: {out}"
+            );
+            assert!(
+                out.contains("\n+3 more commands (list_commands)"),
+                "the surplus is counted, and names where to read it: {out}"
+            );
+            assert!(
+                !out.contains("instance_id=i-12"),
+                "the 13th command is NOT listed: {out}"
+            );
+            // Exactly twelve is the boundary: no surplus line at all.
+            let out12 = workspace_commands_block(&rows[..12], no_overlay);
+            assert!(
+                !out12.contains("more commands (list_commands)"),
+                "twelve commands fit: no surplus line: {out12}"
+            );
+        }
+
+        /// A long command is TRUNCATED — the rendered text never exceeds the bound, ellipsis included,
+        /// and the ellipsis says so. The agent has `list_commands` for the exact text; the block is there
+        /// for it to RECOGNIZE the command.
+        #[test]
+        fn a_command_longer_than_the_bound_is_truncated() {
+            let long = "x".repeat(400);
+            let rows = vec![row("i-long", "big", &long, db::STATE_IDLE)];
+            let out = workspace_commands_block(&rows, no_overlay);
+            let line = out
+                .lines()
+                .find(|l| l.starts_with("- big "))
+                .expect("the long command has a line");
+            let rendered = line
+                .split(" · ")
+                .nth(1)
+                .expect("the line carries a command field");
+            assert_eq!(
+                rendered.chars().count(),
+                MAX_COMMAND_CHARS,
+                "the rendered command is capped at the bound, ellipsis included: {rendered}"
+            );
+            assert!(
+                rendered.ends_with('…'),
+                "the truncation is visible: {rendered}"
+            );
+            assert!(
+                !out.contains(&long),
+                "the raw command never reaches the block: {out}"
+            );
+            // A command AT the bound is left strictly alone.
+            let exact = "y".repeat(MAX_COMMAND_CHARS);
+            let fit = [row("i-fit", "fit", &exact, db::STATE_IDLE)];
+            let kept = workspace_commands_block(&fit, no_overlay);
+            assert!(
+                kept.contains(&exact),
+                "a command exactly at the bound is not touched"
+            );
+        }
+
+        /// `group_id=…` is rendered on a GROUPED command and on nothing else — and the group DIRECTIVE
+        /// follows the same rule, because telling an agent about `start_command {group_id}` in a
+        /// workspace that has no group is telling it about a call it cannot make.
+        #[test]
+        fn only_a_grouped_command_carries_a_group_id_and_the_group_directive() {
+            let mut grouped = row("i-api", "api", "bun run api", db::STATE_IDLE);
+            grouped.group_id = Some("grp-1".to_string());
+            let solo = row("i-solo", "solo", "bun run solo", db::STATE_IDLE);
+
+            let with_group = workspace_commands_block(&[grouped, solo.clone()], no_overlay);
+            assert!(
+                with_group.contains("· instance_id=i-api · group_id=grp-1"),
+                "the grouped command names its group, last on the line: {with_group}"
+            );
+            assert!(
+                with_group.contains("· instance_id=i-solo\n"),
+                "the solo command carries nothing more: {with_group}"
+            );
+            assert!(
+                with_group.contains(GROUP_DIRECTIVE_LINE),
+                "the group directive is rendered when a group is on screen: {with_group}"
+            );
+
+            let solo_only = workspace_commands_block(&[solo], no_overlay);
+            assert!(
+                !solo_only.contains("group_id="),
+                "no group anywhere, so not a word about groups: {solo_only}"
+            );
+            assert!(
+                !solo_only.contains(GROUP_DIRECTIVE_LINE),
+                "…the group directive included: {solo_only}"
+            );
+        }
+
+        /// THE DIRECTIVE, and what it must NAME. The tool names are the contract: an agent told to
+        /// "prefer nyx" without them has to go discover the surface it was supposed to save.
+        #[test]
+        fn the_directive_names_the_tools_and_states_the_no_op_and_the_snapshot() {
+            let out = workspace_commands_block(&[row("i", "dev", "c", db::STATE_IDLE)], no_overlay);
+            for tool in [
+                "start_command",
+                "relaunch_command",
+                "list_commands",
+                "get_command_output",
+            ] {
+                assert!(out.contains(tool), "the directive names {tool}: {out}");
+            }
+            assert!(
+                out.contains("was_running:true") && out.contains("restarted:false"),
+                "it states the ack a no-op start returns, so nothing is relaunched blind: {out}"
+            );
+            assert!(
+                out.contains("/clear") && out.contains("/compact"),
+                "the snapshot sentence says WHEN the block is re-taken — /clear and /compact included, \
+                 which is what `hooks.json` actually matches: {out}"
+            );
+            let directive: Vec<&str> = out
+                .lines()
+                .filter(|l| !l.starts_with("- ") && !l.starts_with("Managed commands"))
+                .collect();
+            assert!(
+                directive.len() <= 4,
+                "the directive stays lean — 4 lines at most, got {}: {directive:?}",
+                directive.len()
+            );
+        }
+
+        /// WHERE the snapshot sentence puts `/clear` and `/compact`, not merely THAT it names them
+        /// (finding `01M1A4J8W87R23ZRJ7QVVS6B3S`). The first wording named both — and a real session
+        /// still read the line back as "a snapshot taken at session open", because they sat in an
+        /// em-dash aside behind that framing, and an aside is what a model drops first when it
+        /// compresses. Presence was already asserted; it is the SHAPE that failed, so the shape is
+        /// what this locks.
+        #[test]
+        fn the_snapshot_sentence_carries_clear_and_compact_in_its_main_clause() {
+            let out = workspace_commands_block(&[row("i", "dev", "c", db::STATE_IDLE)], no_overlay);
+            let line = out
+                .lines()
+                .find(|l| l.contains("SNAPSHOT"))
+                .unwrap_or_else(|| panic!("the block ends on the snapshot directive: {out}"));
+
+            assert!(
+                !line.contains('—'),
+                "no em-dash aside holds a fact here — an aside is the first thing a model drops \
+                 when it compresses: {line}"
+            );
+
+            let clear_at = line.find("/clear").expect("names /clear");
+            let compact_at = line.find("/compact").expect("names /compact");
+            let fact_at = clear_at.max(compact_at);
+
+            if let Some(session_at) = line.find("session") {
+                assert!(
+                    fact_at < session_at,
+                    "nothing frames the snapshot at session open BEFORE naming what re-takes it: \
+                     {line}"
+                );
+            }
+
+            for remedy in ["list_commands", "get_command_output"] {
+                let remedy_at = line.find(remedy).unwrap();
+                assert!(
+                    fact_at < remedy_at,
+                    "the fact leads, the remedy follows — {remedy} comes after /clear and /compact: \
+                     {line}"
+                );
+            }
+        }
+
+        /// NO ENVIRONMENT VALUE can reach the block — and this proves it through the REAL reader, not by
+        /// re-asserting the struct's shape. `env` is a column of `managed_commands` (the TEMPLATE), so a
+        /// template CAN carry a secret; `db::list_command_lines_for_workspace` never selects it and
+        /// `WorkspaceCommandLine` has no field to hold it, so the render cannot leak what it was never
+        /// handed.
+        #[test]
+        fn no_environment_value_reaches_the_render() {
+            let db = Db::in_memory();
+            let rows = db
+                .with_conn(|c| {
+                    let (project, root) = db::create_project(c, "p", "/tmp/env-leak", None)?;
+                    let tpl = db::create_template(
+                        c,
+                        &project.id,
+                        "dev",
+                        "bun run dev",
+                        None,
+                        db::CommandSource::default(),
+                    )?;
+                    db::set_template_env(
+                        c,
+                        &tpl.id,
+                        Some(r#"{"VAULT_TOKEN":"s3cr3t-do-not-inject"}"#),
+                    )?;
+                    db::list_command_lines_for_workspace(c, &root.id)
+                })
+                .expect("seeded workspace");
+            assert_eq!(rows.len(), 1, "the template materialized one instance");
+            let out = workspace_commands_block(&rows, no_overlay);
+            assert!(
+                out.contains("- dev · bun run dev · idle · instance_id="),
+                "the command IS rendered: {out}"
+            );
+            assert!(
+                !out.contains("s3cr3t-do-not-inject") && !out.contains("VAULT_TOKEN"),
+                "…and its environment is nowhere near it: {out}"
+            );
+        }
     }
 }

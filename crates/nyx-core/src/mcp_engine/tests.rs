@@ -23,6 +23,32 @@ fn db_guard() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// A [`crate::command::RunnerSink`] that records nothing — the hook path below only READS the
+/// runner (a `SessionStart` states the factual run state of the workspace's managed commands in the
+/// context it injects), and these tests drive `UserPromptSubmit`/`SessionEnd`, which read nothing.
+struct NoopSink;
+impl crate::command::RunnerSink for NoopSink {
+    fn on_state(&self, _: &str, _: crate::command::RunState, _: Option<i32>) {}
+    fn on_acknowledge(&self, _: &str) {}
+    fn on_output(&self, _: &str, _: &[u8]) {}
+    fn persist_scrollback(&self, _: &str, _: &str) {}
+    fn archive_previous_run(&self, _: &str) {}
+    fn clear_output(&self, _: &str) {}
+}
+
+/// An EMPTY runner: nothing live on it, so every instance reports its persisted state.
+fn noop_runner() -> crate::command::CommandRunner<NoopSink> {
+    crate::command::CommandRunner::new(
+        NoopSink,
+        portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    )
+}
+
 /// RAII temp dir removed on drop — the sandbox the gate runs in (its cwd).
 struct TempDir(PathBuf);
 impl TempDir {
@@ -1410,7 +1436,7 @@ impl Session {
                 .unwrap()
                 .insert("prompt_id".into(), json!(id));
         }
-        crate::mcp_tools_core::agent_session_event(db, &self.activity, &args)
+        crate::mcp_tools_core::agent_session_event(db, &noop_runner(), &self.activity, &args)
             .expect("the UserPromptSubmit hook is accepted");
     }
 
@@ -1420,6 +1446,7 @@ impl Session {
     fn session_ends(&self, db: &Db) {
         crate::mcp_tools_core::agent_session_event(
             db,
+            &noop_runner(),
             &self.activity,
             &json!({
                 "NYX_TERMINAL_ID": self.terminal_id,

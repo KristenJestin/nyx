@@ -53,6 +53,7 @@
 use std::path::PathBuf;
 
 use nyx_core::agent_activity::AgentActivityStore;
+use nyx_core::command::{CommandRunner, RunState, RunnerSink};
 use nyx_core::db::{self, Db};
 use nyx_core::mcp::RpcCode;
 use nyx_core::mcp_context::dispatch_context_tool;
@@ -62,6 +63,32 @@ use nyx_core::mcp_tools_core::{
 };
 use nyx_core::mcp_tools_spec::dispatch_spec_tool;
 use serde_json::{json, Value};
+
+/// A [`RunnerSink`] that records nothing, and the EMPTY [`CommandRunner`] built over it —
+/// `agent_session_event` READS the runner (a `SessionStart`'s injected context states the FACTUAL
+/// run state of the workspace's managed commands), and this gate drives a workspace with no managed
+/// command at all, so an empty runner is the faithful shape.
+struct NoopSink;
+impl RunnerSink for NoopSink {
+    fn on_state(&self, _: &str, _: RunState, _: Option<i32>) {}
+    fn on_acknowledge(&self, _: &str) {}
+    fn on_output(&self, _: &str, _: &[u8]) {}
+    fn persist_scrollback(&self, _: &str, _: &str) {}
+    fn archive_previous_run(&self, _: &str) {}
+    fn clear_output(&self, _: &str) {}
+}
+
+fn noop_runner() -> CommandRunner<NoopSink> {
+    CommandRunner::new(
+        NoopSink,
+        portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    )
+}
 
 /// A RAII guard over a test's on-disk temp dir: it removes the dir on drop, so the gate no
 /// longer leaks `nyx-gate-2-5-8-*` dirs under `$TMPDIR`. This is the missing HALF of the
@@ -647,6 +674,7 @@ fn sessionstart_orientation_line_is_unchanged() {
 
     let out = agent_session_event(
         &db,
+        &noop_runner(),
         &activity,
         &json!({
             "hook_event_name": "SessionStart",

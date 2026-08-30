@@ -35,11 +35,24 @@
 //!   * every non-injecting outcome leaves its OWN one-line trace on stderr — a foreign slash
 //!     command, an unreachable sidecar, a REFUSED `run_start` (which injects NOTHING, never a
 //!     manual with no run), a refused `agent_context`, an answer with no context. That silence is
-//!     what let the dead injection survive a release, so it is itself under test.
+//!     what let the dead injection survive a release, so it is itself under test;
+//!   * the OTHER relay, and the only other one the hook has: a `SessionStart` whose
+//!     `agent_session_event` answers with the AMBIENT context — the `You're in nyx — …` orientation
+//!     line plus the workspace's managed-command block — emits it as `additionalContext` BYTE FOR
+//!     BYTE (multi-line, `·` separators, accents, `group_id` included), and an answer carrying no
+//!     context injects nothing and still exits 0. Every other leg here is a `UserPromptSubmit`; this
+//!     branch of the `.cjs` was covered by nothing, which is exactly where a silent corruption of
+//!     the injected block would have lived.
 //!
-//! It runs in the SAME reproducible CI as the gate (`cargo test -p nyx-core`). If `node` is not
-//! on PATH the test SKIPS with a note (node-agnostic by contract, mirroring how the sidecar
-//! gates skip their git legs when git is absent) — but node is the hook's mandatory runtime.
+//! NOTHING REPLAYS THIS FILE AUTOMATICALLY — run it by hand with
+//! `cargo test -p nyx-core --test hook_push_injection_e2e` (review finding
+//! `01M152SCJ8QHK5C2P002GWZAGA`). Neither `bun run test:core` nor the cross-OS gate workflow
+//! covers it: both invoke `cargo test --workspace --lib`, and `--lib` builds only the library
+//! targets, excluding every integration binary under `crates/nyx-core/tests/` — this one included.
+//! Wiring a declared command and a CI job to these binaries is tracked separately; until that
+//! lands, a regression here breaks in silence. If `node` is not on PATH the test SKIPS with a note
+//! (node-agnostic by contract, mirroring how the sidecar gates skip their git legs when git is
+//! absent) — but node is the hook's mandatory runtime.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -107,6 +120,11 @@ enum Reply {
     Refused,
     /// A 200 result whose shape carries no `structuredContent.context` at all.
     NoContext,
+    /// `agent_session_event` answers a `SessionStart` with the AMBIENT context — the orientation
+    /// line PLUS the workspace's managed-command block. The other variants answer it with the bare
+    /// `{}` a `UserPromptSubmit` gets, which is also the DEGRADED SessionStart case (nothing to
+    /// inject).
+    SessionContext,
 }
 
 /// The refusal wording the mock echoes — the REAL `agent_context` message for an unresolved Spec
@@ -122,6 +140,25 @@ const REFUSAL: &str =
 const RUN_START_REFUSAL: &str =
     "'ndev' works ON a Spec and none could be resolved — pass an explicit `spec_id` (or a \
      `cwd`/`workspace_id` anchoring exactly one active Spec)";
+
+/// The AMBIENT session context the mock's `agent_session_event` answers a `SessionStart` with — the
+/// shape `mcp_tools_core::session_context_line` really produces: the `You're in nyx — …` orientation
+/// line, then the workspace's managed-command block, then the directive.
+///
+/// It is deliberately HOSTILE to a naive relay, because that is the point of this leg: it is
+/// MULTI-LINE (the `.cjs` relays one JSON string; an implementation that split, trimmed or
+/// line-joined would be caught here), it carries the `·` separator and accented text (non-ASCII, so
+/// a byte-length `Content-Length` or a latin-1 read would corrupt it), and it names a `group_id`
+/// (the token an agent needs to start a whole multi-pane group in ONE call).
+const MOCK_SESSION_CONTEXT: &str = "You're in nyx — project \"Café\" (project_id=proj-café) · \
+     workspace \"main\" (workspace_id=ws-1) · terminal_id=term-push-test\n\
+     Managed commands of this workspace:\n\
+     - dev · bun run dev · running · instance_id=inst-1 · group_id=grp-1\n\
+     - api · bun run api --réglages=élevés · idle · instance_id=inst-2 · group_id=grp-1\n\
+     - build · bun run build · success · instance_id=inst-3\n\
+     +2 more commands (list_commands)\n\
+     Prefer start_command over launching these in a raw shell: nyx then supervises the run.\n\
+     start_command is a NO-OP on a command already running (was_running:true, restarted:false).";
 
 /// The run the mock's `run_start` opens. A literal the assertions look for VERBATIM in the injected
 /// text: the `run_id` is the one value every subsequent call takes, and the session now gets it
@@ -287,7 +324,7 @@ fn handle_conn(stream: &mut TcpStream, calls: &Arc<Mutex<Vec<Value>>>, reply: Re
     } else if name == "agent_context" {
         match reply {
             // The run-opening variants all render the manual: what they vary is `run_start`.
-            Reply::Manual | Reply::RunWarnings | Reply::RunStartRefused => {
+            Reply::Manual | Reply::RunWarnings | Reply::RunStartRefused | Reply::SessionContext => {
                 let role = parsed["params"]["arguments"]["role"]
                     .as_str()
                     .unwrap_or_default();
@@ -302,8 +339,15 @@ fn handle_conn(stream: &mut TcpStream, calls: &Arc<Mutex<Vec<Value>>>, reply: Re
                 "structuredContent": { "role": "dev" }
             }}),
         }
+    } else if name == "agent_session_event" && reply == Reply::SessionContext {
+        // The AMBIENT context a `SessionStart` gets back — the orientation line plus the workspace's
+        // managed-command block. This is the ONLY thing the hook's SessionStart branch reads.
+        json!({ "jsonrpc": "2.0", "id": id, "result": {
+            "structuredContent": { "context": MOCK_SESSION_CONTEXT }
+        }})
     } else {
-        // agent_session_event (or anything else) — a bare ok; UserPromptSubmit ignores it.
+        // agent_session_event (or anything else) — a bare ok; UserPromptSubmit ignores it, and a
+        // SessionStart takes it as "nothing to inject".
         json!({ "jsonrpc": "2.0", "id": id, "result": { "structuredContent": {} } })
     }
     .to_string();
@@ -368,6 +412,13 @@ impl HookRun {
     /// `hookSpecificOutput.additionalContext` from stdout, or `None` when the hook injected
     /// nothing (a plain / foreign / failed prompt).
     fn injected(&self) -> Option<String> {
+        self.injected_for("UserPromptSubmit")
+    }
+
+    /// The same, for an arbitrary hook event — the injected block is TAGGED with the event it
+    /// answers, and Claude Code drops one tagged with the wrong name, so the tag is asserted here
+    /// rather than taken on faith.
+    fn injected_for(&self, event: &str) -> Option<String> {
         let trimmed = self.stdout.trim();
         if trimmed.is_empty() {
             return None;
@@ -375,8 +426,8 @@ impl HookRun {
         let v: Value = serde_json::from_str(trimmed).ok()?;
         assert_eq!(
             v["hookSpecificOutput"]["hookEventName"],
-            json!("UserPromptSubmit"),
-            "the injected block is tagged UserPromptSubmit",
+            json!(event),
+            "the injected block is tagged {event}",
         );
         v["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -406,6 +457,44 @@ impl HookRun {
     }
 }
 
+/// The hook events these legs drive, each with the payload field Claude Code actually stamps on it:
+/// the human's raw `prompt` for a `UserPromptSubmit`, the `source` (`startup` | `resume` | `clear` |
+/// `compact`) for a `SessionStart`. Modelled as an enum rather than a free-form JSON so a leg cannot
+/// silently fabricate a field a real hook never receives — the F1 mistake this file exists to guard.
+#[derive(Clone, Copy)]
+enum HookEvent<'a> {
+    UserPromptSubmit(&'a str),
+    SessionStart(&'a str),
+}
+
+impl HookEvent<'_> {
+    /// The `hook_event_name` (and argv[2]) this event is delivered under.
+    fn name(self) -> &'static str {
+        match self {
+            HookEvent::UserPromptSubmit(_) => "UserPromptSubmit",
+            HookEvent::SessionStart(_) => "SessionStart",
+        }
+    }
+
+    /// The stdin payload Claude Code hands the hook for this event.
+    fn payload(self, cwd: &str) -> Value {
+        match self {
+            HookEvent::UserPromptSubmit(prompt) => json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "sess-push-test",
+                "cwd": cwd,
+                "prompt": prompt,
+            }),
+            HookEvent::SessionStart(source) => json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sess-push-test",
+                "cwd": cwd,
+                "source": source,
+            }),
+        }
+    }
+}
+
 /// Run the REAL hook as `node nyx-session-hook.cjs UserPromptSubmit`, piping the given prompt in
 /// the payload shape Claude Code sends, with the mock's port in the environment.
 fn run_hook(prompt: &str, cwd: &str, port: u16) -> HookRun {
@@ -416,17 +505,27 @@ fn run_hook(prompt: &str, cwd: &str, port: u16) -> HookRun {
 /// exports into the shells it spawns) and `CLAUDE_PLUGIN_ROOT` (the plugin dir whose `.mcp.json`
 /// nyx templated its port into at install). `None` for both is a session that knows neither.
 fn run_hook_env(prompt: &str, cwd: &str, port: Option<u16>, plugin_root: Option<&Path>) -> HookRun {
-    let input = json!({
-        "hook_event_name": "UserPromptSubmit",
-        "session_id": "sess-push-test",
-        "cwd": cwd,
-        "prompt": prompt,
-    })
-    .to_string();
+    run_hook_event(
+        HookEvent::UserPromptSubmit(prompt),
+        cwd,
+        port,
+        plugin_root,
+    )
+}
+
+/// Run the REAL hook under `node` for ANY of the events above — same spawn, same env, same stdin
+/// contract; only the payload and argv[2] change.
+fn run_hook_event(
+    event: HookEvent<'_>,
+    cwd: &str,
+    port: Option<u16>,
+    plugin_root: Option<&Path>,
+) -> HookRun {
+    let input = event.payload(cwd).to_string();
 
     let mut cmd = Command::new("node");
     cmd.arg(hook_path())
-        .arg("UserPromptSubmit")
+        .arg(event.name())
         .env_remove("NYX_MCP_PORT")
         .env_remove("CLAUDE_PLUGIN_ROOT")
         .env("NYX_TERMINAL_ID", "term-push-test");
@@ -1072,6 +1171,121 @@ fn an_answer_without_context_is_traced_as_a_shape_problem() {
     assert!(
         trace.contains("result.structuredContent.context"),
         "the trace names the field it did not find: {trace:?}",
+    );
+    mock.stop();
+}
+
+// ---------------------------------------------------------------------------
+// The SessionStart relay — the AMBIENT context (task 01M14TZZJVEG87D1JAZA6NRCR2).
+// ---------------------------------------------------------------------------
+
+/// THE BLOCK REACHES THE SESSION, or it does not exist. A `SessionStart` whose
+/// `agent_session_event` answers with the ambient context — the orientation line PLUS the
+/// workspace's managed-command block — comes back out of the REAL hook as `additionalContext`,
+/// BYTE FOR BYTE: newlines, `·` separators, accented words and the `group_id` included.
+///
+/// This is the one link between the Rust renderer and a live session that nothing covered: the nine
+/// legs above are all `UserPromptSubmit`, and the SessionStart relay — a dozen lines of `.cjs` — was
+/// asserted nowhere. It is also the link where a corruption would be SILENT: the hook swallows its
+/// own errors by design, so a mangled block would simply arrive mangled.
+///
+/// It does NOT change the hook: `JSON.stringify` already relays any string. This PROVES it.
+#[test]
+fn a_session_start_relays_the_ambient_command_block_verbatim() {
+    if !node_available() {
+        eprintln!("node unavailable: skipped the SessionStart relay leg (node-agnostic by contract)");
+        return;
+    }
+    let mock = MockSidecar::start_with(Reply::SessionContext);
+    let run = run_hook_event(
+        HookEvent::SessionStart("startup"),
+        "/tmp/nyx-push-test-workspace",
+        Some(mock.port),
+        None,
+    );
+
+    assert_eq!(run.code, 0, "the hook always exits 0");
+    let injected = run.injected_for("SessionStart").unwrap_or_else(|| {
+        panic!(
+            "a SessionStart carrying a context must inject it: stdout {:?} stderr {:?}",
+            run.stdout, run.stderr
+        )
+    });
+    assert_eq!(
+        injected, MOCK_SESSION_CONTEXT,
+        "the context crosses the hook byte for byte",
+    );
+    // …and, spelled out, the properties that make "byte for byte" worth asserting.
+    assert!(
+        injected.lines().count() >= 5,
+        "the block survives as MULTI-LINE text, not a single joined line: {injected:?}",
+    );
+    assert!(
+        injected.contains("- dev · bun run dev · running · instance_id=inst-1 · group_id=grp-1"),
+        "a whole command line — separators and group_id included — arrives intact: {injected:?}",
+    );
+    assert!(
+        injected.contains("réglages=élevés") && injected.contains("Café"),
+        "non-ASCII text is not mangled on the way: {injected:?}",
+    );
+    assert!(
+        run.stderr.trim().is_empty(),
+        "the happy path is silent, got stderr {:?}",
+        run.stderr,
+    );
+
+    // It got there through `agent_session_event` ALONE: a SessionStart opens no run and pulls no
+    // manual, so the two run-opening calls must not fire.
+    assert_eq!(
+        mock.tool_names(),
+        vec!["agent_session_event".to_string()],
+        "a SessionStart POSTs exactly one tool call",
+    );
+    let args = mock
+        .args_for("agent_session_event")
+        .expect("the session event was POSTed");
+    assert_eq!(
+        args["hook_event_name"],
+        json!("SessionStart"),
+        "…the event nyx resolves the context for",
+    );
+    assert_eq!(
+        args["NYX_TERMINAL_ID"],
+        json!("term-push-test"),
+        "…on the terminal whose workspace the block belongs to",
+    );
+    mock.stop();
+}
+
+/// THE DEGRADED CASE, which must stay harmless: a `SessionStart` whose answer carries NO `context`
+/// (an older sidecar, a loose terminal, a workspace with no managed command) injects NOTHING and
+/// still exits 0 — the session works, it just starts without the block. Anything else would make a
+/// nyx-less answer fatal to every session start.
+#[test]
+fn a_session_start_without_a_context_injects_nothing_and_still_exits_zero() {
+    if !node_available() {
+        eprintln!("node unavailable: skipped the SessionStart relay leg (node-agnostic by contract)");
+        return;
+    }
+    // Every non-`SessionContext` variant answers `agent_session_event` with a bare `{}`.
+    let mock = MockSidecar::start_with(Reply::Manual);
+    let run = run_hook_event(
+        HookEvent::SessionStart("resume"),
+        "/tmp/nyx-push-test-workspace",
+        Some(mock.port),
+        None,
+    );
+
+    assert_eq!(run.code, 0, "no context is not a failure");
+    assert!(
+        run.stdout.trim().is_empty(),
+        "nothing is injected at all (stdout: {:?})",
+        run.stdout,
+    );
+    assert_eq!(
+        mock.tool_names(),
+        vec!["agent_session_event".to_string()],
+        "the session event still reached nyx — only the injection is empty",
     );
     mock.stop();
 }

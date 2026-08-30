@@ -8673,6 +8673,12 @@ pub struct InstanceWithTemplate {
     pub source_package_json_path: Option<String>,
     pub source_script_name: Option<String>,
     pub package_manager: Option<String>,
+    /// The template's multi-pane GROUP membership (`None` = solo). Joined from
+    /// `managed_commands.group_id` so a reader of a workspace's instances can tell a
+    /// grouped command from a solo one WITHOUT a second `{ project_id }` round-trip —
+    /// which is what lets `start_command { group_id, workspace_id }` start a whole
+    /// disposition in ONE call.
+    pub group_id: Option<String>,
     /// The instance's workspace path (joined from `workspaces`). The base the run
     /// directory resolves against.
     pub workspace_path: String,
@@ -8686,6 +8692,15 @@ pub struct InstanceWithTemplate {
 /// its workspace `path`. Ordered by the template's `order` (then `id` as a stable
 /// tiebreaker) so the listing matches the project's template order. Returns one row
 /// per instance of `workspace_id`. `cwd` is left `None` (the bridge resolves it).
+///
+/// The FULL row, `scrollback` included — bounded at [`MAX_SCROLLBACK_BYTES`] (256 KiB)
+/// PER INSTANCE, so a twelve-command workspace whose commands have run costs up to
+/// 3 MiB read, UTF-8 validated and allocated here. Take it when the caller genuinely
+/// needs those bytes or the provenance (the UI bridge, `list_commands`, the runtime
+/// overlay). A caller that only needs `name` / `command` / `last_state` / `group_id` /
+/// `order_index` — and above all one on a BUDGETED path, like the `SessionStart` hook
+/// bounded at 1000 ms — takes [`list_command_lines_for_workspace`] instead: same JOIN,
+/// same ordering, six columns, and it never selects `scrollback`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn list_instances_for_workspace(
     conn: &mut SqliteConnection,
@@ -8719,6 +8734,7 @@ pub fn list_instances_for_workspace(
             managed_commands::source_package_json_path,
             managed_commands::source_script_name,
             managed_commands::package_manager,
+            managed_commands::group_id,
             workspaces::root_path,
         ))
         .load::<(
@@ -8737,6 +8753,7 @@ pub fn list_instances_for_workspace(
             String,
             Option<String>,
             i32,
+            Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
@@ -8765,8 +8782,86 @@ pub fn list_instances_for_workspace(
                     source_package_json_path: r.16,
                     source_script_name: r.17,
                     package_manager: r.18,
-                    workspace_path: r.19,
+                    group_id: r.19,
+                    workspace_path: r.20,
                     cwd: None,
+                })
+                .collect()
+        })
+}
+
+/// ONE LINE of the ambient session-context block: the strict subset of an instance
+/// the block renders, and NOTHING else. Deliberately NOT [`InstanceWithTemplate`].
+///
+/// WHY A SECOND, LEANER ROW (review finding `01M152NMXPWKD59QFK95CMSZWQ`).
+/// [`InstanceWithTemplate`] carries `scrollback`, bounded to [`MAX_SCROLLBACK_BYTES`]
+/// (256 KiB) PER INSTANCE — so a workspace whose 12 commands have actually run makes
+/// [`list_instances_for_workspace`] read, UTF-8 validate and allocate up to 3 MiB. The
+/// UI and `list_commands` need those bytes; the ambient block does not — it renders
+/// `name · command · state · instance_id` and nothing more. And it renders them on the
+/// ONE path with a hard budget: the Claude Code hook bounds its `SessionStart` POST at
+/// 1000 ms, and a timeout drops the WHOLE injected context, orientation line included.
+/// Carrying the dominant term of that budget for a block that never reads it is the
+/// cost this row removes.
+///
+/// `allow(dead_code)` outside `cfg(test)` covers `order_index` alone: the SQL does the
+/// ordering, so only the reader's own test reads the column back off the row.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCommandLine {
+    /// The INSTANCE id — the token `start_command` takes, hence the point of the block.
+    pub id: String,
+    /// The template's display name.
+    pub name: String,
+    /// The template's command text (the block truncates it for rendering).
+    pub command: String,
+    /// The PERSISTED run state. The live runner overlay wins over it when it has an
+    /// entry for `id` — the block applies the same precedence `list_commands` does.
+    pub last_state: String,
+    /// The template's multi-pane GROUP membership (`None` = solo).
+    pub group_id: Option<String>,
+    /// The template's sidebar order — the column this reader sorts on, kept on the row
+    /// so a caller can assert the order it got is the project's own.
+    pub order_index: i32,
+}
+
+/// The AMBIENT-BLOCK reader: a workspace's command instances as [`WorkspaceCommandLine`]
+/// rows — same JOIN and same ordering as [`list_instances_for_workspace`] (template
+/// `order_index`, then `id`), so the block agrees with the project's sidebar, but
+/// selecting only the six columns the block renders. It never touches `scrollback`.
+///
+/// Used by `mcp_tools_core::session_context_line` and by nothing else: every other
+/// caller (the UI bridge, `list_commands`, the runtime overlay) genuinely needs the
+/// full row and keeps [`list_instances_for_workspace`].
+pub fn list_command_lines_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<Vec<WorkspaceCommandLine>> {
+    command_instances::table
+        .inner_join(managed_commands::table)
+        .filter(command_instances::workspace_id.eq(workspace_id))
+        .order((
+            managed_commands::order_index.asc(),
+            managed_commands::id.asc(),
+        ))
+        .select((
+            command_instances::id,
+            managed_commands::name,
+            managed_commands::command,
+            command_instances::last_state,
+            managed_commands::group_id,
+            managed_commands::order_index,
+        ))
+        .load::<(String, String, String, String, Option<String>, i32)>(conn)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| WorkspaceCommandLine {
+                    id: r.0,
+                    name: r.1,
+                    command: r.2,
+                    last_state: r.3,
+                    group_id: r.4,
+                    order_index: r.5,
                 })
                 .collect()
         })
@@ -25976,6 +26071,108 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "listing an unknown workspace returns an empty vec (not an error)"
+        );
+    }
+
+    /// The listing carries the template's multi-pane `group_id` (`None` = solo), so a reader of a
+    /// workspace's instances tells a grouped command from a solo one WITHOUT a second
+    /// `{ project_id }` round-trip. This is what lets the ambient session context name the group an
+    /// agent can start in ONE `start_command { group_id, workspace_id }` call.
+    #[test]
+    fn list_instances_carries_the_templates_group_membership() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let mk = |conn: &mut SqliteConnection, name: &str| {
+            create_template(conn, &project.id, name, "cmd", None, CommandSource::default()).unwrap()
+        };
+        let a = mk(&mut conn, "alpha");
+        let b = mk(&mut conn, "bravo");
+        let solo = mk(&mut conn, "solo");
+        let group = create_command_group(&mut conn, &project.id, &[a.id.clone(), b.id.clone()])
+            .expect("group");
+
+        let rows = list_instances_for_workspace(&mut conn, &root.id).unwrap();
+        let by_command = |command_id: &str| {
+            rows.iter()
+                .find(|r| r.command_id == command_id)
+                .unwrap_or_else(|| panic!("row for {command_id}"))
+        };
+        assert_eq!(
+            by_command(&a.id).group_id.as_deref(),
+            Some(group.id.as_str()),
+            "a grouped command's instance carries its group"
+        );
+        assert_eq!(by_command(&b.id).group_id.as_deref(), Some(group.id.as_str()));
+        assert_eq!(
+            by_command(&solo.id).group_id,
+            None,
+            "a solo command's instance carries no group"
+        );
+    }
+
+    /// THE LEAN READER agrees with the full one on WHAT it lists and in WHICH ORDER — same
+    /// instance ids, same template fields, same `group_id`, same `order_index`-then-`id` order —
+    /// while selecting six columns instead of twenty-one. The point of it is what it does NOT
+    /// select: `command_instances.scrollback`, bounded at [`MAX_SCROLLBACK_BYTES`] per instance,
+    /// which the ambient session-context block never reads but would otherwise pay for on the
+    /// SessionStart hook's hard budget (review finding `01M152NMXPWKD59QFK95CMSZWQ`).
+    ///
+    /// The instances here are seeded with a FULL 256 KiB scrollback each, precisely so the
+    /// equivalence is asserted on the workload the cheap reader exists for.
+    #[test]
+    fn the_lean_command_line_reader_matches_the_full_one_and_never_loads_scrollback() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let mk = |conn: &mut SqliteConnection, name: &str| {
+            create_template(conn, &project.id, name, "bun run x", None, CommandSource::default())
+                .unwrap()
+        };
+        let a = mk(&mut conn, "alpha");
+        let b = mk(&mut conn, "bravo");
+        mk(&mut conn, "solo");
+        let group = create_command_group(&mut conn, &project.id, &[a.id.clone(), b.id.clone()])
+            .expect("group");
+
+        // Every instance carries a FULL scrollback: the realistic state of a workspace whose
+        // commands have actually run, and the one the full reader would drag along.
+        let full = "z".repeat(MAX_SCROLLBACK_BYTES);
+        let fat = list_instances_for_workspace(&mut conn, &root.id).unwrap();
+        for inst in &fat {
+            persist_instance_scrollback(&mut conn, &inst.id, &full).unwrap();
+        }
+        let fat = list_instances_for_workspace(&mut conn, &root.id).unwrap();
+        assert!(
+            fat.iter().all(|r| r.scrollback.len() == MAX_SCROLLBACK_BYTES),
+            "the full reader really does load 256 KiB per instance"
+        );
+
+        let lean = list_command_lines_for_workspace(&mut conn, &root.id).unwrap();
+        assert_eq!(
+            lean.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            fat.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            "same instances, same order as the full reader"
+        );
+        for (thin, thick) in lean.iter().zip(fat.iter()) {
+            assert_eq!(thin.name, thick.name);
+            assert_eq!(thin.command, thick.command);
+            assert_eq!(thin.last_state, thick.last_state);
+            assert_eq!(thin.group_id, thick.group_id);
+            assert_eq!(thin.order_index, thick.order_index);
+        }
+        // The grouping is readable off the lean row too — the block renders `group_id`.
+        let by_name = |name: &str| {
+            lean.iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("row for {name}"))
+        };
+        assert_eq!(by_name("alpha").group_id.as_deref(), Some(group.id.as_str()));
+        assert_eq!(by_name("bravo").group_id.as_deref(), Some(group.id.as_str()));
+        assert_eq!(by_name("solo").group_id, None);
+        assert!(
+            list_command_lines_for_workspace(&mut conn, "no-such-workspace")
+                .unwrap()
+                .is_empty(),
+            "an unknown workspace lists nothing (not an error)"
         );
     }
 

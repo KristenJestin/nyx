@@ -565,8 +565,9 @@ pub fn list_workspaces(db: &Db, args: &Value) -> Result<Value, RpcError> {
 /// the `groups` of its reply.
 ///
 /// The `{ workspace_id }` form lists INSTANCES, which are per workspace while a group is project
-/// data; each instance still names its `command_id`, so an agent that started there resolves the
-/// grouping with one `{ project_id }` call.
+/// data; each instance carries its template's `group_id` (`null` = solo) so membership is readable
+/// WITHOUT a second call — and still names its `command_id`, so an agent that wants the group's
+/// name, colour and member order resolves those with one `{ project_id }` call.
 pub fn list_commands<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
@@ -609,6 +610,12 @@ pub fn list_commands<S: RunnerSink>(
                     "cwd": cwd,
                     "source_kind": row.source_kind,
                     "package_manager": row.package_manager,
+                    // The multi-pane GROUP the instance's template belongs to (`null` = solo). The
+                    // ambient session context names it on every grouped command so the agent can
+                    // start a whole disposition with ONE `start_command { group_id, workspace_id }`
+                    // — so the tool the context sends it back to must carry it too, or "go check
+                    // list_commands" would mean "go read something poorer".
+                    "group_id": row.group_id,
                 });
                 if let (Some(map), Some(status_map)) = (entry.as_object_mut(), status.as_object()) {
                     for (k, v) in status_map {
@@ -2056,7 +2063,19 @@ fn is_activity_hook(name: &str) -> bool {
 /// Deliberately LEAN — NO path (already in the agent's cwd/context) and NO sibling-workspace
 /// list (rarely useful every session); the generic "what/when/how to use nyx" stays in the
 /// MCP server instructions, not re-injected here each turn.
-fn session_context_line(db: &Db, session: &db::AgentSession) -> String {
+///
+/// AND, under that line, the workspace's MANAGED COMMANDS — name, command, FACTUAL state,
+/// `instance_id` (plus `group_id` on a grouped one) — followed by the directive that says what to do
+/// with them. Rendered by [`crate::mcp_context::workspace_commands_block`], which takes the run-state
+/// overlay as a CLOSURE over THIS dispatcher's live `runner` — the same `runner.outcome(…)` else
+/// persisted `last_state` fallback `list_commands` applies, so the block cannot claim a command is
+/// up when it is not. A LOOSE terminal, or a workspace with no managed command, gets NEITHER: the
+/// line stays exactly what it was.
+fn session_context_line<S: RunnerSink>(
+    db: &Db,
+    runner: &CommandRunner<S>,
+    session: &db::AgentSession,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(ws_id) = session.workspace_id.as_deref() {
         if let Some(ws) = db.with_conn(|c| db::get_workspace(c, ws_id)).ok().flatten() {
@@ -2077,7 +2096,28 @@ fn session_context_line(db: &Db, session: &db::AgentSession) -> String {
         }
     }
     parts.push(format!("terminal_id={}", session.terminal_id));
-    format!("You're in nyx — {}", parts.join(" · "))
+    let mut context = format!("You're in nyx — {}", parts.join(" · "));
+    // The managed-command block. Best-effort by construction: a read that fails yields no
+    // instances, hence no block — this line must never fail a SessionStart (the hook drops the
+    // WHOLE context, orientation included, on an error or a timeout).
+    if let Some(ws_id) = session.workspace_id.as_deref() {
+        // The LEAN reader, not `list_instances_for_workspace` (review finding
+        // `01M152NMXPWKD59QFK95CMSZWQ`): the full row carries each instance's `scrollback`, bounded
+        // at 256 KiB apiece — up to 3 MiB read, UTF-8 validated and allocated on a workspace whose
+        // commands have actually run — for a block that renders name/command/state/instance_id and
+        // nothing else. On the ONE path with a hard budget, the dominant term is the one that is
+        // never read.
+        let instances = db
+            .with_conn(|c| db::list_command_lines_for_workspace(c, ws_id))
+            .unwrap_or_default();
+        let overlay = |instance_id: &str| runner.outcome(instance_id).map(|(state, _, _)| state);
+        let block = crate::mcp_context::workspace_commands_block(&instances, overlay);
+        if !block.is_empty() {
+            context.push('\n');
+            context.push_str(&block);
+        }
+    }
+    context
 }
 
 /// `agent_session_event` — the Claude Code hook target. Handles BOTH:
@@ -2099,6 +2139,11 @@ fn session_context_line(db: &Db, session: &db::AgentSession) -> String {
 ///
 /// `activity` is the host's runtime store. Parity with the Tauri `agent_session_event`
 /// for the session half (over the shared `agent`/`db` layer).
+///
+/// `runner` is this dispatcher's live [`CommandRunner`] — the handler itself never starts anything;
+/// it READS the runner so a `SessionStart`'s injected context can state the FACTUAL run state of the
+/// workspace's managed commands (see [`session_context_line`]). That is the whole reason this
+/// handler is generic over `S`.
 /// R1 — set by the HOST at the START of an ordered shutdown (before it stops the MCP listener and
 /// kills the PTYs). While true, a real `SessionEnd` does NOT mark its session `ended`: the row stays
 /// `active` so lazy-resume reclaims it next boot. This is the fix for R1 — on a normal close, the
@@ -2128,8 +2173,9 @@ fn reset_session_end_suppression() {
     SESSION_END_SUPPRESSED.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
-pub fn agent_session_event(
+pub fn agent_session_event<S: RunnerSink>(
     db: &Db,
+    runner: &CommandRunner<S>,
     activity: &AgentActivityStore,
     args: &Value,
 ) -> Result<ToolOutcome, RpcError> {
@@ -2279,7 +2325,7 @@ pub fn agent_session_event(
             // The MINIMAL nyx-context line the SessionStart hook injects as
             // `additionalContext` (#22). Returned in `structuredContent.context` so the
             // `.cjs` hook can relay it WITHOUT any new per-spawn env injection.
-            let context = session_context_line(db, &session);
+            let context = session_context_line(db, runner, &session);
             Ok(ToolOutcome::changed(
                 json!({
                     "event": "SessionStart",
@@ -2849,7 +2895,9 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         crate::mcp::REORDER_COMMANDS_TOOL => Some(reorder_commands(db, args)),
         crate::mcp::CLEAR_COMMAND_OUTPUT_TOOL => Some(clear_command_output(db, runner, args)),
         // Agent-session channel (session lifecycle + runtime activity).
-        crate::mcp::AGENT_SESSION_EVENT_TOOL => Some(agent_session_event(db, activity, args)),
+        crate::mcp::AGENT_SESSION_EVENT_TOOL => {
+            Some(agent_session_event(db, runner, activity, args))
+        }
         // The v2.8 ENGINE run-lifecycle entry: OPEN a run and get its run_id (the dispatcher calls
         // this once, then loops on nyx_next). Resolves the workflow + optional Spec binding. It
         // reaches the SAME process-global engine registry the tick below does, because opening a run
@@ -2982,6 +3030,19 @@ mod tests {
     fn db_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// [`agent_session_event`] over a runner with NOTHING live on it — the shape every
+    /// session-lifecycle / activity test wants: the handler only READS the runner (to state the
+    /// FACTUAL run state of the workspace's commands in a `SessionStart`'s context), so an empty one
+    /// makes those tests fall back on the persisted `last_state`, which is what they seed. A test
+    /// that needs a LIVE state passes its own runner to `agent_session_event` directly.
+    fn session_event(
+        db: &Db,
+        activity: &AgentActivityStore,
+        args: &Value,
+    ) -> Result<ToolOutcome, RpcError> {
+        agent_session_event(db, &noop_runner(), activity, args)
     }
 
     #[test]
@@ -4232,7 +4293,7 @@ mod tests {
 
         // A `/clear` (SessionEnd reason=clear) VACATES the set and pushes `specs://changed`,
         // but the session row stays ACTIVE (an internal transition — never ended).
-        let cleared = agent_session_event(
+        let cleared = session_event(
             &db,
             &activity,
             &json!({
@@ -4283,7 +4344,7 @@ mod tests {
             1,
             "the proto set has one prototype again"
         );
-        let resumed = agent_session_event(
+        let resumed = session_event(
             &db,
             &activity,
             &json!({
@@ -4984,7 +5045,7 @@ mod tests {
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
-        let out = agent_session_event(
+        let out = session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
@@ -5018,7 +5079,7 @@ mod tests {
         let ledger = || db.with_conn(|c| db::last_human_turn(c, &tid)).unwrap();
         assert_eq!(ledger(), None, "no prompt, no turn");
 
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5034,7 +5095,7 @@ mod tests {
         assert_eq!(turn.prompt, "oui, passe-la en ready");
 
         // A tool the AGENT runs is a beat of its turn, not a turn of the human's.
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "PreToolUse", "NYX_TERMINAL_ID": tid, "tool_name": "Bash" }),
@@ -5048,7 +5109,7 @@ mod tests {
 
         // THE SESSION ENDS — the whole of a `claude -p` invocation. The dot goes (nothing is
         // running), the human's turn STAYS: they typed it, and it is still the last thing they said.
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5071,7 +5132,7 @@ mod tests {
 
         // A provider that sends NO prompt id still produces a DISTINCT turn — nyx mints the identity
         // itself, because all the consent check asks is "is this another turn than the one I saw?".
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5121,7 +5182,7 @@ mod tests {
 
         // The host begins its ordered shutdown → suppress. The dying PTY's SessionEnd is IGNORED.
         suppress_session_end_marking();
-        let out = agent_session_event(&db, &activity, &end_event).expect("handled");
+        let out = session_event(&db, &activity, &end_event).expect("handled");
         assert_eq!(out.result["ended"], json!(false));
         let survived = db
             .with_conn(|c| crate::db::get_session(c, &session_id))
@@ -5135,7 +5196,7 @@ mod tests {
 
         // Mirror: WITHOUT suppression (the app running normally) the SAME event DOES end it.
         reset_session_end_suppression();
-        agent_session_event(&db, &activity, &end_event).expect("handled");
+        session_event(&db, &activity, &end_event).expect("handled");
         let ended = db
             .with_conn(|c| crate::db::get_session(c, &session_id))
             .unwrap()
@@ -5158,13 +5219,13 @@ mod tests {
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
         )
         .unwrap();
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "Stop", "NYX_TERMINAL_ID": tid }),
@@ -5190,20 +5251,20 @@ mod tests {
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
         )
         .unwrap();
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "SubagentStart", "NYX_TERMINAL_ID": tid }),
         )
         .unwrap();
         assert!(activity.snapshot(&tid).unwrap().activity == Activity::Working);
-        let out = agent_session_event(
+        let out = session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "SubagentStop", "NYX_TERMINAL_ID": tid }),
@@ -5231,7 +5292,7 @@ mod tests {
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
-        let send = |args: serde_json::Value| agent_session_event(&db, &activity, &args).unwrap();
+        let send = |args: serde_json::Value| session_event(&db, &activity, &args).unwrap();
 
         // --- BACKGROUND: SubagentStart → Stop → SubagentStop ---
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
@@ -5289,7 +5350,7 @@ mod tests {
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
-        let send = |args: serde_json::Value| agent_session_event(&db, &activity, &args).unwrap();
+        let send = |args: serde_json::Value| session_event(&db, &activity, &args).unwrap();
 
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
         // A long tool: PreToolUse with no Post → stays working across reads.
@@ -5358,7 +5419,7 @@ mod tests {
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
-        let send = |args: serde_json::Value| agent_session_event(&db, &activity, &args).unwrap();
+        let send = |args: serde_json::Value| session_event(&db, &activity, &args).unwrap();
 
         // A question blocks the agent → yellow.
         send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
@@ -5409,7 +5470,7 @@ mod tests {
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
         // Record the session (so SessionEnd has a row to end).
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5421,7 +5482,7 @@ mod tests {
         )
         .unwrap();
         // A prompt → working.
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
@@ -5429,7 +5490,7 @@ mod tests {
         .unwrap();
         assert!(activity.snapshot(&tid).unwrap().activity == Activity::Working);
         // SessionEnd → clears the runtime activity (no phantom).
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5468,7 +5529,7 @@ mod tests {
         let baseline = db.with_conn(db::list_domain_events).unwrap().len();
 
         // SessionStart → `agent_session.started`.
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5480,7 +5541,7 @@ mod tests {
         )
         .unwrap();
         // SessionEnd (a real end — logout) → `agent_session.ended`.
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5526,7 +5587,7 @@ mod tests {
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
-        let out = agent_session_event(
+        let out = session_event(
             &db,
             &activity,
             &json!({
@@ -5579,7 +5640,7 @@ mod tests {
         })
         .unwrap();
 
-        let out = agent_session_event(
+        let out = session_event(
             &db,
             &activity,
             &json!({
@@ -5605,6 +5666,540 @@ mod tests {
         );
     }
 
+    /// A project + a workspace carrying `command_count` managed commands, and a terminal BOUND to
+    /// that workspace — the shape every ambient-context test needs. `group` names the templates that
+    /// are put in ONE multi-pane group (by index); fewer than two leaves every command solo.
+    /// Returns `(project_id, workspace_id, terminal_id, group_id)`.
+    fn workspace_with_commands(
+        db: &Db,
+        command_count: usize,
+        group: &[usize],
+    ) -> (String, String, String, Option<String>) {
+        use crate::schema::terminals;
+        use diesel::prelude::*;
+        let host = NoTerminalHost;
+        let (project, workspace) = db
+            .with_conn(|c| db::create_project(c, "sandbox", "/tmp/ambient", None))
+            .unwrap();
+        let mut template_ids: Vec<String> = Vec::new();
+        for i in 0..command_count {
+            let t = db
+                .with_conn(|c| {
+                    db::create_template(
+                        c,
+                        &project.id,
+                        &format!("cmd-{i}"),
+                        &format!("bun run task-{i}"),
+                        None,
+                        db::CommandSource::default(),
+                    )
+                })
+                .unwrap();
+            template_ids.push(t.id);
+        }
+        let group_id = if group.len() >= 2 {
+            let members: Vec<String> = group.iter().map(|i| template_ids[*i].clone()).collect();
+            Some(
+                db.with_conn(|c| db::create_command_group(c, &project.id, &members))
+                    .expect("group")
+                    .id,
+            )
+        } else {
+            None
+        };
+        let created = create_terminal(db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        db.with_conn(|c| {
+            diesel::update(terminals::table.find(&tid))
+                .set(terminals::workspace_id.eq(Some(workspace.id.clone())))
+                .execute(c)
+        })
+        .unwrap();
+        (project.id, workspace.id, tid, group_id)
+    }
+
+    /// THE HOOK BUDGET, MEASURED ON THE WORST REALISTIC WORKLOAD — not assumed, and no longer on a
+    /// best case. The bundled `nyx-session-hook.cjs` bounds its `SessionStart` POST at
+    /// `TIMEOUT_MS = 1000` ms, and a timeout drops the WHOLE injected context, orientation line
+    /// included. The block adds one SQLite read plus N `runner.outcome` lookups (each briefly taking
+    /// the runner's `entries` mutex) to that request, so this times the FULL handler on a
+    /// 12-command workspace — the block's own upper bound.
+    ///
+    /// AND IT IS MEASURED ON THE SCROLLBACK-FULL WORKLOAD (review finding
+    /// `01M152NMXPWKD59QFK95CMSZWQ`). A freshly created instance has an EMPTY `scrollback`, so a
+    /// workspace that never ran anything measures the BEST case — while the workspace where the
+    /// block is actually useful is the one whose commands HAVE run, i.e. the one carrying up to
+    /// `12 × db::MAX_SCROLLBACK_BYTES` = 3 MiB of persisted output. The number this test constates
+    /// is therefore the one taken AFTER seeding those 3 MiB.
+    ///
+    /// WHAT THIS TEST IS AND IS NOT (review finding `01M1580EK4BXWC4EP39GQBMDRM`). It carries ONE
+    /// assert, and it is ABSOLUTE: the handler stays a small fraction of the hook's 1000 ms. That
+    /// is the constat the PRD asked for, and a wide absolute bound cannot flake on a shared CI
+    /// runner. It used to carry a SECOND assert comparing the full run against a ceiling derived
+    /// from the empty run (`empty * 6 + 2 ms`) — an instrument that was simply wrong for the job:
+    /// over 43 idle-machine runs `empty` spread by a factor 2.6 while `full` spread by a factor 19
+    /// (0.74 ms → 14.3 ms), because the full phase runs right after writing 3 MiB into SQLite and
+    /// eats the cold pages, the allocator and the journal alone. The two numbers do NOT move
+    /// together, so the ratio flaked (1 failure in 43) — on a test replayed by `bun run test:core`,
+    /// by `bun run test` and by the cross-OS gate.
+    ///
+    /// The property that assert was reaching for — "the SessionStart path never reads
+    /// `scrollback`" — is not a matter of degree, so it is no longer measured at all: it is proven
+    /// structurally, on the SQL the handler actually emits, by
+    /// [`session_start_never_reads_the_scrollback_column`] below. The empty-scrollback timing is
+    /// kept here as an OBSERVATION in the `eprintln!` (no assert derives from it), because seeing
+    /// both numbers side by side is what makes the constat readable.
+    #[test]
+    fn session_start_on_a_twelve_command_workspace_stays_far_under_the_hook_budget() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        let (_p, ws, tid, _g_id) = workspace_with_commands(&db, 12, &[0, 1]);
+        let event = json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sid-budget",
+            "cwd": "/tmp/ambient",
+            "NYX_TERMINAL_ID": tid,
+        });
+        // The worst of 20 full `agent_session_event` calls, after one warm-up (the first call pays
+        // the connection/statement setup, which the hook's real sidecar has long paid by the time
+        // a session starts). Asserts on the way that what is timed really is the 12-command block.
+        fn worst_of_twenty<S: RunnerSink>(
+            db: &Db,
+            runner: &CommandRunner<S>,
+            activity: &AgentActivityStore,
+            event: &Value,
+        ) -> std::time::Duration {
+            agent_session_event(db, runner, activity, event).unwrap();
+            let mut worst = std::time::Duration::ZERO;
+            for _ in 0..20 {
+                let t0 = std::time::Instant::now();
+                let out = agent_session_event(db, runner, activity, event).unwrap();
+                worst = worst.max(t0.elapsed());
+                let ctx = out.result["context"].as_str().unwrap();
+                assert_eq!(
+                    ctx.lines().filter(|l| l.starts_with("- ")).count(),
+                    12,
+                    "what is being timed really is the full 12-command block: {ctx}"
+                );
+            }
+            worst
+        }
+
+        // (1) The best case the previous constat measured: twelve commands that never ran.
+        let empty = worst_of_twenty(&db, &runner, &activity, &event);
+
+        // (2) The realistic one: 256 KiB of persisted output on EVERY one of the twelve instances —
+        // 3 MiB sitting in the rows this SessionStart joins over.
+        let full_scrollback = "z".repeat(db::MAX_SCROLLBACK_BYTES);
+        let seeded = db
+            .with_conn(|c| {
+                let rows = db::list_instances_for_workspace(c, &ws)?;
+                for inst in &rows {
+                    db::persist_instance_scrollback(c, &inst.id, &full_scrollback)?;
+                }
+                db::list_instances_for_workspace(c, &ws)
+            })
+            .expect("seeded scrollbacks");
+        assert_eq!(seeded.len(), 12, "twelve instances were seeded");
+        assert!(
+            seeded
+                .iter()
+                .all(|r| r.scrollback.len() == db::MAX_SCROLLBACK_BYTES),
+            "the workload really carries a full scrollback per instance"
+        );
+        let full = worst_of_twenty(&db, &runner, &activity, &event);
+
+        let budget = std::time::Duration::from_millis(1000);
+        eprintln!(
+            "SessionStart on a 12-command workspace: worst of 20 = {:?} with EMPTY scrollbacks, \
+             {:?} with a FULL {} KiB scrollback on each ({} MiB persisted) — hook budget {:?}, \
+             margin {:?}",
+            empty,
+            full,
+            db::MAX_SCROLLBACK_BYTES / 1024,
+            (12 * db::MAX_SCROLLBACK_BYTES) / (1024 * 1024),
+            budget,
+            budget.saturating_sub(full),
+        );
+        assert!(
+            full < std::time::Duration::from_millis(250),
+            "the whole SessionStart must stay a small fraction of the hook's 1000 ms budget, took {full:?}",
+        );
+    }
+
+    /// THE PROPERTY THE BUDGET RESTS ON, PROVEN STRUCTURALLY — no clock involved (review finding
+    /// `01M1580EK4BXWC4EP39GQBMDRM`).
+    ///
+    /// `session_context_line` must render the ambient block WITHOUT loading
+    /// `command_instances.scrollback`, bounded at [`db::MAX_SCROLLBACK_BYTES`] (256 KiB) per
+    /// instance — up to 3 MiB on a twelve-command workspace, the dominant term of a request the
+    /// hook bounds at 1000 ms. That is why `db::list_command_lines_for_workspace` exists next to
+    /// `db::list_instances_for_workspace`: same JOIN, same order, six columns, no `scrollback`.
+    ///
+    /// "Does not load it" is a fact about the SQL, not about a duration, so it is asserted on the
+    /// SQL: the connection is instrumented ([`diesel::connection::Instrumentation`]), a REAL
+    /// `SessionStart` runs through the REAL handler, and every statement it emitted is inspected.
+    /// `Db::in_memory` pools exactly ONE connection (`max_size(1)`), so the instrumentation
+    /// installed here is still on the connection `agent_session_event` checks out — the evidence is
+    /// what the handler ITSELF ran, not a query rebuilt in the test and free to drift from it.
+    /// Route the block back through `db::list_instances_for_workspace` and this test fails on the
+    /// `scrollback` in the projection — deterministically, on every machine, loaded or idle.
+    #[test]
+    fn session_start_never_reads_the_scrollback_column() {
+        use diesel::connection::{Connection, InstrumentationEvent};
+        use std::sync::{Arc, Mutex};
+
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        let (_p, ws, tid, _g_id) = workspace_with_commands(&db, 12, &[0, 1]);
+
+        // The realistic workload: 256 KiB of persisted output on every one of the twelve
+        // instances, so a reader that DID select the column would have 3 MiB to show for it.
+        let full_scrollback = "z".repeat(db::MAX_SCROLLBACK_BYTES);
+        let seeded = db
+            .with_conn(|c| {
+                let rows = db::list_instances_for_workspace(c, &ws)?;
+                for inst in &rows {
+                    db::persist_instance_scrollback(c, &inst.id, &full_scrollback)?;
+                }
+                db::list_instances_for_workspace(c, &ws)
+            })
+            .expect("seeded scrollbacks");
+        assert!(
+            seeded.len() == 12
+                && seeded
+                    .iter()
+                    .all(|r| r.scrollback.len() == db::MAX_SCROLLBACK_BYTES),
+            "the column the handler must not read really is populated on all twelve instances"
+        );
+
+        // Record every statement the pooled connection runs from here on.
+        let statements: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&statements);
+        db.with_conn(move |c| {
+            c.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+                if let InstrumentationEvent::StartQuery { query, .. } = event {
+                    sink.lock().expect("sql sink").push(query.to_string());
+                }
+            });
+        });
+
+        let out = agent_session_event(
+            &db,
+            &runner,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-sql-probe",
+                "cwd": "/tmp/ambient",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        // Detach before asserting: the sink must not outlive the recorded window.
+        db.with_conn(|c| c.set_instrumentation(|_: InstrumentationEvent<'_>| {}));
+
+        let ctx = out.result["context"].as_str().unwrap();
+        assert_eq!(
+            ctx.lines().filter(|l| l.starts_with("- ")).count(),
+            12,
+            "the recorded window really covers the full twelve-command block: {ctx}"
+        );
+
+        // A captured statement displays as `<SQL> -- binds: [...]`. Only the SQL half is evidence:
+        // a BIND is DATA and can carry the word by accident (a `cwd`, a session id, a command
+        // text), which would make this assert lie in either direction.
+        let sql: Vec<String> = statements
+            .lock()
+            .expect("sql sink")
+            .iter()
+            .map(|s| s.split(" -- binds:").next().unwrap_or(s).to_string())
+            .collect();
+        assert!(
+            sql.iter()
+                .any(|s| s.contains("`command_instances`") && s.contains("`managed_commands`")),
+            "the handler really did join the workspace's command instances: {sql:#?}"
+        );
+        // The QUALIFIED column, deliberately: the 3 MiB at stake is
+        // `command_instances.scrollback`, twelve rows of it. `terminals.scrollback` is a
+        // different, single-row column that the terminal resolution on this path has always
+        // read — out of this property's scope, and naming the table keeps the two apart.
+        let offenders: Vec<&String> = sql
+            .iter()
+            .filter(|s| s.contains("`command_instances`.`scrollback`"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the SessionStart path selected `command_instances`.`scrollback` in {} of its {} \
+             statements — the ambient block is back on a reader that drags up to {} MiB onto the \
+             hook's 1000 ms budget: {offenders:#?}",
+            offenders.len(),
+            sql.len(),
+            (12 * db::MAX_SCROLLBACK_BYTES) / (1024 * 1024),
+        );
+    }
+
+    /// THE AMBIENT BLOCK, THROUGH THE REAL CHAIN. A `SessionStart` on a terminal bound to a
+    /// workspace that HAS managed commands carries, under the untouched orientation line, one line
+    /// per command with its `instance_id` and the directive naming the tools to act on it.
+    #[test]
+    fn session_start_context_carries_the_workspace_commands_and_the_directive() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        let (_p, ws, tid, group_id) = workspace_with_commands(&db, 3, &[0, 1]);
+        let group_id = group_id.expect("two templates were grouped");
+
+        let out = agent_session_event(
+            &db,
+            &runner,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-block",
+                "cwd": "/tmp/ambient",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        let ctx = out.result["context"].as_str().expect("a context line");
+
+        // The orientation line is untouched, and FIRST.
+        assert!(
+            ctx.lines().next().unwrap().starts_with("You're in nyx — "),
+            "the orientation line still opens the context: {ctx}"
+        );
+        assert!(
+            ctx.lines().next().unwrap().contains(&format!("workspace_id={ws}")),
+            "…and still carries the workspace id: {ctx}"
+        );
+        // Then the block: one line per command, each with its instance id.
+        assert_eq!(
+            ctx.lines().filter(|l| l.starts_with("- ")).count(),
+            3,
+            "one line per managed command: {ctx}"
+        );
+        let instances = db
+            .with_conn(|c| db::list_instances_for_workspace(c, &ws))
+            .unwrap();
+        for inst in &instances {
+            assert!(
+                ctx.contains(&format!(
+                    "- {} · bun run task",
+                    inst.name
+                )),
+                "{} is named with its command line: {ctx}",
+                inst.name
+            );
+            assert!(
+                ctx.contains(&format!("· idle · instance_id={}", inst.id)),
+                "{} carries its factual state and its instance id: {ctx}",
+                inst.name
+            );
+        }
+        assert!(
+            ctx.contains(&format!("· group_id={group_id}")),
+            "the grouped commands name their group: {ctx}"
+        );
+        // And the directive, naming the tools.
+        for tool in [
+            "start_command",
+            "relaunch_command",
+            "list_commands",
+            "get_command_output",
+        ] {
+            assert!(ctx.contains(tool), "the directive names {tool}: {ctx}");
+        }
+        assert!(
+            ctx.contains("/clear") && ctx.contains("/compact"),
+            "…and says the snapshot is re-taken at /clear and /compact: {ctx}"
+        );
+    }
+
+    /// NOTHING WITHOUT COMMANDS. A workspace-bound session on a workspace that defines NO managed
+    /// command gets the orientation line and STRICTLY nothing else — no empty header, no directive
+    /// about a list that does not exist.
+    #[test]
+    fn a_workspace_without_commands_gets_neither_block_nor_directive() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        let (_p, _ws, tid, _g_id) = workspace_with_commands(&db, 0, &[]);
+
+        let out = agent_session_event(
+            &db,
+            &runner,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-empty",
+                "cwd": "/tmp/ambient",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        let ctx = out.result["context"].as_str().unwrap();
+        assert_eq!(
+            ctx.lines().count(),
+            1,
+            "the context is the orientation line and nothing else: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Managed commands") && !ctx.contains("start_command"),
+            "no block, no directive: {ctx}"
+        );
+    }
+
+    /// A LOOSE terminal (no workspace) gets no block either — and the HARD constraint holds: its
+    /// context still contains no `workspace_id=` at all. Twin of
+    /// `agent_session_event_start_returns_minimal_nyx_context`, asserted here against the block.
+    #[test]
+    fn a_loose_terminal_gets_no_block_and_still_names_no_workspace() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        // A workspace WITH commands exists in the DB — the loose terminal must still see nothing.
+        workspace_with_commands(&db, 3, &[]);
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let out = agent_session_event(
+            &db,
+            &runner,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-loose",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        let ctx = out.result["context"].as_str().unwrap();
+        assert_eq!(
+            ctx.lines().count(),
+            1,
+            "a loose terminal's context is one line: {ctx}"
+        );
+        assert!(
+            !ctx.contains("workspace_id="),
+            "a loose terminal names no workspace, block or no block: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Managed commands"),
+            "…and lists the commands of no workspace: {ctx}"
+        );
+    }
+
+    /// ISOLATION. Two workspaces of the SAME project each materialize their own instances of the
+    /// project's templates; a session on one names ONLY its own instance ids. A block that leaked a
+    /// sibling's ids would send `start_command` at the wrong worktree.
+    #[test]
+    fn the_block_names_only_the_instances_of_its_own_workspace() {
+        use crate::schema::terminals;
+        use diesel::prelude::*;
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        let (project, root, tid, _g_id) = workspace_with_commands(&db, 2, &[]);
+        // A SECOND workspace on the same project — the templates materialize into it too.
+        let feature = db
+            .with_conn(|c| db::create_workspace(c, &project, "feature", "/tmp/ambient-feature"))
+            .expect("second workspace");
+        let created = create_terminal(&db, &NoTerminalHost, &json!({})).unwrap();
+        let feature_tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        db.with_conn(|c| {
+            diesel::update(terminals::table.find(&feature_tid))
+                .set(terminals::workspace_id.eq(Some(feature.id.clone())))
+                .execute(c)
+        })
+        .unwrap();
+
+        let context_of = |terminal_id: &str, session_id: &str| -> String {
+            agent_session_event(
+                &db,
+                &runner,
+                &activity,
+                &json!({
+                    "hook_event_name": "SessionStart",
+                    "session_id": session_id,
+                    "cwd": "/tmp/ambient",
+                    "NYX_TERMINAL_ID": terminal_id,
+                }),
+            )
+            .unwrap()
+            .result["context"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let root_ctx = context_of(&tid, "sid-root");
+        let feature_ctx = context_of(&feature_tid, "sid-feature");
+
+        let ids_of = |workspace_id: &str| -> Vec<String> {
+            db.with_conn(|c| db::list_instances_for_workspace(c, workspace_id))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        let root_ids = ids_of(&root);
+        let feature_ids = ids_of(&feature.id);
+        assert_eq!(root_ids.len(), 2);
+        assert_eq!(feature_ids.len(), 2);
+        for id in &root_ids {
+            assert!(root_ctx.contains(id), "the root block names its own {id}");
+            assert!(
+                !feature_ctx.contains(id),
+                "…and the feature block does NOT: {feature_ctx}"
+            );
+        }
+        for id in &feature_ids {
+            assert!(feature_ctx.contains(id), "…and vice versa");
+            assert!(!root_ctx.contains(id), "…: {root_ctx}");
+        }
+    }
+
+    /// `list_commands(workspace_id=…)` renders each instance's `group_id` (`null` = solo) — the tool
+    /// the directive sends the agent back to for the LIVE state must carry at least what the block
+    /// carried, or "go re-check list_commands" would mean "go read something poorer".
+    #[test]
+    fn list_commands_by_workspace_carries_the_group_id() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let (_p, ws, _tid, group_id) = workspace_with_commands(&db, 3, &[0, 1]);
+        let group_id = group_id.expect("two templates were grouped");
+
+        let out = list_commands(&db, &runner, &json!({ "workspace_id": ws })).unwrap();
+        let commands = out["commands"].as_array().expect("commands array");
+        assert_eq!(commands.len(), 3);
+        let grouped: Vec<&Value> = commands
+            .iter()
+            .filter(|c| c["group_id"] == json!(group_id))
+            .collect();
+        assert_eq!(
+            grouped.len(),
+            2,
+            "the two grouped instances name their group: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c["group_id"].is_null() && c["name"] == json!("cmd-2")),
+            "…and the solo one renders a null group_id: {commands:?}"
+        );
+    }
+
     /// #18b — the STALE-PLUGIN verdict at SessionStart. A reported `plugin_version` that
     /// DIFFERS from the bundled (expected) version flags the terminal `plugin_outdated`
     /// (runtime, on the activity store + in the result); the CURRENT bundled version does
@@ -5627,7 +6222,7 @@ mod tests {
             let activity = AgentActivityStore::new();
             let created = create_terminal(&db, &host, &json!({})).unwrap();
             let tid = created.result["terminal_id"].as_str().unwrap().to_string();
-            let out = agent_session_event(
+            let out = session_event(
                 &db,
                 &activity,
                 &json!({
@@ -5657,7 +6252,7 @@ mod tests {
             let activity = AgentActivityStore::new();
             let created = create_terminal(&db, &host, &json!({})).unwrap();
             let tid = created.result["terminal_id"].as_str().unwrap().to_string();
-            let out = agent_session_event(
+            let out = session_event(
                 &db,
                 &activity,
                 &json!({
@@ -5689,7 +6284,7 @@ mod tests {
             let activity = AgentActivityStore::new();
             let created = create_terminal(&db, &host, &json!({})).unwrap();
             let tid = created.result["terminal_id"].as_str().unwrap().to_string();
-            let out = agent_session_event(
+            let out = session_event(
                 &db,
                 &activity,
                 &json!({
@@ -5724,7 +6319,7 @@ mod tests {
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
 
         // A live session + an in-flight turn (the dot is on).
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5735,7 +6330,7 @@ mod tests {
             }),
         )
         .unwrap();
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
@@ -5743,7 +6338,7 @@ mod tests {
         .unwrap();
 
         // `/clear` → SessionEnd { reason: clear }. The guard keeps everything live.
-        let out = agent_session_event(
+        let out = session_event(
             &db,
             &activity,
             &json!({
@@ -5774,7 +6369,7 @@ mod tests {
 
         // The following SessionStart { source: clear } refreshes the row in place (new id),
         // keeping ONE active row — not two.
-        agent_session_event(
+        session_event(
             &db,
             &activity,
             &json!({
@@ -5938,7 +6533,7 @@ mod tests {
         let activity = AgentActivityStore::new();
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
-        let err = agent_session_event(
+        let err = session_event(
             &db,
             &activity,
             &json!({ "hook_event_name": "TotallyUnknownHook", "NYX_TERMINAL_ID": tid }),
