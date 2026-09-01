@@ -597,6 +597,11 @@ fn ready_spec_with_tasks(db: &Db, n: usize) -> (String, String) {
 /// while nothing answers it), so the project registers its command and BINDS it. The seeded coder
 /// itself is untouched — it stays the flow this project's runs resolve, and it stays upgradable. The
 /// command runs at the project's root workspace, so that directory must exist for the PTY to have a cwd.
+///
+/// "Always green" was spelled `true` — a POSIX PROGRAM NAME, and nyx hands the line to the
+/// platform shell, which on Windows is PowerShell and has no such program. The gate never went
+/// green there and the ndev loop spun to its cap, which is what made nine of these tests red. It
+/// is now [`crate::test_cmdline::green`]: the same verdict, written for the shell that reads it.
 fn arm_coder_gate(db: &Db, project_id: &str) {
     let cwd = db.with_conn(|c| {
         db::list_workspaces(c, project_id)
@@ -608,8 +613,15 @@ fn arm_coder_gate(db: &Db, project_id: &str) {
     });
     std::fs::create_dir_all(&cwd).expect("the gate needs a real cwd to run in");
     let instance_id = db.with_conn(|c| {
-        let tpl = db::create_template(c, project_id, "gate", "true", None, Default::default())
-            .expect("gate template");
+        let tpl = db::create_template(
+            c,
+            project_id,
+            "gate",
+            &crate::test_cmdline::green(),
+            None,
+            Default::default(),
+        )
+        .expect("gate template");
         db::instance_ids_for_template(c, &tpl.id)
             .expect("gate instances")
             .into_iter()

@@ -992,6 +992,103 @@ mod tests {
         }
     }
 
+    /// A POSIX shell THIS machine can really open, or `None` when it has none.
+    ///
+    /// The PTY tests below drive their shell with POSIX syntax (`echo`, `stty size`, `seq`,
+    /// `$((…))`), so they used to name `"sh"` outright. That is a bet, not a fact: Windows carries
+    /// no `sh` on any `PATH` entry, so every one of them died inside `CreateProcessW` before
+    /// asserting a single thing about nyx. "Which shell can this machine open" is not a question a
+    /// test should answer on its own — [`crate::shells`] owns it for the product, and it is the
+    /// same [`crate::shells::program_exists`] the `$SHELL` check above rests on. So it answers
+    /// here too: the POSIX name where the platform guarantees one, else the POSIX shell DETECTION
+    /// actually found installed (Git Bash, on a Windows dev box). That also makes these tests
+    /// exercise a shell the product would really spawn on this OS, instead of one it never could.
+    fn posix_shell() -> Option<String> {
+        if crate::shells::program_exists("sh") {
+            return Some("sh".to_string());
+        }
+        crate::shells::detect()
+            .into_iter()
+            .find(|shell| shell.args.is_empty() && is_posix_shell(&shell.path))
+            .map(|shell| shell.path)
+    }
+
+    /// Whether a detected shell's binary belongs to the POSIX family whose syntax these tests
+    /// write. Keyed on the executable's own name — what tells `bash.exe` apart from
+    /// `powershell.exe` in a list built from real installs.
+    fn is_posix_shell(path: &str) -> bool {
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        matches!(stem.as_str(), "sh" | "bash")
+    }
+
+    /// Spawn [`posix_shell`] in a PTY, or `None` — after SAYING so — when this machine has none.
+    ///
+    /// The absence of a shell is a skip: what these tests assert is nyx's PTY plumbing, not the
+    /// machine's inventory, and a silent green would be worse than either. A shell that IS there
+    /// and still refuses to start stays a hard failure — that is a real defect, and the `expect`
+    /// keeps it one.
+    ///
+    /// The handshake is played here, BEFORE the caller gets the handle: at this point the shell
+    /// has been asked for nothing, so what it consumes is the ConPTY's own opening sequence and
+    /// nothing the caller could want. A test whose child speaks unprompted (`cmd /C echo …`)
+    /// therefore calls [`play_terminal_handshake`] itself and keeps what it returns.
+    fn spawn_posix_shell() -> Option<(Pty, Receiver<Vec<u8>>)> {
+        let Some(shell) = posix_shell() else {
+            eprintln!("SKIPPED: no POSIX shell on this machine (crate::shells detected none)");
+            return None;
+        };
+        let (pty, rx) = Pty::spawn_program(&shell, small_size(), None)
+            .expect("spawn the machine's POSIX shell");
+        play_terminal_handshake(&pty, &rx);
+        Some((pty, rx))
+    }
+
+    /// Play the TERMINAL's part of a ConPTY's opening handshake, returning everything it read.
+    ///
+    /// A ConPTY asks the terminal where the cursor is (DSR, `ESC[6n`) the instant it opens, and
+    /// HOLDS THE CHILD'S OUTPUT BACK until it is answered. In the app the renderer answers; a
+    /// headless test has no renderer, so every Windows PTY test here received exactly one chunk —
+    /// the query — and then silence, whatever shell it had spawned. That is not a nyx defect and
+    /// it is not something to assert around: it is the terminal's half of the protocol, and in
+    /// these tests the terminal is the test.
+    ///
+    /// The reply is NOT invented here. [`crate::command::scan_terminal_queries`] already answers
+    /// these queries for the read-only command PTY, carry buffer and all, so a query split across
+    /// a read boundary is still recognized and there is one answer to "what does nyx reply".
+    ///
+    /// It WAITS for the query instead of replying blind: written before the ConPTY asks, an
+    /// `ESC[1;1R` is nothing but keystrokes for the shell.
+    #[cfg(windows)]
+    fn play_terminal_handshake(pty: &Pty, rx: &Receiver<Vec<u8>>) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut carry: Vec<u8> = Vec::new();
+        let mut seen = String::new();
+        while Instant::now() < deadline {
+            let chunk = match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(chunk) => chunk,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+            let replies = crate::command::scan_terminal_queries(&chunk, &mut carry);
+            if !replies.is_empty() {
+                pty.write(&replies).expect("answer the ConPTY's query");
+                break;
+            }
+        }
+        seen
+    }
+
+    /// A Unix PTY opens with no such handshake — the child's output flows from the first byte —
+    /// so there is nothing to play and nothing is read.
+    #[cfg(not(windows))]
+    fn play_terminal_handshake(_pty: &Pty, _rx: &Receiver<Vec<u8>>) -> String {
+        String::new()
+    }
+
     /// Drain the receiver into a single String until either we observe `needle`
     /// or `timeout` elapses. Returns the accumulated output.
     fn read_until(rx: &Receiver<Vec<u8>>, needle: &str, timeout: Duration) -> String {
@@ -1014,7 +1111,9 @@ mod tests {
 
     #[test]
     fn spawn_write_read_roundtrip() {
-        let (mut pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((mut pty, rx)) = spawn_posix_shell() else {
+            return;
+        };
         // Send a command; expect its output back through the PTY.
         pty.write(b"echo nyx_marker_123\n").expect("write");
         let out = read_until(&rx, "nyx_marker_123", Duration::from_secs(5));
@@ -1027,7 +1126,9 @@ mod tests {
 
     #[test]
     fn resize_does_not_panic_and_is_reflected() {
-        let (mut pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((mut pty, rx)) = spawn_posix_shell() else {
+            return;
+        };
         // Apply a distinctive size, then ask the shell to report it.
         pty.resize(132, 50, 0, 0).expect("resize");
         // Give the kernel a moment to apply the winsize before querying.
@@ -1044,7 +1145,9 @@ mod tests {
     #[test]
     fn kill_terminates_and_exit_code_recoverable() {
         // A shell that just sleeps for a long time; we kill it.
-        let (mut pty, _rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((mut pty, _rx)) = spawn_posix_shell() else {
+            return;
+        };
         pty.write(b"sleep 60\n").expect("write");
         std::thread::sleep(Duration::from_millis(150));
         assert!(pty.exit_code().is_none(), "child should still be running");
@@ -1066,11 +1169,14 @@ mod tests {
         // We also assert the id allocator advances exactly once per spawn (no
         // double-spawn / no stray PTY) without assuming an absolute id, since
         // tests run in parallel against the shared global counter.
-        let (held, _rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn baseline sh");
+        let Some((held, _rx)) = spawn_posix_shell() else {
+            return;
+        };
         let baseline = held.id();
         let dropped_id = {
-            let (pty, _rx) =
-                Pty::spawn_program("sh", small_size(), None).expect("spawn sh to drop");
+            let Some((pty, _rx)) = spawn_posix_shell() else {
+                return;
+            };
             pty.id()
             // Drop here: kill + join(waiter) + join/detach(reader). Must return
             // promptly (never blocks the caller).
@@ -1086,7 +1192,9 @@ mod tests {
     fn reader_channel_closes_when_child_exits() {
         // `exit 0` makes the shell terminate on its own; the reader thread must
         // observe EOF and drop the sender, disconnecting the receiver.
-        let (mut pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((mut pty, rx)) = spawn_posix_shell() else {
+            return;
+        };
         pty.write(b"exit 0\n").expect("write");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut disconnected = false;
@@ -1118,7 +1226,9 @@ mod tests {
         // the whole UI froze. An idle shell parks the reader in a blocking read:
         // the exact condition. We run the drop on a worker thread and FAIL (not
         // hang) if it does not return promptly.
-        let (pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((pty, rx)) = spawn_posix_shell() else {
+            return;
+        };
         std::thread::sleep(Duration::from_millis(100)); // let the reader settle in read()
 
         let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -1139,7 +1249,9 @@ mod tests {
         // Same invariant, but with the reader ACTIVELY cycling through reads (the
         // shell emits a line every ~20ms): teardown must still return promptly
         // with output in flight, not only when the reader sits idle.
-        let (pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((pty, rx)) = spawn_posix_shell() else {
+            return;
+        };
         pty.write(b"i=0; while :; do echo line $i; i=$((i+1)); sleep 0.02; done\n")
             .expect("write");
         assert!(
@@ -1203,7 +1315,13 @@ mod tests {
             0, // no MCP port for the NYX_TERMINAL_ID-focused assertion
         )
         .expect("spawn cmd /C");
-        let out = read_until(&rx, "NYXTID=[", Duration::from_secs(10));
+        // This child speaks unprompted, so the handshake is played here and what it read is kept:
+        // the ConPTY answers only once the terminal has replied, and the `echo` follows.
+        let opening = play_terminal_handshake(&pty, &rx);
+        let out = format!(
+            "{opening}{}",
+            read_until(&rx, "NYXTID=[", Duration::from_secs(10))
+        );
         assert!(
             out.contains(&format!("NYXTID=[{tid}]")),
             "child cmd must see %NYX_TERMINAL_ID% == the record id; got: {out:?}"
@@ -1401,7 +1519,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn busy_is_idle_at_prompt_without_osc133() {
-        let (mut pty, _rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((mut pty, _rx)) = spawn_posix_shell() else {
+            return;
+        };
         // No command issued, no OSC 133 in play: the only foreground group is the
         // shell's, so busy is false.
         assert_eq!(
@@ -1420,7 +1540,9 @@ mod tests {
     /// cycle — proving the backpressure is lossless, not lossy throttling.
     #[test]
     fn pause_gate_is_lossless_and_ordered() {
-        let (mut pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((mut pty, rx)) = spawn_posix_shell() else {
+            return;
+        };
         let gate = pty.pause_gate();
 
         // Pause BEFORE issuing work, so the stream is gated from the start.
@@ -1498,7 +1620,9 @@ mod tests {
     /// gate so the reader can reach EOF and the (Unix) join returns promptly.
     #[test]
     fn drop_is_prompt_when_paused() {
-        let (pty, rx) = Pty::spawn_program("sh", small_size(), None).expect("spawn sh");
+        let Some((pty, rx)) = spawn_posix_shell() else {
+            return;
+        };
         pty.pause_gate().set_paused(true);
         std::thread::sleep(Duration::from_millis(100)); // let the reader park at the gate
 
@@ -1522,7 +1646,10 @@ mod tests {
         // a single deadlock surfaces as a FAILURE, not a hung test run.
         let mut ptys = Vec::new();
         for _ in 0..8 {
-            ptys.push(Pty::spawn_program("sh", small_size(), None).expect("spawn sh"));
+            let Some(pty) = spawn_posix_shell() else {
+                return;
+            };
+            ptys.push(pty);
         }
         std::thread::sleep(Duration::from_millis(100));
 

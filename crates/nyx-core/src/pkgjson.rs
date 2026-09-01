@@ -1369,11 +1369,14 @@ mod tests {
         assert!(find(&scripts, "start").is_some(), "api start found");
         assert!(find(&scripts, "serve").is_some(), "web serve found");
 
-        // Subfolders are the package locations relative to the workspace.
+        // Subfolders are the package locations relative to the workspace, in the PLATFORM
+        // spelling `relative_under` produces (it slices two `pathnorm`-canonical paths, so
+        // the separator is `\` on Windows). The expectation goes through the same normalizer
+        // rather than hard-coding one platform's separator.
         let start = find(&scripts, "start").unwrap();
-        assert_eq!(start.subfolder, "packages/api");
+        assert_eq!(start.subfolder, pathnorm::normalize("packages/api"));
         let serve = find(&scripts, "serve").unwrap();
-        assert_eq!(serve.subfolder, "apps/web");
+        assert_eq!(serve.subfolder, pathnorm::normalize("apps/web"));
         let build = find(&scripts, "build").unwrap();
         assert_eq!(build.subfolder, "", "root package.json has empty subfolder");
     }

@@ -12,6 +12,11 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::db::{self, Db, SpecSections, SpecTransition};
+// Every gate below is armed through this module: what a gate command must DO (succeed, fail with a
+// given code, print, flood, wait on a sentinel file) written for the shell nyx will really hand it
+// to. See [`crate::test_cmdline`] for why the POSIX spellings these tests used to carry were both
+// red on Windows and — worse — accidentally green for the wrong reason.
+use crate::test_cmdline::{self, Cmdline};
 
 // ---------------------------------------------------------------------------
 // Scaffolding
@@ -100,6 +105,9 @@ fn gate_command_with_env(db: &Db, project_id: &str, cmdline: &str, env: &str) ->
 
 /// Create a gate managed command (`cmdline`, run at the project's root workspace) and return the
 /// materialized instance id — the `command_id` a `gate_check` node references.
+///
+/// `cmdline` comes from [`crate::test_cmdline`], never from a literal: nyx hands it to the PLATFORM
+/// shell, so a POSIX literal is red on Windows for a reason that has nothing to do with the gate.
 fn gate_command(db: &Db, project_id: &str, cmdline: &str) -> String {
     // A UNIQUE template name per cmdline so a test can create several gates in one project (the
     // template name is unique per project).
@@ -301,7 +309,7 @@ fn nyx_next_drives_the_ndev_loop_respawn_on_red_then_advance_in_one_session() {
     let (project_id, workspace_id, ws_path) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
     // The gate: exit 0 only once the coder has produced the sentinel `gate_ok` (the "green fix").
-    let gate = gate_command(&db, &project_id, "test -f gate_ok");
+    let gate = gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("gate_ok"));
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -400,7 +408,8 @@ fn a_red_blocking_gate_makes_nyx_next_refuse_to_advance() {
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
     // No sentinel is ever created → the gate stays RED.
-    let gate = gate_command(&db, &project_id, "test -f never_created");
+    let gate =
+        gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("never_created"));
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -751,7 +760,8 @@ fn gate_enforcement_is_identical_across_providers() {
     let sandbox = temp_dir("crossprov");
     let db = Db::in_memory();
     let (project_id, _workspace_id, _ws) = seed_project(&db, sandbox.path());
-    let gate = gate_command(&db, &project_id, "test -f never_created");
+    let gate =
+        gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("never_created"));
 
     let build = |db: &Db, wf: &str| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -808,7 +818,8 @@ fn enforcement_is_anchored_on_the_verb_not_on_any_hook() {
 
     // (a) GATE RED → the progression verb is refused in the handler (no hook involved).
     let in_progress = spec_in_progress(&db, &project_id, &workspace_id);
-    let gate = gate_command(&db, &project_id, "test -f never_created");
+    let gate =
+        gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("never_created"));
     let (_wf_a, run_a) = workflow_run(&db, Some(&in_progress), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
         add_node(
@@ -1172,7 +1183,8 @@ fn a_red_gate_still_blocks_a_transition_reached_on_a_later_call() {
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
     // No sentinel is ever created → the gate stays RED.
-    let gate = gate_command(&db, &project_id, "test -f never_created");
+    let gate =
+        gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("never_created"));
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -1307,7 +1319,8 @@ fn a_red_non_blocking_gate_does_not_clear_the_blocking_refusal() {
     let db = Db::in_memory();
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let gate = gate_command(&db, &project_id, "test -f never_created");
+    let gate =
+        gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("never_created"));
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -3079,7 +3092,7 @@ fn run_start_warns_through_the_sub_workflow_hop_about_a_gate_it_never_opens() {
     );
 
     // A workflow whose gate HAS a real command → no gate warning.
-    let gate = gate_command(&db, &project_id, "true");
+    let gate = gate_command(&db, &project_id, &test_cmdline::green());
     let wf_ok = db.with_conn(|c| {
         db::create_workflow(c, Some(&project_id), "wf-ok", db::WORKFLOW_SCOPE_CUSTOM, None)
             .expect("wf")
@@ -3559,7 +3572,7 @@ fn the_seeded_coders_empty_gate_refuses_to_certify_a_build_it_never_checked() {
     // command, bind it to the project's `build_check` slot. TWO calls, and NOTHING is forked — the
     // graph is not touched at all, which is the whole point: the coder the project runs stays the
     // shared built-in and keeps receiving its upgrades.
-    let command = gate_command(&db, &project_id, "true");
+    let command = gate_command(&db, &project_id, &test_cmdline::green());
     let authoring = |name: &str, args: Value| {
         crate::mcp_authoring::dispatch_authoring_tool(&db, name, &args)
             .unwrap_or_else(|| panic!("`{name}` was not routed"))
@@ -3785,8 +3798,8 @@ fn a_green_gate_does_not_clear_another_gates_red_block() {
     let db = Db::in_memory();
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let red = gate_command(&db, &project_id, "false");
-    let green = gate_command(&db, &project_id, "true");
+    let red = gate_command(&db, &project_id, &test_cmdline::red());
+    let green = gate_command(&db, &project_id, &test_cmdline::green());
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -4323,7 +4336,8 @@ fn run_start_resumes_a_blocked_run() {
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
     // The sentinel is never created → the blocking gate stays RED and parks the run `blocked` (M5).
-    let gate = gate_command(&db, &project_id, "test -f never_created");
+    let gate =
+        gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("never_created"));
     let wf = db.with_conn(|c| {
         db::create_workflow(c, Some(&project_id), "ndev", db::WORKFLOW_SCOPE_NDEV, None)
             .expect("wf")
@@ -8378,7 +8392,7 @@ fn a_blocked_child_surfaces_a_blocked_sub_result_without_waiting() {
     let db = Db::in_memory();
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let red = gate_command(&db, &project_id, "sh -c 'exit 1'");
+    let red = gate_command(&db, &project_id, &test_cmdline::red());
 
     // CHILD: sequence { gate_check(red, blocking) } — driving it BLOCKS at the end (M5 re-eval).
     let child_wf = child_workflow(&db, |db, wf| {
@@ -8579,7 +8593,7 @@ fn a_red_gate_surfaces_its_failing_command_in_the_refusal() {
     let db = Db::in_memory();
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let gate = gate_command(&db, &project_id, "sh -c 'echo boom; exit 1'");
+    let gate = gate_command(&db, &project_id, &test_cmdline::prints_then_exits("boom", 1));
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -8632,7 +8646,7 @@ fn a_green_gate_captures_its_command_output() {
     let sandbox = temp_dir("m6green");
     let db = Db::in_memory();
     let (project_id, _workspace_id, _ws) = seed_project(&db, sandbox.path());
-    let gate = gate_command(&db, &project_id, "sh -c 'echo hello; exit 0'");
+    let gate = gate_command(&db, &project_id, &test_cmdline::prints_then_exits("hello", 0));
 
     let (_wf, run_id) = workflow_run(&db, None, |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -8685,7 +8699,7 @@ fn a_red_gate_result_is_persisted_and_readable_via_list_workflow_runs() {
     let db = Db::in_memory();
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let gate = gate_command(&db, &project_id, "sh -c 'echo nope; exit 2'");
+    let gate = gate_command(&db, &project_id, &test_cmdline::prints_then_exits("nope", 2));
 
     let (wf_id, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -8760,7 +8774,10 @@ fn a_chatty_gate_command_tail_is_capped_to_the_end() {
     let gate = gate_command(
         &db,
         &project_id,
-        "sh -c 'yes ABCDEFGH | head -n 5000; echo TAIL_SENTINEL; exit 1'",
+        &Cmdline::new()
+            .prints_lines(5000, "ABCDEFGH")
+            .prints("TAIL_SENTINEL")
+            .exits(1),
     );
     let outcome = super::run_gate_bounded(&db, &[gate], super::GATE_TOTAL_TIMEOUT).expect("gate");
     assert!(!outcome.passed, "the command exits non-zero");
@@ -8785,8 +8802,12 @@ fn a_chatty_gate_command_tail_is_capped_to_the_end() {
 /// proves the stored env reached the process nyx spawned ITSELF for the gate — the path that used to
 /// hardcode an empty env while `start_command` honoured one, so the same command was green by hand
 /// and red in the gate.
+///
+/// It used to be `#[cfg(not(windows))]`, for the single reason that its command line said `sh`:
+/// N31 is a property of the SPAWN, not of any shell, and Windows is where it was reported. Reading
+/// a variable is one of the things [`crate::test_cmdline`] knows how to say in every dialect nyx
+/// can spawn, so the test now runs on all of them.
 #[test]
-#[cfg(not(windows))]
 fn a_gate_command_runs_with_the_environment_persisted_on_the_command() {
     let _g = db_guard();
     let sandbox = temp_dir("n31-gate-env");
@@ -8795,7 +8816,10 @@ fn a_gate_command_runs_with_the_environment_persisted_on_the_command() {
     let gate = gate_command_with_env(
         &db,
         &project_id,
-        "sh -c 'echo GOT=$NYX_GATE_PERSISTED; test -n \"$NYX_GATE_PERSISTED\"'",
+        &Cmdline::new()
+            .prints_env("GOT=", "NYX_GATE_PERSISTED", "")
+            .requires_env("NYX_GATE_PERSISTED")
+            .exits(0),
         r#"{"NYX_GATE_PERSISTED":"from-the-command-definition"}"#,
     );
 
@@ -8818,7 +8842,6 @@ fn a_gate_command_runs_with_the_environment_persisted_on_the_command() {
 /// no env from that column. A typo in a stored map must cost the variables, never the ability to run
 /// the command (and therefore to fix it).
 #[test]
-#[cfg(not(windows))]
 fn a_malformed_persisted_env_still_lets_the_gate_run() {
     let _g = db_guard();
     let sandbox = temp_dir("n31-gate-badenv");
@@ -8828,13 +8851,17 @@ fn a_malformed_persisted_env_still_lets_the_gate_run() {
     let broken = gate_command_with_env(
         &db,
         &project_id,
-        "sh -c 'echo BROKEN_RAN; exit 0'",
+        &test_cmdline::prints_then_exits("BROKEN_RAN", 0),
         "not json at all",
     );
+    // The empty brackets are the assertion: the dropped entry must reach the command as an ABSENT
+    // variable, not as the literal it was written as.
     let non_string = gate_command_with_env(
         &db,
         &project_id,
-        "sh -c 'echo NONSTRING=[$NYX_GATE_NONSTRING]; exit 0'",
+        &Cmdline::new()
+            .prints_env("NONSTRING=[", "NYX_GATE_NONSTRING", "]")
+            .exits(0),
         r#"{"NYX_GATE_NONSTRING":5433}"#,
     );
 
@@ -8859,7 +8886,7 @@ fn the_global_budget_marks_a_slow_gate_red_without_hanging() {
     let db = Db::in_memory();
     let (project_id, _ws_id, _ws) = seed_project(&db, sandbox.path());
     // Would sleep far past the injected budget — the global bound must cut it and mark the gate red.
-    let gate = gate_command(&db, &project_id, "sh -c 'sleep 30'");
+    let gate = gate_command(&db, &project_id, &Cmdline::new().sleeps(30).exits(0));
     let outcome = super::run_gate_bounded(&db, &[gate], std::time::Duration::from_millis(100))
         .expect("gate");
     assert!(!outcome.passed, "a gate over its total budget is RED");
@@ -8886,7 +8913,7 @@ fn the_global_budget_marks_a_slow_gate_red_without_hanging() {
 /// M5 (the CORE proof) — a run parked `blocked` on a RED blocking gate is no longer a dead-end. The
 /// gate is RE-RUN at the block point (the transition guard) on every attempt to pass it: fixing the
 /// cause and calling `nyx_next` again re-runs the gate GREEN, clears the anchor, and the run advances
-/// past the transition — no cursor surgery. The gate `test -f gate_ok` is red until the sentinel lands.
+/// past the transition — no cursor surgery. The gate is red until the `gate_ok` sentinel lands.
 #[test]
 fn a_parked_red_gate_re_runs_at_the_block_point_and_advances_once_fixed() {
     let _g = db_guard();
@@ -8895,7 +8922,7 @@ fn a_parked_red_gate_re_runs_at_the_block_point_and_advances_once_fixed() {
     let (project_id, workspace_id, ws_path) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
     // Red until the coder's fix (the sentinel) exists.
-    let gate = gate_command(&db, &project_id, "test -f gate_ok");
+    let gate = gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("gate_ok"));
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -8974,7 +9001,7 @@ fn the_abandon_path_clears_the_gate_block_and_ends_clean_without_refusing() {
     let db = Db::in_memory();
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let gate = gate_command(&db, &project_id, "false"); // never green
+    let gate = gate_command(&db, &project_id, &test_cmdline::red()); // never green
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -9095,7 +9122,7 @@ fn a_refused_tick_carries_the_notes_the_walk_went_past() {
     let db = Db::in_memory();
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let gate = gate_command(&db, &project_id, "false"); // never green
+    let gate = gate_command(&db, &project_id, &test_cmdline::red()); // never green
 
     // A note the walk goes past, then a blocking gate that refuses the tick it is walked in.
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
@@ -9152,7 +9179,7 @@ fn a_run_refused_at_done_by_a_red_gate_still_resumes_in_the_next_session() {
     let db = Db::in_memory();
     let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let gate = gate_command(&db, &project_id, "false"); // never green
+    let gate = gate_command(&db, &project_id, &test_cmdline::red()); // never green
 
     // A gate and NOTHING after it: the walk reaches `Step::Done` in the very tick that runs it.
     let (wf_id, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
@@ -9222,7 +9249,7 @@ fn a_gate_red_retry_re_runs_the_loop_body_and_the_gate() {
     let (project_id, workspace_id, ws_path) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
     // Red until the coder's fix (the sentinel) exists.
-    let gate = gate_command(&db, &project_id, "test -f gate_ok");
+    let gate = gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("gate_ok"));
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -9363,7 +9390,7 @@ fn every_stop_of_nyx_next_journals_exactly_one_run_tick_row() {
     let db = Db::in_memory();
     let (project_id, workspace_id, ws_path) = seed_project(&db, sandbox.path());
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
-    let gate = gate_command(&db, &project_id, "test -f gate_ok");
+    let gate = gate_command(&db, &project_id, &test_cmdline::green_when_file_exists("gate_ok"));
 
     let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
         let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
@@ -9944,7 +9971,7 @@ fn arming_a_gate_mid_run_reaches_the_very_next_tick_of_that_run() {
 
     // The caller walks the route the refusal names, on the run that is parked: register the check,
     // then `node_update` the gate — the real verb, warnings and all.
-    let command = gate_command(&db, &project_id, "true");
+    let command = gate_command(&db, &project_id, &test_cmdline::green());
     let updated = crate::mcp_authoring::dispatch_authoring_tool(
         &db,
         "node_update",
@@ -10067,6 +10094,12 @@ fn two_concurrent_ticks_on_one_run_do_not_both_advance_it() {
     // also gives up on its own after a few seconds and exits GREEN, because a build that let the
     // second tick through would park this test's own thread inside a second gate run that nothing
     // would ever release: the test must FAIL on its assertions, not hang.
+    //
+    // The line stays POSIX, and so does the `#[cfg(not(windows))]` above it — this is the ONE
+    // gate fixture in this file that is not "a command that does X" but a small state machine (a
+    // ledger, a start flag, a bounded poll on a release file), and [`crate::test_cmdline`]
+    // deliberately grows no vocabulary for control flow. What the cfg costs is real and named:
+    // NO Windows coverage of the tick guard.
     let gate = gate_command(
         &db,
         &project_id,
@@ -10195,7 +10228,6 @@ fn a_refused_concurrent_tick_changes_nothing_and_releases_the_run() {
 /// Both outcomes here are produced by the REAL gate runner over a REAL PTY; only the total budget is
 /// shortened, so the timeout is reached in milliseconds instead of the configured 90s.
 #[test]
-#[cfg(not(windows))]
 fn a_gate_cut_short_by_its_budget_is_refused_as_cut_short_not_as_red() {
     let _g = db_guard();
     let sandbox = temp_dir("l1-cutshort");
@@ -10204,7 +10236,7 @@ fn a_gate_cut_short_by_its_budget_is_refused_as_cut_short_not_as_red() {
     let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
 
     // A command that never exits on its own, cut off by the gate's TOTAL budget.
-    let hangs = gate_command(&db, &project_id, "sh -c 'sleep 60'");
+    let hangs = gate_command(&db, &project_id, &Cmdline::new().sleeps(60).exits(0));
     let cut_short = super::run_gate_bounded(&db, &[hangs], std::time::Duration::from_millis(300))
         .expect("the gate runs");
     assert!(!cut_short.passed);
@@ -10215,7 +10247,7 @@ fn a_gate_cut_short_by_its_budget_is_refused_as_cut_short_not_as_red() {
     );
 
     // A command that RAN and failed: the same red, an entirely different fact.
-    let fails = gate_command(&db, &project_id, "sh -c 'echo boom; exit 1'");
+    let fails = gate_command(&db, &project_id, &test_cmdline::prints_then_exits("boom", 1));
     let failed = super::run_gate_bounded(&db, &[fails], super::GATE_TOTAL_TIMEOUT).expect("gate");
     assert!(!failed.passed);
     assert_eq!(failed.commands[0].exit_code, Some(1));

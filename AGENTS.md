@@ -55,10 +55,26 @@ Détails : `contract/README.md` pour le protocole, `e2e/README.md` pour les pré
 - Le mode navigateur exige le binaire Chromium de Playwright : `npx playwright install chromium`.
   Sans lui, une quinzaine de fichiers ne démarrent pas et `bun run test` sort en échec alors que
   toute la suite jsdom est verte.
-- Sous Windows, une vingtaine de tests Rust échouent pour des raisons d'environnement et non de
-  régression : séparateurs `\` contre `/`, casse de la lettre de lecteur (`C:` contre `c:`), tests
-  de PTY et de kill de processus. Vérifier qu'un échec n'appartient pas à cette famille avant de
-  chercher une cause dans le code.
+- Sous Windows, les suites Rust sont **vertes** sur machine au repos. La liste **nommée** fait foi —
+  `crates/nyx-core/BASELINE-REDS.md` — et se compare nom par nom, jamais en comptant. Elle ne porte
+  plus aucun rouge gelé ; une seule famille y subsiste : **sensible à la charge, verte en
+  isolation** — budgets d'horloge (`design`) et watchers de fichiers réels (`git_watch`,
+  `repo_watch` côté sidecar). Rejouer le nom seul, ou `-- --test-threads=1`, avant de conclure.
+  Tout autre rouge est une régression et doit bloquer.
+- **Mesurer depuis PowerShell, pas depuis Git Bash.** `cargo test` lancé depuis Git Bash hérite d'un
+  `PATH` qui porte le `usr\bin` de Git, où vivent `sh.exe`, `true.exe` et `test.exe` : ces noms
+  deviennent résolvables à l'intérieur du shell que nyx lance pour une commande managée, et un test
+  dont la ligne de commande est du POSIX passe au vert. Deux agents obtiennent alors deux baselines
+  sur la même machine, au même commit, et chacun conclut que l'autre a régressé — c'est exactement
+  ce qui s'est produit le 2026-08-26. **Corriger les 18 rouges de cette famille n'a pas désarmé le
+  piège**, seulement retiré les tests qui y étaient tombés. Il a deux bouches, et la seconde est la
+  dangereuse : un test qui attend du VERT diverge visiblement d'un shell à l'autre ; un test qui
+  attend du ROUGE est vert **des deux côtés** en n'assertant rien, `The term 'sh' is not recognized`
+  étant un code de sortie non nul comme un autre — et PowerShell recopiant la ligne entière dans son
+  message d'erreur, même une assertion sur une sentinelle imprimée passe alors que rien n'a tourné.
+  D'où la règle : **jamais de ligne de commande littérale** dans un test qui arme une commande
+  managée. `crate::test_cmdline` rend « la ligne qui fait X sur cette plateforme », dans le dialecte
+  du shell que `pty::resolve_shell` désignera vraiment.
 - La CI porte un gate cross-OS (`.github/workflows/gate-v2.2.5-terminal-persistence.yml`) qui rejoue
   les suites navigateur, unitaire et Rust sur Windows, Linux et macOS.
 

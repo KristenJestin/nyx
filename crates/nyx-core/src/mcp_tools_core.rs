@@ -5462,7 +5462,10 @@ mod tests {
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
         assert_eq!(
             *host.opened.lock().unwrap(),
-            vec![(tid.clone(), "/tmp/h1-open".to_string())],
+            // The cwd the tool STORED is the canonical one, so that is the cwd the host is
+            // handed — the expectation goes through the same normalizer rather than assuming
+            // the argument's spelling survives (on Windows it becomes `\tmp\h1-open`).
+            vec![(tid.clone(), crate::pathnorm::normalize("/tmp/h1-open"))],
             "the tool must ask for the record's shell, at the cwd it stored"
         );
         assert_eq!(

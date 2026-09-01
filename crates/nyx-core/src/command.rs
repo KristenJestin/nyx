@@ -99,7 +99,11 @@ pub fn command_invocation(shell: &str, cmdline: &str) -> (String, Vec<String>) {
 /// `C:\Windows\System32\cmd.exe` -> `cmd`, `pwsh.exe` -> `pwsh`. Splits on BOTH
 /// `/` and `\` so a Windows path classifies even on a Unix build, and strips a
 /// trailing `.exe`/`.cmd`/`.bat`. Pure: unit-tested without spawning.
-fn shell_stem(shell: &str) -> String {
+///
+/// `pub(crate)` for the test-only `crate::test_cmdline`, which must classify the SAME shell the
+/// SAME way to write a command line for it — a second copy of this rule is a second chance to
+/// disagree. (Not an intra-doc link: that module exists only under `cfg(test)`.)
+pub(crate) fn shell_stem(shell: &str) -> String {
     let base = shell
         .rsplit(['/', '\\'])
         .next()
@@ -164,6 +168,13 @@ const DSR_OK_REPLY: &[u8] = b"\x1b[0n";
 /// the human who opened it. The sidecar's pump therefore answers with this same scanner while —
 /// and ONLY while — no view is attached. One scanner, one set of canned replies: a second copy
 /// would be a second terminal emulation to keep honest.
+///
+/// A THIRD caller found the same trap from the other end: a headless TEST on a plain
+/// [`crate::pty::Pty`] gets that cursor-position question and no one to answer it, so the child's
+/// output never arrives and the test reads ~4 bytes then hangs. The two chantiers discovered this
+/// independently — one in production, one in the suite — which is the strongest argument there is
+/// for keeping ONE implementation: a laxer copy grown next to the tests would have hidden the
+/// production hang instead of pointing at it.
 pub fn scan_terminal_queries(chunk: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
     // Fast path: nothing buffered and no ESC in the chunk → no query possible.
     if carry.is_empty() && !chunk.contains(&0x1b) {
@@ -2508,19 +2519,37 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn tree_kill_reaps_grandchild_windows() {
-        // Start a detached grandchild (a sleeping powershell) and print its pid, then
-        // wait on it so the shell tree stays alive and non-trivial. `Start-Process
-        // -PassThru` returns the spawned process object whose `.Id` we echo.
-        let cmdline = "powershell -NoProfile -Command \"$p = Start-Process powershell \
-             -ArgumentList '-NoProfile','-Command','Start-Sleep 120' -PassThru; \
-             Write-Output ('CHILD:' + $p.Id); Wait-Process -Id $p.Id\"";
+        // Start a detached grandchild (a sleeping powershell), print its pid, then sleep so the
+        // shell tree stays alive and non-trivial. `Start-Process -PassThru` returns the spawned
+        // process object whose `.Id` we echo.
+        //
+        // NOT ONE `$` in this command line, and that is deliberate. nyx runs a managed command as
+        // `<platform shell> -Command <cmdline>` ([`command_invocation`]), so wherever the platform
+        // shell is PowerShell — every machine that has one, which is every Windows CI runner —
+        // this string is a PowerShell DOUBLE-QUOTED STRING before it is ever a script: the OUTER
+        // shell expands a `$p` in it (to nothing), and the inner PowerShell is then handed
+        // `('CHILD:' + .Id)` and refuses to parse it. The variable only ever named the spawned
+        // process twice, so the pid is composed inline and the shell is held open by its own
+        // sleep instead of by `Wait-Process -Id $p.Id`. What is asserted below is unchanged.
+        let cmdline = "powershell -NoProfile -Command \"Write-Output ('CHILD:' + (Start-Process \
+             powershell -ArgumentList '-NoProfile','-Command','Start-Sleep 120' -PassThru).Id); \
+             Start-Sleep 120\"";
         let (mut cmd, rx) =
             CommandPty::spawn(cmdline, small_size(), None, &[]).expect("spawn group");
         let out = read_until(&rx, "CHILD:", Duration::from_secs(20));
+        // The pid is found by its MARKER, not by a line that starts with it: a ConPTY opens by
+        // emitting its own escape sequence (cursor query, modes, title) with no newline, so the
+        // first line of the stream is that preamble with `CHILD:<pid>` glued to its end.
         let child_pid: u32 = out
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("CHILD:"))
-            .and_then(|n| n.trim().parse().ok())
+            .rsplit("CHILD:")
+            .next()
+            .map(|rest| {
+                rest.trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .and_then(|digits| digits.parse().ok())
             .unwrap_or_else(|| panic!("could not parse grandchild pid from {out:?}"));
 
         assert!(

@@ -24584,9 +24584,12 @@ mod tests {
             create_project(&mut conn, "Nyx", p("/old/loc", "C:\\old\\loc"), None).unwrap();
         let id = root.id.clone();
 
-        // Simulate the folder moving on disk: the root_path changes, the id does not.
+        // Simulate the folder moving on disk: the root_path changes, the id does not. The move
+        // writes what `create_workspace` writes — the CANONICAL form — because a hand-rolled
+        // UPDATE that skips the normalizer stores a spelling production can never produce, and
+        // the read below would then compare two canonicalizations (`C:\…` against `c:\…`).
         diesel::update(workspaces::table.find(&id))
-            .set(workspaces::root_path.eq(p("/new/loc", "C:\\new\\loc")))
+            .set(workspaces::root_path.eq(pathnorm::normalize(p("/new/loc", "C:\\new\\loc"))))
             .execute(&mut conn)
             .unwrap();
 
@@ -27312,9 +27315,11 @@ mod tests {
         assert!(rows.iter().all(|r| r.workspace_id == root.id));
 
         // The joined WORKSPACE path is carried on every row (the info bar's run-dir
-        // base); a hand-authored template has no source provenance. `cwd` is left
-        // None by the pure-DB query — the bridge resolves it before serializing.
-        assert!(rows.iter().all(|r| r.workspace_path == p("/p", "C:\\p")));
+        // base) in the CANONICAL form the store holds; a hand-authored template has no
+        // source provenance. `cwd` is left None by the pure-DB query — the bridge
+        // resolves it before serializing.
+        let canonical_root = pathnorm::normalize(p("/p", "C:\\p"));
+        assert!(rows.iter().all(|r| r.workspace_path == canonical_root));
         assert!(rows.iter().all(|r| r.source_kind.is_none()));
         assert!(rows.iter().all(|r| r.source_package_json_path.is_none()));
         assert!(rows.iter().all(|r| r.source_script_name.is_none()));
@@ -27476,7 +27481,7 @@ mod tests {
         let r = &rows[0];
         assert_eq!(r.command, "pnpm dev");
         assert_eq!(r.subfolder.as_deref(), Some("frontend"));
-        assert_eq!(r.workspace_path, p("/p", "C:\\p"));
+        assert_eq!(r.workspace_path, pathnorm::normalize(p("/p", "C:\\p")));
         assert_eq!(r.source_kind.as_deref(), Some(SOURCE_KIND_PACKAGE_JSON));
         assert_eq!(
             r.source_package_json_path.as_deref(),
@@ -27704,7 +27709,10 @@ mod tests {
         let ctx = instance_run_context(&mut conn, &inst.id).unwrap().unwrap();
         assert_eq!(ctx.command, "npm run dev");
         assert_eq!(ctx.subfolder.as_deref(), Some("frontend"));
-        assert_eq!(ctx.workspace_path, p("/srv/p", "C:\\srv\\p"));
+        assert_eq!(
+            ctx.workspace_path,
+            pathnorm::normalize(p("/srv/p", "C:\\srv\\p"))
+        );
         assert!(
             ctx.restart_on_startup,
             "the joined template restart flag is surfaced for the restore path"
@@ -27797,7 +27805,7 @@ mod tests {
         // Sanity: the rows carry the command line + cwd inputs the runner needs.
         let on_row = rows.iter().find(|r| r.instance_id == on_inst).unwrap();
         assert_eq!(on_row.command, "npm run dev");
-        assert_eq!(on_row.workspace_path, p("/p", "C:\\p"));
+        assert_eq!(on_row.workspace_path, pathnorm::normalize(p("/p", "C:\\p")));
     }
 
     // --- Source provenance mutation (set/clear) --------------------------------

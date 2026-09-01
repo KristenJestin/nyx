@@ -8312,13 +8312,22 @@ mod tests {
         // certify a build nothing checked) — so take the route the refusal names: register the check
         // and BIND it to this project's slot. Nothing is forked, so this project keeps running (and
         // keeps receiving upgrades of) nyx's own coder graph.
+        //
+        // The always-green check is `exit 0`, NOT `true`. nyx runs a managed command as
+        // `<platform shell> <flag> <cmdline>` (`nyx_core::command::command_invocation`), and `true`
+        // is a POSIX PROGRAM NAME: on Windows the platform shell is PowerShell, which has no such
+        // program, so the gate stayed red and the coder child span until this test tripped its own
+        // runaway guard. `exit <n>` is shell SYNTAX — the one verdict all three shells nyx picks
+        // (POSIX, PowerShell, cmd) spell identically. Same reasoning, and the whole vocabulary of
+        // it, in nyx-core's `test_cmdline` module; only this one line is needed here, and a
+        // `#[cfg(test)]` module of that crate is not visible from this one.
         std::fs::create_dir_all("/tmp/sidecar-ndev").expect("the gate needs a real cwd");
         let gate_instance = h.runtime.db().with_conn(|c| {
             let tpl = nyx_core::db::create_template(
                 c,
                 &project_id,
                 "gate",
-                "true",
+                "exit 0",
                 None,
                 Default::default(),
             )

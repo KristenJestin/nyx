@@ -111,6 +111,13 @@ pub mod workspace_timeline;
 #[cfg(test)]
 mod review_loop_gate;
 
+/// The command line that does X on THIS platform — the shared vehicle for every test that arms a
+/// managed command. It lives at the crate root because the tests that need it are spread across
+/// modules ([`mcp_engine`]'s gates, [`seed`]'s coder gate), and one translation in one place beats
+/// the same `#[cfg]` written out eighteen times. Test-only, so it compiles solely under `--lib`.
+#[cfg(test)]
+pub(crate) mod test_cmdline;
+
 /// ONE process-global lock for every test that mutates a `NYX_CLAUDE_*` env seam
 /// (`NYX_CLAUDE_CONFIG` / `NYX_CLAUDE_SETTINGS` / `NYX_CLAUDE_BIN` /
 /// `NYX_CLAUDE_PLUGIN_DIR` / `NYX_CLAUDE_STABLE_PLUGIN_DIR`). These vars are
