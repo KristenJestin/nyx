@@ -1,4 +1,6 @@
 import { createRequire } from "node:module";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -6,18 +8,28 @@ import Icons from "unplugin-icons/vite";
 import { defineConfig, type Plugin } from "vite";
 import tsconfigPaths from "vite-tsconfig-paths";
 
-// The dev-server port, the identity route and the identity payload come from the SAME module
-// `scripts/dev.cjs` reads, so the launcher and the server can never disagree about either. It is
-// plain CJS (dev.cjs is a `require`-only node script), hence `createRequire` rather than an import.
+// The port derivation, the identity route and the identity payload come from the SAME module
+// `scripts/dev.cjs` reads, so the launcher and the server can never disagree about any of them. It
+// is plain CJS (dev.cjs is a `require`-only node script), hence `createRequire` rather than import.
 const requireCjs = createRequire(import.meta.url);
-const { DEV_SERVER_PORT, DEV_IDENTITY_PATH, identityPayload } = requireCjs(
+const { DEV_IDENTITY_PATH, devHmrPort, devServerPort, identityPayload } = requireCjs(
   "../scripts/dev-server-identity.cjs",
 );
 
+// The renderer root this dev server serves — THIS file's own directory, which is what the port is
+// derived from. `scripts/dev.cjs` derives it from `path.resolve(<electron app>, "renderer")`: the
+// same directory, spelled differently (backslashes, and on Windows a different drive-letter case).
+// `dev-server-identity.cjs` normalizes before hashing, which is what makes the two spellings land
+// on ONE port instead of two. Taken from `import.meta.url` rather than `process.cwd()` so the port
+// does not depend on where the command was typed.
+const rendererRoot = dirname(fileURLToPath(import.meta.url));
+
 /**
  * Publish WHICH renderer root this dev server serves, so `scripts/dev.cjs` can tell our server
- * from another worktree's before pointing Electron at it. The port is fixed and every worktree
- * uses it, so a response on 1420 says only that SOMETHING is listening.
+ * from another worktree's before pointing Electron at it. Deriving the port per worktree made that
+ * collision rare, not impossible — a stale server of ours, a proxy, an unrelated app — and a
+ * response on the port still says only that SOMETHING is listening. Three launches silently ran one
+ * worktree's backend against another's UI before this route existed; that is why it stays.
  *
  * Dev only (`configureServer`): a production build carries no trace of this.
  */
@@ -80,24 +92,30 @@ export default defineConfig(async () => ({
     "import.meta.env.VITE_NYX_E2E": JSON.stringify(nyxE2e),
   },
 
-  // Dev-server options for the Electron dev run (`scripts/dev.cjs` waits on this fixed
-  // port, then points the Electron main at it).
+  // Dev-server options for the Electron dev run (`scripts/dev.cjs` derives the same port from the
+  // same renderer root, waits on it, then points the Electron main at it).
   //
   // 1. don't clear the screen so build/runtime errors stay visible.
   clearScreen: false,
-  // 2. the fixed port the Electron dev launcher expects — ONE definition, in
-  //    `scripts/dev-server-identity.cjs`, which is also where `dev.cjs` reads it. `strictPort`
-  //    makes a taken port a LOUD exit rather than a silent slide to 1421 (and `dev.cjs` now
-  //    aborts on that exit instead of ignoring it).
+  // 2. the port the Electron dev launcher expects — DERIVED from this renderer root by the ONE
+  //    definition in `scripts/dev-server-identity.cjs`, which is also where `dev.cjs` reads it.
+  //    It used to be a fixed 1420 for every worktree; the user reversed that call so worktrees can
+  //    run in parallel. `strictPort` stays: a derived port that is nonetheless taken must be a LOUD
+  //    exit rather than a silent slide to the next port (which would strand `dev.cjs` polling a
+  //    port nobody bound), and `dev.cjs` asks its identity probe who holds it before aborting.
+  // 3. the HMR port is derived too, and only used on the explicit remote-HMR path. It was a
+  //    hard-coded 1421, which would have collided across worktrees through the back door once the
+  //    server ports were separated. The default branch leaves `hmr` undefined so Vite derives its
+  //    own from the server port.
   server: {
-    port: DEV_SERVER_PORT,
+    port: devServerPort(rendererRoot),
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: devHmrPort(rendererRoot),
         }
       : undefined,
   },

@@ -71,12 +71,21 @@ export function WorkspaceRuntimeTree({
   onNewTerminal,
   onNewCommand,
   agentActivity,
+  formatCwd,
 }: {
   snapshot: WorkspaceRuntimeSnapshot;
   /** Open a NEW terminal in THIS workspace (the section "+"). Reused sidebar CRUD upstream. */
   onNewTerminal?: () => void;
   /** Open the project's command manager to CREATE a command (the section gear). */
   onNewCommand?: () => void;
+  /**
+   * Re-render a terminal's CWD for display when the row falls back to it for a name (an unnamed
+   * terminal shows its cwd). The SYSTÈME page passes the home abbreviation so a terminal opened at
+   * the platform home reads `~` instead of `C:/Users/…` — a DISPLAY only: the record's cwd stays
+   * the absolute path the backend wrote, and nothing here is ever sent back. Omitted ⇒ identity,
+   * so every project surface is untouched.
+   */
+  formatCwd?: (cwd: string) => string;
   /**
    * The live per-terminal agent activity lookup (review T2) — `byActivity.get(terminalId)` from
    * the SAME `agent_activity_snapshot` read model the workspace/project rollups consume. Threaded
@@ -139,6 +148,7 @@ export function WorkspaceRuntimeTree({
               // only ever feeds `resolveDisplayName`'s `Terminal <n>` last resort.
               index={rankById.get(terminal.id) ?? 0}
               activity={agentActivity?.(terminal.id)}
+              formatCwd={formatCwd}
             />
           )}
           memberState={(terminal) =>
@@ -377,6 +387,7 @@ export function TerminalRow({
   terminal,
   index = 0,
   activity,
+  formatCwd,
 }: {
   terminal: WorkspaceRuntimeTerminal;
   /**
@@ -386,6 +397,12 @@ export function TerminalRow({
    */
   index?: number;
   activity: AgentActivity | undefined;
+  /**
+   * Re-render the CWD FALLBACK name for display (see `<WorkspaceRuntimeTree>`). It touches the
+   * fallback ONLY: a terminal carrying a manual `label` shows that label untouched, and the
+   * record's cwd is never rewritten — this is a rendering, not a value.
+   */
+  formatCwd?: (cwd: string) => string;
 }) {
   const { isSelected } = useRuntimeSelection();
   const { isConsumed, consume } = useConsumedNotifications();
@@ -408,11 +425,17 @@ export function TerminalRow({
   // was named by its FULL path here (`c:\users\kris\appdata\local\temp\beta-ld4bfi`) while the
   // home named the same session by its basename (`beta-ld4bfi`).
   //
-  // `auto` is `null`: this tree runs no per-row `terminal_info` poll, which is exactly the static
-  // form the home passes too (`homeRowName`) — so the two surfaces resolve the SAME string from
-  // the SAME two fields. The sidebar item that DOES poll (`terminal-item.tsx`) only ever refines
-  // it upwards, through this same function.
-  const label = resolveDisplayName(terminal, index, null);
+  // `auto` is normally `null`: this tree runs no per-row `terminal_info` poll, which is exactly
+  // the static form the home passes too (`homeRowName`) — so the two surfaces resolve the SAME
+  // string from the SAME two fields. The sidebar item that DOES poll (`terminal-item.tsx`) only
+  // ever refines it upwards, through this same function.
+  //
+  // `formatCwd`, when a caller supplies one, feeds THAT slot rather than bypassing the authority:
+  // the Système page renders its cwds home-relative (`~/logs`, `systemCwdLabel`) and the auto slot
+  // is precisely "a computed name, under the manual label and above the bare basename". A manual
+  // rename therefore still wins on the Système page, and every caller WITHOUT a `formatCwd` keeps
+  // the plain basename → `Terminal <n>` ladder untouched.
+  const label = resolveDisplayName(terminal, index, formatCwd ? formatCwd(terminal.cwd) : null);
 
   // AGENT MODE as soon as the line CARRIES an agent glyph — i.e. `providerKind` is defined (a live
   // hook session OR a passively-detected agent), the IDENTICAL predicate that chose the icon above.
@@ -567,7 +590,22 @@ export function TerminalRow({
   );
 }
 
-/** A managed-command service row, with the shared start/stop/relaunch controls. */
+/**
+ * A managed-command service row, with the shared start/stop/relaunch controls.
+ *
+ * ## NO `Clear output` HERE (human review `01M1EC7Y2625Q07C5386GKHZFS`, finding U2)
+ *
+ * The row briefly carried a fourth control — an eraser calling `command_clear_output` — mounted
+ * only where a caller threaded it, which meant the Système page and nowhere else. The user's
+ * verdict on the real app was that the verb's INCOHERENCE was the problem: the same command row
+ * exists on every project surface and only one of them offered it. Given the choice between moving
+ * it everywhere and dropping it, they dropped it. So the row's controls are the lifecycle trio and
+ * nothing else, on every surface — one row, one set of verbs.
+ *
+ * The IPC itself stays (`command_clear_output`, `bridge/contract.ts`): it is the human twin of the
+ * MCP `clear_command_output`, it is covered by the Système guard matrix, and removing it would be a
+ * backend change the user did not ask for.
+ */
 function ServiceRow({
   service,
   viewedByGroup = false,

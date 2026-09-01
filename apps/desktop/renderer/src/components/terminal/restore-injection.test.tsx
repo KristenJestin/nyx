@@ -245,6 +245,132 @@ describe("<Terminal> screen re-hydration (a pane taking over a running shell)", 
   });
 });
 
+/**
+ * GATE CDP « Scope Système », the second defect it caught: a REPLAY must not talk back.
+ *
+ * Dead history and the screen re-hydration are RECORDINGS — bytes some past shell printed. Among
+ * them can be a terminal QUERY: a shell probes its terminal at startup with `ESC[6n` (DSR cursor
+ * position), and on Windows that probe is literally the first thing in a view-less terminal's
+ * scrollback. xterm ANSWERS any query it parses, through the very `onData` that carries the
+ * user's keystrokes — so replaying that history typed `ESC[1;1R` into the LIVE shell, which was
+ * long past its own probe and sitting at a prompt. readline swallowed the CSI and left a bare
+ * `R` on the input line, so the human's next command came out as `Rcd "…"` → `command not found`.
+ * Observed in the real app on a Système terminal.
+ *
+ * It was INTERMITTENT for a mechanical reason worth pinning: `term.write` parses a small payload
+ * synchronously — before the spawn publishes a pty id, which mutes the write on its own — and a
+ * large one across several turns of the event loop, straddling the spawn. So both tests below
+ * use a payload big enough to force the chunked parse; that is the case that used to leak.
+ */
+describe("<Terminal> a replayed recording never answers back to the shell", () => {
+  afterEach(() => {
+    __resetTerminalStore();
+  });
+
+  /**
+   * A DSR cursor-position reply, `ESC[<row>;<col>R` — what xterm sends when it parses `ESC[6n`.
+   * Built from a string so the ESC stays out of a regex literal (`no-control-regex`).
+   */
+  const ESC = "\x1b";
+  const DSR_REPLY = new RegExp(`${ESC}\\[\\d+;\\d+R`);
+  /** Big enough that xterm cannot parse it in one turn; the query rides at the very end. */
+  const bulky = (query: string) => "filler line, replayed\r\n".repeat(12_000) + query;
+
+  it("does not answer a query buried in DEAD HISTORY", async () => {
+    const spy = installIpc();
+    let term: XTerm | null = null;
+    render(
+      <Terminal
+        recordId="replay-dead-history"
+        cwd="/projectA"
+        deadHistory={bulky("\x1b[6n")}
+        onInstance={(t) => {
+          term = t;
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(term).not.toBeNull());
+    await waitFor(() => expect(spy.spawnCwds).toHaveLength(1));
+    // Let the chunked parse run to its end, well past the spawn that published the pty id.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    expect(spy.ptyWrites.join("")).not.toMatch(DSR_REPLY);
+  });
+
+  it("does not answer a query buried in the SCREEN RE-HYDRATION", async () => {
+    const ptyWrites: string[] = [];
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    let spawned = false;
+    mockIPC(
+      (cmd, args) => {
+        const a = (args ?? {}) as Record<string, unknown>;
+        switch (cmd) {
+          case "terminal_screen_rehydration":
+            return { bytes: Array.from(encoder.encode(bulky("\x1b[6n"))) };
+          case "pty_spawn":
+            spawned = true;
+            return 302;
+          case "pty_write":
+            ptyWrites.push(decoder.decode(Uint8Array.from((a.data as number[]) ?? [])));
+            return null;
+          default:
+            return null;
+        }
+      },
+      { shouldMockEvents: true },
+    );
+
+    let term: XTerm | null = null;
+    render(
+      <Terminal
+        recordId="replay-rehydration"
+        onInstance={(t) => {
+          term = t;
+        }}
+      />,
+    );
+    await waitFor(() => expect(term).not.toBeNull());
+    await waitFor(() => expect(spawned).toBe(true));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    expect(ptyWrites.join("")).not.toMatch(DSR_REPLY);
+  });
+
+  /** …and the mute is RELEASED: once the replay is parsed, real keystrokes reach the shell again. */
+  it("still forwards the user's own keystrokes once the replay is done", async () => {
+    const spy = installIpc();
+    let term: XTerm | null = null;
+    render(
+      <Terminal
+        recordId="replay-then-typing"
+        cwd="/projectA"
+        deadHistory={bulky("\x1b[6n")}
+        onInstance={(t) => {
+          term = t;
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(term).not.toBeNull());
+    await waitFor(() => expect(spy.spawnCwds).toHaveLength(1));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    await act(async () => {
+      term?.input("echo hello\r");
+    });
+    await waitFor(() => expect(spy.ptyWrites.join("")).toContain("echo hello"));
+    expect(spy.ptyWrites.join("")).not.toMatch(DSR_REPLY);
+  });
+});
+
 /** Read the whole xterm buffer (screen + scrollback) as a newline-joined string. */
 function readBuffer(term: XTerm | null): string {
   if (!term) return "";

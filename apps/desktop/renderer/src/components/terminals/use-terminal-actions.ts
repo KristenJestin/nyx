@@ -95,6 +95,18 @@ export function useTerminalActions(
    * tiling — the chords then exist but do nothing.
    */
   paneShortcuts?: PaneShortcutHandlers,
+  /**
+   * REPLACE the default two-step creation (`create_terminal` then `attach_terminal`) with ONE
+   * atomic call, resolving to the new record id.
+   *
+   * The SYSTÈME scope is why this seam exists (PRD « Scope Système »): `create_system_terminal`
+   * writes the record with its cwd, its workspace and its `manual` binding in a SINGLE
+   * transaction, and only then opens the shell. The default path cannot serve it — it creates a
+   * LOOSE terminal first and binds it after, so the terminal exists unattached for a round-trip,
+   * which is precisely the "fourre-tout du workspace_id null" the scope must never be confused
+   * with. Omitted ⇒ every caller behaves exactly as before.
+   */
+  createTerminal?: (workspaceId: string, path: string) => Promise<string>,
 ): UseTerminalActions {
   const { projects } = useProjects();
   // Borrow the sidebar CRUD surface ONLY — the page's terminal set is driven by the runtime
@@ -123,11 +135,14 @@ export function useTerminalActions(
   // the page snapshot, surfacing the terminal in the tree and mounting its live pane.
   const createTerminalInWorkspace = useCallback(
     async (workspaceId: string, path: string) => {
+      // An ATOMIC creator (the Système scope's `create_system_terminal`) replaces the pair whole:
+      // one transaction writes the record already bound, so there is no unattached instant.
+      if (createTerminal) return createTerminal(workspaceId, path);
       const row = await create(path);
       await attach(row.id, workspaceId, "manual");
       return row.id;
     },
-    [create, attach],
+    [create, attach, createTerminal],
   );
 
   const newTerminalInWorkspace = useCallback(

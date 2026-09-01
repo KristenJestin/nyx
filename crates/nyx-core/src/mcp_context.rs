@@ -1983,12 +1983,19 @@ fn unanchored_signal(db: &Db, args: &Value) -> Result<UnanchoredSignal, RpcError
 /// registering a second workspace on a folder never re-points the cwd of the first, and the answer
 /// for a given database never depends on when it is asked.
 ///
+/// THE SYSTÈME WORKSPACE IS NOT A CANDIDATE. [`db::resolvable_workspaces`] excludes it by join on
+/// `projects.kind`, and it must: its `root_path` is the HOME directory, an ancestor of nearly every
+/// folder on the machine, so it would win the cwd of anything outside a registered project. Its
+/// path is a place to RUN, never an identity — membership in the Système scope is a positive
+/// attachment, never a path match. The same reader feeds terminal auto-attach, so the two selectors
+/// still see the very same set (the invariant restated just below).
+///
 /// LIVENESS IS NOT PART OF THE RANKING — said here rather than left to be discovered. The candidate
-/// set is [`db::all_workspaces`], which filters NOTHING: an ARCHIVED workspace (`archived_at`), or
+/// set is [`db::resolvable_workspaces`], which filters nothing ELSE: an ARCHIVED workspace (`archived_at`), or
 /// one whose worktree folder was cleaned up at merge (`folder_removed_at` — the row is PERMANENT by
 /// PDR-0008), still competes. So on a shared `root_path` the incumbent wins even when it is archived
 /// and its folder is gone, ahead of a live registration. That is a deliberate LIMIT, not an
-/// oversight: [`crate::resolve::resolve_workspace`] ranks the very same unfiltered set for terminal
+/// oversight: [`crate::resolve::resolve_workspace`] ranks the very same set for terminal
 /// auto-attach, and one cwd must not resolve to one workspace for a terminal and another for a Spec.
 /// Filtering the dead rows is therefore a change to make in BOTH selectors at once, never here
 /// alone. Pinned by `an_archived_workspace_still_wins_the_cwd_because_liveness_is_not_ranked`.
@@ -1996,7 +2003,7 @@ fn best_workspace_for_cwd(
     conn: &mut diesel::SqliteConnection,
     normalized: &str,
 ) -> Result<Option<db::Workspace>, diesel::result::Error> {
-    let workspaces = db::all_workspaces(conn)?;
+    let workspaces = db::resolvable_workspaces(conn)?;
     let candidates: Vec<crate::resolve::WorkspaceMatch> = workspaces
         .iter()
         .map(|w| crate::resolve::WorkspaceMatch {
@@ -2260,7 +2267,7 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
             // Spec exists yet), they are made to SAY it — the same sentence, on both channels.
             //
             // DIAGNOSED INSIDE THE TWO BRANCHES THAT SPEAK IT, never before the role is read: the
-            // diagnosis is a second pass over `db::all_workspaces` (the cwd anchor re-runs
+            // diagnosis is a second pass over `db::resolvable_workspaces` (the cwd anchor re-runs
             // [`best_workspace_for_cwd`], which loads and clones every workspace row), and the four
             // Spec-scoped roles below throw it away to return `invalid_id`. A signal nobody reads is
             // a table scan nobody asked for.
@@ -2304,6 +2311,49 @@ pub fn agent_context(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     }
 }
 
+/// THE MCP HALF OF THE SYSTÈME DOMAIN BOUNDARY: `Some(RpcError)` when calling `tool` with these
+/// `args` would aim a capability the Système scope does not have at the Système scope, `None`
+/// otherwise.
+///
+/// One function, called from the TOP of each MCP dispatcher, over the allow-list — so a tool cannot
+/// be added to the surface and silently gain power over the singleton: it is refused until it is
+/// written down.
+///
+/// IT READS BOTH HALVES OF THE ALLOW-LIST, on both surfaces. The table is split in two NAMESPACES —
+/// [`crate::system_scope::SYSTEM_SCOPE_MCP_CAPABILITIES`] (the agent's advertised tool names) and
+/// [`crate::system_scope::SYSTEM_SCOPE_IPC_CAPABILITIES`] (the UI bridge's db-command names) — and
+/// `system_scope::is_system_capability` reads both, so this guard does too. The consequence, stated
+/// rather than hidden: an IPC-ONLY name (`command_list`, `attach_terminal`,
+/// `workspace_runtime_snapshot`…) also traverses this guard UNREFUSED when it arrives on the agent
+/// surface. It is harmless only because no such name is an advertised MCP tool — it comes back out
+/// of the shell's dispatcher as `method_not_found` — and the only thing keeping it that way is
+/// `system_scope::tests::the_two_halves_of_the_allow_list_do_not_share_a_name_with_the_live_mcp_surface`,
+/// which fails the day one of them is advertised. Advertising a tool under an IPC-only name would
+/// allow-list it for the AGENT without a single edit to this file: that is the residual risk of the
+/// split, assumed and pinned by that test.
+///
+/// The refusal carries [`crate::mcp::RpcCode::SystemScopeForbidden`], never `invalid_id`: the
+/// singleton EXISTS, and saying so is deliberate. Its id is not a secret and hiding it was never
+/// the defense (`list_projects` omits it for ergonomics only); an agent that holds the id gets the
+/// same refusal as one that guessed it.
+///
+/// A DB error while reading the scope is reported rather than swallowed — failing OPEN here would
+/// turn a transient SQL hiccup into a hole in the boundary.
+///
+/// The DB-FREE pre-check ([`crate::system_scope::needs_scope_lookup`]) runs before `with_conn`, so
+/// an allow-listed tool or a payload that carries no string at all is answered without checking a
+/// connection out of the pool. It asks exactly the question `guard_payload` asks first, so the
+/// boundary is the same one either way.
+pub fn refuse_system_scope(db: &Db, tool: &str, args: &Value) -> Option<RpcError> {
+    if !crate::system_scope::needs_scope_lookup(tool, args) {
+        return None;
+    }
+    match db.with_conn(|c| crate::system_scope::guard_payload(c, tool, args)) {
+        Ok(()) => None,
+        Err(e) => Some(e.into()),
+    }
+}
+
 /// Route the `agent_context` tool call, or `None` when `name` is not ours. Called from
 /// [`crate::mcp_tools_core::dispatch_extension_tool`] (one dispatcher, one pool).
 pub fn dispatch_context_tool(
@@ -2318,23 +2368,50 @@ pub fn dispatch_context_tool(
 }
 
 // ---------------------------------------------------------------------------
-// The WORKSPACE COMMANDS block of the AMBIENT session context.
+// The COMMANDS block of the AMBIENT session context — the workspace's, and the SHARED ones.
 // ---------------------------------------------------------------------------
 //
 // It renders HERE, next to the role manuals, and not in `mcp_tools_core` — this is the module that
 // renders agent-facing TEXT, and the one place the wording of what an agent reads is reviewable in
-// one pass. `mcp_tools_core::session_context_line` calls it with the workspace's instances and an
-// overlay closure over its runner.
+// one pass. `mcp_tools_core::session_context_line` calls it with the workspace's instances, the
+// Système scope's instances, and an overlay closure over its runner.
 
 /// How many command lines the ambient block renders before it stops counting them one by one. Past
 /// it the block says HOW MANY are left and names the tool that lists them all — the point of the
 /// block is orientation, not an exhaustive dump into every session's first tokens.
 const MAX_COMMAND_LINES: usize = 12;
 
+/// The same kind of cap for the SHARED half — and a SEPARATE budget on purpose.
+///
+/// THE ARBITRATION, spelled out because it is a decision and not an accident. The two halves could
+/// have shared [`MAX_COMMAND_LINES`]; they do not, because one budget makes them COMPETE, and both
+/// directions of that competition are wrong:
+///
+/// * a workspace defining twelve commands would push every machine-wide service out of the block —
+///   the agent would be told about its own dev servers and never about the SHARED ones it is the
+///   most likely to break without meaning to;
+/// * and a machine carrying a dozen services would do the reverse, hiding the workspace the session
+///   was actually started in behind other projects' infrastructure.
+///
+/// So each half is bounded on its own and neither can starve the other. EIGHT rather than twelve
+/// because the two are not symmetric: the workspace list is the agent's WORKING SET, the shared one
+/// is context it must not ignore, and cross-project services are few by nature. Nothing becomes
+/// unreachable either way — each half counts its own surplus and names its own listing tool. The
+/// worst case the block puts in front of a session is therefore twenty lines, not twelve.
+const MAX_SYSTEM_COMMAND_LINES: usize = 8;
+
 /// The widest a rendered command line is, ellipsis INCLUDED. A managed command can be a whole shell
 /// pipeline; the agent needs to RECOGNIZE it (and it has `list_commands` for the exact text), not to
 /// re-type it from the block.
 const MAX_COMMAND_CHARS: usize = 160;
+
+/// The header of the WORKSPACE half — the commands of the workspace this session was started in.
+const WORKSPACE_BLOCK_HEADER: &str = "Managed commands of this workspace:";
+
+/// The header of the SHARED half. It says the two things that make these lines different from the
+/// ones above — they are NOT this workspace's, and they are machine-wide — before a single command
+/// is read, so a reader that keeps only the header still knows what it is looking at.
+const SYSTEM_BLOCK_HEADER: &str = "Shared System commands — machine-wide, NOT this workspace's:";
 
 /// WHAT TO DO WITH THE LIST — the two directives that hold for every workspace that has one.
 ///
@@ -2381,6 +2458,37 @@ const SNAPSHOT_DIRECTIVE_LINE: &str =
      goes stale as commands start and stop. For the current state call list_commands, for what a \
      command printed call get_command_output.";
 
+/// THE SHARED DIRECTIVE — the reason the System half is in this block at all, and the one fact an
+/// agent that keeps a single sentence of it must keep.
+///
+/// The lines above it are a LIST; a list of services reads exactly like a list of dev servers, and
+/// an agent that treats a machine-wide service as its own will stop it to "free the port" the way
+/// it stops its own watcher. So the sentence leads on the SHARING and states its consequence in the
+/// main clause — same rule as [`SNAPSHOT_DIRECTIVE_LINE`], for the same reason: a fact carried in an
+/// aside is the first thing a model drops when it compresses.
+const SYSTEM_SHARED_DIRECTIVE_LINE: &str =
+    "Those System commands are SHARED: machine-wide services, the same ones for every project and \
+     every agent on this machine. Stopping one stops it for ALL of them at once — it is not your \
+     own dev server.";
+
+/// THE AUTHORIZATION DIRECTIVE — what the backend already does with each verb, said rather than
+/// discovered.
+///
+/// It is not a new right and it grants none: `crate::system_command_guard` classifies these calls
+/// the same way whether the agent read this line or not — a start on a stopped instance is FREE, a
+/// stop / relaunch / edit / removal is PROTECTED and answered by a human approval the call WAITS
+/// for. Saying so is what stops an agent from reading a blocked call as a hung tool, and from
+/// treating the free half as licence over the rest.
+///
+/// It names `list_system_commands` last because that door carries what the block deliberately does
+/// NOT: the scope's own `project_id` / `workspace_id` (the pair a group start or a creation takes)
+/// and every command past the cap.
+const SYSTEM_AUTHORIZATION_DIRECTIVE_LINE: &str =
+    "Starting a stopped System command is free, exactly like a project one. Stopping, relaunching, \
+     editing or deleting one needs the USER's approval: that call BLOCKS until they answer in the \
+     nyx app, and nyx performs it itself. list_system_commands has the full inventory and the ids \
+     to address the scope.";
+
 /// The command text as the block shows it: newlines flattened (one command, one line) and the whole
 /// thing capped at [`MAX_COMMAND_CHARS`] — the ellipsis counts INSIDE the cap, so a rendered command
 /// is never longer than the bound. Counts CHARS, not bytes, so a truncation never splits a
@@ -2395,56 +2503,27 @@ fn render_command_text(command: &str) -> String {
     out
 }
 
-/// Render the workspace's MANAGED COMMANDS as the block the ambient session context carries after
-/// the `You're in nyx — …` orientation line, so an agent knows what this workspace already defines
-/// and WHAT IS ALREADY UP without a single discovery call.
+/// ONE HALF of the block: `rows` rendered as command lines, capped at `cap`, appended to `out`.
+/// Answers whether at least one rendered line carried a `group_id` (the group directive's
+/// condition), for the caller to fold over both halves.
 ///
-/// One line per instance — `name · command · state · instance_id=…`, plus `· group_id=…` on a
-/// command that belongs to a multi-pane group and NOTHING more on a solo one. `command_id` is
-/// deliberately absent: no tool takes it, and it would cost an ULID per line in every session's
-/// first tokens.
-///
-/// `instances` is rendered in the order it arrives — [`db::list_command_lines_for_workspace`]
-/// already orders by the template's `order_index` then `id`, which is the order of the project's
-/// sidebar, so re-sorting here would make the block disagree with what the user sees.
-///
-/// THE STATE IS FACTUAL, and `overlay` is why: it is the runner's live outcome for an instance id
-/// (`None` when no live entry backs it), so a command running THIS session reads `running` even
-/// when its persisted `last_state` is stale — the same fallback `list_commands` applies. Taking it
-/// as a CLOSURE rather than a `&CommandRunner<S>` is what makes this renderer testable without
-/// spawning a single process. The vocabulary is the domain's own ([`RunState::as_db_str`]):
-/// `idle | running | success | error`.
-///
-/// The list is followed by the DIRECTIVE — [`DIRECTIVE_LINES`], the group line when a rendered
-/// command carries a `group_id`, then [`SNAPSHOT_DIRECTIVE_LINE`] — because a list with no
-/// instruction is what nyx already had: an agent that knows the commands exist and launches them in
-/// a raw shell anyway.
-///
-/// An EMPTY `instances` renders an EMPTY string — a workspace with no managed command, or a loose
-/// terminal, gets no block at all (and, therefore, no directive either).
-///
-/// No environment value can leak here: [`db::WorkspaceCommandLine`] carries none (`env` is a column
-/// of `managed_commands`, which its reader does not select), and the block renders nothing it is
-/// not handed.
-///
-/// THE ROW IS THE LEAN ONE, ON PURPOSE (review finding `01M152NMXPWKD59QFK95CMSZWQ`). This takes
-/// [`db::WorkspaceCommandLine`], not [`db::InstanceWithTemplate`]: the latter carries each
-/// instance's `scrollback` (up to 256 KiB apiece, so up to 3 MiB on a full workspace) which this
-/// renderer never reads, and it renders on the SessionStart hook's hard 1000 ms budget — where a
-/// timeout costs the whole injected context.
-pub(crate) fn workspace_commands_block<F>(
-    instances: &[db::WorkspaceCommandLine],
-    overlay: F,
-) -> String
+/// `nature` is written on the line ONLY for the shared half. It is the SAME value
+/// [`db::PROJECT_KIND_SYSTEM`] that `list_commands` / `list_system_commands` put on the wire — the
+/// vocabulary an agent already meets there, not a second label invented for the text — and it is
+/// per-line on purpose: a section header can be summarized away, a marker sitting on the line an
+/// agent is about to act on cannot.
+fn push_command_lines<F>(
+    out: &mut String,
+    rows: &[db::WorkspaceCommandLine],
+    overlay: &F,
+    cap: usize,
+    system: bool,
+) -> bool
 where
     F: Fn(&str) -> Option<RunState>,
 {
-    if instances.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("Managed commands of this workspace:");
     let mut rendered_a_group = false;
-    for row in instances.iter().take(MAX_COMMAND_LINES) {
+    for row in rows.iter().take(cap) {
         let state = overlay(&row.id).unwrap_or_else(|| RunState::from_db_str(&row.last_state));
         out.push_str(&format!(
             "\n- {} · {} · {} · instance_id={}",
@@ -2453,14 +2532,121 @@ where
             state.as_db_str(),
             row.id,
         ));
+        if system {
+            out.push_str(&format!(" · nature={}", db::PROJECT_KIND_SYSTEM));
+        }
         if let Some(group_id) = row.group_id.as_deref().filter(|g| !g.is_empty()) {
             out.push_str(&format!(" · group_id={group_id}"));
             rendered_a_group = true;
         }
     }
-    let overflow = instances.len().saturating_sub(MAX_COMMAND_LINES);
-    if overflow > 0 {
-        out.push_str(&format!("\n+{overflow} more commands (list_commands)"));
+    rendered_a_group
+}
+
+/// Render the MANAGED COMMANDS this session can act on as the block the ambient context carries
+/// after the `You're in nyx — …` orientation line, so an agent knows what already exists and WHAT IS
+/// ALREADY UP without a single discovery call.
+///
+/// TWO HALVES, ONE BLOCK. `workspace` is the session's own workspace; `system` is the Système
+/// scope's — the user's machine-wide services, which every agent on this machine shares. They arrive
+/// together because they are available together: a session that is told about its dev server and not
+/// about the shared database it is about to restart has been told half of its situation. They stay
+/// TOLD APART because acting on them does not cost the same (see below).
+///
+/// One line per instance — `name · command · state · instance_id=…`, plus `· nature=system` on a
+/// shared one and `· group_id=…` on a command that belongs to a multi-pane group. `command_id` is
+/// deliberately absent: no tool takes it, and it would cost an ULID per line in every session's
+/// first tokens.
+///
+/// Each half is rendered in the order it arrives — [`db::list_command_lines_for_workspace`] already
+/// orders by the template's `order_index` then `id`, which is the order of the sidebar, so
+/// re-sorting here would make the block disagree with what the user sees.
+///
+/// THE STATE IS FACTUAL, and `overlay` is why: it is the runner's live outcome for an instance id
+/// (`None` when no live entry backs it), so a command running THIS session reads `running` even
+/// when its persisted `last_state` is stale — the same fallback `list_commands` applies. Taking it
+/// as a CLOSURE rather than a `&CommandRunner<S>` is what makes this renderer testable without
+/// spawning a single process. The vocabulary is the domain's own ([`RunState::as_db_str`]):
+/// `idle | running | success | error`. ONE overlay for both halves: an instance id is unique
+/// whatever container it hangs from, and the runner keys on nothing else.
+///
+/// The lists are followed by the DIRECTIVE — [`DIRECTIVE_LINES`], the group line when a rendered
+/// command carries a `group_id`, the two SYSTEM lines when a shared command was rendered, then
+/// [`SNAPSHOT_DIRECTIVE_LINE`] — because a list with no instruction is what nyx already had: an
+/// agent that knows the commands exist and launches them in a raw shell anyway. The system lines
+/// render on the same rule as the group one: no shared command on screen, not a word about sharing.
+///
+/// TWO EMPTY HALVES render an EMPTY string — a loose terminal on a machine with no Système command
+/// gets no block at all (and, therefore, no directive either). Either half alone renders its own
+/// header and nothing of the other's.
+///
+/// No environment value can leak here: [`db::WorkspaceCommandLine`] carries none (`env` is a column
+/// of `managed_commands`, which its reader does not select), and the block renders nothing it is
+/// not handed. That holds for BOTH halves — the shared one goes through the very same row and the
+/// very same reader.
+///
+/// THE ROW IS THE LEAN ONE, ON PURPOSE (review finding `01M152NMXPWKD59QFK95CMSZWQ`). This takes
+/// [`db::WorkspaceCommandLine`], not [`db::InstanceWithTemplate`]: the latter carries each
+/// instance's `scrollback` (up to 256 KiB apiece, so up to 3 MiB on a full workspace) which this
+/// renderer never reads, and it renders on the SessionStart hook's hard 1000 ms budget — where a
+/// timeout costs the whole injected context.
+///
+/// ## THE ASSUMED DEVIATION — the shared half short-circuits the dedicated discovery door
+///
+/// The Système container is deliberately ABSENT from `list_projects` and `list_workspaces`, and its
+/// commands are reached through ONE door, `mcp_tools_core::list_system_commands`. Listing them here
+/// means an agent meets them WITHOUT walking through that door. That is a deviation from the
+/// principle the PRD posed, it is the user's call (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`), and it is
+/// written here rather than left to be discovered as a side effect.
+///
+/// What it costs: nothing in RIGHTS. Reading the inventory and starting a stopped instance are
+/// already FREE in `crate::system_command_guard`'s matrix, whichever way the ids were learned, and
+/// every other verb stays behind the same human approval. The scope is never defended by hiding an
+/// id ([`crate::system_scope::guard_payload`]) — which is exactly what makes handing these ones over
+/// safe.
+///
+/// What it deliberately does NOT carry, so the door keeps a job: the scope's `project_id` and
+/// `workspace_id`. `instance_id` is what the lifecycle verbs take, so the block carries that and
+/// stops there; the pair a whole-group start (`start_command {group_id, workspace_id}`) or a
+/// creation (`add_command {project_id}`) needs still comes from `list_system_commands`, which the
+/// authorization directive names.
+pub(crate) fn session_commands_block<F>(
+    workspace: &[db::WorkspaceCommandLine],
+    system: &[db::WorkspaceCommandLine],
+    overlay: F,
+) -> String
+where
+    F: Fn(&str) -> Option<RunState>,
+{
+    if workspace.is_empty() && system.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut rendered_a_group = false;
+    if !workspace.is_empty() {
+        out.push_str(WORKSPACE_BLOCK_HEADER);
+        rendered_a_group |=
+            push_command_lines(&mut out, workspace, &overlay, MAX_COMMAND_LINES, false);
+        let overflow = workspace.len().saturating_sub(MAX_COMMAND_LINES);
+        if overflow > 0 {
+            out.push_str(&format!("\n+{overflow} more commands (list_commands)"));
+        }
+    }
+    if !system.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(SYSTEM_BLOCK_HEADER);
+        rendered_a_group |=
+            push_command_lines(&mut out, system, &overlay, MAX_SYSTEM_COMMAND_LINES, true);
+        // Its OWN surplus, counted against its OWN cap and pointing at its OWN door — the two halves
+        // never borrow lines from each other, so neither can hide the other's overflow either.
+        let overflow = system.len().saturating_sub(MAX_SYSTEM_COMMAND_LINES);
+        if overflow > 0 {
+            out.push_str(&format!(
+                "\n+{overflow} more System commands (list_system_commands)"
+            ));
+        }
     }
     for line in DIRECTIVE_LINES {
         out.push('\n');
@@ -2469,6 +2655,12 @@ where
     if rendered_a_group {
         out.push('\n');
         out.push_str(GROUP_DIRECTIVE_LINE);
+    }
+    if !system.is_empty() {
+        out.push('\n');
+        out.push_str(SYSTEM_SHARED_DIRECTIVE_LINE);
+        out.push('\n');
+        out.push_str(SYSTEM_AUTHORIZATION_DIRECTIVE_LINE);
     }
     out.push('\n');
     out.push_str(SNAPSHOT_DIRECTIVE_LINE);
@@ -3193,7 +3385,7 @@ mod tests {
     ///
     /// The preamble stays STATIC: it renders NO command list. It has neither a workspace nor a runner
     /// in hand; the LIVE list is the ambient session context's job
-    /// ([`workspace_commands_block`]), and only that one has the state to render.
+    /// ([`session_commands_block`]), and only that one has the state to render.
     #[test]
     fn coder_preamble_names_the_command_tools_without_rendering_any_list() {
         let _g = db_guard();
@@ -4529,9 +4721,9 @@ mod tests {
     }
 
     /// LIVENESS IS NOT IN THE RANKING, pinned so the limit is a DECISION and not an accident. The
-    /// candidate set of [`best_workspace_for_cwd`] is `db::all_workspaces`, which filters neither
+    /// candidate set of [`best_workspace_for_cwd`] is `db::resolvable_workspaces`, which filters neither
     /// `archived_at` nor `folder_removed_at`, so on a shared `root_path` the incumbent takes the cwd
-    /// even archived and folder-cleaned, ahead of a live registration. It is the same unfiltered set
+    /// even archived and folder-cleaned, ahead of a live registration. It is the same set
     /// [`crate::resolve::resolve_workspace`] ranks for terminal auto-attach: filtering dead rows must
     /// happen in BOTH selectors (and change this test), or a cwd would answer one workspace for a
     /// terminal and another for a Spec.
@@ -5835,7 +6027,7 @@ mod tests {
     /// without a `CommandRunner` and without spawning one process — which matters twice over: there
     /// is no API to mark an instance `running` in a runner short of launching a real process, and
     /// such a test would land squarely in the Windows PTY/kill failure family `CLAUDE.md` documents.
-    mod workspace_commands_block_tests {
+    mod session_commands_block_tests {
         use super::*;
 
         /// One `WorkspaceCommandLine` row, with the fields the block reads spelled out. Built by hand
@@ -5866,7 +6058,7 @@ mod tests {
                 row("inst-dev", "dev", "bun run dev", db::STATE_RUNNING),
                 row("inst-build", "build", "bun run build", db::STATE_IDLE),
             ];
-            let out = workspace_commands_block(&rows, no_overlay);
+            let out = session_commands_block(&rows, &[], no_overlay);
             assert!(
                 out.starts_with("Managed commands of this workspace:"),
                 "the block opens with its header: {out}"
@@ -5885,7 +6077,7 @@ mod tests {
         /// context of such a session is exactly the orientation line it always was.
         #[test]
         fn no_command_renders_no_block_and_no_directive() {
-            let out = workspace_commands_block(&[], no_overlay);
+            let out = session_commands_block(&[], &[], no_overlay);
             assert!(out.is_empty(), "an empty workspace renders nothing: {out:?}");
         }
 
@@ -5899,7 +6091,7 @@ mod tests {
                 row("i-ok", "c", "c", db::STATE_SUCCESS),
                 row("i-ko", "d", "c", db::STATE_ERROR),
             ];
-            let out = workspace_commands_block(&rows, no_overlay);
+            let out = session_commands_block(&rows, &[], no_overlay);
             for (id, state) in [
                 ("i-idle", "idle"),
                 ("i-run", "running"),
@@ -5923,7 +6115,7 @@ mod tests {
                 row("i-live", "dev", "bun run dev", db::STATE_IDLE),
                 row("i-cold", "build", "bun run build", db::STATE_SUCCESS),
             ];
-            let out = workspace_commands_block(&rows, |id: &str| {
+            let out = session_commands_block(&rows, &[], |id: &str| {
                 (id == "i-live").then_some(RunState::Running)
             });
             assert!(
@@ -5947,7 +6139,7 @@ mod tests {
                 row("i-1", "alpha", "c", db::STATE_IDLE),
                 row("i-2", "mike", "c", db::STATE_IDLE),
             ];
-            let out = workspace_commands_block(&rows, no_overlay);
+            let out = session_commands_block(&rows, &[], no_overlay);
             let order: Vec<&str> = out
                 .lines()
                 .filter(|l| l.starts_with("- "))
@@ -5968,7 +6160,7 @@ mod tests {
             let rows: Vec<db::WorkspaceCommandLine> = (0..15)
                 .map(|i| row(&format!("i-{i}"), &format!("cmd-{i}"), "c", db::STATE_IDLE))
                 .collect();
-            let out = workspace_commands_block(&rows, no_overlay);
+            let out = session_commands_block(&rows, &[], no_overlay);
             assert_eq!(
                 out.lines().filter(|l| l.starts_with("- ")).count(),
                 MAX_COMMAND_LINES,
@@ -5983,7 +6175,7 @@ mod tests {
                 "the 13th command is NOT listed: {out}"
             );
             // Exactly twelve is the boundary: no surplus line at all.
-            let out12 = workspace_commands_block(&rows[..12], no_overlay);
+            let out12 = session_commands_block(&rows[..12], &[], no_overlay);
             assert!(
                 !out12.contains("more commands (list_commands)"),
                 "twelve commands fit: no surplus line: {out12}"
@@ -5997,7 +6189,7 @@ mod tests {
         fn a_command_longer_than_the_bound_is_truncated() {
             let long = "x".repeat(400);
             let rows = vec![row("i-long", "big", &long, db::STATE_IDLE)];
-            let out = workspace_commands_block(&rows, no_overlay);
+            let out = session_commands_block(&rows, &[], no_overlay);
             let line = out
                 .lines()
                 .find(|l| l.starts_with("- big "))
@@ -6022,7 +6214,7 @@ mod tests {
             // A command AT the bound is left strictly alone.
             let exact = "y".repeat(MAX_COMMAND_CHARS);
             let fit = [row("i-fit", "fit", &exact, db::STATE_IDLE)];
-            let kept = workspace_commands_block(&fit, no_overlay);
+            let kept = session_commands_block(&fit, &[], no_overlay);
             assert!(
                 kept.contains(&exact),
                 "a command exactly at the bound is not touched"
@@ -6038,7 +6230,7 @@ mod tests {
             grouped.group_id = Some("grp-1".to_string());
             let solo = row("i-solo", "solo", "bun run solo", db::STATE_IDLE);
 
-            let with_group = workspace_commands_block(&[grouped, solo.clone()], no_overlay);
+            let with_group = session_commands_block(&[grouped, solo.clone()], &[], no_overlay);
             assert!(
                 with_group.contains("· instance_id=i-api · group_id=grp-1"),
                 "the grouped command names its group, last on the line: {with_group}"
@@ -6052,7 +6244,7 @@ mod tests {
                 "the group directive is rendered when a group is on screen: {with_group}"
             );
 
-            let solo_only = workspace_commands_block(&[solo], no_overlay);
+            let solo_only = session_commands_block(&[solo], &[], no_overlay);
             assert!(
                 !solo_only.contains("group_id="),
                 "no group anywhere, so not a word about groups: {solo_only}"
@@ -6067,7 +6259,7 @@ mod tests {
         /// "prefer nyx" without them has to go discover the surface it was supposed to save.
         #[test]
         fn the_directive_names_the_tools_and_states_the_no_op_and_the_snapshot() {
-            let out = workspace_commands_block(&[row("i", "dev", "c", db::STATE_IDLE)], no_overlay);
+            let out = session_commands_block(&[row("i", "dev", "c", db::STATE_IDLE)], &[], no_overlay);
             for tool in [
                 "start_command",
                 "relaunch_command",
@@ -6104,7 +6296,7 @@ mod tests {
         /// what this locks.
         #[test]
         fn the_snapshot_sentence_carries_clear_and_compact_in_its_main_clause() {
-            let out = workspace_commands_block(&[row("i", "dev", "c", db::STATE_IDLE)], no_overlay);
+            let out = session_commands_block(&[row("i", "dev", "c", db::STATE_IDLE)], &[], no_overlay);
             let line = out
                 .lines()
                 .find(|l| l.contains("SNAPSHOT"))
@@ -6166,13 +6358,269 @@ mod tests {
                 })
                 .expect("seeded workspace");
             assert_eq!(rows.len(), 1, "the template materialized one instance");
-            let out = workspace_commands_block(&rows, no_overlay);
+            let out = session_commands_block(&rows, &[], no_overlay);
             assert!(
                 out.contains("- dev · bun run dev · idle · instance_id="),
                 "the command IS rendered: {out}"
             );
             assert!(
                 !out.contains("s3cr3t-do-not-inject") && !out.contains("VAULT_TOKEN"),
+                "…and its environment is nowhere near it: {out}"
+            );
+        }
+
+        // --- THE SHARED HALF (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`) ------------------
+        //
+        // The Système commands ride in the SAME block as the workspace's, because they are
+        // available to the same session — and they are told apart, because acting on them does not
+        // cost the same and, above all, does not affect the same people.
+
+        /// The shared half renders under its OWN header, and EVERY one of its lines carries the
+        /// `nature=system` marker — the same value `list_commands` puts on the wire, not a second
+        /// label. Per line and not only in the header: a header is exactly what a model drops when
+        /// it compresses, and the line is what it will act on.
+        #[test]
+        fn the_shared_half_renders_under_its_own_header_and_marks_every_line() {
+            let ws = vec![row("i-dev", "dev", "bun run dev", db::STATE_RUNNING)];
+            let sys = vec![
+                row("i-svc", "services", "docker compose up", db::STATE_RUNNING),
+                row("i-tick", "Commande factice", "node ticker.js", db::STATE_IDLE),
+            ];
+            let out = session_commands_block(&ws, &sys, no_overlay);
+
+            assert!(
+                out.starts_with("Managed commands of this workspace:\n- dev "),
+                "the workspace half still opens the block, unchanged: {out}"
+            );
+            assert!(
+                out.contains(SYSTEM_BLOCK_HEADER),
+                "the shared half has its own header: {out}"
+            );
+            assert!(
+                out.contains("\n- services · docker compose up · running · instance_id=i-svc · nature=system\n")
+                    && out.contains("\n- Commande factice · node ticker.js · idle · instance_id=i-tick · nature=system\n"),
+                "each shared line carries its state, its launchable id and its nature: {out}"
+            );
+            assert!(
+                !out.contains("- dev · bun run dev · running · instance_id=i-dev · nature="),
+                "…and the workspace's own lines carry no nature at all: {out}"
+            );
+            // The two headers, in this order, and the workspace's first: the session's own working
+            // set leads, the shared context follows.
+            let ws_at = out.find(WORKSPACE_BLOCK_HEADER).expect("workspace header");
+            let sys_at = out.find(SYSTEM_BLOCK_HEADER).expect("system header");
+            assert!(ws_at < sys_at, "the workspace half comes first: {out}");
+        }
+
+        /// THE DIRECTIVE THE WHOLE FINDING IS ABOUT. Three facts, all of them already enforced by
+        /// the backend and none of them previously SAID: the services are shared machine-wide, a
+        /// start is free, and every other verb blocks on a human approval.
+        #[test]
+        fn the_system_directive_states_the_sharing_the_free_start_and_the_blocking_approval() {
+            let out = session_commands_block(
+                &[row("i-dev", "dev", "c", db::STATE_IDLE)],
+                &[row("i-svc", "services", "c", db::STATE_RUNNING)],
+                no_overlay,
+            );
+
+            // 1. SHARED, machine-wide, and what that implies — in the main clause, not an aside.
+            let shared = out
+                .lines()
+                .find(|l| l.contains("SHARED"))
+                .unwrap_or_else(|| panic!("the sharing is stated: {out}"));
+            assert!(
+                shared.contains("machine-wide")
+                    && shared.contains("every project")
+                    && shared.contains("every agent"),
+                "the reach is named — machine-wide, every project, every agent: {shared}"
+            );
+            assert!(
+                shared.contains("ALL of them at once"),
+                "…and the consequence of a stop is spelled out, not implied: {shared}"
+            );
+            assert!(
+                shared.find("SHARED").unwrap() < shared.find("Stopping").unwrap(),
+                "the fact leads and the consequence follows it: {shared}"
+            );
+
+            // 2 + 3. The two authorization halves, in one sentence: free start, blocking approval.
+            let auth = out
+                .lines()
+                .find(|l| l.contains("free"))
+                .unwrap_or_else(|| panic!("the authorization rule is stated: {out}"));
+            assert!(
+                auth.contains("Starting a stopped System command is free"),
+                "starting is free, said plainly: {auth}"
+            );
+            for verb in ["Stopping", "relaunching", "editing", "deleting"] {
+                assert!(
+                    auth.contains(verb),
+                    "the protected verb {verb} is named: {auth}"
+                );
+            }
+            assert!(
+                auth.contains("BLOCKS"),
+                "…and that the call WAITS for the human, which is what stops an agent from \
+                 reading it as a hung tool: {auth}"
+            );
+            assert!(
+                auth.contains("list_system_commands"),
+                "…and the door that carries the rest is named: {auth}"
+            );
+
+            // The block stays LEAN: two headers, two generic directives, two system ones, the
+            // snapshot. Nothing else was smuggled in.
+            let prose: Vec<&str> = out.lines().filter(|l| !l.starts_with("- ")).collect();
+            assert!(
+                prose.len() <= 7,
+                "the block stays lean — 7 non-command lines at most, got {}: {prose:#?}",
+                prose.len()
+            );
+        }
+
+        /// NOT A WORD ABOUT SHARING when nothing shared is on screen — the same rule the group
+        /// directive follows. A machine with no Système command must read exactly as it did before.
+        #[test]
+        fn no_shared_command_means_no_system_header_and_no_system_directive() {
+            let out = session_commands_block(&[row("i", "dev", "c", db::STATE_IDLE)], &[], no_overlay);
+            assert!(
+                !out.contains(SYSTEM_BLOCK_HEADER)
+                    && !out.contains(SYSTEM_SHARED_DIRECTIVE_LINE)
+                    && !out.contains(SYSTEM_AUTHORIZATION_DIRECTIVE_LINE)
+                    && !out.contains("nature="),
+                "nothing shared on screen ⇒ nothing about sharing: {out}"
+            );
+        }
+
+        /// EITHER HALF ALONE renders. A workspace with no command of its own still gets the shared
+        /// services (and no empty "Managed commands of this workspace:" header above them); two
+        /// empty halves still render nothing at all.
+        #[test]
+        fn the_shared_half_renders_on_its_own_when_the_workspace_has_no_command() {
+            let sys = vec![row("i-svc", "services", "docker compose up", db::STATE_RUNNING)];
+            let out = session_commands_block(&[], &sys, no_overlay);
+            assert!(
+                out.starts_with(SYSTEM_BLOCK_HEADER),
+                "the block opens on the shared header: {out}"
+            );
+            assert!(
+                !out.contains(WORKSPACE_BLOCK_HEADER),
+                "no empty workspace header is announced: {out}"
+            );
+            assert!(
+                out.contains("· instance_id=i-svc · nature=system")
+                    && out.contains(SYSTEM_SHARED_DIRECTIVE_LINE)
+                    && out.contains(SNAPSHOT_DIRECTIVE_LINE),
+                "the shared half carries its lines and its full directive: {out}"
+            );
+            assert!(
+                session_commands_block(&[], &[], no_overlay).is_empty(),
+                "…and two empty halves are still no block at all"
+            );
+        }
+
+        /// THE ARBITRATION ON THE CAPS, asserted rather than merely argued: the two halves have
+        /// SEPARATE budgets, so a workspace at its own ceiling cannot push the shared services out
+        /// of the block, and a machine full of services cannot bury the workspace. Each half counts
+        /// its own surplus and names its own listing tool.
+        #[test]
+        fn the_two_caps_are_independent_so_neither_half_can_starve_the_other() {
+            let ws: Vec<db::WorkspaceCommandLine> = (0..15)
+                .map(|i| row(&format!("i-w{i}"), &format!("ws-{i}"), "c", db::STATE_IDLE))
+                .collect();
+            let sys: Vec<db::WorkspaceCommandLine> = (0..12)
+                .map(|i| row(&format!("i-s{i}"), &format!("svc-{i}"), "c", db::STATE_IDLE))
+                .collect();
+            let out = session_commands_block(&ws, &sys, no_overlay);
+
+            let system_lines = out.lines().filter(|l| l.contains("nature=system")).count();
+            let all_lines = out.lines().filter(|l| l.starts_with("- ")).count();
+            assert_eq!(
+                system_lines, MAX_SYSTEM_COMMAND_LINES,
+                "the shared half gets its OWN eight lines even though the workspace filled \
+                 its twelve: {out}"
+            );
+            assert_eq!(
+                all_lines - system_lines,
+                MAX_COMMAND_LINES,
+                "…and the workspace half is untouched by the shared one: {out}"
+            );
+            assert!(
+                out.contains("\n+3 more commands (list_commands)"),
+                "the workspace surplus points at list_commands: {out}"
+            );
+            assert!(
+                out.contains("\n+4 more System commands (list_system_commands)"),
+                "the shared surplus points at its own door: {out}"
+            );
+        }
+
+        /// The shared half is rendered in the order it ARRIVES, exactly like the workspace one —
+        /// `db::list_command_lines_for_workspace` already ordered it by `order_index` then `id`,
+        /// which is the order of the Système page's own list.
+        #[test]
+        fn the_shared_half_keeps_the_reader_order_and_is_never_re_sorted() {
+            let sys = vec![
+                row("i-3", "zulu", "c", db::STATE_IDLE),
+                row("i-1", "alpha", "c", db::STATE_IDLE),
+                row("i-2", "mike", "c", db::STATE_IDLE),
+            ];
+            let out = session_commands_block(&[], &sys, no_overlay);
+            let order: Vec<&str> = out
+                .lines()
+                .filter(|l| l.starts_with("- "))
+                .map(|l| l.split(" · ").next().unwrap_or_default())
+                .collect();
+            assert_eq!(
+                order,
+                vec!["- zulu", "- alpha", "- mike"],
+                "the shared half is the reader's order, not an alphabetical one: {out}"
+            );
+        }
+
+        /// NO ENVIRONMENT VALUE reaches the SHARED half either — proven through the REAL reader on a
+        /// REAL bootstrapped Système scope, not by re-asserting the struct. A Système service is
+        /// precisely the kind of command whose template carries a token, and it goes through the
+        /// very same lean reader, which never selects `env`.
+        #[test]
+        fn no_environment_value_reaches_the_shared_render() {
+            let db = Db::in_memory();
+            let rows = db
+                .with_conn(|c| {
+                    let scope = crate::system_scope::ensure_system_scope(
+                        c,
+                        &crate::system_scope::FixedHomeDirProvider::at(if cfg!(windows) {
+                            "C:\\Users\\kris"
+                        } else {
+                            "/home/kris"
+                        }),
+                    )
+                    .expect("bootstrap the Système scope");
+                    let tpl = db::create_template(
+                        c,
+                        &scope.project.id,
+                        "services",
+                        "docker compose up",
+                        None,
+                        db::CommandSource::default(),
+                    )?;
+                    db::set_template_env(
+                        c,
+                        &tpl.id,
+                        Some(r#"{"SYSTEM_VAULT_TOKEN":"sys-s3cr3t-do-not-inject"}"#),
+                    )?;
+                    db::list_command_lines_for_workspace(c, &scope.workspace.id)
+                })
+                .expect("seeded the Système workspace");
+            assert_eq!(rows.len(), 1, "the Système template materialized one instance");
+            let out = session_commands_block(&[], &rows, no_overlay);
+            assert!(
+                out.contains("- services · docker compose up · idle · instance_id=")
+                    && out.contains("· nature=system"),
+                "the shared command IS rendered: {out}"
+            );
+            assert!(
+                !out.contains("sys-s3cr3t-do-not-inject") && !out.contains("SYSTEM_VAULT_TOKEN"),
                 "…and its environment is nowhere near it: {out}"
             );
         }

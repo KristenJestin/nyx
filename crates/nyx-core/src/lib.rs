@@ -93,6 +93,12 @@ pub mod shells;
 pub mod spec_activity;
 pub mod spec_ref;
 pub mod subfolder;
+pub mod system_approvals;
+/// The Système command-guard MATRIX. `pub(crate)`: every item in it is reached from `mcp_runtime`
+/// and `mcp_tools_core`, both in this crate — the sidecar drives the guard through the DISPATCHERS,
+/// never directly (review 01M15QP3HVYV9Q729ZYTNJB8T2, finding 01M15RGASGXY1MACGEDHDEXSDR).
+pub(crate) mod system_command_guard;
+pub mod system_scope;
 pub mod usecase;
 pub mod vt_screen;
 pub mod workspace_git;

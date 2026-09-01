@@ -154,7 +154,17 @@ const DSR_OK_REPLY: &[u8] = b"\x1b[0n";
 /// scans, and refills it with the new unterminated tail. The carry is bounded (a
 /// CSI query is a handful of bytes); a runaway `ESC[` with no final byte is dropped
 /// once it exceeds a small cap so a hostile stream cannot grow it without limit.
-fn scan_terminal_queries(chunk: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
+///
+/// `pub` FOR A SECOND, CROSS-CRATE CALLER (gate CDP « Scope Système »). The very same
+/// "~4 bytes then silence" hang appears on an INTERACTIVE pty that has NO renderer view —
+/// `nyx_sidecar::runtime::pty::spawn_headless`, the shell a Système terminal and an MCP
+/// `create_terminal` open before (or without) a pane. There the emulator that normally answers
+/// is the renderer's, and it is not there yet; on Windows the ConPTY probe is emitted at
+/// startup, so the shell blocks before printing its first prompt and the terminal is DEAD to
+/// the human who opened it. The sidecar's pump therefore answers with this same scanner while —
+/// and ONLY while — no view is attached. One scanner, one set of canned replies: a second copy
+/// would be a second terminal emulation to keep honest.
+pub fn scan_terminal_queries(chunk: &[u8], carry: &mut Vec<u8>) -> Vec<u8> {
     // Fast path: nothing buffered and no ESC in the chunk → no query possible.
     if carry.is_empty() && !chunk.contains(&0x1b) {
         return Vec::new();

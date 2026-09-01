@@ -116,6 +116,11 @@ function installBackend() {
           );
         case "pty_spawn":
           return 100;
+        case "system_scope_detail":
+          // The Système singleton is ABSENT on this fixture — the documented `null` answer of a
+          // database with no scope. The rail then renders no tile, which is what these cases are
+          // about; the catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`.
+          return null;
         default:
           return [];
       }
@@ -197,6 +202,10 @@ describe("Cross-project focus from the global home", () => {
             services: [],
           };
         if (cmd === "pty_spawn") return 100;
+        // The Système singleton is ABSENT here — the documented `null` of a database with no scope.
+        // The catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`: the rail
+        // would dereference it and the shell error boundary would swallow the screen.
+        if (cmd === "system_scope_detail") return null;
         return [];
       },
       { shouldMockEvents: true },
@@ -274,6 +283,11 @@ describe("Cross-project focus from the global home", () => {
             };
           case "pty_spawn":
             return 100;
+          case "system_scope_detail":
+            // The Système singleton is ABSENT on this fixture — the documented `null` answer of a
+            // database with no scope. The rail then renders no tile, which is what these cases are
+            // about; the catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`.
+            return null;
           default:
             return [];
         }

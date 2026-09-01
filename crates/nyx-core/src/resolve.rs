@@ -43,7 +43,7 @@
 //! The terminal bridge wires the live `/proc`/OSC7 cwd + the workspace list from
 //! the DB into these functions, then persists the decided attachment via the
 //! Task-#1 `attach_terminal`/`detach_terminal` DB functions. Both MCP paths read
-//! `db::all_workspaces` for themselves: the Spec/project one writes nothing at
+//! `db::resolvable_workspaces` for themselves: the Spec/project one writes nothing at
 //! all, and the terminal-create one persists its own `attach_terminal` in
 //! `mcp_tools_core`. [`auto_attach_terminal`] is the ONLY function in this module
 //! that touches the DB.
@@ -249,8 +249,11 @@ pub fn auto_attach_terminal(
         mode,
     };
 
-    // The candidate set is ONLY the already-known workspaces (auto-attach creates none).
-    let known: Vec<WorkspaceMatch> = db::all_workspaces(conn)?
+    // The candidate set is ONLY the already-known RESOLVABLE workspaces (auto-attach creates none,
+    // and the Système workspace does not compete — its `root_path` is the home, an ancestor of
+    // nearly everything, so leaving it in would auto-attach every loose terminal INTO the Système
+    // scope. Membership there is POSITIVE or it is nothing; see `db::resolvable_workspaces`).
+    let known: Vec<WorkspaceMatch> = db::resolvable_workspaces(conn)?
         .into_iter()
         .map(|w| WorkspaceMatch {
             id: w.id,

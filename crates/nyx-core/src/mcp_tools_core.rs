@@ -37,6 +37,7 @@
 //! documents. A shell with a front fires the matching event AFTER a successful
 //! dispatch; the core-host's renderer re-pulls on its own invalidations.
 
+use diesel::sqlite::SqliteConnection;
 use serde_json::{json, Value};
 
 use crate::agent::{AgentEvent, AgentRegistry};
@@ -91,6 +92,18 @@ pub enum ChangedTopic {
     /// future proto overlay, PDR-0009) is a later phase, but the mutation authority NAMES the
     /// topic here so the seam is single-authority end to end.
     Prototypes,
+    // NO `SystemApprovals` VARIANT, and its absence is the honest shape (review
+    // 01M15QP3HVYV9Q729ZYTNJB8T2, finding 01M15RFKAPVSBCA9XGZP4DZCYC).
+    //
+    // This enum names what a SUCCESSFUL mutation changed — it rides on `ToolOutcome::effects`, and
+    // effects exist only on the `Ok` path. The Système approval queue moves on the opposite event:
+    // a protected call mutates nothing and comes back as `approval_required`, and THAT is when the
+    // human has something to do. A variant here could therefore never be constructed, and it was
+    // not: both real emitters spell the topic from
+    // [`crate::system_approvals::SYSTEM_APPROVALS_CHANGED_TOPIC`] directly — the MCP dispatcher off
+    // the refusal's code, and the UI's grant/deny routes after a decision. That constant is the
+    // single authority for the wire string; a second, unreachable one would only be a place for the
+    // two to drift.
 }
 
 impl ChangedTopic {
@@ -366,12 +379,15 @@ fn parse_window_knobs(args: &Value) -> Result<(usize, Option<usize>, bool), RpcE
 /// The actionable `invalid_id` for an id that is NOT a known TEMPLATE: if it turns out to
 /// be a launchable instance, NAME the correct path; else the generic unknown-template
 /// error. Parity with the Tauri `bad_command_id_error`.
-fn bad_command_id_error(db: &Db, id: &str) -> RpcError {
-    let is_instance = db
-        .with_conn(|c| db::get_instance(c, id))
-        .ok()
-        .flatten()
-        .is_some();
+/// CONNECTION-SCOPED, like every command-CRUD helper below it.
+///
+/// The protected Système path builds its errors from INSIDE the transaction the claim shares with
+/// the mutation ([`crate::system_approvals::claim_and_mutate`]), where a `Db::with_conn` would ask
+/// the pool for a SECOND connection — and the in-memory pool the tests run on holds exactly one.
+/// Every `*_on_conn` twin in this file exists for that same reason, and each public `fn(db, …)` is
+/// now a one-line `with_conn` over its twin, so the two surfaces cannot drift.
+fn bad_command_id_error_on_conn(conn: &mut SqliteConnection, id: &str) -> RpcError {
+    let is_instance = db::get_instance(conn, id).ok().flatten().is_some();
     if is_instance {
         RpcError::new(
             RpcCode::InvalidId,
@@ -556,7 +572,10 @@ pub fn list_workspaces(db: &Db, args: &Value) -> Result<Value, RpcError> {
     let cwd = optional_str(args, "cwd")?;
     let mut workspaces = db
         .with_conn(|c| crate::usecase::list_workspaces(c, project_id))
-        .map_err(internal_db)?;
+        // The use case can refuse (the Système singleton is not a USER container to enumerate);
+        // `From<SystemScopeError>` carries that as `system_scope_forbidden`, a DB failure as
+        // `internal` — never as `invalid_id`, which would claim the project does not exist.
+        .map_err(RpcError::from)?;
     if let Some(cwd) = cwd {
         let needle = crate::pathnorm::normalize(cwd);
         workspaces.retain(|w| path_matches(&w.root_path, &needle));
@@ -591,6 +610,11 @@ pub fn list_commands<S: RunnerSink>(
     args: &Value,
 ) -> Result<Value, RpcError> {
     if let Some(workspace_id) = optional_str(args, "workspace_id")? {
+        // The NATURE of every entry of this listing, resolved ONCE: the instances of one workspace
+        // all share that workspace, so they all share its container's nature.
+        let nature = db
+            .with_conn(|c| crate::system_scope::is_system_workspace(c, workspace_id))
+            .map_err(internal_db)?;
         let rows = db
             .with_conn(|c| db::list_instances_for_workspace(c, workspace_id))
             .map_err(internal_db)?;
@@ -633,6 +657,7 @@ pub fn list_commands<S: RunnerSink>(
                     // — so the tool the context sends it back to must carry it too, or "go check
                     // list_commands" would mean "go read something poorer".
                     "group_id": row.group_id,
+                    "nature": command_nature(nature),
                 });
                 if let (Some(map), Some(status_map)) = (entry.as_object_mut(), status.as_object()) {
                     for (k, v) in status_map {
@@ -645,10 +670,23 @@ pub fn list_commands<S: RunnerSink>(
         return Ok(json!({ "commands": commands }));
     }
     if let Some(project_id) = optional_str(args, "project_id")? {
+        // Same nature, read from the container itself this time — one project, one answer.
+        let nature = db
+            .with_conn(|c| crate::system_scope::is_system_project(c, project_id))
+            .map_err(internal_db)?;
         let templates = db
             .with_conn(|c| db::list_templates(c, project_id))
             .map_err(internal_db)?;
-        let commands: Vec<Value> = templates.iter().map(template_json).collect();
+        let commands: Vec<Value> = templates
+            .iter()
+            .map(|t| {
+                let mut entry = template_json(t);
+                if let Some(map) = entry.as_object_mut() {
+                    map.insert("nature".to_string(), json!(command_nature(nature)));
+                }
+                entry
+            })
+            .collect();
         // The project's command GROUPS, each with its id, name, colour and its member ids in
         // DISPOSITION order — the read half of `manage_command_group`, from the very reader that
         // tool echoes after a mutation.
@@ -661,6 +699,135 @@ pub fn list_commands<S: RunnerSink>(
         RpcCode::InvalidArgument,
         "list_commands requires either workspace_id (instances) or project_id (templates)",
     ))
+}
+
+/// The `nature` an agent-facing command entry carries: which KIND of container it belongs to.
+///
+/// The SAME vocabulary as [`db::PROJECT_KINDS`] and not a second one, because it answers the same
+/// question — `projects.kind` is the single source of truth for a container's nature, and this is
+/// that value travelling to the wire rather than a parallel label. Every authorized entry of
+/// `list_commands` carries it, and every entry of `list_system_commands` carries `system`: one
+/// reader tells a project command from a Système service without a second call.
+fn command_nature(is_system: bool) -> &'static str {
+    if is_system {
+        db::PROJECT_KIND_SYSTEM
+    } else {
+        db::PROJECT_KIND_USER
+    }
+}
+
+/// `list_system_commands` — `{}` → `{ scope, commands, groups }`. THE agent's dedicated discovery
+/// of the Système scope's commands (PRD « Scope Système »).
+///
+/// ## Why it exists at all
+///
+/// The Système container is a singleton project deliberately ABSENT from `list_projects` /
+/// `list_workspaces` — it is not a container an agent may work IN (no Spec, no repository, no
+/// workspace lifecycle), and offering it there would invite exactly the operations the domain
+/// boundary refuses. But its COMMANDS have to be discoverable: they are the user's cross-project
+/// services, and an agent that cannot name `services` can neither read its log nor start it. So
+/// discovery gets its own door, and that door hands back everything needed to ACT on a command
+/// through the ordinary runtime tools — the launchable `instance_id` above all — and nothing else
+/// of the scope.
+///
+/// ## The one thing that ALSO names them, and why that is not a second door
+///
+/// The ambient `SessionStart` context lists the Système commands next to the session's own
+/// (`session_context_line`, review `01M1EJ84VCWRD6F4NDVD2M0QWJ`): an agent that can act on them has
+/// to be TOLD they exist and that they are shared, and waiting for it to guess this tool's name was
+/// the failure the user observed on a real agent. So this door is no longer the only place the
+/// names appear — a deviation from "discovery gets its own door", assumed and written down (see
+/// [`crate::mcp_context::session_commands_block`], which spells out the trade in full).
+///
+/// It stays the DOOR because the block deliberately stops at `instance_id`: `scope.project_id` and
+/// `scope.workspace_id` — the pair `add_command` and a whole-group `start_command` take — come from
+/// HERE and from nowhere else, as does anything past the block's cap. And nothing about either path
+/// changes what an id is worth: the matrix authorizes the same verbs whichever way it was learned.
+///
+/// ## What it does NOT open
+///
+/// The Système TERMINALS. They are absent from this answer, absent from `list_terminals`, and
+/// refused by id on `read`/`send_to`/`send_keys`/`close_terminal` (`refuse_system_terminal`).
+/// Discovering the commands is not a step towards them.
+///
+/// Nor does it grant anything: an id learned here goes through the very same authorization as an
+/// id learned anywhere else. The scope is never defended by hiding an id
+/// ([`crate::system_scope::guard_payload`]), which is precisely what makes it safe to hand these
+/// ones over.
+///
+/// ## Shape
+///
+/// `scope` names the container (`project_id`, `workspace_id`) and the `home` every Système command
+/// runs from — the workspace's `root_path`, so what is advertised here IS what the runner will use.
+/// `commands` reuses the entry shape of `list_commands(workspace_id=…)` (same fields, same live
+/// status overlay from the runner) plus `group_id` and `nature`. `groups` is the SAME
+/// `db::list_command_groups` reader `list_commands(project_id=…)` and `manage_command_group`
+/// return, so the three cannot describe different worlds.
+///
+/// An un-bootstrapped scope is an `internal` error, not an empty answer: `Db::open` always
+/// bootstraps, so its absence is a failure of nyx and saying "there are no Système commands" would
+/// be a lie an agent could act on.
+pub fn list_system_commands<S: RunnerSink>(
+    db: &Db,
+    runner: &CommandRunner<S>,
+    _args: &Value,
+) -> Result<Value, RpcError> {
+    let scope = db
+        .with_conn(crate::system_scope::load)
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::from(crate::system_scope::SystemScopeError::NotBootstrapped)
+        })?;
+
+    // The instances of the ONE workspace — the same reader, the same entry shape and the same live
+    // overlay `list_commands(workspace_id=…)` serves, so an agent that knows one knows the other.
+    let mut listed = list_commands(
+        db,
+        runner,
+        &json!({ "workspace_id": scope.workspace.id }),
+    )?;
+    let commands = listed
+        .get_mut("commands")
+        .map(Value::take)
+        .unwrap_or_else(|| json!([]));
+    let groups = db
+        .with_conn(|c| db::list_command_groups(c, &scope.project.id))
+        .map_err(internal_db)?;
+    // The GROUP each command belongs to, folded onto its entry: the instance listing is per
+    // workspace while a group is project data, and making the agent re-join them by hand is the
+    // shape `list_commands` already regretted.
+    let commands: Vec<Value> = commands
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut entry| {
+            let group_id = entry
+                .get("command_id")
+                .and_then(Value::as_str)
+                .and_then(|cid| {
+                    groups
+                        .iter()
+                        .find(|g| g.command_ids.iter().any(|m| m == cid))
+                        .map(|g| g.id.clone())
+                });
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("group_id".to_string(), json!(group_id));
+            }
+            entry
+        })
+        .collect();
+
+    Ok(json!({
+        "scope": {
+            "project_id": scope.project.id,
+            "workspace_id": scope.workspace.id,
+            "name": scope.project.name,
+            "home": scope.home(),
+        },
+        "commands": commands,
+        "groups": groups,
+    }))
 }
 
 /// `workspace_runtime` — `{ workspace_id }` → `{ runtime }`. The v2.2 cockpit read model
@@ -1121,6 +1288,15 @@ fn optional_env_column(args: &Value, key: &str) -> Result<Option<Option<String>>
 /// `env` persists the command's OWN environment (N31): the base every spawn path applies — an
 /// agent start/relaunch, the boot restore, and a `gate_check` nyx runs itself. Omitted → none.
 pub fn add_command(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    db.with_conn(|c| add_command_on_conn(c, args))
+}
+
+/// The CONNECTION-SCOPED body of [`add_command`] — see [`bad_command_id_error_on_conn`] for why
+/// every protected command tool has one.
+pub(crate) fn add_command_on_conn(
+    conn: &mut SqliteConnection,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let name = require_str(args, "name")?;
     let command = require_str(args, "command")?;
@@ -1134,20 +1310,19 @@ pub fn add_command(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
         source_script_command_snapshot: None,
         package_manager,
     };
-    let template = db
-        .with_conn(|c| -> Result<db::ManagedCommand, diesel::result::Error> {
-            let created = db::create_template(c, project_id, name, command, subfolder, source)?;
-            match env.flatten() {
-                // Only a non-empty map is written: an absent / cleared env leaves the column NULL,
-                // which is already the state a fresh row is in.
-                Some(env) => {
-                    db::set_template_env(c, &created.id, Some(&env))?;
-                    Ok(db::get_template(c, &created.id)?.unwrap_or(created))
-                }
-                None => Ok(created),
+    let template = (|| -> Result<db::ManagedCommand, diesel::result::Error> {
+        let created = db::create_template(conn, project_id, name, command, subfolder, source)?;
+        match env.flatten() {
+            // Only a non-empty map is written: an absent / cleared env leaves the column NULL,
+            // which is already the state a fresh row is in.
+            Some(env) => {
+                db::set_template_env(conn, &created.id, Some(&env))?;
+                Ok(db::get_template(conn, &created.id)?.unwrap_or(created))
             }
-        })
-        .map_err(|e| map_template_write_err(project_id, e))?;
+            None => Ok(created),
+        }
+    })()
+    .map_err(|e| map_template_write_err(project_id, e))?;
     Ok(ToolOutcome::changed(
         json!({ "command": template_json(&template) }),
         ChangedTopic::Commands,
@@ -1356,6 +1531,15 @@ pub fn update_command<S: RunnerSink>(
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<ToolOutcome, RpcError> {
+    db.with_conn(|c| update_command_on_conn(c, runner, args))
+}
+
+/// The CONNECTION-SCOPED body of [`update_command`] — see [`bad_command_id_error_on_conn`].
+pub(crate) fn update_command_on_conn<S: RunnerSink>(
+    conn: &mut SqliteConnection,
+    runner: &CommandRunner<S>,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
     let command_id = require_str(args, "command_id")?;
     let new_name = optional_str(args, "name")?;
     let new_command = optional_str(args, "command")?;
@@ -1363,53 +1547,51 @@ pub fn update_command<S: RunnerSink>(
     let new_subfolder = optional_str(args, "subfolder")?;
     let new_env = optional_env_column(args, "env")?;
 
-    assert_template_not_running(db, runner, command_id)?;
+    assert_template_not_running(conn, runner, command_id)?;
 
-    let updated = db
-        .with_conn(
-            |c| -> Result<Option<db::ManagedCommand>, diesel::result::Error> {
-                let Some(current) = db::get_template(c, command_id)? else {
-                    return Ok(None);
-                };
-                let name = new_name.unwrap_or(current.name.as_str());
-                let command = new_command.unwrap_or(current.command.as_str());
-                let subfolder: Option<&str> = if subfolder_present {
-                    new_subfolder
-                } else {
-                    current.subfolder.as_deref()
-                };
-                let detach = current.source_script_name.is_some()
-                    && crate::pkgjson::command_detaches_source(&current, command);
-                db::update_template(c, command_id, name, command, subfolder)?;
-                if detach {
-                    db::set_template_source(c, command_id, db::CommandSource::default())?;
-                }
-                if let Some(env) = new_env {
-                    db::set_template_env(c, command_id, env.as_deref())?;
-                }
-                db::get_template(c, command_id)
-            },
-        )
-        .map_err(map_template_write_err_generic)?;
+    let updated = (|| -> Result<Option<db::ManagedCommand>, diesel::result::Error> {
+        let Some(current) = db::get_template(conn, command_id)? else {
+            return Ok(None);
+        };
+        let name = new_name.unwrap_or(current.name.as_str());
+        let command = new_command.unwrap_or(current.command.as_str());
+        let subfolder: Option<&str> = if subfolder_present {
+            new_subfolder
+        } else {
+            current.subfolder.as_deref()
+        };
+        let detach = current.source_script_name.is_some()
+            && crate::pkgjson::command_detaches_source(&current, command);
+        db::update_template(conn, command_id, name, command, subfolder)?;
+        if detach {
+            db::set_template_source(conn, command_id, db::CommandSource::default())?;
+        }
+        if let Some(env) = new_env {
+            db::set_template_env(conn, command_id, env.as_deref())?;
+        }
+        db::get_template(conn, command_id)
+    })()
+    .map_err(map_template_write_err_generic)?;
     match updated {
         Some(template) => Ok(ToolOutcome::changed(
             json!({ "command": template_json(&template) }),
             ChangedTopic::Commands,
         )),
-        None => Err(bad_command_id_error(db, command_id)),
+        None => Err(bad_command_id_error_on_conn(conn, command_id)),
     }
 }
 
 /// Refuse a template edit while any of its instances is running (parity with the Tauri
 /// `assert_template_not_running`).
+///
+/// Connection-scoped, because both its callers now are: the runner's live map is consulted
+/// AFTER the id read, and consulting it needs no connection of its own.
 fn assert_template_not_running<S: RunnerSink>(
-    db: &Db,
+    conn: &mut SqliteConnection,
     runner: &CommandRunner<S>,
     command_id: &str,
 ) -> Result<(), RpcError> {
-    let instance_ids = db
-        .with_conn(|c| db::instance_ids_for_template(c, command_id))
-        .map_err(internal_db)?;
+    let instance_ids = db::instance_ids_for_template(conn, command_id).map_err(internal_db)?;
     if runner.any_running(&instance_ids) {
         return Err(RpcError::new(
             RpcCode::InvalidState,
@@ -1425,7 +1607,7 @@ fn assert_template_not_running<S: RunnerSink>(
 /// Resolve the import target `(project_id, [workspace paths])` + run the discovery
 /// (parity with the Tauri `discover_importable`).
 fn discover_importable(
-    db: &Db,
+    conn: &mut SqliteConnection,
     args: &Value,
 ) -> Result<(String, Vec<crate::pkgjson::DiscoveredScript>, usize), RpcError> {
     let (project_id, workspace_paths): (String, Vec<String>) = match (
@@ -1433,8 +1615,7 @@ fn discover_importable(
         optional_str(args, "project_id")?,
     ) {
         (Some(workspace_id), _) => {
-            let ws = db
-                .with_conn(|c| db::get_workspace(c, workspace_id))
+            let ws = db::get_workspace(conn, workspace_id)
                 .map_err(internal_db)?
                 .ok_or_else(|| {
                     RpcError::new(
@@ -1445,9 +1626,7 @@ fn discover_importable(
             (ws.project_id, vec![ws.root_path])
         }
         (None, Some(project_id)) => {
-            let workspaces = db
-                .with_conn(|c| db::list_workspaces(c, project_id))
-                .map_err(internal_db)?;
+            let workspaces = db::list_workspaces(conn, project_id).map_err(internal_db)?;
             if workspaces.is_empty() {
                 return Err(RpcError::new(
                     RpcCode::InvalidId,
@@ -1475,7 +1654,8 @@ fn discover_importable(
 /// `list_importable_scripts` — `{ project_id? | workspace_id? }` → `{ scripts,
 /// manifests_found }`. Read-only import preview. Parity with the Tauri tool.
 pub fn list_importable_scripts(db: &Db, args: &Value) -> Result<Value, RpcError> {
-    let (_project_id, scripts, manifests_found) = discover_importable(db, args)?;
+    let (_project_id, scripts, manifests_found) =
+        db.with_conn(|c| discover_importable(c, args))?;
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let listed: Vec<Value> = scripts
         .iter()
@@ -1485,12 +1665,33 @@ pub fn list_importable_scripts(db: &Db, args: &Value) -> Result<Value, RpcError>
     Ok(json!({ "scripts": listed, "manifests_found": manifests_found }))
 }
 
-/// `import_commands` — `{ project_id? | workspace_id?, names?, preview? }` → `{ imported,
-/// would_import, skipped, manifests_found, preview }`. Parity with the Tauri `import_commands`.
-pub fn import_commands(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+/// What `import_commands` needs BEFORE it may write anything: the target project, the scripts the
+/// discovery found, and how many manifests it walked.
+pub(crate) type ImportDiscovery = (String, Vec<crate::pkgjson::DiscoveredScript>, usize);
+
+/// The CONNECTION-SCOPED body of `import_commands` — see [`bad_command_id_error_on_conn`].
+///
+/// THE DISCOVERY IS NOT DONE HERE, and that is the point of the argument (review
+/// 01M15QP3HVYV9Q729ZYTNJB8T2, finding 01M15REGB574G6HD7WZ0MRQVXC). This body runs INSIDE the
+/// approval claim's transaction, and the claim writes before it — so SQLite's single write lock is
+/// held from the first statement onwards. A four-level filesystem walk in there holds that lock for
+/// as long as the walk takes, which over a large tree is past the five-second `busy_timeout` every
+/// other connection waits on: a "database is locked" under the user's hands, bought by a scan that
+/// writes nothing.
+///
+/// So the walk is hoisted to the guard's PREPARE step
+/// ([`crate::system_command_guard::run_db_mutation_prepared`]), which runs it on the same
+/// connection with no transaction open — after the credential check, so an unapproved attempt still
+/// buys no scan. What the transaction keeps is the half worth having: an import of twelve scripts
+/// lands whole with its claim, or not at all.
+pub(crate) fn import_commands_on_conn(
+    conn: &mut SqliteConnection,
+    args: &Value,
+    discovery: ImportDiscovery,
+) -> Result<ToolOutcome, RpcError> {
     let name_filter = optional_str_set(args, "names")?;
     let preview = optional_bool(args, "preview")?.unwrap_or(false);
-    let (project_id, scripts, manifests_found) = discover_importable(db, args)?;
+    let (project_id, scripts, manifests_found) = discovery;
 
     let mut matched_requests: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut imported: Vec<Value> = Vec::new();
@@ -1524,16 +1725,14 @@ pub fn import_commands(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
             source_script_command_snapshot: Some(script.script_command_snapshot.clone()),
             package_manager: Some(script.package_manager.clone()),
         };
-        let result = db.with_conn(|c| {
-            crate::pkgjson::import_command(
-                c,
-                &project_id,
-                &script.proposed_name,
-                &script.default_command,
-                &script.subfolder,
-                source,
-            )
-        });
+        let result = crate::pkgjson::import_command(
+            conn,
+            &project_id,
+            &script.proposed_name,
+            &script.default_command,
+            &script.subfolder,
+            source,
+        );
         match result {
             Ok(template) => imported.push(template_json(&template)),
             Err(detail) => skipped.push(json!({
@@ -1661,6 +1860,10 @@ pub fn remove_workspace<S: RunnerSink>(
                  its own; delete the whole project instead"
             ),
         ),
+        // The domain boundary keeps its OWN code on the wire (`system_scope_forbidden`) instead of
+        // borrowing `invalid_state` from the root rule next to it: the Système workspace is not a
+        // workspace in a state that forbids removal, it is a container with no removal at all.
+        crate::usecase::RemoveWorkspaceError::SystemScope(e) => RpcError::from(e),
         crate::usecase::RemoveWorkspaceError::Db(e) => internal_db(e),
     })?;
     Ok(ToolOutcome::changed(
@@ -1672,19 +1875,15 @@ pub fn remove_workspace<S: RunnerSink>(
 /// Remove ONE command template (id validation + running-guard + cascade delete), returning
 /// the cascaded-instance count. Parity with the Tauri `remove_one_command`.
 fn remove_one_command<S: RunnerSink>(
-    db: &Db,
+    conn: &mut SqliteConnection,
     runner: &CommandRunner<S>,
     command_id: &str,
 ) -> Result<usize, RpcError> {
-    let template = db
-        .with_conn(|c| db::get_template(c, command_id))
-        .map_err(internal_db)?;
+    let template = db::get_template(conn, command_id).map_err(internal_db)?;
     if template.is_none() {
-        return Err(bad_command_id_error(db, command_id));
+        return Err(bad_command_id_error_on_conn(conn, command_id));
     }
-    let instance_ids = db
-        .with_conn(|c| db::instance_ids_for_template(c, command_id))
-        .map_err(internal_db)?;
+    let instance_ids = db::instance_ids_for_template(conn, command_id).map_err(internal_db)?;
     if runner.any_running(&instance_ids) {
         return Err(RpcError::new(
             RpcCode::InvalidState,
@@ -1695,8 +1894,7 @@ fn remove_one_command<S: RunnerSink>(
         ));
     }
     let removed_instances = instance_ids.len();
-    db.with_conn(|c| db::delete_template(c, command_id))
-        .map_err(internal_db)?;
+    db::delete_template(conn, command_id).map_err(internal_db)?;
     Ok(removed_instances)
 }
 
@@ -1707,8 +1905,17 @@ pub fn remove_command<S: RunnerSink>(
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<ToolOutcome, RpcError> {
+    db.with_conn(|c| remove_command_on_conn(c, runner, args))
+}
+
+/// The CONNECTION-SCOPED body of [`remove_command`] — see [`bad_command_id_error_on_conn`].
+pub(crate) fn remove_command_on_conn<S: RunnerSink>(
+    conn: &mut SqliteConnection,
+    runner: &CommandRunner<S>,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
     let command_id = require_str(args, "command_id")?;
-    let removed_instances = remove_one_command(db, runner, command_id)?;
+    let removed_instances = remove_one_command(conn, runner, command_id)?;
     Ok(ToolOutcome::changed(
         json!({ "removed": true, "removed_instances": removed_instances }),
         ChangedTopic::Commands,
@@ -1723,6 +1930,15 @@ pub fn remove_commands<S: RunnerSink>(
     runner: &CommandRunner<S>,
     args: &Value,
 ) -> Result<ToolOutcome, RpcError> {
+    db.with_conn(|c| remove_commands_on_conn(c, runner, args))
+}
+
+/// The CONNECTION-SCOPED body of [`remove_commands`] — see [`bad_command_id_error_on_conn`].
+pub(crate) fn remove_commands_on_conn<S: RunnerSink>(
+    conn: &mut SqliteConnection,
+    runner: &CommandRunner<S>,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
     let ids = require_str_vec(args, "command_ids")?;
     let mut removed = 0usize;
     let mut removed_instances = 0usize;
@@ -1732,7 +1948,7 @@ pub fn remove_commands<S: RunnerSink>(
         if !seen.insert(id.as_str()) {
             continue;
         }
-        match remove_one_command(db, runner, id) {
+        match remove_one_command(conn, runner, id) {
             Ok(n) => {
                 removed += 1;
                 removed_instances += n;
@@ -1772,11 +1988,17 @@ pub fn remove_commands<S: RunnerSink>(
 /// resulting order is neither the old one nor the asked one. Refusing names the mistake; accepting
 /// would silently scramble the list.
 pub fn reorder_commands(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    db.with_conn(|c| reorder_commands_on_conn(c, args))
+}
+
+/// The CONNECTION-SCOPED body of [`reorder_commands`] — see [`bad_command_id_error_on_conn`].
+pub(crate) fn reorder_commands_on_conn(
+    conn: &mut SqliteConnection,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?.to_string();
     let command_ids = require_str_vec(args, "command_ids")?;
-    let current = db
-        .with_conn(|c| db::list_templates(c, &project_id))
-        .map_err(internal_db)?;
+    let current = db::list_templates(conn, &project_id).map_err(internal_db)?;
 
     let mut wanted: Vec<&str> = command_ids.iter().map(String::as_str).collect();
     wanted.sort_unstable();
@@ -1796,11 +2018,8 @@ pub fn reorder_commands(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> 
         ));
     }
 
-    db.with_conn(|c| db::reorder_templates(c, &command_ids))
-        .map_err(internal_db)?;
-    let commands = db
-        .with_conn(|c| db::list_templates(c, &project_id))
-        .map_err(internal_db)?;
+    db::reorder_templates(conn, &command_ids).map_err(internal_db)?;
+    let commands = db::list_templates(conn, &project_id).map_err(internal_db)?;
     Ok(ToolOutcome::changed(
         json!({
             "project_id": project_id,
@@ -1849,12 +2068,20 @@ fn command_group_err(e: db::CommandGroupError) -> RpcError {
 /// The reply always carries the project's `groups` AFTER the change, so an agent that chains
 /// several actions never has to re-list between them.
 pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    db.with_conn(|c| manage_command_group_on_conn(c, args))
+}
+
+/// The CONNECTION-SCOPED body of [`manage_command_group`] — see [`bad_command_id_error_on_conn`].
+pub(crate) fn manage_command_group_on_conn(
+    conn: &mut SqliteConnection,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
     let action = require_str(args, "action")?;
 
     /// The project a group (or a command) belongs to — needed to return the post-change list even
     /// when the action's own target has just ceased to exist.
-    fn project_of_group(db: &Db, group_id: &str) -> Result<String, RpcError> {
-        db.with_conn(|c| db::get_command_group(c, group_id))
+    fn project_of_group(conn: &mut SqliteConnection, group_id: &str) -> Result<String, RpcError> {
+        db::get_command_group(conn, group_id)
             .map_err(internal_db)?
             .map(|g| g.project_id)
             .ok_or_else(|| {
@@ -1864,8 +2091,11 @@ pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
                 )
             })
     }
-    fn project_of_command(db: &Db, command_id: &str) -> Result<String, RpcError> {
-        db.with_conn(|c| db::get_template(c, command_id))
+    fn project_of_command(
+        conn: &mut SqliteConnection,
+        command_id: &str,
+    ) -> Result<String, RpcError> {
+        db::get_template(conn, command_id)
             .map_err(internal_db)?
             .map(|t| t.project_id)
             .ok_or_else(|| {
@@ -1878,23 +2108,21 @@ pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
         "create" => {
             let project_id = require_str(args, "project_id")?.to_string();
             let command_ids = require_str_vec(args, "command_ids")?;
-            let group = db
-                .with_conn(|c| db::create_command_group(c, &project_id, &command_ids))
+            let group = db::create_command_group(conn, &project_id, &command_ids)
                 .map_err(command_group_err)?;
             (Some(group), project_id)
         }
         "add" => {
             let group_id = require_str(args, "group_id")?.to_string();
             let command_id = require_str(args, "command_id")?.to_string();
-            let project_id = project_of_group(db, &group_id)?;
-            let group = db
-                .with_conn(|c| db::add_to_command_group(c, &group_id, &command_id))
+            let project_id = project_of_group(conn, &group_id)?;
+            let group = db::add_to_command_group(conn, &group_id, &command_id)
                 .map_err(command_group_err)?;
             (Some(group), project_id)
         }
         "remove" => {
             let command_id = require_str(args, "command_id")?.to_string();
-            let project_id = project_of_command(db, &command_id)?;
+            let project_id = project_of_command(conn, &command_id)?;
             // The group SURVIVES most removals — it only dissolves when the removal takes it under
             // two members — and the reply must say which happened. It used to answer `group: null`
             // in BOTH cases (review finding `01M11XKKFVQWSHZQ4TGT3P3Z06`), so a caller reading
@@ -1902,30 +2130,26 @@ pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
             // alive with its remaining members, listed two fields away in `groups`. The DB
             // transition now returns the survivor (or `None` on a real dissolution) from INSIDE its
             // own transaction, which is the only place the two can be told apart without a race.
-            let survivor = db
-                .with_conn(|c| db::remove_from_command_group(c, &command_id))
-                .map_err(command_group_err)?;
+            let survivor =
+                db::remove_from_command_group(conn, &command_id).map_err(command_group_err)?;
             (survivor, project_id)
         }
         "dissolve" => {
             let group_id = require_str(args, "group_id")?.to_string();
-            let project_id = project_of_group(db, &group_id)?;
-            db.with_conn(|c| db::dissolve_command_group(c, &group_id))
-                .map_err(command_group_err)?;
+            let project_id = project_of_group(conn, &group_id)?;
+            db::dissolve_command_group(conn, &group_id).map_err(command_group_err)?;
             (None, project_id)
         }
         "name" | "color" => {
             let group_id = require_str(args, "group_id")?.to_string();
-            let project_id = project_of_group(db, &group_id)?;
+            let project_id = project_of_group(conn, &group_id)?;
             // An OMITTED value CLEARS the label — the tool has one action per label, so "name
             // without a name" can only mean "remove the name". (The DB layer's third state,
             // "leave it alone", is what the OTHER action uses on this same call.)
             let group = if action == "name" {
                 let name = optional_str(args, "name")?.map(str::to_string);
-                db.with_conn(|c| {
-                    db::set_command_group_labels(c, &group_id, Some(name.as_deref()), None)
-                })
-                .map_err(command_group_err)?
+                db::set_command_group_labels(conn, &group_id, Some(name.as_deref()), None)
+                    .map_err(command_group_err)?
             } else {
                 let color = match args.get("color") {
                     None | Some(Value::Null) => None,
@@ -1941,7 +2165,7 @@ pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
                         },
                     )?),
                 };
-                db.with_conn(|c| db::set_command_group_labels(c, &group_id, None, Some(color)))
+                db::set_command_group_labels(conn, &group_id, None, Some(color))
                     .map_err(command_group_err)?
             };
             (Some(group), project_id)
@@ -1949,9 +2173,8 @@ pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
         "layout" => {
             let group_id = require_str(args, "group_id")?.to_string();
             let command_ids = require_str_vec(args, "command_ids")?;
-            let project_id = project_of_group(db, &group_id)?;
-            let group = db
-                .with_conn(|c| db::set_command_group_layout(c, &group_id, &command_ids))
+            let project_id = project_of_group(conn, &group_id)?;
+            let group = db::set_command_group_layout(conn, &group_id, &command_ids)
                 .map_err(command_group_err)?;
             (Some(group), project_id)
         }
@@ -1962,10 +2185,9 @@ pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
         "shape" => {
             let group_id = require_str(args, "group_id")?.to_string();
             let shape = require_str(args, "shape")?.to_string();
-            let project_id = project_of_group(db, &group_id)?;
-            let group = db
-                .with_conn(|c| db::set_command_group_shape(c, &group_id, &shape))
-                .map_err(command_group_err)?;
+            let project_id = project_of_group(conn, &group_id)?;
+            let group =
+                db::set_command_group_shape(conn, &group_id, &shape).map_err(command_group_err)?;
             (Some(group), project_id)
         }
         other => {
@@ -1979,9 +2201,7 @@ pub fn manage_command_group(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
         }
     };
 
-    let groups = db
-        .with_conn(|c| db::list_command_groups(c, &project_id))
-        .map_err(internal_db)?;
+    let groups = db::list_command_groups(conn, &project_id).map_err(internal_db)?;
     Ok(ToolOutcome::changed(
         json!({ "action": action, "group": group, "groups": groups }),
         ChangedTopic::Commands,
@@ -2093,6 +2313,45 @@ fn is_activity_hook(name: &str) -> bool {
     )
 }
 
+/// The SHARED half of the ambient block's data: the Système scope's command lines, or an EMPTY vec.
+///
+/// A FUNCTION, and one that returns no error, because "best-effort" is a property this path has to
+/// HOLD, not merely intend. The `SessionStart` hook drops the WHOLE injected context — orientation
+/// line included — on an error or on a timeout, so the shared read must be incapable of costing
+/// anything but its own lines. Every way it can go wrong ends on the same empty vec:
+///
+/// * the scope is NOT BOOTSTRAPPED (`load` ⇒ `None`) — every test `Db` that never called
+///   `ensure_system_scope`, which is most of them;
+/// * the scope is HALF THERE (a singleton whose primary workspace row is gone) — `load` answers
+///   `None` rather than a half-scope, by contract;
+/// * the query FAILS — `unwrap_or_default()`, the same swallow the workspace half already applies.
+///
+/// It is also where the DOUBLE-RENDER is refused: a session whose own workspace IS the Système one
+/// gets its commands ONCE, under its own header, not twice under two.
+///
+/// THE ID COMES FROM THE SCOPE'S OWN READ. [`crate::system_scope::load`], never
+/// `db::resolvable_workspaces` — which excludes the singleton deliberately (phase 1) so the cwd
+/// auto-attach can never capture it. Injecting the commands does not touch that exclusion: no
+/// resolver learns the workspace, and the block itself never renders its id.
+///
+/// THE READER IS THE LEAN ONE, like the workspace half: this runs on the hook's 1000 ms budget, and
+/// `db::list_command_lines_for_workspace` is the reader that never selects `scrollback`.
+fn system_command_lines(
+    db: &Db,
+    session_workspace_id: Option<&str>,
+) -> Vec<db::WorkspaceCommandLine> {
+    db.with_conn(|c| -> diesel::QueryResult<Vec<db::WorkspaceCommandLine>> {
+        let Some(scope) = crate::system_scope::load(c)? else {
+            return Ok(Vec::new());
+        };
+        if session_workspace_id == Some(scope.workspace.id.as_str()) {
+            return Ok(Vec::new());
+        }
+        db::list_command_lines_for_workspace(c, &scope.workspace.id)
+    })
+    .unwrap_or_default()
+}
+
 /// Build the MINIMAL one-line nyx context injected into a STARTING agent session as the
 /// SessionStart hook's `additionalContext` (FEEDBACK #22), so the agent situates itself
 /// inside nyx AND can act on the MCP tools WITHOUT discovery:
@@ -2106,13 +2365,22 @@ fn is_activity_hook(name: &str) -> bool {
 /// list (rarely useful every session); the generic "what/when/how to use nyx" stays in the
 /// MCP server instructions, not re-injected here each turn.
 ///
-/// AND, under that line, the workspace's MANAGED COMMANDS — name, command, FACTUAL state,
-/// `instance_id` (plus `group_id` on a grouped one) — followed by the directive that says what to do
-/// with them. Rendered by [`crate::mcp_context::workspace_commands_block`], which takes the run-state
-/// overlay as a CLOSURE over THIS dispatcher's live `runner` — the same `runner.outcome(…)` else
-/// persisted `last_state` fallback `list_commands` applies, so the block cannot claim a command is
-/// up when it is not. A LOOSE terminal, or a workspace with no managed command, gets NEITHER: the
-/// line stays exactly what it was.
+/// AND, under that line, the MANAGED COMMANDS this session can act on — name, command, FACTUAL
+/// state, `instance_id` (plus `group_id` on a grouped one) — followed by the directive that says
+/// what to do with them. Rendered by [`crate::mcp_context::session_commands_block`], which takes the
+/// run-state overlay as a CLOSURE over THIS dispatcher's live `runner` — the same `runner.outcome(…)`
+/// else persisted `last_state` fallback `list_commands` applies, so the block cannot claim a command
+/// is up when it is not.
+///
+/// TWO SOURCES feed that block, read here and never merged into one query: the session's OWN
+/// workspace, and the Système scope's — the machine-wide services every agent on this machine
+/// shares, which the block marks as such (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`). The Système
+/// workspace id comes from [`crate::system_scope::load`], the scope's own read, and NEVER from a
+/// resolver: `db::resolvable_workspaces` excludes the singleton on purpose since phase 1, and
+/// nothing here undoes that.
+///
+/// A session with NOTHING on either side — a loose terminal on a machine with no Système command —
+/// gets no block at all: the line stays exactly what it was.
 fn session_context_line<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
@@ -2142,22 +2410,29 @@ fn session_context_line<S: RunnerSink>(
     // The managed-command block. Best-effort by construction: a read that fails yields no
     // instances, hence no block — this line must never fail a SessionStart (the hook drops the
     // WHOLE context, orientation included, on an error or a timeout).
-    if let Some(ws_id) = session.workspace_id.as_deref() {
-        // The LEAN reader, not `list_instances_for_workspace` (review finding
-        // `01M152NMXPWKD59QFK95CMSZWQ`): the full row carries each instance's `scrollback`, bounded
-        // at 256 KiB apiece — up to 3 MiB read, UTF-8 validated and allocated on a workspace whose
-        // commands have actually run — for a block that renders name/command/state/instance_id and
-        // nothing else. On the ONE path with a hard budget, the dominant term is the one that is
-        // never read.
-        let instances = db
+    //
+    // The LEAN reader, not `list_instances_for_workspace` (review finding
+    // `01M152NMXPWKD59QFK95CMSZWQ`): the full row carries each instance's `scrollback`, bounded
+    // at 256 KiB apiece — up to 3 MiB read, UTF-8 validated and allocated on a workspace whose
+    // commands have actually run — for a block that renders name/command/state/instance_id and
+    // nothing else. On the ONE path with a hard budget, the dominant term is the one that is
+    // never read. The SHARED half below takes the same reader, for the same reason.
+    let workspace_lines = match session.workspace_id.as_deref() {
+        Some(ws_id) => db
             .with_conn(|c| db::list_command_lines_for_workspace(c, ws_id))
-            .unwrap_or_default();
-        let overlay = |instance_id: &str| runner.outcome(instance_id).map(|(state, _, _)| state);
-        let block = crate::mcp_context::workspace_commands_block(&instances, overlay);
-        if !block.is_empty() {
-            context.push('\n');
-            context.push_str(&block);
-        }
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    // The SHARED half — the Système scope's commands, which every agent on this machine can act on
+    // (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`). SECOND, and it CANNOT subtract anything but itself:
+    // the workspace read above has already produced its rows before this one starts.
+    let system_lines = system_command_lines(db, session.workspace_id.as_deref());
+    let overlay = |instance_id: &str| runner.outcome(instance_id).map(|(state, _, _)| state);
+    let block =
+        crate::mcp_context::session_commands_block(&workspace_lines, &system_lines, overlay);
+    if !block.is_empty() {
+        context.push('\n');
+        context.push_str(&block);
     }
     context
 }
@@ -2530,6 +2805,42 @@ pub fn agent_session_event<S: RunnerSink>(
 
 // --- Interactive-terminal tools (DB-record half + TerminalHost) ------------
 
+/// THE TERMINAL-ID HALF OF THE SYSTÈME BOUNDARY, for the four generic terminal VERBS an agent can
+/// aim at one id: `read_terminal`, `send_to_terminal`, `send_keys`, `close_terminal`.
+///
+/// ## Why these four cannot be covered by the allow-list
+///
+/// [`crate::system_scope::guard_payload`] keys on the singleton's PROJECT and WORKSPACE ids
+/// appearing in the payload. These tools carry a `terminal_id` and nothing else, so that guard
+/// sees nothing to match — the membership is one join away
+/// ([`crate::system_scope::is_system_terminal`]), and only a read can answer it. Hence a second,
+/// narrower door rather than a new allow-list entry.
+///
+/// ## Refused, not hidden
+///
+/// The refusal is [`RpcCode::SystemScopeForbidden`] and it NAMES the terminal — never `invalid_id`,
+/// which would claim the record does not exist. Same rule as everywhere else in this scope: the
+/// singleton is not defended by concealment, so an agent that learns a Système terminal's id (from
+/// a log, from a human, by guessing) is refused for what it is asking, not left to wonder whether
+/// it mistyped. `list_terminals` omits those terminals for ERGONOMICS — an agent should not be
+/// offered ids it may not use — and that omission is not the defense either: these four verbs
+/// refuse the id whether or not the list ever showed it.
+///
+/// A terminal of a user project, an unattached (orphan) one, and an id that names nothing all pass
+/// through untouched: `None`.
+fn refuse_system_terminal(db: &Db, terminal_id: &str, capability: &str) -> Option<RpcError> {
+    // The SAME guard the binding writers pose (`db::detach_terminal`,
+    // `db::unpin_terminal_workspace`), not a second reading of the same question — so "what is a
+    // Système terminal" has one answer in the crate, and the refusal carries the same entity, id
+    // and capability whichever door it comes out of.
+    //
+    // A DB failure is REPORTED, never swallowed (`From<SystemScopeError>` maps it to `internal`):
+    // failing open here would turn a transient SQL hiccup into a hole in the boundary.
+    db.with_conn(|c| crate::system_scope::require_user_terminal(c, terminal_id, capability))
+        .err()
+        .map(RpcError::from)
+}
+
 /// `create_terminal` — `{ cwd?, command?, label? }` → `{ terminal_id, cwd, workspace_id,
 /// has_command }`. Writes the record + resolves auto-attach + parks any opening command, then
 /// STARTS the shell — see [`TerminalHost::open_terminal_shell`] for why the tool opens it rather
@@ -2593,7 +2904,10 @@ fn resolve_attach_for_new_terminal(
         workspace_id: None,
         mode: BindingMode::Auto,
     };
-    let known: Vec<WorkspaceMatch> = db::all_workspaces(conn)?
+    // The SAME candidate set as `resolve::auto_attach_terminal` — `db::resolvable_workspaces`, the
+    // single reader that excludes the Système workspace by join. An agent-created terminal must
+    // never auto-attach into the Système scope any more than a UI-created one can.
+    let known: Vec<WorkspaceMatch> = db::resolvable_workspaces(conn)?
         .into_iter()
         .map(|w| WorkspaceMatch {
             id: w.id,
@@ -2619,6 +2933,12 @@ pub fn send_to_terminal(
 ) -> Result<ToolOutcome, RpcError> {
     let terminal_id = require_str(args, "terminal_id")?;
     let command = require_str(args, "command")?;
+    // A Système terminal is not the agent's to type into — refused BEFORE the liveness read, so
+    // the refusal never depends on whether a shell happens to be up.
+    if let Some(refusal) = refuse_system_terminal(db, terminal_id, crate::mcp::SEND_TO_TERMINAL_TOOL)
+    {
+        return Err(refusal);
+    }
     // The id must name an ALIVE record first (so "unknown id" is distinct from "no PTY").
     let record = db
         .with_conn(|c| db::get_terminal(c, terminal_id))
@@ -2712,6 +3032,10 @@ fn resolve_keys(elements: &[String]) -> Vec<u8> {
 pub fn send_keys(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<ToolOutcome, RpcError> {
     let terminal_id = require_str(args, "terminal_id")?;
     let keys = require_str_vec(args, "keys")?;
+    // Same rule as `send_to_terminal`: raw keystrokes into a Système terminal are the human's.
+    if let Some(refusal) = refuse_system_terminal(db, terminal_id, crate::mcp::SEND_KEYS_TOOL) {
+        return Err(refusal);
+    }
     // The id must name an ALIVE record first (so "unknown id" is distinct from "no PTY").
     let record = db
         .with_conn(|c| db::get_terminal(c, terminal_id))
@@ -2745,9 +3069,28 @@ pub fn send_keys(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<ToolO
 /// `list_terminals`.
 pub fn list_terminals(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<Value, RpcError> {
     let include_closed = optional_bool(args, "include_closed")?.unwrap_or(false);
+    // The Système workspace's id, read ONCE, so the filter below is a string comparison per row
+    // rather than a join per row. `None` when the scope is not bootstrapped — nothing to exclude.
+    let system_workspace = db
+        .with_conn(|c| -> Result<Option<String>, diesel::result::Error> {
+            Ok(crate::system_scope::load(c)?.map(|s| s.workspace.id))
+        })
+        .map_err(internal_db)?;
     let records = db.with_conn(db::list_terminals).map_err(internal_db)?;
     let terminals: Vec<Value> = records
         .into_iter()
+        // A SYSTÈME terminal is not offered to the agent. ERGONOMICS, not the defense: the four
+        // verbs (`read`/`send_to`/`send_keys`/`close_terminal`) refuse its id whether or not this
+        // list ever showed it (`refuse_system_terminal`). What the omission does buy is that an
+        // agent is never handed an id it may not use.
+        //
+        // Keyed on the POSITIVE membership — the row's `workspace_id` naming the singleton's
+        // workspace — so an ORPHAN (`workspace_id IS NULL`) is untouched: the two sets stay
+        // disjoint here as everywhere.
+        .filter(|t| match (&t.workspace_id, &system_workspace) {
+            (Some(ws), Some(sys)) => ws != sys,
+            _ => true,
+        })
         .filter(|t| include_closed || t.status == db::STATUS_ALIVE)
         .map(|t| {
             let (live, busy) = host.terminal_liveness(&t.id);
@@ -2776,6 +3119,11 @@ pub fn close_terminal(
     args: &Value,
 ) -> Result<ToolOutcome, RpcError> {
     let terminal_id = require_str(args, "terminal_id")?;
+    // Closing a Système terminal is the human's gesture, from the UI — refused here BEFORE the
+    // record is even read, so no agent can end a service shell it cannot see.
+    if let Some(refusal) = refuse_system_terminal(db, terminal_id, crate::mcp::CLOSE_TERMINAL_TOOL) {
+        return Err(refusal);
+    }
     let record = db
         .with_conn(|c| db::get_terminal(c, terminal_id))
         .map_err(internal_db)?;
@@ -2812,6 +3160,10 @@ pub fn close_terminal(
 /// shows now"; anything else is a past snapshot, said out loud rather than passed off as current.
 pub fn read_terminal(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<Value, RpcError> {
     let terminal_id = require_str(args, "terminal_id")?;
+    // A Système terminal's scrollback is not an agent read: refused before the buffer is loaded.
+    if let Some(refusal) = refuse_system_terminal(db, terminal_id, crate::mcp::READ_TERMINAL_TOOL) {
+        return Err(refusal);
+    }
     let (effective_tail, since, strip) = parse_window_knobs(args)?;
     let scrollback = match db
         .with_conn(|c| db::get_terminal(c, terminal_id))
@@ -2860,13 +3212,89 @@ pub fn read_terminal(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<V
 ///   shell should broadcast after this returns (the event seam).
 /// - `Some(Err(e))` — the tool ran but produced a domain error (`invalid_id`/…); it is
 ///   STILL served (never `method_not_found`/`unknown tool`).
-/// - `None` — `name` is NOT one of this module's tools (it belongs to
-///   [`crate::mcp_runtime`]: the runtime command tools `start_command`/… or the workspace
-///   registration tools `workspace_add`/`create_workspace`), so the caller falls through.
+/// - `Some(Err(system_scope_forbidden))` — the SYSTÈME BOUNDARY refused the call BEFORE any
+///   routing happened (the guard below). The exact condition: `name` is on NEITHER half of the
+///   allow-list ([`crate::system_scope::SYSTEM_SCOPE_MCP_CAPABILITIES`] /
+///   [`crate::system_scope::SYSTEM_SCOPE_IPC_CAPABILITIES`], both read by the guard) AND its
+///   payload aims the singleton — including a name this module does not serve, and a name that
+///   exists nowhere. It is therefore the one case where a `Some(_)` does not mean "this module owns
+///   the tool". Symmetrically, an ALLOW-LISTED name is never refused here whatever it aims:
+///   `start_command` or `command_list` carrying the singleton's `project_id` goes straight past.
+/// - `None` — `name` is not one of this module's tools AND the guard above did not fire, so the
+///   caller falls through. In practice that is [`crate::mcp_runtime`]'s surface, in two groups: the
+///   runtime command tools (`start_command`, `stop_command`, `relaunch_command`,
+///   `get_command_output`, `wait_for_command`) are ON the allow-list, so they fall through even
+///   when their payload names the singleton; the workspace registration tools (`workspace_add`,
+///   `create_workspace`) are NOT, so they fall through only while their payload aims elsewhere.
 ///
-/// This is what guarantees that NO tool advertised by `tools/list` falls into the
-/// dispatcher's `unknown tool` arm: every advertised name resolves to either this module
-/// or [`crate::mcp_runtime`].
+/// ## The routing consequence: call this LAST
+///
+/// Because the refusal precedes the routing, a `Some(_)` here does not mean "this module owns the
+/// tool" — it may be a refusal issued on behalf of a name belonging to a sibling dispatcher, or to
+/// nobody. So this must be the caller's LAST step, which is what `nyx_sidecar::runtime::mcp` does
+/// (`dispatch_repo_watch`, then the runtime command tools, then `dispatch_workspace_tool`, then
+/// this).
+///
+/// WHAT THE ORDER DOES NOT BUY, since the allow-list was split in two. It is NOT that
+/// [`crate::mcp_runtime`]'s tools would be swallowed: five of its seven names are on the allow-list
+/// (above), so this guard never fires on them whatever they aim. The two that are not,
+/// `workspace_add` and `create_workspace`, must be refused on the singleton anyway, and their own
+/// dispatcher refuses them through THIS VERY function — so for them the order changes the verdict
+/// not at all. The order is a STRUCTURAL precaution, not a live fix: it preserves "each sibling
+/// dispatcher decides its own names" for the day a sibling wants a verdict other than this guard's.
+///
+/// Every advertised name still resolves to either this module or [`crate::mcp_runtime`], so no
+/// advertised tool can fall into the dispatcher's `unknown tool` arm — the guarantee is unchanged,
+/// it is simply no longer expressible as "`None` means fall through".
+///
+/// ## THE SECOND GATE, on the command arms
+///
+/// "Allow-listed" answers « le scope Système peut-il être la cible de ce verbe » and stops there. A
+/// SECOND, different question — « ce geste exige-t-il une main humaine » — is asked per call by
+/// [`crate::system_command_guard`], on the command-CRUD arms below and on
+/// [`crate::mcp_runtime`]'s three lifecycle verbs. For a USER project it is inert (one
+/// set-membership walk, then the identical body on the identical connection); on the Système
+/// singleton it is the approval protocol, and a protected call comes back as
+/// [`crate::mcp::RpcCode::ApprovalRequired`] carrying its ticket.
+///
+/// The two gates are kept apart because they are not decided the same way: the first reads the
+/// PAYLOAD, the second reads the payload AND the live run state (`stop` on an idle service is free,
+/// `stop` on a running one is not). Folding them would make "the scope can hold commands" and "an
+/// agent may create one" the same sentence — the window this phase closed.
+///
+/// SIDE EFFECT WORTH KNOWING. An UNKNOWN method whose payload aims the singleton now answers
+/// JSON-RPC `-32000` (`system_scope_forbidden`) instead of `-32601` (`method_not_found`). That is
+/// deliberate: the call was refused either way, and answering "forbidden" removes the incentive to
+/// probe the surface for a name that slipped through the allow-list. A caller distinguishing
+/// "unknown method" from "refused" must therefore not aim the singleton to find out.
+///
+/// ONE EXCEPTION TO THAT, and it is the allow-list's other half: an unknown name that happens to be
+/// an IPC-ONLY entry (`command_list`, `attach_terminal`, `workspace_runtime_snapshot`…) is NOT
+/// refused — it traverses the guard, matches no arm here, and comes back out of the shell's
+/// dispatcher as `method_not_found`. Nothing leaks, because none of those names is an advertised
+/// tool — which `system_scope::tests::the_two_halves_of_the_allow_list_do_not_share_a_name_with_the_live_mcp_surface`
+/// pins — but the probe-resistance above does not extend to them.
+/// The three-argument spelling of [`crate::system_command_guard::run_db_mutation`] for the arms
+/// whose conn-scoped body needs no runner — written once so the dispatcher's table stays readable.
+fn guarded_db<S: RunnerSink>(
+    db: &Db,
+    runner: &CommandRunner<S>,
+    tool: &str,
+    args: &Value,
+    caller_terminal_id: Option<&str>,
+    body: impl FnOnce(&mut SqliteConnection, &Value) -> Result<ToolOutcome, RpcError>,
+) -> Result<ToolOutcome, RpcError> {
+    crate::system_command_guard::run_db_mutation(
+        db,
+        runner,
+        &crate::system_approvals::SystemClock,
+        tool,
+        args,
+        caller_terminal_id,
+        body,
+    )
+}
+
 pub fn dispatch_extension_tool<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
@@ -2876,6 +3304,22 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
     args: &Value,
     caller_terminal_id: Option<&str>,
 ) -> Option<Result<ToolOutcome, RpcError>> {
+    // THE SYSTÈME DOMAIN BOUNDARY, checked BEFORE any tool body runs (a refusal must cost nothing,
+    // and must certainly not happen after a half-applied write).
+    //
+    // This dispatcher is the LAST step of the shell's routing and the entry to every sub-dispatcher
+    // (Spec, context, ideas, annexes, graph authoring, prototypes, design, engine), so one check
+    // here covers the whole remaining surface — instead of one `require_user_project` per tool,
+    // which is exactly the shape that ends up with a hole in it.
+    //
+    // It fires for any name that is on NEITHER half of the allow-list and whose payload aims the
+    // singleton, including one this dispatcher does not serve: answering `system_scope_forbidden` to
+    // `nonexistent_tool(project_id: <système>)` rather than `method_not_found` costs nothing (the
+    // call was refused either way) and removes the temptation to probe the surface for a name that
+    // slipped through the table.
+    if let Some(refusal) = crate::mcp_context::refuse_system_scope(db, name, args) {
+        return Some(Err(refusal));
+    }
     // Read tools wrap their plain JSON result into a no-effect `ToolOutcome`.
     let read = |r: Result<Value, RpcError>| Some(r.map(ToolOutcome::read));
     let dispatched = match name {
@@ -2884,6 +3328,9 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         "list_projects" => read(list_projects(db)),
         "list_workspaces" => read(list_workspaces(db, args)),
         "list_commands" => read(list_commands(db, runner, args)),
+        // The agent's DEDICATED discovery of the Système scope's commands — the one door onto a
+        // container `list_projects` / `list_workspaces` deliberately omit. Read-only.
+        crate::mcp::LIST_SYSTEM_COMMANDS_TOOL => read(list_system_commands(db, runner, args)),
         // The v2.2 cockpit read model: a workspace's LIVE runtime aggregate (terminals +
         // sessions + services), overlaying live run state from `runner` — the SAME
         // `workspace_runtime::snapshot` the UI bridge drives (PDR-0005).
@@ -2929,20 +3376,86 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         // Explicit repository config (finding #27): SET a project's repos — mutating → repos
         // changed so any open review/cockpit re-pulls. The SAME `db::set_project_repositories`.
         crate::mcp::PROJECT_SET_REPOS_TOOL => Some(project_set_repos(db, args)),
+        // The Système approval protocol's ONE extra tool: the TOKEN-OWNED read of a single
+        // request. Grant/deny are NEVER here — they are UI-only db-commands, because a tool that
+        // lets the caller approve its own request is not an approval.
+        crate::mcp::SYSTEM_APPROVAL_STATUS_TOOL => read(
+            crate::system_command_guard::system_approval_status(
+                db,
+                &crate::system_approvals::SystemClock,
+                args,
+            ),
+        ),
         // Command-template CRUD (mutating → carry a `changed` effect).
-        crate::mcp::ADD_COMMAND_TOOL => Some(add_command(db, args)),
-        crate::mcp::UPDATE_COMMAND_TOOL => Some(update_command(db, runner, args)),
-        crate::mcp::IMPORT_COMMANDS_TOOL => Some(import_commands(db, args)),
+        //
+        // EACH goes through `system_command_guard::run_db_mutation`, which is a NO-OP for a user
+        // project (one set-membership walk, then the very same body on the very same connection)
+        // and, on the Système singleton, is the approval protocol: raise a request and refuse with
+        // its ticket, or claim the ticket INSIDE the mutation's own transaction. That placement is
+        // what makes "impossible de créer une commande arbitraire puis la démarrer librement" true
+        // — the creation never happens without a human.
+        crate::mcp::ADD_COMMAND_TOOL => Some(guarded_db(db, runner, name, args, caller_terminal_id, add_command_on_conn)),
+        crate::mcp::UPDATE_COMMAND_TOOL => Some(crate::system_command_guard::run_db_mutation(
+            db,
+            runner,
+            &crate::system_approvals::SystemClock,
+            name,
+            args,
+            caller_terminal_id,
+            |c, a| update_command_on_conn(c, runner, a),
+        )),
+        // `import_commands` is the ONE arm with a PREPARE step: its package.json discovery is a
+        // filesystem walk, and a walk inside the claim's transaction would hold SQLite's write lock
+        // for its whole duration (finding 01M15REGB574G6HD7WZ0MRQVXC). The walk runs on the same
+        // connection, after the credential check and before the transaction opens.
+        crate::mcp::IMPORT_COMMANDS_TOOL => Some(crate::system_command_guard::run_db_mutation_prepared(
+            db,
+            runner,
+            &crate::system_approvals::SystemClock,
+            name,
+            args,
+            caller_terminal_id,
+            |c, a| discover_importable(c, a),
+            import_commands_on_conn,
+        )),
         crate::mcp::REMOVE_WORKSPACE_TOOL => Some(remove_workspace(db, runner, host, args)),
-        crate::mcp::REMOVE_COMMAND_TOOL => Some(remove_command(db, runner, args)),
-        crate::mcp::REMOVE_COMMANDS_TOOL => Some(remove_commands(db, runner, args)),
+        crate::mcp::REMOVE_COMMAND_TOOL => Some(crate::system_command_guard::run_db_mutation(
+            db,
+            runner,
+            &crate::system_approvals::SystemClock,
+            name,
+            args,
+            caller_terminal_id,
+            |c, a| remove_command_on_conn(c, runner, a),
+        )),
+        crate::mcp::REMOVE_COMMANDS_TOOL => Some(crate::system_command_guard::run_db_mutation(
+            db,
+            runner,
+            &crate::system_approvals::SystemClock,
+            name,
+            args,
+            caller_terminal_id,
+            |c, a| remove_commands_on_conn(c, runner, a),
+        )),
         // The multi-pane GROUPING of commands (review #90): one tool, eight actions, delegating
         // to the SAME `db::` transitions the UI's `command_group_*` routes call.
-        crate::mcp::MANAGE_COMMAND_GROUP_TOOL => Some(manage_command_group(db, args)),
+        crate::mcp::MANAGE_COMMAND_GROUP_TOOL => Some(guarded_db(db, runner, name, args, caller_terminal_id, manage_command_group_on_conn)),
         // The ORDER of the command LIST — the agent's half of `command_reorder`, over the same
         // `db::reorder_templates` (review 01M11WE6H9E5D5FCS6RT0ZXAXN).
-        crate::mcp::REORDER_COMMANDS_TOOL => Some(reorder_commands(db, args)),
-        crate::mcp::CLEAR_COMMAND_OUTPUT_TOOL => Some(clear_command_output(db, runner, args)),
+        crate::mcp::REORDER_COMMANDS_TOOL => Some(guarded_db(db, runner, name, args, caller_terminal_id, reorder_commands_on_conn)),
+        // Clearing a captured buffer is a RUNNER effect (it empties an in-memory tail), so it takes
+        // the other discipline: claim BEFORE the I/O, one attempt.
+        crate::mcp::CLEAR_COMMAND_OUTPUT_TOOL => {
+            Some(crate::system_command_guard::run_runner_effect(
+                db,
+                runner,
+                &crate::system_approvals::SystemClock,
+                name,
+                args,
+                caller_terminal_id,
+                || clear_command_output(db, runner, args),
+            ))
+        }
         // Agent-session channel (session lifecycle + runtime activity).
         crate::mcp::AGENT_SESSION_EVENT_TOOL => {
             Some(agent_session_event(db, runner, activity, args))
@@ -4486,6 +4999,423 @@ mod tests {
         assert_eq!(err.code, RpcCode::InvalidId);
     }
 
+    /// DONE-CRITERION (« Frontière de domaine ») — the boundary fires through the REAL dispatcher,
+    /// not only through the guard read in isolation: an agent that holds the Système project's id
+    /// gets `system_scope_forbidden` from the tools it may not use, and a normal answer from the
+    /// ones it may.
+    ///
+    /// The Git family is here too (« Workspace Système hors des lectures Git »): `workspace_git`,
+    /// `repo_diff` and `repo_git_view` are refused BEFORE they resolve a path, so no Git subprocess
+    /// is even reached — the home is not a repository the agent may walk.
+    #[test]
+    fn the_dispatcher_refuses_the_system_scope_for_every_capability_it_does_not_have() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+
+        let scope = db
+            .with_conn(|c| {
+                crate::system_scope::ensure_system_scope(
+                    c,
+                    &crate::system_scope::FixedHomeDirProvider::at(if cfg!(windows) {
+                        "C:\\Users\\kris"
+                    } else {
+                        "/home/kris"
+                    }),
+                )
+            })
+            .expect("bootstrap the Système scope");
+        let args = json!({
+            "project_id": scope.project.id,
+            "workspace_id": scope.workspace.id,
+            "repository_id": "whatever",
+            "kind": "working_tree",
+        });
+
+        for tool in [
+            // the project's own lifecycle + settings
+            "set_project_settings",
+            "project_set_repos",
+            // workspace lifecycle + inventory
+            "list_workspaces",
+            "remove_workspace",
+            // GIT — refused before any path resolution, hence before any subprocess
+            crate::mcp::WORKSPACE_GIT_TOOL,
+            crate::mcp::REPO_DIFF_TOOL,
+            crate::mcp::REPO_GIT_VIEW_TOOL,
+            // the runtime aggregate is a UI read, not an agent one
+            crate::mcp::WORKSPACE_RUNTIME_TOOL,
+            // product aggregates
+            "spec_create",
+            "idea_capture",
+            "workflow_create",
+        ] {
+            let err = dispatch_extension_tool(
+                &db, &runner, &host, &activity, tool, &args, None,
+            )
+            .unwrap_or_else(|| panic!("`{tool}` must be served (refused), not fall through"))
+            .expect_err("this capability is not the Système scope's");
+            assert_eq!(
+                err.code,
+                RpcCode::SystemScopeForbidden,
+                "`{tool}` must refuse with the dedicated code, got {err:?}"
+            );
+            // The WIRE spelling, not merely the variant: a caller discriminates on the string, so
+            // "this exists and you may not" must reach it as `system_scope_forbidden` and never as
+            // an unknown-id code. (Asserting `!= InvalidId` right after the `==` above would have
+            // been a tautology — two variants of one enum — and would have proven nothing.)
+            assert_eq!(
+                err.code.as_str(),
+                crate::system_scope::SYSTEM_SCOPE_FORBIDDEN,
+                "`{tool}` must NOT pretend the container does not exist"
+            );
+        }
+
+        // …while the scope's OWN capability answers normally: `list_commands` on the singleton is
+        // a legitimate read (it is the container of the user's cross-project services).
+        let listed = dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            "list_commands",
+            &json!({ "project_id": scope.project.id }),
+            None,
+        )
+        .expect("list_commands IS an MCP tool")
+        .expect("and it is a capability of the Système scope");
+        assert!(listed.result.get("commands").is_some());
+
+        // …and a USER project passes every one of the refused tools' boundary (the refusal is
+        // about the container's NATURE, never about the tool).
+        let (user, _root) = db
+            .with_conn(|c| crate::db::create_project(c, "app", "/tmp/sys-boundary", None))
+            .unwrap();
+        let ok = dispatch_extension_tool(
+            &db,
+            &runner,
+            &host,
+            &activity,
+            "list_workspaces",
+            &json!({ "project_id": user.id }),
+            None,
+        )
+        .expect("list_workspaces IS an MCP tool")
+        .expect("a user project is listable");
+        assert!(ok.result.get("workspaces").is_some());
+    }
+
+    /// A [`crate::system_scope::SystemTerminalShell`] that opens nothing — this module's tests
+    /// have no PTY, and the DB half is the whole subject here.
+    struct NoShell;
+    impl crate::system_scope::SystemTerminalShell for NoShell {
+        fn open_at_home(&self, _terminal_id: &str, _home: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// DONE-CRITERION (« Terminal Système atomique ») — the generic MCP terminal tools neither
+    /// LIST, READ, WRITE nor CLOSE a Système terminal.
+    ///
+    /// This is the half [`crate::system_scope::guard_payload`] structurally cannot cover: these
+    /// five tools carry a `terminal_id`, and the payload guard only knows the singleton's project
+    /// and workspace ids. So they read [`crate::system_scope::is_system_terminal`] instead
+    /// (`refuse_system_terminal`), and this walks all five through the REAL dispatcher.
+    ///
+    /// Both directions, because only the pair means anything: the Système terminal must be
+    /// refused, and an ORDINARY terminal must still work through the very same five tools.
+    ///
+    /// The refusal is `system_scope_forbidden` and NAMES the terminal — never `invalid_id`, which
+    /// would claim the record does not exist. Omitting it from `list_terminals` is ergonomics (do
+    /// not offer an id that cannot be used); the four verbs refuse the id regardless, which is why
+    /// they are asserted with the id in hand.
+    #[test]
+    fn the_generic_terminal_tools_neither_list_read_write_nor_close_a_system_terminal() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        db.with_conn(|c| {
+            crate::system_scope::ensure_system_scope(
+                c,
+                &crate::system_scope::FixedHomeDirProvider::at(if cfg!(windows) {
+                    "C:\\Users\\kris"
+                } else {
+                    "/home/kris"
+                }),
+            )
+        })
+        .expect("bootstrap the Système scope");
+
+        let sys = crate::system_scope::create_system_terminal(&db, Some("services".into()), &NoShell)
+            .expect("the human's Système terminal");
+        let sys_id = sys.terminal.id.clone();
+        // An ORDINARY terminal beside it, through the agent's own tool.
+        let user_id = create_terminal(&db, &host, &json!({ "label": "agent" }))
+            .unwrap()
+            .result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let call = |name: &str, args: Value| {
+            dispatch_extension_tool(&db, &runner, &host, &activity, name, &args, None)
+                .unwrap_or_else(|| panic!("`{name}` is an MCP tool"))
+        };
+
+        // 1. LIST — the Système terminal is not offered, the ordinary one is. `include_closed`
+        //    changes nothing: the filter is on MEMBERSHIP, not on status.
+        for args in [json!({}), json!({ "include_closed": true })] {
+            let listed = call(crate::mcp::LIST_TERMINALS_TOOL, args).unwrap();
+            let ids: Vec<&str> = listed.result["terminals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["terminal_id"].as_str().unwrap())
+                .collect();
+            assert!(
+                !ids.contains(&sys_id.as_str()),
+                "an agent must not be offered a Système terminal: {ids:?}"
+            );
+            assert!(ids.contains(&user_id.as_str()), "…while ordinary ones stay listed");
+        }
+
+        // 2. The four VERBS — refused BY NAME, with the stable code and the entity.
+        for (tool, args) in [
+            (crate::mcp::READ_TERMINAL_TOOL, json!({ "terminal_id": sys_id })),
+            (
+                crate::mcp::SEND_TO_TERMINAL_TOOL,
+                json!({ "terminal_id": sys_id, "command": "rm -rf /" }),
+            ),
+            (
+                crate::mcp::SEND_KEYS_TOOL,
+                json!({ "terminal_id": sys_id, "keys": ["ctrl+c"] }),
+            ),
+            (crate::mcp::CLOSE_TERMINAL_TOOL, json!({ "terminal_id": sys_id })),
+        ] {
+            let err = call(tool, args).expect_err("a Système terminal is not the agent's");
+            assert_eq!(
+                err.code,
+                RpcCode::SystemScopeForbidden,
+                "`{tool}` must refuse with the dedicated code, got {err:?}"
+            );
+            assert_eq!(
+                err.code.as_str(),
+                crate::system_scope::SYSTEM_SCOPE_FORBIDDEN,
+                "`{tool}` must NOT pretend the terminal does not exist"
+            );
+            let data = err.data.expect("the refusal is machine-readable");
+            assert_eq!(data["entity"], "terminal");
+            assert_eq!(data["id"], json!(sys_id));
+            assert_eq!(data["capability"], json!(tool));
+        }
+
+        // Not one of those refusals touched the record: still alive, still a member.
+        let row = db
+            .with_conn(|c| crate::db::get_terminal(c, &sys_id))
+            .unwrap()
+            .expect("the record stands");
+        assert_eq!(row.status, crate::db::STATUS_ALIVE);
+        assert_eq!(row.workspace_binding_mode, crate::db::BINDING_MANUAL);
+        assert!(db
+            .with_conn(|c| crate::system_scope::is_system_terminal(c, &sys_id))
+            .unwrap());
+
+        // 3. NON-VACUOUS — the same four tools work on the ORDINARY terminal. The refusal is about
+        //    the terminal's MEMBERSHIP, never about the tool.
+        call(
+            crate::mcp::READ_TERMINAL_TOOL,
+            json!({ "terminal_id": user_id }),
+        )
+        .expect("an ordinary terminal is readable");
+        // `send_to_terminal` / `send_keys` need a LIVE shell, which `NoTerminalHost` never gives —
+        // so they answer `invalid_state` here. That is the point: they got PAST the boundary and
+        // failed on liveness, which a `system_scope_forbidden` would have pre-empted.
+        for (tool, args) in [
+            (
+                crate::mcp::SEND_TO_TERMINAL_TOOL,
+                json!({ "terminal_id": user_id, "command": "ls" }),
+            ),
+            (
+                crate::mcp::SEND_KEYS_TOOL,
+                json!({ "terminal_id": user_id, "keys": ["enter"] }),
+            ),
+        ] {
+            let err = call(tool, args).expect_err("no live shell behind a NoTerminalHost");
+            assert_eq!(err.code, RpcCode::InvalidState, "`{tool}`: {err:?}");
+        }
+        call(
+            crate::mcp::CLOSE_TERMINAL_TOOL,
+            json!({ "terminal_id": user_id }),
+        )
+        .expect("an ordinary terminal is closable");
+    }
+
+    /// DONE-CRITERIA (« MCP : découverte dédiée et nature des commandes Système ») — the whole of
+    /// what an agent may learn about the scope, and the whole of what it may do with it.
+    ///
+    ///  1. `list_system_commands` answers the SCOPE (project, workspace, home), the COMMANDS with
+    ///     their `command_id` / launchable `instance_id` / `group_id` / `nature: "system"`, and the
+    ///     GROUPS.
+    ///  2. `list_commands` carries `nature` on BOTH its forms, for user commands as well — one
+    ///     reader tells a project command from a Système service.
+    ///  3. `list_projects` / `list_workspaces` stay USER-ONLY: the singleton is not in the first,
+    ///     and the second refuses it outright.
+    ///  4. An agent can go from the discovery response STRAIGHT to reading output and starting a
+    ///     stopped command — and still cannot see, let alone drive, a Système TERMINAL.
+    #[test]
+    fn list_system_commands_discovers_the_scope_and_opens_nothing_else() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let runner = noop_runner();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let scope = db
+            .with_conn(|c| {
+                crate::system_scope::ensure_system_scope(
+                    c,
+                    &crate::system_scope::FixedHomeDirProvider::at(if cfg!(windows) {
+                        "C:\\Users\\kris"
+                    } else {
+                        "/home/kris"
+                    }),
+                )
+            })
+            .expect("bootstrap the Système scope");
+
+        // Two Système services, grouped — plus a Système TERMINAL, which must stay invisible.
+        let (grouped, group_id, user_project) = db.with_conn(|c| {
+            let ids: Vec<String> = ["services", "docker"]
+                .iter()
+                .map(|name| {
+                    crate::db::create_template(
+                        c,
+                        &scope.project.id,
+                        name,
+                        "echo hi",
+                        None,
+                        crate::db::CommandSource::default(),
+                    )
+                    .expect("Système command")
+                    .id
+                })
+                .collect();
+            let group = crate::db::create_command_group(c, &scope.project.id, &ids).expect("group");
+            let (user, _root) =
+                crate::db::create_project(c, "app", "/tmp/sys-mcp-user", None).expect("project");
+            crate::db::create_template(
+                c,
+                &user.id,
+                "dev",
+                "npm run dev",
+                None,
+                crate::db::CommandSource::default(),
+            )
+            .expect("user command");
+            (ids, group.id, user.id)
+        });
+        let sys_terminal =
+            crate::system_scope::create_system_terminal(&db, Some("shell".into()), &NoShell)
+                .expect("a Système terminal")
+                .terminal
+                .id;
+
+        let call = |name: &str, args: Value| {
+            dispatch_extension_tool(&db, &runner, &host, &activity, name, &args, None)
+                .unwrap_or_else(|| panic!("`{name}` is an MCP tool"))
+        };
+
+        // 1. THE DISCOVERY.
+        let out = call(crate::mcp::LIST_SYSTEM_COMMANDS_TOOL, json!({}))
+            .expect("list_system_commands is a capability of the Système scope")
+            .result;
+        assert_eq!(out["scope"]["project_id"], json!(scope.project.id));
+        assert_eq!(out["scope"]["workspace_id"], json!(scope.workspace.id));
+        assert_eq!(
+            out["scope"]["home"],
+            json!(scope.home()),
+            "the home an agent is told about IS the one the runner will spawn in"
+        );
+        let commands = out["commands"].as_array().expect("commands");
+        assert_eq!(commands.len(), 2, "the singleton's ONE workspace ⇒ one instance each");
+        for entry in commands {
+            assert_eq!(entry["nature"], json!("system"));
+            assert_eq!(entry["workspace_id"], json!(scope.workspace.id));
+            assert_eq!(entry["group_id"], json!(group_id), "the grouping is readable here");
+            assert!(entry["instance_id"].as_str().is_some(), "the LAUNCHABLE id");
+            assert!(grouped.contains(&entry["command_id"].as_str().unwrap().to_string()));
+            assert_eq!(entry["cwd"], json!(scope.home()));
+        }
+        let groups = out["groups"].as_array().expect("groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["id"], json!(group_id));
+        assert_eq!(groups[0]["command_ids"], json!(grouped));
+
+        // 2. `list_commands` CARRIES THE NATURE, on both forms and for both natures.
+        for (args, expected) in [
+            (json!({ "workspace_id": scope.workspace.id }), "system"),
+            (json!({ "project_id": scope.project.id }), "system"),
+            (json!({ "project_id": user_project }), "user"),
+        ] {
+            let listed = call("list_commands", args.clone()).unwrap().result;
+            let rows = listed["commands"].as_array().unwrap();
+            assert!(!rows.is_empty(), "non-vacuous for {args}");
+            for row in rows {
+                assert_eq!(row["nature"], json!(expected), "{args} → {row}");
+            }
+        }
+
+        // 3. THE USER INVENTORIES stay user-only.
+        let projects = call("list_projects", json!({})).unwrap().result;
+        assert!(
+            !projects["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == json!(scope.project.id)),
+            "list_projects never shows the technical container: {projects}"
+        );
+        let refused = call("list_workspaces", json!({ "project_id": scope.project.id }))
+            .expect_err("the singleton is not a USER container to enumerate");
+        assert_eq!(refused.code, RpcCode::SystemScopeForbidden);
+
+        // 4. FROM THE RESPONSE STRAIGHT TO ACTING — reading output and starting a stopped command,
+        //    with nothing else discovered.
+        //
+        //    (Those two are served by `mcp_runtime`'s dispatcher, not by this module's — they are
+        //    the ORDINARY runtime tools, which is the point: discovery hands back an id the
+        //    existing surface already knows what to do with. They are on the Système allow-list,
+        //    so the boundary lets them through with the singleton's ids in the payload.)
+        let instance = commands[0]["instance_id"].as_str().unwrap().to_string();
+        let runtime_call = |name: &str, args: Value| {
+            crate::mcp_runtime::dispatch_command_tool(&db, &runner, name, &args, None)
+                .unwrap_or_else(|| panic!("`{name}` is a runtime MCP tool"))
+        };
+        runtime_call("get_command_output", json!({ "instance_id": instance }))
+            .expect("reading a Système command's output is free");
+        runtime_call("start_command", json!({ "instance_id": instance }))
+            .expect("starting a stopped Système command is free");
+        let _ = runner.stop(&instance);
+
+        // …and the Système TERMINAL was never part of the deal.
+        let terminals = call(crate::mcp::LIST_TERMINALS_TOOL, json!({}))
+            .unwrap()
+            .result;
+        assert!(
+            terminals["terminals"].as_array().unwrap().is_empty(),
+            "the discovery of the COMMANDS opens no terminal: {terminals}"
+        );
+        let err = call(
+            crate::mcp::READ_TERMINAL_TOOL,
+            json!({ "terminal_id": sys_terminal }),
+        )
+        .expect_err("even holding its id, an agent may not read a Système terminal");
+        assert_eq!(err.code, RpcCode::SystemScopeForbidden);
+    }
+
     #[test]
     fn create_then_list_then_close_terminal_roundtrips() {
         let _g = db_guard();
@@ -5916,12 +6846,55 @@ mod tests {
         (project.id, workspace.id, tid, group_id)
     }
 
+    /// The BOOTSTRAPPED Système scope carrying `command_count` commands — the other half of every
+    /// ambient-context test since the shared commands ride in the same block
+    /// (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`). Returns the scope, so a test can assert on the ids it
+    /// must NOT find in the context as easily as on the instances it must.
+    ///
+    /// `Db::in_memory` does NOT bootstrap the singleton (only `Db::open` does), which is why every
+    /// ambient test written before this one still measures a machine with no shared command at all —
+    /// and why that case had to be re-proven rather than assumed.
+    fn system_scope_with_commands(
+        db: &Db,
+        command_count: usize,
+    ) -> crate::system_scope::SystemScope {
+        let scope = db
+            .with_conn(|c| {
+                crate::system_scope::ensure_system_scope(
+                    c,
+                    &crate::system_scope::FixedHomeDirProvider::at(if cfg!(windows) {
+                        "C:\\Users\\kris"
+                    } else {
+                        "/home/kris"
+                    }),
+                )
+            })
+            .expect("bootstrap the Système scope");
+        for i in 0..command_count {
+            db.with_conn(|c| {
+                db::create_template(
+                    c,
+                    &scope.project.id,
+                    &format!("svc-{i}"),
+                    &format!("docker compose up svc-{i}"),
+                    None,
+                    db::CommandSource::default(),
+                )
+            })
+            .expect("a Système command");
+        }
+        scope
+    }
+
     /// THE HOOK BUDGET, MEASURED ON THE WORST REALISTIC WORKLOAD — not assumed, and no longer on a
     /// best case. The bundled `nyx-session-hook.cjs` bounds its `SessionStart` POST at
     /// `TIMEOUT_MS = 1000` ms, and a timeout drops the WHOLE injected context, orientation line
-    /// included. The block adds one SQLite read plus N `runner.outcome` lookups (each briefly taking
-    /// the runner's `entries` mutex) to that request, so this times the FULL handler on a
-    /// 12-command workspace — the block's own upper bound.
+    /// included. The block adds TWO SQLite reads plus N `runner.outcome` lookups (each briefly
+    /// taking the runner's `entries` mutex) to that request, so this times the FULL handler on the
+    /// block's own upper bound: a 12-command workspace AND a Système scope at its own cap of eight
+    /// shared commands — the twenty lines the renderer can put in front of a session, both halves
+    /// carrying a full scrollback (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`; the shared half doubles the
+    /// number of reads on this path, so it is the half that had to be re-measured, not assumed).
     ///
     /// AND IT IS MEASURED ON THE SCROLLBACK-FULL WORKLOAD (review finding
     /// `01M152NMXPWKD59QFK95CMSZWQ`). A freshly created instance has an EMPTY `scrollback`, so a
@@ -5954,6 +6927,9 @@ mod tests {
         let activity = AgentActivityStore::new();
         let runner = noop_runner();
         let (_p, ws, tid, _g_id) = workspace_with_commands(&db, 12, &[0, 1]);
+        // …AND the shared half at its own cap: eight machine-wide services, read by a SECOND lean
+        // query on the same request.
+        let scope = system_scope_with_commands(&db, 8);
         let event = json!({
             "hook_event_name": "SessionStart",
             "session_id": "sid-budget",
@@ -5962,7 +6938,8 @@ mod tests {
         });
         // The worst of 20 full `agent_session_event` calls, after one warm-up (the first call pays
         // the connection/statement setup, which the hook's real sidecar has long paid by the time
-        // a session starts). Asserts on the way that what is timed really is the 12-command block.
+        // a session starts). Asserts on the way that what is timed really is the FULL block — the
+        // twelve workspace commands AND the eight shared ones.
         fn worst_of_twenty<S: RunnerSink>(
             db: &Db,
             runner: &CommandRunner<S>,
@@ -5978,46 +6955,56 @@ mod tests {
                 let ctx = out.result["context"].as_str().unwrap();
                 assert_eq!(
                     ctx.lines().filter(|l| l.starts_with("- ")).count(),
-                    12,
-                    "what is being timed really is the full 12-command block: {ctx}"
+                    20,
+                    "what is being timed really is the full block, both halves: {ctx}"
+                );
+                assert_eq!(
+                    ctx.lines().filter(|l| l.contains("nature=system")).count(),
+                    8,
+                    "…the shared half included: {ctx}"
                 );
             }
             worst
         }
 
-        // (1) The best case the previous constat measured: twelve commands that never ran.
+        // (1) The best case the previous constat measured: commands that never ran.
         let empty = worst_of_twenty(&db, &runner, &activity, &event);
 
-        // (2) The realistic one: 256 KiB of persisted output on EVERY one of the twelve instances —
-        // 3 MiB sitting in the rows this SessionStart joins over.
+        // (2) The realistic one: 256 KiB of persisted output on EVERY instance of BOTH workspaces —
+        // 5 MiB sitting in the rows this SessionStart joins over.
         let full_scrollback = "z".repeat(db::MAX_SCROLLBACK_BYTES);
-        let seeded = db
-            .with_conn(|c| {
-                let rows = db::list_instances_for_workspace(c, &ws)?;
+        let seed = |workspace_id: &str| -> Vec<db::InstanceWithTemplate> {
+            db.with_conn(|c| {
+                let rows = db::list_instances_for_workspace(c, workspace_id)?;
                 for inst in &rows {
                     db::persist_instance_scrollback(c, &inst.id, &full_scrollback)?;
                 }
-                db::list_instances_for_workspace(c, &ws)
+                db::list_instances_for_workspace(c, workspace_id)
             })
-            .expect("seeded scrollbacks");
-        assert_eq!(seeded.len(), 12, "twelve instances were seeded");
+            .expect("seeded scrollbacks")
+        };
+        let seeded = seed(&ws);
+        let seeded_system = seed(&scope.workspace.id);
+        assert_eq!(seeded.len(), 12, "twelve workspace instances were seeded");
+        assert_eq!(seeded_system.len(), 8, "eight shared instances were seeded");
         assert!(
             seeded
                 .iter()
+                .chain(seeded_system.iter())
                 .all(|r| r.scrollback.len() == db::MAX_SCROLLBACK_BYTES),
-            "the workload really carries a full scrollback per instance"
+            "the workload really carries a full scrollback per instance, on both sides"
         );
         let full = worst_of_twenty(&db, &runner, &activity, &event);
 
         let budget = std::time::Duration::from_millis(1000);
         eprintln!(
-            "SessionStart on a 12-command workspace: worst of 20 = {:?} with EMPTY scrollbacks, \
-             {:?} with a FULL {} KiB scrollback on each ({} MiB persisted) — hook budget {:?}, \
-             margin {:?}",
+            "SessionStart on a 12-command workspace + 8 shared System commands: worst of 20 = \
+             {:?} with EMPTY scrollbacks, {:?} with a FULL {} KiB scrollback on each ({} MiB \
+             persisted) — hook budget {:?}, margin {:?}",
             empty,
             full,
             db::MAX_SCROLLBACK_BYTES / 1024,
-            (12 * db::MAX_SCROLLBACK_BYTES) / (1024 * 1024),
+            (20 * db::MAX_SCROLLBACK_BYTES) / (1024 * 1024),
             budget,
             budget.saturating_sub(full),
         );
@@ -6054,25 +7041,34 @@ mod tests {
         let activity = AgentActivityStore::new();
         let runner = noop_runner();
         let (_p, ws, tid, _g_id) = workspace_with_commands(&db, 12, &[0, 1]);
+        // The SHARED half is under the same property, and it is a SECOND read of the same shape —
+        // so it is seeded and recorded here too rather than trusted to be lean by family
+        // resemblance (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`).
+        let scope = system_scope_with_commands(&db, 8);
 
-        // The realistic workload: 256 KiB of persisted output on every one of the twelve
-        // instances, so a reader that DID select the column would have 3 MiB to show for it.
+        // The realistic workload: 256 KiB of persisted output on every one of the twenty
+        // instances, so a reader that DID select the column would have 5 MiB to show for it.
         let full_scrollback = "z".repeat(db::MAX_SCROLLBACK_BYTES);
-        let seeded = db
-            .with_conn(|c| {
-                let rows = db::list_instances_for_workspace(c, &ws)?;
+        let seed = |workspace_id: &str| -> Vec<db::InstanceWithTemplate> {
+            db.with_conn(|c| {
+                let rows = db::list_instances_for_workspace(c, workspace_id)?;
                 for inst in &rows {
                     db::persist_instance_scrollback(c, &inst.id, &full_scrollback)?;
                 }
-                db::list_instances_for_workspace(c, &ws)
+                db::list_instances_for_workspace(c, workspace_id)
             })
-            .expect("seeded scrollbacks");
+            .expect("seeded scrollbacks")
+        };
+        let seeded = seed(&ws);
+        let seeded_system = seed(&scope.workspace.id);
         assert!(
             seeded.len() == 12
+                && seeded_system.len() == 8
                 && seeded
                     .iter()
+                    .chain(seeded_system.iter())
                     .all(|r| r.scrollback.len() == db::MAX_SCROLLBACK_BYTES),
-            "the column the handler must not read really is populated on all twelve instances"
+            "the column the handler must not read really is populated on all twenty instances"
         );
 
         // Record every statement the pooled connection runs from here on.
@@ -6104,8 +7100,13 @@ mod tests {
         let ctx = out.result["context"].as_str().unwrap();
         assert_eq!(
             ctx.lines().filter(|l| l.starts_with("- ")).count(),
-            12,
-            "the recorded window really covers the full twelve-command block: {ctx}"
+            20,
+            "the recorded window really covers the full block, shared half included: {ctx}"
+        );
+        assert_eq!(
+            ctx.lines().filter(|l| l.contains("nature=system")).count(),
+            8,
+            "…and the shared read really did happen inside it: {ctx}"
         );
 
         // A captured statement displays as `<SQL> -- binds: [...]`. Only the SQL half is evidence:
@@ -6222,6 +7223,10 @@ mod tests {
     /// NOTHING WITHOUT COMMANDS. A workspace-bound session on a workspace that defines NO managed
     /// command gets the orientation line and STRICTLY nothing else — no empty header, no directive
     /// about a list that does not exist.
+    ///
+    /// "No command" means on EITHER side: this `Db` has no bootstrapped Système scope, so there is
+    /// no shared half either (see `a_session_start_carries_the_shared_system_commands_next_to_the_workspaces_own`
+    /// for the machine that has one).
     #[test]
     fn a_workspace_without_commands_gets_neither_block_nor_directive() {
         let _g = db_guard();
@@ -6257,6 +7262,10 @@ mod tests {
     /// A LOOSE terminal (no workspace) gets no block either — and the HARD constraint holds: its
     /// context still contains no `workspace_id=` at all. Twin of
     /// `agent_session_event_start_returns_minimal_nyx_context`, asserted here against the block.
+    ///
+    /// On a machine that HAS shared services the loose terminal does get those (they are its to act
+    /// on) — `a_loose_terminal_gets_the_shared_half_and_still_names_no_workspace`. Here the Système
+    /// scope is not bootstrapped, so what is pinned is the workspace half and it alone.
     #[test]
     fn a_loose_terminal_gets_no_block_and_still_names_no_workspace() {
         let _g = db_guard();
@@ -6365,6 +7374,309 @@ mod tests {
             assert!(feature_ctx.contains(id), "…and vice versa");
             assert!(!root_ctx.contains(id), "…: {root_ctx}");
         }
+    }
+
+    // --- THE SHARED HALF (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`) ----------------------
+    //
+    // The user watched a real agent start in one of his projects and see `fake-ticker`,
+    // `fake-worker`, `fake-idle` — and NOT `Commande factice`, the Système command it was perfectly
+    // authorized to read and to start. Nothing was refusing it: the block simply asked ONE
+    // workspace. These tests are that gap, closed and pinned.
+
+    /// WHAT AN AGENT NOW RECEIVES. A session started in a PROJECT gets its own commands AND the
+    /// machine-wide ones, in the same block, told apart line by line, with the directive that says
+    /// what sharing costs.
+    #[test]
+    fn a_session_start_carries_the_shared_system_commands_next_to_the_workspaces_own() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        let (_p, ws, tid, _g_id) = workspace_with_commands(&db, 2, &[]);
+        let scope = system_scope_with_commands(&db, 2);
+
+        let out = agent_session_event(
+            &db,
+            &runner,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-shared",
+                "cwd": "/tmp/ambient",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        let ctx = out.result["context"].as_str().unwrap();
+
+        // The workspace's own half, unchanged.
+        for inst in db
+            .with_conn(|c| db::list_instances_for_workspace(c, &ws))
+            .unwrap()
+        {
+            assert!(
+                ctx.contains(&format!("· instance_id={}", inst.id)),
+                "the workspace command {} is still there: {ctx}",
+                inst.name
+            );
+        }
+        // …and the shared one, marked, with the launchable id of each service.
+        let shared = db
+            .with_conn(|c| db::list_instances_for_workspace(c, &scope.workspace.id))
+            .unwrap();
+        assert_eq!(shared.len(), 2, "two Système services were seeded");
+        for inst in &shared {
+            assert!(
+                ctx.contains(&format!(
+                    "· instance_id={} · nature=system",
+                    inst.id
+                )),
+                "the shared command {} rides in the block, marked as shared: {ctx}",
+                inst.name
+            );
+        }
+        assert!(
+            ctx.contains("Shared System commands"),
+            "the shared half announces itself: {ctx}"
+        );
+        // THE THREE FACTS THE DIRECTIVE OWES THE AGENT.
+        assert!(
+            ctx.contains("machine-wide")
+                && ctx.contains("every project")
+                && ctx.contains("every agent")
+                && ctx.contains("ALL of them at once"),
+            "1. these services are shared machine-wide, and stopping one stops it for all: {ctx}"
+        );
+        assert!(
+            ctx.contains("Starting a stopped System command is free"),
+            "2. starting is free, like a project command: {ctx}"
+        );
+        assert!(
+            ctx.contains("needs the USER's approval") && ctx.contains("BLOCKS"),
+            "3. every other verb waits for a human, and the call blocks meanwhile: {ctx}"
+        );
+
+        // THE DEVIATION STAYS BOUNDED: the block hands over what the lifecycle verbs take
+        // (`instance_id`) and NOT the scope's own ids — `list_system_commands` is still where a
+        // creation or a whole-group start gets its `project_id` / `workspace_id`.
+        assert!(
+            !ctx.contains(&scope.workspace.id) && !ctx.contains(&scope.project.id),
+            "the Système scope's own ids are NOT injected: {ctx}"
+        );
+    }
+
+    /// THE INVARIANT THAT MUST NOT BE UNDONE BY THIS. The Système workspace is excluded from
+    /// `db::resolvable_workspaces` since phase 1 so the cwd auto-attach can never capture it — and
+    /// the shared half does NOT go through a resolver: it reads the scope's own door
+    /// (`system_scope::load`). Both facts are asserted in one place, because the cheap way to
+    /// implement this finding would have been to widen the resolver, and that is exactly what the
+    /// PRD forbids.
+    #[test]
+    fn the_shared_half_reads_the_scope_and_leaves_the_resolver_exclusion_alone() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        let (_p, _ws, tid, _g_id) = workspace_with_commands(&db, 1, &[]);
+        let scope = system_scope_with_commands(&db, 1);
+
+        let resolvable = db.with_conn(db::resolvable_workspaces).unwrap();
+        assert!(
+            !resolvable.iter().any(|w| w.id == scope.workspace.id),
+            "the Système workspace is still out of the resolver's candidate set"
+        );
+
+        let ctx = agent_session_event(
+            &db,
+            &runner,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-resolver",
+                "cwd": "/tmp/ambient",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap()
+        .result["context"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ctx.contains("nature=system"),
+            "…and its commands reach the block all the same, through the scope's own read: {ctx}"
+        );
+    }
+
+    /// BEST-EFFORT, PROVEN ON A READ THAT ACTUALLY FAILS. The `SessionStart` hook drops the WHOLE
+    /// injected context — orientation line included — on an error, so the shared read may cost its
+    /// own lines and NOTHING else. The DB is broken underneath it (the join's table is dropped) and
+    /// the workspace half, already read, still renders whole.
+    ///
+    /// The order is the handler's own: workspace first, shared second. That is not a coincidence to
+    /// be preserved by luck — it is why the shared half cannot subtract the workspace's.
+    #[test]
+    fn a_failing_shared_read_costs_its_own_lines_and_nothing_else() {
+        use diesel::prelude::*;
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (_p, ws, _tid, _g_id) = workspace_with_commands(&db, 3, &[]);
+        let _scope = system_scope_with_commands(&db, 2);
+
+        // HEALTHY first, so what follows is a regression of a real answer and not an empty that was
+        // always empty.
+        assert_eq!(
+            system_command_lines(&db, Some(&ws)).len(),
+            2,
+            "the shared read answers on a healthy DB"
+        );
+        // The handler reads the workspace half FIRST.
+        let workspace_lines = db
+            .with_conn(|c| db::list_command_lines_for_workspace(c, &ws))
+            .unwrap_or_default();
+        assert_eq!(workspace_lines.len(), 3, "three workspace commands in hand");
+
+        // …and the DB breaks under the shared read.
+        db.with_conn(|c| {
+            diesel::sql_query("PRAGMA foreign_keys = OFF")
+                .execute(c)
+                .expect("pragma off");
+            diesel::sql_query("DROP TABLE command_instances")
+                .execute(c)
+                .expect("the join's table is gone");
+        });
+
+        let system_lines = system_command_lines(&db, Some(&ws));
+        assert!(
+            system_lines.is_empty(),
+            "a failing shared read yields no line — and no panic, and no error to propagate"
+        );
+        let block =
+            crate::mcp_context::session_commands_block(&workspace_lines, &system_lines, |_| None);
+        assert!(
+            block.contains("Managed commands of this workspace:")
+                && block.lines().filter(|l| l.starts_with("- ")).count() == 3,
+            "the workspace block is rendered WHOLE: {block}"
+        );
+        assert!(
+            !block.contains("nature=system") && !block.contains("Shared System commands"),
+            "…and not a word claims a shared command that could not be read: {block}"
+        );
+    }
+
+    /// A LOOSE terminal (no workspace) on a machine that HAS shared services gets them — they are
+    /// available to it exactly as they are to a project session, and the matrix says the same thing
+    /// either way. The hard constraint still holds: no `workspace_id=` anywhere in its context, and
+    /// no header claiming the commands of a workspace it does not have.
+    #[test]
+    fn a_loose_terminal_gets_the_shared_half_and_still_names_no_workspace() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        // A workspace WITH commands exists in the DB — the loose terminal must still see none of it.
+        workspace_with_commands(&db, 3, &[]);
+        let _scope = system_scope_with_commands(&db, 2);
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let ctx = agent_session_event(
+            &db,
+            &runner,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-loose-shared",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap()
+        .result["context"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            !ctx.contains("workspace_id="),
+            "a loose terminal names no workspace, block or no block: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Managed commands of this workspace:"),
+            "…and no header claims the commands of a workspace it has not got: {ctx}"
+        );
+        assert_eq!(
+            ctx.lines().filter(|l| l.contains("nature=system")).count(),
+            2,
+            "…while the shared services, which it CAN act on, are there: {ctx}"
+        );
+        assert_eq!(
+            ctx.lines().filter(|l| l.starts_with("- ")).count(),
+            2,
+            "…and nothing of the other workspace leaked in: {ctx}"
+        );
+    }
+
+    /// A session whose OWN workspace is the Système one lists its commands ONCE, under one header —
+    /// not twice under two. A floor rather than a live case (the agent-facing terminal tools refuse
+    /// a Système terminal outright), but a block that described the same list twice would be a
+    /// block an agent has to reconcile.
+    #[test]
+    fn a_session_on_the_system_workspace_lists_its_commands_once() {
+        use crate::schema::terminals;
+        use diesel::prelude::*;
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let activity = AgentActivityStore::new();
+        let runner = noop_runner();
+        let scope = system_scope_with_commands(&db, 2);
+        let created = create_terminal(&db, &NoTerminalHost, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        db.with_conn(|c| {
+            diesel::update(terminals::table.find(&tid))
+                .set(terminals::workspace_id.eq(Some(scope.workspace.id.clone())))
+                .execute(c)
+        })
+        .unwrap();
+
+        let ctx = agent_session_event(
+            &db,
+            &runner,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-on-system",
+                "cwd": "/tmp/ambient",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap()
+        .result["context"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            ctx.lines().filter(|l| l.starts_with("- ")).count(),
+            2,
+            "two commands, two lines — not four: {ctx}"
+        );
+        for inst in db
+            .with_conn(|c| db::list_instances_for_workspace(c, &scope.workspace.id))
+            .unwrap()
+        {
+            assert_eq!(
+                ctx.matches(&inst.id).count(),
+                1,
+                "{} is named exactly once: {ctx}",
+                inst.name
+            );
+        }
+        assert!(
+            !ctx.contains("Shared System commands"),
+            "no second header for a list that is already this session's own: {ctx}"
+        );
     }
 
     /// `list_commands(workspace_id=…)` renders each instance's `group_id` (`null` = solo) — the tool

@@ -471,6 +471,23 @@ pub struct Project {
     /// path under it); the WHAT — clone, worktree, root files, setup commands — stays out of scope
     /// and belongs to idea 01M04W3RZ333NC01R216MNXAFK. Full note on `build_nspec` in `crate::seed`.
     pub worktrees_root: Option<String>,
+    /// The NATURE of the container — [`PROJECT_KIND_USER`] (the default, every project a human
+    /// creates) or [`PROJECT_KIND_SYSTEM`] (the singleton technical container of the **Système**
+    /// scope: cross-project terminals and commands that belong to no code project).
+    ///
+    /// This is the SINGLE source of truth for that nature. `workspaces` carries no `kind`: a
+    /// workspace's nature is DERIVED through its project ([`is_system_workspace`]), so a
+    /// system workspace under a user project is not representable rather than merely improbable.
+    ///
+    /// The value is CHECKed in SQL and a UNIQUE PARTIAL index (`idx_projects_single_system`) admits
+    /// at most ONE `system` row in the whole database — the singleton is enforced by SQLite, which
+    /// is what makes a concurrent [`ensure_system_scope`] safe.
+    ///
+    /// Membership in the Système scope is always POSITIVE — a terminal/command hangs on this
+    /// project's real workspace. It is NEVER derived from the absence of a project: the
+    /// `workspace_id IS NULL` orphan bucket that [`delete_project`] deliberately creates stays a
+    /// separate, disjoint thing.
+    pub kind: String,
     /// The project's ACCENT colour — an opaque string the core stores and never interprets (the
     /// renderer resolves it against the design system). `None` (the default) means the project has
     /// no chosen identity colour and falls back to the neutral tile. CHOSEN, never derived: a
@@ -500,6 +517,20 @@ pub enum ProjectMark {
     Image(String),
 }
 
+/// [`Project::kind`] of an ordinary, human-created project — the DEFAULT, and the value of every
+/// row that predates the `projects.kind` migration.
+pub const PROJECT_KIND_USER: &str = "user";
+
+/// [`Project::kind`] of the SINGLETON technical container of the Système scope. At most one row in
+/// the database carries it (`idx_projects_single_system`).
+pub const PROJECT_KIND_SYSTEM: &str = "system";
+
+/// The closed `projects.kind` vocabulary, mirroring the SQL `CHECK` of the
+/// `projects_kind_system_scope` migration. Pinned against the live CHECK by
+/// `system_scope::tests::project_kind_is_a_closed_vocabulary_defaulting_to_user`, which inserts
+/// each advertised value and asserts a third one is refused by the database itself.
+pub(crate) const PROJECT_KINDS: &[&str] = &[PROJECT_KIND_USER, PROJECT_KIND_SYSTEM];
+
 #[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = projects)]
 struct NewProject {
@@ -513,6 +544,11 @@ struct NewProject {
     /// deterministic, unique-by-construction stub so the UNIQUE constraint holds even
     /// before the curated value is set by the use-case layer (later phases).
     key: String,
+    /// The container's NATURE ([`PROJECT_KIND_USER`] / [`PROJECT_KIND_SYSTEM`]). Written
+    /// EXPLICITLY at every insert rather than left to the SQL DEFAULT, so the only place that can
+    /// mint a `system` row is [`ensure_system_scope`] — a caller reading `create_project` sees the
+    /// nature it produces instead of having to know the column's default.
+    kind: String,
 }
 
 /// A `workspaces` row. `path` is the canonical (normalized) absolute folder.
@@ -5018,6 +5054,18 @@ impl Db {
         // finds them present and leaves them untouched.
         crate::seed::seed_builtin_workflows(&mut conn)
             .map_err(|e| anyhow::anyhow!("failed to seed built-in workflows: {e}"))?;
+        // Bring up the Système singleton (the project-less scope of cross-project terminals and
+        // commands) right after the schema is ready and before anything is served, so no read ever
+        // observes a half-existing scope. IDEMPOTENT: a re-boot on a healthy scope writes nothing.
+        //
+        // A failure REFUSES THE START, like a failed migration — an unresolvable home or an
+        // incoherent scope means the Système commands would run somewhere nyx cannot name, and
+        // running them anyway is worse than not starting.
+        crate::system_scope::ensure_system_scope(
+            &mut conn,
+            &crate::system_scope::EnvHomeDirProvider,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to bootstrap the Système scope: {e}"))?;
         drop(conn);
         Ok(Db { pool })
     }
@@ -5054,6 +5102,39 @@ impl Db {
     /// race the schema-migration write lock ("database schema is locked: main"). The
     /// per-instance name isolates each test's DB while keeping the shared-cache +
     /// one-connection-pool trick that keeps the memory DB alive.
+    ///
+    /// ## MIGRATED, NOT BOOTSTRAPPED — and deliberately so
+    ///
+    /// [`Db::open`] does one more thing than this helper: it runs
+    /// [`crate::system_scope::ensure_system_scope`], so PRODUCTION always boots with the Système
+    /// singleton present. This helper stops at [`run_migrations`]. A database from here therefore
+    /// has NO singleton: `system_scope::guard_payload` matches nothing, `resolvable_workspaces`
+    /// returns what an unfiltered read would, and `list_projects`' `kind = 'user'` filter never
+    /// meets a `system` row. Know that before writing a new test against this shape.
+    ///
+    /// WHY NOT BOOTSTRAP HERE. `ensure_system_scope` needs a [`crate::system_scope::HomeDirProvider`].
+    /// Passing the production one would make EVERY unit test of the crate depend on the runner's
+    /// `$HOME`/`$USERPROFILE` — the exact environment coupling that provider seam exists to remove,
+    /// and a panic on any machine that resolves no home. Passing a fixed synthetic home would couple
+    /// this helper to `system_scope`'s own test constants. Either way the bootstrap's OWN tests need
+    /// the un-bootstrapped shape to exist (`system_scope::tests::an_unbootstrapped_database_has_no_scope`,
+    /// `a_missing_home_refuses_the_bootstrap_and_leaves_no_partial_state`,
+    /// `project_kind_is_a_closed_vocabulary_defaulting_to_user`, which inserts a `system` row itself
+    /// and would collide with `idx_projects_single_system`) — so a second, non-bootstrapping helper
+    /// would have to exist anyway, and the divergence would simply move.
+    ///
+    /// WHERE THE BOOTSTRAPPED SHAPE IS COVERED. Every test wanting it calls `ensure_system_scope`
+    /// explicitly on top of this helper — `system_scope::tests` does that throughout
+    /// (`every_advertised_mcp_tool_is_classified`,
+    /// `the_boundary_keys_on_the_id_being_aimed_not_on_it_being_secret`,
+    /// `deleting_a_user_project_leaves_orphans_that_the_system_scope_never_adopts`…) — and the REAL
+    /// boot path is exercised end to end by the sidecar harness, which opens a temp file through
+    /// [`Db::open`]: `nyx_sidecar::runtime::db_command::tests::the_ui_bridge_refuses_the_system_scope_for_every_capability_it_does_not_have`,
+    /// `::the_system_scope_accepts_a_manual_binding_of_a_terminal_and_no_other` and
+    /// `::every_ipc_capability_of_the_system_scope_is_served_by_the_dispatcher`. The schema side is
+    /// pinned by `tests::migration_projects_kind_adds_the_nature_and_the_system_singleton`, and the
+    /// concurrent boot by `system_scope::tests::concurrent_bootstraps_converge_on_one_singleton`
+    /// (file-backed, since `:memory:` cannot race with itself).
     #[cfg(test)]
     pub fn in_memory() -> Self {
         let url = format!("file:nyx-mem-{}?mode=memory&cache=shared", Uuid::now_v7());
@@ -5295,6 +5376,7 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "idx_one_active_session_per_terminal_agent",
     "idx_one_root_per_project",
     "idx_projects_key",
+    "idx_projects_single_system",
     "idx_prototype_feedback_prototype",
     "idx_prototype_feedback_prototype_status",
     "idx_prototype_page_versions_page",
@@ -5322,6 +5404,8 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "idx_specs_project_slug",
     "idx_specs_project_status",
     "idx_specs_workspace",
+    "idx_system_approvals_pending_fingerprint",
+    "idx_system_approvals_state_expiry",
     "idx_task_dependencies_depends_on",
     "idx_tasks_from_comment",
     "idx_tasks_parent",
@@ -5379,6 +5463,7 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "projects.id",
     "projects.image_path",
     "projects.key",
+    "projects.kind",
     "projects.name",
     "projects.order",
     "projects.primary_workspace_id",
@@ -5540,6 +5625,25 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "specs.title",
     "specs.updated_at",
     "specs.workspace_id",
+    "system_command_approvals",
+    "system_command_approvals.canonical_payload",
+    "system_command_approvals.claimed_at",
+    "system_command_approvals.completed_at",
+    "system_command_approvals.decided_at",
+    "system_command_approvals.decided_by",
+    "system_command_approvals.expires_at",
+    "system_command_approvals.fingerprint",
+    "system_command_approvals.id",
+    "system_command_approvals.member_snapshot",
+    "system_command_approvals.operation_kind",
+    "system_command_approvals.outcome",
+    "system_command_approvals.project_id",
+    "system_command_approvals.requested_at",
+    "system_command_approvals.requested_by",
+    "system_command_approvals.result_json",
+    "system_command_approvals.state",
+    "system_command_approvals.target_revision",
+    "system_command_approvals.tool_name",
     "task_dependencies",
     "task_dependencies.created_at",
     "task_dependencies.depends_on_task_id",
@@ -6459,6 +6563,10 @@ pub fn create_project(
                 updated_at: now,
                 order_index: next_order,
                 key,
+                // A project created through this path is ALWAYS a user project. The Système
+                // singleton has exactly one minting site (`ensure_system_scope`), and it is not
+                // this one.
+                kind: PROJECT_KIND_USER.to_string(),
             })
             .execute(conn)?;
 
@@ -6496,11 +6604,228 @@ pub fn create_project(
     })
 }
 
-/// List all projects in SIDEBAR ORDER (`order` asc, then `created_at`/`id` asc as a
-/// stable tiebreak). The order column is user-controlled via [`reorder_projects`]; the
-/// v9 backfill seeds it from the prior created-at order so this is unchanged on upgrade.
+// --- Système scope persistence primitives (PRD « Scope Système ») ------------
+//
+// The three writes + two reads [`crate::system_scope`] composes. They live HERE because they
+// need `NewProject` / `NewWorkspace` / [`unique_project_key`], which are private to this module —
+// but the POLICY (when to create, when to repair, when to refuse) is not here: it is in
+// `system_scope`, which owns the home resolution and the refusals.
+
+/// The display name of the singleton Système project. Not a user-facing free label: the human
+/// never renames it (the domain boundary refuses `update_project` on it), so it is a constant.
+pub(crate) const SYSTEM_PROJECT_NAME: &str = "Système";
+
+/// The `projects.key` stub the Système singleton claims. Fed through [`unique_project_key`] like
+/// any other project's, so a pre-existing user project already holding `SYS` does not collide —
+/// it just pushes the singleton to `SYS2`.
+const SYSTEM_PROJECT_KEY_STUB: &str = "SYS";
+
+/// The name of the Système project's single primary workspace.
+const SYSTEM_WORKSPACE_NAME: &str = "home";
+
+/// Read the Système singleton project, or `None` when it has not been bootstrapped yet.
+///
+/// `idx_projects_single_system` guarantees at most one row matches, so this is a `first`, not a
+/// list. This is the INTERNAL read (bootstrap + `system_scope_detail`), deliberately separate from
+/// [`list_projects`], which only ever exposes USER containers.
+pub(crate) fn system_project(conn: &mut SqliteConnection) -> QueryResult<Option<Project>> {
+    projects::table
+        .filter(projects::kind.eq(PROJECT_KIND_SYSTEM))
+        .select(Project::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// INSERT the Système singleton: the `kind = 'system'` project plus its primary workspace anchored
+/// at `home` (already resolved, absolute and normalized by the caller), with the project's
+/// `primary_workspace_id` pointing at it. One transaction — a half-created singleton is never
+/// observable.
+///
+/// NO GIT IS READ. [`create_project`] calls `gitbranch::detect` on the folder it anchors; this path
+/// deliberately stores `branch = None` instead, because the home directory is not a work tree and
+/// the Système scope is excluded from every Git read (`repository::workspace_members` returns empty
+/// for it). Detecting a branch here would be the one Git subprocess the scope promises never to run.
+///
+/// A concurrent bootstrap that lost the race fails on `idx_projects_single_system` (a UNIQUE
+/// violation) rather than creating a second singleton; [`crate::system_scope::ensure_system_scope`]
+/// catches that and re-reads the winner.
+pub(crate) fn insert_system_scope(
+    conn: &mut SqliteConnection,
+    home: &str,
+) -> QueryResult<(Project, Workspace)> {
+    let now = now_millis();
+    let project_id = Uuid::now_v7().to_string();
+    // BEGIN IMMEDIATE, not the deferred default. This transaction READS (the next order, the free
+    // key) before it WRITES, and SQLite refuses to upgrade a deferred read lock to a write lock
+    // WITHOUT consulting the busy handler — so two boots racing on one file would get an instant
+    // `database is locked` instead of waiting their turn. Taking the write lock at BEGIN puts the
+    // race back under `busy_timeout`, where the loser waits, then loses cleanly on
+    // `idx_projects_single_system` and re-reads the winner.
+    conn.immediate_transaction(|conn| {
+        use diesel::dsl::max;
+        let next_order = projects::table
+            .select(max(projects::order_index))
+            .first::<Option<i32>>(conn)?
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let key = unique_project_key(conn, SYSTEM_PROJECT_KEY_STUB)?;
+
+        diesel::insert_into(projects::table)
+            .values(NewProject {
+                id: project_id.clone(),
+                name: SYSTEM_PROJECT_NAME.to_string(),
+                created_at: now,
+                updated_at: now,
+                order_index: next_order,
+                key,
+                kind: PROJECT_KIND_SYSTEM.to_string(),
+            })
+            .execute(conn)?;
+
+        let workspace = insert_system_workspace(conn, &project_id, home, now)?;
+        let project = diesel::update(projects::table.find(&project_id))
+            .set(projects::primary_workspace_id.eq(&workspace.id))
+            .returning(Project::as_returning())
+            .get_result(conn)?;
+        Ok((project, workspace))
+    })
+}
+
+/// INSERT the Système project's primary workspace at `home` and point
+/// `projects.primary_workspace_id` at it — the REPAIR write for a singleton whose workspace is
+/// missing. Same no-Git rule as [`insert_system_scope`].
+pub(crate) fn repair_system_primary_workspace(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    home: &str,
+) -> QueryResult<Workspace> {
+    let now = now_millis();
+    // BEGIN IMMEDIATE, for the same reason as [`insert_system_scope`]: the repair reads inside the
+    // transaction it writes in, and a deferred lock upgrade is not covered by `busy_timeout`.
+    conn.immediate_transaction(|conn| {
+        let workspace = insert_system_workspace(conn, project_id, home, now)?;
+        diesel::update(projects::table.find(project_id))
+            .set((
+                projects::primary_workspace_id.eq(&workspace.id),
+                projects::updated_at.eq(now),
+            ))
+            .execute(conn)?;
+        Ok(workspace)
+    })
+}
+
+/// Point the Système project's `primary_workspace_id` at `workspace_id` — the REPAIR write for a
+/// singleton whose lone workspace exists but is not (or no longer) named as primary. Writes no
+/// workspace row.
+pub(crate) fn repair_system_primary_pointer(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    workspace_id: &str,
+) -> QueryResult<usize> {
+    diesel::update(projects::table.find(project_id))
+        .set((
+            projects::primary_workspace_id.eq(workspace_id),
+            projects::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// The shared workspace INSERT of both Système write paths: root/live, `branch = None` (no Git
+/// read), instances materialized like any other workspace so a Système command template lands an
+/// instance here too.
+fn insert_system_workspace(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    home: &str,
+    now: i64,
+) -> QueryResult<Workspace> {
+    let workspace = diesel::insert_into(workspaces::table)
+        .values(NewWorkspace {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            name: SYSTEM_WORKSPACE_NAME.to_string(),
+            root_path: home.to_string(),
+            branch: None,
+            is_root: true,
+            created_at: now,
+            updated_at: now,
+        })
+        .returning(Workspace::as_returning())
+        .get_result(conn)?;
+    materialize_instances_for_workspace(conn, &workspace.id)?;
+    Ok(workspace)
+}
+
+/// INSERT a terminal that is a member of the Système scope FROM ITS FIRST BYTE: one statement
+/// carrying the cwd (`home`), the singleton's `workspace_id` and `workspace_binding_mode = manual`.
+///
+/// ## Why an insert of its own rather than [`create_terminal`] + [`attach_terminal`]
+///
+/// The two-step shape has a WINDOW: between the insert and the attach the row exists with
+/// `workspace_id IS NULL` and mode `auto` — which is, exactly, the ORPHAN bucket the Système scope
+/// is disjoint from ([`crate::system_scope`]). A crash, a rolled-back second statement, or a
+/// concurrent [`crate::resolve::auto_attach_terminal`] pass reading that window would leave (or
+/// see) a terminal that is neither a Système member nor a deliberate orphan. Writing the
+/// membership WITH the row removes the window instead of narrowing it: there is no instant at
+/// which the row is not already what it is meant to be.
+///
+/// It also keeps [`attach_terminal`] out of this path entirely, which matters because that
+/// primitive is unconditional by design (its Système rule is a decision about a CALL and its
+/// payload, posed at the two adapters) — a `BINDING_AUTO` slip through it would break the scope
+/// silently.
+///
+/// `home` is the ALREADY-RESOLVED absolute home ([`crate::system_scope::SystemScope::home`], i.e.
+/// the singleton workspace's `root_path`): never `.`, never `~`. `workspace_id` must be the
+/// singleton's workspace — the caller ([`crate::system_scope::create_system_terminal`]) reads both
+/// from the same [`crate::system_scope::SystemScope`], so they cannot disagree.
+///
+/// The transaction is this function's own, so the caller's failure BEFORE it (no bootstrapped
+/// scope) and its failure INSIDE it (any SQL error) both leave ZERO rows.
+pub(crate) fn insert_system_terminal(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+    home: &str,
+    label: Option<String>,
+) -> QueryResult<Terminal> {
+    use diesel::dsl::max;
+    conn.transaction(|conn| {
+        // Appended after the current max order, exactly like `create_terminal`: a Système terminal
+        // takes its place in the same sidebar order as any other.
+        let next_order = terminals::table
+            .select(max(terminals::order_index))
+            .first::<Option<i32>>(conn)?
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let new = NewTerminal::alive(home, label, next_order);
+        diesel::insert_into(terminals::table)
+            .values((
+                &new,
+                terminals::workspace_id.eq(Some(workspace_id.to_string())),
+                terminals::workspace_binding_mode.eq(BINDING_MANUAL),
+            ))
+            .returning(Terminal::as_returning())
+            .get_result(conn)
+    })
+}
+
+/// List the USER projects in SIDEBAR ORDER (`order` asc, then `created_at`/`id` asc as a stable
+/// tiebreak). The order column is user-controlled via [`reorder_projects`]; the v9 backfill seeds
+/// it from the prior created-at order so this is unchanged on upgrade.
+///
+/// THE SYSTÈME SINGLETON IS NOT HERE, and that is the contract: this list feeds the sidebar's
+/// re-orderable project array and the MCP `list_projects`, neither of which may see a technical
+/// container they could rename, archive or drag. The scope is read through its own door
+/// (`system_project` / `system_scope_detail`). Hiding it is a UI/ergonomics decision, NEVER the
+/// authorization — a caller aiming the singleton is refused by the DOMAIN BOUNDARY, which keys on
+/// the container's nature and not on the id being secret, so knowing that id buys nothing. The
+/// boundary is posed at the TWO ADAPTERS ([`crate::system_scope::guard_payload`], called at the top
+/// of the UI/IPC db-command dispatcher and of the MCP dispatchers) and, for the identity use cases
+/// only, inside `usecase.rs` ([`crate::system_scope::require_user_project`]). The primitives of
+/// this file — [`update_project`], [`delete_project`], [`reorder_projects`],
+/// [`set_project_collapsed`] — are NOT guarded from within: see the `system_scope` module doc.
 pub fn list_projects(conn: &mut SqliteConnection) -> QueryResult<Vec<Project>> {
     projects::table
+        .filter(projects::kind.eq(PROJECT_KIND_USER))
         .order((
             projects::order_index.asc(),
             projects::created_at.asc(),
@@ -6788,18 +7113,39 @@ pub fn list_workspaces(
         .load(conn)
 }
 
-/// Every workspace across all projects — the candidate set fed to
-/// [`crate::resolve::resolve_workspace`], the repo's single cwd→workspace selector.
-/// Matching is GLOBAL (never project-scoped), and this read is SHARED by BOTH of that
-/// selector's consumers: TERMINAL auto-attach (`resolve::auto_attach_terminal` and the
-/// MCP terminal-create path, `mcp_tools_core::resolve_attach_for_new_terminal`), which
-/// turns the winner into a persisted binding — and the MCP Spec/project resolution by
-/// cwd (`mcp_context::best_workspace_for_cwd`), which only READS the winner and binds
-/// NOTHING. So a match here does not imply a write. The set filters nothing (archived
-/// and folder-removed rows still compete — a deliberate limit documented at
-/// `mcp_context::best_workspace_for_cwd`). Ordered by path for deterministic iteration.
-pub fn all_workspaces(conn: &mut SqliteConnection) -> QueryResult<Vec<Workspace>> {
+/// The candidate set of the cwd→workspace selector: every workspace whose project is a USER
+/// project — the Système singleton's excluded BY JOIN on `projects.kind`, never by comparing a
+/// path, and never by an id list the caller has to remember.
+///
+/// THE ONLY WORKSPACE-INVENTORY READ. There deliberately is no unfiltered `all_workspaces` twin
+/// beside it: two near-identical public readers, of which the more obviously named one silently
+/// re-admits the Système workspace, is exactly how a future cwd resolver would reintroduce the
+/// capture below. A caller that genuinely needs the raw inventory (a test asserting the singleton's
+/// workspace row exists at all) queries `workspaces` directly and says so on the spot.
+///
+/// ## Why the Système workspace must not be a candidate
+///
+/// Its `root_path` is the HOME directory, which is an ancestor of nearly every folder on the
+/// machine. Left in the candidate set it would win the cwd of any terminal opened outside a
+/// registered project — auto-attaching loose terminals INTO the Système scope, which is exactly the
+/// "capture par auto-attach" the scope forbids: membership there is POSITIVE (a manual binding
+/// posed at creation) or it is nothing. A user workspace deeper than the home still wins on its own
+/// merits; removing home from the race changes no user-vs-user ranking, because a candidate that
+/// only ever competed as the shallowest possible ancestor can never have been the longest match
+/// against a user workspace.
+///
+/// Both consumers of [`crate::resolve::resolve_workspace`] read THIS: terminal auto-attach
+/// ([`crate::resolve::auto_attach_terminal`] and the MCP terminal-create path) and the MCP
+/// Spec/project resolution by cwd (`mcp_context::best_workspace_for_cwd`). One reader, so a cwd
+/// can never resolve to one workspace for a terminal and another for a Spec.
+///
+/// The nature is the ONLY thing it filters (archived / folder-removed rows still compete — the
+/// deliberate limit documented at `mcp_context::best_workspace_for_cwd`). Ordered by path for
+/// deterministic iteration.
+pub fn resolvable_workspaces(conn: &mut SqliteConnection) -> QueryResult<Vec<Workspace>> {
     workspaces::table
+        .inner_join(projects::table.on(projects::id.eq(workspaces::project_id)))
+        .filter(projects::kind.ne(PROJECT_KIND_SYSTEM))
         .order((workspaces::root_path.asc(), workspaces::id.asc()))
         .select(Workspace::as_select())
         .load(conn)
@@ -7259,6 +7605,22 @@ fn unique_repository_name(
 /// (`auto`|`manual`), bumping `updated_at`. Returns rows updated (0 = unknown
 /// terminal). The foreign key ensures `workspace_id` exists; the CHECK ensures
 /// `mode` is valid (an invalid mode yields an `Err`).
+///
+/// THE FIRST OF THE THREE WRITERS of `terminals.workspace_binding_mode`, and the only one whose
+/// Système rule is expressible from its ARGUMENTS: naming the singleton's workspace is allowed with
+/// `mode = "manual"` (the positive membership the scope is built on) and refused otherwise. That
+/// refusal lives at the two adapters, in `system_scope::allowed_payload`, because it is a decision
+/// about a CALL and its payload; this primitive stays unconditional. The two other writers
+/// ([`detach_terminal`], [`unpin_terminal_workspace`]) carry no mode and no workspace, so they
+/// enforce the same invariant themselves — see [`crate::system_scope::require_user_terminal`].
+///
+/// NOTHING IN THE SYSTÈME SCOPE ROUTES THROUGH IT. A member is minted by
+/// `insert_system_terminal`, which writes the workspace AND the `manual` mode WITH the row — so
+/// no production path reaches this unconditional primitive carrying the singleton's workspace
+/// except the human's own `attach_terminal` db-command, which the payload guard has already
+/// vetted. A future caller aiming the singleton HERE, with `BINDING_AUTO`, would break the scope
+/// silently: it must go through an adapter that calls
+/// [`crate::system_scope::guard_payload`], or pose its own guard.
 pub fn attach_terminal(
     conn: &mut SqliteConnection,
     terminal_id: &str,
@@ -7276,14 +7638,27 @@ pub fn attach_terminal(
 
 /// Detach `terminal_id` from any workspace (clears `workspace_id`) and reset its
 /// binding mode to `auto` so it resumes auto-attach. Returns rows updated.
-pub fn detach_terminal(conn: &mut SqliteConnection, terminal_id: &str) -> QueryResult<usize> {
-    diesel::update(terminals::table.find(terminal_id))
+///
+/// REFUSES A SYSTÈME TERMINAL, with the stable `system_scope_forbidden` code. Clearing the
+/// `workspace_id` of a member of the Système scope would drop it into the ORPHAN bucket
+/// (`workspace_id IS NULL`) — the very bucket the scope is disjoint from by construction (a member
+/// is POSITIVELY attached to the singleton's workspace; an orphan is what `delete_project` leaves
+/// behind, and nothing adopts it). See [`crate::system_scope::require_user_terminal`] for the rule
+/// and `system_scope::allowed_payload` for its `attach_terminal` half.
+///
+/// Terminals of user projects, and unattached ones, are unaffected.
+pub fn detach_terminal(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+) -> Result<usize, crate::system_scope::SystemScopeError> {
+    crate::system_scope::require_user_terminal(conn, terminal_id, "detach_terminal")?;
+    Ok(diesel::update(terminals::table.find(terminal_id))
         .set((
             terminals::workspace_id.eq(None::<String>),
             terminals::workspace_binding_mode.eq(BINDING_AUTO),
             terminals::updated_at.eq(now_millis()),
         ))
-        .execute(conn)
+        .execute(conn)?)
 }
 
 /// PIN `terminal_id` to `workspace_id`: attach it and set mode `manual` so a
@@ -7299,16 +7674,28 @@ pub fn pin_terminal_workspace(
 /// UNPIN `terminal_id`: flip mode back to `auto` (auto-attach resumes) while
 /// KEEPING the current `workspace_id` until the resolver next moves it. Returns
 /// rows updated.
+///
+/// REFUSES A SYSTÈME TERMINAL, with the stable `system_scope_forbidden` code. "Auto mode while the
+/// `workspace_id` still names the singleton" is LITERALLY the state the boundary refuses on the way
+/// in (`system_scope::allowed_payload`, which only lets `attach_terminal` name the Système
+/// workspace with `mode = "manual"`): [`crate::resolve::decide_attachment`] pins `manual` alone, so
+/// the next [`crate::resolve::auto_attach_terminal`] pass would re-bind the terminal onto whatever
+/// user workspace covers its cwd — the member would LEAVE the scope, silently. See
+/// [`crate::system_scope::require_user_terminal`].
+///
+/// Terminals of user projects are unaffected: unpinning stays the ordinary "let the resolver decide
+/// again" gesture everywhere else.
 pub fn unpin_terminal_workspace(
     conn: &mut SqliteConnection,
     terminal_id: &str,
-) -> QueryResult<usize> {
-    diesel::update(terminals::table.find(terminal_id))
+) -> Result<usize, crate::system_scope::SystemScopeError> {
+    crate::system_scope::require_user_terminal(conn, terminal_id, "unpin_terminal_workspace")?;
+    Ok(diesel::update(terminals::table.find(terminal_id))
         .set((
             terminals::workspace_binding_mode.eq(BINDING_AUTO),
             terminals::updated_at.eq(now_millis()),
         ))
-        .execute(conn)
+        .execute(conn)?)
 }
 
 // --- Managed command (template) CRUD (PRD-3 v3) --------------------------
@@ -16436,6 +16823,13 @@ pub fn set_app_setting(
 
 /// Open an in-memory SQLite database with migrations applied — used by tests so
 /// they never touch the real `app_data_dir` DB.
+///
+/// MIGRATED, NOT BOOTSTRAPPED. [`Db::open`] additionally runs
+/// [`crate::system_scope::ensure_system_scope`], so a PRODUCTION database always carries the
+/// Système singleton and one connection from here does not. A test that needs the production shape
+/// calls `ensure_system_scope` itself (as `system_scope::tests` does throughout) or goes through
+/// the sidecar harness, which opens a temp file via [`Db::open`]. The full rationale, and the list
+/// of tests covering the bootstrapped shape, is on [`Db::in_memory`].
 #[cfg(test)]
 pub fn open_in_memory() -> SqliteConnection {
     let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory sqlite");
@@ -29336,6 +29730,216 @@ mod tests {
             Some("D:/wt2"),
             "and it is writable again through the same setter"
         );
+    }
+
+    /// MIGRATION 20260828180000: the NATURE of a container (`projects.kind`) and the SQL singleton
+    /// (`idx_projects_single_system`) ship together, so ONE revert must take BOTH away. A DB
+    /// migrated through the head carries the column and refuses a second system project; reverted
+    /// by ONE step both are GONE while the neighbour below — the command groups' `layout_shape` —
+    /// is STILL standing, so one revert too few or one too many fails instead of passing on an
+    /// unexercised `down.sql`.
+    ///
+    /// The down is deliberately NON-DESTRUCTIVE of rows: it erases the nature, not the project, so
+    /// a bootstrapped singleton comes back up as an ordinary project carrying its terminals and
+    /// commands. The re-`up` therefore restores the column with its DEFAULT — every row is `user`
+    /// again, including the one that used to be the singleton, which is exactly what the down's
+    /// note warns about.
+    #[test]
+    fn migration_projects_kind_adds_the_nature_and_the_system_singleton() {
+        let mut conn = open_in_memory();
+        let scope = crate::system_scope::ensure_system_scope(
+            &mut conn,
+            &crate::system_scope::FixedHomeDirProvider::at(if cfg!(windows) {
+                "C:\\Users\\kris"
+            } else {
+                "/home/kris"
+            }),
+        )
+        .expect("the migrated schema bootstraps the scope");
+
+        // The migrated schema carries BOTH halves: the column holds the nature…
+        assert_eq!(
+            get_project(&mut conn, &scope.project.id)
+                .unwrap()
+                .unwrap()
+                .kind,
+            PROJECT_KIND_SYSTEM,
+            "the migrated schema carries the column"
+        );
+        // …and the partial unique index really is the singleton.
+        assert!(
+            index_exists(&mut conn, "idx_projects_single_system"),
+            "the migrated schema carries the singleton index"
+        );
+        assert!(
+            diesel::sql_query(
+                "INSERT INTO projects (id, name, collapsed, created_at, updated_at, \
+                 resume_agent_sessions, \"order\", key, kind) \
+                 VALUES ('sys-x', 'x', 0, 0, 0, 0, 7, 'SYSX', 'system')"
+            )
+            .execute(&mut conn)
+            .is_err(),
+            "and it refuses a second system project"
+        );
+
+        // NAMED, not counted: revert down THROUGH this migration, whatever gets stacked on it later.
+        revert_down_through(&mut conn, "20260828180000");
+        assert!(
+            diesel::sql_query("SELECT kind FROM projects")
+                .execute(&mut conn)
+                .is_err(),
+            "after that revert the column must be gone — one revert too FEW and this passes blind"
+        );
+        assert!(
+            !index_exists(&mut conn, "idx_projects_single_system"),
+            "and the index goes with it (the down drops it FIRST, before the column it indexes)"
+        );
+        assert!(
+            diesel::sql_query("SELECT layout_shape FROM managed_command_groups")
+                .execute(&mut conn)
+                .is_ok(),
+            "the chain stops AT this migration: the neighbour below (layout_shape) is untouched — \
+             one revert too MANY drops it and fails here"
+        );
+        // The project SURVIVED the downgrade: the down erases a nature, never a row. Read through
+        // raw SQL — the typed `Project` selects a column that no longer exists down here.
+        assert_eq!(
+            projects::table
+                .find(&scope.project.id)
+                .select(projects::name)
+                .first::<String>(&mut conn)
+                .optional()
+                .unwrap()
+                .as_deref(),
+            Some(SYSTEM_PROJECT_NAME)
+        );
+
+        // The up restores both halves — with the DEFAULT, so the former singleton is a plain user
+        // project again and `ensure_system_scope` is free to mint a NEW one.
+        run_migrations(&mut conn).expect("re-apply the projects.kind migration");
+        assert_eq!(
+            get_project(&mut conn, &scope.project.id)
+                .unwrap()
+                .unwrap()
+                .kind,
+            PROJECT_KIND_USER,
+            "the column comes back with its DEFAULT — the down dropped it, value and all"
+        );
+        assert!(index_exists(&mut conn, "idx_projects_single_system"));
+    }
+
+    /// MIGRATION 20260829120000: the Système APPROVAL LEDGER — the table, its `state` CHECK, and
+    /// the UNIQUE PARTIAL index that IS the "one pending request per fingerprint" rule — all ship
+    /// together, so ONE revert must take all three away.
+    ///
+    /// The three things asserted, in the order they matter:
+    ///
+    /// 1. the `state` vocabulary is CLOSED IN SQL, so a fifth word cannot reach the backend even
+    ///    through a raw insert;
+    /// 2. the partial index admits ONE `pending` row per fingerprint and as many TERMINAL ones as
+    ///    the machine produces — the shape the concurrent-request protocol relies on, checked at
+    ///    the SQL level rather than through the Rust that reads it;
+    /// 3. the down really drops everything, with the neighbour BELOW still standing so a chain one
+    ///    link too short (or too long) fails here instead of passing on an unexercised `down.sql`.
+    ///
+    /// Unlike `projects.kind`'s down, this one is DESTRUCTIVE by design: an approval is a
+    /// five-minute security token, and carrying tokens across a schema round-trip would mean
+    /// keeping authorisations whose expiry nothing checks any more.
+    #[test]
+    fn migration_system_command_approvals_adds_the_ledger_and_its_pending_uniqueness() {
+        let mut conn = open_in_memory();
+        let scope = crate::system_scope::ensure_system_scope(
+            &mut conn,
+            &crate::system_scope::FixedHomeDirProvider::at(if cfg!(windows) {
+                "C:\\Users\\kris"
+            } else {
+                "/home/kris"
+            }),
+        )
+        .expect("the migrated schema bootstraps the scope");
+        let insert = |conn: &mut SqliteConnection, id: &str, fp: &str, state: &str| {
+            diesel::sql_query(format!(
+                "INSERT INTO system_command_approvals \
+                 (id, project_id, tool_name, operation_kind, canonical_payload, fingerprint, \
+                  state, requested_at, expires_at) \
+                 VALUES ('{id}', '{}', 'add_command', 'add_command', '{{}}', '{fp}', '{state}', 0, 1)",
+                scope.project.id
+            ))
+            .execute(conn)
+        };
+        // THE RESHAPE (`20260831160000`, PDR-0030) is in force by the time the chain ends: the
+        // ledger carries the TOOL to re-dispatch and the RESULT to hand back, and carries no
+        // credential column at all — the agent never replays, so there is nothing to store.
+        assert!(
+            diesel::sql_query("SELECT tool_name, result_json FROM system_command_approvals")
+                .execute(&mut conn)
+                .is_ok(),
+            "the execute-on-grant reshape ships the tool name and the effect's result"
+        );
+        assert!(
+            diesel::sql_query("SELECT token_hash FROM system_command_approvals")
+                .execute(&mut conn)
+                .is_err(),
+            "…and takes the token column away: a column nothing writes is a claim nothing keeps"
+        );
+
+        // (1) the `state` vocabulary is closed in SQL.
+        assert!(
+            insert(&mut conn, "a", "fp-a", "pending").is_ok(),
+            "the migrated schema carries the table"
+        );
+        assert!(
+            insert(&mut conn, "bad", "fp-bad", "approved").is_err(),
+            "a fifth state word cannot reach the backend — the CHECK is in SQL"
+        );
+
+        // (2) the partial index IS the rule: one pending per fingerprint…
+        assert!(
+            index_exists(&mut conn, "idx_system_approvals_pending_fingerprint"),
+            "the migrated schema carries the pending-uniqueness index"
+        );
+        assert!(
+            insert(&mut conn, "a2", "fp-a", "pending").is_err(),
+            "two pending rows may not share a fingerprint"
+        );
+        // …and as many TERMINAL rows on that same fingerprint as the machine produces.
+        assert!(insert(&mut conn, "a3", "fp-a", "denied").is_ok());
+        assert!(insert(&mut conn, "a4", "fp-a", "expired").is_ok());
+        assert!(insert(&mut conn, "a5", "fp-a", "granted").is_ok());
+
+        // (3) ONE revert takes the whole thing away, and stops exactly there.
+        revert_down_through(&mut conn, "20260829120000");
+        assert!(
+            diesel::sql_query("SELECT id FROM system_command_approvals")
+                .execute(&mut conn)
+                .is_err(),
+            "after that revert the table must be gone — one revert too FEW and this passes blind"
+        );
+        assert!(
+            !index_exists(&mut conn, "idx_system_approvals_pending_fingerprint"),
+            "and both indexes go with it"
+        );
+        assert!(
+            !index_exists(&mut conn, "idx_system_approvals_state_expiry"),
+            "including the read index"
+        );
+        assert!(
+            diesel::sql_query("SELECT accent FROM projects")
+                .execute(&mut conn)
+                .is_ok(),
+            "the chain stops AT this migration: the neighbour below (projects_identity, whose date \
+             20260828182220 slots BETWEEN projects.kind and this ledger) is untouched — one revert \
+             too MANY drops its columns and fails here"
+        );
+
+        // The up restores the table EMPTY: a token does not survive a schema round-trip.
+        run_migrations(&mut conn).expect("re-apply the approval-ledger migration");
+        let remaining: i64 = crate::schema::system_command_approvals::table
+            .count()
+            .get_result(&mut conn)
+            .expect("the table is back");
+        assert_eq!(remaining, 0, "the down erased the tokens, deliberately");
+        assert!(index_exists(&mut conn, "idx_system_approvals_pending_fingerprint"));
     }
 
     /// MIGRATION 20260828182220: a project's CHOSEN visual identity. A fresh project has NONE of

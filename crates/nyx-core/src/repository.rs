@@ -127,10 +127,28 @@ pub fn register_project(
 /// tree (the Git reads then degrade to an empty state). A project that HAS configured
 /// repos but marked them all `optional` is a deliberate config: its membership is
 /// legitimately empty (no fallback).
+///
+/// SYSTÈME SCOPE: empty, unconditionally and before any other rule — see the guard in the body.
 pub fn workspace_members(
     conn: &mut SqliteConnection,
     workspace: &Workspace,
 ) -> QueryResult<Vec<WorkspaceRepo>> {
+    // THE SYSTÈME WORKSPACE HAS NO MEMBERS, and the answer is EMPTY rather than the fallback.
+    //
+    // Its `root_path` is the HOME directory. The fallback below would hand back a synthetic repo at
+    // `"."` — i.e. the whole home — and every Git read downstream (`workspace_git`, `repo_diff`,
+    // the watcher, the review engine) would then walk it: a `git status` over a user's entire home
+    // is the one Git subprocess the Système scope promises never to run, and the "changed files" it
+    // would surface belong to no project at all.
+    //
+    // This is the FIRST of the two halves that close Git for the scope: this one makes the derived
+    // membership empty, so every consumer that iterates members does nothing; the callers that take
+    // a workspace id directly refuse it up front — the Git READ surfaces (`workspace_git`,
+    // `repo_diff`, `repo_watch`…) through `system_scope::guard_payload` at the two adapters, and
+    // the workspace IDENTITY verbs through `system_scope::require_user_workspace` in `usecase.rs`.
+    if crate::system_scope::is_system_workspace(conn, &workspace.id)? {
+        return Ok(Vec::new());
+    }
     let repos = db::list_repositories(conn, &workspace.project_id)?;
     if repos.is_empty() {
         // No repo configured on the project → the current folder as the sole repo.
@@ -777,5 +795,72 @@ mod tests {
                 "the worktree inherits the ONE project config at its own root_path"
             );
         }
+    }
+
+    /// DONE-CRITERION (« Workspace Système hors des lectures Git ») — [`workspace_members`] is
+    /// EMPTY for the Système workspace, and NO Git is read for it.
+    ///
+    /// The test is built so the answer cannot be right by accident: the Système home is pointed at
+    /// a REAL git work tree on a KNOWN branch. A USER workspace registered on the very same folder
+    /// derives its member and reports `work-sys` — proving the folder is a live repo and the Git
+    /// reads do work here — while the Système one derives NOTHING, so there is nothing to read Git
+    /// for. Without the guard the `"."` fallback would hand back the whole home and every
+    /// downstream Git read (`workspace_git`, `repo_diff`, the watcher) would walk it.
+    #[test]
+    fn the_system_workspace_derives_no_member_and_reads_no_git() {
+        if !git_available() {
+            eprintln!("skipping système git-isolation test: git unavailable");
+            return;
+        }
+        let home = scratch_dir("system-home");
+        init_repo(&home, "work-sys");
+        let home_str = home.to_str().expect("utf8 home");
+
+        let mut conn = open_in_memory();
+        let scope = crate::system_scope::ensure_system_scope(
+            &mut conn,
+            &crate::system_scope::FixedHomeDirProvider::at(home_str),
+        )
+        .expect("bootstrap the Système scope on a real work tree");
+
+        // The bootstrap itself ran NO branch detection: `create_project` would have stored
+        // `work-sys` here; the Système insert deliberately stores nothing.
+        assert_eq!(
+            scope.workspace.branch, None,
+            "the bootstrap must not run `git` on the home"
+        );
+
+        // Derived membership: EMPTY — not the `"."` fallback the same shape would earn a user
+        // project with no configured repos.
+        assert!(
+            workspace_members(&mut conn, &scope.workspace)
+                .unwrap()
+                .is_empty(),
+            "the Système workspace has no members at all"
+        );
+        // …so the shared Git read model has nothing to read, and reads nothing.
+        let summary = crate::workspace_git::summary(&mut conn, &scope.workspace.id)
+            .unwrap()
+            .expect("the workspace resolves");
+        assert!(summary.repos.is_empty(), "no repo, hence no Git call");
+        // …and the single-repo path cannot resolve one either, whatever id is asked for.
+        assert_eq!(
+            member_absolute_path(&mut conn, &scope.workspace.id, "any-repo").unwrap(),
+            None,
+            "repo_diff / repo_git_view / repo_watch resolve nothing for the Système workspace"
+        );
+
+        // THE CONTROL: the same folder, registered as a USER project, DOES derive a member and
+        // DOES report the live branch — so the emptiness above is the guard, not a dead repo.
+        let (_p, user_ws) = register_project(&mut conn, "Same folder", home_str, None).unwrap();
+        let user_members = workspace_members(&mut conn, &user_ws).unwrap();
+        assert_eq!(user_members.len(), 1, "the fallback member of a user project");
+        assert_eq!(
+            read_git_state(&user_members[0].absolute_path).branch.as_deref(),
+            Some("work-sys"),
+            "the folder really is a git work tree on a known branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

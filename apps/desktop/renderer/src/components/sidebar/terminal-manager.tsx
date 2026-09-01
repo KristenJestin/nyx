@@ -717,14 +717,16 @@ export function TerminalManager() {
             open={projectSettings !== null}
             projectId={liveTree?.project.id ?? null}
             projectName={liveTree?.project.name ?? ""}
-            resumeAgentSessions={liveTree?.project.resume_agent_sessions ?? false}
             importWorkspaceId={manageWorkspace?.id ?? null}
             workspacePath={manageWorkspace?.path ?? null}
             initialSection={projectSettings?.section ?? "global"}
-            onRename={(name) => (targetId ? updateProject(targetId, name) : Promise.resolve())}
-            onResumeChange={(resume) =>
-              targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve()
-            }
+            // Wiring the Global pane is what puts it in the rail — see `globalSection`.
+            globalSection={{
+              resumeAgentSessions: liveTree?.project.resume_agent_sessions ?? false,
+              onRename: (name) => (targetId ? updateProject(targetId, name) : Promise.resolve()),
+              onResumeChange: (resume) =>
+                targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve(),
+            }}
             onClose={() => {
               setProjectSettings(null);
               void refreshCommands();

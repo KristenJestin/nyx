@@ -858,6 +858,36 @@ export type BackendCommand =
   // FEEDBACK #32: persist a terminal's live cwd into its record so a relaunch
   // re-spawns at the LAST directory, not the stale spawn-time cwd.
   | "set_terminal_cwd"
+  // Système scope (PRD « Scope Système »): the cross-project terminals and commands that belong
+  // to no code project. Both commands are HUMAN-ONLY — there is no MCP twin, and the agent-facing
+  // terminal tools cannot see what the first one creates.
+  //
+  // `create_system_terminal` is ATOMIC: one transaction writes the record with the absolute home
+  // as its cwd, the Système workspace as its `workspaceId` and a MANUAL binding, and only then is
+  // the shell opened. So a `cd` never re-homes it, and it never passes through the unattached
+  // (loose) state. `{ label? }` → the created `Terminal` row, exactly like `create_terminal`.
+  | "create_system_terminal"
+  // `system_scope_detail` is the ONE read of the singleton: `list_projects` / `list_workspaces`
+  // stay user-only (a technical container must not land in the re-orderable sidebar array), so
+  // the Système page reads its project, its home workspace and the `home` path here instead.
+  // `{}` → `{ project, workspace, home }`, or `null` before the scope is bootstrapped.
+  | "system_scope_detail"
+  // The HUMAN's half of the SYSTÈME APPROVAL protocol — the three commands behind the decision
+  // surface. HUMAN-ONLY, and this is the entry where that matters most in the whole contract:
+  // there is deliberately no MCP twin of `system_approval_grant`, because an agent that could
+  // approve its own request would turn the protocol into a formality. The agent's counterpart is
+  // the single MCP read `system_approval_status`, which answers only the request its token opens.
+  //
+  // `system_approval_list` ({}) → the PENDING requests, oldest first, deduplicated by fingerprint
+  // and bounded by the backend. Each carries what a decision needs — the operation, a one-line
+  // summary, the fingerprint, the expiry — and NOTHING of the opaque token or its hash.
+  | "system_approval_list"
+  // `system_approval_grant` / `system_approval_deny` ({ requestId }) → the decided request. Both
+  // are CONDITIONAL transitions out of `pending`: a request already decided, or one whose
+  // five-minute window has closed, is refused rather than silently re-decided. Each broadcasts
+  // `system-approvals://changed`.
+  | "system_approval_grant"
+  | "system_approval_deny"
   // projects / workspaces
   | "list_projects"
   | "create_project"
@@ -935,6 +965,22 @@ export type BackendCommand =
   | "command_relaunch"
   | "command_acknowledge"
   | "command_output"
+  // `command_clear_output` ({ instanceId }) — EMPTY a managed command's captured output: the live
+  // in-memory tail AND the persisted scrollback, with a `command://output-cleared` push so every
+  // mounted `<CommandOutputPanel>` for that instance wipes its xterm. The HUMAN twin of the MCP
+  // `clear_command_output` tool — same runner call, same entry on the Système guard matrix.
+  //
+  // NO RENDERER CALLER TODAY. Phase 3 put an eraser on the Système command rows to give the verb a
+  // hand at the keyboard; human review `01M1EC7Y2625Q07C5386GKHZFS` (finding U2) removed it. Seen
+  // in the real app, the user judged a verb offered on ONE command surface and no other incoherent,
+  // and, given the choice between generalising it and dropping it, chose to drop it — so no
+  // `nyxBridge.invoke` names this command any more (`system-scope-page.tsx`, `workspace-runtime-
+  // tree.tsx`). The IPC is KEPT on purpose: it is the human half of a capability whose sidecar half
+  // is live, tested and gated, and a surface that generalises the verb re-uses it unchanged.
+  //
+  // A clear wipes BYTES, never the run result: no state transition, and a running instance keeps
+  // streaming onto the freshly-emptied buffer.
+  | "command_clear_output"
   | "command_instance_list"
   | "command_import_scripts"
   | "command_import_create"
@@ -1439,4 +1485,11 @@ export type BackendEvent =
   // v2.4 (task 01KX0F6GDZEH3YN6QJDB7FC0WC / 01KX0F6GY96096AHWD8RZ2BMM0): a WATCHED repo's
   // work-tree/ref changed (edit / commit / checkout). The living review re-pulls the
   // affected repo's `repo_diff` / `repo_git_view` — the "sans polling" refresh (Q-015).
-  | "repos://changed";
+  | "repos://changed"
+  // PRD « Scope Système » : the pending APPROVAL queue moved. Emitted from BOTH sides, which is
+  // what makes one topic enough — the human's own `system_approval_grant` / `system_approval_deny`
+  // routes emit it after the decision, and the MCP dispatcher emits it when a protected call is
+  // REFUSED with `approval_required`. That second one is the odd case worth knowing: it is the one
+  // place in nyx where a REFUSAL is the event, because the refusal is exactly the moment the human
+  // has something to do (`ToolOutcome::effects` rides the success path and cannot carry it).
+  | "system-approvals://changed";

@@ -1215,11 +1215,48 @@ pub fn dispatch_command_tool<S: RunnerSink>(
     runner: &CommandRunner<S>,
     name: &str,
     args: &Value,
+    caller_terminal_id: Option<&str>,
 ) -> Option<Result<Value, RpcError>> {
+    // NO DOMAIN-BOUNDARY GUARD HERE, and that is a decision rather than an omission: all five
+    // runtime command tools are ON the allow-list
+    // ([`crate::system_scope::SYSTEM_SCOPE_MCP_CAPABILITIES`]) — managed commands are precisely
+    // what the Système scope is FOR. The test `every_advertised_mcp_tool_is_classified` pins that,
+    // so moving one off the allow-list turns this comment into a failing test rather than into a
+    // silent hole.
+    //
+    // THE APPROVAL GUARD, however, IS here — because "may this container be asked" and "does this
+    // gesture need a human" are two different questions, and only the second one distinguishes
+    // starting a service from killing it. The three lifecycle verbs go through
+    // [`crate::system_command_guard::run_runner_effect`], which is a no-op for a user project and,
+    // on the Système singleton, applies the matrix: `start` free when it carries NO per-run `env`
+    // (no-op when already running) and protected when it brings one — an environment changes what
+    // a fixed command line executes — `stop` free when already idle and protected when it would
+    // kill a live process, `relaunch` always protected. The two READS below are free on every
+    // scope.
+    //
+    // `claim BEFORE the I/O, one attempt` is the discipline these get: a `kill(2)` is not
+    // replayable, so a stop that fails has spent its approval rather than re-opening it.
+    //
+    // `caller_terminal_id` travels the WHOLE way (review 01M15QP3HVYV9Q729ZYTNJB8T2, finding
+    // 01M15RF21A72775DEBDK9DYNTB): the request the human is shown says WHO asked, and the two verbs
+    // that kill a live service were precisely the ones that could not say it. The shell knows the
+    // calling terminal; the only reason it did not arrive here was this parameter's absence.
+    let clock = crate::system_approvals::SystemClock;
+    let guarded = |body: &dyn Fn() -> Result<Value, RpcError>| {
+        crate::system_command_guard::run_runner_effect(
+            db,
+            runner,
+            &clock,
+            name,
+            args,
+            caller_terminal_id,
+            body,
+        )
+    };
     match name {
-        "start_command" => Some(start_command(db, runner, args)),
-        "stop_command" => Some(stop_command(db, runner, args)),
-        "relaunch_command" => Some(relaunch_command(db, runner, args)),
+        "start_command" => Some(guarded(&|| start_command(db, runner, args))),
+        "stop_command" => Some(guarded(&|| stop_command(db, runner, args))),
+        "relaunch_command" => Some(guarded(&|| relaunch_command(db, runner, args))),
         "get_command_output" => Some(get_command_output(db, runner, args)),
         crate::mcp::WAIT_FOR_COMMAND_TOOL => Some(wait_for_command(db, runner, args)),
         _ => None,
@@ -1423,6 +1460,10 @@ fn create_workspace_inner(
             crate::usecase::RegisterWorkspaceError::Anchor(e) => {
                 crate::mcp_tools_spec::map_set_workspace_err(e)
             }
+            // The Système singleton owns exactly one bootstrapped workspace; adding a second is
+            // refused with its own code, not folded into the duplicate-path/unknown-project
+            // vocabulary of `map_create_workspace_err`.
+            crate::usecase::RegisterWorkspaceError::SystemScope(e) => RpcError::from(e),
         })?;
     match spec {
         Some(spec) => Ok(json!({ "workspace": workspace, "spec": spec })),
@@ -1611,6 +1652,15 @@ pub fn dispatch_workspace_tool(
     name: &str,
     args: &Value,
 ) -> Option<Result<Value, RpcError>> {
+    // The Système project has exactly ONE workspace, bootstrapped, and no verb creates a second —
+    // so both tools here are refused when their `project_id` names the singleton. The guard runs
+    // only once `name` is known to belong to this dispatcher, or a foreign tool would be answered
+    // instead of falling through.
+    if matches!(name, "workspace_add" | "create_workspace") {
+        if let Some(refusal) = crate::mcp_context::refuse_system_scope(db, name, args) {
+            return Some(Err(refusal));
+        }
+    }
     match name {
         "workspace_add" => Some(workspace_add(db, events, args)),
         "create_workspace" => Some(create_workspace(db, events, args)),

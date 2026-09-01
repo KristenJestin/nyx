@@ -293,8 +293,13 @@ export function CommandsSection({
     // "Close" is given to the list rather than taken off the dialog, which is where it is worth
     // something: four more command lines before the catalogue has to scroll.
     <div data-commands-section className="flex h-[32rem] min-h-0 min-w-0 flex-1">
+      {/* `loading` reaches the CATALOGUE and not only the panel below (review finding
+          01M1C7EMPGY1YDXHC6F1TJPFWS): the flag existed and was destructured here, but only gated
+          the detail column — so while the read was in flight the list said `0` and "No commands
+          yet", which reads as an answer rather than as a wait. */}
       <CommandCatalog
         commands={commandRows}
+        loading={loading}
         controller={commandGroups}
         selection={selection}
         onSelect={setSelection}

@@ -87,8 +87,9 @@ export default defineConfig({
             //
             // 5310 is chosen because it sits BELOW the dynamic port range, where Windows never
             // carves a reservation, so it is immune to that whole class of failure rather than
-            // merely free today. It also stays clear of the app's own ports (1420 dev, 1421 HMR)
-            // and of Vite's defaults (5173, 4173).
+            // merely free today. It also stays clear of the app's own dev ports (the 14200–14711
+            // window `scripts/dev-server-identity.cjs` derives a per-worktree dev-server + HMR pair
+            // from — it used to be a fixed 1420/1421) and of Vite's defaults (5173, 4173).
             //
             // `strictPort` is deliberately left at its default (`false`): Vite then walks to the
             // next free port if some other service already holds 5310, which is the closest

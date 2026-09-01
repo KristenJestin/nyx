@@ -2,8 +2,9 @@
  * Dev/prod mode detection and env-driven knobs for the Electron shell.
  *
  * The shell must run in two modes from the SAME main code:
- *   - **dev** — load the renderer from the running Vite dev server
- *     (`http://localhost:1420`), open DevTools, no ASAR.
+ *   - **dev** — load the renderer from the running Vite dev server (on a localhost port DERIVED
+ *     per worktree by `scripts/dev-server-identity.cjs`, no longer a fixed 1420), open DevTools,
+ *     no ASAR.
  *   - **prod** — load the renderer from the packaged static build
  *     (`dist/renderer/index.html`, relative to this package) shipped inside the app.
  *

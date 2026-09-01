@@ -90,10 +90,21 @@ export function CommandCatalog({
   onSelect,
   onDelete,
   importableCount,
+  loading = false,
   className,
 }: {
   /** Every command of the project, in list order. */
   commands: readonly CommandRow[];
+  /**
+   * Whether the list is still being READ.
+   *
+   * Distinct from `commands.length === 0`, and the distinction is a defect this fixes (review
+   * finding 01M1C7EMPGY1YDXHC6F1TJPFWS): while the read was in flight the catalogue showed
+   * `COMMANDS 0` and "No commands yet", i.e. it asserted an absence it had not yet checked. The
+   * user read that as "there is nothing here" and was, at the time, waiting on a call that took
+   * about ten seconds.
+   */
+  loading?: boolean;
   controller: CommandGroupsController;
   /** What the detail panel is showing — the catalogue paints it, it does not own it. */
   selection: CommandsSelection;
@@ -240,11 +251,13 @@ export function CommandCatalog({
             the footer), and the one affordance that opens the creation panel. */}
         <div className="flex items-center gap-2 px-3 pt-3 pb-1.5">
           <MicroLabel>Commands</MicroLabel>
+          {/* A COUNT, or a dash while there is nothing to count yet. `0` during the read is an
+              assertion the catalogue has not earned — see the `loading` prop. */}
           <span
             data-command-count
             className="rounded-full bg-muted px-1.5 text-2xs leading-relaxed font-medium text-muted-foreground tabular-nums"
           >
-            {commands.length}
+            {loading && commands.length === 0 ? "—" : commands.length}
           </span>
           <Button
             type="button"
@@ -266,8 +279,11 @@ export function CommandCatalog({
           className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-2 pb-2"
         >
           {commands.length === 0 ? (
-            <p className="px-1 py-6 text-center text-xs text-muted-foreground/70 italic">
-              No commands yet.
+            <p
+              data-command-list-status
+              className="px-1 py-6 text-center text-xs text-muted-foreground/70 italic"
+            >
+              {loading ? "Loading commands…" : "No commands yet."}
             </p>
           ) : (
             blocks.map((block, index) =>

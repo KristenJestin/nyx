@@ -12,6 +12,7 @@ import { queryClient } from "@/lib/query";
 import { ActiveProjectProvider } from "@/components/terminals/active-project";
 import { BaseLayout } from "@/components/terminals/base-layout";
 import { TerminalsPage } from "@/components/terminals/terminals-page";
+import { SystemScopePage } from "@/components/system/system-scope-page";
 import { HomePage } from "@/components/home/home-page";
 import { BoardPage } from "@/components/specs/board-page";
 import { SpecDetailPage } from "@/components/specs/spec-detail-page";
@@ -94,6 +95,35 @@ const terminalsRoute = createRoute({
     if (typeof search.command === "string") out.command = search.command;
     return out;
   },
+});
+
+/**
+ * SYSTÈME (`/system`) — the singleton's terminals and commands, on a ROUTE OF ITS OWN (human review
+ * `01M1EC7Y2625Q07C5386GKHZFS`, finding U1).
+ *
+ * ## Why it has its own path now
+ *
+ * It used to share the index route with `<TerminalsPage>`, dispatched by a `systemScope` boolean:
+ * Système was modelled as a SCOPE that REPLACED the entered project, so it took the project's slot,
+ * the project's rail selection and — since it was rendered at `/` — the project's active nav entry
+ * too. Tested in the real app that model failed on its own terms: entering Système switched off the
+ * project tile and hid Work / Knowledge / Engine / Catalogue, and the rail still lit `Terminals`
+ * over a page that was not the project's Terminals.
+ *
+ * Système is a PAGE, like any other page of the shell: the entered project stays entered while one
+ * reads it, and the only thing that has to change is which entry the rail marks. That is exactly
+ * what a path is for — `pathname === "/system"` lights the Système tile and nothing else, and
+ * `pathname === "/"` goes back to meaning "the project's Terminals" and nothing else. No dispatch
+ * component, no scope flag, no redirect table.
+ *
+ * The `?terminal=` / `?command=` deep-links stay the index route's: they name runtime objects of a
+ * project, and this route is not the project's. A separate path drops them by construction — there
+ * is no shared search to carry over.
+ */
+const systemRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/system",
+  component: SystemScopePage,
 });
 
 /**
@@ -238,6 +268,7 @@ const componentDetailRoute = createRoute({
 
 const routeTree = rootRoute.addChildren([
   terminalsRoute,
+  systemRoute,
   homeRoute,
   workRoute,
   specDetailRoute,

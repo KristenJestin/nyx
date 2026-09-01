@@ -1,5 +1,6 @@
+import * as React from "react";
 import { afterEach, describe, expect, it } from "vitest";
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import { Toaster, toast, toastManager } from "./toast";
 
@@ -102,6 +103,89 @@ describe("<Toaster> rendering", () => {
     await waitFor(() => {
       expect(screen.queryByText("Dismiss me")).not.toBeInTheDocument();
     });
+  });
+});
+
+describe("toast.decision — the actionable toast (human review 01M1E7K6D81M057JG5MVV4J7QE / T2)", () => {
+  /** A body with its OWN state: what the free content slot exists for (a live countdown). */
+  function Body() {
+    const [ticks, setTicks] = React.useState(0);
+    return (
+      <div data-testid="decision-body">
+        <p>Approve this?</p>
+        <button type="button" onClick={() => setTicks((n) => n + 1)}>
+          Yes ({ticks})
+        </button>
+      </div>
+    );
+  }
+
+  it("renders its own content — not a title/description pair — and that content stays live", async () => {
+    render(<Toaster />);
+    act(() => {
+      toast.decision({ id: "decision-1", body: Body });
+    });
+
+    const body = await screen.findByTestId("decision-body");
+    const root = body.closest("[data-variant]") as HTMLElement;
+    // The shell is the stack's own card (same variant marker, same animation classes); what is
+    // inside it is the caller's.
+    expect(root).toHaveAttribute("data-variant", "warning");
+    expect(root).toHaveAttribute("data-pinned");
+    // The body owns its state: it re-renders without the manager being updated once.
+    act(() => {
+      screen.getByRole("button", { name: /^Yes/ }).click();
+    });
+    expect(screen.getByRole("button", { name: "Yes (1)" })).toBeTruthy();
+  });
+
+  it("cannot be dismissed — no close control, and only the owner takes it back", async () => {
+    render(<Toaster />);
+    act(() => {
+      toast.decision({ id: "decision-2", body: Body });
+    });
+    const root = (await screen.findByTestId("decision-body")).closest(
+      "[data-variant]",
+    ) as HTMLElement;
+
+    expect(root.querySelector('[aria-label="Dismiss"]')).toBeNull();
+    act(() => {
+      root.focus();
+    });
+    fireEvent.keyDown(root, { key: "Escape" });
+    expect(screen.getByTestId("decision-body")).toBeTruthy();
+
+    // …while an ordinary toast beside it keeps every one of those exits.
+    act(() => {
+      toast.info("Just so you know");
+    });
+    const ordinary = (await screen.findByText("Just so you know")).closest(
+      "[data-variant]",
+    ) as HTMLElement;
+    expect(ordinary.querySelector('[aria-label="Dismiss"]')).not.toBeNull();
+
+    // The owner is the only way out.
+    act(() => {
+      toast.dismiss("decision-2");
+    });
+    await waitFor(() => expect(screen.queryByTestId("decision-body")).not.toBeInTheDocument());
+  });
+
+  it("is PINNED: it keeps stack rank 0 whatever lands after it", async () => {
+    render(<Toaster />);
+    act(() => {
+      toast.decision({ id: "decision-3", body: Body });
+      toast.success("Saved");
+    });
+    const decision = (await screen.findByTestId("decision-body")).closest(
+      "[data-variant]",
+    ) as HTMLElement;
+    const ordinary = (await screen.findByText("Saved")).closest("[data-variant]") as HTMLElement;
+
+    // Arrival order would put the newest — `Saved` — at rank 0, in front of the decision.
+    expect(decision.style.getPropertyValue("--toast-index")).toBe("0");
+    expect(ordinary.style.getPropertyValue("--toast-index")).toBe("1");
+    expect(Number(decision.style.zIndex)).toBeGreaterThan(Number(ordinary.style.zIndex));
   });
 });
 

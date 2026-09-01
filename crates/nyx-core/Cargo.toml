@@ -24,7 +24,14 @@ handlebars = { version = "6", default-features = false }
 portable-pty = "0.9"
 anyhow = "1"
 # Terminal record ids are UUIDv7 (time-ordered).
-uuid = { version = "1", features = ["v7"] }
+#
+# `v4` is enabled ALONGSIDE `v7`, for exactly one job: the opaque approval TOKEN of the Système
+# scope's one-shot ledger (`system_approvals`). A v7 id is time-ordered — it carries the clock in
+# its high bits — which is precisely what an unguessable secret must not do, so the token is built
+# from two v4s (244 CSPRNG bits, from the very `getrandom` backend `v7` already pulls in) rather
+# than from the id generator used everywhere else. No new crate enters the tree: this is one
+# feature flag on a dependency already present.
+uuid = { version = "1", features = ["v4", "v7"] }
 # Persistence: SQLite via Diesel. `bundled` vendors SQLite (no system lib).
 # `returning_clauses_for_sqlite_3_35` enables RETURNING on INSERT.
 # `r2d2` pulls in diesel's re-exported r2d2 connection pool (the PRD-frozen pool —

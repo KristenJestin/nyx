@@ -179,6 +179,11 @@ function installBackend({ snapshot = EMPTY, fail = false, hang = false }: Backen
           if (fail) throw new Error("nope");
           if (hang) return new Promise(() => {});
           return snapshot;
+        case "system_scope_detail":
+          // The Système singleton is ABSENT on this fixture — the documented `null` answer of a
+          // database with no scope. The rail then renders no tile, which is what these cases are
+          // about; the catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`.
+          return null;
         default:
           return [];
       }
@@ -225,6 +230,10 @@ describe("HomePage — the project scope", () => {
         if (cmd === "workspace_runtime_snapshot") {
           return { workspace: { id: "ws-p1", name: "root", path: "/" }, terminals: [], services: [] };
         }
+        // The Système singleton is ABSENT here — the documented `null` of a database with no scope.
+        // The catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`: the rail
+        // would dereference it and the shell error boundary would swallow the screen.
+        if (cmd === "system_scope_detail") return null;
         return [];
       },
       { shouldMockEvents: true },
@@ -269,6 +278,10 @@ describe("HomePage — the project scope", () => {
       (cmd) => {
         if (cmd === "list_projects") return [];
         if (cmd === "home_snapshot") throw new Error("the project home must not read a scope here");
+        // The Système singleton is ABSENT here — the documented `null` of a database with no scope.
+        // The catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`: the rail
+        // would dereference it and the shell error boundary would swallow the screen.
+        if (cmd === "system_scope_detail") return null;
         return [];
       },
       { shouldMockEvents: true },
@@ -590,6 +603,11 @@ describe("HomePage — the information slot reads the LIVE activity", () => {
                 session({ session_id: "s1", state: "waiting", secondary: snapshotSecondary }),
               ],
             };
+          case "system_scope_detail":
+            // The Système singleton is ABSENT on this fixture — the documented `null` answer of a
+            // database with no scope. The rail then renders no tile, which is what these cases are
+            // about; the catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`.
+            return null;
           default:
             return [];
         }
@@ -666,6 +684,10 @@ describe("HomePage — the cross-project scope", () => {
         }
         if (cmd === "list_projects") return [projectRecord("p1", "nyx")];
         if (cmd === "list_workspaces") return [workspaceRecord("p1")];
+        // The Système singleton is ABSENT here — the documented `null` of a database with no scope.
+        // The catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`: the rail
+        // would dereference it and the shell error boundary would swallow the screen.
+        if (cmd === "system_scope_detail") return null;
         return [];
       },
       { shouldMockEvents: true },
@@ -746,6 +768,11 @@ describe("HomePage — the cross-project scope", () => {
               services: [service({ instance_id: "i1", project: PALBANK })],
               terminals: [terminal({ terminal_id: "t1", project: KEYROAD })],
             };
+          case "system_scope_detail":
+            // The Système singleton is ABSENT on this fixture — the documented `null` answer of a
+            // database with no scope. The rail then renders no tile, which is what these cases are
+            // about; the catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`.
+            return null;
           default:
             return [];
         }

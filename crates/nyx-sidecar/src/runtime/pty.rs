@@ -1204,6 +1204,9 @@ fn run_pump(params: PumpParams) {
     let mut last_save = Instant::now();
     let mut osc133_tail: Vec<u8> = Vec::new();
     let mut exec_sm = osc133::ExecStateMachine::new();
+    // The carry of the VIEW-LESS terminal-query responder below: a CSI query split across two
+    // reads is still recognised (see `nyx_core::command::scan_terminal_queries`).
+    let mut query_carry: Vec<u8> = Vec::new();
     // WHICH exit we took, read by the teardown below: an EXPLICIT close (the flag) or the
     // child's own EOF (the reader disconnecting).
     let mut closed = false;
@@ -1270,6 +1273,29 @@ fn run_pump(params: PumpParams) {
                 // mount must never cost the terminal the bytes it printed just before the pane
                 // appeared). A no-op once a pane owns the buffer.
                 scrollback.record_headless(&chunk);
+                // ANSWER THE TERMINAL QUERIES WHILE NOBODY ELSE CAN (gate CDP « Scope Système »).
+                //
+                // A shell probes its terminal on startup — DSR cursor position (`ESC[6n`), DSR
+                // status, Primary Device Attributes — and WITHHOLDS everything until it is
+                // answered. For a terminal with a pane the answer comes from the renderer's
+                // emulator. For a VIEW-LESS one there is no emulator anywhere: [`flush`] drops the
+                // bytes (no view means no acking creditor), so the query reaches nobody and the
+                // shell blocks BEFORE its first prompt — the observed "4 bytes then silence"
+                // (`ESC[6n` and nothing more), which on Windows is every headless spawn. That is
+                // the same hang [`nyx_core::command`] already answers for managed commands, with
+                // the same scanner and the same canned replies; the only new thing here is WHO
+                // asks, and it is asked ONLY while no view is attached.
+                //
+                // Once a pane attaches the responder goes quiet in the same breath — the renderer
+                // owns the emulation from then on and a second answer would be a duplicate
+                // keystroke on the child's stdin. The carry is dropped with it, so a partial
+                // sequence never straddles the hand-over.
+                let replies = view_less_query_replies(&scrollback, &chunk, &mut query_carry);
+                if !replies.is_empty() {
+                    // Best-effort: a write that fails means the child is gone, which the
+                    // reader's own disconnect reports one iteration later.
+                    let _ = pty.lock().unwrap().write(&replies);
+                }
                 // Forward the SAME raw bytes to the headless VT feeder (v2.2.5) with an O(1)
                 // channel send — the slow byte-wise parse runs on the FEEDER thread, so it never
                 // slows this read→emit loop and can never widen the read-ahead window that the
@@ -1347,6 +1373,30 @@ fn run_pump(params: PumpParams) {
         }
     };
     events.emit(Event::PtyExit { terminal_id, code });
+}
+
+/// The canned replies a VIEW-LESS terminal owes its own shell for this chunk — and an EMPTY
+/// vector for one whose pane is attached.
+///
+/// The rule in one place, so the pump reads as a single line and the rule itself is testable
+/// without a live shell. See the call site for the why; the short version is that a shell probes
+/// its terminal at startup and withholds everything until it is answered, the renderer's emulator
+/// is the one that answers, and a terminal with no pane has none — on Windows that is every
+/// headless spawn, which then dies at four bytes (`ESC[6n`) before its first prompt.
+///
+/// `carry` is DROPPED the moment a view exists: from then on the renderer owns the emulation, and
+/// a partial sequence held across the hand-over could only produce a duplicate answer to a query
+/// the pane has already replied to.
+fn view_less_query_replies(
+    scrollback: &ScrollbackOwner,
+    chunk: &[u8],
+    carry: &mut Vec<u8>,
+) -> Vec<u8> {
+    if scrollback.has_view() {
+        carry.clear();
+        return Vec::new();
+    }
+    nyx_core::command::scan_terminal_queries(chunk, carry)
 }
 
 /// Save a VIEW-LESS terminal's accumulated scrollback into its record, at most once per
@@ -2172,6 +2222,73 @@ mod tests {
             "the attach must resize the shell to the pane it is now shown in"
         );
         mgr.close(mounted);
+    }
+
+    /// A [`ScrollbackOwner`] with the view bit set as asked and no persistence — the only two
+    /// things [`view_less_query_replies`] reads.
+    fn owner(has_view: bool) -> ScrollbackOwner {
+        ScrollbackOwner {
+            has_view: Arc::new(AtomicBool::new(has_view)),
+            dirty: Arc::new(AtomicBool::new(false)),
+            sidecar: None,
+        }
+    }
+
+    /// GATE CDP « Scope Système », the defect it caught: a shell with NO renderer view must have
+    /// its own terminal QUERIES answered, or it never prints a thing.
+    ///
+    /// A shell probes its terminal at startup (DSR cursor position `ESC[6n`) and WITHHOLDS all
+    /// output until it is answered. The answer normally comes from the renderer's emulator; a
+    /// view-less shell has none, and [`flush`] drops the bytes on the floor, so on Windows every
+    /// [`PtyManager::spawn_headless`] — a Système terminal, an MCP `create_terminal` — stalled at
+    /// four bytes and never reached its prompt. Observed in the real app: the terminal opened,
+    /// stayed blank forever and swallowed every keystroke.
+    ///
+    /// Three rules, and the third is the one that keeps this from becoming a bug of its own:
+    ///  1. NO VIEW ⇒ the pump answers, with [`nyx_core::command`]'s canned replies (one scanner
+    ///     for the whole product — the managed-command runtime has answered the same three
+    ///     queries since the "only 4 bytes captured" bug).
+    ///  2. A VIEW ⇒ the pump stays SILENT: the renderer owns the emulation and a second reply
+    ///     would be a phantom keystroke on the child's stdin.
+    ///  3. The carry does not survive the hand-over — a sequence half-read when the pane attaches
+    ///     is the renderer's to answer, not ours to finish.
+    #[test]
+    fn a_view_less_shell_gets_its_terminal_queries_answered_and_an_attached_one_does_not() {
+        // 1. The startup probe of a headless shell is answered, cursor-position and all.
+        let mut carry = Vec::new();
+        assert_eq!(
+            view_less_query_replies(&owner(false), b"\x1b[6n", &mut carry),
+            b"\x1b[1;1R".to_vec(),
+            "a view-less shell's DSR cursor-position probe must be answered by the pump"
+        );
+        // …including one SPLIT across two reads (the carry is what makes that work).
+        let mut split = Vec::new();
+        assert!(
+            view_less_query_replies(&owner(false), b"prompt\x1b[", &mut split).is_empty(),
+            "half a query is not a query yet"
+        );
+        assert_eq!(
+            view_less_query_replies(&owner(false), b"6n", &mut split),
+            b"\x1b[1;1R".to_vec(),
+            "the second half completes it, and the answer still goes out"
+        );
+
+        // 2. With a pane attached the pump says NOTHING — the renderer answers.
+        let mut attached = Vec::new();
+        assert!(
+            view_less_query_replies(&owner(true), b"\x1b[6n", &mut attached).is_empty(),
+            "a terminal with a view must not be answered twice"
+        );
+
+        // 3. …and a partial sequence held from the view-less days is dropped at the hand-over.
+        let mut handover = Vec::new();
+        assert!(view_less_query_replies(&owner(false), b"\x1b[", &mut handover).is_empty());
+        assert!(!handover.is_empty(), "the partial sequence was carried");
+        assert!(view_less_query_replies(&owner(true), b"6n", &mut handover).is_empty());
+        assert!(
+            handover.is_empty(),
+            "the carry must not survive the attach — the renderer owns the emulation now"
+        );
     }
 
     /// A shell with NO view streams nothing over the pipe, and starts streaming the moment one

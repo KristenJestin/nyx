@@ -76,6 +76,11 @@ function installBackend() {
           return { sessions: [], services: [], specs: [], terminals: [] };
         case "spec_list":
           return [];
+        case "system_scope_detail":
+          // The Système singleton is ABSENT on this fixture — the documented `null` answer of a
+          // database with no scope. The rail then renders no tile, which is what these cases are
+          // about; the catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`.
+          return null;
         default:
           return [];
       }

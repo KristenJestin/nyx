@@ -63,6 +63,15 @@ import { loadGlobalScope, saveGlobalScope, saveLastProjectId } from "./ui-persis
  * off. The project id is a HINT the rail validates against the live tree (a deleted project falls
  * back cleanly); the scope flag needs no validation — "all projects" is true of every tree — so it
  * is seeded straight into this provider's state.
+ *
+ * ## Système is NOT a third thing here
+ *
+ * A `systemScope` boolean briefly sat beside these two (human review `01M1EC7Y2625Q07C5386GKHZFS`,
+ * finding U1), back when Système was modelled as a SCOPE that REPLACED the entered project. That
+ * made the rail carry two mutually exclusive selections for one question. Système is a PAGE now, at
+ * `/system`, so "which page am I on" is the ROUTER's answer and the entered project survives the
+ * visit untouched. Do not reintroduce it: the two fields above are the whole of this context, and
+ * the global scope is about WHICH PROJECTS one is reading, never about which page is open.
  */
 
 /**

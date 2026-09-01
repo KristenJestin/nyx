@@ -141,6 +141,18 @@ pub fn dispatch(
         events.emit(Event::Changed {
             topic: "agent-sessions".to_string(),
         });
+    } else if decides_system_approvals(command) {
+        // A human just granted or refused a Système approval: every open decision surface drops
+        // the card. The SAME constant the MCP dispatcher emits when a protected call is REFUSED
+        // and thereby CREATES a request (`runtime::mcp::dispatch`), so the pending list is driven
+        // by one topic whichever side moved it — and by one authority, since both sites spell it
+        // from `system_approvals::SYSTEM_APPROVALS_CHANGED_TOPIC` rather than from a `ChangedTopic`
+        // variant that could never be constructed (a `ToolOutcome` effect rides the success path,
+        // and this event is a refusal). The only subscriber is a pure reader
+        // (`system_approval_list`), so no reconcile loop.
+        events.emit(Event::Changed {
+            topic: nyx_core::system_approvals::SYSTEM_APPROVALS_CHANGED_TOPIC.to_string(),
+        });
     } else if mutates_review_comments(command) {
         // A review COMMENT mutation (post/reply/resolve/reopen) broadcasts `repos://changed`
         // — the SAME topic the git-watch pushes and the MCP `review_comment_post` tool emits
@@ -172,6 +184,36 @@ struct Ctx<'a> {
     command: &'a str,
     args: Value,
     events: &'a EventSink,
+}
+
+/// The sidecar's implementation of the seam `nyx_core::system_scope::create_system_terminal` opens
+/// a Système terminal's shell through — the PTY half of the atomic use case, called by the core
+/// AFTER the record is committed.
+///
+/// HEADLESS, like the MCP `create_terminal` path: the record is born before any pane shows it (the
+/// human may be looking at another project, and the Système page renders its own list), so the
+/// shell must be real without a view behind it. A pane that mounts later ATTACHES to this very PTY
+/// (`PtyManager::spawn` returns the live one) instead of opening a second, wrong prompt.
+///
+/// The cwd is the ABSOLUTE home the core resolved off the bootstrapped scope, passed through
+/// verbatim: no `.`, no `~`, and no second derivation that could disagree with where the Système
+/// COMMANDS run.
+struct SystemShellOpener<'a> {
+    runtime: &'a Runtime,
+    events: &'a EventSink,
+}
+
+impl nyx_core::system_scope::SystemTerminalShell for SystemShellOpener<'_> {
+    fn open_at_home(&self, terminal_id: &str, home: &str) -> Result<(), String> {
+        // The port THIS instance's MCP server bound, read live (0 before it binds), so a `claude`
+        // launched from a Système terminal reaches this nyx — the same rule as every other spawn.
+        let mcp_port = self.runtime.mcp().map(|m| m.bound_port()).unwrap_or(0);
+        self.runtime
+            .pty()
+            .spawn_headless(home, terminal_id, mcp_port, self.events.clone())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 impl Ctx<'_> {
@@ -303,6 +345,58 @@ impl Ctx<'_> {
     /// Map a Diesel error to a readable string.
     fn db_err(e: diesel::result::Error) -> String {
         format!("db error: {e}")
+    }
+
+    /// Surface a use case that can refuse on the SYSTÈME domain boundary: the refusal keeps its
+    /// stable `system_scope_forbidden` wording (so the renderer keys on a code, not on prose).
+    ///
+    /// A SQL failure UNDERNEATH keeps its own prefix — `SystemScopeError::Db` renders
+    /// "Système scope database error: {e}", NOT the "db error: {e}" of [`Self::db_err`]. That is
+    /// deliberate: the wording says WHERE the query failed, which is strictly more than `db_err`
+    /// carries, and nothing keys on the prefix (the renderer discriminates on the
+    /// `system_scope_forbidden` code, never on the DB wording). The one call site that already
+    /// holds the two apart — `workspace_delete`, whose error type has both a `SystemScope` and a
+    /// `Db` arm — routes each to its own mapper.
+    fn scope_err(e: nyx_core::system_scope::SystemScopeError) -> String {
+        e.to_string()
+    }
+
+    /// THE UI/IPC HALF OF THE SYSTÈME DOMAIN BOUNDARY: refuse this db-command when its payload
+    /// AIMS the Système singleton and the command is not one of the scope's capabilities
+    /// (`nyx_core::system_scope::SYSTEM_SCOPE_IPC_CAPABILITIES` — this bridge's half of the SAME
+    /// table the MCP dispatchers read, so the two surfaces cannot drift apart on what the scope may
+    /// do; `every_ipc_capability_of_the_system_scope_is_served_by_the_dispatcher` confronts that
+    /// half with the live match below).
+    ///
+    /// Called ONCE, at the top of [`Self::run`], for the same reason the MCP guard sits at the top
+    /// of its dispatcher: this file is a hundred-arm match reaching `nyx_core::db` primitives
+    /// directly — the "chemins DB directs historiques" — and a per-arm guard in a match that long
+    /// is a hole waiting for the next arm.
+    ///
+    /// The refusal is a plain `Err(String)`, the vocabulary this transport already speaks; the
+    /// message carries the stable `system_scope_forbidden` code so the renderer can key on it
+    /// instead of matching prose.
+    ///
+    /// The DB-FREE pre-check runs FIRST, deliberately outside `with_conn`: the guard's placement at
+    /// the top of a ~120-arm match is what makes it exhaustive, but it also puts it on arms that
+    /// touch no database — `terminal_info` (`{ id: <number> }`, polled at 1 Hz per open terminal),
+    /// `shell_list` and `integration_list` (invoked with no argument, i.e. `{}`).
+    ///
+    /// `needs_scope_lookup` answers those from the PAYLOAD alone, and only from the payload: no
+    /// command name is dispensed as such. An arm that touches no database still pays the lookup as
+    /// soon as its payload carries a string — `register_terminal_pty` is a no-op here, yet the
+    /// renderer sends it `{ recordId, ptyId }`, so it checks a connection out like every other
+    /// stringful call. The boundary is unchanged either way: `guard_payload` asks the very same
+    /// question first.
+    fn refuse_system_scope(&self) -> Result<(), String> {
+        if !nyx_core::system_scope::needs_scope_lookup(self.command, &self.args) {
+            return Ok(());
+        }
+        self.db()
+            .with_conn(|c| {
+                nyx_core::system_scope::guard_payload(c, self.command, &self.args)
+            })
+            .map_err(|e| e.to_string())
     }
 
     /// Surface a state-guarded content-write refusal (v2.8 review B4): a `Forbidden` becomes a clear
@@ -590,6 +684,7 @@ impl Ctx<'_> {
     /// and be swallowed by the renderer (regression #43: the `command_output` backlog never
     /// replayed). Do NOT return a raw `String` from an arm — wrap it through [`Self::json`].
     fn run(&self) -> Result<String, String> {
+        self.refuse_system_scope()?;
         match self.command {
             // --- terminals -----------------------------------------------------
             "list_terminals" => self
@@ -676,6 +771,127 @@ impl Ctx<'_> {
                     .with_conn(|c| db::attach_terminal(c, &terminal_id, &workspace_id, &mode))
                     .map_err(Self::db_err)?;
                 Ok("null".to_string())
+            }
+            // --- the Système scope (PRD « Scope Système ») -----------------------
+            "create_system_terminal" => {
+                // The ATOMIC creation: `nyx_core` writes the record with its cwd (the absolute
+                // home), its `workspace_id` and `workspace_binding_mode = manual` in ONE
+                // transaction, then opens the shell through the seam below — after the commit.
+                // Nothing here re-derives the home: the use case reads it off the bootstrapped
+                // scope, which is the very `root_path` every Système COMMAND spawns in.
+                let label = self.arg_opt_str("label");
+                let created = nyx_core::system_scope::create_system_terminal(
+                    self.db(),
+                    label,
+                    &SystemShellOpener {
+                        runtime: self.runtime,
+                        events: self.events,
+                    },
+                )
+                .map_err(Self::scope_err)?;
+                if let Some(reason) = &created.shell_error {
+                    // The record STANDS — alive, manually bound to the singleton, so the next
+                    // mount spawns its shell through the ordinary path. Say why it is silent
+                    // rather than let the human meet a mute terminal (same policy, and the same
+                    // wording, as the MCP host's `open_terminal_shell`).
+                    self.events.log(
+                        "warn",
+                        format!(
+                            "Système terminal {} got no shell: {reason}",
+                            created.terminal.id
+                        ),
+                    );
+                }
+                Self::json(&created.terminal)
+            }
+            // --- the HUMAN's half of the approval protocol -------------------
+            //
+            // The decision surface, and the ONLY place a Système approval can be granted or
+            // denied. These three names are on the IPC HALF of the allow-list and MUST NEVER get
+            // an MCP twin: an agent that could approve its own request would turn the protocol
+            // into a formality. The agent's counterpart is the single read
+            // `system_approval_status`, which reports a decision and a result — never a licence.
+            //
+            // GRANTING IS NOW ALSO EXECUTING (PDR-0030). The click does not hand a ticket back to
+            // the agent; it performs the operation, here, on the canonical charge the ledger froze
+            // and the toast displayed. That is what removed the token from the protocol, and with
+            // it the finding that made the whole capability unusable: there is nothing left that
+            // has to reach the model through `error.data`.
+            "system_approval_list" => {
+                // Applies the LAZY expiry and the bounded retention on the way through, which is
+                // why the pending surface never shows a request that is already dead: the read IS
+                // the expiry pass.
+                let pending = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::system_approvals::list_pending(
+                            c,
+                            &nyx_core::system_approvals::SystemClock,
+                        )
+                    })
+                    .map_err(Self::db_err)?;
+                let rendered: Vec<serde_json::Value> =
+                    pending.iter().map(|a| a.public_json()).collect();
+                Self::json(&rendered)
+            }
+            "system_approval_grant" | "system_approval_deny" => {
+                let request_id = self.arg_str_nonempty("requestId")?;
+                let clock = nyx_core::system_approvals::SystemClock;
+                // `Some("ui")` is the actor, and it is the whole point of the column: the ledger
+                // records that a HUMAN at this app decided, not that some process did.
+                let decided = if self.command == "system_approval_grant" {
+                    // The MCP runtime is what resolves a tool name to a tool, so the operation the
+                    // user approved is performed through the SAME dispatch table an agent's call
+                    // would have taken. Absent it (a bare build, or a grant before `mcp_start`)
+                    // there is nothing that could have raised the request in the first place — so
+                    // the ledger records a failure rather than a silent success.
+                    let mcp = self.runtime.mcp();
+                    let effect = |tool: &str, args: &serde_json::Value| match &mcp {
+                        Some(mcp) => mcp.execute_granted(tool, args),
+                        None => Err("the MCP runtime is not started, so nyx cannot perform the \
+                                     approved operation"
+                            .to_string()),
+                    };
+                    nyx_core::system_approvals::grant_and_execute(
+                        self.db(),
+                        &clock,
+                        &request_id,
+                        Some("ui"),
+                        &effect,
+                    )
+                } else {
+                    self.db()
+                        .with_conn(|c| {
+                            nyx_core::system_approvals::deny(c, &clock, &request_id, Some("ui"))
+                        })
+                };
+                Self::json(&decided.map_err(|e| e.to_string())?.public_json())
+            }
+            "system_scope_detail" => {
+                // The UI's ONE door onto the singleton: `list_projects` / `list_workspaces` are
+                // user-only by contract, so the Système project and its home workspace are read
+                // HERE — deliberately outside the re-orderable project array the sidebar renders.
+                //
+                // IPC-ONLY. It is on the IPC half of the allow-list and must never become an MCP
+                // tool: an agent discovers the Système COMMANDS through `list_system_commands`
+                // and nothing else of the scope. Pinned by
+                // `system_scope::tests::the_two_halves_of_the_allow_list_do_not_share_a_name_with_the_live_mcp_surface`.
+                //
+                // `null` when the scope is absent (a database that never booted through
+                // `Db::open`): a read, so it reports the absence instead of bootstrapping behind
+                // the caller's back.
+                let scope = self
+                    .db()
+                    .with_conn(nyx_core::system_scope::load)
+                    .map_err(Self::db_err)?;
+                match scope {
+                    Some(scope) => Self::json(&serde_json::json!({
+                        "project": scope.project,
+                        "workspace": scope.workspace,
+                        "home": scope.home(),
+                    })),
+                    None => Ok("null".to_string()),
+                }
             }
             // --- live-PTY introspection + auto-attach (host-owned, not the DB) --
             "terminal_info" => {
@@ -921,7 +1137,7 @@ impl Ctx<'_> {
                 let project_id = self.arg_str("projectId")?;
                 self.db()
                     .with_conn(|c| nyx_core::usecase::list_workspaces(c, &project_id))
-                    .map_err(Self::db_err)
+                    .map_err(Self::scope_err)
                     .and_then(|rows| Self::json(&rows))
             }
             "create_workspace" => {
@@ -951,7 +1167,7 @@ impl Ctx<'_> {
                             nyx_core::usecase::DomainEventSource::Ui,
                         )
                     })
-                    .map_err(Self::db_err)
+                    .map_err(Self::scope_err)
                     .and_then(|row| Self::json(&row))
             }
             "rename_workspace" => {
@@ -974,7 +1190,7 @@ impl Ctx<'_> {
                             nyx_core::usecase::DomainEventSource::Ui,
                         )
                     })
-                    .map_err(Self::db_err)?;
+                    .map_err(Self::scope_err)?;
                 Ok("null".to_string())
             }
             "workspace_delete" => {
@@ -1039,6 +1255,11 @@ impl Ctx<'_> {
                         }
                         nyx_core::usecase::RemoveWorkspaceError::IsRoot => {
                             "this is the project's root workspace — it cannot be removed on its own; delete the whole project instead".to_string()
+                        }
+                        // The Système workspace is not "a root that cannot be removed on its
+                        // own": it is a container with no removal at all, and it says so.
+                        nyx_core::usecase::RemoveWorkspaceError::SystemScope(e) => {
+                            Self::scope_err(e)
                         }
                         nyx_core::usecase::RemoveWorkspaceError::Db(e) => Self::db_err(e),
                     })?;
@@ -2086,6 +2307,34 @@ impl Ctx<'_> {
                     .ok_or_else(|| "managed-command runtime not started".to_string())?;
                 Self::json(&cmd.acknowledge(&instance_id))
             }
+            "command_clear_output" => {
+                // The HUMAN half of the MCP `clear_command_output` tool: same runner call, same
+                // `command://output-cleared` push, no approval ledger — a hand at the keyboard is
+                // the authorisation. It existed only for the agent until the Système scope needed
+                // the human to own every verb of its commands, so the renderer had no way at all
+                // to empty a captured buffer.
+                //
+                // A clear wipes BYTES, never the run result: no state transition is emitted, and a
+                // running instance keeps streaming onto the freshly-emptied buffer
+                // (`CommandRunner::clear_output`).
+                let instance_id = self.arg_str("instanceId")?;
+                // Validate the id against the DB first, exactly as the MCP tool does: clearing an
+                // instance that does not exist would otherwise be a silent success.
+                let exists = self
+                    .db()
+                    .with_conn(|c| db::get_instance(c, &instance_id))
+                    .map_err(Self::db_err)?
+                    .is_some();
+                if !exists {
+                    return Err(format!("unknown command instance {instance_id}"));
+                }
+                let cmd = self
+                    .runtime
+                    .command()
+                    .ok_or_else(|| "managed-command runtime not started".to_string())?;
+                cmd.runner().clear_output(&instance_id);
+                Self::json(&serde_json::json!({ "instance_id": instance_id, "cleared": true }))
+            }
             // --- agents --------------------------------------------------------
             "agent_active_sessions" => self
                 .db()
@@ -2707,7 +2956,7 @@ impl Ctx<'_> {
             // the `design` + `design_components` authority (Phase 1) and the composition renderer
             // (`nyx_core::render`, Phase 3 task #6). These are PURE reads/renders + a per-node param
             // persistence: no agent ACTION lives here (the agent drives the proto via the MCP
-            // `proto_*` tools, never a UI button — the "actions via MCP" seam of PDR-0009).
+            // `proto_*` tools, never a UI button — the "actions via MCP" seam of PDR-0030).
             //
             // `design_get` — a project's design-system row: the derived `theme_tokens_json` (the
             // iframe's `@theme`) + the DESIGN.md `content`, or `null` when the project has none yet.
@@ -2991,7 +3240,7 @@ impl Ctx<'_> {
                         // GUARDED: editing a variant that is the FROZEN elected composition
                         // of a design-locked round is refused (the "élection figée"
                         // invariant) — iterate by opening a NEW round, never mutate a frozen
-                        // one (PDR-0009).
+                        // one (PDR-0030).
                         match db::update_variant_composition(c, &variant_id, &json) {
                             Ok(Some(v)) => Ok(Ok((v, warnings))),
                             Ok(None) => Ok(Err(format!("unknown variant {variant_id}"))),
@@ -2999,7 +3248,7 @@ impl Ctx<'_> {
                                 Ok(Err(format!(
                                     "variant {variant_id} is part of the FROZEN design \
                                          (round {locked_round_id} is locked): its composition is \
-                                         immutable — open a NEW round to iterate (PDR-0009)"
+                                         immutable — open a NEW round to iterate (PDR-0030)"
                                 )))
                             }
                             Err(db::RoundMutationError::Db(e)) => Err(e),
@@ -3350,7 +3599,7 @@ impl Ctx<'_> {
             // The DATA layer the future proto UI (onglet + viewer / rounds / élection / commentaires
             // / composition — T25-T29) consumes. Reads share `nyx_core::db` with the MCP `proto_*`
             // tools (PDR-0005: one authority for UI + MCP); the WRITES are the USER's decisions
-            // (RETENU is the user's choice, distinct from the agent's is_main — PDR-0009) and reuse
+            // (RETENU is the user's choice, distinct from the agent's is_main — PDR-0030) and reuse
             // the SAME guarded `db` authority, so the "élection figée" lock still refuses a mutation
             // on a design-locked round. Every write emits `prototypes://changed` so an open surface
             // re-pulls (symmetric to the `proto_*` tools' `ChangedTopic::Prototypes`).
@@ -3371,7 +3620,7 @@ impl Ctx<'_> {
             // the frozen round, the arbre nommé = PLACEMENT with each node classified by its NATURE
             // ([DS] catalogue / [NEW] to-build / [inline] bespoke) carrying a per-node design-system
             // `component_ref`, the `[NEW]` candidates, and the pre-dev review as ANCHORS + COUNTS
-            // ONLY — never the comment BODIES (PDR-0009: the review is never transmitted to the
+            // ONLY — never the comment BODIES (PDR-0030: the review is never transmitted to the
             // coder, and this is the seam a coder harness consumes — review #47).
             // `null` until the design is LOCKED (the "élection figée" empty cue: no lock → nothing to
             // expose, so the seam never drifts). SAME `nyx_core::db` authority as the MCP
@@ -3423,7 +3672,7 @@ impl Ctx<'_> {
                                     Ok(Err(format!(
                                         "round {locked_round_id} is FROZEN (its design is locked): \
                                          its election is immutable — open a NEW round (rollback) to \
-                                         iterate (PDR-0009)"
+                                         iterate (PDR-0030)"
                                     )))
                                 }
                                 Err(db::RoundMutationError::Db(e)) => Err(e),
@@ -3437,7 +3686,7 @@ impl Ctx<'_> {
                 Self::json(&serde_json::json!({ "round_page": round_page }))
             }
             // `proto_election_clear` — RETIRE the USER's RETENU for a page in a round (RETENU is
-            // reversible, PDR-0009). Same lock guard as `proto_elect`. `{ roundId, pageId }` ->
+            // reversible, PDR-0030). Same lock guard as `proto_elect`. `{ roundId, pageId }` ->
             // `{ round_page }`.
             "proto_election_clear" => {
                 let round_id = self.arg_str("roundId")?;
@@ -3455,7 +3704,7 @@ impl Ctx<'_> {
                                     Ok(Err(format!(
                                         "round {locked_round_id} is FROZEN (its design is locked): \
                                          its election is immutable — open a NEW round (rollback) to \
-                                         iterate (PDR-0009)"
+                                         iterate (PDR-0030)"
                                     )))
                                 }
                                 Err(db::RoundMutationError::Db(e)) => Err(e),
@@ -3470,7 +3719,7 @@ impl Ctx<'_> {
             }
             // `proto_comment_add` — ADD a pre-dev review comment anchored to a tree NODE (T28). The UI
             // is the HUMAN façade, so `authorKind` defaults to `user` (an explicit value is honoured).
-            // Unknown prototype → readable error. Never transmitted to the coder (PDR-0009). `{
+            // Unknown prototype → readable error. Never transmitted to the coder (PDR-0030). `{
             // prototypeId, body, nodeKey?, originVariantId?, authorKind?, authorRef? }` -> `{ feedback }`.
             "proto_comment_add" => {
                 let prototype_id = self.arg_str("prototypeId")?;
@@ -3543,7 +3792,7 @@ impl Ctx<'_> {
             // A pure READ: no mutation, no `changed` broadcast. CONSULTING IS NOT ROLLING BACK —
             // it opens no round, copies no manifest and moves no election. `proto_round_rebase`
             // below stays the only thing that creates a round, and the UI does not call it
-            // (PDR-0009: the agent opens a round to apply a correction; the human reads).
+            // (PDR-0030: the agent opens a round to apply a correction; the human reads).
             "proto_round_manifest" => {
                 let round_id = self.arg_str("roundId")?;
                 self.db()
@@ -3553,7 +3802,7 @@ impl Ctx<'_> {
             }
             // `proto_round_rebase` — ROLLBACK onto an earlier round (T26): open a NEW current round
             // whose manifest COPIES the source round's pinned versions, so the design returns to that
-            // snapshot WITHOUT mutating the frozen source (PDR-0009: rounds gardés comme rollback).
+            // snapshot WITHOUT mutating the frozen source (PDR-0030: rounds gardés comme rollback).
             // Unknown / cross-prototype source → readable error. `{ prototypeId, sourceRoundId, label,
             // summary? }` -> `{ round }`.
             "proto_round_rebase" => {
@@ -3675,6 +3924,13 @@ fn mutates_review_findings(command: &str) -> bool {
     command == "review_task_promote"
 }
 
+/// The db-commands that MOVE the Système approval queue — a human granting or refusing a request.
+/// `system_approval_list` is deliberately absent: a read invalidates nothing, and broadcasting on
+/// it would make the decision surface re-pull itself forever.
+fn decides_system_approvals(command: &str) -> bool {
+    matches!(command, "system_approval_grant" | "system_approval_deny")
+}
+
 /// The terminal RECORD-MUTATING DB commands whose UI path must broadcast `terminals://changed`
 /// — SYMMETRIC to the MCP terminal tools (`create_terminal`/`close_terminal`/`attach_terminal`
 /// emit `ChangedTopic::Terminals` via `emit_effects`). These flip a terminal record's existence
@@ -3702,10 +3958,18 @@ fn mutates_review_findings(command: &str) -> bool {
 /// `workspaces://changed` push does NOT refresh the terminal list (a different topic), so without
 /// this entry the deleted rows stayed on screen — reclassified as loose terminals by the
 /// renderer's optimistic detach — until an unrelated action happened to trigger a re-list.
+/// INCLUDED for the SAME reason as `create_terminal`: `create_system_terminal` mints a terminal
+/// RECORD (already bound to the Système workspace), so every surface reading the runtime aggregate
+/// — the Système page first of all — must re-pull to see it.
 fn mutates_terminals(command: &str) -> bool {
     matches!(
         command,
-        "create_terminal" | "close_terminal" | "attach_terminal" | "rename" | "workspace_delete"
+        "create_terminal"
+            | "create_system_terminal"
+            | "close_terminal"
+            | "attach_terminal"
+            | "rename"
+            | "workspace_delete"
     )
 }
 
@@ -3905,6 +4169,655 @@ mod tests {
         fn terminals_changed(&self) -> usize {
             changed_count(&self.buf, "terminals")
         }
+        /// Every `system-approvals://changed` invalidation captured on the pipe — the topic the
+        /// decision surface re-pulls on, emitted by a human's grant/deny here and by an agent's
+        /// `approval_required` refusal on the MCP side.
+        fn approvals_changed(&self) -> usize {
+            changed_count(
+                &self.buf,
+                nyx_core::system_approvals::SYSTEM_APPROVALS_CHANGED_TOPIC,
+            )
+        }
+    }
+
+    /// DONE-CRITERION (« Frontière de domaine : capacités autorisées du projet Système ») — the
+    /// UI/IPC surface refuses the singleton for every capability it does not have, table-driven
+    /// over the REAL dispatch (`Harness::run` drives the same `dispatch` the pipe loop does).
+    ///
+    /// This file is the "chemin DB direct historique": a hundred-arm match reaching
+    /// `nyx_core::db` primitives. The guard sits at the top of `Ctx::run`, so the table below is
+    /// what proves it covers the arms, not just the ones that happened to be rewritten.
+    ///
+    /// Both directions are asserted, because only the pair is meaningful: the FORBIDDEN list must
+    /// refuse, and the ALLOWED list must NOT — a boundary that refuses everything would pass a
+    /// one-sided test while making the Système page unbuildable.
+    #[test]
+    fn the_ui_bridge_refuses_the_system_scope_for_every_capability_it_does_not_have() {
+        let h = Harness::new();
+        // `Db::open` bootstrapped the scope on the real boot path; read it back through its own
+        // door (it is deliberately absent from `list_projects`).
+        let scope = h
+            .runtime
+            .db()
+            .with_conn(nyx_core::system_scope::load)
+            .expect("read the scope")
+            .expect("Db::open bootstraps the Système scope");
+        let pid = scope.project.id.as_str();
+        let wid = scope.workspace.id.as_str();
+
+        // (command, payload) — every family the PRD names as refused, in the UI's own spelling.
+        let forbidden: Vec<(&str, serde_json::Value)> = vec![
+            // project lifecycle + settings
+            ("update_project", serde_json::json!({ "id": pid, "name": "hack" })),
+            ("delete_project", serde_json::json!({ "id": pid })),
+            ("set_project_collapsed", serde_json::json!({ "id": pid, "collapsed": true })),
+            (
+                "set_project_resume_agent_sessions",
+                serde_json::json!({ "id": pid, "resume": true }),
+            ),
+            ("projects_reorder", serde_json::json!({ "ids": [pid] })),
+            // workspace lifecycle + inventory
+            ("list_workspaces", serde_json::json!({ "projectId": pid })),
+            (
+                "create_workspace",
+                serde_json::json!({ "projectId": pid, "name": "extra", "path": "/tmp/nope" }),
+            ),
+            ("rename_workspace", serde_json::json!({ "id": wid, "name": "hack" })),
+            ("workspace_delete", serde_json::json!({ "id": wid })),
+            ("set_workspace_collapsed", serde_json::json!({ "id": wid, "collapsed": true })),
+            // Git reads
+            ("workspace_git_summary", serde_json::json!({ "workspaceId": wid })),
+            (
+                "repo_diff",
+                serde_json::json!({ "workspaceId": wid, "repositoryId": "r", "kind": "working_tree" }),
+            ),
+            (
+                "repo_git_view",
+                serde_json::json!({ "workspaceId": wid, "repositoryId": "r" }),
+            ),
+            ("repo_watch", serde_json::json!({ "workspaceId": wid, "repositoryId": "r" })),
+            ("repo_unwatch", serde_json::json!({ "workspaceId": wid, "repositoryId": "r" })),
+            // product aggregates — refused even though the caller knows the id
+            ("spec_list", serde_json::json!({ "projectId": pid })),
+            ("idea_list", serde_json::json!({ "projectId": pid })),
+            ("design_get", serde_json::json!({ "projectId": pid })),
+            ("engine_workflow_list", serde_json::json!({ "projectId": pid })),
+            ("workspace_timeline", serde_json::json!({ "workspaceId": wid })),
+            ("workspace_restore_plan", serde_json::json!({ "workspaceId": wid })),
+        ];
+        for (command, args) in forbidden {
+            let err = h
+                .run(command, args)
+                .expect_err("this capability is not the Système scope's");
+            assert!(
+                err.contains("system_scope_forbidden"),
+                "`{command}` must refuse with the stable code, got: {err}"
+            );
+            assert!(
+                err.contains(command),
+                "`{command}`: the refusal must name the capability, got: {err}"
+            );
+        }
+
+        // …and the capabilities the scope DOES have go through: managed commands, their groups and
+        // instances, and the runtime aggregate the human's Système page renders.
+        for (command, args) in [
+            ("command_list", serde_json::json!({ "projectId": pid })),
+            ("command_group_list", serde_json::json!({ "projectId": pid })),
+            ("command_instance_list", serde_json::json!({ "workspaceId": wid })),
+            ("workspace_runtime_snapshot", serde_json::json!({ "workspaceId": wid })),
+            ("workspace_runtime_primary", serde_json::json!({ "projectId": pid })),
+        ] {
+            let out = h
+                .run(command, args)
+                .unwrap_or_else(|e| panic!("`{command}` is a Système capability, got: {e}"));
+            assert!(!out.is_empty(), "`{command}` answered");
+        }
+
+        // The HUMAN's manual binding of a terminal onto the scope is allowed — it is the POSITIVE
+        // membership the whole design rests on, the opposite of the auto-attach capture the cwd
+        // resolver refuses.
+        let term: serde_json::Value = serde_json::from_str(
+            &h.run("create_terminal", serde_json::json!({ "cwd": scope.home() }))
+                .unwrap(),
+        )
+        .unwrap();
+        let term_id = term["id"].as_str().unwrap().to_string();
+        h.run(
+            "attach_terminal",
+            serde_json::json!({ "terminalId": term_id, "workspaceId": wid, "mode": "manual" }),
+        )
+        .expect("a human may bind a terminal onto the Système workspace");
+        assert!(h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::system_scope::is_system_terminal(c, &term_id))
+            .unwrap());
+
+        // The refusal is about the container's NATURE: the very same forbidden commands work on a
+        // USER project, so nothing above passed merely because the command is broken.
+        let created: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/sys-boundary-ui" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let user_id = created["project"]["id"].as_str().unwrap().to_string();
+        h.run("list_workspaces", serde_json::json!({ "projectId": user_id }))
+            .expect("a user project is listable");
+        h.run(
+            "update_project",
+            serde_json::json!({ "id": user_id, "name": "renamed" }),
+        )
+        .expect("a user project is renamable");
+    }
+
+    /// `command_clear_output` — the HUMAN twin of the MCP `clear_command_output` tool, whose own
+    /// code is exactly the ID VALIDATION the runner call does not do.
+    ///
+    /// Two things are asserted, and they are the two the arm is responsible for:
+    ///
+    ///  * an UNKNOWN instance is REFUSED. Without the check, `CommandRunner::clear_output` on an
+    ///    id that names nothing is a silent success — the renderer would be told the buffer was
+    ///    emptied and the user would keep looking at it;
+    ///  * a real SYSTÈME instance gets PAST the domain boundary and past the validation. It cannot
+    ///    go further here (the harness builds no managed-command runtime, so the arm stops at
+    ///    "runtime not started"), and that wording is the proof: a refusal by the boundary reads
+    ///    `system_scope_forbidden`, and an unknown id reads "unknown command instance". Neither is
+    ///    what comes back.
+    ///
+    /// Clearing is the one command verb the HUMAN owns with no approval on either side — a hand at
+    /// the keyboard is the authorisation — while the agent's twin is protected by the matrix
+    /// (nyx-core pins that half).
+    #[test]
+    fn the_ui_bridge_clears_a_system_commands_output_and_refuses_an_unknown_instance() {
+        let h = Harness::new();
+        let scope = h
+            .runtime
+            .db()
+            .with_conn(nyx_core::system_scope::load)
+            .unwrap()
+            .expect("Db::open bootstraps the Système scope");
+
+        // UNKNOWN → refused, by name, and NOT a silent success.
+        let err = h
+            .run(
+                "command_clear_output",
+                serde_json::json!({ "instanceId": "nope" }),
+            )
+            .expect_err("clearing an instance that does not exist is not a success");
+        assert!(err.contains("unknown command instance"), "{err}");
+
+        // A REAL Système instance: past the boundary, past the validation.
+        let instance = h.runtime.db().with_conn(|c| {
+            let tpl = nyx_core::db::create_template(
+                c,
+                &scope.project.id,
+                "services",
+                "echo hi",
+                None,
+                Default::default(),
+            )
+            .expect("Système command");
+            nyx_core::db::instance_ids_for_template(c, &tpl.id)
+                .expect("instances")
+                .into_iter()
+                .next()
+                .expect("the singleton's ONE workspace ⇒ one instance")
+        });
+        let err = h
+            .run(
+                "command_clear_output",
+                serde_json::json!({ "instanceId": instance }),
+            )
+            .expect_err("this harness builds no managed-command runtime");
+        assert!(
+            err.contains("managed-command runtime not started"),
+            "the human's clear must reach the RUNNER, not a refusal: {err}"
+        );
+        assert!(
+            !err.contains(nyx_core::system_scope::SYSTEM_SCOPE_FORBIDDEN),
+            "the Système scope does not refuse its own human clear: {err}"
+        );
+    }
+
+    /// DONE-CRITERIA (« Ledger one-shot ») — the HUMAN's half of the approval protocol, over the
+    /// REAL bridge: LIST the pending requests, GRANT one, DENY another, and broadcast
+    /// `system-approvals://changed` on each decision.
+    ///
+    /// What only this test can show:
+    ///
+    ///  * the three db-commands really exist on the dispatcher (the allow-list's IPC half is a
+    ///    table of NAMES; this is the surface behind them);
+    ///  * `system_approval_list` renders what a human needs to decide — the verb, a summary, the
+    ///    expiry — and NOTHING of the token, not even its hash;
+    ///  * a decision fires exactly one invalidation, and a LIST fires none (a read that invalidated
+    ///    itself would loop the decision surface forever);
+    ///  * a request already decided is refused rather than silently re-decided.
+    #[test]
+    fn the_ui_bridge_lists_grants_and_denies_system_approvals_and_broadcasts_each_decision() {
+        let h = Harness::new();
+        let scope = h
+            .runtime
+            .db()
+            .with_conn(nyx_core::system_scope::load)
+            .unwrap()
+            .expect("Db::open bootstraps the Système scope");
+
+        // TWO requests, raised the way the protocol raises them: an agent's protected call. Built
+        // here through the ledger directly, because what is under test is the DECISION surface, not
+        // the guard (nyx-core pins that end to end).
+        let raise = |name: &str| -> String {
+            let op = nyx_core::system_approvals::ProtectedOperation::new(
+                &scope.project.id,
+                "add_command",
+                "add_command",
+                &serde_json::json!({
+                    "project_id": scope.project.id,
+                    "name": name,
+                    "command": "echo hi",
+                }),
+                None,
+                None,
+            );
+            h.runtime
+                .db()
+                .with_conn(|c| {
+                    nyx_core::system_approvals::request(
+                        c,
+                        &nyx_core::system_approvals::SystemClock,
+                        &op,
+                        None,
+                    )
+                })
+                .expect("raise")
+                .approval()
+                .id
+                .clone()
+        };
+        let first = raise("services");
+        let second = raise("docker");
+
+        // 1) THE LIST — both, oldest first, with what the human needs and nothing else.
+        let before_pushes = h.approvals_changed();
+        let listed: serde_json::Value =
+            serde_json::from_str(&h.run("system_approval_list", serde_json::json!({})).unwrap())
+                .unwrap();
+        let rows = listed.as_array().expect("an array of pending requests");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["request_id"], serde_json::json!(first));
+        assert_eq!(rows[1]["request_id"], serde_json::json!(second));
+        assert_eq!(rows[0]["operation_kind"], "add_command");
+        assert_eq!(rows[0]["summary"], "add_command — services");
+        assert!(rows[0]["expires_at"].as_i64().is_some());
+        assert!(rows[0]["fingerprint"].as_str().is_some());
+        assert!(
+            !listed.to_string().contains("token"),
+            "the human's list carries no token and no token hash"
+        );
+        assert_eq!(
+            h.approvals_changed(),
+            before_pushes,
+            "a READ invalidates nothing — otherwise the decision surface re-pulls itself forever"
+        );
+
+        // 2) GRANT — the row moves, the effect LEAVES WITH THE DECISION (PDR-0030), and exactly one
+        //    invalidation goes out.
+        let granted: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "system_approval_grant",
+                serde_json::json!({ "requestId": first }),
+            )
+            .expect("a human may grant"),
+        )
+        .unwrap();
+        assert_eq!(granted["state"], "granted");
+        assert_eq!(granted["decided_by"], "ui", "the ledger records WHO decided");
+        assert!(
+            granted["claimed_at"].as_i64().is_some(),
+            "the grant IS the authorisation: no approval is left sitting unclaimed"
+        );
+        assert!(
+            granted["completed_at"].as_i64().is_some(),
+            "…and the decision returns only once the effect has been run and journalled"
+        );
+        assert!(
+            granted["outcome"].as_str().is_some(),
+            "the outcome of what the user authorised is on the row: {granted}"
+        );
+        assert_eq!(h.approvals_changed(), before_pushes + 1);
+
+        // 3) DENY the other — same shape, same broadcast.
+        let denied: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "system_approval_deny",
+                serde_json::json!({ "requestId": second }),
+            )
+            .expect("a human may refuse"),
+        )
+        .unwrap();
+        assert_eq!(denied["state"], "denied");
+        assert_eq!(h.approvals_changed(), before_pushes + 2);
+
+        // 4) The pending surface is now EMPTY, and a second decision on a decided request is
+        //    refused rather than applied.
+        let listed: serde_json::Value =
+            serde_json::from_str(&h.run("system_approval_list", serde_json::json!({})).unwrap())
+                .unwrap();
+        assert!(listed.as_array().unwrap().is_empty());
+        let err = h
+            .run(
+                "system_approval_deny",
+                serde_json::json!({ "requestId": first }),
+            )
+            .expect_err("a granted request cannot be re-decided");
+        assert!(err.contains("granted"), "{err}");
+        assert_eq!(
+            h.approvals_changed(),
+            before_pushes + 2,
+            "a REFUSED decision broadcasts nothing"
+        );
+    }
+
+    /// DONE-CRITERIA (« Terminal Système atomique ») — the REAL path, end to end: the UI bridge's
+    /// `create_system_terminal` over a `Db::open`-bootstrapped database, with the sidecar's own
+    /// PTY manager behind the shell seam.
+    ///
+    /// What only this test can show (the core tests use a shell double):
+    ///
+    ///  * a SHELL REALLY OPENS — `PtyManager::spawn_headless` at the absolute home, after the
+    ///    commit, with no renderer pane in sight (the Système page renders its own list, and the
+    ///    human may be looking at another project entirely);
+    ///  * the record is `terminals://changed`-broadcast like any other terminal creation, so the
+    ///    surfaces re-pull;
+    ///  * the human keeps FULL control of it — `close_terminal` through the very same bridge is
+    ///    not refused, which is the other half of "the generic MCP terminal tools cannot".
+    #[test]
+    fn the_ui_bridge_creates_a_system_terminal_at_the_home_and_really_opens_its_shell() {
+        let h = Harness::new();
+        let scope = h
+            .runtime
+            .db()
+            .with_conn(nyx_core::system_scope::load)
+            .expect("read the scope")
+            .expect("Db::open bootstraps the Système scope");
+
+        let before = h.terminals_changed();
+        let row: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "create_system_terminal",
+                serde_json::json!({ "label": "services" }),
+            )
+            .expect("creating a Système terminal is a capability of the scope"),
+        )
+        .unwrap();
+        let id = row["id"].as_str().unwrap().to_string();
+
+        // THE ROW, as one insert wrote it.
+        assert_eq!(row["cwd"].as_str(), Some(scope.home()), "the ABSOLUTE home");
+        assert_ne!(row["cwd"].as_str(), Some("."));
+        assert_eq!(row["workspace_id"].as_str(), Some(scope.workspace.id.as_str()));
+        assert_eq!(row["workspace_binding_mode"], "manual");
+        assert_eq!(row["status"], "alive");
+        assert_eq!(row["label"], "services");
+        assert!(h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::system_scope::is_system_terminal(c, &id))
+            .unwrap());
+
+        // THE SHELL — a real PTY, opened by the real manager at that home, after the commit.
+        assert!(
+            h.runtime.pty().is_live_record(&id),
+            "the Système terminal must come up with a live shell, pane or no pane"
+        );
+
+        // The creation is broadcast like any other terminal creation.
+        assert_eq!(
+            h.terminals_changed(),
+            before + 1,
+            "create_system_terminal broadcasts terminals://changed once"
+        );
+
+        // THE HUMAN KEEPS CONTROL: the UI closes it through the ordinary bridge command. (The
+        // agent's `close_terminal` MCP tool is refused on the very same record — pinned in
+        // nyx-core by `the_generic_terminal_tools_neither_list_read_write_nor_close_a_system_terminal`.)
+        h.run("close_terminal", serde_json::json!({ "id": id }))
+            .expect("the human closes their own Système terminal");
+        assert_eq!(
+            h.runtime
+                .db()
+                .with_conn(|c| nyx_core::db::get_terminal(c, &id))
+                .unwrap()
+                .unwrap()
+                .status,
+            "closed"
+        );
+        h.runtime.pty().close_record(&id);
+    }
+
+    /// DONE-CRITERION #3 (« Commandes Système ») — the IPC UI half: a Système command created
+    /// through the HUMAN bridge lands one instance on the singleton's one workspace, and the run
+    /// directory the UI displays is the HOME.
+    ///
+    /// The other four resolvers (MCP, boot restore, group, engine gate) are pinned in nyx-core by
+    /// `system_scope::tests::a_system_command_has_one_instance_and_every_runner_resolves_it_to_the_home`,
+    /// where the two shared readers they all go through are asserted directly. THIS one has to be
+    /// here: `command_instance_list` fills `cwd` in the bridge, not in the core.
+    #[test]
+    fn the_ui_bridge_creates_a_system_command_with_one_instance_at_the_home() {
+        let h = Harness::new();
+        let scope = h
+            .runtime
+            .db()
+            .with_conn(nyx_core::system_scope::load)
+            .unwrap()
+            .expect("Db::open bootstraps the Système scope");
+
+        let created: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "command_create",
+                serde_json::json!({
+                    "projectId": scope.project.id,
+                    "name": "services",
+                    "command": "docker compose up",
+                }),
+            )
+            .expect("creating a command IS a capability of the Système scope"),
+        )
+        .unwrap();
+        assert_eq!(
+            created["project_id"].as_str(),
+            Some(scope.project.id.as_str()),
+            "managed_commands.project_id names the singleton — never 'no project'"
+        );
+
+        let instances: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "command_instance_list",
+                serde_json::json!({ "workspaceId": scope.workspace.id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rows = instances.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one workspace ⇒ one instance: {instances}");
+        assert_eq!(rows[0]["command_id"].as_str(), created["id"].as_str());
+        assert_eq!(
+            rows[0]["cwd"].as_str(),
+            Some(scope.home()),
+            "the UI's run directory for a Système command IS the home"
+        );
+        assert_eq!(rows[0]["workspace_path"].as_str(), Some(scope.home()));
+    }
+
+    /// DONE-CRITERION (« MCP : découverte dédiée ») — `system_scope_detail` is the UI's ONE door
+    /// onto the singleton, and it is IPC-ONLY.
+    ///
+    /// `list_projects` / `list_workspaces` stay user-only by contract (the sidebar's re-orderable
+    /// array must not contain a technical container), so without this read the human's Système
+    /// page could not name the project it renders. That it is not an MCP tool is pinned from
+    /// nyx-core, where the advertised surface lives
+    /// (`system_scope::tests::the_two_halves_of_the_allow_list_do_not_share_a_name_with_the_live_mcp_surface`).
+    #[test]
+    fn system_scope_detail_is_the_ui_only_door_onto_the_singleton() {
+        let h = Harness::new();
+        let scope = h
+            .runtime
+            .db()
+            .with_conn(nyx_core::system_scope::load)
+            .unwrap()
+            .expect("Db::open bootstraps the Système scope");
+
+        let detail: serde_json::Value =
+            serde_json::from_str(&h.run("system_scope_detail", serde_json::json!({})).unwrap())
+                .unwrap();
+        assert_eq!(detail["project"]["id"].as_str(), Some(scope.project.id.as_str()));
+        assert_eq!(detail["project"]["kind"], "system");
+        assert_eq!(
+            detail["workspace"]["id"].as_str(),
+            Some(scope.workspace.id.as_str())
+        );
+        assert_eq!(detail["home"].as_str(), Some(scope.home()));
+        // The wire field of `root_path` is `path` (the IPC contract predates the column rename).
+        assert_eq!(
+            detail["workspace"]["path"].as_str(),
+            Some(scope.home()),
+            "the home IS the workspace root — one path, not two"
+        );
+
+        // …and the singleton is STILL absent from the user-facing inventory.
+        let projects: serde_json::Value =
+            serde_json::from_str(&h.run("list_projects", serde_json::json!({})).unwrap()).unwrap();
+        assert!(
+            !projects
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"].as_str() == Some(scope.project.id.as_str())),
+            "list_projects is the USER containers' surface: {projects}"
+        );
+    }
+
+    /// FINDING #13 — the IPC HALF of the allow-list, confronted with the LIVE dispatcher.
+    ///
+    /// `nyx_core::system_scope::SYSTEM_SCOPE_IPC_CAPABILITIES` names db-commands, and nothing in
+    /// the type system ties those strings to the match arms below. RENAME an allow-listed arm
+    /// (`command_group_dissolve` → `command_group_ungroup`, say) and the stale entry matches
+    /// nothing: the command keeps working for every user project and is refused for the Système
+    /// scope ALONE — a capability of the scope lost, silently, with every test still green.
+    ///
+    /// This walks the half and asserts each name is SERVED: the dispatcher's fallback arm ("db
+    /// command '…' is not available over the sidecar transport") is the one answer forbidden. The
+    /// payload is deliberately EMPTY — every arm bails on its first missing argument, so nothing
+    /// runs and no state is touched; what is under test is ROUTING, not behaviour.
+    ///
+    /// The other direction — an IPC-only name becoming an advertised MCP tool — is pinned from
+    /// nyx-core, where the advertised surface lives:
+    /// `system_scope::tests::the_two_halves_of_the_allow_list_do_not_share_a_name_with_the_live_mcp_surface`.
+    #[test]
+    fn every_ipc_capability_of_the_system_scope_is_served_by_the_dispatcher() {
+        const NOT_SERVED: &str = "is not available over the sidecar transport";
+        let h = Harness::new();
+        let names = nyx_core::system_scope::SYSTEM_SCOPE_IPC_CAPABILITIES;
+        assert!(names.len() > 20, "the IPC half is not empty: {names:?}");
+
+        for name in names {
+            match h.run(name, serde_json::json!({})) {
+                Ok(_) => {}
+                Err(e) => assert!(
+                    !e.contains(NOT_SERVED),
+                    "`{name}` is on the Système allow-list but NO dispatcher arm serves it — the \
+                     allow-list and the match drifted apart (renamed arm?): {e}"
+                ),
+            }
+        }
+
+        // Non-vacuous: a name the dispatcher really does not serve DOES hit the fallback.
+        let err = h
+            .run("command_group_ungroup", serde_json::json!({}))
+            .expect_err("an unknown db-command is refused");
+        assert!(err.contains(NOT_SERVED), "got: {err}");
+    }
+
+    /// FINDING #14 — the ONLY door into the Système scope opened by this phase accepts a MANUAL
+    /// binding and nothing else, through the REAL dispatch. The three directions:
+    ///
+    ///  1. `mode = "auto"` onto the Système workspace is REFUSED with the stable code. An auto
+    ///     binding would not hold: `resolve::decide_attachment` pins only `manual`, so the next
+    ///     `auto_attach_terminal` pass would re-bind the terminal onto whatever USER workspace
+    ///     covers its cwd — it would silently LEAVE the scope.
+    ///  2. `mode = "manual"` onto the Système workspace PASSES and really lands.
+    ///  3. `mode = "auto"` onto a USER workspace is untouched.
+    #[test]
+    fn the_system_scope_accepts_a_manual_binding_of_a_terminal_and_no_other() {
+        let h = Harness::new();
+        let scope = h
+            .runtime
+            .db()
+            .with_conn(nyx_core::system_scope::load)
+            .expect("read the scope")
+            .expect("Db::open bootstraps the Système scope");
+        let wid = scope.workspace.id.as_str();
+
+        let new_terminal = || {
+            let row: serde_json::Value = serde_json::from_str(
+                &h.run("create_terminal", serde_json::json!({ "cwd": scope.home() }))
+                    .unwrap(),
+            )
+            .unwrap();
+            row["id"].as_str().unwrap().to_string()
+        };
+        let is_system = |id: &str| {
+            h.runtime
+                .db()
+                .with_conn(|c| nyx_core::system_scope::is_system_terminal(c, id))
+                .unwrap()
+        };
+
+        // 1. AUTO onto the singleton — refused, and the terminal did NOT move.
+        let auto_term = new_terminal();
+        let err = h
+            .run(
+                "attach_terminal",
+                serde_json::json!({ "terminalId": auto_term, "workspaceId": wid, "mode": "auto" }),
+            )
+            .expect_err("an auto binding onto the Système workspace is not a capability it has");
+        assert!(
+            err.contains("system_scope_forbidden") && err.contains("attach_terminal"),
+            "the refusal must be the stable boundary one, got: {err}"
+        );
+        assert!(!is_system(&auto_term), "the refused binding wrote nothing");
+
+        // 2. MANUAL onto the singleton — allowed, and it really lands.
+        let manual_term = new_terminal();
+        h.run(
+            "attach_terminal",
+            serde_json::json!({ "terminalId": manual_term, "workspaceId": wid, "mode": "manual" }),
+        )
+        .expect("a human may bind a terminal onto the Système workspace");
+        assert!(is_system(&manual_term));
+
+        // 3. AUTO onto a USER workspace — still legitimate: the refusal is about WHERE the binding
+        //    points, never about the mode.
+        let created: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": "/tmp/sys-attach-mode" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let user_ws = created["root"]["id"].as_str().unwrap().to_string();
+        let user_term = new_terminal();
+        h.run(
+            "attach_terminal",
+            serde_json::json!({ "terminalId": user_term, "workspaceId": user_ws, "mode": "auto" }),
+        )
+        .expect("an auto binding onto a USER workspace is untouched");
+        assert!(!is_system(&user_term));
     }
 
     /// #10 — every IDENTITY mutation of the UI path (create_project, create_workspace,

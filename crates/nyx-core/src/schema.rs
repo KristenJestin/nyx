@@ -157,12 +157,21 @@ diesel::table! {
 //   Appended LAST on `projects` (positional decoding), same shape and same level as
 //   `resume_agent_sessions` (v8). The same migration widens `nodes.type` with `create_workspace`, the
 //   leaf that lands one from a graph.
+// - the projects_kind_system_scope migration (le scope Système) adds `projects.kind` — TEXT NOT NULL
+//   DEFAULT 'user', CHECKed `user|system`, appended on `projects` (positional decoding). C'est
+//   l'UNIQUE source de vérité de la nature d'un conteneur : rien n'est ajouté sur `workspaces`, dont
+//   la nature est dérivée par jointure sur son projet. Un index UNIQUE PARTIEL
+//   (`idx_projects_single_system … WHERE kind = 'system'`) fait du projet Système un singleton au
+//   niveau SQL — donc un bootstrap concurrent ne peut pas en créer deux (un index ne fait pas partie
+//   de `diesel::table!`, il n'apparaît donc que dans la migration et `EXPECTED_SCHEMA`).
 // - the projects_identity migration adds the project's CHOSEN visual identity: `projects.accent`
 //   (Nullable<Text>, an opaque colour the core never interprets) plus the mark in its two
 //   spellings, `icon` (a glyph token) and `image_path` (a file path / URL), which are mutually
 //   exclusive by a SQL CHECK (`image_path IS NULL OR icon IS NULL`). All three NULLABLE and NULL
 //   by default — a project with no identity falls back to its initial on a neutral tile. Appended
-//   LAST on `projects` (positional decoding), same shape as `worktrees_root`.
+//   LAST on `projects` (positional decoding), same shape as `worktrees_root` — its date
+//   (`20260828182220`) lands AFTER `projects_kind_system_scope` (`20260828180000`), so `kind`
+//   precedes the three identity columns in the physical column order.
 diesel::table! {
     projects (id) {
         id -> Text,
@@ -177,6 +186,7 @@ diesel::table! {
         primary_workspace_id -> Nullable<Text>,
         archived_at -> Nullable<BigInt>,
         worktrees_root -> Nullable<Text>,
+        kind -> Text,
         accent -> Nullable<Text>,
         icon -> Nullable<Text>,
         image_path -> Nullable<Text>,
@@ -725,7 +735,7 @@ diesel::table! {
 
 // - v31 (v2.7 Phase 2 — the PROTOTYPE domain, task 01KY4DFNPJHB2NNEH2CEG42GYE) adds the
 //   prototype-as-annexe-1:1-of-a-Spec tree ported from Depot to the frozen decisions of this
-//   PRD (PDR-0009/0010). `prototypes`: ONE row per Spec (UNIQUE(spec_id)) — `spec_id` (FK
+//   PRD (PDR-0030/0010). `prototypes`: ONE row per Spec (UNIQUE(spec_id)) — `spec_id` (FK
 //   CASCADE), `description` (Nullable), epoch-ms `created_at`/`updated_at` + Nullable
 //   `archived_at`. `prototype_pages`: a logical screen — `prototype_id` (FK CASCADE), `slug`
 //   (UNIQUE per prototype — the nav convention), `title`, `position`, epoch-ms `created_at`.
@@ -932,6 +942,46 @@ diesel::table! {
     }
 }
 
+// - the Système scope's APPROVAL LEDGER adds `system_command_approvals` (migrations
+//   `20260829120000_create_system_command_approvals` then
+//   `20260831160000_system_approvals_execute_on_grant`): one row per human authorisation of ONE
+//   exact protected operation on the Système singleton, executed ONCE — AT THE GRANT.
+//
+//   `canonical_payload` is the frozen charge the human is shown AND the charge the server re-runs
+//   when they say yes, so "what was approved" and "what ran" are the same string rather than two
+//   agreeing derivations. `tool_name` is the MCP tool that charge is dispatched to (distinct from
+//   `operation_kind`, which the guard matrix may qualify — `manage_command_group.add`).
+//   `fingerprint` only dedups the pending queue and names the request; nothing authorises on it.
+//
+//   THERE IS NO TOKEN COLUMN, and its absence is the protocol (PDR-0030): the agent never receives
+//   a credential, because it never replays. `claimed_at` is set BY the grant transition itself
+//   (`UPDATE … WHERE state = 'pending'`), so exactly one of N concurrent decisions can start the
+//   effect and the state "granted but never claimed" is not constructible. `completed_at` +
+//   `outcome` + `result_json` journal what the effect produced — `result_json` being what an agent
+//   that came back after its blocking window reads instead of the answer it did not wait for.
+diesel::table! {
+    system_command_approvals (id) {
+        id -> Text,
+        project_id -> Text,
+        tool_name -> Text,
+        operation_kind -> Text,
+        canonical_payload -> Text,
+        fingerprint -> Text,
+        target_revision -> Nullable<Text>,
+        member_snapshot -> Nullable<Text>,
+        state -> Text,
+        requested_at -> BigInt,
+        expires_at -> BigInt,
+        decided_at -> Nullable<BigInt>,
+        claimed_at -> Nullable<BigInt>,
+        completed_at -> Nullable<BigInt>,
+        outcome -> Nullable<Text>,
+        result_json -> Nullable<Text>,
+        requested_by -> Nullable<Text>,
+        decided_by -> Nullable<Text>,
+    }
+}
+
 diesel::joinable!(workspaces -> projects (project_id));
 diesel::joinable!(terminals -> workspaces (workspace_id));
 diesel::joinable!(managed_commands -> projects (project_id));
@@ -976,6 +1026,7 @@ diesel::joinable!(tasks -> specs (spec_id));
 // self-join Diesel cannot declare a single `joinable!` for, so it is intentionally NOT
 // declared (the CRUD queries the two directions explicitly by column instead).
 diesel::joinable!(command_slots -> projects (project_id));
+diesel::joinable!(system_command_approvals -> projects (project_id));
 diesel::joinable!(workflows -> projects (project_id));
 diesel::joinable!(nodes -> workflows (workflow_id));
 diesel::joinable!(workflow_runs -> workflows (workflow_id));
@@ -1019,6 +1070,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     spec_depends_on,
     spec_revisions,
     specs,
+    system_command_approvals,
     task_dependencies,
     tasks,
     terminals,

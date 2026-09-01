@@ -40,11 +40,15 @@ function baseProps() {
     open: true,
     projectId: "p1",
     projectName: "Demo",
-    resumeAgentSessions: false,
     importWorkspaceId: "w1" as string | null,
     workspacePath: "/demo" as string | null,
-    onRename: vi.fn(async () => {}),
-    onResumeChange: vi.fn(),
+    // The Global pane, WIRED — which is also what puts `Global` in the rail. The reduced-rail
+    // describe at the bottom of this file omits it and asserts the section is gone from the LIST.
+    globalSection: {
+      resumeAgentSessions: false,
+      onRename: vi.fn(async () => {}),
+      onResumeChange: vi.fn(),
+    },
     onClose: vi.fn(),
   };
 }
@@ -124,13 +128,13 @@ describe("<ProjectSettingsDialog> — Global pane", () => {
     render(<ProjectSettingsDialog {...props} />);
     fireEvent.change(screen.getByLabelText("Project name"), { target: { value: "  Renamed  " } });
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
-    await waitFor(() => expect(props.onRename).toHaveBeenCalledTimes(1));
-    expect(props.onRename).toHaveBeenCalledWith("Renamed");
+    await waitFor(() => expect(props.globalSection.onRename).toHaveBeenCalledTimes(1));
+    expect(props.globalSection.onRename).toHaveBeenCalledWith("Renamed");
   });
 
   it("surfaces a rename failure inline and keeps the edited value", async () => {
     const props = baseProps();
-    props.onRename = vi.fn(async () => {
+    props.globalSection.onRename = vi.fn(async () => {
       throw "name already in use";
     });
     render(<ProjectSettingsDialog {...props} />);
@@ -147,11 +151,17 @@ describe("<ProjectSettingsDialog> — Global pane", () => {
     const toggle = screen.getByRole("switch", { name: /resume agent sessions/i });
     expect(toggle).toHaveAttribute("aria-checked", "false");
     fireEvent.click(toggle);
-    expect(props.onResumeChange).toHaveBeenCalledWith(true);
+    expect(props.globalSection.onResumeChange).toHaveBeenCalledWith(true);
   });
 
   it("reflects the current resume opt-in from props", () => {
-    render(<ProjectSettingsDialog {...baseProps()} resumeAgentSessions />);
+    const props = baseProps();
+    render(
+      <ProjectSettingsDialog
+        {...props}
+        globalSection={{ ...props.globalSection, resumeAgentSessions: true }}
+      />,
+    );
     expect(screen.getByRole("switch", { name: /resume agent sessions/i })).toHaveAttribute(
       "aria-checked",
       "true",
@@ -159,16 +169,21 @@ describe("<ProjectSettingsDialog> — Global pane", () => {
   });
 
   it("hides the rename field when showRename=false but keeps the resume toggle", () => {
-    // The phase-1 shell entry point passes `showRename={false}` so only the resume toggle is
+    // The phase-1 shell entry point passes `showRename: false` so only the resume toggle is
     // exposed (rename/delete = PRD-B kebab CRUD). The Name field + Save must not render.
     const props = baseProps();
-    render(<ProjectSettingsDialog {...props} showRename={false} />);
+    render(
+      <ProjectSettingsDialog
+        {...props}
+        globalSection={{ ...props.globalSection, showRename: false }}
+      />,
+    );
     expect(screen.queryByLabelText("Project name")).toBeNull();
     expect(screen.queryByRole("button", { name: /save/i })).toBeNull();
     // The resume toggle stays present and functional.
     const toggle = screen.getByRole("switch", { name: /resume agent sessions/i });
     fireEvent.click(toggle);
-    expect(props.onResumeChange).toHaveBeenCalledWith(true);
+    expect(props.globalSection.onResumeChange).toHaveBeenCalledWith(true);
   });
 });
 
@@ -224,5 +239,88 @@ describe("<ProjectSettingsDialog> — its dismissal", () => {
     expect(body.className, "the commands body grew by the footer's band").toContain("h-[32rem]");
     const floor = body.parentElement as HTMLElement;
     expect(floor.className, "and the dialog's floor followed it").toContain("min-h-[32rem]");
+  });
+});
+
+/**
+ * ONE CHASSIS, A VARIABLE RAIL (human review 01M1EP31GWDR6FJEXY6E8CVDZZ, finding Y1).
+ *
+ * The Système scope carried a second modal that re-declared this one's popup, header, dismissal
+ * and sizing to mount the very same body. It is this component now, parameterised — and the
+ * parameter that matters is the rail's LIST OF SECTIONS.
+ *
+ * `Global` is in the rail when, and only when, the caller wires it. Not disabled, not greyed:
+ * ABSENT. The PRD's criterion for the singleton is « aucun bouton settings / rename / delete »,
+ * read as no surface offering them — and both of that pane's controls are refused by the backend
+ * on the singleton (`update_project` AND `set_project_resume_agent_sessions`, behind
+ * `require_user_project`), so neutralising half of it would not have been enough.
+ *
+ * The last test of this block is the POSITIVE CONTROL: the same assertions run against a caller
+ * that DOES wire the pane, and find `Global` there. Without it, "no Global entry" would also pass
+ * on a rail that renders nothing at all.
+ */
+describe("<ProjectSettingsDialog> — the rail reduced to what the caller wires", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    installIpc();
+  });
+
+  /** What `<SystemCommandsDialog>` passes: the same chassis, minus the Global pane's wiring. */
+  function commandsOnlyProps() {
+    return {
+      open: true,
+      projectId: "sys",
+      projectName: "System",
+      title: "System commands",
+      subject: null,
+      onClose: vi.fn(),
+    };
+  }
+
+  it("drops Global from the LIST when no globalSection is wired, and opens on Commands", () => {
+    render(<ProjectSettingsDialog {...commandsOnlyProps()} />);
+    const rail = screen.getByRole("navigation", { name: "System commands sections" });
+    const entries = within(rail).getAllByRole("button");
+    expect(entries, "one entry, and it is Commands").toHaveLength(1);
+    expect(entries[0]).toHaveTextContent("Commands");
+    // Selected by default: `initialSection` falls back to the first section actually wired.
+    expect(entries[0]).toHaveAttribute("aria-current", "page");
+    // NOT "a disabled Global" — no Global entry at all, anywhere in the dialog.
+    expect(screen.queryByRole("button", { name: "Global" })).toBeNull();
+  });
+
+  it("mounts NEITHER of the Global pane's controls when the section is not wired", () => {
+    render(<ProjectSettingsDialog {...commandsOnlyProps()} />);
+    // The rename field the criterion names…
+    expect(screen.queryByLabelText("Project name")).toBeNull();
+    expect(screen.queryByRole("button", { name: /save/i })).toBeNull();
+    // …AND the resume toggle, refused on the singleton the same way — `showRename: false` alone
+    // would have left this one on screen.
+    expect(screen.queryByRole("switch", { name: /resume agent sessions/i })).toBeNull();
+  });
+
+  it("titles the modal and its cross from the caller, with no repeated subject", () => {
+    render(<ProjectSettingsDialog {...commandsOnlyProps()} />);
+    expect(screen.getByText("System commands")).toBeInTheDocument();
+    // `subject={null}` — the name is said once, not echoed an inch to the right.
+    expect(screen.queryByText(/System commands\s*—/)).toBeNull();
+    // The gate drives this exact accessible name (`.shots/system-scope-gate/phase-a.mjs`).
+    expect(screen.getByRole("button", { name: "Close system commands" })).toBeTruthy();
+  });
+
+  it("still mounts the shared Commands body — the reduction is the rail, not the work", async () => {
+    render(<ProjectSettingsDialog {...commandsOnlyProps()} />);
+    await waitFor(() => expect(document.querySelector("[data-commands-section]")).not.toBeNull());
+    expect(document.querySelector("[data-command-list]")).not.toBeNull();
+    // And no Import entry: `importWorkspaceId` is omitted, so the HOME is never scanned.
+    expect(document.querySelector("[data-command-import-entry]")).toBeNull();
+  });
+
+  it("POSITIVE CONTROL: a caller that wires the pane DOES get Global in the rail", () => {
+    render(<ProjectSettingsDialog {...baseProps()} />);
+    const rail = screen.getByRole("navigation", { name: "Project settings sections" });
+    expect(within(rail).getAllByRole("button")).toHaveLength(2);
+    expect(within(rail).getByRole("button", { name: "Global" })).toBeTruthy();
+    expect(screen.getByRole("switch", { name: /resume agent sessions/i })).toBeTruthy();
   });
 });

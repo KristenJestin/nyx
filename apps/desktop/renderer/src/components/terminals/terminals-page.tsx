@@ -211,8 +211,8 @@ export function TerminalsPage() {
       {manualAddDialog}
       {/* THE project-settings modal — mounted ONCE, opened by the header's VISIBLE gear (Global,
           the `resume_agent_sessions` toggle) AND by a workspace's COMMANDS gear (Commands, scoped
-          to that workspace). Rename stays hidden (`showRename={false}`): rename/delete belong to
-          the PRD-B kebab CRUD, so `onRename` is wired (required by the prop) but unreachable.
+          to that workspace). Rename stays hidden (`globalSection.showRename: false`): rename/delete
+          belong to the PRD-B kebab CRUD, so `onRename` is wired but unreachable.
           `activeTree` is non-null in this branch (the early return above guards it), and it is
           derived live from `projects`, so the toggle reflects the optimistic tree update
           immediately.
@@ -224,13 +224,16 @@ export function TerminalsPage() {
         open={settingsTarget != null}
         projectId={activeTree.project.id}
         projectName={activeTree.project.name}
-        resumeAgentSessions={activeTree.project.resume_agent_sessions ?? false}
         initialSection={settingsTarget?.section ?? "global"}
         importWorkspaceId={settingsTarget?.workspace?.id ?? null}
         workspacePath={settingsTarget?.workspace?.path ?? null}
-        showRename={false}
-        onRename={(name) => updateProject(activeTree.project.id, name)}
-        onResumeChange={(resume) => setProjectResumeAgentSessions(activeTree.project.id, resume)}
+        globalSection={{
+          resumeAgentSessions: activeTree.project.resume_agent_sessions ?? false,
+          showRename: false,
+          onRename: (name) => updateProject(activeTree.project.id, name),
+          onResumeChange: (resume) =>
+            setProjectResumeAgentSessions(activeTree.project.id, resume),
+        }}
         onClose={() => setSettingsTarget(null)}
       />
     </TerminalStatsProvider>

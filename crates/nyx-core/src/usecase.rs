@@ -43,6 +43,7 @@ use diesel::Connection;
 use diesel::QueryResult;
 
 use crate::db::{self, NewDomainEvent, Project, Repository, Workspace};
+use crate::system_scope::{require_user_project, require_user_workspace, SystemScopeError};
 
 // --- Domain-event seam (task #8) -------------------------------------------
 //
@@ -110,6 +111,27 @@ pub enum DomainEventKind {
     AgentSessionStarted,
     /// An agent session ended cleanly (`SessionEnd`).
     AgentSessionEnded,
+    // --- Système approval ledger (PRD « Scope Système ») -----------------------
+    // The SIX transitions of a one-shot approval ([`crate::system_approvals`]). Persisted through
+    // the SAME outbox, INSIDE the transaction that performs each transition, so the audit trail of
+    // "who authorised what, and was it used" survives the bounded retention of the ledger rows
+    // themselves. The payloads carry the request id, the operation KIND and the fingerprint —
+    // never the token, never the token hash, never the operation's contents.
+    /// An MCP caller asked a human to authorise a protected Système operation.
+    SystemApprovalRequested,
+    /// A human said yes. The approval is now claimable ONCE, until it expires.
+    SystemApprovalGranted,
+    /// A human said no. Terminal.
+    SystemApprovalDenied,
+    /// The five-minute window closed before the decision or before the claim. Emitted exactly once
+    /// per row, by the conditional update that performs the lazy expiry.
+    SystemApprovalExpired,
+    /// The approval was CONSUMED — the one-shot transition, immediately before (runner) or inside
+    /// (DB mutation) the authorised effect.
+    SystemApprovalClaimed,
+    /// The authorised effect finished; the payload's `state` is unchanged and the outcome is on
+    /// the row. A failure is journalled here too, without re-opening the approval.
+    SystemApprovalCompleted,
 }
 
 impl DomainEventKind {
@@ -136,6 +158,12 @@ impl DomainEventKind {
             DomainEventKind::CommandStopped => "command.stopped",
             DomainEventKind::AgentSessionStarted => "agent_session.started",
             DomainEventKind::AgentSessionEnded => "agent_session.ended",
+            DomainEventKind::SystemApprovalRequested => "system_approval.requested",
+            DomainEventKind::SystemApprovalGranted => "system_approval.granted",
+            DomainEventKind::SystemApprovalDenied => "system_approval.denied",
+            DomainEventKind::SystemApprovalExpired => "system_approval.expired",
+            DomainEventKind::SystemApprovalClaimed => "system_approval.claimed",
+            DomainEventKind::SystemApprovalCompleted => "system_approval.completed",
         }
     }
 }
@@ -153,6 +181,9 @@ pub enum DomainEntity {
     /// An agent session (`agent_sessions` row) — the entity an
     /// `agent_session.started` / `agent_session.ended` event concerns.
     AgentSession,
+    /// A Système approval request (`system_command_approvals` row) — the entity the six
+    /// `system_approval.*` events concern.
+    SystemApproval,
 }
 
 impl DomainEntity {
@@ -163,6 +194,7 @@ impl DomainEntity {
             DomainEntity::Repository => "repository",
             DomainEntity::Command => "command",
             DomainEntity::AgentSession => "agent_session",
+            DomainEntity::SystemApproval => "system_approval",
         }
     }
 }
@@ -413,12 +445,16 @@ pub fn resolve_project(conn: &mut SqliteConnection, id: &str) -> QueryResult<Opt
 /// USE CASE — soft-archive a project (stamp `archived_at`, never a hard delete). Emits a
 /// [`DomainEventKind::ProjectArchived`] ONLY when a row actually flipped (an
 /// already-archived / unknown id is a no-op and emits nothing). Returns rows updated.
+///
+/// SYSTÈME: refused. Archiving the singleton would hide the container of the user's cross-project
+/// services behind a lifecycle it does not have (see [`require_user_project`]).
 pub fn archive_project(
     conn: &mut SqliteConnection,
     events: &dyn EventSink,
     id: &str,
     source: DomainEventSource,
-) -> QueryResult<usize> {
+) -> Result<usize, SystemScopeError> {
+    require_user_project(conn, id, "archive_project")?;
     // The archive flip AND (when a row flipped) its outbox row are one transaction.
     let updated = conn.transaction(|conn| {
         let updated = db::archive_project(conn, id)?;
@@ -446,12 +482,15 @@ pub fn archive_project(
 
 /// USE CASE — reverse [`archive_project`]. Emits [`DomainEventKind::ProjectUnarchived`]
 /// only when a row flipped. Returns rows updated.
+///
+/// SYSTÈME: refused, like its twin — the singleton has no archive lifecycle to reverse.
 pub fn unarchive_project(
     conn: &mut SqliteConnection,
     events: &dyn EventSink,
     id: &str,
     source: DomainEventSource,
-) -> QueryResult<usize> {
+) -> Result<usize, SystemScopeError> {
+    require_user_project(conn, id, "unarchive_project")?;
     let updated = conn.transaction(|conn| {
         let updated = db::unarchive_project(conn, id)?;
         if updated > 0 {
@@ -481,13 +520,18 @@ pub fn unarchive_project(
 /// Emits [`DomainEventKind::PrimaryWorkspaceSet`] (concerning the workspace) ONLY when the
 /// pointer was actually set (`Ok(true)`); an invariant violation writes nothing and emits
 /// nothing. Returns whether the pointer was set.
+///
+/// SYSTÈME: refused. The singleton's primary workspace is BOOTSTRAPPED and is the only workspace
+/// it will ever have; moving the pointer is how every Système command would silently change cwd.
 pub fn set_primary_workspace(
     conn: &mut SqliteConnection,
     events: &dyn EventSink,
     project_id: &str,
     workspace_id: &str,
     source: DomainEventSource,
-) -> QueryResult<bool> {
+) -> Result<bool, SystemScopeError> {
+    require_user_project(conn, project_id, "set_primary_workspace")?;
+    require_user_workspace(conn, workspace_id, "set_primary_workspace")?;
     let set = conn.transaction(|conn| {
         let set = db::set_primary_workspace(conn, project_id, workspace_id)?;
         if set {
@@ -540,15 +584,19 @@ pub fn register_workspace(
     name: &str,
     path: &str,
     source: DomainEventSource,
-) -> QueryResult<Workspace> {
-    // The UNANCHORED contract, byte-for-byte: delegate with `spec_id = None`. With no Spec to
-    // anchor the anchoring half cannot fail, so the only error shape reachable here is `Db`.
+) -> Result<Workspace, SystemScopeError> {
+    // The UNANCHORED contract: delegate with `spec_id = None`. With no Spec to anchor the
+    // anchoring half cannot fail, so the only error shapes reachable here are `Db` and the
+    // Système refusal the anchored path raises before it opens its transaction.
     match register_workspace_anchored(conn, events, project_id, name, path, None, source) {
         Ok((workspace, _)) => Ok(workspace),
-        Err(RegisterWorkspaceError::Db(e)) => Err(e),
+        Err(RegisterWorkspaceError::Db(e)) => Err(SystemScopeError::Db(e)),
+        Err(RegisterWorkspaceError::SystemScope(e)) => Err(e),
         // Unreachable (no `spec_id` ⇒ no anchor step). Collapse to a rollback rather than
         // panic, the same way `content_write_to_query_err` handles its impossible arms.
-        Err(RegisterWorkspaceError::Anchor(_)) => Err(diesel::result::Error::RollbackTransaction),
+        Err(RegisterWorkspaceError::Anchor(_)) => Err(SystemScopeError::Db(
+            diesel::result::Error::RollbackTransaction,
+        )),
     }
 }
 
@@ -562,11 +610,20 @@ pub enum RegisterWorkspaceError {
     Db(diesel::result::Error),
     /// The Spec anchor was refused (the whole transaction rolled back).
     Anchor(db::SetSpecWorkspaceError),
+    /// The target project is the SYSTÈME singleton, which has exactly one BOOTSTRAPPED workspace
+    /// and no verb that adds a second (PRD « Scope Système »).
+    SystemScope(SystemScopeError),
 }
 
 impl From<diesel::result::Error> for RegisterWorkspaceError {
     fn from(e: diesel::result::Error) -> Self {
         RegisterWorkspaceError::Db(e)
+    }
+}
+
+impl From<SystemScopeError> for RegisterWorkspaceError {
+    fn from(e: SystemScopeError) -> Self {
+        RegisterWorkspaceError::SystemScope(e)
     }
 }
 
@@ -603,6 +660,10 @@ pub fn register_workspace_anchored(
     spec_id: Option<&str>,
     source: DomainEventSource,
 ) -> Result<(Workspace, Option<db::Spec>), RegisterWorkspaceError> {
+    // SYSTÈME: refused before the transaction opens. The singleton owns exactly ONE workspace, the
+    // bootstrapped one — a second would make "the Système home" ambiguous and is precisely the
+    // state `ensure_system_scope` refuses to repair at boot.
+    require_user_project(conn, project_id, "register_workspace")?;
     let (workspace, spec) = conn.transaction(|conn| {
         let workspace = crate::repository::register_workspace(conn, project_id, name, path)?;
         let correlation = DomainEventCorrelation {
@@ -639,13 +700,16 @@ pub fn register_workspace_anchored(
 /// persists a correlated [`DomainEventKind::WorkspaceRenamed`] outbox row (task #9); after
 /// commit it emits the domain event through the injected sink (task #10). An unknown id is a
 /// no-op (0 rows) that writes and emits nothing. Returns rows updated.
+///
+/// SYSTÈME: refused. The scope's workspace is named by the bootstrap, not by a human.
 pub fn rename_workspace(
     conn: &mut SqliteConnection,
     events: &dyn EventSink,
     id: &str,
     name: &str,
     source: DomainEventSource,
-) -> QueryResult<usize> {
+) -> Result<usize, SystemScopeError> {
+    require_user_workspace(conn, id, "rename_workspace")?;
     let updated = conn.transaction(|conn| {
         let updated = db::rename_workspace(conn, id, name)?;
         if updated > 0 {
@@ -674,11 +738,17 @@ pub fn rename_workspace(
 }
 
 /// USE CASE — list the workspaces of `project_id` (root first). Read companion; no event.
+///
+/// SYSTÈME: refused. `list_projects` / `list_workspaces` are the USER containers' surface (the
+/// sidebar tree, the MCP inventory); the singleton and its home workspace are read through their
+/// own door instead ([`crate::system_scope::load`]). Refusing rather than answering an empty list
+/// keeps the two apart: an empty list would say "this project has no workspaces", which is false.
 pub fn list_workspaces(
     conn: &mut SqliteConnection,
     project_id: &str,
-) -> QueryResult<Vec<Workspace>> {
-    db::list_workspaces(conn, project_id)
+) -> Result<Vec<Workspace>, SystemScopeError> {
+    require_user_project(conn, project_id, "list_workspaces")?;
+    Ok(db::list_workspaces(conn, project_id)?)
 }
 
 /// USE CASE — resolve ONE workspace by its stable id, or `None`. No event (a read).
@@ -733,12 +803,15 @@ pub fn resolve_primary_workspace(
 /// USE CASE — soft-archive a workspace (the ROW is permanent — PDR-0008 — archiving marks
 /// it inactive without deleting it). Emits [`DomainEventKind::WorkspaceArchived`] only when
 /// a row flipped. Returns rows updated.
+///
+/// SYSTÈME: refused — the scope's one workspace has no archive lifecycle.
 pub fn archive_workspace(
     conn: &mut SqliteConnection,
     events: &dyn EventSink,
     id: &str,
     source: DomainEventSource,
-) -> QueryResult<usize> {
+) -> Result<usize, SystemScopeError> {
+    require_user_workspace(conn, id, "archive_workspace")?;
     let updated = conn.transaction(|conn| {
         let updated = db::archive_workspace(conn, id)?;
         if updated > 0 {
@@ -768,12 +841,15 @@ pub fn archive_workspace(
 
 /// USE CASE — reverse [`archive_workspace`]. Emits
 /// [`DomainEventKind::WorkspaceUnarchived`] only when a row flipped. Returns rows updated.
+///
+/// SYSTÈME: refused, like its twin.
 pub fn unarchive_workspace(
     conn: &mut SqliteConnection,
     events: &dyn EventSink,
     id: &str,
     source: DomainEventSource,
-) -> QueryResult<usize> {
+) -> Result<usize, SystemScopeError> {
+    require_user_workspace(conn, id, "unarchive_workspace")?;
     let updated = conn.transaction(|conn| {
         let updated = db::unarchive_workspace(conn, id)?;
         if updated > 0 {
@@ -811,6 +887,11 @@ pub enum RemoveWorkspaceError {
     /// The id is the project's ROOT workspace — removing it would leave a rootless project,
     /// so it is refused (delete the whole project instead).
     IsRoot,
+    /// The workspace belongs to the SYSTÈME singleton. Named SEPARATELY from [`Self::IsRoot`]
+    /// although the Système workspace happens to be root: the refusal must survive the day the
+    /// root rule changes, and the caller must be able to tell a lifecycle invariant from a
+    /// container that has no lifecycle at all.
+    SystemScope(SystemScopeError),
     /// A DB error surfaced while resolving or deleting.
     Db(diesel::result::Error),
 }
@@ -818,6 +899,12 @@ pub enum RemoveWorkspaceError {
 impl From<diesel::result::Error> for RemoveWorkspaceError {
     fn from(e: diesel::result::Error) -> Self {
         RemoveWorkspaceError::Db(e)
+    }
+}
+
+impl From<SystemScopeError> for RemoveWorkspaceError {
+    fn from(e: SystemScopeError) -> Self {
+        RemoveWorkspaceError::SystemScope(e)
     }
 }
 
@@ -845,6 +932,9 @@ pub fn remove_workspace(
     id: &str,
     source: DomainEventSource,
 ) -> Result<usize, RemoveWorkspaceError> {
+    // SYSTÈME first, before the root rule: the singleton's workspace is not removable at all, and
+    // saying so by name beats leaning on the fact that it also happens to be root.
+    require_user_workspace(conn, id, "remove_workspace")?;
     // The invariant check, the delete AND the `workspace.removed` outbox row are ONE
     // transaction. The correlation is captured from the workspace row BEFORE the delete
     // (after the delete the row — and its `project_id` — are gone), so the removal event is
@@ -908,6 +998,12 @@ pub fn remove_workspace(
 /// companion to auto-detection (both funnel through the same `db` write; auto-detect uses
 /// the idempotent upsert). Emits [`DomainEventKind::RepositoryCreated`] on success. Returns
 /// the new repository.
+///
+/// SYSTÈME: refused. A repository is a Git identity, and the Système scope is closed to Git end to
+/// end — its `root_path` is the home directory, so a repo declared there would point every Git read
+/// at the user's whole home. Refusing HERE is what makes
+/// [`crate::repository::workspace_members`]'s empty answer a consequence rather than a special
+/// case: the singleton can hold no repository to derive in the first place.
 pub fn create_repository(
     conn: &mut SqliteConnection,
     events: &dyn EventSink,
@@ -916,7 +1012,8 @@ pub fn create_repository(
     relative_path: &str,
     optional: bool,
     source: DomainEventSource,
-) -> QueryResult<Repository> {
+) -> Result<Repository, SystemScopeError> {
+    require_user_project(conn, project_id, "create_repository")?;
     let repo = conn.transaction(|conn| {
         let repo = db::create_repository(conn, project_id, name, relative_path, optional)?;
         let correlation = DomainEventCorrelation {
@@ -2507,5 +2604,128 @@ mod tests {
         let baseline = db::list_domain_events(&mut conn).unwrap().len();
         record_agent_session_event(&mut conn, &session, true).unwrap();
         assert_eq!(db::list_domain_events(&mut conn).unwrap().len(), baseline);
+    }
+
+    /// DONE-CRITERION (« Frontière de domaine ») — the boundary holds INSIDE the use-case layer,
+    /// not only at the two adapters. A caller that reaches these functions directly — a future
+    /// bridge, a test, a graph node — gets the same refusal, and nothing is written.
+    ///
+    /// Both directions again: every verb below refuses the SINGLETON and accepts the equivalent
+    /// USER container, so the guard is a boundary and not a broken function.
+    #[test]
+    fn the_identity_use_cases_refuse_the_system_scope_and_write_nothing() {
+        let mut conn = open_in_memory();
+        let sink = RecordingEventSink::new();
+        let scope = crate::system_scope::ensure_system_scope(
+            &mut conn,
+            &crate::system_scope::FixedHomeDirProvider::at(root_path("home")),
+        )
+        .expect("bootstrap the Système scope");
+        let (user, user_root) =
+            create_project(&mut conn, &sink, "app", &root_path("app"), None, DomainEventSource::Ui).unwrap();
+        let baseline = db::list_domain_events(&mut conn).unwrap().len();
+
+        let forbidden = |e: SystemScopeError, what: &str| {
+            assert!(e.is_forbidden(), "{what}: {e}");
+            assert_eq!(e.code(), crate::system_scope::SYSTEM_SCOPE_FORBIDDEN);
+        };
+
+        // --- the PROJECT's own lifecycle ------------------------------------
+        forbidden(
+            archive_project(&mut conn, &sink, &scope.project.id, DomainEventSource::Ui).unwrap_err(),
+            "archive_project",
+        );
+        forbidden(
+            unarchive_project(&mut conn, &sink, &scope.project.id, DomainEventSource::Ui).unwrap_err(),
+            "unarchive_project",
+        );
+        forbidden(
+            set_primary_workspace(
+                &mut conn,
+                &sink,
+                &scope.project.id,
+                &user_root.id,
+                DomainEventSource::Ui,
+            )
+            .unwrap_err(),
+            "set_primary_workspace",
+        );
+        // …and from the WORKSPACE side too: a user project may not adopt the Système workspace
+        // as its primary either.
+        forbidden(
+            set_primary_workspace(&mut conn, &sink, &user.id, &scope.workspace.id, DomainEventSource::Ui)
+                .unwrap_err(),
+            "set_primary_workspace (workspace side)",
+        );
+
+        // --- the WORKSPACE lifecycle ----------------------------------------
+        match register_workspace_anchored(
+            &mut conn,
+            &sink,
+            &scope.project.id,
+            "extra",
+            &root_path("extra"),
+            None,
+            DomainEventSource::Ui,
+        ) {
+            Err(RegisterWorkspaceError::SystemScope(e)) => forbidden(e, "register_workspace"),
+            other => panic!("a SECOND Système workspace must be refused, got {other:?}"),
+        }
+        forbidden(
+            rename_workspace(&mut conn, &sink, &scope.workspace.id, "hack", DomainEventSource::Ui).unwrap_err(),
+            "rename_workspace",
+        );
+        forbidden(
+            archive_workspace(&mut conn, &sink, &scope.workspace.id, DomainEventSource::Ui).unwrap_err(),
+            "archive_workspace",
+        );
+        forbidden(
+            unarchive_workspace(&mut conn, &sink, &scope.workspace.id, DomainEventSource::Ui).unwrap_err(),
+            "unarchive_workspace",
+        );
+        match remove_workspace(&mut conn, &sink, &scope.workspace.id, DomainEventSource::Ui) {
+            Err(RemoveWorkspaceError::SystemScope(e)) => forbidden(e, "remove_workspace"),
+            other => panic!("the Système workspace is not removable, got {other:?}"),
+        }
+        forbidden(
+            list_workspaces(&mut conn, &scope.project.id).unwrap_err(),
+            "list_workspaces",
+        );
+
+        // --- REPOSITORIES: the scope is closed to Git end to end -------------
+        forbidden(
+            create_repository(&mut conn, &sink, &scope.project.id, "api", "api", false, DomainEventSource::Ui)
+                .unwrap_err(),
+            "create_repository",
+        );
+
+        // NOTHING WAS WRITTEN: no outbox row, and the scope is byte-for-byte what it was.
+        assert_eq!(
+            db::list_domain_events(&mut conn).unwrap().len(),
+            baseline,
+            "a refusal must not persist a domain event"
+        );
+        assert_eq!(
+            crate::system_scope::load(&mut conn).unwrap(),
+            Some(scope.clone()),
+            "a refusal must not touch the scope"
+        );
+
+        // --- THE CONTROL: the same verbs work on the USER container ---------
+        assert_eq!(list_workspaces(&mut conn, &user.id).unwrap().len(), 1);
+        assert_eq!(
+            rename_workspace(&mut conn, &sink, &user_root.id, "renamed", DomainEventSource::Ui).unwrap(),
+            1
+        );
+        assert_eq!(
+            archive_project(&mut conn, &sink, &user.id, DomainEventSource::Ui).unwrap(),
+            1
+        );
+        assert_eq!(
+            unarchive_project(&mut conn, &sink, &user.id, DomainEventSource::Ui).unwrap(),
+            1
+        );
+        create_repository(&mut conn, &sink, &user.id, "api", "api", false, DomainEventSource::Ui)
+            .expect("a user project may declare a repository");
     }
 }

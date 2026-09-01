@@ -50,6 +50,22 @@ export interface ProjectRecord {
    */
   resume_agent_sessions: boolean;
   /**
+   * The container's NATURE (`db::Project.kind`, PRD « Scope Système »): `"user"` for an ordinary
+   * human-created project, `"system"` for the SINGLETON technical container of the Système scope.
+   *
+   * IT IS NEVER `"system"` IN THIS ARRAY. `list_projects` filters `kind = 'user'` backend-side, so
+   * every tree `useProjects` holds is a user project — the singleton reaches the UI only through
+   * `system_scope_detail` (`components/system/use-system-scope.ts`), deliberately outside the
+   * drag-reorderable array. The field is carried here because the WIRE carries it (a renderer that
+   * silently dropped a discriminant it receives is how a `system` row eventually slips into a
+   * `user` list unnoticed), and it is what a surface asserts against rather than re-deriving the
+   * nature from a name or an id.
+   *
+   * OPTIONAL because a payload built before the `projects.kind` migration (and every test fixture
+   * that predates it) omits it; absent reads as `"user"`.
+   */
+  kind?: "user" | "system";
+  /**
    * The project's CHOSEN accent colour, or `null`/absent when it has none. An opaque string the
    * backend stores and never interprets — the renderer resolves it (`<ProjectMark>`), falling
    * back to the neutral tile when it is missing. Optional on the wire so a record built before

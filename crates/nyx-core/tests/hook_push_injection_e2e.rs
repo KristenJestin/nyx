@@ -143,13 +143,18 @@ const RUN_START_REFUSAL: &str =
 
 /// The AMBIENT session context the mock's `agent_session_event` answers a `SessionStart` with — the
 /// shape `mcp_tools_core::session_context_line` really produces: the `You're in nyx — …` orientation
-/// line, then the workspace's managed-command block, then the directive.
+/// line, the workspace's managed-command block, the SHARED System half, then the directive.
 ///
 /// It is deliberately HOSTILE to a naive relay, because that is the point of this leg: it is
 /// MULTI-LINE (the `.cjs` relays one JSON string; an implementation that split, trimmed or
 /// line-joined would be caught here), it carries the `·` separator and accented text (non-ASCII, so
 /// a byte-length `Content-Length` or a latin-1 read would corrupt it), and it names a `group_id`
 /// (the token an agent needs to start a whole multi-pane group in ONE call).
+///
+/// The SHARED half is here for the same reason (review `01M1EJ84VCWRD6F4NDVD2M0QWJ`): its marker
+/// (`nature=system`) and the sentence that says stopping one service stops it for everyone are the
+/// payload with the most to lose from a mangled relay — an agent that receives the list without the
+/// warning treats a machine-wide service as its own dev server.
 const MOCK_SESSION_CONTEXT: &str = "You're in nyx — project \"Café\" (project_id=proj-café) · \
      workspace \"main\" (workspace_id=ws-1) · terminal_id=term-push-test\n\
      Managed commands of this workspace:\n\
@@ -157,8 +162,12 @@ const MOCK_SESSION_CONTEXT: &str = "You're in nyx — project \"Café\" (project
      - api · bun run api --réglages=élevés · idle · instance_id=inst-2 · group_id=grp-1\n\
      - build · bun run build · success · instance_id=inst-3\n\
      +2 more commands (list_commands)\n\
+     Shared System commands — machine-wide, NOT this workspace's:\n\
+     - Commande factice · node ticker.js · running · instance_id=inst-sys-1 · nature=system\n\
      Prefer start_command over launching these in a raw shell: nyx then supervises the run.\n\
-     start_command is a NO-OP on a command already running (was_running:true, restarted:false).";
+     start_command is a NO-OP on a command already running (was_running:true, restarted:false).\n\
+     Those System commands are SHARED: machine-wide services, the same ones for every project and \
+     every agent on this machine. Stopping one stops it for ALL of them at once.";
 
 /// The run the mock's `run_start` opens. A literal the assertions look for VERBATIM in the injected
 /// text: the `run_id` is the one value every subsequent call takes, and the session now gets it
@@ -1223,6 +1232,16 @@ fn a_session_start_relays_the_ambient_command_block_verbatim() {
     assert!(
         injected.contains("- dev · bun run dev · running · instance_id=inst-1 · group_id=grp-1"),
         "a whole command line — separators and group_id included — arrives intact: {injected:?}",
+    );
+    assert!(
+        injected
+            .contains("- Commande factice · node ticker.js · running · instance_id=inst-sys-1 · nature=system"),
+        "…and so does a SHARED command line, its nature marker included: {injected:?}",
+    );
+    assert!(
+        injected.contains("Stopping one stops it for ALL of them at once"),
+        "…and the sentence that says what sharing costs, which is the half an agent must not \
+         receive without: {injected:?}",
     );
     assert!(
         injected.contains("réglages=élevés") && injected.contains("Café"),

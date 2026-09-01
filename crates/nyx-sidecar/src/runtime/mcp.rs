@@ -177,6 +177,15 @@ impl SidecarDispatcher {
             _ => return None,
         };
         Some((|| {
+            // The Système workspace is closed to Git, watch included: it is anchored on the HOME
+            // directory, and a real-time watcher over a user's whole home is exactly the Git I/O
+            // the scope promises never to do. Refused HERE, before the watch is registered — the
+            // same `system_scope` table the core dispatchers read.
+            if let Some(refusal) =
+                nyx_core::mcp_context::refuse_system_scope(&self.db, name, args)
+            {
+                return Err(refusal);
+            }
             let workspace_id = require_str(args, "workspace_id")?;
             let repository_id = require_str(args, "repository_id")?;
             let git_watch = self.git_watch.lock().unwrap().clone().ok_or_else(|| {
@@ -250,7 +259,25 @@ impl SidecarDispatcher {
     /// is the terminal the MCP connection is bound to (`Some` on the live MCP path via
     /// `call_with_caller`, `None` for a caller-agnostic invocation / a unit test) — passed
     /// through to `dispatch_extension_tool` for the auto-map.
+    /// THE SYSTÈME APPROVAL PUSH IS NO LONGER HERE, and its move is the protocol change (PDR-0030).
+    ///
+    /// It used to fire when a protected call RETURNED `approval_required` — which worked only
+    /// because the call returned immediately. A protected call now BLOCKS on the human for up to
+    /// forty-five seconds, so a push emitted on the way out would reach the decision surface long
+    /// after the decision was needed. It is emitted by the ledger itself, at the instant the row
+    /// appears (`system_approvals::set_pending_notifier`, installed in `Runtime::attach_events`),
+    /// onto the same `system-approvals` topic the UI's grant/deny routes use.
     fn dispatch(
+        &self,
+        name: &str,
+        arguments: &Value,
+        caller_terminal_id: Option<&str>,
+    ) -> Result<Value, RpcError> {
+        self.dispatch_inner(name, arguments, caller_terminal_id)
+    }
+
+    /// The routing itself.
+    fn dispatch_inner(
         &self,
         name: &str,
         arguments: &Value,
@@ -283,7 +310,7 @@ impl SidecarDispatcher {
                     ),
                 ));
             };
-            return mcp_runtime::dispatch_command_tool(&self.db, &runner, name, arguments)
+            return mcp_runtime::dispatch_command_tool(&self.db, &runner, name, arguments, caller_terminal_id)
                 .expect("runtime command tool dispatch");
         }
 
@@ -417,7 +444,24 @@ impl McpRuntime {
     /// (port taken) is a readable error the caller logs as a warning — NOT a hard boot
     /// failure (it returns `Ok(0)` so the rest of the sidecar serves).
     pub fn start(&self) -> u16 {
-        self.server.set_dispatcher(Arc::new(SidecarDispatcher {
+        self.server.set_dispatcher(Arc::new(self.dispatcher()));
+        match self.server.start() {
+            Ok(port) => port,
+            Err(e) => {
+                self.events
+                    .log("warn", format!("MCP server did not start: {e}"));
+                0
+            }
+        }
+    }
+
+    /// The dispatcher over the shared services — everything in it is an `Arc`/handle, so building
+    /// one is a handful of refcount bumps. Factored out because there are now TWO callers: the MCP
+    /// server (an agent's `tools/call`) and the approval executor below (the HUMAN's grant), and
+    /// they must resolve a tool through the SAME table or the operation the user approved and the
+    /// operation nyx performs could drift apart.
+    fn dispatcher(&self) -> SidecarDispatcher {
+        SidecarDispatcher {
             db: Arc::clone(&self.db),
             runner: Arc::clone(&self.runner),
             terminal_host: SidecarTerminalHost {
@@ -429,15 +473,33 @@ impl McpRuntime {
             activity: Arc::clone(&self.activity),
             events: self.events.clone(),
             git_watch: Arc::clone(&self.git_watch),
-        }));
-        match self.server.start() {
-            Ok(port) => port,
-            Err(e) => {
-                self.events
-                    .log("warn", format!("MCP server did not start: {e}"));
-                0
-            }
         }
+    }
+
+    /// RUN an operation a human has just approved (PDR-0030): dispatch `tool` with the frozen
+    /// canonical `args` the ledger held, with the approval matrix suspended for this call.
+    ///
+    /// This is the whole reason the protocol could drop its token. The agent used to have to come
+    /// back and replay, carrying a secret through a channel no MCP client reliably renders; now the
+    /// decision itself is what performs the operation, so nothing secret ever has to travel.
+    ///
+    /// It goes through [`SidecarDispatcher::dispatch`], NOT through a private table of its own —
+    /// same routing, same effects, same `changed` pushes as if the agent had been allowed to call
+    /// it. `with_granted_authority` is what stops the matrix from classifying this very call as
+    /// protected and asking the user a second time, forever.
+    ///
+    /// `caller_terminal_id` is `None`: the operation is performed by nyx on the user's behalf, not
+    /// by a terminal-bound agent, and pretending otherwise would put a false actor on every record
+    /// the tool writes.
+    pub fn execute_granted(&self, tool: &str, args: &Value) -> Result<Value, String> {
+        let dispatcher = self.dispatcher();
+        nyx_core::system_approvals::with_granted_authority(|| {
+            dispatcher
+                .dispatch(tool, args, None)
+                // The wire error's one-line rendering, which is what the ledger's outcome column
+                // and the waiting agent both read.
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// The port the MCP server bound, or 0 if not started.
@@ -551,6 +613,109 @@ mod tests {
             git_watch: Arc::new(Mutex::new(None)),
         };
         (disp, pty)
+    }
+
+    /// DONE-CRITERIA (« MCP : découverte dédiée ») — through the REAL sidecar dispatcher, over a
+    /// database bootstrapped by the real `Db::open`: an agent discovers the Système commands, acts
+    /// on one straight from the response, and still cannot see a Système terminal.
+    ///
+    /// The nyx-core tests drive the same tools through `dispatch_extension_tool`; what this adds is
+    /// the SIDECAR's own routing — `list_system_commands` reaching that dispatcher at all, and the
+    /// terminal tools refusing on the same wiring the live server installs.
+    #[test]
+    fn an_agent_discovers_the_system_commands_and_never_the_system_terminals() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let db = Arc::new(temp_db());
+        let scope = db
+            .with_conn(nyx_core::system_scope::load)
+            .expect("read the scope")
+            .expect("Db::open bootstraps the Système scope");
+        db.with_conn(|c| {
+            db::create_template(
+                c,
+                &scope.project.id,
+                "services",
+                "echo hi",
+                None,
+                db::CommandSource::default(),
+            )
+        })
+        .expect("a Système service");
+
+        let (disp, pty) = dispatcher_with_pty(Arc::clone(&db), &buf);
+
+        // DISCOVERY — the scope, and a launchable id.
+        let out = disp
+            .call("list_system_commands", &serde_json::json!({}))
+            .expect("the sidecar dispatcher serves list_system_commands");
+        assert_eq!(out["scope"]["project_id"], serde_json::json!(scope.project.id));
+        assert_eq!(out["scope"]["home"], serde_json::json!(scope.home()));
+        let command = &out["commands"].as_array().expect("commands")[0];
+        assert_eq!(command["nature"], "system");
+        assert_eq!(command["cwd"], serde_json::json!(scope.home()));
+        let instance = command["instance_id"].as_str().expect("a launchable id");
+
+        // …and it is immediately usable on the ORDINARY runtime surface: the id goes straight to
+        // `get_command_output`, which the Système BOUNDARY lets through (it is allow-listed) and
+        // which then fails only on this harness having no managed runner. The distinction is the
+        // whole assertion: `mcp_unavailable` means the call was ROUTED, `system_scope_forbidden`
+        // would mean the scope refused its own read. (The end-to-end read-and-start is pinned in
+        // nyx-core by
+        // `mcp_tools_core::tests::list_system_commands_discovers_the_scope_and_opens_nothing_else`,
+        // which has a real runner.)
+        let routed = disp
+            .call(
+                "get_command_output",
+                &serde_json::json!({ "instance_id": instance }),
+            )
+            .expect_err("no managed runner in this harness");
+        assert_eq!(
+            routed.code.as_str(),
+            "mcp_unavailable",
+            "the Système scope's own read must be ROUTED, never refused: {routed:?}"
+        );
+
+        // THE TERMINALS ARE NOT PART OF IT. One exists (created through the human's own use case,
+        // with no shell here), and the agent can neither list it nor read it.
+        let sys_terminal = nyx_core::system_scope::create_system_terminal(
+            &db,
+            Some("shell".into()),
+            &NoOpShell,
+        )
+        .expect("the human's Système terminal")
+        .terminal
+        .id;
+        let listed = disp
+            .call("list_terminals", &serde_json::json!({}))
+            .expect("list_terminals");
+        assert!(
+            !listed["terminals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["terminal_id"] == serde_json::json!(sys_terminal)),
+            "a Système terminal is never offered to an agent: {listed}"
+        );
+        let err = disp
+            .call(
+                "read_terminal",
+                &serde_json::json!({ "terminal_id": sys_terminal }),
+            )
+            .expect_err("nor readable, even with the id in hand");
+        assert_eq!(
+            err.code.as_str(),
+            nyx_core::system_scope::SYSTEM_SCOPE_FORBIDDEN
+        );
+        drop(pty);
+    }
+
+    /// A shell opener that opens nothing — this harness has no pane and the terminal's PTY is not
+    /// the subject of the test above.
+    struct NoOpShell;
+    impl nyx_core::system_scope::SystemTerminalShell for NoOpShell {
+        fn open_at_home(&self, _terminal_id: &str, _home: &str) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     /// done_criterion (T9) — a Spec MUTATION via the MCP tools pushes a `specs://changed`

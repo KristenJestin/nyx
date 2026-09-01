@@ -46,7 +46,7 @@ use nyx_core::agent_activity::AgentActivityStore;
 use nyx_core::command::CommandRunner;
 use nyx_core::db::Db;
 
-use crate::pipe::wire::{Request, Response};
+use crate::pipe::wire::{Event, Request, Response};
 use command::{CommandRuntime, SidecarRunnerSink};
 use events::EventSink;
 use git_watch::GitWatchRuntime;
@@ -251,6 +251,21 @@ impl Runtime {
         ));
         *self.command.lock().unwrap() = Some(Arc::clone(&command));
         *self.mcp.lock().unwrap() = Some(mcp);
+
+        // THE APPROVAL PUSH, installed at its SOURCE (PDR-0009). A protected MCP call now blocks on
+        // the human for up to forty-five seconds, so the decision surface has to learn about the
+        // request the instant the ledger writes it — not when the call it belongs to finally
+        // returns, which is precisely too late to be decided. The ledger owns that instant; this is
+        // the sink it pushes through, and it is the SAME `system-approvals` topic the UI's
+        // grant/deny routes emit, so one topic drives the surface whichever side moved it.
+        {
+            let events = events.clone();
+            nyx_core::system_approvals::set_pending_notifier(move || {
+                events.emit(Event::Changed {
+                    topic: nyx_core::system_approvals::SYSTEM_APPROVALS_CHANGED_TOPIC.to_string(),
+                });
+            });
+        }
 
         // Start the v2.4 real-time GIT-WATCH runtime (Q-015) over the SAME pipe `events`
         // sink the domain events ride: an fs-watch + debounce engine that recomputes the

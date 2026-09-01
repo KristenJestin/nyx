@@ -586,3 +586,53 @@ describe("a command wears the family glyph, on this screen too", () => {
     );
   });
 });
+
+describe("the catalogue tells WAITING apart from EMPTY", () => {
+  /**
+   * REVIEW FINDING 01M1C7EMPGY1YDXHC6F1TJPFWS. While the read was in flight the catalogue showed
+   * `COMMANDS 0` and "No commands yet" — it asserted an absence it had not yet checked. The user
+   * read it as "there is nothing here" while waiting on a call that took about ten seconds.
+   *
+   * The flag existed on `useCommands` and was already destructured by `<CommandsSection>`; it only
+   * gated the DETAIL column. What this pins is that it reaches the LIST.
+   */
+  it("says it is loading — not that there is nothing — until the read lands", async () => {
+    let release: (rows: ManagedCommand[]) => void = () => {};
+    const pending = new Promise<ManagedCommand[]>((resolve) => {
+      release = resolve;
+    });
+    mockIPC((cmd) => {
+      switch (cmd) {
+        case "command_list":
+          return pending;
+        case "command_group_list":
+          return [];
+        default:
+          return null;
+      }
+    });
+
+    const { container } = render(
+      <CommandsSection active projectId="p1" importWorkspaceId={null} workspacePath="/repo" />,
+    );
+
+    const status = await waitFor(() => {
+      const el = container.querySelector("[data-command-list-status]");
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    expect(status.textContent).toContain("Loading");
+    expect(status.textContent).not.toContain("No commands yet");
+    // …and the count does not claim zero either.
+    expect(container.querySelector("[data-command-count]")?.textContent).not.toBe("0");
+
+    // The read lands EMPTY: NOW the absence is a fact, and the screen may say so.
+    release([]);
+    await waitFor(() => {
+      expect(
+        container.querySelector("[data-command-list-status]")?.textContent,
+      ).toContain("No commands yet");
+    });
+    expect(container.querySelector("[data-command-count]")?.textContent).toBe("0");
+  });
+});

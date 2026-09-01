@@ -556,7 +556,7 @@ pub fn run_start(
     let mut warnings = Vec::new();
     // THE WORKSPACE ANCHOR IS RESOLVED HERE — BEFORE ANY WRITE — and only APPLIED further down.
     //
-    // It is a pure READ (`db::all_workspaces` + the shared cwd→workspace selector), so hoisting it
+    // It is a pure READ (`db::resolvable_workspaces` + the shared cwd→workspace selector), so hoisting it
     // costs nothing; what it buys is that its REFUSAL costs nothing either. Since the empty-string
     // hardening ([`crate::mcp_context::resolve_workspace_for_start`] reads `workspace_id` through
     // `anchor_str`), this resolution can FAIL — and it used to fail AFTER `start_or_replace_run`,

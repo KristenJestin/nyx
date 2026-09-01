@@ -110,6 +110,17 @@ export function chooseSpawnDimensions(
 const MEASURE_TICK_BUDGET = 3;
 
 /**
+ * The CEILING on the replay mute — five seconds, an order of magnitude above the longest parse a
+ * dead-history or screen-rehydration replay has ever taken.
+ *
+ * Its only job is to make the worst case finite. The mute is normally released by xterm's own
+ * parse-completion callback; a callback that never fired would leave the pane deaf to the keyboard
+ * forever, with nothing on screen to say so. Generous enough that it never pre-empts a real parse,
+ * and therefore never re-opens the phantom-keystroke window it exists beside.
+ */
+const REPLAY_MUTE_MAX_MS = 5_000;
+
+/**
  * The default clock of {@link awaitMeasuredBox} — a MACROTASK, deliberately not `requestAnimationFrame`.
  *
  * Reading `clientWidth` FORCES a synchronous layout, so a pane that the browser has already been
@@ -239,6 +250,13 @@ export class XtermInstance {
   /** Output buffered before the spawn resolved (id still unknown → cannot route). */
   private pendingOutput: PtyOutputPayload[] = [];
   private readonly encoder = new TextEncoder();
+  /**
+   * How many REPLAYS of recorded history are still being parsed by the emulator — dead history
+   * and screen re-hydration. Non-zero means [`writeToPty`] must stay shut. See [`replay`].
+   */
+  private replaying = 0;
+  /** The safety deadlines of the replays still in flight — cleared on [`dispose`]. */
+  private readonly replayTimers = new Set<number>();
 
   constructor(options: XtermInstanceOptions) {
     this.recordId = options.recordId;
@@ -277,9 +295,10 @@ export class XtermInstance {
     this.term.onResize(() => this.resyncSize());
     this.term.attachCustomKeyEventHandler((e) => this.handleKey(e));
 
-    // Dead history — written synchronously, before any PTY output can arrive — so
-    // the restored "previous session" block sits ABOVE the live prompt. xterm-only.
-    if (options.deadHistory) this.term.write(options.deadHistory);
+    // Dead history — written before any PTY output can arrive — so the restored "previous
+    // session" block sits ABOVE the live prompt. xterm-only, and REPLAYED (see `replay`): the
+    // history is a recording, and a recording must not talk back to the live shell.
+    if (options.deadHistory) this.replay(options.deadHistory);
 
     // Spawn the shell once. Errors are swallowed so a spawn failure never breaks
     // the store (the pane just shows an empty terminal).
@@ -397,7 +416,7 @@ export class XtermInstance {
       const { bytes } = await nyxBridge.invoke<{ bytes: number[] }>("terminal_screen_rehydration", {
         recordId: this.recordId,
       });
-      if (!this.disposed && bytes && bytes.length > 0) this.term.write(Uint8Array.from(bytes));
+      if (!this.disposed && bytes && bytes.length > 0) this.replay(Uint8Array.from(bytes));
     } catch {
       // Nothing to re-hydrate is the normal case for a brand-new terminal, and a failure here
       // must never cost the pane its shell.
@@ -415,8 +434,59 @@ export class XtermInstance {
     });
   }
 
+  /**
+   * Write RECORDED bytes into the emulator with the PTY answer-back MUTED for as long as the
+   * parse lasts.
+   *
+   * A recording is not a conversation. Dead history and the screen re-hydration are bytes some
+   * PAST shell printed, and among them can be a terminal QUERY — a shell probes its terminal at
+   * startup with `ESC[6n` (DSR cursor position), and on Windows that probe is the first thing in
+   * a view-less terminal's scrollback. xterm answers a query it parses, through the very
+   * `onData` that carries the user's keystrokes, so replaying that history sends `ESC[1;1R` to
+   * the LIVE shell — which is long past its own probe and sitting at a prompt. readline eats the
+   * CSI and leaves the bare `R` on the input line, so the user's next command becomes `Rcd …`
+   * and dies as `command not found`. Observed in the real app on a Système terminal (gate CDP
+   * « Scope Système »); intermittent because `term.write` parses a SMALL history synchronously
+   * (before the spawn publishes `ptyId`, which mutes the write by itself) and a LARGE one across
+   * several turns of the event loop, straddling the spawn.
+   *
+   * Hence a counter rather than a boolean, released from xterm's own parse-completion callback:
+   * the mute must outlive the `write` call, and replays can overlap. A keystroke typed during
+   * the replay window is dropped with it — a lost keystroke on a pane that is still painting its
+   * history is a far smaller harm than a phantom one injected into the shell.
+   */
+  private replay(bytes: string | Uint8Array): void {
+    this.replaying += 1;
+    // THE MUTE IS BOUNDED, by a deadline as well as by the callback (review
+    // 01M15QP3HVYV9Q729ZYTNJB8T2, finding 01M15RH653B33VYMRKP7Y2XSR2). The release above is
+    // xterm's parse-completion callback and nothing else; if it ever failed to fire, the pane
+    // would be permanently DEAF to the keyboard with no signal of any kind — a worse failure than
+    // the one this whole mute exists to prevent. There is no known way to make it not fire, and
+    // that is exactly why the ceiling is cheap: it costs one timer, and it turns an unbounded,
+    // silent, un-diagnosable failure into the isolated phantom keystroke we already accept.
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.replaying = Math.max(0, this.replaying - 1);
+    };
+    const deadline = window.setTimeout(() => {
+      this.replayTimers.delete(deadline);
+      release();
+    }, REPLAY_MUTE_MAX_MS);
+    this.replayTimers.add(deadline);
+    this.term.write(bytes, () => {
+      window.clearTimeout(deadline);
+      this.replayTimers.delete(deadline);
+      release();
+    });
+  }
+
   /** Keystrokes (xterm `onData`) → PTY stdin, encoded to bytes. */
   private writeToPty(data: string): void {
+    // A replay in flight owns the parser: whatever the emulator emits right now is its ANSWER to
+    // the recording, not the user's input. See [`replay`].
+    if (this.replaying > 0) return;
     if (this.ptyId === null) return;
     void nyxBridge
       .invoke("pty_write", { id: this.ptyId, data: Array.from(this.encoder.encode(data)) })
@@ -603,6 +673,12 @@ export class XtermInstance {
     this.disposed = true;
     this.stopObserving();
     this.safeUnlisten();
+    // The replay mute dies with the instance: a counter left non-zero would follow a re-created
+    // pane through nothing, but a pending deadline firing into a disposed instance is noise, and
+    // the invariant "no replay is in flight once disposed" is the one worth stating.
+    for (const timer of this.replayTimers) window.clearTimeout(timer);
+    this.replayTimers.clear();
+    this.replaying = 0;
     if (this.ptyId !== null) {
       const id = this.ptyId;
       this.ptyId = null;

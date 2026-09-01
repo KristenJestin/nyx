@@ -4,6 +4,7 @@ import {
   BookOpenIcon,
   BriefcaseIcon,
   ComponentIcon,
+  CpuIcon,
   FolderPlusIcon,
   HouseIcon,
   LayersIcon,
@@ -47,6 +48,8 @@ import { projectRunState } from "./runtime-state";
 import { useConsumedNotifications } from "./use-consumed-notifications";
 import { useProjectRuntime } from "./use-project-runtime";
 import { useActiveProject } from "./active-project";
+import { useSystemScope } from "@/components/system/use-system-scope";
+import { SystemApprovalGate } from "@/components/system/system-approval-gate";
 import { loadLastProjectId } from "./ui-persistence";
 
 /**
@@ -97,6 +100,40 @@ function sectionNav(globalScope: boolean): readonly (typeof NAV)[number][] {
 }
 
 /**
+ * …and the FOOT of the same rail — the entries that do NOT depend on the entered project.
+ *
+ * It holds NO routed entry today, and the empty array is the honest statement of that: what
+ * actually lives at the foot is the SYSTÈME tile (`<SystemRailTile>`) and, under it, the Settings
+ * button (a dialog, not a route). Both are reachable whatever project one is in, which is what the
+ * foot means; neither is a `<Link>`, which is why neither is listed here.
+ *
+ * The Système tile IS a routed page ({@link SYSTEM_ROUTE}) and still not a `FOOT_NAV` entry, for
+ * reasons `renderNavItem` cannot cover: it only exists once the singleton's own read answers, and
+ * it carries the scope's aggregate run-state dot. The array stays as the group's declared seam so a
+ * PLAIN project-independent page has an obvious home and gets `renderNavItem`'s behaviour for free.
+ */
+const FOOT_NAV = [] as const;
+
+/**
+ * The SYSTÈME page's path — the singleton's terminals and commands (PRD « Scope Système »).
+ *
+ * It is a PATH and not a flag since human review `01M1EC7Y2625Q07C5386GKHZFS` (finding U1). The page
+ * used to be rendered in the INDEX route's slot, switched by a `systemScope` boolean, which had
+ * three consequences the user rejected in the real app: the entered project was de-selected, the
+ * project's section-nav entries were masked, and — because the page WAS `/` — the rail lit
+ * `Terminals` over a screen that was not the project's Terminals.
+ *
+ * With a path of its own there is nothing left to arbitrate: `pathname === SYSTEM_ROUTE` marks the
+ * Système tile, `pathname === "/"` marks `Terminals`, and the entered project is untouched by
+ * either. Système is a page one visits, not a place one moves into.
+ *
+ * It is NOT one of {@link NAV}'s entries and takes no `crossProject` flag: the cross-project scope
+ * says WHICH PROJECTS a page reads, and the Système singleton belongs to none of them — the tile
+ * shows in either scope, unchanged.
+ */
+const SYSTEM_ROUTE = "/system" as const;
+
+/**
  * The scope the rail's own cross-project read is made in — hoisted to a module constant so the
  * object identity is stable and the always-mounted {@link AllProjectsRailDot} never re-subscribes.
  */
@@ -104,9 +141,11 @@ const GLOBAL_HOME_SCOPE: HomeReadScope = { global: true };
 
 /**
  * The sliding SELECTION indicator — one bar that glides between items sharing the same
- * `layoutId` (Motion's shared-layout FLIP). The rail (projects) and the section-nav each
- * own their own `layoutId` so the two indicators are independent. It is the "indicateur
- * d'actif animé" of the rail. Colour + geometry are tokens only.
+ * `layoutId` (Motion's shared-layout FLIP). Each GROUP of the rail owns its own `layoutId` —
+ * the projects (`rail-project`), the section-nav (`rail-nav`) and the Système tile at the foot
+ * (`rail-system`, a group of one) — so their indicators are independent and none of them ever
+ * glides ACROSS a group boundary. It is the "indicateur d'actif animé" of the rail. Colour +
+ * geometry are tokens only.
  */
 function ActiveRail({ layoutId, className }: { layoutId: string; className?: string }) {
   return (
@@ -143,8 +182,18 @@ function ActiveRail({ layoutId, className }: { layoutId: string; className?: str
  * renders nothing), so it shows ONLY on a non-active tile once the aggregate is non-quiet
  * (waiting/error/success/running). Rendered inside the tile's `relative` `<li>`.
  */
-function ProjectRailDot({ project, active }: { project: ProjectTree; active: boolean }) {
-  const workspaceIds = useMemo(() => project.workspaces.map((w) => w.id), [project.workspaces]);
+function RailAggregateDot({
+  workspaceIds,
+  active,
+}: {
+  /**
+   * The workspaces whose runtime is folded into this tile's dot. A project hands its own; the
+   * SYSTÈME tile hands the singleton's ONE primary workspace — same rollup, same rule, one
+   * component (a second aggregate would be a second truth about the same colour).
+   */
+  workspaceIds: readonly string[];
+  active: boolean;
+}) {
   const { runtimeByWorkspace } = useProjectRuntime(workspaceIds);
   // The live agent-activity map (`terminal_id → AgentActivity`) from the SAME read model the
   // sidebar rows + terminal LINES use — the source of every AGENT-AWARE signal a hosted agent
@@ -483,6 +532,122 @@ function SortableProjectTile({
   );
 }
 
+/** The per-project reading of {@link RailAggregateDot} — its workspaces, folded to one dot. */
+function ProjectRailDot({ project, active }: { project: ProjectTree; active: boolean }) {
+  const workspaceIds = useMemo(() => project.workspaces.map((w) => w.id), [project.workspaces]);
+  return <RailAggregateDot workspaceIds={workspaceIds} active={active} />;
+}
+
+/**
+ * `<SystemRailTile>` — the entry point to the SYSTÈME PAGE, AT THE FOOT OF THE RAIL, above Settings
+ * (human review `01M1E44265T9F3B6TY8END35TW`, finding S1).
+ *
+ * ## A SERVICE entry, not a peer of the projects
+ *
+ * It used to be pinned at the HEAD of the rail, over the projects — the placement the `rail-dedie`
+ * prototype had (the annex now carries a supersession note on that one point). Testing it, that
+ * head slot read the tile as one MORE scope to choose between, competing with the project
+ * selection. It is not that: it is the HOST the app itself runs on. So it sits with the other
+ * always-available service entry point — Settings — at the foot, in the foot group's list.
+ *
+ * ## It marks a PAGE, and takes nothing from the project (finding U1)
+ *
+ * `active` is `pathname === SYSTEM_ROUTE` — the same rule as any other rail entry, read off the
+ * router. It used to be a `systemScope` flag that also switched the project tile off and masked the
+ * project's section-nav; entering Système now changes the PAGE and only the page, so the project
+ * tile beside it stays lit and Work / Ideas / Engine / Design stay clickable.
+ *
+ * ## OUTSIDE the drag-reorder
+ *
+ * It is rendered OUTSIDE the `<DragDropProvider>` that wraps the project tiles, in the foot list,
+ * under its own separator — so it is structurally not a sortable item: there is no `useSortable`, no
+ * index, and `reorderProjects` (which persists `projects_reorder` over the project array) can never
+ * receive its id. That is the same invariant one level down: the singleton is absent from
+ * `list_projects`, so `useProjects` holds only user projects, so the array being dragged has
+ * nothing of the scope in it. The tile is pinned by CONSTRUCTION, not by a sort key — moving it to
+ * the foot changed WHERE it is, not that.
+ *
+ * ## The SECTION-NAV's rule, not the project tile's skin (human review `01M1E7K6D81M057JG5MVV4J7QE`)
+ *
+ * `size-9`, `rounded-lg` — the geometry the project tiles and the section-nav icons SHARE. What it
+ * no longer shares with a project tile is the SKIN: a permanent `bg-muted`, an `ring-2
+ * ring-primary/60` for the active state and a `hover:scale-105`. That skin was inert while the tile
+ * sat at the head among identical squares; at the foot, among bare icons, the same pixel started
+ * saying "selected" all the time.
+ *
+ * So it follows [`renderNavItem`]'s rule verbatim: `bg-muted text-foreground` when the page is the
+ * one on screen, `text-muted-foreground hover:bg-muted/60 hover:text-foreground` at rest, on
+ * `transition-colors`. The background is not an ornament — it IS the active marker.
+ *
+ * THE RING AND THE SCALE ARE GONE, both, and deliberately. Once the background carries the state,
+ * `ring-2 ring-primary/60` is a THIRD marker for one state (background + ring + the indicator bar
+ * below) where a nav icon uses two — a redundancy that does not emphasise, it just makes this one
+ * tile louder than its neighbours for the very state they all share. And `hover:scale-105` is a
+ * project-tile affordance: those tiles wear a permanent background, so their hover had to be said
+ * by GEOMETRY. A nav icon says hover with `hover:bg-muted/60` — the same channel as its active
+ * state, which is what makes the family read as one. Keeping the scale would leave the tile
+ * speaking two hover languages at once. Aligning is choosing one rule, not keeping half of each.
+ *
+ * What still tells it apart from a nav icon is the GLYPH (a chip, not a section) and the rule above
+ * it, never a colour of its own: it takes no semantic token, because "system" is a nature, not a
+ * state.
+ *
+ * ## No context menu
+ *
+ * A project tile right-clicks into rename / delete / add-workspace. The singleton has none of them —
+ * the backend refuses all three — so the tile carries no menu at all rather than one that opens onto
+ * refusals.
+ *
+ * Renders NOTHING when the scope is absent (a database that never bootstrapped): a tile onto a place
+ * that does not exist would be a dead affordance.
+ */
+function SystemRailTile({
+  workspaceId,
+  active,
+  onEnter,
+}: {
+  workspaceId: string;
+  active: boolean;
+  onEnter: () => void;
+}) {
+  const workspaceIds = useMemo(() => [workspaceId], [workspaceId]);
+  return (
+    <li className="group relative">
+      <button
+        type="button"
+        onClick={onEnter}
+        aria-current={active}
+        aria-label="System"
+        title="System"
+        className={cn(
+          // The SECTION-NAV rule, verbatim (see `renderNavItem`): the background IS the active
+          // marker, so it appears with the state and not before it.
+          "flex size-9 items-center justify-center rounded-lg transition-colors",
+          active
+            ? "bg-muted text-foreground"
+            : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+        )}
+      >
+        <CpuIcon className="size-4" />
+      </button>
+      {/* Its OWN `layoutId` — a shared-layout group of ONE, so the bar fades in and out in place.
+          It used to share `rail-project` with the project tiles ("one indicator for the whole
+          rail"), which held while the tile was their peer at the head; from the foot it would make
+          the bar GLIDE across the boundary between two distinct groups (finding S4). And it does
+          not join `rail-nav` for the same reason: the section-nav is the group ABOVE the foot rule,
+          a bar sliding from `Catalogue` down to here would cross that boundary too. One group, one
+          `layoutId` — the rule the whole rail is built on, applied to a group of one.
+
+          NOTE — the second reason this comment used to give ("`Terminals` already owns that
+          indicator while the scope is entered") DIED WITH THE SCOPE (finding U1). Système has its
+          own route now, so `Terminals` is at rest while this tile is active; the group-boundary
+          argument above is the one that still holds, and it holds on its own. */}
+      {active ? <ActiveRail layoutId="rail-system" /> : null}
+      <RailAggregateDot workspaceIds={workspaceIds} active={active} />
+    </li>
+  );
+}
+
 /**
  * `<BaseLayout>` — the navigation SHELL, ported clean from the prototype against the
  * real design system:
@@ -498,11 +663,19 @@ function SortableProjectTile({
  *  - a SECTION-NAV under the rail, DERIVED FROM THE SCOPE ({@link sectionNav}): Home ·
  *    Terminals · Work · Ideas · Engine · Design inside a project, Home · Work · Ideas
  *    across every project — each a router `<Link>` with an animated active indicator;
+ *  - a FOOT GROUP under it: the SYSTÈME page's tile (`/system`), then the Settings button
+ *    — what is reachable whatever project one is in, and in either scope;
  *  - the MAIN column = `<Outlet/>` (the routed page).
  *
  * One enters a PROJECT here (PDR-0008), never a workspace. The rail owns the ACTIVE
  * PROJECT selection (shared via `useActiveProject`) so the routed pages render that
  * project's runtime. No raw hex, no magic px — tokens and the token-backed scale only.
+ *
+ * THE ENTERED PROJECT SURVIVES EVERY PAGE, Système included (human review
+ * `01M1EC7Y2625Q07C5386GKHZFS`, finding U1). The shell used to carry a SECOND selection beside the
+ * project — a `systemScope` flag — which switched the project tile off, masked four of the five nav
+ * entries and redirected project-scoped routes back to the index. All three are gone: what changes
+ * when one visits Système is the ROUTE, and a route change has never de-selected a project here.
  */
 export function BaseLayout() {
   const {
@@ -518,7 +691,14 @@ export function BaseLayout() {
     setProjectResumeAgentSessions,
   } = useProjects();
   const { activeProjectId, setActiveProjectId, globalScope, setGlobalScope } = useActiveProject();
+  // The SYSTÈME singleton, read through its OWN door (`system_scope_detail`) — never through
+  // `useProjects`, whose array is drag-reorderable and user-only by backend contract. `null` while
+  // it loads, and on a database that has no scope yet: the tile simply does not exist then.
+  const { scope: systemScopeDetail, loading: systemScopeLoading } = useSystemScope();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  // Is the SYSTÈME page the one on screen? The whole "am I in System" question, answered by the
+  // router and by nothing else since finding U1 — there is no scope flag to keep in step with it.
+  const onSystemPage = pathname === SYSTEM_ROUTE;
   // Does the CURRENT url carry one of the `/` route's RUNTIME deep-links (`?terminal=<id>` /
   // `?command=<id>`, written by a Spec's Runtime tab)? Those target a precise runtime object of
   // the project one is currently IN, so they go stale the instant another project is entered —
@@ -663,6 +843,40 @@ export function BaseLayout() {
     [hasRuntimeDeepLink, navigate, onGlobalHome, onHome, setActiveProjectId, setGlobalScope],
   );
 
+  /**
+   * OPEN THE SYSTÈME PAGE — a plain navigation to {@link SYSTEM_ROUTE}, through the same
+   * `startNavTransition` cross-fade every section-nav entry uses.
+   *
+   * It is a navigation and NOTHING ELSE (finding U1). It used to be the twin of
+   * {@link enterProject} — it raised a `systemScope` flag, which de-selected the project tile,
+   * masked the project's nav entries and armed a redirect off every project-scoped route, all to
+   * land on `/` because the page had no path of its own. The page has one now, so opening it is
+   * what opening `/work` is: a route change. The entered project is not touched, the section-nav
+   * is not touched, and there is nothing to redirect — the user can read System and go straight
+   * back to the Spec they came from.
+   *
+   * The `?terminal=`/`?command=` deep-link drop that used to live here left with the shared slot:
+   * those search params belong to `/`, and `/system` is a different route with no search at all.
+   */
+  const openSystemPage = useCallback(() => {
+    if (pathname === SYSTEM_ROUTE) return; // already here — no transition
+    startNavTransition(() => {
+      void navigate({ to: SYSTEM_ROUTE });
+    });
+  }, [navigate, pathname]);
+
+  // The singleton can VANISH under the page (a database read that stops answering, or one that
+  // never bootstrapped). The tile then stops being rendered, so the route it leads to would be a
+  // screen nothing in the rail points at — leave it for the index rather than strand the user
+  // there. Gated on `loading` so the FIRST read (which answers `null` until it lands) never
+  // bounces someone who opened `/system` directly. `<SystemScopePage>` keeps its own honest
+  // "not available on this database" state for the case where the read settles that way while it
+  // is already on screen.
+  useEffect(() => {
+    if (!onSystemPage || systemScopeLoading || systemScopeDetail != null) return;
+    void navigate({ to: "/", search: {}, replace: true });
+  }, [onSystemPage, systemScopeLoading, systemScopeDetail, navigate]);
+
   // Enter a project once the list loads (and recover when the entered project disappears, e.g.
   // it was deleted). RESTORE the LAST entered project (persisted, across relaunch) when it still
   // exists, else fall back to the FIRST — so a relaunch reopens where the user left off rather
@@ -699,10 +913,20 @@ export function BaseLayout() {
         remembered != null && projects.some((p) => p.project.id === remembered)
           ? remembered
           : projects[0]!.project.id;
-      if (activeProjectId === null) setActiveProjectId(restore);
+      // ON THE SYSTÈME PAGE, the recovery only re-points the remembered project: navigating would
+      // eject the user off a page they explicitly opened because a project they are not looking at
+      // disappeared. The selection is restored silently, ready for when they go back to it.
+      if (activeProjectId === null || onSystemPage) setActiveProjectId(restore);
       else enterProject(restore);
     }
-  }, [projectsLoading, projects, activeProjectId, setActiveProjectId, enterProject]);
+  }, [
+    projectsLoading,
+    projects,
+    activeProjectId,
+    setActiveProjectId,
+    enterProject,
+    onSystemPage,
+  ]);
 
   // INERT e2e seam (`window.__nyxWork`), GATED behind the build-time `VITE_NYX_E2E=1` flag —
   // published ONLY by the `build:e2e` renderer build, tree-shaken out of a real production
@@ -736,8 +960,9 @@ export function BaseLayout() {
   }, [createProject, projects, reorderProjects]);
 
   /**
-   * ONE entry of the rail's section-nav — written once and rendered for every entry {@link
-   * sectionNav} keeps in the current scope, so a link's behaviour never depends on where it sits.
+   * ONE entry of the rail's section-nav — written once and rendered by BOTH groups: every entry
+   * {@link sectionNav} keeps in the current scope at the top, and {@link FOOT_NAV} at the foot
+   * (empty today). So a link's behaviour never depends on which group it sits in, nor on the scope.
    *
    * The MAIN-SCREEN change (Terminals ↔ Work ↔ Ideas ↔ Design) is wrapped in a View
    * Transition cross-fade so the screen — terminal included — fades instead of snapping in
@@ -969,6 +1194,9 @@ export function BaseLayout() {
           >
             <ul className="flex flex-col items-center gap-1.5">
               {projects.map((tree, index) => {
+                // THE ENTERED PROJECT IS THE ENTERED PROJECT, whatever page is on screen — Système
+                // included (finding U1). This used to read `!systemScope && …`, which switched the
+                // tile off the moment one opened a page that is not a project's.
                 const active = tree.project.id === activeProjectId;
                 // The project CRUD actions, threaded into the right-click context menu (the sole
                 // entry point — finding #24). Rename opens the project-settings modal (its Global
@@ -1012,10 +1240,50 @@ export function BaseLayout() {
           {/* THE SECTION-NAV, derived from the SCOPE ({@link sectionNav}) — six entries inside a
             project, three across every project. The three without a cross-project reading are not
             rendered at all there, so the list simply changes length when the mode flips; nothing
-            reloads and no entry is left present-but-inert. */}
+            reloads and no entry is left present-but-inert.
+
+            THE SYSTÈME PAGE MASKS NONE OF THEM (finding U1). Four used to be hidden while the
+            Système SCOPE was entered, on the reasoning that Work / Ideas / Engine / Design are
+            surfaces of a code project and the singleton has none of the four aggregates. True of
+            the SINGLETON, and beside the point once Système is a page: the entered project is
+            still entered while one reads it, so those entries still lead to that project's
+            surfaces. Losing the way back to one's own Spec board for the time of a visit is the
+            defect, not the guard. The SCOPE is now the only thing that shortens this list. */}
           <ul className="flex flex-1 flex-col items-center gap-1">
             {sectionNav(globalScope).map((item) => renderNavItem(item))}
           </ul>
+
+          {/* THE FOOT GROUP — see [`FOOT_NAV`]. It holds what is always available WHATEVER project
+            one is in (the section-nav above is `flex-1`, so everything from here down is pushed to
+            the bottom): the SYSTÈME tile, and under it — past the rule — the Settings button. The
+            tile is absent until the scope's dedicated read answers, and absent for good on a
+            database with no singleton: a tile onto a place that does not exist would be a dead
+            affordance. */}
+          <ul className="flex flex-col items-center gap-1">
+            {FOOT_NAV.map((item) => renderNavItem(item))}
+            {systemScopeDetail != null ? (
+              <SystemRailTile
+                workspaceId={systemScopeDetail.workspace.id}
+                active={onSystemPage}
+                onEnter={openSystemPage}
+              />
+            ) : null}
+          </ul>
+
+          {/* THE RULE SEPARATES WHAT NAVIGATES FROM WHAT OPENS (finding X2). It used to sit ABOVE
+            the list, fencing the Système tile off from the section-nav — which made sense while
+            Système was a SCOPE one entered instead of a project. It is a routed PAGE since U1,
+            peer of Terminals / Work / Ideas / Engine / Design, so fencing it off from them
+            drew the one boundary the model says does not exist. The boundary that DOES exist is
+            the next one down: everything above the rule is a route, Settings below it is a dialog.
+
+            UNCONDITIONAL, unlike the tile. It was conditioned on `systemScopeDetail != null` back
+            when it bordered the group holding the tile — no tile, no group, no rule. It borders
+            Settings now, and both of its sides survive the singleton's absence: Settings always
+            renders, and the routes above it are whatever section entries the scope keeps, tile or
+            no tile. A database with no singleton would otherwise glue the gear straight onto the
+            last section entry and lose a distinction that was never the singleton's to carry. */}
+          <div className="my-2 h-px w-7 bg-border/60" />
 
           {/* The global Settings entry point (rebranched from the removed sidebar head). It
             sits at the FOOT of the rail — the section-nav `<ul>` above is `flex-1`, so this
@@ -1046,6 +1314,13 @@ export function BaseLayout() {
           dropping LIVE agent sessions. Mounted once on the always-mounted shell so the
           guard is live on every screen; renders nothing until the OS asks to close. */}
       <CloseGuard />
+
+      {/* THE SYSTÈME APPROVAL SURFACE (PRD « Scope Système ») — the human's half of the one-shot
+          protocol. Mounted HERE, on the always-mounted shell, for the same reason as the guard
+          above: the request is raised by an agent that has no terminal and no screen, so the only
+          place the answer can come from is the person at the machine — whatever project they
+          happen to be looking at. Renders nothing until a request is pending. */}
+      <SystemApprovalGate />
 
       {/* The add-project modal set (folder picker → create modal). Mounted once, portalled. */}
       {manualAddDialog}
@@ -1082,17 +1357,20 @@ export function BaseLayout() {
             open={projectSettingsTree !== null}
             projectId={liveTree?.project.id ?? null}
             projectName={liveTree?.project.name ?? ""}
-            resumeAgentSessions={liveTree?.project.resume_agent_sessions ?? false}
             importWorkspaceId={manageWorkspace?.id ?? null}
             workspacePath={manageWorkspace?.path ?? null}
             initialSection="global"
-            // PRD-B: the Global pane now exposes the project rename (kebab CRUD) alongside
-            // the resume toggle. Rename persists via `update_project`.
-            showRename
-            onRename={(name) => (targetId ? updateProject(targetId, name) : Promise.resolve())}
-            onResumeChange={(resume) =>
-              targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve()
-            }
+            // The Global pane, WIRED — which is also what puts it in the rail (a caller with
+            // nothing to wire there, i.e. the Système singleton, gets no `Global` entry at all).
+            // PRD-B: it exposes the project rename (kebab CRUD) alongside the resume toggle;
+            // rename persists via `update_project`.
+            globalSection={{
+              resumeAgentSessions: liveTree?.project.resume_agent_sessions ?? false,
+              showRename: true,
+              onRename: (name) => (targetId ? updateProject(targetId, name) : Promise.resolve()),
+              onResumeChange: (resume) =>
+                targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve(),
+            }}
             onClose={() => setProjectSettingsTree(null)}
           />
         );

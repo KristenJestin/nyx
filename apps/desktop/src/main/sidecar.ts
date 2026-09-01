@@ -233,6 +233,27 @@ function bootTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
 }
 
+/** The per-request deadline every pipe call gets unless {@link deadlineFor} widens it. */
+const DEFAULT_REQUEST_DEADLINE_MS = 5000;
+
+/**
+ * The db-commands whose work is NOT a database round-trip, and therefore cannot be held to the
+ * 5 s deadline the rest of the surface lives under.
+ *
+ * `system_approval_grant` is the one, and it earned its place with the Système approval protocol
+ * (PDR-0030): approving is no longer just a row transition — it PERFORMS the operation the user
+ * authorised, on the sidecar's request loop. That operation is an ordinary command tool: creating
+ * a template, stopping a process tree, relaunching a service. Most take milliseconds; a stop that
+ * waits on a stubborn tree does not, and timing the click out would tell the user their approval
+ * failed while the effect they authorised was still running. 60 s is the same order as the agent's
+ * own blocking window on the other side of the protocol.
+ *
+ * `system_approval_deny` is deliberately NOT here: refusing runs nothing.
+ */
+function deadlineFor(command: string): number {
+  return command === "system_approval_grant" ? 60_000 : DEFAULT_REQUEST_DEADLINE_MS;
+}
+
 export class Sidecar {
   private child: ChildProcess | null = null;
   private nextId = 1;
@@ -525,7 +546,7 @@ export class Sidecar {
    */
   private requestRaw(
     build: (id: number) => Message,
-    timeoutMs = 5000,
+    timeoutMs = DEFAULT_REQUEST_DEADLINE_MS,
     allowDuringStop = false,
   ): Promise<PipeResponse> {
     if (!allowDuringStop && (this.state === "stopping" || this.state === "stopped")) {
@@ -621,13 +642,16 @@ export class Sidecar {
         // activity / command output+acknowledge) rides the generic `db_command`: the
         // contract command name + JSON args. The sidecar replies a JSON result string the
         // relay parses back to the contract shape.
-        const res = await this.requestRaw((id) => ({
-          category: "request",
-          kind: "db_command",
-          id,
-          command,
-          argsJson: JSON.stringify(args ?? {}),
-        }));
+        const res = await this.requestRaw(
+          (id) => ({
+            category: "request",
+            kind: "db_command",
+            id,
+            command,
+            argsJson: JSON.stringify(args ?? {}),
+          }),
+          deadlineFor(command),
+        );
         if (res.kind === "db_result") {
           return res.resultJson.length === 0 ? null : JSON.parse(res.resultJson);
         }

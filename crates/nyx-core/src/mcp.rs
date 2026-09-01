@@ -121,6 +121,48 @@ pub const CLEAR_COMMAND_OUTPUT_TOOL: &str = "clear_command_output";
 /// `tools/list`, kept out of [`V1_TOOLS`] (same pattern as the other extension tools).
 pub const LIST_IMPORTABLE_SCRIPTS_TOOL: &str = "list_importable_scripts";
 
+/// The `list_system_commands` tool name (PRD « Scope Système »). THE agent's ONE door onto the
+/// Système scope: the cross-project services and launchers that belong to no code project (docker,
+/// machine-wide daemons…), which live under a singleton technical container
+/// ([`crate::db::PROJECT_KIND_SYSTEM`]) deliberately ABSENT from `list_projects` /
+/// `list_workspaces`.
+///
+/// ## Why a dedicated tool rather than "just list the project"
+///
+/// The singleton is not a USER container and must not appear in the inventories the agent walks to
+/// find projects to work in — it has no Spec, no repository, no workspace lifecycle. But its
+/// COMMANDS must be discoverable, or an agent could never learn that `services` exists, let alone
+/// read its output. So discovery gets its own door, which answers the scope, its commands (with
+/// their `instance_id`, ready to `start_command` / `get_command_output`) and its groups — and
+/// nothing else of the scope. In particular the Système TERMINALS are not here and are invisible to
+/// the generic terminal tools: they are the human's.
+///
+/// Advertised in `tools/list`, kept OUT of [`V1_TOOLS`] (same pattern as every other extension
+/// tool). Read-only.
+pub const LIST_SYSTEM_COMMANDS_TOOL: &str = "list_system_commands";
+
+/// The `system_approval_status` tool name (PRD « Scope Système », protocole d'approbation). The
+/// ONE tool the approval protocol adds — and it is a READ of a single request, not a surface onto
+/// the ledger.
+///
+/// ## Why exactly one tool, and why it is a read
+///
+/// A protected call now BLOCKS on the human and, when they approve, nyx runs the operation itself
+/// and answers with its real result (PDR-0030). The block is capped by the MCP client's request
+/// timeout, which is not ours — so the one case this tool exists for is the caller that reached
+/// that ceiling: it holds a `request_id` and comes back for the answer that arrived without it.
+/// Granting and denying are NEVER advertised — they are UI-only db-commands
+/// ([`crate::system_scope::SYSTEM_SCOPE_IPC_CAPABILITIES`]), because a tool that lets the caller
+/// approve its own request is not an approval.
+///
+/// ## No credential, because there is nothing to hold
+///
+/// It takes `request_id` alone. The agent never replays, so it carries no token; what this returns
+/// is a decision and a result, never an authorisation. `wait_ms` long-polls (bounded to
+/// [`crate::system_approvals::APPROVAL_WAIT_CAP_MS`]) so an agent can await the human without a
+/// spin loop. Advertised in `tools/list`, kept OUT of [`V1_TOOLS`] like every other extension tool.
+pub const SYSTEM_APPROVAL_STATUS_TOOL: &str = "system_approval_status";
+
 /// The `remove_commands` tool name (PRD-4 review R-IMPORT #5). GROUPED deletion of
 /// command TEMPLATES by id — the batch mirror of `remove_command`, so a mass import can
 /// be undone in one call. Returns the removed count + per-id acks. Advertised in
@@ -397,9 +439,9 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 /// internal/dev jargon.
 const SERVER_INSTRUCTIONS: &str = "\
 nyx is a local terminal and development cockpit running on the user's machine. It \
-organizes the user's coding projects into projects and workspaces (a workspace is a \
-folder on disk), and it launches and supervises long-running development commands \
-(dev servers, build watchers, test runners, and the like), capturing their output.
+organizes their coding work into projects and workspaces (a workspace is a folder on \
+disk), and it launches and supervises long-running development commands (dev servers, \
+build watchers, test runners), capturing their output.
 
 Use nyx's tools to:
 - Discover what the user is working on: list their projects, the workspaces inside a \
@@ -407,23 +449,26 @@ project, and the commands available in (or running for) a workspace.
 - Launch, stop, and relaunch a managed command, then read its captured output to see \
 what happened (startup logs, errors, a dev server's URL, test results).
 - Register or create a workspace folder when the user wants nyx to track a new one.
-- Adjust an EXISTING project's settings: rename it, or turn on/off whether nyx resumes \
-that project's active agent sessions at relaunch (`set_project_settings`).
+- Adjust an EXISTING project's settings: rename it, or turn agent-session resume on or \
+off (`set_project_settings`).
+- Reach the user's SYSTEM commands: machine-wide services that belong to no project, \
+SHARED by every project and agent — stopping one stops it for all. Absent from \
+list_projects and list_workspaces: `list_system_commands` is the door to them. Reading \
+one and starting a stopped one are free; anything that CHANGES them waits for the user's \
+approval in the nyx app, and nyx performs it itself.
 
 Reach for nyx whenever a request is about the user's local projects or about running, \
 inspecting, or controlling development commands on their machine. Commands are \
-identified by an `instance_id` (a specific launchable command in a workspace) — use \
-that to start, stop, relaunch, or read output. Output reads are incremental: a result \
-returns a `cursor` you can pass back to fetch only what is new.
+identified by an `instance_id` — use that to start, stop, relaunch, or read output. \
+Output reads are incremental: a result returns a `cursor` you can pass back to fetch \
+only what is new.
 
 Do NOT use nyx when:
 - The task is a one-off shell command unrelated to a registered project or workspace \
-(e.g. \"run echo hello\" or a quick file rename with no nyx project context) — run it \
-directly in the shell instead.
-- The user wants to create a new project or add it to nyx for the first time — that \
-is a UI gesture done in the nyx application itself; nyx tools operate on projects that \
-already exist in nyx (you CAN, however, rename an existing project or change its \
-settings with set_project_settings).";
+(e.g. \"run echo hello\") — run it directly in the shell instead.
+- The user wants to create a new project or add it to nyx for the first time — that is \
+a UI gesture in the nyx app; nyx tools operate on projects that already exist (you CAN \
+rename one, or change its settings with set_project_settings).";
 
 /// How many requests the MCP surface serves AT ONCE (v2.8 L1). The accept loop hands each request
 /// to this pool instead of serving it on the accepting thread.
@@ -543,9 +588,28 @@ pub enum RpcCode {
     McpUnavailable,
     /// The tool / method name is not recognized.
     MethodNotFound,
+    /// The operation aims a capability the **Système** scope does not have (PRD « Scope
+    /// Système »). DELIBERATELY DISTINCT FROM [`RpcCode::InvalidId`]: a caller must be able to
+    /// tell "this container exists and you may not do that to it" from "this id names nothing",
+    /// and the Système singleton is never protected by having its id hidden — the refusal keys on
+    /// the container's NATURE, read from the database by the boundary the two adapters pose
+    /// ([`crate::system_scope::guard_payload`]), so learning the id buys nothing. Merging the two
+    /// codes would make that guarantee unobservable.
+    SystemScopeForbidden,
     /// An unexpected internal failure (DB error, etc.).
     Internal,
 }
+
+// THERE IS NO `ApprovalRequired` CODE, and its absence is the protocol (PDR-0030, review finding
+// 01M1C7CWMF4ABHRWT1DGBJTXW3). There used to be: a protected Système call answered with it and
+// carried its ticket in `error.data`. A real agent showed that channel does not exist — no MCP
+// client is obliged to render `error.data` to the model, and the common one renders only
+// `error.message` — so the capability was unreachable in practice while every test was green.
+//
+// "Waiting on the user" is therefore no longer an error at all: the call BLOCKS, and if the human
+// has not answered by the cap it returns a tool RESULT saying so, in the channel every client
+// renders. What remains an error is a DECISION — refused, or expired — and those are
+// [`RpcCode::InvalidState`], with everything the agent needs in `message`.
 
 impl RpcCode {
     /// The stable wire string emitted in `error.data.code`.
@@ -557,6 +621,7 @@ impl RpcCode {
             RpcCode::OutputTooLarge => "output_too_large",
             RpcCode::McpUnavailable => "mcp_unavailable",
             RpcCode::MethodNotFound => "method_not_found",
+            RpcCode::SystemScopeForbidden => crate::system_scope::SYSTEM_SCOPE_FORBIDDEN,
             RpcCode::Internal => "internal",
         }
     }
@@ -571,7 +636,30 @@ impl RpcCode {
             | RpcCode::InvalidState
             | RpcCode::OutputTooLarge
             | RpcCode::McpUnavailable
+            | RpcCode::SystemScopeForbidden
             | RpcCode::Internal => -32000,
+        }
+    }
+}
+
+impl From<crate::system_scope::SystemScopeError> for RpcError {
+    /// Carry a domain-boundary refusal onto the MCP wire WITHOUT collapsing it into
+    /// `invalid_id`. [`crate::system_scope::SystemScopeError::Forbidden`] becomes the dedicated
+    /// [`RpcCode::SystemScopeForbidden`], with the refused `capability` and the aimed-at entity in
+    /// `error.data` so an agent can react without parsing prose. Every other arm is a failure of
+    /// nyx itself (a SQL error, or a bootstrap state that should have refused the boot), so it maps
+    /// to `internal`.
+    fn from(err: crate::system_scope::SystemScopeError) -> Self {
+        use crate::system_scope::SystemScopeError;
+        match &err {
+            SystemScopeError::Forbidden {
+                entity,
+                id,
+                capability,
+            } => RpcError::new(RpcCode::SystemScopeForbidden, err.to_string()).with_data(
+                serde_json::json!({ "entity": entity, "id": id, "capability": capability }),
+            ),
+            _ => RpcError::new(RpcCode::Internal, err.to_string()),
         }
     }
 }
@@ -579,6 +667,14 @@ impl RpcCode {
 impl std::fmt::Display for RpcCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    /// `code: message`, WITHOUT the `data` bag — see [`RpcError::describe`] for why the omission
+    /// is deliberate rather than an economy.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
     }
 }
 
@@ -624,6 +720,21 @@ impl RpcError {
     pub fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
         self
+    }
+
+    /// The one-line rendering of this error, for the places that need a `Display` rather than a
+    /// wire envelope — today the Système approval ledger's outcome journal, which records WHY an
+    /// authorised effect failed (`system_approvals::grant_and_execute`, whose executor stringifies
+    /// the failure through here).
+    ///
+    /// THE `data` BAG IS STILL NOT RENDERED, and the rule outlives its original reason. It was
+    /// written because `data` could carry the approval token, and this string is persisted; there is
+    /// no token any more (PDR-0030), but `data` remains the STRUCTURED half of an error — arbitrary,
+    /// unbounded, and shaped by whichever tool built it — while this is a one-line human sentence
+    /// destined for a 200-character journal column. Rendering it would put an unbounded blob in the
+    /// database for no reader's benefit.
+    fn describe(&self) -> String {
+        format!("{}: {}", self.code.as_str(), self.message)
     }
     /// JSON-RPC numeric code for the transport envelope (delegates to the typed code).
     fn rpc_code(&self) -> i64 {
@@ -1129,7 +1240,11 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "description": "optional per-run environment variables (KEY→VALUE string map) merged \
                             onto the inherited environment for this run — e.g. {\"VAULT_ENV\":\"dev\"} \
                             or values from a .env. Each value must be a string. Applied only to the \
-                            process this call spawns; on a no-op start (already running) it is ignored.",
+                            process this call spawns; on a no-op start (already running) it is ignored. \
+                            ON THE SYSTEM SCOPE this argument makes the call wait for the user's \
+                            approval, even for start_command which is otherwise free: an environment \
+                            changes what a fixed command line executes, so the user is shown the exact \
+                            map. Omit it to start a system command as it is defined, with no request.",
         })
     };
     // The WHOLE-GROUP target (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XVEFEQ524XRT9ARPQFGSV):
@@ -1361,7 +1476,13 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         a package manager invocation (`pnpm dev`, …) has its provenance \
                         inferred. Returns the created template (its `env_keys` list the \
                         stored environment's KEYS; the values are never echoed). A name \
-                        already used in the project → invalid_state.",
+                        already used in the project → invalid_state. \
+                        THIS IS ALSO THE DOOR TO THE SYSTEM SCOPE: pass the `scope.project_id` \
+                        returned by list_system_commands as project_id and you are creating a \
+                        machine-wide SYSTEM command (it runs from the user's home folder, not \
+                        from a project). That call is not refused, it WAITS: nyx asks the user \
+                        to approve it, and on approval nyx creates the command itself and \
+                        returns it to you.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1620,6 +1741,79 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             },
             // project_id OR workspace_id; the tool validates the at-least-one rule.
             "required": [],
+        },
+    }));
+    // Append list_system_commands (PRD « Scope Système »): the agent's dedicated DISCOVERY of the
+    // project-less Système services. Listed AFTER the v1 surface and kept OUT of V1_TOOLS like
+    // every other extension tool.
+    descriptors.push(json!({
+        "name": LIST_SYSTEM_COMMANDS_TOOL,
+        "description": "Discover the SYSTÈME commands: the user's cross-project services and \
+                        launchers (docker, machine daemons, …) that belong to no code project. \
+                        They live in a single technical container that is deliberately ABSENT \
+                        from list_projects / list_workspaces, so this is the only way to find \
+                        them. Takes no argument. Returns `scope` (the container's project_id, \
+                        workspace_id and `home` — every Système command runs from the user's home \
+                        directory), `commands` (each with its `command_id`, its LAUNCHABLE \
+                        `instance_id`, name, command line, resolved `cwd`, `group_id` and current \
+                        run status) and `groups` (the multi-pane groups, with their members in \
+                        order). Every entry carries `nature`:\"system\" — the same field \
+                        list_commands now carries for ordinary commands, so one reader tells the \
+                        two apart. WHAT `scope.project_id` IS FOR: it is the id you pass as \
+                        `project_id` to ADDRESS this container with the ordinary command tools — \
+                        add_command(project_id=scope.project_id, …) creates a new SYSTEM command, \
+                        list_commands(project_id=…) reads its templates and groups. \
+                        `scope.workspace_id` is its run context, the one start/stop/relaunch take \
+                        beside a `name` or a `group_id`. WHAT YOU MAY DO WITH THEM: reading is \
+                        free — pass an `instance_id` straight to get_command_output or \
+                        wait_for_command; STARTING a stopped command is free too (start_command). \
+                        Everything that CHANGES them — creating, importing, editing, removing, \
+                        reordering, regrouping, clearing output, stopping a running command or \
+                        relaunching one — asks the user first. Such a call is not refused: it \
+                        WAITS for their answer, and when they approve, nyx performs the operation \
+                        itself and returns its result to you. If they have not answered in time \
+                        you get a `request_id` and keep waiting with system_approval_status. \
+                        These are the user's own services: nyx will ask them, not you. The \
+                        Système TERMINALS are not listed here and the terminal tools cannot see \
+                        them; they are the human's alone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    }));
+    // Append system_approval_status (PRD « Scope Système », protocole d'approbation): the ONE tool
+    // the approval protocol adds. A READ of one request — never a list, and never a way to decide.
+    // Grant/deny stay UI-only db-commands.
+    descriptors.push(json!({
+        "name": SYSTEM_APPROVAL_STATUS_TOOL,
+        "description": "Collect the outcome of a SYSTEM-command operation the user is still \
+                        deciding on. When you call a tool that CHANGES the user's system commands \
+                        (create, import, edit, remove, reorder, regroup, clear output, stop a \
+                        running command, relaunch), nyx asks them in the app and your call WAITS. \
+                        If they answer in time you simply get the operation's real result. If they \
+                        do not, your call returns \
+                        status:\"approval_required\" with a `request_id` — nothing has happened \
+                        yet. Call this tool with that request_id, and `wait_ms` to keep waiting. \
+                        `state` is \"pending\" (still no answer), \"granted\" (they approved; nyx \
+                        ran the operation and `result` is what it returned), \"denied\" (they \
+                        refused — do not re-raise it, ask them instead) or \"expired\" (the \
+                        5-minute window closed; nothing ran, re-issue the original call if you \
+                        still want it). DO NOT retry the original tool while a request is pending: \
+                        that asks the user twice for the same thing. You never carry a credential \
+                        — approving is the user's gesture and nyx performs the operation itself.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "request_id": str_prop("the request_id nyx gave you when it asked the user to approve your operation"),
+                "wait_ms": {
+                    "type": "integer",
+                    "description": "milliseconds to WAIT for the outcome before answering (0 = answer now). Capped at 45000, just under the usual client request timeout.",
+                    "minimum": 0,
+                    "maximum": 45000,
+                },
+            },
+            "required": ["request_id"],
         },
     }));
     descriptors.push(json!({
@@ -4468,6 +4662,68 @@ mod tests {
         );
     }
 
+    /// REVIEW FINDING 01M1C7F95Q05XQRR6FZTK71BMG — the SYSTEM scope was UNDISCOVERABLE.
+    ///
+    /// It is deliberately absent from `list_projects` and `list_workspaces` ("discovery gets its
+    /// own door"), and the server's instructions — the first and often only thing a model reads
+    /// about nyx — never mentioned that the door existed. On a client with deferred tool schemas
+    /// (the common case), the agent saw the NAME `list_system_commands` among a hundred others and
+    /// loaded it only because the user happened to say the words. Two sentences close that.
+    #[test]
+    fn the_instructions_name_the_system_scope_its_door_and_its_approval() {
+        let lc = SERVER_INSTRUCTIONS.to_lowercase();
+        assert!(
+            lc.contains("system"),
+            "the instructions must say the scope exists"
+        );
+        assert!(
+            SERVER_INSTRUCTIONS.contains(LIST_SYSTEM_COMMANDS_TOOL),
+            "…and name the tool that reaches it, since nothing else leads there"
+        );
+        assert!(
+            lc.contains("approve") || lc.contains("approval"),
+            "…and say that changing them needs the user"
+        );
+    }
+
+    /// REVIEW FINDING 01M1C7FNAXYWVQ34R2ZD3DKMGS — nothing said that `add_command` is the CREATION
+    /// door of the system scope, and `list_system_commands` returned a `scope.project_id` without
+    /// saying what it was for. The agent that tested had to DEDUCE the link; a deduction that
+    /// happens to be right is not a contract.
+    ///
+    /// Answered with a sentence in each description rather than a dedicated `add_system_command`
+    /// tool: the guard matrix already routes by project id, so a second tool would duplicate a
+    /// surface — and duplicated surfaces drift.
+    #[test]
+    fn the_command_tools_say_how_the_system_scope_is_addressed() {
+        let descriptors = tool_descriptors();
+        let describe = |name: &str| -> String {
+            descriptors
+                .iter()
+                .find(|t| t["name"] == json!(name))
+                .unwrap_or_else(|| panic!("`{name}` is advertised"))["description"]
+                .as_str()
+                .expect("a description")
+                .to_string()
+        };
+
+        let add = describe(ADD_COMMAND_TOOL);
+        assert!(
+            add.contains("scope.project_id") && add.contains(LIST_SYSTEM_COMMANDS_TOOL),
+            "add_command must say WHICH id turns it into the system-scope creation door: {add}"
+        );
+        assert!(
+            add.to_lowercase().contains("approve"),
+            "…and that the user is asked: {add}"
+        );
+
+        let list = describe(LIST_SYSTEM_COMMANDS_TOOL);
+        assert!(
+            list.contains("scope.project_id") && list.contains(ADD_COMMAND_TOOL),
+            "list_system_commands must say what the id it returns is FOR: {list}"
+        );
+    }
+
     /// Internal/dev jargon markers that must never appear in agent-facing strings
     /// (the `instructions` and every advertised tool description). These are words
     /// written for nyx developers, not the consuming agent.
@@ -5561,6 +5817,67 @@ mod tests {
         }
     }
 
+    /// DONE-CRITERIA (« MCP : découverte dédiée ») — over the REAL JSON-RPC transport:
+    /// `list_system_commands` is advertised, takes NO argument, and its description states the
+    /// authorization rule an agent has to know BEFORE it calls anything — reading and starting a
+    /// stopped command are free, every MUTATION needs the human's approval.
+    ///
+    /// The description is the one surface with no compiler behind it, and it is the only place an
+    /// agent learns this rule: a tool that answered ids without saying what may be done with them
+    /// would have agents discover the boundary by being refused.
+    #[test]
+    fn list_system_commands_is_advertised_and_states_its_authorization_rule() {
+        let (_server, port) = start_test_server();
+        let req = r#"{"jsonrpc":"2.0","id":21,"method":"tools/list"}"#;
+        let (_status, body) = http_request(port, "POST", "/mcp", Some(req));
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let tool = v["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|t| t["name"] == json!(LIST_SYSTEM_COMMANDS_TOOL))
+            .cloned()
+            .expect("list_system_commands is advertised over tools/list");
+
+        // NO ARGUMENT: the scope is a singleton, so there is nothing to name.
+        assert_eq!(
+            tool["inputSchema"]["required"],
+            json!([]),
+            "the singleton needs no argument: {tool}"
+        );
+        assert_eq!(tool["inputSchema"]["properties"], json!({}));
+
+        let desc = tool["description"].as_str().expect("a description");
+        // WHAT IT ANSWERS — an agent must know it gets a launchable id, and where it runs.
+        for named in ["instance_id", "nature", "groups", "home"] {
+            assert!(desc.contains(named), "the answer names `{named}`: {desc}");
+        }
+        // WHAT MAY BE DONE — the free half and the gated half, both said.
+        assert!(
+            desc.contains("start_command") && desc.contains("get_command_output"),
+            "the FREE operations are named, with the tools that perform them: {desc}"
+        );
+        assert!(
+            desc.to_lowercase().contains("free"),
+            "…and said to be free: {desc}"
+        );
+        assert!(
+            desc.contains("approval") && desc.contains("refused"),
+            "the GATED half is named too, with what happens without it: {desc}"
+        );
+        for mutation in ["creating", "removing", "relaunching", "stopping"] {
+            assert!(
+                desc.contains(mutation),
+                "the description must name `{mutation}` among the gated operations: {desc}"
+            );
+        }
+        // …and the terminals are declared out of reach, so an agent does not go looking.
+        assert!(
+            desc.contains("TERMINALS") || desc.contains("terminals"),
+            "the Système terminals are declared invisible: {desc}"
+        );
+    }
+
     #[test]
     fn tools_list_advertises_v1_surface() {
         let (_server, port) = start_test_server();
@@ -5813,12 +6130,40 @@ mod tests {
                 "v2.7 design tool {expected} must be listed"
             );
         }
+        // The Système scope's DEDICATED discovery, advertised alongside and kept OUT of V1_TOOLS.
+        // It is the agent's ONLY door onto a container `list_projects` / `list_workspaces`
+        // deliberately omit — so if it were not listed, the Système services would be
+        // undiscoverable rather than merely unlisted.
+        assert!(
+            names.contains(&LIST_SYSTEM_COMMANDS_TOOL),
+            "list_system_commands must be listed"
+        );
+        assert!(
+            !V1_TOOLS.contains(&LIST_SYSTEM_COMMANDS_TOOL),
+            "…and it stays OUT of the frozen v1 surface, like every extension tool"
+        );
+        // …and the approval protocol's ONE extra tool beside it: the token-owned read of a
+        // request. It is advertised because an agent has no other way to learn what the human
+        // decided; grant/deny are deliberately NOT advertised (UI-only db-commands), which
+        // `system_scope::tests::the_two_halves_of_the_allow_list_do_not_share_a_name_with_the_live_mcp_surface`
+        // pins.
+        assert!(
+            names.contains(&SYSTEM_APPROVAL_STATUS_TOOL),
+            "system_approval_status must be listed"
+        );
+        assert!(
+            !V1_TOOLS.contains(&SYSTEM_APPROVAL_STATUS_TOOL),
+            "…and it stays OUT of the frozen v1 surface, like every extension tool"
+        );
         assert_eq!(
             names.len(),
             V1_TOOLS.len()
-                // 26 since the command-LIST order was opened (reorder_commands); it was 25 when
-                // the multi-pane grouping landed (manage_command_group).
-                + 26
+                // 28 since the Système approval protocol got its one status tool
+                // (system_approval_status); it was 27 when the scope got its dedicated discovery
+                // (list_system_commands), 26 when the command-LIST order was opened
+                // (reorder_commands), and 25 when the multi-pane grouping landed
+                // (manage_command_group).
+                + 28
                 + 9
                 + 3
                 + crate::mcp_tools_spec::SPEC_TOOLS.len()
@@ -5830,7 +6175,8 @@ mod tests {
             "exactly the v1 surface plus probe + wait_for_command + \
              add_command/update_command/import_commands + remove_workspace/remove_command + \
              clear_command_output + list_importable_scripts/remove_commands + \
-             manage_command_group + reorder_commands + \
+             manage_command_group + reorder_commands + list_system_commands + \
+             system_approval_status + \
              create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
              agent_session_event + set_project_settings + project_set_repos + workspace_runtime + \
              workspace_git + workspace_timeline + the spec authoring/transition tools \
@@ -6254,6 +6600,197 @@ mod tests {
                 "{name} must surface in error.data.code"
             );
             assert_eq!(v["error"]["code"], numeric, "{name} numeric JSON-RPC code");
+        }
+    }
+
+    /// DONE-CRITERION (« Protocole MCP », revue humaine 01M1C7C8K0Q1WBHDQKZ29GH8YJ) — the WHOLE
+    /// loop over the real JSON-RPC wire, and with NO terminal identity anywhere.
+    ///
+    /// The absent header is half the point. The approval protocol exists precisely for a caller
+    /// that has no terminal of its own — a headless agent, an MCP client the human never opened a
+    /// pane for — so every request below is posted WITHOUT `X-Nyx-Terminal-Id`.
+    ///
+    /// THE ASSERTIONS READ ONLY WHAT A POOR CLIENT RENDERS: `result`, and an error's `code` and
+    /// `message`. Never `error.data`. That restriction is the finding this test was rewritten for
+    /// (01M1C7CWMF4ABHRWT1DGBJTXW3): the previous version drove the same wire and passed while the
+    /// capability was unusable, because it read a bag no MCP client is obliged to show the model.
+    ///
+    /// The last assertion is the other half: the UI's decision bridge is NOT reachable here. An
+    /// agent that could call `system_approval_grant` would be approving its own request.
+    #[test]
+    fn the_system_approval_protocol_runs_end_to_end_over_json_rpc_without_a_terminal_identity() {
+        struct NoopSink;
+        impl crate::command::RunnerSink for NoopSink {
+            fn on_state(&self, _: &str, _: crate::command::RunState, _: Option<i32>) {}
+            fn on_acknowledge(&self, _: &str) {}
+            fn on_output(&self, _: &str, _: &[u8]) {}
+            fn persist_scrollback(&self, _: &str, _: &str) {}
+            fn archive_previous_run(&self, _: &str) {}
+            fn clear_output(&self, _: &str) {}
+        }
+        /// The SAME routing a shell installs: every advertised tool through
+        /// `dispatch_extension_tool`, and `method_not_found` for anything it does not own.
+        struct SystemDispatcher {
+            db: crate::db::Db,
+        }
+        impl ToolDispatcher for SystemDispatcher {
+            fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError> {
+                let runner = crate::command::CommandRunner::new(
+                    NoopSink,
+                    portable_pty::PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    },
+                );
+                let activity = crate::agent_activity::AgentActivityStore::new();
+                // The blocking window, shortened ON THE WORKER THREAD that actually serves the
+                // call — the seam is thread-local, so setting it in the test's own thread would
+                // reach nothing here.
+                crate::system_approvals::with_wait_cap(200, || {
+                    match crate::mcp_tools_core::dispatch_extension_tool(
+                        &self.db,
+                        &runner,
+                        &crate::mcp_tools_core::NoTerminalHost,
+                        &activity,
+                        name,
+                        arguments,
+                        None,
+                    ) {
+                        Some(res) => res.map(|o| o.result),
+                        None => Err(RpcError::new(
+                            RpcCode::MethodNotFound,
+                            format!("unknown tool `{name}`"),
+                        )),
+                    }
+                })
+            }
+        }
+
+        let db = crate::db::Db::in_memory();
+        let project_id = db
+            .with_conn(|c| {
+                crate::system_scope::ensure_system_scope(
+                    c,
+                    &crate::system_scope::FixedHomeDirProvider::at(if cfg!(windows) {
+                        "C:\\Users\\kris"
+                    } else {
+                        "/home/kris"
+                    }),
+                )
+            })
+            .expect("bootstrap")
+            .project
+            .id;
+
+        let (server, port) = start_test_server();
+        server.set_dispatcher(Arc::new(SystemDispatcher { db: db.clone() }));
+        let call = |id: u32, name: &str, arguments: Value| -> Value {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            })
+            .to_string();
+            // `None` — NO terminal identity header. The protocol must work for a caller that has
+            // no terminal at all.
+            let (_status, body) = http_post_mcp(port, &req, None);
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        let templates = || {
+            db.with_conn(|c| crate::db::list_templates(c, &project_id))
+                .unwrap()
+                .len()
+        };
+
+        // 1) THE FIRST ATTEMPT — it WAITS for the human, and when the window closes it answers with
+        //    a tool RESULT (never an error bag), naming the request and how to keep waiting.
+        let args = json!({ "project_id": project_id, "name": "svc", "command": "echo hi" });
+        let v = call(1, "add_command", args.clone());
+        assert!(
+            v.get("error").is_none(),
+            "waiting on the user is not a failure of the call: {v}"
+        );
+        let answer = &v["result"]["structuredContent"];
+        assert_eq!(answer["ok"], json!(false), "{v}");
+        assert_eq!(
+            answer["status"],
+            json!(crate::system_approvals::APPROVAL_REQUIRED_CODE)
+        );
+        let request_id = answer["request_id"].as_str().expect("request_id").to_string();
+        assert!(answer["expires_at"].as_i64().is_some());
+        // THE WHOLE ANSWER IS READABLE PROSE, in the channel every client renders. That is the
+        // property the old protocol lacked, and no amount of correct `error.data` replaced it.
+        let text = v["result"]["content"][0]["text"]
+            .as_str()
+            .expect("a rendered text block");
+        assert!(text.contains(&request_id), "{text}");
+        assert!(text.contains(SYSTEM_APPROVAL_STATUS_TOOL), "{text}");
+        assert!(
+            !text.contains("token") && !text.contains("replay"),
+            "nothing secret travels any more: {text}"
+        );
+        assert_eq!(templates(), 0, "nothing was written");
+
+        // 2) THE AGENT KEEPS WAITING — by request id alone. There is no credential to carry.
+        let v = call(2, SYSTEM_APPROVAL_STATUS_TOOL, json!({ "request_id": request_id }));
+        assert_eq!(
+            v["result"]["structuredContent"]["state"],
+            json!(crate::system_approvals::STATE_PENDING),
+            "{v}"
+        );
+
+        // 3) THE HUMAN DECIDES, and the DECISION is what performs the operation — through the same
+        //    entry point the UI bridge drives, with the effect dispatched under the granted
+        //    authority (the sidecar's `McpRuntime::execute_granted`, in miniature).
+        let executor = SystemDispatcher { db: db.clone() };
+        crate::system_approvals::grant_and_execute(
+            &db,
+            &crate::system_approvals::SystemClock,
+            &request_id,
+            Some("ui"),
+            &|tool: &str, tool_args: &Value| {
+                crate::system_approvals::with_granted_authority(|| {
+                    executor.call(tool, tool_args).map_err(|e| e.to_string())
+                })
+            },
+        )
+        .expect("the human grants");
+        assert_eq!(templates(), 1, "the approval IS the execution");
+
+        // 4) THE AGENT COMES BACK and collects the operation's REAL result — the answer that
+        //    arrived while it was not there.
+        let v = call(4, SYSTEM_APPROVAL_STATUS_TOOL, json!({ "request_id": request_id }));
+        let seen = &v["result"]["structuredContent"];
+        assert_eq!(seen["state"], json!(crate::system_approvals::STATE_GRANTED));
+        assert_eq!(seen["ok"], json!(true), "{v}");
+        assert_eq!(seen["result"]["command"]["name"], json!("svc"), "{v}");
+
+        // 5) ONE SHOT — the same request cannot be decided twice, so nothing runs a second time.
+        let again = crate::system_approvals::grant_and_execute(
+            &db,
+            &crate::system_approvals::SystemClock,
+            &request_id,
+            Some("ui"),
+            &|_: &str, _: &Value| Ok(json!(null)),
+        );
+        assert!(again.is_err(), "a spent approval is not decidable again");
+        assert_eq!(templates(), 1, "and nothing ran twice");
+
+        // 6) THE UI BRIDGE IS NOT AN MCP SURFACE — the decision verbs answer `method_not_found`,
+        //    so no agent can grant or deny anything, its own request included.
+        for name in [
+            "system_approval_grant",
+            "system_approval_deny",
+            "system_approval_list",
+        ] {
+            let v = call(6, name, json!({ "requestId": request_id }));
+            assert_eq!(
+                v["error"]["code"], -32601,
+                "`{name}` must not be callable over MCP: {v}"
+            );
         }
     }
 
