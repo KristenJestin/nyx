@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ChevronRightIcon,
   FolderGit2Icon,
@@ -24,6 +24,7 @@ import {
   SidebarLineGlyph,
   SidebarLineLabel,
 } from "@/components/ui/sidebar-line";
+import { useRevealWorkspace } from "./reveal-workspace";
 import { workspaceRunState } from "./runtime-state";
 import { useConsumedNotifications } from "./use-consumed-notifications";
 import { WorkspaceRuntimeTree } from "./workspace-runtime-tree";
@@ -40,6 +41,13 @@ import type { WorkspaceRuntimeSnapshot } from "@/components/runtime/use-workspac
  * rollup dot folds the workspace's whole runtime to one glanceable state (see
  * `workspaceRunState`). The body is `<WorkspaceRuntimeTree>` when the snapshot is loaded, else
  * a muted loading line. Every colour/size is a design-system token.
+ *
+ * IT OPENS BY RANK, OR BY REVEAL. The page starts the FIRST workspace open (`defaultOpen`) and
+ * leaves the rest closed; from there the band is the user's to fold. The one other thing that opens
+ * it is a REVEAL (`./reveal-workspace`): the search palette announcing that the user is landing on
+ * an entity inside this workspace, so the band cannot be the thing hiding it. That signal is
+ * ephemeral and consumed on arrival — it never becomes a stored preference, and a fold performed
+ * after it is honoured.
  *
  * LIFECYCLE ACTIONS (review `01M04WQEQDDPH7NQEK9MPYCXKS`): the header carries a hover-revealed
  * kebab with the workspace's OWN rename/remove. Before it, both lived only in the PROJECT's
@@ -83,7 +91,27 @@ export function WorkspaceAccordion({
    */
   onRemove?: (workspace: WorkspaceRecord) => void;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
+  // THE BAND'S OWN OPEN STATE — local, and deliberately not persisted. `defaultOpen` is the
+  // Terminals page's rank rule (the first workspace of the project starts open), and a toggle from
+  // here is the user's, remembered for as long as the band is mounted and no longer.
+  //
+  // ONE THING ELSE CAN OPEN IT: a REVEAL — the global search palette signalling that the user is
+  // arriving on an entity that lives in THIS workspace. Honoured in the initial state, not only in
+  // the effect below, so a band mounted by the very navigation that raised the signal is open in
+  // its FIRST paint: the target must be there when the page appears, never a beat later.
+  const { revealWorkspaceId, clearReveal } = useRevealWorkspace();
+  const [open, setOpen] = useState(() => defaultOpen || revealWorkspaceId === workspace.id);
+  // …and the same signal for a band ALREADY mounted (a jump inside the project one is already in,
+  // where no remount happens). It is CONSUMED here — `clearReveal` scopes the clear to this
+  // workspace — so it opens the band exactly once: a collapse the user performs afterwards stays,
+  // and a later remount of this band is not re-opened by a signal that already did its work.
+  // Nothing is written anywhere; see `./reveal-workspace` for why this is a signal and not the
+  // persisted `collapsed` flag.
+  useEffect(() => {
+    if (revealWorkspaceId !== workspace.id) return;
+    setOpen(true);
+    clearReveal(workspace.id);
+  }, [revealWorkspaceId, workspace.id, clearReveal]);
   const reduced = useReducedMotion();
   const Icon = workspace.is_root ? FolderGit2Icon : GitBranchIcon;
   // The live per-terminal agent activity from the SAME `agent_activity_snapshot` read model the

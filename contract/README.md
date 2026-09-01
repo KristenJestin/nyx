@@ -5,11 +5,13 @@ TypeScript, this directory holds the **shared cases** that make the two halves
 fail *together*. The fixtures are plain data files read by both suites at test
 time: nothing here is a build step, and neither side builds the other.
 
-Four contracts live here today:
+Five contracts live here today:
 
-1. **the pipe protocol** (`fixtures.json`, PDR-0007, task 523) — below;
+1. **the pipe protocol** (`fixtures.json`, PDR-0007, task 523) — the first
+   section below;
 2. **the design half** (`design-fixtures.json`, finding
-   `01KYSNQWQD1324E0NA0172M66J`) — see the last section;
+   `01KYSNQWQD1324E0NA0172M66J`) — the second section below, with *The shim
+   seam* that completes it;
 3. **the Spec-reference grammar** (`spec-ref-corpus.txt`, finding
    `01M0ZGBRZNAJTD5XQCW43STXZA`) — the token set the grammar is pinned on, read
    from BOTH sides by `crates/nyx-core/src/spec_ref.rs`: every token is replayed
@@ -35,6 +37,8 @@ Four contracts live here today:
    `home-state.ts` derives it from the renderer's own `STATE_PRIORITY` export —
    which is the rule of thumb here: a shared EXPORT when one side can import the
    other, a shared FIXTURE when neither can.
+5. **the global search's product rules** (`search-fixtures.json`, finding
+   `01M15D67D0F686ET3DMXYJCZY9`) — the last section below.
 
 ## The pipe protocol
 
@@ -239,3 +243,40 @@ cd apps/desktop/renderer && bunx vitest run --project unit src/components/design
 **Adding a case** must fail BOTH suites until BOTH implementations agree — that
 is the whole point. Adding one that only fails on one side means the other side
 was already right, and the case is worth keeping anyway.
+
+## The global search's product rules — `search-fixtures.json`
+
+**Hand-written, never generated.** Three rules of the `Mod+K` palette exist
+twice, and each duplication is deliberate: the palette must draw a FIXED group
+order whatever the backend emits first, must know how many suggestions fit
+before the answer arrives, and must issue no read below the query floor. What
+was missing is anything making the two halves fail *together* — a cap raised on
+one side alone shipped a backend answering more rows than the palette drew, with
+every suite green.
+
+- `group_order` — Specs → Tasks → Ideas → Workspaces → Projects → Managed
+  commands → Agent sessions, as the WIRE names (`nyx_core::search::GROUP_ORDER`
+  serialized ⇄ `SEARCH_GROUP_ORDER`). The renderer half also proves it can DRAW
+  every kind the order names (`SEARCH_KIND_META`).
+- `cap_type` — hits per type, and the number of suggestions an empty query
+  returns (`CAP_TYPE` ⇄ `SUGGESTION_CAP`).
+- `min_query_len` — the shortest query that reaches the database
+  (`MIN_QUERY_LEN` ⇄ `MIN_QUERY_LEN`): the renderer issues no request below it,
+  the core answers nothing.
+
+| side | test |
+| --- | --- |
+| Rust | `search/tests.rs::the_shared_fixture_pins_the_three_product_rules_the_renderer_repeats` |
+| TS | `components/search/search-rules-contract.test.ts` |
+
+The TS half also reads the RUST DECLARATIONS out of
+`crates/nyx-core/src/search.rs` (the way `command-group-ipc-contract.test.ts`
+reads the sidecar's dispatch). Without that, editing `search.rs` alone would
+redden the Rust suite and leave TypeScript green until someone thought to touch
+the fixture; with it, a constant moved on either side turns the renderer red too.
+
+```sh
+cargo test -p nyx-core --lib -- the_shared_fixture_pins_the_three_product_rules
+cd apps/desktop/renderer && bunx vitest run --project unit \
+  src/components/search/search-rules-contract.test.ts
+```

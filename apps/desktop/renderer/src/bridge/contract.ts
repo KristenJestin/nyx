@@ -633,6 +633,117 @@ export interface AppSettings {
 }
 
 // ---------------------------------------------------------------------------
+// GLOBAL SEARCH — the `Mod+K` palette's wire model. A faithful mirror of the
+// `nyx_core::search::SearchHit` serde shape (snake_case), returned by the `global_search`
+// db_command.
+// ---------------------------------------------------------------------------
+
+/**
+ * The seven entity types the palette spans (mirror of `nyx_core::search::SearchKind`).
+ *
+ * The order of this union is the DISPLAY order of the result groups — Specs → Tasks → Ideas →
+ * Workspaces → Projects → Managed commands → Agent sessions — and the backend returns its groups in
+ * exactly that sequence. Fixed rather than score-ordered so the palette is muscle memory: a type is
+ * always in the same place, whatever the query.
+ */
+export type GlobalSearchKind =
+  | "spec"
+  | "task"
+  | "idea"
+  | "workspace"
+  | "project"
+  | "command"
+  | "session";
+
+/**
+ * ONE result of the palette: a TYPED TARGET plus what to draw for it.
+ *
+ * There is deliberately no url, href or route fragment here. The backend answers an IDENTITY —
+ * "this is a Spec, in this project" — and the renderer owns the mapping to a route, because the
+ * routes are the renderer's and change with it. `project_id` is what the renderer ACTIVATES before
+ * navigating (every surface of the app reads through the entered project), and that activation
+ * PERSISTS — which is why the palette pre-selects nothing while there is no query.
+ *
+ * The container fields are per-kind and null elsewhere: `workspace_id` for what lives in a
+ * workspace, `spec_id` for a TASK (v1 opens the task's Spec, there is no task route — null for a
+ * task attached to no Spec), `terminal_id` for an agent SESSION (a session is reached through its
+ * terminal or not at all).
+ *
+ * Each container id travels with its NAME (`project_name`, `workspace_name`), joined backend-side.
+ * The palette used to rebuild the project name from the rail's project tree — which only holds what
+ * the rail loaded — and had no workspace name at all; and a name the backend does not read is a
+ * name it cannot MATCH, which it now does (at a lower weight than the entity's own).
+ *
+ * A `command` hit's `id` is a `command_instances.id`, never a `managed_commands.id`: the instance is
+ * what runs, what `WorkspaceRuntimeService.id` is, and what `?command=` deep-links. One template
+ * materialized in two workspaces is therefore TWO hits, told apart by `workspace_name`.
+ */
+export interface GlobalSearchHit {
+  readonly kind: GlobalSearchKind;
+  /**
+   * The entity to open. For a Spec matched through its PROSE this is the Spec, not the revision;
+   * for a managed command it is the INSTANCE (`command_instances.id`), not the template.
+   */
+  readonly id: string;
+  readonly project_id: string;
+  /** The owning project's NAME — always present (every source reaches a project through a NOT NULL FK). */
+  readonly project_name: string;
+  readonly workspace_id: string | null;
+  /** The workspace's NAME, `null` exactly where `workspace_id` is — the two are one pair. */
+  readonly workspace_name: string | null;
+  readonly spec_id: string | null;
+  readonly terminal_id: string | null;
+  /** The entity's name — what the row shows. */
+  readonly label: string;
+  /** A short secondary line, when the source has one (a command line, an agent kind). */
+  readonly detail: string | null;
+  /** The match window, when the source can produce one (the Spec prose, an idea's body). */
+  readonly extract: string | null;
+  /**
+   * The entity's HUMAN KEY when it has one — a Spec's `KEY-number` (e.g. `NYX-42`), `null` for
+   * every other kind. DRAWN, NEVER MATCHED: it is a field of its own rather than a second `detail`
+   * because `detail` is part of the backend's match surface, and a key that ranks would move an
+   * order settled without it. Searching a Spec BY its key is a separate capability.
+   */
+  readonly human_key: string | null;
+  /** The blended relevance in `[0,1]`, higher = better. `0` on a suggestion, which is never scored. */
+  readonly score: number;
+  /** The recency (`updated_at`, or `last_seen_at` for a session) — the ordering of the suggestions. */
+  readonly updated_at: number;
+}
+
+/**
+ * The ANSWER of one `global_search` — the hits, plus the one fact about the install they cannot
+ * carry (mirror of `nyx_core::search::SearchAnswer`).
+ *
+ * `hits` is CAPPED (8 per type, 40 overall), so "this install holds no Spec, no task and no idea"
+ * is unanswerable from it: a Spec absent from the eight most recently touched entities looks
+ * exactly like a Spec that does not exist — and that head is routinely saturated by sessions and
+ * commands, whose recency moves at every agent start while the Specs sit still. The backend is the
+ * only place that knows, so it says so in a field of its own.
+ */
+export interface GlobalSearchAnswer {
+  readonly hits: readonly GlobalSearchHit[];
+  /**
+   * `true` when the install carries NO searchable Spec, NO task and NO idea — the "nothing to
+   * search yet" of a fresh install, which the project and root workspace one just created do not
+   * lift. The palette's empty-install state is keyed on THIS, never on the composition of `hits`.
+   *
+   * The below-`MIN_QUERY_LEN` regime issues no read and answers `false`: the conservative value,
+   * which can only hide the empty state and never invent one.
+   */
+  readonly knowledge_empty: boolean;
+}
+
+/** The args of the `global_search` db_command. */
+export interface GlobalSearchArgs extends Record<string, unknown> {
+  /** The raw user text. Empty = the SUGGESTIONS; one character = an empty answer. */
+  readonly query: string;
+  /** The OVERALL cap, clamped by the core (it can narrow the answer, never widen it). */
+  readonly limit?: number;
+}
+
+// ---------------------------------------------------------------------------
 // v2.8 orchestration ENGINE — the behavior-tree graph read models (Phase 6). These mirror, on the
 // wire, the `nyx_core::db` `Workflow` / `Node` / `WorkflowRun` serde shapes (snake_case) the sidecar
 // engine read-commands return. The graph is DATA (PRD "Orchestration = donnée"); the renderer
@@ -1156,6 +1267,27 @@ export type BackendCommand =
   // (the SAME `nyx_core::idea::search_ideas` the MCP tool serves): each hit carries an extract, the
   // blended score, and the idea's linked Specs.
   | "idea_search"
+  // `global_search` ({ query, limit? }) → `GlobalSearchAnswer` — the backend of the `Mod+K`
+  // palette: ONE ranked, bounded list over the seven entity types of the product, ALL PROJECTS
+  // CONFOUNDED (Specs + the prose of their current revision, tasks, ideas, workspaces, projects,
+  // managed commands, agent sessions). The SAME `nyx_core::search::global_search` engine any other
+  // surface would call (one authority, PDR-0005). A pure read: no mutation, no `changed` broadcast.
+  //
+  // An EMPTY `query` is NOT an error and NOT an empty answer: it returns the SUGGESTIONS — the most
+  // recently touched entities of every type — so the palette has a single rendering path for "just
+  // opened" and "typed something". Beware what that means in the copy: these reflect what was last
+  // TOUCHED, which is often an agent's doing rather than the user's own visits (there is no journal
+  // of opened entities, and this Spec deliberately creates none). A query of ONE character returns
+  // an empty list without touching the database. `limit` is the OVERALL cap and is CLAMPED BY THE
+  // CORE — the caps are the product rule, so asking for more widens nothing.
+  //
+  // The answer is `{ hits, knowledge_empty }`, not a bare array: `knowledge_empty` says whether the
+  // install carries any searchable Spec, task or idea AT ALL — a fact about the database that the
+  // capped `hits` cannot be asked, and what the palette's "nothing to search yet" is keyed on.
+  //
+  // Each hit is a TYPED TARGET, never a URL: the backend says "this is a Spec, in this project" and
+  // the renderer decides which route a kind lands on.
+  | "global_search"
   // `annexe_list` ({ specId }) — a Spec's annexes newest-first, each with its blob `byte_len` (no
   // content in the list). Backs the Spec-detail "Documents" block (the `url` rows it also returns
   // are drawn by the neighbouring "Links" block instead, off `annexe_link_list`).

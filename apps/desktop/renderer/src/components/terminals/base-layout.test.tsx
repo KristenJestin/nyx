@@ -853,3 +853,129 @@ describe("BaseLayout — project right-click CRUD", () => {
     ).toHaveLength(0);
   });
 });
+
+/**
+ * REVIEW-FINDING (« Registre d'actions : créer un terminal ou un workspace depuis la palette ») —
+ * the `Add a workspace to …` action, END TO END through the shell.
+ *
+ * The palette writes NO creation of its own: `<BaseLayout>` hands it `onAddWorkspace`, which is the
+ * rail's `useManualAdd` flow — native folder picker, then the name dialog, then `create_workspace`.
+ * These two tests drive the palette and assert that flow, cancellation included: the whole point of
+ * reusing it is that "cancel creates nothing" is a property of the existing path rather than a new
+ * rule written beside it.
+ */
+describe("BaseLayout — the palette's Add-a-workspace action", () => {
+  /** Serve the rail + a `global_search` answering ONE project hit, and record `create_workspace`. */
+  function installSearchBackend(created: Array<Record<string, unknown>>) {
+    mockIPC((cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      switch (cmd) {
+        case "list_projects":
+          return [project("p1", "Alpha")];
+        case "list_workspaces":
+          return [root("ws-p1", "p1")];
+        case "workspace_runtime_snapshot":
+          return {
+            workspace: { id: a.workspaceId as string, name: "root", path: "/ws-p1" },
+            terminals: [],
+            agent_sessions: [],
+            services: [],
+          };
+        case "global_search":
+          return {
+            hits:
+              (a.query as string) === ""
+                ? []
+                : [
+                    {
+                      kind: "project",
+                      id: "p1",
+                      project_id: "p1",
+                      project_name: "Alpha",
+                      workspace_id: null,
+                      workspace_name: null,
+                      spec_id: null,
+                      terminal_id: null,
+                      label: "Alpha",
+                      detail: null,
+                      extract: null,
+                      human_key: null,
+                      score: 1,
+                      updated_at: 0,
+                    },
+                  ],
+            knowledge_empty: false,
+          };
+        case "create_workspace": {
+          created.push(a);
+          return {
+            id: "ws-new",
+            project_id: "p1",
+            name: (a.name as string) ?? "feature",
+            path: a.path as string,
+            branch: null,
+            is_root: false,
+            collapsed: false,
+            created_at: 0,
+            updated_at: 0,
+          };
+        }
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  /** Open the palette (`Mod+K`, Ctrl under jsdom), type, and hand back the action row. */
+  async function openActionRow() {
+    await screen.findByRole("button", { name: "Project Alpha" });
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true, bubbles: true });
+    const input = await screen.findByRole("combobox");
+    fireEvent.change(input, { target: { value: "alpha" } });
+    return await screen.findByTestId("search-action-project:new-workspace-p1");
+  }
+
+  it("runs the rail's picker → name dialog → create_workspace, with no second creation path", async () => {
+    const created: Array<Record<string, unknown>> = [];
+    installSearchBackend(created);
+    bridgeFake().pickedDirectory = "/home/kris/feature";
+
+    renderLayout();
+    fireEvent.click(await openActionRow());
+
+    // The palette gave way and the RAIL's own dialog took over, seeded by the picked folder — the
+    // very modal the project kebab's "Add workspace" opens, not a second one.
+    await waitFor(() => expect(screen.queryByRole("combobox")).toBeNull());
+    const nameField = await screen.findByRole("textbox", { name: "Workspace name" });
+    await waitFor(() => expect((nameField as HTMLInputElement).value).toBe("feature"));
+
+    const confirmBtns = screen.getAllByRole("button", { name: "Add workspace" });
+    fireEvent.click(confirmBtns[confirmBtns.length - 1]!);
+    await waitFor(() => expect(created.length).toBe(1));
+    expect(created[0]!.projectId).toBe("p1");
+    expect(created[0]!.path).toBe("/home/kris/feature");
+  });
+
+  it("creates NOTHING when the folder picker is cancelled, and leaves the app coherent", async () => {
+    const created: Array<Record<string, unknown>> = [];
+    installSearchBackend(created);
+    bridgeFake().pickedDirectory = null; // cancelled
+
+    const { router } = renderLayout();
+    fireEvent.click(await openActionRow());
+
+    // The palette closed, and NOTHING opened behind it: no name dialog, no backend write.
+    await waitFor(() => expect(screen.queryByRole("combobox")).toBeNull());
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByRole("textbox", { name: "Workspace name" })).toBeNull();
+    expect(created.length).toBe(0);
+
+    // COHERENT: the app is on the project the action named, on its Terminals page — the landing an
+    // ordinary activation of that same project hit would have produced, and nothing more.
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(screen.getByRole("button", { name: "Project Alpha" }).getAttribute("aria-current")).toBe(
+      "true",
+    );
+    vi.clearAllMocks();
+  });
+});

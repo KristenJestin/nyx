@@ -2683,6 +2683,38 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)
                     .and_then(|results| Self::json(&results))
             }
+            // `global_search` — the backend of the `Mod+K` palette: ONE ranked, bounded list over
+            // the seven entity types of the product, ALL PROJECTS CONFOUNDED (Specs + the prose of
+            // their current revision, tasks, ideas, workspaces, projects, managed commands, agent
+            // sessions). The SAME `nyx_core::search::global_search` engine any other surface would
+            // call — one authority for UI + MCP (PDR-0005). A pure read: no mutation, no `changed`
+            // broadcast.
+            //
+            // `{ query, limit? }`. An EMPTY `query` returns the SUGGESTIONS (the most recently
+            // touched entities of every type) rather than nothing, so the palette has a single
+            // rendering path; a one-character query returns an empty list without touching the
+            // database. `limit` is the OVERALL cap and is clamped BY THE CORE — the caps are the
+            // product rule, not a caller's preference, so passing a bigger number widens nothing.
+            //
+            // The answer is `{ hits, knowledge_empty }`, NOT a bare array. `knowledge_empty` says
+            // whether the install carries any searchable Spec, task or idea at all — a property of
+            // the DATABASE, which the capped `hits` cannot be asked (a Spec absent from the eight
+            // most recent entities is indistinguishable from a Spec that does not exist), and the
+            // palette's "nothing to search yet" state is keyed on it.
+            //
+            // Each hit is a TYPED TARGET (`kind` + `id` + the containers), never a URL: which
+            // route a kind lands on is the renderer's business and changes with the routes.
+            "global_search" => {
+                let query = self.arg_str("query")?;
+                let limits = match self.args.get("limit").and_then(|v| v.as_u64()) {
+                    Some(limit) => nyx_core::search::SearchLimits::with_total(limit as usize),
+                    None => nyx_core::search::SearchLimits::default(),
+                };
+                self.db()
+                    .with_conn(|c| nyx_core::search::global_search(c, &query, limits))
+                    .map_err(Self::db_err)
+                    .and_then(|answer| Self::json(&answer))
+            }
             // `annexe_list` — the annexes attached to a Spec (the Spec-detail "Annexes" block),
             // newest-first, each with its blob `byte_len` (no content shipped in the list). The SAME
             // `db::list_annexes` the MCP `annexe_list` tool serves. `{ specId }`.
@@ -7357,6 +7389,252 @@ mod tests {
                 .any(|h| h["title"] == "Parser should stream tokens"),
             "the cross-project search reaches the other project's idea"
         );
+    }
+
+    /// `global_search` serves the `Mod+K` palette through the ONE existing transport: ONE hit per
+    /// source, each a TYPED TARGET carrying no URL, plus the three query regimes (a real query, an
+    /// empty one that returns suggestions, a one-character one that returns nothing) and the
+    /// core-side clamp of `limit`. A pure READ — no push.
+    ///
+    /// The dispatch answers `{ hits, knowledge_empty }` — the envelope, not a bare array: the
+    /// palette's "nothing to search yet" state is a fact about the DATABASE and cannot be read off
+    /// a capped list of hits.
+    #[test]
+    fn global_search_returns_one_typed_hit_per_source_through_the_dispatch() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "pelican project", "/tmp/dbcmd-global-search");
+        let pushes_before = h.pushes();
+
+        // One entity of every searchable type, all naming the same word.
+        let (workspace_id, spec_id, session_id, terminal_id) = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let root = nyx_core::db::list_workspaces(c, &project_id)?
+                    .into_iter()
+                    .next()
+                    .expect("the project has a root workspace");
+                nyx_core::db::rename_workspace(c, &root.id, "pelican workspace")?;
+                let (spec, _rev) = nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "pelican spec",
+                    nyx_core::db::SpecSections {
+                        problem: "the pelican problem".into(),
+                        ..nyx_core::db::SpecSections::empty()
+                    },
+                )?;
+                nyx_core::db::create_idea(c, &project_id, "pelican idea", "b", None, "manual")?;
+                nyx_core::db::create_template(
+                    c,
+                    &project_id,
+                    "pelican command",
+                    "bun run pelican",
+                    None,
+                    nyx_core::db::CommandSource::default(),
+                )?;
+                let terminal = nyx_core::db::create_terminal(
+                    c,
+                    "/tmp/dbcmd-global-search/work",
+                    Some("pelican terminal".to_string()),
+                )?;
+                let session = nyx_core::db::record_session_start(
+                    c,
+                    &terminal.id,
+                    "claude_code",
+                    nyx_core::db::SessionCapture {
+                        workspace_id: Some(root.id.clone()),
+                        external_session_id: "ext-pelican".into(),
+                        cwd: "/tmp/dbcmd-global-search/work".into(),
+                        transcript_path: None,
+                        metadata_json: None,
+                    },
+                )?;
+                Ok::<_, diesel::result::Error>((root.id, spec.id, session.id, terminal.id))
+            })
+            .unwrap();
+        // The task creation carries its own error type, so it takes its own checkout.
+        let task_id = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                let task = nyx_core::db::create_task(
+                    c,
+                    &project_id,
+                    "pelican task",
+                    nyx_core::db::NewTaskInput {
+                        spec_id: Some(spec_id.clone()),
+                        ..nyx_core::db::NewTaskInput::slice()
+                    },
+                )
+                .expect("create the task");
+                Ok::<_, diesel::result::Error>(task.id)
+            })
+            .unwrap();
+
+        /// The `hits` of an answer, and its `knowledge_empty` flag.
+        fn answer(raw: &str) -> (Vec<serde_json::Value>, bool) {
+            let value: serde_json::Value = serde_json::from_str(raw).expect("an answer object");
+            let hits = value["hits"]
+                .as_array()
+                .expect("the answer carries its hits under `hits`")
+                .clone();
+            let empty = value["knowledge_empty"]
+                .as_bool()
+                .expect("the answer carries the install's knowledge flag");
+            (hits, empty)
+        }
+
+        let raw = h
+            .run("global_search", serde_json::json!({ "query": "pelican" }))
+            .expect("the kind is dispatched");
+        let (hits, knowledge_empty) = answer(&raw);
+        assert!(
+            !knowledge_empty,
+            "the fixture holds a Spec, a task and an idea"
+        );
+
+        // ONE HIT PER SOURCE — which is what this dispatch test is about: the seven reads all
+        // travel through the one kind, and each answers.
+        //
+        // The SEQUENCE is deliberately not asserted here. It used to be `GROUP_ORDER`, back when
+        // the palette drew a section per type; the results are now ONE list ordered by
+        // `search::by_rank` (bucket, then coverage, then score, then recency), so the type of a row
+        // no longer decides where it sits. `GROUP_ORDER` survives as the TRIM order — which hits
+        // survive a saturated answer — and this fixture saturates nothing. The ordering rules have
+        // their own tests, on fixtures built to exercise them, in `nyx_core::search`.
+        let mut kinds = hits
+            .iter()
+            .map(|hit| hit["kind"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            vec![
+                "command",
+                "idea",
+                "project",
+                "session",
+                "spec",
+                "task",
+                "workspace"
+            ],
+            "each of the seven sources answers exactly once through the dispatch"
+        );
+
+        // Each hit is a TYPED TARGET: an identity plus the containers to enter, never a route.
+        // REVIEW-FINDING (« Contexte projet + workspace porté par le hit ») : each container id also
+        // crosses the wire WITH ITS NAME — `project_name` always, `workspace_name` exactly where
+        // `workspace_id` is. The palette draws them; it no longer rebuilds the project name from the
+        // rail's tree, and it never had a workspace name to rebuild.
+        for hit in &hits {
+            assert_eq!(hit["project_id"].as_str().unwrap(), project_id);
+            assert_eq!(
+                hit["project_name"].as_str().unwrap(),
+                "pelican project",
+                "every hit names its project on the wire: {hit}"
+            );
+            assert_eq!(
+                hit["workspace_name"].is_null(),
+                hit["workspace_id"].is_null(),
+                "the workspace id and its name are one pair: {hit}"
+            );
+            for forbidden in ["url", "href", "path", "route", "to", "target"] {
+                assert!(
+                    hit.get(forbidden).is_none(),
+                    "`{forbidden}` would put the routing table in the backend: {hit}"
+                );
+            }
+            assert!(!hit["label"].as_str().unwrap().is_empty());
+        }
+        // Reached BY KIND, not by position: the sequence is `by_rank`'s and owes nothing to the
+        // type of a row (see the comment on the kind set above). What each source answers is the
+        // subject here; where it lands is another test's.
+        let of_kind = |kind: &str| {
+            hits.iter()
+                .find(|hit| hit["kind"] == kind)
+                .unwrap_or_else(|| panic!("no `{kind}` hit in the answer"))
+                .clone()
+        };
+        let spec = of_kind("spec");
+        let task = of_kind("task");
+        let workspace = of_kind("workspace");
+        let project = of_kind("project");
+        let command = of_kind("command");
+        let session = of_kind("session");
+
+        assert_eq!(spec["id"].as_str().unwrap(), spec_id);
+        assert_eq!(task["id"].as_str().unwrap(), task_id);
+        assert_eq!(
+            task["spec_id"].as_str().unwrap(),
+            spec_id,
+            "a task opens its Spec — v1 creates no task route"
+        );
+        assert_eq!(workspace["workspace_id"].as_str().unwrap(), workspace_id);
+        assert_eq!(
+            workspace["workspace_name"].as_str().unwrap(),
+            "pelican workspace"
+        );
+        assert_eq!(project["id"].as_str().unwrap(), project_id);
+        // The managed command answers its INSTANCE, in the workspace it runs in — the id
+        // `?command=` is compared against, not the project-level template.
+        assert_ne!(
+            command["id"].as_str().unwrap(),
+            "",
+            "the command hit carries a command_instances.id"
+        );
+        assert_eq!(command["workspace_id"].as_str().unwrap(), workspace_id);
+        assert_eq!(
+            command["workspace_name"].as_str().unwrap(),
+            "pelican workspace"
+        );
+        assert_eq!(session["id"].as_str().unwrap(), session_id);
+        assert_eq!(
+            session["terminal_id"].as_str().unwrap(),
+            terminal_id,
+            "a session is reached through its terminal"
+        );
+
+        // An EMPTY query is the SUGGESTIONS, not an error and not an empty list — one rendering
+        // path for "just opened" and "typed something".
+        let raw = h
+            .run("global_search", serde_json::json!({ "query": "" }))
+            .expect("an empty query is a legitimate call");
+        let (suggestions, knowledge_empty) = answer(&raw);
+        assert!(!suggestions.is_empty());
+        assert!(suggestions
+            .iter()
+            .all(|hit| hit["score"].as_f64().unwrap() == 0.0));
+        assert!(
+            !knowledge_empty,
+            "the suggestions carry the install's knowledge flag too — it is what the palette's \
+             empty state is keyed on"
+        );
+
+        // A ONE-character query is neither a search nor the suggestions.
+        let raw = h
+            .run("global_search", serde_json::json!({ "query": "p" }))
+            .unwrap();
+        assert_eq!(answer(&raw).0, Vec::<serde_json::Value>::new());
+
+        // `limit` narrows and is CLAMPED BY THE CORE — a caller cannot widen the product's caps.
+        let raw = h
+            .run(
+                "global_search",
+                serde_json::json!({ "query": "pelican", "limit": 2 }),
+            )
+            .unwrap();
+        assert_eq!(answer(&raw).0.len(), 2);
+        let raw = h
+            .run(
+                "global_search",
+                serde_json::json!({ "query": "pelican", "limit": 9_999 }),
+            )
+            .unwrap();
+        assert!(answer(&raw).0.len() <= nyx_core::search::CAP_TOTAL);
+
+        // A pure read pushes nothing.
+        assert_eq!(h.pushes(), pushes_before);
     }
 
     /// `annexe_list` returns a Spec's annexes newest-first, each with its blob `byte_len` (no

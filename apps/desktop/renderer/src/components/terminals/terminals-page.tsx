@@ -15,6 +15,7 @@ import { TerminalStatsProvider } from "@/components/sidebar/use-terminal-stats";
 import { TerminalRenameProvider } from "@/components/sidebar/use-terminal-rename";
 import { PagePlaceholder } from "./page-placeholder";
 import { useActiveProject } from "./active-project";
+import { usePendingTerminal } from "./pending-terminal";
 import { useProjectRuntime } from "./use-project-runtime";
 import { RuntimeSelectionProvider, useRuntimeSelection } from "./runtime-selection";
 import { ConsumedNotificationsProvider } from "./use-consumed-notifications";
@@ -333,6 +334,49 @@ function TerminalsBody({
     reorderTerminals,
     orderedTerminalIds,
   } = useTerminalActions(allTerminals, fallbackWorkspace, paneShortcuts);
+
+  /**
+   * HONOUR A PENDING TERMINAL — the search palette's `Open a new terminal in …` action.
+   *
+   * The palette can only REQUEST it (`terminals/pending-terminal`, which carries the whole
+   * rationale): the path that creates a terminal AND ENTERS it is `newTerminalInWorkspace` right
+   * above, whose "enter" is a selection in THIS page's runtime, and the palette is mounted on the
+   * shell. So the signal lands here and is honoured by the very callback the workspace band's "+"
+   * calls — no second creation path, and "…and enter it" comes free with it.
+   *
+   * CONSUMED BEFORE THE CREATION, never after: `clearPendingTerminal` runs first, so the effect
+   * cannot fire twice on one request. It is belt AND braces — `honouringRef` blocks a second run
+   * within the window where the clear has not committed yet (a dep changing identity in between,
+   * React's StrictMode double-invoke), because creating a terminal is not idempotent the way
+   * opening a band is. The ref is RESET when the request goes back to `null`, so asking twice for
+   * the SAME workspace still opens two terminals — which is what the user asked for.
+   *
+   * A request naming ANOTHER project is left standing — the palette enters the target project in
+   * the same breath, so the page that can honour it is one navigation away. But a request naming
+   * THIS project whose workspace is not in the tree is DROPPED: this is the page that would have
+   * held it, so the workspace is gone (deleted between the search and the activation) rather than
+   * still loading. Left standing, such a request fired the day the user reached that project by
+   * some other route, opening a terminal nobody had asked for — and unlike a stale reveal, which
+   * merely opens a band, a stale creation cannot be undone by ignoring it.
+   */
+  const { pendingTerminal, clearPendingTerminal } = usePendingTerminal();
+  const honouringRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (pendingTerminal == null) {
+      honouringRef.current = null;
+      return;
+    }
+    if (pendingTerminal.projectId !== projectId) return;
+    if (honouringRef.current === pendingTerminal.workspaceId) return;
+    const workspace = workspaces.find((w) => w.id === pendingTerminal.workspaceId);
+    if (!workspace) {
+      clearPendingTerminal(pendingTerminal.workspaceId);
+      return;
+    }
+    honouringRef.current = workspace.id;
+    clearPendingTerminal(workspace.id);
+    void newTerminalInWorkspace(workspace.id, workspace.path);
+  }, [pendingTerminal, projectId, workspaces, clearPendingTerminal, newTerminalInWorkspace]);
 
   // WHICH workspaces actually ANSWERED the current runtime read — `useProjectRuntime` silently
   // omits a rejected `workspace_runtime_snapshot`, so `allTerminals` may be PARTIAL rather than

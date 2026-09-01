@@ -1,7 +1,12 @@
 import { renderHook } from "@testing-library/react";
+import { matchesKeyboardEvent } from "@tanstack/react-hotkeys";
 import { describe, expect, it, vi } from "vitest";
 
-import { isTerminalNavChord, useTerminalShortcuts } from "./use-terminal-shortcuts";
+import {
+  isTerminalNavChord,
+  SEARCH_PALETTE_CHORD,
+  useTerminalShortcuts,
+} from "./use-terminal-shortcuts";
 
 /** Build a minimal KeyboardEvent-like object for the pure predicate. */
 function key(
@@ -31,12 +36,52 @@ describe("isTerminalNavChord (pure — drives the xterm yield)", () => {
     expect(isTerminalNavChord(key("PageUp", { ctrl: true }))).toBe(true);
   });
 
+  it("YIELDS Ctrl/Cmd+K — without it the search palette is unreachable from a terminal", () => {
+    // The palette is opened from a focused terminal BY DEFINITION, and xterm stops propagation on
+    // every key it consumes. If `k` leaves this predicate, `Mod+K` never leaves the textarea and
+    // the whole global search dies silently — so this assertion is the feature's tripwire.
+    expect(isTerminalNavChord(key("k", { ctrl: true }))).toBe(true);
+    expect(isTerminalNavChord(key("K", { ctrl: true }))).toBe(true);
+    expect(isTerminalNavChord(key("k", { meta: true }))).toBe(true);
+  });
+
   it("does NOT match plain keys, bare modifiers, or non-bound chords", () => {
     expect(isTerminalNavChord(key("t"))).toBe(false);
+    expect(isTerminalNavChord(key("k"))).toBe(false); // a bare `k` is text, and stays text
     expect(isTerminalNavChord(key("a", { ctrl: true }))).toBe(false);
     expect(isTerminalNavChord(key("Tab"))).toBe(false);
     // Cycling is Ctrl-only: Cmd+Tab is the OS app switcher, not ours.
     expect(isTerminalNavChord(key("Tab", { meta: true }))).toBe(false);
+  });
+});
+
+describe("SEARCH_PALETTE_CHORD (`Mod` is resolved by TanStack, per platform)", () => {
+  // The platform mapping belongs to the library — it is MOCKED here (`matchesKeyboardEvent`'s
+  // `platform` argument) rather than re-implemented, so this proves OUR constant resolves to
+  // Cmd on macOS and Ctrl elsewhere without duplicating a table that would then drift.
+  // A REAL `KeyboardEvent` here (not the minimal literal above): the library compares all four
+  // modifier flags, so an absent `altKey` would fail the match for the wrong reason.
+  const withMods = (mods: Partial<{ ctrl: boolean; meta: boolean }>) =>
+    new KeyboardEvent("keydown", {
+      key: "k",
+      ctrlKey: mods.ctrl ?? false,
+      metaKey: mods.meta ?? false,
+    });
+
+  it("is Cmd+K on macOS — and Ctrl+K does NOT fire there", () => {
+    expect(matchesKeyboardEvent(withMods({ meta: true }), SEARCH_PALETTE_CHORD, "mac")).toBe(true);
+    expect(matchesKeyboardEvent(withMods({ ctrl: true }), SEARCH_PALETTE_CHORD, "mac")).toBe(false);
+  });
+
+  it("is Ctrl+K on Windows and Linux — and Cmd+K does NOT fire there", () => {
+    for (const platform of ["windows", "linux"] as const) {
+      expect(matchesKeyboardEvent(withMods({ ctrl: true }), SEARCH_PALETTE_CHORD, platform)).toBe(
+        true,
+      );
+      expect(matchesKeyboardEvent(withMods({ meta: true }), SEARCH_PALETTE_CHORD, platform)).toBe(
+        false,
+      );
+    }
   });
 });
 

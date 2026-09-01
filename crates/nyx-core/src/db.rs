@@ -5607,6 +5607,10 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "spec_revisions.testing_decisions",
     "spec_revisions.title",
     "spec_revisions.user_stories",
+    "spec_revisions_fts",
+    "spec_revisions_fts_ad",
+    "spec_revisions_fts_ai",
+    "spec_revisions_fts_au",
     "specs",
     "specs.archived_at",
     "specs.completed_at",
@@ -5625,6 +5629,10 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "specs.title",
     "specs.updated_at",
     "specs.workspace_id",
+    "specs_fts",
+    "specs_fts_ad",
+    "specs_fts_ai",
+    "specs_fts_au",
     "system_command_approvals",
     "system_command_approvals.canonical_payload",
     "system_command_approvals.claimed_at",
@@ -5674,6 +5682,10 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "tasks.type",
     "tasks.updated_at",
     "tasks.verification_command",
+    "tasks_fts",
+    "tasks_fts_ad",
+    "tasks_fts_ai",
+    "tasks_fts_au",
     "terminals",
     "terminals.closed_at",
     "terminals.created_at",
@@ -10513,16 +10525,6 @@ pub struct LinkedSpec {
     pub number: i32,
 }
 
-/// One FTS5 hit: an idea `id` and its `bm25` relevance `score` (smaller = better match).
-/// Read via [`fts_match_ideas`] over the external-content `ideas_fts` index.
-#[derive(Debug, Clone, PartialEq, diesel::QueryableByName)]
-pub struct IdeaFtsHit {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    pub id: String,
-    #[diesel(sql_type = diesel::sql_types::Double)]
-    pub score: f64,
-}
-
 /// CREATE an idea in `project_id` (status `open`, no fermeture trail). `theme` is the optional
 /// grouping axis; `source` is how it was captured (`session`/`spec`/`manual`). Timestamps are
 /// stamped by the backend; the FTS5 index is fed by the migration's AFTER INSERT trigger.
@@ -11046,38 +11048,474 @@ pub fn merge_ideas(
     })
 }
 
-/// FTS5 full-text match over `ideas_fts` (external content on `ideas.rowid`), scoped to one
-/// project or to EVERY project, best-match first (`bm25` ascending — smaller is better), capped at
-/// `limit`. `match_query` is a caller-built FTS5 MATCH expression (see `crate::idea::build_fts_query`,
-/// which sanitizes the user's terms). Returns each hit's idea `id` + `bm25` `score`. An
+/// FTS5 full-text match over `ideas_fts` (external content on `ideas.rowid`), best-match first
+/// (`bm25` ascending — smaller is better), capped at `limit`. `match_query` is a caller-built FTS5
+/// MATCH expression (see `crate::idea::build_fts_query`, which sanitizes the user's terms). An
 /// invalid/empty match expression should be avoided by the caller (it would error in FTS5).
 ///
-/// `project_id` is the SCOPE, as in [`list_ideas`]: `None` searches the whole backlog of every
-/// project. A search that stayed inside the entered project while the page showed all of them
-/// would be a silent trap — the query has to span exactly what the list spans.
+/// `project_id` is OPTIONAL, and that is the whole difference between the two callers: the
+/// per-project `idea_search` passes `Some(id)` and stays inside one backlog, while the global
+/// palette passes `None` and spans every project. ONE read, so the two paths cannot drift — the
+/// scoring above it ([`crate::idea::build_fts_query`], the bm25 normalization,
+/// [`crate::idea::combine`]) is shared for the same reason.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn fts_match_ideas(
     conn: &mut SqliteConnection,
     project_id: Option<&str>,
     match_query: &str,
     limit: i64,
-) -> QueryResult<Vec<IdeaFtsHit>> {
-    use diesel::sql_types::{BigInt, Text};
-    // The project predicate is a BOUND parameter either way (`?2 IS NULL OR …`) rather than two
-    // hand-written statements: one query, one place where the join and the ordering live.
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
     diesel::sql_query(
-        "SELECT i.id AS id, bm25(ideas_fts) AS score \
+        "SELECT i.id AS id, i.project_id AS project_id, p.name AS project_name, \
+                NULL AS workspace_id, NULL AS workspace_name, NULL AS spec_id, \
+                NULL AS terminal_id, i.title AS label, NULL AS detail, \
+                snippet(ideas_fts, -1, '', '', '…', 16) AS extract, NULL AS human_key, \
+                i.updated_at AS updated_at, bm25(ideas_fts) AS score \
          FROM ideas_fts \
          JOIN ideas i ON i.rowid = ideas_fts.rowid \
+         JOIN projects p ON p.id = i.project_id \
          WHERE ideas_fts MATCH ? AND (? IS NULL OR i.project_id = ?) \
          ORDER BY score ASC \
          LIMIT ?",
     )
     .bind::<Text, _>(match_query)
-    .bind::<diesel::sql_types::Nullable<Text>, _>(project_id)
-    .bind::<diesel::sql_types::Nullable<Text>, _>(project_id)
+    .bind::<Nullable<Text>, _>(project_id)
+    .bind::<Nullable<Text>, _>(project_id)
     .bind::<BigInt, _>(limit)
-    .load::<IdeaFtsHit>(conn)
+    .load::<SearchCandidate>(conn)
+}
+
+/// ONE row of the GLOBAL SEARCH corpus, in the single shape every source of the palette speaks —
+/// the three FTS5 indexes of migration `20260828205400_create_global_search_fts`
+/// (`specs_fts` / `spec_revisions_fts` / `tasks_fts`), the `ideas_fts` index of v26, and the four
+/// low-volume tables the aggregator scans directly (projects, workspaces, managed commands, agent
+/// sessions). One struct so [`crate::search`] folds seven heterogeneous reads without a
+/// per-source model.
+///
+/// `id` is the ENTITY the palette navigates to — for a Spec-revision hit that is the SPEC, because
+/// a revision has no surface of its own: matching its prose surfaces the Spec that carries it.
+///
+/// The three text fields are ALSO the match surface of the non-FTS sources (the FTS ones were
+/// already matched by SQLite): `label` is the primary name and the key the exact/prefix buckets
+/// compare against, `detail` a short secondary string that is both searchable and displayable (a
+/// command line, an agent kind), `extract` the long tail — the FTS5 `snippet()` for an indexed
+/// source, a searchable working directory for a session. `human_key` stands APART from those
+/// three: it is drawn on the row and never matched (see its own doc).
+#[derive(Debug, Clone, PartialEq, diesel::QueryableByName)]
+pub struct SearchCandidate {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub project_id: String,
+    /// The NAME of `project_id` — the entity's CONTEXT, joined here rather than resolved by the
+    /// caller.
+    ///
+    /// The palette is multi-project by construction, so the project is not decoration: two Specs
+    /// called "Auth" from two projects are the same row without it. It is read at the SOURCE for
+    /// two reasons. The renderer used to rebuild it from the rail's project tree, which only ever
+    /// holds what the rail loaded — and a name the backend does not read cannot be SEARCHED either,
+    /// which is what [`crate::search`] does with it.
+    ///
+    /// Every source joins `projects` INNER: each of the seven tables reaches a project through a
+    /// NOT NULL foreign key, so there is no row whose context is unknown and no fallback to draw.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub project_name: String,
+    /// The workspace the entity anchors on, when it has one (a Spec may, a session and a managed
+    /// COMMAND INSTANCE always do, a workspace hit is its own).
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub workspace_id: Option<String>,
+    /// The NAME of `workspace_id`, and `None` exactly where that is — the EXACT MIRROR of the id
+    /// field, with no per-kind exception to remember.
+    ///
+    /// A project alone stopped being enough context the moment one template could answer several
+    /// rows: two instances of the same command in two workspaces of the same project are one
+    /// indistinguishable row twice without it. The same holds for a workspace hit and for an agent
+    /// session, the two other kinds that live in a workspace rather than merely in a project.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub workspace_name: Option<String>,
+    /// For a TASK hit: the Spec that contains it — the nearest existing surface a task navigates
+    /// to, since v1 creates no task route. `None` for a Spec hit (its own `id` is the Spec) and
+    /// for a task that hangs off no Spec.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub spec_id: Option<String>,
+    /// For an agent-SESSION hit: the terminal that hosts it — a session is reached through its
+    /// terminal, never directly.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub terminal_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub label: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub detail: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub extract: Option<String>,
+    /// The entity's HUMAN KEY, when it has one — today only a Spec does: `projects.key || '-' ||
+    /// specs.number` (e.g. `NYX-42`), the identity the schema itself poses as a Spec's readable
+    /// name (migration `00000000000013_create_specs_revisions`) and the one the user reads on
+    /// every other Spec surface of the app.
+    ///
+    /// DISPLAY ONLY, and a field of its own for exactly that reason: `detail` is BOTH displayable
+    /// and SEARCHABLE ([`crate::search`] feeds it to the literal bucket and to the fuzzy term
+    /// list), so carrying the key there would silently make `NYX-42` a query and move the ranking.
+    /// Searching a Spec BY its key is a separate capability; this field is drawn, never matched.
+    ///
+    /// `NULL` when the project carries no key. `projects.key` was added with `DEFAULT ''`
+    /// (migration `00000000000010_canonical_project_workspace_repository`), so a project predating
+    /// it — or one whose key was never set — concatenated to `-42`, a string that names nothing.
+    /// The reads guard it with `NULLIF(p.key, '')`, and SQLite's `NULL || …` propagates: the field
+    /// is then absent rather than malformed, which is the case the renderer already draws for the
+    /// six kinds that have no key at all.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub human_key: Option<String>,
+    /// The entity's recency key — the tie-break of the ranking, and the SOLE ordering of the
+    /// empty-query suggestions. `updated_at` everywhere except `agent_sessions`, which does not
+    /// carry that column: a session's recency is its `last_seen_at`.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub updated_at: i64,
+    /// The raw `bm25` of an FTS read — SMALLER IS BETTER, and comparable only WITHIN its own FTS
+    /// table, which is why [`crate::search`] normalizes it per source. `0.0` on a recency read,
+    /// where nothing was scored.
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    pub score: f64,
+}
+
+/// FTS5 match over `specs_fts` (external content on `specs.rowid`), best-match first (`bm25`
+/// ascending), capped at `limit`. ARCHIVED Specs are excluded HERE, at query time — the index
+/// deliberately holds every Spec (see the migration header). `project_id` narrows to one project
+/// when given; `None` spans every project (the palette's default, it is a GLOBAL search).
+///
+/// `match_query` is a caller-built FTS5 MATCH expression — build it with
+/// [`crate::idea::build_fts_query`], which quotes each term so the user's reserved characters
+/// (`"`, `*`, `(`, `:`, `NEAR`…) can never break the parse.
+///
+/// The join on `projects` carries the Spec's HUMAN KEY (`key || '-' || number`) — the identity the
+/// user reads on every other Spec surface, and the one thing a title alone cannot disambiguate
+/// between two projects. It lands in `human_key`, NOT in `detail`, because `detail` is searchable.
+pub fn fts_match_specs(
+    conn: &mut SqliteConnection,
+    project_id: Option<&str>,
+    match_query: &str,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    diesel::sql_query(
+        "SELECT s.id AS id, s.project_id AS project_id, p.name AS project_name, \
+                s.workspace_id AS workspace_id, sw.name AS workspace_name, \
+                NULL AS spec_id, NULL AS terminal_id, s.title AS label, NULL AS detail, \
+                NULL AS extract, NULLIF(p.key, '') || '-' || s.number AS human_key, \
+                s.updated_at AS updated_at, bm25(specs_fts) AS score \
+         FROM specs_fts \
+         JOIN specs s ON s.rowid = specs_fts.rowid \
+         JOIN projects p ON p.id = s.project_id \
+         LEFT JOIN workspaces sw ON sw.id = s.workspace_id \
+         WHERE specs_fts MATCH ? AND s.archived_at IS NULL \
+           AND (? IS NULL OR s.project_id = ?) \
+         ORDER BY score ASC \
+         LIMIT ?",
+    )
+    .bind::<Text, _>(match_query)
+    .bind::<Nullable<Text>, _>(project_id)
+    .bind::<Nullable<Text>, _>(project_id)
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+/// FTS5 match over `spec_revisions_fts` — the Spec PROSE (title / problem / solution /
+/// implementation & testing decisions) — resolved to the SPEC each matching revision belongs to.
+///
+/// Two filters ride the join, both at QUERY time because the index holds every revision: only the
+/// CURRENT revision counts (`r.revision_number = s.current_revision_number`, so a superseded draft
+/// never resurfaces) and an ARCHIVED Spec is excluded. `extract` is FTS5's own `snippet()` over
+/// the best-matching column, which is why the prose index yields a real match window where a
+/// title-only index has nothing to add to its label.
+///
+/// It carries the same `human_key` as [`fts_match_specs`]: a Spec found through its PROSE ALONE is
+/// returned by this read and by no other, so leaving the key out here would draw the palette's
+/// Spec row two different ways depending on which index matched.
+pub fn fts_match_spec_revisions(
+    conn: &mut SqliteConnection,
+    project_id: Option<&str>,
+    match_query: &str,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    diesel::sql_query(
+        "SELECT s.id AS id, s.project_id AS project_id, p.name AS project_name, \
+                s.workspace_id AS workspace_id, sw.name AS workspace_name, \
+                NULL AS spec_id, NULL AS terminal_id, s.title AS label, NULL AS detail, \
+                snippet(spec_revisions_fts, -1, '', '', '…', 16) AS extract, \
+                NULLIF(p.key, '') || '-' || s.number AS human_key, \
+                s.updated_at AS updated_at, bm25(spec_revisions_fts) AS score \
+         FROM spec_revisions_fts \
+         JOIN spec_revisions r ON r.rowid = spec_revisions_fts.rowid \
+         JOIN specs s ON s.id = r.spec_id \
+         JOIN projects p ON p.id = s.project_id \
+         LEFT JOIN workspaces sw ON sw.id = s.workspace_id \
+         WHERE spec_revisions_fts MATCH ? \
+           AND s.archived_at IS NULL \
+           AND r.revision_number = s.current_revision_number \
+           AND (? IS NULL OR s.project_id = ?) \
+         ORDER BY score ASC \
+         LIMIT ?",
+    )
+    .bind::<Text, _>(match_query)
+    .bind::<Nullable<Text>, _>(project_id)
+    .bind::<Nullable<Text>, _>(project_id)
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+/// FTS5 match over `tasks_fts` (task TITLES), best-match first, capped at `limit`.
+///
+/// `tasks` carries NO `archived_at` of its own: a task is excluded when ITS SPEC is archived, and
+/// never otherwise — hence the LEFT JOIN plus `t.spec_id IS NULL OR s.archived_at IS NULL`, which
+/// keeps the Spec-less tasks (a standalone/review task is still findable, it just navigates to its
+/// project rather than to a Spec).
+pub fn fts_match_tasks(
+    conn: &mut SqliteConnection,
+    project_id: Option<&str>,
+    match_query: &str,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    diesel::sql_query(
+        "SELECT t.id AS id, t.project_id AS project_id, p.name AS project_name, \
+                s.workspace_id AS workspace_id, sw.name AS workspace_name, \
+                t.spec_id AS spec_id, NULL AS terminal_id, t.title AS label, NULL AS detail, \
+                NULL AS extract, NULL AS human_key, \
+                t.updated_at AS updated_at, bm25(tasks_fts) AS score \
+         FROM tasks_fts \
+         JOIN tasks t ON t.rowid = tasks_fts.rowid \
+         JOIN projects p ON p.id = t.project_id \
+         LEFT JOIN specs s ON s.id = t.spec_id \
+         LEFT JOIN workspaces sw ON sw.id = s.workspace_id \
+         WHERE tasks_fts MATCH ? \
+           AND (t.spec_id IS NULL OR s.archived_at IS NULL) \
+           AND (? IS NULL OR t.project_id = ?) \
+         ORDER BY score ASC \
+         LIMIT ?",
+    )
+    .bind::<Text, _>(match_query)
+    .bind::<Nullable<Text>, _>(project_id)
+    .bind::<Nullable<Text>, _>(project_id)
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+// --- the RECENCY reads: the same seven sources, ordered by their own recency key --------------
+//
+// These serve TWO callers with one query each. The palette opened WITHOUT a query shows
+// SUGGESTIONS — the most recently touched entities, all types and all projects confounded — and
+// reads the head of each. The palette WITH a query reads a BOUNDED candidate set from the four
+// sources that have no FTS index (their volumetry does not warrant one) and matches them in Rust.
+//
+// The recency key is `updated_at` everywhere EXCEPT `agent_sessions`, which simply does not carry
+// that column (`started_at` / `ended_at` / `last_seen_at` only): a session's recency is
+// `last_seen_at`. There is therefore no single column to sort the seven sources on — the merge
+// happens in Rust, over the value each read aliases to `updated_at`.
+//
+// NONE of the seven takes a project filter, and that is not an omission: the palette is GLOBAL by
+// construction (all projects confounded, which is the capability it exists for), so a narrowing
+// clause here would be paid by every caller to serve none. The `fts_match_*` reads above DO carry
+// one, because they have real callers for it — `idea::search_ideas` narrows to the entered project,
+// and the index tests exercise the same parameter on the Spec / revision / task reads.
+
+/// The most recently touched non-archived PROJECTS. A project is its own container: its
+/// `project_id` is its `id`.
+pub fn recent_search_projects(
+    conn: &mut SqliteConnection,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::BigInt;
+    diesel::sql_query(
+        "SELECT p.id AS id, p.id AS project_id, p.name AS project_name, NULL AS workspace_id, \
+                NULL AS workspace_name, NULL AS spec_id, \
+                NULL AS terminal_id, p.name AS label, NULL AS detail, NULL AS extract, \
+                NULL AS human_key, \
+                p.updated_at AS updated_at, 0.0 AS score \
+         FROM projects p \
+         WHERE p.archived_at IS NULL \
+         ORDER BY p.updated_at DESC, p.id DESC \
+         LIMIT ?",
+    )
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+/// The most recently touched non-archived WORKSPACES, each carrying its own id as the workspace
+/// to enter.
+pub fn recent_search_workspaces(
+    conn: &mut SqliteConnection,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::BigInt;
+    diesel::sql_query(
+        "SELECT w.id AS id, w.project_id AS project_id, p.name AS project_name, \
+                w.id AS workspace_id, w.name AS workspace_name, NULL AS spec_id, \
+                NULL AS terminal_id, w.name AS label, NULL AS detail, NULL AS extract, \
+                NULL AS human_key, \
+                w.updated_at AS updated_at, 0.0 AS score \
+         FROM workspaces w \
+         JOIN projects p ON p.id = w.project_id \
+         WHERE w.archived_at IS NULL \
+         ORDER BY w.updated_at DESC, w.id DESC \
+         LIMIT ?",
+    )
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+/// The most recently touched managed-command INSTANCES — ONE ROW PER `command_instances`, not per
+/// template. Both the template's `name` and its `command` line are searchable, so the command line
+/// rides along as the `detail`.
+///
+/// THE ENTITY THE PALETTE OPENS IS THE INSTANCE, and that is why this read is not
+/// `FROM managed_commands`. A `managed_commands` row is a project-level TEMPLATE; what actually
+/// runs, holds a scrollback and can be selected is its materialization in one workspace
+/// (`command_instances`), which is also the id the Terminals page's `?command=` deep-link compares
+/// against (`WorkspaceRuntimeService.id`). Answering a template id therefore matched nothing on
+/// activation and the jump silently opened no pane — the row named something the UI has no handle
+/// for.
+///
+/// A template materialized in N workspaces consequently produces N ROWS, each carrying its own
+/// `workspace_id`. That multiplicity IS the disambiguation: rather than guessing which instance of
+/// `build` the user meant, the palette shows both and lets the workspace on the row decide. The
+/// per-type cap is untouched by this — [`crate::search`] trims after the match pass, so N instances
+/// consume N of the eight slots exactly like N distinct entities would.
+///
+/// The join on `workspaces` is an INNER one, and it excludes the ARCHIVED workspace for the same
+/// reason [`recent_search_workspaces`] does: an archived workspace is absent from the project tree
+/// the Terminals page reads, so its instances have no live service to deep-link to. Surfacing them
+/// would re-create, one archive later, the very dead row this read was changed to remove.
+///
+/// The recency key stays the TEMPLATE's `updated_at`, not the instance's. Everything the row draws
+/// and matches on (`name`, `command`) belongs to the template, and `command_instances.updated_at`
+/// moves at every run-state write — so keying on it would re-shuffle the palette on an agent's
+/// build finishing, and scatter one template's sibling rows through the suggestion list instead of
+/// keeping them adjacent, which is exactly where the workspace on the row does its disambiguating.
+pub fn recent_search_commands(
+    conn: &mut SqliteConnection,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::BigInt;
+    diesel::sql_query(
+        "SELECT ci.id AS id, c.project_id AS project_id, p.name AS project_name, \
+                ci.workspace_id AS workspace_id, w.name AS workspace_name, \
+                NULL AS spec_id, NULL AS terminal_id, c.name AS label, c.command AS detail, \
+                NULL AS extract, NULL AS human_key, \
+                c.updated_at AS updated_at, 0.0 AS score \
+         FROM command_instances ci \
+         JOIN managed_commands c ON c.id = ci.command_id \
+         JOIN workspaces w ON w.id = ci.workspace_id \
+         JOIN projects p ON p.id = c.project_id \
+         WHERE w.archived_at IS NULL \
+         ORDER BY c.updated_at DESC, ci.id DESC \
+         LIMIT ?",
+    )
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+/// The most recently seen AGENT SESSIONS.
+///
+/// `agent_sessions` carries neither a title nor a `project_id`. Its searchable text is its
+/// TERMINAL's (`terminals.label`, `terminals.cwd`) plus its own `agent_kind`, and its project is
+/// DERIVED through `workspace_id → workspaces.project_id`. That derivation is an INNER JOIN on
+/// purpose: a session with no workspace has no project to activate, therefore no navigable target,
+/// and is excluded AT THE SOURCE rather than surfaced as a dead entry.
+///
+/// The recency key is `last_seen_at` — the column this table actually has.
+pub fn recent_search_sessions(
+    conn: &mut SqliteConnection,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::BigInt;
+    diesel::sql_query(
+        "SELECT a.id AS id, w.project_id AS project_id, p.name AS project_name, \
+                a.workspace_id AS workspace_id, w.name AS workspace_name, \
+                NULL AS spec_id, a.terminal_id AS terminal_id, \
+                COALESCE(NULLIF(t.label, ''), t.cwd, a.cwd) AS label, \
+                a.agent_kind AS detail, COALESCE(t.cwd, a.cwd) AS extract, NULL AS human_key, \
+                a.last_seen_at AS updated_at, 0.0 AS score \
+         FROM agent_sessions a \
+         JOIN workspaces w ON w.id = a.workspace_id \
+         JOIN projects p ON p.id = w.project_id \
+         LEFT JOIN terminals t ON t.id = a.terminal_id \
+         ORDER BY a.last_seen_at DESC, a.id DESC \
+         LIMIT ?",
+    )
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+/// The most recently touched non-archived SPECS — the recency companion of [`fts_match_specs`],
+/// carrying the same `human_key`: the empty-query SUGGESTIONS draw the very same row as a result,
+/// so a key present on one path and absent on the other would be a visible inconsistency.
+pub fn recent_search_specs(
+    conn: &mut SqliteConnection,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::BigInt;
+    diesel::sql_query(
+        "SELECT s.id AS id, s.project_id AS project_id, p.name AS project_name, \
+                s.workspace_id AS workspace_id, sw.name AS workspace_name, \
+                NULL AS spec_id, NULL AS terminal_id, s.title AS label, NULL AS detail, \
+                NULL AS extract, NULLIF(p.key, '') || '-' || s.number AS human_key, \
+                s.updated_at AS updated_at, 0.0 AS score \
+         FROM specs s \
+         JOIN projects p ON p.id = s.project_id \
+         LEFT JOIN workspaces sw ON sw.id = s.workspace_id \
+         WHERE s.archived_at IS NULL \
+         ORDER BY s.updated_at DESC, s.id DESC \
+         LIMIT ?",
+    )
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+/// The most recently touched TASKS whose Spec is not archived — the recency companion of
+/// [`fts_match_tasks`], carrying the same "a task is excluded only through ITS Spec" rule.
+pub fn recent_search_tasks(
+    conn: &mut SqliteConnection,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::BigInt;
+    diesel::sql_query(
+        "SELECT t.id AS id, t.project_id AS project_id, p.name AS project_name, \
+                s.workspace_id AS workspace_id, sw.name AS workspace_name, \
+                t.spec_id AS spec_id, NULL AS terminal_id, t.title AS label, NULL AS detail, \
+                NULL AS extract, NULL AS human_key, \
+                t.updated_at AS updated_at, 0.0 AS score \
+         FROM tasks t \
+         JOIN projects p ON p.id = t.project_id \
+         LEFT JOIN specs s ON s.id = t.spec_id \
+         LEFT JOIN workspaces sw ON sw.id = s.workspace_id \
+         WHERE (t.spec_id IS NULL OR s.archived_at IS NULL) \
+         ORDER BY t.updated_at DESC, t.id DESC \
+         LIMIT ?",
+    )
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
+}
+
+/// The most recently touched IDEAS — the recency companion of [`fts_match_ideas`].
+pub fn recent_search_ideas(
+    conn: &mut SqliteConnection,
+    limit: i64,
+) -> QueryResult<Vec<SearchCandidate>> {
+    use diesel::sql_types::BigInt;
+    diesel::sql_query(
+        "SELECT i.id AS id, i.project_id AS project_id, p.name AS project_name, \
+                NULL AS workspace_id, NULL AS workspace_name, NULL AS spec_id, \
+                NULL AS terminal_id, i.title AS label, NULL AS detail, NULL AS extract, \
+                NULL AS human_key, i.updated_at AS updated_at, 0.0 AS score \
+         FROM ideas i \
+         JOIN projects p ON p.id = i.project_id \
+         ORDER BY i.updated_at DESC, i.id DESC \
+         LIMIT ?",
+    )
+    .bind::<BigInt, _>(limit)
+    .load::<SearchCandidate>(conn)
 }
 
 /// One THEME group of a project's idea backlog: the `theme` (`None` = ungrouped ideas), the
@@ -19364,7 +19802,8 @@ mod tests {
         assert_eq!(hits.len(), 1, "project-scoped, body-term match");
         assert_eq!(hits[0].id, a.id);
         // Match on a title term.
-        let title_hits = fts_match_ideas(&mut conn, Some(&project.id), "authentication", 10).unwrap();
+        let title_hits =
+            fts_match_ideas(&mut conn, Some(&project.id), "authentication", 10).unwrap();
         assert_eq!(title_hits.len(), 1);
         assert_eq!(title_hits[0].id, a.id);
 
@@ -32845,6 +33284,675 @@ mod tests {
                 .expect("query")
                 .is_empty()
         );
+    }
+
+    /// The GLOBAL-SEARCH full-text substrate (migration
+    /// `20260828205400_create_global_search_fts`): three external-content FTS5 indexes over
+    /// `specs` / `spec_revisions` / `tasks`, their sync triggers, and the three bounded reads
+    /// that query them ([`fts_match_specs`], [`fts_match_spec_revisions`], [`fts_match_tasks`]).
+    ///
+    /// The invariants pinned here are the ones the migration deliberately does NOT enforce at
+    /// INDEXING time — every revision is indexed, archived Specs included — and therefore MUST
+    /// hold at QUERY time, plus the trigger synchronisation an external-content index lives or
+    /// dies by.
+    mod global_search_index {
+        use super::*;
+
+        /// A Spec with real prose in every indexed section, plus one task on it. Returns
+        /// `(spec_id, task_id)`.
+        fn seed_spec_with_task(
+            conn: &mut SqliteConnection,
+            project_id: &str,
+            title: &str,
+            problem: &str,
+            task_title: &str,
+        ) -> (String, String) {
+            let (spec, _rev) = create_spec(
+                conn,
+                project_id,
+                title,
+                SpecSections {
+                    problem: problem.to_string(),
+                    solution: "a solution".into(),
+                    implementation_decisions: "impl".into(),
+                    testing_decisions: "testing".into(),
+                    user_stories: r#"[{"title":"userstoriesjsonkey"}]"#.into(),
+                    out_of_scope: r#"[{"title":"outofscopejsonkey"}]"#.into(),
+                },
+            )
+            .expect("create the Spec");
+            let task = create_task(
+                conn,
+                project_id,
+                task_title,
+                NewTaskInput {
+                    spec_id: Some(spec.id.clone()),
+                    ..NewTaskInput::slice()
+                },
+            )
+            .expect("create the task");
+            (spec.id, task.id)
+        }
+
+        /// Run a user query through the SAME sanitizer the aggregator uses.
+        fn matched(query: &str) -> String {
+            crate::idea::build_fts_query(query).expect("the query has a usable term")
+        }
+
+        /// DONE-CRITERION ("Un mot du titre d'une spec, d'une section de sa révision courante ou
+        /// d'un titre de tâche retrouve le bon objet"): the three indexes each answer, and each
+        /// answers with the entity the palette navigates to — a Spec id for a Spec or a revision
+        /// hit (a revision has no surface of its own), the task id for a task.
+        #[test]
+        fn a_word_of_a_title_or_of_a_current_revision_section_finds_its_object() {
+            let mut conn = open_in_memory();
+            let (project, _root) =
+                create_project(&mut conn, "Nyx", "/tmp/gs-find", None).expect("project");
+            let (spec_id, task_id) = seed_spec_with_task(
+                &mut conn,
+                &project.id,
+                "Terminal persistence",
+                "the scrollback vanishes on restart",
+                "Rehydrate the viewport",
+            );
+
+            let by_spec_title = fts_match_specs(&mut conn, None, &matched("persistence"), 10)
+                .expect("query specs_fts");
+            assert_eq!(
+                by_spec_title.iter().map(|h| &h.id).collect::<Vec<_>>(),
+                vec![&spec_id],
+                "a word of the Spec title finds the Spec"
+            );
+            assert_eq!(by_spec_title[0].label, "Terminal persistence");
+            assert_eq!(by_spec_title[0].project_id, project.id);
+
+            let by_prose = fts_match_spec_revisions(&mut conn, None, &matched("scrollback"), 10)
+                .expect("query spec_revisions_fts");
+            assert_eq!(
+                by_prose.iter().map(|h| &h.id).collect::<Vec<_>>(),
+                vec![&spec_id],
+                "a word of the current revision's PROBLEM finds its Spec"
+            );
+            assert!(
+                by_prose[0]
+                    .extract
+                    .as_deref()
+                    .is_some_and(|e| e.contains("scrollback")),
+                "the prose index is the one source that yields a match extract, got {:?}",
+                by_prose[0].extract
+            );
+
+            let by_task_title = fts_match_tasks(&mut conn, None, &matched("rehydrate"), 10)
+                .expect("query tasks_fts");
+            assert_eq!(
+                by_task_title.iter().map(|h| &h.id).collect::<Vec<_>>(),
+                vec![&task_id],
+                "a word of the task title finds the task"
+            );
+            assert_eq!(
+                by_task_title[0].spec_id.as_deref(),
+                Some(spec_id.as_str()),
+                "a task carries its Spec — the nearest existing surface it navigates to"
+            );
+
+            // The two JSON columns stay OUT of the index: their keys would match every revision.
+            assert!(
+                fts_match_spec_revisions(&mut conn, None, &matched("userstoriesjsonkey"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "`user_stories` is raw JSON and is deliberately not indexed"
+            );
+            assert!(
+                fts_match_spec_revisions(&mut conn, None, &matched("outofscopejsonkey"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "`out_of_scope` is raw JSON and is deliberately not indexed"
+            );
+        }
+
+        /// DONE-CRITERION ("INSERT, UPDATE et DELETE sur les trois tables sources laissent
+        /// l'index cohérent"): the `_ai` / `_au` / `_ad` triggers of an external-content index.
+        /// Without them a renamed Spec answers to its OLD title forever, and a deleted task
+        /// keeps answering from a row that no longer exists.
+        #[test]
+        fn insert_update_and_delete_keep_the_three_indexes_in_sync() {
+            let mut conn = open_in_memory();
+            let (project, _root) =
+                create_project(&mut conn, "Nyx", "/tmp/gs-sync", None).expect("project");
+            // INSERT (the `_ai` triggers): the freshly created rows already answer. Each source
+            // carries its OWN word, because a revision snapshots the Spec title into its own
+            // `title` column — sharing a word between them would let one index answer for the
+            // other and hide a broken trigger.
+            let (spec_id, task_id) = seed_spec_with_task(
+                &mut conn,
+                &project.id,
+                "Aardvark",
+                "the wombat problem",
+                "Badger the plan",
+            );
+            assert_eq!(
+                fts_match_specs(&mut conn, None, &matched("aardvark"), 10)
+                    .expect("query")
+                    .len(),
+                1
+            );
+
+            // UPDATE (the `_au` triggers) on `specs`, on `spec_revisions` and on `tasks`: the new
+            // text answers and the OLD text stops answering.
+            diesel::update(specs::table.find(&spec_id))
+                .set(specs::title.eq("Capybara"))
+                .execute(&mut conn)
+                .expect("rename the Spec");
+            write_active_revision_section(
+                &mut conn,
+                &spec_id,
+                SpecSection::Problem,
+                "the xerus problem",
+            )
+            .expect("rewrite the problem");
+            diesel::update(tasks::table.find(&task_id))
+                .set(tasks::title.eq("Dingo the plan"))
+                .execute(&mut conn)
+                .expect("rename the task");
+
+            assert!(
+                fts_match_specs(&mut conn, None, &matched("aardvark"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "the OLD Spec title stops answering after the update"
+            );
+            assert_eq!(
+                fts_match_specs(&mut conn, None, &matched("capybara"), 10)
+                    .expect("query")
+                    .len(),
+                1,
+                "the NEW Spec title answers"
+            );
+            assert!(
+                fts_match_spec_revisions(&mut conn, None, &matched("wombat"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "the OLD revision prose stops answering"
+            );
+            assert_eq!(
+                fts_match_spec_revisions(&mut conn, None, &matched("xerus"), 10)
+                    .expect("query")
+                    .len(),
+                1
+            );
+            assert!(
+                fts_match_tasks(&mut conn, None, &matched("badger"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "the OLD task title stops answering"
+            );
+            assert_eq!(
+                fts_match_tasks(&mut conn, None, &matched("dingo"), 10)
+                    .expect("query")
+                    .len(),
+                1
+            );
+
+            // DELETE (the `_ad` triggers). Deleting the Spec cascades to its revisions and tasks,
+            // so one delete exercises all three.
+            diesel::delete(specs::table.find(&spec_id))
+                .execute(&mut conn)
+                .expect("delete the Spec");
+            assert!(
+                fts_match_specs(&mut conn, None, &matched("capybara"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "a deleted Spec leaves nothing behind in specs_fts"
+            );
+            assert!(
+                fts_match_spec_revisions(&mut conn, None, &matched("xerus"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "the cascaded revisions leave nothing behind in spec_revisions_fts"
+            );
+            assert!(
+                fts_match_tasks(&mut conn, None, &matched("dingo"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "the cascaded tasks leave nothing behind in tasks_fts"
+            );
+        }
+
+        /// DONE-CRITERION ("Une révision non courante ne remonte jamais"). Every revision IS
+        /// indexed — the restriction is the join on `specs.current_revision_number`. A fork
+        /// snapshots the sections, so the test rewrites the new active revision to make the two
+        /// texts differ: only the current one answers.
+        #[test]
+        fn a_revision_that_is_not_the_current_one_never_surfaces() {
+            let mut conn = open_in_memory();
+            let (project, _root) =
+                create_project(&mut conn, "Nyx", "/tmp/gs-rev", None).expect("project");
+            let (spec, _rev) = create_spec(
+                &mut conn,
+                &project.id,
+                "Forked Spec",
+                SpecSections {
+                    problem: "the obsoleteword problem".into(),
+                    ..SpecSections::empty()
+                },
+            )
+            .expect("create the Spec");
+
+            fork_spec(&mut conn, &spec.id, Some("rework")).expect("fork");
+            write_active_revision_section(
+                &mut conn,
+                &spec.id,
+                SpecSection::Problem,
+                "the currentword problem",
+            )
+            .expect("rewrite the fork's problem");
+
+            // Both revisions ARE in the index — the superseded row still exists and still
+            // carries its own text.
+            #[derive(diesel::QueryableByName)]
+            struct CountRow {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                n: i64,
+            }
+            let indexed: i64 = diesel::sql_query(
+                "SELECT COUNT(*) AS n FROM spec_revisions_fts WHERE spec_revisions_fts \
+                 MATCH '\"obsoleteword\"*'",
+            )
+            .get_result::<CountRow>(&mut conn)
+            .expect("count raw index rows")
+            .n;
+            assert_eq!(indexed, 1, "the superseded revision IS indexed");
+
+            // …and the READ still refuses it, because the join filters on the current number.
+            assert!(
+                fts_match_spec_revisions(&mut conn, None, &matched("obsoleteword"), 10)
+                    .expect("query")
+                    .is_empty(),
+                "a superseded revision never answers the palette"
+            );
+            assert_eq!(
+                fts_match_spec_revisions(&mut conn, None, &matched("currentword"), 10)
+                    .expect("query")
+                    .len(),
+                1,
+                "the current revision does"
+            );
+        }
+
+        /// DONE-CRITERION ("une spec archivée et ses tâches non plus"). `tasks` carries no
+        /// `archived_at` of its own: a task is excluded when ITS SPEC is archived, and never
+        /// otherwise — so a Spec-less task stays findable.
+        #[test]
+        fn an_archived_spec_hides_itself_and_its_tasks_but_not_a_spec_less_task() {
+            let mut conn = open_in_memory();
+            let (project, _root) =
+                create_project(&mut conn, "Nyx", "/tmp/gs-arch", None).expect("project");
+            let (archived_spec, archived_task) = seed_spec_with_task(
+                &mut conn,
+                &project.id,
+                "Elephant retired",
+                "the elephant problem",
+                "Elephant cleanup",
+            );
+            let (live_spec, live_task) = seed_spec_with_task(
+                &mut conn,
+                &project.id,
+                "Elephant live",
+                "the elephant problem again",
+                "Elephant polish",
+            );
+            let flat = create_task(
+                &mut conn,
+                &project.id,
+                "Elephant chores",
+                NewTaskInput::slice(),
+            )
+            .expect("a task with no Spec");
+
+            diesel::update(specs::table.find(&archived_spec))
+                .set(specs::archived_at.eq(Some(now_millis())))
+                .execute(&mut conn)
+                .expect("archive the Spec");
+
+            let specs_found: Vec<String> =
+                fts_match_specs(&mut conn, None, &matched("elephant"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect();
+            assert_eq!(
+                specs_found,
+                vec![live_spec.clone()],
+                "the archived Spec is gone"
+            );
+            let prose_found: Vec<String> =
+                fts_match_spec_revisions(&mut conn, None, &matched("elephant"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect();
+            assert_eq!(
+                prose_found,
+                vec![live_spec],
+                "the archived Spec's current revision is gone too"
+            );
+
+            let mut tasks_found: Vec<String> =
+                fts_match_tasks(&mut conn, None, &matched("elephant"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect();
+            tasks_found.sort();
+            let mut wanted = vec![live_task, flat.id];
+            wanted.sort();
+            assert_eq!(
+                tasks_found, wanted,
+                "the archived Spec's task is excluded; the live one and the Spec-less one stay"
+            );
+            assert!(
+                !tasks_found.contains(&archived_task),
+                "the archived Spec's task never answers"
+            );
+        }
+
+        /// DONE-CRITERION ("Les caractères réservés FTS5, passés par `build_fts_query`, ne
+        /// cassent pas la requête"). FTS5's own syntax (`"`, `*`, `(`, `:`, `NEAR`, `-`) inside
+        /// user text is a parse error against a RAW match expression; the shared sanitizer quotes
+        /// every term, so each of these is a calm answer instead.
+        #[test]
+        fn fts5_reserved_characters_never_break_the_three_reads() {
+            let mut conn = open_in_memory();
+            let (project, _root) =
+                create_project(&mut conn, "Nyx", "/tmp/gs-chars", None).expect("project");
+            seed_spec_with_task(
+                &mut conn,
+                &project.id,
+                "Quoted \"terminal\" spec",
+                "a NEAR miss on (parens) and colons:here",
+                "Task with * star",
+            );
+
+            for raw in [
+                "\"terminal\"",
+                "NEAR(",
+                "colons:here",
+                "* star",
+                "-minus",
+                "a\"b",
+                "^caret",
+            ] {
+                let expression = matched(raw);
+                fts_match_specs(&mut conn, None, &expression, 10)
+                    .unwrap_or_else(|e| panic!("specs_fts refused `{raw}` -> `{expression}`: {e}"));
+                fts_match_spec_revisions(&mut conn, None, &expression, 10).unwrap_or_else(|e| {
+                    panic!("spec_revisions_fts refused `{raw}` -> `{expression}`: {e}")
+                });
+                fts_match_tasks(&mut conn, None, &expression, 10)
+                    .unwrap_or_else(|e| panic!("tasks_fts refused `{raw}` -> `{expression}`: {e}"));
+            }
+            // The one query with no usable term at all: the sanitizer says so, and the caller
+            // never reaches FTS5 with an empty expression (which WOULD error).
+            assert_eq!(crate::idea::build_fts_query("  ?? "), None);
+        }
+
+        /// The `project_id` filter is OPTIONAL by construction: the palette is global, so `None`
+        /// spans every project, while `Some(id)` narrows exactly as `fts_match_ideas` does.
+        #[test]
+        fn the_project_filter_narrows_and_none_spans_every_project() {
+            let mut conn = open_in_memory();
+            let (one, _r1) = create_project(&mut conn, "One", "/tmp/gs-p1", None).expect("project");
+            let (two, _r2) = create_project(&mut conn, "Two", "/tmp/gs-p2", None).expect("project");
+            let (spec_one, task_one) = seed_spec_with_task(
+                &mut conn,
+                &one.id,
+                "Ferret one",
+                "the ferret problem",
+                "Ferret task one",
+            );
+            let (spec_two, task_two) = seed_spec_with_task(
+                &mut conn,
+                &two.id,
+                "Ferret two",
+                "the ferret problem",
+                "Ferret task two",
+            );
+
+            assert_eq!(
+                fts_match_specs(&mut conn, None, &matched("ferret"), 10)
+                    .expect("query")
+                    .len(),
+                2,
+                "no project filter spans every project"
+            );
+            assert_eq!(
+                fts_match_specs(&mut conn, Some(&one.id), &matched("ferret"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect::<Vec<_>>(),
+                vec![spec_one]
+            );
+            assert_eq!(
+                fts_match_spec_revisions(&mut conn, Some(&two.id), &matched("ferret"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect::<Vec<_>>(),
+                vec![spec_two]
+            );
+            assert_eq!(
+                fts_match_tasks(&mut conn, Some(&one.id), &matched("ferret"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect::<Vec<_>>(),
+                vec![task_one]
+            );
+            assert_eq!(
+                fts_match_tasks(&mut conn, Some(&two.id), &matched("ferret"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect::<Vec<_>>(),
+                vec![task_two]
+            );
+        }
+
+        /// DONE-CRITERION ("`down.sql` est rejouable"): the revert drops the three virtual tables
+        /// and their nine triggers, and re-applying `up.sql` rebuilds an index that answers for
+        /// the rows written WHILE it was absent — which is the whole point of the `'rebuild'`
+        /// backfill, and the case every already-populated database is in.
+        #[test]
+        fn the_migration_reverts_and_replays_over_the_rows_written_meanwhile() {
+            let mut conn = open_in_memory();
+            // Named floor: peel anything stacked above this migration so the head really is it.
+            peel_migrations_above(&mut conn, "20260828205400");
+            conn.revert_last_migration(MIGRATIONS)
+                .expect("revert 20260828205400 (global-search FTS) cleanly");
+
+            // The indexes are gone — a read against them is now a hard SQL error, not an empty
+            // answer, which is what proves `down.sql` really dropped them.
+            assert!(
+                fts_match_specs(&mut conn, None, &matched("anything"), 10).is_err(),
+                "specs_fts no longer exists after the revert"
+            );
+
+            // Rows written while the index is absent have no trigger to feed them.
+            let (project, _root) =
+                create_project(&mut conn, "Nyx", "/tmp/gs-revert", None).expect("project");
+            let (spec_id, task_id) = seed_spec_with_task(
+                &mut conn,
+                &project.id,
+                "Ibex",
+                "the ibex problem",
+                "Ibex chore",
+            );
+
+            // Replay `up.sql`: the `'rebuild'` backfill re-reads the content tables, so the rows
+            // written meanwhile answer exactly as if the triggers had seen them.
+            run_migrations(&mut conn).expect("replay up.sql");
+            assert_eq!(
+                fts_match_specs(&mut conn, None, &matched("ibex"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect::<Vec<_>>(),
+                vec![spec_id.clone()],
+                "the backfill indexes a Spec written while the index did not exist"
+            );
+            assert_eq!(
+                fts_match_spec_revisions(&mut conn, None, &matched("ibex"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect::<Vec<_>>(),
+                vec![spec_id]
+            );
+            assert_eq!(
+                fts_match_tasks(&mut conn, None, &matched("ibex"), 10)
+                    .expect("query")
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect::<Vec<_>>(),
+                vec![task_id]
+            );
+        }
+
+        /// `limit` is honoured by every read — the bound the aggregator's caps rest on.
+        #[test]
+        fn the_limit_bounds_every_read() {
+            let mut conn = open_in_memory();
+            let (project, _root) =
+                create_project(&mut conn, "Nyx", "/tmp/gs-limit", None).expect("project");
+            for n in 0..5 {
+                seed_spec_with_task(
+                    &mut conn,
+                    &project.id,
+                    &format!("Gopher {n}"),
+                    "the gopher problem",
+                    &format!("Gopher task {n}"),
+                );
+            }
+            assert_eq!(
+                fts_match_specs(&mut conn, None, &matched("gopher"), 2)
+                    .expect("query")
+                    .len(),
+                2
+            );
+            assert_eq!(
+                fts_match_spec_revisions(&mut conn, None, &matched("gopher"), 3)
+                    .expect("query")
+                    .len(),
+                3
+            );
+            assert_eq!(
+                fts_match_tasks(&mut conn, None, &matched("gopher"), 1)
+                    .expect("query")
+                    .len(),
+                1
+            );
+        }
+
+        /// REVIEW-FINDING (« Clé humaine KEY-numéro sur les lignes Spec de la palette ») : every
+        /// SPEC read carries the human key `projects.key || '-' || specs.number` — the identity
+        /// the schema itself poses for a Spec (migration `00000000000013`) and the one the user
+        /// reads on every other Spec surface. Asserted on a fixture whose project key and Spec
+        /// numbers are KNOWN (`Nyx` derives the key `NYX`, and the per-project sequence starts at
+        /// 1), so the assertion is a literal, not a re-computation of the accessor's own formula.
+        ///
+        /// The three reads are pinned together because they draw ONE row: the title index, the
+        /// prose index (the only source of a Spec found by its prose alone) and the recency read
+        /// that backs the empty-query suggestions. And the key lands in `human_key`, NOT in
+        /// `detail`: `detail` is a MATCH surface (`crate::search::literal_verdict` /
+        /// `searchable_terms`), so the key would have become a query there.
+        #[test]
+        fn every_spec_read_carries_the_human_key_and_leaves_the_match_surface_alone() {
+            let mut conn = open_in_memory();
+            let (project, _root) =
+                create_project(&mut conn, "Nyx", "/tmp/gs-key", None).expect("project");
+            assert_eq!(project.key, "NYX", "the fixture's key is a known literal");
+            let (first, _task) = seed_spec_with_task(
+                &mut conn,
+                &project.id,
+                "Narwhal one",
+                "the narwhal problem",
+                "Narwhal task",
+            );
+            let (second, _task) = seed_spec_with_task(
+                &mut conn,
+                &project.id,
+                "Narwhal two",
+                "the narwhal problem",
+                "Narwhal task two",
+            );
+
+            // The title index.
+            let by_title =
+                fts_match_specs(&mut conn, None, &matched("narwhal"), 10).expect("query specs_fts");
+            let keyed: Vec<(&str, Option<&str>)> = by_title
+                .iter()
+                .map(|h| (h.id.as_str(), h.human_key.as_deref()))
+                .collect();
+            assert!(
+                keyed.contains(&(first.as_str(), Some("NYX-1"))),
+                "the first Spec of the project is NYX-1, got {keyed:?}"
+            );
+            assert!(
+                keyed.contains(&(second.as_str(), Some("NYX-2"))),
+                "the second is NYX-2, got {keyed:?}"
+            );
+            // The key is DISPLAYED, not searched: it must not have leaked into the two fields the
+            // aggregator matches on.
+            assert!(
+                by_title.iter().all(|h| h.detail.is_none()),
+                "a Spec has no searchable secondary line — the key is NOT one"
+            );
+
+            // The prose index — the ONLY read that returns a Spec matched by its prose alone.
+            let by_prose = fts_match_spec_revisions(&mut conn, None, &matched("narwhal"), 10)
+                .expect("query spec_revisions_fts");
+            assert!(
+                by_prose
+                    .iter()
+                    .any(|h| h.id == first && h.human_key.as_deref() == Some("NYX-1")),
+                "a Spec found through its prose carries the same key, got {:?}",
+                by_prose
+                    .iter()
+                    .map(|h| (&h.id, &h.human_key))
+                    .collect::<Vec<_>>()
+            );
+
+            // The recency read — the empty-query suggestions draw the very same row.
+            let recent = recent_search_specs(&mut conn, 10).expect("recency read");
+            assert_eq!(
+                recent
+                    .iter()
+                    .find(|h| h.id == second)
+                    .and_then(|h| h.human_key.as_deref()),
+                Some("NYX-2"),
+                "the suggestion path carries the key too"
+            );
+
+            // A SECOND project restarts the sequence: the key is what tells two homonyms apart.
+            let (other, _root) =
+                create_project(&mut conn, "Orca", "/tmp/gs-key-2", None).expect("second project");
+            let (elsewhere, _task) = seed_spec_with_task(
+                &mut conn,
+                &other.id,
+                "Narwhal one",
+                "the narwhal problem",
+                "Narwhal task elsewhere",
+            );
+            let all = fts_match_specs(&mut conn, None, &matched("narwhal"), 10).expect("query");
+            assert_eq!(
+                all.iter()
+                    .find(|h| h.id == elsewhere)
+                    .and_then(|h| h.human_key.as_deref()),
+                Some("ORCA-1"),
+                "same title, other project: only the key departs them"
+            );
+        }
     }
 
     /// The naming convention of `crates/nyx-core/migrations/`, and the guard that keeps it.

@@ -10,6 +10,8 @@ import {
 import { errorText } from "@/bridge";
 import { queryClient } from "@/lib/query";
 import { ActiveProjectProvider } from "@/components/terminals/active-project";
+import { RevealWorkspaceProvider } from "@/components/terminals/reveal-workspace";
+import { PendingTerminalProvider } from "@/components/terminals/pending-terminal";
 import { BaseLayout } from "@/components/terminals/base-layout";
 import { TerminalsPage } from "@/components/terminals/terminals-page";
 import { SystemScopePage } from "@/components/system/system-scope-page";
@@ -61,11 +63,27 @@ export interface RouterContext {
  * `<Outlet/>`) is wrapped in the `<ActiveProjectProvider>` so the entered-project
  * selection is shared between the rail and every routed page. `createRootRouteWithContext`
  * types the `queryClient` context every child route (and its loader) receives.
+ *
+ * The `<RevealWorkspaceProvider>` sits INSIDE it and spans the same subtree for the same reason:
+ * its two ends are the global search palette (mounted on `<BaseLayout>`, which SIGNALS the
+ * workspace a jump is landing in) and the Terminals page's workspace bands (which consume that
+ * signal to be open on arrival). Both must read one store, and — unlike the entered project — the
+ * signal is EPHEMERAL: nothing about it is written to the database or remembered across a
+ * relaunch.
+ *
+ * The `<PendingTerminalProvider>` is its exact sibling, spanning the same subtree for the same
+ * reason and with the same lifetime: the palette's `Open a new terminal in …` action REQUESTS one
+ * here, and the Terminals page — the only place that can both create a terminal and ENTER it —
+ * performs it on arrival and consumes the signal. Nothing is persisted either.
  */
 const rootRoute = createRootRouteWithContext<RouterContext>()({
   component: () => (
     <ActiveProjectProvider>
-      <BaseLayout />
+      <RevealWorkspaceProvider>
+        <PendingTerminalProvider>
+          <BaseLayout />
+        </PendingTerminalProvider>
+      </RevealWorkspaceProvider>
     </ActiveProjectProvider>
   ),
 });

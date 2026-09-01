@@ -1,8 +1,10 @@
+import { useEffect, useState } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { mockIPC } from "@/bridge/test-harness";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { WorkspaceRecord } from "@/components/sidebar/use-projects";
+import { RevealWorkspaceProvider, useRevealWorkspace } from "./reveal-workspace";
 import { RuntimeSelectionProvider } from "./runtime-selection";
 import { ConsumedNotificationsProvider } from "./use-consumed-notifications";
 import { WorkspaceAccordion } from "./workspace-accordion";
@@ -193,5 +195,131 @@ describe("WorkspaceAccordion — lifecycle kebab (root shows none)", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Workspace actions for api" }));
     fireEvent.click(await screen.findByRole("menuitem", { name: "Rename workspace api" }));
     expect(renamed).toEqual(["ws2"]);
+  });
+});
+
+/**
+ * REVIEW-FINDING (« que j'arrive sur un terminal, un agent ou une commande, il faut que le truc
+ * ouvre le workspace en question (main compris) si il est pas ouvert ») — the consuming half. The
+ * palette raises an ephemeral reveal (asserted in `search/search-palette.test.tsx`); here is what
+ * the band does with it.
+ *
+ * The band is mounted INSIDE a real `<RevealWorkspaceProvider>` and the signal is raised through
+ * the same `revealWorkspace` the palette calls, so what is under test is the actual channel and not
+ * a prop standing in for it.
+ */
+describe("WorkspaceAccordion — the workspace reveal", () => {
+  beforeEach(() => {
+    mockIPC(() => undefined);
+  });
+
+  /** Raises a reveal on demand — the palette's end of the channel, driven from a test. */
+  function RevealDriver({ target }: { target: string }) {
+    const { revealWorkspace } = useRevealWorkspace();
+    return (
+      <button type="button" onClick={() => revealWorkspace(target)}>
+        reveal
+      </button>
+    );
+  }
+
+  /** The accordion + a driver, both under one provider. `mountRevealed` seeds a PENDING reveal. */
+  function renderRevealable({
+    defaultOpen = false,
+    workspaceId = "ws1",
+    mountRevealed = null as string | null,
+  } = {}) {
+    function Harness() {
+      const { revealWorkspace } = useRevealWorkspace();
+      // Seed BEFORE the band exists — the cross-project case: the jump raises the signal, and the
+      // Terminals page mounts the target project's bands only in the render that follows. The band
+      // is withheld until the reveal is committed, so its FIRST paint is one that can already see
+      // the signal.
+      const [seeded, setSeeded] = useState(mountRevealed === null);
+      useEffect(() => {
+        if (mountRevealed === null) return;
+        revealWorkspace(mountRevealed);
+        setSeeded(true);
+      }, [revealWorkspace]);
+      if (!seeded) return null;
+      return (
+        <RuntimeSelectionProvider initialSelection={null}>
+          <ConsumedNotificationsProvider>
+            <RevealDriver target={workspaceId} />
+            <WorkspaceAccordion
+              workspace={workspace({ id: workspaceId })}
+              snapshot={snapshot([])}
+              defaultOpen={defaultOpen}
+            />
+          </ConsumedNotificationsProvider>
+        </RuntimeSelectionProvider>
+      );
+    }
+    return render(
+      <RevealWorkspaceProvider>
+        <Harness />
+      </RevealWorkspaceProvider>,
+    );
+  }
+
+  const band = () => screen.getByRole("button", { name: "Toggle workspace root" });
+
+  it("opens a CLOSED band that the jump itself mounted, with nothing to wait for", async () => {
+    // The cross-project jump: the band's rank says closed (`defaultOpen={false}` — it is not the
+    // project's first workspace) and the reveal is already pending when it mounts. Asserted with
+    // NO `waitFor`: the band is deployed by the time the page is on screen, not one settle later.
+    // What makes that true is the lazy initial state in the component (the reveal is read in
+    // `useState`, not only in the effect) — jsdom cannot observe paints, so the claim is asserted
+    // where it shows: synchronously.
+    renderRevealable({ defaultOpen: false, mountRevealed: "ws1" });
+    expect(band()).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("opens a CLOSED band already on screen when the signal arrives", async () => {
+    renderRevealable({ defaultOpen: false });
+    expect(band()).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(screen.getByRole("button", { name: "reveal" }));
+    await waitFor(() => expect(band()).toHaveAttribute("aria-expanded", "true"));
+  });
+
+  it("leaves an ALREADY OPEN band open, and consumes the signal all the same", async () => {
+    // The second half of the finding's "no superfluous work": a band that is already deployed has
+    // nothing to do, and must certainly not toggle shut. The signal is still consumed — which the
+    // next test is what proves.
+    renderRevealable({ defaultOpen: true });
+    expect(band()).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(screen.getByRole("button", { name: "reveal" }));
+    await waitFor(() => expect(band()).toHaveAttribute("aria-expanded", "true"));
+  });
+
+  it("is CONSUMED: a fold performed after the jump stays folded", async () => {
+    // The whole reason the signal is ephemeral rather than a stored `collapsed = false`. Once the
+    // arrival is served, the band belongs to the user again — a lingering signal would fight the
+    // very next click.
+    renderRevealable({ defaultOpen: false });
+    fireEvent.click(screen.getByRole("button", { name: "reveal" }));
+    await waitFor(() => expect(band()).toHaveAttribute("aria-expanded", "true"));
+
+    fireEvent.click(band());
+    await waitFor(() => expect(band()).toHaveAttribute("aria-expanded", "false"));
+    // …and it STAYS closed: nothing re-opens it on the next render.
+    expect(band()).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("ignores a reveal aimed at ANOTHER workspace — rank alone decides for the rest", async () => {
+    renderRevealable({ defaultOpen: false, workspaceId: "ws1", mountRevealed: "ws-elsewhere" });
+    expect(band()).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("keeps the rank default with NO provider at all — a normal arrival is untouched", async () => {
+    // The inert context: mounted outside the shell, the band behaves exactly as it always did.
+    render(
+      <RuntimeSelectionProvider initialSelection={null}>
+        <ConsumedNotificationsProvider>
+          <WorkspaceAccordion workspace={workspace()} snapshot={snapshot([])} defaultOpen={false} />
+        </ConsumedNotificationsProvider>
+      </RuntimeSelectionProvider>,
+    );
+    expect(band()).toHaveAttribute("aria-expanded", "false");
   });
 });

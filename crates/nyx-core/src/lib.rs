@@ -87,6 +87,7 @@ pub mod repository;
 pub mod resolve;
 pub mod review_comment;
 pub mod schema;
+pub mod search;
 pub mod seed;
 pub mod shellinteg;
 pub mod shells;

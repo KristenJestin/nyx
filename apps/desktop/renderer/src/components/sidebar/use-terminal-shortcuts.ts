@@ -17,6 +17,13 @@ export const SPLIT_DOWN_CHORD: Hotkey = "Mod+Shift+ArrowDown";
  * commands are the Shift'ed ones.
  */
 export const CLOSE_PANE_CHORD: Hotkey = "Mod+Shift+W";
+/**
+ * Open the GLOBAL SEARCH palette (`<SearchPalette>`) — the one chord of this file that belongs to
+ * no terminal command at all. It lives here because {@link isTerminalNavChord} is what makes xterm
+ * YIELD it, and a binding whose yield rule sits in another file is a binding that silently dies:
+ * the palette is opened from a focused terminal by definition, so the two must be read together.
+ */
+export const SEARCH_PALETTE_CHORD: Hotkey = "Mod+K";
 /** Move the focus to the geometric neighbour — one chord per direction, no wrap. */
 export const FOCUS_LEFT_CHORD: Hotkey = "Alt+ArrowLeft";
 export const FOCUS_RIGHT_CHORD: Hotkey = "Alt+ArrowRight";
@@ -51,7 +58,9 @@ export interface ShortcutHandlers {
  * `attachCustomKeyEventHandler` so xterm YIELDS these chords (lets them through
  * untouched, no PTY byte, no stopPropagation) and they reach TanStack.
  *
- * KEEP THIS IN SYNC with the `useHotkey` bindings below:
+ * KEEP THIS IN SYNC with the `useHotkey` bindings below AND with the ONE binding that lives
+ * elsewhere — the search palette, whose constant is nonetheless declared here
+ * ({@link SEARCH_PALETTE_CHORD}) so this list can never fall out of date on it:
  *  - new        : Ctrl/Cmd + T
  *  - close      : Ctrl/Cmd + W
  *  - next       : Ctrl + Tab         | Ctrl + PageDown
@@ -59,10 +68,19 @@ export interface ShortcutHandlers {
  *  - split      : Ctrl/Cmd + Shift + → / ↓
  *  - close pane : Ctrl/Cmd + Shift + W
  *  - move focus : Alt + ← → ↑ ↓
+ *  - search     : Ctrl/Cmd + K       (`<SearchPalette>`, mounted on the shell)
  *
  * The PANE chords matter here even more than the others: a tiling is driven while a terminal has
  * the keyboard BY DEFINITION (the focused pane's xterm owns the textarea), so a pane chord xterm
  * did not yield would never reach the manager and the tiling would only be drivable by mouse.
+ *
+ * THE PRICE OF `K`, PAID KNOWINGLY. Yielding `Ctrl/Cmd+K` means it no longer reaches the PTY, so
+ * readline's `kill-line` (erase from the cursor to the end of the line) is GONE from nyx terminals
+ * on Windows and Linux — the platforms where `Mod` is Ctrl. That is the accepted trade of the
+ * global-search PRD: the palette must open from where the keyboard actually is, and where the
+ * keyboard actually is, xterm consumes everything it is not told to yield. macOS is unaffected
+ * (`Cmd+K` was never a readline binding there). `Ctrl+U` (kill the whole line) is untouched on
+ * every platform and is the closest remaining readline equivalent.
  */
 export function isTerminalNavChord(e: KeyboardEvent): boolean {
   // The Alt+arrow focus moves carry NO Ctrl/Meta, so they are tested before the primary guard.
@@ -71,7 +89,8 @@ export function isTerminalNavChord(e: KeyboardEvent): boolean {
   if (!primary) return false;
   const lower = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   // Mod+Shift+W (close pane) shares its letter with Mod+W (close terminal) — both must be yielded.
-  if (lower === "t" || lower === "w") return true;
+  // `k` is the SEARCH PALETTE's (see the header): without it the chord never leaves the textarea.
+  if (lower === "t" || lower === "w" || lower === "k") return true;
   if (e.shiftKey && (e.key === "ArrowRight" || e.key === "ArrowDown")) return true;
   if (e.ctrlKey && (e.key === "Tab" || e.key === "PageDown" || e.key === "PageUp")) {
     return true;

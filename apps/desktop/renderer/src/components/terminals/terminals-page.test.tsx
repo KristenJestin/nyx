@@ -11,9 +11,33 @@ import { describe, expect, it } from "vitest";
 
 import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-projects";
 import { ActiveProjectProvider } from "./active-project";
+import { PendingTerminalProvider, usePendingTerminal } from "./pending-terminal";
 import { TerminalsPage } from "./terminals-page";
 import { loadLastTerminalId, saveLastTerminalId } from "./ui-persistence";
 import type { WorkspaceRuntimeSnapshot } from "@/components/runtime/use-workspace-runtime";
+
+/**
+ * The far end of the search palette's `Open a new terminal in …` action, stood in for: a button
+ * that RAISES the one-shot request, and a probe reading whether it is still standing. The palette
+ * itself is not mounted here — what it owes (raising the signal for the right workspace) is
+ * asserted in `search/search-palette.test.tsx`; what the PAGE owes is below.
+ */
+function PendingTerminalHarness({ projectId = "p1" }: { projectId?: string } = {}) {
+  const { pendingTerminal, requestTerminal } = usePendingTerminal();
+  return (
+    <>
+      <button type="button" onClick={() => requestTerminal("ws-feat", projectId)}>
+        raise pending terminal
+      </button>
+      {/* A request this project OWNS but whose workspace no tree carries — the "gone between the
+          search and the activation" case, which the page must drop rather than keep. */}
+      <button type="button" onClick={() => requestTerminal("ws-ghost", projectId)}>
+        raise pending terminal for a ghost
+      </button>
+      <div data-testid="pending-terminal">{pendingTerminal?.workspaceId ?? "none"}</div>
+    </>
+  );
+}
 
 /**
  * Mount `<TerminalsPage>` at `/` under a memory router so its `?terminal=<id>` deep-link search
@@ -25,13 +49,34 @@ function mountTerminalsPage(opts: {
   initialProjectId: string | null;
   terminal?: string;
   command?: string;
+  /**
+   * Mount the one-shot PENDING-TERMINAL channel around the page, plus the harness that raises a
+   * request into it — the palette's `Open a new terminal in …` action, stood in for. Opt-in so
+   * every other test keeps the exact tree (and the exact button set) it had.
+   */
+  pendingTerminal?: boolean;
+  /**
+   * The project the raised request NAMES. Defaults to the page's own, which is the ordinary case;
+   * a test passes another one to stand in for a request aimed at a project this page is not.
+   */
+  pendingTerminalProjectId?: string;
 }) {
   const rootRoute = createRootRoute({
-    component: () => (
-      <ActiveProjectProvider initialProjectId={opts.initialProjectId}>
-        <TerminalsPage />
-      </ActiveProjectProvider>
-    ),
+    component: () =>
+      opts.pendingTerminal ? (
+        <ActiveProjectProvider initialProjectId={opts.initialProjectId}>
+          <PendingTerminalProvider>
+            <PendingTerminalHarness
+              projectId={opts.pendingTerminalProjectId ?? opts.initialProjectId ?? "p1"}
+            />
+            <TerminalsPage />
+          </PendingTerminalProvider>
+        </ActiveProjectProvider>
+      ) : (
+        <ActiveProjectProvider initialProjectId={opts.initialProjectId}>
+          <TerminalsPage />
+        </ActiveProjectProvider>
+      ),
   });
   const indexRoute = createRoute({
     getParentRoute: () => rootRoute,
@@ -303,6 +348,87 @@ describe("TerminalsPage — restored terminal/command affordances (finding 50)",
       const attach = calls.find((c) => c.cmd === "attach_terminal");
       expect(attach?.args.workspaceId).toBe("ws-root");
     });
+  });
+
+  /**
+   * REVIEW-FINDING (« Registre d'actions : créer un terminal ou un workspace depuis la palette ») —
+   * the PAGE's half of the palette's `Open a new terminal in …` action.
+   *
+   * The palette can only REQUEST it (`terminals/pending-terminal`): the path that creates a
+   * terminal AND ENTERS it is `useTerminalActions().newTerminalInWorkspace`, whose "enter" is a
+   * selection in THIS page's runtime. So the request lands here and is honoured by the very
+   * callback the workspace band's "+" calls — which is what "no second creation path" means, and
+   * what this test pins by asserting the SAME three facts as the "+" test above, plus the entering.
+   */
+  it("honours a pending-terminal request: creates in that workspace AND enters the terminal", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    installBackend(calls);
+    const { container } = mountTerminalsPage({ initialProjectId: "p1", pendingTerminal: true });
+    // Wait for the page to settle on its auto-selected first terminal, so "the selection moved"
+    // below is a real move and not the initial one.
+    await waitFor(() => {
+      const first = container.querySelector('[data-terminal-id="ws-root-term"]');
+      expect(first?.getAttribute("data-focused")).toBe("true");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "raise pending terminal" }));
+
+    // CREATE at the named workspace's path, ATTACH to the named workspace — the sidebar CRUD, not
+    // a second one. `ws-feat` is NOT the workspace the selection was in, which is the point: the
+    // request names its target rather than inheriting one.
+    await waitFor(() => expect(calls.some((c) => c.cmd === "create_terminal")).toBe(true));
+    expect(calls.find((c) => c.cmd === "create_terminal")!.args.cwd).toBe("/ws-feat");
+    await waitFor(() =>
+      expect(calls.find((c) => c.cmd === "attach_terminal")?.args.workspaceId).toBe("ws-feat"),
+    );
+
+    // …AND ENTERS IT: the created terminal is the focused pane, which is the half the user asked
+    // for by name (« ajouter ET entrer »).
+    await waitFor(() => {
+      const pane = container.querySelector('[data-terminal-id="new-term-1"]');
+      expect(pane?.getAttribute("data-focused")).toBe("true");
+    });
+
+    // ONE SHOT: the signal is consumed before the creation, so a re-render cannot open a second
+    // terminal for one request.
+    expect(screen.getByTestId("pending-terminal").textContent).toBe("none");
+    expect(calls.filter((c) => c.cmd === "create_terminal")).toHaveLength(1);
+
+    // …but the guard is about ONE request, not about the workspace: asking AGAIN for the same
+    // workspace opens a second terminal, which is what the user asked for.
+    fireEvent.click(screen.getByRole("button", { name: "raise pending terminal" }));
+    await waitFor(() => expect(calls.filter((c) => c.cmd === "create_terminal")).toHaveLength(2));
+  });
+
+  /**
+   * REVIEW-FINDING (« Demande de terminal orpheline créée à retardement ») — a request THIS project
+   * owns but cannot satisfy is DROPPED, not left standing.
+   *
+   * The request names a workspace and its owning project. When the owning project is the one on
+   * screen and the workspace is still absent from the tree, the workspace is gone — deleted between
+   * the search and the activation, or never there — rather than one render away. Left standing, the
+   * request outlived the intent that raised it and fired the day the user reached that project by
+   * some other route, opening a terminal nobody had asked for. Unlike a stale reveal, which merely
+   * opens a band, a stale creation cannot be undone by ignoring it.
+   *
+   * A request naming ANOTHER project is the opposite case and stays: the palette enters that
+   * project in the same breath, so the page able to honour it is one navigation away.
+   */
+  it("drops a pending-terminal request its own project cannot satisfy, and creates nothing", async () => {
+    const calls: Array<{ cmd: string; args: Record<string, unknown> }> = [];
+    installBackend(calls);
+    const { container } = mountTerminalsPage({ initialProjectId: "p1", pendingTerminal: true });
+    await waitFor(() => {
+      const first = container.querySelector('[data-terminal-id="ws-root-term"]');
+      expect(first?.getAttribute("data-focused")).toBe("true");
+    });
+    const before = calls.filter((c) => c.cmd === "create_terminal").length;
+
+    fireEvent.click(screen.getByRole("button", { name: "raise pending terminal for a ghost" }));
+
+    // The signal is consumed — the page proved it unhonourable — and nothing was created.
+    await waitFor(() => expect(screen.getByTestId("pending-terminal").textContent).toBe("none"));
+    expect(calls.filter((c) => c.cmd === "create_terminal")).toHaveLength(before);
   });
 
   it("Ctrl+T opens a new terminal (restored global shortcut)", async () => {

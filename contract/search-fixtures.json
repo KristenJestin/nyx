@@ -1,0 +1,13 @@
+{
+  "group_order": [
+    "spec",
+    "task",
+    "idea",
+    "workspace",
+    "project",
+    "command",
+    "session"
+  ],
+  "cap_type": 8,
+  "min_query_len": 2
+}

@@ -41,6 +41,7 @@ import { SettingsDialog, type SettingsDialogHandle } from "@/components/sidebar/
 import { ProjectSettingsDialog } from "@/components/sidebar/project-settings-dialog";
 import { ChromeBar } from "@/components/chrome/chrome-bar";
 import { CloseGuard } from "@/components/chrome/close-guard";
+import { SearchPalette } from "@/components/search/search-palette";
 import { isQuietState, StatusDot } from "@/components/ui/status-dot";
 import { homeSnapshotRunState } from "@/components/home/home-state";
 import { useHomeSnapshot, type HomeReadScope } from "@/components/home/use-home-snapshot";
@@ -1321,6 +1322,25 @@ export function BaseLayout() {
           place the answer can come from is the person at the machine — whatever project they
           happen to be looking at. Renders nothing until a request is pending. */}
       <SystemApprovalGate />
+      {/* The `Mod+K` GLOBAL SEARCH palette, mounted ONCE here for the same reason the close
+          guard is: it must exist on every route, and its chord is opened from wherever the
+          keyboard happens to be — most often a focused terminal. It takes no DISPLAY data from
+          this shell: each hit carries its own project and workspace NAMES, joined by the backend —
+          the rail's tree only knows the projects it loaded, and knows no workspace names at all.
+          It renders nothing until the chord fires.
+          IT DOES TAKE ONE CAPABILITY. Its `Add a workspace to …` action must run the flow that
+          ALREADY exists — `useManualAdd`'s native folder picker → name dialog → `create_workspace`,
+          the very one the rail's context menu drives two hundred lines above (`onAddWorkspace`) —
+          and that flow is mounted HERE, with its dialogs. So the shell hands it down rather than
+          the palette writing a second creation path. The projectId→tree lookup is the shell's job
+          too: `addWorkspace` needs the TREE (it seeds the default name from the project's root
+          path), and the tree is what this component holds. */}
+      <SearchPalette
+        onAddWorkspace={(projectId) => {
+          const tree = projects.find((p) => p.project.id === projectId);
+          if (tree) void addWorkspace(tree);
+        }}
+      />
 
       {/* The add-project modal set (folder picker → create modal). Mounted once, portalled. */}
       {manualAddDialog}
