@@ -370,6 +370,8 @@ describe("WorkspaceRuntimeTree — agent activity on the LINE (review T2)", () =
       readyUnread: false,
       errorUnread: false,
       pluginOutdated: false,
+      waitingOn: null,
+      tool: null,
       ...overrides,
     };
   }

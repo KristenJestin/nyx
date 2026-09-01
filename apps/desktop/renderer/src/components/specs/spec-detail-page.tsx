@@ -15,6 +15,7 @@ import { Breadcrumb, BreadcrumbCurrent, breadcrumbLinkClass } from "@/components
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs } from "@/components/ui/tabs";
 import { SpecRunButton } from "@/components/engine/run-modal";
+import { useActiveProject } from "@/components/terminals/active-project";
 
 import { DependencyBadges } from "./dependency-badges";
 import { SpecSidebar } from "./spec-sidebar";
@@ -83,6 +84,11 @@ function tabCount(key: SpecTabKey, detail: SpecDetail): number | null {
 export function SpecDetailPage() {
   const { specId } = routeApi.useParams();
   const { detail, loading, error } = useSpecDetail(specId);
+  // THE SCOPE, read the one way the app reads it (never `activeProjectId === null`, which means
+  // "no project is loaded"). Opening a Spec from the cross-project board is scope-NEUTRAL — the
+  // sync below moves the entered project without leaving the transverse view — so this stays true
+  // and the context rail names the Spec's project in clear.
+  const { globalScope } = useActiveProject();
   // Opening a Spec ENTERS its owner project (deep-link, back/forward between two projects' Specs):
   // the route wins, the rail's selection follows, the URL is untouched. Called before the early
   // returns (rules of hooks); a null/failed detail leaves the active project alone.
@@ -119,7 +125,7 @@ export function SpecDetailPage() {
     <div className="flex h-app bg-background">
       {/* The context rail on the LEFT (shared `<SidebarShell>`, same as the Terminals cockpit);
           the header + tabs + tab content occupy the column to its RIGHT. */}
-      <SpecSidebar detail={detail} />
+      <SpecSidebar detail={detail} showProject={globalScope} />
 
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Header — breadcrumb + title + human key. Uses the SHARED `<Breadcrumb>` so the board,

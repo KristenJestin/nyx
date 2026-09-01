@@ -5,6 +5,8 @@ import {
   BriefcaseIcon,
   ComponentIcon,
   FolderPlusIcon,
+  HouseIcon,
+  LayersIcon,
   PencilIcon,
   PlusIcon,
   SettingsIcon,
@@ -30,6 +32,7 @@ import {
   type ProjectTree,
   type WorkspaceRecord,
 } from "@/components/sidebar/use-projects";
+import { ProjectMark } from "@/components/sidebar/project-mark";
 import { useManualAdd } from "@/components/sidebar/use-manual-add";
 import { useAgentSessions } from "@/components/sidebar/use-agent-sessions";
 import { useReconcileTerminals } from "@/components/terminal/use-reconcile-terminals";
@@ -38,6 +41,8 @@ import { ProjectSettingsDialog } from "@/components/sidebar/project-settings-dia
 import { ChromeBar } from "@/components/chrome/chrome-bar";
 import { CloseGuard } from "@/components/chrome/close-guard";
 import { isQuietState, StatusDot } from "@/components/ui/status-dot";
+import { homeSnapshotRunState } from "@/components/home/home-state";
+import { useHomeSnapshot, type HomeReadScope } from "@/components/home/use-home-snapshot";
 import { projectRunState } from "./runtime-state";
 import { useConsumedNotifications } from "./use-consumed-notifications";
 import { useProjectRuntime } from "./use-project-runtime";
@@ -46,33 +51,56 @@ import { loadLastProjectId } from "./ui-persistence";
 
 /**
  * The section-nav entries — the routed pages reachable from the rail. `Terminals` is
- * the index route (`/`); `Work` and `Knowledge` are their own routes. Icons are lucide
+ * the index route (`/`); the four others are their own routes. Icons are lucide
  * (the app's icon set); the label doubles as the `title`/`aria-label`.
+ *
+ * HOME LEADS. It is the recap of the entered project — where the project IS — so it opens the
+ * section-nav, above the surfaces one works IN. The cross-project home is not an entry here: it
+ * belongs to the SCOPE region at the top of the rail (the "All projects" bar), because its scope is
+ * the projects, not a section of one.
+ *
+ * `DESIGN` CLOSES IT, and it used to sit at the FOOT of the rail under the label `Catalogue`
+ * (finding `01KZ41YKMB63GFJ3QMK2ZHJN1C`, since lifted). The foot was for the REFERENCE surfaces,
+ * consulted FROM the screen one is on; the design system turned out to be a section of the project
+ * like the others, so it came back up into this list — once, not duplicated — and took the name
+ * the rest of the app uses for it. The ROUTE is untouched (`/design`): only the label moved.
+ *
+ * `IDEAS` is the label of `/knowledge`, and that is not a typo. `knowledge` is the GLOSSARY's
+ * umbrella — the project knowledge nyx stores, which covers the ideas AND the design system — so
+ * it stays the internal route name while the UI names the one thing this page renders. The router
+ * runs on a memory history, so the path is never on screen. See `docs/product/README.md`.
+ *
+ * `crossProject` is what an entry means in the CROSS-PROJECT scope: `true` when the page has a
+ * reading that spans every project, `false` when it only ever shows one. See {@link sectionNav}.
  */
 const NAV = [
-  { to: "/", icon: SquareTerminalIcon, label: "Terminals" },
-  { to: "/work", icon: BriefcaseIcon, label: "Work" },
-  { to: "/knowledge", icon: BookOpenIcon, label: "Knowledge" },
-  { to: "/engine", icon: WorkflowIcon, label: "Engine" },
+  { to: "/home", icon: HouseIcon, label: "Home", crossProject: true },
+  { to: "/", icon: SquareTerminalIcon, label: "Terminals", crossProject: false },
+  { to: "/work", icon: BriefcaseIcon, label: "Work", crossProject: true },
+  { to: "/knowledge", icon: BookOpenIcon, label: "Ideas", crossProject: true },
+  { to: "/engine", icon: WorkflowIcon, label: "Engine", crossProject: false },
+  { to: "/design", icon: ComponentIcon, label: "Design", crossProject: false },
 ] as const;
 
 /**
- * …and the FOOT of the same rail — the REFERENCE surfaces, under the work ones (finding
- * `01KZ41YKMB63GFJ3QMK2ZHJN1C`).
+ * The entries the rail DRAWS for a scope — six in a project, three across every project
+ * (`Home`, `Work`, `Ideas`).
  *
- * The CATALOGUE is a project-wide reference, not a place one works in: it is consulted FROM the
- * screen one is on. It used to be duplicated as a `Catalogue` link in the PROTOTYPE page's own
- * header — a global link living in the chrome of one page, three centimetres from a rail that
- * already routed to it. The link is gone from there and the entry lives here, at the foot, beside
- * the other always-available entry point (Settings). One place, whatever screen one is on.
+ * The three others are ABSENT, not disabled: `Terminals`, `Engine` and `Design` have no
+ * cross-project reading that means anything (which is the conclusion that closed the three
+ * findings asking for one), and an entry that is present but inert is a promise not kept — the
+ * user was explicit. So the nav is DERIVED from the scope at render time: flipping the mode
+ * changes the list live, with nothing to reload.
  */
-const FOOT_NAV = [{ to: "/design", icon: ComponentIcon, label: "Catalogue" }] as const;
-
-/** The uppercase initial shown on a project tile (first letter of its name, else `?`). */
-function projectInitial(project: ProjectTree["project"]): string {
-  const trimmed = project.name.trim();
-  return trimmed.length > 0 ? trimmed[0]!.toUpperCase() : "?";
+function sectionNav(globalScope: boolean): readonly (typeof NAV)[number][] {
+  return globalScope ? NAV.filter((item) => item.crossProject) : NAV;
 }
+
+/**
+ * The scope the rail's own cross-project read is made in — hoisted to a module constant so the
+ * object identity is stable and the always-mounted {@link AllProjectsRailDot} never re-subscribes.
+ */
+const GLOBAL_HOME_SCOPE: HomeReadScope = { global: true };
 
 /**
  * The sliding SELECTION indicator — one bar that glides between items sharing the same
@@ -80,12 +108,19 @@ function projectInitial(project: ProjectTree["project"]): string {
  * own their own `layoutId` so the two indicators are independent. It is the "indicateur
  * d'actif animé" of the rail. Colour + geometry are tokens only.
  */
-function ActiveRail({ layoutId }: { layoutId: string }) {
+function ActiveRail({ layoutId, className }: { layoutId: string; className?: string }) {
   return (
     <motion.span
       layoutId={layoutId}
+      // The indicator NAMES itself in the DOM: it is a bare decorative span otherwise, with no
+      // role and no text, and "which indicators are lit" is exactly what a test of the rail has
+      // to be able to ask (review 01M1C8AHV63Y0D54BJCSN46737).
+      data-rail={layoutId}
       transition={{ type: "spring", duration: 0.4, bounce: 0.25 }}
-      className="absolute -left-2.5 top-2 h-5 w-0.5 rounded-r-full bg-foreground"
+      // The default offsets are tuned for a `size-9` tile. `className` re-centers the bar on a
+      // host of another shape (the `All projects` BAR) so every indicator of the rail still lands
+      // on the SAME vertical line, whatever the entry it marks.
+      className={cn("absolute -left-2.5 top-2 h-5 w-0.5 rounded-r-full bg-foreground", className)}
     />
   );
 }
@@ -137,6 +172,39 @@ function ProjectRailDot({ project, active }: { project: ProjectTree; active: boo
   // aggregate earns attention. `<StatusDot>` already renders nothing for a quiet state, but we
   // also skip the wrapper so no empty badge box lingers.
   if (active || isQuietState(state)) return null;
+  return (
+    <span className="absolute -right-0.5 -bottom-0.5 rounded-full bg-background p-px ring-2 ring-muted/40">
+      <StatusDot state={state} size="sm" />
+    </span>
+  );
+}
+
+/**
+ * The CROSS-PROJECT run-state dot — the `All projects` tile's badge, and the only signal that
+ * tile carries. Same badge geometry and same quiet-state rule as {@link ProjectRailDot}, because
+ * it answers the same question one scope wider: is anything, anywhere, asking for you.
+ *
+ * NO NUMBER GOES BESIDE IT, here or on any project tile (user decision H1): the dot already ranks
+ * what matters (`waiting > error > success > running`, `STATE_PRIORITY`) and a counter next to it
+ * would duplicate the signal — the same call as "no badge doubles the dot", frozen since the home
+ * landed and checked by the home's own absence tests.
+ *
+ * IT ROLLS UP THE GLOBAL HOME SNAPSHOT, in ONE read, and that choice is the whole point. The rail
+ * builds its project tiles from `list_projects` / `list_workspaces`, which return the USER's
+ * projects; a rollup summed over those tiles would silently miss a `system` project, and the
+ * cross-project view is precisely where the user refuses to miss it. `home_snapshot` in its global
+ * scope joins terminals → workspaces → projects with no filter at all, so it sees every project by
+ * construction — see {@link homeSnapshotRunState}. It is also ONE call for the whole scope, never
+ * a per-project fan-out, which is the read model's standing rule.
+ *
+ * It is NOT masked while the app is in the global scope: unlike an entered project, whose detail
+ * fills the screen under it, the global scope holds on every page and the tile stays the one place
+ * that says what is happening across all of them.
+ */
+function AllProjectsRailDot() {
+  const { snapshot } = useHomeSnapshot(GLOBAL_HOME_SCOPE);
+  const state = useMemo(() => homeSnapshotRunState(snapshot), [snapshot]);
+  if (isQuietState(state)) return null;
   return (
     <span className="absolute -right-0.5 -bottom-0.5 rounded-full bg-background p-px ring-2 ring-muted/40">
       <StatusDot state={state} size="sm" />
@@ -341,17 +409,44 @@ function ProjectRailContextMenu({
  * the project and the right-click context menu still fires (a click under 5px is never a drag), so
  * the drag never breaks the phase-2/3 rail affordances. A drop hands the new project id order to
  * `reorderProjects` (persisted via `projects_reorder`).
+ *
+ * BEING the entered project (`active`) and being SHOWN as the rail's selection (`selected`) are
+ * two different things, and only in the GLOBAL SCOPE do they part ways — see `selected`.
  */
 function SortableProjectTile({
   tree,
   index,
   active,
+  selected,
   railActions,
   onEnter,
 }: {
   tree: ProjectTree;
   index: number;
+  /** THE ENTERED PROJECT — what the tile IS. Drives `aria-current` and the aggregate dot's mask. */
   active: boolean;
+  /**
+   * …and whether the rail DRAWS that selection. They differ in ONE situation, and one only: the
+   * GLOBAL SCOPE, on ANY page. There the `All projects` tile is the lit selection because it is
+   * what the pages are showing, and a ring on a project would say the screen is scoped to that
+   * project — which is exactly what it is not. Two marks in the SAME region, contradicting each
+   * other, is what the user reads as a second selection ("la double selection c'est hyper chelou").
+   *
+   * HOME IS NOT A CASE OF ITS OWN — it briefly was, and that was an over-correction (review
+   * `01M1EJK7VF9WG86V85AJ5K8JFC`). The rule above was extended to `!onHome`, which took the ring
+   * away on the PROJECT home too: the page displayed the project's name in its header while the
+   * rail said "no project", and Home became the only page in the app that de-selects the project.
+   * There is no contradiction to resolve there — one is inside a project, on that project's home,
+   * and the ring says true. The rail's two regions answer two questions (the project list says
+   * WHICH SCOPE, the section-nav says WHICH PAGE) and on the project home BOTH have something to
+   * say at once: the project's ring AND the lit `Home` entry — the same shape already settled for
+   * the global home, where the `All projects` tile and `Home` light together.
+   *
+   * The scope wins: in the global scope the entered project keeps its `aria-current` and its
+   * place, and gives up only the ring — nothing takes its place, in no attenuated form, or there
+   * would be two marks again.
+   */
+  selected: boolean;
   railActions: ProjectRailActions;
   onEnter: () => void;
 }) {
@@ -368,17 +463,21 @@ function SortableProjectTile({
           aria-label={`Project ${tree.project.name}`}
           title={tree.project.name}
           className={cn(
-            "flex size-9 items-center justify-center rounded-lg bg-muted font-medium text-xs text-foreground/85 transition-transform hover:scale-105",
-            active && "ring-2 ring-primary/60",
+            "flex size-9 items-center justify-center rounded-lg transition-transform hover:scale-105",
+            selected && "ring-2 ring-primary/60",
           )}
         >
-          {projectInitial(tree.project)}
+          {/* The project's CHOSEN identity — its accent + its icon/image — or, when it has
+              none, the initial on the neutral tile the rail always showed. One component, the
+              same one the home renders beside a cross-project session. */}
+          <ProjectMark project={tree.project} className="size-full" />
         </button>
       </ProjectRailContextMenu>
-      {/* The active-selection indicator shows ONLY on the entered tile; the aggregated run-state
-          dot shows on the OTHER (non-active) tiles — masked on the active one and hidden when the
-          aggregate is quiet. */}
-      {active ? <ActiveRail layoutId="rail-project" /> : null}
+      {/* The active-selection indicator shows ONLY on the tile the rail draws as selected — the
+          entered one, and not while the global scope owns this region's mark. The aggregated
+          run-state dot is unmoved by that: it keys off `active`, so the entered project stays
+          masked in the global scope too and no mark slides in where the ring left. */}
+      {selected ? <ActiveRail layoutId="rail-project" /> : null}
       <ProjectRailDot project={tree} active={active} />
     </li>
   );
@@ -390,12 +489,15 @@ function SortableProjectTile({
  *
  *  - the window's own CHROME BAR (`<ChromeBar>`) as the top strip, ABOVE the rail: the
  *    window is frameless, so that bar is what moves / minimizes / maximizes / closes it;
- *  - a vertical RAIL on the left (~60px) listing the PROJECTS (`list_projects`): a
- *    letter tile + an AGGREGATED run-state dot (the project's whole runtime folded to
- *    one state, hidden when idle) when not entered, replaced by an animated active
- *    indicator when it is the entered project;
- *  - a SECTION-NAV under the rail: Terminals (`/`) · Work (`/work`) · Knowledge
- *    (`/knowledge`), each a router `<Link>` with an animated active indicator;
+ *  - a vertical RAIL on the left (~60px), opening on the `All projects` BAR in its own
+ *    pinned region — the cross-project scope, ruled off from the tiles below it;
+ *  - under that rule, the PROJECTS (`list_projects`), drag-sortable: a letter tile + an
+ *    AGGREGATED run-state dot (the project's whole runtime folded to one state, hidden
+ *    when idle) when not entered, replaced by an animated active indicator when it is
+ *    the entered project;
+ *  - a SECTION-NAV under the rail, DERIVED FROM THE SCOPE ({@link sectionNav}): Home ·
+ *    Terminals · Work · Ideas · Engine · Design inside a project, Home · Work · Ideas
+ *    across every project — each a router `<Link>` with an animated active indicator;
  *  - the MAIN column = `<Outlet/>` (the routed page).
  *
  * One enters a PROJECT here (PDR-0008), never a workspace. The rail owns the ACTIVE
@@ -415,7 +517,7 @@ export function BaseLayout() {
     reorderProjects,
     setProjectResumeAgentSessions,
   } = useProjects();
-  const { activeProjectId, setActiveProjectId } = useActiveProject();
+  const { activeProjectId, setActiveProjectId, globalScope, setGlobalScope } = useActiveProject();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   // Does the CURRENT url carry one of the `/` route's RUNTIME deep-links (`?terminal=<id>` /
   // `?command=<id>`, written by a Spec's Runtime tab)? Those target a precise runtime object of
@@ -427,6 +529,20 @@ export function BaseLayout() {
       return search.terminal != null || search.command != null;
     },
   });
+  // Is the CROSS-PROJECT home the SCREEN one is on? Distinct from `globalScope`, which is the
+  // app-wide SCOPE and holds on every page: this one answers "is the global home already up", and
+  // it is only ever used to decide whether a click on the `All projects` tile still has somewhere
+  // to navigate. Selected to a boolean so the shell re-renders only on the edge.
+  const onGlobalHome = useRouterState({
+    select: (s) =>
+      s.location.pathname === "/home" && (s.location.search as { scope?: unknown }).scope === "all",
+  });
+  // Is a HOME the current screen — EITHER scope? `/home` serves both, so the bare path answers it.
+  // Its ONLY reader is `enterProject`: a home already IS the screen a project switch would take
+  // you to, so there is nothing to navigate from there. It says nothing about the rail's marks —
+  // the ring follows the SCOPE, on Home like on every other page (see `<SortableProjectTile>`'s
+  // `selected`).
+  const onHome = pathname === "/home";
   const navigate = useNavigate();
 
   // APP-WIDE terminal-store reconciliation, mounted ONCE on the always-mounted shell. It disposes
@@ -496,45 +612,55 @@ export function BaseLayout() {
 
   /**
    * ENTER a project — the ONE path the rail (and its recovery effect) goes through, because
-   * entering a project is a NAVIGATION, not only a selection (PRD fix 2).
+   * entering a project is a NAVIGATION and a SCOPE change, not only a selection.
    *
-   * The defect: `onEnter` used to call `setActiveProjectId` alone, so switching project from a
-   * page SCOPED to the previous one (a Spec detail, a review, a prototype) left the view on that
-   * page — one ended up reading a page that does not belong to the entered project and had to
-   * re-navigate by hand.
+   * The original defect (PRD fix 2): `onEnter` called `setActiveProjectId` alone, so switching
+   * project from a page SCOPED to the previous one (a Spec detail, a review, a prototype) left the
+   * view on that page — one ended up reading a page that does not belong to the entered project.
    *
-   * The landing page is `/` (Terminals) — NOT a new target: it is already scoped to the active
-   * project and already RESTORES that project's last terminal (`loadLastTerminalId(projectId)` in
-   * `<TerminalsPage>`), falling back to its existing empty state when the project has none. The
-   * change is routed through the SAME `startNavTransition` the section-nav uses, so the screen
-   * cross-fades instead of snapping (and it no-ops cleanly under reduced motion / jsdom).
+   * THE LANDING PAGE IS THE PROJECT'S HOME (user feedback: « si je suis sur la home et que je
+   * change de projet ca reste sur la home, si je suis sur une autre page et que je change de projet
+   * au lieu d'aller dans terminals ca va sur la home »). It used to be `/` (Terminals) from every
+   * route but a home, which made the switch answer two different questions depending on where you
+   * clicked from. One answer now: entering a project SHOWS you that project, and the screen that
+   * shows a project is its home. This LIFTS the Home task's declared non-goal ("Faire de Home la
+   * cible du switch de projet"), which the user lifted explicitly after having it under their eyes.
    *
-   * NO STACKING: when the route is ALREADY `/` there is nothing to navigate to — the page simply
-   * re-scopes to the newly entered project — so we skip the navigation entirely rather than push
-   * a second identical history entry.
+   * The landing search is `{}`, always, and that is what keeps THE STALE DEEP-LINK (review
+   * `01M069MWRNR1PEZZW7YTPAHSKK`) buried. A Spec's Runtime tab opens a precise runtime object by
+   * navigating to `/?terminal=<id>` (resp. `?command=`), and nothing clears that search afterwards.
+   * Those ids belong to the project one is LEAVING: left in the url, `<TerminalsPage>` waits
+   * forever for a target that will never appear in the entered project's runtime, and that pending
+   * deep-link SUPPRESSES its last-terminal restore — an EMPTY deck. Landing on `/home` disposes of
+   * it by leaving the route entirely; and because a deep-linked `/` in the BACK stack is the same
+   * trap one step away, the navigation REPLACES it rather than stacking on top of it
+   * ({@link hasRuntimeDeepLink}). From a plain page the navigation is a normal push: the page one
+   * came from is a legitimate place to go back to.
    *
-   * THE STALE DEEP-LINK (review `01M069MWRNR1PEZZW7YTPAHSKK`): "already on `/`" is NOT always
-   * "nothing to do". A Spec's Runtime tab opens a precise terminal/command by navigating to
-   * `/?terminal=<id>` (resp. `?command=`), and nothing clears that search afterwards. Those ids
-   * belong to the project one is LEAVING, so after the switch `<TerminalsPage>` waits forever for
-   * a target that will never appear in the entered project's runtime — and that pending deep-link
-   * SUPPRESSES its last-terminal restore, landing the user on an EMPTY deck. So when the url still
-   * carries one, we drop the search. `replace` keeps the no-stacking guarantee (and never leaves a
-   * back step pointing at another project's runtime object). The landing search is `{}` in the
-   * cross-route case too, so a stale deep-link can never ride along.
+   * ON A HOME, THERE IS NOTHING TO NAVIGATE (user feedback: "quand je change de projet ca quitte la
+   * home du coup c'est trop bizarre"). The home is the same screen for every project and answers
+   * the switch on its own by re-reading in the new scope. From the PROJECT home nothing in the url
+   * has to move at all; from the GLOBAL home the search must be dropped — entering a project from
+   * the cross-project view is leaving it — and `replace` keeps the switch from stacking a second
+   * identical screen.
+   *
+   * ENTERING A PROJECT LEAVES THE GLOBAL SCOPE, always and everywhere: the two are exclusive (see
+   * `active-project.tsx`). This is the ONE gesture that says "not all of them — this one", so it is
+   * the one that turns the mode off, whatever page it is made from.
    */
   const enterProject = useCallback(
     (projectId: string) => {
       setActiveProjectId(projectId);
-      if (pathname === "/") {
-        if (hasRuntimeDeepLink) void navigate({ to: "/", search: {}, replace: true });
+      setGlobalScope(false);
+      if (onHome) {
+        if (onGlobalHome) void navigate({ to: "/home", search: {}, replace: true });
         return;
       }
       startNavTransition(() => {
-        void navigate({ to: "/", search: {} });
+        void navigate({ to: "/home", search: {}, replace: hasRuntimeDeepLink });
       });
     },
-    [hasRuntimeDeepLink, navigate, pathname, setActiveProjectId],
+    [hasRuntimeDeepLink, navigate, onGlobalHome, onHome, setActiveProjectId, setGlobalScope],
   );
 
   // Enter a project once the list loads (and recover when the entered project disappears, e.g.
@@ -610,11 +736,10 @@ export function BaseLayout() {
   }, [createProject, projects, reorderProjects]);
 
   /**
-   * ONE entry of the rail's section-nav — written once and rendered by BOTH groups ({@link NAV} at
-   * the top, {@link FOOT_NAV} at the foot), so a link's behaviour never depends on which group it
-   * sits in.
+   * ONE entry of the rail's section-nav — written once and rendered for every entry {@link
+   * sectionNav} keeps in the current scope, so a link's behaviour never depends on where it sits.
    *
-   * The MAIN-SCREEN change (Terminals ↔ Work ↔ Knowledge ↔ Catalogue) is wrapped in a View
+   * The MAIN-SCREEN change (Terminals ↔ Work ↔ Ideas ↔ Design) is wrapped in a View
    * Transition cross-fade so the screen — terminal included — fades instead of snapping in
    * ("collé", user feedback). We intercept the click and drive the navigation ourselves inside
    * `startNavTransition`: it snapshots the old DOM, cross-fades to the new, and only calls
@@ -625,13 +750,42 @@ export function BaseLayout() {
    * modified / non-primary click fall through to the browser's default so it is not hijacked.
    */
   const renderNavItem = (item: {
-    to: (typeof NAV)[number]["to"] | (typeof FOOT_NAV)[number]["to"];
+    to: (typeof NAV)[number]["to"];
     icon: typeof BriefcaseIcon;
     label: string;
   }) => {
+    // THE RAIL ANSWERS TWO QUESTIONS IN TWO REGIONS, and this one is "WHICH PAGE?".
+    //
+    // Everything above the rule answers "WHICH SCOPE?" — the `All projects` bar and, under it, the
+    // project tiles.
+    // The two are INDEPENDENT axes, so being in the cross-project scope AND on the Home page is a
+    // perfectly coherent state and BOTH regions say so — the `All projects` tile is lit and this
+    // entry is lit (user feedback: « la route home est pas selectionne quand je suis dans "all
+    // project" »).
+    //
+    // This entry used to be forced dark on `/home?scope=all`, which was an over-application of the
+    // double-selection rule the user had removed (review `01M1C8AHV63Y0D54BJCSN46737`). That rule
+    // is about two marks in the SAME region contradicting each other — the `All projects` tile lit
+    // WHILE a project wore its entered ring. Two marks in two regions answering two questions are
+    // not that. The same conclusion later had to be applied one step further, on the PROJECT home:
+    // the ring stays ON there, beside this lit entry (review `01M1EJK7VF9WG86V85AJ5K8JFC`).
+    //
+    // The other entries are scope-NEUTRAL: `Work` and `Ideas` are the same screen in either scope,
+    // which is the whole point of the mode ("si je vais sur toute les autres pages en etant sur le
+    // all project ca m'affiches les pages normalement avec tout"), and the three that are not are
+    // simply not drawn there.
     const active = pathname === item.to;
+    // …AND A CLICK IS A NO-OP ONLY WHEN IT HAS NOWHERE TO GO, which is NOT the same question.
+    // `Home` is the one entry that can be lit and still have somewhere to take you: on
+    // `/home?scope=all` the path already matches while the SCREEN is the cross-project home, so
+    // the click still has to run — it is what leaves the global scope for the project recap.
+    const alreadyHere = active && !(item.to === "/home" && globalScope);
     return (
-      <li key={item.to} className="relative">
+      // `data-active` is the rail's OWN answer to "which entry is the PAGE you are on" — the one
+      // the sliding indicator follows, and the one a test reads (the router runs on memory
+      // history, so `location` is never the observable). It answers the page axis only: the SCOPE
+      // is said by the project list, in its own region, with its own indicator.
+      <li key={item.to} data-active={active} className="relative">
         <Link
           to={item.to}
           title={item.label}
@@ -647,10 +801,31 @@ export function BaseLayout() {
             ) {
               return;
             }
-            if (pathname === item.to) return; // already here — no transition
+            // `alreadyHere`, not `active` and not the bare path: on `/home?scope=all` this entry
+            // is LIT (the page axis says Home) yet the screen is the OTHER home, so it still has
+            // somewhere to go.
+            if (alreadyHere) return; // already here — no transition
             e.preventDefault();
+            // `Home` is the ENTERED PROJECT's recap — that is what the entry means, and what
+            // separates it from the `All projects` tile that owns the other home. So it is also a
+            // way OUT of the global scope, the mirror of the tile that is the way in. The four
+            // other entries never touch the scope.
+            if (item.to === "/home") setGlobalScope(false);
             startNavTransition(() => {
-              void navigate({ to: item.to });
+              // `search: {}` CLEARS the url's query. It is here for `/home`, which is the only
+              // entry that can navigate to the path it is ALREADY on: from `/home?scope=all` the
+              // screen is the cross-project home, so the Home entry still has somewhere to go —
+              // and TanStack keeps the current search when a navigation does not replace it, so
+              // without this the entry could never leave the global scope.
+              //
+              // It is inert for the others: `/work` and `/knowledge` take no search at all,
+              // and `/`'s only ones are the `?terminal=` / `?command=` DEEP-LINKS, which are
+              // consumed on arrival and belong to the url that CARRIED them — never to a rail
+              // click, which means "take me to the Terminals screen", not "take me back to
+              // whatever this url pointed at". Every rail entry therefore lands on its screen's
+              // plain form, which is also the only behaviour that does not depend on where you
+              // clicked from.
+              void navigate({ to: item.to, search: {} });
             });
           }}
           className={cn(
@@ -686,10 +861,103 @@ export function BaseLayout() {
 
       <div className="grid min-h-0 flex-1 grid-cols-[60px_1fr]">
         <aside className="flex h-full flex-col items-center border-r border-border/60 bg-muted/40 py-3">
+          {/* ALL PROJECTS — its OWN region, pinned above the projects and ruled off from them.
+            It answers the same question as the tiles below (WHICH SCOPE am I in), which is why it
+            is here and not in the section-nav; but it is not one MORE project, and the rail now
+            says so structurally instead of by decoration.
+
+            IT LEFT THE LIST, AND THAT IS THE POINT (review `01M1EJK7VF9WG86V85AJ5K8JFC`). It used
+            to be the first `<li>` of the sortable project list, wearing a project's `size-9`
+            rounded square with a `layers` glyph. A PRD of project identity customisation is coming
+            (`01M1C8DP7VBD0CAFPG1Y4Z6662`): the moment a user can pick a project's icon and accent,
+            any distinction drawn in THAT vocabulary is one a user choice can undo. So the tile
+            changes CATEGORY rather than decoration — its own region, its own geometry.
+
+            THE GEOMETRY IS A BAR, not a square: `h-7 w-11` where a project is `size-9`. Wider than
+            the column of squares and shorter than them, so it reads as a header over the list
+            rather than an item of it. A user chooses what goes INSIDE their tile, never the SHAPE
+            of the tile — which is what makes this distinction impossible to imitate.
+
+            IT IS OUTSIDE THE `<DragDropProvider>` below, so it is structurally not a sortable
+            item: no `useSortable`, no index, and `reorderProjects` (which persists the PROJECT
+            array) can never receive it. It is pinned by CONSTRUCTION, not by a sort key. This is
+            the same convention the Système chantier uses for its own pinned tile
+            (`01KY4FJXT0J2XSP53KK61ZA5R8`, branch `feature/system-scope`): a region of its own,
+            outside the provider, under its own rule. That one pins at the FOOT, above Settings,
+            and this one at the HEAD — so the two merge without competing.
+
+            It is DRAWN as selected from the app's scope, not from the route: the global mode holds
+            on every page now (`Work`, `Knowledge`, …), so a tile lit only on the cross-project home
+            would go dark the moment you navigate and leave the rail unable to say what the pages
+            are showing. It still NAVIGATES to the cross-project home — entering the scope shows you
+            the scope — which is why the "already here" guard reads the ROUTE (`onGlobalHome`) and
+            not the mode: from `/work` in the global scope the tile has somewhere to go.
+
+            It does not ENTER or LEAVE a project: `activeProjectId` is untouched, so the rail knows
+            where to put you back the moment you enter a project again. */}
+          <ul className="flex flex-col items-center">
+            <li data-active={globalScope} className="relative">
+              <Link
+                to="/home"
+                search={{ scope: "all" }}
+                title="All projects"
+                aria-label="All projects"
+                onClick={(e) => {
+                  if (
+                    e.defaultPrevented ||
+                    e.button !== 0 ||
+                    e.metaKey ||
+                    e.ctrlKey ||
+                    e.shiftKey ||
+                    e.altKey
+                  ) {
+                    return;
+                  }
+                  setGlobalScope(true);
+                  if (onGlobalHome) return;
+                  e.preventDefault();
+                  startNavTransition(() => {
+                    void navigate({ to: "/home", search: { scope: "all" } });
+                  });
+                }}
+                className={cn(
+                  // THE BAR — the one geometry of the rail no project tile can claim.
+                  "flex h-7 w-11 items-center justify-center rounded-md transition-colors",
+                  globalScope
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                )}
+              >
+                <LayersIcon className="size-4" />
+              </Link>
+              {/* Its OWN `layoutId`, still — and now for a second reason. It never was one of the
+                  project tiles (entering the cross-project home leaves the entered project ENTERED,
+                  so sharing `rail-project` would have Motion slide the project's bar up onto this
+                  one and back down on the way out, animating a project switch that never happened);
+                  and it now sits in another REGION, across a rule, which a shared-layout bar must
+                  never glide over. A group of one: it fades in and out in place. The `className`
+                  re-centers it on the bar's height so it lands on the same vertical line as the
+                  project indicators below. */}
+              {globalScope ? (
+                <ActiveRail layoutId="rail-all-projects" className="-left-1.5 top-1" />
+              ) : null}
+              {/* The CROSS-PROJECT rollup badge — the same corner badge a project tile wears, over
+                  every project at once (Système included). No counter beside it. */}
+              <AllProjectsRailDot />
+            </li>
+          </ul>
+
+          {/* The rule that MAKES the region: what is above it is the cross-project scope, what is
+            below it is the projects. Tighter than the section-nav's rule further down (`my-4`),
+            because these two regions answer the same question — the wider gap is what separates
+            "which scope" from "which page". */}
+          <div className="my-2 h-px w-7 bg-border/60" />
+
           {/* DRAG-REORDER the rail's PROJECTS (v2.5.6): one `DragDropProvider` around the project
-            tiles (the "+ add project" tile is not sortable). A drop reorders the tree
-            optimistically and persists via `projects_reorder` (`reorderProjects`), so the order
-            survives a reload. Reuses the SAME dnd-kit setup as the terminal rows. */}
+            tiles (the "+ add project" tile is not sortable, and the `All projects` bar above is not
+            even inside it). A drop reorders the tree optimistically and persists via
+            `projects_reorder` (`reorderProjects`), so the order survives a reload. Reuses the SAME
+            dnd-kit setup as the terminal rows. */}
           <DragDropProvider
             sensors={reorderSensors}
             onDragEnd={(event) => {
@@ -719,6 +987,7 @@ export function BaseLayout() {
                     tree={tree}
                     index={index}
                     active={active}
+                    selected={active && !globalScope}
                     railActions={railActions}
                     onEnter={() => enterProject(tree.project.id)}
                   />
@@ -740,15 +1009,12 @@ export function BaseLayout() {
 
           <div className="my-4 h-px w-7 bg-border/60" />
 
+          {/* THE SECTION-NAV, derived from the SCOPE ({@link sectionNav}) — six entries inside a
+            project, three across every project. The three without a cross-project reading are not
+            rendered at all there, so the list simply changes length when the mode flips; nothing
+            reloads and no entry is left present-but-inert. */}
           <ul className="flex flex-1 flex-col items-center gap-1">
-            {NAV.map((item) => renderNavItem(item))}
-          </ul>
-
-          {/* THE REFERENCE ENTRIES, at the foot — see [`FOOT_NAV`]. Same element, same active
-            indicator, same transition as the work entries above; only the place differs, because
-            what they are differs. */}
-          <ul className="flex flex-col items-center gap-1">
-            {FOOT_NAV.map((item) => renderNavItem(item))}
+            {sectionNav(globalScope).map((item) => renderNavItem(item))}
           </ul>
 
           {/* The global Settings entry point (rebranched from the removed sidebar head). It

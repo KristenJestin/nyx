@@ -82,8 +82,9 @@ describe("CataloguePage", () => {
 
   it("lists the project's components (DS + NEW) with provenance badges", async () => {
     renderPage();
-    // The catalogue heading + all three components (DS and NEW) with a rendered preview each.
-    expect(await screen.findByRole("heading", { name: "Catalogue" })).toBeTruthy();
+    // The page heading — `Design`, the ONE name the rail says too — plus all three components
+    // (DS and NEW) with a rendered preview each.
+    expect(await screen.findByRole("heading", { name: "Design" })).toBeTruthy();
     expect(await screen.findByTestId("component-card-c1")).toBeTruthy();
     expect(screen.getByTestId("component-card-c2")).toBeTruthy();
     expect(screen.getByTestId("component-card-c3")).toBeTruthy();
@@ -399,7 +400,7 @@ describe("CataloguePage", () => {
     // FIRST click ARMS it — nothing is deleted yet, and the card did NOT navigate to the detail.
     fireEvent.click(remove);
     expect(calls.some((c) => c.cmd === "design_component_delete")).toBe(false);
-    expect(screen.getByRole("heading", { name: "Catalogue" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Design" })).toBeTruthy();
 
     // SECOND click removes it, and the catalogue re-pulls without the row.
     fireEvent.click(

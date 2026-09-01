@@ -52,9 +52,16 @@ vi.mock("@dnd-kit/react", () => ({
 }));
 
 // The rail tiles read only `{ ref, isDragging }`; a no-op stands in for the real (context- and
-// DOM-bound) sortable so the rail renders under the stubbed provider.
+// DOM-bound) sortable so the rail renders under the stubbed provider. It also RECORDS every id
+// registered as sortable — the observable for "what the drag can actually grab" (see the pinned
+// `All projects` test below).
+const sortable = vi.hoisted(() => ({ registered: [] as string[] }));
+
 vi.mock("@dnd-kit/react/sortable", () => ({
-  useSortable: () => ({ ref: () => {}, isDragging: false }),
+  useSortable: ({ id }: { id: string }) => {
+    if (!sortable.registered.includes(id)) sortable.registered.push(id);
+    return { ref: () => {}, isDragging: false };
+  },
 }));
 
 import { ActiveProjectProvider } from "./active-project";
@@ -148,6 +155,7 @@ function renderLayout() {
 describe("BaseLayout — project rail onDragEnd glue (dnd-kit)", () => {
   beforeEach(() => {
     dnd.onDragEnd = null;
+    sortable.registered = [];
   });
 
   it("a drag that CHANGES the order persists projects_reorder with the reordered ids", async () => {
@@ -183,5 +191,46 @@ describe("BaseLayout — project rail onDragEnd glue (dnd-kit)", () => {
     // Give any (unexpected) async persist a chance to fire, then assert none did.
     await new Promise((r) => setTimeout(r, 0));
     expect(backend.reorders).toEqual([]);
+  });
+
+  /**
+   * THE PINNED `All projects` BAR IS NOT DRAGGABLE, and it is not draggable BY CONSTRUCTION —
+   * review `01M1EJK7VF9WG86V85AJ5K8JFC`. It used to be the FIRST `<li>` of this very list; it now
+   * lives in its own region above, OUTSIDE the `<DragDropProvider>`. So it registers no
+   * `useSortable`, holds no index, and the id array the drop reorders (`projects.map(…)`) is the
+   * PROJECT array — the bar has no id in it to be moved to, or moved away from.
+   *
+   * The registry the sortable mock keeps is the observable: what a drag can grab is exactly what
+   * called `useSortable`. The "+ add project" tile has never been in it either.
+   */
+  it("registers ONLY the projects as sortable — the pinned `All projects` bar is not draggable", async () => {
+    installBackend([project("p1", "Alpha"), project("p2", "Beta"), project("p3", "Gamma")]);
+    renderLayout();
+    await screen.findByRole("button", { name: "Project Alpha" });
+    // The bar IS rendered — it is simply not part of the sortable set.
+    expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
+    await waitFor(() => expect(sortable.registered).toEqual(["p1", "p2", "p3"]));
+  });
+
+  /**
+   * …and the drop still commits ONLY project ids, in the project count. A stray entry inside the
+   * list would surface here as an extra id in what `projects_reorder` persists.
+   */
+  it("persists a reorder made of project ids ONLY, nothing else of the rail", async () => {
+    const backend = installBackend([
+      project("p1", "Alpha"),
+      project("p2", "Beta"),
+      project("p3", "Gamma"),
+    ]);
+    renderLayout();
+    await screen.findByRole("button", { name: "Project Alpha" });
+    await waitFor(() => expect(dnd.onDragEnd).not.toBeNull());
+
+    await act(async () => {
+      dnd.onDragEnd!(drop("p3", "p1"));
+    });
+
+    await waitFor(() => expect(backend.reorders).toHaveLength(1));
+    expect([...backend.reorders[0]!].sort()).toEqual(["p1", "p2", "p3"]);
   });
 });

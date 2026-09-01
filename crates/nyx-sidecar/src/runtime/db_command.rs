@@ -1117,6 +1117,45 @@ impl Ctx<'_> {
                 self.apply_terminal_live(&mut snapshot);
                 Self::json(&snapshot)
             }
+            // The HOME read model — the synthesis page's ONE read, in either scope: `{ projectId }`
+            // for a project's home, NOTHING for the cross-project one. Four joined DB reads plus
+            // the three live overlays the sidecar (and only the sidecar) can supply:
+            //   * the runtime AGENT ACTIVITY — the shared `AgentActivityStore` the per-turn hooks
+            //     write, which is where both the row's state and its secondary text come from;
+            //   * PTY LIVENESS — the DORMANT filter. The idle-unload closes a dormant session's PTY
+            //     and leaves its row `active` on purpose, so nothing in the DB can tell the two
+            //     apart; only this layer can.
+            //   * the managed-command runner's FACTUAL outcome — never `last_state` alone.
+            // Deliberately NOT a per-workspace fan-out: `workspace_runtime_snapshot` costs one IPC
+            // EACH, which in the global scope would be dozens of round trips for one page.
+            "home_snapshot" => {
+                let project_id = self.arg_opt_str("projectId");
+                let scope = match project_id.as_deref() {
+                    Some(id) => nyx_core::home::HomeScope::Project(id),
+                    None => nyx_core::home::HomeScope::Global,
+                };
+                // The PTY manager and the activity store are shared `Arc`s — cloned out so the
+                // overlay closures own what they read and nothing is held across the DB read.
+                let pty = self.runtime.pty().clone();
+                let alive = move |record_id: &str| pty.is_live_record(record_id);
+                let activity = self.runtime.activity().clone();
+                // The runner handle is CLONED OUT of the cell (and the guard dropped) so the DB
+                // read below never runs under the cell's mutex — the `delete_project` reflex. A
+                // runtime that has not built its runner yet yields `None` per instance, and each
+                // service falls back to its persisted outcome.
+                let runner = self.runtime.runner_cell().lock().unwrap().clone();
+                let services =
+                    move |instance_id: &str| runner.as_ref().and_then(|r| r.outcome(instance_id));
+                let overlays = nyx_core::home::HomeOverlays {
+                    activity: activity.as_ref(),
+                    alive: &alive,
+                    services: &services,
+                };
+                self.db()
+                    .with_conn(|c| nyx_core::home::snapshot(c, scope, &overlays))
+                    .map_err(Self::db_err)
+                    .and_then(|snapshot| Self::json(&snapshot))
+            }
             // v2.2 workspace CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a
             // restart, WHAT this workspace offers to resume — computed by REUSING the existing
             // resume policies (NO third system, Q-011). Two parts, both from live authorities:
@@ -1177,15 +1216,39 @@ impl Ctx<'_> {
             // `spec_list` — the board read model: every LIVE Spec of a project (via
             // `db::list_specs`, archived excluded) with its per-Spec task tally (done/total
             // over `db::list_tasks_for_spec`) so the card renders its progress bar, and the
-            // project's Linear `key` so the card shows the human key `KEY-number`. `{ projectId }`.
+            // project's Linear `key` so the card shows the human key `KEY-number`.
+            //
+            // `{ projectId }` for one project's board — and NOTHING for the CROSS-PROJECT one,
+            // the same shape `home_snapshot` takes ("absent" = every project). The board is the
+            // SAME page in either scope: one query, no per-project fan-out, and the entry shape is
+            // untouched — `project_key` simply stops being constant, which is exactly what makes
+            // the card's `KEY-number` name its project without a mark or a column of its own.
+            //
+            // The project keys are resolved through a small per-call CACHE rather than one read
+            // per Spec: the cross-project board can hold hundreds of Specs over a handful of
+            // projects, and each project's row is the same row every time.
             "spec_list" => {
-                let project_id = self.arg_str("projectId")?;
+                let project_id = self.arg_opt_str("projectId");
                 #[derive(serde::Serialize)]
                 struct SpecListEntry {
                     #[serde(flatten)]
                     spec: db::Spec,
                     /// The project's Linear prefix (the card's human key is `key-number`).
                     project_key: String,
+                    /// WHOSE Spec it is — the identity `<ProjectMark>` paints, in the SAME wire
+                    /// shape every other cross-project read model carries
+                    /// (`nyx_core::home::HomeProject`), never a second one.
+                    ///
+                    /// The board used to get by on `project_key` alone: `BETA-1` names its project
+                    /// in the place the eye already goes. The user looked at the real board and
+                    /// did not recognise it (« je suis en all dans works, j'ai aucun sign du
+                    /// projet en question sur les card ? ») — a key is a string to READ and decode,
+                    /// a mark is seen. So the identity travels with the entry and the card draws
+                    /// both, in the cross-project scope only.
+                    ///
+                    /// `None` only for a Spec whose project row has vanished — such a card keeps
+                    /// its place, unmarked, exactly as an orphaned idea row does.
+                    project: Option<nyx_core::home::HomeProject>,
                     /// Tasks reaching `done` (the progress bar's numerator).
                     tasks_done: i64,
                     /// Total tasks of the Spec (the denominator).
@@ -1198,11 +1261,37 @@ impl Ctx<'_> {
                 }
                 self.db()
                     .with_conn(|c| {
-                        let project = db::get_project(c, &project_id)?;
-                        let project_key = project.map(|p| p.key).unwrap_or_default();
-                        let specs = db::list_specs(c, &project_id)?;
+                        let specs = db::list_specs(c, project_id.as_deref())?;
+                        // The project's KEY and its IDENTITY come from the same row, so they are
+                        // resolved together and cached together — one read per project, never one
+                        // per Spec (the `idea_list` cache, verbatim).
+                        let mut projects: std::collections::HashMap<
+                            String,
+                            (String, Option<nyx_core::home::HomeProject>),
+                        > = std::collections::HashMap::new();
                         let mut entries = Vec::with_capacity(specs.len());
                         for spec in specs {
+                            let (project_key, project) = match projects.get(&spec.project_id) {
+                                Some(resolved) => resolved.clone(),
+                                None => {
+                                    let resolved = db::get_project(c, &spec.project_id)?
+                                        .map(|p| {
+                                            (
+                                                p.key.clone(),
+                                                Some(nyx_core::home::HomeProject {
+                                                    id: p.id,
+                                                    name: p.name,
+                                                    accent: p.accent,
+                                                    icon: p.icon,
+                                                    image_path: p.image_path,
+                                                }),
+                                            )
+                                        })
+                                        .unwrap_or_default();
+                                    projects.insert(spec.project_id.clone(), resolved.clone());
+                                    resolved
+                                }
+                            };
                             let tasks = db::list_tasks_for_spec(c, &spec.id)?;
                             let tasks_total = tasks.len() as i64;
                             let tasks_done = tasks
@@ -1215,7 +1304,8 @@ impl Ctx<'_> {
                             let deps = db::spec_dependency_view(c, &spec.id)?;
                             entries.push(SpecListEntry {
                                 spec,
-                                project_key: project_key.clone(),
+                                project_key,
+                                project,
                                 tasks_done,
                                 tasks_total,
                                 blocked_by_count: deps.blocked_by_count,
@@ -1232,6 +1322,14 @@ impl Ctx<'_> {
             // workspace context (workspace → project → repos, via
             // `db::spec_workspace_context`, `None` until the Spec is anchored). This is what
             // the detail's spec / tasks / activity / runtime tabs consume. `{ specId }`.
+            //
+            // It also carries the OWNER project's identity, and that is a read the detail did
+            // not have: the only project it could reach was `workspace_context.project`, which
+            // is a bare `id`/`name`/`key` and — worse — is `None` on any Spec not yet posed on
+            // a dev workspace. A detail opened from the CROSS-PROJECT board has to name its
+            // project in clear, so the identity is read from `spec.project_id` (the Spec's own
+            // owner, PDR-0013's rule that the anchor is derived and never authoritative) in the
+            // SAME `HomeProject` wire shape `spec_list` / `idea_list` / the home already carry.
             "spec_detail" => {
                 let spec_id = self.arg_str("specId")?;
                 #[derive(serde::Serialize)]
@@ -1243,6 +1341,13 @@ impl Ctx<'_> {
                     revision: db::SpecRevision,
                     tasks: Vec<db::Task>,
                     dependencies: Vec<db::TaskDependency>,
+                    /// WHOSE Spec it is — the identity `<ProjectMark>` paints AND the NAME the
+                    /// detail writes in clear in the cross-project scope. Read from the Spec's
+                    /// OWNER project, not from `workspace_context` (which is absent on an
+                    /// unanchored Spec and carries no accent/icon/image). `None` only for a Spec
+                    /// whose project row has vanished — the page then names no project at all
+                    /// rather than an empty one.
+                    project: Option<nyx_core::home::HomeProject>,
                     /// Workspace → project → repos, DERIVED from the anchor. `None` until the
                     /// Spec is posed on a dev workspace (a sane state, not an error).
                     workspace_context: Option<db::SpecWorkspaceContext>,
@@ -1262,12 +1367,22 @@ impl Ctx<'_> {
                         for task in &tasks {
                             dependencies.extend(db::list_task_dependency_edges(c, &task.id)?);
                         }
+                        let project = db::get_project(c, &spec.project_id)?.map(|p| {
+                            nyx_core::home::HomeProject {
+                                id: p.id,
+                                name: p.name,
+                                accent: p.accent,
+                                icon: p.icon,
+                                image_path: p.image_path,
+                            }
+                        });
                         let workspace_context = db::spec_workspace_context(c, &spec_id)?;
                         Ok::<_, diesel::result::Error>(Some(SpecDetail {
                             spec,
                             revision,
                             tasks,
                             dependencies,
+                            project,
                             workspace_context,
                         }))
                     })
@@ -2070,6 +2185,14 @@ impl Ctx<'_> {
                     ready_unread: bool,
                     error_unread: bool,
                     plugin_outdated: bool,
+                    /// WHAT the agent is blocked on while `activity == "waiting"` — the question
+                    /// it asked or the permission it is waiting for. `null` when nothing blocks,
+                    /// and also when the hook payload carried no readable text (no info is a
+                    /// legitimate answer; there is no filler).
+                    waiting_on: Option<String>,
+                    /// The tool currently in flight — the fallback secondary information, read
+                    /// when the agent is not blocked. `null` when nothing is running.
+                    tool: Option<String>,
                 }
                 let rows: Vec<ActivityRow> = self
                     .runtime
@@ -2082,6 +2205,8 @@ impl Ctx<'_> {
                         ready_unread: snap.ready_unread,
                         error_unread: snap.error_unread,
                         plugin_outdated: snap.plugin_outdated,
+                        waiting_on: snap.waiting_on,
+                        tool: snap.tool,
                     })
                     .collect();
                 Self::json(&rows)
@@ -2177,14 +2302,18 @@ impl Ctx<'_> {
             // (ungrouped ideas fold into a single `theme = null` group), each with the total count
             // and the per-status breakdown (`open`/`planned`/`implemented`/`dropped`), biggest group
             // first. Backs the Idées group headers (counter + status mini-dots) + the theme facet.
-            // `{ projectId }`.
+            // `{ projectId }` for one project — and NOTHING for the CROSS-PROJECT scope, the same
+            // "absent = all" shape `home_snapshot` and `spec_list` take. A theme shared by two
+            // projects stays ONE group with the summed counts: the theme is the axis of this view,
+            // and re-cutting it per project would be a grouping the cross-project scope does not
+            // invent.
             "idea_themes" => {
-                let project_id = self.arg_str("projectId")?;
+                let project_id = self.arg_opt_str("projectId");
                 // The renderer paints the FULL per-status breakdown (mini-dots) + filters
                 // client-side, so the UI read spans EVERY status (`include_terminal = true`). The
                 // active-only default is the MCP `idea_themes` tool's, not this UI read.
                 self.db()
-                    .with_conn(|c| db::list_idea_themes(c, &project_id, true))
+                    .with_conn(|c| db::list_idea_themes(c, project_id.as_deref(), true))
                     .map_err(Self::db_err)
                     .and_then(|themes| Self::json(&themes))
             }
@@ -2193,9 +2322,16 @@ impl Ctx<'_> {
             // "corps + Specs liées + motif de fermeture" from the same item, no second round-trip).
             // Composes `db::list_ideas` + `db::linked_specs_for_idea` per row — the SAME composition
             // pattern as `spec_list` (list + per-item tally). Always capped (never Depot's unbounded
-            // dump). `{ projectId, status?, theme? }`.
+            // dump). `{ projectId?, status?, theme? }` — an ABSENT `projectId` is every project.
+            //
+            // Each row also carries its PROJECT's identity (name + accent/icon/image), because a
+            // cross-project row is the case where the mark is the only thing saying whose idea it
+            // is (`<ProjectMark>`). `spec_list` carries the same field for the same reason — the
+            // Spec card was the one surface that tried to get by on its `KEY-number` alone, and
+            // the user reported that a key is read, not seen. The projects are resolved through a
+            // per-call CACHE, not one read per row.
             "idea_list" => {
-                let project_id = self.arg_str("projectId")?;
+                let project_id = self.arg_opt_str("projectId");
                 let status = self.arg_opt_str("status");
                 let theme = self.arg_opt_str("theme");
                 /// The BOUNDED cap on the browse list — generous for a real backlog while it can
@@ -2208,6 +2344,10 @@ impl Ctx<'_> {
                     idea: db::Idea,
                     /// The idée↔Spec links, each with the Spec's title/status/number.
                     linked_specs: Vec<db::LinkedSpec>,
+                    /// WHOSE idea it is — the identity `<ProjectMark>` paints. The SAME wire shape
+                    /// the home's rows carry (`nyx_core::home::HomeProject`), not a second one.
+                    /// `None` only for an idea whose project row has vanished.
+                    project: Option<nyx_core::home::HomeProject>,
                 }
                 // The renderer paints its own status filter client-side (default "Active" =
                 // open+planned), so the UI list fetches EVERY status by default (`All`) and narrows
@@ -2221,16 +2361,40 @@ impl Ctx<'_> {
                     .with_conn(|c| {
                         let ideas = db::list_ideas(
                             c,
-                            &project_id,
+                            project_id.as_deref(),
                             status_filter,
                             theme.as_deref(),
                             IDEA_LIST_CAP,
                             0,
                         )?;
+                        let mut projects: std::collections::HashMap<
+                            String,
+                            Option<nyx_core::home::HomeProject>,
+                        > = std::collections::HashMap::new();
                         let mut items = Vec::with_capacity(ideas.len());
                         for idea in ideas {
                             let linked_specs = db::linked_specs_for_idea(c, &idea.id)?;
-                            items.push(IdeaListItem { idea, linked_specs });
+                            let project = match projects.get(&idea.project_id) {
+                                Some(p) => p.clone(),
+                                None => {
+                                    let p = db::get_project(c, &idea.project_id)?.map(|p| {
+                                        nyx_core::home::HomeProject {
+                                            id: p.id,
+                                            name: p.name,
+                                            accent: p.accent,
+                                            icon: p.icon,
+                                            image_path: p.image_path,
+                                        }
+                                    });
+                                    projects.insert(idea.project_id.clone(), p.clone());
+                                    p
+                                }
+                            };
+                            items.push(IdeaListItem {
+                                idea,
+                                linked_specs,
+                                project,
+                            });
                         }
                         Ok::<_, diesel::result::Error>(items)
                     })
@@ -2243,7 +2407,10 @@ impl Ctx<'_> {
             // the candidate set; `limit` is clamped by the engine. `{ projectId, query, theme?,
             // status?, limit? }`.
             "idea_search" => {
-                let project_id = self.arg_str("projectId")?;
+                // The SCOPE, as everywhere else: absent = every project. The search follows the
+                // list — one that stayed inside the entered project while the page showed all of
+                // them would be a silent trap.
+                let project_id = self.arg_opt_str("projectId");
                 let query = self.arg_str("query")?;
                 let theme = self.arg_opt_str("theme");
                 let status = self.arg_opt_str("status");
@@ -2257,7 +2424,7 @@ impl Ctx<'_> {
                     .with_conn(|c| {
                         nyx_core::idea::search_ideas(
                             c,
-                            &project_id,
+                            project_id.as_deref(),
                             &query,
                             theme.as_deref(),
                             status.as_deref(),
@@ -2670,7 +2837,7 @@ impl Ctx<'_> {
                         // Union the component names referenced across every proto composition of the
                         // project (spec -> prototype -> page -> version -> variant.composition_json).
                         let mut linked: Vec<String> = Vec::new();
-                        for spec in db::list_specs(c, &project_id)? {
+                        for spec in db::list_specs(c, Some(&project_id))? {
                             let Some(proto) = db::get_prototype_for_spec(c, &spec.id)? else {
                                 continue;
                             };
@@ -2735,7 +2902,7 @@ impl Ctx<'_> {
                 self.db()
                     .with_conn(|c| {
                         let mut nodes: Vec<ComponentNode> = Vec::new();
-                        for spec in db::list_specs(c, &project_id)? {
+                        for spec in db::list_specs(c, Some(&project_id))? {
                             let Some(proto) = db::get_prototype_for_spec(c, &spec.id)? else {
                                 continue;
                             };
@@ -4313,6 +4480,191 @@ mod tests {
         assert!(err.contains("no primary workspace"), "got: {err}");
     }
 
+    /// THE HOME's ONE READ, over the real bridge — the three LIVE seams `nyx_core::home`'s own
+    /// tests cannot reach, because they run on `HomeOverlays::default()` (every terminal alive, no
+    /// activity, no runner) and so neutralise exactly what this dispatch wires:
+    ///
+    ///   * **SCOPE** — `{ projectId }` narrows to one project, nothing reaches every project.
+    ///   * **PTY LIVENESS** (the load-bearing one) — `alive` is `pty.is_live_record(record_id)`,
+    ///     and the id it is handed is the `terminals.id` `db::home_sessions` returns. Were those
+    ///     two keys ever to drift apart, every session would read dormant and the home would come
+    ///     back EMPTY in production with the whole Rust suite green. The test drives it both ways:
+    ///     registered in `live_records` → the session is in the flow; retracted → it is gone, and
+    ///     the OTHER session (still registered) stays. Only a correct key can do both.
+    ///   * **THE ACTIVITY STORE** — the shared `AgentActivityStore` the per-turn hooks write is
+    ///     where the row's `state` AND its `secondary` come from.
+    ///
+    /// The services overlay is exercised on its fallback leg: this runtime has no runner, so a
+    /// service falls back to its persisted outcome — which is what a running one must do to appear.
+    ///
+    /// `live_records` is populated directly rather than by spawning a shell: the seam under test is
+    /// the KEY, not the process, and a real PTY would drag the platform in for nothing.
+    #[test]
+    fn home_snapshot_wires_scope_pty_liveness_and_activity_over_the_ui_bridge() {
+        use nyx_core::agent_activity::ActivityEvent;
+
+        let h = Harness::new();
+
+        // Two projects, one agent session each — the cross-project flow the global home exists for.
+        let made = |name: &str, root: &str| {
+            let created = h
+                .run(
+                    "create_project",
+                    serde_json::json!({ "name": name, "rootPath": root }),
+                )
+                .unwrap();
+            let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+            let project_id = created["project"]["id"].as_str().unwrap().to_string();
+            let ws_id = created["root"]["id"].as_str().unwrap().to_string();
+            let terminal_id = h
+                .runtime
+                .db()
+                .with_conn(|c| {
+                    let t = nyx_core::db::create_terminal(c, root, None)?;
+                    nyx_core::db::attach_terminal(c, &t.id, &ws_id, "auto")?;
+                    nyx_core::db::record_session_start(
+                        c,
+                        &t.id,
+                        "claude_code",
+                        nyx_core::db::SessionCapture {
+                            workspace_id: Some(ws_id.clone()),
+                            external_session_id: format!("sess-{name}"),
+                            cwd: root.to_string(),
+                            transcript_path: None,
+                            metadata_json: None,
+                        },
+                    )?;
+                    Ok::<_, diesel::result::Error>(t.id)
+                })
+                .unwrap();
+            (project_id, ws_id, terminal_id)
+        };
+        let (proj_a, ws_a, term_a) = made("Alpha", "/tmp/home-a");
+        let (proj_b, _ws_b, term_b) = made("Beta", "/tmp/home-b");
+
+        // A RUNNING service in A — the third overlay, on its no-runner fallback leg.
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_template(
+                    c,
+                    &proj_a,
+                    "dev-a",
+                    "npm run dev",
+                    None,
+                    nyx_core::db::CommandSource::default(),
+                )?;
+                let instance = nyx_core::db::list_instances_for_workspace(c, &ws_a)?[0]
+                    .id
+                    .clone();
+                nyx_core::db::set_run_state(c, &instance, "running", None)
+            })
+            .unwrap();
+
+        // Both terminals have a live PTY — registered under their RECORD id, the key the whole
+        // liveness join is built on.
+        {
+            let live = h.runtime.pty().live_records();
+            let mut live = live.lock().unwrap();
+            live.insert(term_a.clone(), 1);
+            live.insert(term_b.clone(), 2);
+        }
+
+        // A tool in flight on A, posted on the SHARED store the dispatch reads.
+        h.runtime
+            .activity()
+            .apply(&term_a, ActivityEvent::PromptSubmitted);
+        h.runtime.activity().apply(
+            &term_a,
+            ActivityEvent::ToolStarted {
+                tool: Some("Bash".to_string()),
+            },
+        );
+
+        let pushes_before = h.pushes();
+        let home = |args: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&h.run("home_snapshot", args).unwrap()).unwrap()
+        };
+        let terminals_of = |snapshot: &serde_json::Value| -> Vec<String> {
+            snapshot["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["terminal_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // GLOBAL SCOPE — no `projectId`: every project's sessions.
+        let all = home(serde_json::json!({}));
+        let mut global = terminals_of(&all);
+        global.sort();
+        let mut both = vec![term_a.clone(), term_b.clone()];
+        both.sort();
+        assert_eq!(global, both, "the global home reaches into every project");
+
+        // …and the row carries what the ACTIVITY STORE holds, not what the DB alone knows.
+        let a_row = all["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["terminal_id"] == serde_json::json!(term_a))
+            .unwrap();
+        assert_eq!(
+            a_row["state"],
+            serde_json::json!("working"),
+            "the tool in flight posted on the shared store IS the row's state"
+        );
+        assert_eq!(
+            a_row["secondary"],
+            serde_json::json!("Bash"),
+            "and its name IS the row's secondary text"
+        );
+        // The services overlay fell back to the persisted outcome for the running service.
+        assert_eq!(
+            all["services"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["dev-a"],
+            "a running service is on the home through the runner-less fallback"
+        );
+
+        // PROJECT SCOPE — only A's session, and only A's own terminal.
+        let a_home = home(serde_json::json!({ "projectId": proj_a }));
+        assert_eq!(terminals_of(&a_home), vec![term_a.clone()]);
+        let b_home = home(serde_json::json!({ "projectId": proj_b }));
+        assert_eq!(terminals_of(&b_home), vec![term_b.clone()]);
+
+        // THE DORMANT FILTER, end to end: retract A's PTY (what the idle-unload does) and leave
+        // its `agent_sessions` row `active`. A drops out of the flow, B does not — which is only
+        // possible if `is_live_record` is being asked about the terminal id `home_sessions` returns.
+        h.runtime
+            .pty()
+            .live_records()
+            .lock()
+            .unwrap()
+            .remove(&term_a);
+        let after = home(serde_json::json!({}));
+        assert_eq!(
+            terminals_of(&after),
+            vec![term_b.clone()],
+            "a session whose PTY is gone is dormant — out of the flow, while the live one stays"
+        );
+        assert!(
+            terminals_of(&home(serde_json::json!({ "projectId": proj_a }))).is_empty(),
+            "and it is gone from its project's home too"
+        );
+
+        // Pure read: no `changed` broadcast for any of those calls.
+        assert_eq!(
+            h.pushes(),
+            pushes_before,
+            "home_snapshot is a pure read — no changed broadcast"
+        );
+    }
+
     /// WORKSPACE CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a restart, the
     /// `workspace_restore_plan` db-command REUSES the existing resume policies to report, for
     /// ONE workspace: (a) the per-session `decide_resume` verdicts (resume the `resume_agent_
@@ -5202,10 +5554,77 @@ mod tests {
             !entry["project_key"].as_str().unwrap().is_empty(),
             "the project key is derived for the human key"
         );
+        // …and the project's IDENTITY travels with it, in the `HomeProject` wire shape, so the
+        // card can paint `<ProjectMark>` in the cross-project scope without a second read.
+        let project = &entry["project"];
+        assert_eq!(project["id"].as_str().unwrap(), project_id);
+        assert!(
+            !project["name"].as_str().unwrap().is_empty(),
+            "the entry carries the identity `<ProjectMark>` paints, not just the key"
+        );
+        for field in ["accent", "icon", "image_path"] {
+            assert!(
+                project.get(field).is_some(),
+                "the identity triplet is present (null is a first-class value): {field}"
+            );
+        }
         assert_eq!(
             h.pushes(),
             pushes_before,
             "spec_list is a pure read (no push)"
+        );
+    }
+
+    /// `spec_list` WITHOUT a `projectId` is the CROSS-PROJECT board: every project's live Specs,
+    /// in ONE call, each carrying its OWN project key (which is what names its project on the
+    /// card). The scope is spelled by the ABSENCE of the argument, exactly as `home_snapshot`
+    /// spells it — and no `kind` narrowing hides a project from it.
+    #[test]
+    fn spec_list_without_a_project_lists_every_project() {
+        let h = Harness::new();
+        let alpha = make_project(&h, "Alpha", "/tmp/dbcmd-spec-list-alpha");
+        let beta = make_project(&h, "Beta", "/tmp/dbcmd-spec-list-beta");
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_spec(c, &alpha, "Alpha work", Default::default())?;
+                nyx_core::db::create_spec(c, &beta, "Beta work", Default::default())?;
+                Ok::<_, nyx_core::db::ContentWriteError>(())
+            })
+            .unwrap();
+
+        // Each project's own board still sees only its own.
+        for (project_id, title) in [(&alpha, "Alpha work"), (&beta, "Beta work")] {
+            let scoped = h
+                .run("spec_list", serde_json::json!({ "projectId": project_id }))
+                .unwrap();
+            let scoped: serde_json::Value = serde_json::from_str(&scoped).unwrap();
+            let arr = scoped.as_array().unwrap();
+            assert_eq!(arr.len(), 1, "one Spec on {title}'s own board");
+            assert_eq!(arr[0]["title"].as_str().unwrap(), title);
+        }
+
+        // …and the argument-less read sees both, each with the key of ITS project.
+        let all = h.run("spec_list", serde_json::json!({})).unwrap();
+        let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+        let arr = all.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "every project's Specs, from one call");
+        let mut seen: Vec<(String, String)> = arr
+            .iter()
+            .map(|e| {
+                (
+                    e["title"].as_str().unwrap().to_string(),
+                    e["project_key"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "Alpha work");
+        assert_eq!(seen[1].0, "Beta work");
+        assert_ne!(
+            seen[0].1, seen[1].1,
+            "each entry carries its OWN project key — the card's `KEY-number` names its project"
         );
     }
 
@@ -5336,6 +5755,22 @@ mod tests {
         assert_eq!(deps[0]["task_id"].as_str().unwrap(), t2_id);
         // No anchor posed → the derived workspace context is null (a sane state).
         assert!(detail["workspace_context"].is_null());
+        // …and THAT is exactly why the OWNER project travels separately: the detail must be able
+        // to name its project in clear in the cross-project scope, including on a Spec that was
+        // never posed on a dev workspace. Same `HomeProject` wire shape as `spec_list`.
+        let project = &detail["project"];
+        assert_eq!(
+            project["id"].as_str().unwrap(),
+            project_id,
+            "the owner project of the Spec, not the (absent) anchor's"
+        );
+        assert_eq!(project["name"].as_str().unwrap(), "Nyx");
+        for field in ["accent", "icon", "image_path"] {
+            assert!(
+                project.get(field).is_some(),
+                "the identity triplet is present (null is a first-class value): {field}"
+            );
+        }
 
         // Unknown spec id → a readable error.
         let err = h
@@ -5922,6 +6357,93 @@ mod tests {
             "Cache permission resolution"
         );
         assert!(hits[0]["score"].as_f64().unwrap() > 0.0);
+    }
+
+    /// The three IDEA reads WITHOUT a `projectId` are the CROSS-PROJECT Idées table: every
+    /// project's ideas, its themes summed across them, and — the trap this closes — a SEARCH that
+    /// spans the same scope the list does. Each row carries its OWN project's identity, which is
+    /// what `<ProjectMark>` paints (an idea has no `KEY-number` to name its project with).
+    #[test]
+    fn the_idea_reads_without_a_project_span_every_project() {
+        let h = Harness::new();
+        let alpha = make_project(&h, "Alpha", "/tmp/dbcmd-idea-scope-alpha");
+        let beta = make_project(&h, "Beta", "/tmp/dbcmd-idea-scope-beta");
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_idea(
+                    c,
+                    &alpha,
+                    "Cache the loader manifest",
+                    "the loader re-reads it each boot",
+                    Some("perf"),
+                    "manual",
+                )?;
+                nyx_core::db::create_idea(
+                    c,
+                    &beta,
+                    "Parser should stream tokens",
+                    "the parser buffers the whole file",
+                    Some("perf"),
+                    "manual",
+                )?;
+                Ok::<_, diesel::result::Error>(())
+            })
+            .unwrap();
+
+        // LIST — every project, from one call, each row wearing its own project.
+        let all = h.run("idea_list", serde_json::json!({})).unwrap();
+        let all: serde_json::Value = serde_json::from_str(&all).unwrap();
+        let rows = all.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "every project's ideas, from one call");
+        let mut marks: Vec<&str> = rows
+            .iter()
+            .map(|r| r["project"]["name"].as_str().unwrap())
+            .collect();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec!["Alpha", "Beta"],
+            "each row carries the identity `<ProjectMark>` paints"
+        );
+
+        // THEMES — a theme shared by two projects is ONE group with the summed counts.
+        let themes = h.run("idea_themes", serde_json::json!({})).unwrap();
+        let themes: serde_json::Value = serde_json::from_str(&themes).unwrap();
+        let themes = themes.as_array().unwrap();
+        assert_eq!(themes.len(), 1, "the theme is the axis, not the project");
+        assert_eq!(themes[0]["theme"].as_str().unwrap(), "perf");
+        assert_eq!(themes[0]["total"].as_i64().unwrap(), 2);
+
+        // SEARCH — it spans what the list spans. Scoped to Alpha, Beta's idea is out of reach;
+        // unscoped, it is found. That asymmetry IS the trap this closes.
+        let scoped = h
+            .run(
+                "idea_search",
+                serde_json::json!({ "projectId": alpha, "query": "parser stream" }),
+            )
+            .unwrap();
+        let scoped: serde_json::Value = serde_json::from_str(&scoped).unwrap();
+        assert!(
+            !scoped
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["title"] == "Parser should stream tokens"),
+            "Alpha's own backlog does not contain Beta's idea"
+        );
+        let global = h
+            .run("idea_search", serde_json::json!({ "query": "parser stream" }))
+            .unwrap();
+        let global: serde_json::Value = serde_json::from_str(&global).unwrap();
+        assert!(
+            global
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["title"] == "Parser should stream tokens"),
+            "the cross-project search reaches the other project's idea"
+        );
     }
 
     /// `annexe_list` returns a Spec's annexes newest-first, each with its blob `byte_len` (no

@@ -25,15 +25,22 @@ export function KanbanColumn({
   col,
   collapsed,
   onToggle,
+  showProject = false,
 }: {
   col: BoardColumn;
   collapsed: boolean;
   onToggle: () => void;
+  /** CROSS-PROJECT scope: each card opens on its project's mark. Passed straight to the card. */
+  showProject?: boolean;
 }) {
   const meta = statusMeta(col.status);
   return (
     <motion.div
       initial={false}
+      // The column NAMES itself in the DOM: the board is the same page in two scopes, and
+      // "the columns did not move when the scope flipped" is exactly what a test of that has to
+      // be able to ask (`board-scope.test.tsx`).
+      data-testid={`kanban-column-${col.status}`}
       // Motion doesn't reliably animate flex-basis; basis stays a static class (basis-12 =
       // 48px, the collapsed width) + shrink-0, and only flex-grow is animated (0 ↔ 1).
       animate={{ flexGrow: collapsed ? 0 : 1 }}
@@ -58,7 +65,7 @@ export function KanbanColumn({
         </button>
         <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-2 pb-2">
           {col.specs.map((s) => (
-            <SpecCardView key={s.id} spec={s} />
+            <SpecCardView key={s.id} spec={s} showProject={showProject} />
           ))}
           {col.specs.length === 0 ? (
             <p className="px-2 py-6 text-center text-xs text-muted-foreground/40">Empty</p>

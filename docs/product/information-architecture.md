@@ -4,7 +4,7 @@
 
 **Status: partiellement validé — shell de navigation posé (PDR-0025, PDR-0026), structure projet riche encore proposed**
 
-Le **shell multi-pages** est tranché et livré : rail de projets à gauche + section-nav + `<Outlet/>` (PDR-0025), terminaux montés en permanence via le store no-host (PDR-0026). Le shell **livré** expose trois pages — **Terminals** (`/`), **Work** (`/work`), **Knowledge** (`/knowledge`) — validées par le prototype de référence.
+Le **shell multi-pages** est tranché et livré : rail de projets à gauche + section-nav + `<Outlet/>` (PDR-0025), terminaux montés en permanence via le store no-host (PDR-0026). La section-nav est **dérivée du scope** : six entrées dans un projet — **Home** (`/home`), **Terminals** (`/`), **Work** (`/work`), **Ideas** (`/knowledge`), **Engine** (`/engine`), **Design** (`/design`) — et **trois** en scope transverse (« All projects ») : Home, Work, Ideas. Les trois autres n'ont pas de lecture transverse qui ait un sens et sont **absentes** là-bas, jamais grisées. Les libellés `Ideas` et `Design` nomment des routes internes inchangées (`/knowledge`, `/design`) : voir la correspondance au glossaire.
 
 **Écart à réconcilier :** la structure projet **plus riche** décrite ci-dessous (Overview / Specs / Runtime / Knowledge) reste **proposed**. Le shell livré la simplifie (Terminals = Runtime, Work = Specs+Overview) ; « Specs », « Runtime » et les onglets de détail Spec seront branchés à leur tranche (v2.4). Ce document décrit la cible ; le shell v2.2.5 en est la première itération, pas la forme finale.
 

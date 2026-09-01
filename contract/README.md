@@ -5,7 +5,7 @@ TypeScript, this directory holds the **shared cases** that make the two halves
 fail *together*. The fixtures are plain data files read by both suites at test
 time: nothing here is a build step, and neither side builds the other.
 
-Three contracts live here today:
+Four contracts live here today:
 
 1. **the pipe protocol** (`fixtures.json`, PDR-0007, task 523) — below;
 2. **the design half** (`design-fixtures.json`, finding
@@ -22,6 +22,19 @@ Three contracts live here today:
    deliberately forwards what `parse` refuses. That asymmetry is the division of
    labour: the hook recognises a SHAPE and forwards the token raw, the core
    decides a VALUE.
+4. **an agent row's secondary information**
+   (`home-secondary-info.json`, finding `01M1509VGMJH3HHSSJP61GZ3S2`) — the
+   display-time rule "blocked → the question, otherwise the tool in flight,
+   otherwise nothing", written once in Rust (`nyx_core::home::secondary_info`)
+   and once in TS (`secondaryInfo`,
+   `apps/desktop/renderer/src/components/sidebar/use-agent-sessions.tsx`)
+   because the home resolves it in the backend while the sidebar holds only the
+   raw activity map. The file is the CASES: Rust replays them in
+   `home.rs`'s `mod tests`, TS in `use-agent-sessions.test.tsx`, so reordering
+   the rule on either side fails the other. The rank next door needs no fixture —
+   `home-state.ts` derives it from the renderer's own `STATE_PRIORITY` export —
+   which is the rule of thumb here: a shared EXPORT when one side can import the
+   other, a shared FIXTURE when neither can.
 
 ## The pipe protocol
 

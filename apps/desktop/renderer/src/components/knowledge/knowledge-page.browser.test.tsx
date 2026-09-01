@@ -60,6 +60,7 @@ function idea(overrides: Partial<IdeaListItem>): IdeaListItem {
     closed_at: null,
     closed_reason: null,
     linked_specs: [],
+    project: null,
     ...overrides,
   };
 }

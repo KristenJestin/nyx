@@ -216,8 +216,14 @@ export function CataloguePage() {
           <Breadcrumb className="mb-2">
             <BreadcrumbCurrent>Design system</BreadcrumbCurrent>
           </Breadcrumb>
+          {/* `Design`, not `Catalogue`: the UI carries ONE name for this page, the one the rail
+              says (`base-layout.tsx`, where the entry moved up from the foot and took it). The
+              ROUTE stays `/design` — it is an internal identifier on a memory history, never seen.
+              `catalogue` survives as the COMMON NOUN of what the page lists (the empty states, the
+              removal copy) and as the domain concept the backend and the MCP tools carry; it is
+              the page's NAME that could not be two things at once. */}
           <h1 className="font-heading text-xl font-semibold tracking-tight text-foreground">
-            Catalogue
+            Design
           </h1>
           {/* WHAT IS ON SCREEN — and the whole only when nothing narrows it. The nature / linked /
               orphan counts moved onto the filters that produce them (see `matchesFilter`). */}

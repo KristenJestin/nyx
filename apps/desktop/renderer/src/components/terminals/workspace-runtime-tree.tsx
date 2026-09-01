@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { PencilIcon, PlusIcon, Settings2Icon, XIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,7 @@ import { commandGroupTally } from "@/components/command/use-command-group-run";
 import { useCommandGroupsContext } from "@/components/command/command-groups-context";
 import type { CommandGroup } from "@/components/command/use-command-groups";
 import { agentProviderFor } from "@/components/sidebar/agent-providers";
+import { resolveDisplayName } from "@/components/sidebar/auto-label";
 import type { AgentActivity } from "@/components/sidebar/use-agent-sessions";
 import { useRenameTerminal } from "@/components/sidebar/use-terminal-rename";
 import {
@@ -92,6 +93,13 @@ export function WorkspaceRuntimeTree({
   // (human review 01M12MW1DV1V455EWBMV048TE6); the list aggregates it per block with the shared
   // `aggregateState`, so there is no second rollup rule anywhere.
   const { isConsumed } = useConsumedNotifications();
+  // The rank of each terminal in the workspace's OWN list, resolved once. The row render-prop is
+  // handed a terminal and not its index (the sortable list renumbers its members, which is exactly
+  // what this rank must not follow), so without this map every row would scan the array again.
+  const rankById = useMemo(
+    () => new Map(terminals.map((terminal, index) => [terminal.id, index])),
+    [terminals],
+  );
   return (
     <div className="flex flex-col py-2">
       {/* (v2.5.8: the post-crash "Interrupted — Resume/Ignore" restore panel was reverted. A crash
@@ -124,7 +132,14 @@ export function WorkspaceRuntimeTree({
           group={snapshot.workspace.id}
           empty="No open terminals."
           renderRow={(terminal) => (
-            <TerminalRow terminal={terminal} activity={agentActivity?.(terminal.id)} />
+            <TerminalRow
+              terminal={terminal}
+              // The row's rank in the workspace's own list — read from the source array rather
+              // than from the sortable list, whose blocks/folders renumber their members. It
+              // only ever feeds `resolveDisplayName`'s `Terminal <n>` last resort.
+              index={rankById.get(terminal.id) ?? 0}
+              activity={agentActivity?.(terminal.id)}
+            />
           )}
           memberState={(terminal) =>
             terminalRollupState(terminal, agentActivity?.(terminal.id), isConsumed)
@@ -360,9 +375,16 @@ function CommandGroupBlock({
  */
 export function TerminalRow({
   terminal,
+  index = 0,
   activity,
 }: {
   terminal: WorkspaceRuntimeTerminal;
+  /**
+   * The row's position in its list — it feeds ONLY {@link resolveDisplayName}'s `Terminal <n>`
+   * last resort (a terminal with neither a manual label nor a usable cwd). Defaults to `0` so a
+   * caller that has no list position still renders a name.
+   */
+  index?: number;
   activity: AgentActivity | undefined;
 }) {
   const { isSelected } = useRuntimeSelection();
@@ -379,7 +401,18 @@ export function TerminalRow({
   const providerKind = liveSession?.agent_kind ?? terminal.detected_agent_kind ?? undefined;
   const provider = agentProviderFor(providerKind);
   const Icon = provider?.icon ?? LINE_FAMILY_ICON.terminal;
-  const label = terminal.label ?? terminal.cwd;
+  // THE NAME — resolved by `resolveDisplayName`, the app's ONE naming authority (a manual label,
+  // then the live auto label, then the cwd BASENAME, then `Terminal <n>`), so one terminal cannot
+  // be called two things on two screens (review 01M15AWP3W1Y2PD3YHB406ERYT). This line used to
+  // read the raw `terminal.label ?? terminal.cwd`: an unlabelled terminal — the DEFAULT case —
+  // was named by its FULL path here (`c:\users\kris\appdata\local\temp\beta-ld4bfi`) while the
+  // home named the same session by its basename (`beta-ld4bfi`).
+  //
+  // `auto` is `null`: this tree runs no per-row `terminal_info` poll, which is exactly the static
+  // form the home passes too (`homeRowName`) — so the two surfaces resolve the SAME string from
+  // the SAME two fields. The sidebar item that DOES poll (`terminal-item.tsx`) only ever refines
+  // it upwards, through this same function.
+  const label = resolveDisplayName(terminal, index, null);
 
   // AGENT MODE as soon as the line CARRIES an agent glyph — i.e. `providerKind` is defined (a live
   // hook session OR a passively-detected agent), the IDENTICAL predicate that chose the icon above.
@@ -427,7 +460,7 @@ export function TerminalRow({
   const inputRef = useRef<HTMLInputElement>(null);
 
   const beginRename = () => {
-    setDraft(terminal.label?.trim() ? terminal.label : typeof label === "string" ? label : "");
+    setDraft(terminal.label?.trim() ? terminal.label : label);
     setEditing(true);
   };
 
@@ -446,7 +479,9 @@ export function TerminalRow({
     if (editing) inputRef.current?.select();
   }, [editing]);
 
-  const nameForLabels = typeof label === "string" ? label : terminal.id;
+  // `resolveDisplayName` always yields a non-empty string (its last resort is `Terminal <n>`),
+  // so the row's accessible names read the SAME name the user sees.
+  const nameForLabels = label;
 
   return (
     <RuntimeRow

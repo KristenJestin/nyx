@@ -54,11 +54,27 @@ export interface Idea {
 }
 
 /**
+ * WHOSE idea it is — the identity `<ProjectMark>` paints, and the renderer half of
+ * `nyx_core::home::HomeProject` (named after the home, which needed it first, and reused by every
+ * cross-project read model since so a project cannot wear two faces on two screens).
+ */
+export interface IdeaProject {
+  readonly id: string;
+  readonly name: string;
+  readonly accent: string | null;
+  readonly icon: string | null;
+  readonly image_path: string | null;
+}
+
+/**
  * The `idea_list` entry: an `Idea` ENRICHED with its linked Specs — the dense-table ROW (its Spec
- * badges) AND the detail drawer source (body + linked Specs + closure reason from one item).
+ * badges) AND the detail drawer source (body + linked Specs + closure reason from one item) — plus
+ * the PROJECT it belongs to, which the row wears as a mark in the cross-project scope. `null` only
+ * for an idea whose project row has vanished; such a row keeps its place in the flow, unmarked.
  */
 export interface IdeaListItem extends Idea {
   readonly linked_specs: readonly LinkedSpec[];
+  readonly project: IdeaProject | null;
 }
 
 /**

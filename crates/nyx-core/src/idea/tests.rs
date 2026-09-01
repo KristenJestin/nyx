@@ -123,7 +123,7 @@ fn search_combines_fts_and_fuzzy_scored_with_linked_specs() {
     )
     .unwrap();
 
-    let results = search_ideas(&mut conn, &project_id, "authentication", None, None, 10).unwrap();
+    let results = search_ideas(&mut conn, Some(&project_id), "authentication", None, None, 10).unwrap();
 
     // The unrelated idea is excluded; both auth ideas surface.
     let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
@@ -185,14 +185,14 @@ fn search_honors_theme_and_status_filters() {
     .unwrap();
 
     // theme=auth → only idea `a`, even though both match "login".
-    let auth = search_ideas(&mut conn, &project_id, "login", Some("auth"), None, 10).unwrap();
+    let auth = search_ideas(&mut conn, Some(&project_id), "login", Some("auth"), None, 10).unwrap();
     assert_eq!(auth.len(), 1);
     assert_eq!(auth[0].id, a.id);
 
     // status=implemented → nothing until we close one; then only that one.
     assert!(search_ideas(
         &mut conn,
-        &project_id,
+        Some(&project_id),
         "login",
         None,
         Some(db::IDEA_STATUS_IMPLEMENTED),
@@ -203,7 +203,7 @@ fn search_honors_theme_and_status_filters() {
     db::close_idea(&mut conn, &b.id, db::IDEA_STATUS_IMPLEMENTED, Some("done")).unwrap();
     let done = search_ideas(
         &mut conn,
-        &project_id,
+        Some(&project_id),
         "login",
         None,
         Some(db::IDEA_STATUS_IMPLEMENTED),
@@ -229,9 +229,9 @@ fn search_bounds_the_top_n() {
         )
         .unwrap();
     }
-    let top2 = search_ideas(&mut conn, &project_id, "search", None, None, 2).unwrap();
+    let top2 = search_ideas(&mut conn, Some(&project_id), "search", None, None, 2).unwrap();
     assert_eq!(top2.len(), 2, "limit caps the result set");
     // A limit above the ceiling is clamped, not honored literally.
-    let capped = search_ideas(&mut conn, &project_id, "search", None, None, 9_999).unwrap();
+    let capped = search_ideas(&mut conn, Some(&project_id), "search", None, None, 9_999).unwrap();
     assert!(capped.len() <= MAX_SEARCH_LIMIT);
 }

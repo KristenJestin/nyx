@@ -52,8 +52,10 @@ describe("app router", () => {
 
   it("mounts the Knowledge route at `/knowledge`", async () => {
     renderAt("/knowledge");
-    // The Idées view's own heading is "Ideas"; the section-nav still carries a "Knowledge" link.
+    // The page is named `Ideas` everywhere in the UI — heading and rail entry alike; `knowledge`
+    // stays the internal route name (`docs/product/README.md`).
     expect(await screen.findByRole("heading", { name: "Ideas" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Ideas" })).toBeTruthy();
   });
 
   it("accepts a `?terminal=<id>` deep-link on `/` (the Runtime-tab open-terminal seam)", async () => {
@@ -78,7 +80,7 @@ describe("app router", () => {
     renderAt("/work");
     await waitFor(() => expect(screen.getByRole("link", { name: "Work" })).toBeTruthy());
     expect(screen.getByRole("link", { name: "Terminals" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Knowledge" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Ideas" })).toBeTruthy();
     // The "Add project" affordance (never "Add workspace") is on the rail.
     expect(screen.getByRole("button", { name: "Add project" })).toBeTruthy();
   });

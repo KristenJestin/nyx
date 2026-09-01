@@ -40,7 +40,7 @@
 use serde_json::{json, Value};
 
 use crate::agent::{AgentEvent, AgentRegistry};
-use crate::agent_activity::{ActivityEvent, AgentActivityStore};
+use crate::agent_activity::{ActivityEvent, AgentActivityStore, HookFacts};
 use crate::command::{CommandRunner, RunState, RunnerSink};
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
@@ -250,6 +250,23 @@ impl TerminalHost for NoTerminalHost {
 }
 
 // --- Argument helpers specific to this module ------------------------------
+
+/// A CLEARABLE optional string argument — the three-state read a partial-update tool needs:
+/// `None` (omitted ⇒ leave it alone), `Some(None)` (explicit `null` ⇒ CLEAR it) and
+/// `Some(Some(s))` (a value ⇒ set it). Distinct from [`optional_str`], whose `null → None` would
+/// make "clear it" and "leave it alone" the same request on a setting whose absence is a state.
+/// Anything that is not a string or `null` is `invalid_argument`.
+fn clearable_str<'a>(args: &'a Value, key: &str) -> Result<Option<Option<&'a str>>, RpcError> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(s)) => Ok(Some(Some(s.as_str()))),
+        Some(_) => Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!("argument '{key}' must be a string (or null to clear it)"),
+        )),
+    }
+}
 
 /// An OPTIONAL array-of-strings argument as a de-duplicating set (`names`). Absent/null
 /// → `None`; non-array / non-string element → `invalid_argument`.
@@ -1137,36 +1154,42 @@ pub fn add_command(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     ))
 }
 
-/// `set_project_settings` — `{ project_id, name?, resume_agent_sessions?, worktrees_root? }` →
-/// `{ project }`. Modify an EXISTING project's mutable settings (rename, the PRD-5 #5 resume opt-in,
-/// and the worktrees root), the MCP mirror of the UI's project-settings modal. It reuses the SAME
-/// `db::update_project` / `db::set_project_resume_agent_sessions` /
-/// `db::set_project_worktrees_root` writes the UI bridge drives, so both surfaces
+/// `set_project_settings` — `{ project_id, name?, resume_agent_sessions?, worktrees_root?,
+/// accent?, icon?, image? }` → `{ project }`. Modify an EXISTING project's mutable settings
+/// (rename, the PRD-5 #5 resume opt-in, the worktrees root and the project's visual identity), the
+/// MCP mirror of the UI's project-settings modal. It reuses the SAME `db::update_project` /
+/// `db::set_project_resume_agent_sessions` / `db::set_project_worktrees_root` /
+/// `db::set_project_accent` / `db::set_project_mark` writes the UI bridge drives, so both surfaces
 /// converge on one code path. Partial update: only the supplied fields change. Returns the
 /// project's post-write state and a `workspaces` changed effect so any open front re-pulls
 /// (the agent-driven mutation the UI never invoked is reflected without a manual reload).
 ///
-/// `worktrees_root` is the ROOT FOLDER this project's dev workspaces land under. It is the one
-/// argument here where an EMPTY string is a VALUE and not a silence: passing `""` (or `null`) CLEARS
-/// the setting, which is the state a flow needing a workspace reads as "ask the human where". So it
-/// is read from the raw args rather than through [`optional_str`], whose `"" → None` would make
+/// `worktrees_root`, `accent`, `icon` and `image` are the arguments here where an EMPTY value is a
+/// VALUE and not a silence: passing `null` CLEARS the setting (for the root, the state a flow
+/// needing a workspace reads as "ask the human where"; for the identity, the fallback tile). They
+/// are read through [`clearable_str`] rather than [`optional_str`], whose `null → None` would make
 /// "clear it" and "leave it alone" the same request.
+///
+/// `icon` and `image` are the SAME slot in two spellings (the `projects` CHECK enforces it):
+/// supplying one clears the other, and supplying both is `invalid_argument` rather than an
+/// arbitrary winner.
 pub fn set_project_settings(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let new_name = optional_str(args, "name")?;
     let new_resume = optional_bool(args, "resume_agent_sessions")?;
-    let new_worktrees_root: Option<Option<&str>> = match args.get("worktrees_root") {
-        // Omitted → unchanged. Explicitly null/empty → cleared. A path → set.
-        None => None,
-        Some(Value::Null) => Some(None),
-        Some(Value::String(s)) => Some(Some(s.as_str())),
-        Some(_) => {
-            return Err(RpcError::new(
-                RpcCode::InvalidArgument,
-                "argument 'worktrees_root' must be a string (or null to clear it)",
-            ))
-        }
-    };
+    let new_worktrees_root = clearable_str(args, "worktrees_root")?;
+    let new_accent = clearable_str(args, "accent")?;
+    let new_icon = clearable_str(args, "icon")?;
+    let new_image = clearable_str(args, "image")?;
+    // The mark is ONE slot in two spellings (the `projects` CHECK enforces it), so a call that
+    // supplies BOTH is a request nyx cannot honour — refused up front rather than silently
+    // letting one win.
+    if matches!(new_icon, Some(Some(_))) && matches!(new_image, Some(Some(_))) {
+        return Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            "a project carries an 'icon' OR an 'image', never both — pass one of them",
+        ));
+    }
 
     // Validate the id up front so an unknown project yields a clean `invalid_id` rather
     // than a silent zero-row no-op (the writes return rows-updated, not Err, on a bad id).
@@ -1202,6 +1225,25 @@ pub fn set_project_settings(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
 
     if let Some(root) = new_worktrees_root {
         db.with_conn(|c| db::set_project_worktrees_root(c, project_id, root))
+            .map_err(internal_db)?;
+    }
+
+    if let Some(accent) = new_accent {
+        db.with_conn(|c| db::set_project_accent(c, project_id, accent))
+            .map_err(internal_db)?;
+    }
+
+    // ONE write for the mark whichever spelling arrived, so setting one ALWAYS clears the other
+    // (`db::set_project_mark` writes both columns). `Some(None)` on either side is an explicit
+    // "drop the mark" and lands the same way.
+    let new_mark = match (new_icon, new_image) {
+        (Some(Some(icon)), _) => Some(Some(db::ProjectMark::Icon(icon.to_string()))),
+        (_, Some(Some(image))) => Some(Some(db::ProjectMark::Image(image.to_string()))),
+        (Some(None), _) | (_, Some(None)) => Some(None),
+        (None, None) => None,
+    };
+    if let Some(mark) = new_mark {
+        db.with_conn(|c| db::set_project_mark(c, project_id, mark.as_ref()))
             .map_err(internal_db)?;
     }
 
@@ -2242,11 +2284,18 @@ pub fn agent_session_event<S: RunnerSink>(
                 let turn_id = optional_str(args, "prompt_id")?;
                 let _ = db.with_conn(|c| db::record_human_turn(c, terminal_id, turn_id, prompt));
             }
-            let tool_name = args.get("tool_name").and_then(|v| v.as_str());
-            let notification_type = args.get("notification_type").and_then(|v| v.as_str());
-            if let Some(activity_event) =
-                ActivityEvent::from_hook(hook_name, tool_name, notification_type)
-            {
+            // The FACTS off the raw payload. `tool_input` and `message` are the SECONDARY
+            // INFORMATION half (the question Claude is asking, the permission it is blocked on):
+            // the `.cjs` hook already forwards Claude's whole stdin, so both are simply read here
+            // instead of being dropped. Every one is optional and read defensively — a payload
+            // shaped differently yields an event with no text, never an error.
+            let facts = HookFacts {
+                tool_name: args.get("tool_name").and_then(|v| v.as_str()),
+                tool_input: args.get("tool_input"),
+                notification_type: args.get("notification_type").and_then(|v| v.as_str()),
+                message: args.get("message").and_then(|v| v.as_str()),
+            };
+            if let Some(activity_event) = ActivityEvent::from_hook(hook_name, facts) {
                 activity.apply(terminal_id, activity_event);
                 return Ok(ToolOutcome::changed(
                     json!({
@@ -4878,6 +4927,65 @@ mod tests {
         );
     }
 
+    /// The project's VISUAL IDENTITY through the same tool: `accent` and the mark are independent,
+    /// the mark is ONE slot in two spellings (`icon` / `image`), and `list_projects` renders all
+    /// three — which is where the home reads them back. A project that sets nothing keeps the three
+    /// columns null, which IS the repli.
+    #[test]
+    fn set_project_settings_carries_the_identity_and_the_mark_is_exclusive() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/identity-mcp", None))
+            .unwrap();
+        assert_eq!(project.accent, None, "a fresh project has no identity");
+        assert_eq!(project.icon, None);
+        assert_eq!(project.image_path, None);
+
+        // A colour AND a glyph.
+        let out = set_project_settings(
+            &db,
+            &json!({ "project_id": project.id, "accent": "#4f46e5", "icon": "rocket" }),
+        )
+        .unwrap();
+        assert_eq!(out.result["project"]["accent"], json!("#4f46e5"));
+        assert_eq!(out.result["project"]["icon"], json!("rocket"));
+        assert_eq!(out.result["project"]["image_path"], json!(null));
+
+        // Switching to an IMAGE clears the glyph; the accent is untouched (independent halves).
+        set_project_settings(
+            &db,
+            &json!({ "project_id": project.id, "image": "D:/logo.png" }),
+        )
+        .unwrap();
+        let listed = list_projects(&db).unwrap();
+        assert_eq!(listed["projects"][0]["image_path"], json!("D:/logo.png"));
+        assert_eq!(listed["projects"][0]["icon"], json!(null));
+        assert_eq!(listed["projects"][0]["accent"], json!("#4f46e5"));
+
+        // An explicit null CLEARS — back to the repli.
+        set_project_settings(
+            &db,
+            &json!({ "project_id": project.id, "accent": null, "image": null }),
+        )
+        .unwrap();
+        let bare = db
+            .with_conn(|c| db::get_project(c, &project.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(bare.accent, None);
+        assert_eq!(bare.icon, None);
+        assert_eq!(bare.image_path, None);
+
+        // Asking for BOTH spellings at once is refused, not arbitrated.
+        let err = set_project_settings(
+            &db,
+            &json!({ "project_id": project.id, "icon": "rocket", "image": "D:/logo.png" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+    }
+
     #[test]
     fn set_project_settings_unknown_id_is_invalid_id() {
         let _g = db_guard();
@@ -5455,6 +5563,96 @@ mod tests {
             Activity::Working,
             "a new prompt after a declined question clears the stuck yellow (#26)"
         );
+    }
+
+    /// THE SECONDARY INFORMATION, end to end over the real hook path: the data ALREADY arrives
+    /// (the `.cjs` hook forwards Claude's whole stdin), so this proves the tool now RETAINS it —
+    /// the `AskUserQuestion` `tool_input`, the permission `message`, the in-flight `tool_name` —
+    /// and that a payload of an unexpected shape degrades to "no info" WITHOUT failing the hook.
+    #[test]
+    fn agent_session_event_captures_the_question_the_permission_and_the_tool() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        // Built ONCE and borrowed by every send: the hook path takes a runner since the managed
+        // commands joined the agent context, and this test only ever needs it to exist.
+        let runner = noop_runner();
+        let send = |payload: Value| {
+            agent_session_event(&db, &runner, &activity, &payload).expect("a hook is never failed")
+        };
+
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
+
+        // A TOOL in flight: its name is retained, not just used as a discriminant.
+        send(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": "cargo test" },
+            "NYX_TERMINAL_ID": tid,
+        }));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Working);
+        assert_eq!(snap.tool.as_deref(), Some("Bash"));
+
+        // A QUESTION: the tool_input is read and the row can say what is being asked.
+        send(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": { "questions": [{ "question": "Ship it or hold?" }] },
+            "NYX_TERMINAL_ID": tid,
+        }));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Waiting);
+        assert_eq!(snap.waiting_on.as_deref(), Some("Ship it or hold?"));
+
+        // ANSWERED → back to Working, and the question is gone with the yellow.
+        send(json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "AskUserQuestion",
+            "NYX_TERMINAL_ID": tid,
+        }));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Working);
+        assert_eq!(snap.waiting_on, None);
+
+        // A PERMISSION: Claude's own message is the text.
+        send(json!({
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt",
+            "message": "Claude needs your permission to use Bash",
+            "NYX_TERMINAL_ID": tid,
+        }));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Waiting);
+        assert_eq!(
+            snap.waiting_on.as_deref(),
+            Some("Claude needs your permission to use Bash")
+        );
+
+        // AN UNEXPECTED PAYLOAD still blocks, with no info — and the hook does NOT fail (`send`
+        // unwraps, so an Err here fails this test).
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
+        let out = send(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": { "surprise": [1, 2, 3] },
+            "NYX_TERMINAL_ID": tid,
+        }));
+        assert_eq!(out.result["activity"], json!(true));
+        let snap = activity.snapshot(&tid).unwrap();
+        assert_eq!(snap.activity, Activity::Waiting, "the block still happens");
+        assert_eq!(snap.waiting_on, None, "…with no text rather than a guess");
+        // A payload with NO `tool_input` at all is the same story.
+        send(json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }));
+        send(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "NYX_TERMINAL_ID": tid,
+        }));
+        assert_eq!(activity.snapshot(&tid).unwrap().waiting_on, None);
     }
 
     /// A clean `SessionEnd` clears the runtime activity too (the clean-end anti-phantom

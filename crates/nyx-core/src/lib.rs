@@ -54,6 +54,7 @@ pub mod frontier;
 pub mod git_diff;
 pub mod git_views;
 pub mod git_watch;
+pub mod home;
 pub mod idea;
 pub mod integrations;
 pub mod mcp;

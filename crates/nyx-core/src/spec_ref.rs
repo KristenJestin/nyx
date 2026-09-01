@@ -285,7 +285,7 @@ pub fn likely_candidate(
     // very reason). `n - wanted` on a negative `number` would then overflow — a debug panic, a wrap
     // in release — and `i64::MIN.abs()` panics either way. Saturating keeps a "how far off is this?"
     // heuristic total: at that distance the ordering it produces is the same one.
-    Ok(db::list_specs(conn, project_id)?
+    Ok(db::list_specs(conn, Some(project_id))?
         .into_iter()
         .min_by_key(|s| {
             let n = i64::from(s.number);

@@ -627,15 +627,6 @@ struct CurrentPhase {
     name: String,
 }
 
-/// A phase entry parsed from `specs.phases` (`[{number,name}]`, PDR-0022) — a local mirror
-/// (the `db` one is private) used only to name the resolved current phase.
-#[derive(serde::Deserialize)]
-struct PhaseEntry {
-    number: i64,
-    #[serde(default)]
-    name: String,
-}
-
 /// Resolve the CURRENT phase from the Spec's `phases` plan + its `tasks`: the lowest phase
 /// number that still carries a non-terminal (not done, not cancelled) task. Returns `None`
 /// for a flat plan (no phases) or an all-terminal Spec.
@@ -644,7 +635,11 @@ fn resolve_current_phase(phases_json: &str, tasks: &[db::Task]) -> Option<Curren
     if trimmed.is_empty() || trimmed == "[]" {
         return None;
     }
-    let entries: Vec<PhaseEntry> = serde_json::from_str(trimmed).ok()?;
+    // The phase plan is parsed with `db::PhaseEntry` — the one declaration of what a
+    // `specs.phases` entry IS. This file used to carry a byte-identical local mirror, justified
+    // by "the db one is private"; it is `pub(crate)` since the home read model started reading it
+    // (`home::spec_progress`), so the mirror had lost its reason to exist.
+    let entries: Vec<db::PhaseEntry> = serde_json::from_str(trimmed).ok()?;
     // The phases (by number) that still have open work.
     let mut open: Vec<i64> = tasks
         .iter()
@@ -1083,7 +1078,7 @@ fn render_agent_context_with_rules(
             // The Spec AUTHOR weaves the project's OTHER live Specs (anti-duplication); the other
             // roles never need them, so we only pay the query for the `spec` role.
             let sibling_specs = if role == AgentRole::Spec {
-                db::list_specs(c, &spec.project_id)?
+                db::list_specs(c, Some(&spec.project_id))?
             } else {
                 Vec::new()
             };
@@ -1383,7 +1378,7 @@ fn render_spec_authoring(
     match project {
         Some(p) => {
             let specs = db
-                .with_conn(|c| db::list_specs(c, &p.id))
+                .with_conn(|c| db::list_specs(c, Some(&p.id)))
                 .map_err(internal_db)?;
             if specs.is_empty() {
                 out.push_str(
@@ -1421,7 +1416,7 @@ fn render_spec_authoring(
                 .with_conn(|c| {
                     db::list_ideas(
                         c,
-                        &p.id,
+                        Some(&p.id),
                         db::IdeaStatusFilter::One(db::IDEA_STATUS_OPEN),
                         None,
                         SPEC_AUTHORING_IDEA_PREVIEW,

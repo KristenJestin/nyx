@@ -884,6 +884,15 @@ export type BackendCommand =
   // WITHOUT a Spec. Same shape + same shared read model as `workspace_runtime_snapshot`, keyed
   // on the project (resolves `primary_workspace_id`, root fallback). `{ projectId }`.
   | "workspace_runtime_primary"
+  // The HOME read model — the synthesis page in either scope: pass `{ projectId }` for a
+  // project's home, NOTHING for the cross-project one. ONE read returns the four families
+  // (agent sessions with their state, running/failed services, recently-touched Specs, bare
+  // terminals), already sorted `waiting > error > ready > working > idle` with the oldest first
+  // in each rank — a single flat flow, never grouped by project. Deliberately NOT a
+  // `workspace_runtime_snapshot` per workspace: that costs one IPC each, which in the global
+  // scope is dozens of round trips for one page. Read-only; re-pulled on the same coarse
+  // invalidation topics the runtime aggregate uses.
+  | "home_snapshot"
   // v2.2 workspace CONTEXT-RESTORE plan (task 01KWHPV33M4H5YSMGYNW9TG6J0): after a restart,
   // WHAT a workspace offers to resume — computed by REUSING the existing resume policies (no
   // 3rd system): per-session `decide_resume` verdicts (`resume_sessions`) + the

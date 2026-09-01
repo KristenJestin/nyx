@@ -75,6 +75,8 @@ function activity(overrides: Partial<AgentActivity> = {}): AgentActivity {
     readyUnread: false,
     errorUnread: false,
     pluginOutdated: false,
+    waitingOn: null,
+    tool: null,
     ...overrides,
   };
 }

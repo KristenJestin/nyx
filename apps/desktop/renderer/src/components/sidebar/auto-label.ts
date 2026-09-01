@@ -85,7 +85,12 @@ export function autoLabel(
  * Pure → unit-tested. This is the single authority the sidebar item renders.
  */
 export function resolveDisplayName(
-  record: TerminalRecord,
+  // WIDENED to the two fields the policy actually reads (from the whole `TerminalRecord`) so the
+  // HOME can call the SAME authority: its rows come from the `home_snapshot` read model, which
+  // carries a terminal's label + cwd and none of the record's storage fields. Narrowing the input
+  // is what makes "the home's label is the sidebar's label" a shared function instead of a shared
+  // intention. Every existing caller still passes a full record.
+  record: Pick<TerminalRecord, "label" | "cwd">,
   index: number,
   auto: string | null,
 ): string {

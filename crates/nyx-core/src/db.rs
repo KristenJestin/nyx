@@ -471,6 +471,33 @@ pub struct Project {
     /// path under it); the WHAT — clone, worktree, root files, setup commands — stays out of scope
     /// and belongs to idea 01M04W3RZ333NC01R216MNXAFK. Full note on `build_nspec` in `crate::seed`.
     pub worktrees_root: Option<String>,
+    /// The project's ACCENT colour — an opaque string the core stores and never interprets (the
+    /// renderer resolves it against the design system). `None` (the default) means the project has
+    /// no chosen identity colour and falls back to the neutral tile. CHOSEN, never derived: a
+    /// deterministic hash on [`Project::key`] was explicitly ruled out — a colour nobody picked is
+    /// a colour nobody recognises.
+    pub accent: Option<String>,
+    /// The project's MARK as a glyph token (resolved by the renderer's icon set), or `None`.
+    /// Mutually exclusive with [`Project::image_path`] — the two are the same slot in two
+    /// spellings, and the exclusion is a SQL CHECK, not a convention (see [`set_project_mark`]).
+    pub icon: Option<String>,
+    /// The project's MARK as an image (a file path or URL the renderer renders as an `<img>`), or
+    /// `None`. Mutually exclusive with [`Project::icon`].
+    pub image_path: Option<String>,
+}
+
+/// The project's MARK — the identity glyph shown beside a project, in its two mutually exclusive
+/// spellings. Modelled as ONE value because that is what the DB CHECK enforces: a project carries
+/// at most one mark, never a glyph AND a picture. `None` at the call sites clears both columns.
+///
+/// The core never interprets either payload: it stores the string and the renderer resolves it
+/// (a glyph token against its icon set, a path/URL as an image source).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectMark {
+    /// A glyph token, resolved by the renderer's icon set.
+    Icon(String),
+    /// A file path or URL rendered as an image.
+    Image(String),
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -1702,15 +1729,34 @@ pub fn get_spec(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Spe
         .optional()
 }
 
-/// List the Specs of `project_id`, ordered by `position` (then `number`) for a
-/// deterministic board order. Excludes soft-archived rows (`archived_at IS NOT NULL`) so
-/// callers see only the LIVE Specs.
+/// List the Specs of one project, or of EVERY project, ordered by `position` (then `number`,
+/// then `id`) for a deterministic board order. Excludes soft-archived rows (`archived_at IS NOT
+/// NULL`) so callers see only the LIVE Specs.
+///
+/// `project_id` is the SCOPE, spelled the way the home read model spells it
+/// ([`home_sessions`] & co.): `Some(id)` is one project's board, `None` is the CROSS-PROJECT one
+/// — every project's Specs in a single query, never a per-project fan-out. No `kind` narrowing:
+/// the scope is "all of them", and a project the rail does not list is still a project.
+///
+/// The `id` tiebreak only matters in the cross-project scope, where `(position, number)` is no
+/// longer unique (it is per project); inside one project it changes nothing.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn list_specs(conn: &mut SqliteConnection, project_id: &str) -> QueryResult<Vec<Spec>> {
-    specs::table
-        .filter(specs::project_id.eq(project_id))
+pub fn list_specs(
+    conn: &mut SqliteConnection,
+    project_id: Option<&str>,
+) -> QueryResult<Vec<Spec>> {
+    let mut query = specs::table
         .filter(specs::archived_at.is_null())
-        .order((specs::position.asc(), specs::number.asc()))
+        .into_boxed();
+    if let Some(id) = project_id {
+        query = query.filter(specs::project_id.eq(id.to_string()));
+    }
+    query
+        .order((
+            specs::position.asc(),
+            specs::number.asc(),
+            specs::id.asc(),
+        ))
         .select(Spec::as_select())
         .load(conn)
 }
@@ -2242,10 +2288,10 @@ pub enum ReadyValidation {
 /// [`resolve_or_create_phase`] GROWS the plan from a task's phase name; the column stays the
 /// JSON source of truth.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-struct PhaseEntry {
-    number: i64,
+pub(crate) struct PhaseEntry {
+    pub(crate) number: i64,
     #[serde(default)]
-    name: String,
+    pub(crate) name: String,
 }
 
 /// Run the PRE-READY VALIDATIONS on a Spec and return the list of failures (empty = the
@@ -5325,10 +5371,13 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "nodes.updated_at",
     "nodes.workflow_id",
     "projects",
+    "projects.accent",
     "projects.archived_at",
     "projects.collapsed",
     "projects.created_at",
+    "projects.icon",
     "projects.id",
+    "projects.image_path",
     "projects.key",
     "projects.name",
     "projects.order",
@@ -6574,6 +6623,61 @@ pub fn set_project_worktrees_root(
     diesel::update(projects::table.find(id))
         .set((
             projects::worktrees_root.eq(root),
+            projects::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Trim a chosen-identity string down to its stored form: blank becomes `None`. The
+/// [`set_project_worktrees_root`] reflex — an empty accent and an unset accent are the SAME state
+/// for every reader, and a config whose "absent" has two spellings gets checked for one of them.
+fn identity_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Persist a project's ACCENT colour, bumping `updated_at`. `None` (or a blank string) CLEARS it,
+/// which puts the project back on the neutral tile. Returns rows updated (0 if the id is unknown).
+/// The core stores the string and never interprets it — the renderer resolves it against the
+/// design system.
+pub fn set_project_accent(
+    conn: &mut SqliteConnection,
+    id: &str,
+    accent: Option<&str>,
+) -> QueryResult<usize> {
+    diesel::update(projects::table.find(id))
+        .set((
+            projects::accent.eq(accent.and_then(identity_value)),
+            projects::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Persist a project's MARK — its glyph OR its image — bumping `updated_at`. `None` (or a blank
+/// payload) CLEARS both columns, which puts the project back on its initial. Returns rows updated
+/// (0 if the id is unknown).
+///
+/// The mark is ONE argument ([`ProjectMark`]) rather than two precisely so the "icon OR image,
+/// never both" exclusion cannot be spelled wrong here: writing a [`ProjectMark::Icon`] NULLs
+/// `image_path` and vice versa, which is also what the column CHECK requires.
+pub fn set_project_mark(
+    conn: &mut SqliteConnection,
+    id: &str,
+    mark: Option<&ProjectMark>,
+) -> QueryResult<usize> {
+    let (icon, image_path) = match mark {
+        Some(ProjectMark::Icon(v)) => (identity_value(v), None),
+        Some(ProjectMark::Image(v)) => (None, identity_value(v)),
+        None => (None, None),
+    };
+    diesel::update(projects::table.find(id))
+        .set((
+            projects::icon.eq(icon),
+            projects::image_path.eq(image_path),
             projects::updated_at.eq(now_millis()),
         ))
         .execute(conn)
@@ -9124,6 +9228,320 @@ pub fn active_agent_sessions(conn: &mut SqliteConnection) -> QueryResult<Vec<Act
         .load::<ActiveAgentSession>(conn)
 }
 
+// --- HOME read model: the four joined queries behind the synthesis pages ---------------
+//
+// The home (one project, or every project at once) is ONE aggregate over four families:
+// agent sessions, services, recent Specs, bare terminals. It is served by FOUR joined reads —
+// not by fanning out `workspace_runtime_snapshot` per workspace, which costs one IPC EACH and
+// turns the cross-project view into dozens of round trips.
+//
+// Every one of them takes the SAME scope argument: `Some(project_id)` for a project home,
+// `None` for the cross-project one. The joins go `terminals → workspaces → projects` and are
+// LEFT joins on purpose: neither `terminals.workspace_id` nor `agent_sessions.workspace_id`
+// is NOT NULL, so a session on a loose terminal has no workspace and no project. It comes back
+// with a null project rather than being dropped or attached to an arbitrary one.
+//
+// These functions carry NO policy: they select rows and let `crate::home` decide what is in the
+// flow, in what order, and what each line says. The one thing they do decide is a BOUND (a
+// closed terminal, an archived Spec), because that belongs to the query.
+
+/// One agent SESSION row of the home, joined to everything a line needs: the session, its host
+/// terminal (for the label + the focus target), and — when the terminal has one — its workspace
+/// and project (for the project mark and the branch).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable)]
+pub struct HomeSessionRow {
+    pub session_id: String,
+    /// The persisted `agent_sessions.state` — always `active`, since that is the only state the
+    /// query loads. Carried anyway so the caller feeds it to
+    /// [`crate::home::session_attention`], which stays the ONE place the state exclusions are
+    /// decided rather than having the call site assert what the query already bounded.
+    pub session_state: String,
+    pub agent_kind: String,
+    pub started_at: i64,
+    /// The FOCUS target: which terminal to select to land on this session.
+    pub terminal_id: String,
+    /// The terminal's manual label, `None` when never renamed — the first rung of the display
+    /// name the renderer resolves (`resolveDisplayName`).
+    pub terminal_label: Option<String>,
+    /// The terminal's cwd — the basename is the display-name fallback, and the path is what a
+    /// human recognises the session by.
+    pub terminal_cwd: String,
+    pub workspace_id: Option<String>,
+    pub workspace_name: Option<String>,
+    pub workspace_branch: Option<String>,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub project_accent: Option<String>,
+    pub project_icon: Option<String>,
+    pub project_image_path: Option<String>,
+}
+
+/// One SERVICE row of the home — a managed-command instance joined to its template (the name)
+/// and to its workspace/project. `last_state` is the PERSISTED outcome; the caller overlays the
+/// live runner state over it before deciding whether the row belongs on the home at all.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable)]
+pub struct HomeServiceRow {
+    pub instance_id: String,
+    pub name: String,
+    pub last_state: String,
+    pub last_exit_code: Option<i32>,
+    pub unread: bool,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub workspace_branch: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+    pub project_accent: Option<String>,
+    pub project_icon: Option<String>,
+    pub project_image_path: Option<String>,
+}
+
+/// One recent SPEC row of the home, with its project's identity (the human key is
+/// `project_key-number`).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable)]
+pub struct HomeSpecRow {
+    pub spec_id: String,
+    pub number: i32,
+    pub title: String,
+    pub status: String,
+    /// The ordered phase plan as stored (`[{number,name}]` JSON, PDR-0022; `[]` = unphased).
+    /// Carried RAW because the home resolves the card's phase label from it — parsing belongs
+    /// to the read model, not to a query.
+    pub phases: String,
+    pub updated_at: i64,
+    pub project_id: String,
+    pub project_key: String,
+    pub project_name: String,
+    pub project_accent: Option<String>,
+    pub project_icon: Option<String>,
+    pub project_image_path: Option<String>,
+}
+
+/// One TERMINAL row of the home — the same join as a session row, minus the session. The caller
+/// drops the ones that host an agent (those are session rows, not bare shells).
+#[derive(Debug, Clone, PartialEq, Eq, Queryable)]
+pub struct HomeTerminalRow {
+    pub terminal_id: String,
+    pub label: Option<String>,
+    pub cwd: String,
+    pub exec_state: String,
+    pub exec_state_unread: bool,
+    pub workspace_id: Option<String>,
+    pub workspace_name: Option<String>,
+    pub workspace_branch: Option<String>,
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub project_accent: Option<String>,
+    pub project_icon: Option<String>,
+    pub project_image_path: Option<String>,
+}
+
+/// Every agent session on an ALIVE terminal, for one project or across all of them. Oldest
+/// started first, which is the tiebreak the home's rank sort preserves within a rank.
+///
+/// BOUNDS, not policy: a `closed` terminal is excluded (its PTY is gone and its session cannot
+/// be focused), and only the `active` state is loaded — `ended`, `unknown` and `resume_failed`
+/// are sessions [`crate::home::session_attention`] refuses anyway (see its doc for why `ended`
+/// carries no exception), so shipping them to the caller would only be rows it drops.
+pub fn home_sessions(
+    conn: &mut SqliteConnection,
+    project_id: Option<&str>,
+) -> QueryResult<Vec<HomeSessionRow>> {
+    let mut query = agent_sessions::table
+        .inner_join(terminals::table.on(terminals::id.eq(agent_sessions::terminal_id)))
+        .left_join(workspaces::table.on(workspaces::id.nullable().eq(terminals::workspace_id)))
+        .left_join(
+            projects::table.on(projects::id
+                .nullable()
+                .eq(workspaces::project_id.nullable())),
+        )
+        .filter(terminals::status.eq(STATUS_ALIVE))
+        .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
+        .into_boxed();
+    if let Some(id) = project_id {
+        query = query.filter(projects::id.nullable().eq(Some(id)));
+    }
+    query
+        .order((agent_sessions::started_at.asc(), agent_sessions::id.asc()))
+        .select((
+            agent_sessions::id,
+            agent_sessions::state,
+            agent_sessions::agent_kind,
+            agent_sessions::started_at,
+            agent_sessions::terminal_id,
+            terminals::label,
+            terminals::cwd,
+            workspaces::id.nullable(),
+            workspaces::name.nullable(),
+            workspaces::branch.nullable(),
+            projects::id.nullable(),
+            projects::name.nullable(),
+            projects::accent.nullable(),
+            projects::icon.nullable(),
+            projects::image_path.nullable(),
+        ))
+        .load::<HomeSessionRow>(conn)
+}
+
+/// Every materialized command instance, for one project or across all of them, joined to its
+/// template and its workspace/project. Inner joins throughout: an instance ALWAYS belongs to a
+/// workspace, which always belongs to a project. Ordered oldest-updated first so the caller's
+/// stable sort keeps the longest-standing service on top of its rank.
+pub fn home_services(
+    conn: &mut SqliteConnection,
+    project_id: Option<&str>,
+) -> QueryResult<Vec<HomeServiceRow>> {
+    let mut query = command_instances::table
+        .inner_join(managed_commands::table)
+        .inner_join(workspaces::table)
+        .inner_join(projects::table.on(projects::id.eq(workspaces::project_id)))
+        .into_boxed();
+    if let Some(id) = project_id {
+        query = query.filter(projects::id.eq(id));
+    }
+    query
+        .order((
+            command_instances::updated_at.asc(),
+            command_instances::id.asc(),
+        ))
+        .select((
+            command_instances::id,
+            managed_commands::name,
+            command_instances::last_state,
+            command_instances::last_exit_code,
+            command_instances::unread,
+            command_instances::workspace_id,
+            workspaces::name,
+            workspaces::branch,
+            projects::id,
+            projects::name,
+            projects::accent,
+            projects::icon,
+            projects::image_path,
+        ))
+        .load::<HomeServiceRow>(conn)
+}
+
+/// The most recently touched Specs, for one project or across all of them — `limit` rows,
+/// newest activity first. "Last activity" is `specs.updated_at`, which every Spec mutation
+/// bumps. Archived Specs are excluded (a BOUND: an archived Spec is not where work is).
+pub fn home_specs(
+    conn: &mut SqliteConnection,
+    project_id: Option<&str>,
+    limit: i64,
+) -> QueryResult<Vec<HomeSpecRow>> {
+    let mut query = specs::table
+        .inner_join(projects::table.on(projects::id.eq(specs::project_id)))
+        .filter(specs::archived_at.is_null())
+        .into_boxed();
+    if let Some(id) = project_id {
+        query = query.filter(specs::project_id.eq(id));
+    }
+    query
+        .order((specs::updated_at.desc(), specs::id.desc()))
+        .limit(limit)
+        .select((
+            specs::id,
+            specs::number,
+            specs::title,
+            specs::status,
+            specs::phases,
+            specs::updated_at,
+            projects::id,
+            projects::key,
+            projects::name,
+            projects::accent,
+            projects::icon,
+            projects::image_path,
+        ))
+        .load::<HomeSpecRow>(conn)
+}
+
+/// One PLAN TASK of a home Spec card — the three columns its progress is folded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeSpecTaskRow {
+    /// Which Spec the task belongs to — the rows come back for a batch of cards at once.
+    pub spec_id: String,
+    /// The task's phase number, `None` on a flat (unphased) plan.
+    pub phase: Option<i32>,
+    pub status: String,
+}
+
+/// The PLAN tasks of the given Specs — one [`HomeSpecTaskRow`] per task — for the home's
+/// per-card progress (the `done/total` tally and which phase the work is on).
+///
+/// ONE query for the whole page, keyed on the ids [`home_specs`] just returned: the ceiling is
+/// [`crate::home::RECENT_SPECS`], so this is a bounded `IN (…)`, never a per-card round trip.
+///
+/// `kind=review` tasks are EXCLUDED, the same exclusion [`current_phase_for_spec`] makes and for
+/// the same reason: a finding is the rework a review triggers ON TOP of the plan, so counting it
+/// would push a delivered Spec's bar backwards the moment its first finding lands.
+pub fn home_spec_tasks(
+    conn: &mut SqliteConnection,
+    spec_ids: &[String],
+) -> QueryResult<Vec<HomeSpecTaskRow>> {
+    if spec_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = tasks::table
+        .filter(tasks::spec_id.eq_any(spec_ids))
+        .filter(tasks::kind.ne(TASK_KIND_REVIEW))
+        .select((tasks::spec_id, tasks::phase, tasks::status))
+        .load::<(Option<String>, Option<i32>, String)>(conn)?;
+    // `spec_id` is NULLABLE in the schema, but the filter above already restricts to the ids in
+    // hand, so every row has one. Unwrapped by pattern rather than by assertion.
+    Ok(rows
+        .into_iter()
+        .filter_map(|(spec_id, phase, status)| {
+            spec_id.map(|spec_id| HomeSpecTaskRow {
+                spec_id,
+                phase,
+                status,
+            })
+        })
+        .collect())
+}
+
+/// Every ALIVE terminal, for one project or across all of them, with its optional workspace and
+/// project. This returns ALL of them — including the ones hosting an agent: the caller drops
+/// those, because it is the one that already knows which terminals carry a session (it just
+/// loaded them) and so avoids a fifth query to ask the same question twice.
+pub fn home_terminals(
+    conn: &mut SqliteConnection,
+    project_id: Option<&str>,
+) -> QueryResult<Vec<HomeTerminalRow>> {
+    let mut query = terminals::table
+        .left_join(workspaces::table.on(workspaces::id.nullable().eq(terminals::workspace_id)))
+        .left_join(
+            projects::table.on(projects::id
+                .nullable()
+                .eq(workspaces::project_id.nullable())),
+        )
+        .filter(terminals::status.eq(STATUS_ALIVE))
+        .into_boxed();
+    if let Some(id) = project_id {
+        query = query.filter(projects::id.nullable().eq(Some(id)));
+    }
+    query
+        .order((terminals::order_index.asc(), terminals::id.asc()))
+        .select((
+            terminals::id,
+            terminals::label,
+            terminals::cwd,
+            terminals::exec_state,
+            terminals::exec_state_unread,
+            workspaces::id.nullable(),
+            workspaces::name.nullable(),
+            workspaces::branch.nullable(),
+            projects::id.nullable(),
+            projects::name.nullable(),
+            projects::accent.nullable(),
+            projects::icon.nullable(),
+            projects::image_path.nullable(),
+        ))
+        .load::<HomeTerminalRow>(conn)
+}
+
 /// All sessions of `terminal_id` (every state), newest started last
 /// (`started_at` asc, `id` asc tiebreak). A terminal keeps many historical rows.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -9774,23 +10192,31 @@ pub enum IdeaStatusFilter<'a> {
     One(&'a str),
 }
 
-/// LIST the ideas of `project_id`, newest-first, filtered by `status` scope and/or `theme`, and
-/// BOUNDED by `limit`/`offset`. This is the paginated fetch-all fallback (the "secours" of PRD
-/// Impl Decisions): the primary read is `idea_search`; this is the raw dump, always capped so it
-/// can never re-create the flat unbounded list Depot drowned in. The `status` scope is
-/// [`IdeaStatusFilter`] — `Active` (open+planned) is the maintained default the MCP tool applies.
+/// LIST the ideas of one project — or of EVERY project — newest-first, filtered by `status` scope
+/// and/or `theme`, and BOUNDED by `limit`/`offset`. This is the paginated fetch-all fallback (the
+/// "secours" of PRD Impl Decisions): the primary read is `idea_search`; this is the raw dump,
+/// always capped so it can never re-create the flat unbounded list Depot drowned in. The `status`
+/// scope is [`IdeaStatusFilter`] — `Active` (open+planned) is the maintained default the MCP tool
+/// applies.
+///
+/// `project_id` is the PROJECT scope, spelled the way the home read model spells it
+/// ([`home_sessions`] & co.): `Some(id)` is one project's backlog, `None` is the CROSS-PROJECT one
+/// — every project's ideas in a single query, never a per-project fan-out, and with no `kind`
+/// narrowing that could hide a project from it. The order already carried an `id` tiebreak, which
+/// is what keeps it deterministic once two projects' rows can share a `created_at`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn list_ideas(
     conn: &mut SqliteConnection,
-    project_id: &str,
+    project_id: Option<&str>,
     status: IdeaStatusFilter,
     theme: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> QueryResult<Vec<Idea>> {
-    let mut query = ideas::table
-        .filter(ideas::project_id.eq(project_id))
-        .into_boxed();
+    let mut query = ideas::table.into_boxed();
+    if let Some(id) = project_id {
+        query = query.filter(ideas::project_id.eq(id.to_string()));
+    }
     match status {
         IdeaStatusFilter::All => {}
         IdeaStatusFilter::Active => {
@@ -10233,29 +10659,36 @@ pub fn merge_ideas(
     })
 }
 
-/// FTS5 full-text match over `ideas_fts` (external content on `ideas.rowid`), scoped to
-/// `project_id`, best-match first (`bm25` ascending — smaller is better), capped at `limit`.
-/// `match_query` is a caller-built FTS5 MATCH expression (see `crate::idea::build_fts_query`,
+/// FTS5 full-text match over `ideas_fts` (external content on `ideas.rowid`), scoped to one
+/// project or to EVERY project, best-match first (`bm25` ascending — smaller is better), capped at
+/// `limit`. `match_query` is a caller-built FTS5 MATCH expression (see `crate::idea::build_fts_query`,
 /// which sanitizes the user's terms). Returns each hit's idea `id` + `bm25` `score`. An
 /// invalid/empty match expression should be avoided by the caller (it would error in FTS5).
+///
+/// `project_id` is the SCOPE, as in [`list_ideas`]: `None` searches the whole backlog of every
+/// project. A search that stayed inside the entered project while the page showed all of them
+/// would be a silent trap — the query has to span exactly what the list spans.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn fts_match_ideas(
     conn: &mut SqliteConnection,
-    project_id: &str,
+    project_id: Option<&str>,
     match_query: &str,
     limit: i64,
 ) -> QueryResult<Vec<IdeaFtsHit>> {
     use diesel::sql_types::{BigInt, Text};
+    // The project predicate is a BOUND parameter either way (`?2 IS NULL OR …`) rather than two
+    // hand-written statements: one query, one place where the join and the ordering live.
     diesel::sql_query(
         "SELECT i.id AS id, bm25(ideas_fts) AS score \
          FROM ideas_fts \
          JOIN ideas i ON i.rowid = ideas_fts.rowid \
-         WHERE ideas_fts MATCH ? AND i.project_id = ? \
+         WHERE ideas_fts MATCH ? AND (? IS NULL OR i.project_id = ?) \
          ORDER BY score ASC \
          LIMIT ?",
     )
     .bind::<Text, _>(match_query)
-    .bind::<Text, _>(project_id)
+    .bind::<diesel::sql_types::Nullable<Text>, _>(project_id)
+    .bind::<diesel::sql_types::Nullable<Text>, _>(project_id)
     .bind::<BigInt, _>(limit)
     .load::<IdeaFtsHit>(conn)
 }
@@ -10297,7 +10730,7 @@ pub struct IdeaThemeGroup {
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn list_idea_themes(
     conn: &mut SqliteConnection,
-    project_id: &str,
+    project_id: Option<&str>,
     include_terminal: bool,
 ) -> QueryResult<Vec<IdeaThemeGroup>> {
     // The active-only default restricts the rows counted to the live backlog; the opt-in spans all.
@@ -10306,6 +10739,10 @@ pub fn list_idea_themes(
     } else {
         "AND status IN ('open', 'planned') "
     };
+    // `project_id` is the SCOPE, as in [`list_ideas`]: `None` groups EVERY project's backlog, so a
+    // theme shared by two projects is ONE group with the summed counts — the theme is the axis,
+    // and splitting it per project would be the grouping the cross-project view explicitly does
+    // not invent. The predicate is a bound parameter (`? IS NULL OR …`) so there is one statement.
     diesel::sql_query(format!(
         "SELECT theme AS theme, \
          COUNT(*) AS total, \
@@ -10315,11 +10752,12 @@ pub fn list_idea_themes(
          SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed, \
          SUM(CASE WHEN status = 'dropped' THEN 1 ELSE 0 END) AS dropped \
          FROM ideas \
-         WHERE project_id = ? {scope}\
+         WHERE (? IS NULL OR project_id = ?) {scope}\
          GROUP BY theme \
          ORDER BY total DESC, theme ASC"
     ))
-    .bind::<diesel::sql_types::Text, _>(project_id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(project_id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(project_id)
     .load::<IdeaThemeGroup>(conn)
 }
 
@@ -16664,11 +17102,11 @@ mod tests {
         .unwrap();
 
         // list_ideas is project-scoped + bounded; a theme filter narrows it.
-        let all = list_ideas(&mut conn, &project.id, IdeaStatusFilter::All, None, 50, 0).unwrap();
+        let all = list_ideas(&mut conn, Some(&project.id), IdeaStatusFilter::All, None, 50, 0).unwrap();
         assert_eq!(all.len(), 2, "only this project's ideas");
         let auth = list_ideas(
             &mut conn,
-            &project.id,
+            Some(&project.id),
             IdeaStatusFilter::All,
             Some("auth"),
             50,
@@ -16679,7 +17117,7 @@ mod tests {
         assert_eq!(auth[0].id, idea.id);
         // The bound really caps the dump.
         assert_eq!(
-            list_ideas(&mut conn, &project.id, IdeaStatusFilter::All, None, 1, 0)
+            list_ideas(&mut conn, Some(&project.id), IdeaStatusFilter::All, None, 1, 0)
                 .unwrap()
                 .len(),
             1
@@ -16968,7 +17406,7 @@ mod tests {
         assert_eq!(closed.status, IDEA_STATUS_CLOSED);
         // The FTS index + triggers survived the column rebuild: the idea is still searchable, and
         // the status-scan index + idea_specs FK still hold (a link inserts + reads back).
-        let hits = fts_match_ideas(&mut conn, &project.id, "\"body\"*", 10).unwrap();
+        let hits = fts_match_ideas(&mut conn, Some(&project.id), "\"body\"*", 10).unwrap();
         assert!(
             hits.iter().any(|h| h.id == idea.id),
             "fts still indexes the row"
@@ -17303,7 +17741,7 @@ mod tests {
         .unwrap();
 
         // include_terminal=true: the FULL breakdown (every status) the renderer's mini-dots paint.
-        let groups = list_idea_themes(&mut conn, &project.id, true).unwrap();
+        let groups = list_idea_themes(&mut conn, Some(&project.id), true).unwrap();
         assert_eq!(
             groups.len(),
             3,
@@ -17341,7 +17779,7 @@ mod tests {
         // include_terminal=false (the maintained default): only the ACTIVE backlog is counted, so
         // `auth`'s total drops to 2 (open+planned; the implemented one is terminal) and the wholly
         // terminal `ui` theme (a lone dropped idea) drops out entirely.
-        let active = list_idea_themes(&mut conn, &project.id, false).unwrap();
+        let active = list_idea_themes(&mut conn, Some(&project.id), false).unwrap();
         assert_eq!(
             active.len(),
             2,
@@ -17367,7 +17805,7 @@ mod tests {
         );
 
         // An empty project yields no groups (either scope).
-        assert!(list_idea_themes(&mut conn, "no-such-project", true)
+        assert!(list_idea_themes(&mut conn, Some("no-such-project"), true)
             .unwrap()
             .is_empty());
     }
@@ -18528,11 +18966,11 @@ mod tests {
         .unwrap();
 
         // Match on a body term, project-scoped: only idea `a`.
-        let hits = fts_match_ideas(&mut conn, &project.id, "login", 10).unwrap();
+        let hits = fts_match_ideas(&mut conn, Some(&project.id), "login", 10).unwrap();
         assert_eq!(hits.len(), 1, "project-scoped, body-term match");
         assert_eq!(hits[0].id, a.id);
         // Match on a title term.
-        let title_hits = fts_match_ideas(&mut conn, &project.id, "authentication", 10).unwrap();
+        let title_hits = fts_match_ideas(&mut conn, Some(&project.id), "authentication", 10).unwrap();
         assert_eq!(title_hits.len(), 1);
         assert_eq!(title_hits[0].id, a.id);
 
@@ -18546,13 +18984,13 @@ mod tests {
             .execute(&mut conn)
             .unwrap();
         assert!(
-            fts_match_ideas(&mut conn, &project.id, "login", 10)
+            fts_match_ideas(&mut conn, Some(&project.id), "login", 10)
                 .unwrap()
                 .is_empty(),
             "old body term re-indexed away"
         );
         assert_eq!(
-            fts_match_ideas(&mut conn, &project.id, "passkeys", 10)
+            fts_match_ideas(&mut conn, Some(&project.id), "passkeys", 10)
                 .unwrap()
                 .len(),
             1,
@@ -18564,7 +19002,7 @@ mod tests {
             .execute(&mut conn)
             .unwrap();
         assert!(
-            fts_match_ideas(&mut conn, &project.id, "authentication", 10)
+            fts_match_ideas(&mut conn, Some(&project.id), "authentication", 10)
                 .unwrap()
                 .is_empty(),
             "deleted idea gone from the index"
@@ -21142,7 +21580,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SetSpecWorkspaceError::WorkspaceNotFound));
         assert_eq!(
-            list_specs(&mut conn, &project.id).unwrap().len(),
+            list_specs(&mut conn, Some(&project.id)).unwrap().len(),
             1,
             "the refused creation wrote no Spec"
         );
@@ -28897,6 +29335,76 @@ mod tests {
                 .as_deref(),
             Some("D:/wt2"),
             "and it is writable again through the same setter"
+        );
+    }
+
+    /// MIGRATION 20260828182220: a project's CHOSEN visual identity. A fresh project has NONE of
+    /// the three columns set — that absence is the repli (the renderer draws the initial on a
+    /// neutral tile), so it has to be a clean `None` and never an empty string. The setter then
+    /// writes the colour and the mark independently, and the mark is ONE slot in two spellings:
+    /// picking an image DROPS the glyph and vice versa, which the column CHECK enforces even
+    /// against a write that bypasses the setter.
+    #[test]
+    fn project_identity_is_optional_and_the_mark_is_exclusive() {
+        let mut conn = open_in_memory();
+        let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/identity", None).unwrap();
+        let read = |conn: &mut SqliteConnection| get_project(conn, &project.id).unwrap().unwrap();
+
+        // THE REPLI: a project nobody dressed carries no identity at all.
+        let fresh = read(&mut conn);
+        assert_eq!(fresh.accent, None, "a fresh project has no accent");
+        assert_eq!(fresh.icon, None, "…no glyph");
+        assert_eq!(fresh.image_path, None, "…and no image");
+
+        // A colour AND a glyph: both halves land, through their own setter.
+        set_project_accent(&mut conn, &project.id, Some("primary")).unwrap();
+        set_project_mark(
+            &mut conn,
+            &project.id,
+            Some(&ProjectMark::Icon("rocket".to_string())),
+        )
+        .unwrap();
+        let dressed = read(&mut conn);
+        assert_eq!(dressed.accent.as_deref(), Some("primary"));
+        assert_eq!(dressed.icon.as_deref(), Some("rocket"));
+        assert_eq!(dressed.image_path, None);
+
+        // Switching to an IMAGE drops the glyph — one slot, two spellings — and leaves the
+        // colour, which is the other, independent half.
+        set_project_mark(
+            &mut conn,
+            &project.id,
+            Some(&ProjectMark::Image("D:/logo.png".to_string())),
+        )
+        .unwrap();
+        let swapped = read(&mut conn);
+        assert_eq!(swapped.icon, None, "choosing an image clears the glyph");
+        assert_eq!(swapped.image_path.as_deref(), Some("D:/logo.png"));
+        assert_eq!(
+            swapped.accent.as_deref(),
+            Some("primary"),
+            "the accent is untouched by a mark change"
+        );
+
+        // A blank accent is the SAME state as no accent (one spelling of absent), and a `None`
+        // mark clears both columns back to the repli.
+        set_project_accent(&mut conn, &project.id, Some("   ")).unwrap();
+        set_project_mark(&mut conn, &project.id, None).unwrap();
+        let cleared = read(&mut conn);
+        assert_eq!(
+            cleared.accent, None,
+            "a blank accent is normalised to unset"
+        );
+        assert_eq!(cleared.icon, None);
+        assert_eq!(cleared.image_path, None);
+
+        // The exclusion is STRUCTURAL: a write that spells both refuses at the DB, not at the
+        // setter that happens to be well-behaved.
+        assert!(
+            diesel::sql_query("UPDATE projects SET icon = 'rocket', image_path = 'D:/logo.png'")
+                .execute(&mut conn)
+                .is_err(),
+            "the CHECK refuses a project carrying a glyph AND an image"
         );
     }
 

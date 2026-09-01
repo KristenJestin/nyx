@@ -57,9 +57,29 @@ export interface Spec {
 }
 
 /** The `spec_list` entry: a Spec + its board-card derivations (`spec_list` db-command). */
+/**
+ * WHOSE Spec it is — the identity `<ProjectMark>` paints, and the renderer half of
+ * `nyx_core::home::HomeProject`, the one wire shape every cross-project read model carries (the
+ * home's rows and `IdeaListItem` carry the same one, so a project cannot wear two faces).
+ */
+export interface SpecProject {
+  readonly id: string;
+  readonly name: string;
+  readonly accent: string | null;
+  readonly icon: string | null;
+  readonly image_path: string | null;
+}
+
 export interface SpecListEntry extends Spec {
   /** The project's Linear prefix — the card's human key is `project_key-number`. */
   readonly project_key: string;
+  /**
+   * The project's IDENTITY, which the card and the table row wear as a mark in the cross-project
+   * scope. `null` for a Spec whose project row has vanished (the card stays, unmarked) — and
+   * OPTIONAL on the wire so an entry built before this field existed (a fixture, an older payload)
+   * simply reads as "no mark".
+   */
+  readonly project?: SpecProject | null;
   /** Tasks reaching `done` (the progress bar's numerator). */
   readonly tasks_done: number;
   /** Total tasks of the Spec (the denominator). */
@@ -178,6 +198,18 @@ export interface SpecDetail {
   readonly revision: SpecRevision;
   readonly tasks: readonly Task[];
   readonly dependencies: readonly TaskDependency[];
+  /**
+   * The OWNER project's identity — what the detail's context rail names in clear in the
+   * cross-project scope, next to its `<ProjectMark>`.
+   *
+   * It is NOT {@link SpecWorkspaceContext.project}: that one is derived through the dev workspace,
+   * so it is absent on any Spec not yet anchored and carries no accent/icon/image. This field
+   * comes off `spec.project_id` on the Rust side, in the one `HomeProject` wire shape every
+   * cross-project read model carries. `null` for a Spec whose project row has vanished (the rail
+   * then names no project at all) — and OPTIONAL on the wire, so a payload built before the field
+   * existed reads as "no project" rather than as a crash.
+   */
+  readonly project?: SpecProject | null;
   readonly workspace_context: SpecWorkspaceContext | null;
 }
 

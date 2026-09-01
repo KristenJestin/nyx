@@ -144,6 +144,7 @@ function renderLayout(initialEntry = "/") {
     createRoute({ getParentRoute: () => rootRoute, path, component: () => <div>{text}</div> });
   const routeTree = rootRoute.addChildren([
     mk("/", "TERMINALS PAGE"),
+    mk("/home", "HOME PAGE"),
     mk("/work", "WORK PAGE"),
     mk("/work/$specId", "SPEC PAGE"),
     mk("/knowledge", "KNOWLEDGE PAGE"),
@@ -199,11 +200,10 @@ describe("BaseLayout", () => {
    * `onEnter` callback, which only called `setActiveProjectId` and never navigated.
    *
    * So this test asserts the two things SEPARATELY — the selection moved (`aria-current`) AND the
-   * ROUTE left the old project's page for the entered project's default page (`/`, already scoped
-   * to the active project and restoring its last terminal). Only the second assertion is red
-   * before the fix, which is exactly the defect.
+   * ROUTE left the old project's page for the entered project's HOME. Only the second assertion is
+   * red before the fix, which is exactly the defect.
    */
-  it("entering another project LEAVES the previous project's page for `/` (route, not just selection)", async () => {
+  it("entering another project LEAVES the previous project's page for its HOME (route, not just selection)", async () => {
     const { router } = renderLayout("/work/s1");
     const beta = await screen.findByRole("button", { name: "Project Beta" });
     // Starting point: a project-scoped page (a Spec of the project one is currently in).
@@ -214,16 +214,40 @@ describe("BaseLayout", () => {
 
     // The SELECTION follows the click (this half already worked)…
     await waitFor(() => expect(beta.getAttribute("aria-current")).toBe("true"));
-    // …and so does the ROUTE: the view lands on the entered project's default page.
-    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
-    expect(await screen.findByText("TERMINALS PAGE")).toBeTruthy();
+    // …and so does the ROUTE: the view lands on the entered project's home.
+    await waitFor(() => expect(router.state.location.pathname).toBe("/home"));
+    expect(await screen.findByText("HOME PAGE")).toBeTruthy();
   });
 
-  it("renders the section-nav (Terminals / Work / Knowledge) and the index page in the Outlet", async () => {
+  /**
+   * THE SWITCH ALWAYS LANDS ON THE HOME, FROM EVERY PAGE (user feedback: « si je suis sur une autre
+   * page et que je change de projet au lieu d'aller dans terminals ca va sur la home »).
+   *
+   * This test used to assert the opposite — that `/work` and `/knowledge` still landed on `/`,
+   * which is what the switch did before the home became the one landing page. The list is the
+   * whole section-nav plus the Catalogue at its foot: none of them is an exception, and the landing
+   * search is `{}` everywhere so nothing of the page one left rides along. (The `/` case, with its
+   * stale-deep-link semantics, is covered by `project-switch.test.tsx` against the real pages.)
+   */
+  it("lands on the project's HOME from every other page — `/work`, `/knowledge`, `/`", async () => {
+    for (const from of ["/work", "/knowledge", "/"]) {
+      const { router, unmount } = renderLayout(from);
+      const beta = await screen.findByRole("button", { name: "Project Beta" });
+      expect(router.state.location.pathname).toBe(from);
+
+      fireEvent.click(beta);
+
+      await waitFor(() => expect(router.state.location.pathname).toBe("/home"));
+      expect(router.state.location.search).toEqual({});
+      unmount();
+    }
+  });
+
+  it("renders the section-nav (Terminals / Work / Ideas) and the index page in the Outlet", async () => {
     renderLayout("/");
     expect(await screen.findByRole("link", { name: "Terminals" })).toBeTruthy();
     expect(screen.getByRole("link", { name: "Work" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Knowledge" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Ideas" })).toBeTruthy();
     expect(screen.getByText("TERMINALS PAGE")).toBeTruthy();
   });
 
@@ -235,27 +259,30 @@ describe("BaseLayout", () => {
   });
 
   /**
-   * DONE-CRITERION (finding `01KZ41YKMB63GFJ3QMK2ZHJN1C`, point 1) — THE CATALOGUE IS IN THE APP
-   * RAIL, AT ITS FOOT.
+   * DONE-CRITERION (H5) — THE DESIGN ENTRY CAME UP FROM THE FOOT INTO THE SECTION-NAV, ONCE.
    *
-   * It was ALSO a link in the PROTOTYPE page's own header — a project-wide reference living in the
-   * chrome of one page. That copy is gone (`specs/prototype-page.test.tsx` asserts its absence), so
-   * this is the one entry point, and it must be reachable from every screen: it is a rail entry like
-   * the others, placed with Settings rather than with the work sections, because it is consulted
-   * FROM a screen, not worked in.
+   * It used to sit at the foot of the rail under the label `Catalogue` (finding
+   * `01KZ41YKMB63GFJ3QMK2ZHJN1C`, since lifted): the foot was for the REFERENCE surfaces,
+   * consulted FROM the screen one is on. The design system turned out to be a section of the
+   * project like the others, so the entry moved up and took the name the rest of the app uses. The
+   * ROUTE is untouched — only the label and the place moved — and it is NOT duplicated: nothing
+   * is left between the section-nav and the Settings control.
    */
-  it("routes to the catalogue from the FOOT of the rail, under the work sections", async () => {
+  it("puts Design LAST in the section-nav — not at the foot, and not twice", async () => {
     renderLayout("/");
-    const catalogue = await screen.findByRole("link", { name: "Catalogue" });
-    expect(catalogue.getAttribute("href")).toBe("/design");
-    // AT THE FOOT: after every work section, and beside the Settings control.
-    const knowledge = screen.getByRole("link", { name: "Knowledge" });
-    expect(
-      knowledge.compareDocumentPosition(catalogue) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    const design = await screen.findByRole("link", { name: "Design" });
+    expect(design.getAttribute("href")).toBe("/design");
+    // The former label is gone from the rail entirely.
+    expect(screen.queryByRole("link", { name: "Catalogue" })).toBeNull();
+    // IN the section-nav list, after every other entry — one entry, one list.
+    const ideas = screen.getByRole("link", { name: "Ideas" });
+    expect(design.closest("ul")).toBe(ideas.closest("ul"));
+    expect(screen.getAllByRole("link", { name: "Design" })).toHaveLength(1);
+    expect(ideas.compareDocumentPosition(design) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // …and the Settings control still closes the rail below it.
     const settings = screen.getByRole("button", { name: "Settings" });
     expect(
-      catalogue.compareDocumentPosition(settings) & Node.DOCUMENT_POSITION_FOLLOWING,
+      design.compareDocumentPosition(settings) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
 });
@@ -304,7 +331,7 @@ describe("BaseLayout — navigation cross-fade (View Transitions API)", () => {
     expect(vtDoc.startViewTransition).toBeUndefined();
     renderLayout("/");
     expect(await screen.findByText("TERMINALS PAGE")).toBeTruthy();
-    fireEvent.click(screen.getByRole("link", { name: "Knowledge" }));
+    fireEvent.click(screen.getByRole("link", { name: "Ideas" }));
     expect(await screen.findByText("KNOWLEDGE PAGE")).toBeTruthy();
   });
 

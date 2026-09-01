@@ -389,7 +389,8 @@ fn action_in_flight_is_never_unloaded() {
         .expect("spawn pty");
 
     rt.activity().apply(&record, ActivityEvent::PromptSubmitted);
-    rt.activity().apply(&record, ActivityEvent::ToolStarted); // a long action begins.
+    rt.activity()
+        .apply(&record, ActivityEvent::ToolStarted { tool: None }); // a long action begins.
     let u = rt.unload_idle_sessions(Duration::ZERO, &no_visits(), &events);
     assert!(
         u.is_empty() && rt.pty().is_live_record(&record),

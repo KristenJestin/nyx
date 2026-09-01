@@ -1484,7 +1484,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     descriptors.push(json!({
         "name": SET_PROJECT_SETTINGS_TOOL,
         "description": "Change an EXISTING project's settings, via the SAME path as the \
-                        UI's project-settings modal. You can rename it (`name`) and/or \
+                        UI's project-settings modal. You can rename it (`name`), give it a \
+                        visual identity (`accent` plus `icon` OR `image`) and/or \
                         turn its agent-session resume on/off (`resume_agent_sessions`): \
                         when on, nyx re-attaches that project's terminals' active agent \
                         sessions at relaunch (exact --resume) instead of opening a bare \
@@ -1511,6 +1512,26 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                                    from it instead of asking you where. Pass an empty string (or \
                                    null) to CLEAR it, which puts the flow back on asking. Unchanged \
                                    if omitted.",
+                }),
+                "accent": json!({
+                    "type": "string",
+                    "description": "optional; the project's ACCENT COLOUR — how a human recognises \
+                                   this project at a glance in a list that mixes several. Pass \
+                                   null (or an empty string) to CLEAR it, which puts the project \
+                                   back on the neutral tile. Unchanged if omitted.",
+                }),
+                "icon": json!({
+                    "type": "string",
+                    "description": "optional; the project's MARK as an icon name. Mutually \
+                                   exclusive with `image` — supplying one CLEARS the other, and \
+                                   supplying both is an error. Pass null to clear the mark, which \
+                                   falls back to the project's initial. Unchanged if omitted.",
+                }),
+                "image": json!({
+                    "type": "string",
+                    "description": "optional; the project's MARK as an image (a file path or URL). \
+                                   Mutually exclusive with `icon` — see it. Pass null to clear the \
+                                   mark. Unchanged if omitted.",
                 }),
             },
             "required": ["project_id"],

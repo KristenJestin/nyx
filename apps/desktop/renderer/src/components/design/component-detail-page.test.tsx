@@ -668,9 +668,10 @@ describe("ComponentDetailPage", () => {
     expect(screen.getAllByText("Button")).toHaveLength(1);
     expect(screen.getByRole("heading", { name: "Button" })).toBeTruthy();
     // The BREADCRUMB's own way back — scoped, because the app rail also routes to `/design` since
-    // the catalogue link left the prototype page's chrome (finding `01KZ41YKMB63GFJ3QMK2ZHJN1C`).
+    // that link left the prototype page's chrome (finding `01KZ41YKMB63GFJ3QMK2ZHJN1C`). It reads
+    // `Design`, the ONE name the rail and the page itself carry.
     expect(
-      within(screen.getByTestId("breadcrumb")).getByRole("link", { name: "Catalogue" }),
+      within(screen.getByTestId("breadcrumb")).getByRole("link", { name: "Design" }),
     ).toBeTruthy();
     expect(screen.queryByText("DS")).toBeNull();
   });

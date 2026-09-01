@@ -52,6 +52,18 @@ interface AgentActivityRow {
    * Runtime-only (never persisted); set once at SessionStart, cleared on session restart.
    */
   plugin_outdated?: boolean;
+  /**
+   * WHAT the agent is blocked on while `activity === "waiting"` — the `AskUserQuestion` question
+   * it asked, or the permission prompt it is waiting for. `null`/absent when nothing blocks, AND
+   * when the block exists but the hook payload carried no readable text: no info is a legitimate
+   * answer, and the yellow dot already carries the message. Runtime-only, like everything here.
+   */
+  waiting_on?: string | null;
+  /**
+   * The tool currently IN FLIGHT — the fallback secondary information, read when the agent is not
+   * blocked. `null`/absent when nothing is running.
+   */
+  tool?: string | null;
 }
 
 /** The per-terminal activity the row consumes (the `terminal_id` is the map key). */
@@ -69,6 +81,43 @@ export interface AgentActivity {
    * The row shows a muted ⚠ affordance inviting a session restart. See `AgentActivityRow`.
    */
   pluginOutdated: boolean;
+  /**
+   * The question / permission the agent is blocked on, or `null`. See `AgentActivityRow`. The
+   * home's row reads it through {@link secondaryInfo}, which decides WHICH of the two texts (if
+   * either) is shown.
+   */
+  waitingOn: string | null;
+  /** The tool currently in flight, or `null`. See `AgentActivityRow`. */
+  tool: string | null;
+}
+
+/**
+ * The SECONDARY INFORMATION of a row — what the agent is asking, or what it is doing — resolved in
+ * ONE order: the block if it is blocked, otherwise the tool in flight, otherwise NOTHING. The last
+ * branch is the rule, not a gap: a row with nothing to say renders no filler text.
+ *
+ * The exact twin of `nyx_core::home::secondary_info`, kept here so a renderer holding only the
+ * activity map (the sidebar, a tooltip) resolves it the same way as the home read model does. A
+ * `waiting` row whose text is missing shows nothing rather than falling through to a tool it is
+ * not running.
+ *
+ * WHAT KEEPS THE TWO FROM DRIFTING: `contract/home-secondary-info.json`, the shared case table
+ * replayed by BOTH suites — `use-agent-sessions.test.tsx` here and
+ * `nyx_core::home::tests::secondary_info_prefers_the_block_then_the_tool_then_nothing` there.
+ * Reorder the rule on either side and the other side's suite fails. That is the same mooring
+ * `home-state.ts` gets from `STATE_PRIORITY`, done with the one mechanism that crosses a language
+ * boundary (see `contract/README.md`).
+ *
+ * ITS READER (the debt this function was written against, settled in phase 2): the home's
+ * `<HomeSessionRow>`. The page lives under the `<Outlet/>`, outside the `<AgentSessionsProvider>`,
+ * and takes `useAgentSessions()` directly for the LIVE activity map; a row with an entry in it
+ * resolves its information slot through THIS function and falls back to the snapshot's
+ * already-resolved `HomeSession.secondary` otherwise. The two authorities agree because they run
+ * the same rule off the same fixture — reading the live one only makes the line fresher.
+ */
+export function secondaryInfo(activity: AgentActivity): string | null {
+  if (activity.activity === "waiting") return activity.waitingOn;
+  return activity.tool;
 }
 
 /**
@@ -161,6 +210,10 @@ export function useAgentSessions(): AgentSessionsState {
                   readyUnread: a.ready_unread,
                   errorUnread: a.error_unread ?? false,
                   pluginOutdated: a.plugin_outdated ?? false,
+                  // Absent and null are the SAME state (no info) — a payload the backend could
+                  // not read is indistinguishable from one that carried nothing, on purpose.
+                  waitingOn: a.waiting_on ?? null,
+                  tool: a.tool ?? null,
                 });
               }
               byActivity = next;

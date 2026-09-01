@@ -272,7 +272,7 @@ describe("Deep-linked Specs enter their owner project", () => {
 
   /**
    * THE TWO HALVES OF FIX 2 MEETING (the regression this suite exists to hold): the rail ENTERS a
-   * project and routes to `/`, while a Spec page ENTERS its owner project. On a real Spec page both
+   * project and routes to its home, while a Spec page ENTERS its owner project. On a real Spec page both
    * are live at once, and a sync that watched the SELECTION would undo the rail click mid-flight —
    * the tile would light up, snap back, and the user would still be in the Spec's project.
    */
@@ -283,7 +283,7 @@ describe("Deep-linked Specs enter their owner project", () => {
     // Leave Beta's Spec for Alpha, from the rail.
     fireEvent.click(await tile("Alpha"));
 
-    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/home"));
     await expectEntered("Alpha", "Beta");
   });
 

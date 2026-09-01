@@ -51,6 +51,7 @@ Lexique de référence des termes du produit nyx V2. Définitions courtes ; la v
 
 ## Knowledge & mémoire projet
 
+- **Knowledge** — **parapluie**, pas un synonyme d'« idées » : le knowledge projet stocké dans nyx couvre les **idées** *et* le **design-system** (README, décision 16). Le terme est **interne** — il nomme la route `/knowledge`, jamais une surface. Correspondance à ne pas « corriger » : la page des idées s'appelle **`Ideas`** dans l'UI et vit sur la route interne **`/knowledge`** ; la page du design-system s'appelle **`Design`** — entrée de rail, titre de page et fil d'Ariane du détail composant, tous anciennement libellés `Catalogue` — et vit sur **`/design`**. `catalogue` y reste le **nom commun** de ce que la page liste (états vides, copie de retrait) et le concept que portent la base et les outils MCP : c'est le *nom* de la surface qui ne pouvait pas être double, pas le concept. Les deux routes sont invisibles (le routeur tourne sur une memory history, PDR-0025) : renommer `/knowledge` en `/ideas` rétrécirait un concept du glossaire pour l'aligner sur une seule de ses deux surfaces, pour zéro bénéfice utilisateur.
 - **Idea** — capture pré-engagement, promouvable en Spec.
 - **ADR** — Architecture Decision Record (numéroté par projet).
 - **Directive** — fragment de contexte/règle projet ; constitue le playbook (« directives v2 »).

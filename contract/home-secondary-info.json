@@ -1,0 +1,77 @@
+{
+  "_comment": [
+    "THE SECONDARY INFORMATION of an agent row — the short text beside the label saying what the",
+    "agent is asking, or what it is doing. The rule is resolved at DISPLAY time over two raw facts",
+    "the activity snapshot holds, in ONE order: the block if the agent is blocked, otherwise the",
+    "tool in flight, otherwise NOTHING (no filler sentence — the dot already carries the message).",
+    "",
+    "It is implemented TWICE, once per side of the boundary:",
+    "  * Rust — nyx_core::home::secondary_info (crates/nyx-core/src/home.rs)",
+    "  * TS   — secondaryInfo (apps/desktop/renderer/src/components/sidebar/use-agent-sessions.tsx)",
+    "",
+    "This file is the CASES, read by both suites at test time, so reordering the rule on one side",
+    "fails the other. Adding a case here fails BOTH suites until BOTH implementations agree —",
+    "the same mechanism design-fixtures.json and spec-ref-corpus.txt use.",
+    "",
+    "`activity` is the resolved kind (nyx_core::agent_activity::Activity / AgentActivityKind).",
+    "`waiting_on` and `tool` are the two raw facts. `secondary` is what BOTH must return."
+  ],
+  "cases": [
+    {
+      "id": "blocked-shows-the-question-over-any-tool",
+      "why": "the block outranks the tool: a blocked agent is not doing, it is asking",
+      "activity": "waiting",
+      "waiting_on": "Ship it or hold?",
+      "tool": "Bash",
+      "secondary": "Ship it or hold?"
+    },
+    {
+      "id": "blocked-with-no-readable-text-says-nothing",
+      "why": "NEVER the tool underneath — that would caption a blocked agent with something it is not doing",
+      "activity": "waiting",
+      "waiting_on": null,
+      "tool": "Bash",
+      "secondary": null
+    },
+    {
+      "id": "working-falls-back-to-the-tool-in-flight",
+      "why": "the only fallback, and only when nothing blocks",
+      "activity": "working",
+      "waiting_on": null,
+      "tool": "Bash",
+      "secondary": "Bash"
+    },
+    {
+      "id": "working-with-no-tool-renders-no-filler",
+      "why": "step 3 is a rule, not an oversight",
+      "activity": "working",
+      "waiting_on": null,
+      "tool": null,
+      "secondary": null
+    },
+    {
+      "id": "idle-with-nothing-renders-no-filler",
+      "why": "the quiet row says nothing at all",
+      "activity": "idle",
+      "waiting_on": null,
+      "tool": null,
+      "secondary": null
+    },
+    {
+      "id": "not-blocked-reads-the-tool-whatever-the-kind",
+      "why": "the branch is on `waiting`, not on `working` — an idle snapshot still holding a tool reads it",
+      "activity": "idle",
+      "waiting_on": null,
+      "tool": "Bash",
+      "secondary": "Bash"
+    },
+    {
+      "id": "a-stale-block-text-is-ignored-once-the-agent-is-working",
+      "why": "`waiting_on` is only consulted while the kind IS `waiting`; an answered question is not a caption",
+      "activity": "working",
+      "waiting_on": "Ship it or hold?",
+      "tool": "Bash",
+      "secondary": "Bash"
+    }
+  ]
+}

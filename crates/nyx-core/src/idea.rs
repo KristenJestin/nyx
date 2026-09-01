@@ -185,18 +185,23 @@ pub fn make_extract(title: &str, body: &str, query_terms: &[String]) -> String {
     out
 }
 
-/// SEARCH the ideas of `project_id` for `query`, returning a top-N SCORED over FTS5 + a fuzzy
-/// trigram pass (best first). `theme` / `status` NARROW the candidate set (a `None` filter is
-/// "any"); `limit` is clamped to `[1, MAX_SEARCH_LIMIT]` (default [`DEFAULT_SEARCH_LIMIT`]).
-/// Each result carries the idea's title, a match extract, the blended score, and its linked
-/// Specs. An empty/termless query degrades to the most-recent matching ideas (score 0).
+/// SEARCH the ideas of one project — or of EVERY project — for `query`, returning a top-N SCORED
+/// over FTS5 + a fuzzy trigram pass (best first). `theme` / `status` NARROW the candidate set (a
+/// `None` filter is "any"); `limit` is clamped to `[1, MAX_SEARCH_LIMIT]` (default
+/// [`DEFAULT_SEARCH_LIMIT`]). Each result carries the idea's title, a match extract, the blended
+/// score, and its linked Specs. An empty/termless query degrades to the most-recent matching
+/// ideas (score 0).
+///
+/// `project_id` is the SCOPE (`None` = every project, the same spelling [`db::list_ideas`] takes):
+/// a search that stayed inside the entered project while the page listed all of them would be a
+/// silent trap — the query spans exactly what the list spans.
 ///
 /// Orchestration only: reads through the `db` authority (`fts_match_ideas` + a bounded
 /// `list_ideas` candidate set, unioned so an FTS hit past the cap is never lost), then scores
 /// with the pure helpers above.
 pub fn search_ideas(
     conn: &mut SqliteConnection,
-    project_id: &str,
+    project_id: Option<&str>,
     query: &str,
     theme: Option<&str>,
     status: Option<&str>,

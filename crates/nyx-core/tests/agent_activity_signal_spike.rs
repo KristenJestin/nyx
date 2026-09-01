@@ -65,7 +65,7 @@ fn long_action_in_flight_never_reads_idle() {
     let store = AgentActivityStore::new();
     let t = "rec-2";
     store.apply(t, ActivityEvent::PromptSubmitted);
-    store.apply(t, ActivityEvent::ToolStarted); // a long-running tool begins (e.g. a build).
+    store.apply(t, ActivityEvent::ToolStarted { tool: None }); // a long-running tool begins (e.g. a build).
 
     // Observe MANY times (as the unload sweep would poll) — never Idle while in flight.
     for i in 0..1000 {
@@ -105,7 +105,7 @@ fn blocked_on_user_reads_waiting_not_idle() {
     let t = "rec-3";
     store.apply(t, ActivityEvent::PromptSubmitted);
 
-    let s = store.apply(t, ActivityEvent::AttentionNeeded); // a permission prompt.
+    let s = store.apply(t, ActivityEvent::AttentionNeeded { permission: None }); // a permission prompt.
     assert_eq!(
         s.activity,
         Activity::Waiting,
@@ -123,7 +123,7 @@ fn bare_interrupt_fails_safe_stays_working() {
     let store = AgentActivityStore::new();
     let t = "rec-4";
     store.apply(t, ActivityEvent::PromptSubmitted);
-    store.apply(t, ActivityEvent::ToolStarted);
+    store.apply(t, ActivityEvent::ToolStarted { tool: None });
     // User hits Esc — Claude emits NO hook. The store cannot observe the abort, so it stays
     // Working. For the unload this is the SAFE direction: keep, never unload.
     assert_eq!(
@@ -146,7 +146,7 @@ fn clear_on_death_drops_to_idle() {
     let store = AgentActivityStore::new();
     let t = "rec-5";
     store.apply(t, ActivityEvent::PromptSubmitted);
-    store.apply(t, ActivityEvent::ToolStarted);
+    store.apply(t, ActivityEvent::ToolStarted { tool: None });
     assert_eq!(store.snapshot(t).unwrap().activity, Activity::Working);
     store.clear(t); // PTY death / SessionEnd.
     assert!(

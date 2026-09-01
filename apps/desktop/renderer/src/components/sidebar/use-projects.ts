@@ -49,6 +49,23 @@ export interface ProjectRecord {
    * terminal with a live session here triggers the close-warning (#6).
    */
   resume_agent_sessions: boolean;
+  /**
+   * The project's CHOSEN accent colour, or `null`/absent when it has none. An opaque string the
+   * backend stores and never interprets — the renderer resolves it (`<ProjectMark>`), falling
+   * back to the neutral tile when it is missing. Optional on the wire so a record built before
+   * this column existed (a fixture, an older payload) simply reads as "no accent".
+   */
+  accent?: string | null;
+  /**
+   * The project's MARK as an icon name, or `null`/absent. Mutually exclusive with
+   * {@link ProjectRecord.image_path} — a backend CHECK enforces it, so at most one is ever set.
+   */
+  icon?: string | null;
+  /**
+   * The project's MARK as an image (a file path or URL), or `null`/absent. Mutually exclusive
+   * with {@link ProjectRecord.icon}.
+   */
+  image_path?: string | null;
 }
 
 /** A `workspaces` row, mirroring `db::Workspace` across the IPC boundary. */

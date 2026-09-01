@@ -195,7 +195,13 @@ pub enum Activity {
 /// The activity SNAPSHOT the host surfaces to the front for one terminal: the resolved
 /// [`Activity`] kind plus the focus-aware "response ready" unread bit. The `in_flight`
 /// counter is an internal implementation detail and is NOT surfaced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// It also carries the SECONDARY INFORMATION — the short sentence that says what the agent is
+/// asking or doing ([`Self::waiting_on`], [`Self::tool`]). Those two are RAW FACTS, not a resolved
+/// label: which of them (if either) a row shows is decided at display time by
+/// [`crate::home::secondary_info`]. Like every other field here they are RUNTIME-ONLY — nothing
+/// added here is persisted, and the store is empty at boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivitySnapshot {
     pub activity: Activity,
     /// `true` when a turn finished (`Stop`/`idle_prompt`) and the user has NOT yet viewed
@@ -213,6 +219,19 @@ pub struct ActivitySnapshot {
     /// surfaces that invitation. Cleared on [`AgentActivityStore::clear`] (PTY death /
     /// SessionEnd / close), so a fresh (restarted) session starts NOT outdated.
     pub plugin_outdated: bool,
+    /// WHAT the agent is blocked on, while it is: the `AskUserQuestion` question or the
+    /// permission/elicitation message that raised the current [`Activity::Waiting`]. `None` when
+    /// nothing is blocking, and ALSO `None` when the block exists but the hook payload carried no
+    /// readable text — an unexpected shape degrades to "no info", never to an error and never to a
+    /// placeholder sentence. Cleared the instant the `Waiting` lifts, including through the
+    /// defensive [`Entry::clear_waiting_if_working`] path: an answered question must not survive
+    /// as a caption on a row that is demonstrably working again.
+    pub waiting_on: Option<String>,
+    /// The name of the tool currently IN FLIGHT — the ONLY fallback for the secondary
+    /// information, read when the agent is not blocked. `None` when no tool is running, or when
+    /// the `PreToolUse` payload carried no `tool_name`. Cleared when the last tool returns and at
+    /// every turn end, so it never captions an agent that has stopped doing that thing.
+    pub tool: Option<String>,
 }
 
 /// One stored entry — the full per-terminal runtime state machine.
@@ -229,7 +248,7 @@ pub struct ActivitySnapshot {
 /// `SubagentStop` --), kept apart from the tool counter because a BACKGROUND sub-agent
 /// OUTLIVES the main turn's `Stop` (the #21 fix). A `Stop` resets the tool bookkeeping but
 /// NEVER this counter; while `subagents_in_flight > 0` the dot stays `Working`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Entry {
     /// The "base" activity the explicit events set, BEFORE the in-flight override.
     /// `Waiting` here means a permission/elicitation block OR an `AskUserQuestion` block;
@@ -267,17 +286,23 @@ struct Entry {
     /// [`AgentActivityStore::clear`] drops it. So a working/idle transition never clears the
     /// badge, and a SessionEnd/restart (which clears the entry) does.
     plugin_outdated: bool,
+    /// The question / permission text that raised the current `Waiting` (see
+    /// [`ActivitySnapshot::waiting_on`]). It lives and dies with the `Waiting` it explains.
+    waiting_on: Option<String>,
+    /// The name of the last tool that STARTED and has not returned — the in-flight tool the
+    /// secondary information falls back on (see [`ActivitySnapshot::tool`]). Tracked as ONE name
+    /// rather than a stack: with several tools in flight the last one started is the one worth
+    /// naming, and a `PostToolUse` cannot say WHICH tool returned, so the name is dropped when the
+    /// counter reaches 0 rather than pretending to pair Posts with Pres.
+    tool: Option<String>,
 }
 
 impl Entry {
-    /// A fresh entry for a brand-new turn (`UserPromptSubmit`): `Working`, no tools/
-    /// sub-agents in flight, no pending question, no deferred turn-end, ready cleared (a new
-    /// turn supersedes a prior answer). `plugin_outdated` is CARRIED OVER from the prior
-    /// entry — a new turn does NOT restart the session, so the stale-plugin verdict (set once
-    /// at SessionStart) persists until the session actually restarts (which clears the entry).
-    fn new_turn(plugin_outdated: bool) -> Self {
+    /// The ZERO entry — `Idle`, nothing in flight, nothing unread, no text. What a terminal the
+    /// store has never heard of resolves to, and the base the other constructors spread from.
+    fn empty() -> Self {
         Self {
-            base: Activity::Working,
+            base: Activity::Idle,
             in_flight: 0,
             subagents_in_flight: 0,
             ask_in_flight: false,
@@ -285,7 +310,24 @@ impl Entry {
             pending_is_error: false,
             ready_unread: false,
             error_unread: false,
+            plugin_outdated: false,
+            waiting_on: None,
+            tool: None,
+        }
+    }
+
+    /// A fresh entry for a brand-new turn (`UserPromptSubmit`): `Working`, no tools/
+    /// sub-agents in flight, no pending question, no deferred turn-end, ready cleared (a new
+    /// turn supersedes a prior answer). `plugin_outdated` is CARRIED OVER from the prior
+    /// entry — a new turn does NOT restart the session, so the stale-plugin verdict (set once
+    /// at SessionStart) persists until the session actually restarts (which clears the entry).
+    /// The secondary-information texts are NOT carried over: a new turn is neither asking the old
+    /// question nor running the old tool.
+    fn new_turn(plugin_outdated: bool) -> Self {
+        Self {
+            base: Activity::Working,
             plugin_outdated,
+            ..Self::empty()
         }
     }
 
@@ -308,6 +350,8 @@ impl Entry {
             ready_unread: self.ready_unread,
             error_unread: self.error_unread,
             plugin_outdated: self.plugin_outdated,
+            waiting_on: self.waiting_on.clone(),
+            tool: self.tool.clone(),
         }
     }
 
@@ -324,9 +368,25 @@ impl Entry {
     /// `AskFinished`) and does NOT touch a finished turn: only the explicit working signals
     /// call it, so `Notification → Waiting`, `Stop → Idle`, and the deferred-background (#21)
     /// paths are untouched.
+    ///
+    /// It DOES drop `waiting_on`: the question/permission text explains the block, so the moment
+    /// the block lifts the text is wrong. Clearing it HERE (and not only on the precise lifts) is
+    /// what stops a resolved question from surviving as a caption on a row that is working again —
+    /// the same reason this defensive path exists for the dot.
     fn clear_waiting_if_working(&mut self) {
         if self.base == Activity::Waiting {
             self.base = Activity::Working;
+            self.waiting_on = None;
+        }
+    }
+
+    /// Drop the in-flight tool NAME once nothing is in flight any more. A `PostToolUse` does not
+    /// say which tool returned, so the name is only trustworthy while the counter is non-zero;
+    /// past that, keeping it would caption a row with a tool that has finished. With tools still
+    /// running the last-started name stays, which is the one worth showing.
+    fn forget_tool_when_idle(&mut self) {
+        if self.in_flight == 0 {
+            self.tool = None;
         }
     }
 }
@@ -338,17 +398,91 @@ impl Entry {
 /// Several events carry a discriminator read from the hook payload (the tool name, the
 /// notification type) so the same `hook_event_name` can mean different things — the core
 /// reads `args.tool_name` / `args.notification_type` and builds the right variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The FACTS a hook payload can contribute beyond its name — the discriminators that make one
+/// `hook_event_name` mean different things, PLUS the two texts the secondary information is built
+/// from. Every field is optional and every field is read DEFENSIVELY: the `.cjs` hook forwards
+/// Claude's stdin verbatim, so what arrives is whatever Claude sent, and a shape we did not expect
+/// must degrade to "no info" rather than fail a hook.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HookFacts<'a> {
+    /// `tool_name` on a `PreToolUse`/`PostToolUse` — the discriminator that separates an ordinary
+    /// tool from the `AskUserQuestion` block, and the name shown as the in-flight tool.
+    pub tool_name: Option<&'a str>,
+    /// `tool_input` on a `PreToolUse` — read ONLY for `AskUserQuestion`, to pull the question out
+    /// (see [`ask_question_text`]).
+    pub tool_input: Option<&'a serde_json::Value>,
+    /// `notification_type` on a `Notification` — permission/elicitation (a block), `idle_prompt`
+    /// (a turn end), a background-sub-agent completion, or something we ignore.
+    pub notification_type: Option<&'a str>,
+    /// `message` on a `Notification` — Claude's own human-readable sentence for the prompt it is
+    /// blocked on ("Claude needs your permission to use Bash"). Used verbatim as the permission
+    /// text; absent ⇒ no text, and the dot still turns yellow.
+    pub message: Option<&'a str>,
+}
+
+/// The `tool_input` field names an `AskUserQuestion` payload may carry the question under, in the
+/// order they are tried. NAMED here rather than pattern-matched inline so the shapes nyx claims to
+/// understand are readable in one place — and so the note on [`ASK_USER_QUESTION_TOOL`] (the tool's
+/// payload shape is PROBABLE but UNCONFIRMED) has somewhere concrete to point.
+///
+/// Two shapes are covered: the structured one, `{ questions: [{ question, header, … }] }` (the
+/// first entry wins — a row shows one line, not a form), and the flat one, `{ question }` /
+/// `{ prompt }`. ANYTHING else — a different key, a nested object, a number, no `tool_input` at
+/// all — yields `None`, which is "no info": the row shows the yellow dot and no caption.
+const ASK_QUESTION_FIELDS: &[&str] = &["question", "header", "prompt"];
+
+/// Pull the QUESTION out of an `AskUserQuestion` `tool_input`, or `None` when the payload does not
+/// have a shape we recognise. Total and infallible by construction — there is no error branch,
+/// because a hook must never fail over a caption.
+pub fn ask_question_text(tool_input: &serde_json::Value) -> Option<String> {
+    /// The first non-blank string among [`ASK_QUESTION_FIELDS`] on one JSON object.
+    fn field_of(value: &serde_json::Value) -> Option<String> {
+        // The blank test lives INSIDE the search, not after it: a payload that carries an EMPTY
+        // `question` alongside a real `header` must fall through to the header. Filtering after
+        // `find_map` would stop on the first field that merely EXISTS and then throw it away,
+        // which reads as "no question" while the words were right there in the next field.
+        ASK_QUESTION_FIELDS.iter().find_map(|key| {
+            value
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+    }
+    // The STRUCTURED shape first — `questions` is a list and a row shows ONE line, so the first
+    // entry is the question. Then the FLAT shape, read off the payload itself.
+    tool_input
+        .get("questions")
+        .and_then(|q| q.as_array())
+        .and_then(|items| items.first())
+        .and_then(field_of)
+        .or_else(|| field_of(tool_input))
+}
+
+/// Normalise a hook-supplied text to what is worth storing: trimmed, and `None` when blank. Keeps
+/// "the payload carried nothing" and "the payload carried whitespace" the same state, so a caption
+/// is either real words or absent.
+fn hook_text(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityEvent {
     /// `UserPromptSubmit` — the user sent a prompt; a NEW turn begins → `Working`,
     /// `in_flight` reset to 0, ready cleared.
     PromptSubmitted,
     /// `PreToolUse` for an ordinary tool — one more tool in flight (`in_flight += 1`),
-    /// the dot stays/goes `Working`.
-    ToolStarted,
+    /// the dot stays/goes `Working`. Carries the tool's NAME when the payload had one: it is the
+    /// fallback secondary information, shown when the agent is not blocked on anything.
+    ToolStarted { tool: Option<String> },
     /// `PreToolUse` for `AskUserQuestion` — Claude asks the user and blocks → `Waiting`,
-    /// remembering the question is in flight so the paired `PostToolUse` lifts it.
-    AskStarted,
+    /// remembering the question is in flight so the paired `PostToolUse` lifts it. Carries the
+    /// QUESTION when the payload had a shape we recognise (see [`ask_question_text`]); `None`
+    /// still blocks, it just says nothing about what is being asked.
+    AskStarted { question: Option<String> },
     /// `PostToolUse`/`PostToolUseFailure` for an ordinary tool — one fewer in flight
     /// (`in_flight = in_flight.saturating_sub(1)`); if that was the last tool the dot
     /// stays `Working` (Claude is generating text) until `Stop`.
@@ -366,8 +500,9 @@ pub enum ActivityEvent {
     /// → `Idle` + green; otherwise it only decrements.
     SubagentFinished,
     /// `Notification(permission_prompt|elicitation_dialog)` — Claude is blocked on the
-    /// user → `Waiting`.
-    AttentionNeeded,
+    /// user → `Waiting`. Carries the notification's `message` (Claude's own sentence for the
+    /// prompt) when it had one; `None` blocks just the same, with no caption.
+    AttentionNeeded { permission: Option<String> },
     /// `Stop`/`StopFailure`, or `Notification(idle_prompt)` — the main turn finished. Resets
     /// the TOOL bookkeeping (`in_flight`, `ask_in_flight`) and, IF no sub-agent is still in
     /// flight, goes `Idle` + raises the "response ready" notification. If a sub-agent is
@@ -393,18 +528,29 @@ impl ActivityEvent {
     /// notification is a no-op (`None`).
     ///
     /// `SessionStart`/`SessionEnd` are session lifecycle (handled elsewhere) → `None`.
-    pub fn from_hook(
-        name: &str,
-        tool_name: Option<&str>,
-        notification_type: Option<&str>,
-    ) -> Option<Self> {
+    ///
+    /// The texts ride the same way: the `AskUserQuestion` question is pulled from
+    /// `facts.tool_input` and the permission sentence from `facts.message`. Both are BEST-EFFORT —
+    /// a shape we did not expect produces an event with `None` text, never an error, so the dot
+    /// moves exactly as it did before this existed and only the caption is missing.
+    pub fn from_hook(name: &str, facts: HookFacts<'_>) -> Option<Self> {
+        let HookFacts {
+            tool_name,
+            tool_input,
+            notification_type,
+            message,
+        } = facts;
         match name {
             "UserPromptSubmit" => Some(ActivityEvent::PromptSubmitted),
             "PreToolUse" => {
                 if tool_name == Some(ASK_USER_QUESTION_TOOL) {
-                    Some(ActivityEvent::AskStarted)
+                    Some(ActivityEvent::AskStarted {
+                        question: tool_input.and_then(ask_question_text),
+                    })
                 } else {
-                    Some(ActivityEvent::ToolStarted)
+                    Some(ActivityEvent::ToolStarted {
+                        tool: hook_text(tool_name),
+                    })
                 }
             }
             "PostToolUse" | "PostToolUseFailure" => {
@@ -418,7 +564,9 @@ impl ActivityEvent {
             "SubagentStop" => Some(ActivityEvent::SubagentFinished),
             "Notification" => match notification_type {
                 Some(t) if WAITING_NOTIFICATION_TYPES.contains(&t) => {
-                    Some(ActivityEvent::AttentionNeeded)
+                    Some(ActivityEvent::AttentionNeeded {
+                        permission: hook_text(message),
+                    })
                 }
                 Some(t) if t == IDLE_NOTIFICATION_TYPE => Some(ActivityEvent::TurnFinished),
                 // A "background sub-agent completed" notification is treated like a
@@ -439,11 +587,11 @@ impl ActivityEvent {
         }
     }
 
-    /// BACK-COMPAT thin wrapper: map a hook name with no payload discriminators. A
-    /// `PreToolUse`/`PostToolUse` without a `tool_name` is an ordinary tool; a
-    /// `Notification` without a type is a no-op. Used where only the name is available.
+    /// BACK-COMPAT thin wrapper: map a hook name with NO payload facts at all. A
+    /// `PreToolUse`/`PostToolUse` without a `tool_name` is an ordinary tool (with no name to
+    /// show); a `Notification` without a type is a no-op. Used where only the name is available.
     pub fn from_hook_event_name(name: &str) -> Option<Self> {
-        Self::from_hook(name, None, None)
+        Self::from_hook(name, HookFacts::default())
     }
 }
 
@@ -478,17 +626,7 @@ impl AgentActivityStore {
     pub fn apply(&self, terminal_id: &str, event: ActivityEvent) -> ActivitySnapshot {
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         // Read-or-default the current entry (a missing terminal is Idle with no tools).
-        let mut entry = map.get(terminal_id).copied().unwrap_or(Entry {
-            base: Activity::Idle,
-            in_flight: 0,
-            subagents_in_flight: 0,
-            ask_in_flight: false,
-            ready_pending: false,
-            pending_is_error: false,
-            ready_unread: false,
-            error_unread: false,
-            plugin_outdated: false,
-        });
+        let mut entry = map.get(terminal_id).cloned().unwrap_or_else(Entry::empty);
 
         match event {
             // A new turn starts fresh: Working, no tools, no question, ready cleared (the
@@ -502,8 +640,12 @@ impl AgentActivityStore {
             // "agent is working again" signal, so it ALSO lifts a stale `Waiting` (#26): if
             // the user declined an AskUserQuestion ("chat about this") and Claude resumed by
             // running a tool, the yellow must not stay stuck.
-            ActivityEvent::ToolStarted => {
+            ActivityEvent::ToolStarted { tool } => {
                 entry.in_flight = entry.in_flight.saturating_add(1);
+                // The in-flight tool is the FALLBACK secondary information. The last tool to start
+                // is the one named; a payload with no `tool_name` drops the caption rather than
+                // keeping the previous tool's name, which would be a lie.
+                entry.tool = tool;
                 entry.clear_waiting_if_working();
                 if entry.base == Activity::Idle {
                     // Work RESUMED after a turn-end (a tool started while the base was Idle — an
@@ -520,10 +662,14 @@ impl AgentActivityStore {
             }
             // AskUserQuestion in flight → explicit Waiting (yellow), remember it so the
             // paired Post lifts it. It still counts as in-flight work.
-            ActivityEvent::AskStarted => {
+            ActivityEvent::AskStarted { question } => {
                 entry.in_flight = entry.in_flight.saturating_add(1);
                 entry.ask_in_flight = true;
                 entry.base = Activity::Waiting;
+                // WHAT is being asked, when the payload said so. `None` is a legitimate outcome
+                // (an unrecognised `tool_input` shape): the row still turns yellow, it just has
+                // nothing to caption it with.
+                entry.waiting_on = question;
             }
             // An ordinary tool returned: one fewer in flight. The base stays Working (if
             // it was) — when in_flight hits 0 the dot stays Working until Stop (Claude is
@@ -532,6 +678,7 @@ impl AgentActivityStore {
             // tool's PostToolUse must not leave the yellow stuck.
             ActivityEvent::ToolFinished => {
                 entry.in_flight = entry.in_flight.saturating_sub(1);
+                entry.forget_tool_when_idle();
                 entry.clear_waiting_if_working();
             }
             // The user answered (or declined — "chat about this") an AskUserQuestion: lift
@@ -541,7 +688,13 @@ impl AgentActivityStore {
             ActivityEvent::AskFinished => {
                 entry.in_flight = entry.in_flight.saturating_sub(1);
                 entry.ask_in_flight = false;
+                entry.forget_tool_when_idle();
                 entry.clear_waiting_if_working();
+                // The question is ANSWERED: drop its text even if the base was not `Waiting` any
+                // more (a defensive lift already ran). `clear_waiting_if_working` only fires while
+                // the base IS `Waiting`, so the caption needs its own unconditional clear here —
+                // the same reason the yellow lift itself became unconditional (#26).
+                entry.waiting_on = None;
             }
             // A sub-agent started → one more sub-agent in flight (Working). Counted in the
             // DEDICATED sub-agent counter (NOT the tool `in_flight`) so a background
@@ -579,8 +732,9 @@ impl AgentActivityStore {
                 }
             }
             // A permission/elicitation block → Waiting (yellow). Leaves both counters as-is.
-            ActivityEvent::AttentionNeeded => {
+            ActivityEvent::AttentionNeeded { permission } => {
                 entry.base = Activity::Waiting;
+                entry.waiting_on = permission;
             }
             // The turn finished (Stop / StopFailure / idle_prompt): reset the TOOL
             // bookkeeping (in_flight / ask_in_flight) — a finished turn has no live tools —
@@ -591,6 +745,12 @@ impl AgentActivityStore {
             ActivityEvent::TurnFinished => {
                 entry.in_flight = 0;
                 entry.ask_in_flight = false;
+                // A finished turn asks nothing and runs nothing: both captions go with the tool
+                // bookkeeping they belong to. (A DEFERRED end keeps the dot blue for a background
+                // sub-agent, but the main turn's tool has still returned and its question is
+                // still moot.)
+                entry.waiting_on = None;
+                entry.tool = None;
                 if entry.subagents_in_flight > 0 {
                     // A background sub-agent outlives this turn → stay busy, defer the green.
                     entry.ready_pending = true;
@@ -607,6 +767,8 @@ impl AgentActivityStore {
             ActivityEvent::TurnFailed => {
                 entry.in_flight = 0;
                 entry.ask_in_flight = false;
+                entry.waiting_on = None;
+                entry.tool = None;
                 if entry.subagents_in_flight > 0 {
                     // A background sub-agent outlives this errored turn → stay busy, defer the RED.
                     entry.ready_pending = true;
@@ -621,8 +783,9 @@ impl AgentActivityStore {
             }
         }
 
+        let snapshot = entry.snapshot();
         map.insert(terminal_id.to_string(), entry);
-        entry.snapshot()
+        snapshot
     }
 
     /// FORCE a terminal's activity to `Idle` and drop its "ready" notification — the
@@ -659,15 +822,8 @@ impl AgentActivityStore {
                     map.insert(
                         terminal_id.to_string(),
                         Entry {
-                            base: Activity::Idle,
-                            in_flight: 0,
-                            subagents_in_flight: 0,
-                            ask_in_flight: false,
-                            ready_pending: false,
-                            pending_is_error: false,
-                            ready_unread: false,
-                            error_unread: false,
                             plugin_outdated: true,
+                            ..Entry::empty()
                         },
                     );
                 }
@@ -727,6 +883,23 @@ impl AgentActivityStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// A `PreToolUse`/`PostToolUse` payload with just its tool name.
+    fn tool_facts(name: &str) -> HookFacts<'_> {
+        HookFacts {
+            tool_name: Some(name),
+            ..HookFacts::default()
+        }
+    }
+
+    /// A `Notification` payload with just its type.
+    fn notif_facts(kind: &str) -> HookFacts<'_> {
+        HookFacts {
+            notification_type: Some(kind),
+            ..HookFacts::default()
+        }
+    }
 
     /// `from_hook` maps the per-turn hooks, reading the tool name / notification type to
     /// disambiguate. The `AskUserQuestion` Pre/Post become `Ask*`; an ordinary tool's
@@ -746,26 +919,35 @@ mod tests {
             ActivityEvent::from_hook_event_name("StopFailure"),
             Some(ActivityEvent::TurnFailed)
         );
-        // PreToolUse: ordinary tool vs AskUserQuestion.
+        // PreToolUse: ordinary tool vs AskUserQuestion. An ordinary tool CARRIES its name — the
+        // fallback secondary information — instead of the name being used as a discriminant and
+        // then thrown away.
         assert_eq!(
-            ActivityEvent::from_hook("PreToolUse", Some("Bash"), None),
-            Some(ActivityEvent::ToolStarted)
+            ActivityEvent::from_hook("PreToolUse", tool_facts("Bash")),
+            Some(ActivityEvent::ToolStarted {
+                tool: Some("Bash".to_string())
+            })
+        );
+        // A `PreToolUse` with NO tool name at all is still an ordinary tool, with nothing to say.
+        assert_eq!(
+            ActivityEvent::from_hook("PreToolUse", HookFacts::default()),
+            Some(ActivityEvent::ToolStarted { tool: None })
         );
         assert_eq!(
-            ActivityEvent::from_hook("PreToolUse", Some(ASK_USER_QUESTION_TOOL), None),
-            Some(ActivityEvent::AskStarted)
+            ActivityEvent::from_hook("PreToolUse", tool_facts(ASK_USER_QUESTION_TOOL)),
+            Some(ActivityEvent::AskStarted { question: None })
         );
         // PostToolUse + PostToolUseFailure, ordinary vs Ask.
         assert_eq!(
-            ActivityEvent::from_hook("PostToolUse", Some("Bash"), None),
+            ActivityEvent::from_hook("PostToolUse", tool_facts("Bash")),
             Some(ActivityEvent::ToolFinished)
         );
         assert_eq!(
-            ActivityEvent::from_hook("PostToolUseFailure", Some("Bash"), None),
+            ActivityEvent::from_hook("PostToolUseFailure", tool_facts("Bash")),
             Some(ActivityEvent::ToolFinished)
         );
         assert_eq!(
-            ActivityEvent::from_hook("PostToolUse", Some(ASK_USER_QUESTION_TOOL), None),
+            ActivityEvent::from_hook("PostToolUse", tool_facts(ASK_USER_QUESTION_TOOL)),
             Some(ActivityEvent::AskFinished)
         );
         // Subagent start/stop.
@@ -779,32 +961,35 @@ mod tests {
         );
         // Notification discrimination.
         assert_eq!(
-            ActivityEvent::from_hook("Notification", None, Some("permission_prompt")),
-            Some(ActivityEvent::AttentionNeeded)
+            ActivityEvent::from_hook("Notification", notif_facts("permission_prompt")),
+            Some(ActivityEvent::AttentionNeeded { permission: None })
         );
         assert_eq!(
-            ActivityEvent::from_hook("Notification", None, Some("elicitation_dialog")),
-            Some(ActivityEvent::AttentionNeeded)
+            ActivityEvent::from_hook("Notification", notif_facts("elicitation_dialog")),
+            Some(ActivityEvent::AttentionNeeded { permission: None })
         );
         assert_eq!(
-            ActivityEvent::from_hook("Notification", None, Some("idle_prompt")),
+            ActivityEvent::from_hook("Notification", notif_facts("idle_prompt")),
             Some(ActivityEvent::TurnFinished)
         );
         // A background sub-agent completion notification (defensive, best-guess strings) maps
         // to SubagentFinished — the same decrement as a SubagentStop.
         for t in SUBAGENT_DONE_NOTIFICATION_TYPES {
             assert_eq!(
-                ActivityEvent::from_hook("Notification", None, Some(t)),
+                ActivityEvent::from_hook("Notification", notif_facts(t)),
                 Some(ActivityEvent::SubagentFinished),
                 "a '{t}' notification decrements the sub-agent counter"
             );
         }
         // An unknown / absent notification type does not move the dot.
         assert_eq!(
-            ActivityEvent::from_hook("Notification", None, Some("something_else")),
+            ActivityEvent::from_hook("Notification", notif_facts("something_else")),
             None
         );
-        assert_eq!(ActivityEvent::from_hook("Notification", None, None), None);
+        assert_eq!(
+            ActivityEvent::from_hook("Notification", HookFacts::default()),
+            None
+        );
         // Session lifecycle + anything else is not an activity event.
         assert_eq!(ActivityEvent::from_hook_event_name("SessionStart"), None);
         assert_eq!(ActivityEvent::from_hook_event_name("SessionEnd"), None);
@@ -849,7 +1034,7 @@ mod tests {
     fn long_running_tool_stays_working_until_post() {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        store.apply("t1", ActivityEvent::ToolStarted); // a 10-minute tool begins.
+        store.apply("t1", ActivityEvent::ToolStarted { tool: None }); // a 10-minute tool begins.
         for _ in 0..5 {
             assert_eq!(
                 store.snapshot("t1").unwrap().activity,
@@ -877,8 +1062,8 @@ mod tests {
     fn in_flight_counter_balances_overlapping_tools() {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        store.apply("t1", ActivityEvent::ToolStarted);
-        store.apply("t1", ActivityEvent::ToolStarted); // two tools in flight.
+        store.apply("t1", ActivityEvent::ToolStarted { tool: None });
+        store.apply("t1", ActivityEvent::ToolStarted { tool: None }); // two tools in flight.
         store.apply("t1", ActivityEvent::ToolFinished); // one returns, one still running.
         assert_eq!(
             store.snapshot("t1").unwrap().activity,
@@ -902,7 +1087,7 @@ mod tests {
     fn ask_user_question_waits_then_resumes() {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        let s = store.apply("t1", ActivityEvent::AskStarted);
+        let s = store.apply("t1", ActivityEvent::AskStarted { question: None });
         assert_eq!(
             s.activity,
             Activity::Waiting,
@@ -924,8 +1109,8 @@ mod tests {
     fn ask_waiting_with_other_tool_in_flight_stays_working_after_answer() {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        store.apply("t1", ActivityEvent::ToolStarted); // a background tool.
-        store.apply("t1", ActivityEvent::AskStarted); // + a question → Waiting wins.
+        store.apply("t1", ActivityEvent::ToolStarted { tool: None }); // a background tool.
+        store.apply("t1", ActivityEvent::AskStarted { question: None }); // + a question → Waiting wins.
         assert_eq!(store.snapshot("t1").unwrap().activity, Activity::Waiting);
         store.apply("t1", ActivityEvent::AskFinished); // answered.
         assert_eq!(
@@ -941,7 +1126,7 @@ mod tests {
     fn notification_permission_waits_idle_prompt_finishes() {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        let s = store.apply("t1", ActivityEvent::AttentionNeeded); // permission_prompt.
+        let s = store.apply("t1", ActivityEvent::AttentionNeeded { permission: None }); // permission_prompt.
         assert_eq!(s.activity, Activity::Waiting);
         assert!(
             !s.ready_unread,
@@ -965,9 +1150,9 @@ mod tests {
         // A tool STARTING after the Waiting lifts it.
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        store.apply("t1", ActivityEvent::AskStarted); // Waiting (the asked question).
+        store.apply("t1", ActivityEvent::AskStarted { question: None }); // Waiting (the asked question).
         assert_eq!(store.snapshot("t1").unwrap().activity, Activity::Waiting);
-        let s = store.apply("t1", ActivityEvent::ToolStarted); // resumed via a tool.
+        let s = store.apply("t1", ActivityEvent::ToolStarted { tool: None }); // resumed via a tool.
         assert_eq!(
             s.activity,
             Activity::Working,
@@ -978,8 +1163,8 @@ mod tests {
         // time — no paired Ask Post — and the resume arrives as a tool's PostToolUse).
         let store = AgentActivityStore::new();
         store.apply("t2", ActivityEvent::PromptSubmitted);
-        store.apply("t2", ActivityEvent::ToolStarted); // a tool is in flight.
-        store.apply("t2", ActivityEvent::AttentionNeeded); // permission_prompt → Waiting.
+        store.apply("t2", ActivityEvent::ToolStarted { tool: None }); // a tool is in flight.
+        store.apply("t2", ActivityEvent::AttentionNeeded { permission: None }); // permission_prompt → Waiting.
         assert_eq!(store.snapshot("t2").unwrap().activity, Activity::Waiting);
         let s = store.apply("t2", ActivityEvent::ToolFinished); // that tool returns → resumed.
         assert_eq!(
@@ -991,7 +1176,7 @@ mod tests {
         // A SUB-AGENT starting after the Waiting lifts it too.
         let store = AgentActivityStore::new();
         store.apply("t3", ActivityEvent::PromptSubmitted);
-        store.apply("t3", ActivityEvent::AttentionNeeded); // Waiting.
+        store.apply("t3", ActivityEvent::AttentionNeeded { permission: None }); // Waiting.
         let s = store.apply("t3", ActivityEvent::SubagentStarted);
         assert_eq!(
             s.activity,
@@ -1002,7 +1187,7 @@ mod tests {
         // A NEW PROMPT (the existing reset path) also clears a stale Waiting.
         let store = AgentActivityStore::new();
         store.apply("t4", ActivityEvent::PromptSubmitted);
-        store.apply("t4", ActivityEvent::AttentionNeeded); // Waiting.
+        store.apply("t4", ActivityEvent::AttentionNeeded { permission: None }); // Waiting.
         let s = store.apply("t4", ActivityEvent::PromptSubmitted);
         assert_eq!(
             s.activity,
@@ -1019,7 +1204,7 @@ mod tests {
     fn ask_finished_lifts_waiting_on_decline() {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        store.apply("t1", ActivityEvent::AskStarted); // the question → Waiting.
+        store.apply("t1", ActivityEvent::AskStarted { question: None }); // the question → Waiting.
         assert_eq!(store.snapshot("t1").unwrap().activity, Activity::Waiting);
         // The user declines / answers — the AskUserQuestion Post fires.
         let s = store.apply("t1", ActivityEvent::AskFinished);
@@ -1038,14 +1223,14 @@ mod tests {
         let store = AgentActivityStore::new();
         // Stop with a tool still "in flight" (its Post was lost) → in_flight reset, Idle + green.
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        store.apply("t1", ActivityEvent::ToolStarted);
+        store.apply("t1", ActivityEvent::ToolStarted { tool: None });
         let s = store.apply("t1", ActivityEvent::TurnFinished); // Stop.
         assert_eq!(s.activity, Activity::Idle);
         assert!(s.ready_unread);
         assert!(!s.error_unread);
         // A fresh turn then StopFailure idles + resets too, but raises the RED, not the green.
         store.apply("t2", ActivityEvent::PromptSubmitted);
-        store.apply("t2", ActivityEvent::ToolStarted);
+        store.apply("t2", ActivityEvent::ToolStarted { tool: None });
         let s = store.apply("t2", ActivityEvent::TurnFailed); // StopFailure.
         assert_eq!(s.activity, Activity::Idle);
         assert!(!s.ready_unread, "a failed turn is not 'ready' (green)");
@@ -1248,8 +1433,8 @@ mod tests {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
         store.apply("t1", ActivityEvent::SubagentStarted); // background sub-agent.
-        store.apply("t1", ActivityEvent::ToolStarted); // a tool whose Post will be "lost".
-                                                       // Stop: the tool bookkeeping is reset, but the sub-agent survives → still Working.
+        store.apply("t1", ActivityEvent::ToolStarted { tool: None }); // a tool whose Post will be "lost".
+                                                                      // Stop: the tool bookkeeping is reset, but the sub-agent survives → still Working.
         let s = store.apply("t1", ActivityEvent::TurnFinished);
         assert_eq!(
             s.activity,
@@ -1319,7 +1504,11 @@ mod tests {
     fn background_subagent_completion_via_notification_lifts_deferred_green() {
         let store = AgentActivityStore::new();
         let apply_hook = |name: &str, ntype: Option<&str>| {
-            let ev = ActivityEvent::from_hook(name, None, ntype).expect("recognized hook");
+            let facts = HookFacts {
+                notification_type: ntype,
+                ..HookFacts::default()
+            };
+            let ev = ActivityEvent::from_hook(name, facts).expect("recognized hook");
             store.apply("t1", ev)
         };
         apply_hook("UserPromptSubmit", None);
@@ -1372,7 +1561,7 @@ mod tests {
         let s = store.apply("t1", ActivityEvent::TurnFinished);
         assert!(s.ready_unread);
         // Simulate a bare-Esc-then-new-prompt: leave a tool "in flight" then prompt again.
-        store.apply("t1", ActivityEvent::AskStarted); // Waiting + in_flight=1 dangling.
+        store.apply("t1", ActivityEvent::AskStarted { question: None }); // Waiting + in_flight=1 dangling.
         let s = store.apply("t1", ActivityEvent::PromptSubmitted);
         assert_eq!(
             s.activity,
@@ -1392,7 +1581,7 @@ mod tests {
     fn clear_forces_idle_and_drops_ready_phantom() {
         let store = AgentActivityStore::new();
         store.apply("t1", ActivityEvent::PromptSubmitted);
-        store.apply("t1", ActivityEvent::ToolStarted); // a tool in flight, no Stop (a kill).
+        store.apply("t1", ActivityEvent::ToolStarted { tool: None }); // a tool in flight, no Stop (a kill).
         store.clear("t1");
         assert!(
             store.snapshot("t1").is_none(),
@@ -1447,7 +1636,7 @@ mod tests {
         assert_eq!(store.snapshot("t1").unwrap().activity, Activity::Idle);
 
         // Waiting holds the same way until a clear/event.
-        store.apply("t2", ActivityEvent::AttentionNeeded);
+        store.apply("t2", ActivityEvent::AttentionNeeded { permission: None });
         assert_eq!(store.snapshot("t2").unwrap().activity, Activity::Waiting);
         store.clear("t2");
         assert!(store.snapshot("t2").is_none(), "only a hard clear drops it");
@@ -1469,7 +1658,7 @@ mod tests {
         let s = store.apply("t1", ActivityEvent::TurnFinished); // Idle + green.
         assert_eq!(s.activity, Activity::Idle);
         assert!(s.ready_unread);
-        let s = store.apply("t1", ActivityEvent::ToolStarted); // work resumes, no new prompt.
+        let s = store.apply("t1", ActivityEvent::ToolStarted { tool: None }); // work resumes, no new prompt.
         assert_eq!(
             s.activity,
             Activity::Working,
@@ -1508,7 +1697,7 @@ mod tests {
         store.apply("t-c", ActivityEvent::PromptSubmitted);
         store.clear("t-c"); // gone.
         store.apply("t-d", ActivityEvent::PromptSubmitted);
-        store.apply("t-d", ActivityEvent::AttentionNeeded); // Waiting.
+        store.apply("t-d", ActivityEvent::AttentionNeeded { permission: None }); // Waiting.
 
         let all = store.snapshot_all();
         let ids: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
@@ -1578,5 +1767,242 @@ mod tests {
             store.snapshot("t-stale").is_none(),
             "a restart clears the stale-plugin badge — a fresh session is not outdated"
         );
+    }
+
+    // --- SECONDARY INFORMATION (the question / the tool) ----------------------------------
+
+    /// The QUESTION is pulled out of the `AskUserQuestion` `tool_input`, in both shapes nyx claims
+    /// to understand — the structured `{ questions: [ { question | header } ] }` and the flat
+    /// `{ question | prompt }` — and from NOTHING ELSE. Every other shape is "no info": a `None`,
+    /// never an error and never a placeholder.
+    #[test]
+    fn the_question_is_read_from_the_named_fields_and_nothing_else() {
+        // The structured shape: the FIRST entry is the question (a row shows one line).
+        assert_eq!(
+            ask_question_text(&json!({
+                "questions": [
+                    { "question": "Ship it or hold?", "header": "Release" },
+                    { "question": "…and the second one" }
+                ]
+            })),
+            Some("Ship it or hold?".to_string())
+        );
+        // …falling back to its `header` when the entry has no `question`.
+        assert_eq!(
+            ask_question_text(&json!({ "questions": [{ "header": "Release" }] })),
+            Some("Release".to_string())
+        );
+        // The flat shapes.
+        assert_eq!(
+            ask_question_text(&json!({ "question": "Ship it?" })),
+            Some("Ship it?".to_string())
+        );
+        assert_eq!(
+            ask_question_text(&json!({ "prompt": "Ship it?" })),
+            Some("Ship it?".to_string())
+        );
+        // UNEXPECTED SHAPES → no info, no panic. A different key, a nested object where a string
+        // was expected, a non-object payload, an empty list, blank text.
+        assert_eq!(ask_question_text(&json!({ "ask": "Ship it?" })), None);
+        assert_eq!(
+            ask_question_text(&json!({ "question": { "text": "x" } })),
+            None
+        );
+        assert_eq!(ask_question_text(&json!({ "question": 42 })), None);
+        assert_eq!(ask_question_text(&json!({ "questions": [] })), None);
+        assert_eq!(ask_question_text(&json!({ "questions": "Ship it?" })), None);
+        assert_eq!(ask_question_text(&json!({ "question": "   " })), None);
+        // A BLANK first field does not end the search: the next field that carries real words
+        // wins. Reading "the first field that exists" instead of "the first non-blank one" would
+        // report no question while the words sat in `header`.
+        assert_eq!(
+            ask_question_text(&json!({ "question": "  ", "header": "Ship it or hold?" })),
+            Some("Ship it or hold?".to_string()),
+        );
+        assert_eq!(
+            ask_question_text(&json!({ "question": "", "header": " ", "prompt": "Fold them?" })),
+            Some("Fold them?".to_string()),
+        );
+        assert_eq!(ask_question_text(&json!([1, 2, 3])), None);
+        assert_eq!(ask_question_text(&json!("just a string")), None);
+        assert_eq!(ask_question_text(&json!(null)), None);
+    }
+
+    /// The `Waiting` text and its DISAPPEARANCE. A question (or a permission) is held for exactly
+    /// as long as the block lasts: the answer, or any signal that the agent is working again,
+    /// takes it away with the yellow — including through the defensive
+    /// [`Entry::clear_waiting_if_working`] path, which is the one a "chat about this" decline
+    /// travels.
+    #[test]
+    fn the_waiting_text_lives_and_dies_with_the_waiting() {
+        // A QUESTION.
+        let store = AgentActivityStore::new();
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        let s = store.apply(
+            "t1",
+            ActivityEvent::AskStarted {
+                question: Some("Ship it or hold?".to_string()),
+            },
+        );
+        assert_eq!(s.activity, Activity::Waiting);
+        assert_eq!(s.waiting_on.as_deref(), Some("Ship it or hold?"));
+        // Answered → Working, and the question is gone.
+        let s = store.apply("t1", ActivityEvent::AskFinished);
+        assert_eq!(s.activity, Activity::Working);
+        assert_eq!(
+            s.waiting_on, None,
+            "an answered question does not survive into Working"
+        );
+
+        // A PERMISSION, lifted by the DEFENSIVE path (a tool starting, not the paired Post).
+        let store = AgentActivityStore::new();
+        store.apply("t2", ActivityEvent::PromptSubmitted);
+        let s = store.apply(
+            "t2",
+            ActivityEvent::AttentionNeeded {
+                permission: Some("Claude needs your permission to use Bash".to_string()),
+            },
+        );
+        assert_eq!(s.activity, Activity::Waiting);
+        assert_eq!(
+            s.waiting_on.as_deref(),
+            Some("Claude needs your permission to use Bash")
+        );
+        let s = store.apply(
+            "t2",
+            ActivityEvent::ToolStarted {
+                tool: Some("Bash".to_string()),
+            },
+        );
+        assert_eq!(s.activity, Activity::Working);
+        assert_eq!(
+            s.waiting_on, None,
+            "the permission text goes with the yellow it explained"
+        );
+
+        // A turn END also drops it (a finished turn asks nothing).
+        let store = AgentActivityStore::new();
+        store.apply("t3", ActivityEvent::PromptSubmitted);
+        store.apply(
+            "t3",
+            ActivityEvent::AttentionNeeded {
+                permission: Some("allow?".to_string()),
+            },
+        );
+        let s = store.apply("t3", ActivityEvent::TurnFinished);
+        assert_eq!(s.waiting_on, None);
+    }
+
+    /// A `Waiting` whose payload had NO readable text still blocks — the dot is the message, and
+    /// the row simply carries no caption. This is the "unexpected payload degrades to no info,
+    /// never to an error" contract, driven end to end through `from_hook`.
+    #[test]
+    fn a_block_with_no_readable_payload_still_blocks_with_no_text() {
+        let store = AgentActivityStore::new();
+        // An AskUserQuestion whose tool_input is a shape we do not recognise.
+        let ev = ActivityEvent::from_hook(
+            "PreToolUse",
+            HookFacts {
+                tool_name: Some(ASK_USER_QUESTION_TOOL),
+                tool_input: Some(&json!({ "unexpected": { "nested": true } })),
+                ..HookFacts::default()
+            },
+        )
+        .expect("an unexpected payload is still a recognized hook");
+        let s = store.apply("t1", ev);
+        assert_eq!(s.activity, Activity::Waiting, "the block still happens");
+        assert_eq!(
+            s.waiting_on, None,
+            "…with no info rather than a placeholder"
+        );
+
+        // A permission Notification with no `message`.
+        let ev = ActivityEvent::from_hook("Notification", notif_facts("permission_prompt"))
+            .expect("recognized hook");
+        let s = store.apply("t2", ev);
+        assert_eq!(s.activity, Activity::Waiting);
+        assert_eq!(s.waiting_on, None);
+    }
+
+    /// The TOOL IN FLIGHT is the fallback: it is the last tool to have started, and it is dropped
+    /// when the last one returns and at every turn end — so it never captions an agent that has
+    /// stopped doing that thing.
+    #[test]
+    fn the_in_flight_tool_is_held_only_while_a_tool_is_running() {
+        let store = AgentActivityStore::new();
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        assert_eq!(
+            store.snapshot("t1").unwrap().tool,
+            None,
+            "a turn with no tool running names none"
+        );
+        let s = store.apply(
+            "t1",
+            ActivityEvent::ToolStarted {
+                tool: Some("Bash".to_string()),
+            },
+        );
+        assert_eq!(s.tool.as_deref(), Some("Bash"));
+        // A second tool: the LAST one started is the one named.
+        let s = store.apply(
+            "t1",
+            ActivityEvent::ToolStarted {
+                tool: Some("Read".to_string()),
+            },
+        );
+        assert_eq!(s.tool.as_deref(), Some("Read"));
+        // One returns — still one in flight, so the name stays.
+        let s = store.apply("t1", ActivityEvent::ToolFinished);
+        assert_eq!(s.tool.as_deref(), Some("Read"), "a tool is still running");
+        // The last returns → nothing in flight, no name.
+        let s = store.apply("t1", ActivityEvent::ToolFinished);
+        assert_eq!(
+            s.tool, None,
+            "with nothing in flight there is no tool to name"
+        );
+
+        // A turn end drops it too, even with a Post lost to an interrupt.
+        store.apply(
+            "t1",
+            ActivityEvent::ToolStarted {
+                tool: Some("Bash".to_string()),
+            },
+        );
+        let s = store.apply("t1", ActivityEvent::TurnFinished);
+        assert_eq!(s.tool, None);
+        // …and a new turn starts with a clean slate.
+        let s = store.apply("t1", ActivityEvent::PromptSubmitted);
+        assert_eq!(s.tool, None);
+        assert_eq!(s.waiting_on, None);
+    }
+
+    /// THE RUNTIME-ONLY CONTRACT still holds with the added fields: the store is EMPTY at boot,
+    /// and a hard `clear` (PTY death / SessionEnd / close) takes the texts with everything else.
+    /// Nothing here is persisted — there is no column, no migration, nothing to survive a restart.
+    #[test]
+    fn the_secondary_information_is_runtime_only() {
+        let store = AgentActivityStore::new();
+        assert!(
+            store.snapshot_all().is_empty(),
+            "a fresh store holds no text for anyone"
+        );
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        store.apply(
+            "t1",
+            ActivityEvent::AskStarted {
+                question: Some("Ship it?".to_string()),
+            },
+        );
+        assert_eq!(
+            store.snapshot("t1").unwrap().waiting_on.as_deref(),
+            Some("Ship it?")
+        );
+        store.clear("t1");
+        assert!(
+            store.snapshot("t1").is_none(),
+            "a clear drops the question with the entry — nothing outlives the session"
+        );
+        // A brand-new store over the same terminal id knows nothing (the boot state).
+        assert!(AgentActivityStore::new().snapshot("t1").is_none());
     }
 }

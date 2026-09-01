@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { nyxBridge } from "@/bridge";
+import type { ActiveScope } from "@/components/terminals/active-project";
 
 import type { SpecListEntry } from "./types";
 
@@ -32,25 +33,43 @@ export interface UseSpecs {
 }
 
 /**
- * Load the Specs of `projectId` and keep them live. A `null` project disables the hook
- * (empty list, not loading). A load that resolves after the effect was cancelled is dropped
- * so it never clobbers a newer project's state.
+ * Load the Specs of a SCOPE and keep them live.
+ *
+ * The scope is the app's own {@link ActiveScope}, not a `projectId: string | null` — and that is
+ * the point. `null` has ONE meaning here, "no project is loaded" (a fresh install, or the window
+ * before the rail resolves the entered one), which disables the hook. "Every project" is a
+ * DIFFERENT case, spelled `{ kind: "all" }`, and it makes ONE call with no project filter — never
+ * a loop of per-project calls. Encoding both on the same `null` is the ambiguity the app's scope
+ * type exists to remove (`components/terminals/active-project.tsx`).
+ *
+ * A load that resolves after the effect was cancelled is dropped so it never clobbers a newer
+ * scope's state.
  */
-export function useSpecs(projectId: string | null): UseSpecs {
-  const enabled = projectId !== null;
+export function useSpecs(scope: ActiveScope): UseSpecs {
+  const global = scope.kind === "all";
+  // The project the read is narrowed to, or `null` for the cross-project read.
+  const projectId = global ? null : scope.projectId;
+  // NO project loaded yet — not "every project". The hook says nothing rather than reading
+  // the whole app's Specs onto a page that means to show one project's.
+  const enabled = global || projectId !== null;
   const [specs, setSpecs] = useState<readonly SpecListEntry[]>([]);
   const [loading, setLoading] = useState<boolean>(enabled);
   const [error, setError] = useState<boolean>(false);
 
   const load = useCallback(async () => {
-    if (projectId === null) {
+    if (!enabled) {
       setSpecs([]);
       setLoading(false);
       setError(false);
       return;
     }
     try {
-      const rows = await nyxBridge.invoke<SpecListEntry[]>("spec_list", { projectId });
+      // `projectId` is OMITTED (not sent as `null`) for the cross-project read: the dispatch
+      // reads `arg_opt_str("projectId")`, and "absent" is what it takes as "every project".
+      const rows = await nyxBridge.invoke<SpecListEntry[]>(
+        "spec_list",
+        projectId === null ? {} : { projectId },
+      );
       setSpecs(rows);
       setError(false);
     } catch {
@@ -58,12 +77,12 @@ export function useSpecs(projectId: string | null): UseSpecs {
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, [enabled, projectId]);
 
-  // Initial load (and reload when the project changes).
+  // Initial load (and reload when the scope changes).
   useEffect(() => {
     let cancelled = false;
-    if (projectId === null) {
+    if (!enabled) {
       setSpecs([]);
       setLoading(false);
       setError(false);
@@ -73,7 +92,7 @@ export function useSpecs(projectId: string | null): UseSpecs {
     }
     setLoading(true);
     void nyxBridge
-      .invoke<SpecListEntry[]>("spec_list", { projectId })
+      .invoke<SpecListEntry[]>("spec_list", projectId === null ? {} : { projectId })
       .then((rows) => {
         if (cancelled) return;
         setSpecs(rows);
@@ -88,7 +107,7 @@ export function useSpecs(projectId: string | null): UseSpecs {
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+  }, [enabled, projectId]);
 
   // Live: re-pull on the coarse `specs://changed` (every MCP spec/task mutation) AND
   // `workspaces://changed` (the Spec's derived workspace anchoring) invalidations — the

@@ -71,17 +71,35 @@ interface RenderGroup {
 }
 
 /**
- * `<KnowledgePage>` — the routed Knowledge surface (`/knowledge`): the native IDÉES view (layout L1).
- * A dense table GROUPED BY THEME with collapsible animated groups (header = counter + status
- * mini-dots), a toolbar (search + status filter + theme facet + expand/collapse all), and the idea
- * DETAIL in a drawer (body + linked Specs with status + closure reason). Placement reproduced from
- * the validated prototype annex `idees-liste-l1`; the LOOK is this project's design system (tokens +
- * the shared UI primitives), never the mockup's pixels. Data flows through the bridge read models
- * (`idea_themes` / `idea_list` / `idea_search`), one board per ENTERED project (`useActiveProject`).
+ * `<KnowledgePage>` — the routed IDEAS surface (`/knowledge` — the route name is the glossary's
+ * umbrella, the UI's name for the page is `Ideas`; see `docs/product/glossary.md`): the native
+ * IDÉES view (layout L1). A dense table GROUPED BY THEME with collapsible animated groups (header =
+ * counter + status mini-dots), a toolbar (search + status filter + theme facet + expand/collapse
+ * all), and the idea DETAIL in a drawer (body + linked Specs with status + closure reason).
+ * Placement reproduced from the validated prototype annex `idees-liste-l1`; the LOOK is this
+ * project's design system (tokens + the shared UI primitives), never the mockup's pixels. Data
+ * flows through the bridge read models (`idea_themes` / `idea_list` / `idea_search`).
+ *
+ * ## ONE TABLE, TWO SCOPES — the same page, re-parameterised
+ *
+ * The page reads the app's {@link useActiveProject} SCOPE and hands it, whole, to `useIdeas` AND
+ * to `useIdeaSearch`. In the project scope it lists the entered project's ideas; in the
+ * cross-project scope it lists every project's, through the same reads with no project filter.
+ * Two things change and nothing else: the list grows, and each row wears its project's
+ * `<ProjectMark>` (`idea-row.tsx`). Same toolbar, same theme grouping, same drawer, same order —
+ * the same code.
+ *
+ * THE SEARCH FOLLOWS. It is the same scope object, so a query spans exactly what the list spans.
+ * A search that stayed inside the entered project while the table showed everything would drop
+ * rows for a reason nothing on screen explains — the silent trap this page must not set.
+ *
+ * The THEME grouping is unchanged: a theme shared by two projects is ONE group with the summed
+ * counts. The theme is this view's axis; re-cutting it by project would be a grouping the
+ * cross-project scope has no business inventing.
  */
 export function KnowledgePage() {
-  const { activeProjectId } = useActiveProject();
-  const { themes, ideas, loading, error } = useIdeas(activeProjectId);
+  const { scope, globalScope } = useActiveProject();
+  const { themes, ideas, loading, error } = useIdeas(scope);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // Default = the ACTIVE backlog (open + planned): a fresh load hides Done/Dropped (finding).
@@ -104,8 +122,10 @@ export function KnowledgePage() {
     }
   }, [layout]);
 
-  // Backend FTS5 + fuzzy search → the SET of matching ids (null while the query is blank).
-  const matchIds = useIdeaSearch(activeProjectId, query);
+  // Backend FTS5 + fuzzy search → the SET of matching ids (null while the query is blank). It
+  // takes the SAME scope object the list does, so the two can never disagree about what is being
+  // searched.
+  const matchIds = useIdeaSearch(scope, query);
   const filtering = status !== "all" || query.trim() !== "";
 
   // Group the enriched rows by theme, then walk the AUTHORITATIVE theme order (`idea_themes`,
@@ -202,7 +222,10 @@ export function KnowledgePage() {
     <div className="flex h-app flex-col overflow-x-clip bg-background px-6 pb-6 pt-10">
       <header className="mb-4 shrink-0">
         <Breadcrumb className="mb-2">
-          <BreadcrumbCurrent>Knowledge</BreadcrumbCurrent>
+          {/* `Ideas`, not `Knowledge`: the UI carries ONE name for this page, the one of the
+              object it renders. `knowledge` stays the internal route (and the glossary's umbrella
+              over the ideas + the design system) — see `docs/product/README.md`. */}
+          <BreadcrumbCurrent>Ideas</BreadcrumbCurrent>
         </Breadcrumb>
         <h1 className="font-heading text-xl font-semibold tracking-tight text-foreground">Ideas</h1>
         <p className="mt-0.5 text-sm text-muted-foreground">
@@ -348,15 +371,27 @@ export function KnowledgePage() {
             <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
               Could not load the ideas.
             </div>
-          ) : activeProjectId === null ? (
+          ) : /* NO PROJECT IS LOADED — a fresh install, or the window before the rail resolves
+                  the entered one. Read off the SCOPE, so it cannot fire in the cross-project mode,
+                  where there is deliberately no project id to be `null`. */
+          scope.kind === "project" && scope.projectId === null ? (
             <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
               Enter a project to see its ideas.
             </div>
           ) : isEmpty ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
+            <div
+              data-testid="ideas-empty"
+              className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground"
+            >
               <LightbulbIcon className="size-6 opacity-40" />
+              {/* The scope's own emptiness, named after the scope that was actually looked at —
+                  the homes' `HomeEmpty` hint precedent. The filtered-out case keeps its own line. */}
               <p className="text-sm">
-                {ideas.length === 0 ? "No ideas captured yet." : "No idea matches the filters."}
+                {ideas.length > 0
+                  ? "No idea matches the filters."
+                  : globalScope
+                    ? "No idea captured on any project yet."
+                    : "No ideas captured yet."}
               </p>
             </div>
           ) : layout === "flat" ? (
@@ -369,6 +404,7 @@ export function KnowledgePage() {
                   selected={item.id === selectedId}
                   onSelect={() => setSelectedId(item.id)}
                   showTheme
+                  showProject={globalScope}
                 />
               ))}
             </div>
@@ -389,6 +425,7 @@ export function KnowledgePage() {
                     item={item}
                     selected={item.id === selectedId}
                     onSelect={() => setSelectedId(item.id)}
+                    showProject={globalScope}
                   />
                 ))}
               </IdeaThemeGroup>
@@ -414,7 +451,11 @@ export function KnowledgePage() {
             // Fixed inner width — comfortable for the body + linked Specs, clamped to a share of the
             // window so the list stays usable; `min-w` keeps it from squishing as the track narrows.
             <div className="flex h-full min-w-[clamp(30rem,45vw,42rem)]">
-              <IdeaDetailDrawer item={drawerItem} onClose={() => setSelectedId(null)} />
+              <IdeaDetailDrawer
+                item={drawerItem}
+                onClose={() => setSelectedId(null)}
+                showProject={globalScope}
+              />
             </div>
           ) : null}
         </div>

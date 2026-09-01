@@ -221,7 +221,7 @@ pub fn idea_search(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let limit = optional_usize(args, "limit")?.unwrap_or(DEFAULT_SEARCH_LIMIT);
 
     let results = db
-        .with_conn(|c| idea::search_ideas(c, project_id, query, theme, status, limit))
+        .with_conn(|c| idea::search_ideas(c, Some(project_id), query, theme, status, limit))
         .map_err(internal_db)?;
     Ok(ToolOutcome::read(json!({ "results": results })))
 }
@@ -431,7 +431,7 @@ pub fn idea_list(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     };
 
     let ideas = db
-        .with_conn(|c| db::list_ideas(c, project_id, filter, theme, limit as i64, offset as i64))
+        .with_conn(|c| db::list_ideas(c, Some(project_id), filter, theme, limit as i64, offset as i64))
         .map_err(internal_db)?;
     Ok(ToolOutcome::read(
         json!({ "ideas": ideas, "limit": limit, "offset": offset }),
@@ -449,7 +449,7 @@ pub fn idea_themes(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let include_terminal = optional_bool(args, "include_terminal")?.unwrap_or(false);
     let themes = db
-        .with_conn(|c| db::list_idea_themes(c, project_id, include_terminal))
+        .with_conn(|c| db::list_idea_themes(c, Some(project_id), include_terminal))
         .map_err(internal_db)?;
     Ok(ToolOutcome::read(json!({ "themes": themes })))
 }

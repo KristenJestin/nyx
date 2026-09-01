@@ -25,6 +25,10 @@
 
 /** The last ENTERED project id. */
 const PROJECT_KEY = "nyx.ui.lastProjectId";
+/** Whether the app was left in the CROSS-PROJECT scope (`<ActiveProjectProvider>`'s `globalScope`). */
+const GLOBAL_SCOPE_KEY = "nyx.ui.globalScope";
+/** Schema version of the global-scope flag — a bare boolean. */
+const GLOBAL_SCOPE_VERSION = 1;
 /** Prefix for the per-project last SELECTED terminal id (`<prefix><projectId>`). */
 const TERMINAL_KEY_PREFIX = "nyx.ui.lastTerminalId:";
 /** Prefix for a GROUP BLOCK's folded/unfolded state (`<prefix><groupId>`). */
@@ -71,6 +75,32 @@ export function loadLastProjectId(): string | null {
 /** Remember (or, for `null`, forget) the last entered project id. */
 export function saveLastProjectId(projectId: string | null): void {
   write(PROJECT_KEY, projectId);
+}
+
+/**
+ * Whether the app was left in the CROSS-PROJECT scope ("All projects"). `false` when nothing is
+ * remembered — the app's default scope is the entered project.
+ *
+ * It rides the SAME registry as the entered project right above, and for the same reason: the two
+ * are ONE answer to "where was the user" and a relaunch has to restore them together, or reopening
+ * in the global scope would land on a rail that says otherwise. Unlike the project id, there is
+ * nothing to VALIDATE against a live tree — "all projects" is true of every tree, the empty one
+ * included — so this hint is honoured as read, and the provider seeds itself from it directly
+ * rather than waiting for a restore effect.
+ */
+export function loadGlobalScope(): boolean {
+  return (
+    loadVersionedJson(
+      GLOBAL_SCOPE_KEY,
+      GLOBAL_SCOPE_VERSION,
+      (value): value is boolean => typeof value === "boolean",
+    ) ?? false
+  );
+}
+
+/** Remember whether the app is in the cross-project scope. */
+export function saveGlobalScope(global: boolean): void {
+  saveVersionedJson(GLOBAL_SCOPE_KEY, GLOBAL_SCOPE_VERSION, global);
 }
 
 /** The last selected terminal id for `projectId`, or `null` when none is remembered. */

@@ -12,6 +12,7 @@ import { queryClient } from "@/lib/query";
 import { ActiveProjectProvider } from "@/components/terminals/active-project";
 import { BaseLayout } from "@/components/terminals/base-layout";
 import { TerminalsPage } from "@/components/terminals/terminals-page";
+import { HomePage } from "@/components/home/home-page";
 import { BoardPage } from "@/components/specs/board-page";
 import { SpecDetailPage } from "@/components/specs/spec-detail-page";
 import { PrototypePage } from "@/components/specs/prototype-page";
@@ -94,6 +95,41 @@ const terminalsRoute = createRoute({
     return out;
   },
 });
+
+/**
+ * The `/home` search params — WHICH SCOPE the one home page is read in:
+ *  - absent / `scope=project`: the ENTERED project's recap;
+ *  - `scope=all`: the same page across every project (the cross-project home).
+ *
+ * A search param rather than a second route because the two homes are ONE page over one read
+ * model in two scopes (`nyx_core::home::HomeScope`) — a second route would invite a second
+ * component, which is the drift the elected design spent five rounds removing.
+ */
+interface HomeSearch {
+  readonly scope?: "all";
+}
+
+/**
+ * Home (`/home`) — the recap of the entered project, and (with `?scope=all`) of every project:
+ * the agent sessions in one attention-sorted flow, the running services, the Specs that moved and
+ * the bare shells. Reached from the rail — the Home entry at the head of the section-nav for the
+ * project scope, the "All projects" bar in its own region at the top of the rail for the global
+ * one — and
+ * from nowhere else.
+ */
+const homeRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/home",
+  component: HomeRouteComponent,
+  validateSearch: (search: Record<string, unknown>): HomeSearch =>
+    search.scope === "all" ? { scope: "all" } : {},
+});
+
+/** Hand the validated `?scope=` down as the page's one prop. */
+function HomeRouteComponent() {
+  const { scope } = homeRoute.useSearch();
+  return <HomePage scope={scope === "all" ? "all" : "project"} />;
+}
 
 /** Work (`/work`) — the Specs BOARD (kanban / list of the entered project's Specs, v2.4). */
 const workRoute = createRoute({
@@ -202,6 +238,7 @@ const componentDetailRoute = createRoute({
 
 const routeTree = rootRoute.addChildren([
   terminalsRoute,
+  homeRoute,
   workRoute,
   specDetailRoute,
   specReviewRoute,

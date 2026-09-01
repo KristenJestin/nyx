@@ -1,7 +1,14 @@
-import { CircleDotIcon, FolderGit2Icon, GitBranchIcon, LayersIcon } from "lucide-react";
+import {
+  CircleDotIcon,
+  FolderGit2Icon,
+  FolderGitIcon,
+  GitBranchIcon,
+  LayersIcon,
+} from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { SidebarShell } from "@/components/ui/sidebar-shell";
+import { ProjectMark } from "@/components/sidebar/project-mark";
 
 import { priorityMeta, statusMeta } from "./spec-meta";
 import { Dot, MicroLabel } from "./spec-primitives";
@@ -37,14 +44,61 @@ function Section({
  * prototype's `spec/sidebar` (status → category → repos → workspace sections), consuming the
  * phase-3 workspace context (`detail.workspace_context`, `null` until the Spec is anchored).
  * Design-system tokens only, the real `<Badge>` primitive.
+ *
+ * ## THE PROJECT, NAMED IN CLEAR (`showProject`)
+ *
+ * In the CROSS-PROJECT scope a Spec is opened out of a flow that mixes every project, and nothing
+ * on the page said which one it came from. The breadcrumb's `BETA-1` is a KEY — a string to decode
+ * — and the user had already ruled on that reading for the board's cards; a coloured mark alone is
+ * worse here still, because a DETAIL has no neighbouring row to compare against and the reader
+ * would have to REMEMBER which colour is which project. So this rail writes the project's NAME,
+ * with its `<ProjectMark>` beside it: the same couple the project home's header carries.
+ *
+ * PLACEMENT: it is a `<Section>` of this panel like the other four, not a banner bolted on top —
+ * one more attribute, in the panel's own typography. It comes FIRST because the panel then reads
+ * OUTSIDE-IN (project → status → mode → repositories → workspace), and "whose Spec is this" is the
+ * question the reader arrives with when they got here from the transverse board.
+ *
+ * In the PROJECT scope it is not rendered at all: the rail already says where you are, and
+ * repeating it would be the noise the row marks are conditioned away from for the same reason. A
+ * Spec whose project row has vanished (`detail.project === null`) renders no section either —
+ * never an empty field, never a filler label.
  */
-export function SpecSidebar({ detail }: { detail: SpecDetail }) {
+export function SpecSidebar({
+  detail,
+  showProject = false,
+}: {
+  detail: SpecDetail;
+  /** CROSS-PROJECT scope: name the Spec's project in clear, at the head of the panel. */
+  showProject?: boolean;
+}) {
   const { spec, workspace_context } = detail;
   const status = statusMeta(spec.status);
   const priority = priorityMeta(spec.priority);
+  const project = detail.project ?? null;
 
   return (
     <SidebarShell aria-label="Spec context">
+      {showProject && project ? (
+        <Section icon={<FolderGitIcon className="size-3" />} label="Project">
+          <span className="flex items-center gap-2">
+            {/* `<ProjectMark>` stays the silent DRAWING (no `labelled`): the name is written right
+                next to it, so labelling the mark too would read the project twice aloud. */}
+            <ProjectMark
+              project={project}
+              data-testid="spec-detail-project-mark"
+              className="size-5 shrink-0 rounded-md"
+            />
+            <span
+              data-testid="spec-detail-project-name"
+              className="min-w-0 truncate text-sm text-foreground/90"
+            >
+              {project.name}
+            </span>
+          </span>
+        </Section>
+      ) : null}
+
       <Section icon={<CircleDotIcon className="size-3" />} label="Status">
         <div className="flex items-center justify-between gap-2">
           <span className="inline-flex items-center gap-1.5 text-sm text-foreground">

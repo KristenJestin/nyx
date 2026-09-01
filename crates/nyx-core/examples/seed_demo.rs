@@ -932,11 +932,11 @@ fn demo_member_path(db: &Db, workspace_id: &str, repository_id: &str) -> String 
 
 fn print_counts(db: &Db, proj_a: &str, proj_b: &str, ws_a: &str, api_repo: &str) {
     let specs_a = db
-        .with_conn(|c| db::list_specs(c, proj_a))
+        .with_conn(|c| db::list_specs(c, Some(proj_a)))
         .map(|v| v.len())
         .unwrap_or(0);
     let specs_b = db
-        .with_conn(|c| db::list_specs(c, proj_b))
+        .with_conn(|c| db::list_specs(c, Some(proj_b)))
         .map(|v| v.len())
         .unwrap_or(0);
     let comments = db

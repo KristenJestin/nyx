@@ -385,7 +385,7 @@ export function ComponentDetailPage() {
       <div className="flex h-app flex-col bg-background px-6 pb-6 pt-10">
         <Breadcrumb className="mb-2">
           <Link to="/design" className={breadcrumbLinkClass}>
-            Catalogue
+            Design
           </Link>
           <BreadcrumbCurrent>Component</BreadcrumbCurrent>
         </Breadcrumb>
@@ -400,12 +400,13 @@ export function ComponentDetailPage() {
       {/* THE NAME, ONCE (finding `01KZ3JW5A63TJWX83V8ZKX62CN`). It used to sit in the breadcrumb,
           in the title and in the preview's caption — three times inside 200 px, on a page whose
           whole subject is that one component. The TITLE keeps it; the breadcrumb is reduced to what
-          it is actually for here, the way back to the catalogue; the caption names what it shows
+          it is actually for here, the way back to `Design`; the caption names what it shows
           without re-naming the page. And only the EXCEPTION is badged: `DS` is the norm. */}
       <header className="mb-4 shrink-0">
         <Breadcrumb className="mb-2">
+          {/* The way back carries the page's ONE name — the rail's and the page's own. */}
           <Link to="/design" className={breadcrumbLinkClass}>
-            Catalogue
+            Design
           </Link>
         </Breadcrumb>
         <div className="flex items-center gap-2">

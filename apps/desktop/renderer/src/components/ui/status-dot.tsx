@@ -145,8 +145,13 @@ export function StatusDot({ state, size, className }: StatusDotProps) {
  * `running` (busy, no action needed) > the quiet `idle`/`closed` (which `isQuietState` hides
  * — no dot). So the rail/accordion rollup reads: yellow(question) > red(error) >
  * green(success) > blue(running) > nothing.
+ *
+ * EXPORTED since the home pages landed: they sort a flat, cross-project flow of agent rows by
+ * exactly this rank, and the whole point is that they reuse it rather than declare a second one
+ * (`components/home/home-state.ts` derives its order from this array, so a reorder here moves the
+ * home with it — or fails its test).
  */
-const STATE_PRIORITY: readonly RunState[] = [
+export const STATE_PRIORITY: readonly RunState[] = [
   "waiting",
   "error",
   "success",

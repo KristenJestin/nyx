@@ -1,8 +1,32 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { nyxBridge } from "@/bridge";
+import type { ActiveScope } from "@/components/terminals/active-project";
 
 import type { IdeaListItem, IdeaSearchResult, IdeaThemeGroup } from "./types";
+
+/**
+ * The `{ projectId }` a read is made with — OMITTED for the cross-project scope, because the
+ * dispatch reads `arg_opt_str("projectId")` and takes "absent" as "every project" (the same shape
+ * `home_snapshot` and `spec_list` take). Shared by the three idea reads so the LIST, the THEMES
+ * and the SEARCH can never end up in different scopes.
+ */
+function scopeArgs(projectId: string | null): Record<string, string> {
+  return projectId === null ? {} : { projectId };
+}
+
+/**
+ * Read the SCOPE the way both hooks below need it: the project to narrow to (`null` = every
+ * project), and whether there is anything to read at all.
+ *
+ * `null` has ONE meaning in the app's scope type — "no project is loaded" — and that case disables
+ * the read rather than widening it. "Every project" is the OTHER case, and it is spelled by the
+ * scope's own `kind`.
+ */
+function readScope(scope: ActiveScope): { projectId: string | null; enabled: boolean } {
+  if (scope.kind === "all") return { projectId: null, enabled: true };
+  return { projectId: scope.projectId, enabled: scope.projectId !== null };
+}
 
 /**
  * `use-ideas` — the LIVE Idées read model: a project's THEME groups (`idea_themes`, for the group
@@ -28,16 +52,22 @@ export interface UseIdeas {
   refresh: () => Promise<void>;
 }
 
-/** Load a project's ideas (themes + rows) and keep them live. A `null` project disables the hook. */
-export function useIdeas(projectId: string | null): UseIdeas {
-  const enabled = projectId !== null;
+/**
+ * Load the ideas (themes + rows) of a SCOPE and keep them live.
+ *
+ * The scope is the app's own {@link ActiveScope}, not a `projectId: string | null` — see
+ * {@link readScope}. In the cross-project scope the two reads are made ONCE, with no project
+ * filter, and each row comes back carrying its project's identity; never a call per project.
+ */
+export function useIdeas(scope: ActiveScope): UseIdeas {
+  const { projectId, enabled } = readScope(scope);
   const [themes, setThemes] = useState<readonly IdeaThemeGroup[]>([]);
   const [ideas, setIdeas] = useState<readonly IdeaListItem[]>([]);
   const [loading, setLoading] = useState<boolean>(enabled);
   const [error, setError] = useState<boolean>(false);
 
   const load = useCallback(async () => {
-    if (projectId === null) {
+    if (!enabled) {
       setThemes([]);
       setIdeas([]);
       setLoading(false);
@@ -45,9 +75,10 @@ export function useIdeas(projectId: string | null): UseIdeas {
       return;
     }
     try {
+      const args = scopeArgs(projectId);
       const [themeRows, ideaRows] = await Promise.all([
-        nyxBridge.invoke<IdeaThemeGroup[]>("idea_themes", { projectId }),
-        nyxBridge.invoke<IdeaListItem[]>("idea_list", { projectId }),
+        nyxBridge.invoke<IdeaThemeGroup[]>("idea_themes", args),
+        nyxBridge.invoke<IdeaListItem[]>("idea_list", args),
       ]);
       setThemes(themeRows ?? []);
       setIdeas(ideaRows ?? []);
@@ -57,13 +88,13 @@ export function useIdeas(projectId: string | null): UseIdeas {
     } finally {
       setLoading(false);
     }
-  }, [projectId]);
+  }, [enabled, projectId]);
 
-  // Initial load (and reload when the project changes). A load that resolves after the effect was
-  // cancelled is dropped so it never clobbers a newer project's state.
+  // Initial load (and reload when the scope changes). A load that resolves after the effect was
+  // cancelled is dropped so it never clobbers a newer scope's state.
   useEffect(() => {
     let cancelled = false;
-    if (projectId === null) {
+    if (!enabled) {
       setThemes([]);
       setIdeas([]);
       setLoading(false);
@@ -73,9 +104,10 @@ export function useIdeas(projectId: string | null): UseIdeas {
       };
     }
     setLoading(true);
+    const args = scopeArgs(projectId);
     void Promise.all([
-      nyxBridge.invoke<IdeaThemeGroup[]>("idea_themes", { projectId }),
-      nyxBridge.invoke<IdeaListItem[]>("idea_list", { projectId }),
+      nyxBridge.invoke<IdeaThemeGroup[]>("idea_themes", args),
+      nyxBridge.invoke<IdeaListItem[]>("idea_list", args),
     ])
       .then(([themeRows, ideaRows]) => {
         if (cancelled) return;
@@ -92,7 +124,7 @@ export function useIdeas(projectId: string | null): UseIdeas {
     return () => {
       cancelled = true;
     };
-  }, [projectId]);
+  }, [enabled, projectId]);
 
   // Live: re-pull on the coarse `ideas://changed` (agent backlog upkeep) AND `specs://changed`
   // (a linked Spec's status) invalidations — the "sans polling" path. StrictMode-safe teardown.
@@ -129,12 +161,13 @@ export function useIdeas(projectId: string | null): UseIdeas {
  * scored search through the bridge is the "recherche" of the Idées toolbar; the grouping + facet
  * stay client-side over the loaded rows.
  */
-export function useIdeaSearch(projectId: string | null, query: string): ReadonlySet<string> | null {
+export function useIdeaSearch(scope: ActiveScope, query: string): ReadonlySet<string> | null {
+  const { projectId, enabled } = readScope(scope);
   const [matchIds, setMatchIds] = useState<ReadonlySet<string> | null>(null);
 
   useEffect(() => {
     const q = query.trim();
-    if (projectId === null || q === "") {
+    if (!enabled || q === "") {
       setMatchIds(null);
       return;
     }
@@ -142,7 +175,14 @@ export function useIdeaSearch(projectId: string | null, query: string): Readonly
     // Debounce so a fast typist does not fire a search per keystroke.
     const handle = setTimeout(() => {
       void nyxBridge
-        .invoke<IdeaSearchResult[]>("idea_search", { projectId, query: q, limit: 50 })
+        // THE SEARCH FOLLOWS THE LIST'S SCOPE, through the same {@link scopeArgs}. A query that
+        // stayed inside the entered project while the page listed every project's ideas would be
+        // a silent trap: rows would vanish for no reason the user can see.
+        .invoke<IdeaSearchResult[]>("idea_search", {
+          ...scopeArgs(projectId),
+          query: q,
+          limit: 50,
+        })
         .then((hits) => {
           if (!cancelled) setMatchIds(new Set((hits ?? []).map((h) => h.id)));
         })
@@ -154,7 +194,7 @@ export function useIdeaSearch(projectId: string | null, query: string): Readonly
       cancelled = true;
       clearTimeout(handle);
     };
-  }, [projectId, query]);
+  }, [enabled, projectId, query]);
 
   return matchIds;
 }

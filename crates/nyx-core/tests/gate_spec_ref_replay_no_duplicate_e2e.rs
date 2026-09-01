@@ -555,7 +555,7 @@ impl Scene {
     /// compares before and after.
     fn specs(&self) -> Vec<(i32, String)> {
         self.db
-            .with_conn(|c| db::list_specs(c, &self.project_id))
+            .with_conn(|c| db::list_specs(c, Some(&self.project_id)))
             .expect("list the project's Specs")
             .into_iter()
             .map(|s| (s.number, s.id))

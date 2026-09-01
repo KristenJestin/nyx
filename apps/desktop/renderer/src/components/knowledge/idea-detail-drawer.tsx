@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { MicroLabel } from "@/components/ui/micro-label";
 import { specKey, statusMeta as specStatusMeta } from "@/components/specs/spec-meta";
 import { Dot } from "@/components/specs/spec-primitives";
+import { ProjectMark } from "@/components/sidebar/project-mark";
 
 import { formatShortDate, ideaStatusMeta, themeTone } from "./idea-meta";
 import { UNGROUPED_THEME } from "./types";
@@ -18,8 +19,33 @@ import type { IdeaListItem } from "./types";
  * closure motif ("motif de fermeture"). All three required sections render from the enriched
  * `IdeaListItem` (no second round-trip). Built on the shared `<Badge>`/`<Dot>`/`<MicroLabel>`
  * primitives + tokens — the prototype's `detail` placement, none of its pixels.
+ *
+ * ## THE PROJECT, NAMED IN CLEAR (`showProject`)
+ *
+ * The ROW names its project with a mark alone, and that is right for a row: the place is missing
+ * and the neighbouring rows give the scale to read the colour against. A DETAIL has neither — it
+ * has the room, and it has no neighbour — so a coloured square alone would ask the reader to
+ * REMEMBER which colour is which project. Here the project's NAME is written, with its
+ * `<ProjectMark>` beside it: the couple the project home's header already carries.
+ *
+ * PLACEMENT: inside the existing meta row (`<dl>`), as one more `dt`/`dd` pair in that row's own
+ * typography — not a banner added above it. It leads the row, ahead of Status/Theme/Captured,
+ * because it is the outermost fact and because the row's mark leads its title the same way.
+ *
+ * Conditioned on the CROSS-PROJECT scope, exactly like the row's mark: inside a project the rail
+ * already says where you are. And an ORPHANED idea (`item.project === null`, its project row gone)
+ * names nothing at all — no empty field, no filler label — just as its row wears no mark.
  */
-export function IdeaDetailDrawer({ item, onClose }: { item: IdeaListItem; onClose: () => void }) {
+export function IdeaDetailDrawer({
+  item,
+  onClose,
+  showProject = false,
+}: {
+  item: IdeaListItem;
+  onClose: () => void;
+  /** CROSS-PROJECT scope: name the idea's project in clear, at the head of the meta row. */
+  showProject?: boolean;
+}) {
   const meta = ideaStatusMeta(item.status);
   const themeLabel = item.theme ?? UNGROUPED_THEME;
   return (
@@ -58,6 +84,23 @@ export function IdeaDetailDrawer({ item, onClose }: { item: IdeaListItem; onClos
         </h2>
 
         <dl className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-lg border border-border/60 bg-card px-3 py-2 text-2xs text-muted-foreground">
+          {showProject && item.project ? (
+            <div className="flex min-w-0 items-center gap-1.5">
+              <dt>Project</dt>
+              <dd className="flex min-w-0 items-center gap-1.5 font-medium text-foreground/80">
+                {/* The mark stays the silent DRAWING (no `labelled`) — the name is written beside
+                    it, so labelling it too would say the project twice to a reader. */}
+                <ProjectMark
+                  project={item.project}
+                  data-testid="idea-detail-project-mark"
+                  className="size-4 shrink-0 rounded"
+                />
+                <span data-testid="idea-detail-project-name" className="truncate">
+                  {item.project.name}
+                </span>
+              </dd>
+            </div>
+          ) : null}
           <div className="flex items-center gap-1.5">
             <Dot tone={meta.dot} size="xs" />
             <dt className="sr-only">Status</dt>

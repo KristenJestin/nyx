@@ -157,6 +157,12 @@ diesel::table! {
 //   Appended LAST on `projects` (positional decoding), same shape and same level as
 //   `resume_agent_sessions` (v8). The same migration widens `nodes.type` with `create_workspace`, the
 //   leaf that lands one from a graph.
+// - the projects_identity migration adds the project's CHOSEN visual identity: `projects.accent`
+//   (Nullable<Text>, an opaque colour the core never interprets) plus the mark in its two
+//   spellings, `icon` (a glyph token) and `image_path` (a file path / URL), which are mutually
+//   exclusive by a SQL CHECK (`image_path IS NULL OR icon IS NULL`). All three NULLABLE and NULL
+//   by default — a project with no identity falls back to its initial on a neutral tile. Appended
+//   LAST on `projects` (positional decoding), same shape as `worktrees_root`.
 diesel::table! {
     projects (id) {
         id -> Text,
@@ -171,6 +177,9 @@ diesel::table! {
         primary_workspace_id -> Nullable<Text>,
         archived_at -> Nullable<BigInt>,
         worktrees_root -> Nullable<Text>,
+        accent -> Nullable<Text>,
+        icon -> Nullable<Text>,
+        image_path -> Nullable<Text>,
     }
 }
 
