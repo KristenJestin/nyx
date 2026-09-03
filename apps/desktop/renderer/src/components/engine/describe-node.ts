@@ -52,6 +52,8 @@ export function describeNode(
       return describeTransitionTask(cfg);
     case "create_workspace":
       return describeCreateWorkspace(cfg);
+    case "set_category":
+      return describeSetCategory(cfg);
     default:
       return null;
   }
@@ -150,6 +152,29 @@ function describeCreateWorkspace(cfg: Record<string, unknown>): string {
   return `Creates the Spec's dev workspace ${where}, and anchors the Spec to it${clause}.`;
 }
 
+/**
+ * `set_category` → "Classifies the Spec with the category named in `category_choice`.". The sentence
+ * must name the KEY and not a category, because that is the node's whole decision and it is taken
+ * from the BLACKBOARD: the label is a per-run answer (a judge's verdict, a human's reply), so a graph
+ * that named a literal would classify every Spec the same way. It says "named in", never "as", for
+ * exactly that reason.
+ *
+ * A node with no `category_key` says so rather than reading as configured — the same treatment
+ * `create_workspace`'s missing `root_key` gets, and for the same reason: authoring refuses the
+ * omission, so a node that reaches the visualiser without one was hand-inserted or seeded, and the
+ * panel is where a reader finds that out. The `gate_on` clause is worded like `transition`'s, since it
+ * is the same gate — an UNGATED node fires unconditionally and the clause is dropped.
+ */
+function describeSetCategory(cfg: Record<string, unknown>): string {
+  const categoryKey = asString(cfg.category_key);
+  const gateOn = asString(cfg.gate_on);
+  const clause = gateOn ? `, only if \`${gateOn}\` was approved` : "";
+  if (!categoryKey) {
+    return `Classifies the Spec — but with nothing: it names no category key${clause}.`;
+  }
+  return `Classifies the Spec with the category named in \`${categoryKey}\`${clause}.`;
+}
+
 /** `loop` → "Repeats its contents until `grill_status = complete`, 25 iterations max." */
 function describeLoop(config: string, cfg: Record<string, unknown>): string {
   const cond = describeLoopCondition(config);
@@ -192,24 +217,42 @@ function describeTransition(cfg: Record<string, unknown>): string {
 }
 
 /**
- * `gate_check` → what this gate actually runs. A gate arms itself one of two ways and the sentence
- * must not blur them: a `slot` names WHAT must be verified and leaves the WITH WHAT to the project
- * that binds it (the shape a SHARED graph uses — no built-in can name `bun test`), while
- * `command_ids` names the commands outright. A slot gate reads as unconfigured otherwise, which is
- * the opposite of true: it is configured, and it is the project that has yet to answer.
+ * `gate_check` → what this gate actually runs, and WHICH OUTCOME it demands. A gate arms itself one
+ * of two ways and the sentence must not blur them: a `slot` names WHAT must be verified and leaves
+ * the WITH WHAT to the project that binds it (the shape a SHARED graph uses — no built-in can name
+ * `bun test`), while `command_ids` names the commands outright. A slot gate reads as unconfigured
+ * otherwise, which is the opposite of true: it is configured, and it is the project that has yet to
+ * answer.
+ *
+ * `expect` IS THE OTHER HALF, and reading it backwards is worse than not reading it at all. The
+ * seeded coder's two reproduction gates declare `expect: red` then `expect: green` on the SAME slot,
+ * and that difference IS the red-before-green proof: the first blocks the run until the check
+ * FAILS. Rendering both as "blocks the run until it passes" made the two nodes indistinguishable
+ * and told the reader the exact opposite of what the first one enforces. Absent means `green` — the
+ * runtime's default, and the shape of every gate that is not a reproduction.
  */
 function describeGate(cfg: Record<string, unknown>): string {
   // A gate is BLOCKING by nature (the engine defaults `blocking` true); only an explicit `false` is advisory.
   const blocking = cfg.blocking !== false;
+  // Only the literal `red` inverts the demand: an absent or unrecognised value is the `green`
+  // default, which is what the runtime grades against too.
+  const expectsRed = asString(cfg.expect) === "red";
+  const verdict = (subject: "it" | "they") => {
+    const one = subject === "it";
+    if (expectsRed) {
+      return blocking
+        ? `blocks the run until ${one ? "it FAILS" : "they FAIL"} — a reproduction: a check that passes here has reproduced nothing`
+        : `expects a FAILURE (a reproduction), advisory only`;
+    }
+    return blocking ? `blocks the run until ${one ? "it passes" : "they pass"}` : "advisory only";
+  };
   const slot = asString(cfg.slot);
   if (slot) {
-    return `Runs whatever this project binds to the \`${slot}\` slot; ${
-      blocking ? "blocks the run until it passes" : "advisory only"
-    } (unbound, it verifies nothing and the run is refused).`;
+    return `Runs whatever this project binds to the \`${slot}\` slot; ${verdict("it")} (unbound, it verifies nothing and the run is refused).`;
   }
   const ids = stringArray(cfg.command_ids);
   if (ids.length === 0) return "No command configured: always passes green and checks nothing.";
-  return `Runs \`${ids.join(", ")}\`; ${blocking ? "blocks the run until they pass" : "advisory only"}.`;
+  return `Runs \`${ids.join(", ")}\`; ${verdict("they")}.`;
 }
 
 /** `spawn_subagent` → "Launches the `spec` effector in this session (inline mode, so it can address you)." */

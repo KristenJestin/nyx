@@ -71,6 +71,34 @@ pub const DEFAULT_JUDGE_OUTPUT_KEY: &str = "verdict";
 /// / an engaging `transition`'s `gate_on` reads it). Overridable per node via `output_key`.
 pub const DEFAULT_ASK_HUMAN_OUTPUT_KEY: &str = "human";
 
+/// The blackboard key carrying WHAT THE GATE'S COMMAND DID: `true` when every command exited 0.
+/// It answers "did the check pass", and nothing else — notably NOT "was that the answer the graph
+/// asked for", which is [`GATE_SATISFIED_KEY`]'s question and a different fact entirely.
+///
+/// The two are separate keys because collapsing them is the failure this whole discipline exists
+/// against: a reproduction gate declaring `expect: red` is SATISFIED by a command that FAILED, and a
+/// single key would have had to write "green" for it — recording the opposite of what the command
+/// just did, under the name every existing graph reads.
+pub const GATE_PASSED_KEY: &str = "gate_passed";
+
+/// The HISTORICAL spelling of [`GATE_PASSED_KEY`], written beside it with the same value.
+///
+/// TEMPORARY, and deliberately so: every graph authored before the expectation split reads
+/// `gate_green` (`{"var": "gate_green", "truthy": false}` is the seeded coder's retry condition), and
+/// a rename would have silently turned those conditions into reads of an absent key — which is
+/// falsy, so the loops would have kept walking and nobody would have seen a thing. It is dropped
+/// when no built-in and no project graph names it any more.
+pub const GATE_GREEN_KEY: &str = "gate_green";
+
+/// The blackboard key carrying WHETHER THE ATTEMPT ANSWERED WHAT THE NODE DECLARED: `true` when the
+/// gate's tri-valued grade ([`GateGrade`]) satisfies its [`GateExpectation`].
+///
+/// For a gate with no declared `expect` this is exactly [`GATE_PASSED_KEY`] (the default expectation
+/// is `green`), which is why adding it breaks nothing. For a reproduction gate declaring
+/// `expect: red` the two DIVERGE, and that divergence is the point: `gate_passed=false` +
+/// `gate_satisfied=true` is what "the defect was observed failing, as demanded" looks like.
+pub const GATE_SATISFIED_KEY: &str = "gate_satisfied";
+
 /// The blackboard key a `transition_task` reads its target task id from by default. Overridable per
 /// node via `TransitionTaskConfig.task_key` (v2.8 lot 2).
 pub const DEFAULT_TASK_KEY: &str = "task_id";
@@ -86,6 +114,13 @@ pub const DEFAULT_WORKSPACE_NAME_KEY: &str = "workspace_name";
 /// fact writes AND the key the question asked when nothing is configured writes into: ONE key, so the
 /// folder a graph checks is the folder it then creates.
 pub const DEFAULT_WORKTREES_ROOT_KEY: &str = "worktrees_root";
+
+/// The blackboard key a `set_category` reads the category LABEL from by default. Overridable per node
+/// via `SetCategoryConfig.category_key`. It is deliberately the same word the `spec_category` query
+/// fact is normally written under, so a graph that READS the Spec's current genre and a graph that
+/// WRITES one speak of the same board key — the reason `task_key` is shared between `query` and
+/// `transition_task`, and `root_key` between `query` and `create_workspace`.
+pub const DEFAULT_CATEGORY_KEY: &str = "category";
 
 /// The RUN-SCOPED fact that authorizes ONE Spec-section write on a Spec whose sections are otherwise
 /// FROZEN (H12). The freeze stays the rule — the human is its only exception — so this key is written
@@ -165,8 +200,8 @@ pub const LOOP_ITER_KEY: &str = "loop_iter";
 // Node types
 // ============================================================================
 
-/// A behavior-tree node type — the FULL PRD vocabulary (the 3 composites + the 13 leaves enumerated
-/// below). Mirrors the DB `nodes.type` CHECK ([`db::NODE_TYPES`]), whose `[&str; 16]` is the count
+/// A behavior-tree node type — the FULL PRD vocabulary (the 3 composites + the 14 leaves enumerated
+/// below). Mirrors the DB `nodes.type` CHECK ([`db::NODE_TYPES`]), whose `[&str; 17]` is the count
 /// that fails to compile when a type is added on one side only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeType {
@@ -193,6 +228,11 @@ pub enum NodeType {
     /// Opens the DEV WORKSPACE of the run's bound Spec — a nyx-own inline effect that goes through
     /// the SAME `create_workspace` the MCP tool calls, anchor included.
     CreateWorkspace,
+    /// CLASSIFIES the run's bound Spec — writes the genre of work it carries through the SAME
+    /// [`crate::category`] service the MCP surface calls, so the same-project refusal and the
+    /// on-the-fly MINT of an unknown label are one authority. A nyx-own inline effect, like
+    /// [`NodeType::Transition`] (PDR-0017 / ADR-0006).
+    SetCategory,
     /// Opens a CHILD run of another flow (a fresh sub-agent drives it) and folds the child's VERIFIED
     /// blackboard result back onto the parent board — the one HYBRID leaf (a nyx-own inline effect
     /// that ALSO suspends the parent while the child runs) (v2.8 lot 2).
@@ -219,6 +259,7 @@ impl NodeType {
             db::NODE_TYPE_FORK_SPEC => NodeType::ForkSpec,
             db::NODE_TYPE_TRANSITION_TASK => NodeType::TransitionTask,
             db::NODE_TYPE_CREATE_WORKSPACE => NodeType::CreateWorkspace,
+            db::NODE_TYPE_SET_CATEGORY => NodeType::SetCategory,
             db::NODE_TYPE_SUB_WORKFLOW => NodeType::SubWorkflow,
             db::NODE_TYPE_ASK_HUMAN => NodeType::AskHuman,
             db::NODE_TYPE_PRODUCE => NodeType::Produce,
@@ -242,6 +283,7 @@ impl NodeType {
             NodeType::ForkSpec => db::NODE_TYPE_FORK_SPEC,
             NodeType::TransitionTask => db::NODE_TYPE_TRANSITION_TASK,
             NodeType::CreateWorkspace => db::NODE_TYPE_CREATE_WORKSPACE,
+            NodeType::SetCategory => db::NODE_TYPE_SET_CATEGORY,
             NodeType::SubWorkflow => db::NODE_TYPE_SUB_WORKFLOW,
             NodeType::AskHuman => db::NODE_TYPE_ASK_HUMAN,
             NodeType::Produce => db::NODE_TYPE_PRODUCE,
@@ -306,6 +348,139 @@ pub struct GateConfig {
     pub slot: Option<String>,
     #[serde(default = "default_true")]
     pub blocking: bool,
+    /// What this gate DECLARES the check must do — `green` (the default meaning) or `red`.
+    ///
+    /// `None` means the node NEVER DECLARED ONE, and that is not the same fact as declaring the
+    /// default. The VALUE it resolves to is the same ([`GateConfig::expectation`] answers
+    /// `green` for both), but a gate that declared nothing keeps the pre-expectation ENFORCEMENT —
+    /// the M5 red anchor, refused at the next `transition`/`done` — while a gate that declared one
+    /// is enforced on the spot ([`crate::mcp_engine`]'s gate arm). That is what makes "a graph with
+    /// no `expect` behaves exactly as it did before" a property of the code rather than a hope.
+    #[serde(default)]
+    pub expect: Option<GateExpectation>,
+}
+
+impl GateConfig {
+    /// The expectation this gate is GRADED against: the declared one, else `green`.
+    pub fn expectation(&self) -> GateExpectation {
+        self.expect.unwrap_or(GateExpectation::Green)
+    }
+}
+
+/// What a `gate_check` DECLARES its check must do — the second half of "was this verified", and the
+/// half a boolean verdict could not carry.
+///
+/// A `bug` Spec owes a red-before-green proof: the reproduction check is OBSERVED failing before the
+/// fix and passing after. The SAME node type serves both ends of that sequence; what differs is only
+/// what the graph asked for, which is this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateExpectation {
+    /// The check must PASS — every existing gate, and the default of every new one.
+    Green,
+    /// The check must FAIL, by exiting non-zero after running to completion. The reproduction end of
+    /// a `bug` flow: the defect is made to fail on purpose, and a check that passes here has NOT
+    /// reproduced anything.
+    Red,
+}
+
+impl GateExpectation {
+    /// The stable wire/board spelling (`green` | `red`), as the discipline texts name it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GateExpectation::Green => "green",
+            GateExpectation::Red => "red",
+        }
+    }
+
+    /// Whether `grade` ANSWERS this expectation.
+    ///
+    /// The whole table, and it is deliberately not a boolean comparison:
+    ///
+    /// | grade | `expect: green` | `expect: red` |
+    /// |---|---|---|
+    /// | [`GateGrade::Passed`] | satisfied | NO |
+    /// | [`GateGrade::Failed`] | NO | satisfied |
+    /// | [`GateGrade::Indeterminate`] | **NO** | **NO** |
+    ///
+    /// The bottom row is the reason this function exists. Graded as a boolean, "not green" would
+    /// have covered both "the check ran and failed" and "the check never ran", so a timeout, a
+    /// missing binary or a spawn failure would have SATISFIED a reproduction expectation — a gate
+    /// that verified nothing standing as the proof that the defect reproduces. An indeterminate
+    /// attempt answers neither expectation, ever.
+    pub fn is_satisfied_by(self, grade: GateGrade) -> bool {
+        match self {
+            GateExpectation::Green => grade == GateGrade::Passed,
+            GateExpectation::Red => grade == GateGrade::Failed,
+        }
+    }
+}
+
+/// The TRI-VALUED grade of ONE gate attempt — what the check ACTUALLY did, before anyone asks
+/// whether that was what the graph wanted.
+///
+/// Three values and not two, because "did not pass" conflates two opposite facts that take opposite
+/// fixes: a verdict (the check ran, the work did not pass — fix the work) and the ABSENCE of a
+/// verdict (nothing was judged — fix the harness). The engine already told those apart in prose for
+/// the cut-short refusal; this makes the distinction a value the graph can be graded on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateGrade {
+    /// Every command terminated normally with status 0.
+    Passed,
+    /// A command TERMINATED NORMALLY with a non-zero status — a real verdict about the work.
+    Failed,
+    /// The attempt produced NO verdict: a timeout (per-command or the gate's total budget), a
+    /// cancellation, a spawn failure, a command that could not be resolved, an unreachable service —
+    /// any fault of the infrastructure rather than of the work under check.
+    Indeterminate,
+}
+
+impl GateGrade {
+    /// The stable wire/board spelling (`passed` | `failed` | `indeterminate`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GateGrade::Passed => "passed",
+            GateGrade::Failed => "failed",
+            GateGrade::Indeterminate => "indeterminate",
+        }
+    }
+}
+
+/// ONE graded gate attempt as the effects layer produced it: what the check DID ([`GateGrade`]) and
+/// what the node had DECLARED ([`GateExpectation`]). Carried back into the engine as a
+/// [`NodeResult::Gate`] so the fold writes all three board keys from one value — there is no second
+/// place where "passed" and "satisfied" could be derived differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateVerdict {
+    pub grade: GateGrade,
+    pub expect: GateExpectation,
+}
+
+impl GateVerdict {
+    /// The verdict of a gate that declared nothing and whose commands passed / failed — the shape
+    /// every pre-expectation call site produced, spelled once so those call sites keep reading as
+    /// what they are.
+    pub fn from_passed(passed: bool) -> Self {
+        GateVerdict {
+            grade: if passed {
+                GateGrade::Passed
+            } else {
+                GateGrade::Failed
+            },
+            expect: GateExpectation::Green,
+        }
+    }
+
+    /// WHAT THE COMMAND DID — [`GATE_PASSED_KEY`] (and its [`GATE_GREEN_KEY`] alias).
+    pub fn passed(self) -> bool {
+        self.grade == GateGrade::Passed
+    }
+
+    /// WHETHER THAT ANSWERED THE DECLARATION — [`GATE_SATISFIED_KEY`].
+    pub fn satisfied(self) -> bool {
+        self.expect.is_satisfied_by(self.grade)
+    }
 }
 
 /// `judge` config — `{prompt, output_schema}` + an optional `output_key` (the blackboard key the
@@ -472,6 +647,29 @@ pub struct CreateWorkspaceConfig {
     pub root_key: Option<String>,
     #[serde(default)]
     pub name_key: Option<String>,
+    #[serde(default)]
+    pub gate_on: Option<String>,
+}
+
+/// `set_category` config — `{category_key, gate_on?}`: WHICH category the run's bound Spec takes,
+/// named through a BLACKBOARD KEY rather than a literal, because the answer is per-run (a `judge`'s
+/// verdict, a human's reply) and a shared graph holds none of them.
+///
+/// `category_key` names the board key holding the category LABEL — a SLUG (`bug`) or a human NAME
+/// (`Dette technique`), resolved slug-first inside the SPEC'S OWN project and MINTED — valid as it
+/// stands, PDR-0017 amended 2026-09-02 — when the project has nothing that answers
+/// ([`crate::category::set_spec_category_by_label`]).
+/// A label, and never an id: the graph is shared by every project and a `categories.id` is one
+/// project's row.
+///
+/// `gate_on` is the OPTIONAL affirmative board key the effect fires on (UNGATED when absent) — the
+/// same shape as [`TransitionTaskConfig::gate_on`], for a flow that wants a human's word before the
+/// classification lands. The seeded `/nspec` leaves it out: the classification is the engine's to
+/// impose (ADR-0006), and it stays correctable at any Spec status.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SetCategoryConfig {
+    #[serde(default)]
+    pub category_key: Option<String>,
     #[serde(default)]
     pub gate_on: Option<String>,
 }
@@ -1765,6 +1963,10 @@ pub enum Action {
         command_ids: Vec<String>,
         slot: Option<String>,
         blocking: bool,
+        /// The DECLARED expectation, or `None` when the node declared none — see
+        /// [`GateConfig::expect`]. Carried rather than collapsed to its default because the effects
+        /// layer enforces the two cases differently, and only the undeclared one keeps the M5 anchor.
+        expect: Option<GateExpectation>,
     },
     /// Ask the LLM the structured `prompt` — report the verdict.
     Judge {
@@ -1828,6 +2030,29 @@ pub enum Action {
         name: String,
         gate_on: Option<String>,
     },
+    /// CLASSIFY the run's bound Spec with `category` — a nyx-own inline effect the T4 handler resolves
+    /// itself (never surfaced to the dispatcher), through the SAME
+    /// [`crate::category::set_spec_category_by_label`] the MCP `spec_set_category` tool calls.
+    ///
+    /// `category` is RESOLVED FROM THE BOARD by the engine (the pure half): the LABEL the node's
+    /// `category_key` names — a slug or a human name. It can be EMPTY, and the handler owns what that
+    /// means (nothing to classify with, so nothing is written), because only it can see the Spec.
+    /// `gate_on` is the OPTIONAL affirmative board key (UNGATED when None).
+    ///
+    /// `key` is the board key `category` was interpolated FROM (the declared `category_key`, else
+    /// [`DEFAULT_CATEGORY_KEY`]). The handler needs the key and not only the rendered string because
+    /// interpolation FLATTENS: a `null` on the board renders as the four letters `null`, which is a
+    /// perfectly good category name and would be MINTED as one. Only the raw board value says
+    /// whether anything was actually answered, and only the key can name it in the refusal.
+    ///
+    /// It reports [`NodeResult::Ack`] and writes NO board key: the classification lives in the Spec
+    /// domain, and a graph that routes on it reads it BACK through the `spec_category` query fact.
+    SetCategory {
+        node_id: String,
+        key: String,
+        category: String,
+        gate_on: Option<String>,
+    },
     /// Pause — report the ack to resume.
     Wait { node_id: String },
     /// Inject free `text` into the dispatcher (trappe) — report the ack. `clear_gate_block` (M5) marks
@@ -1879,6 +2104,7 @@ impl Action {
             | Action::ForkSpec { node_id, .. }
             | Action::TransitionTask { node_id, .. }
             | Action::CreateWorkspace { node_id, .. }
+            | Action::SetCategory { node_id, .. }
             | Action::Wait { node_id }
             | Action::Note { node_id, .. }
             | Action::AskHuman { node_id, .. }
@@ -1896,8 +2122,8 @@ pub enum NodeResult {
     Ack,
     /// A `spawn_subagent`'s extracted diff.
     Diff(String),
-    /// A `gate_check` verdict (`true` = green).
-    Gate(bool),
+    /// A `gate_check` attempt, GRADED against what the node declared — see [`GateVerdict`].
+    Gate(GateVerdict),
     /// A `judge` verdict (any JSON — a string like `"clair"`, or a structured object).
     Verdict(Value),
     /// An `ask_human` decision.
@@ -2187,6 +2413,27 @@ impl Engine {
     /// declare a write to be an `ask_human`'s — which is the one claim the consent check acts on. An
     /// id the tree does not hold degrades to an UNATTRIBUTED write (the provenance is dropped), never
     /// to a guess.
+    /// Fold a gate attempt's [`GateVerdict`] onto the board on behalf of `node_id` — the THREE keys
+    /// a `gate_check` writes: what the command did ([`GATE_PASSED_KEY`]), its historical alias
+    /// ([`GATE_GREEN_KEY`]), and whether that answered the declaration ([`GATE_SATISFIED_KEY`]).
+    ///
+    /// Called from TWO places, and it is one function for exactly that reason: the ordinary fold
+    /// ([`Engine::apply_result`], when the walk goes on) and the effects layer's refusal path
+    /// (when an unmet expectation stops the tick BEFORE the result is ever folded). A run parked on
+    /// a mismatch must carry the same three facts as one that walked past — otherwise the blocked
+    /// run, which is precisely the one somebody is about to read, would be the one with an empty
+    /// board.
+    pub fn set_gate_verdict(&mut self, node_id: &str, verdict: GateVerdict) {
+        let passed = verdict.passed();
+        self.set_board_as(node_id, GATE_PASSED_KEY, Value::from(passed));
+        self.set_board_as(node_id, GATE_GREEN_KEY, Value::from(passed));
+        self.set_board_as(
+            node_id,
+            GATE_SATISFIED_KEY,
+            Value::from(verdict.satisfied()),
+        );
+    }
+
     pub fn set_board_as(&mut self, node_id: &str, key: &str, value: Value) {
         match self.node_origin(node_id) {
             Some(by) => self.board.written_by(&by).set(key, value),
@@ -2631,6 +2878,7 @@ impl Engine {
                     command_ids: cfg.command_ids,
                     slot: cfg.slot,
                     blocking: cfg.blocking,
+                    expect: cfg.expect,
                 }
             }
             NodeType::Judge => {
@@ -2703,6 +2951,29 @@ impl Engine {
                     gate_on: cfg.gate_on,
                 }
             }
+            NodeType::SetCategory => {
+                let cfg: SetCategoryConfig = self.parse_config(idx)?;
+                // The LABEL is RESOLVED FROM THE BOARD through the same `{{path}}` interpolation
+                // `create_workspace`'s root/name and `transition_task`'s task id use — the engine
+                // stays pure and the graph names a KEY, never a literal. A key nothing wrote
+                // interpolates to the empty string, which is exactly the "unset" the handler branches
+                // on (no label ⇒ nothing to classify with ⇒ nothing written).
+                let key = cfg
+                    .category_key
+                    .as_deref()
+                    .unwrap_or(DEFAULT_CATEGORY_KEY);
+                let category = if key.is_empty() {
+                    String::new()
+                } else {
+                    interpolate(&format!("{{{{{key}}}}}"), &self.board)
+                };
+                Action::SetCategory {
+                    node_id,
+                    key: key.to_string(),
+                    category,
+                    gate_on: cfg.gate_on,
+                }
+            }
             NodeType::Wait => Action::Wait { node_id },
             NodeType::Note => {
                 let cfg: NoteConfig = self.parse_config(idx)?;
@@ -2756,10 +3027,8 @@ impl Engine {
                     .set("last_diff", Value::from(diff));
                 self.board.written_by(&by).increment("spawns");
             }
-            (NodeType::GateCheck, NodeResult::Gate(green)) => {
-                self.board
-                    .written_by(&by)
-                    .set("gate_green", Value::from(green));
+            (NodeType::GateCheck, NodeResult::Gate(verdict)) => {
+                self.set_gate_verdict(&node_id, verdict);
             }
             (NodeType::Judge, NodeResult::Verdict(verdict)) => {
                 self.write_result(leaf_idx, DEFAULT_JUDGE_OUTPUT_KEY, verdict);

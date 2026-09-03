@@ -9,6 +9,7 @@ import {
   ListPlusIcon,
   type LucideIcon,
   PencilIcon,
+  TagIcon,
   WorkflowIcon,
 } from "lucide-react";
 
@@ -69,6 +70,7 @@ const EVENT_ICONS: Readonly<Record<string, LucideIcon>> = {
   "spec.transitioned": WorkflowIcon,
   "spec.forked": GitForkIcon,
   "spec.workspace_changed": AnchorIcon,
+  "spec.category_set": TagIcon,
   "task.added": ListPlusIcon,
   "task.transitioned": ArrowRightLeftIcon,
   "task.dependency_added": LinkIcon,
@@ -86,6 +88,7 @@ function iconFor(eventType: string): LucideIcon {
  *   - `spec.transitioned` (from=draft, to=ready) → "Spec transitioned draft → ready"
  *   - `spec.forked` (from=1, to=2) → "Spec forked: revision 1 → 2"
  *   - `spec.workspace_changed` → "Spec anchored to a workspace" / "…re-anchored" / "…detached"
+ *   - `spec.category_set` (category_id, slug) → "Category set to bug" / "Category removed"
  *   - `task.added` → "Task added"
  *   - `task.transitioned` uses the requested `verb` (+ block/skip `reason`):
  *       verb=block → "Task blocked: <reason>", verb=skip → "Task skipped: <reason>",
@@ -127,6 +130,16 @@ function describeEvent(ev: ActivityEntry): string {
       if (hasWorkspace) return "Spec anchored to a workspace";
       if (hadWorkspace) return "Spec workspace detached";
       return "Spec workspace changed";
+    }
+    // THE WRITER CARRIES `category_id` "(null on removal) so the feed can name what it became", and
+    // its `slug` beside it. Without this arm the generic fallback de-dotted the type into "Spec
+    // category set" — for a REMOVAL as much as for an assignment, i.e. the exact opposite of what
+    // happened, on data that was right there in the payload.
+    case "spec.category_set": {
+      const slug = typeof payload.slug === "string" && payload.slug.trim() ? payload.slug : null;
+      const assigned = payload.category_id !== null && payload.category_id !== undefined;
+      if (!assigned) return "Category removed";
+      return slug !== null ? `Category set to ${slug}` : "Category set";
     }
     case "task.added":
       return "Task added";

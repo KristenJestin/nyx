@@ -25,6 +25,7 @@ function detailFixture(): SpecDetail {
         { number: 1, name: "Foundation" },
         { number: 2, name: "UI" },
       ]),
+      category_id: null,
       current_revision_number: 2,
       position: 0,
       created_at: 0,
@@ -124,6 +125,7 @@ function detailFixture(): SpecDetail {
         },
       ],
     },
+    category: null,
   };
 }
 

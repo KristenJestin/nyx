@@ -20,6 +20,22 @@
 // - Les remotes, branches courantes et dirty states sont detectes depuis Git, pas autoritaires en DB.
 // - Design-system projet en base (tables design + design_components, PDR-0010). Le sous-systeme
 //   prototype detaille (prototypes/pages/variants/rounds/feedback) s'absorbe a v2.7 (PDR-0009).
+//
+// PERIMETRE - CE QUI N'EST PAS MODELISE ICI, ET POURQUOI :
+// - Les tables d'EXECUTION du moteur d'orchestration - nodes, workflow_runs, command_slots,
+//   human_turns, gate_attempts - ne figurent pas dans ce fichier. Elles n'ont de sens que dans un
+//   workflow_run (elles sont correlees a un run_id / node_id) et decrivent le DEROULE d'un travail,
+//   pas le modele de domaine durable qu'un lecteur vient chercher ici. Leur schema autoritaire est
+//   crates/nyx-core/src/schema.rs. Seules workflows / agents / workflow_agents - la DEFINITION d'un
+//   flow, qui est une donnee de projet - sont ici (TableGroup agentic).
+// - Les tables OPERATIONNELLES de l'app - app_settings, managed_command_groups - non plus, pour la
+//   meme raison : ce sont des reglages d'installation, pas du domaine.
+// - domain_events EST modelise malgre sa forme de journal append-only a ids de correlation :
+//   l'appartenance ne se lit pas de la FORME d'une table mais de ce qu'elle decrit. domain_events
+//   est l'historique metier du domaine ; gate_attempts est la trace d'execution d'un run.
+// - Consequence pratique : une table presente dans schema.rs et absente d'ici releve de cette regle
+//   ou d'un oubli, et c'est cette liste qui permet de trancher. Une nouvelle table d'execution ne
+//   s'ajoute pas ici ; une nouvelle table de domaine, si.
 
 // -----------------------------------------------------------------------------
 // ENUMS
@@ -258,24 +274,29 @@ Table milestones {
   }
 }
 
-// Categorie = axe UNIQUE de classification d'un Spec (1 par Spec, PDR-0017). Set par projet,
-// cure par l'humain : l'agent assigne depuis l'existant et peut en CREER une (non bloquant),
-// flaggee proposee (created_by_type=agent + confirmed_at null) jusqu'a curation. Remplace les tags.
+// Categorie = axe UNIQUE de classification d'un Spec (1 par Spec, PDR-0017). Set par projet :
+// l'agent assigne depuis l'existant et peut en CREER une (non bloquant) ; l'humain cure le
+// VOCABULAIRE (creer / renommer / supprimer) depuis les settings du projet. Remplace les tags.
+// Amendement 2026-09-02 : l'axe proposee/confirmee est retire — ce que l'agent minte vaut
+// validation. confirmed_at est conserve sans migration, desormais toujours renseigne et lu par
+// personne (retrait a prevoir a la prochaine migration de la table).
 Table categories {
   id varchar [pk]
   project_id varchar [not null, ref: > projects.id]
+  slug varchar [not null]
   name varchar [not null]
   color_token varchar
   position integer [not null, default: 0]
   created_by_type author_type [not null]
   confirmed_at datetime
   created_at datetime [not null]
+  updated_at datetime [not null]
 
   indexes {
-    (project_id, name) [unique]
+    (project_id, slug) [unique]
   }
 
-  Note: 'Set human-curated. created_by_type=agent + confirmed_at null = proposee, a curer (confirmer/renommer/fusionner). L agent prefere reutiliser ; creation = fallback non bloquant (PDR-0017).'
+  Note: 'Set human-curated. slug = identite STABLE et IMMUABLE, unique par projet : c est ce que le harnais agent lit (feature/bug/refactor/chore) pour decider de la discipline. name = libelle humain, editable et libre d etre homonyme (un renommage ne doit jamais changer la regle a laquelle une Spec est soumise) — d ou l unique sur slug et non sur name. created_by_type = provenance de la LIGNE (system = seed, agent = mint a la volee, human = creation depuis les settings) ; il n y a plus d etat de curation depuis l amendement du 2026-09-02, confirmed_at est vestigial (toujours renseigne, lu par personne). L agent prefere reutiliser ; creation = fallback non bloquant (PDR-0017). L humain cure le vocabulaire : creer, renommer, supprimer (suppression refusee sur les quatre slugs systeme et sur une categorie encore portee par une Spec). Un slug fraichement forge ne retombe JAMAIS sur un des quatre slugs systeme. Les quatre categories systeme sont seedees par projet, idempotemment.'
 }
 
 Table specs {
@@ -306,7 +327,7 @@ Table specs {
     (project_id, status)
   }
 
-  Note: 'Ticket durable et unite de travail de l humain (PDR-0014). Cle humaine = projects.key + "-" + number (ex. NYX-42) ; slug descriptif conserve pour l URL. priority stockee (string). workspace_id = pointeur unique vers le worktree de dev, posable des que la Spec est ready (sans transition de statut) ou au lancement du dev, ecrasable, jamais perdu.'
+  Note: 'Ticket durable et unite de travail de l humain (PDR-0014). Cle humaine = projects.key + "-" + number (ex. NYX-42) ; slug descriptif conserve pour l URL. priority stockee (string). workspace_id = pointeur unique vers le worktree de dev, posable des que la Spec est ready (sans transition de statut) ou au lancement du dev, ecrasable, jamais perdu. category_id nullable = non categorise (etat legitime, jamais une erreur) ; ON DELETE SET NULL (retirer une categorie libere ses Specs, ne les supprime pas). La categorie doit appartenir au MEME projet que la Spec : la FK SQL ne peut pas l exprimer, le refus est prononce par le service de domaine (crates/nyx-core/src/category.rs, PDR-0017). Physiquement la colonne est ajoutee EN DERNIER par ALTER TABLE ADD COLUMN et doit etre declaree en dernier dans schema.rs (decodage positionnel Diesel) ; elle est dessinee ici pres de priority pour la lecture seulement.'
 }
 
 Table spec_revisions {

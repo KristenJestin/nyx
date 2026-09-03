@@ -68,10 +68,11 @@ import {
  * How many `--group-N` tokens exist — the ONE place the palette's size is written on this side.
  *
  * It is pinned to the CSS by `group-palette.test.ts` (which derives the token names from this very
- * constant) and to the backend by the Rust `the_palette_size_is_the_same_number_on_all_four_layers`
+ * constant) and to the backend by the Rust `the_palette_size_is_the_same_number_on_all_five_layers`
  * test (`crates/nyx-core/src/db.rs`, `mod tests`), which reads this line, the `--group-N` tokens in
- * `globals.css`, `COMMAND_GROUP_COLOR_MAX`, the `create_command_groups` `up.sql` CHECK and the
- * `manage_command_group` MCP schema, and refuses any disagreement. Nothing may restate the number.
+ * `globals.css`, `COMMAND_GROUP_COLOR_MAX`, the `create_command_groups` `up.sql` CHECK, the
+ * `manage_command_group` MCP schema and `CATEGORY_COLOR_TOKENS`, and refuses any disagreement.
+ * Nothing may restate the number.
  */
 export const GROUP_COLOR_COUNT = 6;
 

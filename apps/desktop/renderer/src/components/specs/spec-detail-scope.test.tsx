@@ -61,6 +61,8 @@ function detail(overrides: Partial<SpecDetail> = {}): SpecDetail {
       updated_at: 0,
       completed_at: null,
       archived_at: null,
+      // PDR-0017: uncategorized is the steady state, and the field is REQUIRED on the wire shape.
+      category_id: null,
     },
     revision: {
       id: "r1",
@@ -80,6 +82,8 @@ function detail(overrides: Partial<SpecDetail> = {}): SpecDetail {
     tasks: [],
     dependencies: [],
     project: BETA_PROJECT,
+    // PDR-0017: the RESOLVED category of `spec.category_id` — `null` for an uncategorized Spec.
+    category: null,
     workspace_context: null,
     ...overrides,
   };

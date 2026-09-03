@@ -1334,6 +1334,53 @@ export type BackendCommand =
   // Spec-detail dependency badges ("bloquée par N" / "débloque M"); the board reads the counts off
   // the enriched `spec_list`.
   | "spec_dependency_view"
+  // v2.9 CATEGORY — the HUMAN half of PDR-0017. The AGENT classifies and MINTS a category on the
+  // fly through MCP; these are what a human does afterwards — assign / un-assign from the Spec
+  // detail, and CURATE THE VOCABULARY ITSELF (create / rename / delete) from the project settings.
+  // They exist on this surface ALONE. Each is a thin adapter over the `nyx_core::category`
+  // service — the same-project refusal of an assignment, the project scope of a curation gesture,
+  // the resolution of a name and its ambiguity, the IMMUTABILITY OF THE SLUG, the refusal of a
+  // blank name and the TWO REFUSALS OF A DELETION (a system slug, a category a Spec still carries)
+  // are all pronounced THERE, once, and reach this surface as the authority's own sentence.
+  // Nothing here re-checks any of them.
+  //
+  // THE 2026-09-02 AMENDMENT of PDR-0017 retired the proposed/confirmed axis: `category_confirm`
+  // is gone, and so is the `state` field of the payload — an agent's mint is valid as it stands.
+  //
+  // `category_list` ({ projectId }) → the project's vocabulary in CURATED order, each entry
+  // `{ id, slug, name, color_token, created_by_type, confirmed_at, system }` — the SAME payload
+  // the agent's `spec_category` read answers with. `system` is the BACKEND's verdict on the slug
+  // (`db::SYSTEM_CATEGORY_SLUGS`, the very list `category::delete` refuses on), so the settings
+  // can omit its Delete control on those rows without carrying a copy of the four literals.
+  // A pure read.
+  | "category_list"
+  // `category_create` ({ projectId, name }) → `{ category }`. The human MINTS a vocabulary entry
+  // from the settings. The slug is DERIVED from the name by the service (collision-safe, and never
+  // one of the four system slugs) and is not an argument. Filed `created_by_type: human` with the
+  // `ui` provenance the service freezes. Pushes `specs://changed`.
+  | "category_create"
+  // `category_delete` ({ projectId, categoryId }) → `{ deleted: true, category }` — the deleted
+  // row comes BACK, in the same shape `category_list` answers with, so a caller can name what it
+  // just removed without having kept it. REFUSED by the service on a system category (the four
+  // slugs the harness reads) and on a category a Spec still carries — that second refusal NAMES
+  // the count, so the app never has to compute it. Pushes `specs://changed`.
+  | "category_delete"
+  // `spec_category_assign` ({ specId, categoryId }) → `{ spec, category }`. Assign BY EXACT ID —
+  // the selector has just read the list. There is no label path and no creation on THIS command:
+  // minting from a typed label is the agent's ergonomics (PDR-0017), and a human creates
+  // deliberately through `category_create`. A category of ANOTHER project is refused by the
+  // service, naming both projects. Pushes `specs://changed`.
+  | "spec_category_assign"
+  // `spec_category_unassign` ({ specId }) → `{ spec, category: null }`. A FIRST-CLASS write with
+  // its own event, not a no-op — and a SEPARATE command, so an absent `categoryId` can never read
+  // as "un-categorize". Pushes `specs://changed`.
+  | "spec_category_unassign"
+  // `category_rename` ({ projectId, categoryId, name }) → `{ category, homonym_slugs }`. Changes
+  // the LABEL only: the slug is not an argument, and the write path does not take one. A rename
+  // INTO a homonym is ALLOWED (PDR-0017 — names are labels), so `homonym_slugs` is not a refusal
+  // but the RESOLVER'S VERDICT on the new name: the slugs that now answer it, `[]` when it stayed
+  // unique. The surface DRAWS that conflict; it never computes it. Pushes `specs://changed`.
+  | "category_rename"
   // v2.8 ORCHESTRATION ENGINE read models (Phase 6 — the React Flow graph view). Pure reads over
   // the SAME `nyx_core::db` engine accessors + `render_agent_context` the Phase-2/4/5 interpreter,
   // authoring and context tools use (one authority for UI + MCP, PDR-0005). No mutation, nothing

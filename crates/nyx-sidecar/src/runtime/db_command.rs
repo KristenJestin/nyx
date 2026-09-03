@@ -420,6 +420,27 @@ impl Ctx<'_> {
         }
     }
 
+    /// Surface a CATEGORY refusal (v2.9 phase 8, PDR-0017) with the AUTHORITY'S OWN SENTENCE.
+    ///
+    /// Every refusal a curation gesture can meet — the unknown Spec, the reference no category
+    /// of the project answers, the CROSS-PROJECT assignment (which SQLite's FK cannot express),
+    /// the AMBIGUOUS name (which lists the candidate slugs), the BLANK name, and the two refusals
+    /// of a DELETION (a system slug; a category N Specs still carry, named with N) — are all
+    /// pronounced by
+    /// [`nyx_core::category::CategoryError`]'s `Display`, once, in the service. This function only
+    /// picks the DB error out of the set so it keeps the dispatcher's usual `db error: …` shape;
+    /// everything else is handed on VERBATIM.
+    ///
+    /// Re-wording any of them here would be the second lieu de vérité PDR-0017 refuses: the app and
+    /// the agent would then be told two different things about the same refusal. It is also what
+    /// makes the responses STABLE — a sentence has exactly one author.
+    fn category_err(e: nyx_core::category::CategoryError) -> String {
+        match e {
+            nyx_core::category::CategoryError::Db(d) => Self::db_err(d),
+            other => other.to_string(),
+        }
+    }
+
     /// Drive a GROUP-WIDE lifecycle gesture (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding
     /// 01M11XVEFEQ524XRT9ARPQFGSV) through the SHARED `nyx_core::command::run_command_group` — the
     /// one place the rule "play only starts what is not started" is written. The MCP tools call
@@ -1572,6 +1593,18 @@ impl Ctx<'_> {
                     /// Workspace → project → repos, DERIVED from the anchor. `None` until the
                     /// Spec is posed on a dev workspace (a sane state, not an error).
                     workspace_context: Option<db::SpecWorkspaceContext>,
+                    /// v2.9 (PDR-0017) — the Spec's ONE genre-of-work category, RESOLVED: id,
+                    /// stable `slug`, human `name`, colour token, `created_by_type` provenance and
+                    /// the `system` flag. NO curation state: the 2026-09-02 amendment of PDR-0017
+                    /// retired the proposed/confirmed axis, and `category_payload` emits no `state`
+                    /// key. `None` on an uncategorized Spec (a legitimate state, not an error).
+                    ///
+                    /// `spec.category_id` already crosses the wire, but an id alone cannot draw a
+                    /// chip: the detail would have to list the project's categories just to learn
+                    /// the name of the one it already carries. The resolution rides the SAME
+                    /// `nyx_core::mcp_tools_spec::category_payload` the agent's `spec_category`
+                    /// read answers with — one shape, two surfaces.
+                    category: Option<Value>,
                 }
                 self.db()
                     .with_conn(|c| {
@@ -1598,6 +1631,15 @@ impl Ctx<'_> {
                             }
                         });
                         let workspace_context = db::spec_workspace_context(c, &spec_id)?;
+                        // The category row behind `spec.category_id`, rendered through the SHARED
+                        // payload. A dangling id cannot happen (the FK), so `None` here means the
+                        // Spec carries no category at all.
+                        let category = match spec.category_id.as_deref() {
+                            Some(id) => db::get_category(c, id)?
+                                .as_ref()
+                                .map(nyx_core::mcp_tools_spec::category_payload),
+                            None => None,
+                        };
                         Ok::<_, diesel::result::Error>(Some(SpecDetail {
                             spec,
                             revision,
@@ -1605,6 +1647,7 @@ impl Ctx<'_> {
                             dependencies,
                             project,
                             workspace_context,
+                            category,
                         }))
                     })
                     .map_err(Self::db_err)?
@@ -2880,6 +2923,262 @@ impl Ctx<'_> {
                     .with_conn(|c| db::spec_dependency_view(c, &spec_id))
                     .map_err(Self::db_err)
                     .and_then(|view| Self::json(&view))
+            }
+            // ================================================================
+            // v2.9 CATEGORY — the HUMAN half of PDR-0017 (phase 8)
+            // ================================================================
+            //
+            // PDR-0017 splits the "genre of work" axis in two: the AGENT classifies (and mints a
+            // category when nothing fits) through the MCP surface of phase 2; the HUMAN owns the
+            // VOCABULARY — creating, renaming and deleting entries — and assigns from the Spec
+            // detail screen. These commands are that second half, and they exist ONLY here.
+            //
+            // THE 2026-09-02 AMENDMENT of PDR-0017 retired the proposed/confirmed axis, and
+            // `category_confirm` with it: the agent has full rights, `spec_set_category` IS the
+            // validation, and there is nothing left to bless one mint at a time.
+            //
+            // THEY ARE AN ADAPTER, NOT A SECOND AUTHORITY. Every rule stays where phase 1 put it,
+            // in `nyx_core::category`, and not one of them is re-stated below:
+            //
+            //   * the SAME-PROJECT refusal of an assignment — `category::assign_spec_category`,
+            //     the only writer of `specs.category_id`, which names both projects;
+            //   * the PROJECT SCOPE of a rename / delete — `category::resolve(project_id, …)`,
+            //     which reports a category of another project as "no such category" because, asked
+            //     inside THIS project, that is the true answer;
+            //   * slug-then-name resolution and the AMBIGUOUS-name refusal — `category::resolve`;
+            //   * THE SLUG IS NEVER TOUCHED by a rename — `db::update_category_name` does not even
+            //     take one, so no path here could rewrite the identity the harness reads;
+            //   * the refusal of a BLANK name — `category::rename` / `category::create_by_human`;
+            //   * THE TWO REFUSALS OF A DELETION — a system slug, and a category a Spec still
+            //     carries — `category::delete`, which also names the count.
+            //
+            // PROVENANCE. Every one of these gestures is a human's, so every one of them is filed
+            // `DomainEventSource::Ui` in `domain_events`. `create_by_human`, `rename` and `delete`
+            // FREEZE it at the service ([`nyx_core::category::create_by_human`],
+            // [`nyx_core::category::rename`], [`nyx_core::category::delete`] — they are human by
+            // definition, the agent surface has none of them. Named by SYMBOL rather than
+            // by a line range: a `<file>.rs:<line>` reference into another crate is stale the first
+            // time anything is inserted above it — that one already was at delivery, and the
+            // compiler cannot check it either way, so the symbol is the only durable form);
+            // `assign` / `unassign` RECEIVE it, because the same call is reached by the
+            // agent's `spec_set_category` (which passes `Mcp`) — so this surface passes `Ui`
+            // explicitly, and that is exactly the trace "the human curated after" depends on.
+            //
+            // `category_list` — the project's category vocabulary in curated order, the read behind
+            // the Spec-detail selector. `{ projectId }` -> `[category_payload]`. A project with no
+            // category answers `[]` (the selector's EMPTY state, not an error — a project is seeded
+            // with the four system categories, so this is the fresh-migration case). A pure read:
+            // no mutation, no `changed` broadcast — the live refresh rides the `specs://changed`
+            // the four mutations below push.
+            "category_list" => {
+                let project_id = self.arg_str_nonempty("projectId")?;
+                self.db()
+                    .with_conn(|c| db::list_categories(c, &project_id))
+                    .map_err(Self::db_err)
+                    .and_then(|categories| {
+                        let payloads: Vec<Value> = categories
+                            .iter()
+                            .map(nyx_core::mcp_tools_spec::category_payload)
+                            .collect();
+                        Self::json(&payloads)
+                    })
+            }
+            // `category_create` — the human MINTS a vocabulary entry from the project settings.
+            // `{ projectId, name }` -> `{ category }`. A mutation → pushes `specs://changed`, on
+            // which the settings list AND the Spec-detail selector both re-pull.
+            //
+            // THE SLUG IS NOT AN ARGUMENT. It is derived from the name by
+            // `category::create_by_human` → `slugify_for`, which is where "collision-safe, and
+            // never one of the four system slugs" is written — once, for the agent's mint and the
+            // human's creation alike. A `slug` parameter here would be a second minting rule, and
+            // the one thing it could produce that the service refuses is exactly `bug`.
+            //
+            // `created_by_type: human` and the `ui` provenance are FROZEN by the service: creating
+            // from the settings is a human gesture by definition, and the agent surface has no
+            // counterpart to this command.
+            "category_create" => {
+                let project_id = self.arg_str_nonempty("projectId")?;
+                // PRESENT-but-blank is left to the service, which trims and refuses with its own
+                // sentence — the same one a blank rename gets. Only the MISSING argument is this
+                // layer's business.
+                let name = self.arg_str("name")?;
+                let category = self
+                    .db()
+                    .with_conn(|c| nyx_core::category::create_by_human(c, &project_id, &name))
+                    .map_err(Self::category_err)?;
+                self.events.emit(Event::Changed {
+                    topic: "specs".to_string(),
+                });
+                Self::json(&serde_json::json!({
+                    "category": nyx_core::mcp_tools_spec::category_payload(&category),
+                }))
+            }
+            // `category_delete` — the human REMOVES a vocabulary entry from the project settings.
+            // `{ projectId, categoryId }` -> `{ deleted: true, category }`. A mutation → pushes
+            // `specs://changed`.
+            //
+            // THE TWO REFUSALS ARE THE SERVICE'S, and this arm re-checks NEITHER: a system slug
+            // (nyx's own vocabulary — the slug is what carries the discipline) and a category some
+            // Spec still carries (whose refusal NAMES THE COUNT, read inside the service's own
+            // transaction so it cannot be stale). The settings screen also hides the button on the
+            // four system rows, but that is a courtesy on top of the guarantee, not the guarantee:
+            // this command is reachable without that screen.
+            "category_delete" => {
+                let project_id = self.arg_str_nonempty("projectId")?;
+                let category_id = self.arg_str_nonempty("categoryId")?;
+                let category = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::category::delete(
+                            c,
+                            &project_id,
+                            nyx_core::category::CategoryRef::Id(&category_id),
+                        )
+                    })
+                    .map_err(Self::category_err)?;
+                self.events.emit(Event::Changed {
+                    topic: "specs".to_string(),
+                });
+                Self::json(&serde_json::json!({
+                    "deleted": true,
+                    "category": nyx_core::mcp_tools_spec::category_payload(&category),
+                }))
+            }
+            // `spec_category_assign` — the human ASSIGNS a category to a Spec from the detail
+            // screen. `{ specId, categoryId }` -> `{ spec, category }`. A mutation → pushes
+            // `specs://changed` (the detail and the board re-pull).
+            //
+            // BY ID AND ONLY BY ID: the selector has just read `category_list`, so it names the
+            // exact row. The LABEL path — with its slug-then-name resolution and its non-blocking
+            // MINT — is the AGENT's ergonomics (`spec_set_category`), and a human who types a name
+            // into a searchable list is choosing from what is there, not creating. A human who
+            // WANTS a new entry says so deliberately, through `category_create` above.
+            //
+            // The cross-project refusal is NOT re-checked here: `assign_spec_category` resolves the
+            // id GLOBALLY on purpose so it can name both projects, and refuses before writing.
+            "spec_category_assign" => {
+                let spec_id = self.arg_str_nonempty("specId")?;
+                let category_id = self.arg_str_nonempty("categoryId")?;
+                let (spec, category) = self
+                    .db()
+                    .with_conn(|c| {
+                        let spec = nyx_core::category::assign_spec_category(
+                            c,
+                            &spec_id,
+                            Some(nyx_core::category::CategoryRef::Id(&category_id)),
+                            db::DomainEventSource::Ui,
+                        )?;
+                        let category = db::get_category(c, &category_id)?;
+                        Ok::<_, nyx_core::category::CategoryError>((spec, category))
+                    })
+                    .map_err(Self::category_err)?;
+                self.events.emit(Event::Changed {
+                    topic: "specs".to_string(),
+                });
+                Self::json(&serde_json::json!({
+                    "spec": spec,
+                    "category": category.as_ref().map(nyx_core::mcp_tools_spec::category_payload),
+                }))
+            }
+            // `spec_category_unassign` — the human REMOVES the Spec's category. `{ specId }` ->
+            // `{ spec, category: null }`. A mutation → pushes `specs://changed`.
+            //
+            // A FIRST-CLASS WRITE, not a no-op: `assign_spec_category(None)` records its own
+            // `spec.category_set` event with `category_id: null`, so "this Spec was deliberately
+            // un-classified by a human" is a fact the activity feed carries. It is a SEPARATE
+            // command from the assignment — on the MCP surface `None` doubles as the removal, an
+            // ergonomics that only makes sense for a caller typing arguments; here an absent
+            // `categoryId` is a caller bug, and answering it by silently uncategorizing the Spec is
+            // the one thing this surface must not do.
+            "spec_category_unassign" => {
+                let spec_id = self.arg_str_nonempty("specId")?;
+                let spec = self
+                    .db()
+                    .with_conn(|c| {
+                        nyx_core::category::assign_spec_category(
+                            c,
+                            &spec_id,
+                            None,
+                            db::DomainEventSource::Ui,
+                        )
+                    })
+                    .map_err(Self::category_err)?;
+                self.events.emit(Event::Changed {
+                    topic: "specs".to_string(),
+                });
+                Self::json(&serde_json::json!({ "spec": spec, "category": Value::Null }))
+            }
+            // `category_rename` — the human curation gesture on a label: change the LABEL a category is
+            // read by. `{ projectId, categoryId, name }` -> `{ category, homonym_slugs }`. A
+            // mutation → pushes `specs://changed`.
+            //
+            // THE SLUG IS NOT AN ARGUMENT, here or anywhere. It is the identity the harness reads
+            // (`bug` decides a discipline), so it is minted once and never rewritten; the app
+            // PRESENTS it and offers no way to edit it. Nothing below could rewrite one even by
+            // mistake — `category::rename` reaches `db::update_category_name`, which takes a name
+            // and nothing else.
+            //
+            // `homonym_slugs` — THE RENAME CONFLICT, as the service sees it. PDR-0017 ALLOWS a
+            // rename into a homonym (names are labels; merging is a different gesture nobody asked
+            // for yet), so this is not a refusal. But the pair it creates can no longer be told
+            // apart by name, so the answer carries the slugs that now answer the new name, in list
+            // order, or `[]` when the name is unique. The app renders the conflict from this list —
+            // it does not compute it, and no copy of "when are two names the same name" (accents,
+            // case, whitespace — `normalize_name`) crosses into TypeScript.
+            //
+            // THE PROBE IS `category::homonym_slugs` AND NOT `category::resolve`, and the difference
+            // is not cosmetic. `resolve` answers "which row does this label designate", EXACT SLUG
+            // FIRST — so renaming a category to a string that happens to be another row's slug
+            // (`chore`, lower-case, on a freshly seeded project where every system slug is also its
+            // name) short-circuited on that slug, returned `Ok` of the system row, and reported NO
+            // conflict. The app then announced a clean rename over a vocabulary in which two rows
+            // share a name and the renamed one is unreachable by it. Typing `Chore` reported the
+            // conflict correctly, which is exactly the kind of difference nobody discovers by hand.
+            "category_rename" => {
+                let project_id = self.arg_str_nonempty("projectId")?;
+                let category_id = self.arg_str_nonempty("categoryId")?;
+                // PRESENT-but-blank is left to the service: `category::rename` trims and refuses a
+                // blank name with its own sentence, which is the one the app shows. Only the
+                // MISSING argument is this layer's business.
+                let name = self.arg_str("name")?;
+                let (category, homonym_slugs) = self
+                    .db()
+                    .with_conn(|c| {
+                        let category = nyx_core::category::rename(
+                            c,
+                            &project_id,
+                            nyx_core::category::CategoryRef::Id(&category_id),
+                            &name,
+                        )?;
+                        // WHICH OTHER ROWS now carry this very name. A DB failure while reading
+                        // back is NOT "no homonym" — it propagates, because reporting a clean
+                        // rename on a connection that is not answering is the one wrong answer.
+                        let others = nyx_core::category::homonym_slugs(
+                            c,
+                            &project_id,
+                            &category.name,
+                            Some(&category.id),
+                        )?;
+                        // The wire field is "every slug the name now answers to, or `[]` when it is
+                        // unique" — the shape the app already reads (`slugs.length > 1`), with the
+                        // renamed row named first so the notice can list them all.
+                        let homonyms = if others.is_empty() {
+                            Vec::new()
+                        } else {
+                            std::iter::once(category.slug.clone())
+                                .chain(others)
+                                .collect::<Vec<String>>()
+                        };
+                        Ok::<_, nyx_core::category::CategoryError>((category, homonyms))
+                    })
+                    .map_err(Self::category_err)?;
+                self.events.emit(Event::Changed {
+                    topic: "specs".to_string(),
+                });
+                Self::json(&serde_json::json!({
+                    "category": nyx_core::mcp_tools_spec::category_payload(&category),
+                    "homonym_slugs": homonym_slugs,
+                }))
             }
             // ================================================================
             // v2.8 ORCHESTRATION ENGINE — the read models the React Flow graph view consumes
@@ -6724,6 +7023,612 @@ mod tests {
         assert!(err.contains("unknown spec"), "readable error: {err}");
     }
 
+    // --- v2.9 phase 8: the CATEGORY curation commands (PDR-0017) ------------------------
+
+    /// Every `specs://changed` invalidation captured on the pipe.
+    fn specs_changed(h: &Harness) -> usize {
+        changed_count(&h.buf, "specs")
+    }
+
+    /// Seed a bare Spec in `project_id` and return its id (the authoring path is the MCP
+    /// surface, out of this phase's scope).
+    fn make_spec(h: &Harness, project_id: &str, title: &str) -> String {
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_spec(c, project_id, title, Default::default())
+                    .map(|(spec, _rev)| spec.id)
+            })
+            .unwrap()
+    }
+
+    /// The id of the project's category carrying `slug`.
+    fn category_id_by_slug(h: &Harness, project_id: &str, slug: &str) -> String {
+        h.runtime
+            .db()
+            .with_conn(|c| nyx_core::db::find_category_by_slug(c, project_id, slug))
+            .unwrap()
+            .unwrap_or_else(|| panic!("no category '{slug}' in {project_id}"))
+            .id
+    }
+
+    /// The `source` column of the LAST `domain_events` row whose type is `event_type` — the
+    /// persisted provenance, which is the only thing telling PDR-0017's two halves apart.
+    fn last_event_source(h: &Harness, event_type: &str) -> String {
+        h.runtime
+            .db()
+            .with_conn(nyx_core::db::list_domain_events)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == event_type)
+            .next_back()
+            .unwrap_or_else(|| panic!("no '{event_type}' event recorded"))
+            .source
+    }
+
+    /// DONE-CRITERION: "Commandes list/… disponibles avec contrôle de projet."
+    ///
+    /// `category_list` serves the project's OWN vocabulary in curated order, each entry carrying
+    /// the id / stable slug / name / colour token / provenance — and NO curation state, retired
+    /// with the proposed/confirmed axis (PDR-0017 amended 2026-09-02).
+    /// A pure read: no `specs://changed`. The scope is the project's — a second project's
+    /// categories never leak into the first's list.
+    #[test]
+    fn category_list_serves_the_projects_own_vocabulary_with_its_provenance() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-category-list");
+        let other_id = make_project(&h, "Other", "/tmp/dbcmd-category-list-other");
+        // The agent MINTS a category in the first project, and one in the second.
+        h.runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::category::create_by_agent(c, &project_id, "Dette technique")?;
+                nyx_core::category::create_by_agent(c, &other_id, "Ailleurs")
+            })
+            .unwrap();
+        let pushes_before = specs_changed(&h);
+
+        let listed: serde_json::Value = serde_json::from_str(
+            &h.run("category_list", serde_json::json!({ "projectId": project_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        let rows = listed.as_array().unwrap();
+        let slugs: Vec<&str> = rows.iter().map(|r| r["slug"].as_str().unwrap()).collect();
+        assert_eq!(
+            slugs,
+            vec!["feature", "bug", "refactor", "chore", "dette-technique"],
+            "the four seeded system categories in curated order, then the minted one"
+        );
+        assert!(
+            !slugs.contains(&"ailleurs"),
+            "another project's vocabulary never leaks into this list: {slugs:?}"
+        );
+        // Every payload field the chip and the selector need.
+        let bug = rows.iter().find(|r| r["slug"] == "bug").unwrap();
+        assert_eq!(bug["name"].as_str().unwrap(), "Bug");
+        assert_eq!(bug["created_by_type"].as_str().unwrap(), "system");
+        assert_eq!(
+            bug["color_token"].as_str().unwrap(),
+            "group-2",
+            "the colour is a --group-N design token, never a literal"
+        );
+        assert!(!bug["id"].as_str().unwrap().is_empty());
+        assert_eq!(
+            bug["system"],
+            serde_json::json!(true),
+            "the SETTINGS read this verdict to omit its Delete control — it is derived from \
+             SYSTEM_CATEGORY_SLUGS here, never from four literals in TypeScript"
+        );
+        let minted = rows.iter().find(|r| r["slug"] == "dette-technique").unwrap();
+        assert_eq!(minted["created_by_type"].as_str().unwrap(), "agent");
+        assert_eq!(minted["system"], serde_json::json!(false));
+        for row in rows {
+            assert!(
+                row.get("state").is_none(),
+                "the proposed/confirmed axis is off the wire: {row}"
+            );
+        }
+
+        assert_eq!(
+            specs_changed(&h),
+            pushes_before,
+            "category_list is a pure read (no push)"
+        );
+    }
+
+    /// DONE-CRITERION: "`spec_detail` expose id, slug, nom" + "Commandes
+    /// list/assign/unassign/… disponibles" + "publient `ChangedTopic::Specs`".
+    ///
+    /// The human ASSIGNS from the Spec detail: the Spec carries the category, `spec_detail`
+    /// RESOLVES it (id + slug + name, not just the raw `category_id`), the mutation pushes
+    /// `specs://changed`, and the persisted provenance is `ui` — the trace PDR-0017's "the human
+    /// curates after" half depends on. Un-assigning is the symmetric first-class write.
+    #[test]
+    fn assign_and_unassign_resolve_on_spec_detail_push_specs_and_file_the_human_provenance() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-category-assign");
+        let spec_id = make_spec(&h, &project_id, "A spec");
+        let bug_id = category_id_by_slug(&h, &project_id, "bug");
+
+        // Before: no category at all — a legitimate state, not an error.
+        let detail: serde_json::Value = serde_json::from_str(
+            &h.run("spec_detail", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(detail["spec"]["category_id"].is_null());
+        assert!(detail["category"].is_null(), "uncategorized → null");
+
+        let pushes_before = specs_changed(&h);
+        let assigned: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "spec_category_assign",
+                serde_json::json!({ "specId": spec_id, "categoryId": bug_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(assigned["spec"]["category_id"].as_str().unwrap(), bug_id);
+        assert_eq!(assigned["category"]["slug"].as_str().unwrap(), "bug");
+        assert_eq!(
+            specs_changed(&h),
+            pushes_before + 1,
+            "an assignment pushes specs://changed exactly once"
+        );
+        assert_eq!(
+            last_event_source(&h, "spec.category_set"),
+            "ui",
+            "the human's assignment is filed Ui, not Mcp"
+        );
+
+        // `spec_detail` RESOLVES the category — the four fields a chip draws with.
+        let detail: serde_json::Value = serde_json::from_str(
+            &h.run("spec_detail", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detail["category"]["id"].as_str().unwrap(), bug_id);
+        assert_eq!(detail["category"]["slug"].as_str().unwrap(), "bug");
+        assert_eq!(detail["category"]["name"].as_str().unwrap(), "Bug");
+        assert!(detail["category"].get("state").is_none());
+
+        // REMOVAL — a first-class write with its own event and its own push.
+        let pushes_before = specs_changed(&h);
+        let removed: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "spec_category_unassign",
+                serde_json::json!({ "specId": spec_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(removed["spec"]["category_id"].is_null());
+        assert!(removed["category"].is_null());
+        assert_eq!(specs_changed(&h), pushes_before + 1);
+        assert_eq!(last_event_source(&h, "spec.category_set"), "ui");
+        let detail: serde_json::Value = serde_json::from_str(
+            &h.run("spec_detail", serde_json::json!({ "specId": spec_id }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(detail["category"].is_null(), "the chip is gone");
+    }
+
+    /// DONE-CRITERION: "Erreurs d'ambiguïté, permission et cross-project ont des réponses stables."
+    ///
+    /// Each refusal reaches the app with the SERVICE'S OWN sentence — cross-project (which names
+    /// BOTH projects), out-of-scope confirm/rename, unknown Spec, blank name — and a missing
+    /// argument is refused before any of them. Nothing is re-worded here, so the app and the agent
+    /// are told the same thing about the same refusal.
+    #[test]
+    fn the_category_commands_surface_the_services_own_refusals() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-category-refusals");
+        let other_id = make_project(&h, "Other", "/tmp/dbcmd-category-refusals-other");
+        let spec_id = make_spec(&h, &project_id, "A spec");
+        let other_bug_id = category_id_by_slug(&h, &other_id, "bug");
+
+        // CROSS-PROJECT assignment: the same-project guard SQLite's FK cannot express.
+        let err = h
+            .run(
+                "spec_category_assign",
+                serde_json::json!({ "specId": spec_id, "categoryId": other_bug_id }),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("a Spec may only carry a category of its OWN project")
+                && err.contains(&project_id)
+                && err.contains(&other_id),
+            "the authority's cross-project sentence, naming both projects: {err}"
+        );
+
+        // PROJECT SCOPE of a curation gesture: a category of another project simply is not one of
+        // this project's, and `category::resolve` says so.
+        let err = h
+            .run(
+                "category_rename",
+                serde_json::json!({
+                    "projectId": project_id,
+                    "categoryId": other_bug_id,
+                    "name": "Peu importe",
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err, "no such category", "category_rename: {err}");
+
+        // An unknown Spec, and a BLANK rename — both the service's own words.
+        let err = h
+            .run(
+                "spec_category_unassign",
+                serde_json::json!({ "specId": "nope" }),
+            )
+            .unwrap_err();
+        assert_eq!(err, "no such Spec");
+        let bug_id = category_id_by_slug(&h, &project_id, "bug");
+        let err = h
+            .run(
+                "category_rename",
+                serde_json::json!({
+                    "projectId": project_id, "categoryId": bug_id, "name": "   ",
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err, "a category name cannot be blank");
+
+        // A MISSING argument is the dispatcher's own refusal, before the service is reached — an
+        // absent `categoryId` must never read as "un-categorize".
+        let err = h
+            .run(
+                "spec_category_assign",
+                serde_json::json!({ "specId": spec_id }),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("missing string arg 'categoryId'"),
+            "readable arg error: {err}"
+        );
+
+        // AMBIGUITY. No command above can raise it — they all name a category by its exact id,
+        // and an id is unique — but the mapper is what makes the answer STABLE the day a service
+        // call does: it hands the authority's sentence on VERBATIM, listing the candidate slugs
+        // the caller must re-ask with, and re-words nothing. The DB arm is the one exception, and
+        // it keeps the dispatcher's usual shape.
+        assert_eq!(
+            Ctx::category_err(nyx_core::category::CategoryError::AmbiguousName {
+                name: "Défaut".to_string(),
+                matches: vec!["bug".to_string(), "chore".to_string()],
+            }),
+            "'Défaut' names 2 categories of this project (bug, chore) — re-ask by slug, which is \
+             unique",
+        );
+        assert!(Ctx::category_err(nyx_core::category::CategoryError::Db(
+            diesel::result::Error::NotFound
+        ))
+        .starts_with("db error: "));
+    }
+
+    /// THE AXIS IS GONE. `category_confirm` was retired with the proposed/confirmed state
+    /// (PDR-0017 amended 2026-09-02): the agent has full rights and its mint is valid as it
+    /// stands, so there is nothing left to bless. The command must answer like any other unknown
+    /// one — not silently succeed, and not linger as a no-op an old renderer could still call.
+    #[test]
+    fn category_confirm_is_retired_and_no_longer_a_command() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-category-confirm-gone");
+        let minted = h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::category::create_by_agent(c, &project_id, "Dette technique"))
+            .unwrap();
+        assert!(
+            minted.confirmed_at.is_some(),
+            "born VALID — there is no proposed state to leave"
+        );
+
+        let err = h
+            .run(
+                "category_confirm",
+                serde_json::json!({ "projectId": project_id, "categoryId": minted.id }),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("category_confirm"),
+            "an unknown command names itself: {err}"
+        );
+        assert_eq!(
+            h.runtime
+                .db()
+                .with_conn(nyx_core::db::list_domain_events)
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "category.confirmed")
+                .count(),
+            0,
+            "`category.confirmed` is not an event this build can produce"
+        );
+    }
+
+    /// DONE-CRITERION (review 01M1H5QY53WMGA8Y46DC2T655W): "Créer : nom -> slug via la
+    /// slugification existante (collision-safe, jamais un slug système), created_by_type=human".
+    ///
+    /// `category_create` is the settings' CREATE. The slug is DERIVED — it is not an argument —
+    /// so the one minting rule stays in `slugify_for`: collision-safe, and never one of the four
+    /// system slugs, whoever asks. The provenance is frozen `human` / `ui`, and the write pushes
+    /// `specs://changed` so both the settings list and the Spec-detail selector re-pull.
+    #[test]
+    fn category_create_derives_the_slug_freezes_the_human_provenance_and_broadcasts() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-category-create");
+
+        let pushes_before = specs_changed(&h);
+        let created: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "category_create",
+                serde_json::json!({ "projectId": project_id, "name": "  Dette technique  " }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["category"]["name"].as_str().unwrap(), "Dette technique");
+        assert_eq!(
+            created["category"]["slug"].as_str().unwrap(),
+            "dette-technique",
+            "the slug is DERIVED from the name, never sent"
+        );
+        assert_eq!(created["category"]["created_by_type"].as_str().unwrap(), "human");
+        assert_eq!(specs_changed(&h), pushes_before + 1);
+        assert_eq!(
+            last_event_source(&h, "category.created"),
+            "ui",
+            "a creation from the settings is a HUMAN gesture — the service freezes Ui"
+        );
+
+        // A SYSTEM SLUG IS UNREACHABLE from this surface too — the rule lives in `slugify_for`,
+        // and there is no `slug` argument through which it could be bypassed.
+        let shadow: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "category_create",
+                serde_json::json!({ "projectId": project_id, "name": "Bug" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shadow["category"]["slug"].as_str().unwrap(), "bug-2");
+
+        // A BLANK name is the SERVICE's refusal, verbatim; a MISSING one is the dispatcher's.
+        assert_eq!(
+            h.run(
+                "category_create",
+                serde_json::json!({ "projectId": project_id, "name": "   " }),
+            )
+            .unwrap_err(),
+            "a category name cannot be blank"
+        );
+        assert!(h
+            .run("category_create", serde_json::json!({ "projectId": project_id }))
+            .unwrap_err()
+            .contains("missing string arg 'name'"));
+    }
+
+    /// DONE-CRITERION (review 01M1H5QY53WMGA8Y46DC2T655W): "Supprimer : refusé si une Spec porte
+    /// encore la catégorie (message nommant le compte) ; les quatre catégories système ne sont pas
+    /// supprimables (… refus aussi côté service)."
+    ///
+    /// The two refusals reach this surface as the SERVICE'S OWN sentences — the count included —
+    /// and this arm re-checks neither. A freed, non-system category deletes, pushes
+    /// `specs://changed` and files `category.deleted` as the human gesture it is.
+    #[test]
+    fn category_delete_relays_the_services_two_refusals_and_deletes_what_is_free() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-category-delete");
+        let spec_id = make_spec(&h, &project_id, "A spec");
+        let bug_id = category_id_by_slug(&h, &project_id, "bug");
+
+        // (1) A SYSTEM CATEGORY: refused, and the refusal says why the slug matters.
+        let err = h
+            .run(
+                "category_delete",
+                serde_json::json!({ "projectId": project_id, "categoryId": bug_id }),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("system categories") && err.contains("'bug'"),
+            "the authority's sentence, naming the slug: {err}"
+        );
+        assert!(
+            !h.runtime
+                .db()
+                .with_conn(|c| nyx_core::db::get_category(c, &bug_id))
+                .unwrap()
+                .is_none(),
+            "the refused row is still there"
+        );
+
+        // (2) A CATEGORY A SPEC STILL CARRIES: refused, and the refusal NAMES THE COUNT.
+        let debt: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "category_create",
+                serde_json::json!({ "projectId": project_id, "name": "Dette technique" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let debt_id = debt["category"]["id"].as_str().unwrap().to_string();
+        h.run(
+            "spec_category_assign",
+            serde_json::json!({ "specId": spec_id, "categoryId": debt_id }),
+        )
+        .unwrap();
+        let err = h
+            .run(
+                "category_delete",
+                serde_json::json!({ "projectId": project_id, "categoryId": debt_id }),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("still carried by 1 Spec") && err.contains("Dette technique"),
+            "the count is the service's, and it travels: {err}"
+        );
+
+        // (3) FREED, IT GOES.
+        h.run(
+            "spec_category_unassign",
+            serde_json::json!({ "specId": spec_id }),
+        )
+        .unwrap();
+        let pushes_before = specs_changed(&h);
+        let removed: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "category_delete",
+                serde_json::json!({ "projectId": project_id, "categoryId": debt_id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(removed["deleted"], serde_json::json!(true));
+        assert_eq!(removed["category"]["slug"].as_str().unwrap(), "dette-technique");
+        assert_eq!(specs_changed(&h), pushes_before + 1);
+        assert_eq!(last_event_source(&h, "category.deleted"), "ui");
+        assert!(h
+            .runtime
+            .db()
+            .with_conn(|c| nyx_core::db::get_category(c, &debt_id))
+            .unwrap()
+            .is_none());
+
+        // A MISSING argument is the dispatcher's own refusal, before the service is reached.
+        assert!(h
+            .run("category_delete", serde_json::json!({ "projectId": project_id }))
+            .unwrap_err()
+            .contains("missing string arg 'categoryId'"));
+    }
+
+    /// DONE-CRITERION: "renommage vérifie l'intention humaine et publie
+    /// `ChangedTopic::Specs`." + the UI's "conflit de renommage" state.
+    ///
+    /// `category_rename` changes the LABEL and NEVER the slug — the identity the harness reads —
+    /// files `ui`, and pushes `specs://changed`. It reports the RENAME CONFLICT the way the
+    /// service sees it: renaming into a homonym is allowed (PDR-0017), but the resulting pair can
+    /// no longer be told apart by name, so the answer carries `homonym_slugs` — literally the
+    /// candidate list `category::resolve` would refuse with. A unique name answers `[]`.
+    #[test]
+    fn category_rename_keeps_the_slug_and_reports_the_homonym_conflict() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-category-rename");
+        let bug_id = category_id_by_slug(&h, &project_id, "bug");
+
+        let pushes_before = specs_changed(&h);
+        let renamed: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "category_rename",
+                serde_json::json!({
+                    "projectId": project_id, "categoryId": bug_id, "name": "  Défaut  ",
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(renamed["category"]["name"].as_str().unwrap(), "Défaut");
+        assert_eq!(
+            renamed["category"]["slug"].as_str().unwrap(),
+            "bug",
+            "THE SLUG IS THE IDENTITY — a rename never rewrites it"
+        );
+        assert_eq!(
+            renamed["homonym_slugs"].as_array().unwrap().len(),
+            0,
+            "a unique name is no conflict"
+        );
+        assert_eq!(specs_changed(&h), pushes_before + 1);
+        assert_eq!(
+            last_event_source(&h, "category.renamed"),
+            "ui",
+            "renaming is a HUMAN gesture — the service freezes Ui"
+        );
+
+        // THE CONFLICT: a second category renamed into a homonym of the first. Accepted, and
+        // reported — the two slugs the resolver would list.
+        let chore_id = category_id_by_slug(&h, &project_id, "chore");
+        let conflict: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "category_rename",
+                serde_json::json!({
+                    "projectId": project_id, "categoryId": chore_id, "name": "défaut",
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut homonyms: Vec<&str> = conflict["homonym_slugs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        homonyms.sort_unstable();
+        assert_eq!(
+            homonyms,
+            vec!["bug", "chore"],
+            "the rename succeeded AND the app is handed the resolver's own candidate list"
+        );
+        assert_eq!(
+            conflict["category"]["slug"].as_str().unwrap(),
+            "chore",
+            "still no slug rewritten"
+        );
+    }
+
+    /// THE HOMONYM THE OLD PROBE COULD NOT SEE — renaming a category to a string that is ANOTHER
+    /// row's SLUG.
+    ///
+    /// The probe used to be `category::resolve`, whose first rule is EXACT SLUG FIRST (and rightly:
+    /// `bug` must always mean the seeded `bug` row, whatever anybody renamed). Asked whether
+    /// `chore` is now ambiguous, it short-circuited on the slug lookup, answered `Ok` of the system
+    /// row and reported NO conflict — while the project really did hold two rows normalising to the
+    /// same name, and the renamed one had become unreachable by its own name: every later
+    /// `resolve(Label("chore"))` from `spec_set_category` or `spec_create(category:…)` lands on the
+    /// system row, silently.
+    ///
+    /// On a freshly seeded project the four system categories have slug == normalized name, so the
+    /// gesture below is one lower-case word away from an ordinary rename — and spelled `Chore` it
+    /// reported the conflict correctly. That is the whole tell.
+    #[test]
+    fn renaming_into_another_rows_slug_is_reported_as_the_homonym_it_is() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-category-rename-slug");
+        let refactor_id = category_id_by_slug(&h, &project_id, "refactor");
+
+        let answer: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "category_rename",
+                serde_json::json!({
+                    "projectId": project_id, "categoryId": refactor_id, "name": "chore",
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            answer["category"]["slug"].as_str().unwrap(),
+            "refactor",
+            "the rename landed and the slug is untouched"
+        );
+        let mut homonyms: Vec<&str> = answer["homonym_slugs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        homonyms.sort_unstable();
+        assert_eq!(
+            homonyms,
+            vec!["chore", "refactor"],
+            "TWO rows now answer the name `chore` and the app is told so — the probe compares \
+             NAMES, never slugs"
+        );
+    }
+
     /// `spec_activity` serves the SPEC-scoped, bounded, oldest-first `domain_events` fil over
     /// the UI bridge: the Spec's own lifecycle (creation, section edit, transition) + its
     /// tasks' events (add/transition), NEVER a terminal byte. A pure read (no push). An unknown
@@ -8425,6 +9330,11 @@ mod tests {
             match cout["action"]["type"].as_str().unwrap() {
                 "done" => break,
                 "spawn_subagent" => clast = Some(serde_json::json!({ "diff": "d" })),
+                // The coder's CATEGORY PREFLIGHT (built-in revision 24): this fixture's Spec carries
+                // no category, so the flow classifies it explicitly before it routes on the genre.
+                // `feature` — the branch that owes no reproduction, which is the path this read-model
+                // test has always walked.
+                "judge" => clast = Some(serde_json::json!({ "verdict": "feature" })),
                 "note" => {}
                 other => panic!("unexpected coder child action '{other}'"),
             }

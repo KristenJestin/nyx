@@ -776,7 +776,7 @@ export function BaseLayout() {
     settingsDialogRef.current?.reload();
   }, []);
 
-  // The per-project settings modal (Global / Commands): which project's settings are open
+  // The per-project settings modal (Global / Categories / Commands): which project's settings are open
   // (`null` = closed). Reached from the rail tile's right-click "Project settings" — the
   // project-level entry point rebranched into the active shell. Its Global pane finally
   // exposes the `resume_agent_sessions` toggle (persisted via `set_project_resume_agent_

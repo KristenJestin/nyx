@@ -817,6 +817,7 @@ function draftSpec(): Spec {
     status: "draft",
     mode: "feature",
     phases: "[]",
+    category_id: null,
     current_revision_number: 1,
     position: 0,
     created_at: 0,

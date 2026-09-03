@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { EngineNode } from "@/bridge";
@@ -153,6 +155,43 @@ describe("describeNode", () => {
     );
   });
 
+  it("gate_check with `expect: red` → says the check must FAIL, never that it must pass", () => {
+    // THE TWO REPRODUCTION GATES OF THE SEEDED CODER differ by this one field, on the SAME slot:
+    // the first blocks the run until the check FAILS, the second until the same check passes. That
+    // difference IS the red-before-green proof, and describing both as "blocks the run until it
+    // passes" told the reader the exact opposite of what the first node enforces — and made the two
+    // indistinguishable in the inspector.
+    expect(
+      describeNode("gate_check", cfg({ slot: "repro_check", expect: "red", blocking: true })),
+    ).toBe(
+      "Runs whatever this project binds to the `repro_check` slot; blocks the run until it FAILS — " +
+        "a reproduction: a check that passes here has reproduced nothing " +
+        "(unbound, it verifies nothing and the run is refused).",
+    );
+    expect(
+      describeNode("gate_check", cfg({ slot: "repro_check", expect: "green", blocking: true })),
+    ).toBe(
+      "Runs whatever this project binds to the `repro_check` slot; blocks the run until it passes " +
+        "(unbound, it verifies nothing and the run is refused).",
+    );
+    // ABSENT means green — the runtime default, and the shape of every gate that is not a
+    // reproduction. Same sentence as before this field existed.
+    expect(describeNode("gate_check", cfg({ slot: "repro_check" }))).toBe(
+      "Runs whatever this project binds to the `repro_check` slot; blocks the run until it passes " +
+        "(unbound, it verifies nothing and the run is refused).",
+    );
+    // …and the same reading on a gate that names its own commands.
+    expect(describeNode("gate_check", cfg({ command_ids: ["repro"], expect: "red" }))).toBe(
+      "Runs `repro`; blocks the run until they FAIL — a reproduction: a check that passes here has " +
+        "reproduced nothing.",
+    );
+    // A non-blocking red still says which outcome it expects: advisory is about the CONSEQUENCE,
+    // never about the declaration.
+    expect(
+      describeNode("gate_check", cfg({ command_ids: ["repro"], expect: "red", blocking: false })),
+    ).toBe("Runs `repro`; expects a FAILURE (a reproduction), advisory only.");
+  });
+
   it("spawn_subagent → launches the effector, inline vs native mode", () => {
     expect(describeNode("spawn_subagent", cfg({ agent_id: "spec", inline: true }))).toBe(
       "Launches the `spec` effector in this session (inline mode, so it can address you).",
@@ -281,36 +320,101 @@ describe("create_workspace is described (never the note fallback)", () => {
 });
 
 /**
+ * `set_category` is the SEVENTEENTH node type, and it is the one nyx uses to IMPOSE a Spec's genre of
+ * work (PDR-0017 / ADR-0006). Its whole decision is WHICH BOARD KEY holds the label — the category is
+ * a per-run answer, so a graph never names one literally — and the sentence has to say that, or a
+ * reader takes the node for a constant classification.
+ */
+describe("set_category is described (never the note fallback)", () => {
+  it("names the board key the label comes from, plus the gate", () => {
+    expect(
+      describeNode("set_category", cfg({ category_key: "category_choice", gate_on: "cat_ok" })),
+    ).toBe(
+      "Classifies the Spec with the category named in `category_choice`, only if `cat_ok` was approved.",
+    );
+  });
+
+  it("drops the clause when ungated — the default shape, since the engine imposes it", () => {
+    expect(describeNode("set_category", cfg({ category_key: "category_choice" }))).toBe(
+      "Classifies the Spec with the category named in `category_choice`.",
+    );
+  });
+
+  it("says so when the node names no key at all, rather than reading as configured", () => {
+    expect(describeNode("set_category", "{}")).toContain("names no category key");
+    expect(describeNode("set_category", "not json")).toContain("names no category key");
+    // A LITERAL category is not a thing this node takes — authoring refuses the field, and the
+    // sentence must not quietly report it as the configured source.
+    expect(describeNode("set_category", cfg({ category: "bug" }))).toContain(
+      "names no category key",
+    );
+  });
+});
+
+/**
+ * THE RENDERER'S VOCABULARY IS THE ENGINE'S, AND THE TWO ARE MADE TO FAIL TOGETHER.
+ *
  * `metaFor` must resolve every DB node type to its OWN metadata — the `note` fallback exists for a
  * FORWARD-compatible type the renderer has not met yet, never for one that already ships in the
- * seeded graphs. This is the check that would have caught `sub_workflow`, `transition_task` and
- * `create_workspace` on the day each reached the engine.
+ * seeded graphs. `sub_workflow`, `transition_task` and `create_workspace` each reached the engine and
+ * the seeded graphs while the visualiser knew nothing of them, so the node that opens a whole child
+ * run, the one that moves a task and the one that creates a folder all painted as inert grey markers.
+ *
+ * The list used to be RETYPED here, which closed the case for the sixteen types of the day and for
+ * nothing after: an EIGHTEENTH type added in Rust left this file green. So the list is now READ from
+ * `db::NODE_TYPES` in `crates/nyx-core/src/db.rs` — the same "derive it, never restate it" the
+ * command-group IPC contract uses to pin the renderer against the sidecar. Add a node type on the
+ * Rust side and this turns red until the renderer knows it.
  */
-describe("metaFor knows every node type the engine ships", () => {
+describe("the renderer knows every node type the engine ships", () => {
+  /** The `db::NODE_TYPES` entries, read out of the Rust constant that IS the vocabulary. */
+  const dbNodeTypes = ((): string[] => {
+    const source = readFileSync(
+      join(process.cwd(), "..", "..", "..", "crates", "nyx-core", "src", "db.rs"),
+      "utf8",
+    );
+    const declaration = /pub const NODE_TYPES: \[&str; (\d+)\] = \[([^\]]*)\]/.exec(source);
+    expect(declaration, "db.rs no longer declares NODE_TYPES the way this guard reads it").not.toBe(
+      null,
+    );
+    const [, count, body] = declaration!;
+    // Each entry is a `NODE_TYPE_*` constant; its VALUE is the string the DB stores, so resolve each
+    // one through its own `pub const NODE_TYPE_X: &str = "…";` rather than lower-casing the name.
+    const types = [...body.matchAll(/NODE_TYPE_[A-Z_]+/g)].map((m) => {
+      const value = new RegExp(`pub const ${m[0]}: &str = "([a-z_]+)";`).exec(source);
+      expect(value, `db.rs declares ${m[0]} without a readable string value`).not.toBe(null);
+      return value![1];
+    });
+    expect(types.length, "the NODE_TYPES array length must match its declared size").toBe(
+      Number(count),
+    );
+    return types;
+  })();
+
   it("resolves each DB type to its own metadata, never the note fallback", () => {
-    const dbNodeTypes = [
-      "sequence",
-      "loop",
-      "selector",
-      "spawn_subagent",
-      "gate_check",
-      "judge",
-      "transition",
-      "wait",
-      "note",
-      "query",
-      "fork_spec",
-      "transition_task",
-      "create_workspace",
-      "sub_workflow",
-      "ask_human",
-      "produce",
-    ];
     for (const type of dbNodeTypes) {
       if (type === "note") continue;
       expect(metaFor(type), `${type} must not read as an inert note`).not.toBe(NODE_META.note);
     }
     // …and an unknown type STILL paints, on the muted note fallback (forward compatibility).
     expect(metaFor("dragon")).toBe(NODE_META.note);
+  });
+
+  it("explains each DB type in plain language, save the ones that have nothing to say", () => {
+    // `wait` pauses and `produce` produces whatever the node asks for: neither carries a config to
+    // put in a sentence, so `describeNode` answers `null` and the inspector falls back to its generic
+    // line + the raw-config accordion. Every OTHER type must have a describer, or the panel says
+    // "No description for this node" about a node that decides something.
+    const NO_NATURAL_LANGUAGE_FORM = ["wait", "produce"];
+    for (const type of dbNodeTypes) {
+      if (NO_NATURAL_LANGUAGE_FORM.includes(type)) {
+        expect(describeNode(type, "{}"), `${type} is declared as having no sentence`).toBe(null);
+        continue;
+      }
+      expect(
+        describeNode(type, "{}", [child("a")]),
+        `${type} has no describer — the inspector would show "No description" for a node that decides something`,
+      ).not.toBe(null);
+    }
   });
 });

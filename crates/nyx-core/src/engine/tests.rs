@@ -403,6 +403,111 @@ fn freezing_an_unrelated_key_does_not_kill_a_live_loop() {
 }
 
 // ---------------------------------------------------------------------------
+// the gate expectation: the grading table and the three keys it folds
+// ---------------------------------------------------------------------------
+
+/// THE SATISFACTION TABLE, exhaustively — the rule the whole red-before-green proof rests on.
+///
+/// The row that matters is the third: an `indeterminate` satisfies NOTHING. Graded as a boolean,
+/// "not green" would have covered both "the check ran and failed" and "the check never ran", and a
+/// timeout or a missing binary would have SATISFIED a reproduction's `expect: red` — a gate that
+/// verified nothing standing as the proof that a defect reproduces, which is the precise failure
+/// this discipline exists to prevent.
+#[test]
+fn an_indeterminate_attempt_satisfies_neither_expectation() {
+    use GateExpectation::{Green, Red};
+    use GateGrade::{Failed, Indeterminate, Passed};
+
+    assert!(Green.is_satisfied_by(Passed), "green is answered by a pass");
+    assert!(!Green.is_satisfied_by(Failed));
+    assert!(!Green.is_satisfied_by(Indeterminate));
+
+    assert!(Red.is_satisfied_by(Failed), "red is answered by a real failure");
+    assert!(!Red.is_satisfied_by(Passed));
+    assert!(!Red.is_satisfied_by(Indeterminate));
+
+    // The wire spellings the discipline texts and the DB CHECKs are written on.
+    assert_eq!((Green.as_str(), Red.as_str()), ("green", "red"));
+    assert_eq!(
+        (Passed.as_str(), Failed.as_str(), Indeterminate.as_str()),
+        ("passed", "failed", "indeterminate")
+    );
+}
+
+/// `expect` DEFAULTS to `green` and is OPTIONAL — a config that never mentions it decodes to "not
+/// declared", which resolves to `green` and therefore grades exactly as every pre-expectation gate
+/// did. The two facts are distinct on purpose: the VALUE is the same, the ENFORCEMENT is not.
+#[test]
+fn an_absent_expect_decodes_as_undeclared_and_resolves_to_green() {
+    let legacy: GateConfig =
+        serde_json::from_str(r#"{"command_ids":["c"],"blocking":true}"#).expect("decodes");
+    assert_eq!(legacy.expect, None, "nothing was declared");
+    assert_eq!(legacy.expectation(), GateExpectation::Green);
+    assert!(legacy.blocking, "and `blocking` still defaults TRUE");
+
+    let declared: GateConfig =
+        serde_json::from_str(r#"{"slot":"repro_check","expect":"red"}"#).expect("decodes");
+    assert_eq!(declared.expect, Some(GateExpectation::Red));
+    assert_eq!(declared.expectation(), GateExpectation::Red);
+
+    // A green DECLARED is still a declaration — the value it resolves to says nothing about that.
+    let explicit: GateConfig = serde_json::from_str(r#"{"expect":"green"}"#).expect("decodes");
+    assert_eq!(explicit.expect, Some(GateExpectation::Green));
+}
+
+/// The FOLD writes THREE keys from ONE verdict: what the command did, its historical alias, and
+/// whether that answered the declaration. On a satisfied `expect: red` the first two are `false` and
+/// the third is `true` — the divergence that a single key could not have expressed, and the reason
+/// `gate_green` had to stay an alias of `gate_passed` rather than become "the gate is fine".
+#[test]
+fn the_gate_fold_writes_passed_its_alias_and_satisfied_from_one_verdict() {
+    let tree = Tree::from_rows(
+        &[
+            node("root", None, 0, db::NODE_TYPE_SEQUENCE, "{}"),
+            node(
+                "gate",
+                Some("root"),
+                0,
+                db::NODE_TYPE_GATE_CHECK,
+                r#"{"command_ids":["c"],"blocking":true,"expect":"red"}"#,
+            ),
+        ],
+        Some("root"),
+    )
+    .unwrap();
+
+    let mut engine = Engine::start(tree);
+    let action = match engine.tick(None).unwrap() {
+        Step::Action(a) => a,
+        other => panic!("expected the gate, got {other:?}"),
+    };
+    assert_eq!(
+        action,
+        Action::GateCheck {
+            node_id: "gate".into(),
+            command_ids: vec!["c".into()],
+            slot: None,
+            blocking: true,
+            expect: Some(GateExpectation::Red),
+        },
+        "the declared expectation TRAVELS to the effects layer"
+    );
+
+    let _ = engine.tick(Some(NodeResult::Gate(GateVerdict {
+        grade: GateGrade::Failed,
+        expect: GateExpectation::Red,
+    })));
+    let bb = engine.blackboard();
+    assert_eq!(bb.get(GATE_PASSED_KEY), Some(&json!(false)));
+    assert_eq!(bb.get(GATE_GREEN_KEY), Some(&json!(false)));
+    assert_eq!(
+        bb.get(GATE_SATISFIED_KEY),
+        Some(&json!(true)),
+        "failing IS what this gate declared"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // selector
 // ---------------------------------------------------------------------------
 
@@ -449,7 +554,7 @@ fn selector_routes_on_the_gate_verdict() {
     // GREEN gate → the selector descends into the "advance" branch.
     let mut green = Engine::start(make_tree());
     let green_actions = drive(&mut green, |action| match action {
-        Action::GateCheck { .. } => NodeResult::Gate(true),
+        Action::GateCheck { .. } => NodeResult::Gate(GateVerdict::from_passed(true)),
         _ => NodeResult::Ack,
     });
     assert_eq!(
@@ -471,7 +576,7 @@ fn selector_routes_on_the_gate_verdict() {
     // RED gate → the selector descends into the "retry" branch instead.
     let mut red = Engine::start(make_tree());
     let red_actions = drive(&mut red, |action| match action {
-        Action::GateCheck { .. } => NodeResult::Gate(false),
+        Action::GateCheck { .. } => NodeResult::Gate(GateVerdict::from_passed(false)),
         _ => NodeResult::Ack,
     });
     assert_eq!(
@@ -688,7 +793,7 @@ fn every_leaf_type_yields_its_action_and_updates_the_blackboard() {
         } => {
             assert_eq!(command_ids, &vec!["tc".to_string()]);
             assert!(*blocking);
-            NodeResult::Gate(true)
+            NodeResult::Gate(GateVerdict::from_passed(true))
         }
         Action::Judge { prompt, .. } => {
             assert_eq!(prompt, "q");
@@ -717,10 +822,11 @@ fn every_leaf_type_yields_its_action_and_updates_the_blackboard() {
             assert_eq!(gate_on.as_deref(), Some("revise_ok"));
             NodeResult::Ack
         }
-        // This tree carries no transition_task / create_workspace / sub_workflow leaf; the arms keep
-        // the match total.
+        // This tree carries no transition_task / create_workspace / set_category / sub_workflow
+        // leaf; the arms keep the match total.
         Action::TransitionTask { .. } => NodeResult::Ack,
         Action::CreateWorkspace { .. } => NodeResult::Ack,
+        Action::SetCategory { .. } => NodeResult::Ack,
         Action::SubWorkflow { .. } => NodeResult::SubResult(json!({ "status": "done" })),
     });
 
@@ -795,7 +901,7 @@ fn ndev_shaped_loop_advances_only_after_green_gate() {
             if green {
                 saw_green = true;
             }
-            NodeResult::Gate(green)
+            NodeResult::Gate(GateVerdict::from_passed(green))
         }
         Action::Transition { .. } => {
             assert!(
@@ -1048,6 +1154,76 @@ fn tick_with_unexpected_result_errors() {
         engine.tick(Some(NodeResult::Ack)),
         Err(EngineError::UnexpectedResult)
     );
+}
+
+/// THE SEVENTEENTH LEAF READS ITS CATEGORY OFF THE BOARD, and never from a literal.
+///
+/// The engine's half of `set_category` is exactly that resolution: the node names a KEY, the walk
+/// renders the value under it through the same `{{path}}` interpolation `create_workspace`'s root and
+/// `transition_task`'s task id use, and the LABEL travels on the action. Three readings, because each
+/// is a different way for a graph to be wrong:
+///
+///   * the DECLARED key wins (`category_key`), so a graph can route a judge's verdict into it;
+///   * an OMITTED key falls back to [`DEFAULT_CATEGORY_KEY`] — the runtime stays lenient even though
+///     authoring refuses the omission, so a hand-inserted or seeded node still walks;
+///   * a key NOTHING WROTE renders EMPTY, which is the "unset" the effects layer branches on — it
+///     must not become the literal `{{missing}}`, which would be classified as a category.
+#[test]
+fn set_category_resolves_its_label_from_the_named_board_key() {
+    let rows = vec![
+        node("root", None, 0, db::NODE_TYPE_SEQUENCE, "{}"),
+        node(
+            "declared",
+            Some("root"),
+            0,
+            db::NODE_TYPE_SET_CATEGORY,
+            r#"{"category_key":"category_choice","gate_on":"cat_ok"}"#,
+        ),
+        node("default", Some("root"), 1, db::NODE_TYPE_SET_CATEGORY, "{}"),
+        node(
+            "unwritten",
+            Some("root"),
+            2,
+            db::NODE_TYPE_SET_CATEGORY,
+            r#"{"category_key":"nobody_wrote_this"}"#,
+        ),
+    ];
+    let tree = Tree::from_rows(&rows, Some("root")).unwrap();
+    let mut board = Blackboard::new();
+    board.set("category_choice", json!("bug"));
+    board.set("category", json!("Dette technique"));
+    let mut engine = Engine::new(tree, board);
+
+    let actions = drive(&mut engine, |_| NodeResult::Ack);
+    assert_eq!(
+        actions,
+        vec![
+            Action::SetCategory {
+                node_id: "declared".into(),
+                key: "category_choice".into(),
+                category: "bug".into(),
+                gate_on: Some("cat_ok".into()),
+            },
+            Action::SetCategory {
+                node_id: "default".into(),
+                key: DEFAULT_CATEGORY_KEY.into(),
+                category: "Dette technique".into(),
+                gate_on: None,
+            },
+            Action::SetCategory {
+                node_id: "unwritten".into(),
+                key: "nobody_wrote_this".into(),
+                category: String::new(),
+                gate_on: None,
+            },
+        ],
+        "the label comes off the board, the default key is `category`, and an unwritten key is EMPTY"
+    );
+    // …and the KEY travels beside the rendered label, because interpolation flattens: `null` would
+    // arrive as the four letters `null`, and only the raw board value says whether the judge that
+    // fills this key answered anything at all (the effects layer refuses on that).
+    // The leaf carries no result of its own: nothing lands on the board (unlike judge/ask_human).
+    assert!(engine.blackboard().get("verdict").is_none());
 }
 
 /// `NodeType` round-trips through its DB string, and composites are flagged.

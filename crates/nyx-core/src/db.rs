@@ -49,12 +49,13 @@ const POOL_MAX_SIZE: u32 = 8;
 use crate::pathnorm;
 use crate::schema::{
     agent_session_prototypes, agent_session_specs, agent_sessions, annex_blobs, annexes,
-    app_settings, command_instances, command_slots, design, design_components, domain_events,
-    human_turns, idea_specs, ideas, managed_command_groups, managed_commands, nodes, projects,
-    prototype_design_lock, prototype_feedback, prototype_page_versions, prototype_pages,
-    prototype_round_pages, prototype_rounds, prototype_variants, prototypes, repositories,
-    review_comments, review_reads, review_tasks, spec_depends_on, spec_revisions, specs,
-    task_dependencies, tasks, terminals, workflow_runs, workflows, workspaces,
+    app_settings, categories, command_instances, command_slots, design, design_components,
+    domain_events, gate_attempts, human_turns, idea_specs, ideas, managed_command_groups,
+    managed_commands, nodes, projects, prototype_design_lock, prototype_feedback,
+    prototype_page_versions, prototype_pages, prototype_round_pages, prototype_rounds,
+    prototype_variants, prototypes, repositories, review_comments, review_reads, review_tasks,
+    spec_depends_on, spec_revisions, specs, task_dependencies, tasks, terminals, workflow_runs,
+    workflows, workspaces,
 };
 
 /// The migrations baked into the binary at compile time from `migrations/`.
@@ -686,6 +687,54 @@ pub struct NewDomainEvent {
     pub actor: Option<String>,
     pub payload: String,
     pub created_at: i64,
+}
+
+/// WHERE a mutation originated — the two callers of the shared use-case layer (PDR-0005), plus the
+/// runtime itself. Persisted verbatim in the `domain_events.source` column (through
+/// [`DomainEventSource::as_str`]) so the audit log records whether a change came from the UI, from
+/// an MCP tool (an agent), or from the runtime. A closed enum (not a free string) so a new source
+/// is a compile error at every call site.
+///
+/// **Narrowed on purpose.** `docs/product/data-model.dbml` declares SIX values for the
+/// `event_source` vocabulary (`ui`, `mcp`, `agent_hook`, `runtime`, `migration`, `system`); this
+/// type carries only the three a domain service can actually attribute today. The column is free
+/// TEXT (no CHECK), so widening it later costs a variant and no migration.
+///
+/// **It lives HERE, next to [`NewDomainEvent`]**, rather than in `crate::usecase` where it was
+/// born: `usecase` imports `db` and never the reverse, so the outbox writers that live in this
+/// module ([`record_category_event`], [`record_spec_category_event`]) can only take a TYPED
+/// provenance if the vocabulary sits at this layer. `crate::usecase` re-exports it, so every
+/// existing `usecase::DomainEventSource` path — the ~19 use-case signatures and the sidecar
+/// adapters — still resolves unchanged.
+///
+/// A typed provenance rather than a `&str` parameter because the two halves of PDR-0017's category
+/// axis are told apart by NOTHING ELSE in the persisted trace: an agent MINTS a category on the
+/// fly and CLASSIFIES with it, a human CURATES the project's vocabulary from the settings (create,
+/// rename, delete), and a `source` misspelled at one call site would merge the two halves silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainEventSource {
+    /// A HUMAN acting through nyx's own surface — the desktop UI bridge (`db_command.rs`) and the
+    /// sidecar commands it drives.
+    Ui,
+    /// An AGENT acting through an MCP tool (the MCP dispatcher) or an engine node.
+    Mcp,
+    /// Driven by the runtime lifecycle itself, not clearly attributable to a single UI or
+    /// MCP call — a managed-command run-state transition (start / stop / natural exit) or an
+    /// agent-session lifecycle hook the runner/plugin channel drives. The runner sink and the
+    /// agent-session hook are shared by both surfaces, so a runtime event's origin is `system`.
+    System,
+}
+
+impl DomainEventSource {
+    /// The stable wire/DB string (`ui` | `mcp` | `system`). Free TEXT in `domain_events.source`
+    /// (no CHECK), so a new source needs no migration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DomainEventSource::Ui => "ui",
+            DomainEventSource::Mcp => "mcp",
+            DomainEventSource::System => "system",
+        }
+    }
 }
 
 /// Append ONE `domain_events` row to the outbox and return it (with its assigned
@@ -1515,6 +1564,448 @@ pub fn recent_domain_events_for_spec(
         .load(conn)
 }
 
+// --- Category domain models (PDR-0017) -----------------------------------
+
+/// `categories.created_by_type` — minted by nyx's per-project SEED. The four rows every project is
+/// born with, and the only ones a workflow may name by slug.
+pub const CATEGORY_CREATED_BY_SYSTEM: &str = "system";
+/// `categories.created_by_type` — minted ON THE FLY by an agent that found nothing to reuse
+/// (PDR-0017: creation is a non-blocking fallback). Minted by
+/// [`crate::category::create_by_agent`], and VALID AS IT STANDS since the 2026-09-02 amendment of
+/// PDR-0017 retired the proposed/confirmed axis.
+pub const CATEGORY_CREATED_BY_AGENT: &str = "agent";
+/// `categories.created_by_type` — minted by a HUMAN gesture, from the project settings' Categories
+/// section ([`crate::category::create_by_human`]).
+///
+/// PDR-0017 as amended 2026-09-02 gives the human the VOCABULARY — create, rename, delete — and
+/// the agent the classification inside it. This value is what tells such a row from the agent's
+/// mint and from the four seeded system rows.
+pub const CATEGORY_CREATED_BY_HUMAN: &str = "human";
+
+/// The CLOSED `categories.created_by_type` vocabulary, mirroring the CHECK written by
+/// `20260828180916_create_categories`. A test exercises this constant against the live CHECK so the
+/// two spellings cannot drift.
+pub const CATEGORY_CREATED_BY_TYPES: [&str; 3] = [
+    CATEGORY_CREATED_BY_SYSTEM,
+    CATEGORY_CREATED_BY_AGENT,
+    CATEGORY_CREATED_BY_HUMAN,
+];
+
+/// The one system category SLUG that carries an execution DISCIPLINE (PDR-0017 / ADR-0006) — the
+/// only member of [`SYSTEM_CATEGORIES`] anything outside this module needs to name.
+///
+/// IT LIVES HERE, WITH THE VOCABULARY IT BELONGS TO, and [`SYSTEM_CATEGORIES`] is built FROM it, so
+/// the literal `"bug"` is written once in the crate. The alternative — a second `const` beside the
+/// reader that happens to need it — is exactly what [`SYSTEM_CATEGORY_SLUGS`] refuses two doc
+/// comments below, and for the same reason: the discipline is READ OFF THE SLUG, so two spellings
+/// that drift disarm it for every Spec rather than failing loudly.
+///
+/// IT IS THE SAME STRING ON FOUR SIDES, which is why it is named rather than spelled at each site:
+/// the row this list seeds in every project, the slug [`crate::category::slugify_for`] refuses to
+/// let an agent's category land on, the value the `spec_category` query fact writes to the
+/// blackboard, and — since built-in revision 24 — the literal the seeded coder/nspec graphs' "bug
+/// discipline?" selector branches on ([`crate::seed`]) and the one `run_start`'s scanner reads to
+/// decide whether the reproduction slot is owed at all ([`crate::mcp_engine`]).
+pub const CATEGORY_SLUG_BUG: &str = "bug";
+
+/// The four SYSTEM categories every project is seeded with — `(slug, name, color_token)`, in the
+/// order they take `position` 0..3.
+///
+/// The SLUGS are the contract: the agent harness reads [`CATEGORY_SLUG_BUG`] (and, later, the other
+/// three) to decide which discipline a Spec is subject to. Their NAMES are labels a human may freely
+/// rewrite, and their colours are fixed here rather than derived so the four never collide inside
+/// the six-slot palette (see [`category_color_token`], which derives the rest).
+pub const SYSTEM_CATEGORIES: [(&str, &str, &str); 4] = [
+    ("feature", "Feature", "group-1"),
+    (CATEGORY_SLUG_BUG, "Bug", "group-2"),
+    ("refactor", "Refactor", "group-3"),
+    ("chore", "Chore", "group-4"),
+];
+
+/// The reserved slugs, for membership tests — the first column of [`SYSTEM_CATEGORIES`], DERIVED
+/// from it at compile time rather than restated.
+///
+/// A slug minted for an agent's category may NEVER land on one of these: the discipline is read off
+/// the slug, so an agent-minted category that inherited `bug` would inherit `bug`'s execution constraint
+/// — a red-before-green gate imposed on work nobody classified as a bug. `category::slugify_for`
+/// is what enforces it.
+///
+/// That refusal is only as good as this list is COMPLETE, so there is deliberately no second
+/// literal to keep in agreement: a fifth system category, or a corrected slug, lands here by
+/// construction. A hand-copied twin would let one be edited alone and leave the new slug quietly
+/// reservable, with nothing to go red.
+pub const SYSTEM_CATEGORY_SLUGS: [&str; SYSTEM_CATEGORIES.len()] = {
+    let mut slugs = [""; SYSTEM_CATEGORIES.len()];
+    let mut i = 0;
+    while i < SYSTEM_CATEGORIES.len() {
+        slugs[i] = SYSTEM_CATEGORIES[i].0;
+        i += 1;
+    }
+    slugs
+};
+
+/// The category colour palette: the design tokens `var(--group-N)` already defined in the
+/// renderer's `globals.css`, stored WITHOUT the `--` prefix. Reused rather than duplicated — a
+/// second six-colour palette would be a second thing to keep in sync with the theme.
+///
+/// It is nonetheless a fifth WRITING of the palette size, so it is held by the same guard as the
+/// other four: `the_palette_size_is_the_same_number_on_all_five_layers` (`mod tests`) confronts
+/// this list, token by token, with the `--group-N` tokens `globals.css` really declares.
+pub const CATEGORY_COLOR_TOKENS: [&str; 6] = [
+    "group-1", "group-2", "group-3", "group-4", "group-5", "group-6",
+];
+
+/// The colour token a category with `slug` gets when nobody chose one — DETERMINISTIC, so the same
+/// slug always shows the same colour in every project and across a re-seed, and so a test can
+/// assert it without reading the row back.
+///
+/// A system slug returns its FIXED token from [`SYSTEM_CATEGORIES`] (the four are hand-spread over
+/// the palette); anything else is folded onto the palette with a stable FNV-1a hash. Not a
+/// cryptographic choice — it only has to be pure, cheap and identical on every platform, which
+/// `DefaultHasher` explicitly is NOT (its output is unspecified across releases).
+pub fn category_color_token(slug: &str) -> &'static str {
+    if let Some((_, _, token)) = SYSTEM_CATEGORIES.iter().find(|(s, _, _)| *s == slug) {
+        return token;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in slug.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    CATEGORY_COLOR_TOKENS[(hash % CATEGORY_COLOR_TOKENS.len() as u64) as usize]
+}
+
+/// A `categories` row: one entry of a project's "genre of work" vocabulary (PDR-0017). `Serialize`
+/// for the IPC/MCP boundary.
+///
+/// `slug` is the STABLE identity — UNIQUE within the project, IMMUTABLE, and the only thing the
+/// agent harness ever reads. `name` is the human label: editable, and free to be a homonym of
+/// another category's name. `created_by_type` carries the PROVENANCE — `system` (the seed),
+/// `agent` (an on-the-fly mint) or `human` (the settings' Categories section) — which is the one
+/// curation fact PDR-0017 still asks the trace to keep.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = categories)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct Category {
+    pub id: String,
+    pub project_id: String,
+    /// The immutable, machine-read identity (ASCII, lowercase, hyphens).
+    pub slug: String,
+    /// The editable human label.
+    pub name: String,
+    /// A `--group-N` design token WITHOUT its `--` prefix; `None` = no colour chosen.
+    pub color_token: Option<String>,
+    /// Position in the project's curated list (append order).
+    pub position: i32,
+    /// `system` | `agent` | `human` — see [`CATEGORY_CREATED_BY_TYPES`].
+    pub created_by_type: String,
+    /// Epoch ms the category became valid — VESTIGIAL since the 2026-09-02 amendment of PDR-0017
+    /// retired the proposed/confirmed axis. It is now ALWAYS set (the seed, the agent's mint and
+    /// the human's creation all stamp it) and NOTHING reads it: no payload field, no UI badge, no
+    /// query. The column survives because dropping it would cost a SQLite table rebuild for a
+    /// value that harms nobody.
+    ///
+    /// FUTURE CLEANUP: drop `categories.confirmed_at` and this field the next time the
+    /// `categories` table is migrated for another reason.
+    pub confirmed_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = categories)]
+struct NewCategory {
+    id: String,
+    project_id: String,
+    slug: String,
+    name: String,
+    color_token: Option<String>,
+    position: i32,
+    created_by_type: String,
+    confirmed_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+/// List the categories of `project_id` in curated order (`position`, then `slug` as a stable
+/// tiebreak). The read behind the UI selector, the MCP resolution and the seed's idempotence check.
+pub fn list_categories(conn: &mut SqliteConnection, project_id: &str) -> QueryResult<Vec<Category>> {
+    categories::table
+        .filter(categories::project_id.eq(project_id))
+        .order((categories::position.asc(), categories::slug.asc()))
+        .select(Category::as_select())
+        .load(conn)
+}
+
+/// Fetch ONE category by id, or `None` when the id is unknown. The read the assignment service
+/// makes to compare the category's `project_id` with the Spec's.
+pub fn get_category(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Category>> {
+    categories::table
+        .find(id)
+        .select(Category::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// Fetch the category of `project_id` carrying `slug`, or `None`. Resolved through the UNIQUE
+/// `idx_categories_project_slug`, so the answer is 0 or 1 row and never a choice — which is exactly
+/// why the harness keys on the slug and not on the (freely colliding) name.
+pub fn find_category_by_slug(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    slug: &str,
+) -> QueryResult<Option<Category>> {
+    categories::table
+        .filter(categories::project_id.eq(project_id))
+        .filter(categories::slug.eq(slug))
+        .select(Category::as_select())
+        .first(conn)
+        .optional()
+}
+
+/// The next append position inside `project_id` (max + 1; 0 when the project has none). Mirrors the
+/// "append after the current max" gesture `create_project` / `create_terminal` make.
+pub fn next_category_position(conn: &mut SqliteConnection, project_id: &str) -> QueryResult<i32> {
+    use diesel::dsl::max;
+    Ok(categories::table
+        .filter(categories::project_id.eq(project_id))
+        .select(max(categories::position))
+        .first::<Option<i32>>(conn)?
+        .map(|m| m + 1)
+        .unwrap_or(0))
+}
+
+/// Insert ONE category and return it. The RAW write — it validates nothing beyond what the schema
+/// does. Every caller outside the seed goes through [`crate::category`], which owns the slug rules,
+/// the same-project rule and the events.
+pub fn insert_category(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    slug: &str,
+    name: &str,
+    created_by_type: &str,
+    confirmed_at: Option<i64>,
+) -> QueryResult<Category> {
+    let now = now_millis();
+    let position = next_category_position(conn, project_id)?;
+    diesel::insert_into(categories::table)
+        .values(NewCategory {
+            id: Uuid::now_v7().to_string(),
+            project_id: project_id.to_string(),
+            slug: slug.to_string(),
+            name: name.to_string(),
+            color_token: Some(category_color_token(slug).to_string()),
+            position,
+            created_by_type: created_by_type.to_string(),
+            confirmed_at,
+            created_at: now,
+            updated_at: now,
+        })
+        .returning(Category::as_returning())
+        .get_result(conn)
+}
+
+/// Rewrite a category's human `name`, bumping `updated_at`. Returns rows updated (0 = unknown id).
+/// The RAW write — `slug` is deliberately NOT a parameter: it is the stable identity, and no code
+/// path anywhere may rewrite it (see [`Category`]).
+pub fn update_category_name(
+    conn: &mut SqliteConnection,
+    id: &str,
+    name: &str,
+) -> QueryResult<usize> {
+    diesel::update(categories::table.find(id))
+        .set((
+            categories::name.eq(name),
+            categories::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// DELETE one category and return the rows removed (0 = unknown id). The RAW write.
+///
+/// The Specs that carried it are RELEASED, never deleted: `specs.category_id` is
+/// `ON DELETE SET NULL` (held by `deleting_a_category_releases_its_specs_and_deleting_a_project_
+/// takes_its_vocabulary` in this module's tests). It validates NOTHING else — the two refusals
+/// that make a deletion safe (a system slug, a category still borne by a Spec) are pronounced by
+/// [`crate::category::delete`], which is the only caller outside these tests.
+pub fn delete_category(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
+    diesel::delete(categories::table.find(id)).execute(conn)
+}
+
+/// Count the Specs currently carrying `category_id` — the number
+/// [`crate::category::delete`]'s refusal names, and the reason it refuses.
+pub fn count_specs_with_category(conn: &mut SqliteConnection, category_id: &str) -> QueryResult<i64> {
+    specs::table
+        .filter(specs::category_id.eq(category_id))
+        .count()
+        .get_result(conn)
+}
+
+/// Write `specs.category_id` (`None` = unassign), bumping the Spec's `updated_at`. Returns rows
+/// updated (0 = unknown Spec).
+///
+/// The RAW write, and it does NOT check that the category belongs to the Spec's project — SQLite's
+/// FK cannot express that, and neither does this. [`crate::category::assign_spec_category`] is the
+/// authority that refuses a cross-project assignment; this is its persistence step.
+pub fn set_spec_category_id(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+    category_id: Option<&str>,
+) -> QueryResult<usize> {
+    diesel::update(specs::table.find(spec_id))
+        .set((
+            specs::category_id.eq(category_id),
+            specs::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Seed the four [`SYSTEM_CATEGORIES`] into `project_id`, and return how many rows were INSERTED.
+///
+/// IDEMPOTENT by construction: the insert is `ON CONFLICT (project_id, slug) DO NOTHING`, so a slug
+/// already present is left EXACTLY as it stands — a `bug` a human renamed to "Défaut" and recoloured
+/// keeps its name, its colour, its position and its `created_by_type`. That is the whole contract of
+/// the boot backfill: it can only ever ADD what is missing.
+///
+/// The four are born `created_by_type = 'system'`: they are nyx's own vocabulary, and their
+/// PROVENANCE is the only curation fact a row still carries. They also stamp `confirmed_at` — like
+/// every other creation path, and for no reason beyond the column being NOT NULL-in-practice: the
+/// 2026-09-02 amendment of PDR-0017 retired the proposed/confirmed axis, so that value is vestigial
+/// and nothing branches on it (see [`Category::confirmed_at`]). Positions are appended after
+/// whatever the project already holds, so a backfill never renumbers an existing list.
+pub fn seed_system_categories_for_project(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+) -> QueryResult<usize> {
+    let now = now_millis();
+    let mut inserted = 0;
+    for (slug, name, color_token) in SYSTEM_CATEGORIES {
+        let position = next_category_position(conn, project_id)?;
+        inserted += diesel::insert_into(categories::table)
+            .values(NewCategory {
+                id: Uuid::now_v7().to_string(),
+                project_id: project_id.to_string(),
+                slug: slug.to_string(),
+                name: name.to_string(),
+                color_token: Some(color_token.to_string()),
+                position,
+                created_by_type: CATEGORY_CREATED_BY_SYSTEM.to_string(),
+                confirmed_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            })
+            .on_conflict((categories::project_id, categories::slug))
+            .do_nothing()
+            .execute(conn)?;
+    }
+    Ok(inserted)
+}
+
+/// `domain_events.aggregate` for a CATEGORY-domain mutation.
+const AGGREGATE_CATEGORY: &str = "category";
+
+/// Record ONE `domain_events` outbox row for a CATEGORY mutation, INSIDE the caller's transaction
+/// (outbox pattern — the event commits with the write it describes, or with nothing).
+///
+/// `source` is the PROVENANCE of the gesture and it is a parameter, not a constant, because
+/// PDR-0017 splits this domain in two halves that must stay distinguishable in the trace: the
+/// agent's on-the-fly creation is [`DomainEventSource::Mcp`], the human's curation (confirm,
+/// rename) is [`DomainEventSource::Ui`]. Recording both as `mcp` would make the human's decision
+/// unreadable afterwards — and the caller that will drive the human half from the app (the
+/// sidecar's confirm/rename commands) has nothing else to say it with.
+///
+/// `extra` is folded into the payload next to the identity fields, so a rename can carry the new
+/// name without a second event shape.
+pub fn record_category_event(
+    conn: &mut SqliteConnection,
+    event_type: &str,
+    category: &Category,
+    source: DomainEventSource,
+    extra: serde_json::Value,
+) -> QueryResult<()> {
+    let mut payload = serde_json::json!({
+        "category_id": category.id,
+        "slug": category.slug,
+        "name": category.name,
+    });
+    if let (Some(map), Some(extra)) = (payload.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    record_domain_event(
+        conn,
+        NewDomainEvent {
+            project_id: category.project_id.clone(),
+            workspace_id: None,
+            aggregate: AGGREGATE_CATEGORY.to_string(),
+            event_type: event_type.to_string(),
+            source: source.as_str().to_string(),
+            actor: None,
+            payload: payload.to_string(),
+            created_at: 0,
+        },
+    )?;
+    Ok(())
+}
+
+/// Record the `spec.category_set` outbox row, INSIDE the caller's transaction. Carries `spec_id`
+/// so [`recent_domain_events_for_spec`] — which matches on `$.spec_id` — surfaces the
+/// (re)categorization in the Spec's own Activity feed, and `category_id` (`null` on removal) so the
+/// feed can name what it became.
+///
+/// `source` is a parameter for the same reason as in [`record_category_event`], and with a sharper
+/// edge: [`crate::category::assign_spec_category`] is the ONLY writer of `specs.category_id`, and
+/// BOTH halves of PDR-0017 reach it — an agent through the MCP surface, a human through the Spec
+/// detail screen's assign / unassign. Pinning `mcp` here would file a human's classification as the
+/// agent's and make the curation half of that PDR unreadable, which is precisely what this axis
+/// exists to trace. Contrast [`crate::category::confirm`] / [`crate::category::rename`], which are
+/// human BY DEFINITION and therefore pin `Ui` at their own call site.
+pub fn record_spec_category_event(
+    conn: &mut SqliteConnection,
+    project_id: &str,
+    spec_id: &str,
+    category: Option<&Category>,
+    source: DomainEventSource,
+) -> QueryResult<()> {
+    let payload = serde_json::json!({
+        "spec_id": spec_id,
+        "category_id": category.map(|c| c.id.as_str()),
+        "slug": category.map(|c| c.slug.as_str()),
+    })
+    .to_string();
+    record_domain_event(
+        conn,
+        NewDomainEvent {
+            project_id: project_id.to_string(),
+            workspace_id: None,
+            aggregate: AGGREGATE_SPEC.to_string(),
+            event_type: "spec.category_set".to_string(),
+            source: source.as_str().to_string(),
+            actor: None,
+            payload,
+            created_at: 0,
+        },
+    )?;
+    Ok(())
+}
+
+/// Replay [`seed_system_categories_for_project`] over EVERY project — the boot BACKFILL, run once
+/// per start next to the built-in workflow seed.
+///
+/// A database that predates `20260828180916_create_categories` holds projects with no categories at
+/// all; without this they would have to be recreated to gain the vocabulary the harness reads. It
+/// is a no-op on a database already seeded (the per-project call inserts nothing), so the steady
+/// state costs four conflicting inserts per project and nothing else.
+pub fn seed_system_categories(conn: &mut SqliteConnection) -> QueryResult<usize> {
+    let project_ids: Vec<String> = projects::table.select(projects::id).load(conn)?;
+    let mut inserted = 0;
+    for project_id in project_ids {
+        inserted += seed_system_categories_for_project(conn, &project_id)?;
+    }
+    Ok(inserted)
+}
+
 // --- Spec domain models (v2.4 Phase 1, v13, PDR-0014) --------------------
 
 /// A `specs` row: the durable Spec identity within a project (PDR-0014). `Serialize`
@@ -1563,6 +2054,13 @@ pub struct Spec {
     /// `None` = not under a per-phase review. A stable anchor for the overlay badge + finding
     /// attribution (the middle rung of the finding-phase precedence).
     pub reviewing_phase: Option<i32>,
+    /// The Spec's SINGLE category (PDR-0017); `None` = uncategorized, which is a legitimate steady
+    /// state and never an error. Points at a [`Category`] of the SAME project — an invariant the
+    /// FK cannot express and [`crate::category::assign_spec_category`] pronounces.
+    ///
+    /// LAST in the struct because it is last in the table: `ALTER TABLE ADD COLUMN` appends, and
+    /// `Queryable` decodes POSITIONALLY (see the note in `schema.rs`).
+    pub category_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -5066,6 +5564,18 @@ impl Db {
             &crate::system_scope::EnvHomeDirProvider,
         )
         .map_err(|e| anyhow::anyhow!("failed to bootstrap the Système scope: {e}"))?;
+        // BACKFILL the per-project category vocabulary (PDR-0017). `create_project` seeds every
+        // project born from now on; this covers the ones that already exist in a database
+        // migrated onto `20260828180916_create_categories`, which would otherwise have no
+        // categories at all and no way to gain them short of being recreated. IDEMPOTENT — a
+        // project already holding the four slugs is left untouched, renames included.
+        //
+        // AFTER the Système bootstrap, deliberately: the singleton is inserted by
+        // `insert_system_scope`, not by `create_project`, so it would otherwise gain its vocabulary
+        // only at the NEXT boot — the same database would hold two different states depending on
+        // how many times nyx had started. One order, one outcome.
+        seed_system_categories(&mut conn)
+            .map_err(|e| anyhow::anyhow!("failed to seed system categories: {e}"))?;
         drop(conn);
         Ok(Db { pool })
     }
@@ -5266,6 +5776,17 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "app_settings.key",
     "app_settings.updated_at",
     "app_settings.value",
+    "categories",
+    "categories.color_token",
+    "categories.confirmed_at",
+    "categories.created_at",
+    "categories.created_by_type",
+    "categories.id",
+    "categories.name",
+    "categories.position",
+    "categories.project_id",
+    "categories.slug",
+    "categories.updated_at",
     "command_instances",
     "command_instances.command_id",
     "command_instances.created_at",
@@ -5323,6 +5844,24 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "domain_events.sequence",
     "domain_events.source",
     "domain_events.workspace_id",
+    "gate_attempts",
+    "gate_attempts.blocking",
+    "gate_attempts.command_line",
+    "gate_attempts.commands_json",
+    "gate_attempts.created_at",
+    "gate_attempts.cwd",
+    "gate_attempts.declared",
+    "gate_attempts.duration_ms",
+    "gate_attempts.exit_code",
+    "gate_attempts.expect",
+    "gate_attempts.node_id",
+    "gate_attempts.outcome",
+    "gate_attempts.output_excerpt",
+    "gate_attempts.run_id",
+    "gate_attempts.satisfied",
+    "gate_attempts.sequence",
+    "gate_attempts.slot",
+    "gate_attempts.spec_id",
     "human_turns",
     "human_turns.consumed_by",
     "human_turns.prompt",
@@ -5357,6 +5896,7 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "idx_annexes_content_hash",
     "idx_annexes_spec",
     "idx_annexes_url_unique_per_spec",
+    "idx_categories_project_slug",
     "idx_command_instances_command",
     "idx_command_instances_workspace",
     "idx_command_slots_project_slot",
@@ -5364,6 +5904,8 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "idx_design_project",
     "idx_domain_events_project",
     "idx_domain_events_workspace",
+    "idx_gate_attempts_run",
+    "idx_gate_attempts_spec",
     "idx_idea_specs_spec",
     "idx_ideas_project_status",
     "idx_ideas_project_theme",
@@ -5400,6 +5942,7 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "idx_spec_depends_on_to",
     "idx_spec_revisions_spec",
     "idx_spec_revisions_spec_number",
+    "idx_specs_category",
     "idx_specs_project_number",
     "idx_specs_project_slug",
     "idx_specs_project_status",
@@ -5613,6 +6156,7 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "spec_revisions_fts_au",
     "specs",
     "specs.archived_at",
+    "specs.category_id",
     "specs.completed_at",
     "specs.created_at",
     "specs.current_revision_number",
@@ -6611,6 +7155,14 @@ pub fn create_project(
         // here; it keeps the "create workspace → materialize instances" invariant
         // uniform across both workspace-creation paths (root + added).
         materialize_instances_for_workspace(conn, &workspace.id)?;
+
+        // Seed the project's default "genre of work" vocabulary (PDR-0017): a project is born
+        // with `feature` / `bug` / `refactor` / `chore`, so the agent has something to assign
+        // from and the harness has the slugs it reads. INSIDE the transaction — a project that
+        // failed to be created must not leave four orphan categories behind. `Db::open`'s boot
+        // backfill covers the projects that predate the migration; this covers every new one,
+        // and this is the ONLY insertion point into `projects`.
+        seed_system_categories_for_project(conn, &project_id)?;
 
         Ok((project, workspace))
     })
@@ -12523,12 +13075,43 @@ pub const NODE_TYPE_TRANSITION_TASK: &str = "transition_task";
 /// `project.worktrees_root` query fact and the widening of the `nodes.type` CHECK; the full note is
 /// on `build_nspec` in `crate::seed`, which names all THREE items this pass crossed.
 pub const NODE_TYPE_CREATE_WORKSPACE: &str = "create_workspace";
+/// A `set_category` CLASSIFIES the run's bound Spec — it writes the genre of work the Spec carries
+/// (`specs.category_id`) through the SAME [`crate::category::set_spec_category_by_label`] the MCP
+/// surface calls, so the same-project refusal, the on-the-fly MINT of an unknown label and the
+/// `spec.category_set` event are ONE authority and never a second implementation (PDR-0017).
+///
+/// Its whole configuration is `{category_key, gate_on?}`: `category_key` NAMES the blackboard key
+/// holding the category LABEL (a slug or a human name), never a literal — the label is a per-run
+/// answer (a `judge`'s verdict, a `query spec_category` reading, a human's reply) and a shared graph
+/// holds none of them. `gate_on` is the OPTIONAL affirmative board key the effect fires on (UNGATED
+/// when absent), the same shape as [`NODE_TYPE_TRANSITION_TASK`]'s.
+///
+/// IT WRITES NO BLACKBOARD KEY, AND THE ROUTING OUTPUT IS THE READ-BACK. The classification lands in
+/// the DOMAIN (`specs.category_id`), never on the run's board: a board copy would be a second truth,
+/// stale the instant a human recategorizes the Spec from the detail screen (which PDR-0017 allows at
+/// any status). A graph that BRANCHES on the genre of work therefore reads it back with a
+/// `query { query: "spec_category" }` — the fact answers the persisted SLUG — and a `selector` tests
+/// that. `set_category` is consequently absent from every `output_key` census
+/// ([`crate::mcp_authoring`]'s `node_written_board_keys`), deliberately and by name.
+///
+/// WHY A NODE AND NOT A SENTENCE. A prompt asking an agent to classify can be skipped, forgotten or
+/// argued with; a node of the graph cannot. The `bug` discipline this product hangs on the category
+/// (a red-before-green proof) is only as reliable as the classification under it, so the
+/// classification is IMPOSED by the engine — exactly the way `transition`, `fork_spec` and
+/// `create_workspace` impose theirs (ADR-0006).
+///
+/// HORS PERIMETRE ASSUME. This SEVENTEENTH node type is added to the orchestration engine 2.8, which
+/// is FROZEN (in_progress). The crossing is deliberate and it has an identical, documented precedent:
+/// [`NODE_TYPE_CREATE_WORKSPACE`], the sixteenth type, was added to the same frozen engine on the
+/// user's explicit decision of 2026-08-18. ADR-0006 records this one — "le nœud `set_category` est un
+/// type moteur complet : runtime, validation, authoring MCP, dataflow, rendu et inspection".
+pub const NODE_TYPE_SET_CATEGORY: &str = "set_category";
 
-/// The sixteen valid node `type` values, in the migration's CHECK order — the vocabulary the
+/// The seventeen valid node `type` values, in the migration's CHECK order — the vocabulary the
 /// interpreter and the authoring layer validate against. Every [`NODE_TYPES`] entry round-trips
 /// through [`crate::engine::NodeType`].
 #[cfg_attr(not(test), allow(dead_code))]
-pub const NODE_TYPES: [&str; 16] = [
+pub const NODE_TYPES: [&str; 17] = [
     NODE_TYPE_SEQUENCE,
     NODE_TYPE_LOOP,
     NODE_TYPE_SELECTOR,
@@ -12545,6 +13128,7 @@ pub const NODE_TYPES: [&str; 16] = [
     NODE_TYPE_SUB_WORKFLOW,
     NODE_TYPE_TRANSITION_TASK,
     NODE_TYPE_CREATE_WORKSPACE,
+    NODE_TYPE_SET_CATEGORY,
 ];
 
 /// A workflow_run's `status` (CHECK-enforced in the migration).
@@ -15964,6 +16548,396 @@ pub fn persist_run_tick(
         }
         Ok(updated)
     })
+}
+
+// --- gate_attempts: the APPEND-ONLY evidence journal ---------------------------------------
+//
+// Every `gate_check` execution lands here, and nothing ever overwrites one. The whole rationale —
+// why a table instead of a blackboard key, why the correlation ids carry no FK — is written once, in
+// `migrations/20260828230451_create_gate_attempts/up.sql`, and not repeated here.
+
+/// `gate_attempts.expect` — the check must PASS. The default meaning, and every pre-expectation gate.
+pub const GATE_EXPECT_GREEN: &str = "green";
+/// `gate_attempts.expect` — the check must FAIL, by exiting non-zero after running to completion.
+pub const GATE_EXPECT_RED: &str = "red";
+/// The `expect` vocabulary the migration's CHECK closes. Confronted with the live CHECK by
+/// `mod tests`, so the two spellings cannot drift.
+pub const GATE_EXPECTATIONS: [&str; 2] = [GATE_EXPECT_GREEN, GATE_EXPECT_RED];
+
+/// `gate_attempts.outcome` — every command terminated normally with status 0.
+pub const GATE_OUTCOME_PASSED: &str = "passed";
+/// `gate_attempts.outcome` — a command TERMINATED NORMALLY with a non-zero status. A verdict about
+/// the work, and the ONLY outcome that can answer an `expect: red`.
+pub const GATE_OUTCOME_FAILED: &str = "failed";
+/// `gate_attempts.outcome` — NO verdict was produced: a timeout, a cancellation, a spawn failure, an
+/// unreachable service. It answers NEITHER expectation.
+pub const GATE_OUTCOME_INDETERMINATE: &str = "indeterminate";
+/// The `outcome` vocabulary the migration's CHECK closes.
+pub const GATE_OUTCOMES: [&str; 3] = [
+    GATE_OUTCOME_PASSED,
+    GATE_OUTCOME_FAILED,
+    GATE_OUTCOME_INDETERMINATE,
+];
+
+/// # THE OUTPUT POLICY of the gate evidence journal — bounding and sanitisation
+///
+/// A gate's captured output is the one part of an attempt whose SIZE and CONTENT nyx does not
+/// control: it is whatever an arbitrary project command printed. Stored raw and unbounded in a
+/// durable, append-only table, it would be two problems at once — a journal that grows without
+/// limit (one attempt per gate per tick, forever, for every project) and a journal that may hold
+/// whatever a command happened to echo. So the boundary between "what the PTY captured" and "what
+/// is persisted" carries an explicit policy, and this is it. Four rules:
+///
+/// 1. **BOUNDED, from the END.** At most [`GATE_EVIDENCE_EXCERPT_CHARS`] characters are kept, taken
+///    from the tail, with [`GATE_EVIDENCE_TRUNCATED`] prepended when the value was cut so a
+///    shortened excerpt never reads as a whole one. The end is kept because the end is what explains
+///    a failure — the assertion, the stack trace, the summary line. This bound applies ON TOP of the
+///    16 KiB tail the capture path already keeps in memory: the journal is a durable record, not a
+///    copy of the terminal.
+/// 2. **INERT.** ANSI/OSC escape sequences are stripped ([`crate::ansi::strip_ansi`]) and the
+///    remaining control characters (other than `\n` and `\t`) are dropped. A record an auditor reads
+///    must be text: an OSC sequence surviving into a stored excerpt is a small injection surface
+///    into whatever renders it, and a NUL byte is a value SQLite will happily store and no reader
+///    handles.
+/// 3. **REDACTED where a secret is SELF-DISCLOSED.** A `NAME=value` (or `NAME: value`) whose NAME
+///    looks like a credential — one of [`SECRET_NAME_FRAGMENTS`] as a whole segment of it, and the
+///    name half must look like a name at all ([`name_looks_like_a_credential`]) — has its VALUE
+///    replaced by [`GATE_EVIDENCE_REDACTED`], and an authorization header's `Bearer <token>` is
+///    redacted likewise ([`bearer_header_at`]). This is a deliberate, NARROW rule: it catches
+///    the shape a leak actually takes in command output (a dumped env, a curl trace) without
+///    attempting content-level secret detection, which would mangle legitimate test output — a
+///    journal that silently corrupts the evidence it exists to preserve would be worse than one that
+///    misses a disclosure.
+/// 4. **NO ENVIRONMENT VALUES, EVER — and that one is upstream.** A gate command's persisted `env`
+///    reaches `cmd.env` and nothing else ([`crate::mcp_engine`]'s runner); the capture path takes
+///    the command's OUTPUT only. Rule 3 exists precisely because rule 4 cannot cover what a command
+///    chooses to print about itself.
+///
+/// What this function does NOT do is decide WHETHER to record. Every attempt is journaled, including
+/// the ones that produced no verdict: an auditor is told to treat what they cannot see recorded as
+/// absent, so a journal allowed to skip entries would turn a harness fault into a missing attempt.
+pub fn gate_evidence_excerpt(raw: &str) -> String {
+    let redacted = sanitise_free_text(raw);
+    // Bound LAST, so a redaction never gets half-applied by a cut that landed inside a value.
+    match redacted
+        .char_indices()
+        .nth_back(GATE_EVIDENCE_EXCERPT_CHARS.saturating_sub(1))
+    {
+        Some((cut, _)) if cut > 0 => format!("{GATE_EVIDENCE_TRUNCATED}{}", &redacted[cut..]),
+        _ => redacted,
+    }
+}
+
+/// RULES 2 AND 3 OF [`gate_evidence_excerpt`], ON THEIR OWN — the INERT + REDACTED prelude, with no
+/// bound applied. ANSI/OSC sequences stripped, control bytes other than `\n` / `\t` dropped, and a
+/// self-disclosed credential's value replaced by [`GATE_EVIDENCE_REDACTED`].
+///
+/// `pub` because a gate's captured output is NOT the only untrusted free text that reaches a stored,
+/// rendered surface: the `bug` discipline's MANUAL route records a HUMAN's answer — a pasted
+/// terminal transcript, a `curl -v` trace — and the auditor's context promises that answer is
+/// "bounded and sanitised exactly like a command's output extract" ([`crate::mcp_context`]). It said
+/// so while applying neither rule, so a pasted OSC sequence and an unredacted `Bearer …` went
+/// straight through. One function, called from both, is what makes the promise true; two copies of
+/// the policy would be the same defect waiting to reappear.
+///
+/// The newline SURVIVES here on purpose: rule 3 is line-oriented, so any folding a caller wants must
+/// happen after this, never before.
+pub fn sanitise_free_text(raw: &str) -> String {
+    let inert: String = crate::ansi::strip_ansi(raw)
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect();
+    redact_disclosed_secrets(&inert)
+}
+
+/// How many CHARS of a gate's combined output ride in the journal — see [`gate_evidence_excerpt`].
+/// 4 KiB is ample for a failing test's summary plus a stack trace or two (the reason the tail is the
+/// half kept), and small enough that a Spec's whole red→green sequence stays a record rather than a
+/// transcript.
+pub const GATE_EVIDENCE_EXCERPT_CHARS: usize = 4096;
+/// Prepended to a CUT excerpt (the head is what was dropped), so a shortened value never reads as a
+/// whole one.
+pub const GATE_EVIDENCE_TRUNCATED: &str = "…[truncated]\n";
+/// What replaces a SELF-DISCLOSED secret's value — see rule 3 of [`gate_evidence_excerpt`].
+pub const GATE_EVIDENCE_REDACTED: &str = "«redacted»";
+
+/// The NAME fragments that make an assignment in command output look like a credential — rule 3 of
+/// [`gate_evidence_excerpt`]. Matched case-insensitively against a WHOLE SEGMENT of the name (the
+/// pieces `_`, `-` and `.` separate), so `GITHUB_TOKEN`, `npm_password` and `x-api-key` all land
+/// while `authoritative`, `tokenizer` and `secretary` do not.
+///
+/// A fragment spelled with an `_` is a RUN of segments (`api_key` matches `API_KEY`, `x-api-key`
+/// and `aws.api.key` alike) — the separator is not part of the comparison, only the boundaries are.
+const SECRET_NAME_FRAGMENTS: [&str; 11] = [
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "bearer",
+    "credential",
+    "private_key",
+];
+
+/// Whether the NAME half of an assignment looks like a credential — rule 3's test, ANCHORED.
+///
+/// It used to be `name.contains(fragment)`, which is not a test on a name at all: `test auth`,
+/// `thread 'main' panicked at src/auth.rs` and `test token_parser` all contain a fragment, and every
+/// one of them is an ordinary line of a `cargo test` run — the exact output a red-vs-green
+/// comparison is made of. Redacted, those lines lost the very thing the auditor reads them for.
+///
+/// So the name must first LOOK like a name (no whitespace, no path separator, no `::`), and the
+/// fragment must then match a RUN OF WHOLE SEGMENTS of it, `_`, `-` and `.` all counting as the
+/// separator. That keeps every shape a dumped credential really takes (`GITHUB_TOKEN`,
+/// `npm_password`, `x-api-key`, `AWS.SECRET`, `X-Private-Key`) and lets prose through untouched.
+fn name_looks_like_a_credential(name: &str) -> bool {
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("::")
+    {
+        return false;
+    }
+    let segments: Vec<&str> = name.split(['_', '-', '.']).filter(|s| !s.is_empty()).collect();
+    SECRET_NAME_FRAGMENTS.iter().any(|fragment| {
+        let wanted: Vec<&str> = fragment.split('_').collect();
+        segments.windows(wanted.len()).any(|w| w == wanted.as_slice())
+    })
+}
+
+/// Where a line's `bearer ` really is an AUTHORIZATION HEADER carrying a token — the byte offset of
+/// the word, or `None`.
+///
+/// Two shapes qualify, and nothing else: the canonical `Bearer ` capitalisation (what a `curl -v`
+/// trace prints), and any capitalisation on a line whose NAME HALF is an `authorization` header
+/// (HTTP/2 lower-cases header names, so `authorization: bearer …` is the same disclosure). In both
+/// cases the rest of the line must hold a non-empty token — `Bearer` with nothing after it discloses
+/// nothing and is not worth destroying a line for.
+fn bearer_header_at(line: &str) -> Option<usize> {
+    let lowered = line.to_ascii_lowercase();
+    let at = lowered.find("bearer ")?;
+    if lowered[at + "bearer ".len()..].trim().is_empty() {
+        return None;
+    }
+    let canonical = line[at..].starts_with("Bearer ");
+    let authorization_header = line
+        .find(':')
+        .filter(|sep| *sep < at)
+        .is_some_and(|sep| line[..sep].trim().to_ascii_lowercase().ends_with("authorization"));
+    (canonical || authorization_header).then_some(at)
+}
+
+/// Rule 3 of [`gate_evidence_excerpt`]: replace the VALUE of a credential-looking assignment, and
+/// the token of a `Bearer …`, with [`GATE_EVIDENCE_REDACTED`].
+///
+/// Line-oriented and deliberately simple. A secret dumped by a command appears on its own line (an
+/// `env` dump, a config echo, a curl `-v` header); a regex-grade parser over arbitrary output would
+/// buy no precision and would cost the property that matters here — that a reader can predict
+/// exactly what the journal will and will not keep.
+///
+/// **NARROW IS THE POINT**, and the doc above says why: a journal that silently corrupts the
+/// evidence it exists to preserve is worse than one that misses a disclosure. Both halves of the
+/// rule are therefore anchored — see [`name_looks_like_a_credential`] for the assignment, and the
+/// `Bearer ` branch below, which requires the header's own capitalisation followed by a non-empty
+/// token rather than firing on any line that happens to contain the word.
+fn redact_disclosed_secrets(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            // `Bearer <token>` — an authorization header. IT MUST LOOK LIKE ONE: the canonical
+            // `Bearer ` spelling, or a lower-cased one carried by a header line whose name half IS
+            // an `authorization` (HTTP/2 lower-cases header names, so both really occur). Plus a
+            // NON-EMPTY token after it. Firing on any line containing the word truncated
+            // `test bearer token handling ... ok` — a test name, on which no credential ever was.
+            if let Some(at) = bearer_header_at(line) {
+                let head = &line[..at + "bearer ".len()];
+                return format!("{head}{GATE_EVIDENCE_REDACTED}");
+            }
+            let Some(sep) = line.find(['=', ':']) else {
+                return line.to_string();
+            };
+            let name = line[..sep].trim().to_ascii_lowercase();
+            if name_looks_like_a_credential(&name) {
+                format!("{}{}{GATE_EVIDENCE_REDACTED}", &line[..sep], &line[sep..=sep])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A `gate_attempts` row — ONE recorded `gate_check` execution. `Serialize` for the diagnostic
+/// surfaces that read it back.
+#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
+#[diesel(table_name = gate_attempts)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct GateAttemptRow {
+    /// Monotonic append order — THE ordering key of the journal (never the clock).
+    pub sequence: i64,
+    pub run_id: String,
+    pub spec_id: Option<String>,
+    pub node_id: String,
+    pub slot: Option<String>,
+    /// [`GATE_EXPECT_GREEN`] | [`GATE_EXPECT_RED`].
+    pub expect: String,
+    /// Whether the node SPELLED its expectation (vs. defaulting to green).
+    pub declared: bool,
+    pub blocking: bool,
+    /// [`GATE_OUTCOME_PASSED`] | [`GATE_OUTCOME_FAILED`] | [`GATE_OUTCOME_INDETERMINATE`].
+    pub outcome: String,
+    /// Whether `outcome` answered `expect`.
+    pub satisfied: bool,
+    /// The RESOLVED command line(s), newline-joined — the identity an auditor compares.
+    pub command_line: String,
+    /// The RESOLVED run director(ies), newline-joined.
+    pub cwd: String,
+    /// The deciding command's exit status; `None` when none was ever read.
+    pub exit_code: Option<i32>,
+    pub duration_ms: i64,
+    /// The bounded, sanitised extract of the combined output — [`gate_evidence_excerpt`].
+    pub output_excerpt: String,
+    /// The per-command detail as JSON, bounded by the same policy.
+    pub commands_json: String,
+    pub created_at: i64,
+}
+
+/// A new `gate_attempts` row. `sequence` is OMITTED — SQLite assigns the rowid, which IS the
+/// journal's order.
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = gate_attempts)]
+pub struct NewGateAttempt {
+    pub run_id: String,
+    pub spec_id: Option<String>,
+    pub node_id: String,
+    pub slot: Option<String>,
+    pub expect: String,
+    pub declared: bool,
+    pub blocking: bool,
+    pub outcome: String,
+    pub satisfied: bool,
+    pub command_line: String,
+    pub cwd: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: i64,
+    pub output_excerpt: String,
+    pub commands_json: String,
+    pub created_at: i64,
+}
+
+/// ONE `run.gate_attempt` — the RUN-aggregate event that points at a recorded attempt.
+///
+/// It exists so a reader of the run's own journal can get from "this run ticked" to "and here is
+/// what the gate did, recorded under this sequence" without having to know the evidence table. The
+/// payload carries `evidence_sequence`, which is the primary key of the [`GateAttemptRow`] it
+/// describes — the reference, not a copy: the attempt's bounded output stays in the evidence table
+/// and never gets duplicated into the outbox, whose rows are small by design.
+pub const EVENT_RUN_GATE_ATTEMPT: &str = "run.gate_attempt";
+
+/// APPEND one gate attempt to the journal and, in the SAME transaction, record the
+/// [`EVENT_RUN_GATE_ATTEMPT`] run event that REFERENCES it.
+///
+/// Append-only in the strict sense: this is the only write to `gate_attempts` in the codebase, and
+/// it is an INSERT. Two attempts on the same gate of the same run produce two rows, ordered by
+/// `sequence` — which is exactly what makes a red followed by a green readable as one sequence
+/// instead of a single overwritten key.
+///
+/// The two writes are ATOMIC and their failure modes are NOT symmetric, deliberately:
+///
+///   * the evidence row is the point of the call and its failure propagates;
+///   * the run EVENT is skipped — without failing — when the run resolves to no project, because
+///     `domain_events.project_id` is not nullable and a run bound to neither Spec nor workspace is a
+///     legitimate state. The same choice [`record_run_tick_event`] makes, for the same reason. The
+///     evidence is still recorded; only the pointer to it is not filed.
+pub fn append_gate_attempt(
+    conn: &mut SqliteConnection,
+    mut attempt: NewGateAttempt,
+) -> QueryResult<GateAttemptRow> {
+    conn.transaction(|conn| {
+        if attempt.created_at == 0 {
+            attempt.created_at = now_millis();
+        }
+        let row: GateAttemptRow = diesel::insert_into(gate_attempts::table)
+            .values(&attempt)
+            .returning(GateAttemptRow::as_returning())
+            .get_result(conn)?;
+        record_gate_attempt_event(conn, &row)?;
+        Ok(row)
+    })
+}
+
+/// The `run.gate_attempt` outbox row for `row`, inside the caller's transaction. Skipped (without
+/// failing) when the run is gone or resolves to no project — see [`append_gate_attempt`].
+fn record_gate_attempt_event(
+    conn: &mut SqliteConnection,
+    row: &GateAttemptRow,
+) -> QueryResult<()> {
+    let Some(run) = get_workflow_run(conn, &row.run_id)? else {
+        return Ok(());
+    };
+    let Some(project_id) = run_project(conn, &run)? else {
+        return Ok(());
+    };
+    let mut payload = serde_json::Map::new();
+    payload.insert("run_id".into(), row.run_id.clone().into());
+    payload.insert("node_id".into(), row.node_id.clone().into());
+    payload.insert("expect".into(), row.expect.clone().into());
+    payload.insert("outcome".into(), row.outcome.clone().into());
+    payload.insert("satisfied".into(), row.satisfied.into());
+    payload.insert("blocking".into(), row.blocking.into());
+    // THE REFERENCE: the evidence row's primary key. A reader follows it to the full attempt.
+    payload.insert("evidence_sequence".into(), row.sequence.into());
+    if let Some(spec_id) = &row.spec_id {
+        payload.insert("spec_id".into(), spec_id.clone().into());
+    }
+    if let Some(slot) = &row.slot {
+        payload.insert("slot".into(), slot.clone().into());
+    }
+    record_domain_event(
+        conn,
+        NewDomainEvent {
+            project_id,
+            workspace_id: run.workspace_id.clone(),
+            aggregate: AGGREGATE_RUN.to_string(),
+            event_type: EVENT_RUN_GATE_ATTEMPT.to_string(),
+            source: "mcp".to_string(),
+            actor: None,
+            payload: serde_json::Value::Object(payload).to_string(),
+            created_at: 0,
+        },
+    )?;
+    Ok(())
+}
+
+/// A Spec's gate attempts, OLDEST FIRST — the order they happened in, which is the order the proof
+/// is read in. The auditor's "the red precedes the fix" and the resume engine's "has this Spec
+/// already produced its red" are both this query.
+pub fn list_gate_attempts_for_spec(
+    conn: &mut SqliteConnection,
+    spec_id: &str,
+) -> QueryResult<Vec<GateAttemptRow>> {
+    gate_attempts::table
+        .filter(gate_attempts::spec_id.eq(spec_id))
+        .order(gate_attempts::sequence.asc())
+        .select(GateAttemptRow::as_select())
+        .load(conn)
+}
+
+/// A RUN's gate attempts, oldest first — the diagnostic read (a run card, a resume that holds the
+/// run id but not the Spec).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn list_gate_attempts_for_run(
+    conn: &mut SqliteConnection,
+    run_id: &str,
+) -> QueryResult<Vec<GateAttemptRow>> {
+    gate_attempts::table
+        .filter(gate_attempts::run_id.eq(run_id))
+        .order(gate_attempts::sequence.asc())
+        .select(GateAttemptRow::as_select())
+        .load(conn)
 }
 
 /// PERSIST a run's live state — the cursor (`current_node_id`), the `blackboard` JSON, the `status`,
@@ -30179,6 +31153,102 @@ mod tests {
         );
     }
 
+    /// EXHAUSTIVE — THE VOCABULARY AND THE CHECK ARE ONE THING, WRITTEN TWICE. [`NODE_TYPES`] is what
+    /// the interpreter ([`crate::engine::NodeType`]) and the authoring layer
+    /// ([`crate::mcp_authoring::parse_node_type`]) validate against; the `nodes.type` CHECK is what
+    /// the database enforces. A type that lands in one and not the other is a graph nyx accepts to
+    /// AUTHOR and refuses to STORE — or, worse, a stored row the interpreter cannot read.
+    ///
+    /// So this replays the WHOLE constant against the real migrated schema, one insert per entry, and
+    /// pins the complement: a word that is not in it is refused. An EIGHTEENTH node type declared
+    /// without its migration fails HERE, on the type it forgot, instead of at the first `node_add` a
+    /// user makes.
+    #[test]
+    fn every_declared_node_type_is_accepted_by_the_stored_check() {
+        let mut conn = open_in_memory();
+        let wf =
+            create_workflow(&mut conn, None, "vocabulary", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
+        for (order, node_type) in NODE_TYPES.iter().enumerate() {
+            create_node(&mut conn, &wf.id, None, order as i32, node_type, "n", "{}")
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "the stored `nodes.type` CHECK refuses the declared node type \
+                         '{node_type}' — NODE_TYPES and the migration chain have drifted: {e}"
+                    )
+                });
+        }
+        assert!(
+            create_node(&mut conn, &wf.id, None, 900, "dragon", "n", "{}").is_err(),
+            "and the CHECK is a CLOSED set — a word outside NODE_TYPES is refused, or the constant \
+             describes nothing"
+        );
+    }
+
+    /// MIGRATION 20260828205640: the SEVENTEENTH node type, `set_category` — the classification the
+    /// engine IMPOSES (PDR-0017 / ADR-0006). One migration, one CHECK, both directions exercised: the
+    /// migrated head accepts it, ONE revert refuses it again while every type it inherited still
+    /// stores, and re-applying accepts it once more with the rows carried through both rebuilds
+    /// untouched. The `down.sql` is therefore never an unexercised file.
+    #[test]
+    fn migration_set_category_widens_and_narrows_the_node_type_check() {
+        /// A node of `node_type` on `wf`, so the CHECK is probed on ONE short line per assertion.
+        fn add_node(
+            conn: &mut SqliteConnection,
+            wf: &str,
+            order: i32,
+            node_type: &str,
+        ) -> QueryResult<Node> {
+            create_node(conn, wf, None, order, node_type, "n", "{}")
+        }
+
+        let mut conn = open_in_memory();
+        let wf = create_workflow(&mut conn, None, "set-cat", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
+
+        let carried = add_node(&mut conn, &wf.id, 0, NODE_TYPE_NOTE).expect("a plain note node");
+        let doomed = add_node(&mut conn, &wf.id, 1, NODE_TYPE_SET_CATEGORY)
+            .expect("the widened CHECK accepts 'set_category'");
+
+        // THE DOWN CLEANS UP AFTER ITSELF — unlike its four predecessors, which narrow the same
+        // CHECK and leave the deletion to the operator. It has to: this migration is the HEAD, and
+        // any booted nyx carries a seeded `set_category` node, so a down that refused to touch rows
+        // could never run at all. The node below is left in place ON PURPOSE — the revert must
+        // succeed with it there.
+        revert_down_through(&mut conn, "20260828205640");
+        assert!(
+            get_node(&mut conn, &doomed.id).unwrap().is_none(),
+            "the revert removed what was written in the vocabulary it removed — anything else is \
+             not a revert"
+        );
+        assert!(
+            add_node(&mut conn, &wf.id, 1, NODE_TYPE_SET_CATEGORY).is_err(),
+            "after the revert the narrowed CHECK refuses 'set_category' again — one revert too few \
+             and this passes blind"
+        );
+        assert!(
+            add_node(&mut conn, &wf.id, 2, NODE_TYPE_CREATE_WORKSPACE).is_ok(),
+            "while the sixteen types it inherited are untouched by the rebuild"
+        );
+        // LOWER END — the migration directly below is still standing (the `categories` table of this
+        // same PRD), so one revert too MANY fails here instead of passing on a peeled chain.
+        assert!(
+            diesel::sql_query("SELECT slug FROM categories")
+                .execute(&mut conn)
+                .is_ok(),
+            "the chain stops just under the head: the `categories` table below it is still applied"
+        );
+
+        run_migrations(&mut conn).expect("re-apply the set_category migration");
+        assert_eq!(
+            get_node(&mut conn, &carried.id).unwrap().unwrap(),
+            carried,
+            "the note carried through both CHECK rebuilds comes back untouched"
+        );
+        assert!(
+            add_node(&mut conn, &wf.id, 3, NODE_TYPE_SET_CATEGORY).is_ok(),
+            "the re-applied CHECK accepts 'set_category' again"
+        );
+    }
+
     /// MIGRATION 20260828180000: the NATURE of a container (`projects.kind`) and the SQL singleton
     /// (`idx_projects_single_system`) ship together, so ONE revert must take BOTH away. A DB
     /// migrated through the head carries the column and refuses a second system project; reverted
@@ -30755,6 +31825,15 @@ mod tests {
         // and v37 rewrites DESIGN CONTENT, never a project — so nothing this test proves depends
         // on when it lands.
         let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/rename-ws", None).unwrap();
+        // The scaffolding SPEC is created here for the same reason, and it became NECESSARY with
+        // `20260828180916_create_categories`: that migration appends `specs.category_id`, so below
+        // the step-back the head `Spec` model over-reads a column the table does not have — and
+        // unlike a plain over-read, `create_spec` NAMES it in its `RETURNING`, which is a hard
+        // "no such column". The Spec is pure scaffolding for the composition seeded further down
+        // (v37 rewrites design CONTENT, never a Spec), so hoisting it above the step-back changes
+        // nothing this test proves.
+        let (spec, _rev) =
+            create_spec(&mut conn, &project.id, "Feature", SpecSections::empty()).unwrap();
         // Step back BEFORE v37 so the seeded rows are what a pre-rename DB really holds. That also
         // steps back before v38 (`design_components.css_slot_json`), which sits on top of it — so at
         // this schema the Diesel MODEL of a component does not match the table, and every read and
@@ -30875,9 +31954,8 @@ mod tests {
             None,
         );
 
-        // …and the same story on a composition's INLINE MARKUP.
-        let (spec, _rev) =
-            create_spec(&mut conn, &project.id, "Feature", SpecSections::empty()).unwrap();
+        // …and the same story on a composition's INLINE MARKUP (on the Spec hoisted above the
+        // step-back — see the note there).
         let proto = create_prototype(&mut conn, &spec.id, None).unwrap();
         let page = create_page(&mut conn, &proto.id, "home", "Home", 0).unwrap();
         let version = create_page_version(&mut conn, &page.id, "v1", None).unwrap();
@@ -32964,8 +34042,8 @@ mod tests {
         assert!(schema_health(&mut conn).up_to_date);
     }
 
-    /// THE PALETTE SIZE IS ONE NUMBER, WRITTEN ON FOUR LAYERS, AND NOTHING DERIVES ONE FROM
-    /// ANOTHER ACROSS THE LANGUAGE BOUNDARY — so this test IS the derivation. It reads all four
+    /// THE PALETTE SIZE IS ONE NUMBER, WRITTEN ON FIVE LAYERS, AND NOTHING DERIVES ONE FROM
+    /// ANOTHER ACROSS THE LANGUAGE BOUNDARY — so this test IS the derivation. It reads all five
     /// and refuses any disagreement:
     ///
     ///  1. the `--group-N` design tokens in `apps/desktop/renderer/src/globals.css` (`--group-0`
@@ -32977,12 +34055,19 @@ mod tests {
     ///     `CHECK` from `20260819140000_create_command_groups` rather than against the text of
     ///     `up.sql` — the boundary that actually refuses a write;
     ///  4. the `manage_command_group` MCP schema's `color` bounds, read off the descriptor the
-    ///     agent is really served, not off this source.
+    ///     agent is really served, not off this source;
+    ///  5. [`CATEGORY_COLOR_TOKENS`], the same palette spelled as token NAMES for the category
+    ///     chips (PDR-0017) — the one layer that stores `group-N` as text rather than as an
+    ///     integer, so it is confronted name by name and not merely by count, and read against
+    ///     layer 1 directly (which is where it sits in the body, out of listing order).
     ///
     /// Without this, adding a seventh token paints `var(--group-7)` on a value the write path then
-    /// rejects — the colour shows, the save fails, and nothing says why.
+    /// rejects — the colour shows, the save fails, and nothing says why. Layer 5 closes the
+    /// mirror-image hole: a token REMOVED from `globals.css` would leave `category_color_token`
+    /// folding a slug onto `group-6` and the chip painting `var(--group-6)`, which resolves to
+    /// nothing at all.
     #[test]
-    fn the_palette_size_is_the_same_number_on_all_four_layers() {
+    fn the_palette_size_is_the_same_number_on_all_five_layers() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -32998,6 +34083,16 @@ mod tests {
         assert!(
             css.contains("--group-0:"),
             "the neutral default token must exist alongside the palette"
+        );
+
+        // LAYER 5 — read HERE, right against layer 1: it is the only other layer that spells the
+        // palette as token NAMES rather than as a count or a bound, so it is confronted name by
+        // name (a count alone would let `group-9` sit in the list undetected).
+        let css_tokens: Vec<String> = (1..=css_count).map(|n| format!("group-{n}")).collect();
+        assert_eq!(
+            CATEGORY_COLOR_TOKENS.to_vec(),
+            css_tokens,
+            "CATEGORY_COLOR_TOKENS and the --group-N tokens of globals.css disagree"
         );
 
         // LAYER 2 — the renderer's constant.
@@ -33292,6 +34387,687 @@ mod tests {
                 .expect("query")
                 .is_empty()
         );
+    }
+
+    /// The CATEGORY schema (PDR-0017): the migration's shape, its reversibility, the CHECK
+    /// vocabulary, the same-project FK behaviour and the positional decoding of the column
+    /// `ALTER TABLE` appended to `specs`.
+    mod categories_schema {
+        use super::*;
+
+        fn category_slugs(conn: &mut SqliteConnection, project_id: &str) -> Vec<String> {
+            list_categories(conn, project_id)
+                .expect("list categories")
+                .into_iter()
+                .map(|c| c.slug)
+                .collect()
+        }
+
+        /// THE MIGRATION IS REVERSIBLE, and it is the head that has to prove it: the chain's tests
+        /// replay `revert_last_migration`, and a `down.sql` that fails leaves a half-reverted
+        /// schema behind (SQLite discovers an index written on a dropped column only AFTER it has
+        /// rewritten the table). Up → assert → down → assert → up again.
+        #[test]
+        fn the_categories_migration_applies_and_reverts_and_re_applies_cleanly() {
+            let mut conn = open_in_memory();
+
+            let present = |conn: &mut SqliteConnection| {
+                (
+                    table_exists(conn, "categories"),
+                    index_exists(conn, "idx_categories_project_slug"),
+                    index_exists(conn, "idx_specs_category"),
+                    diesel::sql_query("SELECT category_id FROM specs")
+                        .execute(conn)
+                        .is_ok(),
+                )
+            };
+            assert_eq!(present(&mut conn), (true, true, true, true));
+
+            revert_down_through(&mut conn, "20260828180916");
+            assert_eq!(
+                present(&mut conn),
+                (false, false, false, false),
+                "down.sql removes the table, both indexes and the Spec column"
+            );
+
+            run_migrations(&mut conn).expect("re-apply the chain");
+            assert_eq!(present(&mut conn), (true, true, true, true));
+        }
+
+        /// The `created_by_type` vocabulary is written TWICE — the SQL CHECK and
+        /// [`CATEGORY_CREATED_BY_TYPES`] — so this exercises the constant against the live CHECK.
+        /// A fourth provenance added to one side and not the other fails here.
+        #[test]
+        fn the_created_by_type_vocabulary_is_the_same_list_in_sql_and_in_rust() {
+            let mut conn = open_in_memory();
+            let (project, _) =
+                create_project(&mut conn, "alpha", "/tmp/alpha", None).expect("create project");
+
+            for (n, provenance) in CATEGORY_CREATED_BY_TYPES.iter().enumerate() {
+                insert_category(
+                    &mut conn,
+                    &project.id,
+                    &format!("vocab-{n}"),
+                    "Vocab",
+                    provenance,
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("the CHECK must accept '{provenance}': {e}"));
+            }
+            assert!(
+                insert_category(&mut conn, &project.id, "vocab-x", "Vocab", "robot", None).is_err(),
+                "the CHECK refuses a provenance outside CATEGORY_CREATED_BY_TYPES"
+            );
+        }
+
+        /// A slug is unique WITHIN a project and free ACROSS projects — the index that is both the
+        /// invariant and the idempotent seed's upsert key.
+        #[test]
+        fn a_slug_is_unique_inside_a_project_and_free_across_projects() {
+            let mut conn = open_in_memory();
+            let (alpha, _) =
+                create_project(&mut conn, "alpha", "/tmp/alpha", None).expect("create project");
+            let (beta, _) =
+                create_project(&mut conn, "beta", "/tmp/beta", None).expect("create project");
+
+            assert!(
+                insert_category(
+                    &mut conn,
+                    &alpha.id,
+                    "bug",
+                    "Another Bug",
+                    CATEGORY_CREATED_BY_AGENT,
+                    None
+                )
+                .is_err(),
+                "the project already answers `bug`"
+            );
+            // The SAME slug in another project is two distinct rows, which is what makes a
+            // category a per-PROJECT vocabulary.
+            let alpha_bug = find_category_by_slug(&mut conn, &alpha.id, "bug")
+                .expect("read")
+                .expect("seeded");
+            let beta_bug = find_category_by_slug(&mut conn, &beta.id, "bug")
+                .expect("read")
+                .expect("seeded");
+            assert_ne!(alpha_bug.id, beta_bug.id);
+        }
+
+        /// `specs.category_id` was APPENDED by `ALTER TABLE ADD COLUMN`, and Diesel decodes
+        /// POSITIONALLY. This is the assertion that the `table!` declaration ordered it LAST: with
+        /// the line moved up next to `priority` (where the DBML draws it) the two trailing
+        /// nullables swap, and `reviewing_phase`'s value lands in `category_id`.
+        #[test]
+        fn the_spec_column_appended_by_the_alter_table_decodes_in_its_own_position() {
+            let mut conn = open_in_memory();
+            let (project, _) =
+                create_project(&mut conn, "alpha", "/tmp/alpha", None).expect("create project");
+            let (spec, _) = create_spec(&mut conn, &project.id, "A Spec", SpecSections::default())
+                .expect("create spec");
+            let bug = find_category_by_slug(&mut conn, &project.id, "bug")
+                .expect("read")
+                .expect("seeded");
+
+            // Both trailing nullable columns populated, with values of DIFFERENT types.
+            set_spec_category_id(&mut conn, &spec.id, Some(&bug.id)).expect("assign");
+            diesel::update(specs::table.find(&spec.id))
+                .set(specs::reviewing_phase.eq(Some(3)))
+                .execute(&mut conn)
+                .expect("set reviewing_phase");
+
+            let reloaded = get_spec(&mut conn, &spec.id).expect("read").expect("spec");
+            assert_eq!(reloaded.category_id.as_deref(), Some(bug.id.as_str()));
+            assert_eq!(reloaded.reviewing_phase, Some(3));
+            assert_eq!(reloaded.title, "A Spec", "the head of the row is untouched");
+
+            // …and NULL is a first-class value: uncategorized is the steady state.
+            set_spec_category_id(&mut conn, &spec.id, None).expect("unassign");
+            assert_eq!(
+                get_spec(&mut conn, &spec.id)
+                    .expect("read")
+                    .expect("spec")
+                    .category_id,
+                None
+            );
+        }
+
+        /// The two FK dispositions: removing a CATEGORY releases its Specs (`ON DELETE SET NULL` —
+        /// it never deletes work), and removing a PROJECT takes its whole vocabulary with it
+        /// (`ON DELETE CASCADE`). Both require `PRAGMA foreign_keys = ON`, which
+        /// [`open_in_memory`] sets.
+        #[test]
+        fn deleting_a_category_releases_its_specs_and_deleting_a_project_takes_its_vocabulary() {
+            let mut conn = open_in_memory();
+            let (project, _) =
+                create_project(&mut conn, "alpha", "/tmp/alpha", None).expect("create project");
+            let (spec, _) = create_spec(&mut conn, &project.id, "A Spec", SpecSections::default())
+                .expect("create spec");
+            let bug = find_category_by_slug(&mut conn, &project.id, "bug")
+                .expect("read")
+                .expect("seeded");
+            set_spec_category_id(&mut conn, &spec.id, Some(&bug.id)).expect("assign");
+
+            diesel::delete(categories::table.find(&bug.id))
+                .execute(&mut conn)
+                .expect("delete the category");
+            let released = get_spec(&mut conn, &spec.id).expect("read").expect("spec");
+            assert_eq!(
+                released.category_id, None,
+                "the Spec is RELEASED, never deleted with its category"
+            );
+
+            delete_project(&mut conn, &project.id).expect("delete the project");
+            assert!(list_categories(&mut conn, &project.id)
+                .expect("list")
+                .is_empty());
+        }
+
+        /// A brand-new project carries EXACTLY the four system categories, in order, confirmed,
+        /// and attributed to the system.
+        #[test]
+        fn a_new_project_carries_exactly_the_four_system_categories() {
+            let mut conn = open_in_memory();
+            let (project, _) =
+                create_project(&mut conn, "alpha", "/tmp/alpha", None).expect("create project");
+
+            let seeded = list_categories(&mut conn, &project.id).expect("list");
+            assert_eq!(
+                seeded.iter().map(|c| c.slug.as_str()).collect::<Vec<_>>(),
+                vec!["feature", "bug", "refactor", "chore"],
+                "the four slugs the harness reads, in seed order"
+            );
+            assert_eq!(seeded.len(), 4, "EXACTLY four — nothing else is seeded");
+            for (position, category) in seeded.iter().enumerate() {
+                assert_eq!(category.created_by_type, CATEGORY_CREATED_BY_SYSTEM);
+                assert!(
+                    category.confirmed_at.is_some(),
+                    "nyx's own vocabulary is not a proposal awaiting curation: {}",
+                    category.slug
+                );
+                assert_eq!(category.position, position as i32);
+                assert!(category.color_token.is_some());
+            }
+            assert_eq!(
+                seeded.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                vec!["Feature", "Bug", "Refactor", "Chore"]
+            );
+        }
+
+        /// THE SEED IS IDEMPOTENT: replayed on a project that already holds the four, it inserts
+        /// nothing AND modifies nothing — not a name, not a position, not an `updated_at`. This is
+        /// what makes the boot backfill safe to run on every start.
+        #[test]
+        fn re_seeding_a_project_inserts_nothing_and_modifies_nothing() {
+            let mut conn = open_in_memory();
+            let (project, _) =
+                create_project(&mut conn, "alpha", "/tmp/alpha", None).expect("create project");
+            let before = list_categories(&mut conn, &project.id).expect("list");
+
+            let inserted =
+                seed_system_categories_for_project(&mut conn, &project.id).expect("re-seed");
+            assert_eq!(inserted, 0, "a replayed seed inserts nothing");
+            assert_eq!(
+                seed_system_categories(&mut conn).expect("re-seed every project"),
+                0,
+                "and neither does the boot backfill"
+            );
+            assert_eq!(
+                list_categories(&mut conn, &project.id).expect("list"),
+                before,
+                "every column of every row is byte-identical after a replay"
+            );
+        }
+
+        /// THE BOOT BACKFILL, on the REAL boot path (`Db::open`) and on a FILE, because that is
+        /// where it has to work: a database migrated onto this schema holds projects with no
+        /// categories at all, and no way to gain them short of being recreated.
+        ///
+        /// The second half is the one that constrains the implementation: a project whose `bug` a
+        /// human RENAMED must come out of the backfill untouched — same id, same name, same
+        /// provenance — while still regaining whatever system slug it is genuinely missing.
+        #[test]
+        fn a_database_whose_projects_have_no_categories_is_backfilled_at_boot() {
+            let dir = std::env::temp_dir().join(format!("nyx-db-categories-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).expect("create temp db dir");
+            let path = dir.join("nyx.db");
+
+            let (empty_project, curated_project, kept_bug_id) = {
+                let db = Db::open(&path).expect("boot a fresh db");
+                let (empty, curated, bug_id) = db.with_conn(|conn| {
+                    let (empty, _) = create_project(conn, "empty", "/tmp/empty", None)
+                        .expect("create project");
+                    let (curated, _) = create_project(conn, "curated", "/tmp/curated", None)
+                        .expect("create project");
+
+                    // A database from BEFORE this migration: no categories at all.
+                    diesel::delete(
+                        categories::table.filter(categories::project_id.eq(&empty.id)),
+                    )
+                    .execute(conn)
+                    .expect("strip the categories");
+
+                    // …and a project a human has already curated: `bug` renamed, `chore` dropped.
+                    let bug = find_category_by_slug(conn, &curated.id, "bug")
+                        .expect("read")
+                        .expect("seeded");
+                    update_category_name(conn, &bug.id, "Défaut").expect("rename");
+                    diesel::delete(
+                        categories::table
+                            .filter(categories::project_id.eq(&curated.id))
+                            .filter(categories::slug.eq("chore")),
+                    )
+                    .execute(conn)
+                    .expect("drop chore");
+
+                    (empty.id, curated.id, bug.id)
+                });
+                assert!(
+                    db.with_conn(|conn| list_categories(conn, &empty).expect("list")).is_empty(),
+                    "the pre-migration state this test exists to repair"
+                );
+                (empty, curated, bug_id)
+            };
+
+            // THE REAL BOOT PATH over that existing file.
+            let db = Db::open(&path).expect("re-boot");
+            db.with_conn(|conn| {
+                let backfilled = category_slugs(conn, &empty_project);
+                assert_eq!(
+                    backfilled,
+                    vec!["feature", "bug", "refactor", "chore"],
+                    "a project with no categories gains the four"
+                );
+
+                let curated = list_categories(conn, &curated_project).expect("list");
+                let bug = curated
+                    .iter()
+                    .find(|c| c.slug == "bug")
+                    .expect("the renamed bug is still there");
+                assert_eq!(bug.id, kept_bug_id, "the SAME row, not a re-created one");
+                assert_eq!(
+                    bug.name, "Défaut",
+                    "the human's rename survives the backfill untouched"
+                );
+                assert_eq!(bug.created_by_type, CATEGORY_CREATED_BY_SYSTEM);
+                assert!(
+                    curated.iter().any(|c| c.slug == "chore"),
+                    "…and the slug it was genuinely missing comes back"
+                );
+                assert_eq!(curated.len(), 4);
+            });
+
+            drop(db);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// The colour a category shows is DERIVED from its slug, purely and identically on every
+        /// platform — never `DefaultHasher`, whose output is unspecified across releases.
+        #[test]
+        fn the_colour_of_a_category_is_derived_from_its_slug_and_stays_in_the_palette() {
+            for (slug, _, token) in SYSTEM_CATEGORIES {
+                assert_eq!(
+                    category_color_token(slug),
+                    token,
+                    "a system slug keeps the token the seed hand-picked"
+                );
+            }
+            let system_tokens: std::collections::BTreeSet<&str> =
+                SYSTEM_CATEGORIES.iter().map(|(_, _, t)| *t).collect();
+            assert_eq!(
+                system_tokens.len(),
+                4,
+                "the four are spread over the palette, never colliding"
+            );
+            for slug in ["tech-debt", "perf", "category", "spike", "docs"] {
+                let token = category_color_token(slug);
+                assert!(
+                    CATEGORY_COLOR_TOKENS.contains(&token),
+                    "{slug} folded onto {token}, outside the palette"
+                );
+                assert_eq!(token, category_color_token(slug), "…and it is PURE");
+            }
+        }
+    }
+
+    /// The APPEND-ONLY gate evidence journal: what it keeps, what it never loses, and the output
+    /// policy that bounds and sanitises what a project's command printed.
+    mod gate_evidence_journal {
+        use super::*;
+
+        /// A project + Spec + workflow + run, the correlations an attempt hangs on.
+        fn run_fixture(conn: &mut SqliteConnection) -> (String, String) {
+            let (project, _ws) = create_project(conn, "P", "/tmp/gate-evidence", None).unwrap();
+            let (spec, _rev) = create_spec(conn, &project.id, "S", SpecSections::empty()).unwrap();
+            let wf = create_workflow(conn, Some(&project.id), "wf", WORKFLOW_SCOPE_CUSTOM, None)
+                .unwrap();
+            let run = create_workflow_run(conn, &wf.id, Some(&spec.id), None, "{}").unwrap();
+            (spec.id, run.id)
+        }
+
+        /// One attempt, spelled once so the tests below vary only what they are about.
+        fn attempt(run_id: &str, spec_id: &str, outcome: &str, expect: &str) -> NewGateAttempt {
+            NewGateAttempt {
+                run_id: run_id.to_string(),
+                spec_id: Some(spec_id.to_string()),
+                node_id: "repro-gate".into(),
+                slot: Some("repro_check".into()),
+                expect: expect.to_string(),
+                declared: true,
+                blocking: true,
+                outcome: outcome.to_string(),
+                satisfied: (expect == GATE_EXPECT_RED && outcome == GATE_OUTCOME_FAILED)
+                    || (expect == GATE_EXPECT_GREEN && outcome == GATE_OUTCOME_PASSED),
+                command_line: "cargo test -p nyx-core repro_".into(),
+                cwd: "/tmp/gate-evidence".into(),
+                exit_code: if outcome == GATE_OUTCOME_PASSED {
+                    Some(0)
+                } else {
+                    Some(1)
+                },
+                duration_ms: 1234,
+                output_excerpt: "1 test failed".into(),
+                commands_json: "[]".into(),
+                created_at: 0,
+            }
+        }
+
+        /// THE INVARIANT the whole table exists for: successive attempts ACCUMULATE. A red followed
+        /// by a green is TWO rows, readable in the order they happened — which is exactly what a
+        /// single overwritten blackboard key could not give, and what "the red preceded the fix" is
+        /// read from.
+        #[test]
+        fn successive_attempts_accumulate_and_none_overwrites_another() {
+            let mut conn = open_in_memory();
+            let (spec_id, run_id) = run_fixture(&mut conn);
+
+            let red = append_gate_attempt(
+                &mut conn,
+                attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED),
+            )
+            .expect("the red is recorded");
+            let green = append_gate_attempt(
+                &mut conn,
+                attempt(&run_id, &spec_id, GATE_OUTCOME_PASSED, GATE_EXPECT_GREEN),
+            )
+            .expect("the green is recorded");
+
+            assert!(
+                green.sequence > red.sequence,
+                "the journal is ordered by append, not by clock"
+            );
+            let sequence = list_gate_attempts_for_spec(&mut conn, &spec_id).unwrap();
+            assert_eq!(sequence.len(), 2, "BOTH survive — nothing was overwritten");
+            assert_eq!(
+                sequence
+                    .iter()
+                    .map(|a| a.outcome.as_str())
+                    .collect::<Vec<_>>(),
+                vec![GATE_OUTCOME_FAILED, GATE_OUTCOME_PASSED],
+                "and they read RED FIRST — the order the proof is made of"
+            );
+            assert!(sequence[0].satisfied && sequence[1].satisfied);
+            // The IDENTITY of the control is comparable between the two, which is what the auditor
+            // is told to check: same slot, same resolved commands, same cwd.
+            assert_eq!(sequence[0].slot, sequence[1].slot);
+            assert_eq!(sequence[0].command_line, sequence[1].command_line);
+            assert_eq!(sequence[0].cwd, sequence[1].cwd);
+            // The run-scoped read answers the same series.
+            assert_eq!(list_gate_attempts_for_run(&mut conn, &run_id).unwrap().len(), 2);
+        }
+
+        /// RETENTION — the journal outlives what it describes. Deleting the RUN (the gesture nyx's
+        /// own refusals tell a caller to make) must not erase the evidence: the correlation ids
+        /// carry no FK precisely so a CASCADE cannot silently truncate an append-only proof.
+        #[test]
+        fn the_evidence_outlives_the_run_and_the_workflow_it_describes() {
+            let mut conn = open_in_memory();
+            let (spec_id, run_id) = run_fixture(&mut conn);
+            append_gate_attempt(
+                &mut conn,
+                attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED),
+            )
+            .unwrap();
+
+            let run = get_workflow_run(&mut conn, &run_id).unwrap().expect("the run");
+            delete_workflow_run(&mut conn, &run_id).expect("drop the run");
+            assert!(get_workflow_run(&mut conn, &run_id).unwrap().is_none());
+            // Dropping the WORKFLOW cascades its runs; the evidence is still not among them.
+            delete_workflow(&mut conn, &run.workflow_id).expect("drop the workflow");
+
+            let kept = list_gate_attempts_for_spec(&mut conn, &spec_id).unwrap();
+            assert_eq!(
+                kept.len(),
+                1,
+                "the attempt HAPPENED — no later deletion may make it unhappen"
+            );
+            assert_eq!(kept[0].run_id, run_id, "and it still names what it described");
+        }
+
+        /// The run's own journal REFERENCES the evidence: every append files a `run.gate_attempt`
+        /// outbox row carrying the attempt's `sequence`, so a reader of the run's history can get to
+        /// the full record without knowing the evidence table. The reference and not a copy — the
+        /// bounded output stays where it was written.
+        #[test]
+        fn every_append_files_a_run_event_that_points_at_it() {
+            let mut conn = open_in_memory();
+            let (spec_id, run_id) = run_fixture(&mut conn);
+            let row = append_gate_attempt(
+                &mut conn,
+                attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED),
+            )
+            .unwrap();
+
+            let events: Vec<DomainEvent> = list_domain_events(&mut conn)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.event_type == EVENT_RUN_GATE_ATTEMPT)
+                .collect();
+            assert_eq!(events.len(), 1, "one attempt, one run event");
+            assert_eq!(events[0].aggregate, AGGREGATE_RUN);
+            let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+            assert_eq!(
+                payload["evidence_sequence"],
+                serde_json::json!(row.sequence),
+                "THE REFERENCE — the evidence row's own key"
+            );
+            assert_eq!(payload["run_id"], serde_json::json!(run_id));
+            assert_eq!(payload["spec_id"], serde_json::json!(spec_id));
+            assert_eq!(payload["outcome"], serde_json::json!(GATE_OUTCOME_FAILED));
+            assert_eq!(payload["expect"], serde_json::json!(GATE_EXPECT_RED));
+            assert_eq!(payload["satisfied"], serde_json::json!(true));
+            assert!(
+                !events[0].payload.contains("1 test failed"),
+                "the outbox row references the evidence, it does not copy its output"
+            );
+        }
+
+        /// THE ERROR PATH — a run that resolves to NO project still gets its evidence recorded. The
+        /// run EVENT cannot be filed (`domain_events.project_id` is not nullable) and is skipped
+        /// without failing, because losing the pointer must not lose the proof.
+        #[test]
+        fn an_attempt_on_a_run_with_no_project_is_still_recorded() {
+            let mut conn = open_in_memory();
+            let wf = create_workflow(&mut conn, None, "global", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
+            let run = create_workflow_run(&mut conn, &wf.id, None, None, "{}").unwrap();
+
+            let mut orphan = attempt(&run.id, "unused", GATE_OUTCOME_INDETERMINATE, GATE_EXPECT_RED);
+            orphan.spec_id = None;
+            orphan.satisfied = false;
+            let row = append_gate_attempt(&mut conn, orphan).expect("the evidence is still written");
+            assert_eq!(
+                list_gate_attempts_for_run(&mut conn, &run.id).unwrap(),
+                vec![row],
+                "the attempt is journaled even with nothing to scope an outbox row to"
+            );
+            assert!(
+                list_domain_events(&mut conn)
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.event_type != EVENT_RUN_GATE_ATTEMPT),
+                "and no un-scopable run event was invented"
+            );
+            // An attempt on a run that is ALREADY gone is recorded too — the journal never depends
+            // on the thing it describes still existing.
+            delete_workflow_run(&mut conn, &run.id).unwrap();
+            append_gate_attempt(
+                &mut conn,
+                attempt(&run.id, "unused", GATE_OUTCOME_FAILED, GATE_EXPECT_RED),
+            )
+            .expect("a vanished run does not fail the journal");
+        }
+
+        /// CONCURRENCY — appends racing from several threads onto ONE database each get their own
+        /// row and their own `sequence`. A gate runs on the `nyx_next` dispatch path, which is
+        /// served by a worker POOL, so two runs can be journaling at the same instant; a journal
+        /// that lost or merged one of them would lose an attempt nobody could tell was missing.
+        #[test]
+        fn concurrent_appends_each_get_their_own_row_and_sequence() {
+            let db = Db::in_memory();
+            let (spec_id, run_id) = db.with_conn(run_fixture);
+
+            const THREADS: usize = 6;
+            const EACH: usize = 4;
+            std::thread::scope(|scope| {
+                for t in 0..THREADS {
+                    let db = &db;
+                    let (spec_id, run_id) = (spec_id.clone(), run_id.clone());
+                    scope.spawn(move || {
+                        for i in 0..EACH {
+                            let mut a =
+                                attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED);
+                            a.node_id = format!("gate-{t}-{i}");
+                            db.with_conn(|c| append_gate_attempt(c, a)).expect("append");
+                        }
+                    });
+                }
+            });
+
+            let all = db
+                .with_conn(|c| list_gate_attempts_for_spec(c, &spec_id))
+                .unwrap();
+            assert_eq!(all.len(), THREADS * EACH, "every append landed");
+            let sequences: std::collections::BTreeSet<i64> =
+                all.iter().map(|a| a.sequence).collect();
+            assert_eq!(sequences.len(), all.len(), "and each got its OWN sequence");
+            let nodes: std::collections::BTreeSet<&str> =
+                all.iter().map(|a| a.node_id.as_str()).collect();
+            assert_eq!(nodes.len(), THREADS * EACH, "no attempt overwrote another's");
+        }
+
+        /// The vocabularies the migration's CHECKs close are the ones `db.rs` spells — confronted
+        /// with the LIVE constraint, so a re-spelling on either side goes red instead of quietly
+        /// letting an ungradeable value into the journal.
+        #[test]
+        fn the_expect_and_outcome_vocabularies_match_the_live_checks() {
+            let mut conn = open_in_memory();
+            let (spec_id, run_id) = run_fixture(&mut conn);
+
+            for expect in GATE_EXPECTATIONS {
+                for outcome in GATE_OUTCOMES {
+                    append_gate_attempt(&mut conn, attempt(&run_id, &spec_id, outcome, expect))
+                        .unwrap_or_else(|e| panic!("({expect}, {outcome}) must be storable: {e}"));
+                }
+            }
+            let mut bad = attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED);
+            bad.expect = "orange".into();
+            assert!(
+                append_gate_attempt(&mut conn, bad).is_err(),
+                "an expectation outside the vocabulary is refused by the schema"
+            );
+            let mut bad = attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED);
+            bad.outcome = "maybe".into();
+            assert!(
+                append_gate_attempt(&mut conn, bad).is_err(),
+                "so is an outcome outside it"
+            );
+        }
+
+        /// THE OUTPUT POLICY, rule by rule — see [`gate_evidence_excerpt`].
+        #[test]
+        fn the_output_policy_bounds_from_the_end_strips_control_bytes_and_redacts_disclosures() {
+            // 1. BOUNDED, from the END, and MARKED when cut.
+            let long = "x".repeat(GATE_EVIDENCE_EXCERPT_CHARS * 2) + "THE-ASSERTION-THAT-FAILED";
+            let cut = gate_evidence_excerpt(&long);
+            assert!(
+                cut.starts_with(GATE_EVIDENCE_TRUNCATED),
+                "a cut excerpt says so, so it never reads as a whole one"
+            );
+            assert!(
+                cut.ends_with("THE-ASSERTION-THAT-FAILED"),
+                "and the END is what is kept — the part that explains a failure"
+            );
+            assert!(
+                cut.chars().count()
+                    <= GATE_EVIDENCE_EXCERPT_CHARS + GATE_EVIDENCE_TRUNCATED.chars().count(),
+                "the bound holds"
+            );
+            // A short one is untouched and unmarked.
+            let short = gate_evidence_excerpt("1 test failed\n");
+            assert_eq!(short, "1 test failed");
+
+            // 2. INERT: escape sequences and control bytes never reach the journal.
+            let painted = gate_evidence_excerpt("\u{1b}[31mFAILED\u{1b}[0m\u{0}\u{7}\nline two\t.");
+            assert_eq!(painted, "FAILED\nline two\t.", "got {painted:?}");
+
+            // 3. REDACTED where a secret is SELF-DISCLOSED by the command's own output.
+            let dumped = gate_evidence_excerpt(
+                "GITHUB_TOKEN=ghp_supersecretvalue\n\
+                 npm_password: hunter2\n\
+                 Authorization: Bearer eyJhbGciOi\n\
+                 EXPECTED=42\n\
+                 assert_eq failed: left = 1, right = 2",
+            );
+            assert!(!dumped.contains("ghp_supersecretvalue"), "got {dumped}");
+            assert!(!dumped.contains("hunter2"), "got {dumped}");
+            assert!(!dumped.contains("eyJhbGciOi"), "got {dumped}");
+            assert!(
+                dumped.matches(GATE_EVIDENCE_REDACTED).count() == 3,
+                "each disclosure is replaced, not the whole line: {dumped}"
+            );
+            assert!(
+                dumped.contains("GITHUB_TOKEN=") && dumped.contains("npm_password:"),
+                "the NAME survives — a reader must see WHAT was disclosed: {dumped}"
+            );
+            assert!(
+                dumped.contains("EXPECTED=42")
+                    && dumped.contains("assert_eq failed: left = 1, right = 2"),
+                "and ordinary test output is NOT mangled — a journal that corrupts the evidence it \
+                 keeps is worse than one that misses a disclosure: {dumped}"
+            );
+
+            // …AND THE SHAPE EVERY `cargo test` LINE HAS. A `::`-qualified path, a panic locator and
+            // a test name are the lines a red-vs-green comparison is actually made of, and the
+            // fragment list matched them as a SUBSTRING of everything before the first `:` — so
+            // `test auth::…` became `test auth:«redacted»` and the auditor never saw which test
+            // failed. The name half must LOOK like a name, and the fragment must be a whole segment
+            // of it.
+            let real_output = "test auth::session::rejects_expired_token ... FAILED\n\
+                               thread 'main' panicked at src/auth.rs:12:5:\n\
+                               test bearer token handling ... ok\n\
+                               test token_parser::parses_bare ... ok\n\
+                               authoritative: the source of truth\n\
+                               note: run with `RUST_BACKTRACE=1`";
+            let kept = gate_evidence_excerpt(real_output);
+            assert_eq!(
+                kept, real_output,
+                "not one byte of ordinary Rust test output is redacted: {kept}"
+            );
+
+            // The disclosures that hide INSIDE that shape are still caught — the anchoring narrows
+            // the rule, it does not switch it off.
+            for (line, disclosed) in [
+                ("x-api-key: sk-live-42", "sk-live-42"),
+                ("AWS.SECRET=abc", "abc"),
+                ("authorization: bearer eyJhbGciOi", "eyJhbGciOi"),
+                ("> Authorization: Bearer eyJhbGciOi", "eyJhbGciOi"),
+            ] {
+                let out = gate_evidence_excerpt(line);
+                assert!(
+                    !out.contains(disclosed) && out.contains(GATE_EVIDENCE_REDACTED),
+                    "'{line}' still discloses: {out}"
+                );
+            }
+        }
     }
 
     /// The GLOBAL-SEARCH full-text substrate (migration

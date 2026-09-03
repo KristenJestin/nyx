@@ -41,6 +41,8 @@ pub const SPEC_FORK_TOOL: &str = "spec_fork";
 pub const SPEC_TRANSITION_TOOL: &str = "spec_transition";
 /// `spec_set_workspace` — anchor (or detach) a Spec on a dev workspace.
 pub const SPEC_SET_WORKSPACE_TOOL: &str = "spec_set_workspace";
+/// `spec_set_category` — ASSIGN the Spec's one category (PDR-0017), or REMOVE it.
+pub const SPEC_SET_CATEGORY_TOOL: &str = "spec_set_category";
 /// `task_add` — add a task (slice/human/review) to a Spec.
 pub const TASK_ADD_TOOL: &str = "task_add";
 /// `task_transition` — a GUARDED task transition (start/done/block/skip) or human verify.
@@ -62,11 +64,12 @@ pub const SPEC_DEPS_TOOL: &str = "spec_deps";
 /// imposed by NYX at the graph node built for each (ndev/nspec cover start/review/done/cancel and
 /// ready), so the effector never transitions a Spec — it only authors the draft. (`task_transition`
 /// STAYS: no graph covers task-level granularity — N17(d).)
-pub const SPEC_TOOLS: [&str; 11] = [
+pub const SPEC_TOOLS: [&str; 12] = [
     SPEC_CREATE_TOOL,
     SPEC_UPDATE_SECTION_TOOL,
     SPEC_FORK_TOOL,
     SPEC_SET_WORKSPACE_TOOL,
+    SPEC_SET_CATEGORY_TOOL,
     TASK_ADD_TOOL,
     TASK_TRANSITION_TOOL,
     TASK_ADD_DEPENDENCY_TOOL,
@@ -345,22 +348,124 @@ pub(crate) fn map_set_workspace_err(e: db::SetSpecWorkspaceError) -> RpcError {
     }
 }
 
+/// Map a [`crate::category::CategoryError`] onto the RPC vocabulary — the STABLE codes the category
+/// surface answers with, so a caller reacts on `error.data.code` instead of parsing prose:
+///
+///   * an unknown Spec or an unknown category ID is an `invalid_id` (a reference that names nothing
+///     — the same code every other unknown id answers with);
+///   * a CROSS-PROJECT category is an `invalid_argument` naming BOTH projects — the argument is
+///     well-formed and the row exists, it just does not belong to this Spec's vocabulary (the twin
+///     of `SetSpecWorkspaceError::SpecProjectMismatch` above, which answers the same way);
+///   * an AMBIGUOUS name is an `invalid_argument` LISTING the slugs that matched, because the
+///     caller's next move is to re-ask with one of them and it needs the exact strings;
+///   * a BLANK name is an `invalid_argument`;
+///   * the two DELETION refusals — a system category, a category N Specs still carry — are
+///     `invalid_argument` carrying the service's sentence. They are UNREACHABLE from this surface
+///     (no MCP tool deletes a category: curating the vocabulary is the human's, from the settings)
+///     and mapped anyway, so the day one is added it answers like the others instead of falling
+///     into a wildcard nobody chose.
+///
+/// An unknown LABEL is deliberately absent: it is not an error at all, it is a creation
+/// ([`crate::category::resolve_or_create`] — PDR-0017's non-blocking mint).
+pub fn map_category_err(e: crate::category::CategoryError) -> RpcError {
+    use crate::category::CategoryError;
+    match e {
+        CategoryError::SpecNotFound => RpcError::new(RpcCode::InvalidId, "unknown spec"),
+        CategoryError::NotFound => RpcError::new(
+            RpcCode::InvalidId,
+            "no category of this Spec's project answers that reference",
+        ),
+        e @ (CategoryError::ProjectMismatch { .. }
+        | CategoryError::AmbiguousName { .. }
+        | CategoryError::BlankName
+        | CategoryError::SystemCategory { .. }
+        | CategoryError::CategoryInUse { .. }) => {
+            RpcError::new(RpcCode::InvalidArgument, e.to_string())
+        }
+        CategoryError::Db(e) => internal_db(e),
+    }
+}
+
+/// The category as the MCP surface returns it: its ID, its STABLE `slug`, its human `name`, the
+/// colour token a chip draws with, `created_by_type` — WHO minted the row — and `system`, whether
+/// the slug is one of nyx's four.
+///
+/// **`system` IS A VERDICT, AND IT IS DERIVED HERE SO NOBODY RE-DERIVES IT.** It is
+/// `db::SYSTEM_CATEGORY_SLUGS.contains(slug)` — the same list [`crate::category::delete`] refuses
+/// on and [`crate::category::slugify_for`] reserves against. The settings screen hides its Delete
+/// button on exactly these rows, and it must not do so by carrying a copy of the four literals in
+/// TypeScript: a fifth system category would then be deletable on screen and refused by the
+/// service, which is the drift this field exists to prevent.
+///
+/// **NO `state` FIELD, since the 2026-09-02 amendment of PDR-0017.** There is no proposed /
+/// confirmed axis any more: the agent has full rights over the classification, so a mint is valid
+/// as it stands and there is nothing for a consumer to branch on. `created_by_type` remains — the
+/// provenance is a fact, and a useful one; the curation STATE was a verdict, and there is no longer
+/// anyone to pronounce it. `confirmed_at` is still carried as the RAW column it is (always set,
+/// read by nobody — see [`db::Category::confirmed_at`]), so the payload keeps mirroring the row
+/// rather than hiding half of it.
+///
+/// `pub` since v2.9 phase 8: the SIDECAR's human curation commands (`category_list`,
+/// `category_create`, `spec_category_assign`, `category_rename`) answer the app with the EXACT
+/// same object. A second shape would mean the Spec-detail chip and the agent's `spec_category`
+/// read disagreeing about the same row — one derivation, one payload, two surfaces.
+pub fn category_payload(category: &db::Category) -> Value {
+    json!({
+        "id": category.id,
+        "slug": category.slug,
+        "name": category.name,
+        "color_token": category.color_token,
+        "created_by_type": category.created_by_type,
+        "confirmed_at": category.confirmed_at,
+        "system": db::SYSTEM_CATEGORY_SLUGS.contains(&category.slug.as_str()),
+    })
+}
+
 // --- Tool handlers ---------------------------------------------------------
 
-/// `spec_create` — `{ project_id, title, problem?, solution?, implementation_decisions?,
-/// testing_decisions?, user_stories?, out_of_scope? }` → `{ spec, revision }`. Creates a
-/// `draft` Spec (+ its first `active` revision) via the SHARED `db::create_spec` authority.
-/// A Spec is authored PROJECT-scoped and UNANCHORED (review finding): there is NO
-/// `workspace_id` here — the dev workspace anchor is posed later, at the ready→in_progress
-/// `start` transition (`spec_transition`), never at authoring.
+/// `spec_create` — `{ project_id, title, category?, problem?, solution?,
+/// implementation_decisions?, testing_decisions?, user_stories?, out_of_scope? }` →
+/// `{ spec, revision, category }`. Creates a `draft` Spec (+ its first `active` revision) via the
+/// SHARED `db::create_spec` authority. A Spec is authored PROJECT-scoped and UNANCHORED (review
+/// finding): there is NO `workspace_id` here — the dev workspace anchor is posed later, at the
+/// ready→in_progress `start` transition (`spec_transition`), never at authoring.
+///
+/// `category` is the Spec's ONE genre-of-work axis (PDR-0017), named by slug (`bug`) or by human
+/// name ("Dette technique"). It is OPTIONAL — an uncategorized Spec is a legitimate state — and an
+/// unknown label MINTS a category rather than refusing. The classification rides the SAME
+/// transaction as the creation ([`crate::category::create_spec_with_category`]), so a Spec is never
+/// left half-classified and a minted category is never orphaned by a failure downstream of it.
+///
+/// ONLY THE ABSENCE OF THE ARGUMENT MEANS "UNCLASSIFIED", and it is read with the same
+/// [`anchor_str`] the sibling verb `spec_set_category` uses. Read with `optional_str`, `""` folded
+/// into `None` BEFORE the service — so the same uninitialised caller variable produced three
+/// different outcomes on one argument: `""` created a silently UNCLASSIFIED Spec (precisely what
+/// escapes the red-before-green discipline), `" "` reached the service's blank-label guard and took
+/// the whole Spec down with it, and `""` on `spec_set_category` was an explicit refusal. One
+/// spelling, one behaviour: an empty string is refused here too, with the sentence that says an
+/// empty string is not a way to say "none".
+///
+/// The PROVENANCE filed is [`db::DomainEventSource::Mcp`]: this is the agent classifying its own
+/// draft. The human's assignment, from the Spec detail screen, files `Ui` through the same service —
+/// see [`crate::category::assign_spec_category`].
 pub fn spec_create(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let title = require_str(args, "title")?;
     let sections = sections_from_args(args)?;
+    let category = anchor_str(args, "category", "create the Spec UNCLASSIFIED")?;
 
-    let (spec, revision) = db
-        .with_conn(|c| db::create_spec(c, project_id, title, sections))
-        .map_err(internal_db)?;
+    let (spec, revision, category) = db
+        .with_conn(|c| {
+            crate::category::create_spec_with_category(
+                c,
+                project_id,
+                title,
+                sections,
+                category,
+                db::DomainEventSource::Mcp,
+            )
+        })
+        .map_err(map_category_err)?;
     // BIND the run that authored it (F5): a `/nspec` run starts with no Spec and CREATES one here, so
     // this is the moment — and the only one — where the run and its Spec can be tied together. Left
     // untied, the run stays inert (every Spec query answers null/0, every transition applies to
@@ -373,7 +478,95 @@ pub fn spec_create(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
         &spec.id,
     );
     Ok(ToolOutcome::changed(
-        json!({ "spec": spec, "revision": revision, "bound_run_id": bound_run_id }),
+        json!({
+            "spec": spec,
+            "revision": revision,
+            "bound_run_id": bound_run_id,
+            "category": category.as_ref().map(category_payload),
+        }),
+        ChangedTopic::Specs,
+    ))
+}
+
+/// `spec_set_category` — `{ spec_id, category? | category_id? }` → `{ spec, category, created }`.
+/// ASSIGN the Spec's ONE category (PDR-0017), or REMOVE it by naming neither.
+///
+/// TWO WAYS TO NAME A CATEGORY, and they are separate arguments because they resolve by different
+/// rules and fail in different ways ([`crate::category::CategoryRef`]):
+///
+///   * `category_id` — the EXACT row, what a caller sends having just read the list. An id that
+///     names nothing is `invalid_id`; an id that names a category of ANOTHER project is
+///     `invalid_argument` naming both projects (the same-project guard, which SQLite's FK cannot
+///     express — it lives in [`crate::category::assign_spec_category`]).
+///   * `category` — the ERGONOMIC reference an agent types: the slug it read in a workflow
+///     (`bug`), or the human name it saw on a chip. Resolved EXACT SLUG FIRST, then by normalized
+///     name; a name matching two categories is refused, LISTING their slugs, rather than guessed.
+///     An UNKNOWN label is not a refusal — it MINTS a category (`created_by_type=agent`, valid as
+///     it stands since the 2026-09-02 amendment), and the response says `created: true`.
+///     Cross-project is unreachable this way: the label is resolved inside the SPEC'S OWN project.
+///
+/// Passing BOTH is `invalid_argument` — two references that can disagree, and picking one silently
+/// would classify the Spec by an argument the caller did not intend.
+///
+/// NAMING NEITHER IS THE REMOVAL, and it is a first-class write with its own event, not a no-op.
+/// An EMPTY STRING is refused on both arguments (through [`anchor_str`]): here `None` is not
+/// "nothing was said", it IS the removal, so absorbing `""` into it would let an uninitialized
+/// caller variable silently uncategorize a Spec.
+///
+/// THE CATEGORY IS NOT FROZEN BY THE LIFECYCLE. Unlike `spec_update_section`, this call is accepted
+/// at ANY Spec status: a classification is metadata about the genre of work, not prose the build
+/// contracted on, and mis-classifying a Spec must stay correctable after it left draft — which is
+/// precisely when a coder preflight discovers it. (A recategorization does NOT replay gates already
+/// crossed; it changes what the next ones read.)
+pub fn spec_set_category(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let spec_id = spec_id.as_str();
+    let removes = "REMOVE the Spec's category";
+    let category_id = anchor_str(args, "category_id", removes)?;
+    let label = anchor_str(args, "category", removes)?;
+    if category_id.is_some() && label.is_some() {
+        return Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            "pass EITHER 'category_id' (an exact category) OR 'category' (a slug or a name), not \
+             both — two references that can disagree, and nyx will not choose between them. Omit \
+             both to REMOVE the Spec's category",
+        ));
+    }
+
+    let (spec, category, created) = db
+        .with_conn(|c| match label {
+            // The ERGONOMIC path, and the ONLY one that may mint (PDR-0017).
+            Some(label) => crate::category::set_spec_category_by_label(
+                c,
+                spec_id,
+                label,
+                db::DomainEventSource::Mcp,
+            )
+            .map(|(spec, category, created)| (spec, Some(category), created)),
+            // The EXACT path, and the REMOVAL — one call, because `None` is the removal.
+            None => crate::category::assign_spec_category(
+                c,
+                spec_id,
+                category_id.map(crate::category::CategoryRef::Id),
+                db::DomainEventSource::Mcp,
+            )
+            .and_then(|spec| {
+                let category = match spec.category_id.as_deref() {
+                    Some(id) => db::get_category(c, id)?,
+                    None => None,
+                };
+                Ok((spec, category, false))
+            }),
+        })
+        .map_err(map_category_err)?;
+
+    Ok(ToolOutcome::changed(
+        json!({
+            "spec": spec,
+            "category": category.as_ref().map(category_payload),
+            "created": created,
+        }),
         ChangedTopic::Specs,
     ))
 }
@@ -795,6 +988,7 @@ pub fn dispatch_spec_tool(
         // `spec_transition` is intentionally NOT routed to the agent (N17(b)) — nyx transitions the
         // Spec at the graph node; the effector never does. The function stays for the UI/tests.
         SPEC_SET_WORKSPACE_TOOL => Some(spec_set_workspace(db, args)),
+        SPEC_SET_CATEGORY_TOOL => Some(spec_set_category(db, args)),
         TASK_ADD_TOOL => Some(task_add(db, args)),
         TASK_TRANSITION_TOOL => Some(task_transition(db, args)),
         TASK_ADD_DEPENDENCY_TOOL => Some(task_add_dependency(db, args)),
@@ -2355,5 +2549,397 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidArgument);
         assert!(err.message.contains("spec_id"), "the refusal names spec_id");
+    }
+
+    // --- PDR-0017: the CATEGORY surface ------------------------------------
+
+    /// The category of `spec_id`, read back from the DB — the assertion every test below makes,
+    /// since the point is always what was PERSISTED, never what the response claimed.
+    fn category_of(db: &Db, spec_id: &str) -> Option<db::Category> {
+        db.with_conn(|c| {
+            let spec = db::get_spec(c, spec_id).expect("read").expect("spec");
+            match spec.category_id.as_deref() {
+                Some(id) => db::get_category(c, id).expect("read"),
+                None => None,
+            }
+        })
+    }
+
+    /// DONE-CRITERION: `spec_create(category)` accepts a slug or a name, resolves (or creates) the
+    /// category, and lands it on the Spec — and the response says which one, with its provenance.
+    #[test]
+    fn spec_create_classifies_the_draft_it_authors() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+
+        // A SEEDED slug — the nominal case: `bug` is the project's own, minted by the seed.
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "A bug", "category": "bug" }),
+        )
+        .expect("create");
+        let sid = spec_id_of(&created);
+        assert_eq!(created.result["category"]["slug"], json!("bug"));
+        assert_eq!(created.result["category"]["name"], json!("Bug"));
+        assert_eq!(
+            created.result["category"]["created_by_type"],
+            json!(db::CATEGORY_CREATED_BY_SYSTEM)
+        );
+        assert!(created.result["category"]["id"].is_string());
+        assert_eq!(category_of(&db, &sid).expect("classified").slug, "bug");
+
+        // A human NAME resolves too — case and inner whitespace fold.
+        let by_name = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "Cleanup", "category": "  rEfActor " }),
+        )
+        .expect("create");
+        assert_eq!(
+            category_of(&db, &spec_id_of(&by_name)).expect("classified").slug,
+            "refactor"
+        );
+
+        // An UNKNOWN name is a CREATION, not a refusal (PDR-0017): the category is minted, and —
+        // since the 2026-09-02 amendment — it is VALID as it stands. The payload says who minted
+        // it and carries no curation `state` at all.
+        let minted = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "Debt", "category": "Dette technique" }),
+        )
+        .expect("create");
+        assert_eq!(minted.result["category"]["slug"], json!("dette-technique"));
+        assert!(
+            minted.result["category"].get("state").is_none(),
+            "the proposed/confirmed axis was retired: {}",
+            minted.result["category"]
+        );
+        assert_eq!(
+            minted.result["category"]["created_by_type"],
+            json!(db::CATEGORY_CREATED_BY_AGENT)
+        );
+
+        // OMITTING it leaves the Spec unclassified — a legitimate state, and the response says so.
+        let plain =
+            spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).expect("create");
+        assert_eq!(plain.result["category"], json!(null));
+        assert!(category_of(&db, &spec_id_of(&plain)).is_none());
+
+        // …AND `null` READS AS THE OMISSION IT IS.
+        let explicit_none = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "N", "category": Value::Null }),
+        )
+        .expect("create");
+        assert_eq!(explicit_none.result["category"], json!(null));
+    }
+
+    /// **ONLY THE ABSENCE OF `category` MEANS "UNCLASSIFIED"** — the same rule the sibling verb
+    /// `spec_set_category` states, on the same argument name.
+    ///
+    /// Read with `optional_str`, an EMPTY string folded into `None` before the service ever saw it,
+    /// so one uninitialised caller variable produced three incompatible outcomes on one argument:
+    /// `""` created a silently UNCLASSIFIED Spec — precisely the shape that escapes the
+    /// red-before-green discipline, and the population the coder preflight exists for — `" "`
+    /// reached `resolve_or_create`'s blank-label guard and took the whole Spec down with it, and
+    /// `""` on `spec_set_category` was an explicit refusal. The guard `create_spec_with_category`
+    /// documents ("A BLANK label … takes the Spec down with it") was unreachable for the one
+    /// spelling a caller is most likely to send.
+    #[test]
+    fn spec_create_refuses_an_empty_category_exactly_as_its_sibling_verb_does() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+
+        for blank in ["", "   "] {
+            let err = spec_create(
+                &db,
+                &json!({ "project_id": project_id, "title": "S", "category": blank }),
+            )
+            .expect_err("a blank category is not a way to say 'none'");
+            assert_eq!(err.code, RpcCode::InvalidArgument, "category {blank:?}: {err:?}");
+            assert!(
+                db.with_conn(|c| db::list_specs(c, Some(&project_id)))
+                    .expect("read")
+                    .is_empty(),
+                "category {blank:?}: and no Spec is left behind either way",
+            );
+        }
+
+        // The sibling verb answers the empty string the same way, in the same words — which is the
+        // whole point: one argument name, one behaviour.
+        let created =
+            spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).expect("create");
+        let err = spec_set_category(
+            &db,
+            &json!({ "spec_id": spec_id_of(&created), "category": "" }),
+        )
+        .expect_err("the sibling verb refuses it too");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(err.message.contains("EMPTY string"), "{}", err.message);
+    }
+
+    /// DONE-CRITERION: a refused category takes the Spec with it — the classification rides the
+    /// creation's own transaction, so `spec_create` never leaves a half-classified draft behind.
+    /// (The other half — an error injected AFTER both writes rolling back the MINTED category too —
+    /// is pinned at the service, `category::tests`.)
+    #[test]
+    fn spec_create_leaves_no_spec_behind_when_its_category_is_refused() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        // Two categories answering the same NAME: `bug`, and a `chore` renamed onto it.
+        db.with_conn(|c| {
+            crate::category::rename(
+                c,
+                &project_id,
+                crate::category::CategoryRef::Label("chore"),
+                "Bug",
+            )
+        })
+        .expect("rename");
+
+        let err = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "Doomed", "category": "Bug" }),
+        )
+        .expect_err("an ambiguous name is refused");
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("bug") && err.message.contains("chore"),
+            "the refusal LISTS the slugs to re-ask with: {}",
+            err.message
+        );
+        assert!(
+            db.with_conn(|c| db::list_specs(c, Some(&project_id)))
+                .expect("read")
+                .is_empty(),
+            "no Spec was created for a classification that was refused"
+        );
+    }
+
+    /// DONE-CRITERION: `spec_set_category` ASSIGNS by explicit id, ASSIGNS by unambiguous
+    /// reference, MINTS on the fly for an unknown one, and REMOVES when neither is named.
+    #[test]
+    fn spec_set_category_assigns_mints_and_removes() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let sid = spec_id_of(
+            &spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).expect("create"),
+        );
+
+        // BY REFERENCE (a slug).
+        let assigned = dispatch_spec_tool(
+            &db,
+            SPEC_SET_CATEGORY_TOOL,
+            &json!({ "spec_id": sid, "category": "bug" }),
+        )
+        .expect("routed")
+        .expect("assign");
+        assert_eq!(assigned.result["category"]["slug"], json!("bug"));
+        assert_eq!(assigned.result["created"], json!(false));
+        assert_eq!(category_of(&db, &sid).expect("classified").slug, "bug");
+
+        // BY EXPLICIT ID — what a caller sends having just read the list.
+        let feature = db
+            .with_conn(|c| db::find_category_by_slug(c, &project_id, "feature"))
+            .expect("read")
+            .expect("seeded");
+        let by_id = spec_set_category(
+            &db,
+            &json!({ "spec_id": sid, "category_id": feature.id }),
+        )
+        .expect("assign");
+        assert_eq!(by_id.result["category"]["id"], json!(feature.id));
+        assert_eq!(category_of(&db, &sid).expect("classified").slug, "feature");
+
+        // AN UNKNOWN LABEL MINTS — `created_by_type=agent`, NO error, and NO curation state to
+        // wait on (PDR-0017 amended 2026-09-02: the agent's mint is valid as it stands).
+        let minted = spec_set_category(
+            &db,
+            &json!({ "spec_id": sid, "category": "Flaky Infra" }),
+        )
+        .expect("mint + assign");
+        assert_eq!(minted.result["created"], json!(true));
+        assert_eq!(minted.result["category"]["slug"], json!("flaky-infra"));
+        assert!(
+            minted.result["category"].get("state").is_none(),
+            "no proposed/confirmed axis on the wire: {}",
+            minted.result["category"]
+        );
+        let now = category_of(&db, &sid).expect("classified");
+        assert_eq!(now.slug, "flaky-infra");
+        assert_eq!(now.created_by_type, db::CATEGORY_CREATED_BY_AGENT);
+        assert!(now.confirmed_at.is_some());
+
+        // NAMING NEITHER IS THE REMOVAL — a first-class write, not a no-op.
+        let removed = spec_set_category(&db, &json!({ "spec_id": sid })).expect("remove");
+        assert_eq!(removed.result["category"], json!(null));
+        assert!(category_of(&db, &sid).is_none());
+        // …and the minted category SURVIVES the removal: it is the project's vocabulary now, not
+        // the Spec's property.
+        assert!(db
+            .with_conn(|c| db::find_category_by_slug(c, &project_id, "flaky-infra"))
+            .expect("read")
+            .is_some());
+
+        // The mutation announces the topic an open Specs surface re-pulls on.
+        assert!(matches!(removed.effects.as_slice(), [ChangedTopic::Specs]));
+    }
+
+    /// DONE-CRITERION: THE CATEGORY IS NOT FROZEN BY THE LIFECYCLE. `spec_update_section` refuses a
+    /// Spec that has left draft; a classification is metadata about the GENRE of work, and staying
+    /// correctable is the whole point — a `/ndev` preflight discovers a mis-classified Spec exactly
+    /// when it is already under build.
+    #[test]
+    fn a_spec_out_of_draft_can_still_be_reclassified() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let sid = spec_id_of(
+            &spec_create(
+                &db,
+                &json!({
+                    "project_id": project_id, "title": "S",
+                    "problem": "the purge is manual", "solution": "a purge module",
+                    "category": "feature",
+                }),
+            )
+            .expect("create"),
+        );
+        db.with_conn(|c| {
+            db::transition_spec(c, &sid, db::SpecTransition::Ready, true).expect("ready");
+            db::transition_spec(c, &sid, db::SpecTransition::Start, true).expect("start");
+        });
+
+        // The CONTRAST, asserted rather than assumed: prose IS frozen here…
+        let frozen = spec_update_section(
+            &db,
+            &json!({ "spec_id": sid, "section": "problem", "value": "rewritten" }),
+        )
+        .expect_err("a section of a Spec under build is frozen");
+        assert_eq!(frozen.code, RpcCode::InvalidState);
+
+        // …and the classification is NOT. It was a feature; it is a bug.
+        spec_set_category(&db, &json!({ "spec_id": sid, "category": "bug" }))
+            .expect("reclassifying an in_progress Spec is allowed");
+        assert_eq!(category_of(&db, &sid).expect("classified").slug, "bug");
+        // Removing it is allowed just the same.
+        spec_set_category(&db, &json!({ "spec_id": sid })).expect("un-classifying too");
+        assert!(category_of(&db, &sid).is_none());
+    }
+
+    /// DONE-CRITERION: unknown / ambiguous / cross-project references answer STABLE codes, and
+    /// none of them writes anything.
+    #[test]
+    fn a_category_reference_that_cannot_be_honoured_answers_a_stable_code() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let beta = db
+            .with_conn(|c| db::create_project(c, "Beta", "/tmp/beta", None))
+            .expect("project")
+            .0
+            .id;
+        let beta_bug = db
+            .with_conn(|c| db::find_category_by_slug(c, &beta, "bug"))
+            .expect("read")
+            .expect("seeded");
+        let sid = spec_id_of(
+            &spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).expect("create"),
+        );
+
+        // CROSS-PROJECT: the row exists, it just is not this project's vocabulary. The refusal
+        // names BOTH projects, and `specs.category_id` is untouched.
+        let cross = spec_set_category(
+            &db,
+            &json!({ "spec_id": sid, "category_id": beta_bug.id }),
+        )
+        .expect_err("a category of another project is refused");
+        assert_eq!(cross.code, RpcCode::InvalidArgument);
+        assert!(
+            cross.message.contains(&project_id) && cross.message.contains(&beta),
+            "the refusal names both projects: {}",
+            cross.message
+        );
+        assert!(category_of(&db, &sid).is_none(), "nothing was written");
+
+        // AN UNKNOWN ID is a mistake — `invalid_id`. (An unknown LABEL is not: it MINTS.)
+        assert_eq!(
+            spec_set_category(&db, &json!({ "spec_id": sid, "category_id": "nope" }))
+                .expect_err("unknown id")
+                .code,
+            RpcCode::InvalidId
+        );
+
+        // AN AMBIGUOUS NAME is refused rather than guessed, and LISTS the slugs to re-ask with.
+        db.with_conn(|c| {
+            crate::category::rename(
+                c,
+                &project_id,
+                crate::category::CategoryRef::Label("chore"),
+                "Bug",
+            )
+        })
+        .expect("rename");
+        let ambiguous = spec_set_category(&db, &json!({ "spec_id": sid, "category": "Bug" }))
+            .expect_err("two categories answer that name");
+        assert_eq!(ambiguous.code, RpcCode::InvalidArgument);
+        assert!(
+            ambiguous.message.contains("bug") && ambiguous.message.contains("chore"),
+            "the refusal lists the slugs: {}",
+            ambiguous.message
+        );
+        // …and the SLUG still resolves, unambiguously.
+        spec_set_category(&db, &json!({ "spec_id": sid, "category": "bug" })).expect("by slug");
+        assert_eq!(category_of(&db, &sid).expect("classified").slug, "bug");
+
+        // BOTH references at once is refused: two references that can disagree.
+        let both = spec_set_category(
+            &db,
+            &json!({ "spec_id": sid, "category": "feature", "category_id": beta_bug.id }),
+        )
+        .expect_err("either, not both");
+        assert_eq!(both.code, RpcCode::InvalidArgument);
+
+        // An EMPTY STRING is never read as the removal — the `spec_set_workspace` lesson (F2):
+        // `None` here is an EFFECT, so an uninitialized caller variable must not trigger it.
+        for empty in ["category", "category_id"] {
+            let err = spec_set_category(&db, &json!({ "spec_id": sid, empty: "" }))
+                .expect_err("an empty reference is refused");
+            assert_eq!(err.code, RpcCode::InvalidArgument);
+        }
+        assert_eq!(
+            category_of(&db, &sid).expect("still classified").slug,
+            "bug",
+            "no refusal above un-classified the Spec"
+        );
+
+        // An unknown SPEC is `invalid_id`.
+        assert_eq!(
+            spec_set_category(&db, &json!({ "spec_id": "01JZZZZZZZZZZZZZZZZZZZZZZZ" }))
+                .expect_err("unknown spec")
+                .code,
+            RpcCode::InvalidId
+        );
+    }
+
+    /// DONE-CRITERION: the tool LIST carries the new verb. `SPEC_TOOLS` is the one closed slice the
+    /// advertisement, the dispatch and the surface count all read (`mcp::tests`), so a twelfth entry
+    /// that is not routed — or routed but not advertised, which makes it undispatchable (N17) —
+    /// fails here.
+    #[test]
+    fn the_category_verb_is_the_twelfth_spec_tool_and_it_is_routed() {
+        let _g = db_guard();
+        assert_eq!(SPEC_TOOLS.len(), 12);
+        assert!(SPEC_TOOLS.contains(&SPEC_SET_CATEGORY_TOOL));
+        let (db, project_id, _ws) = seeded_db();
+        let sid = spec_id_of(
+            &spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).expect("create"),
+        );
+        assert!(
+            dispatch_spec_tool(
+                &db,
+                SPEC_SET_CATEGORY_TOOL,
+                &json!({ "spec_id": sid, "category": "bug" })
+            )
+            .is_some(),
+            "every SPEC_TOOLS entry must be routed by the shared dispatcher"
+        );
     }
 }

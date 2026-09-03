@@ -159,7 +159,7 @@
 //! never a refusing transition that freezes the run. The "build abandoned" note carries
 //! `clear_gate_block` so any stale block is lifted before the run's clean `done`.
 //!
-//! ## nspec — entry gate, (skippable) grill, (optional) proto, N16-safe commit
+//! ## nspec — entry gate, (skippable) grill, category + bug contract, (optional) proto, N16-safe commit
 //!
 //! ```text
 //! sequence "/nspec"
@@ -174,6 +174,17 @@
 //! │  ├─ (entry_choice == "ready")  note "grill skipped"
 //! │  └─ (else)  loop "grill" until grill_status == "complete" [ spawn spec inline → ask_human "steer"
 //! │             {append answers} → judge "complete?" reads {{answers}} → grill_status ]      (N9)
+//! ├─ sequence "categorize"                        (revision 23 — PDR-0017: the genre of work, IMPOSED)
+//! │  ├─ query "current category"  spec_category → current_category      (a re-run may keep it)
+//! │  ├─ judge "which category?"   → category_choice   {a system slug, OR a short name of its own}
+//! │  ├─ set_category {category_key: category_choice}     (nyx WRITES it — through crate::category)
+//! │  └─ query "category"          spec_category → spec_category    (the PERSISTED slug, read BACK)
+//! ├─ selector "bug discipline?"              (the FIRST use of the classification — after the write)
+//! │  ├─ (spec_category == "bug")  loop "bug contract" until bug_contract == "complete"
+//! │  │      [ spawn spec inline {subject: bug_reproduction_contract} → ask_human "steer the
+//! │  │        reproduction" {append bug_answers} → judge "reproduction contract complete?" — the SIX:
+//! │  │        observed / expected / counter-example / scope / reproduction strategy / criteria ]
+//! │  └─ (else)                    note "not a bug — no reproduction contract"    (SAFE default)
 //! ├─ sequence "proto?"                                       (v2.8 lot 2 — before the ready commit)
 //! │  ├─ judge "graphic render?"  → needs_proto  {ui / none}
 //! │  └─ selector "proto path"
@@ -226,6 +237,24 @@
 //! `ready` with no workspace and nothing said so. It is the prevalidation rule this PRD already
 //! applies to the disk ("prevalidate, then mkdir"), applied to the TRANSITION.
 //!
+//! THE CLASSIFICATION IS A NODE, AND ITS PLACE IN THE ORDER IS THE POINT (revision 23). PDR-0017
+//! hangs a real execution constraint on the genre of work — a `bug` owes a red-before-green proof —
+//! and a constraint is only as reliable as the classification under it. A sentence asking an agent to
+//! classify can be ignored; a node of the graph cannot, which is why the `judge` is followed by a
+//! `set_category` that WRITES the answer through the shared `crate::category` service rather than by
+//! an instruction to write it. The second `query spec_category` then reads the PERSISTED slug back,
+//! and the "bug discipline?" selector branches on THAT: the judge said `Dette technique`, the domain
+//! holds `dette-technique`, and only the domain's word decides. A branch on the judge's key would fire
+//! the discipline on a classification that never landed.
+//!
+//! THE SECOND PASS IS OWED BY BUGS ALONE. Every other genre takes the note and walks on — tested, not
+//! assumed: a discipline that also ran on a `feature` would be a tax on work that owes no proof, and
+//! the "conditionally" of ADR-0006 would be a word. What the pass asks for is a REPRODUCTION CONTRACT,
+//! and its judge names its six elements outright (observed, expected, counter-example, scope,
+//! reproduction strategy, verifiable criteria) because a prompt that says "be precise" gets prose. The
+//! human is in that loop for the same reason the grill has a steer: the observed behaviour and the
+//! counter-example are facts only they hold.
+//!
 //! A `sub_workflow` CHILD THAT DIED IS A FACT THE PARENT MUST TEST (H4). The child's status lands on
 //! the parent board (`proto_result.status`) whatever it is — and a value nothing reads changes nothing:
 //! nspec walked from a `failed` prototyper straight to its ready commit, in one tick, in silence. The
@@ -261,10 +290,18 @@
 //! reaching it by fall-through — the two things that let a decision be taken on a value nothing
 //! constrained.
 //!
-//! ## coder (sub-workflow-only) — drain the current phase, one gate per task
+//! ## coder (sub-workflow-only) — classify, then drain the current phase, one gate per task
 //!
 //! ```text
 //! sequence "coder"
+//! ├─ sequence "preflight"                            (revision 24 — CLASSIFY BEFORE ROUTING)
+//! │  ├─ query "category"  spec_category → spec_category
+//! │  └─ selector "classified?"
+//! │     ├─ (spec_category falsy)  sequence "classify it now"
+//! │     │     ├─ judge "which category?" → category_choice
+//! │     │     ├─ set_category "classify" {category_key: category_choice}
+//! │     │     └─ query "category"  spec_category → spec_category    (the PERSISTED slug, read back)
+//! │     └─ (else)  note "already classified"                        (SAFE default: nothing written)
 //! └─ loop "tasks"  until phase_open_tasks is falsy            (COMPLETION: drain the phase)
 //!    ├─ query "next task"  phase_next_task  → task_id
 //!    ├─ selector "have a task?"
@@ -275,7 +312,24 @@
 //!    │  │   │  ├─ (task_close == "verify")  sequence "human action"   (a kind=human task NEVER reaches the coder)
 //!    │  │   │  │     ├─ ask_human "your action" {done/skip} → human_action
 //!    │  │   │  │     └─ selector [ (skip) transition_task skip {reason} / (else) note "performed" ]
-//!    │  │   │  └─ (else)  loop "make it green" until gate_green == true
+//!    │  │   │  └─ (else)  sequence "build the task"
+//!    │  │   │        ├─ selector "bug discipline?"          (revision 24 — the PROOF the genre owes)
+//!    │  │   │        │  ├─ (spec_category == "bug")  sequence "reproduce before repairing"
+//!    │  │   │        │  │     ├─ spawn "write the reproduction" {coder}
+//!    │  │   │        │  │     ├─ ask_human "reproduced automatically?" {automated/manual} → repro_mode
+//!    │  │   │        │  │     └─ selector "reproduction route"
+//!    │  │   │        │  │        ├─ (manual)  sequence "manual protocol"     (EXPLICIT, never fallen into)
+//!    │  │   │        │  │        │     ├─ ask_human "the protocol + what you SEE" → manual_repro_before
+//!    │  │   │        │  │        │     ├─ loop "repair" until manual_repro_after == "fixed"
+//!    │  │   │        │  │        │     │  [ spawn "repair the defect" {coder}
+//!    │  │   │        │  │        │     │    → ask_human "the SAME protocol, after" {fixed/still-broken} ]
+//!    │  │   │        │  │        │     └─ note "both observations recorded"   (the double validation)
+//!    │  │   │        │  │        └─ (else)  sequence "automated reproduction"          (SAFE default)
+//!    │  │   │        │  │              ├─ gate_check "reproduction" {slot: repro_check, expect: RED}
+//!    │  │   │        │  │              ├─ spawn "repair the defect" {coder}
+//!    │  │   │        │  │              └─ gate_check "…, green"     {slot: repro_check, expect: GREEN}
+//!    │  │   │        │  └─ (else)  note "no reproduction owed"      (SAFE default: bugs alone owe it)
+//!    │  │   │        └─ loop "make it green" until gate_green == true    (…THEN the build control)
 //!    │  │   │              [ spawn_subagent "implement" {coder} → gate_check "checks" {slot: build_check}
 //!    │  │   │                → gate_green ]
 //!    │  │   ├─ query "how does it close now?"  task_close_route → task_close    (the OUTCOME, re-derived)
@@ -330,6 +384,42 @@
 //! customisation — and a fork that has fallen behind its source is now REPORTED by `run_start`
 //! (`workflow_fork_stale`), which is what stops the remaining ones rotting unseen.
 //!
+//! AN ABSENT CLASSIFICATION IS NOT A WAY OUT (revision 24). PDR-0017 hangs a real execution
+//! constraint on the genre of work, and a constraint is only as reliable as the classification under
+//! it — which `/nspec` writes, for the Specs that go through `/nspec` from now on. Every other Spec
+//! reaches this graph carrying `null`: authored before the PDR, created straight through
+//! `spec_create`, or classified by a write that failed. `null` matches no branch, so the discipline
+//! selector would have fallen through to its safe default and the build would have walked past the
+//! red-before-green obligation having never met it — a silent exit available to exactly the Specs
+//! nobody examined. The preflight is that door shut: it READS the persisted slug, and only when
+//! there is none does it judge the genre, WRITE it through the shared `crate::category` service, and
+//! read it BACK. A classified Spec is never re-decided — the coder is no authority on the genre of
+//! work — and the branch below tests what was persisted, never the judge's word.
+//!
+//! AND THE SEQUENCE IS THE PROOF, so the graph carries it (revision 24). For a `bug` and nothing
+//! else, an agent task reproduces before it repairs: the coder writes the failing check, a BLOCKING
+//! `gate_check` declaring `expect: red` on [`REPRO_CHECK_SLOT`] observes it FAIL, the fix lands, and
+//! a DISTINCT gate declaring `expect: green` on the SAME slot — hence the same resolved commands and
+//! the same cwd — observes it PASS. Only then does the `checks` gate run: the reproduction is an
+//! extra obligation laid on a bug, never a substitute for the project's own control. Both attempts
+//! are journalled, so "was it the same check" is something the auditor VERIFIES rather than assumes,
+//! and the record survives the build gate that follows it. The coder's context carries the matching
+//! discipline text (`crate::mcp_context`) — the text says what these nodes will ask for, and the
+//! nodes are what makes an agent that skipped the text unable to skip the sequence.
+//!
+//! A ROUTE A GATE CANNOT READ HAS TO BE A BRANCH (revision 24). That discipline also announces an
+//! exit: a defect no command can reproduce — a device, a third-party account, a gesture, a state no
+//! command can set up. Announced in prose alone, that exit was UNREACHABLE, and worse than absent: a
+//! blocking `expect: red` nothing can satisfy parks the run at that node forever, with no question
+//! ever put to anyone. So the decision of impracticability is a node — asked AFTER the coder has
+//! tried, so it is taken on what the attempt found, and BEFORE any gate has refused, so the answer
+//! can still change the route. A human's 'manual' then runs the same proof in human form: the
+//! protocol and the observation made BEFORE the fix, the repair, then that SAME protocol quoted back
+//! verbatim and observed again, both answers persisted side by side for the auditor to compare. The
+//! automated route is the default (N12(d)) — dropping the machine-checked proof is said, never
+//! fallen into. The precedent is nspec's "proto did not complete" and this graph's own
+//! [`escalate_blocked_task`]: a dead end in the machinery goes to the one party who can rule on it.
+//!
 //! ## prototyper (sub-workflow-only) — design rounds until the freeze
 //!
 //! ```text
@@ -376,13 +466,50 @@ use crate::db::{
     NODE_TYPE_FORK_SPEC as FORK_SPEC, NODE_TYPE_GATE_CHECK as GATE_CHECK, NODE_TYPE_JUDGE as JUDGE,
     NODE_TYPE_LOOP as LOOP, NODE_TYPE_NOTE as NOTE, NODE_TYPE_QUERY as QUERY,
     NODE_TYPE_SELECTOR as SELECTOR, NODE_TYPE_SEQUENCE as SEQUENCE,
-    NODE_TYPE_SPAWN_SUBAGENT as SPAWN, NODE_TYPE_SUB_WORKFLOW as SUB_WORKFLOW,
-    NODE_TYPE_TRANSITION as TRANSITION, NODE_TYPE_TRANSITION_TASK as TRANSITION_TASK,
+    NODE_TYPE_SET_CATEGORY as SET_CATEGORY, NODE_TYPE_SPAWN_SUBAGENT as SPAWN,
+    NODE_TYPE_SUB_WORKFLOW as SUB_WORKFLOW, NODE_TYPE_TRANSITION as TRANSITION,
+    NODE_TYPE_TRANSITION_TASK as TRANSITION_TASK,
 };
 
 /// The current code revision of the built-in default graphs. BUMP this whenever a `build_*` graph
 /// changes so an EXISTING DB's built-in is upgraded on the next boot ([`ensure_builtin`] replaces the
 /// tree when the stored `workflows.builtin_revision` is older — v2.8 review N11).
+///
+/// Revision 24 makes the `coder` flow EXECUTE the discipline revision 23 wrote the contract for, and
+/// it closes the door revision 23 left open. Two things, and the first is the one nothing else could
+/// do: a Spec arriving with NO category is CLASSIFIED — a preflight at the head of the graph reads
+/// the persisted slug, and only when there is none judges the genre, writes it through the shared
+/// [`crate::category`] service and reads it back. Without that node an unclassified Spec matched no
+/// branch, fell through the safe default and walked past the red-before-green obligation having
+/// never met it: the absence of a classification would have been a silent exit from the discipline,
+/// available to precisely the Specs nobody ever classified. Then, for a `bug` and for nothing else,
+/// an agent task REPRODUCES BEFORE IT REPAIRS: the coder writes the failing check, a BLOCKING
+/// `gate_check` declaring `expect: red` on the [`REPRO_CHECK_SLOT`] observes it fail, the fix lands,
+/// and a DISTINCT gate declaring `expect: green` on the SAME slot — hence the same resolved commands
+/// and the same cwd — observes it pass, before the project's own `build_check` runs at all. Both
+/// attempts are journalled, so the identity of the two controls is something an auditor VERIFIES
+/// rather than takes on trust, and it survives the build gate that follows.
+///
+/// AND THE HUMAN EXIT IS A BRANCH OF THAT GRAPH, not a sentence in a manual. The discipline
+/// announces a route out for a defect no command can reproduce — a device, a third-party account, a
+/// gesture. Left to the gate alone that route was UNREACHABLE: a blocking `expect: red` nothing can
+/// satisfy parks the run forever, with no question ever put. So the graph asks — after the coder has
+/// tried, so the answer is taken on what it found — and a human's 'manual' opens the same proof in
+/// human form: the protocol and the observation made BEFORE the fix, the repair, then the SAME
+/// protocol quoted back verbatim and observed again, both answers persisted side by side. The
+/// automated route stays the default, per the least-destructive rule: dropping the machine-checked
+/// proof is said, never fallen into. PDR-0017 / ADR-0006.
+///
+/// Revision 23 gives `/nspec` a CATEGORY, and gives a `bug` Spec the contract that makes it provable.
+/// After the general grill — never before it, or half the Specs would be classified on a title — a
+/// `judge` names the genre of work, a `set_category` node WRITES it through the shared
+/// [`crate::category`] service, and a second `query spec_category` reads the PERSISTED slug back. Only
+/// then does the graph use it: a selector on that slug routes a `bug` into a second pass that will not
+/// end until the Spec states its observed behaviour, its expected result, a concrete counter-example,
+/// its scope, the reproduction strategy (the check that fails today and must pass after the fix) and
+/// verifiable completion criteria — and routes every other genre to a note, because the discipline is
+/// owed by bugs alone. The order is the substance: a classification that is merely SPOKEN can be
+/// ignored, and a discipline that reads an unpersisted claim fires on nothing. PDR-0017 / ADR-0006.
 ///
 /// Revision 22 REPAIRS revision 21's workspace branch, on the two defects a live run found the day it
 /// shipped (human review finding `01M0B5AG0XR4BG6DSGEFGKW6C4`). The question now asks for a ROOT and
@@ -462,7 +589,7 @@ use crate::db::{
 /// top of revision 5's N17 lifecycle-entry work and revision 4's N16/N19/spec_can_transition
 /// corrections. Every earlier built-in (a lower revision or a pre-N11 NULL, treated as 0) upgrades on
 /// the first boot.
-const BUILTIN_REVISION: i32 = 22;
+const BUILTIN_REVISION: i32 = 24;
 
 /// The SLOT the seeded coder's `checks` gate declares — the name a project binds its real build check
 /// to (`slot_bind slot="build_check" command_ids=[…]`, [`crate::mcp_authoring::slot_bind`]).
@@ -472,6 +599,25 @@ const BUILTIN_REVISION: i32 = 22;
 /// wrapper script — is per-project by nature, and it was naming the answer in a shared graph that made
 /// forking mandatory and upgrades impossible.
 pub const BUILD_CHECK_SLOT: &str = "build_check";
+
+/// The SLOT the seeded coder's REPRODUCTION gates declare — the check a `bug` Spec is made to fail
+/// on purpose BEFORE the fix and to pass after (revision 24, PDR-0017 / ADR-0006).
+///
+/// It is a SLOT for the same reason [`BUILD_CHECK_SLOT`] is one: "the check that reproduces this
+/// project's defects" is a question every project answers differently (`cargo test repro_…` here,
+/// `bun test *.repro.test.ts` there), and a graph shared by every project can only state the
+/// question. Naming the answer would put the arming behind a FORK, and a fork is never upgraded.
+///
+/// It is a SECOND slot rather than a reuse of `build_check` because the two ask different things and
+/// are answered by different commands: `build_check` asks "is the project green", the whole suite;
+/// this one asks "does THIS defect still fail", one check, which is the only thing that can honestly
+/// be declared `expect: red` before a fix. Binding the whole suite to a red expectation would demand
+/// a project be broken to pass its own reproduction gate.
+///
+/// The string is the one the coder's `bug` discipline already tells the coder to write for
+/// (`crate::mcp_context`'s `BUG_DISCIPLINE_CODER` names it outright), so the text and the graph
+/// speak of the same slot — `mod tests` confronts them.
+pub const REPRO_CHECK_SLOT: &str = "repro_check";
 
 /// How many REWORK rounds ndev's inner "build" loop runs before it gives up (revision 14).
 ///
@@ -1455,12 +1601,187 @@ fn build_nspec(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
         }),
     )?;
 
-    // 3 — PROTO? (lot 2) — for a Spec with a graphical/UI surface, OFFER to settle the design with a
+    // 3 — CATEGORIZE (revision 23, PDR-0017 / ADR-0006) — the GENRE OF WORK, decided AFTER the
+    //     general grill and IMPOSED by the graph, then used to harden a `bug` Spec and nothing else.
+    //
+    //     WHY THE ORDER IS THE WHOLE POINT. The category is what the harness reads to decide which
+    //     discipline a Spec is subject to — a `bug` owes a red-before-green proof, the others do not.
+    //     Deciding it AFTER the grill means the judge reads a Spec whose problem and solution are
+    //     settled (before it, half the Specs would be classified on a title); PERSISTING it before
+    //     the discipline runs means the branch below reads a FACT and never a board claim. So the
+    //     four nodes are four steps of one gesture, in this order and no other:
+    //
+    //       0. READ what the Spec already carries — a re-run of `/nspec` on a classified Spec must be
+    //          able to keep the classification instead of re-deciding it from nothing;
+    //       1. JUDGE the genre — one of the project's SYSTEM slugs, or a SHORT NAME OF ITS OWN when
+    //          none fits. Both answers are first-class: PDR-0017's governance is a grill, not a lock,
+    //          and an unknown label MINTS a category — valid as it stands since the 2026-09-02
+    //          amendment — rather than being refused. That is why the question is a `judge` and not
+    //          an `ask_human` with `options`: a closed answer set would forbid the free label the
+    //          PDR grants;
+    //       2. SET_CATEGORY — nyx WRITES it, through the same `crate::category` service the MCP tool
+    //          calls. A sentence asking an agent to classify can be ignored; this cannot;
+    //       3. READ IT BACK — the PERSISTED slug, which is not the judge's word: a free-form label is
+    //          slugified (`Dette technique` → `dette-technique`) and a system slug is resolved to the
+    //          seeded row. The discipline branches on THAT, so it cannot fire on a classification
+    //          that failed to land.
+    let categorize = node(tc, wf, Some(&root), 3, SEQUENCE, "categorize", json!({}))?;
+    node(
+        tc,
+        wf,
+        Some(&categorize),
+        0,
+        QUERY,
+        "current category",
+        json!({ "query": "spec_category", "write": "current_category" }),
+    )?;
+    // THE PROMPT IS SEEDED DATA, SO THIS CORRECTION IS IN TWO TIMES (2026-09-02). The text below is
+    // the TRUE one as of the 2026-09-02 amendment of PDR-0017: a mint is valid as it stands, so the
+    // anti-proliferation rests entirely on this sentence asking the judge to REUSE first — the axis
+    // that used to carry it (`proposed`, reviewed by a human later) no longer exists. But a `prompt`
+    // is a `nodes` row, not source read at run time: a base already stamped `BUILTIN_REVISION = 24`
+    // keeps the OLD sentence until `ensure_builtin` replays, and it only replays on a BUMP — which
+    // does `delete_nodes_for_workflow` + `mark_runs_graph_replaced`, i.e. every live run loses its
+    // cursor. That price is not worth paying for a re-wording, so the bump is DEFERRED to the next
+    // one motivated by something else (depot task `01M1HB1PR66A084BFMQXVJ318S`, awaiting the user's
+    // go-ahead). Until then a FRESH database seeds the corrected text and an existing one does not —
+    // two bases stamped 24 no longer hold exactly the same graph, which is the accepted cost.
+    node(
+        tc,
+        wf,
+        Some(&categorize),
+        1,
+        JUDGE,
+        "which category?",
+        json!({
+            "prompt": "Classify this Spec's GENRE OF WORK in ONE label — the category nyx records on it. \
+                       The project's own vocabulary is 'feature', 'bug', 'refactor', 'chore'; answer one of \
+                       those when it fits. Answer 'bug' ONLY for work that REPAIRS a behaviour that is \
+                       already broken — a missing capability is a 'feature', a restructuring with no \
+                       behaviour change is a 'refactor'. PREFER AN EXISTING LABEL: only when none of the \
+                       four fits, answer a SHORT name of your own (two or three words), which nyx registers \
+                       as a category of this project straight away — it is valid as it stands, nobody \
+                       reviews it afterwards, and only a human can take it back from the project settings, \
+                       so a label that merely rephrases one of the four dilutes the vocabulary for \
+                       everybody. nyx currently records this Spec as: {{current_category}} (null = \
+                       not classified yet) — answer that back unchanged when it is still right. Answer the \
+                       label alone, nothing else.",
+            "output_key": "category_choice",
+        }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&categorize),
+        2,
+        SET_CATEGORY,
+        "classify",
+        json!({ "category_key": "category_choice" }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&categorize),
+        3,
+        QUERY,
+        "category",
+        json!({ "query": "spec_category", "write": "spec_category" }),
+    )?;
+    // 4 — THE BUG DISCIPLINE, and it is CONDITIONAL. Only a Spec that came out of the step above
+    //     carrying the `bug` slug takes a second pass; every other genre routes to a note and walks on.
+    //     The branch reads the PERSISTED slug (written one node above), so this is the first place the
+    //     discipline is used and the classification is already committed when it is.
+    //
+    //     WHAT THE SECOND PASS IS FOR. A bug Spec that says "the sidebar is broken" cannot be proved
+    //     fixed: there is nothing to run before the fix and nothing to run after. The pass exists to
+    //     turn the report into a REPRODUCTION CONTRACT — six things, and the judge below names all six
+    //     because a prompt that says "be precise" is a prompt that gets prose. The human is in the
+    //     loop for the same reason the grill has a steer: the observed behaviour and the counter-example
+    //     are facts only they hold.
+    let discipline = node(
+        tc,
+        wf,
+        Some(&root),
+        4,
+        SELECTOR,
+        "bug discipline?",
+        json!({ "branches": [
+            // The SAME literal the coder's own `bug discipline?` selector reads, taken from the SAME
+            // constant ([`crate::db::CATEGORY_SLUG_BUG`]) rather than spelled again here:
+            // one string decides which Specs owe a reproduction, and two graphs comparing two
+            // spellings of it would diverge silently the day either moved.
+            { "cond": { "var": "spec_category", "eq": crate::db::CATEGORY_SLUG_BUG }, "child": 0 },
+            { "cond": { "always": true }, "child": 1 },
+        ] }),
+    )?;
+    let bug_contract = node(
+        tc,
+        wf,
+        Some(&discipline),
+        0,
+        LOOP,
+        "bug contract",
+        json!({ "until": { "var": "bug_contract", "eq": "complete" } }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&bug_contract),
+        0,
+        SPAWN,
+        "harden the bug spec",
+        json!({ "agent_id": "spec", "inline": true, "subject": "bug_reproduction_contract" }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&bug_contract),
+        1,
+        ASK_HUMAN,
+        "steer the reproduction",
+        json!({
+            "prompt": "Answer the author's question about the defect — what you SEE, what you EXPECTED, and \
+                       the case that shows it (or add a correction).",
+            "output_key": "bug_answers",
+            "append": true,
+        }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&bug_contract),
+        2,
+        JUDGE,
+        "reproduction contract complete?",
+        json!({
+            "prompt": "This Spec is classified as a BUG, so it owes a REPRODUCTION CONTRACT. Given what has \
+                       been gathered so far: {{bug_answers}}. Does the Spec now state, explicitly, ALL SIX \
+                       of: (1) the OBSERVED behaviour — what happens today; (2) the EXPECTED result — what \
+                       should happen instead; (3) a CONTRE-EXEMPLE — one concrete case, with its input or \
+                       its steps, that exhibits the defect; (4) the SCOPE — what is affected and what is \
+                       not; (5) the REPRODUCTION STRATEGY — the check that FAILS today and must PASS after \
+                       the fix, named concretely enough to be run; (6) VERIFIABLE COMPLETION CRITERIA — how \
+                       anyone tells the fix landed. Answer 'complete' when all six are stated, or 'more' \
+                       naming exactly which of the six is missing.",
+            "output_key": "bug_contract",
+        }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&discipline),
+        1,
+        NOTE,
+        "no reproduction contract",
+        json!({ "text": "This Spec is not classified as a bug — no reproduction contract is required of it." }),
+    )?;
+
+    // 5 — PROTO? (lot 2) — for a Spec with a graphical/UI surface, OFFER to settle the design with a
     //     prototype BEFORE the ready commit. nyx JUDGES whether there is a graphic surface, then (only
     //     for a 'ui' verdict) asks the human; a 'yes' DELEGATES the design rounds to the prototyper
     //     SUB-WORKFLOW (which loops proto → election → lock and freezes the design). Every branch's
     //     default is a clean note — a Spec with no graphic surface, or a declined proto, simply skips it.
-    let proto = node(tc, wf, Some(&root), 3, SEQUENCE, "proto?", json!({}))?;
+    let proto = node(tc, wf, Some(&root), 5, SEQUENCE, "proto?", json!({}))?;
     node(
         tc,
         wf,
@@ -1590,18 +1911,18 @@ fn build_nspec(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
         json!({ "text": "No graphic surface — no prototype needed." }),
     )?;
 
-    // 4 — re-read the LIVE status (a fork reopened it to draft; the grill may have completed it).
+    // 6 — re-read the LIVE status (a fork reopened it to draft; the grill may have completed it).
     node(
         tc,
         wf,
         Some(&root),
-        4,
+        6,
         QUERY,
         "final status",
         json!({ "query": "spec_status", "write": "final_status" }),
     )?;
 
-    // 5 — COMMIT: only a DRAFT can go ready. Ask, then a selector ROUTES the answer — 'yes' →
+    // 7 — COMMIT: only a DRAFT can go ready. Ask, then a selector ROUTES the answer — 'yes' →
     //     transition, else → a clean "left as draft" note. THE N16 FIX: the refusal has a proper exit,
     //     so a "no" never freezes the run on a refusing transition. The default (not a draft) is a safe
     //     note too (N12(d)).
@@ -1612,7 +1933,7 @@ fn build_nspec(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
         tc,
         wf,
         Some(&root),
-        5,
+        7,
         SELECTOR,
         "commit",
         json!({ "branches": [
@@ -2024,14 +2345,35 @@ fn build_ndoc(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
 fn build_coder(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
     let root = node(tc, wf, None, 0, SEQUENCE, "coder", json!({}))?;
 
-    // The per-phase TASK LOOP: keep building while the CURRENT build phase has open tasks
+    // 0 — THE PREFLIGHT (revision 24). CLASSIFY BEFORE ROUTING, because an absent category is the
+    //     one way out of this discipline that costs nobody anything.
+    category_preflight(tc, wf, &root, 0)?;
+
+    // 1 — THE PROOF THIS SPEC'S CATEGORY OWES (revision 24), ONCE PER RUN — a `bug` reproduces
+    //     before it repairs, every other genre owes nothing. It sits HERE, between the preflight
+    //     that classified and the task loop, and NOT inside the loop, because a reproduction is a
+    //     fact about the DEFECT and not about a task: a phase carrying two agent tasks would
+    //     otherwise re-enter the whole branch on its second pass, re-run the `expect: red` gate on
+    //     a defect the first pass just repaired, and wedge the run on the very proof it produced
+    //     (`crate::mcp_engine::refuse_gate_expectation` is sticky and a built-in cannot be
+    //     `node_update`d out of the way). See the 2026-09-03 review finding C19.
+    //
+    //     THE POSITION IS SEEDED DATA, SO THIS CORRECTION IS IN TWO TIMES: the parent/order of a
+    //     node is a `nodes` row, and `ensure_builtin` only replays on a BUMP of
+    //     [`BUILTIN_REVISION`], which resets every live run's cursor. The bump is DEFERRED
+    //     (depot task `01M1HB1PR66A084BFMQXVJ318S`), so a base already stamped 24 keeps the old
+    //     placement until then — a fresh database seeds this one. Accepted cost, same as the
+    //     re-worded prompts below.
+    bug_reproduction(tc, wf, &root, 1)?;
+
+    // 2 — The per-phase TASK LOOP: keep building while the CURRENT build phase has open tasks
     // (`phase_open_tasks`, written by the recount at the END of each pass — repeat-until, so it runs
     // at least once). Bounded by a modest backstop.
     let tasks = node(
         tc,
         wf,
         Some(&root),
-        0,
+        2,
         LOOP,
         "tasks",
         json!({ "until": { "var": "phase_open_tasks", "truthy": false }, "max_iterations": 50 }),
@@ -2151,9 +2493,17 @@ fn build_coder(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
         json!({ "text": "The human performed the action — nyx closes the task through the verified path." }),
     )?;
 
-    // (else) — an AGENT task: make it green. Spawn the coder effector, run the gate, re-spawn while
-    // the gate is RED (a repeat-until on `gate_green`, bounded). The gate ships BLOCKING and declares
-    // the [`BUILD_CHECK_SLOT`] SLOT instead of naming commands: this graph is shared by every project,
+    // (else) — an AGENT task. The project's own quality gate, and ONLY it: the PROOF a `bug` owes
+    // was produced once, above the loop, before any task was picked (see `bug_reproduction`'s
+    // placement at the head of this flow). The build control is the SAME single node for every
+    // genre — the reproduction is an extra obligation laid on a bug, never a substitute for the
+    // checks — which is also what keeps `run_start` reporting ONE unbound `build_check` and not one
+    // per genre.
+    let build = node(tc, wf, Some(&who), 1, SEQUENCE, "build the task", json!({}))?;
+
+    // Make it green. Spawn the coder effector, run the gate, re-spawn while the gate is RED (a
+    // repeat-until on `gate_green`, bounded). The gate ships BLOCKING and declares the
+    // [`BUILD_CHECK_SLOT`] SLOT instead of naming commands: this graph is shared by every project,
     // and `bun test` is not something a shared graph can know. Until the project BINDS that slot
     // (`slot_bind`), the gate arms nothing and `nyx_next` REFUSES to advance past it — deliberate,
     // since the alternative, shipping a gate that passes without running a thing, is what let a coder
@@ -2162,8 +2512,8 @@ fn build_coder(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
     let green = node(
         tc,
         wf,
-        Some(&who),
-        1,
+        Some(&build),
+        0,
         LOOP,
         "make it green",
         json!({ "until": { "var": "gate_green", "eq": true }, "max_iterations": 25 }),
@@ -2260,6 +2610,430 @@ fn build_coder(tc: &mut SqliteConnection, wf: &str) -> QueryResult<String> {
     )?;
 
     Ok(root)
+}
+
+/// THE CATEGORY PREFLIGHT of the coder flow — wired at the HEAD of the graph, before the task loop
+/// and therefore before anything routes on the genre of work (revision 24). Returns its sequence id.
+///
+/// # Why a flow that only BUILDS has to classify
+///
+/// `/nspec` classifies (revision 23), so in the nominal path this preflight finds a category and
+/// says so. It exists for every other path, and they are not exotic: a Spec authored before
+/// PDR-0017, one created straight through `spec_create` with no `category`, one whose classification
+/// failed to land. Each of them arrives at the coder carrying `null`, and `null` matches no branch —
+/// so without this node the "bug discipline?" selector below would fall through to its safe default
+/// and the Spec would walk past the red-before-green obligation having never met it. The absence of
+/// a category would be a silent EXIT from the discipline, available to exactly the Specs nobody
+/// classified — which is the population most likely to hold an unexamined bug.
+///
+/// So the answer is not "assume it is not a bug". It is: CLASSIFY IT, here, explicitly, and then
+/// route on what was persisted.
+///
+/// # The four steps are the same four `/nspec` takes, and for the same reasons
+///
+///   0. READ what the Spec already carries. A classified Spec is NEVER re-decided — the coder is not
+///      an authority on the genre of work, and a re-judge would let a build silently overwrite a
+///      curator's answer.
+///   1. JUDGE the genre — only when there is none. A `judge` and not an `ask_human`: PDR-0017's
+///      governance is a grill, not a lock, and an unknown label MINTS a category (valid as it
+///      stands since the 2026-09-02 amendment) rather than being refused, which a closed answer set
+///      could not express.
+///   2. SET_CATEGORY — nyx WRITES it, through the shared [`crate::category`] service. A sentence
+///      asking an agent to classify can be ignored; a node cannot.
+///   3. READ IT BACK. The branch below tests the PERSISTED slug, never the judge's word: a free-form
+///      label is slugified and a system slug resolved to the seeded row, so a classification that
+///      failed to land arms nothing.
+///
+/// The default (`always`) branch is the NOTE, per N12(d): the branch that WRITES is reached only by
+/// the explicit "there is no category" condition, never by fall-through.
+fn category_preflight(
+    tc: &mut SqliteConnection,
+    wf: &str,
+    parent: &str,
+    order: i32,
+) -> QueryResult<String> {
+    let seq = node(tc, wf, Some(parent), order, SEQUENCE, "preflight", json!({}))?;
+    node(
+        tc,
+        wf,
+        Some(&seq),
+        0,
+        QUERY,
+        "category",
+        json!({ "query": "spec_category", "write": "spec_category" }),
+    )?;
+    let classified = node(
+        tc,
+        wf,
+        Some(&seq),
+        1,
+        SELECTOR,
+        "classified?",
+        json!({ "branches": [
+            // `null` — the fact spells BOTH ways of having no category one way, so this tests them
+            // both: an unclassified Spec, and a run carrying no Spec at all (which classifies
+            // nothing — `set_category` on a Spec-less run writes nothing and the read-back stays
+            // null, so the discipline still does not fire on a run that has no Spec to owe it).
+            { "cond": { "var": "spec_category", "truthy": false }, "child": 0 },
+            { "cond": { "always": true }, "child": 1 },
+        ] }),
+    )?;
+    let classify = node(tc, wf, Some(&classified), 0, SEQUENCE, "classify it now", json!({}))?;
+    // SAME TWO-TIME CORRECTION AS `/nspec`'s twin judge (2026-09-02) — see the comment on the
+    // `which category?` node in `build_nspec`. The sentence below is the true one since PDR-0017 was
+    // amended: the mint is valid as it stands, so "prefer an existing label" is what now carries the
+    // anti-proliferation. Because a `prompt` is a seeded `nodes` row, a base already stamped
+    // `BUILTIN_REVISION = 24` keeps the old wording until a bump replays `ensure_builtin` — and a
+    // bump resets every live run's cursor. Deferred to the next bump motivated by something else
+    // (depot task `01M1HB1PR66A084BFMQXVJ318S`).
+    node(
+        tc,
+        wf,
+        Some(&classify),
+        0,
+        JUDGE,
+        "which category?",
+        json!({
+            "prompt": "This Spec carries NO category, and nyx hangs a real execution constraint on \
+                       the genre of work: a Spec classified `bug` owes a reproduction OBSERVED \
+                       FAILING before the fix and passing after, and the other genres owe none. \
+                       Classify it in ONE label before this build routes on it. The project's own \
+                       vocabulary is 'feature', 'bug', 'refactor', 'chore'; answer one of those when \
+                       it fits. Answer 'bug' ONLY for work that REPAIRS a behaviour that is already \
+                       broken — a missing capability is a 'feature', a restructuring with no \
+                       behaviour change is a 'refactor'. PREFER AN EXISTING LABEL: only when none of \
+                       the four fits, answer a SHORT name of your own (two or three words), which \
+                       nyx registers as a category of this project straight away — it is valid as it \
+                       stands, nobody reviews it afterwards, and only a human can take it back from \
+                       the project settings. Answer the label alone, nothing else.",
+            "output_key": "category_choice",
+        }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&classify),
+        1,
+        SET_CATEGORY,
+        "classify",
+        json!({ "category_key": "category_choice" }),
+    )?;
+    // READ BACK the PERSISTED slug over the judge's word — the same key the read above wrote, so the
+    // selector below has exactly one source whichever branch ran.
+    node(
+        tc,
+        wf,
+        Some(&classify),
+        2,
+        QUERY,
+        "category",
+        json!({ "query": "spec_category", "write": "spec_category" }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&classified),
+        1,
+        NOTE,
+        "already classified",
+        json!({ "text": "This Spec is classified `{{spec_category}}` — the build routes on that." }),
+    )?;
+    Ok(seq)
+}
+
+/// THE REPRODUCTION a `bug` Spec owes before it is repaired — wired ONCE at the head of the coder
+/// flow, at `order`, right after the classification preflight and ABOVE the per-task loop
+/// (revision 24, PDR-0017 / ADR-0006). Returns the selector's id.
+///
+/// # ONCE PER RUN, never once per task
+///
+/// A reproduction is a fact about the DEFECT, not about a unit of work: the same check going red
+/// then green is the whole proof, and it can only be produced once. Grafted inside the task loop —
+/// where this branch first shipped — a phase carrying two agent tasks re-entered it on its second
+/// pass, re-ran the `expect: red` gate against a defect the first pass had already repaired, and the
+/// gate then PASSED where the graph declared `red`. That mismatch is refused on the spot and is
+/// sticky ([`crate::mcp_engine`]), a built-in cannot be `node_update`d out of the way, and the run
+/// was wedged by the very proof it had just produced — the exact failure the anchor/expectation
+/// separation was written to avoid. Hoisting the branch above the loop is what makes the obligation
+/// unrepeatable; `mod tests` pins the SHAPE (this selector hangs off the flow's root), and
+/// `tests/gate_v2_9_spec_category_e2e.rs` walks TWO tasks over one `bug` Spec on the real graph to
+/// keep it that way.
+///
+/// # It is a BRANCH OF THE GRAPH, in both of its shapes
+///
+/// The `bug` discipline injected into the coder's context ([`crate::mcp_context`]) describes exactly
+/// this sequence, and a text is not an enforcement: an agent that reads "reproduce before you
+/// repair" can repair first and report a green. So the order lives HERE, in nodes the interpreter
+/// walks, and the text's job is to say what the nodes will ask for.
+///
+/// ```text
+/// selector "bug discipline?"
+/// ├─ (spec_category == "bug")  sequence "reproduce before repairing"
+/// │     ├─ spawn "write the reproduction"        {coder}      (1 — the check that must fail)
+/// │     ├─ ask_human "can this be reproduced automatically?"  {automated|manual} → repro_mode
+/// │     └─ selector "reproduction route"
+/// │        ├─ (repro_mode == "manual")  sequence "manual protocol"     (EXPLICIT — never fallen into)
+/// │        │     ├─ ask_human "the protocol, and what you SEE now"  → manual_repro_before
+/// │        │     ├─ loop "repair"  until manual_repro_after == "fixed"
+/// │        │     │  ├─ spawn "repair the defect"  {coder}                        (3 — the fix)
+/// │        │     │  └─ ask_human "the SAME protocol, after" {fixed|still-broken} → manual_repro_after
+/// │        │     └─ note "both observations recorded"        (4 — the double validation, persisted)
+/// │        └─ (else)  sequence "automated reproduction"                 (the SAFE default)
+/// │              ├─ gate_check "reproduction"       {slot: repro_check, expect: RED}    (2)
+/// │              ├─ spawn "repair the defect"       {coder}                             (3)
+/// │              └─ gate_check "the same reproduction, green" {slot: repro_check, expect: GREEN} (4)
+/// └─ (else)  note "no reproduction owed"          (SAFE default — the genre owes nothing)
+/// ```
+///
+/// # Why the human branch is a BRANCH and not a paragraph
+///
+/// The discipline tells the coder to STOP when the reproduction cannot be automated — a device, a
+/// third-party account, a gesture no command can perform. A text can announce that exit; a GATE
+/// cannot read it. Left to the gate alone, an impracticable reproduction would meet a blocking
+/// `expect: red` it can never satisfy, and the run would park there forever with NO QUESTION EVER
+/// PUT — the discipline's own declared route rendered unreachable by the machinery meant to enforce
+/// it. So the graph carries the decision, and it carries it where the two facts the decision needs
+/// are: AFTER the coder has tried (its hand-back rides in the question) and BEFORE any gate has
+/// refused. The precedent is nspec's "proto did not complete" {hold|ready} and the coder's own
+/// [`escalate_blocked_task`] — a dead end in the machinery is handed to the one party who can rule
+/// on it, and their ruling is read by a node.
+///
+/// What the manual branch then owes is the SAME proof in human form, and the graph imposes its two
+/// halves the only way it can: the after-question QUOTES the protocol the before-question wrote
+/// (`{{manual_repro_before}}`), so "the same protocol" is not a request but the literal text on
+/// screen; and the loop will not close until that same protocol comes back `fixed`. Both answers
+/// persist on the run's blackboard under their own keys — neither overwrites the other, which is
+/// what makes them a PAIR an auditor can read.
+///
+/// # Why the automated branch is TWO gate nodes on ONE slot
+///
+/// The red and the green are two DISTINCT nodes because they declare opposite things, and they name
+/// the SAME [`REPRO_CHECK_SLOT`] because a red obtained on one check and a green obtained on another
+/// demonstrate nothing together. The slot is what makes that identity structural rather than
+/// hoped-for: both nodes resolve through the project's ONE binding, so the commands and the cwd are
+/// the same by construction, and the journal records both attempts with those two fields for the
+/// auditor to compare ([`crate::db::append_gate_attempt`]).
+///
+/// Both are BLOCKING, and that is the whole enforcement: a declared expectation that is not
+/// satisfied refuses the tick ON THE SPOT and stays sticky (`crate::mcp_engine`), so a check that
+/// passes where the graph declared `red` cannot be walked past, and neither can an `indeterminate` —
+/// a gate that could not run has proved nothing and answers no declaration at all. And a BLOCKING
+/// gate the project has bound NOTHING to is an `invalid_state`, never a green light: the question is
+/// not "did anything fail" but "was this verified", exactly as for `build_check`.
+fn bug_reproduction(
+    tc: &mut SqliteConnection,
+    wf: &str,
+    parent: &str,
+    order: i32,
+) -> QueryResult<String> {
+    let discipline = node(
+        tc,
+        wf,
+        Some(parent),
+        order,
+        SELECTOR,
+        "bug discipline?",
+        json!({ "branches": [
+            // The PERSISTED slug the preflight read back — never the judge's word, and never a claim
+            // an effector wrote. The literal is [`crate::db::CATEGORY_SLUG_BUG`], the same
+            // string the discipline text is keyed on; `mod tests` confronts the two.
+            { "cond": { "var": "spec_category", "eq": crate::db::CATEGORY_SLUG_BUG }, "child": 0 },
+            { "cond": { "always": true }, "child": 1 },
+        ] }),
+    )?;
+    let repro = node(
+        tc,
+        wf,
+        Some(&discipline),
+        0,
+        SEQUENCE,
+        "reproduce before repairing",
+        json!({}),
+    )?;
+    // 1 — THE CHECK THAT MUST FAIL. Written FIRST, before any production code changes: a fix written
+    //     before anything went red proves nothing, because the symptom may have been a stale cache or
+    //     an unrelated commit and the change may be a no-op nobody can tell from a cure.
+    node(
+        tc,
+        wf,
+        Some(&repro),
+        0,
+        SPAWN,
+        "write the reproduction",
+        json!({ "agent_id": "coder", "subject": "bug_reproduction" }),
+    )?;
+    // THE DECISION OF IMPRACTICABILITY — a HUMAN's, put after the attempt so it is taken on what the
+    // coder actually found, and before the gate so the answer can still change the route.
+    node(
+        tc,
+        wf,
+        Some(&repro),
+        1,
+        ASK_HUMAN,
+        "can this be reproduced automatically?",
+        json!({
+            "prompt": "This Spec is a BUG, so it owes a check OBSERVED FAILING before the fix and \
+                       passing after. The coder has just tried to write one and reports: \
+                       {{last_diff}}. Answer 'automated' to run that check as the reproduction gate \
+                       (nyx runs the project's `repro_check` commands and REFUSES to go on unless \
+                       they FAIL now). Answer 'manual' ONLY if no command can reproduce this defect \
+                       — it needs a device, a third-party account, a human gesture or a state no \
+                       command can set up — and nyx will run the human protocol instead: you \
+                       describe it and what you see BEFORE the fix, and you observe the SAME \
+                       protocol again after.",
+            "output_key": "repro_mode",
+            "options": ["automated", "manual"],
+        }),
+    )?;
+    let route = node(
+        tc,
+        wf,
+        Some(&repro),
+        2,
+        SELECTOR,
+        "reproduction route",
+        json!({ "branches": [
+            { "cond": { "var": "repro_mode", "eq": "manual" }, "child": 0 },
+            { "cond": { "always": true }, "child": 1 },
+        ] }),
+    )?;
+
+    // 'manual' — the EXPLICIT route (N12(d): the machine-checked proof is the default; dropping it is
+    // said, never fallen into).
+    let manual = node(tc, wf, Some(&route), 0, SEQUENCE, "manual protocol", json!({}))?;
+    node(
+        tc,
+        wf,
+        Some(&manual),
+        0,
+        ASK_HUMAN,
+        "the protocol, and what you see BEFORE the fix",
+        json!({
+            "prompt": "The reproduction cannot be automated, so YOU are the check. Write, in one \
+                       answer: (1) the PROTOCOL — the steps a stranger can follow from a stated \
+                       starting state; and (2) what you OBSERVE right now, with the defect present, \
+                       stated so the difference after the fix is a fact and not an impression. nyx \
+                       records this verbatim and will show it back to you unchanged after the fix — \
+                       the proof is that the SAME protocol gives a different observation, so write \
+                       the steps you are willing to repeat.",
+            "output_key": "manual_repro_before",
+        }),
+    )?;
+    // The FIX, then the SAME protocol again — looped, because "still broken" is an answer that buys
+    // another repair pass rather than closing anything.
+    let repair = node(
+        tc,
+        wf,
+        Some(&manual),
+        1,
+        LOOP,
+        "repair under the protocol",
+        json!({
+            // THE KEY AND THE CLOSING ANSWER ARE THE READER'S OWN CONSTANTS. `crate::mcp_context`
+            // decides whether the manual pair PROVES anything by comparing the recorded answer to
+            // `MANUAL_REPRO_FIXED`; a second spelling on either side would make a loop that never
+            // closed look closed to the auditor, or the reverse.
+            "until": {
+                "var": crate::mcp_context::MANUAL_REPRO_AFTER_KEY,
+                "eq": crate::mcp_context::MANUAL_REPRO_FIXED,
+            },
+            "max_iterations": BUILD_REWORK_ROUNDS,
+        }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&repair),
+        0,
+        SPAWN,
+        "repair the defect",
+        json!({ "agent_id": "coder", "subject": "bug_fix" }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&repair),
+        1,
+        ASK_HUMAN,
+        "the SAME protocol, after the fix",
+        json!({
+            "prompt": "The fix is in. Run the protocol you wrote before the fix — THIS one, \
+                       unchanged: {{manual_repro_before}} — and answer 'fixed' if the defect is gone \
+                       under those very steps, or 'still-broken' if you still observe it (the coder \
+                       then gets another pass). Changing the steps between the two observations \
+                       destroys the comparison they exist to make.",
+            "output_key": crate::mcp_context::MANUAL_REPRO_AFTER_KEY,
+            "options": [
+                crate::mcp_context::MANUAL_REPRO_FIXED,
+                crate::mcp_context::MANUAL_REPRO_STILL_BROKEN,
+            ],
+        }),
+    )?;
+    node(
+        tc,
+        wf,
+        Some(&manual),
+        2,
+        NOTE,
+        "both observations recorded",
+        json!({
+            "text": "The reproduction was ruled impracticable to automate, so the proof is the pair \
+                     of human observations nyx just recorded on this run. BEFORE the fix: \
+                     {{manual_repro_before}} — AFTER, under those same steps: {{manual_repro_after}}. \
+                     Both ride in your hand-back; the auditor judges the pair, not the account of it.",
+        }),
+    )?;
+
+    // (else) — THE AUTOMATED ROUTE, the safe default: the same check, red then green, on ONE slot.
+    let automated = node(tc, wf, Some(&route), 1, SEQUENCE, "automated reproduction", json!({}))?;
+    // 2 — RED. Declared, blocking: an attempt that PASSES has reproduced nothing and an
+    //     `indeterminate` has verified nothing — neither satisfies this, and neither advances.
+    node(
+        tc,
+        wf,
+        Some(&automated),
+        0,
+        GATE_CHECK,
+        "reproduction",
+        json!({ "slot": REPRO_CHECK_SLOT, "expect": "red", "blocking": true }),
+    )?;
+    // 3 — THE FIX, and only now.
+    node(
+        tc,
+        wf,
+        Some(&automated),
+        1,
+        SPAWN,
+        "repair the defect",
+        json!({ "agent_id": "coder", "subject": "bug_fix" }),
+    )?;
+    // 4 — GREEN, a DISTINCT node on the SAME slot: same binding ⇒ same resolved commands and cwd,
+    //     which is the identity the recorded evidence lets the auditor verify.
+    node(
+        tc,
+        wf,
+        Some(&automated),
+        2,
+        GATE_CHECK,
+        "the same reproduction, green",
+        json!({ "slot": REPRO_CHECK_SLOT, "expect": "green", "blocking": true }),
+    )?;
+
+    // (else) — every other genre. The SAFE default is a note: the discipline is owed by bugs alone,
+    // and a reproduction demanded of a `feature` would be a tax on work that owes no proof.
+    node(
+        tc,
+        wf,
+        Some(&discipline),
+        1,
+        NOTE,
+        "no reproduction owed",
+        json!({
+            "text": "This Spec is classified `{{spec_category}}`, not `bug` — no reproduction is \
+                     owed before the fix.",
+        }),
+    )?;
+    Ok(discipline)
 }
 
 /// The ESCALATION GATE of a task the coder BLOCKED — wired as one branch of the coder's "close the

@@ -156,7 +156,8 @@ diesel::table! {
 //   never sets it is asked for a path instead, so nothing changes for anyone who ignores it).
 //   Appended LAST on `projects` (positional decoding), same shape and same level as
 //   `resume_agent_sessions` (v8). The same migration widens `nodes.type` with `create_workspace`, the
-//   leaf that lands one from a graph.
+//   leaf that lands one from a graph; `20260828205640` widens it again with `set_category`, the leaf
+//   that classifies the run's bound Spec (PDR-0017).
 // - the projects_kind_system_scope migration (le scope Système) adds `projects.kind` — TEXT NOT NULL
 //   DEFAULT 'user', CHECKed `user|system`, appended on `projects` (positional decoding). C'est
 //   l'UNIQUE source de vérité de la nature d'un conteneur : rien n'est ajouté sur `workspaces`, dont
@@ -331,6 +332,32 @@ diesel::table! {
     }
 }
 
+// - `20260828180916_create_categories` adds `categories` — the per-PROJECT vocabulary of the ONE
+//   "genre of work" axis a Spec carries (PDR-0017), replacing the tags PDR-0014 had acted.
+//   `project_id` (FK CASCADE), `slug` (the STABLE, machine-read identity the agent harness reads —
+//   UNIQUE within the project and IMMUTABLE), `name` (the editable human label, free to collide),
+//   `color_token` (Nullable), `position`, `created_by_type` (`system` | `agent` | `human`, CHECKed)
+//   and `confirmed_at` (Nullable in SQL, VESTIGIAL in fact: the 2026-09-02 amendment of PDR-0017
+//   retired the proposed/confirmed axis, so every creation path stamps it and nothing reads it —
+//   to be dropped the next time this table is migrated; see `db::Category::confirmed_at`), epoch-ms
+//   `created_at`/`updated_at`. UNIQUE(project_id, slug) is both the invariant and the idempotent
+//   seed's upsert key. Column ORDER here must match the SQL migration exactly (Diesel positional
+//   decoding).
+diesel::table! {
+    categories (id) {
+        id -> Text,
+        project_id -> Text,
+        slug -> Text,
+        name -> Text,
+        color_token -> Nullable<Text>,
+        position -> Integer,
+        created_by_type -> Text,
+        confirmed_at -> Nullable<BigInt>,
+        created_at -> BigInt,
+        updated_at -> BigInt,
+    }
+}
+
 diesel::table! {
     specs (id) {
         id -> Text,
@@ -354,6 +381,18 @@ diesel::table! {
         // and cleared on leaving review. Appended LAST by `ALTER TABLE ADD COLUMN` (Diesel positional
         // decoding).
         reviewing_phase -> Nullable<Integer>,
+        // `20260828180916_create_categories` — the Spec's SINGLE category (PDR-0017). NULL =
+        // uncategorized, the steady state of every Spec that predates the migration. FK → a
+        // `categories` row, ON DELETE SET NULL.
+        //
+        // ⚠ DECLARED LAST, DELIBERATELY. The DBML draws `category_id` next to `priority`, and it
+        // reads better there — but `ALTER TABLE ADD COLUMN` appends the column at the END of the
+        // table's physical layout, and Diesel decodes a row POSITIONALLY (a `Queryable` binds by
+        // ORDER, not by name). Moving this line up would make every `Spec` load decode
+        // `reviewing_phase`'s bytes into `category_id` and fail — or, worse, silently succeed on
+        // two adjacent nullable columns. Any FUTURE column added by `ALTER TABLE` goes BELOW this
+        // one, for the same reason.
+        category_id -> Nullable<Text>,
     }
 }
 
@@ -625,7 +664,7 @@ diesel::table! {
 //   — the tree root, set after nodes exist), `forked_from` (Nullable self-FK SET NULL — fork
 //   provenance), epoch-ms `created_at`/`updated_at`. `nodes`: the PURE tree — `workflow_id` (FK
 //   CASCADE), `parent_id` (Nullable self-FK CASCADE — NULL = root), `order_index` (sibling order),
-//   `type` (TEXT CHECK: the 3 composites + the 13 leaves of `db::NODE_TYPES`; a SQL/Rust keyword,
+//   `type` (TEXT CHECK: the 3 composites + the 14 leaves of `db::NODE_TYPES`; a SQL/Rust keyword,
 //   exposed as `type_` via `#[sql_name = "type"]` like `tasks`), `label`, `config` (TEXT JSON typed
 //   per node kind), epoch-ms timestamps. `workflow_runs`: one live execution — `workflow_id` (FK
 //   CASCADE), `spec_id` (Nullable FK → specs SET NULL), `current_node_id` (Nullable FK → nodes SET
@@ -942,6 +981,37 @@ diesel::table! {
     }
 }
 
+// - the gate EVIDENCE journal adds `gate_attempts`: ONE row per `gate_check` execution, APPEND-ONLY
+//   (insert is the only write — nothing updates or deletes a row). `sequence` is the rowid alias
+//   that orders the journal without depending on the clock. `run_id` / `spec_id` / `node_id` are
+//   CORRELATION ids with NO `joinable!` and no FK, exactly like `domain_events`': a CASCADE that can
+//   silently truncate an append-only proof would defeat its purpose. `expect` + `declared` are what
+//   the graph asked for, `outcome` (`passed` | `failed` | `indeterminate`) is what the check did,
+//   and `satisfied` is whether the second answered the first. `command_line` / `cwd` are the
+//   RESOLVED identity of the control, denormalised out of `commands_json` so comparing a red
+//   attempt with the green that follows it is a string comparison.
+diesel::table! {
+    gate_attempts (sequence) {
+        sequence -> BigInt,
+        run_id -> Text,
+        spec_id -> Nullable<Text>,
+        node_id -> Text,
+        slot -> Nullable<Text>,
+        expect -> Text,
+        declared -> Bool,
+        blocking -> Bool,
+        outcome -> Text,
+        satisfied -> Bool,
+        command_line -> Text,
+        cwd -> Text,
+        exit_code -> Nullable<Integer>,
+        duration_ms -> BigInt,
+        output_excerpt -> Text,
+        commands_json -> Text,
+        created_at -> BigInt,
+    }
+}
+
 // - the Système scope's APPROVAL LEDGER adds `system_command_approvals` (migrations
 //   `20260829120000_create_system_command_approvals` then
 //   `20260831160000_system_approvals_execute_on_grant`): one row per human authorisation of ONE
@@ -1026,6 +1096,8 @@ diesel::joinable!(tasks -> specs (spec_id));
 // self-join Diesel cannot declare a single `joinable!` for, so it is intentionally NOT
 // declared (the CRUD queries the two directions explicitly by column instead).
 diesel::joinable!(command_slots -> projects (project_id));
+diesel::joinable!(categories -> projects (project_id));
+diesel::joinable!(specs -> categories (category_id));
 diesel::joinable!(system_command_approvals -> projects (project_id));
 diesel::joinable!(workflows -> projects (project_id));
 diesel::joinable!(nodes -> workflows (workflow_id));
@@ -1043,11 +1115,13 @@ diesel::allow_tables_to_appear_in_same_query!(
     annex_blobs,
     annexes,
     app_settings,
+    categories,
     command_instances,
     command_slots,
     design,
     design_components,
     domain_events,
+    gate_attempts,
     human_turns,
     idea_specs,
     ideas,

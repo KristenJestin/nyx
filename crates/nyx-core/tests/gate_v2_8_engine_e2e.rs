@@ -125,6 +125,9 @@ fn spec_in_progress(db: &Db, project_id: &str, workspace_id: &str) -> String {
 
 /// Create a gate managed command (`cmdline`, run at the project's root workspace) and return the
 /// materialized instance id — the `command_id` a `gate_check` node references.
+///
+/// The COMMAND LINE is never a shell built-in: see [`always_green_command`] and
+/// [`sentinel_gate_command`], the only two callers, for why.
 fn gate_command(db: &Db, project_id: &str, cmdline: &str) -> String {
     db.with_conn(|c| {
         let tpl = db::create_template(
@@ -144,6 +147,76 @@ fn gate_command(db: &Db, project_id: &str, cmdline: &str) -> String {
     })
 }
 
+// ----------------------------------------------------------------------------
+// THE TWO CHECKS THIS FILE ARMS ITS GATES WITH — as SCRIPTS, never as shell built-ins.
+//
+// A gate spawns its command through [`nyx_core::pty::resolve_shell`], i.e. under WHATEVER shell the
+// machine offers: `bash -c` on a Unix box or a Git Bash session, `powershell.exe -Command` on a
+// plain Windows one. A literal command line therefore does not mean one thing — it means whatever
+// the shell of the day makes of it. `true` and `test -f gate_ok` are POSIX BUILT-INS: under
+// PowerShell `true` is not a command at all (non-zero exit → the always-green gate comes out RED,
+// and the coder loop spins to its iteration cap), and `test -f gate_ok` never returns zero (→ the
+// green half of every sentinel deroulé is unreachable). The file was consequently green only when
+// launched from Git Bash — 0/7 under PowerShell — and, since `test:core` runs `--lib` and skips
+// `tests/`, most often not launched at all.
+//
+// The fix is the one `gate_v2_9_spec_category_e2e.rs` already applied for the same reason: express
+// the check as a `node` SCRIPT written into the workspace the gate runs in. `node <file>` is one
+// program with one argument — the same sentence under `-c` and under `-Command` — and its exit code
+// is what the shell reports either way. What each check MEANS is unchanged, so what the assertions
+// prove is unchanged: the always-green check still always passes, and the sentinel check is still
+// red until `gate_ok` lands in the gate's own cwd (`existsSync("gate_ok")` is `test -f gate_ok`,
+// letter for letter).
+//
+// The helpers are DUPLICATED from `gate_v2_9_spec_category_e2e.rs` rather than shared: `tests/`
+// carries no common module today, and introducing one would drag a file this finding does not name
+// into the change. Two four-line scripts is the smaller debt.
+// ----------------------------------------------------------------------------
+
+/// The ALWAYS-GREEN check's script name and command line — the stand-in for a build control.
+const ALWAYS_GREEN_SCRIPT: &str = "nyx-always-green.js";
+const ALWAYS_GREEN_CMDLINE: &str = "node nyx-always-green.js";
+
+/// The SENTINEL check's script name and command line. RED (exit 1) while `gate_ok` is absent from
+/// the working directory, GREEN (exit 0) once the deroulé's fix spawn has created it.
+const SENTINEL_SCRIPT: &str = "nyx-sentinel-check.js";
+const SENTINEL_CMDLINE: &str = "node nyx-sentinel-check.js";
+
+/// Write `body` as `name` in `dir` — the workspace the gate will run in, so the relative command
+/// lines above resolve against the gate's own cwd and nothing else.
+fn write_check_script(dir: &Path, name: &str, body: &str) {
+    std::fs::write(dir.join(name), body).expect("the check script");
+}
+
+/// An ALWAYS-GREEN check, armed on `project_id` and materialized in `dir`.
+fn always_green_command(db: &Db, project_id: &str, dir: &Path) -> String {
+    write_check_script(
+        dir,
+        ALWAYS_GREEN_SCRIPT,
+        "// An always-green check — the portable spelling of `true`.\n\
+         console.log('checks green');\n\
+         process.exit(0);\n",
+    );
+    gate_command(db, project_id, ALWAYS_GREEN_CMDLINE)
+}
+
+/// The SENTINEL check, armed on `project_id` and materialized in `dir`: red until `gate_ok` exists
+/// in the gate's cwd.
+fn sentinel_gate_command(db: &Db, project_id: &str, dir: &Path) -> String {
+    write_check_script(
+        dir,
+        SENTINEL_SCRIPT,
+        // `existsSync("gate_ok")` is relative to the process's cwd — which is the gate's cwd, i.e.
+        // exactly what `test -f gate_ok` used to read.
+        "// The SENTINEL check: red until the sentinel `gate_ok` lands in the workspace.\n\
+         const fs = require('node:fs');\n\
+         const ok = fs.existsSync('gate_ok');\n\
+         console.log(ok ? 'gate: the sentinel is there' : 'gate: no sentinel yet');\n\
+         process.exit(ok ? 0 : 1);\n",
+    );
+    gate_command(db, project_id, SENTINEL_CMDLINE)
+}
+
 /// ARM the project's coder gate with a real, always-green check, walking the EXACT route nyx's own
 /// refusal names — through the real MCP verbs, no DB shortcut. The seeded coder ships its `checks` gate
 /// BLOCKING and declaring the `build_check` SLOT, and `nyx_next` refuses to advance past a gate that
@@ -155,8 +228,11 @@ fn gate_command(db: &Db, project_id: &str, cmdline: &str) -> String {
 /// upgrading. Arming used to mean forking that built-in — the only way to set commands on a node of an
 /// immutable seeded tree — which froze the project's coder graph at the revision of the day it was
 /// armed. Returns the BUILT-IN coder's workflow id: the flow this project now runs.
-fn arm_coder_gate(db: &Db, project_id: &str) -> String {
-    let command = gate_command(db, project_id, "true");
+///
+/// `dir` is the project's ROOT workspace — where the check script is materialized, since that is
+/// the cwd the gate's command line resolves against.
+fn arm_coder_gate(db: &Db, project_id: &str, dir: &Path) -> String {
+    let command = always_green_command(db, project_id, dir);
     let (builtin_coder, _n) = builtin(db, "coder");
     author(
         db,
@@ -269,6 +345,11 @@ fn drive_coder_child(db: &Db, rt: &EngineRuntime, child_run_id: &str, provider: 
         let out = tick(db, rt, child_run_id, provider, last.take());
         match out["action"]["type"].as_str().unwrap() {
             "done" => break,
+            // The coder's CATEGORY PREFLIGHT (built-in revision 24). These Specs carry no category,
+            // which is exactly the population the preflight exists for: it classifies EXPLICITLY
+            // before the flow routes on the genre. `feature` — the branch that owes no reproduction,
+            // which is the path this gate has always walked.
+            "judge" => last = Some(json!({ "verdict": "feature" })),
             "spawn_subagent" => {
                 assert_eq!(out["action"]["agent_id"], "coder", "the coder child spawns the coder");
                 if provider == "claude" {
@@ -408,7 +489,7 @@ fn ndev_default_unrolls_single_session_start_to_done() {
     let (project_id, _workspace_id, _ws) = live_project(&db, tmp.path());
     // The coder child's per-task gate ships unarmed and REFUSES to advance — configure it first, the
     // way a project does before its first /ndev.
-    arm_coder_gate(&db, &project_id);
+    arm_coder_gate(&db, &project_id, tmp.path());
     // A READY Spec with one build task, so the coder sub-workflow child has real work to drive.
     let spec_id = spec_ready_with_tasks(&db, &project_id, 1);
 
@@ -562,7 +643,7 @@ fn a_build_stops_on_lows_and_the_spec_completes_carrying_them() {
     let tmp = temp_dir("lows");
     let db = open_seeded_db(&tmp);
     let (project_id, _workspace_id, _ws) = live_project(&db, tmp.path());
-    arm_coder_gate(&db, &project_id);
+    arm_coder_gate(&db, &project_id, tmp.path());
     // ONE phase, one build task — the user's Spec.
     let spec_id = spec_ready_with_tasks(&db, &project_id, 1);
 
@@ -710,7 +791,7 @@ fn a_red_blocking_gate_blocks_progression() {
     let (project_id, workspace_id, ws_path) = live_project(&db, tmp.path());
 
     // The gate is green ONLY once the sentinel `gate_ok` exists in the workspace.
-    let gate = gate_command(&db, &project_id, "test -f gate_ok");
+    let gate = sentinel_gate_command(&db, &project_id, tmp.path());
 
     let build = |db: &Db, wf: &str| {
         let root = db.with_conn(|c| {
@@ -816,7 +897,7 @@ fn a_custom_workflow_authored_via_mcp_runs_end_to_end() {
     let tmp = temp_dir("custom");
     let db = open_seeded_db(&tmp);
     let (project_id, _workspace_id, ws_path) = live_project(&db, tmp.path());
-    let gate = gate_command(&db, &project_id, "test -f gate_ok");
+    let gate = sentinel_gate_command(&db, &project_id, tmp.path());
 
     // --- AUTHOR the graph via MCP -------------------------------------------------------------
     let wf = author(
@@ -945,7 +1026,7 @@ fn the_engine_read_model_reflects_the_live_run() {
     let tmp = temp_dir("fidelity");
     let db = open_seeded_db(&tmp);
     let (project_id, _ws_id, _ws) = live_project(&db, tmp.path());
-    arm_coder_gate(&db, &project_id);
+    arm_coder_gate(&db, &project_id, tmp.path());
     // A READY Spec with one open build task — the ndev build gate reads `spec_open_tasks`, so real work
     // is what routes the run into the coder sub-workflow this test parks on.
     let spec_id = spec_ready_with_tasks(&db, &project_id, 1);
@@ -1038,7 +1119,7 @@ fn the_spawn_adapter_resolves_native_for_claude_and_inline_fallback_in_the_derou
     let tmp = temp_dir("provider");
     let db = open_seeded_db(&tmp);
     let (project_id, _ws, _) = live_project(&db, tmp.path());
-    arm_coder_gate(&db, &project_id);
+    arm_coder_gate(&db, &project_id, tmp.path());
     let (wf, _nodes) = builtin(&db, "ndev");
 
     // Drive the seeded ndev to done under `provider` (bound to a fresh READY Spec with one build task
@@ -1078,6 +1159,8 @@ fn the_spawn_adapter_resolves_native_for_claude_and_inline_fallback_in_the_derou
                         let cout = tick(&db, &rt, &child, provider, clast.take());
                         match cout["action"]["type"].as_str().unwrap() {
                             "done" => break,
+                            // The category preflight (revision 24) — see `drive_coder_child`.
+                            "judge" => clast = Some(json!({ "verdict": "feature" })),
                             "spawn_subagent" => {
                                 record(&cout);
                                 clast = Some(json!({ "diff": "d" }));
@@ -1148,7 +1231,7 @@ fn the_coder_subworkflow_walks_a_task_start_gate_green_to_done() {
     let tmp = temp_dir("coder-walk");
     let db = open_seeded_db(&tmp);
     let (project_id, workspace_id, _ws) = live_project(&db, tmp.path());
-    let coder_wf_id = arm_coder_gate(&db, &project_id);
+    let coder_wf_id = arm_coder_gate(&db, &project_id, tmp.path());
     // An in_progress Spec with one build task (todo) in a phase — the coder's active phase. The plan
     // is POSED first: past `draft` a task may only name a phase the plan already holds, never mint
     // one (K2).
@@ -1182,6 +1265,9 @@ fn the_coder_subworkflow_walks_a_task_start_gate_green_to_done() {
         let out = tick(&db, &rt, &run_id, "claude", last.take());
         match out["action"]["type"].as_str().unwrap() {
             "done" => break,
+            // The category preflight (revision 24) — this Spec carries none, so the genre is
+            // classified before the build routes on it. `feature`: no reproduction owed.
+            "judge" => last = Some(json!({ "verdict": "feature" })),
             "spawn_subagent" => {
                 assert_eq!(out["action"]["agent_id"], "coder", "the coder built-in spawns the coder");
                 // The task was STARTED (transition_task start ran inline) before the coder implements it.

@@ -4,12 +4,14 @@ import {
   FolderGitIcon,
   GitBranchIcon,
   LayersIcon,
+  TagIcon,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { SidebarShell } from "@/components/ui/sidebar-shell";
 import { ProjectMark } from "@/components/sidebar/project-mark";
 
+import { SpecCategoryPicker } from "./spec-category";
 import { priorityMeta, statusMeta } from "./spec-meta";
 import { Dot, MicroLabel } from "./spec-primitives";
 import type { SpecDetail } from "./types";
@@ -37,13 +39,17 @@ function Section({
 
 /**
  * `<SpecSidebar>` — the PRD detail's LEFT context rail: the Spec's status + priority, its
- * category (mode), the DERIVED repositories and the dev workspace it is anchored on. It sits in
- * the SHARED `<SidebarShell>` — same width / LEFT position / border / surface as the Terminals
- * cockpit sidebar (review finding: one common shell, both rails to the left; only the CONTENT
- * differs). The tabs + tab content occupy the area to its RIGHT. Placement reproduced from the
- * prototype's `spec/sidebar` (status → category → repos → workspace sections), consuming the
- * phase-3 workspace context (`detail.workspace_context`, `null` until the Spec is anchored).
- * Design-system tokens only, the real `<Badge>` primitive.
+ * CATEGORY (the PDR-0017 genre-of-work axis), its mode, the DERIVED repositories and the dev
+ * workspace it is anchored on. It sits in the SHARED `<SidebarShell>` — same width / LEFT position
+ * / border / surface as the Terminals cockpit sidebar (review finding: one common shell, both rails
+ * to the left; only the CONTENT differs). The tabs + tab content occupy the area to its RIGHT.
+ * Placement reproduced from the prototype's `spec/sidebar` (status → category → repos → workspace
+ * sections), consuming the phase-3 workspace context (`detail.workspace_context`, `null` until the
+ * Spec is anchored). Design-system tokens only, the real `<Badge>` primitive.
+ *
+ * The CATEGORY section is the block PDR-0017's human half lives in ({@link SpecCategoryPicker}): it
+ * is where the axis was always meant to sit in this rail, and where "Mode" — a different property
+ * entirely — used to stand in for it.
  *
  * ## THE PROJECT, NAMED IN CLEAR (`showProject`)
  *
@@ -66,9 +72,12 @@ function Section({
  */
 export function SpecSidebar({
   detail,
+  refresh,
   showProject = false,
 }: {
   detail: SpecDetail;
+  /** Re-pull the Spec detail after a curation gesture — the existing `spec_detail` channel. */
+  refresh: () => Promise<void>;
   /** CROSS-PROJECT scope: name the Spec's project in clear, at the head of the panel. */
   showProject?: boolean;
 }) {
@@ -107,6 +116,10 @@ export function SpecSidebar({
           </span>
           <Badge variant={priority.variant}>{priority.label}</Badge>
         </div>
+      </Section>
+
+      <Section icon={<TagIcon className="size-3" />} label="Category">
+        <SpecCategoryPicker detail={detail} refresh={refresh} />
       </Section>
 
       <Section icon={<LayersIcon className="size-3" />} label="Mode">

@@ -38,15 +38,24 @@ bun run build          # build renderer ; build:desktop pour l'app complète
 ## Tests
 
 ```sh
-bun run test           # suite complète : renderer + core + contrat
+bun run test           # suite complète : renderer + core + e2e de gate + contrat
 bun run test:frontend  # renderer seul
 bun run test:core      # cargo test --workspace --lib + contrat sidecar
+bun run test:core:e2e  # les e2e de gate de crates/nyx-core/tests/ (voir ci-dessous)
 bun run test:contract  # parité protocole Rust ↔ TS
 bun run check          # oxfmt + oxlint + tsc côté renderer, cargo check côté Rust
 ```
 
 Dans `apps/desktop/renderer`, la suite se scinde en deux projets vitest : `test:unit` (jsdom) et
 `test:browser` (Vitest Browser Mode — vrai Chromium via Playwright, vrai cœur ghostty en WASM).
+
+`test:core:e2e` est **le** point d'entrée des e2e de `crates/nyx-core/tests/`, et il est appelé par
+`bun run test`. Il nomme ses cibles une à une plutôt que de balayer le dossier, parce que deux
+fichiers de `tests/` n'y ont pas leur place et sont **exclus délibérément** : `nyx_next_loop_spike`
+et `agent_activity_signal_spike` sont des *spikes* — des relevés de faisabilité datés, adossés à
+`docs/spikes/`, pas des gates de non-régression — et `nyx_next_loop_spike` est rouge sous Windows
+(3/3) pour des raisons d'environnement PTY. Ajouter un fichier à `tests/` n'a donc aucun effet tant
+qu'il n'est pas ajouté à ce script.
 
 Détails : `contract/README.md` pour le protocole, `e2e/README.md` pour les prérequis end-to-end.
 
@@ -55,6 +64,12 @@ Détails : `contract/README.md` pour le protocole, `e2e/README.md` pour les pré
 - Le mode navigateur exige le binaire Chromium de Playwright : `npx playwright install chromium`.
   Sans lui, une quinzaine de fichiers ne démarrent pas et `bun run test` sort en échec alors que
   toute la suite jsdom est verte.
+- **`node` doit être sur le `PATH`** pour `bun run test:core:e2e`. Un gate lance sa commande à
+  travers le shell du jour (`bash -c` sous Unix ou Git Bash, `powershell.exe -Command` sous Windows
+  nu), donc aucune de ces suites n'arme un built-in POSIX : elles écrivent un petit script `node`
+  dans le workspace du gate et lancent `node <script>`, une phrase qui veut dire la même chose sous
+  les deux shells. Sans `node`, les checks sortent rouges et les e2e échouent pour une raison qui
+  n'est pas une régression.
 - Sous Windows, les suites Rust sont **vertes** sur machine au repos. La liste **nommée** fait foi —
   `crates/nyx-core/BASELINE-REDS.md` — et se compare nom par nom, jamais en comptant. Elle ne porte
   plus aucun rouge gelé ; une seule famille y subsiste : **sensible à la charge, verte en

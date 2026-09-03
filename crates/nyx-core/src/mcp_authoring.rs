@@ -334,10 +334,10 @@ fn require_scope_available(
 /// the `output_key`/`append` output-routing. The single source for the "no unknown field" check
 /// (v2.8 review N10a). Serde `deny_unknown_fields` cannot be used: the multi-decode makes every
 /// field "unknown" to the OTHER struct, so it would reject valid N9 configs.
-fn known_config_fields(node_type: &str) -> &'static [&'static str] {
+pub(crate) fn known_config_fields(node_type: &str) -> &'static [&'static str] {
     match node_type {
         db::NODE_TYPE_SPAWN_SUBAGENT => &["agent_id", "inline", "subject"],
-        db::NODE_TYPE_GATE_CHECK => &["command_ids", "slot", "blocking"],
+        db::NODE_TYPE_GATE_CHECK => &["command_ids", "slot", "blocking", "expect"],
         db::NODE_TYPE_JUDGE => &["prompt", "output_schema", "output_key", "append"],
         db::NODE_TYPE_ASK_HUMAN => &[
             "prompt",
@@ -359,6 +359,10 @@ fn known_config_fields(node_type: &str) -> &'static [&'static str] {
         // this arm the type fell to the catch-all below, which MEANS "takes no config" — and the
         // node is inexecutable without one.
         db::NODE_TYPE_CREATE_WORKSPACE => &["root_key", "name_key", "gate_on"],
+        // set_category — exactly the fields [`crate::engine::SetCategoryConfig`] decodes, for the
+        // same reason `create_workspace` has its own arm: the catch-all below MEANS "takes no
+        // config", and this node is inexecutable without one.
+        db::NODE_TYPE_SET_CATEGORY => &["category_key", "gate_on"],
         db::NODE_TYPE_NOTE => &["text", "clear_gate_block", "revoke_spec_write"],
         db::NODE_TYPE_LOOP => &["until", "max_iterations"],
         db::NODE_TYPE_SELECTOR => &["branches"],
@@ -437,6 +441,28 @@ fn validate_node_config(node_type: &str, config: &Value) -> Result<(), RpcError>
                  its commands) OR with a 'slot' each project binds (a graph SHARED by every project) \
                  — never both: only the slot would be run, and the ids beside it would read as the \
                  truth while doing nothing",
+            ))
+        }
+        // A DECLARED `expect` must be one of the two words the runtime grades against. The runtime
+        // is lenient by design and would fail to DECODE the config, which parks the run on the node
+        // with a decode error at the moment the gate should have run — the authoring side is where
+        // "expect: raed" has to be a typo and not a wedged flow. Absent is valid and means `green`,
+        // so only a PRESENT value is checked.
+        db::NODE_TYPE_GATE_CHECK
+            if config.get("expect").is_some_and(|v| {
+                serde_json::from_value::<crate::engine::GateExpectation>(v.clone()).is_err()
+            }) =>
+        {
+            Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "a 'gate_check' node's 'expect' must be \"{}\" (the check must PASS — the \
+                     default when the field is absent) or \"{}\" (the check must FAIL, which is how \
+                     a reproduction is declared), got {}",
+                    db::GATE_EXPECT_GREEN,
+                    db::GATE_EXPECT_RED,
+                    config.get("expect").unwrap_or(&Value::Null)
+                ),
             ))
         }
         db::NODE_TYPE_TRANSITION => {
@@ -521,6 +547,25 @@ fn validate_node_config(node_type: &str, config: &Value) -> Result<(), RpcError>
                 "a 'create_workspace' node needs a 'root_key' — the blackboard key holding the ROOT \
                  its folder is created under (a `query project_worktrees_root`, or an ask_human that \
                  asked for one). Without it there is no folder to derive",
+            ))
+        }
+        db::NODE_TYPE_SET_CATEGORY if !non_empty("category_key") => {
+            // set_category — the category must RESOLVE from the node's ONE declared source, NAMED.
+            //
+            // The RUNTIME would not strictly force it: `SetCategoryConfig` defaults `category_key` to
+            // `None` and the engine then reads [`crate::engine::DEFAULT_CATEGORY_KEY`], so a
+            // config-less node classifies whenever the board happens to carry `category`. THAT is why
+            // the WRITE side is stricter, not laxer — the same reading as `create_workspace`'s
+            // `root_key`: the one thing this node does is say WHICH category, and a node that says it
+            // by omission says it to whatever a sibling last wrote. Under this PRD that is not
+            // cosmetic: the `bug` discipline is read off the slug this node lands, so a Spec
+            // classified from a stray board key is a Spec put under (or out of) a red-before-green
+            // gate by accident. `gate_on` stays optional (an absent gate means UNGATED).
+            Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                "a 'set_category' node needs a 'category_key' — the blackboard key holding the \
+                 category LABEL it assigns (a slug like `bug`, or a human name; a `judge` verdict or \
+                 a `query spec_category` reading fills it). Without it there is no category to assign",
             ))
         }
         db::NODE_TYPE_SUB_WORKFLOW => {
@@ -885,14 +930,27 @@ fn node_written_board_keys(n: &db::Node) -> Vec<String> {
             None => Vec::new(),
         },
         db::NODE_TYPE_SPAWN_SUBAGENT => vec!["last_diff".to_string(), "spawns".to_string()],
-        // A `gate_check` writes THREE keys, and only the first is a config-visible one: `drive` also
-        // folds the full verdict object and (for a BLOCKING gate) the red-gate anchor array.
+        // A `gate_check` writes FIVE keys, and none is a config-visible one. Three come from the
+        // fold — WHAT the command did ([`crate::engine::GATE_PASSED_KEY`]), its historical alias
+        // ([`crate::engine::GATE_GREEN_KEY`]) and whether that ANSWERED the declared expectation
+        // ([`crate::engine::GATE_SATISFIED_KEY`]) — and `drive` also folds the full verdict object
+        // and (for a BLOCKING gate with no declared expectation) the red-gate anchor array.
         db::NODE_TYPE_GATE_CHECK => vec![
-            "gate_green".to_string(),
+            crate::engine::GATE_PASSED_KEY.to_string(),
+            crate::engine::GATE_GREEN_KEY.to_string(),
+            crate::engine::GATE_SATISFIED_KEY.to_string(),
             crate::mcp_engine::LAST_GATE_RESULT_KEY.to_string(),
             crate::mcp_engine::BLOCKING_GATE_RED_KEY.to_string(),
         ],
         db::NODE_TYPE_LOOP => vec![crate::engine::LOOP_ITER_KEY.to_string()],
+        // `set_category` writes NOTHING on the board, and that is a decision rather than an
+        // omission: it READS a label (`category_key`) and commits it to `specs.category_id`, so the
+        // classification lives in the DOMAIN and not on the run's board. A graph that has to ROUTE on
+        // it reads it BACK through the `spec_category` query fact, which answers the persisted slug —
+        // one source of truth for the genre of work, never a board copy that can go stale the moment
+        // a human recategorizes the Spec. The arm is spelled out so the census names the type
+        // deliberately instead of letting it fall to the catch-all below.
+        db::NODE_TYPE_SET_CATEGORY => Vec::new(),
         _ => Vec::new(),
     }
 }

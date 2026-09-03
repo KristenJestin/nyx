@@ -66,6 +66,7 @@ function detail(phasesJson: string, tasks: Task[]): SpecDetail {
       status: "in_progress",
       mode: "stepped",
       phases: phasesJson,
+      category_id: null,
       current_revision_number: 1,
       position: 0,
       created_at: 0,
@@ -91,6 +92,7 @@ function detail(phasesJson: string, tasks: Task[]): SpecDetail {
     tasks,
     dependencies: [],
     workspace_context: null,
+    category: null,
   };
 }
 

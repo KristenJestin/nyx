@@ -27,6 +27,9 @@ function installIpc() {
           return [];
         case "command_import_scripts":
           return [];
+        // The Categories pane's vocabulary read (v2.9 / PDR-0017).
+        case "category_list":
+          return [];
         default:
           return null;
       }
@@ -64,15 +67,47 @@ describe("<ProjectSettingsDialog> — section rail", () => {
     expect(screen.queryByText(/Project settings/)).toBeNull();
   });
 
-  it("renders the rail with Global + Commands and opens on the requested section", () => {
+  it("renders the rail with Global + Categories + Commands and opens on the requested section", () => {
     render(<ProjectSettingsDialog {...baseProps()} initialSection="global" />);
     const rail = screen.getByRole("navigation", { name: "Project settings sections" });
     const global = within(rail).getByRole("button", { name: "Global" });
+    const categories = within(rail).getByRole("button", { name: "Categories" });
     const commands = within(rail).getByRole("button", { name: "Commands" });
     expect(global).toHaveAttribute("aria-current", "page");
+    expect(categories).not.toHaveAttribute("aria-current", "page");
     expect(commands).not.toHaveAttribute("aria-current", "page");
     // The Global pane is shown (its rename field is present).
     expect(screen.getByLabelText("Project name")).toBeInTheDocument();
+  });
+
+  /**
+   * The CATEGORIES pane (v2.9 / PDR-0017 as amended 2026-09-02) — where a human curates the
+   * project's genre-of-work vocabulary. It is reached from the rail like any other section, and it
+   * is scoped to the project the modal was opened on.
+   */
+  it("navigates to the Categories pane, which reads the CURRENT project's vocabulary", async () => {
+    const calls: string[] = [];
+    mockIPC(
+      (cmd, args) => {
+        calls.push(`${cmd}:${JSON.stringify(args)}`);
+        return cmd === "category_list" ? [] : null;
+      },
+      { shouldMockEvents: true },
+    );
+    render(<ProjectSettingsDialog {...baseProps()} initialSection="global" />);
+    const rail = screen.getByRole("navigation", { name: "Project settings sections" });
+
+    fireEvent.click(within(rail).getByRole("button", { name: "Categories" }));
+    expect(within(rail).getByRole("button", { name: "Categories" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    // Its create field is the pane's own control, and the Global rename field is gone.
+    expect(await screen.findByLabelText("New category name")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Project name")).toBeNull();
+    await waitFor(() =>
+      expect(calls.some((c) => c.startsWith('category_list:{"projectId":"p1"}'))).toBe(true),
+    );
   });
 
   it("opens directly on the Commands section when asked", async () => {
@@ -265,7 +300,11 @@ describe("<ProjectSettingsDialog> — the rail reduced to what the caller wires"
     installIpc();
   });
 
-  /** What `<SystemCommandsDialog>` passes: the same chassis, minus the Global pane's wiring. */
+  /**
+   * What `<SystemCommandsDialog>` passes: the same chassis, minus the Global pane's wiring — and
+   * minus Categories, the other USER-PROJECT vocabulary, which classifies Specs the singleton
+   * does not hold.
+   */
   function commandsOnlyProps() {
     return {
       open: true,
@@ -273,6 +312,7 @@ describe("<ProjectSettingsDialog> — the rail reduced to what the caller wires"
       projectName: "System",
       title: "System commands",
       subject: null,
+      showCategories: false,
       onClose: vi.fn(),
     };
   }
@@ -319,7 +359,8 @@ describe("<ProjectSettingsDialog> — the rail reduced to what the caller wires"
   it("POSITIVE CONTROL: a caller that wires the pane DOES get Global in the rail", () => {
     render(<ProjectSettingsDialog {...baseProps()} />);
     const rail = screen.getByRole("navigation", { name: "Project settings sections" });
-    expect(within(rail).getAllByRole("button")).toHaveLength(2);
+    // Three: Global + Categories + Commands — the full project rail.
+    expect(within(rail).getAllByRole("button")).toHaveLength(3);
     expect(within(rail).getByRole("button", { name: "Global" })).toBeTruthy();
     expect(screen.getByRole("switch", { name: /resume agent sessions/i })).toBeTruthy();
   });

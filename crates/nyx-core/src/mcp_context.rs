@@ -619,6 +619,842 @@ fn resolve_rule_set(_db: &Db, _role: AgentRole, _spec_id: &str) -> RuleSet {
     RuleSet::empty()
 }
 
+// ===========================================================================
+// `category_discipline` — the discipline nyx attaches to a Spec's CATEGORY.
+//
+// PDR-0017 gives a Spec ONE category, and ADR-0006 hangs a real execution constraint on it: a Spec
+// classified `bug` owes a red-before-green proof, the other genres owe nothing. The constraint the
+// ENGINE can impose is the SEQUENCE (the graph runs the reproduction gate before the fix and again
+// after); what it cannot impose is the QUALITY of that proof, which is read, not executed. This is
+// where the read half lives: a text, keyed on (role, slug), injected into the roles that act on it.
+//
+// A CHANNEL OF ITS OWN, DELIBERATELY NOT `{{rules}}`. The two look adjacent and are not:
+//   * `{{rules}}` is "Rules (project directives)" — what a HUMAN configures FOR THIS PROJECT,
+//     resolved by scope (always / role:<role> / fork) and owned by a per-project store. Nothing in
+//     it depends on the Spec.
+//   * the CATEGORY DISCIPLINE comes from NYX, is the same in every project, and depends on the one
+//     thing `{{rules}}` knows nothing about — the Spec's persisted category.
+// Folding one into the other would also have been impossible where it matters most: the `spec`
+// preamble carries NO `{{rules}}` marker at all (it is neither an effector nor the dispatcher), and
+// the spec author is precisely the role that must hear the bug discipline first. Hence a separate
+// block, with its own heading, injected at a position of its own. See ADR-0006.
+// ===========================================================================
+
+// THE SLUG THIS BLOCK IS KEYED ON is `db::CATEGORY_SLUG_BUG`, and it is named at its SOURCE rather
+// than restated here. It was declared in this module while it was only useful here, and the phases
+// that followed imported a DATABASE-vocabulary constant from the agent-context RENDERER — the one
+// dependency of that direction in the change set. It now lives beside `db::SYSTEM_CATEGORIES`,
+// which is BUILT from it, so the literal `"bug"` is written once in the crate.
+
+/// The HEADING every category-discipline block opens with, live or deferred — and therefore the
+/// MARKER a render asserts on ("this context carries the discipline", "that one does not").
+pub const CATEGORY_DISCIPLINE_HEADING: &str = "## Category discipline";
+
+/// The `bug` discipline for the SPEC AUTHOR — what the Spec must carry for a reproduction to be
+/// POSSIBLE at all.
+///
+/// The engine can force the sequence (red, then fix, then green) and it can force the question to
+/// be asked; what no node can produce is a defect described precisely enough that a check CAN be
+/// pointed at it. That is written here, once, by the author — and every later step spends it: the
+/// coder turns it into the red, the auditor re-reads it to decide whether the red was about this
+/// defect. Hence the five elements are NAMED: a text that said "be precise" gets prose.
+const BUG_DISCIPLINE_SPEC: &str = "\
+This Spec is classified `bug`, and nyx hangs a red-before-green proof on that classification: an \
+identified check must be OBSERVED failing BEFORE the fix and passing after. What that check can \
+even BE is decided here, by what this Spec says about the defect — so a bug report is not a Spec \
+until it is a REPRODUCTION CONTRACT.\n\
+\n\
+It owes five things, and each one has to be checkable by somebody who was not there:\n\
+\n\
+- the OBSERVED behaviour — what the system actually does, from someone who saw it: the exact input, \
+  the state it was in, the version / platform, and what appeared. Not \"it is broken\".\n\
+- the EXPECTED result — what it should have done instead, stated so that the gap between the two is \
+  a difference of fact and not of taste.\n\
+- a COUNTER-EXAMPLE — the neighbouring case that behaves CORRECTLY. It is what separates a defect \
+  from a design somebody dislikes, and it is what tells the fix where to stop.\n\
+- the SCOPE — which inputs, versions, platforms, entry points and data shapes are affected, and \
+  which are explicitly NOT. An unbounded report cannot be closed, because nothing says which cases \
+  the fix owes.\n\
+- a REPRODUCTION STRATEGY that is VERIFIABLE — a sequence a stranger can run from a stated starting \
+  state, whose failure is OBSERVABLE without judgement: a command that exits non-zero, an assertion \
+  that fails, a named screen state. \"It feels slow\" is not observable; \"the call takes over 5 s \
+  where the same call on an empty cache takes 200 ms\" is. Name what will carry it — which test, \
+  which command, or which manual protocol.\n\
+\n\
+Write all of it for the person who will have to make the defect FAIL ON PURPOSE before touching the \
+code, and for the auditor who will later re-read that failure and ask whether it was about THIS \
+defect. Neither of them has anything but what this Spec says.\n\
+\n\
+IF THE REPRODUCTION CANNOT BE AUTOMATED on this project — it needs a device, a third-party account, \
+a human gesture, a state no command can set up — SAY SO here, and write the manual protocol \
+instead: the steps, and what the observer will see while the defect is present. nyx carries a human \
+branch of the flow for that case, and this section is what that branch gets run against. It is a \
+declared route, never a way out of the proof.";
+
+/// The `bug` discipline for the CODER — reproduce BEFORE repairing, and what does not count as a
+/// reproduction.
+///
+/// The second half is the safety core of this PRD, and it is the half a coder gets wrong in good
+/// faith: a gate that could not RUN also comes back "not green", and treating that as the red would
+/// let a run that verified nothing stand as the proof of reproduction. So the text names the
+/// tri-valued grading and the engine keys it is written in (`gate_passed` / `gate_satisfied`), and
+/// it refuses the three tempting exits — weaken the check, re-run the gate, proceed anyway — by
+/// pointing at the branch the graph actually carries.
+const BUG_DISCIPLINE_CODER: &str = "\
+This Spec is classified `bug`. You do not get to assert that the fix works: the defect is made to \
+FAIL first, on purpose, and only then repaired. nyx runs that sequence itself — a reproduction gate \
+declaring `expect: red` before your change, then the SAME check declaring `expect: green` after — \
+and records both attempts. What follows is what you owe it.\n\
+\n\
+- REPRODUCE BEFORE YOU REPAIR. The reproduction check runs and is OBSERVED failing BEFORE any \
+  production code changes. Write the reproducing test first, under the project's convention so the \
+  bound `repro_check` slot picks it up (`repro_…` on the Rust side, `*.repro.test.ts` on the \
+  renderer side); it then stays as this defect's anti-regression case. A fix written before \
+  anything went red proves nothing — the symptom may have been a stale cache, a restart or an \
+  unrelated commit, and your change may be a no-op nobody can tell from a cure.\n\
+- THE SAME CHECK, AFTER. The green that closes the bug is the SAME slot, the SAME resolved commands \
+  and the SAME cwd as the red. A red obtained on one check and a green obtained on another \
+  demonstrate nothing together — and the auditor compares them.\n\
+- A CHECK THAT COULD NOT RUN IS NOT A RED. nyx separates what the command DID (`gate_passed`, whose \
+  historical alias is `gate_green`) from whether that ANSWERED the declared expectation \
+  (`gate_satisfied`), and it grades an attempt three ways: `passed` (exit 0), `failed` (normal \
+  termination with a non-zero status) and `indeterminate` (a timeout, a cancellation, a spawn that \
+  failed, any fault that left NO exit status to read). Only a `failed` satisfies `expect: red`; an \
+  `indeterminate` satisfies NOTHING — neither red nor green. So never present a run that could not \
+  execute as your reproduction: a gate that verified nothing has proved nothing. And know what the \
+  grade cannot tell you — a BROKEN INVOCATION (a missing binary, a test file that does not compile) \
+  terminates normally with a non-zero status, so it is graded `failed` and would answer the red. \
+  Only the PAIR catches it: the same command must exit 0 after your fix, and a broken invocation \
+  never will, so a reproduction you did not really write cannot close the bug — it parks the run on \
+  the green gate.\n\
+- REPORT BOTH ATTEMPTS. Your hand-back names the check, the commands, the cwd and what each attempt \
+  returned. The auditor judges the recorded evidence, not the narrative around it.\n\
+\n\
+IF THE REPRODUCTION CANNOT BE AUTOMATED — the defect needs a device, a third-party account, a human \
+gesture, a state no command can set up — STOP and hand back saying so, with what you tried. Do NOT \
+invent a workaround, do NOT weaken the check until something goes red, do NOT re-run the gate \
+hoping it turns, and do NOT proceed on the strength of an `indeterminate`. The flow carries a HUMAN \
+branch for exactly this: nyx asks whether automation is impracticable, records the manual protocol \
+and the observation made BEFORE the fix, and requires the SAME protocol observed again after. That \
+branch is a node of the graph — nyx asks the question, and you never route yourself around it.";
+
+/// The `bug` discipline for the AUDITOR — how to JUDGE the sequence the engine executed.
+///
+/// This is the text the PRD's own scope note is about: the red proves that an identified check
+/// failed before the fix and passed after, and it does NOT prove the failure came from the right
+/// defect — a syntactically broken test produces just as valid a red. That question is unobservable
+/// by execution and is deliberately confided to a re-read, which is why the discipline is INJECTED
+/// here rather than only enforced by the gate.
+const BUG_DISCIPLINE_AUDITOR: &str = "\
+This Spec is classified `bug`, so it owes a proof the other categories do not: an identified check \
+was OBSERVED failing BEFORE the fix and passing after. nyx EXECUTES that sequence and can tell you \
+it happened; what it cannot do is judge whether the failure was worth anything. That half is read, \
+not run, and it is yours.\n\
+\n\
+- THE TWO RUNS ARE THE SAME CHECK. Compare the red attempt and the green one: same slot, same \
+  RESOLVED COMMANDS, same CWD. A red on one command and a green on another are two facts about two \
+  different things. Any divergence there is a finding, however good the diff looks.\n\
+- THE RED IS A REAL RED. It must be a normal termination with a non-zero status — `gate_passed` \
+  false, answering a declared `expect: red`, hence `gate_satisfied` true. A timeout, a \
+  cancellation, a spawn that failed, any fault that left no exit status to read is graded \
+  `indeterminate` and satisfies NOTHING. A run that verified nothing is not evidence, and accepting \
+  one as the reproduction is the precise failure this discipline exists to prevent.\n\
+- THE RED IS ABOUT THE RIGHT DEFECT. This is the part nothing can execute for you, and the reason \
+  this text is in your context: a syntactically broken test, a mistyped import, a missing binary, \
+  an assertion on the wrong subject all terminate non-zero and are graded `failed` just as \
+  convincingly as a real reproduction. Read the reproduction ITSELF against the Spec's \
+  OBSERVED behaviour, its EXPECTED result and its COUNTER-EXAMPLE, and ask whether THIS failure is \
+  THAT defect. If it is not, file it: the sequence was satisfied and the proof is still missing.\n\
+- ORDER, NOT JUST PRESENCE. The red precedes the fix. A green recorded first, or a red produced \
+  after the change, does not establish the counterfactual the classification demands.\n\
+\n\
+IF THE MANUAL BRANCH WAS TAKEN — a human ruled the automated reproduction impracticable — the same \
+questions apply to the two human observations: ONE written protocol, observed before the fix and \
+observed again after, BOTH recorded, the same steps in both. A single observation, or a protocol \
+that changed between them, is a finding.\n\
+\n\
+Judge the RECORDED evidence, not the coder's account of it: what you cannot see recorded, treat as \
+absent — and an absent red on a `bug` Spec is a finding of its own.";
+
+/// The DISCIPLINE nyx injects for a `role` working on a Spec whose persisted category is `slug` —
+/// `None` when the pair owes none (every role on a category with no discipline, and `dev` / `doc` /
+/// `prototype` on any category at all).
+///
+/// The three roles that carry one for `bug` are the three that ACT on the proof: the `spec` author
+/// writes the reproduction contract, the `coder` produces the red before the fix, and the `auditor`
+/// judges what was produced. The dispatcher (`dev`) performs one atomic action per tick and decides
+/// nothing about a reproduction; `doc` syncs documentation after the fact; `prototype` runs before
+/// any code exists.
+///
+/// PURE — no DB, no run: the (role, slug) pair is all it takes, which is what lets the static role
+/// template render the same text cold and a test snapshot it without a fixture.
+pub fn category_discipline(role: AgentRole, slug: &str) -> Option<String> {
+    let body = match (slug, role) {
+        (db::CATEGORY_SLUG_BUG, AgentRole::Spec) => BUG_DISCIPLINE_SPEC,
+        (db::CATEGORY_SLUG_BUG, AgentRole::Coder) => BUG_DISCIPLINE_CODER,
+        (db::CATEGORY_SLUG_BUG, AgentRole::Auditor) => BUG_DISCIPLINE_AUDITOR,
+        _ => return None,
+    };
+    Some(format!(
+        "{CATEGORY_DISCIPLINE_HEADING} — `{slug}`\n\n{body}"
+    ))
+}
+
+/// Whether `role` can EVER carry a category discipline — DERIVED from [`category_discipline`] over
+/// the seeded vocabulary rather than restated, so a discipline added for another system slug (or a
+/// role added to `bug`'s) reaches the static template by construction, with no second list to keep
+/// in agreement.
+fn role_carries_category_discipline(role: AgentRole) -> bool {
+    db::SYSTEM_CATEGORY_SLUGS
+        .iter()
+        .any(|slug| category_discipline(role, slug).is_some())
+}
+
+/// **THE SEAM the durable reproduction EVIDENCE arrives through** — the proof the auditor's `bug`
+/// discipline tells them to judge, on EITHER of the two routes the graph carries:
+///
+///   * the AUTOMATED route's red→green sequence, read out of the append-only journal
+///     ([`db::list_gate_attempts_for_spec`]);
+///   * the MANUAL route's two human observations, read off the run blackboards
+///     ([`resolve_manual_repro`]) — the proof a defect no command can reproduce produces instead.
+///
+/// BOTH, IN ONE SUB-BLOCK, because the auditor's question is one question: *is there a reproduction,
+/// and is it about this defect?* Rendering only the journal made the two routes look alike from the
+/// auditor's seat and, worse than a mere silence, made the manual route look like a FAILURE — the
+/// manual branch runs no reproduction gate, so a Spec that took it carries exactly one attempt (the
+/// build control, green), and the sequence reading landed on "a green and no red, the reproduction
+/// is missing, which is a finding of its own" about a proof that exists and was validated twice by
+/// a human. Hence [`gate_sequence_verdict`] now reads BOTH sources.
+///
+/// `None` when the Spec has NEITHER a recorded attempt NOR a manual observation, which sends
+/// [`category_discipline_evidence`] to [`GATE_EVIDENCE_PENDING`]. That distinction is the point of
+/// this whole block: "no evidence rendered" and "no evidence exists" must not look alike in an
+/// auditor's context, and only the second one is a finding.
+///
+/// # Ordering — OLDEST FIRST, and never re-sorted
+///
+/// The attempts are rendered in the order they HAPPENED. Sorting the reds to the top would put the
+/// reproduction "first" at the cost of destroying the fact the auditor is told to check — *the red
+/// precedes the fix; a green recorded first does not establish the counterfactual*. A chronological
+/// render puts the red first exactly when the sequence really was red-then-green, and shows the
+/// violation when it was not. The [`gate_sequence_verdict`] line above the list states which of the
+/// two this Spec produced, so the reading does not depend on the auditor reconstructing it.
+///
+/// # Bounding — see [`GATE_EVIDENCE_ATTEMPTS_RENDERED`] and [`MANUAL_REPRO_RENDERED_CHARS`]
+///
+/// This block rides EVERY auditor pass of a `bug` Spec, four times per audit cycle, so its size is
+/// part of the context budget. A Spec whose gate ran twenty times renders the FIRST attempt (the
+/// reproduction, whose absence is a finding) and the LAST few (the state the fix left), with the
+/// elision stated; a human observation is FREE TEXT and is bounded and sanitised exactly like a
+/// command's output extract. Nothing is silently dropped: the full journal is in the database, and
+/// the header says how many attempts there are in total.
+fn resolve_gate_evidence(db: &Db, spec_id: &str) -> Option<String> {
+    let attempts = db
+        .with_conn(|c| db::list_gate_attempts_for_spec(c, spec_id))
+        .ok()?;
+    let manual = resolve_manual_repro(db, spec_id);
+    if attempts.is_empty() && manual.is_none() {
+        return None;
+    }
+    let total = attempts.len();
+    let mut out = format!(
+        "### Reproduction evidence — {}\n\n{}\n",
+        evidence_headline(total, manual.as_ref()),
+        gate_sequence_verdict(&attempts, manual.as_ref()),
+    );
+    if let Some(manual) = &manual {
+        out.push_str(&render_manual_repro(manual));
+    }
+    if attempts.is_empty() {
+        return Some(out);
+    }
+    out.push_str(
+        "\nnyx also recorded these GATE ATTEMPTS for this Spec, OLDEST FIRST — the order they \
+         happened in, which is the order the proof is made of.\n\n\
+         Each line states the CONTROL (slot, node, resolved command, cwd), what was DECLARED \
+         (`expect`), what the check DID (`passed` / `failed` / `indeterminate`) and whether that \
+         ANSWERED the declaration. An `indeterminate` answers nothing: it is a check that produced \
+         no verdict, and it is never a reproduction.\n",
+    );
+    for (position, attempt) in rendered_attempts(&attempts) {
+        match position {
+            RenderedAt::Elision(skipped) => {
+                out.push_str(&format!(
+                    "\n… {skipped} intermediate attempt{} not shown (the full journal is stored; \
+                     the first and the most recent are what the sequence is read from)\n",
+                    if skipped == 1 { "" } else { "s" }
+                ));
+            }
+            RenderedAt::Index(i) => out.push_str(&render_gate_attempt(i, attempt)),
+        }
+    }
+    Some(out)
+}
+
+/// What the `### Reproduction evidence` heading says this Spec HAS — the one line that tells an
+/// auditor which of the two routes produced the proof before they read a word of it.
+///
+/// The attempt count keeps its exact former wording (`N recorded gate attempt(s)`) when that is all
+/// there is, because it is the shape every automated Spec renders and the one the budget is priced
+/// on; the manual route prepends what it is, and a Spec that carries both says both.
+fn evidence_headline(total: usize, manual: Option<&ManualRepro>) -> String {
+    let attempts = format!(
+        "{total} recorded gate attempt{}",
+        if total == 1 { "" } else { "s" }
+    );
+    match manual {
+        None => attempts,
+        Some(manual) => {
+            // WHAT THE SECOND OBSERVATION SAID, not merely that there was one. The seeded question
+            // offers two answers and one of them means NOT FIXED, so "observed before and after"
+            // about a `still-broken` would announce a closed pair over a defect the human says is
+            // still reproducing.
+            let route = match manual.outcome() {
+                ManualOutcome::Fixed => "the MANUAL protocol, observed before and after",
+                ManualOutcome::StillBroken(_) => {
+                    "the MANUAL protocol, observed twice and STILL REPRODUCING"
+                }
+                ManualOutcome::Pending => "the MANUAL protocol, observed ONCE",
+            };
+            if total == 0 {
+                route.to_string()
+            } else {
+                format!("{route} · {attempts}")
+            }
+        }
+    }
+}
+
+/// How many attempts the auditor block RENDERS at most — the FIRST (the reproduction) plus the most
+/// recent ones. Four is what an honest red→green sequence needs with room for a re-run or two, and
+/// it caps this block's contribution to an audit pass at roughly 1.4 kB whatever a Spec's gate
+/// history looks like: without a cap, a flaky check re-run thirty times would silently take the
+/// whole context budget with a transcript nobody asked for.
+const GATE_EVIDENCE_ATTEMPTS_RENDERED: usize = 4;
+
+/// How many characters of an attempt's stored output extract ride in the AUDITOR's render — a
+/// second bound, INSIDE [`db::gate_evidence_excerpt`]'s 4 kB storage bound. The two answer different
+/// questions: the storage bound asks "what is worth keeping", this one asks "what fits in a context
+/// that carries three other attempts and a whole Spec". A reader who needs more reads the journal.
+const GATE_EVIDENCE_RENDERED_OUTPUT_CHARS: usize = 240;
+
+/// WHERE a rendered attempt sits in the list: its 1-based position, or the elision standing for the
+/// attempts the bound left out.
+enum RenderedAt {
+    Index(usize),
+    Elision(usize),
+}
+
+/// The attempts to render, paired with their position: the FIRST one, then (when the bound elides
+/// anything) an elision marker, then the most recent ones. Positions are the ones in the FULL
+/// journal, so a numbered line always names the attempt's real rank.
+fn rendered_attempts(
+    attempts: &[db::GateAttemptRow],
+) -> Vec<(RenderedAt, &db::GateAttemptRow)> {
+    let total = attempts.len();
+    if total <= GATE_EVIDENCE_ATTEMPTS_RENDERED {
+        return attempts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (RenderedAt::Index(i + 1), a))
+            .collect();
+    }
+    let tail_start = total - (GATE_EVIDENCE_ATTEMPTS_RENDERED - 1);
+    let mut out = vec![(RenderedAt::Index(1), &attempts[0])];
+    out.push((RenderedAt::Elision(tail_start - 1), &attempts[0]));
+    out.extend(
+        attempts[tail_start..]
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (RenderedAt::Index(tail_start + i + 1), a)),
+    );
+    out
+}
+
+/// The ONE-SENTENCE reading of the whole sequence — whether a SATISFIED red precedes a SATISFIED
+/// green on the same control, stated so the auditor does not have to reconstruct it from the list,
+/// and stated as a FINDING when it does not hold.
+///
+/// "The same control" is compared the way the discipline says to compare it: same slot, same
+/// RESOLVED commands, same cwd. A red on one check and a green on another are two facts about two
+/// different things, and this sentence refuses to call that a sequence.
+///
+/// # THE THREE STATES, kept apart
+///
+/// 1. a satisfied RED is recorded — the AUTOMATED route ran, and the reading below is the whole of
+///    it, unchanged: the manual observations (if any) are extra colour, never what answers the red;
+/// 2. no satisfied red, but the MANUAL route was taken — the human WAS the check, and the proof is
+///    the pair of observations. The auditor is told what to judge (one protocol, both sides) instead
+///    of being told a proof that exists is missing. A pair with only ONE half recorded — or one
+///    whose second half says the defect is STILL THERE — is itself named as the finding it is,
+///    exactly as the discipline text says;
+/// 3. neither — the absence stands, and "an absent red on a `bug` Spec is a finding of its own"
+///    stays word for word what the auditor reads.
+///
+/// # THE GREEN IS THE ONE THAT **ANSWERS** THE RED, and nothing else qualifies
+///
+/// The journal is per-SPEC and spans every run it ever had, so "the first satisfied green in the
+/// list" is not the green that closes a reproduction — it is whatever green happened first. A Spec
+/// built as a `feature` (its `build_check` attempts journaled as `expect: green`, satisfied, since a
+/// gate declaring nothing is graded green by default), then RE-CLASSIFIED `bug`, journals its
+/// reproduction's red AFTER those greens; read positionally, that produced "a satisfied GREEN is
+/// recorded BEFORE the satisfied red … this is a finding" about a perfectly correct sequence, on a
+/// green belonging to another check entirely. The same false reading came for free on a multi-task
+/// `bug` Spec whose earlier task took the manual route.
+///
+/// So the search for the green starts AFTER the red and is restricted to the SAME CONTROL — same
+/// slot, same resolved command line, same cwd, which is exactly what the discipline tells the
+/// auditor to confront. An earlier green on ANOTHER control is not a violation and is never reported
+/// as one; an earlier green on the SAME control still is, because that one really is the order
+/// violation the discipline names.
+fn gate_sequence_verdict(attempts: &[db::GateAttemptRow], manual: Option<&ManualRepro>) -> String {
+    let red = attempts
+        .iter()
+        .position(|a| a.satisfied && a.expect == db::GATE_EXPECT_RED);
+    // STATE 2 — the manual route ANSWERS the missing red, and only then. A satisfied red means the
+    // automated sequence really ran, and that reading (state 1) is the one that must not move.
+    if red.is_none() {
+        if let Some(manual) = manual {
+            return match manual.outcome() {
+                ManualOutcome::Fixed => MANUAL_SEQUENCE_VERDICT.to_string(),
+                ManualOutcome::StillBroken(said) => {
+                    MANUAL_SEQUENCE_UNFIXED_VERDICT.replace("{after}", &manual_observation(&said))
+                }
+                ManualOutcome::Pending => MANUAL_SEQUENCE_HALF_VERDICT.to_string(),
+            };
+        }
+    }
+    let Some(r) = red else {
+        return if attempts
+            .iter()
+            .any(|a| a.satisfied && a.expect == db::GATE_EXPECT_GREEN)
+        {
+            "A satisfied GREEN is recorded and NO satisfied red. The check passes; nothing shows it \
+             ever failed, so the reproduction is missing — and an absent red on a `bug` Spec is a \
+             finding of its own."
+                .to_string()
+        } else {
+            "NO attempt satisfied its declared expectation. Nothing here demonstrates a \
+             reproduction; read each line for what actually happened, and treat an `indeterminate` \
+             as a check that verified nothing."
+                .to_string()
+        };
+    };
+    let red_row = &attempts[r];
+    let answering_green = attempts
+        .iter()
+        .enumerate()
+        .skip(r + 1)
+        .find(|(_, a)| {
+            a.satisfied && a.expect == db::GATE_EXPECT_GREEN && same_control(red_row, a)
+        })
+        .map(|(i, _)| i);
+    match answering_green {
+        Some(g) => "A satisfied RED (#{r}) precedes a satisfied GREEN (#{g}) on the SAME control — \
+                    same slot, same resolved commands, same cwd. The sequence is there; whether the \
+                    failure was about THIS defect is the half only you can judge."
+            .replace("{r}", &(r + 1).to_string())
+            .replace("{g}", &(g + 1).to_string()),
+        // An earlier green ON THE SAME CONTROL is the order violation the discipline names, and it
+        // is only nameable once "the same control" has been checked.
+        None if attempts[..r]
+            .iter()
+            .any(|a| a.satisfied && a.expect == db::GATE_EXPECT_GREEN && same_control(red_row, a)) =>
+        {
+            "A satisfied GREEN on this very control is recorded BEFORE the satisfied red, and none \
+             after it. Order is part of the proof: a red produced after the change does not \
+             establish the counterfactual the classification demands. This is a finding."
+                .to_string()
+        }
+        None => "A satisfied RED is recorded and NO satisfied green after it ON THE SAME CONTROL — \
+                 the defect was observed failing, and nothing yet shows it fixed under that same \
+                 check. A green obtained on another slot, another command or another cwd is a fact \
+                 about something else and does not close this red."
+            .to_string(),
+    }
+}
+
+/// Whether two attempts ran THE SAME CHECK — same slot, same resolved command line, same cwd. The
+/// identity the `bug` discipline tells the auditor to confront a red and a green on: "a red obtained
+/// on one check and a green obtained on another demonstrate nothing together".
+fn same_control(a: &db::GateAttemptRow, b: &db::GateAttemptRow) -> bool {
+    a.slot == b.slot && a.command_line == b.command_line && a.cwd == b.cwd
+}
+
+/// ONE attempt as the auditor reads it — the control, the declaration, the grade, and a bounded
+/// extract of what the command printed.
+fn render_gate_attempt(index: usize, a: &db::GateAttemptRow) -> String {
+    let verdict = if a.satisfied {
+        "SATISFIED"
+    } else {
+        "NOT satisfied"
+    };
+    let exit = match a.exit_code {
+        Some(code) => format!("exit {code}"),
+        None => "no exit status (nothing was judged)".to_string(),
+    };
+    let mut block = format!(
+        "\n{index}. `{outcome}` — declared `expect: {expect}` ⇒ {verdict}\n   \
+         control : slot `{slot}` · node `{node}`\n   \
+         command : {command}\n   \
+         cwd     : {cwd}\n   \
+         result  : {exit} · {duration} ms · run `{run}` · t={at}\n",
+        outcome = a.outcome,
+        expect = a.expect,
+        slot = a.slot.as_deref().unwrap_or("(none — the node names its own commands)"),
+        node = a.node_id,
+        command = a.command_line.replace('\n', " ; "),
+        cwd = a.cwd.replace('\n', " ; "),
+        duration = a.duration_ms,
+        run = a.run_id,
+        at = a.created_at,
+    );
+    let output = truncate_chars(
+        &a.output_excerpt.replace('\n', " ⏎ "),
+        GATE_EVIDENCE_RENDERED_OUTPUT_CHARS,
+    );
+    if !output.trim().is_empty() {
+        block.push_str(&format!("   output  : {output}\n"));
+    }
+    block
+}
+
+/// The LAST `max` characters of `text`, marked when cut — the tail is the part that explains a
+/// failure. Char-indexed, never byte-sliced (a cut through a multi-byte code point panics, and a
+/// broken code point is not a shorter string but an invalid one).
+fn truncate_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth_back(max.saturating_sub(1)) {
+        Some((cut, _)) if cut > 0 => format!("…{}", &text[cut..]),
+        _ => text.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE MANUAL ROUTE'S EVIDENCE — the proof a defect no command can reproduce produces instead.
+//
+// The `bug` discipline announces an exit for a defect that needs a device, a third-party account or
+// a human gesture, and the seeded coder graph carries it as a real branch: a human rules automation
+// impracticable, writes the PROTOCOL plus what they observe with the defect present, and — after
+// the fix — is shown that protocol back VERBATIM and observes it again. The two answers are written
+// to the run's blackboard under the keys below, side by side, neither overwriting the other, which
+// is what makes them a PAIR an auditor can compare (`crate::seed::bug_reproduction`).
+//
+// They live on a BLACKBOARD and not in the gate journal because no gate ran: the manual branch
+// bypasses the reproduction gate — that is the whole point of taking it — so there is no attempt to
+// record. Reading them here is what closes the gap between the two routes at the auditor's seat.
+// ---------------------------------------------------------------------------
+
+/// The blackboard key the manual branch's FIRST question writes — the protocol AND the observation
+/// made with the defect still present. One key for both, because the human answers them in one
+/// breath and the "same protocol" the after-question quotes back is that very text.
+///
+/// The literal is the `output_key` of the seeded `ask_human` node ([`crate::seed`]), and
+/// `seed::tests` asserts the node against THIS constant rather than against a second spelling — so a
+/// re-spelling on either side goes red instead of quietly emptying the auditor's evidence block.
+pub(crate) const MANUAL_REPRO_BEFORE_KEY: &str = "manual_repro_before";
+
+/// The blackboard key the manual branch's SECOND question writes — the observation made under the
+/// SAME protocol, after the fix (`fixed` closes the repair loop, `still-broken` buys another pass).
+/// Confronted with the seeded graph the same way [`MANUAL_REPRO_BEFORE_KEY`] is.
+pub(crate) const MANUAL_REPRO_AFTER_KEY: &str = "manual_repro_after";
+
+/// The answer that CLOSES the manual route — the `fixed` of the seeded question's two options, and
+/// the literal the repair loop's `until` exits on. Named here rather than spelled twice because the
+/// graph WRITES it and this module READS it: a re-spelling on either side would make a run that
+/// never closed look closed, or the reverse.
+pub(crate) const MANUAL_REPRO_FIXED: &str = "fixed";
+
+/// The other answer — the defect is STILL THERE under the same steps, which buys another repair
+/// pass. It is a recorded observation, and it is emphatically not a proof of repair.
+pub(crate) const MANUAL_REPRO_STILL_BROKEN: &str = "still-broken";
+
+/// What the manual pair AMOUNTS TO — the reading `after`'s presence alone could not give.
+enum ManualOutcome {
+    /// Both halves recorded and the second one says `fixed`: the pair is complete.
+    Fixed,
+    /// Both halves recorded and the second one does NOT say `fixed` — carries what it did say, so
+    /// the render can quote it rather than paraphrase.
+    StillBroken(String),
+    /// No second observation yet: a run parked between the two questions, or one that died there.
+    Pending,
+}
+
+/// How many characters of ONE human observation ride in the auditor's render.
+///
+/// A human observation is FREE TEXT — nothing bounds what somebody types into an `ask_human` — so it
+/// gets the same treatment a command's output extract gets ([`GATE_EVIDENCE_RENDERED_OUTPUT_CHARS`])
+/// for the same reason: this block rides four passes of every audit cycle, and an unbounded field
+/// would let one verbose protocol take the whole context budget. Wider than an output extract
+/// because a protocol is STEPS, and steps truncated to a couple of lines cannot be compared; still
+/// finite, and the run's blackboard holds the full text for a reader who needs it.
+const MANUAL_REPRO_RENDERED_CHARS: usize = 480;
+
+/// The two HUMAN observations of the manual reproduction protocol, as the auditor is to judge them.
+///
+/// `after` is `Option` on purpose: a run parked between the two questions has a protocol and no
+/// second observation, and that state is NOT the same as no manual route at all — it is the "single
+/// observation" the discipline names as a finding, and the render says so rather than hiding half a
+/// pair behind a complete-looking block.
+struct ManualRepro {
+    /// The protocol and the BEFORE observation, verbatim as the human wrote them.
+    before: String,
+    /// The AFTER observation under those same steps — `None` while the run has not asked it yet.
+    after: Option<String>,
+    /// The run the pair was recorded on — the coder CHILD run, named so the auditor can go read the
+    /// full text and the surrounding history rather than only the bounded extract.
+    run_id: String,
+}
+
+impl ManualRepro {
+    /// What this pair AMOUNTS TO — the value of the second observation, never merely its presence.
+    ///
+    /// The seeded `ask_human` closes its answer set on `{fixed, still-broken}` and the repair loop
+    /// exits only on `fixed`, so ONE of the two members means the defect is still reproducing.
+    /// Reading `after.is_some()` as "the pair is complete" therefore rendered a `still-broken` as a
+    /// closed, validated proof — about work a human had just said was NOT repaired. The state is
+    /// reachable through the run the loop's own limit kills: it dies with `still-broken` on its
+    /// board, the board persists, and a later pass reads it back.
+    ///
+    /// Anything that is neither `fixed` nor absent is read as NOT FIXED, on purpose: an answer
+    /// outside the declared set is not an approval either.
+    fn outcome(&self) -> ManualOutcome {
+        match self.after.as_deref() {
+            None => ManualOutcome::Pending,
+            Some(after) if after.trim().eq_ignore_ascii_case(MANUAL_REPRO_FIXED) => {
+                ManualOutcome::Fixed
+            }
+            Some(after) => ManualOutcome::StillBroken(after.to_string()),
+        }
+    }
+}
+
+/// Read the manual reproduction pair off the Spec's runs — `None` when no run of this Spec ever took
+/// the manual branch.
+///
+/// THE QUERY IS [`db::list_runs_for_spec`], the same "runs of THIS Spec" read [`spec_live_runs`]
+/// uses, and it must be that one: the pair is written by the CODER CHILD run, not by the ndev run
+/// bound to the Spec, so anything that looked only at the top-level run would find nothing. Runs
+/// come back newest-first and the FIRST one carrying a protocol wins — a Spec re-driven through the
+/// branch is judged on the observations of its latest pass.
+///
+/// BOTH HALVES COME FROM THE SAME RUN. Pairing a protocol from one run with an observation from
+/// another would manufacture exactly the thing the discipline forbids: two observations that are not
+/// of the same protocol.
+///
+/// A run that FAILED is skipped. Its board is a wreck, not a record: the repair loop dies through
+/// `EngineError::LoopLimit` when the human keeps answering `still-broken`, which the seed documents
+/// as the normal recovery ("the tasks are untouched — a /ndev re-run resumes the very same work with
+/// a fresh run"), and it leaves that dead board behind forever. Left in the scan, a Spec re-driven
+/// down the AUTOMATED route — which writes no manual key at all — was judged on the abandoned
+/// protocol of a run that never finished.
+fn resolve_manual_repro(db: &Db, spec_id: &str) -> Option<ManualRepro> {
+    let runs = db
+        .with_conn(|c| db::list_runs_for_spec(c, spec_id))
+        .ok()?;
+    for run in runs {
+        if run.status == db::RUN_STATUS_FAILED {
+            continue;
+        }
+        let Ok(board) = serde_json::from_str::<serde_json::Value>(&run.blackboard) else {
+            continue;
+        };
+        let Some(before) = board_text(&board, MANUAL_REPRO_BEFORE_KEY) else {
+            continue;
+        };
+        return Some(ManualRepro {
+            before,
+            after: board_text(&board, MANUAL_REPRO_AFTER_KEY),
+            run_id: run.id,
+        });
+    }
+    None
+}
+
+/// One blackboard key as TEXT — a JSON string unwrapped, anything else spelled as JSON, `null` and
+/// absent alike answering `None`. The board is a free-form scratchpad, so a key whose value is not
+/// the string the graph writes must still render as something rather than panic or vanish.
+fn board_text(board: &serde_json::Value, key: &str) -> Option<String> {
+    match board.get(key) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// The reading of a manual pair, for the render's verdict line — a proof, not an absence.
+///
+/// It says what the auditor OWES the pair rather than declaring the matter settled: the discipline's
+/// hard question ("is this failure THAT defect?") is the same on both routes, and on this one it is
+/// asked of two sentences instead of two exit codes.
+const MANUAL_SEQUENCE_VERDICT: &str = "\
+A human ruled the automated reproduction IMPRACTICABLE, so the proof on this Spec is the MANUAL \
+protocol, and both halves of it are recorded: the protocol with the observation made BEFORE the \
+fix, and the observation made AFTER under those same steps. The reproduction is NOT missing — do \
+not read the gate journal below as if it were the sequence. What you owe the pair is what you would \
+owe a red and a green: ONE protocol, the SAME steps on both sides, and an observed difference that \
+is a fact and not an impression. A protocol that changed between the two observations is a finding.";
+
+/// The reading of a manual pair whose SECOND observation says the defect is still there — recorded,
+/// complete as a pair, and the opposite of a proof of repair. `{after}` is the human's own words.
+///
+/// It is its own verdict because neither of the other two describes it: the complete reading would
+/// announce a closed proof, and the half reading would say the observation is missing when it is
+/// recorded and unambiguous. What the auditor owes it is the plainest possible reading.
+const MANUAL_SEQUENCE_UNFIXED_VERDICT: &str = "\
+A human ruled the automated reproduction IMPRACTICABLE and BOTH observations are recorded — but the \
+second one does NOT say the defect is gone: under the same steps, the human answered \"{after}\". \
+That is a recorded observation and it is the opposite of a proof of repair: this Spec has a \
+reproduction and NO demonstration that it was fixed. Unless a later pass records a `fixed` \
+observation under that same protocol, it is a finding.";
+
+/// The reading of a manual pair with ONE half recorded — the finding the discipline names, stated as
+/// one rather than smoothed into the complete case.
+const MANUAL_SEQUENCE_HALF_VERDICT: &str = "\
+A human ruled the automated reproduction IMPRACTICABLE and the protocol is recorded WITH its BEFORE \
+observation — but NO observation after the fix. A single observation demonstrates that the defect \
+was there, never that it is gone: half a pair is not the proof this classification owes, and it is \
+a finding unless the run is still parked before the second question.";
+
+/// ONE manual pair as the auditor reads it — the protocol, the two observations, and where the full
+/// text lives.
+///
+/// SANITISED LIKE ANY OTHER FREE TEXT that reaches this render: newlines folded to `⏎` (a human
+/// answer is an arbitrary blob, and a blob that can start a line can forge a `###` heading inside
+/// the auditor's own block) and truncated to [`MANUAL_REPRO_RENDERED_CHARS`]. The truncation keeps
+/// the HEAD, where [`truncate_chars`] keeps the tail: a protocol's steps start at its beginning,
+/// where a command's failure explains itself at its end.
+fn render_manual_repro(manual: &ManualRepro) -> String {
+    let mut out = format!(
+        "\nThe two HUMAN observations, recorded on run `{run}` — read them against the Spec's \
+         OBSERVED behaviour, its EXPECTED result and its COUNTER-EXAMPLE, exactly as you would read \
+         a reproducing test:\n\
+         \n\
+         - BEFORE the fix — the protocol, and what was observed with the defect present:\n\
+        \x20    {before}\n",
+        run = manual.run_id,
+        before = manual_observation(&manual.before),
+    );
+    match &manual.after {
+        Some(after) => out.push_str(&format!(
+            "- AFTER the fix — the SAME protocol, quoted back to the human unchanged, observed \
+             again:\n\x20    {}\n",
+            manual_observation(after),
+        )),
+        None => out.push_str(
+            "- AFTER the fix — NOT RECORDED. Nothing here shows the defect gone under those steps.\n",
+        ),
+    }
+    out
+}
+
+/// One human observation, MADE INERT, folded to a single line and bounded — see
+/// [`render_manual_repro`].
+///
+/// THE SAME POLICY THE JOURNAL APPLIES, through the same function ([`db::sanitise_free_text`]) and
+/// not a second copy of it. This block's own doc promises a human observation is "bounded and
+/// sanitised exactly like a command's output extract"; it used to fold newlines and cut, and that
+/// was all. The asymmetry was structural rather than accidental: a gate's output is sanitised at
+/// WRITE time, so the render only ever bounds an already-inert string, whereas THIS text — whatever
+/// a human pasted into an `ask_human`, typically a terminal transcript or a `curl -v` trace — meets
+/// its first and only filter here. A pasted OSC sequence went into the auditor's markdown intact
+/// (the injection surface rule 2 exists for) and a pasted `Bearer …` went in unredacted.
+///
+/// ORDER MATTERS: inert-and-redact FIRST (rule 3 is line-oriented, so it needs its newlines), fold
+/// SECOND, bound LAST — a redaction half-applied by a cut would be no redaction.
+fn manual_observation(text: &str) -> String {
+    truncate_head_chars(
+        &db::sanitise_free_text(text).replace('\n', " ⏎ "),
+        MANUAL_REPRO_RENDERED_CHARS,
+    )
+}
+
+/// The FIRST `max` characters of `text`, marked when cut — the mirror of [`truncate_chars`]. Same
+/// char-indexed care: a cut through a multi-byte code point panics, and a broken code point is not a
+/// shorter string but an invalid one.
+fn truncate_head_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+/// What the auditor reads in place of the recorded sequence while [`resolve_gate_evidence`] has
+/// nothing to hand them — NEITHER a gate attempt NOR a manual observation. It states the ABSENCE
+/// rather than hiding it, and says what to do with an absence — because "no evidence rendered" and
+/// "no evidence exists" must not look alike here, and the second one is a finding.
+const GATE_EVIDENCE_PENDING: &str = "\
+### Reproduction evidence — none recorded for this Spec\n\
+\n\
+nyx has no gate attempt to show you for this Spec. Read the run's own history and the coder's \
+hand-back for the two observations, and hold them to the questions above. An absent red is not a \
+formality you may waive: a `bug` Spec that reaches you with no observed failure before the fix has \
+not produced the proof it owes, and that is a finding of its own.";
+
+/// The EVIDENCE sub-block that hangs under a live discipline — the auditor's, on a `bug` Spec, and
+/// nobody else's: the spec author writes the contract before any run exists and the coder PRODUCES
+/// the attempts rather than reviewing them, so neither is served by a transcript of them.
+fn category_discipline_evidence(
+    db: &Db,
+    role: AgentRole,
+    slug: &str,
+    spec_id: &str,
+) -> Option<String> {
+    if role != AgentRole::Auditor || slug != db::CATEGORY_SLUG_BUG {
+        return None;
+    }
+    Some(resolve_gate_evidence(db, spec_id).unwrap_or_else(|| GATE_EVIDENCE_PENDING.to_string()))
+}
+
+/// The category-discipline block a LIVE render injects: the (role, slug) text, plus the evidence
+/// sub-block for the role that judges it. `slug` is the Spec's PERSISTED category (`None` =
+/// unclassified), never a claim written on a run's board — a discipline that fired on an
+/// unpersisted answer would fire on a classification that never landed.
+fn render_category_discipline(
+    db: &Db,
+    role: AgentRole,
+    slug: Option<&str>,
+    spec_id: &str,
+) -> Option<String> {
+    let slug = slug?;
+    let mut block = category_discipline(role, slug)?;
+    if let Some(evidence) = category_discipline_evidence(db, role, slug, spec_id) {
+        block.push_str("\n\n");
+        block.push_str(&evidence);
+    }
+    Some(block)
+}
+
+/// The category-discipline placeholder of the STATIC role template (review finding #35): with no
+/// run there is no Spec, hence no category, hence no way to know WHICH discipline applies — so the
+/// template names the channel and DEFERS its content, exactly as [`deferred_rules_block`] does for
+/// the project directives.
+///
+/// `None` for a role that can never carry one ([`role_carries_category_discipline`]): a "resolved at
+/// run" placeholder on the dispatcher or the doc-sync would promise a block no run ever produces,
+/// which is a worse silence than none.
+fn deferred_category_discipline_block(role: AgentRole) -> Option<String> {
+    if !role_carries_category_discipline(role) {
+        return None;
+    }
+    let mut out = format!(
+        "{CATEGORY_DISCIPLINE_HEADING} — (resolved at run)\n\n\
+         _Resolved at run from the Spec's CATEGORY (PDR-0017): a Spec classified \
+         `{bug}` carries this role's red-before-green discipline here, and a Spec of \
+         any other category carries none. This is nyx's own text, keyed on the category — NOT a \
+         project directive (those resolve at the Rules block above). Bind a run to a Spec to see \
+         which one applies._",
+        bug = db::CATEGORY_SLUG_BUG,
+    );
+    if role == AgentRole::Auditor {
+        out.push_str(
+            "\n\n_The reproduction evidence recorded for that Spec — the red attempt and the green \
+             one, or the two observations of the manual protocol — is rendered under it, at run._",
+        );
+    }
+    Some(out)
+}
+
 /// A Spec's CURRENT PHASE: the lowest phase number that still has un-done tasks, resolved
 /// from the phase plan + the task statuses. `None` when the Spec has no phase plan (flat
 /// tasks) or every task is terminal. The `name` is looked up in the phase plan.
@@ -1003,7 +1839,8 @@ pub fn render_effector_context(
 /// `spawn_subagent` node is clicked with NO run bound: the brief is STATIC, so it is visible cold.
 ///
 /// The parts that DEPEND on a run — the Spec/Project/Workspace header, the current phase + its
-/// tasks, the workspace & repos, and the resolved `{{rules}}` — are rendered as EXPLICIT
+/// tasks, the workspace & repos, the resolved `{{rules}}` and the Spec's CATEGORY DISCIPLINE — are
+/// rendered as EXPLICIT
 /// "resolved at run" placeholders (parity with the live render's section order), never requiring a
 /// Spec; a bound run swaps them for the live values via [`render_agent_context`]. A pure function,
 /// no DB read (the role manual is a compile-time constant + the deferred-scope naming).
@@ -1025,14 +1862,24 @@ pub fn render_role_template(role: AgentRole) -> String {
     // A one-line note: this IS the static brief; the run-specific parts fill in when a run binds.
     out.push_str(
         "> This is the sub-agent's STATIC role template (its brief). The Spec / Project / \
-         Workspace header, the current phase & tasks, the workspace & repos, and the project rules \
-         are RESOLVED AT RUN — bind this workflow to a run on a Spec to see them.\n\n",
+         Workspace header, the current phase & tasks, the workspace & repos, the project rules and \
+         the Spec's category discipline are RESOLVED AT RUN — bind this workflow to a run on a Spec \
+         to see them.\n\n",
     );
 
     // The ROLE preamble (the manual) — the STATIC part. The `{{rules}}` marker is replaced by the
     // DEFERRED placeholder (rules resolve per run).
     out.push_str(&inject_deferred_rules(role.preamble(), role));
     out.push_str("\n\n");
+
+    // The CATEGORY DISCIPLINE, at the SAME position it occupies live (right after the preamble) and
+    // as an EXPLICIT "resolved at run" placeholder — review finding #35's parity rule applied to
+    // this channel too: without a run there is no Spec, so there is no category, so there is no way
+    // to know which discipline applies. A role that can never carry one renders nothing.
+    if let Some(block) = deferred_category_discipline_block(role) {
+        out.push_str(&block);
+        out.push_str("\n\n");
+    }
 
     // The run-resolved sections, as EXPLICIT placeholders (same shape/order as the live render).
     out.push_str("## Current phase — (resolved at run)\n\n");
@@ -1082,6 +1929,14 @@ fn render_agent_context_with_rules(
             } else {
                 Vec::new()
             };
+            // THE PERSISTED CATEGORY SLUG (PDR-0017) — what decides whether this render carries a
+            // category discipline, and `None` for an unclassified Spec. Read off `specs.category_id`
+            // and resolved to the row's SLUG, which is the immutable identity the harness keys on;
+            // the NAME is a human label and may be renamed into a homonym at any time.
+            let category_slug = match spec.category_id.as_deref() {
+                Some(id) => db::get_category(c, id)?.map(|category| category.slug),
+                None => None,
+            };
             // WHAT IS ALREADY DRIVING THIS SPEC — for EVERY role, not just the author. "Does this
             // Spec have a run in progress?" cost the observed session four MCP calls for a fact nyx
             // holds in one join, and the answer it never got is what let a second run open beside a
@@ -1096,11 +1951,21 @@ fn render_agent_context_with_rules(
                 repos,
                 sibling_specs,
                 live_runs,
+                category_slug,
             )))
         })
         .map_err(internal_db)?;
-    let Some((spec, revision, tasks, workspace_context, project, repos, sibling_specs, live_runs)) =
-        bundle
+    let Some((
+        spec,
+        revision,
+        tasks,
+        workspace_context,
+        project,
+        repos,
+        sibling_specs,
+        live_runs,
+        category_slug,
+    )) = bundle
     else {
         return Ok(None);
     };
@@ -1198,6 +2063,20 @@ fn render_agent_context_with_rules(
     // preamble with no marker (spec / prototype) passes through unchanged.
     out.push_str(&rules.inject(role.preamble(), role));
     out.push_str("\n\n");
+
+    // THE CATEGORY DISCIPLINE (PDR-0017 / ADR-0006) — nyx's own text, keyed on the Spec's PERSISTED
+    // category, on a channel of its own (never the `{{rules}}` marker — see the section note beside
+    // [`category_discipline`]).
+    //
+    // ITS POSITION IS PART OF THE CONTRACT, and it is asserted by test: immediately AFTER the role
+    // preamble and BEFORE `## Existing Specs` — therefore before EVERY section of the Spec for every
+    // other role. It qualifies how the whole state below is to be read and what the hand-back owes,
+    // so a reader that met the Spec first would have already formed the plan the discipline
+    // constrains.
+    if let Some(block) = render_category_discipline(db, role, category_slug.as_deref(), spec_id) {
+        out.push_str(&block);
+        out.push_str("\n\n");
+    }
 
     // SPEC AUTHOR live state: the project's OTHER Specs, so the author does not duplicate an
     // existing one (anti-duplication). Rendered only for the `spec` role.
@@ -3630,6 +4509,1250 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // PDR-0017 / ADR-0006 — the CATEGORY DISCIPLINE: its own channel, its own
+    // position, and the three roles that owe it
+    // ========================================================================
+
+    /// [`seeded`], with the Spec CLASSIFIED through [`crate::category::set_spec_category_by_label`]
+    /// — the domain service that is the ONLY writer of `specs.category_id`. The render must read a
+    /// slug that actually landed, so the fixture goes through the same door the MCP tool and the
+    /// engine's `set_category` node use, never a direct column write.
+    fn seeded_classified(label: &str) -> (Db, String) {
+        let (db, spec_id, _ws, _cwd) = seeded();
+        db.with_conn(|c| {
+            crate::category::set_spec_category_by_label(
+                c,
+                &spec_id,
+                label,
+                db::DomainEventSource::Mcp,
+            )
+            .expect("classify the fixture Spec")
+        });
+        (db, spec_id)
+    }
+
+    /// The six roles, once, so no list of them drifts from another in this section.
+    const ALL_ROLES: [AgentRole; 6] = [
+        AgentRole::Spec,
+        AgentRole::Dev,
+        AgentRole::Coder,
+        AgentRole::Auditor,
+        AgentRole::Doc,
+        AgentRole::Prototype,
+    ];
+
+    /// DONE-CRITERION — `category_discipline(role, slug)` renders a NON-EMPTY block for
+    /// spec / coder / auditor on `bug`, and `None` for everything else: the three roles that neither
+    /// write, produce nor judge the proof, and EVERY other slug — the three other seeded genres, a
+    /// category an agent minted, and the near-misses (empty, wrong case).
+    ///
+    /// The last assertion is the one that keeps the whole thing armed: the discipline is keyed on
+    /// the SLUG the project seeds, so a `bug` spelled differently here would disarm it silently for
+    /// every Spec — no test would fail, and every bug would ship without a reproduction.
+    #[test]
+    fn the_bug_discipline_is_owed_by_three_roles_on_one_slug_and_by_nothing_else() {
+        for role in [AgentRole::Spec, AgentRole::Coder, AgentRole::Auditor] {
+            let block = category_discipline(role, db::CATEGORY_SLUG_BUG)
+                .unwrap_or_else(|| panic!("{} owes the bug discipline", role.slug()));
+            assert!(
+                !block.trim().is_empty(),
+                "{}: the bug discipline must be a block, not an empty string",
+                role.slug(),
+            );
+            assert!(
+                block.starts_with(CATEGORY_DISCIPLINE_HEADING),
+                "{}: the block opens on the heading a render asserts on:\n{block}",
+                role.slug(),
+            );
+            assert_eq!(
+                block.lines().next().unwrap(),
+                format!("{CATEGORY_DISCIPLINE_HEADING} — `{}`", db::CATEGORY_SLUG_BUG),
+                "{}: …under one heading line that names the category it comes from",
+                role.slug(),
+            );
+        }
+        // THREE ROLES, THREE TEXTS. The author writes the contract, the coder produces the red and
+        // the auditor judges it — a discipline that said the same thing to all three would be
+        // telling two of them to do a job that is not theirs.
+        let bodies = [
+            category_discipline(AgentRole::Spec, db::CATEGORY_SLUG_BUG).unwrap(),
+            category_discipline(AgentRole::Coder, db::CATEGORY_SLUG_BUG).unwrap(),
+            category_discipline(AgentRole::Auditor, db::CATEGORY_SLUG_BUG).unwrap(),
+        ];
+        for (i, a) in bodies.iter().enumerate() {
+            for b in bodies.iter().skip(i + 1) {
+                assert_ne!(a, b, "each role's bug discipline is its own text");
+            }
+        }
+        for role in [AgentRole::Dev, AgentRole::Doc, AgentRole::Prototype] {
+            assert!(
+                category_discipline(role, db::CATEGORY_SLUG_BUG).is_none(),
+                "{} owes no category discipline: the dispatcher performs one atomic action per \
+                 tick, doc-sync runs after the fact, and the prototyper runs before any code",
+                role.slug(),
+            );
+        }
+        for slug in [
+            "feature",
+            "refactor",
+            "chore",
+            "dette-technique",
+            "bugfix",
+            "Bug",
+            "",
+        ] {
+            for role in ALL_ROLES {
+                assert!(
+                    category_discipline(role, slug).is_none(),
+                    "no discipline exists for ({}, '{slug}') — only `bug` carries one today",
+                    role.slug(),
+                );
+            }
+        }
+        // THE GUARD THAT USED TO STAND HERE — "the discipline keys on a slug every project is
+        // actually seeded with" — is GONE, and its absence is the fix: `db::SYSTEM_CATEGORIES` is
+        // now BUILT from `db::CATEGORY_SLUG_BUG`, so the membership it asserted holds by
+        // construction and the two spellings it existed to reconcile no longer exist. A guard that
+        // cannot fail is not a guard; it is a claim that the thing it watches is still watched.
+    }
+
+    /// DONE-CRITERION — the SNAPSHOT of the `bug` discipline, role by role: what each text must
+    /// DEMAND, and in whose vocabulary.
+    ///
+    /// PHRASE-ANCHORED, NOT BYTE-EXACT, and deliberately. This crate carries no snapshot harness,
+    /// and a byte-exact literal of three ~2 kB constants would assert that a constant equals itself
+    /// while going red on every comma. What is pinned here is what the text must still SAY after any
+    /// rewrite — the demands the PRD's criteria name — plus the engine keys it is written in, which
+    /// is the half a rewrite loses silently: a discipline that stopped saying `indeterminate`
+    /// satisfies nothing would still read perfectly well and would no longer prevent anything.
+    ///
+    /// Asserted on the LIVE render, not on the constants, so "the text exists" and "the text reaches
+    /// the agent" are one fact.
+    #[test]
+    fn the_bug_discipline_says_what_each_role_owes_in_the_engines_vocabulary() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+
+        // The SPEC AUTHOR — observed / expected / counter-example / scope, and a reproduction
+        // strategy that can be CHECKED rather than believed.
+        //
+        // The CODER — reproduce before repairing, and the three-way grading that keeps a gate which
+        // could not run from passing for a reproduction.
+        //
+        // The AUDITOR — the identity of the two runs, the reality of the red, and the one question
+        // no execution answers: was the red about the right defect.
+        let owed: [(AgentRole, &[&str]); 3] = [
+            (
+                AgentRole::Spec,
+                &[
+                    "OBSERVED behaviour",
+                    "EXPECTED result",
+                    "COUNTER-EXAMPLE",
+                    "SCOPE",
+                    "REPRODUCTION STRATEGY that is VERIFIABLE",
+                    "REPRODUCTION CONTRACT",
+                    "CANNOT BE AUTOMATED",
+                    "manual protocol",
+                    "human branch",
+                ],
+            ),
+            (
+                AgentRole::Coder,
+                &[
+                    "REPRODUCE BEFORE YOU REPAIR",
+                    "BEFORE any production code changes",
+                    "THE SAME CHECK, AFTER",
+                    "COULD NOT RUN IS NOT A RED",
+                    "`gate_passed`",
+                    "`gate_satisfied`",
+                    "`gate_green`",
+                    "`expect: red`",
+                    "`expect: green`",
+                    "`repro_check`",
+                    "`indeterminate`",
+                    "a timeout, a cancellation, a spawn that failed",
+                    "satisfies NOTHING",
+                    // …AND WHAT THE GRADE CANNOT CATCH. The list above once ended in "missing
+                    // binary, unreachable service", which the engine does not grade that way at
+                    // all: a gate runs its command line under a SHELL, so a binary that is not on
+                    // `PATH` makes the shell terminate normally with a non-zero status — a
+                    // `failed`, and therefore an answer to `expect: red`. The text now says so, and
+                    // names the thing that really holds the line: the same command must exit 0
+                    // after the fix, so a broken invocation wedges the run on the green gate
+                    // instead of closing the bug (`mcp_engine`'s
+                    // `a_broken_invocation_answers_the_red_but_can_never_answer_the_green…`).
+                    "BROKEN INVOCATION",
+                    "Only the PAIR catches it",
+                    "CANNOT BE AUTOMATED",
+                    "Do NOT invent a workaround",
+                    "do NOT re-run the gate hoping it turns",
+                    "HUMAN branch",
+                    "node of the graph",
+                ],
+            ),
+            (
+                AgentRole::Auditor,
+                &[
+                    "THE TWO RUNS ARE THE SAME CHECK",
+                    "same slot, same RESOLVED COMMANDS, same CWD",
+                    "THE RED IS A REAL RED",
+                    "`gate_passed`",
+                    "`gate_satisfied`",
+                    "`expect: red`",
+                    "`indeterminate`",
+                    "satisfies NOTHING",
+                    "THE RED IS ABOUT THE RIGHT DEFECT",
+                    // The auditor's half of the same correction: a red CAN come from a broken
+                    // invocation, so the re-reading this bullet asks for is not optional. The
+                    // sentence that told them a missing binary "is graded `indeterminate`" would
+                    // have let them rule that case out without looking.
+                    "all terminate non-zero and are graded `failed`",
+                    "COUNTER-EXAMPLE",
+                    "ORDER, NOT JUST PRESENCE",
+                    "IF THE MANUAL BRANCH WAS TAKEN",
+                    "ONE written protocol",
+                    "BOTH recorded",
+                    "is a finding",
+                ],
+            ),
+        ];
+
+        for (role, demands) in owed {
+            let block = category_discipline(role, db::CATEGORY_SLUG_BUG)
+                .unwrap_or_else(|| panic!("{} owes the bug discipline", role.slug()));
+            let live = render_agent_context(&db, role, &spec_id, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                live.contains(&block),
+                "{}: the live render carries the discipline VERBATIM, not a paraphrase of it",
+                role.slug(),
+            );
+            for demand in demands {
+                assert!(
+                    block.contains(demand),
+                    "the {} bug discipline must still say '{demand}':\n{block}",
+                    role.slug(),
+                );
+            }
+        }
+    }
+
+    /// DONE-CRITERION — an IMPRACTICABLE reproduction routes to the graph's HUMAN branch, and the
+    /// text offers no other exit: no workaround, no weakening of the check until something goes red,
+    /// and no re-running of the gate in the hope that it turns.
+    ///
+    /// This is the criterion a reassuring sentence would satisfy on paper and betray in practice, so
+    /// it is asserted as a PAIR: the route must be named (the coder is told where impracticability
+    /// goes, and that nyx asks the question) AND each tempting exit must be named and refused. A
+    /// text that only said "the flow has a manual branch" would leave "re-run it until it fails" as
+    /// the reader's own idea.
+    #[test]
+    fn an_impracticable_reproduction_is_routed_to_the_human_branch_and_to_nothing_else() {
+        let coder = category_discipline(AgentRole::Coder, db::CATEGORY_SLUG_BUG).unwrap();
+        for refused in [
+            "Do NOT invent a workaround",
+            "do NOT weaken the check until something goes red",
+            "do NOT re-run the gate hoping it turns",
+            "do NOT proceed on the strength of an `indeterminate`",
+        ] {
+            assert!(
+                coder.contains(refused),
+                "the coder discipline must refuse this exit — '{refused}':\n{coder}",
+            );
+        }
+        for routed in [
+            "STOP and hand back",
+            "The flow carries a HUMAN branch",
+            "records the manual protocol",
+            "the SAME protocol observed again after",
+            "nyx asks the question, and you never route yourself around it",
+        ] {
+            assert!(
+                coder.contains(routed),
+                "…and must name the route it DOES have — '{routed}':\n{coder}",
+            );
+        }
+
+        // The author's half of the same route: an impracticable reproduction is DECLARED in the
+        // Spec, with the protocol the human branch will be run against.
+        let author = category_discipline(AgentRole::Spec, db::CATEGORY_SLUG_BUG).unwrap();
+        assert!(
+            author.contains("write the manual protocol")
+                && author.contains("never a way out of the proof"),
+            "the author declares the manual protocol rather than dropping the requirement:\n\
+             {author}",
+        );
+
+        // And the auditor's: the manual branch is judged by the SAME questions, on two recorded
+        // observations of ONE protocol.
+        let auditor = category_discipline(AgentRole::Auditor, db::CATEGORY_SLUG_BUG).unwrap();
+        assert!(
+            auditor.contains("the same questions apply to the two human observations"),
+            "the manual branch is audited, not waived:\n{auditor}",
+        );
+    }
+
+    /// DONE-CRITERION — the discipline is injected into a LIVE render for spec / coder / auditor on
+    /// a Spec the DOMAIN holds as `bug`, and is absent from every other (role, Spec) pair: the three
+    /// other roles on that same Spec, all six on a `feature` Spec, and all six on a Spec nobody
+    /// classified.
+    ///
+    /// The unclassified case is not a rounding error: it is the state every Spec authored before
+    /// PDR-0017 is in, and a render that guessed a discipline for it would impose a red-before-green
+    /// proof on work nobody called a bug.
+    #[test]
+    fn the_discipline_is_injected_only_for_the_roles_and_the_category_that_owe_it() {
+        let _g = db_guard();
+
+        let (db, bug_spec) = seeded_classified("bug");
+        for role in ALL_ROLES {
+            let text = render_agent_context(&db, role, &bug_spec, None)
+                .unwrap()
+                .unwrap();
+            let owed = category_discipline(role, db::CATEGORY_SLUG_BUG).is_some();
+            assert_eq!(
+                text.contains(CATEGORY_DISCIPLINE_HEADING),
+                owed,
+                "{}: a bug Spec must carry the discipline for exactly the roles that owe one",
+                role.slug(),
+            );
+        }
+
+        for label in ["feature", "refactor", "chore", "Dette technique"] {
+            let (db, spec_id) = seeded_classified(label);
+            for role in ALL_ROLES {
+                let text = render_agent_context(&db, role, &spec_id, None)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    !text.contains(CATEGORY_DISCIPLINE_HEADING),
+                    "{} on a '{label}' Spec must carry NO discipline — only `bug` owes one",
+                    role.slug(),
+                );
+            }
+        }
+
+        let (db, unclassified, _ws, _cwd) = seeded();
+        for role in ALL_ROLES {
+            let text = render_agent_context(&db, role, &unclassified, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !text.contains(CATEGORY_DISCIPLINE_HEADING),
+                "{} on an UNCLASSIFIED Spec must carry no discipline: absence of a category is not \
+                 a bug",
+                role.slug(),
+            );
+        }
+    }
+
+    /// DONE-CRITERION — the POSITION, which is part of the contract and therefore asserted: the
+    /// block lands right AFTER the role preamble and BEFORE `## Existing Specs` for the author —
+    /// hence before EVERY section of the Spec for the other roles.
+    ///
+    /// It qualifies how the whole state below is read and what the hand-back owes, so a reader who
+    /// met the Spec first would already have formed the plan the discipline constrains.
+    #[test]
+    fn the_discipline_lands_after_the_preamble_and_before_any_spec_section() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+
+        let author = render_agent_context(&db, AgentRole::Spec, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        let at = |text: &str, needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing '{needle}' in:\n{text}"))
+        };
+        assert!(
+            at(&author, "# Context: Spec Author")
+                < at(&author, CATEGORY_DISCIPLINE_HEADING),
+            "the author's discipline follows the role preamble:\n{author}",
+        );
+        assert!(
+            at(&author, CATEGORY_DISCIPLINE_HEADING)
+                < at(&author, "## Existing Specs in the project"),
+            "…and precedes `## Existing Specs`, the first section of the author's live state:\n\
+             {author}",
+        );
+        assert!(
+            at(&author, "## Existing Specs in the project") < at(&author, "## Spec — "),
+            "…which is itself before the Spec block (the order the render already had):\n{author}",
+        );
+
+        for (role, preamble) in [
+            (AgentRole::Coder, "# Context: Coder Agent"),
+            (AgentRole::Auditor, "# Context: Auditor Agent"),
+        ] {
+            let text = render_agent_context(&db, role, &spec_id, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !text.contains("## Existing Specs"),
+                "{}: only the author gets the sibling Specs",
+                role.slug(),
+            );
+            assert!(
+                at(&text, preamble) < at(&text, CATEGORY_DISCIPLINE_HEADING)
+                    && at(&text, CATEGORY_DISCIPLINE_HEADING) < at(&text, "## Spec — "),
+                "{}: the discipline sits between the preamble and the Spec's own sections:\n{text}",
+                role.slug(),
+            );
+        }
+    }
+
+    /// ADR-0006 — the discipline is a channel SEPARATE from the `{{rules}}` marker, and this is the
+    /// pair that makes the two non-substitutable:
+    ///
+    ///   * the `spec` preamble carries NO rules marker at all (it is neither an effector nor the
+    ///     dispatcher) and yet is the FIRST role that must hear the bug discipline — routing the
+    ///     discipline through the marker would have left the spec author out entirely;
+    ///   * on a role that DOES carry the marker, the two blocks are rendered separately, under
+    ///     their own headings, in their own order.
+    #[test]
+    fn the_discipline_is_its_own_channel_never_the_project_rules_marker() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+
+        assert!(
+            !AgentRole::Spec.preamble().contains(RULES_MARKER),
+            "the spec preamble carries no rules marker — the discipline cannot ride on it",
+        );
+        let author = render_agent_context(&db, AgentRole::Spec, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            author.contains(CATEGORY_DISCIPLINE_HEADING),
+            "…and the author still receives the discipline:\n{author}",
+        );
+        assert!(
+            !author.contains("## Rules (project directives)"),
+            "…on a manual that has no project-directives block at all:\n{author}",
+        );
+
+        let coder = render_agent_context(&db, AgentRole::Coder, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        let rules_at = coder
+            .find("## Rules (project directives)")
+            .expect("the coder resolves its rules marker");
+        let discipline_at = coder
+            .find(CATEGORY_DISCIPLINE_HEADING)
+            .expect("…and carries the discipline too");
+        assert!(
+            rules_at < discipline_at,
+            "two blocks, two headings: the discipline is appended after the preamble (rules \
+             marker included), never inside the resolved directives:\n{coder}",
+        );
+        assert!(
+            !coder.contains(RULES_MARKER),
+            "and no stray marker survives:\n{coder}",
+        );
+    }
+
+    /// Review finding #35 — PARITY of the STATIC template: with no run there is no Spec, hence no
+    /// category, hence no way to know WHICH discipline applies, so the template names the channel
+    /// and marks it "resolved at run" exactly as it does for the header, the phase, the workspace
+    /// and the project rules. A role that can never carry one renders nothing rather than promising
+    /// a block no run produces.
+    #[test]
+    fn the_static_template_defers_the_discipline_like_every_other_run_resolved_part() {
+        for role in [AgentRole::Spec, AgentRole::Coder, AgentRole::Auditor] {
+            let text = render_role_template(role);
+            assert!(
+                text.contains(&format!("{CATEGORY_DISCIPLINE_HEADING} — (resolved at run)")),
+                "{}: the static template defers the discipline explicitly:\n{text}",
+                role.slug(),
+            );
+            let discipline_at = text.find(CATEGORY_DISCIPLINE_HEADING).unwrap();
+            assert!(
+                text.find("## Current phase — (resolved at run)").unwrap() > discipline_at,
+                "{}: …at the SAME position it occupies live (before the run-resolved sections)",
+                role.slug(),
+            );
+            assert!(
+                !text.contains(RULES_MARKER),
+                "{}: the rules marker is still consumed",
+                role.slug(),
+            );
+        }
+        for role in [AgentRole::Dev, AgentRole::Doc, AgentRole::Prototype] {
+            assert!(
+                !render_role_template(role).contains(CATEGORY_DISCIPLINE_HEADING),
+                "{}: no discipline can ever resolve for this role — promising one would be worse \
+                 than saying nothing",
+                role.slug(),
+            );
+        }
+        assert!(
+            render_role_template(AgentRole::Auditor).contains("reproduction evidence"),
+            "the auditor's placeholder also announces the evidence rendered under it at run",
+        );
+    }
+
+    /// **THE SEAM** the evidence journal plugs into: the auditor's discipline carries a
+    /// `### Reproduction evidence` sub-block, fed by [`resolve_gate_evidence`], and its position,
+    /// its heading and its fallback are pinned here so none of the three can move by accident.
+    ///
+    /// WHAT THE ABSENCE RENDERS IS THE POINT. "No evidence rendered" and "no evidence exists" must
+    /// not look alike in an auditor's context — that confusion is the whole defect this PRD attacks
+    /// — so with an EMPTY journal the fallback STATES the absence and says an absent red is itself a
+    /// finding. This half of the test is unchanged by the journal landing, and must stay so: a Spec
+    /// that never ran a gate is exactly the one whose context must not look like it has evidence.
+    #[test]
+    fn the_auditors_discipline_carries_the_evidence_seam_and_states_its_absence() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+
+        let auditor = render_agent_context(&db, AgentRole::Auditor, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        let discipline_at = auditor.find(CATEGORY_DISCIPLINE_HEADING).unwrap();
+        let evidence_at = auditor
+            .find("### Reproduction evidence")
+            .expect("the auditor's discipline carries the evidence seam");
+        assert!(
+            discipline_at < evidence_at,
+            "the evidence hangs UNDER the discipline that says how to judge it:\n{auditor}",
+        );
+        assert!(
+            auditor.contains("none recorded for this Spec"),
+            "with an EMPTY journal, the ABSENCE is stated, never silently skipped:\n{auditor}",
+        );
+        assert!(
+            resolve_gate_evidence(&db, &spec_id).is_none(),
+            "an empty journal answers None — that is what routes the render to the fallback",
+        );
+
+        for role in [AgentRole::Spec, AgentRole::Coder] {
+            let text = render_agent_context(&db, role, &spec_id, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                text.contains(CATEGORY_DISCIPLINE_HEADING),
+                "{}: still gets the discipline",
+                role.slug(),
+            );
+            assert!(
+                !text.contains("### Reproduction evidence"),
+                "{}: but not a transcript of attempts — the author writes the contract before any \
+                 run exists, and the coder PRODUCES the attempts rather than reviewing them",
+                role.slug(),
+            );
+        }
+    }
+
+    /// Record `attempts` — `(expect, outcome, satisfied)` — against `spec_id` on ONE control, in the
+    /// order given. The control (slot / resolved command / cwd) is IDENTICAL across them, which is
+    /// what an honest red→green sequence looks like and what the render must be able to state.
+    fn journal_attempts(db: &Db, spec_id: &str, attempts: &[(&str, &str, bool)]) -> String {
+        let run_id = evidence_run(db, spec_id);
+        for (expect, outcome, satisfied) in attempts {
+            journal_attempt_on(
+                db,
+                &run_id,
+                spec_id,
+                ("repro_check", "cargo test -p nyx-core repro_"),
+                (expect, outcome, *satisfied),
+            );
+        }
+        run_id
+    }
+
+    /// A run of `spec_id` to hang journaled attempts on.
+    fn evidence_run(db: &Db, spec_id: &str) -> String {
+        db.with_conn(|c| {
+            let project_id = db::get_spec(c, spec_id)
+                .expect("spec")
+                .expect("row")
+                .project_id;
+            let wf = db::create_workflow(
+                c,
+                Some(&project_id),
+                "evidence-flow",
+                db::WORKFLOW_SCOPE_CUSTOM,
+                None,
+            )
+            .expect("workflow");
+            db::create_workflow_run(c, &wf.id, Some(spec_id), None, "{}")
+                .expect("run")
+                .id
+        })
+    }
+
+    /// Record ONE attempt on a NAMED control — `(slot, resolved command line)` — which is what
+    /// [`journal_attempts`] cannot vary and what the "same control" reading turns on. A Spec's
+    /// journal really does mix controls: the build check and the reproduction are two different
+    /// commands, journaled side by side across every run the Spec ever had.
+    fn journal_attempt_on(
+        db: &Db,
+        run_id: &str,
+        spec_id: &str,
+        control: (&str, &str),
+        verdict: (&str, &str, bool),
+    ) {
+        let (slot, command_line) = control;
+        let (expect, outcome, satisfied) = verdict;
+        db.with_conn(|c| {
+            db::append_gate_attempt(
+                c,
+                db::NewGateAttempt {
+                    run_id: run_id.to_string(),
+                    spec_id: Some(spec_id.to_string()),
+                    node_id: format!("{slot}-gate"),
+                    slot: Some(slot.to_string()),
+                    expect: expect.to_string(),
+                    declared: true,
+                    blocking: true,
+                    outcome: outcome.to_string(),
+                    satisfied,
+                    command_line: command_line.to_string(),
+                    cwd: "/repo/nyx-v2".into(),
+                    exit_code: if outcome == db::GATE_OUTCOME_PASSED {
+                        Some(0)
+                    } else {
+                        Some(1)
+                    },
+                    duration_ms: 4210,
+                    output_excerpt: "test repro_the_defect ... FAILED\n1 failed; 0 passed".into(),
+                    commands_json: "[]".into(),
+                    created_at: 0,
+                },
+            )
+            .expect("append")
+        });
+    }
+
+    /// **THE GREEN THAT ANSWERS A RED IS AFTER IT AND ON THE SAME CONTROL** — read any other way,
+    /// the sequence line accuses a correct run of a violation it did not commit.
+    ///
+    /// The journal is per-SPEC and spans every run, and a gate that declares NOTHING is journaled
+    /// `expect: green`, satisfied — so a Spec's build checks fill it with satisfied greens that have
+    /// nothing to do with any reproduction. Picking "the first satisfied green in the list" then
+    /// produced, on a Spec built as a `feature` and RE-CLASSIFIED `bug` (which
+    /// `spec_set_category` explicitly allows at any status), the verdict "A satisfied GREEN is
+    /// recorded BEFORE the satisfied red … This is a finding" — printed directly above a red→green
+    /// sequence the auditor can see is in order.
+    #[test]
+    fn the_sequence_reading_ignores_a_green_obtained_on_another_control() {
+        let _g = db_guard();
+
+        // (a) THE RE-CLASSIFIED SPEC: build greens first, then a real red→green on the repro check.
+        let (db, spec_id) = seeded_classified("bug");
+        let run = evidence_run(&db, &spec_id);
+        journal_attempt_on(
+            &db,
+            &run,
+            &spec_id,
+            ("build_check", "bun test"),
+            (db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true),
+        );
+        journal_attempt_on(
+            &db,
+            &run,
+            &spec_id,
+            ("repro_check", "bun test repro"),
+            (db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true),
+        );
+        journal_attempt_on(
+            &db,
+            &run,
+            &spec_id,
+            ("repro_check", "bun test repro"),
+            (db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true),
+        );
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("A satisfied RED (#2) precedes a satisfied GREEN (#3) on the SAME control"),
+            "the sequence is read on the control it was made on:\n{text}",
+        );
+        assert!(
+            !text.contains("BEFORE the satisfied red"),
+            "an earlier green belonging to ANOTHER check is not an order violation:\n{text}",
+        );
+
+        // (b) A RED WITH NO GREEN OF ITS OWN: the build check goes green afterwards, and that
+        //     closes nothing. Half a sequence, said as half a sequence — not as a violation, and
+        //     not as a completed pair either.
+        let (db, spec_id) = seeded_classified("bug");
+        let run = evidence_run(&db, &spec_id);
+        journal_attempt_on(
+            &db,
+            &run,
+            &spec_id,
+            ("repro_check", "bun test repro"),
+            (db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true),
+        );
+        journal_attempt_on(
+            &db,
+            &run,
+            &spec_id,
+            ("build_check", "bun test"),
+            (db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true),
+        );
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("NO satisfied green after it ON THE SAME CONTROL"),
+            "nothing shows the defect fixed under the check that showed it broken:\n{text}",
+        );
+        assert!(
+            !text.contains("precedes a satisfied GREEN"),
+            "…and a green on another command is not credited as the closing one:\n{text}",
+        );
+
+        // (c) THE REAL ORDER VIOLATION is still named: a green BEFORE the red, on the SAME control.
+        let (db, spec_id) = seeded_classified("bug");
+        journal_attempts(
+            &db,
+            &spec_id,
+            &[
+                (db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true),
+                (db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true),
+            ],
+        );
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("BEFORE the satisfied red") && text.contains("finding"),
+            "the violation the discipline names is still reported:\n{text}",
+        );
+    }
+
+    /// THE OTHER STATE OF THE SEAM: with attempts recorded, the auditor reads the SEQUENCE — the
+    /// control, the declaration, the tri-valued grade and whether it answered — in the order the
+    /// attempts HAPPENED, with the fallback gone.
+    ///
+    /// The ordering assertion is the load-bearing one. The discipline tells the auditor "the red
+    /// precedes the fix; a green recorded first does not establish the counterfactual", so the
+    /// render must not sort the reds to the top: it renders chronologically, and STATES which of the
+    /// two orders this Spec actually produced.
+    #[test]
+    fn the_recorded_sequence_reaches_the_auditor_red_first_and_in_the_order_it_happened() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+        journal_attempts(
+            &db,
+            &spec_id,
+            &[
+                (db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true),
+                (db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true),
+            ],
+        );
+
+        let auditor = render_agent_context(&db, AgentRole::Auditor, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !auditor.contains("none recorded for this Spec"),
+            "the fallback is gone once there IS evidence:\n{auditor}",
+        );
+        let evidence_at = auditor
+            .find("### Reproduction evidence")
+            .expect("the block is still there, at the same heading");
+        assert!(
+            auditor.find(CATEGORY_DISCIPLINE_HEADING).unwrap() < evidence_at,
+            "and still UNDER the discipline that says how to judge it",
+        );
+        assert!(
+            auditor.contains("2 recorded gate attempts"),
+            "the header counts them:\n{auditor}",
+        );
+        // The SEQUENCE reading, stated rather than left to be reconstructed.
+        assert!(
+            auditor.contains("A satisfied RED (#1) precedes a satisfied GREEN (#2) on the SAME control"),
+            "the render states the sequence it found:\n{auditor}",
+        );
+        // ORDER: the red is rendered BEFORE the green, because that is when it happened.
+        let red_at = auditor.find("1. `failed`").expect("the red attempt");
+        let green_at = auditor.find("2. `passed`").expect("the green attempt");
+        assert!(red_at < green_at, "red first — chronologically:\n{auditor}");
+        // The IDENTITY of the control travels, which is what the auditor compares.
+        assert_eq!(
+            auditor.matches("slot `repro_check`").count(),
+            2,
+            "both attempts name the slot they ran"
+        );
+        assert_eq!(auditor.matches("cargo test -p nyx-core repro_").count(), 2);
+        assert!(auditor.contains("/repo/nyx-v2"), "and the cwd");
+        assert!(
+            auditor.contains("repro_the_defect ... FAILED"),
+            "with a bounded extract of what the check printed:\n{auditor}",
+        );
+
+        // The three roles that do not judge the proof still get no transcript of it.
+        for role in [AgentRole::Spec, AgentRole::Coder, AgentRole::Dev] {
+            let text = render_agent_context(&db, role, &spec_id, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !text.contains("### Reproduction evidence"),
+                "{}: the evidence is the AUDITOR's block and nobody else's",
+                role.slug(),
+            );
+        }
+    }
+
+    /// The two ORDER violations the discipline names are reported AS violations, not smoothed over:
+    /// a green recorded before the red, and a red and green obtained on DIFFERENT controls. And a
+    /// journal of nothing but `indeterminate` attempts demonstrates nothing at all.
+    #[test]
+    fn the_sequence_reading_names_the_violations_instead_of_hiding_them() {
+        let _g = db_guard();
+
+        // GREEN FIRST — the counterfactual is not established.
+        let (db, spec_id) = seeded_classified("bug");
+        journal_attempts(
+            &db,
+            &spec_id,
+            &[
+                (db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true),
+                (db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true),
+            ],
+        );
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("BEFORE the satisfied red") && text.contains("finding"),
+            "a green recorded first is reported as a finding:\n{text}",
+        );
+
+        // NOTHING SATISFIED — every attempt was an infrastructure fault.
+        let (db, spec_id) = seeded_classified("bug");
+        journal_attempts(
+            &db,
+            &spec_id,
+            &[
+                (db::GATE_EXPECT_RED, db::GATE_OUTCOME_INDETERMINATE, false),
+                (db::GATE_EXPECT_RED, db::GATE_OUTCOME_INDETERMINATE, false),
+            ],
+        );
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("NO attempt satisfied its declared expectation")
+                && text.contains("verified nothing"),
+            "an all-indeterminate journal demonstrates nothing, and says so:\n{text}",
+        );
+
+        // A GREEN AND NO RED — the reproduction is missing, which is a finding of its own.
+        let (db, spec_id) = seeded_classified("bug");
+        journal_attempts(
+            &db,
+            &spec_id,
+            &[(db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true)],
+        );
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("1 recorded gate attempt\n"),
+            "one attempt is not pluralised in the heading:\n{text}",
+        );
+        assert!(
+            text.contains("NO satisfied red") && text.contains("finding of its own"),
+            "an absent red stays a finding even when a green is recorded:\n{text}",
+        );
+    }
+
+    /// Record a manual reproduction pair on a run of `spec_id`, the way the seeded coder graph's
+    /// `ask_human` nodes do — two blackboard keys, side by side, on the CHILD run that asked them.
+    /// `after` `None` is the run parked between the two questions.
+    ///
+    /// A COMPLETE pair leaves the run `done`, which is the state the real branch leaves behind (the
+    /// e2e asserts it) and the state an auditor renders against: the coder child has finished, and
+    /// its line has already fallen out of the `Run     :` block. A half pair leaves the run live,
+    /// because that is what a run parked between the two questions IS.
+    fn record_manual_repro(db: &Db, spec_id: &str, before: &str, after: Option<&str>) -> String {
+        let mut board = serde_json::Map::new();
+        board.insert(
+            MANUAL_REPRO_BEFORE_KEY.to_string(),
+            serde_json::Value::String(before.to_string()),
+        );
+        if let Some(after) = after {
+            board.insert(
+                MANUAL_REPRO_AFTER_KEY.to_string(),
+                serde_json::Value::String(after.to_string()),
+            );
+        }
+        let board = serde_json::Value::Object(board).to_string();
+        let complete = after.is_some();
+        db.with_conn(|c| {
+            let project_id = db::get_spec(c, spec_id)
+                .expect("spec")
+                .expect("row")
+                .project_id;
+            let wf = db::create_workflow(
+                c,
+                Some(&project_id),
+                "manual-flow",
+                db::WORKFLOW_SCOPE_CUSTOM,
+                None,
+            )
+            .expect("workflow");
+            let run = db::create_workflow_run(c, &wf.id, Some(spec_id), None, &board)
+                .expect("run");
+            if complete {
+                db::update_workflow_run(c, &run.id, None, &board, db::RUN_STATUS_DONE, None)
+                    .expect("close the child run");
+            }
+            run.id
+        })
+    }
+
+    /// **THE MANUAL ROUTE REACHES THE AUDITOR** — the second half of the phase-4 done-criterion
+    /// ("the auditor context carries the full red→green sequence OR the two manual observations").
+    ///
+    /// WHAT THIS TEST IS ABOUT is not a missing paragraph. On the manual route the graph runs NO
+    /// reproduction gate, so the Spec carries exactly ONE attempt — the build control, green — and a
+    /// render that read only the journal told the auditor, at the top of their evidence block, that
+    /// "a satisfied GREEN is recorded and NO satisfied red … the reproduction is missing, and an
+    /// absent red on a `bug` Spec is a finding of its own". The auditor of a Spec that took a
+    /// first-class route, carried by the graph and validated TWICE by a human, was being invited to
+    /// file a finding for a proof that exists. So: both observations rendered, and the sequence
+    /// reading no longer calling the proof absent.
+    #[test]
+    fn the_manual_pair_is_rendered_and_the_reproduction_is_no_longer_called_missing() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+        // The shape the manual branch really leaves behind: one green build attempt, and the pair.
+        journal_attempts(
+            &db,
+            &spec_id,
+            &[(db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true)],
+        );
+        const PROTOCOL: &str = "unplug the reader, scan the badge, watch the LED stay red";
+        let run_id = record_manual_repro(&db, &spec_id, PROTOCOL, Some("fixed"));
+
+        let auditor = render_agent_context(&db, AgentRole::Auditor, &spec_id, None)
+            .unwrap()
+            .unwrap();
+        let evidence_at = auditor
+            .find("### Reproduction evidence")
+            .expect("the block keeps its heading and its place");
+        assert!(
+            auditor.find(CATEGORY_DISCIPLINE_HEADING).unwrap() < evidence_at,
+            "…still UNDER the discipline that says how to judge it:\n{auditor}",
+        );
+        // BOTH observations, in the ONE sub-block.
+        assert!(
+            auditor.contains(PROTOCOL) && auditor.contains("BEFORE the fix — the protocol"),
+            "the protocol and the BEFORE observation are rendered:\n{auditor}",
+        );
+        assert!(
+            auditor.contains("AFTER the fix — the SAME protocol") && auditor.contains("fixed"),
+            "and so is the AFTER one:\n{auditor}",
+        );
+        assert!(
+            auditor.contains(&run_id),
+            "with the run the pair was recorded on, so the full text is reachable:\n{auditor}",
+        );
+        // AND THE VERDICT NO LONGER DECLARES THE PROOF ABSENT.
+        assert!(
+            auditor.contains("The reproduction is NOT missing"),
+            "the sequence reading names the manual route as the proof:\n{auditor}",
+        );
+        for absent in [
+            "the reproduction is missing",
+            "NO satisfied red",
+            "none recorded for this Spec",
+        ] {
+            assert!(
+                !auditor.contains(absent),
+                "no rendered phrase calls this Spec's proof absent — found '{absent}':\n{auditor}",
+            );
+        }
+        // The heading names BOTH sources, and the build attempt is still listed as what it is.
+        assert!(
+            auditor.contains(
+                "### Reproduction evidence — the MANUAL protocol, observed before and after · 1 \
+                 recorded gate attempt"
+            ),
+            "the heading says which route produced the proof:\n{auditor}",
+        );
+        assert!(
+            auditor.contains("1. `passed`"),
+            "the build control's attempt is still rendered:\n{auditor}",
+        );
+        // And the roles that do not judge the proof still get none of it.
+        for role in [AgentRole::Spec, AgentRole::Coder] {
+            let text = render_agent_context(&db, role, &spec_id, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !text.contains("### Reproduction evidence") && !text.contains(PROTOCOL),
+                "{}: the evidence is the AUDITOR's block and nobody else's",
+                role.slug(),
+            );
+        }
+    }
+
+    /// THE OTHER TWO STATES the reading has to keep apart from the one above.
+    ///
+    /// HALF A PAIR IS A FINDING, not a proof: a run parked between the two questions has a protocol
+    /// and no observation after the fix, and the discipline says in so many words that a single
+    /// observation is a finding. And A SATISFIED RED STILL WINS: when the automated sequence really
+    /// ran, its reading is the one the auditor gets — the manual text is colour around it, never
+    /// what answers the red.
+    #[test]
+    fn a_half_pair_is_named_a_finding_and_a_real_red_still_owns_the_reading() {
+        let _g = db_guard();
+
+        // HALF A PAIR — the protocol is there, the after observation is not.
+        let (db, spec_id) = seeded_classified("bug");
+        record_manual_repro(&db, &spec_id, "scan the badge, watch the LED", None);
+        let text = resolve_gate_evidence(&db, &spec_id).expect("a manual-only block still renders");
+        assert!(
+            text.starts_with("### Reproduction evidence — the MANUAL protocol, observed ONCE\n"),
+            "the heading says half a pair is what there is:\n{text}",
+        );
+        assert!(
+            text.contains("NO observation after the fix") && text.contains("it is a finding"),
+            "half a pair is named as the finding it is:\n{text}",
+        );
+        assert!(
+            text.contains("AFTER the fix — NOT RECORDED"),
+            "…and the missing half is shown as missing, not omitted:\n{text}",
+        );
+
+        // A REAL RED — the automated reading is untouched by the presence of a manual note.
+        let (db, spec_id) = seeded_classified("bug");
+        journal_attempts(
+            &db,
+            &spec_id,
+            &[
+                (db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true),
+                (db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true),
+            ],
+        );
+        record_manual_repro(&db, &spec_id, "a note somebody left", Some("fixed"));
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("A satisfied RED (#1) precedes a satisfied GREEN (#2) on the SAME control"),
+            "a satisfied red keeps the automated reading:\n{text}",
+        );
+        assert!(
+            !text.contains("The reproduction is NOT missing"),
+            "…and the manual verdict does not displace it:\n{text}",
+        );
+    }
+
+    /// **`still-broken` IS A RECORDED OBSERVATION, AND IT IS NOT A PROOF OF REPAIR.**
+    ///
+    /// The seeded question closes its answer set on `{fixed, still-broken}` and the repair loop
+    /// exits only on `fixed`, so ONE of the two members means the defect is still reproducing.
+    /// Reading `after.is_some()` as "the pair is complete" rendered that answer as a closed,
+    /// validated proof — heading included ("observed before and after") — about work a human had
+    /// just said was NOT repaired.
+    ///
+    /// And the state persists: the loop dies through `EngineError::LoopLimit` when the human keeps
+    /// answering `still-broken`, which the seed documents as the normal recovery, leaving that board
+    /// behind forever. So the second half of this test pins the other side of the same defect — a
+    /// FAILED run's board is not the Spec's evidence, and a later pass down the automated route
+    /// (which writes no manual key at all) must not be judged on an abandoned protocol.
+    #[test]
+    fn a_second_observation_that_says_still_broken_is_never_read_as_a_closed_pair() {
+        let _g = db_guard();
+
+        let (db, spec_id) = seeded_classified("bug");
+        record_manual_repro(&db, &spec_id, "scan the badge, watch the LED", Some("still-broken"));
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("STILL REPRODUCING"),
+            "the heading says what the pair amounts to:\n{text}",
+        );
+        assert!(
+            text.contains("does NOT say the defect is gone")
+                && text.contains("still-broken")
+                && text.contains("it is a finding"),
+            "…and the verdict quotes the human's own answer:\n{text}",
+        );
+        assert!(
+            !text.contains("The reproduction is NOT missing")
+                && !text.contains("observed before and after"),
+            "nothing here announces a closed proof:\n{text}",
+        );
+
+        // THE DEAD RUN. Its board keeps `still-broken` forever; the Spec is then re-driven and takes
+        // the AUTOMATED route, which records a real red→green and writes no manual key at all.
+        let (db, spec_id) = seeded_classified("bug");
+        let dead = record_manual_repro(&db, &spec_id, "the abandoned protocol", Some("still-broken"));
+        db.with_conn(|c| {
+            let run = db::get_workflow_run(c, &dead).expect("run").expect("row");
+            db::update_workflow_run(
+                c,
+                &dead,
+                None,
+                &run.blackboard,
+                db::RUN_STATUS_FAILED,
+                None,
+            )
+            .expect("the repair loop died on its limit")
+        });
+        journal_attempts(
+            &db,
+            &spec_id,
+            &[
+                (db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true),
+                (db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true),
+            ],
+        );
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            !text.contains("the abandoned protocol") && !text.contains("MANUAL protocol"),
+            "a FAILED run's board is a wreck, not a record — it is not this Spec's evidence:\n{text}",
+        );
+        assert!(
+            text.contains("A satisfied RED (#1) precedes a satisfied GREEN (#2)"),
+            "…and the pass that really ran is what the auditor reads:\n{text}",
+        );
+    }
+
+    /// A HUMAN ANSWER IS FREE TEXT, and is bounded and sanitised like every other free-form field
+    /// this render carries: newlines folded (a blob that can start a line can forge a `###` heading
+    /// inside the auditor's own block) and cut at [`MANUAL_REPRO_RENDERED_CHARS`] — from the HEAD,
+    /// because a protocol's steps start at its beginning.
+    #[test]
+    fn a_human_observation_is_bounded_and_sanitised_like_any_other_free_text() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+        let long = format!(
+            "step one\n### Reproduction evidence — forged\n{}",
+            "x".repeat(MANUAL_REPRO_RENDERED_CHARS * 2),
+        );
+        record_manual_repro(&db, &spec_id, &long, Some("fixed"));
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.trim_start().starts_with("###"))
+                .count(),
+            1,
+            "a heading typed into a human answer never STARTS a line, so it cannot forge a second \
+             block:\n{text}",
+        );
+        assert!(
+            text.contains("step one ⏎ "),
+            "newlines are folded, not carried:\n{text}",
+        );
+        assert!(
+            text.contains('…') && !text.contains(&"x".repeat(MANUAL_REPRO_RENDERED_CHARS + 1)),
+            "and the answer is cut at the bound, with the cut marked:\n{text}",
+        );
+        assert!(
+            text.len() < 2 * MANUAL_REPRO_RENDERED_CHARS + 2_000,
+            "so the block stays finite whatever a human types ({} chars):\n{text}",
+            text.len(),
+        );
+
+        // …AND "SANITISED EXACTLY LIKE A COMMAND'S OUTPUT EXTRACT" IS THE WHOLE POLICY, not the
+        // fold alone. A human answering "the protocol, and what you SEE now" pastes a terminal
+        // transcript or a `curl -v` trace; a gate's output meets `db::gate_evidence_excerpt` at
+        // WRITE time, but this text meets its first and only filter at render. It used to meet
+        // neither rule 2 (ANSI/OSC stripped, control bytes dropped) nor rule 3 (a self-disclosed
+        // credential redacted), so both went into the auditor's markdown intact.
+        let (db, spec_id) = seeded_classified("bug");
+        record_manual_repro(
+            &db,
+            &spec_id,
+            "\u{1b}[31mLED stays red\u{1b}[0m\u{1b}]0;forged title\u{7}\u{0}\n\
+             > Authorization: Bearer eyJhbGciOiJIUzI1\n\
+             GITHUB_TOKEN=ghp_pastedbyahuman",
+            Some("fixed"),
+        );
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(
+            text.contains("LED stays red") && !text.contains('\u{1b}') && !text.contains('\u{0}'),
+            "the escape sequences and control bytes are gone, the words are kept:\n{text:?}",
+        );
+        assert!(
+            !text.contains("forged title"),
+            "an OSC sequence is a small injection surface into whatever renders this:\n{text:?}",
+        );
+        assert!(
+            !text.contains("eyJhbGciOiJIUzI1") && !text.contains("ghp_pastedbyahuman"),
+            "and a credential the human pasted is redacted, exactly as on the command path:\n{text}",
+        );
+        assert!(
+            text.contains(db::GATE_EVIDENCE_REDACTED),
+            "…visibly, so a reader knows something was removed:\n{text}",
+        );
+    }
+
+    /// The render is BOUNDED whatever a Spec's gate history looks like: a check re-run many times
+    /// renders the FIRST attempt (the reproduction, whose absence would be a finding) and the most
+    /// recent ones, with the elision STATED — never silently dropped, and never the whole transcript.
+    #[test]
+    fn a_long_gate_history_renders_the_first_and_the_last_with_the_elision_stated() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+        let mut history = vec![(db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true)];
+        for _ in 0..11 {
+            history.push((db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_FAILED, false));
+        }
+        history.push((db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true));
+        journal_attempts(&db, &spec_id, &history);
+
+        let text = resolve_gate_evidence(&db, &spec_id).expect("evidence");
+        assert!(text.contains("13 recorded gate attempts"), "{text}");
+        assert!(text.contains("1. `failed`"), "the reproduction is kept:\n{text}");
+        assert!(
+            text.contains("13. `passed`"),
+            "and so is the most recent attempt, at its REAL rank:\n{text}",
+        );
+        assert!(
+            text.contains("9 intermediate attempts not shown"),
+            "and the elision is stated, with its count:\n{text}",
+        );
+        assert_eq!(
+            text.matches("   control : ").count(),
+            GATE_EVIDENCE_ATTEMPTS_RENDERED,
+            "exactly the bound's worth of attempts is rendered:\n{text}",
+        );
+    }
+
+    /// DONE-CRITERION — the SIX roles, rendered on a `bug` Spec (the shape that now carries an extra
+    /// block), still render everything they rendered before: their own preamble, the Spec's
+    /// sections, the current phase, the project/workspace section, and no stray rules marker.
+    ///
+    /// Inserting a block BETWEEN the preamble and the sections is exactly what can break these, so
+    /// the regression is asserted on the categorized shape rather than only on the fixture that
+    /// carries no category.
+    #[test]
+    fn inserting_the_discipline_left_the_six_role_renders_intact() {
+        let _g = db_guard();
+        let (db, spec_id) = seeded_classified("bug");
+        for (role, preamble) in [
+            (AgentRole::Spec, "# Context: Spec Author"),
+            (AgentRole::Dev, "# Context: Dev — dispatcher"),
+            (AgentRole::Coder, "# Context: Coder Agent"),
+            (AgentRole::Auditor, "# Context: Auditor Agent"),
+            (AgentRole::Doc, "# Context: Doc-sync"),
+            (AgentRole::Prototype, "# Context: Prototype (sub-agent)"),
+        ] {
+            let text = render_agent_context(&db, role, &spec_id, None)
+                .unwrap()
+                .unwrap();
+            let slug = role.slug();
+            assert!(text.contains(preamble), "{slug}: its own preamble");
+            assert!(
+                text.contains(&format!("=== NYX CONTEXT — {} ===", role.label())),
+                "{slug}: the header banner",
+            );
+            assert!(text.contains(SOURCES_NOTE), "{slug}: the sources note");
+            assert!(
+                text.contains("the problem") && text.contains("the solution"),
+                "{slug}: the Spec's sections",
+            );
+            assert!(
+                text.contains("Current phase — 1 · Foundation")
+                    && text.contains("Phase 1 task"),
+                "{slug}: the current phase and its task",
+            );
+            assert!(
+                text.contains("Project, repos & workspace") && text.contains("api → ."),
+                "{slug}: the project/workspace section",
+            );
+            assert!(!text.contains(RULES_MARKER), "{slug}: no stray rules marker");
+        }
+    }
+
     /// Review finding 01KY4ZJQ6BCXHQZ8268P47ZGNH: the Coder is a non-interactive sub-agent — it
     /// SURFACES a discovered follow-up UPWARD to the dev orchestrator (final report / note, like a
     /// scope-gap) and never calls `idea_add` itself.
@@ -5941,6 +8064,164 @@ mod tests {
             cycle < whole.len() * 2,
             "four narrowed passes ({cycle}) must cost less than two whole-Spec ones ({})",
             whole.len() * 2,
+        );
+    }
+
+    /// THE SAME MEASUREMENT ON THE `bug` SHAPE — the one an audit pass gets when the Spec carries a
+    /// category discipline AND every kind of reproduction evidence the render knows how to print (a
+    /// red→green sequence at the attempt bound AND a manual pair at the observation bound), which is
+    /// the heaviest an auditor pass can be.
+    ///
+    /// [`AUDIT_PASS_CONTEXT_MAX`] / [`AUDIT_CYCLE_CONTEXT_MAX`] above are priced on an
+    /// UNCATEGORIZED Spec, and deliberately stay that way: they are the regression guard on the
+    /// render every Spec gets, and folding a category-conditional block into them would make them
+    /// answer two questions at once. A `bug` Spec pays two extra blocks on top, and this is where
+    /// they are priced, measured rather than assumed.
+    ///
+    /// MEASURED on [`seeded_realistic`] classified `bug`, with BOTH routes' evidence AT the render's
+    /// own bounds — a FOUR-attempt journal ([`GATE_EVIDENCE_ATTEMPTS_RENDERED`]) AND a manual pair
+    /// whose two observations each exceed [`MANUAL_REPRO_RENDERED_CHARS`], so a Spec whose gate ran
+    /// thirty times and whose human wrote an essay renders exactly this and no more:
+    ///
+    ///   * the auditor `bug` discipline text: 2 330 bytes;
+    ///   * the evidence block at its bound: 3 530 — of which ~1 441 is the manual pair (two
+    ///     observations of 480 characters plus the prose that says what to judge in them);
+    ///   * the two together, framing included: 6 035 per pass (the framing is the 175 bytes the
+    ///     block's own separators cost — the delta is asserted against the two lengths below, so
+    ///     that figure is derived rather than remembered);
+    ///   * PASSES: 11 513 – 13 022, against 5 517 – 6 987 for the same fixture UNCATEGORIZED;
+    ///   * CYCLE: 48 621, against 24 481 uncategorized.
+    ///
+    /// The bounds are 13 200 (178 of slack on the dearest pass) and 49 200 (579, about 145 per pass
+    /// — deliberately no tighter per pass than [`AUDIT_CYCLE_CONTEXT_MAX`]'s, so the `bug` fixture
+    /// is not the more sensitive of the three).
+    ///
+    /// RE-PRICED when the MANUAL route's two observations joined the block (they were persisted and
+    /// never rendered, which made a manual Spec look to its auditor like a fix with no
+    /// reproduction). The pair costs 1 441 per pass, 5 764 per cycle, at its bound — that is what
+    /// moved 11 650 → 13 200 and 43 100 → 49 200, and it is the price of the second route being
+    /// visible at all. Note that no REAL Spec pays both halves: the manual branch runs no
+    /// reproduction gate, so a manual Spec carries one attempt, not four. This fixture pays both on
+    /// purpose, because a budget priced on the shape that cannot happen is not a budget.
+    ///
+    /// WHAT A RED HERE MEANS. Either a discipline text grew (they are constants in this file), or
+    /// the evidence render did: one attempt costs ~430 bytes per pass, so lifting
+    /// [`GATE_EVIDENCE_ATTEMPTS_RENDERED`] by one costs ~1 720 across a cycle and lands here at
+    /// once; one character of [`MANUAL_REPRO_RENDERED_CHARS`] costs 8 across a cycle (2 observations
+    /// × 4 passes). That is the point of pricing it — a bound the auditor pass discovers in
+    /// production is a bound that was never set.
+    ///
+    /// WHAT IT IS NOT is a capacity bound on the STATE, for the same reason
+    /// [`AUDIT_CYCLE_AT_RUN_CAP_MAX`] is not: two of the things an attempt line prints are free-form
+    /// — the RESOLVED command line and the cwd, both as long as the project made them — and each
+    /// extra character of them costs 16 across a cycle (4 attempts × 4 passes). What IS bounded, and
+    /// is what makes the block finite at all, is the attempt COUNT, the per-attempt output extract
+    /// ([`GATE_EVIDENCE_RENDERED_OUTPUT_CHARS`]) and the per-observation extract
+    /// ([`MANUAL_REPRO_RENDERED_CHARS`]) — the last of which is what keeps a free-form human answer
+    /// from taking the whole budget on its own.
+    const AUDIT_PASS_ON_BUG_MAX: usize = 13_200;
+    const AUDIT_CYCLE_ON_BUG_MAX: usize = 49_200;
+
+    /// The FOUR Spec commitments an ndev audit cycle walks, one pass each — the cycle every budget
+    /// in this section is a sum over.
+    const AUDIT_SUBJECTS: [&str; 4] = [
+        "user_stories",
+        "testing_decisions",
+        "implementation_decisions",
+        "out_of_scope",
+    ];
+
+    #[test]
+    fn the_bug_shape_of_an_audit_pass_is_priced_with_its_discipline_and_its_evidence() {
+        let _g = db_guard();
+        let (db, spec_id, _run_id) = seeded_realistic();
+
+        // The UNCATEGORIZED cost of the same fixture — the baseline the deltas below are read
+        // against, measured here rather than remembered from a comment.
+        let plain: usize = AUDIT_SUBJECTS
+            .iter()
+            .map(|subject| {
+                render_effector_context(&db, "auditor", Some(&spec_id), Some(subject))
+                    .unwrap()
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+
+        db.with_conn(|c| {
+            crate::category::set_spec_category_by_label(
+                c,
+                &spec_id,
+                "bug",
+                db::DomainEventSource::Mcp,
+            )
+            .expect("classify the fixture Spec")
+        });
+        // A journal AT the render's own bound: any longer history renders the same four attempts,
+        // so this is the worst case and not merely a plausible one.
+        let mut history = vec![(db::GATE_EXPECT_RED, db::GATE_OUTCOME_FAILED, true)];
+        for _ in 0..2 {
+            history.push((db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_FAILED, false));
+        }
+        history.push((db::GATE_EXPECT_GREEN, db::GATE_OUTCOME_PASSED, true));
+        journal_attempts(&db, &spec_id, &history);
+        // …AND A MANUAL PAIR AT ITS OWN BOUND, on the same Spec. A Spec does not normally carry
+        // both — the manual branch runs no reproduction gate — but the render will print both when
+        // both exist, and a budget priced on the shape that cannot happen is not a budget. Two
+        // observations of exactly [`MANUAL_REPRO_RENDERED_CHARS`] is the most this block can cost.
+        record_manual_repro(
+            &db,
+            &spec_id,
+            &"unplug the reader, scan the badge, watch the LED. "
+                .repeat(MANUAL_REPRO_RENDERED_CHARS),
+            Some(&"the LED goes green under those very steps. ".repeat(MANUAL_REPRO_RENDERED_CHARS)),
+        );
+
+        let mut cycle = 0usize;
+        for subject in AUDIT_SUBJECTS {
+            let pass = render_effector_context(&db, "auditor", Some(&spec_id), Some(subject))
+                .unwrap()
+                .unwrap();
+            // THE FIXTURE IS THE ONE CLAIMED: this pass really does carry BOTH extra blocks. A
+            // render that lost one of them would re-price the budget on a shape it never has.
+            assert!(
+                pass.contains(CATEGORY_DISCIPLINE_HEADING)
+                    && pass.contains("### Reproduction evidence"),
+                "the '{subject}' pass must carry the discipline AND the evidence:\n{pass}",
+            );
+            assert_eq!(
+                pass.matches("   control : ").count(),
+                GATE_EVIDENCE_ATTEMPTS_RENDERED,
+                "…with the evidence block AT its own bound",
+            );
+            assert!(
+                pass.len() <= AUDIT_PASS_ON_BUG_MAX,
+                "the '{subject}' audit pass on a `bug` Spec is {} chars, over the \
+                 {AUDIT_PASS_ON_BUG_MAX} budget",
+                pass.len(),
+            );
+            cycle += pass.len();
+        }
+        assert!(
+            cycle <= AUDIT_CYCLE_ON_BUG_MAX,
+            "a 4-pass audit cycle on a `bug` Spec is {cycle} chars, over the \
+             {AUDIT_CYCLE_ON_BUG_MAX} budget (the same cycle uncategorized costs {plain})",
+        );
+        // The two blocks are what the difference IS — not a manual or a section that grew under
+        // them. Priced as a whole so the arithmetic in the doc above stays checkable.
+        let discipline = category_discipline(AgentRole::Auditor, "bug").expect("the text");
+        let evidence = resolve_gate_evidence(&db, &spec_id).expect("the block");
+        let blocks = discipline.len() + evidence.len();
+        assert!(
+            cycle - plain >= 4 * blocks,
+            "the delta ({}) is at least the two blocks themselves, four times over ({})",
+            cycle - plain,
+            4 * blocks,
+        );
+        assert!(
+            cycle - plain <= 4 * (blocks + 200),
+            "…and nothing else of consequence: {} bytes per pass of framing around them",
+            (cycle - plain) / 4 - blocks,
         );
     }
 

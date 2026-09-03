@@ -647,8 +647,15 @@ fn arm_coder_gate(db: &Db, project_id: &str) {
 /// Drive a coder SUB-WORKFLOW child (from a surfaced `sub_workflow` action) to `done`, exactly like the
 /// real dispatcher: loop `nyx_next(child_run_id)` performing each action until it returns done. The
 /// child owns the per-phase task loop (spawn coder → the gate nyx runs itself → transition_task done),
-/// so it surfaces only `spawn_subagent{coder}` + `note` + `done`. Returns the number of coder spawns it
-/// performed (one per open task in the phase; 0 when the phase is already drained).
+/// so it surfaces only the PREFLIGHT `judge` + `spawn_subagent{coder}` + `note` + `done`. Returns the
+/// number of coder spawns it performed (one per open task in the phase; 0 when the phase is already
+/// drained).
+///
+/// The `judge` is revision 24's CATEGORY PREFLIGHT, and it is here rather than stubbed out of the
+/// fixtures on purpose: these Specs carry no category (nothing in `draft_spec` classifies one), which
+/// is precisely the population the preflight exists for. Every one of these end-to-end tests
+/// therefore walks it, and the `feature` answer is what routes them past the `bug` discipline — the
+/// same path they took before revision 24, now reached by a classification instead of by silence.
 fn drive_coder_child(db: &Db, rt: &EngineRuntime, child_run_id: &str) -> usize {
     let mut coder_spawns = 0;
     let mut last: Option<Value> = None;
@@ -657,6 +664,20 @@ fn drive_coder_child(db: &Db, rt: &EngineRuntime, child_run_id: &str) -> usize {
         let out = tick(db, rt, child_run_id, last.take());
         match out["action"]["type"].as_str().unwrap() {
             "done" => break,
+            "judge" => {
+                assert!(
+                    out["action"]["prompt"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("GENRE OF WORK")
+                        || out["action"]["prompt"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("carries NO category"),
+                    "the only judge the coder child surfaces is the category preflight: {out}"
+                );
+                last = Some(json!({ "verdict": "feature" }));
+            }
             "spawn_subagent" => {
                 assert_eq!(out["action"]["agent_id"], "coder", "the coder child spawns the coder");
                 coder_spawns += 1;
@@ -722,7 +743,9 @@ fn drive_coder_child_answering(
                 ));
                 last = Some(on_action(&action));
             }
-            "ask_human" => last = Some(on_action(&action)),
+            // The category PREFLIGHT (revision 24) and the questions the graph parks on both go to
+            // `on_action`, so a test can answer the classification the way its case needs it.
+            "judge" | "ask_human" => last = Some(on_action(&action)),
             other => panic!("unexpected coder child action '{other}': {out}"),
         }
         steps += 1;
@@ -877,9 +900,18 @@ fn nspec_grills_a_draft_then_commits_it_to_ready() {
                 last = Some(json!({ "diff": "spec text" }));
             }
             "judge" => {
-                grills += 1;
-                // NYX's judge ends the grill: one more round, then complete.
-                last = Some(json!({ "verdict": if grills < 2 { "more" } else { "complete" } }));
+                // Revision 23 put a SECOND judge on this path — the category one — so the verdict is
+                // chosen by the QUESTION and no longer by a counter alone: answering "complete" to
+                // "which category?" would classify the Spec as a category literally named `complete`.
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let verdict = if p.contains("GENRE OF WORK") {
+                    "feature"
+                } else {
+                    grills += 1;
+                    // NYX's judge ends the grill: one more round, then complete.
+                    if grills < 2 { "more" } else { "complete" }
+                };
+                last = Some(json!({ "verdict": verdict }));
             }
             "ask_human" => {
                 // The draft is ready-able, so the entry offers "grill or finalize" — choose to KEEP
@@ -964,8 +996,17 @@ fn nspec_yes_with_workspace_uses_the_configured_root_without_asking() {
             "done" => break,
             "spawn_subagent" => last = Some(json!({ "diff": "d" })),
             "judge" => {
-                grills += 1;
-                last = Some(json!({ "verdict": if grills < 1 { "more" } else { "complete" } }));
+                // The category judge (revision 23) wants a LABEL, not a grill verdict — `feature`,
+                // so these runs take the same path they always did (no bug contract). Every other
+                // judge on this path is a completion verdict.
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let verdict = if p.contains("GENRE OF WORK") {
+                    "feature".to_string()
+                } else {
+                    grills += 1;
+                    if grills < 1 { "more" } else { "complete" }.to_string()
+                };
+                last = Some(json!({ "verdict": verdict }));
             }
             "ask_human" => {
                 let p = out["action"]["prompt"].as_str().unwrap_or("");
@@ -1073,8 +1114,17 @@ fn nspec_yes_with_workspace_asks_for_the_path_when_no_root_is_configured() {
             "done" => break,
             "spawn_subagent" => last = Some(json!({ "diff": "d" })),
             "judge" => {
-                grills += 1;
-                last = Some(json!({ "verdict": if grills < 1 { "more" } else { "complete" } }));
+                // The category judge (revision 23) wants a LABEL, not a grill verdict — `feature`,
+                // so these runs take the same path they always did (no bug contract). Every other
+                // judge on this path is a completion verdict.
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let verdict = if p.contains("GENRE OF WORK") {
+                    "feature".to_string()
+                } else {
+                    grills += 1;
+                    if grills < 1 { "more" } else { "complete" }.to_string()
+                };
+                last = Some(json!({ "verdict": verdict }));
             }
             "ask_human" => {
                 let p = out["action"]["prompt"].as_str().unwrap_or("");
@@ -1187,8 +1237,17 @@ fn drive_nspec(
             "done" => return out,
             "spawn_subagent" => last = Some(json!({ "diff": "d" })),
             "judge" => {
-                grills += 1;
-                last = Some(json!({ "verdict": if grills < 1 { "more" } else { "complete" } }));
+                // The category judge (revision 23) wants a LABEL, not a grill verdict — `feature`,
+                // so these runs take the same path they always did (no bug contract). Every other
+                // judge on this path is a completion verdict.
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let verdict = if p.contains("GENRE OF WORK") {
+                    "feature".to_string()
+                } else {
+                    grills += 1;
+                    if grills < 1 { "more" } else { "complete" }.to_string()
+                };
+                last = Some(json!({ "verdict": verdict }));
             }
             "ask_human" => {
                 let p = out["action"]["prompt"].as_str().unwrap_or("");
@@ -1416,8 +1475,17 @@ fn nspec_declining_confirm_ready_leaves_a_draft_without_freezing() {
             "done" => break,
             "spawn_subagent" => last = Some(json!({ "diff": "d" })),
             "judge" => {
-                grills += 1;
-                last = Some(json!({ "verdict": if grills < 1 { "more" } else { "complete" } }));
+                // The category judge (revision 23) wants a LABEL, not a grill verdict — `feature`,
+                // so these runs take the same path they always did (no bug contract). Every other
+                // judge on this path is a completion verdict.
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let verdict = if p.contains("GENRE OF WORK") {
+                    "feature".to_string()
+                } else {
+                    grills += 1;
+                    if grills < 1 { "more" } else { "complete" }.to_string()
+                };
+                last = Some(json!({ "verdict": verdict }));
             }
             "ask_human" => {
                 let p = out["action"]["prompt"].as_str().unwrap_or("");
@@ -1975,6 +2043,8 @@ fn a_human_task_is_settled_by_the_human_and_closed_through_the_verified_path() {
                         // Reported for completeness — the assertions below prove the coder is never
                         // spawned on an action reserved for the user.
                         "spawn_subagent" => json!({ "diff": "d" }),
+                        // The revision-24 preflight: this fixture's Spec carries no category.
+                        "judge" => json!({ "verdict": "feature" }),
                         _ => {
                             let prompt = action["prompt"].as_str().unwrap_or("");
                             assert!(
@@ -2102,6 +2172,8 @@ fn a_blocked_task_escalates_and_the_human_alone_opens_the_spec_freeze() {
                             }
                             json!({ "diff": "d" })
                         }
+                        // The revision-24 preflight: this fixture's Spec carries no category.
+                        "judge" => json!({ "verdict": "feature" }),
                         // The SPEC AUTHOR nyx spawns on the 'spec' ruling — this spawn IS the window.
                         "spawn_subagent" => {
                             assert_eq!(action["agent_id"], "spec", "the escalation spawns the Spec author");
@@ -2208,6 +2280,8 @@ fn a_deferred_blocked_task_is_closed_with_its_reason_after_the_idea_is_recorded(
                             json!({ "diff": "d" })
                         }
                         "spawn_subagent" => json!({ "diff": "idea recorded" }),
+                        // The revision-24 preflight: this fixture's Spec carries no category.
+                        "judge" => json!({ "verdict": "feature" }),
                         _ => json!({ "decision": "defer" }),
                     }
                 }));
@@ -2466,6 +2540,19 @@ fn the_builtin_questions_a_human_alone_may_answer_are_the_ones_that_commit() {
     assert_eq!(
         committing,
         vec![
+            // REVISION 24 — and this one is why the manual reproduction branch is not the escape it
+            // looks like. "the SAME protocol, after the fix" writes `manual_repro_after`, the key the
+            // "repair under the protocol" loop exits on, and that loop's body SPAWNS the coder — so
+            // the derivation classifies it `AnotherRound` and nyx demands a real human turn for it.
+            // A dispatcher that answers the impracticability question 'manual' by itself (that
+            // question commits nothing, so it stays ordinary) therefore routes itself into a branch
+            // it CANNOT close alone: the machine-checked proof it dropped is replaced by a HUMAN's,
+            // never by nothing.
+            (
+                "coder",
+                "the SAME protocol, after the fix".to_string(),
+                HumanCommitment::AnotherRound,
+            ),
             // The BUILD ROUNDS (J2) — each re-opens a loop whose body opens a coder child / the doc
             // effector, so answering it buys another sub-agent pass.
             ("ndev", "coder blocked".to_string(), HumanCommitment::AnotherRound),
@@ -2599,20 +2686,39 @@ fn no_seeded_gate_names_a_command_only_the_slot_a_project_binds() {
             );
         }
     }
-    assert_eq!(gates, 1, "exactly one seeded gate today — the coder's `checks`");
+    assert_eq!(
+        gates, 3,
+        "the three seeded gates: the coder's `checks`, and revision 24's red + green reproduction",
+    );
 }
 
 /// The coder's `checks` gate, precisely: BLOCKING (so an unbound project is refused, not waved
 /// through) and declaring [`BUILD_CHECK_SLOT`] — the name the refusal tells the project to bind, so
 /// the two must be the same string or the instruction points at nothing.
+///
+/// ONE `checks` node and no more, revision 24's `bug` branch notwithstanding: the reproduction is an
+/// extra obligation laid on a bug, and it is wired BEFORE the shared build control rather than
+/// beside a second copy of it. A per-genre duplicate would make `run_start` report the same unbound
+/// slot twice and would let the two copies drift.
 #[test]
 fn the_seeded_coder_gate_declares_the_build_check_slot() {
     let db = seeded_db();
     let (_wf, nodes) = builtin(&db, db::WORKFLOW_SCOPE_CODER);
-    let gate = nodes
+    let build_gates: Vec<&db::Node> = nodes
         .iter()
-        .find(|n| n.type_ == db::NODE_TYPE_GATE_CHECK)
-        .expect("the coder's checks gate");
+        .filter(|n| n.type_ == db::NODE_TYPE_GATE_CHECK)
+        .filter(|n| {
+            serde_json::from_str::<Value>(&n.config).expect("gate config is JSON")["slot"]
+                == json!(BUILD_CHECK_SLOT)
+        })
+        .collect();
+    assert_eq!(
+        build_gates.len(),
+        1,
+        "ONE build control, shared by every genre: {:?}",
+        build_gates.iter().map(|n| &n.label).collect::<Vec<_>>(),
+    );
+    let gate = build_gates[0];
     assert_eq!(gate.label, "checks");
     let cfg: Value = serde_json::from_str(&gate.config).expect("gate config is JSON");
     assert_eq!(cfg["slot"], json!(BUILD_CHECK_SLOT));
@@ -2620,6 +2726,11 @@ fn the_seeded_coder_gate_declares_the_build_check_slot() {
     assert!(
         cfg.get("command_ids").is_none(),
         "and it carries no command list at all: {cfg}",
+    );
+    assert!(
+        cfg.get("expect").is_none(),
+        "the build control declares NO expectation — it keeps the pre-expectation M5 anchor, which \
+         is what lets the 'make it green' loop re-spawn on a red instead of refusing the tick: {cfg}",
     );
 }
 
@@ -2856,4 +2967,1084 @@ fn only_one_seeded_sensitive_gate_hangs_on_something_no_question_writes() {
         .collect::<Vec<_>>(),
         "every sensitive gate of the built-ins, and what fills the key it reads",
     );
+}
+
+// --- Revision 23: the category, and the reproduction contract a `bug` owes -------
+
+/// One `/nspec` run driven end to end, RECORDING what the graph surfaced and in what order.
+///
+/// `category` is the answer given to the "which category?" judge — the one input these two tests
+/// differ by. Every other answer is the ordinary one: the grill ends on its first verdict, the
+/// reproduction contract on its first, the proto judge sees no graphic surface, and the commit is
+/// declined (`no`) so the run ends on the note rather than on a transition these tests are not about.
+///
+/// The trace is a list of short TAGS — `grill_spawn`, `category_judge`, `bug_spawn`, … — because what
+/// both tests assert is an ORDER and a PRESENCE, and a tag says which node produced a step where a
+/// raw action type would only say "spawn_subagent" three times.
+fn drive_nspec_categorized(db: &Db, wf_id: &str, spec_id: &str, category: &str) -> Vec<String> {
+    let rt = EngineRuntime::new();
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, wf_id, Some(spec_id), None, "{}"))
+        .unwrap()
+        .id;
+    let mut trace: Vec<String> = Vec::new();
+    let mut last: Option<Value> = None;
+    let mut steps = 0;
+    loop {
+        let out = tick(db, &rt, &run_id, last.take());
+        match out["action"]["type"].as_str().unwrap() {
+            "done" => return trace,
+            "spawn_subagent" => {
+                let subject = out["action"]["subject"].as_str().unwrap_or("");
+                trace.push(
+                    if subject == "bug_reproduction_contract" {
+                        "bug_spawn"
+                    } else {
+                        "grill_spawn"
+                    }
+                    .to_string(),
+                );
+                last = Some(json!({ "diff": "d" }));
+            }
+            "judge" => {
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let verdict = if p.contains("GENRE OF WORK") {
+                    trace.push("category_judge".to_string());
+                    category.to_string()
+                } else if p.contains("REPRODUCTION CONTRACT") {
+                    trace.push("bug_judge".to_string());
+                    "complete".to_string()
+                } else if p.contains("graphical/UI surface") {
+                    trace.push("proto_judge".to_string());
+                    "none".to_string()
+                } else {
+                    trace.push("grill_judge".to_string());
+                    "complete".to_string()
+                };
+                last = Some(json!({ "verdict": verdict }));
+            }
+            "ask_human" => {
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let ans = if p.contains("finalize") {
+                    trace.push("entry_choice".to_string());
+                    "grill"
+                } else if p.contains("author's question about the defect") {
+                    trace.push("bug_steer".to_string());
+                    "it panics on an empty path"
+                } else if p.contains("author's question") {
+                    trace.push("grill_steer".to_string());
+                    "an answer"
+                } else {
+                    trace.push("confirm_ready".to_string());
+                    "no"
+                };
+                last = answer(db, &out, ans);
+            }
+            other => panic!("unexpected surfaced action '{other}': {out}"),
+        }
+        steps += 1;
+        assert!(steps < 40, "runaway nyx_next loop: {trace:?}");
+    }
+}
+
+/// The Spec's persisted category SLUG, or `None` — read from the DOMAIN, which is the only place the
+/// classification counts.
+fn spec_category(db: &Db, spec_id: &str) -> Option<String> {
+    db.with_conn(|c| {
+        let spec = db::get_spec(c, spec_id).unwrap()?;
+        let id = spec.category_id?;
+        db::get_category(c, &id).unwrap().map(|c| c.slug)
+    })
+}
+
+/// DONE-CRITERIA (revision 23) — THE ORDER IS THE SUBSTANCE: the category judge runs AFTER the general
+/// grill, `set_category` PERSISTS the answer, and only then does the graph use the classification.
+///
+/// The trace pins the order end to end (grill, then category, then the bug pass), and the DB pins the
+/// half a trace cannot see: by the time the reproduction pass is surfaced, `specs.category_id` already
+/// holds `bug`. That is what "persist before any use of the discipline" means operationally — the
+/// selector reads the `spec_category` FACT, so it can only be true if the write landed first.
+///
+/// It also pins the SECOND PASS ITSELF: its judge names all six elements a reproducible bug contract
+/// owes (observed, expected, counter-example, scope, reproduction strategy, verifiable criteria). A
+/// pass that merely said "be precise" would leave the red-before-green proof resting on an agent's
+/// taste.
+#[test]
+fn nspec_classifies_after_the_grill_then_hardens_a_bug_before_the_commit() {
+    let db = seeded_db();
+    let (wf, nodes) = builtin(&db, "nspec");
+    let (_project, spec_id) = draft_spec(&db);
+
+    let trace = drive_nspec_categorized(&db, &wf.id, &spec_id, "bug");
+
+    let at = |tag: &str| {
+        trace
+            .iter()
+            .position(|t| t == tag)
+            .unwrap_or_else(|| panic!("the run never reached '{tag}': {trace:?}"))
+    };
+    assert!(
+        at("grill_judge") < at("category_judge"),
+        "the category is decided AFTER the general grill, on a Spec whose problem and solution are \
+         settled: {trace:?}"
+    );
+    assert!(
+        at("category_judge") < at("bug_spawn"),
+        "and the classification comes BEFORE the discipline it selects: {trace:?}"
+    );
+    assert!(
+        at("bug_spawn") < at("confirm_ready"),
+        "the reproduction contract is hardened BEFORE the Spec is offered for commit: {trace:?}"
+    );
+
+    assert_eq!(
+        spec_category(&db, &spec_id).as_deref(),
+        Some("bug"),
+        "`set_category` PERSISTED the judge's answer — the `bug` branch fired on the `spec_category` \
+         fact, which only answers what the domain holds"
+    );
+
+    // THE SIX. The pass is only a discipline if it names what it demands.
+    let contract = nodes
+        .iter()
+        .find(|n| n.label == "reproduction contract complete?")
+        .expect("the bug pass judges its own contract");
+    let prompt = contract.config.to_lowercase();
+    for owed in [
+        "observed",
+        "expected",
+        "contre-exemple",
+        "scope",
+        "reproduction strategy",
+        "verifiable completion criteria",
+    ] {
+        assert!(
+            prompt.contains(owed),
+            "the reproduction contract judge must demand '{owed}': {}",
+            contract.config
+        );
+    }
+}
+
+/// DONE-CRITERION (revision 23) — THE SECOND PASS IS OWED BY BUGS ALONE, and that is asserted rather
+/// than assumed. A `feature` takes the note branch: no reproduction spawn, no contract judge, no extra
+/// question put to the human. Without this test "conditionally" is a word in a comment — and the cost
+/// of getting it wrong is a tax (a whole hardening loop, a sub-agent and a human turn) levied on every
+/// Spec that owes no proof at all.
+#[test]
+fn a_spec_that_is_not_a_bug_never_runs_the_reproduction_contract() {
+    let db = seeded_db();
+    let (wf, _nodes) = builtin(&db, "nspec");
+    let (project, spec_id) = draft_spec(&db);
+
+    let trace = drive_nspec_categorized(&db, &wf.id, &spec_id, "feature");
+
+    assert!(
+        trace.contains(&"category_judge".to_string()),
+        "the classification still happens — every Spec is classified: {trace:?}"
+    );
+    assert_eq!(
+        spec_category(&db, &spec_id).as_deref(),
+        Some("feature"),
+        "and it landed on the project's SEEDED `feature`, not a homonym"
+    );
+    for absent in ["bug_spawn", "bug_steer", "bug_judge"] {
+        assert!(
+            !trace.contains(&absent.to_string()),
+            "a non-bug Spec must not run the reproduction contract ('{absent}' fired): {trace:?}"
+        );
+    }
+
+    // THE OTHER HALF OF THE JUDGE'S REACH — its answer may be a SYSTEM slug (above) or a LABEL of
+    // its own (PDR-0017: creation is a non-blocking fallback, not a refusal). Such a label is
+    // slugified and minted; it is not a `bug`, so it takes the note branch too. This is also why
+    // the question is a `judge` and not an `ask_human` with `options`: a closed answer set would
+    // forbid exactly this.
+    let minted_spec = draft_spec_in(&db, &project, "S2");
+    let trace = drive_nspec_categorized(&db, &wf.id, &minted_spec, "Dette technique");
+    assert_eq!(
+        spec_category(&db, &minted_spec).as_deref(),
+        Some("dette-technique"),
+        "an agent's own label is MINTED and assigned, slugified: {trace:?}"
+    );
+    let minted = db
+        .with_conn(|c| db::list_categories(c, &project))
+        .unwrap()
+        .into_iter()
+        .find(|c| c.slug == "dette-technique")
+        .expect("the label became a category of this project");
+    assert_eq!(minted.created_by_type, db::CATEGORY_CREATED_BY_AGENT);
+    assert!(
+        minted.confirmed_at.is_some(),
+        "and it is VALID AS IT STANDS — PDR-0017 amended 2026-09-02 retired the curation state"
+    );
+    assert!(
+        !trace.contains(&"bug_spawn".to_string()),
+        "an agent-minted category is not a bug either: {trace:?}"
+    );
+}
+
+/// DONE-CRITERION (phase 4) — `/nspec` RECEIVES the bug discipline in its SECOND pass, AFTER
+/// `set_category`, and never before the decision.
+///
+/// The two halves of that sentence are checked where they actually happen. The graph is driven for
+/// real, and at EVERY `spawn_subagent` the run surfaces, the test renders the very context that
+/// spawn's inline effector would pull — `agent_context(role=spec, subject=<the node's subject>)` —
+/// and records whether it carries the discipline heading. The answer must be NO at the general
+/// grill (the Spec is not classified yet: the judge has not been asked and `set_category` has not
+/// written) and YES at the `bug_reproduction_contract` spawn.
+///
+/// WHY IT IS ASSERTED HERE AND NOT ONLY IN THE RENDER'S OWN TESTS. `mcp_context` proves the
+/// discipline follows the PERSISTED slug; this proves the graph puts the persistence BEFORE the
+/// spawn that needs it. Either half alone is compatible with an author hardening a reproduction
+/// contract it was never told it owed — or with a discipline fired on a classification that had not
+/// landed.
+#[test]
+fn nspec_gets_the_bug_discipline_on_its_second_pass_never_before_the_classification() {
+    use crate::mcp_context::{render_agent_context, AgentRole, CATEGORY_DISCIPLINE_HEADING};
+
+    let db = seeded_db();
+    let (wf, _nodes) = builtin(&db, "nspec");
+    let (_project, spec_id) = draft_spec(&db);
+
+    let rt = EngineRuntime::new();
+    let run_id = db
+        .with_conn(|c| db::create_workflow_run(c, &wf.id, Some(&spec_id), None, "{}"))
+        .unwrap()
+        .id;
+
+    // (the spawn's subject, did the context it would pull carry the discipline?) — captured at the
+    // moment the action was surfaced, which is the only moment that answers the question.
+    let mut spawns: Vec<(String, bool)> = Vec::new();
+    let mut last: Option<Value> = None;
+    let mut steps = 0;
+    loop {
+        let out = tick(&db, &rt, &run_id, last.take());
+        match out["action"]["type"].as_str().unwrap() {
+            "done" => break,
+            "spawn_subagent" => {
+                let subject = out["action"]["subject"].as_str().unwrap_or("").to_string();
+                let context =
+                    render_agent_context(&db, AgentRole::Spec, &spec_id, Some(&subject))
+                        .unwrap()
+                        .expect("the run's Spec renders");
+                spawns.push((subject, context.contains(CATEGORY_DISCIPLINE_HEADING)));
+                last = Some(json!({ "diff": "d" }));
+            }
+            "judge" => {
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let verdict = if p.contains("GENRE OF WORK") {
+                    // The Spec is STILL unclassified while this question is being answered.
+                    assert_eq!(
+                        spec_category(&db, &spec_id),
+                        None,
+                        "the discipline cannot have fired yet — nothing is persisted at the judge",
+                    );
+                    "bug"
+                } else if p.contains("REPRODUCTION CONTRACT") {
+                    "complete"
+                } else if p.contains("graphical/UI surface") {
+                    "none"
+                } else {
+                    "complete"
+                };
+                last = Some(json!({ "verdict": verdict }));
+            }
+            "ask_human" => {
+                let p = out["action"]["prompt"].as_str().unwrap_or("");
+                let ans = if p.contains("finalize") {
+                    "grill"
+                } else if p.contains("author's question about the defect") {
+                    "it panics on an empty path"
+                } else if p.contains("author's question") {
+                    "an answer"
+                } else {
+                    "no"
+                };
+                last = answer(&db, &out, ans);
+            }
+            other => panic!("unexpected surfaced action '{other}': {out}"),
+        }
+        steps += 1;
+        assert!(steps < 40, "runaway nyx_next loop: {spawns:?}");
+    }
+
+    assert!(
+        spawns
+            .iter()
+            .any(|(subject, _)| subject == "bug_reproduction_contract"),
+        "the run must have reached the reproduction pass: {spawns:?}",
+    );
+    assert!(
+        spawns.len() > 1,
+        "…and the general grill must have spawned before it: {spawns:?}",
+    );
+    for (subject, carried) in &spawns {
+        let owed = subject == "bug_reproduction_contract";
+        assert_eq!(
+            *carried, owed,
+            "the '{subject}' spawn pulls a context that {} the bug discipline — it is owed by the \
+             SECOND pass alone, once `set_category` has landed: {spawns:?}",
+            if owed { "must carry" } else { "must not carry" },
+        );
+    }
+    assert_eq!(
+        spec_category(&db, &spec_id).as_deref(),
+        Some("bug"),
+        "and what the discipline fired on is the PERSISTED slug",
+    );
+}
+
+/// DONE-CRITERION (revision 23) — THE BUMP IS WHAT MAKES ANY OF THIS REACH A RUNNING NYX, and a FORK
+/// is never dragged along with it.
+///
+/// `ensure_builtin` replaces a built-in only when the code revision is NEWER than the stored one, so a
+/// DB sitting at 22 — the revision every install shipped before this — must be upgraded to 23 and come
+/// back with the categorize step it did not have. Without the bump the new nodes exist in the code and
+/// in no running nyx, which is precisely the failure the N11 revision counter was added for.
+///
+/// The other half is the one that must NOT happen: a project that FORKED `/nspec` owns its copy, and a
+/// fork is never upgraded — deliberately (an upgrade would silently discard the customisation), and at
+/// a known cost: that project stays on revision 22 and gets no categorization until it re-forks. It is
+/// asserted here so the cost is a recorded fact rather than a surprise.
+#[test]
+fn an_nspec_at_revision_22_upgrades_to_23_and_a_project_fork_does_not() {
+    let db = seeded_db();
+    let (wf, fresh_nodes) = builtin(&db, "nspec");
+    assert_eq!(
+        wf.builtin_revision,
+        Some(super::BUILTIN_REVISION),
+        "the code ships revision {}",
+        super::BUILTIN_REVISION
+    );
+    assert!(
+        super::BUILTIN_REVISION >= 23,
+        "the classification landed at revision 23; a later revision carries it forward, never back"
+    );
+    let categorize_types = |nodes: &[db::Node]| -> usize {
+        nodes
+            .iter()
+            .filter(|n| n.type_ == db::NODE_TYPE_SET_CATEGORY)
+            .count()
+    };
+    assert_eq!(
+        categorize_types(&fresh_nodes),
+        1,
+        "a fresh seed carries the classification node"
+    );
+
+    // A project FORK, stamped at 22 like every copy taken before this revision.
+    let (project, _root) = db
+        .with_conn(|c| db::create_project(c, "P", "/tmp/rev23-fork", None))
+        .unwrap();
+    let fork_id = db
+        .with_conn(|c| {
+            db::create_workflow(
+                c,
+                Some(&project.id),
+                "my nspec",
+                db::WORKFLOW_SCOPE_NSPEC,
+                Some(&wf.id),
+            )
+        })
+        .unwrap()
+        .id;
+    let fork_root = db
+        .with_conn(|c| {
+            node(
+                c,
+                &fork_id,
+                None,
+                0,
+                db::NODE_TYPE_NOTE,
+                "mine",
+                json!({ "text": "my own nspec" }),
+            )
+        })
+        .unwrap();
+    db.with_conn(|c| db::set_workflow_root(c, &fork_id, Some(&fork_root)))
+        .unwrap();
+    db.with_conn(|c| db::set_builtin_revision(c, &fork_id, 22))
+        .unwrap();
+
+    // Put the BUILT-IN back to what revision 22 shipped — a tree without the classification step —
+    // and re-boot.
+    db.with_conn(|c| db::delete_nodes_for_workflow(c, &wf.id))
+        .unwrap();
+    let old_root = db
+        .with_conn(|c| {
+            node(
+                c,
+                &wf.id,
+                None,
+                0,
+                db::NODE_TYPE_NOTE,
+                "rev22",
+                json!({ "text": "the revision 22 tree" }),
+            )
+        })
+        .unwrap();
+    db.with_conn(|c| db::set_workflow_root(c, &wf.id, Some(&old_root)))
+        .unwrap();
+    db.with_conn(|c| db::set_builtin_revision(c, &wf.id, 22))
+        .unwrap();
+
+    db.with_conn(seed_builtin_workflows).unwrap();
+
+    let (upgraded, up_nodes) = builtin(&db, "nspec");
+    assert_eq!(
+        upgraded.builtin_revision,
+        Some(super::BUILTIN_REVISION),
+        "22 is older than the code, so the built-in is upgraded"
+    );
+    assert_eq!(
+        categorize_types(&up_nodes),
+        1,
+        "and the upgraded tree carries the classification node — without this bump the new nodes \
+         would exist only in the source"
+    );
+    assert!(
+        up_nodes
+            .iter()
+            .any(|n| n.label == "reproduction contract complete?"),
+        "the bug contract came with it"
+    );
+    assert_eq!(
+        up_nodes.len(),
+        fresh_nodes.len(),
+        "the upgraded tree IS the freshly-seeded one"
+    );
+
+    // The FORK is untouched, revision and tree alike.
+    let fork_nodes = db.with_conn(|c| db::list_nodes(c, &fork_id)).unwrap();
+    assert_eq!(
+        fork_nodes.len(),
+        1,
+        "a project's fork is its customisation — the upgrade never rewrites it: {fork_nodes:?}"
+    );
+    assert_eq!(
+        db.with_conn(|c| db::get_workflow(c, &fork_id))
+            .unwrap()
+            .unwrap()
+            .builtin_revision,
+        Some(22),
+        "and it is not even re-stamped: it stays on 22, and gets no categorization until it re-forks"
+    );
+}
+
+// --- revision 24: the coder flow carries the `bug` discipline ---------------
+
+/// THE ONE node of the coder built-in whose label is `label` — the graph is small enough that a
+/// label is an identity, and reading a node by its label is how these tests talk about the shape
+/// without re-encoding node ids.
+fn coder_node(db: &Db, label: &str) -> db::Node {
+    let (_wf, nodes) = builtin(db, db::WORKFLOW_SCOPE_CODER);
+    let mut found: Vec<db::Node> = nodes.into_iter().filter(|n| n.label == label).collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one coder node is labelled '{label}' — found {}",
+        found.len()
+    );
+    found.remove(0)
+}
+
+/// The ORDERED children of `parent` in the coder built-in, as `(order, type, label)`.
+fn coder_children(db: &Db, parent: &str) -> Vec<(i32, String, String)> {
+    let (_wf, nodes) = builtin(db, db::WORKFLOW_SCOPE_CODER);
+    let mut kids: Vec<(i32, String, String)> = nodes
+        .iter()
+        .filter(|n| n.parent_id.as_deref() == Some(parent))
+        .map(|n| (n.order_index, n.type_.clone(), n.label.clone()))
+        .collect();
+    kids.sort_by_key(|(order, _, _)| *order);
+    kids
+}
+
+/// The JSON config of a coder node, by label.
+fn coder_config(db: &Db, label: &str) -> Value {
+    serde_json::from_str(&coder_node(db, label).config).expect("a JSON config")
+}
+
+/// DONE-CRITERION ("Une Spec sans catégorie est classée explicitement avant routage") — the SHAPE
+/// half of it, read off the seeded graph rather than off a run.
+///
+/// Four nodes, in this order and no other, and each of the four answers a way the classification
+/// could have been a fiction: READ what is persisted (so a classified Spec is never re-decided by a
+/// flow that has no authority over the genre of work), JUDGE only when there is nothing (a `judge`
+/// and not a closed `ask_human`, because PDR-0017 lets an unknown label MINT a category), WRITE it
+/// through the shared service (a node, not a sentence an agent may ignore), and READ IT BACK (the
+/// persisted slug, never the judge's word — a free-form label is slugified and a system label
+/// resolved, so a classification that failed to land arms nothing).
+///
+/// And it sits BEFORE the task loop: everything that routes on the genre is downstream of it.
+#[test]
+fn the_coder_preflight_classifies_before_anything_routes_on_the_genre() {
+    let db = seeded_db();
+    let (wf, nodes) = builtin(&db, db::WORKFLOW_SCOPE_CODER);
+    let root = wf.root_node_id.clone().expect("the coder is rooted");
+    assert_eq!(
+        coder_children(&db, &root),
+        vec![
+            (0, db::NODE_TYPE_SEQUENCE.to_string(), "preflight".to_string()),
+            (
+                1,
+                db::NODE_TYPE_SELECTOR.to_string(),
+                "bug discipline?".to_string()
+            ),
+            (2, db::NODE_TYPE_LOOP.to_string(), "tasks".to_string()),
+        ],
+        "the preflight is the FIRST thing the flow does — before a task is even picked — and the \
+         reproduction it routes to is the SECOND, still outside the loop: one proof per run",
+    );
+
+    let preflight = coder_node(&db, "preflight");
+    assert_eq!(
+        coder_children(&db, &preflight.id),
+        vec![
+            (0, db::NODE_TYPE_QUERY.to_string(), "category".to_string()),
+            (1, db::NODE_TYPE_SELECTOR.to_string(), "classified?".to_string()),
+        ],
+    );
+    let read = nodes
+        .iter()
+        .find(|n| n.parent_id.as_deref() == Some(preflight.id.as_str()) && n.order_index == 0)
+        .expect("the read");
+    let read_cfg: Value = serde_json::from_str(&read.config).unwrap();
+    assert_eq!(read_cfg["query"], json!("spec_category"));
+    assert_eq!(read_cfg["write"], json!("spec_category"));
+
+    // THE FORK: the branch that WRITES is reached by an EXPLICIT "there is no category", and the
+    // default (`always`) branch is the note that writes nothing — the least-destructive default
+    // (N12(d)) applied to a classification.
+    let classified = coder_config(&db, "classified?");
+    assert_eq!(
+        classified["branches"][0]["cond"],
+        json!({ "var": "spec_category", "truthy": false }),
+        "the classification fires on the ABSENCE of one, tested by name: {classified}",
+    );
+    assert_eq!(classified["branches"][1]["cond"], json!({ "always": true }));
+    let default_branch = coder_children(&db, &coder_node(&db, "classified?").id)
+        .into_iter()
+        .find(|(order, _, _)| *order == 1)
+        .expect("the default branch");
+    assert_eq!(
+        default_branch.1,
+        db::NODE_TYPE_NOTE,
+        "…and falling through writes NOTHING: {default_branch:?}",
+    );
+
+    let classify = coder_node(&db, "classify it now");
+    assert_eq!(
+        coder_children(&db, &classify.id),
+        vec![
+            (0, db::NODE_TYPE_JUDGE.to_string(), "which category?".to_string()),
+            (1, db::NODE_TYPE_SET_CATEGORY.to_string(), "classify".to_string()),
+            (2, db::NODE_TYPE_QUERY.to_string(), "category".to_string()),
+        ],
+        "judge → WRITE → read the persisted slug BACK, in that order",
+    );
+    assert_eq!(
+        coder_config(&db, "classify")["category_key"],
+        json!("category_choice"),
+        "the node names the key the judge wrote — never an implicit board key a sibling might fill",
+    );
+    assert_eq!(
+        coder_config(&db, "which category?")["output_key"],
+        json!("category_choice"),
+    );
+}
+
+/// DONE-CRITERION ("Voie automatisée : … gate rouge … gate verte distincte sur le même slot" +
+/// "Voie manuelle : décision humaine d'impraticabilité, protocole/observation avant, correctif, même
+/// protocole après") — the SHAPE of both routes, and the branch condition that chooses between them.
+///
+/// THE ORDER IS THE SUBSTANCE, so it is asserted as an order and not as a presence. A graph holding
+/// the same five nodes in any other arrangement — the fix before the red, the green before the fix,
+/// the build control before either — would satisfy a "contains" assertion and prove nothing at all.
+#[test]
+fn the_coder_bug_branch_reproduces_before_it_repairs_and_carries_the_human_route() {
+    let db = seeded_db();
+
+    // THE FORK, on the PERSISTED slug the preflight read back — and on the same literal the
+    // discipline text is keyed on, so the branch and the text cannot drift apart.
+    let discipline = coder_config(&db, "bug discipline?");
+    assert_eq!(
+        discipline["branches"][0]["cond"],
+        json!({ "var": "spec_category", "eq": crate::db::CATEGORY_SLUG_BUG }),
+        "the reproduction is owed by `bug` alone, named by the slug: {discipline}",
+    );
+    assert_eq!(discipline["branches"][1]["cond"], json!({ "always": true }));
+    let owed_by_nobody_else = coder_children(&db, &coder_node(&db, "bug discipline?").id)
+        .into_iter()
+        .find(|(order, _, _)| *order == 1)
+        .expect("the default branch");
+    assert_eq!(
+        (owed_by_nobody_else.1.as_str(), owed_by_nobody_else.2.as_str()),
+        (db::NODE_TYPE_NOTE, "no reproduction owed"),
+        "every other genre takes a note and walks on — a reproduction demanded of a `feature` is a \
+         tax on work that owes no proof",
+    );
+
+    // THE BUILD CONTROL RUNS AFTER THE PROOF, and it is the SAME loop the other genres take.
+    //
+    // THE PROOF IS NOT IN THE TASK. `build the task` carries the quality gate and nothing else: the
+    // reproduction hangs off the flow's ROOT, above the `tasks` loop, so a phase with two agent
+    // tasks owes it ONCE. Grafted here it was re-entered on the second pass and re-ran an
+    // `expect: red` gate on a defect already repaired, which wedges the run for good (finding C19).
+    let (coder, nodes) = builtin(&db, db::WORKFLOW_SCOPE_CODER);
+    let root = coder.root_node_id.clone().expect("the coder is rooted");
+    assert_eq!(
+        nodes
+            .iter()
+            .find(|n| n.label == "bug discipline?")
+            .expect("the discipline selector")
+            .parent_id
+            .as_deref(),
+        Some(root.as_str()),
+        "the reproduction hangs off the ROOT — one proof per run, never one per task",
+    );
+    assert_eq!(
+        coder_children(&db, &coder_node(&db, "build the task").id),
+        vec![(0, db::NODE_TYPE_LOOP.to_string(), "make it green".to_string())],
+        "the reproduction is an EXTRA obligation laid on a bug, never a substitute for the checks",
+    );
+
+    // THE SEQUENCE the `bug` arm imposes.
+    assert_eq!(
+        coder_children(&db, &coder_node(&db, "reproduce before repairing").id),
+        vec![
+            (
+                0,
+                db::NODE_TYPE_SPAWN_SUBAGENT.to_string(),
+                "write the reproduction".to_string()
+            ),
+            (
+                1,
+                db::NODE_TYPE_ASK_HUMAN.to_string(),
+                "can this be reproduced automatically?".to_string()
+            ),
+            (
+                2,
+                db::NODE_TYPE_SELECTOR.to_string(),
+                "reproduction route".to_string()
+            ),
+        ],
+        "the check is written FIRST, and the impracticability question is put on what was found",
+    );
+    let route = coder_config(&db, "reproduction route");
+    assert_eq!(
+        route["branches"][0]["cond"],
+        json!({ "var": "repro_mode", "eq": "manual" }),
+        "dropping the machine-checked proof is SAID — reached by an explicit answer: {route}",
+    );
+    assert_eq!(
+        route["branches"][1]["cond"],
+        json!({ "always": true }),
+        "…and the automated route is the default nothing has to ask for: {route}",
+    );
+    assert_eq!(
+        coder_config(&db, "can this be reproduced automatically?")["options"],
+        json!(["automated", "manual"]),
+        "the answer set the branch compares by equality is DECLARED (J1)",
+    );
+
+    // THE AUTOMATED ROUTE — red, fix, green, and the two gates are DISTINCT nodes on ONE slot.
+    assert_eq!(
+        coder_children(&db, &coder_node(&db, "automated reproduction").id),
+        vec![
+            (0, db::NODE_TYPE_GATE_CHECK.to_string(), "reproduction".to_string()),
+            (
+                1,
+                db::NODE_TYPE_SPAWN_SUBAGENT.to_string(),
+                "repair the defect".to_string()
+            ),
+            (
+                2,
+                db::NODE_TYPE_GATE_CHECK.to_string(),
+                "the same reproduction, green".to_string()
+            ),
+        ],
+        "RED before the fix, GREEN after — the counterfactual the classification demands",
+    );
+    for (label, expect) in [
+        ("reproduction", "red"),
+        ("the same reproduction, green", "green"),
+    ] {
+        let cfg = coder_config(&db, label);
+        assert_eq!(cfg["slot"], json!(REPRO_CHECK_SLOT), "gate '{label}': {cfg}");
+        assert_eq!(cfg["expect"], json!(expect), "gate '{label}': {cfg}");
+        assert_eq!(
+            cfg["blocking"],
+            json!(true),
+            "an unsatisfied declaration must REFUSE, not advise — gate '{label}': {cfg}",
+        );
+        assert!(
+            cfg.get("command_ids").is_none(),
+            "and it names no command: the identity of the two runs comes from the ONE binding \
+             behind the slot — gate '{label}': {cfg}",
+        );
+    }
+
+    // THE MANUAL ROUTE — the BEFORE observation, the fix, the SAME protocol after, both recorded.
+    assert_eq!(
+        coder_children(&db, &coder_node(&db, "manual protocol").id),
+        vec![
+            (
+                0,
+                db::NODE_TYPE_ASK_HUMAN.to_string(),
+                "the protocol, and what you see BEFORE the fix".to_string()
+            ),
+            (
+                1,
+                db::NODE_TYPE_LOOP.to_string(),
+                "repair under the protocol".to_string()
+            ),
+            (
+                2,
+                db::NODE_TYPE_NOTE.to_string(),
+                "both observations recorded".to_string()
+            ),
+        ],
+    );
+    assert_eq!(
+        coder_children(&db, &coder_node(&db, "repair under the protocol").id),
+        vec![
+            (
+                0,
+                db::NODE_TYPE_SPAWN_SUBAGENT.to_string(),
+                "repair the defect".to_string()
+            ),
+            (
+                1,
+                db::NODE_TYPE_ASK_HUMAN.to_string(),
+                "the SAME protocol, after the fix".to_string()
+            ),
+        ],
+        "the fix, then the observation — and the loop re-buys a repair pass on 'still-broken'",
+    );
+    assert_eq!(
+        coder_config(&db, "repair under the protocol")["until"],
+        json!({ "var": crate::mcp_context::MANUAL_REPRO_AFTER_KEY, "eq": "fixed" }),
+    );
+    assert_eq!(
+        coder_config(&db, "the SAME protocol, after the fix")["options"],
+        json!(["fixed", "still-broken"]),
+    );
+    // "THE SAME PROTOCOL" IS NOT A REQUEST — the after-question QUOTES what the before-question
+    // wrote, so the steps on the human's screen are the steps they already committed to.
+    let after = coder_config(&db, "the SAME protocol, after the fix");
+    assert!(
+        after["prompt"]
+            .as_str()
+            .expect("a prompt")
+            .contains("{{manual_repro_before}}"),
+        "the after-question interpolates the protocol itself: {after}",
+    );
+    // …and the two observations land on TWO keys, so neither can overwrite the other.
+    //
+    // THE KEYS ARE NAMED, NOT SPELLED, and that is what makes this a guard rather than a
+    // restatement: `crate::mcp_context` READS these two keys off the run's board to render the pair
+    // to the auditor, and a re-spelling on either side would empty that block in silence — the
+    // manual route would go back to looking, from the auditor's seat, like a fix with no
+    // reproduction. Confronting the graph with the reader's own constants makes that go red here.
+    assert_eq!(
+        coder_config(&db, "the protocol, and what you see BEFORE the fix")["output_key"],
+        json!(crate::mcp_context::MANUAL_REPRO_BEFORE_KEY),
+    );
+    assert_eq!(
+        coder_config(&db, "the SAME protocol, after the fix")["output_key"],
+        json!(crate::mcp_context::MANUAL_REPRO_AFTER_KEY),
+    );
+    let recorded = coder_config(&db, "both observations recorded");
+    let text = recorded["text"].as_str().expect("a note text");
+    assert!(
+        text.contains("{{manual_repro_before}}") && text.contains("{{manual_repro_after}}"),
+        "and the hand-back states BOTH of them: {text}",
+    );
+}
+
+/// **THE GRAPH AND THE TEXT SAY THE SAME THING**, which is the one property this phase could get
+/// wrong in a way nothing else would catch.
+///
+/// The coder's `bug` discipline is INJECTED prose: it tells an effector what the flow will ask of
+/// it. The flow is nodes. Nothing but this test confronts the two, and a divergence between them is
+/// worse than either alone — an agent told to write a `repro_check` while the graph declares another
+/// slot does exactly as instructed and still fails the gate, with no line anywhere saying why.
+///
+/// So each assertion below pairs ONE sentence of the text with the node that keeps it.
+#[test]
+fn the_coder_bug_discipline_text_describes_the_graph_the_coder_will_actually_walk() {
+    let db = seeded_db();
+    let text = crate::mcp_context::category_discipline(
+        crate::mcp_context::AgentRole::Coder,
+        crate::db::CATEGORY_SLUG_BUG,
+    )
+    .expect("the coder carries the `bug` discipline");
+
+    // "…so the bound `repro_check` slot picks it up" — and the graph's two gates declare THAT slot.
+    assert!(
+        text.contains(REPRO_CHECK_SLOT),
+        "the text names the slot the coder must write for: {text}",
+    );
+    let (_wf, nodes) = builtin(&db, db::WORKFLOW_SCOPE_CODER);
+    let repro_gates: Vec<&db::Node> = nodes
+        .iter()
+        .filter(|n| n.type_ == db::NODE_TYPE_GATE_CHECK)
+        .filter(|n| {
+            serde_json::from_str::<Value>(&n.config).unwrap()["slot"] == json!(REPRO_CHECK_SLOT)
+        })
+        .collect();
+    assert_eq!(repro_gates.len(), 2, "the red and the green, and nothing else");
+
+    // "a reproduction gate declaring `expect: red` before your change, then the SAME check declaring
+    //  `expect: green` after" — the two spellings are the engine's, and the graph writes them.
+    assert!(text.contains("expect: red") && text.contains("expect: green"), "{text}");
+    let expectations: HashSet<String> = repro_gates
+        .iter()
+        .map(|n| {
+            serde_json::from_str::<Value>(&n.config).unwrap()["expect"]
+                .as_str()
+                .expect("a declared expectation")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        expectations,
+        HashSet::from([
+            crate::engine::GateExpectation::Red.as_str().to_string(),
+            crate::engine::GateExpectation::Green.as_str().to_string(),
+        ]),
+        "one of each, spelled as the engine grades them",
+    );
+
+    // "The green that closes the bug is the SAME slot, the SAME resolved commands and the SAME cwd
+    //  as the red." — one slot, no `command_ids`, so the identity is structural.
+    assert!(text.contains("the SAME slot"), "{text}");
+    let slots: HashSet<String> = repro_gates
+        .iter()
+        .map(|n| {
+            serde_json::from_str::<Value>(&n.config).unwrap()["slot"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(slots.len(), 1, "ONE slot answers both ends: {slots:?}");
+
+    // "nyx asks whether automation is impracticable, records the manual protocol and the observation
+    //  made BEFORE the fix, and requires the SAME protocol observed again after. That branch is a
+    //  node of the graph" — so it had better be one.
+    assert!(
+        text.contains("nyx asks whether automation is impracticable"),
+        "the text promises the question: {text}",
+    );
+    assert!(
+        text.contains("That branch is a node of the graph"),
+        "…and promises it is a node: {text}",
+    );
+    let ask = coder_node(&db, "can this be reproduced automatically?");
+    assert_eq!(ask.type_, db::NODE_TYPE_ASK_HUMAN, "the promise, kept");
+    coder_node(&db, "the protocol, and what you see BEFORE the fix");
+    coder_node(&db, "the SAME protocol, after the fix");
+
+    // "A CHECK THAT COULD NOT RUN IS NOT A RED … never present a run that could not execute as your
+    //  reproduction" — the text names the three grades, and the engine's own spellings are what it
+    //  names, so a renamed grade goes red here instead of leaving the manual describing nothing.
+    for grade in [
+        crate::engine::GateGrade::Passed,
+        crate::engine::GateGrade::Failed,
+        crate::engine::GateGrade::Indeterminate,
+    ] {
+        assert!(
+            text.contains(grade.as_str()),
+            "the text names the `{}` grade the gate can return: {text}",
+            grade.as_str(),
+        );
+    }
+}
+
+/// **ONE STRING DECIDES WHO OWES A REPRODUCTION, AND TWO GRAPHS READ IT.**
+///
+/// `/nspec` routes its bug-contract pass on the Spec's category, and the coder routes the
+/// red-before-green obligation on the same fact — two selectors, two graphs, two revisions apart
+/// (23 and 24), both comparing `spec_category` to the slug `bug`. They are only "the same
+/// condition" for as long as nobody re-spells one of them: a graph testing `"bugs"` or `"Bug"` does
+/// not fail, it simply never takes its branch, and the discipline it guards silently stops applying
+/// to the Specs it was written for.
+///
+/// So both are taken from [`crate::db::CATEGORY_SLUG_BUG`] — the very constant
+/// `category_discipline` is keyed on — and this test confronts the SEEDED CONFIG with it, on the
+/// rows a boot really wrote. The text↔graph test above does the same job for the coder's prose; this
+/// one does it for the two graphs against each other.
+#[test]
+fn both_seeded_flows_route_the_bug_discipline_on_the_one_slug_the_harness_reads() {
+    let db = seeded_db();
+    let expected = json!(crate::db::CATEGORY_SLUG_BUG);
+
+    for scope in [db::WORKFLOW_SCOPE_NSPEC, db::WORKFLOW_SCOPE_CODER] {
+        let (_wf, nodes) = builtin(&db, scope);
+        let selector = nodes
+            .iter()
+            .find(|n| n.label == "bug discipline?")
+            .unwrap_or_else(|| panic!("'{scope}' carries the category branch"));
+        assert_eq!(selector.type_, db::NODE_TYPE_SELECTOR);
+        let config: Value = serde_json::from_str(&selector.config).expect("a selector config");
+        let branches = config["branches"].as_array().expect("branches");
+        assert_eq!(
+            branches[0]["cond"],
+            json!({ "var": "spec_category", "eq": expected }),
+            "'{scope}' tests the PERSISTED slug against the constant the discipline is keyed on — \
+             a second spelling of it here would be a branch nobody ever takes",
+        );
+        assert_eq!(
+            branches[1]["cond"],
+            json!({ "always": true }),
+            "…and the other genres reach the safe default explicitly, never by a missing arm",
+        );
+    }
+
+    // And the constant really IS a slug a project seeds — held by CONSTRUCTION rather than by an
+    // assertion: `db::SYSTEM_CATEGORIES` is built from `db::CATEGORY_SLUG_BUG`, so the branch cannot
+    // route on a label no row can ever carry. The assertion that used to sit here compared the
+    // constant with a list derived from it, and would have passed whatever either said.
+}
+
+/// DONE-CRITERION ("`BUILTIN_REVISION` 24 et la prose de revision sont explicites ; upgrade 23→24 et
+/// forks sont testés").
+///
+/// WITHOUT THE BUMP THE WHOLE PHASE EXISTS ONLY IN THE SOURCE. `ensure_builtin` upgrades a built-in
+/// whose stored revision is OLDER than the code's; a DB sitting at 23 with the code at 23 is left
+/// exactly as it is, so the preflight and the reproduction branch would be written, reviewed, merged
+/// — and absent from every running nyx.
+///
+/// AND A FORK IS NEVER TOUCHED, which is the same statement read the other way: a project that
+/// forked `coder` (or `nspec`) keeps its own graph and therefore does NOT get this discipline. That
+/// is known, assumed, and asserted here rather than left to be discovered — the fork stays on its
+/// revision, `run_start` reports it as stale (`workflow_fork_stale`), and re-forking is what adopts
+/// the new one.
+#[test]
+fn a_coder_at_revision_23_upgrades_to_24_and_a_project_fork_keeps_its_own_graph() {
+    let db = seeded_db();
+    assert_eq!(
+        super::BUILTIN_REVISION, 24,
+        "this phase ships revision 24 — the preflight and the reproduction branch"
+    );
+    let (wf, fresh_nodes) = builtin(&db, db::WORKFLOW_SCOPE_CODER);
+    assert_eq!(wf.builtin_revision, Some(24), "a fresh seed stamps it");
+
+    // A project FORK of the coder, stamped at 23 like every copy taken before this revision.
+    let (project, _root) = db
+        .with_conn(|c| db::create_project(c, "P", "/tmp/rev24-fork", None))
+        .unwrap();
+    let fork_id = db
+        .with_conn(|c| {
+            db::create_workflow(
+                c,
+                Some(&project.id),
+                "my coder",
+                db::WORKFLOW_SCOPE_CODER,
+                Some(&wf.id),
+            )
+        })
+        .unwrap()
+        .id;
+    let fork_root = db
+        .with_conn(|c| {
+            node(
+                c,
+                &fork_id,
+                None,
+                0,
+                db::NODE_TYPE_NOTE,
+                "mine",
+                json!({ "text": "my own coder" }),
+            )
+        })
+        .unwrap();
+    db.with_conn(|c| db::set_workflow_root(c, &fork_id, Some(&fork_root)))
+        .unwrap();
+    db.with_conn(|c| db::set_builtin_revision(c, &fork_id, 23))
+        .unwrap();
+
+    // Put the BUILT-IN back to what revision 23 shipped — a tree without the preflight and without
+    // the reproduction branch — and re-boot.
+    db.with_conn(|c| db::delete_nodes_for_workflow(c, &wf.id))
+        .unwrap();
+    let old_root = db
+        .with_conn(|c| {
+            node(
+                c,
+                &wf.id,
+                None,
+                0,
+                db::NODE_TYPE_NOTE,
+                "rev23",
+                json!({ "text": "the revision 23 coder tree" }),
+            )
+        })
+        .unwrap();
+    db.with_conn(|c| db::set_workflow_root(c, &wf.id, Some(&old_root)))
+        .unwrap();
+    db.with_conn(|c| db::set_builtin_revision(c, &wf.id, 23))
+        .unwrap();
+
+    db.with_conn(seed_builtin_workflows).unwrap();
+
+    let (upgraded, up_nodes) = builtin(&db, db::WORKFLOW_SCOPE_CODER);
+    assert_eq!(
+        upgraded.builtin_revision,
+        Some(24),
+        "23 is older than the code, so the built-in is UPGRADED in place"
+    );
+    assert_eq!(
+        up_nodes.len(),
+        fresh_nodes.len(),
+        "and the upgraded tree IS the freshly-seeded one"
+    );
+    let labels: HashSet<&str> = up_nodes.iter().map(|n| n.label.as_str()).collect();
+    for owed in [
+        "preflight",
+        "classify",
+        "bug discipline?",
+        "reproduction",
+        "the same reproduction, green",
+        "can this be reproduced automatically?",
+        "the SAME protocol, after the fix",
+    ] {
+        assert!(
+            labels.contains(owed),
+            "the upgrade carried '{owed}' into the DB — without the bump it would live in the \
+             source alone: {labels:?}",
+        );
+    }
+    assert_eq!(
+        up_nodes
+            .iter()
+            .filter(|n| n.type_ == db::NODE_TYPE_SET_CATEGORY)
+            .count(),
+        1,
+        "including the preflight's `set_category` — the 17th node type, put to work here",
+    );
+
+    // THE FORK IS UNTOUCHED — tree and revision alike. A project that forked `coder` does NOT get
+    // the discipline, and that is the price of a fork, not an oversight.
+    let fork_nodes = db.with_conn(|c| db::list_nodes(c, &fork_id)).unwrap();
+    assert_eq!(
+        fork_nodes.len(),
+        1,
+        "a project's fork is its customisation — the upgrade never rewrites it: {fork_nodes:?}"
+    );
+    assert_eq!(
+        db.with_conn(|c| db::get_workflow(c, &fork_id))
+            .unwrap()
+            .unwrap()
+            .builtin_revision,
+        Some(23),
+        "it is not even re-stamped: it stays on 23, with no preflight and no reproduction gate",
+    );
+
+    // Idempotent: a second boot at the same revision leaves the built-in alone.
+    db.with_conn(seed_builtin_workflows).unwrap();
+    assert_eq!(builtin(&db, db::WORKFLOW_SCOPE_CODER).1.len(), fresh_nodes.len());
 }

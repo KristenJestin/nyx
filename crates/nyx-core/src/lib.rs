@@ -43,6 +43,7 @@ pub mod agent_liveness;
 pub mod agent_resume;
 pub mod agent_unload;
 pub mod ansi;
+pub mod category;
 pub mod command;
 pub mod css_slot;
 pub mod db;

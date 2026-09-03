@@ -2243,13 +2243,18 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         testing_decisions / user_stories / out_of_scope). The Spec is authored \
                         PROJECT-scoped and UNANCHORED — the dev workspace anchor is posed later, \
                         at the ready→in_progress start transition (spec_transition), not here. \
-                        Returns the created spec and revision. Use spec_update_section to fill \
-                        sections later, and spec_transition to move its lifecycle.",
+                        Optionally CLASSIFY it with `category` (the genre of work: bug, feature, \
+                        refactor, chore, or any category of the project) — assigned in the SAME \
+                        transaction, so the Spec is never created half-classified. Returns the \
+                        created spec, revision and category. Use spec_update_section to fill \
+                        sections later, spec_set_category to reclassify, and spec_transition to \
+                        move its lifecycle.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project_id": str_prop("project to create the Spec in (from list_projects)"),
                 "title": str_prop("the Spec's title"),
+                "category": str_prop("optional genre of work for the Spec — its slug (bug | feature | refactor | chore, or one the project added) or its human name. An UNKNOWN name is not an error: nyx mints that category in the project's vocabulary and it is VALID AS IT STANDS, no review pending (its slug is derived from the name and never lands on a system slug). Prefer an EXISTING category when one fits — a mint that only rephrases one already there dilutes the vocabulary for everybody. Omit it to leave the Spec unclassified"),
                 "problem": str_prop("optional 'problem' section (markdown)"),
                 "solution": str_prop("optional 'solution' section (markdown)"),
                 "implementation_decisions": str_prop("optional 'implementation decisions' section (markdown)"),
@@ -2330,6 +2335,38 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                      path omits by definition, so a number never resolves while detaching",
                 ),
                 "workspace_id": str_prop("the dev workspace to anchor on (from list_workspaces); omit or null to detach. An EMPTY string is refused, never read as a detach — detaching is an act you ask for by omitting the argument, not something an uninitialized variable should trigger"),
+            },
+            "required": ["spec_id"],
+        },
+    }));
+    // PDR-0017 — the Spec's ONE genre-of-work axis. Assignment AND removal in one verb, like
+    // `spec_set_workspace` above: naming no category IS the removal.
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_SET_CATEGORY_TOOL,
+        "description": "Set a Spec's CATEGORY — its genre of work (bug, feature, refactor, chore, \
+                        or any category the project added) — or REMOVE it by naming none. A Spec \
+                        carries at most ONE category. Name it with `category` (its slug, or its \
+                        human name) or with `category_id` (an exact category), never both. An \
+                        UNKNOWN name is not an error: nyx MINTS that category in the project's \
+                        vocabulary and assigns it — the response says created:true. The mint is \
+                        VALID AS IT STANDS, nothing is pending on it, so PREFER AN EXISTING \
+                        category whenever one fits: a mint that only rephrases one already there \
+                        dilutes the project's vocabulary and only a human can take it back, from \
+                        the project settings. A name that matches two categories is refused, \
+                        listing their slugs, so you can re-ask by slug. The category must belong \
+                        to the Spec's own project. Unlike the Spec's sections, the category is NOT \
+                        frozen by the lifecycle: reclassifying a Spec is allowed at any status. \
+                        Returns the updated spec and the category (id, slug, name, color_token, \
+                        created_by_type, system).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                // This call carries NO project anchor of its own, and the one argument that could
+                // be read as one is the OPTIONAL category — which the REMOVAL omits by definition.
+                // So a `#N` never resolves here, exactly as on `spec_set_workspace`'s detach path.
+                "spec_id": anchorless_spec_ref_prop("the Spec to classify (or to un-classify)"),
+                "category": str_prop("the category's slug (bug | feature | refactor | chore, or one the project added) or its human name. Unknown → nyx mints it, valid as it stands (slug derived from the name, never a system slug) — so reach for an existing one first. Omit BOTH this and category_id to REMOVE the Spec's category. An EMPTY string is refused, never read as a removal"),
+                "category_id": str_prop("an EXACT category id, when you already have one. Mutually exclusive with 'category'. An EMPTY string is refused, never read as a removal"),
             },
             "required": ["spec_id"],
         },
@@ -3160,7 +3197,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "workflow_id": str_prop("the workflow to add the node to"),
                 "type": str_prop("the node type (sequence/loop/selector/spawn_subagent/gate_check/judge/transition/wait/note/ask_human/produce)"),
                 "label": str_prop("optional: human label for the node"),
-                "config": json!({ "type": "object", "description": "the node's typed config JSON (unknown fields are REFUSED). Per type: spawn_subagent→{agent_id, inline?}; gate_check→{command_ids | slot, blocking?} (a gate names its OWN command instance ids, or declares a `slot` each project binds with slot_bind — the shape a SHARED graph uses; never both); transition→{target_state}; judge→{prompt, output_schema?, output_key?, append?}; ask_human→{prompt, output_key?, append?}; produce→{output_key?, append?}; loop→{until, max_iterations?}; selector→{branches:[{cond, child?}]}; note→{text}; sequence/wait→{}. output_key routes the result on the blackboard; append pushes onto an array instead of overwriting; inline runs the effector in-session (for an interactive one)" }),
+                "config": json!({ "type": "object", "description": "the node's typed config JSON (unknown fields are REFUSED). Per type: spawn_subagent→{agent_id, inline?}; gate_check→{command_ids | slot, blocking?, expect?} (a gate names its OWN command instance ids, or declares a `slot` each project binds with slot_bind — the shape a SHARED graph uses; never both. expect declares WHICH OUTCOME satisfies the gate: \"green\" = the check must PASS, the default when the field is absent; \"red\" = the check must FAIL, which is how a REPRODUCTION is declared — a check that passes there has reproduced nothing and does not advance. A fault that left no exit status is `indeterminate` and satisfies NEITHER); transition→{target_state}; judge→{prompt, output_schema?, output_key?, append?}; ask_human→{prompt, output_key?, append?}; produce→{output_key?, append?}; loop→{until, max_iterations?}; selector→{branches:[{cond, child?}]}; note→{text}; sequence/wait→{}. output_key routes the result on the blackboard; append pushes onto an array instead of overwriting; inline runs the effector in-session (for an interactive one)" }),
                 "parent_id": str_prop("optional: the PARENT composite node (omit for the workflow's root node)"),
                 "order_index": json!({ "type": "integer", "description": "optional: sibling order under the parent (default 0)" }),
             },
@@ -3449,8 +3486,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         run again. \
                         done — the run is over; stop calling. \
                         AND NOTHING ELSE WILL EVER REACH YOU. gate_check, transition, \
-                        transition_task, query, fork_spec, create_workspace and note are nyx's OWN \
-                        effects: nyx holds \
+                        transition_task, query, fork_spec, create_workspace, set_category and note \
+                        are nyx's OWN effects: nyx holds \
                         the PTY, the Spec authority and the DB, so it runs them INSIDE the tick and \
                         you never see them. Do not wait for one — a dispatcher parked on a gate_check \
                         it expects to be handed waits for something that never comes; the tick that \
@@ -4981,10 +5018,12 @@ mod tests {
             }
         }
         assert_eq!(
-            anchorless, 12,
-            "the twelve anchorless `spec_id` FIELDS (fewer tools than fields — `spec_link` and \
+            anchorless, 13,
+            "the anchorless `spec_id` FIELDS (fewer tools than fields — `spec_link` and \
              `spec_unlink` carry two each) are the ones the finding enumerates — a change in that \
-             count is a change of contract, not a detail"
+             count is a change of contract, not a detail. It went from 12 to 13 with \
+             `spec_set_category` (PDR-0017), whose only other arguments name a CATEGORY: no \
+             project_id / workspace_id / cwd / run_id, so a bare number has nothing to be counted in"
         );
         assert_eq!(
             optional_anchor, 5,
@@ -5267,6 +5306,137 @@ mod tests {
     /// guard, stated so it is not read as more: every name the trailer advertises IN THAT SHAPE
     /// must be a key of `run_start`'s own `inputSchema.properties`, and any other shape has to come
     /// back through this test.
+    /// **`node_add`'s CONFIG DESCRIPTOR ANNOUNCES EVERY FIELD `gate_check` ACCEPTS** — derived from
+    /// the authoring side's own list, not re-typed beside it.
+    ///
+    /// WHY THIS ONE TYPE GETS A GUARD. The descriptor's sentence opens with "unknown fields are
+    /// REFUSED" and then ENUMERATES the fields of each type, so for a `tools/list` reader that
+    /// enumeration IS the contract: a field missing from it reads as a field the tool will reject.
+    /// `expect` shipped validated ([`crate::mcp_authoring::known_config_fields`], and a value
+    /// outside the vocabulary is refused with the two words spelled out) and UNANNOUNCED — an agent
+    /// reading the descriptor could not discover the one field that declares a reproduction.
+    ///
+    /// WHAT IT REACHES, stated so it is not read as more: the `gate_check→{…}` enumeration, against
+    /// [`crate::mcp_authoring::known_config_fields`] for that type. Other types' enumerations are
+    /// partial by inheritance (`set_category`, `query`, `sub_workflow` and others are absent
+    /// entirely) and that pre-existing debt is not what this guard is about; extend it to them the
+    /// day their enumerations are completed.
+    #[test]
+    fn node_add_announces_every_config_field_a_gate_check_accepts() {
+        let tools = tool_descriptors();
+        let desc = tools
+            .iter()
+            .find(|t| t["name"] == crate::mcp_authoring::NODE_ADD_TOOL)
+            .and_then(|t| t["inputSchema"]["properties"]["config"]["description"].as_str())
+            .expect("node_add advertises a config description")
+            .to_string();
+        // The `type→{fields}` shape the descriptor writes its enumerations in — asserted before it
+        // is used, so a re-write into prose fails HERE instead of leaving the loop below vacuous.
+        let announced = desc
+            .split("gate_check→{")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect(
+                "the descriptor enumerates gate_check's fields in the `gate_check→{…}` shape this \
+                 guard derives them from",
+            )
+            .to_string();
+        for field in crate::mcp_authoring::known_config_fields(crate::db::NODE_TYPE_GATE_CHECK) {
+            assert!(
+                announced.contains(field),
+                "the authoring side accepts a 'gate_check' config field '{field}' the descriptor \
+                 does not announce — and the same sentence says unknown fields are REFUSED, so a \
+                 reader concludes it may not use it: {announced}",
+            );
+        }
+        // …and `expect`'s VOCABULARY is spelled out, since knowing the field exists without knowing
+        // which two words it takes is not a discoverable field.
+        assert!(
+            desc.contains(crate::db::GATE_EXPECT_RED)
+                && desc.contains(crate::db::GATE_EXPECT_GREEN)
+                && desc.contains("the default when the field is absent"),
+            "the descriptor states what `red` and `green` mean and that absent means green: {desc}",
+        );
+    }
+
+    /// **`spec_set_category` ANNOUNCES THE CATEGORY OBJECT IT ACTUALLY RETURNS** — derived from
+    /// [`crate::mcp_tools_spec::category_payload`], not re-typed beside it.
+    ///
+    /// WHY THIS DESCRIPTOR GETS A GUARD, on the model of
+    /// [`node_add_announces_every_config_field_a_gate_check_accepts`] just above. The sentence
+    /// enumerates the response's category fields, so for a `tools/list` reader that enumeration IS
+    /// the contract. It shipped announcing `state: proposed | confirmed` — a key
+    /// [`crate::mcp_tools_spec::category_payload`] never emitted after the 2026-09-02 amendment of
+    /// PDR-0017 retired the proposed/confirmed axis, so an agent branching on `category.state` read
+    /// `undefined` (finding `01M1HB6GZD0EZC6NBAFDR2GV4M`). Walking the payload's OWN keys is what
+    /// makes the next removal fail here instead of shipping.
+    ///
+    /// ONE KEY IS DELIBERATELY NOT ANNOUNCED, and it is named rather than silently skipped:
+    /// `confirmed_at` is the VESTIGIAL column ([`crate::db::Category::confirmed_at`]) — always set,
+    /// read by nobody, slated to be dropped the next time `categories` is migrated. The payload
+    /// mirrors the row rather than hiding half of it; the DESCRIPTOR is an agent's contract, and
+    /// advertising a field whose only meaning is "ignore me" is how the axis got re-derived in the
+    /// first place. A key added to the payload for any other reason lands in the loop below.
+    ///
+    /// AND THE RETIRED AXIS STAYS OUT OF EVERY `spec_*` DESCRIPTOR — description and schema alike.
+    /// The four surviving mentions were spread over `spec_create` and `spec_set_category`, so the
+    /// second half of this guard sweeps the whole family rather than the one verb that was fixed.
+    #[test]
+    fn spec_set_category_announces_the_category_object_it_returns() {
+        let tools = tool_descriptors();
+        let desc = tools
+            .iter()
+            .find(|t| t["name"] == crate::mcp_tools_spec::SPEC_SET_CATEGORY_TOOL)
+            .and_then(|t| t["description"].as_str())
+            .expect("spec_set_category is advertised")
+            .to_string();
+        let sample = crate::db::Category {
+            id: "cat_1".to_string(),
+            project_id: "prj_1".to_string(),
+            slug: "dette-technique".to_string(),
+            name: "Dette technique".to_string(),
+            color_token: Some("group-3".to_string()),
+            position: 4,
+            created_by_type: crate::db::CATEGORY_CREATED_BY_AGENT.to_string(),
+            confirmed_at: Some(1),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let payload = crate::mcp_tools_spec::category_payload(&sample);
+        let keys = payload.as_object().expect("the payload is an object");
+        for key in keys.keys() {
+            // The vestigial column — carried by the payload, deliberately unadvertised (see above).
+            if key == "confirmed_at" {
+                continue;
+            }
+            assert!(
+                desc.contains(key.as_str()),
+                "spec_set_category returns a category field '{key}' its description does not \
+                 announce — and that enumeration is what a `tools/list` reader takes for the \
+                 response's shape: {desc}",
+            );
+        }
+        assert!(
+            !desc.contains("state"),
+            "spec_set_category must not announce a `state` key: `category_payload` emits none \
+             since PDR-0017 was amended on 2026-09-02, and an agent branching on it reads \
+             undefined: {desc}",
+        );
+        // NO `spec_*` DESCRIPTOR RE-ANNOUNCES THE RETIRED AXIS — description and schema alike.
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap_or_default();
+            if !name.starts_with("spec_") {
+                continue;
+            }
+            let rendered = tool.to_string().to_lowercase();
+            assert!(
+                !rendered.contains("proposed"),
+                "'{name}' still describes the proposed/confirmed axis PDR-0017 retired on \
+                 2026-09-02 — this text is what an agent reads before it classifies: {rendered}",
+            );
+        }
+    }
+
     #[test]
     fn run_start_advises_only_anchors_its_own_schema_advertises() {
         let tools = tool_descriptors();
@@ -6390,6 +6560,69 @@ mod tests {
         }
     }
 
+    /// The dispatcher the two auto-map wire tests below share: it mirrors the real
+    /// `SidecarDispatcher::call_with_caller` by threading the caller into
+    /// `dispatch_extension_tool` against a live in-memory `Db`, over a throwaway no-op runner +
+    /// host (the sidecar's own pre-runtime path).
+    ///
+    /// It is at module level rather than inside one test because BOTH the `spec_create` seam and
+    /// the `run_start` seam need exactly it, and a second copy is a second thing to keep in step
+    /// with the production dispatcher.
+    struct AutoMapDispatcher {
+        db: crate::db::Db,
+    }
+    impl AutoMapDispatcher {
+        fn dispatch(
+            &self,
+            name: &str,
+            args: &Value,
+            caller: Option<&str>,
+        ) -> Result<Value, RpcError> {
+            struct NoopSink;
+            impl crate::command::RunnerSink for NoopSink {
+                fn on_state(&self, _: &str, _: crate::command::RunState, _: Option<i32>) {}
+                fn on_acknowledge(&self, _: &str) {}
+                fn on_output(&self, _: &str, _: &[u8]) {}
+                fn persist_scrollback(&self, _: &str, _: &str) {}
+                fn archive_previous_run(&self, _: &str) {}
+                fn clear_output(&self, _: &str) {}
+            }
+            let runner = crate::command::CommandRunner::new(
+                NoopSink,
+                portable_pty::PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            );
+            let host = crate::mcp_tools_core::NoTerminalHost;
+            let activity = crate::agent_activity::AgentActivityStore::new();
+            match crate::mcp_tools_core::dispatch_extension_tool(
+                &self.db, &runner, &host, &activity, name, args, caller,
+            ) {
+                Some(res) => res.map(|o| o.result),
+                None => Err(RpcError::new(
+                    RpcCode::MethodNotFound,
+                    format!("unknown tool '{name}'"),
+                )),
+            }
+        }
+    }
+    impl ToolDispatcher for AutoMapDispatcher {
+        fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError> {
+            self.dispatch(name, arguments, None)
+        }
+        fn call_with_caller(
+            &self,
+            name: &str,
+            arguments: &Value,
+            caller_terminal_id: Option<&str>,
+        ) -> Result<Value, RpcError> {
+            self.dispatch(name, arguments, caller_terminal_id)
+        }
+    }
+
     #[test]
     fn header_x_nyx_terminal_id_threads_the_caller_into_the_auto_map() {
         // v2.5.10 Phase-1 review finding 01KXNC0KHS2YX3KHRMK9QW803P: the PRODUCTION seam
@@ -6403,63 +6636,8 @@ mod tests {
         // a `spec_create` carrying the header lands the worked Spec in the header terminal's
         // live-session set; the SAME call WITHOUT the header maps nothing.
         //
-        // The dispatcher mirrors the real `SidecarDispatcher::call_with_caller`: it threads
-        // the caller into `dispatch_extension_tool` against a live in-memory `Db`, over a
-        // throwaway no-op runner + host (the sidecar's own pre-runtime path).
-        struct AutoMapDispatcher {
-            db: crate::db::Db,
-        }
-        impl AutoMapDispatcher {
-            fn dispatch(
-                &self,
-                name: &str,
-                args: &Value,
-                caller: Option<&str>,
-            ) -> Result<Value, RpcError> {
-                struct NoopSink;
-                impl crate::command::RunnerSink for NoopSink {
-                    fn on_state(&self, _: &str, _: crate::command::RunState, _: Option<i32>) {}
-                    fn on_acknowledge(&self, _: &str) {}
-                    fn on_output(&self, _: &str, _: &[u8]) {}
-                    fn persist_scrollback(&self, _: &str, _: &str) {}
-                    fn archive_previous_run(&self, _: &str) {}
-                    fn clear_output(&self, _: &str) {}
-                }
-                let runner = crate::command::CommandRunner::new(
-                    NoopSink,
-                    portable_pty::PtySize {
-                        rows: 24,
-                        cols: 80,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    },
-                );
-                let host = crate::mcp_tools_core::NoTerminalHost;
-                let activity = crate::agent_activity::AgentActivityStore::new();
-                match crate::mcp_tools_core::dispatch_extension_tool(
-                    &self.db, &runner, &host, &activity, name, args, caller,
-                ) {
-                    Some(res) => res.map(|o| o.result),
-                    None => Err(RpcError::new(
-                        RpcCode::MethodNotFound,
-                        format!("unknown tool '{name}'"),
-                    )),
-                }
-            }
-        }
-        impl ToolDispatcher for AutoMapDispatcher {
-            fn call(&self, name: &str, arguments: &Value) -> Result<Value, RpcError> {
-                self.dispatch(name, arguments, None)
-            }
-            fn call_with_caller(
-                &self,
-                name: &str,
-                arguments: &Value,
-                caller_terminal_id: Option<&str>,
-            ) -> Result<Value, RpcError> {
-                self.dispatch(name, arguments, caller_terminal_id)
-            }
-        }
+        // The dispatcher is [`AutoMapDispatcher`] above: it mirrors the real
+        // `SidecarDispatcher::call_with_caller`.
 
         // Live substrate: a project + a terminal hosting a LIVE agent session (the caller).
         let db = crate::db::Db::in_memory();
@@ -6536,6 +6714,113 @@ mod tests {
             1,
             "no X-Nyx-Terminal-Id header → no caller → the set is unchanged (no auto-map)"
         );
+    }
+
+    /// THE SEAM THE SESSION HOOK ACTUALLY USES — `run_start`, over the wire, with and without the
+    /// header (human review 01M1H5QY53WMGA8Y46DC2T655W).
+    ///
+    /// The test above proves the chain on `spec_create`, which is the tool `/nspec` reaches through
+    /// `.mcp.json` — a transport that has always carried `X-Nyx-Terminal-Id`. `/ndev` reaches
+    /// nothing of the sort at its start: the `UserPromptSubmit` HOOK
+    /// (`resources/claude-plugin/hooks/nyx-session-hook.cjs`) opens the run with a `run_start` of
+    /// its own, and it sent `content-type` / `content-length` and nothing else. So `run_start`
+    /// arrived with `caller_terminal_id: None`, `dispatch_extension_tool` skipped
+    /// `link_terminal_active_session_spec`, and the terminal's dev overlay never learnt which Spec
+    /// the run was on — `/nspec` mapped, `/ndev` never did.
+    ///
+    /// `run_start` is a MUTATING tool that reports the Spec it bound (`spec_id` in its result), so
+    /// it is auto-mappable exactly like `spec_create`; the header was the only missing half. This
+    /// pins BOTH directions over the real loopback wire so the fix cannot silently come undone.
+    #[test]
+    fn run_start_over_the_wire_auto_maps_only_when_the_terminal_header_is_sent() {
+        use crate::db::{self as ndb, SpecSections, SpecTransition};
+
+        let db = ndb::Db::in_memory();
+        db.with_conn(crate::seed::seed_builtin_workflows)
+            .expect("the built-in ndev/coder graphs the run resolves");
+
+        // A project with its root workspace, an in-progress Spec anchored on it, and a terminal
+        // hosting a LIVE agent session — the caller the header names.
+        let (spec_id, terminal_id) = db.with_conn(|c| {
+            let (project, root) =
+                ndb::create_project(c, "Proj", "/work-runstart", None).expect("project");
+            let (spec, _rev) = ndb::create_spec(
+                c,
+                &project.id,
+                "Spec driven by /ndev",
+                SpecSections {
+                    problem: "the overlay must know".into(),
+                    solution: "send the header".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("spec");
+            ndb::transition_spec(c, &spec.id, SpecTransition::Ready, true).expect("ready");
+            ndb::transition_spec_with_workspace(
+                c,
+                &spec.id,
+                SpecTransition::Start,
+                true,
+                Some(&root.id),
+            )
+            .expect("start");
+            let terminal = ndb::create_terminal(c, "/work-runstart", None).expect("terminal");
+            ndb::record_session_start(
+                c,
+                &terminal.id,
+                ndb::AGENT_KIND_CLAUDE_CODE,
+                ndb::SessionCapture {
+                    external_session_id: "ext-runstart-1".into(),
+                    cwd: "/work-runstart".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("session");
+            (spec.id, terminal.id)
+        });
+        let mapped = |db: &ndb::Db| {
+            db.with_conn(|c| ndb::specs_for_terminal(c, &terminal_id))
+                .unwrap()
+        };
+        assert!(mapped(&db).is_empty(), "nothing is mapped before the call");
+
+        let (server, port) = start_test_server();
+        server.set_dispatcher(Arc::new(AutoMapDispatcher { db: db.clone() }));
+        let run_start = |id: u32| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{}","arguments":{{"spec_id":"{spec_id}"}}}}}}"#,
+                crate::mcp_engine::RUN_START_TOOL,
+            )
+        };
+
+        // 1) WITHOUT the header — the shape the hook shipped. The run opens, and NOTHING is mapped:
+        //    no caller, no `agent_session_specs` row, no overlay.
+        let (status, body) = http_post_mcp(port, &run_start(1), None);
+        assert!(status.contains("200"), "run_start call 200, got {status}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["isError"], false, "run_start must succeed: {body}");
+        assert_eq!(
+            v["result"]["structuredContent"]["spec_id"], spec_id,
+            "the run IS bound to the Spec — the mapping's raw material was there all along: {body}"
+        );
+        assert!(
+            mapped(&db).is_empty(),
+            "no X-Nyx-Terminal-Id → no caller → no auto-map: this is the bug, pinned"
+        );
+
+        // 2) WITH the header — the shape the hook ships now. ONE `agent_session_specs` row, naming
+        //    that terminal's live session and that Spec.
+        let (status2, body2) = http_post_mcp(port, &run_start(2), Some(&terminal_id));
+        assert!(status2.contains("200"), "second run_start 200, got {status2}");
+        let v2: Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(v2["result"]["isError"], false, "run_start must succeed: {body2}");
+        let linked = mapped(&db);
+        assert_eq!(
+            linked.len(),
+            1,
+            "the header terminal's live session gains exactly the Spec the run is bound to"
+        );
+        assert_eq!(linked[0].id, spec_id);
     }
 
     #[test]

@@ -501,6 +501,14 @@ function readStdin() {
  * `{ status, body }` (the sidecar answered) or `{ error }` (it did not: down, timeout, socket
  * error). The two must stay apart — a caller that cannot tell them apart cannot say WHY it
  * injected nothing.
+ *
+ * IT CARRIES `x-nyx-terminal-id`, and that is not decoration. The sidecar reads that header to
+ * learn WHICH TERMINAL is calling (`caller_terminal_id`), and the extension-tool dispatch uses it
+ * to auto-map the Spec a call worked on onto that terminal's agent session
+ * (`link_terminal_active_session_spec`). Without it, `run_start` — the very call this hook makes at
+ * `UserPromptSubmit` — arrived with no caller, the auto-map was skipped, and the terminal's dev
+ * overlay never learnt which Spec the run was on: `/nspec` mapped (its `spec_create` goes through
+ * `.mcp.json`, which DOES carry the header) and `/ndev` never did.
  */
 function post(body, timeoutMs = TIMEOUT_MS) {
   return new Promise((resolve) => {
@@ -521,6 +529,10 @@ function post(body, timeoutMs = TIMEOUT_MS) {
           headers: {
             "content-type": "application/json",
             "content-length": Buffer.byteLength(body),
+            // Only when it is really known: an EMPTY header is not "no terminal", it is a header
+            // the server has to decide what to do with. Omitting it keeps "the hook ran outside a
+            // nyx terminal" the same fact on the wire as before.
+            ...(TERMINAL_ID ? { "x-nyx-terminal-id": TERMINAL_ID } : {}),
           },
         },
         (res) => {

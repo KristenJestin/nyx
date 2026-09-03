@@ -36,8 +36,13 @@ export const buttonVariants = cva(
           "not-disabled:inset-shadow-[0_1px_--theme(--color-white/16%)] border-destructive bg-destructive text-destructive-foreground shadow-destructive/24 shadow-xs hover:bg-destructive/90 data-pressed:bg-destructive/90 *:data-[slot=button-loading-indicator]:text-destructive-foreground [:active,[data-pressed]]:inset-shadow-[0_1px_--theme(--color-black/8%)] [:disabled,:active,[data-pressed]]:shadow-none",
         "destructive-outline":
           "border-input bg-popover not-dark:bg-clip-padding text-destructive shadow-xs/5 not-disabled:not-active:not-data-pressed:before:shadow-[0_1px_--theme(--color-black/4%)] hover:border-destructive/32 hover:bg-destructive/4 data-pressed:border-destructive/32 data-pressed:bg-destructive/4 *:data-[slot=button-loading-indicator]:text-foreground dark:bg-input/32 dark:not-disabled:before:shadow-[0_-1px_--theme(--color-white/2%)] dark:not-disabled:not-active:not-data-pressed:before:shadow-[0_-1px_--theme(--color-white/6%)] [:disabled,:active,[data-pressed]]:shadow-none",
+        // `sidebar-accent`, NOT `accent`: nyx declares no `--accent` at all (`globals.css` maps
+        // `--color-sidebar-accent` and stops there), so Tailwind emitted no `bg-accent` rule and
+        // EVERY ghost button in the app hovered and pressed with no paint whatsoever. This is the
+        // subtle surface tint the rest of the design system already uses for a hovered row
+        // (`ui/menu.tsx`), which is what a ghost button asks for.
         ghost:
-          "border-transparent text-foreground hover:bg-accent data-pressed:bg-accent *:data-[slot=button-loading-indicator]:text-foreground",
+          "border-transparent text-foreground hover:bg-sidebar-accent data-pressed:bg-sidebar-accent *:data-[slot=button-loading-indicator]:text-foreground",
         "ghost-destructive":
           "border-transparent text-muted-foreground transition-colors hover:bg-destructive hover:text-destructive-foreground data-pressed:bg-destructive data-pressed:text-destructive-foreground *:data-[slot=button-loading-indicator]:text-destructive-foreground",
         link: "border-transparent text-foreground underline-offset-4 hover:underline data-pressed:underline *:data-[slot=button-loading-indicator]:text-foreground",

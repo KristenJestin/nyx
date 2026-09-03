@@ -83,7 +83,7 @@ function tabCount(key: SpecTabKey, detail: SpecDetail): number | null {
  */
 export function SpecDetailPage() {
   const { specId } = routeApi.useParams();
-  const { detail, loading, error } = useSpecDetail(specId);
+  const { detail, loading, error, refresh } = useSpecDetail(specId);
   // THE SCOPE, read the one way the app reads it (never `activeProjectId === null`, which means
   // "no project is loaded"). Opening a Spec from the cross-project board is scope-NEUTRAL — the
   // sync below moves the entered project without leaving the transverse view — so this stays true
@@ -125,7 +125,7 @@ export function SpecDetailPage() {
     <div className="flex h-app bg-background">
       {/* The context rail on the LEFT (shared `<SidebarShell>`, same as the Terminals cockpit);
           the header + tabs + tab content occupy the column to its RIGHT. */}
-      <SpecSidebar detail={detail} showProject={globalScope} />
+      <SpecSidebar detail={detail} refresh={refresh} showProject={globalScope} />
 
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Header — breadcrumb + title + human key. Uses the SHARED `<Breadcrumb>` so the board,

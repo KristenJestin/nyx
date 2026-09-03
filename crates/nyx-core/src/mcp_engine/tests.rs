@@ -3066,11 +3066,23 @@ fn run_start_warns_through_the_sub_workflow_hop_about_a_gate_it_never_opens() {
         db::list_nodes(c, &coder_wf)
             .unwrap()
             .into_iter()
-            .find(|n| n.type_ == db::NODE_TYPE_GATE_CHECK)
+            // BY LABEL: since revision 24 the coder graph also holds the two reproduction gates.
+            .find(|n| n.type_ == db::NODE_TYPE_GATE_CHECK && n.label == "checks")
             .expect("the coder's checks gate")
             .id
     });
     assert_eq!(warned["node_id"], json!(gate_node), "and the NODE to fix");
+    // …AND IT IS THE ONLY GATE WARNED ABOUT. This Spec is not a `bug`, so the two reproduction gates
+    // sit on a branch this run cannot reach, and a warning about them would be a false alarm — see
+    // [`super::gate_is_owed_by_this_run`].
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w["code"] == "gate_unconfigured")
+            .count(),
+        1,
+        "one unarmed gate is REACHABLE by this run, so exactly one is reported: {warnings:?}",
+    );
     assert_eq!(
         warned["blocking"],
         json!(true),
@@ -3479,9 +3491,19 @@ fn the_seeded_coders_empty_gate_refuses_to_certify_a_build_it_never_checked() {
         .expect("a child run")
         .to_string();
 
-    // The child starts the task and spawns the coder…
+    // The child's FIRST node is revision 24's category PREFLIGHT: this Spec carries no category, so
+    // the genre is classified EXPLICITLY before anything routes on it. `feature` here — which is what
+    // sends this run down the branch that owes no reproduction, leaving the `checks` gate as the one
+    // thing standing between the coder and a closed task.
+    let preflight = tick(&db, &rt, &child, None);
     assert_eq!(
-        tick(&db, &rt, &child, None)["action"]["type"],
+        preflight["action"]["type"], "judge",
+        "an unclassified Spec is classified before the build routes: {preflight}"
+    );
+
+    // The child then starts the task and spawns the coder…
+    assert_eq!(
+        tick(&db, &rt, &child, Some(json!({ "verdict": "feature" })))["action"]["type"],
         "spawn_subagent"
     );
     assert_eq!(
@@ -3515,7 +3537,9 @@ fn the_seeded_coders_empty_gate_refuses_to_certify_a_build_it_never_checked() {
         db::list_nodes(c, &coder_wf)
             .unwrap()
             .into_iter()
-            .find(|n| n.type_ == db::NODE_TYPE_GATE_CHECK)
+            // BY LABEL: since revision 24 the coder graph also holds the two reproduction gates, and
+            // "the first gate_check in the tree" is no longer a name for the build control.
+            .find(|n| n.type_ == db::NODE_TYPE_GATE_CHECK && n.label == "checks")
             .expect("the coder's checks gate")
             .id
     });
@@ -3651,17 +3675,23 @@ fn the_seeded_coders_empty_gate_refuses_to_certify_a_build_it_never_checked() {
         let gate = db::list_nodes(c, &coder_builtin)
             .unwrap()
             .into_iter()
-            .find(|n| n.type_ == db::NODE_TYPE_GATE_CHECK)
+            .find(|n| n.type_ == db::NODE_TYPE_GATE_CHECK && n.label == "checks")
             .expect("the checks gate");
         db::update_node(c, &gate.id, Some("stale label from an old revision"), None).unwrap();
     });
     db.with_conn(crate::seed::seed_builtin_workflows).unwrap();
     let (revision, gate_label) = db.with_conn(|c| {
         let wf = db::get_workflow(c, &coder_builtin).unwrap().expect("the built-in survives");
+        // The BUILD gate, by its SLOT: revision 24 added the two reproduction gates beside it, and
+        // "the first gate_check" stopped being a name for the control this test mutilated.
         let label = db::list_nodes(c, &coder_builtin)
             .unwrap()
             .into_iter()
-            .find(|n| n.type_ == db::NODE_TYPE_GATE_CHECK)
+            .find(|n| {
+                n.type_ == db::NODE_TYPE_GATE_CHECK
+                    && serde_json::from_str::<Value>(&n.config).unwrap()["slot"]
+                        == json!(crate::seed::BUILD_CHECK_SLOT)
+            })
             .expect("the rebuilt gate")
             .label;
         (wf.builtin_revision, label)
@@ -8904,6 +8934,1275 @@ fn the_global_budget_marks_a_slow_gate_red_without_hanging() {
 
     // The marker helper formats the configured GATE_TOTAL_TIMEOUT.
     assert!(super::gate_total_budget_marker().contains("90s"));
+
+    // And the tri-valued grade says WHICH kind of "not green" this is: the clock ran out, so
+    // NOTHING was judged — `indeterminate`, never `failed`.
+    assert_eq!(outcome.outcome, GateGrade::Indeterminate);
+    assert!(!GateExpectation::Green.is_satisfied_by(outcome.outcome));
+    assert!(
+        !GateExpectation::Red.is_satisfied_by(outcome.outcome),
+        "a gate that never ran must not pass for a reproduction"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The DECLARED expectation: red|green, the tri-valued grade, and the sticky block
+// ---------------------------------------------------------------------------
+
+/// Re-point a gate's managed command at `cmdline` — "the coder fixed the code" expressed as the only
+/// thing that can change a check's verdict between two attempts on the SAME gate. Keeps the
+/// template's name and subfolder (so the slot binding and the instance are untouched); only what the
+/// command RUNS changes.
+fn retarget_gate_command(db: &Db, instance_id: &str, cmdline: &str) {
+    db.with_conn(|c| {
+        let command_id = db::get_instance(c, instance_id)
+            .expect("instance")
+            .expect("materialized")
+            .command_id;
+        let tpl = db::get_template(c, &command_id)
+            .expect("template")
+            .expect("row");
+        db::update_template(c, &command_id, &tpl.name, cmdline, tpl.subfolder.as_deref())
+            .expect("retarget the gate command");
+    });
+}
+
+/// The gate attempts recorded for `run_id`, oldest first — the durable journal, read back the way
+/// the auditor and the resume engine read it.
+fn attempts(db: &Db, run_id: &str) -> Vec<db::GateAttemptRow> {
+    db.with_conn(|c| db::list_gate_attempts_for_run(c, run_id)).expect("the journal")
+}
+
+/// THE NON-REGRESSION PROOF, and the most important one of this slice: a `gate_check` that declares
+/// NO `expect` behaves EXACTLY as it did before expectations existed.
+///
+/// Everything an existing graph could observe is asserted here: the gate is graded `green` by
+/// default, so `gate_satisfied` agrees with `gate_passed` and with the `gate_green` alias; a red one
+/// RAISES the M5 anchor on the board rather than refusing on the spot; and the refusal lands LATER,
+/// at the `transition` the anchor guards, with the same `gate_red` reason and the same blocked run.
+/// Any of those changing would silently re-time or re-word the refusal every graph in the field is
+/// written against.
+#[test]
+fn a_gate_that_declares_no_expectation_is_enforced_exactly_as_before() {
+    let _g = db_guard();
+    let sandbox = temp_dir("expect-absent");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let failing = gate_command(&db, &project_id, "exit 1");
+
+    let mut gate_node = String::new();
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        gate_node = add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            // NO `expect` — the shape every graph authored before this slice has.
+            json!({ "command_ids": [failing], "blocking": true }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_TRANSITION,
+            json!({ "target_state": "in_review" }),
+        );
+    });
+
+    let rt = EngineRuntime::new();
+    let err = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id })).unwrap_err();
+    assert_eq!(err.code, "invalid_state");
+    assert_eq!(
+        err.data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("gate_red"),
+        "the refusal keeps its historical reason — not the expectation-mismatch one"
+    );
+    assert_eq!(run_row(&db, &run_id).status, db::RUN_STATUS_BLOCKED);
+    assert_eq!(spec_status(&db, &spec_id), db::SPEC_STATUS_IN_PROGRESS);
+
+    let board: Value = serde_json::from_str(&run_row(&db, &run_id).blackboard).unwrap();
+    assert_eq!(
+        board[super::BLOCKING_GATE_RED_KEY],
+        json!([gate_node]),
+        "an undeclared gate still raises the M5 anchor — that IS its enforcement"
+    );
+    // The three board keys AGREE, because the default expectation is `green`: nothing an existing
+    // condition (`{\"var\": \"gate_green\", ...}`) reads has changed value.
+    assert_eq!(board["gate_green"], json!(false));
+    assert_eq!(board["gate_passed"], json!(false));
+    assert_eq!(board["gate_satisfied"], json!(false));
+    // And the surfaced result says what it was graded against.
+    assert_eq!(board["last_gate_result"]["expect"], json!("green"));
+    assert_eq!(board["last_gate_result"]["outcome"], json!("failed"));
+    assert_eq!(board["last_gate_result"]["satisfied"], json!(false));
+}
+
+/// A DECLARED `expect: red` is SATISFIED by a check that ran and failed — and the run walks on.
+///
+/// The second assertion is the load-bearing one: **no `blocking_gate_red` anchor is raised**. A
+/// satisfied reproduction is not a problem to be guarded against, and anchoring it would arm the M5
+/// re-eval on a gate whose expectation the fix is about to stop satisfying.
+#[test]
+fn a_satisfied_red_expectation_advances_the_run_and_raises_no_anchor() {
+    let _g = db_guard();
+    let sandbox = temp_dir("expect-red-ok");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let reproduces = gate_command(&db, &project_id, "exit 1");
+
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            json!({ "command_ids": [reproduces], "blocking": true, "expect": "red" }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_TRANSITION,
+            json!({ "target_state": "in_review" }),
+        );
+    });
+
+    let rt = EngineRuntime::new();
+    let out = tick(&db, &rt, &run_id, None);
+    assert_eq!(
+        out["action"]["type"], "done",
+        "the defect reproduced as declared, so the run advances: {out}"
+    );
+    assert_eq!(spec_status(&db, &spec_id), db::SPEC_STATUS_IN_REVIEW);
+
+    let board: Value = serde_json::from_str(&run_row(&db, &run_id).blackboard).unwrap();
+    assert!(
+        board.get(super::BLOCKING_GATE_RED_KEY).is_none(),
+        "a SATISFIED red gate raises no anchor — the M5 re-eval must never see it: {board}"
+    );
+    // The two facts DIVERGE here, which is the whole reason they are two keys.
+    assert_eq!(board["gate_passed"], json!(false), "the command failed");
+    assert_eq!(board["gate_green"], json!(false), "and the alias says the same");
+    assert_eq!(
+        board["gate_satisfied"],
+        json!(true),
+        "and failing is exactly what this gate asked for"
+    );
+    assert_eq!(board["last_gate_result"]["expect"], json!("red"));
+    assert_eq!(board["last_gate_result"]["satisfied"], json!(true));
+}
+
+/// **THE GUARD AGAINST A PERMANENT BLOCK.** A reproduction gate that anchored itself would be
+/// RE-RUN by the M5 re-eval at the next block point — AFTER the fix, where it passes, where passing
+/// no longer answers `expect: red`, and where it would refuse the transition forever. The run would
+/// be wedged by the very proof it produced.
+///
+/// The scenario is the real one, tick by tick: the gate goes red (satisfied) and the run yields its
+/// coder; the fix lands BETWEEN the two ticks — the same check now passes — and the second tick
+/// reaches the `transition`, which is exactly where `reeval_red_gates` runs. It must fire.
+#[test]
+fn a_satisfied_reproduction_gate_does_not_wedge_the_transition_once_the_fix_lands() {
+    let _g = db_guard();
+    let sandbox = temp_dir("expect-red-nowedge");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let repro = gate_command(&db, &project_id, "exit 1");
+
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            json!({ "command_ids": [repro], "blocking": true, "expect": "red" }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_SPAWN_SUBAGENT,
+            json!({ "agent_id": "coder" }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            2,
+            db::NODE_TYPE_TRANSITION,
+            json!({ "target_state": "in_review" }),
+        );
+    });
+
+    let rt = EngineRuntime::new();
+    let first = tick(&db, &rt, &run_id, None);
+    assert_eq!(
+        first["action"]["type"], "spawn_subagent",
+        "the red was observed and the run handed the coder its work: {first}"
+    );
+
+    // THE FIX. The very same check now passes — which is what makes the anchored version of this
+    // gate fatal at the block point the next tick walks into.
+    retarget_gate_command(&db, &repro, "exit 0");
+
+    let second = tick(&db, &rt, &run_id, Some(json!({ "diff": "the fix" })));
+    assert_eq!(
+        second["action"]["type"], "done",
+        "the transition fired — an anchored reproduction gate would have refused it forever: {second}"
+    );
+    assert_eq!(spec_status(&db, &spec_id), db::SPEC_STATUS_IN_REVIEW);
+    assert_eq!(run_row(&db, &run_id).status, db::RUN_STATUS_DONE);
+}
+
+/// A DECLARED expectation that is NOT met blocks IMMEDIATELY — with no `transition` and no `done`
+/// downstream to carry an anchor's refusal — and STAYS blocked on every subsequent call until an
+/// attempt satisfies it.
+///
+/// The graph is deliberately a gate and NOTHING ELSE: under the anchor mechanism this run would
+/// simply walk to its end (there is nothing for an anchor to guard), so a refusal here can only come
+/// from the on-the-spot enforcement. The stickiness is then proven the only way it can be — by
+/// calling again and getting the same refusal — and the release the only way it can be: by making
+/// the check do what it declared.
+#[test]
+fn an_unmet_declared_expectation_blocks_on_the_spot_and_stays_sticky_until_it_is_met() {
+    let _g = db_guard();
+    let sandbox = temp_dir("expect-sticky");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let check = gate_command(&db, &project_id, "exit 1");
+
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            json!({ "command_ids": [check], "blocking": true, "expect": "green" }),
+        );
+    });
+
+    let rt = EngineRuntime::new();
+    for attempt in 1..=2 {
+        let err =
+            super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id })).unwrap_err();
+        assert_eq!(err.code, "invalid_state", "call {attempt}");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str),
+            Some(super::GATE_EXPECTATION_MISMATCH_REASON),
+            "call {attempt} is refused as an EXPECTATION mismatch, not as a plain red"
+        );
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("outcome")),
+            Some(&json!("failed"))
+        );
+        assert_eq!(run_row(&db, &run_id).status, db::RUN_STATUS_BLOCKED);
+        let board: Value = serde_json::from_str(&run_row(&db, &run_id).blackboard).unwrap();
+        assert!(
+            board.get(super::BLOCKING_GATE_RED_KEY).is_none(),
+            "the block does NOT go through the M5 anchor: {board}"
+        );
+        assert_eq!(board["gate_satisfied"], json!(false));
+    }
+
+    // A REPLAY that satisfies the declaration is what lifts it — and nothing else did in between.
+    retarget_gate_command(&db, &check, "exit 0");
+    let out = tick(&db, &rt, &run_id, None);
+    assert_eq!(
+        out["action"]["type"], "done",
+        "the gate finally did what it declared, so the run advances: {out}"
+    );
+
+    // Every one of the three attempts is in the journal, in order — nothing overwrote anything.
+    let journal = attempts(&db, &run_id);
+    let outcomes: Vec<&str> = journal.iter().map(|a| a.outcome.as_str()).collect();
+    assert_eq!(
+        outcomes,
+        vec!["failed", "failed", "passed"],
+        "the three attempts are recorded in the order they happened"
+    );
+    assert!(journal.iter().all(|a| a.expect == db::GATE_EXPECT_GREEN && a.declared));
+    assert_eq!(
+        journal.iter().map(|a| a.satisfied).collect::<Vec<_>>(),
+        vec![false, false, true]
+    );
+}
+
+/// A NON-BLOCKING gate with a declared expectation is ADVISORY, exactly as a non-blocking gate has
+/// always been: the mismatch is RECORDED (both on the board and in the journal) and refuses nothing.
+/// Only a promise can be broken, and a non-blocking gate makes none.
+#[test]
+fn a_non_blocking_gate_records_its_mismatch_without_refusing_anything() {
+    let _g = db_guard();
+    let sandbox = temp_dir("expect-advisory");
+    let db = Db::in_memory();
+    let (project_id, _ws_id, _ws) = seed_project(&db, sandbox.path());
+    let check = gate_command(&db, &project_id, "exit 0");
+
+    let (_wf, run_id) = workflow_run(&db, None, |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            json!({ "command_ids": [check], "blocking": false, "expect": "red" }),
+        );
+    });
+
+    let rt = EngineRuntime::new();
+    let out = tick(&db, &rt, &run_id, None);
+    assert_eq!(out["action"]["type"], "done", "nothing is refused: {out}");
+    let board: Value = serde_json::from_str(&run_row(&db, &run_id).blackboard).unwrap();
+    assert_eq!(board["gate_passed"], json!(true), "the check passed");
+    assert_eq!(
+        board["gate_satisfied"],
+        json!(false),
+        "and passing is NOT what it declared — recorded, and only recorded"
+    );
+    assert_eq!(attempts(&db, &run_id).len(), 1, "the attempt is still journaled");
+}
+
+/// The GRADING rules, on the two shapes a real PTY cannot be made to produce on demand: a command
+/// that could not be launched at all, and a gate mixing one that answered with one that did not.
+///
+/// An INDETERMINATE dominates: an absent answer cannot be outvoted by the commands that did answer,
+/// because the gate's claim is "this was verified" and one unverified command falsifies it.
+#[test]
+fn a_command_that_could_not_run_grades_the_whole_gate_indeterminate() {
+    let could_not = super::GateCommandResult::could_not_run(
+        "c1",
+        "bun test",
+        "/tmp/ws",
+        "gate spawn failed: No such file or directory",
+    );
+    assert_eq!(could_not.outcome, GateGrade::Indeterminate);
+    assert!(!could_not.passed, "and it is certainly not green");
+    assert!(
+        could_not.output_tail.contains("spawn failed"),
+        "the harness fault is what the record has to show"
+    );
+
+    let failed = super::GateCommandResult {
+        command_id: "c2".into(),
+        cmdline: "bun test".into(),
+        cwd: "/tmp/ws".into(),
+        exit_code: Some(1),
+        passed: false,
+        outcome: GateGrade::Failed,
+        output_tail: "1 test failed".into(),
+        timeout: None,
+        duration_ms: 12,
+    };
+    let passed = super::GateCommandResult {
+        outcome: GateGrade::Passed,
+        exit_code: Some(0),
+        passed: true,
+        ..failed.clone()
+    };
+
+    assert_eq!(super::fold_gate_grade(&[]), GateGrade::Passed);
+    assert_eq!(super::fold_gate_grade(&[passed.clone()]), GateGrade::Passed);
+    assert_eq!(super::fold_gate_grade(&[failed.clone()]), GateGrade::Failed);
+    assert_eq!(
+        super::fold_gate_grade(&[failed, could_not]),
+        GateGrade::Indeterminate,
+        "one command that produced no verdict makes the whole gate unverified"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// THE SAFETY CLAUSE, cause by cause (PRD `01KYA6K26JBYETDMDXYGZVVA03`, phase 9):
+// « Un timeout, une commande introuvable ou une erreur d'infrastructure ne peut
+//   satisfaire le rouge. »
+//
+// The three tests below take the three causes NAMED by that criterion, ONE EACH,
+// and put each of them to the same question: does this attempt satisfy an
+// `expect: red`? It must not, and the reason is the whole point of the PRD. A
+// reproduction gate is the only place in nyx where FAILURE is the awaited answer
+// — so it is the only place where "the check could not run" and "the check ran
+// and failed" collapsing into one another turns an infrastructure fault into a
+// PROOF. A missing binary, a dead network, a suite cut short by the clock would
+// each have certified that a defect reproduces, and the fix that followed would
+// have been accepted on a counterfactual nobody ever observed.
+//
+// Read in binary — the shape every gate had before this PRD — that collapse is
+// automatic: `passed == false` is all a boolean can say, and "not green" is
+// exactly what `expect: red` is waiting for. The third grade is what separates
+// them, and these three tests are what stop it being quietly re-flattened.
+// ---------------------------------------------------------------------------
+
+/// CAUSE 1 of 3 — A TIMEOUT.
+///
+/// A timeout is the ABSENCE of a verdict: the clock ran out, nothing was judged. It is produced by
+/// the REAL runner here, on the two clocks that can cut a gate short — the gate's TOTAL budget
+/// ([`super::GATE_TOTAL_TIMEOUT`], injected so the bound is proven without sleeping ninety seconds)
+/// and, on a platform where a hanging command is spawnable, the per-command one.
+///
+/// The tick itself cannot be driven into a timeout from a test without waiting out the real budget,
+/// so the attempt is carried through the REST of the path by the very functions the tick calls:
+/// [`super::refuse_gate_expectation`] builds the refusal, [`super::record_gate_attempt`] files the
+/// evidence. Nothing here is a stand-in — the outcome is a real one and every function it meets is
+/// production code — and the three cheap facts asserted are the three that matter: the grade, the
+/// satisfaction, and what the journal will show the auditor.
+#[test]
+fn a_timeout_is_indeterminate_and_can_never_answer_a_reproductions_expect_red() {
+    let _g = db_guard();
+    let sandbox = temp_dir("safety-timeout");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let check = gate_command(&db, &project_id, "true");
+
+    // The gate's TOTAL budget, spent before the command could start — nothing was even launched, so
+    // nothing was judged. Zero is not a corner case invented for the test: it is the state a gate
+    // whose earlier commands ate the budget arrives in.
+    let cut_short = super::run_gate_bounded(&db, &[check.clone()], std::time::Duration::ZERO)
+        .expect("the gate runs");
+    assert_eq!(cut_short.outcome, GateGrade::Indeterminate);
+    assert!(!cut_short.passed);
+    assert_eq!(cut_short.commands[0].exit_code, None, "no status was ever read");
+    assert!(
+        cut_short.commands[0]
+            .timeout
+            .as_deref()
+            .unwrap_or_default()
+            .contains("total time budget"),
+        "the record says WHICH clock cut it: {:?}",
+        cut_short.commands[0].timeout,
+    );
+
+    // THE DECISION, on the one function that takes it.
+    assert!(
+        !GateExpectation::Red.is_satisfied_by(cut_short.outcome),
+        "A CHECK THAT RAN OUT OF TIME HAS REPRODUCED NOTHING. This is the assertion the whole PRD \
+         rests on: `expect: red` is answered by a NORMAL termination with a non-zero status and by \
+         nothing else",
+    );
+    assert!(!GateExpectation::Green.is_satisfied_by(cut_short.outcome), "nor a green");
+
+    // THE REFUSAL the dispatcher actually reads — built by the same function the tick builds it
+    // with, on a gate that DECLARED `red`.
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            json!({ "command_ids": [check], "blocking": true, "expect": "red" }),
+        );
+    });
+    let run = run_row(&db, &run_id);
+    let gate_node = "the-reproduction";
+    let mut engine = super::build_engine(&db, &run).expect("engine");
+    let refusal = super::refuse_gate_expectation(
+        &db,
+        &run,
+        &mut engine,
+        gate_node,
+        GateExpectation::Red,
+        cut_short.outcome,
+        None,
+    );
+    assert_eq!(refusal.code, "invalid_state");
+    let data = refusal.data.as_ref().expect("machine-readable beside the sentence");
+    assert_eq!(data["outcome"], json!("indeterminate"));
+    assert_eq!(data["expect"], json!("red"));
+    assert_eq!(data["satisfied"], json!(false));
+    assert!(
+        refusal.message.contains("NO verdict") && !refusal.message.contains("FAILED"),
+        "a gate that never finished is reported as having judged NOTHING, never as a failing \
+         check — told 'your gate is red', a session goes hunting for a defect the gate never read: \
+         {}",
+        refusal.message,
+    );
+
+    // AND THE JOURNAL SAYS SO TOO, which is what the auditor will read months later.
+    super::record_gate_attempt(
+        &db,
+        &super::GateAttempt {
+            run: &run,
+            node_id: gate_node,
+            slot: Some(crate::seed::REPRO_CHECK_SLOT),
+            expect: GateExpectation::Red,
+            declared: true,
+            blocking: true,
+            grade: cut_short.outcome,
+            satisfied: GateExpectation::Red.is_satisfied_by(cut_short.outcome),
+            commands: &cut_short.commands,
+        },
+    );
+    let journal = attempts(&db, &run_id);
+    assert_eq!(
+        journal
+            .iter()
+            .map(|a| (a.expect.as_str(), a.outcome.as_str(), a.satisfied))
+            .collect::<Vec<_>>(),
+        vec![("red", "indeterminate", false)],
+        "the evidence records an attempt that answered nothing — not a reproduction: {journal:?}",
+    );
+
+    // The OTHER clock, on a platform where a hanging command can be spawned: the per-command bound
+    // reaches the same grade by the same rule (`sh` is not spawnable everywhere — the sibling
+    // timeout tests carry the same guard).
+    #[cfg(unix)]
+    {
+        let hangs = gate_command(&db, &project_id, "sh -c 'sleep 60'");
+        let timed_out =
+            super::run_gate_bounded(&db, &[hangs], std::time::Duration::from_millis(300))
+                .expect("the gate runs");
+        assert_eq!(timed_out.outcome, GateGrade::Indeterminate);
+        assert!(timed_out.commands[0].timeout.is_some());
+        assert!(
+            !GateExpectation::Red.is_satisfied_by(timed_out.outcome),
+            "a command killed by the clock is not a reproduction either",
+        );
+    }
+}
+
+/// CAUSE 2 of 3 — A COMMAND NYX CANNOT FIND.
+///
+/// The gate names a managed command that no longer exists: bound when it did (`slot_bind` refuses an
+/// unknown instance, so this state is REACHED, never authored), retired since. `slot_bind` stores
+/// IDS, not rows, so nothing anywhere notices until the gate tries to resolve one — which is exactly
+/// the shape of a project whose command list was tidied up.
+///
+/// THE WHOLE TICK IS DRIVEN HERE, because the thing on trial is not the grader: it is that a
+/// resolution failure reaches the JOURNAL as a graded attempt instead of vanishing as a bare error.
+/// A journal the auditor is told to treat as complete ("what you cannot see recorded, treat as
+/// absent") must not be able to omit the attempts that never ran — the absence of a record would
+/// read as the absence of an attempt, and an absent attempt on a `bug` Spec is a finding while a
+/// silently-swallowed one is nothing at all.
+#[test]
+fn a_gate_command_nyx_cannot_find_is_indeterminate_and_can_never_answer_expect_red() {
+    let _g = db_guard();
+    let sandbox = temp_dir("safety-not-found");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let check = gate_command(&db, &project_id, "true");
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            json!({ "command_ids": [check.clone()], "blocking": true, "expect": "red" }),
+        );
+    });
+    // THE COMMAND DISAPPEARS — the managed command is retired, the node still names its instance.
+    db.with_conn(|c| {
+        let command_id = db::get_instance(c, &check)
+            .expect("instance")
+            .expect("materialized")
+            .command_id;
+        db::delete_template(c, &command_id).expect("the managed command is retired");
+    });
+
+    let rt = EngineRuntime::new();
+    let refusal = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+        .expect_err("a gate whose command cannot be found must refuse");
+    assert!(
+        refusal.message.contains("gate command"),
+        "the refusal names what could not be resolved: {}",
+        refusal.message,
+    );
+    assert_eq!(
+        run_row(&db, &run_id).status,
+        db::RUN_STATUS_BLOCKED,
+        "the run is PARKED on the gate — an inline effect that failed must never be decoded as an \
+         acknowledgement and walked past, which on a blocking gate is a check skipped in silence",
+    );
+
+    let journal = attempts(&db, &run_id);
+    assert_eq!(
+        journal
+            .iter()
+            .map(|a| (a.expect.as_str(), a.outcome.as_str(), a.satisfied))
+            .collect::<Vec<_>>(),
+        vec![("red", "indeterminate", false)],
+        "the attempt IS journaled, and it satisfies nothing: a gate that could not even find its \
+         command has not observed a defect reproducing: {journal:?}",
+    );
+    assert_eq!(journal[0].exit_code, None, "there was never a status to read");
+
+    // STICKY: the next call meets the same wall, and appends rather than overwrites.
+    super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+        .expect_err("still refused");
+    let after = attempts(&db, &run_id);
+    assert_eq!(after.len(), 2, "append-only: the second attempt sits beside the first");
+    assert!(after.iter().all(|a| !a.satisfied));
+    assert_eq!(after[0].sequence, journal[0].sequence, "the first row is untouched");
+}
+
+/// CAUSE 3 of 3 — AN INFRASTRUCTURE FAULT.
+///
+/// The check is armed and the machine underneath it is not: the directory it was to run in has gone
+/// (a worktree removed, a mount that went away, a checkout the user cleaned up mid-run). Nothing is
+/// wrong with the code and nothing is wrong with the check; the harness simply could not put one in
+/// front of the other, and the attempt therefore says nothing about the defect.
+///
+/// It is driven through the WHOLE TICK on a gate that declares `expect: red`, and what it adds to
+/// cause 2 is the CAUSE the operator is shown: cause 2's evidence names a command nyx could not
+/// find, this one names a directory that is not there. Both are unverified attempts and neither is
+/// a reproduction — but a run parked with the wrong explanation sends someone to fix the wrong
+/// thing, which on a reproduction gate means weakening a check until it goes red.
+///
+/// A note on the platform guard at the end. On Unix the SPAWN itself fails when the cwd is missing
+/// ([`super::GateCommandResult::could_not_run`], the branch the `bug` discipline promises the agent
+/// about — "a spawn failure … satisfies NOTHING"), so the fault can also be produced one layer
+/// lower. On Windows the PTY backend does not refuse a missing cwd, so that layer is unobservable
+/// there; the resolution above is the portable expression of the same fault and it is the one the
+/// body asserts.
+#[test]
+fn an_infrastructure_fault_that_stops_the_check_is_indeterminate_and_never_answers_expect_red() {
+    let _g = db_guard();
+    let sandbox = temp_dir("safety-infra");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, ws_path) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+
+    // A check that runs in a SUBFOLDER of the workspace — the ordinary shape of a monorepo's test
+    // command, and the one whose run directory can disappear on its own.
+    let checks_dir = std::path::Path::new(&ws_path).join("checks");
+    std::fs::create_dir_all(&checks_dir).expect("the check's folder");
+    let check = db.with_conn(|c| {
+        let tpl = db::create_template(
+            c,
+            &project_id,
+            "repro",
+            "true",
+            Some("checks"),
+            db::CommandSource::default(),
+        )
+        .expect("gate template");
+        db::instance_ids_for_template(c, &tpl.id)
+            .expect("instances")
+            .into_iter()
+            .next()
+            .expect("one instance")
+    });
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            json!({ "command_ids": [check], "blocking": true, "expect": "red" }),
+        );
+    });
+    // THE FAULT.
+    std::fs::remove_dir_all(&checks_dir).expect("the run directory goes away under the run");
+
+    let rt = EngineRuntime::new();
+    let refusal = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+        .expect_err("a gate whose run directory is gone must refuse");
+    assert!(
+        refusal.message.contains("gate command"),
+        "the refusal names the check that could not be run: {}",
+        refusal.message,
+    );
+    assert_eq!(
+        run_row(&db, &run_id).status,
+        db::RUN_STATUS_BLOCKED,
+        "the run is PARKED on the gate rather than walked past it",
+    );
+
+    let journal = attempts(&db, &run_id);
+    assert_eq!(
+        journal
+            .iter()
+            .map(|a| (a.expect.as_str(), a.outcome.as_str(), a.satisfied))
+            .collect::<Vec<_>>(),
+        vec![("red", "indeterminate", false)],
+        "AN INFRASTRUCTURE FAULT ANSWERS NOTHING. The declared red is still owed, and the run \
+         cannot advance on the strength of a check the machine never managed to run: {journal:?}",
+    );
+    assert_eq!(journal[0].exit_code, None, "no status was ever produced");
+    assert!(
+        journal[0].output_excerpt.contains("checks"),
+        "and the evidence names the CAUSE — the directory, not a defect in the code: {:?}",
+        journal[0].output_excerpt,
+    );
+
+    // The SPAWN layer, where the platform lets it be observed: same fault, one level lower, and the
+    // same verdict — an attempt that never started satisfies neither expectation.
+    #[cfg(unix)]
+    {
+        let root_check = gate_command(&db, &project_id, "true");
+        std::fs::remove_dir_all(&ws_path).expect("the whole workspace goes away");
+        let outcome = super::run_gate(&db, &[root_check]).expect("the gate runs");
+        assert_eq!(outcome.outcome, GateGrade::Indeterminate);
+        assert!(
+            outcome.commands[0].output_tail.contains("spawn failed"),
+            "the harness fault is what the record shows: {:?}",
+            outcome.commands[0].output_tail,
+        );
+        assert!(!GateExpectation::Red.is_satisfied_by(outcome.outcome));
+        assert!(!GateExpectation::Green.is_satisfied_by(outcome.outcome));
+    }
+}
+
+/// **AN INHERITED ANCHOR MUST NOT OUTLIVE THE DECLARATION IT PREDATES.**
+///
+/// "A declared gate raises no anchor" is true of a gate that already declares one. It says nothing
+/// about an anchor the gate INHERITED — and inheriting one is not exotic, it is the route out this
+/// very module recommends: `refuse_gate_expectation`'s own doc tells a human that `node_update`
+/// on the gate "reaches the VERY NEXT tick of this run", and adding `expect: red` to a reproduction
+/// gate that first went red without one is exactly that gesture.
+///
+/// What used to happen next, tick by tick, is what this walks. Tick 1: the gate declares nothing,
+/// runs red, anchors itself, the `transition` refuses and parks the run ON THE TRANSITION. The
+/// human adds `expect: red`. Tick 2: the cursor is the transition, so the M5 re-eval re-runs the
+/// gate — which still fails, which now SATISFIES what it declares, which the journal duly records
+/// as satisfied — and the anchor was then lifted on `green` alone. A reproduction does not pass, so
+/// the anchor held, and the run refused its transition forever for a red the node had asked for.
+/// The journal said `satisfied: true` while the engine said "a blocking gate_check is RED", on
+/// every call, with no exit but `run_delete`.
+#[test]
+fn a_re_evaluated_gate_that_now_declares_the_red_it_produces_lifts_its_inherited_anchor() {
+    let _g = db_guard();
+    let sandbox = temp_dir("inherited-anchor");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let reproduces = gate_command(&db, &project_id, "exit 1");
+
+    let mut gate_node = String::new();
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        gate_node = add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            // NO expectation yet — the shape that raises the M5 anchor.
+            json!({ "command_ids": [reproduces], "blocking": true }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_TRANSITION,
+            json!({ "target_state": "in_review" }),
+        );
+    });
+
+    let rt = EngineRuntime::new();
+    let refused = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+        .expect_err("an undeclared red gate blocks the transition");
+    assert_eq!(refused.code, "invalid_state");
+    let board: Value = serde_json::from_str(&run_row(&db, &run_id).blackboard).unwrap();
+    assert_eq!(board[super::BLOCKING_GATE_RED_KEY], json!([gate_node]));
+
+    // THE AUTHORING GESTURE the refusal's own doc names: the gate now DECLARES the red it produces.
+    db.with_conn(|c| {
+        db::update_node(
+            c,
+            &gate_node,
+            None,
+            Some(
+                &json!({ "command_ids": [reproduces], "blocking": true, "expect": "red" })
+                    .to_string(),
+            ),
+        )
+        .expect("node_update")
+    });
+
+    let out = tick(&db, &rt, &run_id, None);
+    assert_eq!(
+        out["action"]["type"], "done",
+        "the gate answers what it declares, so the anchor lifts and the run advances: {out}"
+    );
+    assert_eq!(spec_status(&db, &spec_id), db::SPEC_STATUS_IN_REVIEW);
+    let board: Value = serde_json::from_str(&run_row(&db, &run_id).blackboard).unwrap();
+    assert!(
+        board.get(super::BLOCKING_GATE_RED_KEY).is_none(),
+        "and the anchor left no residue: {board}"
+    );
+    let journal = attempts(&db, &run_id);
+    assert_eq!(
+        journal
+            .iter()
+            .map(|a| (a.expect.as_str(), a.outcome.as_str(), a.satisfied))
+            .collect::<Vec<_>>(),
+        vec![("green", "failed", false), ("red", "failed", true)],
+        "both attempts are recorded, and the second one is the one the node asked for: {journal:?}"
+    );
+}
+
+/// **THE GATE NAMED IN A REFUSAL IS THE SAME ONE AT EVERY TICK** — the anchor is an ordered set.
+///
+/// Two blocking gates that declare nothing and both go red anchor both ids. The block points then
+/// pick the gate to refuse with `.iter().next()`, and over a `HashSet` that is a draw: the set is
+/// REBUILT from the persisted board on every `nyx_next`, so each tick gets a fresh `RandomState` and
+/// two consecutive calls on the very same state could name two different gates — while the board
+/// itself listed them sorted. A caller (or a human reading the trace) was told to go and fix
+/// whichever one the hash happened to yield.
+#[test]
+fn two_anchored_gates_refuse_through_the_same_one_at_every_tick() {
+    let _g = db_guard();
+    let sandbox = temp_dir("anchor-order");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let failing = gate_command(&db, &project_id, "exit 1");
+
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        for order in 0..2 {
+            add_node(
+                db,
+                wf,
+                Some(&root),
+                order,
+                db::NODE_TYPE_GATE_CHECK,
+                json!({ "command_ids": [failing], "blocking": true }),
+            );
+        }
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            2,
+            db::NODE_TYPE_TRANSITION,
+            json!({ "target_state": "in_review" }),
+        );
+    });
+
+    let rt = EngineRuntime::new();
+    let named = |db: &Db| -> String {
+        super::nyx_next(db, &rt, no_session(), &json!({ "run_id": run_id }))
+            .expect_err("two red blocking gates refuse the transition")
+            .data
+            .and_then(|d| d.get("node_id").and_then(Value::as_str).map(str::to_string))
+            .expect("the refusal names a gate")
+    };
+    let first = named(&db);
+    let second = named(&db);
+    assert_eq!(
+        first, second,
+        "the same state names the same gate — twice in a row, with no restart in between"
+    );
+
+    let board: Value = serde_json::from_str(&run_row(&db, &run_id).blackboard).unwrap();
+    let anchored = board[super::BLOCKING_GATE_RED_KEY]
+        .as_array()
+        .expect("both gates are anchored");
+    assert_eq!(anchored.len(), 2);
+    assert_eq!(
+        anchored[0].as_str(),
+        Some(first.as_str()),
+        "…and it is the FIRST id of the sorted array a human reads on the board: {board}"
+    );
+}
+
+/// A gate whose command could not be LAUNCHED is told apart from one that TIMED OUT, and from every
+/// ordinary verdict — the discrimination the `None` (undeclared) arm parks on.
+///
+/// Both are graded `indeterminate` and neither is green, but they are opposite facts with opposite
+/// routes out: "the binary is not there" is a harness fault that re-running cannot change, while a
+/// timeout is a check that ran and did not finish, which the M5 anchor already reports in its own
+/// words. Only the first parks the run on the spot.
+#[test]
+fn only_a_launch_failure_is_read_as_a_gate_that_could_not_run() {
+    let could_not_run = super::GateOutcome {
+        passed: false,
+        outcome: GateGrade::Indeterminate,
+        commands: vec![super::GateCommandResult::could_not_run(
+            "cmd-1",
+            "bun test",
+            "D:/repo",
+            "gate spawn failed: No such file or directory",
+        )],
+    };
+    let refusal = super::gate_spawn_failure(&could_not_run).expect("a launch failure is named");
+    assert_eq!(refusal.code, "invalid_state");
+    assert!(
+        refusal.message.contains("could NOT BE RUN") && refusal.message.contains("bun test"),
+        "the refusal says what could not be launched: {}",
+        refusal.message
+    );
+    assert_eq!(
+        refusal
+            .data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("gate_could_not_run"),
+    );
+
+    let timed_out = super::GateOutcome {
+        passed: false,
+        outcome: GateGrade::Indeterminate,
+        commands: vec![super::GateCommandResult::budget_exceeded(
+            "cmd-1",
+            "bun test",
+            "D:/repo",
+            String::new(),
+            90_000,
+        )],
+    };
+    assert!(
+        super::gate_spawn_failure(&timed_out).is_none(),
+        "a TIMEOUT is a check that ran — the anchor's 'cut short' refusal is what reports it"
+    );
+}
+
+/// **A GATE THAT COULD NOT BE LAUNCHED PARKS THE RUN, `expect` OR NO `expect`.**
+///
+/// Before the tri-valued grade, a failed spawn came out of the runner as an `Err` and
+/// `block_on_effect_error` parked the run on the gate in ONE tick, with the spawn's own message.
+/// Graded, it became an ordinary "not green" on a gate that declares nothing: the anchor was raised
+/// and the walk CONTINUED — which on the seeded coder means the `until gate_green` loop re-entering
+/// its body and re-spawning the coder up to 25 times to repair code that is not broken, then dying
+/// on a loop limit that names `gate_green` instead of the missing binary. `run_one_gate`'s doc
+/// claimed "the ENFORCEMENT is unchanged"; it was, for a DECLARED expectation only.
+///
+/// UNIX-ONLY, for the reason the neighbouring infrastructure test states: the PTY backend refuses a
+/// missing cwd there and ignores it on Windows, so the spawn layer is only observable on Unix. The
+/// discrimination the arm turns on is pinned portably just above.
+#[cfg(unix)]
+#[test]
+fn a_gate_that_could_not_be_launched_parks_the_run_even_with_no_declared_expectation() {
+    let _g = db_guard();
+    let sandbox = temp_dir("spawn-parks");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, ws_path) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let check = gate_command(&db, &project_id, "true");
+
+    let mut gate_node = String::new();
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        gate_node = add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            // NO `expect` — the shape every graph authored before expectations existed has.
+            json!({ "command_ids": [check], "blocking": true }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_SPAWN_SUBAGENT,
+            json!({ "agent_id": "coder" }),
+        );
+    });
+    // THE FAULT: the directory the check was to run in is gone, so the spawn cannot start.
+    std::fs::remove_dir_all(&ws_path).expect("the workspace goes away under the run");
+
+    let rt = EngineRuntime::new();
+    let refusal = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+        .expect_err("a gate that could not be launched must stop the tick");
+    assert!(
+        refusal.message.contains("could NOT BE RUN"),
+        "the refusal names the harness fault, not a verdict about the work: {}",
+        refusal.message
+    );
+    assert_eq!(
+        run_row(&db, &run_id).status,
+        db::RUN_STATUS_BLOCKED,
+        "the run is PARKED on the gate — never walked past it into another spawn",
+    );
+    assert_eq!(run_row(&db, &run_id).current_node_id.as_deref(), Some(gate_node.as_str()));
+    // …AFTER the attempt was journaled, which is the record an auditor reads.
+    let journal = attempts(&db, &run_id);
+    assert_eq!(
+        journal
+            .iter()
+            .map(|a| (a.outcome.as_str(), a.satisfied))
+            .collect::<Vec<_>>(),
+        vec![("indeterminate", false)],
+    );
+}
+
+/// **THE JOURNAL NAMES THE COMMAND THAT ACTUALLY FAILED, AND KEEPS WHAT ALREADY RAN.**
+///
+/// A gate arms a LIST, and the runner walks it in order. When the resolution fails on the SECOND
+/// command, the first has already run over the PTY — and the attempt recorded from the bare error
+/// named `command_ids.first()` with an empty cmdline and an empty cwd, then threw the first
+/// command's real result away. Those three fields are the identity the auditor's discipline tells
+/// them to confront between a red and a green ("same slot, same resolved commands, same cwd"), so
+/// an attempt that misattributes them is not a smaller record — it is a false one, accusing a
+/// command that ran fine of being unreachable.
+#[test]
+fn a_resolution_failure_names_the_failing_command_and_keeps_the_ones_that_ran() {
+    let _g = db_guard();
+    let sandbox = temp_dir("gate-partial");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let first = gate_command(&db, &project_id, "exit 0");
+
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            // The SECOND id answers nothing — a command instance that was retired, or a stale
+            // binding. The first one is real and passes.
+            json!({ "command_ids": [first, "no-such-instance"], "blocking": true }),
+        );
+    });
+
+    let rt = EngineRuntime::new();
+    let refusal = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+        .expect_err("an unresolvable command parks the run");
+    assert!(refusal.message.contains("no-such-instance"), "{}", refusal.message);
+
+    let journal = attempts(&db, &run_id);
+    assert_eq!(journal.len(), 1);
+    assert_eq!((journal[0].outcome.as_str(), journal[0].satisfied), ("indeterminate", false));
+    let commands: Vec<Value> = serde_json::from_str(&journal[0].commands_json).expect("commands");
+    assert_eq!(
+        commands
+            .iter()
+            .map(|c| c["command_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec![first.as_str(), "no-such-instance"],
+        "BOTH commands are in the record, in order — the one that ran and the one that could not \
+         be resolved: {commands:?}"
+    );
+    assert_eq!(
+        commands[0]["exit_code"],
+        json!(0),
+        "the command that really ran keeps its verdict, its cmdline and its cwd: {commands:?}"
+    );
+    assert!(!commands[0]["cmdline"].as_str().unwrap_or_default().is_empty());
+    assert!(
+        journal[0].command_line.contains("exit 0"),
+        "…and the attempt's own identity fields carry it: {:?}",
+        journal[0].command_line
+    );
+}
+
+/// **THE M5 RE-EVAL JOURNALS ITS FAILURES TOO** — the hole the tick path was written to close, left
+/// open one function away.
+///
+/// The gate arm records a `GateGrade::Indeterminate` when `run_gate` cannot resolve, with the reason
+/// spelled out in its own comment: "a silent hole in the journal is exactly what an auditor cannot
+/// detect". `reeval_red_gates` propagated the same error bare — no `gate_attempts` row, no
+/// `run.gate_attempt`, and no `persist` either, so the verb failed while the run's status and cursor
+/// stayed on the previous state. The auditor, told to "treat what you cannot see recorded as
+/// absent", was counting one attempt fewer than really happened.
+#[test]
+fn the_re_eval_journals_an_indeterminate_and_parks_when_the_gate_can_no_longer_resolve() {
+    let _g = db_guard();
+    let sandbox = temp_dir("reeval-unresolvable");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    let failing = gate_command(&db, &project_id, "exit 1");
+
+    let mut gate_node = String::new();
+    let (_wf, run_id) = workflow_run(&db, Some(&spec_id), |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        gate_node = add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_GATE_CHECK,
+            json!({ "command_ids": [failing], "blocking": true }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_TRANSITION,
+            json!({ "target_state": "in_review" }),
+        );
+    });
+
+    // Tick 1 — the gate goes red, anchors itself, and the transition refuses. The run is parked ON
+    // THE TRANSITION, which is what makes the NEXT tick go through the re-eval.
+    let rt = EngineRuntime::new();
+    super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+        .expect_err("the red gate blocks the transition");
+    assert_eq!(attempts(&db, &run_id).len(), 1);
+
+    // THE FAULT, between two ticks: the managed command the gate arms is retired, so the id the
+    // node still names answers nothing.
+    db.with_conn(|c| {
+        let command_id = db::get_instance(c, &failing)
+            .expect("instance")
+            .expect("materialized")
+            .command_id;
+        db::delete_template(c, &command_id).expect("the command is retired")
+    });
+
+    let refusal = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+        .expect_err("the re-eval cannot run the gate either");
+    assert!(refusal.message.contains("gate command"), "{}", refusal.message);
+    assert_eq!(
+        run_row(&db, &run_id).status,
+        db::RUN_STATUS_BLOCKED,
+        "the run is PARKED on the gate — the tick no longer fails without persisting anything",
+    );
+    assert_eq!(run_row(&db, &run_id).current_node_id.as_deref(), Some(gate_node.as_str()));
+    let journal = attempts(&db, &run_id);
+    assert_eq!(
+        journal
+            .iter()
+            .map(|a| (a.outcome.as_str(), a.satisfied))
+            .collect::<Vec<_>>(),
+        vec![("failed", false), ("indeterminate", false)],
+        "THE SECOND ATTEMPT IS RECORDED. It proves nothing, and that is exactly why its absence \
+         would be undetectable: {journal:?}"
+    );
+}
+
+/// THE FOURTH CAUSE, AND THE ONE THE GRADE CANNOT CATCH — a BROKEN INVOCATION.
+///
+/// The three tests above cover what the engine can tell apart. This one covers what it cannot, and
+/// it is written because the shipped discipline text used to CLAIM it could: both the coder's and
+/// the auditor's `bug` discipline listed "a missing binary" among the causes graded
+/// `indeterminate`. They are not. A gate runs its command line UNDER A SHELL
+/// ([`crate::command::CommandPty::spawn`]), so a binary that is not on `PATH` makes the SHELL
+/// terminate normally with a non-zero status — `failed`, indistinguishable from a test that ran and
+/// did not pass, and therefore an answer to `expect: red`. The same is true of an unreachable
+/// service, a test file that will not compile, a mistyped flag. An auditor who believed the old
+/// sentence would have concluded that a RECORDED red could not have come from a broken invocation,
+/// and would have skipped the very re-reading the next bullet of their own manual asks for.
+///
+/// SO WHAT ACTUALLY HOLDS THE LINE IS THE PAIR, and that is what this test pins. A broken
+/// invocation answers the red — nothing can prevent it — and it can NEVER answer the green, because
+/// the green is the SAME resolved command and it must exit 0. The sequence therefore cannot
+/// complete on a reproduction nobody really wrote: the run parks on the green gate and stays there.
+/// That is the guarantee the PRD's "rouge-avant-vert" really rests on, and nothing asserted it.
+#[test]
+fn a_broken_invocation_answers_the_red_but_can_never_answer_the_green_that_closes_it() {
+    let _g = db_guard();
+    let sandbox = temp_dir("broken-invocation");
+    let db = Db::in_memory();
+    db.with_conn(crate::seed::seed_builtin_workflows).unwrap();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    classify(&db, &spec_id, "bug");
+    declare_phases(&db, &spec_id, &["Build"]);
+    build_task(&db, &project_id, &spec_id, "repair the defect");
+    // A command line that names nothing this machine has. Every shell answers it the same way: a
+    // NORMAL termination with a non-zero status (127 under a POSIX shell, 1 under PowerShell) — a
+    // `failed`, not an `indeterminate`, whatever the coder's manual used to say.
+    let missing = gate_command(&db, &project_id, "nyx_no_such_binary_for_a_repro_check");
+    let build = gate_command(&db, &project_id, "true");
+    bind_slot(&db, &project_id, crate::seed::REPRO_CHECK_SLOT, &[&missing]);
+    bind_slot(&db, &project_id, crate::seed::BUILD_CHECK_SLOT, &[&build]);
+
+    let rt = EngineRuntime::new();
+    let child = coder_child_of_ndev(&db, &rt, &spec_id);
+    let mut last: Option<Value> = None;
+    let refusal = loop {
+        match super::nyx_next(&db, &rt, no_session(), &{
+            let mut args = json!({ "run_id": child });
+            if let Some(l) = last.take() {
+                args.as_object_mut().unwrap().insert("last_result".into(), l);
+            }
+            args
+        }) {
+            Ok(out) => {
+                let out = out.result;
+                let ty = out["action"]["type"].as_str().expect("a type").to_string();
+                assert_ne!(
+                    ty, "done",
+                    "the run must NOT complete on a reproduction that was never really written",
+                );
+                last = Some(match ty.as_str() {
+                    "spawn_subagent" => json!({ "diff": "d" }),
+                    "ask_human" => json!({ "decision": "automated" }),
+                    other => panic!("unexpected coder action '{other}': {out}"),
+                });
+            }
+            Err(e) => break e,
+        }
+    };
+
+    // THE RED WAS ANSWERED — honestly recorded, because that is what happened.
+    let journal = db
+        .with_conn(|c| db::list_gate_attempts_for_spec(c, &spec_id))
+        .expect("the journal");
+    assert_eq!(
+        journal
+            .iter()
+            .map(|a| (a.expect.as_str(), a.outcome.as_str(), a.satisfied))
+            .collect::<Vec<_>>(),
+        vec![("red", "failed", true), ("green", "failed", false)],
+        "the broken invocation ANSWERED the red (the engine cannot tell it from a reproduction) \
+         and could not answer the green (the same command must exit 0, and it never will): \
+         {journal:?}",
+    );
+    assert_eq!(
+        journal[0].command_line, journal[1].command_line,
+        "…which only works because the two ends are the SAME resolved command — the identity the \
+         slot makes structural is what turns a fake red into a wedged run instead of a green build",
+    );
+    assert_eq!(refusal.code, "invalid_state");
+    assert_eq!(
+        refusal
+            .data
+            .as_ref()
+            .and_then(|d| d.get("reason").cloned())
+            .unwrap_or(Value::Null),
+        json!("gate_expectation_mismatch"),
+        "the run is parked on the GREEN gate: {}",
+        refusal.message,
+    );
+    assert_eq!(run_row(&db, &child).status, db::RUN_STATUS_BLOCKED);
+
+    // AND THE AUDITOR IS NOT TOLD OTHERWISE. The manual no longer claims a missing binary would
+    // have been graded `indeterminate` — it says a red can come from a broken invocation and must
+    // be re-read, which is the only true thing to say.
+    let auditor = crate::mcp_context::category_discipline(
+        crate::mcp_context::AgentRole::Auditor,
+        crate::db::CATEGORY_SLUG_BUG,
+    )
+    .expect("the auditor carries the `bug` discipline");
+    assert!(
+        !auditor.contains("a missing binary or any infrastructure fault is graded"),
+        "the enumeration that misdescribed the grading is gone: {auditor}",
+    );
+    assert!(
+        auditor.contains("a missing binary, an assertion on the wrong subject all terminate \
+                          non-zero and are graded `failed`"),
+        "…replaced by what really happens, in the bullet that owns the re-reading: {auditor}",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -9367,15 +10666,23 @@ fn a_gate_red_retry_re_runs_the_loop_body_and_the_gate() {
 // F3 — every tick leaves an auditable trace in the outbox
 // ---------------------------------------------------------------------------
 
-/// The `run.tick` outbox rows of `run_id`, oldest-first — the run's journal.
-fn tick_rows(db: &Db, run_id: &str) -> Vec<Value> {
+/// The RUN-aggregate outbox rows of `run_id` whose type is `event_type`, oldest-first.
+fn run_event_rows(db: &Db, run_id: &str, event_type: &str) -> Vec<Value> {
     db.with_conn(db::list_domain_events)
         .unwrap()
         .into_iter()
-        .filter(|e| e.aggregate == db::AGGREGATE_RUN)
+        .filter(|e| e.aggregate == db::AGGREGATE_RUN && e.event_type == event_type)
         .map(|e| serde_json::from_str::<Value>(&e.payload).expect("a JSON payload"))
         .filter(|p| p["run_id"] == run_id)
         .collect()
+}
+
+/// The `run.tick` outbox rows of `run_id`, oldest-first — the run's journal. Keyed on the EVENT TYPE
+/// and not merely on the RUN aggregate: a gate attempt files its own run event
+/// ([`db::EVENT_RUN_GATE_ATTEMPT`]) beside the tick that produced it, and the 1:1 invariant below is
+/// about STOPS and ticks, not about everything a run ever files.
+fn tick_rows(db: &Db, run_id: &str) -> Vec<Value> {
+    run_event_rows(db, run_id, db::EVENT_RUN_TICK)
 }
 
 /// F3 (the 1:1 proof) — a STOP of `nyx_next` leaves EXACTLY ONE `run.tick` row, and an engine step
@@ -9675,6 +10982,7 @@ fn every_action() -> Vec<Action> {
             command_ids: vec!["cmd".into()],
             slot: Some("build_check".into()),
             blocking: true,
+            expect: Some(GateExpectation::Red),
         },
         Action::Judge {
             node_id: "n".into(),
@@ -9710,6 +11018,12 @@ fn every_action() -> Vec<Action> {
             node_id: "n".into(),
             root: "D:/work".into(),
             name: "NYX-42".into(),
+            gate_on: Some("approved".into()),
+        },
+        Action::SetCategory {
+            node_id: "n".into(),
+            key: "category_choice".into(),
+            category: "bug".into(),
             gate_on: Some("approved".into()),
         },
         Action::Wait {
@@ -9774,6 +11088,7 @@ fn wire_forms(action: &Action) -> Vec<Value> {
         | Action::ForkSpec { .. }
         | Action::TransitionTask { .. }
         | Action::CreateWorkspace { .. }
+        | Action::SetCategory { .. }
         | Action::Note { .. } => vec![json!({ "type": action_json(action, "claude")["type"] })],
         Action::SpawnSubagent { .. } | Action::Judge { .. } | Action::Wait { .. } | Action::Produce { .. } => {
             vec![action_json(action, "claude")]
@@ -10272,7 +11587,7 @@ fn a_gate_cut_short_by_its_budget_is_refused_as_cut_short_not_as_red() {
         let mut engine = super::build_engine(&db, &run).expect("engine");
         engine.set_board(
             super::LAST_GATE_RESULT_KEY,
-            super::gate_result_json(gate_node, outcome),
+            super::gate_result_json(gate_node, GateExpectation::Green, false, outcome),
         );
         super::refuse_gate(&db, &run, &mut engine, gate_node, None)
     };
@@ -11382,5 +12697,1343 @@ fn a_run_bound_to_no_spec_is_not_refused_for_an_effect_it_cannot_have() {
     assert_eq!(
         out["action"]["type"], "done",
         "an unbound run walks past both nodes exactly as it always did: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PDR-0017 — the `spec_category` query fact
+// ---------------------------------------------------------------------------
+
+/// Build a one-node graph reading `spec_category` into `write`, run it to `done` on `spec_id`, and
+/// return the value the fact folded onto the persisted blackboard. `None` = the KEY IS ABSENT, which
+/// is a different answer from `Some(Value::Null)` and the whole reason this helper reports both.
+fn spec_category_fact(db: &Db, spec_id: Option<&str>) -> (Value, Option<Value>) {
+    let (_wf, run_id) = workflow_run(db, spec_id, |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_QUERY,
+            json!({ "query": "spec_category", "write": "category" }),
+        );
+    });
+    let out = tick(db, &EngineRuntime::new(), &run_id, None);
+    let board = Blackboard::from_json_str(&run_row(db, &run_id).blackboard);
+    (out, board.get("category").cloned())
+}
+
+/// DONE-CRITERIA — `query spec_category` on a run bound to a `bug` Spec writes `"bug"`; an
+/// UNCATEGORIZED Spec writes `null` (the key is written, never omitted); a run with NO Spec writes
+/// `null` too, without erroring and without parking.
+///
+/// AND IT WRITES THE SLUG, NEVER THE NAME. The rename below is the point of the whole fact: a human
+/// curator may relabel the chip `Bug` → `Défaut` at any time, and a graph keyed on the label would
+/// silently drop out of the discipline that day. The slug is minted once and immutable, so it is what
+/// the harness reads.
+#[test]
+fn spec_category_writes_the_immutable_slug_and_a_null_for_every_way_of_having_none() {
+    let _g = db_guard();
+    let sandbox = temp_dir("query-spec-category");
+    let db = Db::in_memory();
+    let (project_id, _wsid, _root) = seed_project(&db, sandbox.path());
+
+    // A Spec CLASSIFIED as a bug — the case the coder flow branches on.
+    let bug = spec_draft(&db, &project_id);
+    db.with_conn(|c| {
+        crate::category::set_spec_category_by_label(c, &bug, "bug", db::DomainEventSource::Mcp)
+    })
+    .expect("classify");
+    let (out, value) = spec_category_fact(&db, Some(&bug));
+    assert_eq!(out["action"]["type"], "done", "the fact folded inline: {out}");
+    assert_eq!(value, Some(json!("bug")));
+
+    // …and it stays `"bug"` after a human RENAMES the category. The label moved; the identity did not.
+    db.with_conn(|c| {
+        crate::category::rename(
+            c,
+            &project_id,
+            crate::category::CategoryRef::Label("bug"),
+            "Défaut",
+        )
+    })
+    .expect("rename");
+    assert_eq!(
+        spec_category_fact(&db, Some(&bug)).1,
+        Some(json!("bug")),
+        "the SLUG is the harness key — a renamed chip must not take a Spec out of its discipline"
+    );
+
+    // An UNCATEGORIZED Spec: `null` is WRITTEN. Not an absent key — a selector must be able to TEST
+    // it, and `{ "var": "category", "eq": null }` cannot match a key nobody wrote.
+    let unclassified = spec_draft(&db, &project_id);
+    let (out, value) = spec_category_fact(&db, Some(&unclassified));
+    assert_eq!(out["action"]["type"], "done");
+    assert_eq!(
+        value,
+        Some(Value::Null),
+        "an uncategorized Spec answers null, and the KEY is there to be tested"
+    );
+
+    // A run bound to NO SPEC: the same `null`, one spelling of absence — and the run WALKS ON. A
+    // `custom` run, or an `/nspec` run before its Spec exists, has no genre of work; that is a fact,
+    // not a failure, so nothing errors and nothing parks.
+    let (out, value) = spec_category_fact(&db, None);
+    assert_eq!(
+        out["action"]["type"], "done",
+        "a run without a Spec advances: {out}"
+    );
+    assert_eq!(value, Some(Value::Null));
+}
+
+/// DONE-CRITERION — a `selector` branching on `{ "var": "spec_category", "eq": "bug" }` ROUTES.
+/// This is the fact's whole reason to exist: without it the coder flow cannot reserve the
+/// reproduction pass to the Specs that are bugs.
+///
+/// The two branches are told apart by the SUBJECT of the leaf they reach, so the assertion is on the
+/// engine's own routing and not on a value the test wrote itself.
+#[test]
+fn a_selector_routes_on_the_spec_category_fact() {
+    let _g = db_guard();
+    let sandbox = temp_dir("selector-spec-category");
+    let db = Db::in_memory();
+    let (project_id, _wsid, _root) = seed_project(&db, sandbox.path());
+
+    // ONE graph, driven twice: query the category, then branch on it.
+    let build = |db: &Db, wf: &str| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_QUERY,
+            json!({ "query": "spec_category", "write": "spec_category" }),
+        );
+        let sel = add_node(
+            db,
+            wf,
+            Some(&root),
+            1,
+            db::NODE_TYPE_SELECTOR,
+            json!({ "branches": [
+                { "cond": { "var": "spec_category", "eq": "bug" }, "child": 0 },
+                { "cond": { "always": true }, "child": 1 },
+            ] }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&sel),
+            0,
+            db::NODE_TYPE_SPAWN_SUBAGENT,
+            json!({ "agent_id": "coder", "subject": "reproduce_before_fixing" }),
+        );
+        add_node(
+            db,
+            wf,
+            Some(&sel),
+            1,
+            db::NODE_TYPE_SPAWN_SUBAGENT,
+            json!({ "agent_id": "coder", "subject": "straight_to_the_work" }),
+        );
+    };
+
+    // A BUG takes the reproduction branch.
+    let bug = spec_draft(&db, &project_id);
+    db.with_conn(|c| {
+        crate::category::set_spec_category_by_label(c, &bug, "bug", db::DomainEventSource::Mcp)
+    })
+    .expect("classify");
+    let (_wf, run_id) = workflow_run(&db, Some(&bug), build);
+    let out = tick(&db, &EngineRuntime::new(), &run_id, None);
+    assert_eq!(out["action"]["type"], "spawn_subagent");
+    assert_eq!(
+        out["action"]["subject"], "reproduce_before_fixing",
+        "a `bug` Spec routes to the reproduction pass: {out}"
+    );
+
+    // A FEATURE does not — and neither does an uncategorized Spec, on the same `null`.
+    let feature = spec_draft(&db, &project_id);
+    db.with_conn(|c| {
+        crate::category::set_spec_category_by_label(
+            c,
+            &feature,
+            "feature",
+            db::DomainEventSource::Mcp,
+        )
+    })
+    .expect("classify");
+    let unclassified = spec_draft(&db, &project_id);
+    for spec_id in [Some(feature.as_str()), Some(unclassified.as_str()), None] {
+        let (_wf, run_id) = workflow_run(&db, spec_id, build);
+        let out = tick(&db, &EngineRuntime::new(), &run_id, None);
+        assert_eq!(
+            out["action"]["subject"], "straight_to_the_work",
+            "only a `bug` buys the reproduction pass ({spec_id:?}): {out}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The SEVENTEENTH node type — `set_category`: the classification the graph IMPOSES
+// ---------------------------------------------------------------------------
+
+/// Build a one-node graph whose only leaf is a `set_category` with `config`, open a run on
+/// `spec_id` seeded with `board`, tick it once, and hand back the tick's payload. Everything these
+/// tests differ by is an argument, so each of them reads as the one fact it pins.
+fn tick_set_category(db: &Db, spec_id: Option<&str>, config: Value, board: Value) -> Value {
+    let run_id = set_category_run(db, spec_id, config, board);
+    tick(db, &EngineRuntime::new(), &run_id, None)
+}
+
+/// [`tick_set_category`] WITHOUT the tick — the run id of the same one-node graph, for the cases
+/// where the tick is REFUSED and the caller needs the error rather than a payload.
+fn set_category_run(db: &Db, spec_id: Option<&str>, config: Value, board: Value) -> String {
+    let wf = db.with_conn(|c| {
+        db::create_workflow(c, None, "classify", db::WORKFLOW_SCOPE_CUSTOM, None)
+            .expect("workflow")
+            .id
+    });
+    let root = add_node(db, &wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(db, &wf, Some(&root), 0, db::NODE_TYPE_SET_CATEGORY, config);
+    db.with_conn(|c| db::create_workflow_run(c, &wf, spec_id, None, &board.to_string()))
+        .expect("run")
+        .id
+}
+
+/// The Spec's category SLUG as the DB now holds it, or `None`.
+fn spec_category_slug(db: &Db, spec_id: &str) -> Option<String> {
+    db.with_conn(|c| {
+        let spec = db::get_spec(c, spec_id).expect("spec")?;
+        let id = spec.category_id?;
+        db::get_category(c, &id).expect("category").map(|c| c.slug)
+    })
+}
+
+/// THE EFFECT GOES THROUGH THE SERVICE, AND THE SERVICE IS WHAT MAKES IT MORE THAN A COLUMN WRITE.
+///
+/// Three behaviours are the service's, not the node's, and all three must be observable from a plain
+/// tick — otherwise the node has quietly grown a second implementation of `specs.category_id`, which
+/// is the one thing [`crate::category`] exists to prevent:
+///
+///   * SLUG-FIRST RESOLUTION — `bug` on the board finds the project's SEEDED `bug` row rather than
+///     minting a homonym, so the discipline the harness reads off that slug is the seeded one;
+///   * NON-BLOCKING CREATION — an unknown label is not a refusal, it MINTS a category
+///     (`created_by_type = agent`) that is VALID AS IT STANDS: PDR-0017 as amended on 2026-09-02
+///     retired the proposed/confirmed axis, so nothing is left pending on the human (the assertion
+///     below reads `confirmed_at` as SET, which is exactly the vestigial column's always-on value);
+///   * THE OUTBOX EVENT — `spec.category_set` is recorded in the same transaction, with the
+///     provenance the engine states (`Mcp`: an engine/agent path, never a human's chip click).
+#[test]
+fn set_category_classifies_the_bound_spec_through_the_category_service() {
+    let _g = db_guard();
+    let sandbox = temp_dir("set-category");
+    let db = Db::in_memory();
+    let (project_id, _root_id, _root) = seed_project(&db, sandbox.path());
+
+    // (a) A SEEDED slug is FOUND, not re-minted.
+    let known = spec_draft(&db, &project_id);
+    let out = tick_set_category(
+        &db,
+        Some(&known),
+        json!({ "category_key": "category_choice" }),
+        json!({ "category_choice": "bug" }),
+    );
+    assert_eq!(
+        out["status"], "done",
+        "the one-node graph walked to the end: {out}"
+    );
+    assert_eq!(spec_category_slug(&db, &known).as_deref(), Some("bug"));
+    let after_known = db
+        .with_conn(|c| db::list_categories(c, &project_id))
+        .expect("categories");
+    assert_eq!(
+        after_known.len(),
+        db::SYSTEM_CATEGORIES.len(),
+        "an EXISTING slug is resolved, never duplicated — the project still holds only its four \
+         seeded categories: {after_known:?}"
+    );
+
+    // (b) An UNKNOWN label MINTS a category rather than refusing (PDR-0017).
+    let novel = spec_draft(&db, &project_id);
+    let out = tick_set_category(
+        &db,
+        Some(&novel),
+        json!({ "category_key": "category_choice" }),
+        json!({ "category_choice": "Dette technique" }),
+    );
+    assert_eq!(
+        out["status"], "done",
+        "an unknown label is a creation, not a refusal: {out}"
+    );
+    let minted = db
+        .with_conn(|c| db::list_categories(c, &project_id))
+        .expect("categories")
+        .into_iter()
+        .find(|c| c.slug == "dette-technique")
+        .expect("the unknown label was minted into the Spec's OWN project");
+    assert_eq!(minted.created_by_type, db::CATEGORY_CREATED_BY_AGENT);
+    assert!(
+        minted.confirmed_at.is_some(),
+        "it is VALID AS IT STANDS — PDR-0017 amended 2026-09-02 retired the proposed/confirmed axis"
+    );
+    assert_eq!(
+        spec_category_slug(&db, &novel).as_deref(),
+        Some("dette-technique")
+    );
+
+    // (c) THE EVENT. The write is the service's transaction, so its outbox event is there with the
+    //     provenance this path states — the trace the "the human curates after" half of PDR-0017
+    //     depends on to tell an agent's classification from a human's.
+    let events = db.with_conn(db::list_domain_events).expect("events");
+    let set: Vec<&db::DomainEvent> = events
+        .iter()
+        .filter(|e| e.event_type == "spec.category_set")
+        .collect();
+    assert_eq!(set.len(), 2, "one per classification: {set:?}");
+    for e in set {
+        assert_eq!(
+            e.source,
+            db::DomainEventSource::Mcp.as_str(),
+            "an engine/agent path, never `ui`: {e:?}"
+        );
+    }
+}
+
+/// THE CROSS-PROJECT REFUSAL IS THE SERVICE'S, AND THE NODE DOES NOT RE-IMPLEMENT IT.
+///
+/// Two halves of one guarantee, because the node reaches the service by LABEL and a label cannot
+/// name another project's row:
+///
+///   * through the NODE — a slug that exists only in ANOTHER project resolves to nothing here, so
+///     the effect mints the label inside the SPEC'S OWN project. The other project's row is never
+///     touched and never assigned: cross-project is unreachable by construction, which is exactly
+///     what the service promises for the label path;
+///   * through the SERVICE, directly — the same category named by ID is
+///     [`crate::category::CategoryError::ProjectMismatch`], naming BOTH projects. That refusal lives
+///     in `assign_spec_category` and nowhere else; this asserts it from here so the node's claim
+///     ("the service pronounces it") is a checked claim and not a comment.
+#[test]
+fn set_category_never_assigns_a_category_of_another_project() {
+    let _g = db_guard();
+    let sandbox = temp_dir("set-category-cross");
+    let db = Db::in_memory();
+    let (project_id, _root_id, _root) = seed_project(&db, sandbox.path());
+    let other_id = db.with_conn(|c| {
+        db::create_project(c, "Other", "/tmp/other-project", None)
+            .expect("the second project")
+            .0
+            .id
+    });
+    // A category that exists ONLY in the other project.
+    let foreign = db
+        .with_conn(|c| crate::category::create_by_agent(c, &other_id, "Perf"))
+        .expect("the other project's own category");
+    assert_eq!(foreign.slug, "perf");
+
+    let spec = spec_draft(&db, &project_id);
+    let out = tick_set_category(
+        &db,
+        Some(&spec),
+        json!({ "category_key": "category_choice" }),
+        json!({ "category_choice": "perf" }),
+    );
+    assert_eq!(out["status"], "done", "{out}");
+
+    let assigned = db
+        .with_conn(|c| {
+            let row = db::get_spec(c, &spec).expect("spec").expect("spec row");
+            db::get_category(c, row.category_id.as_deref().expect("classified"))
+                .expect("category")
+        })
+        .expect("the assigned category row");
+    assert_ne!(
+        assigned.id, foreign.id,
+        "the other project's `perf` was NEVER assigned to this project's Spec"
+    );
+    assert_eq!(
+        assigned.project_id, project_id,
+        "the label was resolved — and minted — inside the Spec's OWN project"
+    );
+
+    // The other half: named by ID, the service REFUSES, naming both projects.
+    let err = db
+        .with_conn(|c| {
+            crate::category::assign_spec_category(
+                c,
+                &spec,
+                Some(crate::category::CategoryRef::Id(&foreign.id)),
+                db::DomainEventSource::Mcp,
+            )
+        })
+        .expect_err("a category of another project is refused BY THE SERVICE");
+    assert!(
+        matches!(err, crate::category::CategoryError::ProjectMismatch { .. }),
+        "the refusal is the service's own, named on both sides: {err}"
+    );
+}
+
+/// A RUN WITHOUT A SPEC COMMITS NOTHING AND IS NOT PARKED — the same arbitrage as `transition` (M2).
+///
+/// There is no Spec to classify, so the node commits nothing; blocking on it would park a run over
+/// an effect that never happens, and a `/nspec` run legitimately reaches this node before its Spec
+/// exists. An EMPTY label reads the same way — the board key the node names holds nothing, so there
+/// is nothing to classify WITH — and neither case may leave the run blocked or write a category.
+#[test]
+fn set_category_without_a_spec_or_a_label_commits_nothing_and_does_not_park() {
+    let _g = db_guard();
+    let sandbox = temp_dir("set-category-unbound");
+    let db = Db::in_memory();
+    let (project_id, _root_id, _root) = seed_project(&db, sandbox.path());
+
+    // (a) NO SPEC — the run walks to `done`, and nothing is classified for anyone.
+    let out = tick_set_category(
+        &db,
+        None,
+        json!({ "category_key": "category_choice" }),
+        json!({ "category_choice": "bug" }),
+    );
+    assert_eq!(
+        out["status"], "done",
+        "a Spec-less run walks PAST the node — never BLOCKED on it: {out}"
+    );
+
+    // (b) A BOUND Spec, but the named key holds nothing: nothing is classified, and the run still
+    //     completes.
+    let spec = spec_draft(&db, &project_id);
+    let out = tick_set_category(
+        &db,
+        Some(&spec),
+        json!({ "category_key": "nobody_wrote_this" }),
+        json!({}),
+    );
+    assert_eq!(out["status"], "done", "{out}");
+    assert_eq!(
+        spec_category_slug(&db, &spec),
+        None,
+        "an empty label classifies nothing — it does not mint a category out of the empty string"
+    );
+
+    // Nothing was written anywhere: no `spec.category_set` event exists at all.
+    let events = db.with_conn(db::list_domain_events).expect("events");
+    assert!(
+        !events.iter().any(|e| e.event_type == "spec.category_set"),
+        "neither case committed a classification: {events:?}"
+    );
+}
+
+/// **A BOARD KEY THAT HOLDS `null` IS NOT A CATEGORY NAMED "null".**
+///
+/// The label reaches the effect through `{{key}}` INTERPOLATION, and interpolation FLATTENS: a
+/// `Value::Null` renders as the four letters `null`, which is a perfectly ordinary category NAME.
+/// The only guard was `!label.is_empty()`, so the node minted `null` into the project's vocabulary
+/// (`created_by_type = agent`, a colour, a position — only a human can take it back from the
+/// settings), classified the Spec under it, and left the `spec_category` fact answering the truthy
+/// slug `"null"`. Every branch that reads it back — starting with the coder preflight's own
+/// `(spec_category falsy)` — then considers that Spec classified, forever: the discipline it exists
+/// to impose is bypassed by the one value that means "nobody answered".
+///
+/// And `null` is not a curiosity on that key. `decode_result` folds a `judge` resumed WITHOUT a
+/// `last_result` into `Verdict(Value::Null)`, and this engine states that a dispatcher calling
+/// `nyx_next` again after a crash "is a stated principle of this engine, so it is not an edge case".
+/// The anti-null guard exists for `ask_human` and only for it.
+///
+/// So the effect reads the RAW board value, and refuses anything that is not a non-empty string —
+/// naming the KEY, because writing that key is the fix.
+#[test]
+fn set_category_refuses_a_board_key_that_holds_no_label_and_mints_nothing() {
+    let _g = db_guard();
+    let sandbox = temp_dir("set-category-null");
+    let db = Db::in_memory();
+    let (project_id, _root_id, _root) = seed_project(&db, sandbox.path());
+
+    let seeded = db
+        .with_conn(|c| db::list_categories(c, &project_id))
+        .expect("categories")
+        .len();
+
+    let rt = EngineRuntime::new();
+    // (a) `null` — what a judge leaves on the board when nothing was answered — and the other
+    //     unusable shapes: a number, an object, a blank string.
+    for value in [json!(null), json!(42), json!({ "verdict": "bug" }), json!("   ")] {
+        let spec = spec_draft(&db, &project_id);
+        let run_id = set_category_run(
+            &db,
+            Some(&spec),
+            json!({ "category_key": "category_choice" }),
+            json!({ "category_choice": value }),
+        );
+        let refusal = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id }))
+            .expect_err("a value that is not a label must never classify a Spec");
+        assert_eq!(refusal.code, "invalid_state", "{value}: {refusal:?}");
+        // The refusal NAMES THE KEY, because writing that key is the way out.
+        assert!(
+            refusal.message.contains("category_choice"),
+            "{value}: the refusal names the board key to write: {}",
+            refusal.message
+        );
+        assert_eq!(
+            run_row(&db, &run_id).status,
+            db::RUN_STATUS_BLOCKED,
+            "{value}: the node is PARKED and re-runs, never walked past",
+        );
+        assert_eq!(spec_category_slug(&db, &spec), None, "{value} classified nothing");
+    }
+    assert_eq!(
+        db.with_conn(|c| db::list_categories(c, &project_id))
+            .expect("categories")
+            .len(),
+        seeded,
+        "AND NOTHING WAS MINTED — no category named `null` in the project's vocabulary, which \
+         would have made the Spec look classified to every branch that reads the fact back"
+    );
+
+    // …while the key NOBODY EVER WROTE stays the long-standing no-op: a graph may name a key a
+    // branch it did not take was to fill, and nothing went wrong.
+    let untouched = spec_draft(&db, &project_id);
+    let out = tick_set_category(
+        &db,
+        Some(&untouched),
+        json!({ "category_key": "nobody_wrote_this" }),
+        json!({}),
+    );
+    assert_eq!(out["status"], "done", "an absent key is nothing to classify WITH: {out}");
+    assert_eq!(spec_category_slug(&db, &untouched), None);
+}
+
+/// THE OPTIONAL GATE. `set_category` is UNGATED by default — the classification is the engine's to
+/// impose (ADR-0006) — but a flow that wants a human's word before it lands names a `gate_on`, and
+/// then a non-affirmative board value stops the effect exactly as it stops a `transition_task`'s.
+#[test]
+fn set_category_honours_its_optional_gate() {
+    let _g = db_guard();
+    let sandbox = temp_dir("set-category-gate");
+    let db = Db::in_memory();
+    let (project_id, _root_id, _root) = seed_project(&db, sandbox.path());
+
+    let refused = spec_draft(&db, &project_id);
+    let out = tick_set_category(
+        &db,
+        Some(&refused),
+        json!({ "category_key": "category_choice", "gate_on": "cat_ok" }),
+        json!({ "category_choice": "bug", "cat_ok": "no" }),
+    );
+    assert_eq!(
+        out["status"], "done",
+        "a gated-off node is a no-op, not a block: {out}"
+    );
+    assert_eq!(
+        spec_category_slug(&db, &refused),
+        None,
+        "the gate said no, so nothing was classified"
+    );
+
+    let approved = spec_draft(&db, &project_id);
+    tick_set_category(
+        &db,
+        Some(&approved),
+        json!({ "category_key": "category_choice", "gate_on": "cat_ok" }),
+        json!({ "category_choice": "bug", "cat_ok": "yes" }),
+    );
+    assert_eq!(
+        spec_category_slug(&db, &approved).as_deref(),
+        Some("bug"),
+        "and an affirmative fires it"
+    );
+}
+
+/// THE OUTPUT NEEDED FOR ROUTING — and it is deliberately NOT one of the node's own.
+///
+/// `set_category` writes NOTHING on the blackboard ([`crate::mcp_authoring::node_written_board_keys`]
+/// says so by name): the classification lands in the DOMAIN (`specs.category_id`), not on the run's
+/// board. A board copy would be a second truth, stale the instant a human recategorizes the Spec
+/// from the detail screen — which PDR-0017 explicitly allows at any status.
+///
+/// So the routing output is the `spec_category` QUERY FACT read BACK afterwards: it answers the
+/// persisted SLUG, and a `selector` branches on that. This walks the whole chain in one run —
+/// classify, read back, route — because each half is checked elsewhere and the JOIN between them is
+/// what a graph actually depends on: an engine that classified without the fact seeing it would leave
+/// every `bug` branch dead, and nothing else would fail.
+#[test]
+fn the_classification_set_by_the_node_is_routable_through_the_spec_category_fact() {
+    let _g = db_guard();
+    let sandbox = temp_dir("set-category-routing");
+    let db = Db::in_memory();
+    let (project_id, _root_id, _root) = seed_project(&db, sandbox.path());
+    let spec = spec_draft(&db, &project_id);
+
+    let wf = db.with_conn(|c| {
+        db::create_workflow(c, None, "classify-then-route", db::WORKFLOW_SCOPE_CUSTOM, None)
+            .expect("workflow")
+            .id
+    });
+    let root = add_node(&db, &wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(
+        &db,
+        &wf,
+        Some(&root),
+        0,
+        db::NODE_TYPE_SET_CATEGORY,
+        json!({ "category_key": "category_choice" }),
+    );
+    add_node(
+        &db,
+        &wf,
+        Some(&root),
+        1,
+        db::NODE_TYPE_QUERY,
+        json!({ "query": "spec_category", "write": "spec_category" }),
+    );
+    let route = add_node(
+        &db,
+        &wf,
+        Some(&root),
+        2,
+        db::NODE_TYPE_SELECTOR,
+        json!({ "branches": [
+            { "cond": { "var": "spec_category", "eq": "bug" }, "child": 0 },
+            { "cond": { "always": true }, "child": 1 },
+        ] }),
+    );
+    add_node(
+        &db,
+        &wf,
+        Some(&route),
+        0,
+        db::NODE_TYPE_SPAWN_SUBAGENT,
+        json!({ "agent_id": "coder", "subject": "reproduce_before_fixing" }),
+    );
+    add_node(
+        &db,
+        &wf,
+        Some(&route),
+        1,
+        db::NODE_TYPE_SPAWN_SUBAGENT,
+        json!({ "agent_id": "coder", "subject": "straight_to_the_work" }),
+    );
+
+    let run_id = db
+        .with_conn(|c| {
+            db::create_workflow_run(
+                c,
+                &wf,
+                Some(&spec),
+                None,
+                &json!({ "category_choice": "bug" }).to_string(),
+            )
+        })
+        .expect("run")
+        .id;
+
+    let out = tick(&db, &EngineRuntime::new(), &run_id, None);
+    assert_eq!(
+        out["blackboard_delta"]["spec_category"], "bug",
+        "the fact read BACK the slug the node had just committed — the join the routing rests on: \
+         {out}"
+    );
+    assert_eq!(
+        out["action"]["subject"], "reproduce_before_fixing",
+        "and the selector took the `bug` arm on it: {out}"
+    );
+    assert_eq!(
+        spec_category_slug(&db, &spec).as_deref(),
+        Some("bug"),
+        "the classification is in the DOMAIN, which is what makes the read-back meaningful"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Revision 24 — the coder flow EXECUTES the `bug` discipline: classify before
+// routing, reproduce before repairing, and a human branch when it cannot.
+// ---------------------------------------------------------------------------
+
+/// BIND `slot` of `project_id` to `command_ids`, through the REAL authoring verb — the same call a
+/// project makes on day one, so nothing here arms a gate by a route a user could not take.
+fn bind_slot(db: &Db, project_id: &str, slot: &str, command_ids: &[&str]) {
+    crate::mcp_authoring::dispatch_authoring_tool(
+        db,
+        "slot_bind",
+        &json!({
+            "project_id": project_id,
+            "slot": slot,
+            "command_ids": command_ids,
+        }),
+    )
+    .expect("`slot_bind` is routed")
+    .expect("`slot_bind` succeeds");
+}
+
+/// CLASSIFY `spec_id` with `label`, through the shared service the MCP tool and the `set_category`
+/// node both call — never a raw column write, which would be a second writer of `category_id`.
+fn classify(db: &Db, spec_id: &str, label: &str) {
+    db.with_conn(|c| {
+        crate::category::set_spec_category_by_label(c, spec_id, label, db::DomainEventSource::Mcp)
+    })
+    .unwrap_or_else(|e| panic!("classify `{label}`: {e}"));
+}
+
+/// ONE open build task on `spec_id`, in the phase the coder child drains.
+fn build_task(db: &Db, project_id: &str, spec_id: &str, title: &str) -> String {
+    db.with_conn(|c| {
+        db::create_task(
+            c,
+            project_id,
+            title,
+            db::NewTaskInput {
+                spec_id: Some(spec_id.to_string()),
+                phase_name: Some("Build".to_string()),
+                ..db::NewTaskInput::slice()
+            },
+        )
+    })
+    .expect("task")
+    .id
+}
+
+/// WHICH of the reproduction branch's three questions a surfaced `ask_human` is — a surfaced
+/// question carries its prompt and not its node label, so the tests name it by the sentence the
+/// human actually reads. A `?` here means the graph asked something these tests never authored.
+fn coder_question(prompt: &str) -> &'static str {
+    if prompt.contains("Answer 'automated'") {
+        "is it automatable?"
+    } else if prompt.contains("YOU are the check") {
+        "the protocol + the BEFORE observation"
+    } else if prompt.contains("The fix is in.") {
+        "the SAME protocol, after"
+    } else {
+        "?"
+    }
+}
+
+/// Open `/ndev` on `spec_id` and walk to the coder CHILD, returning its run id — the graph the
+/// reproduction lives in is never the one `run_start` opens.
+fn coder_child_of_ndev(db: &Db, rt: &EngineRuntime, spec_id: &str) -> String {
+    let run_id = super::run_start(db, rt, &json!({ "scope": "ndev", "spec_id": spec_id }))
+        .expect("run_start")
+        .result["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let opened = tick(db, rt, &run_id, None);
+    assert_eq!(
+        opened["action"]["type"], "sub_workflow",
+        "ndev delegates the build to the coder child: {opened}"
+    );
+    opened["action"]["child_run_id"]
+        .as_str()
+        .expect("a child run")
+        .to_string()
+}
+
+/// DONE-CRITERION ("Voie automatisée : spawn du test, gate rouge, correctif, gate verte distincte sur
+/// le même slot et le même ensemble de commandes/cwd, puis build vert" + "La preuve vérifie
+/// l'identité de commande/cwd entre rouge et vert et reste disponible après le build").
+///
+/// The whole automated route, walked through `nyx_next` on the SEEDED coder graph — no hand-built
+/// tree, because what is on trial is the shipped graph's ORDER. The check is one command
+/// (`test -f fixed`) bound to the project's `repro_check` slot: it FAILS while the sentinel is
+/// missing, and the spawn that stands for the fix creates it. So the red and the green are the same
+/// check in the only sense that matters — same slot, same resolved command line, same cwd — and the
+/// journal is what lets an auditor SEE that rather than take it on trust.
+///
+/// The last assertions are the ones the build gate exists to threaten: `checks` runs AFTER the green
+/// and records an attempt of its own, overwriting the `last_gate_result` board key. The proof must
+/// survive that, which is precisely why it lives in an append-only journal and not on a board.
+#[test]
+fn the_coder_reproduces_red_then_green_on_one_slot_and_the_proof_outlives_the_build_gate() {
+    let _g = db_guard();
+    let sandbox = temp_dir("repro-red-green");
+    let db = Db::in_memory();
+    db.with_conn(crate::seed::seed_builtin_workflows).unwrap();
+    let (project_id, workspace_id, ws_path) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    classify(&db, &spec_id, "bug");
+    declare_phases(&db, &spec_id, &["Build"]);
+    let task_id = build_task(&db, &project_id, &spec_id, "repair the defect");
+    // THE SAME COMMAND on both ends of the reproduction: it FAILS while the sentinel is absent and
+    // PASSES once the fix creates it, which is what a reproduction check is.
+    let repro = gate_command(&db, &project_id, "test -f fixed");
+    let build = gate_command(&db, &project_id, "true");
+    bind_slot(&db, &project_id, crate::seed::REPRO_CHECK_SLOT, &[&repro]);
+    bind_slot(&db, &project_id, crate::seed::BUILD_CHECK_SLOT, &[&build]);
+
+    let rt = EngineRuntime::new();
+    let child = coder_child_of_ndev(&db, &rt, &spec_id);
+
+    let mut surfaced: Vec<String> = Vec::new();
+    let mut last: Option<Value> = None;
+    for _ in 0..30 {
+        let out = tick(&db, &rt, &child, last.take());
+        let action = out["action"].clone();
+        let ty = action["type"].as_str().expect("an action type").to_string();
+        if ty == "done" {
+            surfaced.push("done".to_string());
+            break;
+        }
+        let label = action["label"].as_str().unwrap_or_default().to_string();
+        let prompt = action["prompt"].as_str().unwrap_or_default();
+        surfaced.push(if ty == "ask_human" {
+            format!("ask_human:{}", coder_question(prompt))
+        } else {
+            format!("{ty}:{label}")
+        });
+        last = Some(match ty.as_str() {
+            // THE FIX, and it lands ONLY on the spawn the graph placed AFTER the red gate: creating
+            // the sentinel any earlier would make the reproduction pass, which is the failure this
+            // sequence exists to make impossible.
+            "spawn_subagent" if label == "repair the defect" => {
+                std::fs::write(Path::new(&ws_path).join("fixed"), "repaired").expect("the fix");
+                json!({ "diff": "the defect is repaired" })
+            }
+            "spawn_subagent" => json!({ "diff": "a failing check for this defect" }),
+            "ask_human" => json!({ "decision": "automated" }),
+            other => panic!("unexpected coder action '{other}': {out}"),
+        });
+    }
+
+    assert_eq!(
+        surfaced,
+        vec![
+            // No `judge`: the Spec is ALREADY classified, and the preflight never re-decides a
+            // classification somebody made.
+            "spawn_subagent:write the reproduction".to_string(),
+            "ask_human:is it automatable?".to_string(),
+            // …the RED gate runs here, inline — nyx runs a gate itself and never surfaces it.
+            "spawn_subagent:repair the defect".to_string(),
+            // …then the GREEN gate, then the build loop's own spawn and its `checks`.
+            "spawn_subagent:implement".to_string(),
+            "done".to_string(),
+        ],
+        "the shipped order: write the check, rule on automation, (RED), fix, (GREEN), then build",
+    );
+    assert_eq!(
+        task_status(&db, &task_id),
+        db::TASK_STATUS_DONE,
+        "and the task closed on the far side of the whole sequence"
+    );
+
+    // THE JOURNAL — three attempts, in the order they happened.
+    let attempts = db
+        .with_conn(|c| db::list_gate_attempts_for_spec(c, &spec_id))
+        .expect("the journal");
+    let shape: Vec<(&str, &str, bool, Option<&str>)> = attempts
+        .iter()
+        .map(|a| {
+            (
+                a.expect.as_str(),
+                a.outcome.as_str(),
+                a.satisfied,
+                a.slot.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("red", "failed", true, Some(crate::seed::REPRO_CHECK_SLOT)),
+            ("green", "passed", true, Some(crate::seed::REPRO_CHECK_SLOT)),
+            ("green", "passed", true, Some(crate::seed::BUILD_CHECK_SLOT)),
+        ],
+        "a satisfied RED, then a satisfied GREEN on the same slot, and only THEN the build control",
+    );
+    // THE IDENTITY, in the two fields the discipline tells the auditor to compare.
+    let (red, green) = (&attempts[0], &attempts[1]);
+    assert_ne!(red.node_id, green.node_id, "two DISTINCT gate nodes declared it");
+    assert_eq!(
+        (&red.command_line, &red.cwd),
+        (&green.command_line, &green.cwd),
+        "…resolved through ONE slot binding, so they ran the same command in the same folder",
+    );
+    assert_ne!(
+        red.command_line, attempts[2].command_line,
+        "the build control is a DIFFERENT command — which is why it could not stand in for either",
+    );
+
+    // AND THE PROOF OUTLIVES THE BUILD. The board key the build gate overwrote is not where the
+    // evidence lives; the auditor's context still reads the sequence off the journal.
+    let board: Value = serde_json::from_str(&run_row(&db, &child).blackboard).unwrap();
+    assert_eq!(
+        board["last_gate_result"]["node_id"], attempts[2].node_id,
+        "the LAST attempt is what the board holds — the build gate's: {board}"
+    );
+    let audit = crate::mcp_context::render_agent_context(
+        &db,
+        crate::mcp_context::AgentRole::Auditor,
+        &spec_id,
+        None,
+    )
+    .expect("the auditor context renders")
+    .expect("…and it is bound to this Spec");
+    assert!(
+        audit.contains("SAME control"),
+        "the auditor is told the red and the green ran on the same control, AFTER the build gate \
+         recorded its own attempt: {audit}"
+    );
+    assert!(
+        audit.contains("3 recorded gate attempt"),
+        "and all three attempts are still there: {audit}"
+    );
+}
+
+/// DONE-CRITERION ("Voie manuelle : décision humaine d'impraticabilité, protocole/observation avant,
+/// correctif, même protocole après, double validation persistée").
+///
+/// THE BRANCH EXISTS BECAUSE A GATE CANNOT READ A SENTENCE. The `bug` discipline announces an exit
+/// for a defect no command can reproduce, and announced in prose alone that exit is worse than
+/// absent: the blocking `expect: red` nothing can satisfy would park the run at that node with NO
+/// QUESTION EVER PUT. So the graph asks — and here the human rules 'manual' on a project whose
+/// `repro_check` slot is bound to a check that would have REFUSED the run had it been reached
+/// (`true` answers no red). The run completing at all is the proof the route bypasses the gate; the
+/// two recorded observations are the proof it does not bypass the obligation.
+#[test]
+fn the_human_ruling_of_impracticability_routes_to_a_manual_protocol_observed_twice() {
+    let _g = db_guard();
+    let sandbox = temp_dir("repro-manual");
+    let db = Db::in_memory();
+    db.with_conn(crate::seed::seed_builtin_workflows).unwrap();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    classify(&db, &spec_id, "bug");
+    declare_phases(&db, &spec_id, &["Build"]);
+    let task_id = build_task(&db, &project_id, &spec_id, "repair the defect");
+    // A `repro_check` bound to a check that PASSES: had the automated route been taken, its
+    // `expect: red` would be unsatisfiable and the run would be parked, forever.
+    let never_red = gate_command(&db, &project_id, "true");
+    bind_slot(&db, &project_id, crate::seed::REPRO_CHECK_SLOT, &[&never_red]);
+    bind_slot(&db, &project_id, crate::seed::BUILD_CHECK_SLOT, &[&never_red]);
+
+    const PROTOCOL: &str = "unplug the reader, scan the badge, watch the LED stay red";
+    let rt = EngineRuntime::new();
+    let child = coder_child_of_ndev(&db, &rt, &spec_id);
+
+    // A REAL SESSION WITH A REAL HUMAN IN IT, and that is not test scaffolding. "the SAME protocol,
+    // after the fix" writes the key the repair loop exits on, over a body that spawns the coder, so
+    // the derivation classifies it `HumanCommitment::AnotherRound` and nyx refuses it from a session
+    // it has not witnessed a human speak on. THAT is what makes the manual route not an escape: a
+    // dispatcher may answer the impracticability question by itself, and it lands in a branch it
+    // cannot close alone — the machine-checked proof it dropped is replaced by a human's.
+    let session = Session::new("term-manual-repro");
+
+    let mut quoted_the_protocol_back = false;
+    let mut after_observations = 0;
+    let mut asks: Vec<String> = Vec::new();
+    let mut last: Option<Value> = None;
+    for _ in 0..30 {
+        session.human_says(&db, "at the keyboard, running the protocol");
+        let out = session.tick(&db, &rt, &child, last.take());
+        let action = out["action"].clone();
+        let ty = action["type"].as_str().expect("an action type").to_string();
+        if ty == "done" {
+            break;
+        }
+        let prompt = action["prompt"].as_str().unwrap_or_default().to_string();
+        last = Some(match ty.as_str() {
+            "spawn_subagent" => json!({ "diff": "d" }),
+            "ask_human" => {
+                let question = coder_question(&prompt);
+                asks.push(question.to_string());
+                if question == "is it automatable?" {
+                    json!({ "decision": "manual" })
+                } else if question == "the protocol + the BEFORE observation" {
+                    json!({ "decision": PROTOCOL })
+                } else {
+                    // THE SAME PROTOCOL, and the question proves it by QUOTING it: "run the one you
+                    // wrote" is a request; the text on screen is an imposition.
+                    assert!(
+                        prompt.contains(PROTOCOL),
+                        "the after-question quotes the protocol verbatim: {prompt}"
+                    );
+                    quoted_the_protocol_back = true;
+                    after_observations += 1;
+                    // The first observation says the defect is STILL there — which must buy another
+                    // repair pass, not close the task.
+                    if after_observations == 1 {
+                        json!({ "decision": "still-broken" })
+                    } else {
+                        json!({ "decision": "fixed" })
+                    }
+                }
+            }
+            other => panic!("unexpected coder action '{other}': {out}"),
+        });
+    }
+
+    assert_eq!(
+        asks,
+        vec![
+            "is it automatable?".to_string(),
+            "the protocol + the BEFORE observation".to_string(),
+            "the SAME protocol, after".to_string(),
+            "the SAME protocol, after".to_string(),
+        ],
+        "the decision, the BEFORE observation, then the AFTER one — twice, because the first said \
+         the defect was still there",
+    );
+    assert!(quoted_the_protocol_back);
+    assert_eq!(
+        task_status(&db, &task_id),
+        db::TASK_STATUS_DONE,
+        "the manual route closes the task — it is a declared route, not a dead end",
+    );
+
+    // THE DOUBLE VALIDATION, PERSISTED: two keys, side by side, on the run's stored blackboard —
+    // neither overwriting the other, which is what makes them a PAIR an auditor can compare.
+    let board: Value = serde_json::from_str(&run_row(&db, &child).blackboard).unwrap();
+    assert_eq!(
+        board["manual_repro_before"], json!(PROTOCOL),
+        "the protocol and the BEFORE observation survive the run: {board}"
+    );
+    assert_eq!(
+        board["manual_repro_after"], json!("fixed"),
+        "and so does the AFTER one: {board}"
+    );
+
+    // NO REPRODUCTION GATE WAS RUN — the only recorded attempt is the build control. Had the
+    // automated route been walked, `true` could never have answered `expect: red` and this run would
+    // be blocked instead of done.
+    let attempts = db
+        .with_conn(|c| db::list_gate_attempts_for_spec(c, &spec_id))
+        .expect("the journal");
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|a| a.slot.clone().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec![crate::seed::BUILD_CHECK_SLOT.to_string()],
+        "the manual route skips the reproduction GATE and nothing else",
+    );
+    assert_eq!(run_row(&db, &child).status, db::RUN_STATUS_DONE);
+
+    // AND THE PAIR REACHES THE AUDITOR — the half of the proof this route produces instead of a
+    // red. Persisting the two observations is worth nothing if the only role that JUDGES them never
+    // sees them: rendering only the gate journal made this Spec look like a green with no red, and
+    // told the auditor to file a finding for a proof that exists and was validated twice by a
+    // human. So the context carries BOTH observations, and says the reproduction is NOT missing.
+    let audit = crate::mcp_context::render_agent_context(
+        &db,
+        crate::mcp_context::AgentRole::Auditor,
+        &spec_id,
+        None,
+    )
+    .expect("the auditor context renders")
+    .expect("…and it is bound to this Spec");
+    assert!(
+        audit.contains(PROTOCOL),
+        "the BEFORE observation — the protocol itself — is in the auditor's context: {audit}",
+    );
+    assert!(
+        audit.contains("AFTER the fix — the SAME protocol"),
+        "…and so is the AFTER one, named as the same protocol: {audit}",
+    );
+    assert!(
+        audit.contains("The reproduction is NOT missing"),
+        "…and the sequence reading no longer calls the proof absent: {audit}",
+    );
+    // Not one of the render's own sentences about THIS Spec calls its proof absent. (The
+    // discipline's general rule — "an absent red is a finding of its own" — stays: it is the
+    // instruction, and the evidence block is the fact it applies to.)
+    for absent in [
+        "the reproduction is missing",
+        "NO satisfied red",
+        "none recorded for this Spec",
+    ] {
+        assert!(
+            !audit.contains(absent),
+            "no rendered phrase qualifies this Spec's proof as absent — found '{absent}':\n{audit}",
+        );
+    }
+    // The BUILD attempt is still rendered, as the attempt it is — the manual pair does not hide the
+    // journal, it stops the journal from being read as the whole sequence.
+    assert!(
+        audit.contains("1 recorded gate attempt"),
+        "the build control's attempt is still listed: {audit}",
+    );
+}
+
+/// DONE-CRITERION ("Une Spec sans catégorie est classée explicitement avant routage ; elle ne
+/// contourne pas la discipline bug").
+///
+/// THE HOLE THIS SHUTS. `spec_category` answers `null` for an unclassified Spec, `null` matches no
+/// condition, and the "bug discipline?" selector's safe default is "no reproduction owed" — so
+/// before the preflight, a Spec nobody had classified walked past the red-before-green obligation
+/// having never met it. Not an exotic case: every Spec authored before PDR-0017, every
+/// `spec_create` without a `category`, every classification whose write failed.
+///
+/// So the graph CLASSIFIES first, and the classification is not a claim on a board: the judge's word
+/// goes through `set_category` into `specs.category_id`, and the branch reads the PERSISTED slug
+/// back. Answered `bug` here — and the run lands in the reproduction sequence it would have skipped
+/// a revision ago.
+#[test]
+fn an_unclassified_spec_is_classified_before_the_build_routes_and_lands_in_the_discipline() {
+    let _g = db_guard();
+    let sandbox = temp_dir("preflight-unclassified");
+    let db = Db::in_memory();
+    db.with_conn(crate::seed::seed_builtin_workflows).unwrap();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    declare_phases(&db, &spec_id, &["Build"]);
+    build_task(&db, &project_id, &spec_id, "repair the defect");
+    let anything = gate_command(&db, &project_id, "true");
+    bind_slot(&db, &project_id, crate::seed::REPRO_CHECK_SLOT, &[&anything]);
+    bind_slot(&db, &project_id, crate::seed::BUILD_CHECK_SLOT, &[&anything]);
+    assert_eq!(
+        spec_category_slug(&db, &spec_id),
+        None,
+        "precondition: the Spec reaches the build carrying no category at all"
+    );
+
+    let rt = EngineRuntime::new();
+    let child = coder_child_of_ndev(&db, &rt, &spec_id);
+
+    // THE FIRST THING THE FLOW DOES, before a task is even picked: it asks what genre this is.
+    let preflight = tick(&db, &rt, &child, None);
+    assert_eq!(
+        preflight["action"]["type"], "judge",
+        "the classification is a NODE, not an instruction: {preflight}"
+    );
+    assert_eq!(
+        preflight["blackboard_delta"]["spec_category"],
+        Value::Null,
+        "and it fires precisely because the persisted category is null: {preflight}"
+    );
+
+    let after = tick(&db, &rt, &child, Some(json!({ "verdict": "bug" })));
+    assert_eq!(
+        spec_category_slug(&db, &spec_id).as_deref(),
+        Some("bug"),
+        "the judge's word was WRITTEN to the Spec through the category service, not left on a board",
+    );
+    assert_eq!(
+        after["blackboard_delta"]["spec_category"], json!("bug"),
+        "…and read BACK from the domain before anything routes on it: {after}"
+    );
+    assert_eq!(
+        after["action"]["label"], "write the reproduction",
+        "so the Spec nobody had classified lands INSIDE the discipline, not past it: {after}",
+    );
+}
+
+/// DONE-CRITERION ("Un resume reprend le curseur bloqué et ne sert jamais de pseudo-recatégorisation").
+///
+/// A run parked on the reproduction gate is parked INSIDE the `bug` branch, and `run_start` on the
+/// same (workflow, Spec) RESUMES it — same row, same cursor, same traversal. So re-classifying the
+/// Spec and calling `run_start` again is not a re-route: nothing re-walks the selector that chose
+/// this branch, and the very next tick is the same gate raising the same refusal. Recategorizing is
+/// a legitimate act with a legitimate effect — on the NEXT run, whose preflight reads the new slug —
+/// and it is not a way out of a proof already under way.
+#[test]
+fn a_resume_picks_up_the_blocked_cursor_and_is_never_a_pseudo_recategorization() {
+    let _g = db_guard();
+    let sandbox = temp_dir("repro-resume");
+    let db = Db::in_memory();
+    db.with_conn(crate::seed::seed_builtin_workflows).unwrap();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+    classify(&db, &spec_id, "bug");
+    declare_phases(&db, &spec_id, &["Build"]);
+    build_task(&db, &project_id, &spec_id, "repair the defect");
+    // A reproduction that PASSES — so `expect: red` is never satisfied and the gate refuses.
+    let never_red = gate_command(&db, &project_id, "true");
+    bind_slot(&db, &project_id, crate::seed::REPRO_CHECK_SLOT, &[&never_red]);
+    bind_slot(&db, &project_id, crate::seed::BUILD_CHECK_SLOT, &[&never_red]);
+
+    let rt = EngineRuntime::new();
+    let parent = super::run_start(&db, &rt, &json!({ "scope": "ndev", "spec_id": spec_id }))
+        .expect("run_start")
+        .result["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string();
+    let child = tick(&db, &rt, &parent, None)["action"]["child_run_id"]
+        .as_str()
+        .expect("the coder child")
+        .to_string();
+    assert_eq!(
+        tick(&db, &rt, &child, None)["action"]["label"],
+        "write the reproduction"
+    );
+    assert_eq!(
+        coder_question(
+            tick(&db, &rt, &child, Some(json!({ "diff": "a check" })))["action"]["prompt"]
+                .as_str()
+                .unwrap_or_default()
+        ),
+        "is it automatable?",
+    );
+    let refused = super::nyx_next(
+        &db,
+        &rt,
+        no_session(),
+        &json!({ "run_id": child, "last_result": { "decision": "automated" } }),
+    )
+    .expect_err("a check that PASSES has reproduced nothing");
+    assert_eq!(refused.code, "invalid_state");
+    assert_eq!(
+        refused
+            .data
+            .as_ref()
+            .and_then(|d| d.get("expect"))
+            .and_then(Value::as_str),
+        Some("red"),
+    );
+    let blocked_at = run_row(&db, &child)
+        .current_node_id
+        .expect("the run is parked ON the gate");
+    assert_eq!(run_row(&db, &child).status, db::RUN_STATUS_BLOCKED);
+
+    // THE ATTEMPTED WAY OUT: re-classify the Spec `chore` and re-open the flow.
+    classify(&db, &spec_id, "chore");
+    let resumed = super::run_start(&db, &rt, &json!({ "scope": "ndev", "spec_id": spec_id }))
+        .expect("run_start")
+        .result;
+    assert_eq!(
+        resumed["run_id"].as_str(),
+        Some(parent.as_str()),
+        "the same run is RESUMED, never a fresh one on the new category: {resumed}"
+    );
+    assert_eq!(
+        run_row(&db, &child).current_node_id.as_deref(),
+        Some(blocked_at.as_str()),
+        "and the child's cursor has not moved off the gate"
+    );
+
+    // …and the very next tick is the SAME gate refusing the SAME thing. The branch was chosen by a
+    // selector this run walked past; nothing re-evaluates it, so a new slug re-routes nothing.
+    let again = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": child }))
+        .expect_err("the refusal is where the run left it");
+    assert_eq!(
+        again
+            .data
+            .as_ref()
+            .and_then(|d| d.get("node_id"))
+            .and_then(Value::as_str),
+        Some(blocked_at.as_str()),
+        "the resumed run is parked on the reproduction gate, not routed out of the discipline",
+    );
+    assert_eq!(
+        again
+            .data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some(super::GATE_EXPECTATION_MISMATCH_REASON),
+    );
+}
+
+/// DONE-CRITERION ("Le scanner `run_start` ne signale le slot repro que pour une branche bug
+/// applicable, avec défense runtime conservée").
+///
+/// A `run_start` warning is a promise about what THIS call will hit. The reproduction gates sit
+/// under the `bug` branch, so telling a `feature` run that it "WILL BE REFUSED" there is a false
+/// alarm — and a false alarm on the majority of runs is how a dispatcher learns to skim past the
+/// array that also carries the `build_check` warning, which is true every time.
+///
+/// BOTH HALVES, and the second is what makes the first safe: the scan is quieter, the GATE is not. A
+/// run that reaches an unbound reproduction gate is still refused at the tick, because the question
+/// a gate answers is not "did anything fail" but "was this verified".
+#[test]
+fn run_start_reports_the_reproduction_slot_only_for_a_bug_and_the_gate_still_refuses() {
+    let _g = db_guard();
+    let sandbox = temp_dir("repro-scan");
+    let db = Db::in_memory();
+    db.with_conn(crate::seed::seed_builtin_workflows).unwrap();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+
+    let slots_warned_for = |spec_id: &str| -> Vec<String> {
+        super::run_start(
+            &db,
+            &EngineRuntime::new(),
+            &json!({ "scope": "ndev", "spec_id": spec_id }),
+        )
+        .expect("run_start")
+        .result["warnings"]
+            .as_array()
+            .expect("a warnings array")
+            .iter()
+            .filter(|w| w["code"] == "gate_unconfigured")
+            .map(|w| w["slot"].as_str().unwrap_or("(none)").to_string())
+            .collect()
+    };
+
+    // (a) NOTHING BOUND, and the Spec is a `feature`: the reproduction gates are on a branch this
+    //     run cannot reach, so only the build control is reported.
+    let feature = spec_in_progress(&db, &project_id, &workspace_id);
+    classify(&db, &feature, "feature");
+    assert_eq!(
+        slots_warned_for(&feature),
+        vec![crate::seed::BUILD_CHECK_SLOT.to_string()],
+        "a feature is warned about the gate it will meet, and about nothing else",
+    );
+
+    // (b) AN UNCLASSIFIED Spec is treated the same way, and that is deliberate: the preflight will
+    //     classify it, and a scan cannot know what the judge will answer. Announcing a refusal that
+    //     depends on an answer nobody has given yet is not a promise, it is a guess.
+    let unclassified = spec_in_progress(&db, &project_id, &workspace_id);
+    assert_eq!(
+        slots_warned_for(&unclassified),
+        vec![crate::seed::BUILD_CHECK_SLOT.to_string()],
+    );
+
+    // (c) A `bug`: the reproduction IS owed, so both gates it will walk are reported beside the
+    //     build control — before the first spawn, which is the whole point of scanning at all.
+    let bug = spec_in_progress(&db, &project_id, &workspace_id);
+    classify(&db, &bug, "bug");
+    let warned = slots_warned_for(&bug);
+    assert_eq!(
+        warned
+            .iter()
+            .filter(|s| s.as_str() == crate::seed::REPRO_CHECK_SLOT)
+            .count(),
+        2,
+        "both ends of the reproduction are named — the red and the green: {warned:?}",
+    );
+    assert!(
+        warned.contains(&crate::seed::BUILD_CHECK_SLOT.to_string()),
+        "…and the build control is not lost in the process: {warned:?}",
+    );
+
+    // (d) THE RUNTIME DEFENCE IS UNTOUCHED. Bind `build_check` alone, then walk the bug to the
+    //     reproduction gate: it is an `invalid_state`, never a green light.
+    let build = gate_command(&db, &project_id, "true");
+    bind_slot(&db, &project_id, crate::seed::BUILD_CHECK_SLOT, &[&build]);
+    declare_phases(&db, &bug, &["Build"]);
+    build_task(&db, &project_id, &bug, "repair the defect");
+    let rt = EngineRuntime::new();
+    let child = coder_child_of_ndev(&db, &rt, &bug);
+    assert_eq!(
+        tick(&db, &rt, &child, None)["action"]["label"],
+        "write the reproduction"
+    );
+    assert_eq!(
+        coder_question(
+            tick(&db, &rt, &child, Some(json!({ "diff": "a check" })))["action"]["prompt"]
+                .as_str()
+                .unwrap_or_default()
+        ),
+        "is it automatable?",
+    );
+    let refused = super::nyx_next(
+        &db,
+        &rt,
+        no_session(),
+        &json!({ "run_id": child, "last_result": { "decision": "automated" } }),
+    )
+    .expect_err("an unbound reproduction slot verifies nothing, so it advances nothing");
+    assert_eq!(refused.code, "invalid_state");
+    assert_eq!(
+        refused
+            .data
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str),
+        Some("gate_unconfigured"),
+        "the same refusal `build_check` gets, for the same reason: {refused:?}",
+    );
+    assert!(
+        refused.message.contains(crate::seed::REPRO_CHECK_SLOT),
+        "and it names the slot to bind: {}",
+        refused.message
     );
 }

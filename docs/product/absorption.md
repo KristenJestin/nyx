@@ -67,7 +67,8 @@ CLI + web UI Node, ~39 tables. Le **domaine** est porté ; les **enveloppes** (w
 
 Capture **généreuse** d'événements métier (jamais le runtime octet par octet) :
 
-- **Spec** : `created`, `revision_published`, `status_changed`, `priority_changed`, `category_changed`, `milestone_set`, `dependency_changed`, `workspace_assigned`, `completed`, `archived`
+- **Spec** : `created`, `revision_published`, `status_changed`, `priority_changed`, `category_set`, `milestone_set`, `dependency_changed`, `workspace_assigned`, `completed`, `archived`
+- **Category** (PDR-0017 — la catégorie est une ENTITÉ de projet, pas un champ du Spec ; son cycle de vie a donc ses propres événements, distincts du `spec.category_set` qui n'enregistre qu'une affectation) : `created` (mintée à la volée par un agent — source `mcp` — ou créée par un humain depuis les settings — source `ui`), `renamed` (un humain renomme ; le slug, lui, ne bouge jamais), `deleted` (un humain retire une entrée du vocabulaire ; refusé sur les quatre catégories système et sur une catégorie encore portée par une Spec). L'événement `confirmed` a été **retiré** le 2026-09-02 avec l'axe proposé/confirmé (amendement de PDR-0017) : ce que l'agent minte vaut validation.
 - **Task** : `created`, `status_changed`, `phase_changed`, `priority_changed`, `agent_assigned`, `done`, `blocked`
 - **Review** : `comment_created`, `comment_replied`, `comment_resolved`, `comment_reopened`, `comment_outdated`, `comment_promoted`
 - **Runtime** : `workspace_created`, `workspace_folder_removed`, `terminal_opened`, `terminal_closed`, `command_started`, `command_succeeded`, `command_failed`, `agent_started`, `agent_waiting`, `agent_ended`, `agent_resumed`, `agent_resume_failed`

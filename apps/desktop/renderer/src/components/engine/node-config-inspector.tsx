@@ -173,6 +173,7 @@ const TYPE_TITLE: Partial<Record<EngineNodeType, string>> = {
   spawn_subagent: "Sub-agent",
   sub_workflow: "Sub-workflow",
   transition_task: "Task transition",
+  set_category: "Spec category",
 };
 
 /** Splits a describer sentence into its STATIC prose and its two kinds of DYNAMIC span: a backtick

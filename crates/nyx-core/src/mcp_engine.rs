@@ -47,6 +47,15 @@
 //!     avance", lifted into the real verb. And a BLOCKING gate with NO commands is refused the same
 //!     way, BEFORE it is run ([`refuse_vacuous_gate`]): a gate that verifies nothing cannot certify
 //!     anything, so its "green" is not a verdict — it is the absence of one.
+//!   * DECLARED EXPECTATION — a gate that says what its check must DO
+//!     ([`crate::engine::GateExpectation`]) is graded on THREE values, not two: `passed`, `failed`
+//!     (a real non-zero exit) and `indeterminate` (a timeout, a spawn failure, any infrastructure
+//!     fault). `green` is answered only by `passed`, `red` only by `failed`, and `indeterminate`
+//!     answers NEITHER. A blocking gate whose attempt does not answer its declaration is refused ON
+//!     THE SPOT and stays refused until one does ([`refuse_gate_expectation`]) — never through the
+//!     M5 red anchor, which re-runs what it holds and would therefore wedge a reproduction gate the
+//!     moment the fix made it green. A gate that declares NOTHING keeps the anchor and is enforced
+//!     exactly as it was before expectations existed.
 //!   * STATE RULE — a `transition` node routes through [`crate::db::transition_spec`], whose
 //!     `source_allowed` guard REFUSES an illegal lifecycle move; the refusal surfaces from the
 //!     `nyx_next` handler, so a forbidden transition cannot be walked past either.
@@ -99,7 +108,7 @@
 //!     RE-ATTEMPTS it — without that, simply calling `nyx_next` again (exactly what the dispatcher
 //!     is told to do) would ack the parked leaf and walk straight past the refused effect.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -108,7 +117,10 @@ use portable_pty::PtySize;
 use serde_json::{json, Value};
 
 use crate::db::{self, Db};
-use crate::engine::{Action, Blackboard, Engine, EngineError, NodeResult, NodeType, Step, Tree};
+use crate::engine::{
+    Action, Blackboard, Engine, EngineError, GateExpectation, GateGrade, GateVerdict, NodeResult,
+    NodeType, Step, Tree,
+};
 use crate::mcp::{RpcCode, RpcError};
 use crate::mcp_runtime::{internal_db, optional_str, require_str};
 use crate::mcp_tools_core::{ChangedTopic, ToolOutcome};
@@ -1439,7 +1451,8 @@ fn run_replaced_warning(dropped: &db::WorkflowRun, why: &RpcError) -> Value {
 ///
 ///   * a `gate_check` that resolves to NO command (an empty `command_ids`, or a `slot` this project
 ///     never bound) — it verifies nothing, and a BLOCKING one will REFUSE the run at that node (H10).
-///     Best-effort on the node config: a malformed gate config counts as unarmed → warned.
+///     Best-effort on the node config: a malformed gate config counts as unarmed → warned. RESTRICTED
+///     to the gates THIS run can actually reach: see [`gate_is_owed_by_this_run`].
 ///   * a FORK left behind by its source ([`fork_stale_warning`]) — the project is running a copy taken
 ///     at revision N of a built-in that has since moved on, so nyx's graph fixes never reached it.
 ///
@@ -1465,15 +1478,52 @@ fn flow_graph_warnings(
 ) -> Result<Vec<Value>, RpcError> {
     let mut warnings = Vec::new();
     let project_id = run_project_id(db, run)?;
+    // The run's GENRE OF WORK, resolved through the very fact the graph's own branch will read
+    // ([`QUERY_SPEC_CATEGORY`]) rather than through a second reading of the same table: the scan's
+    // answer to "will this run reach that gate" must be the engine's answer, or the warning and the
+    // walk would be about two different Specs. `null` for an unclassified Spec and for an unbound
+    // run alike — the fact spells both absences one way.
+    let category = resolve_query(db, run, QUERY_SPEC_CATEGORY)?
+        .as_str()
+        .map(str::to_string);
     collect_flow_warnings(
         db,
         run,
         workflow,
         project_id.as_deref(),
+        category.as_deref(),
         &mut HashSet::new(),
         &mut warnings,
     )?;
     Ok(warnings)
+}
+
+/// Whether an unarmed `gate_check` is a finding FOR THIS RUN — i.e. whether the branch it sits on is
+/// one this run's Spec can reach at all.
+///
+/// A `run_start` warning is a promise about what this call will hit, and the seeded coder graph now
+/// holds a gate that MOST runs never reach: the reproduction gate ([`crate::seed::REPRO_CHECK_SLOT`])
+/// lives under `selector "bug discipline?"`, on the branch a `bug` Spec takes and no other genre
+/// does. Reporting it unconditionally would tell every `/ndev` on every `feature` that its run "WILL
+/// BE REFUSED" at a node it is not going to walk — a false alarm on the overwhelming majority of
+/// runs, and the surest way to teach a dispatcher to skim past the array that also carries the
+/// `build_check` warning, which is true every time.
+///
+/// The restriction is on the WARNING and on nothing else. The runtime defence is untouched: should a
+/// run reach that gate unbound — a `bug` classified after the scan, a fork that moved the node, a
+/// project that bound the slot to an empty list — the tick still refuses it as the vacuous gate it
+/// is ([`refuse_vacuous_gate`]). The scan answers "what will you hit"; the gate answers "was this
+/// verified", and only the second one is a guarantee.
+///
+/// Every OTHER gate is owed by every run: `build_check` sits on the path any task takes, and a
+/// project's own graph is its own business.
+fn gate_is_owed_by_this_run(node: &db::Node, category: Option<&str>) -> bool {
+    match node_gate_slot(node).as_deref() {
+        Some(crate::seed::REPRO_CHECK_SLOT) => {
+            category == Some(crate::db::CATEGORY_SLUG_BUG)
+        }
+        _ => true,
+    }
 }
 
 /// One graph's worth of [`flow_graph_warnings`], recursing into the children its `sub_workflow` nodes
@@ -1486,6 +1536,7 @@ fn collect_flow_warnings(
     run: &db::WorkflowRun,
     workflow: &db::Workflow,
     project_id: Option<&str>,
+    category: Option<&str>,
     visited: &mut HashSet<String>,
     warnings: &mut Vec<Value>,
 ) -> Result<(), RpcError> {
@@ -1510,7 +1561,9 @@ fn collect_flow_warnings(
                 let blocking = serde_json::from_str::<crate::engine::GateConfig>(&n.config)
                     .map(|c| c.blocking)
                     .unwrap_or(true);
-                if node_gate_commands(db, project_id, n)?.is_empty() {
+                if gate_is_owed_by_this_run(n, category)
+                    && node_gate_commands(db, project_id, n)?.is_empty()
+                {
                     warnings.push(gate_unconfigured_warning(workflow, n, blocking, project_id));
                 }
             }
@@ -1520,7 +1573,9 @@ fn collect_flow_warnings(
                 if let Ok(child) =
                     resolve_child_workflow(db, run, cfg.workflow_id.as_deref(), &cfg.scope)
                 {
-                    collect_flow_warnings(db, run, &child, project_id, visited, warnings)?;
+                    collect_flow_warnings(
+                        db, run, &child, project_id, category, visited, warnings,
+                    )?;
                 }
             }
             _ => {}
@@ -2227,7 +2282,16 @@ fn walk(
     // `sequence[gate_A(red), gate_B(green), transition]` slip past the still-red A (v2.8 review H1).
     // Seeded from the PERSISTED blackboard (a JSON array), because the guarded `transition`/`done` is
     // typically reached on a LATER call of the dispatcher loop than the gate that must block it.
-    let mut blocking_gates_red: HashSet<String> = engine
+    //
+    // A **B-TREE** set and not a hash one, because the two block points below name the refusing gate
+    // with `.iter().next()`. Over a `HashSet` that is a draw: the set is rebuilt from the board on
+    // every `nyx_next`, so a fresh `RandomState` each tick meant two consecutive calls on the SAME
+    // state could name A then B — while the board persisted `[A, B]` sorted, and while
+    // `reeval_red_gates` re-ran them in that same arbitrary order, each pass overwriting
+    // [`LAST_GATE_RESULT_KEY`], so the gate named and the gate whose evidence rode with the refusal
+    // were not reliably the same one. Ordered, the refusal names the FIRST id of the array the human
+    // can read on the board, every time.
+    let mut blocking_gates_red: BTreeSet<String> = engine
         .blackboard()
         .get(BLOCKING_GATE_RED_KEY)
         .and_then(Value::as_array)
@@ -2264,7 +2328,14 @@ fn walk(
                 // M5 — RE-RUN each still-anchored red gate at the block point before refusing: a run
                 // parked past a red gate now has an EXIT (fix the cause + call again ⇒ the gate re-runs
                 // green ⇒ the block clears ⇒ the run advances). Only a gate STILL red after re-eval blocks.
-                reeval_red_gates(db, run, engine, &mut blocking_gates_red, &evaluated_this_tick)?;
+                reeval_red_gates(
+                    db,
+                    run,
+                    engine,
+                    &mut blocking_gates_red,
+                    &evaluated_this_tick,
+                    last_result,
+                )?;
                 if let Some(node_id) = blocking_gates_red.iter().next().cloned() {
                     return Err(refuse_gate(db, run, engine, &node_id, last_result));
                 }
@@ -2282,6 +2353,7 @@ fn walk(
                     command_ids,
                     slot,
                     blocking,
+                    expect,
                 } => {
                     // WHICH commands this gate runs is resolved HERE, through the one path both ways
                     // of arming a gate go through ([`gate_commands`]): a `slot` gate asks the run's
@@ -2330,23 +2402,67 @@ fn walk(
                     if blocking && command_ids.is_empty() {
                         return Err(refuse_vacuous_gate(db, run, engine, &node_id, last_result));
                     }
+                    // The expectation this attempt is GRADED against — the declared one, else
+                    // `green`. `expect` (the Option) is kept beside it because WHICH ENFORCEMENT
+                    // applies below turns on "did the node declare one", not on the value.
+                    let expectation = expect.unwrap_or(GateExpectation::Green);
                     let gate = match run_gate(db, &command_ids) {
                         Ok(gate) => gate,
-                        // The gate could not be RUN at all (an unknown command instance, a run
-                        // directory that no longer exists, a spawn that failed). That is not a
-                        // green light and not a skip: park on the node and replay.
+                        // The gate could not be RESOLVED at all (an unknown command instance, a run
+                        // directory that no longer exists). That is not a green light and not a
+                        // skip: record the attempt as INDETERMINATE — it proves nothing, and a
+                        // silent hole in the journal is exactly what an auditor cannot detect —
+                        // then park on the node and replay.
+                        //
+                        // THE JOURNAL NAMES THE COMMAND THAT ACTUALLY FAILED, and keeps the ones
+                        // that already ran ([`GateRunError`]). It used to name `command_ids.first()`
+                        // with empty cmdline/cwd whatever went wrong, so a two-command gate whose
+                        // SECOND command was unresolvable accused the first — the one that had just
+                        // run fine — and threw its result away. Those three fields are the identity
+                        // the auditor confronts between a red and a green; an attempt that misnames
+                        // them is worse than one that is missing.
                         Err(e) => {
+                            let mut commands = e.done;
+                            commands.push(GateCommandResult::could_not_run(
+                                &e.failing_id,
+                                "",
+                                "",
+                                &e.error.message,
+                            ));
+                            record_gate_attempt(
+                                db,
+                                &GateAttempt {
+                                    run,
+                                    node_id: &node_id,
+                                    slot: slot.as_deref(),
+                                    expect: expectation,
+                                    declared: expect.is_some(),
+                                    blocking,
+                                    grade: GateGrade::Indeterminate,
+                                    satisfied: false,
+                                    commands: &commands,
+                                },
+                            );
                             return Err(block_on_effect_error(
                                 db,
                                 run,
                                 engine,
                                 &node_id,
                                 last_result,
-                                e,
-                            ))
+                                e.error,
+                            ));
                         }
                     };
                     let green = gate.passed;
+                    let grade = gate.outcome;
+                    // A gate whose command could not be LAUNCHED — see [`gate_spawn_failure`]. Read
+                    // before `gate` is consumed by the surfaced result below, because the `None` arm
+                    // has to park on it.
+                    let spawn_failure = gate_spawn_failure(&gate);
+                    // The SECOND fact, and the one a boolean could not carry: did what the command
+                    // did ANSWER what this node declared. An `indeterminate` answers neither
+                    // expectation, so this is false for it under `green` and under `red` alike.
+                    let satisfied = expectation.is_satisfied_by(grade);
                     // This gate has just been judged on this very tick — the M5 re-eval at the
                     // block point below must not run the project's whole suite a SECOND time for it.
                     evaluated_this_tick.insert(node_id.clone());
@@ -2355,26 +2471,139 @@ fn walk(
                     // the run and rides the tick's `blackboard_delta`, so both the dispatcher and the UI
                     // can see WHY a gate is the colour it is. Only a gate with REAL commands writes it —
                     // an empty (vacuously green) gate has nothing to explain, so it leaves no residue.
+                    //
+                    // The board key is the LATEST attempt and only that — the next gate overwrites it.
+                    // The DURABLE, append-only record of the same attempt is the journal below, which
+                    // is what lets a red and the green that follows it be read as one sequence.
                     if !gate.commands.is_empty() {
+                        record_gate_attempt(
+                            db,
+                            &GateAttempt {
+                                run,
+                                node_id: &node_id,
+                                slot: slot.as_deref(),
+                                expect: expectation,
+                                declared: expect.is_some(),
+                                blocking,
+                                grade,
+                                satisfied,
+                                commands: &gate.commands,
+                            },
+                        );
                         engine.set_board_as(
                             &node_id,
                             LAST_GATE_RESULT_KEY,
-                            gate_result_json(&node_id, gate),
+                            gate_result_json(&node_id, expectation, satisfied, gate),
                         );
                     }
-                    // A GREEN gate clears ONLY ITS OWN red anchor; a RED BLOCKING gate raises its own.
-                    // A red NON-blocking gate, and a green NON-blocking gate that was never anchored,
-                    // change nothing — neither must touch another gate's refusal (H1).
-                    if green {
-                        blocking_gates_red.remove(&node_id);
-                    } else if blocking {
-                        blocking_gates_red.insert(node_id);
+                    match expect {
+                        // NO DECLARED EXPECTATION — the pre-expectation enforcement, unchanged, to
+                        // the letter. A GREEN gate clears ONLY ITS OWN red anchor; a RED BLOCKING
+                        // gate raises its own. A red NON-blocking gate, and a green NON-blocking gate
+                        // that was never anchored, change nothing — neither must touch another gate's
+                        // refusal (H1). The refusal itself lands later, at the `transition`/`done`
+                        // this anchor guards.
+                        None => {
+                            // …WITH ONE EXCEPTION THE ANCHOR CANNOT EXPRESS: a command that could
+                            // not be LAUNCHED. Before the tri-valued grade, a failed spawn came out
+                            // of the runner as an `Err` and parked the run on this very node in ONE
+                            // tick, with the spawn's own message. Graded, it became an ordinary
+                            // "not green" and the walk CONTINUED to the next block point — which, on
+                            // the seeded coder, means the `until gate_green` loop re-entering its
+                            // body and re-spawning the coder up to 25 times to repair code that is
+                            // not broken, before dying on a loop limit that names `gate_green`
+                            // instead of the missing binary. "The binary is not there" is not a
+                            // verdict about the work, and the enforcement `run_one_gate`'s doc
+                            // promises was "unchanged" only for a DECLARED expectation. So it parks
+                            // here too — after the attempt above was journaled as `indeterminate`,
+                            // which is the record an auditor reads.
+                            //
+                            // A TIMEOUT is deliberately NOT this case: it is also `indeterminate`,
+                            // but it is a check that RAN and did not finish, the anchor's
+                            // "cut short" refusal already says so in its own words, and parking on
+                            // it would change an enforcement nobody found wanting.
+                            if blocking {
+                                if let Some(why) = spawn_failure {
+                                    return Err(block_on_effect_error(
+                                        db,
+                                        run,
+                                        engine,
+                                        &node_id,
+                                        last_result,
+                                        why,
+                                    ));
+                                }
+                            }
+                            if green {
+                                blocking_gates_red.remove(&node_id);
+                            } else if blocking {
+                                blocking_gates_red.insert(node_id.clone());
+                            }
+                            // Mirror the set onto the persisted board so it carries across the loop.
+                            mirror_blocking_gates(engine, &blocking_gates_red);
+                        }
+                        // A DECLARED EXPECTATION is enforced HERE and NEVER through the M5 anchor,
+                        // and the reason is the whole point of the separation:
+                        //
+                        // M5 RE-RUNS every anchored gate at each block point. A reproduction gate
+                        // (`expect: red`) that anchored itself would therefore be re-run AFTER the
+                        // fix — where it passes, where passing no longer answers `red`, and where it
+                        // would refuse the transition FOREVER. The run would be wedged by the very
+                        // proof it just produced. So a declared gate raises no anchor, clears none
+                        // (another gate's red is not its business — H1 again), and is never a
+                        // candidate for re-evaluation.
+                        //
+                        // What replaces the anchor is a refusal ON THE SPOT, which is strictly
+                        // stronger: the mismatch does not wait for a `transition` to exist
+                        // downstream, so a graph that ends on a plain `done` — or on nothing at all —
+                        // is guarded too. It is STICKY by the same mechanism every gate refusal uses:
+                        // the leaf is marked for REPLAY, so the next tick re-runs THIS gate and hits
+                        // the same refusal until an attempt satisfies the expectation.
+                        Some(_) => {
+                            if blocking && !satisfied {
+                                // The tick stops HERE, so the ordinary fold never runs — write the
+                                // three verdict keys first, or the one run somebody is about to
+                                // inspect (the blocked one) would be the one with an empty board.
+                                engine.set_gate_verdict(
+                                    &node_id,
+                                    GateVerdict {
+                                        grade,
+                                        expect: expectation,
+                                    },
+                                );
+                                return Err(refuse_gate_expectation(
+                                    db,
+                                    run,
+                                    engine,
+                                    &node_id,
+                                    expectation,
+                                    grade,
+                                    last_result,
+                                ));
+                            }
+                            // A DECLARED GATE THAT ANSWERED ITS DECLARATION CARRIES NO ANCHOR — and
+                            // that has to be enforced, not merely intended. "A declared gate raises
+                            // no anchor" was true of the gate as it stands now; it says nothing
+                            // about an anchor it INHERITED, which is exactly what a `node_update`
+                            // adding `expect: red` to a gate that already went red without one
+                            // leaves behind — the route out this module's own
+                            // [`refuse_gate_expectation`] recommends. The anchor then outlives the
+                            // declaration: the gate satisfies `red`, the journal records it
+                            // satisfied, and the M5 guard refuses the transition forever for a red
+                            // the node no longer treats as one. Dropping its own id here (and in the
+                            // re-eval, which lifts on `satisfied` for a declared gate) is what makes
+                            // the two enforcements mutually exclusive in fact.
+                            if satisfied && blocking_gates_red.remove(&node_id) {
+                                mirror_blocking_gates(engine, &blocking_gates_red);
+                            }
+                        }
                     }
-                    // Mirror the set onto the persisted board so it carries across the dispatcher loop.
-                    mirror_blocking_gates(engine, &blocking_gates_red);
                     // Feed the verdict back so a surrounding loop/selector branches on it, and keep
                     // ticking (the gate is never surfaced to the dispatcher).
-                    result = Some(NodeResult::Gate(green));
+                    result = Some(NodeResult::Gate(GateVerdict {
+                        grade,
+                        expect: expectation,
+                    }));
                 }
                 // nyx IMPOSES the transition through the guarded Spec authority (state rule).
                 Action::Transition {
@@ -2385,7 +2614,14 @@ fn walk(
                     // M5 — RE-RUN each still-anchored red gate before refusing the transition: the run
                     // parked here on red now has an EXIT (fix the cause + call `nyx_next` again ⇒ the
                     // gate re-runs green ⇒ the block clears ⇒ the transition fires). See `reeval_red_gates`.
-                    reeval_red_gates(db, run, engine, &mut blocking_gates_red, &evaluated_this_tick)?;
+                    reeval_red_gates(
+                        db,
+                        run,
+                        engine,
+                        &mut blocking_gates_red,
+                        &evaluated_this_tick,
+                        last_result,
+                    )?;
                     if let Some(gate_node) = blocking_gates_red.iter().next().cloned() {
                         return Err(refuse_gate(db, run, engine, &gate_node, last_result));
                     }
@@ -2759,6 +2995,99 @@ fn walk(
                         // SUCCEEDED path: a gated-off node created nothing, and a refused one
                         // compensated its own folder.
                         note_effect(effects, ChangedTopic::Workspaces);
+                    }
+                    result = Some(NodeResult::Ack);
+                }
+                // nyx CLASSIFIES the run's bound Spec — the genre of work it carries (PDR-0017),
+                // written through the SAME [`crate::category::set_spec_category_by_label`] the
+                // `spec_set_category` tool calls. THE SERVICE AND NEVER A SECOND IMPLEMENTATION: the
+                // same-project refusal, the slug-first resolution, the on-the-fly MINT of an unknown
+                // label and the `spec.category_set` event all live there, and a node that
+                // re-derived any of them would be a second authority over `specs.category_id` — the
+                // one thing that module exists to prevent. In particular the CROSS-PROJECT refusal is
+                // PRONOUNCED BY THE SERVICE (`CategoryError::ProjectMismatch`), never re-checked here.
+                //
+                // UNGATED by default; with `gate_on` set it fires only on an affirmative board key.
+                // Never surfaced to the dispatcher.
+                //
+                // A RUN WITH NO SPEC COMMITS NOTHING AND IS NOT PARKED — the same arbitrage as the
+                // `transition` arm (M2, `apply_transition`'s early return): there is no Spec to
+                // classify, so the node commits nothing, and blocking on it would park a run over an
+                // effect that never happens. A `/nspec` run reaches this node before its Spec exists;
+                // that is a legitimate state, not a failure. A key NOTHING EVER WROTE reads the same
+                // way: the node names a board slot that does not exist, so there is nothing to
+                // classify WITH, and the graph walks on.
+                //
+                // WHAT IS NOT THE SAME IS A KEY THAT HOLDS SOMETHING UNUSABLE, and that distinction
+                // is the whole of [`refuse_unusable_category`]: only a NON-EMPTY STRING is a label.
+                // `Value::Null` in particular is what a `judge` leaves on the board when the
+                // dispatcher resumes a parked run WITHOUT a `last_result` — a stated principle of
+                // this engine, not an edge case — and the label travels here through
+                // `{{key}}` INTERPOLATION, which renders that null as the four letters `null`. A
+                // non-empty string is exactly what the category service MINTS on, so the run used to
+                // come out with a category named `null` in the project's vocabulary, the Spec
+                // classified under it, and the `spec_category` fact answering a truthy slug —
+                // permanently exempting that Spec from the very discipline the preflight exists to
+                // impose. Reading the RAW board value instead of the rendered string is what tells
+                // "the judge answered nothing" apart from "the judge answered a word".
+                //
+                // A REFUSAL the service DOES pronounce (an ambiguous name, a blank label, a DB error)
+                // BLOCKS and is re-attempted on the next call rather than walked past: the discipline
+                // below this node is authored on the classification having landed, and a silent skip
+                // would run a `bug` flow over a Spec nyx never classified.
+                //
+                // The tick's default `ChangedTopic::Specs` already covers this write — unlike
+                // `create_workspace`, it lands INSIDE the Spec domain (see [`outcome`]).
+                Action::SetCategory {
+                    node_id,
+                    key,
+                    category: _,
+                    gate_on,
+                } => {
+                    let approved = gate_on
+                        .as_deref()
+                        .map(|k| board_value_is_affirmative(engine.blackboard().get(k)))
+                        .unwrap_or(true);
+                    if approved {
+                        if let Some(spec_id) = run.spec_id.as_deref() {
+                            let read = board_category_label(engine.blackboard().get(&key));
+                            match read {
+                                BoardLabel::Absent => {}
+                                BoardLabel::Unusable(seen) => {
+                                    let e = refuse_unusable_category(&key, &seen);
+                                    return Err(block_on_effect_error(
+                                        db,
+                                        run,
+                                        engine,
+                                        &node_id,
+                                        last_result,
+                                        e,
+                                    ));
+                                }
+                                BoardLabel::Label(label) => {
+                                    if let Err(e) = db
+                                        .with_conn(|c| {
+                                            crate::category::set_spec_category_by_label(
+                                                c,
+                                                spec_id,
+                                                &label,
+                                                db::DomainEventSource::Mcp,
+                                            )
+                                        })
+                                        .map_err(crate::mcp_tools_spec::map_category_err)
+                                    {
+                                        return Err(block_on_effect_error(
+                                            db,
+                                            run,
+                                            engine,
+                                            &node_id,
+                                            last_result,
+                                            e,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
                     result = Some(NodeResult::Ack);
                 }
@@ -3733,7 +4062,7 @@ fn resolve_child_workflow(
 /// and it is only the command's OUTPUT, never an env VALUE (the "secret values never logged"
 /// invariant is untouched: this path captures output, it does not touch env).
 #[derive(Debug, Clone, serde::Serialize)]
-struct GateCommandResult {
+pub(crate) struct GateCommandResult {
     /// The managed-command instance id the `gate_check` node referenced.
     command_id: String,
     /// The RESOLVED command line nyx actually ran.
@@ -3745,36 +4074,200 @@ struct GateCommandResult {
     exit_code: Option<i32>,
     /// Whether this command passed (exited 0).
     passed: bool,
+    /// The TRI-VALUED grade of this command — `passed` / `failed` (a non-zero EXIT) /
+    /// `indeterminate` (no exit at all: a timeout, a spawn that failed, a command that could not be
+    /// resolved). `passed` above is kept beside it because every existing reader (the UI, the
+    /// refusal payload, the M6 tests) is written on it; what it cannot express is the third value.
+    outcome: GateGrade,
     /// The bounded tail of the command's combined output (the END — the part that explains a failure).
     output_tail: String,
     /// A human-readable marker when the command did NOT exit: its own [`GATE_TIMEOUT`], or the gate's
     /// global [`GATE_TOTAL_TIMEOUT`] budget. `None` on a clean exit.
     timeout: Option<String>,
+    /// Wall time the command took, in ms — part of what makes two attempts on "the same check"
+    /// comparable, and the number that tells a genuinely slow suite from one that hangs.
+    duration_ms: u64,
 }
 
 impl GateCommandResult {
     /// The result recorded when the gate's GLOBAL [`GATE_TOTAL_TIMEOUT`] budget is spent on this
-    /// command (whatever partial `output_tail` was captured travels with it). RED by construction.
-    fn budget_exceeded(command_id: &str, cmdline: &str, cwd: &str, output_tail: String) -> Self {
+    /// command (whatever partial `output_tail` was captured travels with it). Never green — and
+    /// INDETERMINATE, not failed: the budget ran out, so nothing was judged.
+    fn budget_exceeded(
+        command_id: &str,
+        cmdline: &str,
+        cwd: &str,
+        output_tail: String,
+        duration_ms: u64,
+    ) -> Self {
         GateCommandResult {
             command_id: command_id.to_string(),
             cmdline: cmdline.to_string(),
             cwd: cwd.to_string(),
             exit_code: None,
             passed: false,
+            outcome: GateGrade::Indeterminate,
             output_tail,
             timeout: Some(gate_total_budget_marker()),
+            duration_ms,
+        }
+    }
+
+    /// The result recorded when the command could not be RUN AT ALL — a spawn failure, a binary that
+    /// is not there, a run directory that no longer exists. `error` is the harness fault, kept in the
+    /// output tail because that is where a reader looks for "what happened"; the grade is
+    /// INDETERMINATE, which satisfies no expectation whatsoever.
+    fn could_not_run(command_id: &str, cmdline: &str, cwd: &str, error: &str) -> Self {
+        GateCommandResult {
+            command_id: command_id.to_string(),
+            cmdline: cmdline.to_string(),
+            cwd: cwd.to_string(),
+            exit_code: None,
+            passed: false,
+            outcome: GateGrade::Indeterminate,
+            output_tail: error.to_string(),
+            timeout: None,
+            duration_ms: 0,
         }
     }
 }
 
-/// The structured verdict of a whole `gate_check` (M6): `passed` (every command green) plus the
-/// per-command detail. Serialized onto the blackboard ([`LAST_GATE_RESULT_KEY`]) and attached to the
-/// gate-red refusal, so a RED gate explains itself instead of being an opaque exit code.
+/// The structured verdict of a whole `gate_check` (M6): `passed` (every command green), the
+/// TRI-VALUED `outcome`, plus the per-command detail. Serialized onto the blackboard
+/// ([`LAST_GATE_RESULT_KEY`]) and attached to the gate-red refusal, so a RED gate explains itself
+/// instead of being an opaque exit code.
 #[derive(Debug, Clone, serde::Serialize)]
 struct GateOutcome {
     passed: bool,
+    /// The gate's grade, folded from its commands: INDETERMINATE as soon as one command produced no
+    /// verdict, else FAILED as soon as one exited non-zero, else PASSED. The indeterminate wins
+    /// because it is the absence of an answer, and an absent answer cannot be outvoted by the
+    /// commands that did answer.
+    outcome: GateGrade,
     commands: Vec<GateCommandResult>,
+}
+
+// ============================================================================
+// The evidence PORT — every gate attempt, on its way to the durable journal
+// ============================================================================
+
+/// ONE gate attempt, as the tick that ran it saw it — the payload of the evidence PORT.
+///
+/// A "port" and not just a function call: the tick's job is to grade and enforce, and it must not
+/// also decide what a record of the attempt is worth keeping. Everything an auditor was told to
+/// check — WHICH check (node + slot), WHAT was asked of it (`expect`), WHAT it did (`grade`),
+/// whether that ANSWERED (`satisfied`), and the identity of the control itself (each command's
+/// resolved cmdline, its cwd, its exit status, how long it took and a bounded extract of its
+/// output) — travels here, once, from the one place that holds all of it.
+///
+/// The identity fields are not decoration. The auditor's `bug` discipline tells them to confront the
+/// red attempt and the green one on SAME SLOT, SAME RESOLVED COMMANDS, SAME CWD — "a red obtained on
+/// one check and a green obtained on another demonstrate nothing together". That comparison is only
+/// possible if each attempt carries those three, resolved, as they were at the moment it ran.
+pub(crate) struct GateAttempt<'a> {
+    /// The run the attempt belongs to — and, through it, the Spec and the workspace.
+    pub run: &'a db::WorkflowRun,
+    /// The `gate_check` node. Two gates of one flow are two nodes, and this is what keeps their
+    /// attempts apart.
+    pub node_id: &'a str,
+    /// The command SLOT the node declared, when it declared one (`None` = it names its own ids).
+    pub slot: Option<&'a str>,
+    /// The expectation the attempt was graded against (the declared one, else `green`).
+    pub expect: GateExpectation,
+    /// Whether that expectation was DECLARED by the node or defaulted. Recorded because a graph that
+    /// declared nothing and one that declared `green` are graded identically but enforced
+    /// differently, and a journal that flattened the two would misdescribe why a run was refused.
+    pub declared: bool,
+    /// Whether the node is blocking — the difference between a refusal and an advisory reading.
+    pub blocking: bool,
+    /// What the check DID.
+    pub grade: GateGrade,
+    /// Whether that answered [`GateAttempt::expect`].
+    pub satisfied: bool,
+    /// The per-command detail, already BOUNDED by [`GATE_OUTPUT_TAIL_BYTES`] at capture time.
+    pub commands: &'a [GateCommandResult],
+}
+
+/// **THE PORT** every gate attempt is emitted through, on its way to the durable append-only
+/// journal — the one the auditor's `bug` discipline reads the red→green sequence out of.
+///
+/// Called from EVERY attempt site, including the ones that produced no verdict: a journal an
+/// auditor is told to treat as complete ("what you cannot see recorded, treat as absent") must not
+/// be able to omit the attempts that failed to run, or the absence of a record would read as the
+/// absence of an attempt.
+///
+/// It NEVER fails the tick. A gate whose verdict is sound must not be turned into a refusal because
+/// the audit trail could not be written — the enforcement is the tick's promise, the journal is the
+/// record of it, and losing the second must not corrupt the first.
+fn record_gate_attempt(db: &Db, attempt: &GateAttempt<'_>) {
+    // The DECIDING command is the LAST one: `run_gate_bounded` stops at the first command that does
+    // not pass, so the tail of the list is the one that produced the gate's grade. Its exit status is
+    // the attempt's; the identity fields join EVERY command, because "the same check" means the whole
+    // list and not just the one that happened to speak.
+    let deciding = attempt.commands.last();
+    let join = |f: fn(&GateCommandResult) -> &str| -> String {
+        attempt
+            .commands
+            .iter()
+            .map(f)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let output = attempt
+        .commands
+        .iter()
+        .map(|c| c.output_tail.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The SAME bounding + sanitisation policy on both surfaces — the flat excerpt and the
+    // per-command detail — because a policy applied to one of two copies of the same bytes is not a
+    // policy ([`db::gate_evidence_excerpt`]).
+    let commands_json = Value::Array(
+        attempt
+            .commands
+            .iter()
+            .map(|c| {
+                json!({
+                    "command_id": c.command_id,
+                    "cmdline": c.cmdline,
+                    "cwd": c.cwd,
+                    "exit_code": c.exit_code,
+                    "outcome": c.outcome.as_str(),
+                    "duration_ms": c.duration_ms,
+                    "timeout": c.timeout,
+                    "output_excerpt": db::gate_evidence_excerpt(&c.output_tail),
+                })
+            })
+            .collect(),
+    )
+    .to_string();
+    let row = db::NewGateAttempt {
+        run_id: attempt.run.id.clone(),
+        spec_id: attempt.run.spec_id.clone(),
+        node_id: attempt.node_id.to_string(),
+        slot: attempt.slot.map(str::to_string),
+        expect: attempt.expect.as_str().to_string(),
+        declared: attempt.declared,
+        blocking: attempt.blocking,
+        outcome: attempt.grade.as_str().to_string(),
+        satisfied: attempt.satisfied,
+        command_line: join(|c| c.cmdline.as_str()),
+        cwd: join(|c| c.cwd.as_str()),
+        exit_code: deciding.and_then(|c| c.exit_code),
+        duration_ms: attempt
+            .commands
+            .iter()
+            .map(|c| i64::try_from(c.duration_ms).unwrap_or(i64::MAX))
+            .sum(),
+        output_excerpt: db::gate_evidence_excerpt(&output),
+        commands_json,
+        created_at: 0,
+    };
+    // A journal write that fails must not fail the tick — the enforcement already happened and is
+    // the promise; losing the record of it must not corrupt it. It is not swallowed in silence
+    // either: the run's own `run.tick` row still describes the stop, and the missing attempt is
+    // exactly what the auditor's "treat what you cannot see recorded as absent" is written for.
+    let _ = db.with_conn(|c| db::append_gate_attempt(c, row));
 }
 
 /// The marker recorded when a gate blows its GLOBAL [`GATE_TOTAL_TIMEOUT`] budget (all commands
@@ -3787,12 +4280,25 @@ fn gate_total_budget_marker() -> String {
     )
 }
 
-/// Tag a gate's [`GateOutcome`] with the `node_id` it describes and serialize it to the JSON stored
-/// on the blackboard / attached to the refusal, so a reader can tell WHICH gate it belongs to.
-fn gate_result_json(node_id: &str, gate: GateOutcome) -> Value {
+/// Tag a gate's [`GateOutcome`] with the `node_id` it describes, the EXPECTATION it was graded
+/// against and whether it answered it, then serialize it to the JSON stored on the blackboard /
+/// attached to the refusal — so a reader can tell WHICH gate it belongs to and WHAT was asked of it.
+///
+/// `expect` + `satisfied` ride HERE rather than only in the two board booleans because the surfaced
+/// object is what the UI's run card and the refusal payload read, and "the command exited 1" is not
+/// a finding on its own: on a reproduction gate it is the awaited proof, on a build gate it is the
+/// failure. The object has to say which.
+fn gate_result_json(
+    node_id: &str,
+    expect: GateExpectation,
+    satisfied: bool,
+    gate: GateOutcome,
+) -> Value {
     let mut value = serde_json::to_value(gate).unwrap_or(Value::Null);
     if let Some(obj) = value.as_object_mut() {
         obj.insert("node_id".to_string(), Value::from(node_id));
+        obj.insert("expect".to_string(), Value::from(expect.as_str()));
+        obj.insert("satisfied".to_string(), Value::from(satisfied));
     }
     value
 }
@@ -3853,8 +4359,62 @@ impl GateTail {
 /// tree-kill), so a gate command needing a version-manager-provided tool must declare what it needs
 /// in its persisted env, use absolute tool paths, or wrap itself in a script that sources the
 /// environment.
-fn run_gate(db: &Db, command_ids: &[String]) -> Result<GateOutcome, RpcError> {
+fn run_gate(db: &Db, command_ids: &[String]) -> Result<GateOutcome, GateRunError> {
     run_gate_bounded(db, command_ids, GATE_TOTAL_TIMEOUT)
+}
+
+/// A gate that could not be RESOLVED — the one failure [`run_gate_bounded`] cannot grade, carrying
+/// everything the journal needs to describe it honestly.
+///
+/// A bare [`RpcError`] could not: it says WHAT went wrong and nothing about WHERE. A gate arms a
+/// LIST of commands and the runner walks it in order, so the failure can land on the third one after
+/// the first two have already run over the PTY. Recorded from the bare error, the attempt named
+/// `command_ids.first()` — the wrong command, with an empty cmdline and an empty cwd — and dropped
+/// the results of the commands that did run. Those three fields are the identity of the control the
+/// auditor's discipline tells them to confront between a red and a green ([`GateAttempt`]), so an
+/// attempt that misattributes them is not a smaller record, it is a false one.
+#[derive(Debug)]
+struct GateRunError {
+    /// The command instance id whose resolution failed — the one the journal must name.
+    failing_id: String,
+    /// The commands that ALREADY RAN, in order, with their real cmdline, cwd, exit code and output.
+    done: Vec<GateCommandResult>,
+    /// The refusal itself, as the caller propagates it.
+    error: RpcError,
+}
+
+/// The refusal a BLOCKING gate earns when one of its commands could not be LAUNCHED at all — a
+/// binary that is not there, a run directory that vanished, an exhausted PTY. `None` for every other
+/// shape of "not green", including a TIMEOUT: a check that ran and did not finish is a different
+/// fact with a different route out, and the M5 anchor already reports it in its own words.
+///
+/// A spawn failure is told apart from a timeout by the two fields [`GateCommandResult::could_not_run`]
+/// sets and [`GateCommandResult::budget_exceeded`] does not: `indeterminate` with NO timeout marker.
+fn gate_spawn_failure(gate: &GateOutcome) -> Option<RpcError> {
+    let failed = gate
+        .commands
+        .iter()
+        .find(|c| c.outcome == GateGrade::Indeterminate && c.timeout.is_none())?;
+    Some(
+        RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "a blocking gate_check could NOT BE RUN — nyx never obtained a verdict from it, so \
+                 nothing was checked and nyx_next refuses to advance past it. This is not a failing \
+                 check and not a red: `{cmdline}` (cwd `{cwd}`) could not be launched — {why}. Fix \
+                 what stops the command from starting; re-running it changes nothing",
+                cmdline = failed.cmdline,
+                cwd = failed.cwd,
+                why = failed.output_tail.trim(),
+            ),
+        )
+        .with_data(json!({
+            "reason": "gate_could_not_run",
+            "command_id": failed.command_id,
+            "cmdline": failed.cmdline,
+            "cwd": failed.cwd,
+        })),
+    )
 }
 
 /// [`run_gate`] with an INJECTABLE global budget so the total-timeout path is testable without
@@ -3866,41 +4426,78 @@ fn run_gate_bounded(
     db: &Db,
     command_ids: &[String],
     total_budget: Duration,
-) -> Result<GateOutcome, RpcError> {
+) -> Result<GateOutcome, GateRunError> {
     let gate_deadline = Instant::now() + total_budget;
     let mut commands = Vec::new();
-    let mut passed = true;
     for command_id in command_ids {
-        let (cmdline, cwd, env) = crate::command::resolve_command_and_cwd(db, command_id)
-            .map_err(|e| RpcError::new(RpcCode::InvalidId, format!("gate command: {e}")))?;
+        // A RESOLUTION FAILURE NAMES **THIS** COMMAND and hands back what already ran — see
+        // [`GateRunError`]. The loop holds the id; the error is where it used to be lost.
+        let resolved = crate::command::resolve_command_and_cwd(db, command_id).map_err(|e| {
+            GateRunError {
+                failing_id: command_id.clone(),
+                done: std::mem::take(&mut commands),
+                error: RpcError::new(RpcCode::InvalidId, format!("gate command: {e}")),
+            }
+        });
+        let (cmdline, cwd, env) = resolved?;
         let global_left = gate_deadline.saturating_duration_since(Instant::now());
         if global_left.is_zero() {
-            // The global budget is spent before this command could even start — RED, no output.
+            // The global budget is spent before this command could even start — nothing was judged.
             commands.push(GateCommandResult::budget_exceeded(
                 command_id,
                 &cmdline,
                 &cwd,
                 String::new(),
+                0,
             ));
-            passed = false;
             break;
         }
         // Bound EACH command by the smaller of its own cap and the remaining GLOBAL budget.
         let budget = global_left.min(GATE_TIMEOUT);
-        let mut result = run_one_gate(command_id, &cmdline, &cwd, &env, budget)?;
+        let mut result = run_one_gate(command_id, &cmdline, &cwd, &env, budget);
         let cmd_passed = result.passed;
         // A timeout the GLOBAL budget bound (not the command's own 600s) is the total-budget breach —
         // relabel it so the operator sees WHICH limit tripped, keeping the partial output captured.
         if result.timeout.is_some() && global_left <= GATE_TIMEOUT {
-            result = GateCommandResult::budget_exceeded(command_id, &cmdline, &cwd, result.output_tail);
+            result = GateCommandResult::budget_exceeded(
+                command_id,
+                &cmdline,
+                &cwd,
+                result.output_tail,
+                result.duration_ms,
+            );
         }
         commands.push(result);
         if !cmd_passed {
-            passed = false;
             break;
         }
     }
-    Ok(GateOutcome { passed, commands })
+    Ok(GateOutcome {
+        passed: commands.iter().all(|c| c.passed),
+        outcome: fold_gate_grade(&commands),
+        commands,
+    })
+}
+
+/// The gate's grade from its commands' — INDETERMINATE as soon as one produced no verdict, else
+/// FAILED as soon as one exited non-zero, else PASSED (an empty gate is vacuously passed, which is
+/// the vacuous-green rule the blocking case is refused before ever reaching).
+///
+/// The precedence is not arbitrary. [`run_gate_bounded`] stops at the FIRST non-passing command, so
+/// at most one command is ever non-passing — but the fold is written for the general shape anyway,
+/// and in it an ABSENT answer must dominate: a gate whose second command timed out has not been
+/// verified, whatever its first command said.
+fn fold_gate_grade(commands: &[GateCommandResult]) -> GateGrade {
+    if commands
+        .iter()
+        .any(|c| c.outcome == GateGrade::Indeterminate)
+    {
+        GateGrade::Indeterminate
+    } else if commands.iter().any(|c| c.outcome == GateGrade::Failed) {
+        GateGrade::Failed
+    } else {
+        GateGrade::Passed
+    }
 }
 
 /// Spawn ONE managed command over a PTY, CAPTURE a bounded tail of its output (M6), and return its
@@ -3911,14 +4508,21 @@ fn run_gate_bounded(
 /// `env` is the command's PERSISTED environment (N31), merged onto nyx's inherited one — the same
 /// base every other spawn path applies. Its VALUES are secrets: they reach `cmd.env` and nothing
 /// else (the captured output tail is the COMMAND's, not the environment's).
+/// A SPAWN that fails is NOT an error out of this function any more: it is an attempt graded
+/// INDETERMINATE ([`GateCommandResult::could_not_run`]). "The binary is not there" and "the tests
+/// failed" are opposite facts, and the second one is the only one that may ever answer a
+/// reproduction's `expect: red` — so the failure to launch has to be a graded, recorded attempt
+/// rather than a bare `Err` the grading never sees. The tick still parks the run on such a gate
+/// (nothing satisfies an indeterminate), so the ENFORCEMENT is unchanged.
 fn run_one_gate(
     command_id: &str,
     cmdline: &str,
     cwd: &str,
     env: &[(String, String)],
     budget: Duration,
-) -> Result<GateCommandResult, RpcError> {
-    let (mut pty, rx) = crate::command::CommandPty::spawn(
+) -> GateCommandResult {
+    let started = Instant::now();
+    let spawned = crate::command::CommandPty::spawn(
         cmdline,
         PtySize {
             rows: 24,
@@ -3928,8 +4532,18 @@ fn run_one_gate(
         },
         Some(cwd),
         env,
-    )
-    .map_err(|e| RpcError::new(RpcCode::Internal, format!("gate spawn failed: {e}")))?;
+    );
+    let (mut pty, rx) = match spawned {
+        Ok(pair) => pair,
+        Err(e) => {
+            return GateCommandResult::could_not_run(
+                command_id,
+                cmdline,
+                cwd,
+                &format!("gate spawn failed: {e}"),
+            )
+        }
+    };
     // Drain output onto the bounded tail so the reader thread runs to EOF (the channel is unbounded —
     // no backpressure — so we must keep receiving; the TAIL, not the whole stream, is what we retain).
     let mut tail = GateTail::new(GATE_OUTPUT_TAIL_BYTES);
@@ -3949,29 +4563,45 @@ fn run_one_gate(
     let output_tail = tail.into_string();
     if timed_out {
         // Dropping `pty` on return kills the process tree.
-        return Ok(GateCommandResult {
+        return GateCommandResult {
             command_id: command_id.to_string(),
             cmdline: cmdline.to_string(),
             cwd: cwd.to_string(),
             exit_code: None,
             passed: false,
+            outcome: GateGrade::Indeterminate,
             output_tail,
             timeout: Some(format!(
                 "gate command exceeded its {}s time limit",
                 budget.as_secs()
             )),
-        });
+            duration_ms: elapsed_ms(started),
+        };
     }
     let exit_code = pty.wait();
-    Ok(GateCommandResult {
+    GateCommandResult {
         command_id: command_id.to_string(),
         cmdline: cmdline.to_string(),
         cwd: cwd.to_string(),
         exit_code,
         passed: exit_code == Some(0),
+        // An exit code nyx could not READ is not a non-zero exit: the process is gone and its status
+        // with it, so nothing was judged.
+        outcome: match exit_code {
+            Some(0) => GateGrade::Passed,
+            Some(_) => GateGrade::Failed,
+            None => GateGrade::Indeterminate,
+        },
         output_tail,
         timeout: None,
-    })
+        duration_ms: elapsed_ms(started),
+    }
+}
+
+/// Milliseconds since `started`, saturated into a `u64` (a duration that overflows one is a clock
+/// anomaly, not a measurement — record the ceiling rather than panic inside a gate).
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// An ENTRY transition — the graph's opening move (`start`, ready→in_progress), whose consent came
@@ -4020,6 +4650,64 @@ pub(crate) fn board_value_is_affirmative(v: Option<&Value>) -> bool {
         ),
         _ => false,
     }
+}
+
+/// What the board holds under a `set_category` node's key, read as a LABEL — the three states the
+/// effect arm branches on, and they are three and not two on purpose.
+enum BoardLabel {
+    /// The key is not on the board at all: nothing was ever written there. Nothing to classify
+    /// WITH, and nothing went wrong — the node is a no-op and the walk continues (the long-standing
+    /// arbitrage, kept: a graph may name a key a branch above it did not take).
+    Absent,
+    /// The key EXISTS and holds something that is not a label: `null` (a judge that answered
+    /// nothing — what a resume without `last_result` leaves), a number, a bool, an object, an array,
+    /// or a string that is blank once trimmed. A value was written and it says nothing. Carries the
+    /// value as the refusal names it, so the message can quote what was found.
+    Unusable(String),
+    /// A real label — a non-empty, trimmed string.
+    Label(String),
+}
+
+/// Read a `set_category` node's board key as a [`BoardLabel`].
+///
+/// THE RAW VALUE, NEVER THE INTERPOLATED STRING. `{{key}}` interpolation flattens every JSON value
+/// to its `to_string()`, so `Value::Null` arrives as the four letters `null` — a perfectly ordinary
+/// category NAME, which `crate::category::resolve_or_create` would happily mint. Distinguishing "no
+/// answer" from "the answer is the word null" is only possible before that flattening.
+fn board_category_label(value: Option<&Value>) -> BoardLabel {
+    match value {
+        None => BoardLabel::Absent,
+        Some(Value::String(s)) if !s.trim().is_empty() => BoardLabel::Label(s.trim().to_string()),
+        Some(Value::Null) => BoardLabel::Unusable("null".to_string()),
+        Some(Value::String(_)) => BoardLabel::Unusable("an empty string".to_string()),
+        Some(other) => BoardLabel::Unusable(format!("`{other}`")),
+    }
+}
+
+/// The refusal a `set_category` node earns when its key holds something that is not a label — a
+/// `null`, a number, an object, a blank string. NAMES THE KEY, because the fix is to write that key
+/// (re-answer the judge, re-run the query) and a message that only said "invalid category" would
+/// send a reader looking at the vocabulary instead of at the board.
+///
+/// It is an `invalid_state` and it PARKS the run (the caller hands it to
+/// [`block_on_effect_error`]), for the same reason the service's own refusals do: the discipline
+/// downstream of this node is authored on the classification HAVING LANDED. Walking past it would
+/// run a `bug` flow over a Spec nyx never classified — and minting a category out of the rendered
+/// value would be worse still, since a truthy `spec_category` fact then exempts that Spec from the
+/// preflight forever.
+fn refuse_unusable_category(key: &str, seen: &str) -> RpcError {
+    RpcError::new(
+        RpcCode::InvalidState,
+        format!(
+            "the `set_category` node reads its label from the blackboard key '{key}', and that key \
+             holds {seen} — not a category label. nyx will NOT classify a Spec with it: a rendered \
+             `null` is a perfectly good category NAME and would be minted as one, which then makes \
+             the Spec look classified to every branch that reads it back. Write '{key}' (answer the \
+             judge that fills it, or re-run the query that does) and call nyx_next again — this \
+             node re-runs until it holds a real label"
+        ),
+    )
+    .with_data(json!({ "reason": "category_label_unusable", "key": key }))
 }
 
 /// Whether a selector branch's `eq` LITERAL is an approval the RUNTIME can actually match — the
@@ -4336,6 +5024,21 @@ fn resolve_workspace_target_free(
 /// The nyx fact a `query` node reads: the bound Spec's STATUS (`draft` / `in_review` / …). Extend
 /// this set as graphs need more verifiable state to branch on (v2.8 review B2).
 const QUERY_SPEC_STATUS: &str = "spec_status";
+/// The bound Spec's CATEGORY — its genre of work (PDR-0017), as the **SLUG** (`"bug"`,
+/// `"feature"`, a project's own), or `null`.
+///
+/// THE SLUG AND NEVER THE NAME. A category carries both, and only one of them is an identity: the
+/// name is a human label a curator may rewrite at will (`Bug` → `Défaut`), while the slug is minted
+/// once and immutable ([`crate::category`]). A graph branching on the name would silently leave the
+/// discipline the day somebody renamed the chip — which is exactly the failure this whole PRD exists
+/// to prevent, arriving through the back door.
+///
+/// `null` IS WRITTEN, NOT OMITTED, and for both of the ways there is no category: the Spec is
+/// UNCLASSIFIED, or the run carries NO SPEC at all. A selector must be able to TEST the key — an
+/// absent key and a key holding `null` read the same to a human and differently to a matcher, so the
+/// fact spells absence one way. A run with no Spec is a legitimate state (a `custom` run, a `/nspec`
+/// run before its Spec exists), so it answers `null` and keeps walking: never an error, never a park.
+const QUERY_SPEC_CATEGORY: &str = "spec_category";
 /// A PARAMETERIZED fact: whether the bound Spec CAN take the transition named by the node's `target`
 /// — the legality from the current status ([`db::SpecTransition::source_allowed`]) PLUS the quality
 /// gate (`ready` runs the pre-ready validations). Lets a graph CHECK before it proposes, routing away
@@ -4439,8 +5142,9 @@ fn spec_binding_is_settled_absent(run: &db::WorkflowRun) -> bool {
 
 /// Resolve a `query` node's fact NAME against real nyx state, returning the JSON value `drive` folds
 /// onto the blackboard. `spec_status` yields the bound Spec's status (or `null` when the run is not
-/// bound to a Spec — an unbound run has no status to read, not an error). An UNKNOWN fact name is a
-/// mis-authored node, refused so it surfaces rather than silently branching on `null` (B2).
+/// bound to a Spec — an unbound run has no status to read, not an error); `spec_category` its
+/// category SLUG, on the same terms. An UNKNOWN fact name is a mis-authored node, refused so it
+/// surfaces rather than silently branching on `null` (B2).
 fn resolve_query(db: &Db, run: &db::WorkflowRun, query: &str) -> Result<Value, RpcError> {
     match query {
         QUERY_SPEC_STATUS => {
@@ -4453,6 +5157,29 @@ fn resolve_query(db: &Db, run: &db::WorkflowRun, query: &str) -> Result<Value, R
                 .map(|s| Value::from(s.status))
                 .unwrap_or(Value::Null);
             Ok(status)
+        }
+        QUERY_SPEC_CATEGORY => {
+            // The bound Spec's category SLUG, or `null` — written either way (see the const's doc:
+            // a selector must be able to test the key, and the two ways to have no category are one
+            // spelling of absence). An unbound run answers `null` and the walk continues: a run with
+            // no Spec has no genre of work, which is a fact and not a failure.
+            let Some(spec_id) = run.spec_id.as_deref() else {
+                return Ok(Value::Null);
+            };
+            let slug = db
+                .with_conn(|c| -> Result<Option<String>, diesel::result::Error> {
+                    let Some(spec) = db::get_spec(c, spec_id)? else {
+                        return Ok(None);
+                    };
+                    let Some(category_id) = spec.category_id else {
+                        return Ok(None);
+                    };
+                    Ok(db::get_category(c, &category_id)?.map(|category| category.slug))
+                })
+                .map_err(|e| {
+                    RpcError::new(RpcCode::Internal, format!("query spec_category: {e}"))
+                })?;
+            Ok(slug.map(Value::from).unwrap_or(Value::Null))
         }
         QUERY_SPEC_OPEN_TASKS => {
             // COUNT the bound Spec's work that REOPENS THE BUILD ([`db::reopens_the_build`] — build
@@ -4883,6 +5610,7 @@ fn resolve_can_transition(
 /// `workspace_target_free` landed the day after and made the first one wrong).
 pub(crate) const QUERY_FACTS: &[&str] = &[
     QUERY_SPEC_STATUS,
+    QUERY_SPEC_CATEGORY,
     QUERY_SPEC_CAN_TRANSITION,
     QUERY_SPEC_OPEN_TASKS,
     QUERY_SPEC_OPEN_FINDINGS,
@@ -5166,6 +5894,9 @@ fn action_json(action: &Action, provider: &str) -> Value {
         // `create_workspace` is a nyx-own inline effect resolved in `drive` — it never reaches the
         // dispatcher; this arm only keeps the match total.
         Action::CreateWorkspace { .. } => json!({ "type": "create_workspace" }),
+        // `set_category` is a nyx-own inline effect resolved in `drive` — it never reaches the
+        // dispatcher; the arm exists so the match stays total.
+        Action::SetCategory { .. } => json!({ "type": "set_category" }),
         // `sub_workflow` builds its OWN dispatcher-facing action in `drive` ([`subworkflow_wait_json`],
         // which carries the child run_id + context); this arm only keeps the match total.
         Action::SubWorkflow { .. } => json!({ "type": "sub_workflow" }),
@@ -5347,15 +6078,16 @@ fn tick_trace<'a>(
 /// sorted for a deterministic board, so it rides `persist` across the dispatcher loop. An EMPTY set
 /// CLEARS the key entirely (no residue). Shared by the `gate_check` arm, the M5 re-eval, and the
 /// abandon note, so the board and the in-memory set never drift.
-fn mirror_blocking_gates(engine: &mut Engine, blocking: &HashSet<String>) {
+///
+/// The set is a [`BTreeSet`], so the array is written in the set's own order — the same order the
+/// block points pick the refusing gate in, and the same order the re-eval re-runs them in.
+fn mirror_blocking_gates(engine: &mut Engine, blocking: &BTreeSet<String>) {
     if blocking.is_empty() {
         engine.clear_board(BLOCKING_GATE_RED_KEY);
     } else {
-        let mut ids: Vec<&str> = blocking.iter().map(String::as_str).collect();
-        ids.sort_unstable();
         engine.set_board(
             BLOCKING_GATE_RED_KEY,
-            Value::Array(ids.into_iter().map(Value::from).collect()),
+            Value::Array(blocking.iter().map(|id| Value::from(id.as_str())).collect()),
         );
     }
 }
@@ -5382,8 +6114,9 @@ fn reeval_red_gates(
     db: &Db,
     run: &db::WorkflowRun,
     engine: &mut Engine,
-    blocking: &mut HashSet<String>,
+    blocking: &mut BTreeSet<String>,
     already_run: &HashSet<String>,
+    last_result: Option<&Value>,
 ) -> Result<(), RpcError> {
     if blocking.is_empty() || blocking.iter().all(|id| already_run.contains(id)) {
         return Ok(());
@@ -5393,7 +6126,9 @@ fn reeval_red_gates(
         .with_conn(|c| db::list_nodes(c, &run.workflow_id))
         .map_err(internal_db)?;
     let project_id = run_project_id(db, run)?;
-    // Snapshot the ids so the set can be mutated while iterating.
+    // Snapshot the ids so the set can be mutated while iterating. ORDERED, because `blocking` is a
+    // `BTreeSet`: the gate whose result lands last on [`LAST_GATE_RESULT_KEY`] is the same one from
+    // one tick to the next, and it is the same one the caller then names in its refusal.
     for node_id in blocking.iter().cloned().collect::<Vec<_>>() {
         if already_run.contains(&node_id) {
             continue;
@@ -5404,17 +6139,91 @@ fn reeval_red_gates(
             continue;
         };
         let command_ids = node_gate_commands(db, project_id.as_deref(), node)?;
-        let outcome = run_gate(db, &command_ids)?;
+        // A RESOLUTION FAILURE IS AN ATTEMPT HERE TOO. The tick's own gate arm records it as
+        // `indeterminate` and parks the run, with the reason "a silent hole in the journal is
+        // exactly what an auditor cannot detect" — and this path used to propagate the bare `Err`
+        // instead: no `gate_attempts` row, no `run.gate_attempt`, and no `persist` either, so the
+        // run's status and cursor stayed on the previous state while the verb failed. The auditor
+        // was then counting one attempt fewer than really happened, on a journal they are told to
+        // read as complete.
+        let outcome = match run_gate(db, &command_ids) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let mut commands = e.done;
+                commands.push(GateCommandResult::could_not_run(
+                    &e.failing_id,
+                    "",
+                    "",
+                    &e.error.message,
+                ));
+                record_gate_attempt(
+                    db,
+                    &GateAttempt {
+                        run,
+                        node_id: &node_id,
+                        slot: node_gate_slot(node).as_deref(),
+                        expect: node_gate_expect(node).unwrap_or(GateExpectation::Green),
+                        declared: node_gate_expect(node).is_some(),
+                        blocking: true,
+                        grade: GateGrade::Indeterminate,
+                        satisfied: false,
+                        commands: &commands,
+                    },
+                );
+                // The anchor is KEPT (the set is mirrored on the way out of the tick by the park
+                // itself), and the run is parked on the gate rather than erroring bare.
+                return Err(block_on_effect_error(
+                    db,
+                    run,
+                    engine,
+                    &node_id,
+                    last_result,
+                    e.error,
+                ));
+            }
+        };
         let green = outcome.passed;
-        // Keep M6's surfaced result fresh on every re-run (only a gate with REAL commands writes it).
+        // WHAT THIS GATE DECLARES, read off the node rather than assumed. The anchor is raised only
+        // by a gate that declared NOTHING — but it can be INHERITED by one that declares something
+        // now, because `node_update` may add an `expect` to a gate a previous tick already anchored,
+        // and this module's own expectation refusal names that edit as the route out.
+        let declared = node_gate_expect(node);
+        let expect = declared.unwrap_or(GateExpectation::Green);
+        let satisfied = expect.is_satisfied_by(outcome.outcome);
+        // A RE-RUN is an ATTEMPT, and it is journaled like any other: the M5 exit route works by
+        // running the check again, so a red that lifts on the third re-eval is a three-attempt
+        // sequence, and an auditor reading two of them would read a different story.
         if !outcome.commands.is_empty() {
+            record_gate_attempt(
+                db,
+                &GateAttempt {
+                    run,
+                    node_id: &node_id,
+                    slot: node_gate_slot(node).as_deref(),
+                    expect,
+                    declared: declared.is_some(),
+                    blocking: true,
+                    grade: outcome.outcome,
+                    satisfied,
+                    commands: &outcome.commands,
+                },
+            );
+            // Keep M6's surfaced result fresh on every re-run (only a gate with REAL commands
+            // writes it).
             engine.set_board_as(
                 &node_id,
                 LAST_GATE_RESULT_KEY,
-                gate_result_json(&node_id, outcome),
+                gate_result_json(&node_id, expect, satisfied, outcome),
             );
         }
-        if green {
+        // WHAT LIFTS THE ANCHOR is what the node ASKED FOR — `satisfied` when the gate declares an
+        // expectation, `green` when it declares none (and for an undeclared gate the two are the
+        // same thing, since the default expectation IS green). Reading `green` unconditionally is
+        // what wedged an inherited anchor on an `expect: red` gate: the reproduction went red, was
+        // satisfied, was journaled satisfied — and the anchor held anyway, because a reproduction
+        // does not pass. The run then refused its transition forever for a red the node had asked
+        // for. See the `Some(_)` arm of the gate leaf, which drops the same anchor on the way in.
+        if if declared.is_some() { satisfied } else { green } {
             blocking.remove(&node_id);
         }
     }
@@ -5472,6 +6281,15 @@ fn node_gate_slot(node: &db::Node) -> Option<String> {
     serde_json::from_str::<crate::engine::GateConfig>(&node.config)
         .ok()
         .and_then(|c| c.slot)
+}
+
+/// The expectation a `gate_check` node DECLARES, straight off the stored row — `None` when it
+/// declares none (or its config cannot be decoded, which declares nothing either way). The read the
+/// M5 re-eval and the `run_start` scan need, where the config was never decoded into an [`Action`].
+fn node_gate_expect(node: &db::Node) -> Option<GateExpectation> {
+    serde_json::from_str::<crate::engine::GateConfig>(&node.config)
+        .ok()
+        .and_then(|c| c.expect)
 }
 
 /// Whether a gate's structured result says it was CUT SHORT rather than FAILED: its failing command
@@ -5539,6 +6357,89 @@ fn refuse_gate(
          gives it"
     } else {
         "a blocking gate_check is RED — nyx_next refuses to advance past it"
+    };
+    RpcError::new(RpcCode::InvalidState, message).with_data(data)
+}
+
+/// The machine code of an EXPECTATION MISMATCH — a `gate_check` that DECLARED what its check must do
+/// and got something else. Distinct from [`refuse_gate`]'s `gate_red`, and it has to be: `gate_red`
+/// means "the check did not pass", which on a reproduction gate is the AWAITED result. A reader
+/// keying on the reason must not have to guess which of the two it is looking at.
+pub(crate) const GATE_EXPECTATION_MISMATCH_REASON: &str = "gate_expectation_mismatch";
+
+/// Build the "this gate did not do what it declared it would" refusal: park the run `blocked` on the
+/// gate node and return the [`RpcCode::InvalidState`] error that REFUSES the tick.
+///
+/// IMMEDIATE, not deferred to a block point. The M5 anchor refuses at the next `transition`/`done`,
+/// which presumes one exists downstream and presumes it is reached; a mismatch is refused where it
+/// happens, so a gate at the end of a `sequence`, inside a `loop` body, or in a graph with no
+/// transition at all is guarded identically.
+///
+/// STICKY by [`Engine::replay_current`], the same mechanism every other gate refusal uses: the leaf
+/// stays the run's cursor, so the next `nyx_next` RE-RUNS this gate rather than walking past it. The
+/// block lifts when — and only when — an attempt satisfies the declared expectation. Nothing else
+/// clears it: there is no anchor to clear, no note that lifts it, no other gate whose green could be
+/// mistaken for this one's.
+///
+/// THE ROUTE OUT IS THE CHECK ITSELF, and there is no second one by design — a declared expectation
+/// that a `note` could wave away would declare nothing. What a HUMAN can still do, because a tick
+/// re-reads the graph before it walks ([`adopt_current_tree`]), is `node_update` the gate: changing
+/// its `expect`, its `slot` or its `command_ids` reaches the VERY NEXT tick of this run. That is a
+/// deliberate, recorded authoring gesture on the graph — not a runtime escape hatch — and it leaves
+/// the journal saying exactly what was attempted before it. Dropping the run (`run_delete`) remains
+/// the other honest end.
+///
+/// The message names both halves (what was declared, what happened) because the two mismatches read
+/// nothing alike: a `expect: red` gate that PASSED means the defect did not reproduce, while any
+/// `indeterminate` means nothing ran and the fix is to the harness, not to the code.
+fn refuse_gate_expectation(
+    db: &Db,
+    run: &db::WorkflowRun,
+    engine: &mut Engine,
+    gate_node: &str,
+    expect: GateExpectation,
+    grade: GateGrade,
+    last_result: Option<&Value>,
+) -> RpcError {
+    engine.replay_current();
+    let gate_result = engine
+        .blackboard()
+        .get(LAST_GATE_RESULT_KEY)
+        .filter(|v| v.get("node_id").and_then(Value::as_str) == Some(gate_node))
+        .cloned();
+    let trace = tick_trace(None, last_result);
+    let _ = persist(db, run, engine, Some(gate_node), db::RUN_STATUS_BLOCKED, &trace);
+    let mut data = json!({
+        "reason": GATE_EXPECTATION_MISMATCH_REASON,
+        "node_id": gate_node,
+        "expect": expect.as_str(),
+        "outcome": grade.as_str(),
+        "satisfied": false,
+    });
+    if let Some(gate_result) = gate_result {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("gate_result".to_string(), gate_result);
+        }
+    }
+    let message = match grade {
+        GateGrade::Indeterminate => format!(
+            "a blocking gate_check declaring 'expect: {}' produced NO verdict — it was cut short, \
+             could not be spawned, or never terminated, so nothing was checked. An indeterminate \
+             attempt satisfies NEITHER a red nor a green expectation, and nyx_next refuses to \
+             advance past it. Fix what stopped the check from running; do not re-run it hoping it \
+             turns",
+            expect.as_str()
+        ),
+        _ => format!(
+            "a blocking gate_check declared 'expect: {}' and the check {} — the declared \
+             expectation is NOT satisfied and nyx_next refuses to advance past it. This gate re-runs \
+             on the next call and keeps refusing until it does what it declared",
+            expect.as_str(),
+            match grade {
+                GateGrade::Passed => "PASSED (exit 0)",
+                _ => "FAILED (non-zero exit)",
+            }
+        ),
     };
     RpcError::new(RpcCode::InvalidState, message).with_data(data)
 }

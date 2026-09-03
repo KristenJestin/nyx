@@ -17,12 +17,13 @@ import {
   SearchIcon,
   SplitIcon,
   StickyNoteIcon,
+  TagIcon,
   type LucideIcon,
 } from "lucide-react";
 
 /**
  * The behavior-tree node vocabulary the engine graph paints (v2.8 Phase 6). It mirrors the nyx-core
- * `db::NODE_TYPES` CHECK — the 3 COMPOSITES + the 13 LEAVES — PLUS the two SYNTHETIC pills the graph
+ * `db::NODE_TYPES` CHECK — the 3 COMPOSITES + the 14 LEAVES — PLUS the two SYNTHETIC pills the graph
  * adds for readability (`start` = the workflow entry, `terminal` = its end). The renderer maps each
  * to an icon + a semantic TONE (a design-system token, never a raw colour) and a rendering CATEGORY:
  *   - `flow`  — a custom leaf-style node (spawn / gate / judge / selector / transition / … ).
@@ -45,6 +46,7 @@ export type EngineNodeType =
   | "sub_workflow"
   | "transition_task"
   | "create_workspace"
+  | "set_category"
   | "wait"
   | "note"
   | "ask_human"
@@ -167,6 +169,15 @@ export const NODE_META: Record<EngineNodeType, NodeMeta> = {
     icon: FolderPlusIcon,
     tone: "warning",
     kindLabel: "create_workspace",
+    category: "flow",
+  },
+  // CLASSIFIES the run's Spec — the genre of work the `bug` discipline is read off (PDR-0017). A real
+  // Spec mutation, so it carries the same `destructive` tone as its two siblings that move Spec/task
+  // state, and never the muted `note` default: a node the engine IMPOSES must not read as inert.
+  set_category: {
+    icon: TagIcon,
+    tone: "destructive",
+    kindLabel: "set_category",
     category: "flow",
   },
   wait: { icon: ClockIcon, tone: "muted", kindLabel: "wait", category: "flow" },

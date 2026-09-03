@@ -54,6 +54,7 @@ function detailFixture(specId: string, projectId: string, projectName: string): 
       status: "in_progress",
       mode: "stepped",
       phases: "[]",
+      category_id: null,
       current_revision_number: 1,
       position: 0,
       created_at: 0,
@@ -84,6 +85,7 @@ function detailFixture(specId: string, projectId: string, projectName: string): 
       project: { id: projectId, name: projectName, key: projectName.slice(0, 3).toUpperCase() },
       repos: [],
     },
+    category: null,
   } as unknown as SpecDetail;
 }
 

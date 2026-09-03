@@ -171,7 +171,7 @@ export function TerminalManager() {
     settingsDialogRef.current?.reload();
   }, []);
 
-  // The project-settings modal (Global / Commands): which project is targeted and
+  // The project-settings modal (Global / Categories / Commands): which project is targeted and
   // which section it opens on. `null` = closed. The kebab "Project settings" opens
   // on Global; "Manage commands" opens on Commands — both drive the SAME modal.
   const [projectSettings, setProjectSettings] = useState<{
@@ -689,7 +689,7 @@ export function TerminalManager() {
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
       />
-      {/* Project-settings modal (Global / Commands). Opened from the project kebab —
+      {/* Project-settings modal (Global / Categories / Commands). Opened from the project kebab —
           "Project settings" (Global) or "Manage commands" (Commands). The Commands
           pane scans the project's ROOT workspace for package.json imports (and uses
           its path to relativize the subfolder picker). On close, re-list the

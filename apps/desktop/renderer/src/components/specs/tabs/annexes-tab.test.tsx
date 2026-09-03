@@ -20,6 +20,7 @@ function detailFixture(): SpecDetail {
       status: "in_progress",
       mode: "stepped",
       phases: "[]",
+      category_id: null,
       current_revision_number: 1,
       position: 0,
       created_at: 0,
@@ -45,6 +46,7 @@ function detailFixture(): SpecDetail {
     tasks: [],
     dependencies: [],
     workspace_context: null,
+    category: null,
   };
 }
 

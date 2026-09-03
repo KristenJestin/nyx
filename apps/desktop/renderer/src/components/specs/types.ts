@@ -48,6 +48,12 @@ export interface Spec {
   readonly mode: string;
   /** Ordered phase plan, a JSON string `[{number,name}]` (PDR-0022); `"[]"` = flat. */
   readonly phases: string;
+  /**
+   * The Spec's ONE genre-of-work category (PDR-0017), or `null` when it carries none — a
+   * legitimate state, not an error. This is the raw FK; the detail read model resolves it into
+   * {@link SpecCategory} so a chip can be drawn without a second round-trip.
+   */
+  readonly category_id: string | null;
   readonly current_revision_number: number;
   readonly position: number;
   readonly created_at: number;
@@ -192,6 +198,48 @@ export interface SpecWorkspaceContext {
   readonly repos: readonly RepositoryRef[];
 }
 
+/**
+ * One category of a project's "genre of work" vocabulary (the wire shape of
+ * `nyx_core::mcp_tools_spec::category_payload`, v2.9 / PDR-0017) — served by the `category_list`,
+ * `category_create`, `spec_category_assign`, `category_rename` and `category_delete` db-commands,
+ * and embedded RESOLVED in {@link SpecDetail}.
+ *
+ * `slug` is the STABLE IDENTITY: minted once, never rewritten, and the only thing the agent harness
+ * reads (`bug` is what puts a Spec under the red-before-green discipline). It is PRESENTED by the
+ * app and editable by nobody. `name` is the human label — free to change, and free to become a
+ * homonym of another category's name, which is why the two are separate fields and not one.
+ *
+ * **NO CURATION STATE.** PDR-0017 as amended on 2026-09-02 retired the proposed/confirmed axis: the
+ * agent has full rights over the classification, so a category it mints is valid as it stands and
+ * there is nothing for this type to branch on. `created_by_type` remains — the provenance is a
+ * fact — and it is what the settings' Categories section reads to know which rows are the four
+ * undeletable system ones.
+ */
+export interface SpecCategory {
+  readonly id: string;
+  /** The immutable machine identity. Displayed, never edited. */
+  readonly slug: string;
+  /** The editable human label. */
+  readonly name: string;
+  /** A `--group-N` design token WITHOUT its `--` prefix, or `null`. Never a literal colour. */
+  readonly color_token: string | null;
+  /** `system` | `agent` | `human` — who minted the ROW (not who took the decision). */
+  readonly created_by_type: string;
+  /**
+   * Epoch ms the row was minted, VESTIGIAL since the 2026-09-02 amendment: always set, read by
+   * nobody. Kept because the backend still carries the raw column (see
+   * `nyx_core::db::Category::confirmed_at`, which names the future cleanup).
+   */
+  readonly confirmed_at: number | null;
+  /**
+   * Whether the slug is one of nyx's four (`feature` / `bug` / `refactor` / `chore`) — the
+   * BACKEND'S verdict (`db::SYSTEM_CATEGORY_SLUGS`, the same list `category::delete` refuses on),
+   * not a list of literals repeated here. The settings' Categories section reads it to omit the
+   * Delete control on exactly those rows; the refusal itself stays the service's.
+   */
+  readonly system: boolean;
+}
+
 /** The `spec_detail` read model (the `spec_detail` db-command). */
 export interface SpecDetail {
   readonly spec: Spec;
@@ -211,6 +259,11 @@ export interface SpecDetail {
    */
   readonly project?: SpecProject | null;
   readonly workspace_context: SpecWorkspaceContext | null;
+  /**
+   * The Spec's category, RESOLVED (id + slug + name + colour token + provenance — and no curation
+   * state, see {@link SpecCategory}); `null` when it has none.
+   */
+  readonly category: SpecCategory | null;
 }
 
 /**

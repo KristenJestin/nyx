@@ -20,6 +20,7 @@ function detailFixture(): SpecDetail {
       status: "in_progress",
       mode: "stepped",
       phases: "[]",
+      category_id: null,
       current_revision_number: 1,
       position: 0,
       created_at: 0,
@@ -45,6 +46,7 @@ function detailFixture(): SpecDetail {
     tasks: [],
     dependencies: [],
     workspace_context: null,
+    category: null,
   };
 }
 
@@ -256,6 +258,40 @@ describe("ActivityTab", () => {
     expect(screen.getByText("Task blocked: waiting on API")).toBeTruthy();
     expect(screen.getByText("Task skipped: obsolete")).toBeTruthy();
     expect(screen.getByText("Task verified")).toBeTruthy();
+  });
+
+  it("names the CATEGORY an assignment set, and says REMOVED when it was cleared", async () => {
+    mockIPC((cmd) => {
+      if (cmd === "spec_activity") {
+        return {
+          spec_id: "s1",
+          entries: [
+            entry(1, "spec.category_set", "spec", {
+              spec_id: "s1",
+              category_id: "c1",
+              slug: "bug",
+            }),
+            // The REMOVAL — `category_id: null` is how the writer spells it. The generic fallback
+            // used to render this as "Spec category set", i.e. the opposite of what happened.
+            entry(2, "spec.category_set", "spec", {
+              spec_id: "s1",
+              category_id: null,
+              slug: null,
+            }),
+          ],
+        };
+      }
+      return undefined;
+    });
+
+    const { container } = render(<ActivityTab detail={detailFixture()} />);
+
+    expect(await screen.findByText("Category removed")).toBeTruthy();
+    expect(screen.getByText("Category set to bug")).toBeTruthy();
+    expect(screen.queryByText("Spec category set")).toBeNull();
+    // …and the type has its own glyph rather than the generic activity one.
+    expect(container.querySelector(".lucide-tag")).toBeTruthy();
+    expect(container.querySelector(".lucide-activity")).toBeNull();
   });
 
   it("shows an empty state when the Spec has no activity yet", async () => {

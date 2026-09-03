@@ -1621,6 +1621,160 @@ fn every_fixed_engine_written_key_is_censused() {
     }
 }
 
+/// EXHAUSTIVE — A NODE TYPE THAT TAKES A CONFIG MUST SAY WHICH FIELDS IT TAKES.
+/// [`super::known_config_fields`] ends in a catch-all that MEANS "takes no config": a type that
+/// forgets its arm falls there, and every field an author writes on it is then refused as unknown —
+/// the node is authorable and inexecutable at once. It has happened twice already (`sub_workflow`,
+/// then `create_workspace`), each time discovered on a real fork of a seeded graph.
+///
+/// So the census is taken over [`db::NODE_TYPES`] and the CONFIGLESS set is spelled out: `sequence`
+/// composes its children and `wait` pauses, and neither reads a thing. An EIGHTEENTH type that lands
+/// without its arm fails HERE, on the type it forgot.
+#[test]
+fn every_node_type_that_takes_a_config_declares_its_fields() {
+    /// The only two node types whose behaviour reads NOTHING — the deliberate members of the
+    /// catch-all, named so the assertion below can tell a design from an omission.
+    const CONFIGLESS: [&str; 2] = [db::NODE_TYPE_SEQUENCE, db::NODE_TYPE_WAIT];
+    for node_type in db::NODE_TYPES {
+        let known = super::known_config_fields(node_type);
+        if CONFIGLESS.contains(&node_type) {
+            assert!(
+                known.is_empty(),
+                "'{node_type}' is declared CONFIGLESS here but now names fields ({known:?}) — move \
+                 it out of the list rather than leaving the two readings to disagree"
+            );
+            continue;
+        }
+        assert!(
+            !known.is_empty(),
+            "the node type '{node_type}' declares NO config field, so `known_config_fields` fell to \
+             its catch-all and every field an author writes on it is refused as unknown. Add its \
+             arm — exactly the fields its `crate::engine` config struct decodes"
+        );
+    }
+}
+
+/// The SEVENTEENTH node type is AUTHORABLE, and it is authorable on its own terms.
+///
+/// Three things at once, because each was a real trap for one of its predecessors: its fields are
+/// KNOWN (a `create_workspace` that fell to the catch-all was inexecutable), a config that names no
+/// `category_key` is REFUSED (the `create_workspace` `root_key` reading — the one thing this node
+/// does is say WHICH category, and saying it by omission says it to whatever a sibling last wrote),
+/// and it needs NO human gate: a classification is metadata, correctable at any Spec status, so it is
+/// deliberately NOT a member of [`crate::engine::SensitiveEffect`] and a graph may impose it without
+/// asking (ADR-0006 — "un nœud du graphe ne peut pas être ignoré").
+#[test]
+fn set_category_is_authorable_needs_its_key_and_needs_no_human_gate() {
+    let (db, project) = seeded();
+    let wf = make_workflow(&db, "cat", Some(&project));
+    let root = add_node(&db, &wf, "sequence", None, "root");
+
+    // (a) A config-less node is refused, and the refusal NAMES the field.
+    let err = node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "set_category", "parent_id": root, "order_index": 0,
+            "label": "classify", "config": {}
+        }),
+    )
+    .expect_err("a set_category with no category_key is refused");
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains("category_key"),
+        "the refusal must name the field, got: {}",
+        err.message
+    );
+
+    // (b) A typo'd field is refused too — the N10a "no unknown field" complement.
+    let err = node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "set_category", "parent_id": root, "order_index": 0,
+            "label": "classify", "config": { "category": "bug" }
+        }),
+    )
+    .expect_err("'category' is not 'category_key'");
+    assert!(
+        err.message.contains("unknown config field 'category'"),
+        "got: {}",
+        err.message
+    );
+
+    // (c) The real shape is accepted — with NO ask_human anywhere in this graph, which is the point:
+    //     the classification is imposed, not consented to.
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "set_category", "parent_id": root, "order_index": 0,
+            "label": "classify", "config": { "category_key": "category_choice" }
+        }),
+    )
+    .expect("a set_category naming its key is authorable, and needs no human gate");
+
+    // (d) …and the OPTIONAL gate is accepted as well, for a flow that does want a human's word.
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "set_category", "parent_id": root, "order_index": 1,
+            "label": "classify (gated)",
+            "config": { "category_key": "category_choice", "gate_on": "cat_ok" }
+        }),
+    )
+    .expect("the optional gate is accepted too");
+}
+
+/// COLLISIONS — `set_category` WRITES NOTHING, so it can never be the second writer rule (4)'s
+/// condition (iii) refuses.
+///
+/// Condition (iii) is what keeps a human's approval from being overwritten before the gate reads it:
+/// a sensitive node's `gate_on` key must be written by ONE node, the question. Every type that writes
+/// a board key is censused for it ([`super::node_written_board_keys`]), and a type censused as writing
+/// nothing must genuinely write nothing — otherwise the census certifies a graph the runtime can
+/// still have clobbered.
+///
+/// `set_category` READS its key and commits to the DOMAIN; it writes no board key at all, by design
+/// (a board copy of the classification would be a second truth — see the node's own doc). So this
+/// pins both halves: the census answers EMPTY for it, and a real graph where a `set_category` READS
+/// the very key an `ask_human` writes and a sensitive `transition` gates on stays AUTHORABLE. The day
+/// someone gives this node an `output_key`, that graph stops validating and this test says why.
+#[test]
+fn set_category_writes_no_board_key_and_so_collides_with_no_consent_gate() {
+    let (db, project) = seeded();
+    let wf = make_workflow(&db, "collision", Some(&project));
+    let root = gated_root(&db, &wf, "cat_ok");
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "set_category", "parent_id": root, "order_index": 1,
+            "label": "classify", "config": { "category_key": "cat_ok" }
+        }),
+    )
+    .expect("the classification reads the answer");
+    node_add(
+        &db,
+        &json!({
+            "workflow_id": wf, "type": "transition", "parent_id": root, "order_index": 2,
+            "label": "ready", "config": { "target_state": "ready", "gate_on": "cat_ok" }
+        }),
+    )
+    .expect(
+        "a READ of the gate key is not a WRITE of it — the engaging transition beside it is still \
+         single-writer, and rule (4) must accept this graph",
+    );
+
+    // The census's own answer, read directly: EMPTY, whatever the node's config says.
+    let nodes = db.with_conn(|c| db::list_nodes(c, &wf)).expect("nodes");
+    let classify = nodes
+        .iter()
+        .find(|n| n.type_ == db::NODE_TYPE_SET_CATEGORY)
+        .expect("the set_category node");
+    assert!(
+        super::node_written_board_keys(classify).is_empty(),
+        "a `set_category` writes NO blackboard key — it commits to `specs.category_id`, and a graph \
+         that routes on the classification reads it back through the `spec_category` query fact"
+    );
+}
+
 /// FINDING `01M0C3FGCACXCZA1ZESRV73N0R` — THE DEAD GATES: shapes rule (4) certified HUMAN-GATED that
 /// the RUNTIME can never satisfy. Safe (no consent is fabricated) and still wrong: the author leaves
 /// with a valid graph whose sensitive node will never fire, or whose run dies at the selector.
@@ -2312,6 +2466,54 @@ fn node_add_refuses_an_unknown_config_field() {
         "config": { "agent_id": "auditor", "subject": "out_of_scope" }
     }))
     .expect("a spawn's `subject` is accepted");
+}
+
+/// A `gate_check`'s `expect` is DECLARED at authoring: `green` / `red` are accepted, anything else
+/// is refused with the two words spelled out, and ABSENCE is valid (it means `green`).
+///
+/// The refusal belongs here and not to the runtime for the usual M1/M2 reason: a lenient runtime
+/// would fail to DECODE `"raed"` at the moment the gate should have run, parking the flow on a
+/// decode error long after the typo was written. And the ABSENT case has to stay valid, because
+/// every graph in the field is in it.
+#[test]
+fn node_add_declares_the_gate_expectation_and_refuses_any_other_word() {
+    let (db, project) = seeded();
+    // ONE workflow per node: a gate authored as a second root would be refused for INCOHERENCE
+    // (an orphan), which says nothing about the config this test is here to grade.
+    let mut n = 0;
+    let mut author = |config: Value| {
+        n += 1;
+        let wf = make_workflow(&db, &format!("wf-expect-{n}"), Some(&project));
+        node_add(
+            &db,
+            &json!({ "workflow_id": wf, "type": "gate_check", "config": config }),
+        )
+    };
+
+    for expect in ["green", "red"] {
+        author(json!({ "slot": "repro_check", "expect": expect }))
+            .unwrap_or_else(|e| panic!("'{expect}' is a declarable expectation: {}", e.message));
+    }
+
+    // NO `expect` at all — the shape every pre-expectation graph has.
+    author(json!({ "slot": "build_check" })).expect("an absent `expect` is valid and means green");
+
+    let err = author(json!({ "slot": "repro_check", "expect": "raed" })).unwrap_err();
+    assert_eq!(err.code, "invalid_argument");
+    assert!(
+        err.message.contains("green") && err.message.contains("red"),
+        "the refusal spells the two words out: {}",
+        err.message
+    );
+
+    // And `expect` is a KNOWN field — authoring it must not read as a typo.
+    let unknown = author(json!({ "slot": "repro_check", "expects": "red" })).unwrap_err();
+    assert!(
+        unknown.message.contains("unknown config field 'expects'")
+            && unknown.message.contains("expect"),
+        "the near-miss is caught and the real field listed: {}",
+        unknown.message
+    );
 }
 
 /// H12 — the Spec-write GRANT is nyx's to write, and a node that named it as its own output key would

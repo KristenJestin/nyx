@@ -1,13 +1,14 @@
 import { useState, type ComponentType } from "react";
-import { SettingsIcon, SlidersHorizontalIcon, TerminalSquareIcon } from "lucide-react";
+import { SettingsIcon, SlidersHorizontalIcon, TagIcon, TerminalSquareIcon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { Dialog, DialogBackdrop, DialogCloseX, DialogPopup } from "@/components/ui/dialog";
 import { CommandsSection } from "@/components/command/commands-section";
+import { CategoriesSection } from "./categories-section";
 import { GlobalSection } from "./global-section";
 
 /** Which detail pane of the project-settings modal is shown. */
-export type ProjectSettingsSection = "global" | "commands";
+export type ProjectSettingsSection = "global" | "categories" | "commands";
 
 interface SectionDef {
   id: ProjectSettingsSection;
@@ -17,7 +18,8 @@ interface SectionDef {
 
 /**
  * The project-settings sections, in rail order. Global first (the project-level
- * settings), then Commands (the managed-command templates). Adding a future section
+ * settings), then Categories (the project's genre-of-work vocabulary — PDR-0017's
+ * human half), then Commands (the managed-command templates). Adding a future section
  * is a matter of appending a `SectionDef` here + rendering its pane in the detail
  * switch — the rail, selection state and navigation are generic.
  *
@@ -27,6 +29,7 @@ interface SectionDef {
  */
 const SECTIONS: readonly SectionDef[] = [
   { id: "global", label: "Global", icon: SlidersHorizontalIcon },
+  { id: "categories", label: "Categories", icon: TagIcon },
   { id: "commands", label: "Commands", icon: TerminalSquareIcon },
 ];
 
@@ -65,6 +68,14 @@ export interface ProjectSettingsDialogProps {
    */
   globalSection?: ProjectSettingsGlobalPane;
   /**
+   * The Categories pane — the project's genre-of-work vocabulary (PDR-0017). `true` by default
+   * because every USER project has Specs to classify; a caller whose container holds none (the
+   * Système singleton, which carries commands and terminals and no Spec at all) passes `false`
+   * and the section leaves the LIST, exactly like an unwired `globalSection`. Never rendered
+   * disabled — a rail entry means a pane that works.
+   */
+  showCategories?: boolean;
+  /**
    * A workspace of the project to scan for package.json imports (typically the
    * root). Omitted/`null` disables the Commands Import entry — AND the
    * `command_import_scripts` read behind it. On the Système scope that read is a walk of the
@@ -89,8 +100,9 @@ export interface ProjectSettingsDialogProps {
 }
 
 /**
- * `<ProjectSettingsDialog>` — THE command/settings modal of the app: a **left section rail** + a
- * **right detail pane**, mirroring the global [`SettingsDialog`] layout but scoped to ONE project.
+ * `<ProjectSettingsDialog>` — THE command/settings modal of the app: a **left section rail**
+ * (Global / Categories / Commands, whichever the caller wired) + a **right detail pane**,
+ * mirroring the global [`SettingsDialog`] layout but scoped to ONE project.
  *
  * It supersedes the former standalone "Manage commands" modal: the Commands content
  * is migrated UNCHANGED into the Commands pane (the shared [`CommandsSection`]), and
@@ -121,6 +133,7 @@ export function ProjectSettingsDialog({
   projectId,
   projectName,
   globalSection,
+  showCategories = true,
   importWorkspaceId,
   workspacePath,
   initialSection,
@@ -131,8 +144,14 @@ export function ProjectSettingsDialog({
 }: ProjectSettingsDialogProps) {
   // THE RAIL, REDUCED TO WHAT IS WIRED. `Global` needs its persistence callbacks to exist at all,
   // so a caller that has none simply does not get the entry — the one-line restriction the
-  // `SECTIONS` comment promises, and the guarantee that no inert pane can be reached.
-  const sections = SECTIONS.filter((section) => section.id !== "global" || globalSection != null);
+  // `SECTIONS` comment promises, and the guarantee that no inert pane can be reached. `Categories`
+  // follows the same rule with the only shape it can take (it wires nothing but the `projectId`):
+  // a container with no Specs to classify opts out and the entry is ABSENT, not greyed.
+  const sections = SECTIONS.filter((section) => {
+    if (section.id === "global") return globalSection != null;
+    if (section.id === "categories") return showCategories;
+    return true;
+  });
   const seeded =
     initialSection != null && sections.some((section) => section.id === initialSection)
       ? initialSection
@@ -183,7 +202,8 @@ export function ProjectSettingsDialog({
               01M140VQ4S434P2DMCJSTDR4VM — « la hauteur reprise doit profiter au corps »). It stays
               in lockstep with `<CommandsSection>`'s own height, which is what actually scrolls. */}
           <div className="flex min-h-[32rem] flex-1">
-            {/* Left rail of sections — whichever of Global / Commands the caller wired. */}
+            {/* Left rail of sections — whichever of Global / Categories / Commands the caller
+                wired. */}
             <nav
               aria-label={`${title} sections`}
               className="w-44 shrink-0 border-r border-border bg-muted/30 p-2"
@@ -232,6 +252,13 @@ export function ProjectSettingsDialog({
                   onResumeChange={globalSection.onResumeChange}
                   showRename={globalSection.showRename}
                 />
+              </div>
+            ) : activeSection === "categories" ? (
+              // Same wrapper as Global — a form-shaped pane that owns its padding and its scroll.
+              // The list can outgrow the dialog on a project with a rich vocabulary, and that is
+              // what has to scroll, not the rail beside it.
+              <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 py-5">
+                <CategoriesSection projectId={projectId} />
               </div>
             ) : (
               <CommandsSection

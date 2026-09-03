@@ -199,34 +199,16 @@ impl DomainEntity {
     }
 }
 
-/// WHERE a mutation originated — the two callers of the shared use-case layer (PDR-0005).
-/// Persisted verbatim in the `domain_events.source` column so the audit log records
-/// whether a change came from the UI or from an MCP tool (an agent). A closed enum (not a
-/// free string) so a new source is a compile error at every call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DomainEventSource {
-    /// Driven by the desktop UI bridge (`db_command.rs`).
-    Ui,
-    /// Driven by an MCP tool (an agent), through the MCP dispatcher.
-    Mcp,
-    /// Driven by the runtime lifecycle itself, not clearly attributable to a single UI or
-    /// MCP call — a managed-command run-state transition (start / stop / natural exit) or an
-    /// agent-session lifecycle hook the runner/plugin channel drives. The runner sink and the
-    /// agent-session hook are shared by both surfaces, so a runtime event's origin is `system`.
-    System,
-}
-
-impl DomainEventSource {
-    /// The stable wire/DB string (`ui` | `mcp` | `system`). Free TEXT in `domain_events.source`
-    /// (no CHECK), so a new source needs no migration.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DomainEventSource::Ui => "ui",
-            DomainEventSource::Mcp => "mcp",
-            DomainEventSource::System => "system",
-        }
-    }
-}
+/// WHERE a mutation originated — DEFINED IN [`crate::db`], next to [`NewDomainEvent`], and
+/// re-exported here.
+///
+/// It moved down a layer because `db` also owns outbox writers of its own (the category helpers,
+/// `db::record_category_event` / `db::record_spec_category_event`) that must take the same TYPED
+/// provenance, and `usecase` imports `db` — never the reverse. Re-exported rather than relocated
+/// outright so `usecase::DomainEventSource` keeps resolving: the ~19 signatures below and the
+/// sidecar adapters (`db_command.rs`, `events.rs`) name it through this path. See the definition
+/// for why the enum is closed and why it carries three of the DBML's six sources.
+pub use crate::db::DomainEventSource;
 
 /// The correlation of a domain event: the `project_id` it belongs to (always) plus the
 /// `workspace_id` when the event is workspace-scoped. Resolved from the mutated entity

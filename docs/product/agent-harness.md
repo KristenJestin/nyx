@@ -137,7 +137,7 @@ On te donne un input humain brut (une idée vague, un commentaire de review). Ta
 - déduplique, ordonne, ajoute des critères de done ;
 - conserve l'ancre d'origine (file:line) si elle existe ;
 - ne perds aucune intention de l'input ;
-- pour un Spec, assigne une **catégorie** du set du projet ; si rien ne colle, crée-la (elle naît « proposée », l'humain curera) — ne bloque jamais (PDR-0017).
+- pour un Spec, assigne une **catégorie** du set du projet ; si rien ne colle, crée-la — elle est valide telle quelle, aucune confirmation humaine ne suit (PDR-0017 amendé le 2026-09-02), donc préfère réutiliser une entrée existante ; ne bloque jamais.
 
 L'humain valide ensuite. Tu ne valides jamais à sa place.
 ```

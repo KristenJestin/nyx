@@ -80,7 +80,11 @@ export function SystemCommandsDialog({
       title="System commands"
       subject={null}
       icon={TerminalSquareIcon}
-      // NO `globalSection`: the rail is Commands and nothing else. See the header.
+      // NO `globalSection` and NO Categories: the rail is Commands and nothing else. See the
+      // header for the Global half; the Categories half is the same reasoning on the other
+      // vocabulary — categories classify SPECS (PDR-0017), and this scope holds none, so the
+      // section is dropped from the LIST rather than offered onto an empty subject.
+      showCategories={false}
       // NO `importWorkspaceId` either: no workspace to scan means no Import entry AND no
       // `command_import_scripts` call — and on this scope that call is a walk of the user's HOME.
       workspacePath={home}

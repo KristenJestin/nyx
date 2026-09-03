@@ -52,6 +52,8 @@ function specEntry(overrides: Partial<SpecListEntry>): SpecListEntry {
     updated_at: 0,
     completed_at: null,
     archived_at: null,
+    // PDR-0017: uncategorized is the steady state, and the field is REQUIRED on the wire shape.
+    category_id: null,
     project_key: "ALPHA",
     project: { id: "p1", name: "Alpha", accent: null, icon: null, image_path: null },
     tasks_done: 0,
