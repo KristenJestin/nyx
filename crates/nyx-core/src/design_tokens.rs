@@ -1184,6 +1184,49 @@ pub struct TokenIngest {
     pub tokens_json: String,
 }
 
+/// Whether `value` is the token declaring ITSELF and nothing else — `--radius-md: var(--radius-md)`.
+///
+/// WHY THIS EXISTS (review A8). Tailwind v4's `@theme inline` block is how a project exposes a
+/// `:root` custom property into the theme namespace, and the idiom for doing it is to repeat the
+/// name: the source declares the real value once in `:root` and bridges it once in `@theme inline`,
+/// where the compiler substitutes the value at build time. The source is not defective — measured on
+/// `depot/src/web/styles/globals.css`, which carries `--radius-md: calc(var(--radius) - 2px)` in
+/// `:root` (line 14) and `--radius-md: var(--radius-md)` in `@theme inline` (line 182).
+///
+/// The INGEST is what lost it. Both blocks are GLOBAL scope, so they flatten into one map under the
+/// plain-CSS last-wins rule, and the bridge — which resolves to nothing on its own — overwrote the
+/// value. The layer then handed every consumer `--radius-md: var(--radius-md)`, a variable that
+/// resolves to empty, which is worse than an absent token because it looks defined.
+///
+/// So a pure self-reference is DROPPED rather than merged: the real declaration survives whichever
+/// side of the bridge it sits on, and a name that has ONLY the bridge never enters the layer at all
+/// (a self-referencing token is not something to render). A self-reference WITH a REAL fallback —
+/// `var(--x, 8px)` — is left alone: the fallback is a value. An EMPTY fallback — `var(--x,)`,
+/// Tailwind's "empty unless set" idiom — is still a self-reference: it resolves to nothing.
+///
+/// CSS function names are case-insensitive (`VAR(--x)` is legal) and `!important` is not part of
+/// the value, so both are normalised away before the comparison.
+fn is_self_reference(name: &str, value: &str) -> bool {
+    let v = value.trim();
+    let v = v
+        .strip_suffix("!important")
+        .map(str::trim_end)
+        .unwrap_or(v);
+    let Some(rest) = v
+        .get(..4)
+        .filter(|head| head.eq_ignore_ascii_case("var("))
+        .map(|_| &v[4..])
+    else {
+        return false;
+    };
+    let Some(inner) = rest.strip_suffix(')') else {
+        return false;
+    };
+    let inner = inner.trim();
+    let inner = inner.strip_suffix(',').map(str::trim_end).unwrap_or(inner);
+    inner == name.trim()
+}
+
 /// INGEST a project's design tokens FROM ITS APP: walk the project's repos exactly as the component
 /// inventory does, rank the stylesheets that look like the design system, and merge the global
 /// custom properties of the best few into the project's single token layer.
@@ -1283,13 +1326,19 @@ pub fn ingest_project_tokens(
     let provenance = TokenProvenance::bounded(skipped, discarded, pruned, pruned_total);
 
     // Merge BEST-FIRST-WINS: a name the top sheet declares is never overwritten by a lesser one,
-    // and within ONE sheet the LAST declaration wins (plain CSS cascade).
+    // and within ONE sheet the LAST declaration wins (plain CSS cascade) — except for a pure
+    // self-reference, which is not a declaration of anything (see [`is_self_reference`]).
     let mut layer = TokenLayer::default();
     let mut owned: BTreeSet<String> = BTreeSet::new();
     for (_tier, _score, source, vars) in &ranked {
         let mut sheet_light: BTreeMap<String, String> = BTreeMap::new();
         let mut sheet_dark: BTreeMap<String, String> = BTreeMap::new();
         for var in vars {
+            // A PURE SELF-REFERENCE IS NOT A VALUE (review A8). See [`is_self_reference`] for what
+            // writes one and why dropping it is what "resolve the value" means here.
+            if is_self_reference(&var.name, &var.value) {
+                continue;
+            }
             match var.scope {
                 TokenScope::Root => {
                     sheet_light.insert(var.name.clone(), var.value.clone());

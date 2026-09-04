@@ -1321,8 +1321,12 @@ impl Tree {
         let mut nodes: Vec<EngineNode> = Vec::with_capacity(rows.len());
         let mut index_of: HashMap<&str, usize> = HashMap::with_capacity(rows.len());
         for row in rows {
-            let node_type = NodeType::from_db(&row.type_)
-                .ok_or_else(|| EngineError::UnknownNodeType(row.type_.clone()))?;
+            let node_type = NodeType::from_db(&row.type_).ok_or_else(|| {
+                EngineError::UnknownNodeType {
+                    node_id: row.id.clone(),
+                    node_type: row.type_.clone(),
+                }
+            })?;
             let config: Value =
                 serde_json::from_str(&row.config).map_err(|e| EngineError::BadConfig {
                     node_id: row.id.clone(),
@@ -2154,8 +2158,16 @@ pub enum Step {
 /// `failed`/`blocked` run status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineError {
-    /// A node's `type` is not one of [`db::NODE_TYPES`].
-    UnknownNodeType(String),
+    /// A node's `type` is not one of [`db::NODE_TYPES`] — this build of nyx has no interpreter for
+    /// it. Carries BOTH the node and its type: the type alone said what nyx could not read but not
+    /// WHERE, which is the half an operator needs to go and look (review A1).
+    UnknownNodeType { node_id: String, node_type: String },
+    /// A traversal frame (or `awaiting` cursor) names a node id the tree no longer holds — the
+    /// structural guard on a cross-session resume (B1). DISTINCT from
+    /// [`EngineError::UnknownNodeType`], which is about a type nyx cannot interpret: the two shared
+    /// one variant and therefore one sentence, so a deleted node reported an "unknown node type"
+    /// naming an id (review A1).
+    UnknownNodeId(String),
     /// A node's `config` is not a JSON object (or does not parse).
     BadConfig { node_id: String, message: String },
     /// A child references a `parent_id` that is not in the workflow's rows.
@@ -2207,7 +2219,13 @@ pub enum EngineError {
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EngineError::UnknownNodeType(t) => write!(f, "unknown node type: {t}"),
+            EngineError::UnknownNodeType { node_id, node_type } => write!(
+                f,
+                "node {node_id} has type '{node_type}', which this build of nyx does not implement"
+            ),
+            EngineError::UnknownNodeId(id) => {
+                write!(f, "node {id} is not in this workflow's tree")
+            }
             EngineError::BadConfig { node_id, message } => {
                 write!(f, "bad config on node {node_id}: {message}")
             }
@@ -2321,11 +2339,11 @@ enum TraversalFrame {
 }
 
 /// Resolve a traversal frame's node id to its arena index in `tree`, or fail with
-/// [`EngineError::UnknownNodeType`] carrying the missing id — the structural guard that REFUSES a
+/// [`EngineError::UnknownNodeId`] carrying the missing id — the structural guard that REFUSES a
 /// resume whose traversal references a node the (edited) tree no longer holds (B1).
 fn traversal_index(tree: &Tree, id: &str) -> Result<usize, EngineError> {
     tree.index_of(id)
-        .ok_or_else(|| EngineError::UnknownNodeType(id.to_string()))
+        .ok_or_else(|| EngineError::UnknownNodeId(id.to_string()))
 }
 
 /// The interpreter over ONE run of a [`Tree`]: it holds the traversal stack, the blackboard, and the
@@ -2609,7 +2627,7 @@ impl Engine {
     /// Rebuild an [`Engine`] RESUMING the persisted `traversal` (a [`TraversalState`] JSON) over
     /// `tree`, seeded with `board` — the cross-session resume (v2.8 review B1). Every node id in the
     /// traversal MUST still exist in `tree`: a structural edit (a deleted/renamed node) fails the
-    /// resume with [`EngineError::UnknownNodeType`] rather than resuming a stale walk. A loop frame's
+    /// resume with [`EngineError::UnknownNodeId`] rather than resuming a stale walk. A loop frame's
     /// `body_len` is recomputed from the tree (so it cannot drift from an edited body).
     pub fn restore(tree: Tree, board: Blackboard, traversal: &str) -> Result<Self, EngineError> {
         let state: TraversalState =

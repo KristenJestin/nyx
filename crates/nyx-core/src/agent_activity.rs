@@ -144,6 +144,27 @@ const WAITING_NOTIFICATION_TYPES: &[&str] = &["permission_prompt", "elicitation_
 /// (the green "ready" + idle state), the same effect as a `Stop`.
 const IDLE_NOTIFICATION_TYPE: &str = "idle_prompt";
 
+/// How long a turn nyx JUST SUBMITTED counts as `Working` for a bounded wait, while the agent's
+/// own `UserPromptSubmit` hook is still on its way (see
+/// [`AgentActivityStore::note_prompt_submitted`]).
+///
+/// It bounds ONE latency: a Claude Code hook is a `node` process that has to start and POST back to
+/// nyx. Cold, on Windows, that is the better part of a second, and a loaded machine makes it worse
+/// — so a window measured in hundreds of milliseconds would put the race straight back. Four
+/// seconds is the far side of that latency with margin, and it is a CEILING, not a delay: the first
+/// hook event cancels it ([`AgentActivityStore::apply`]), so the normal turn is armed for as long
+/// as the hook took and no longer. The only call that pays the full window is one where no hook
+/// ever comes — an `enter` that submitted nothing — and paying four seconds once to find that out
+/// is cheaper than handing an agent a `resolved: true` that is not true.
+const SUBMISSION_ARMING_WINDOW: std::time::Duration = std::time::Duration::from_millis(4_000);
+
+/// How long, after nyx wrote an `enter`, a standing `Waiting` keeps reading `Working` for a bounded
+/// wait ([`Entry::resolve_after_submission`]) when no hook has landed. It must cover one FULL
+/// `wait_for_terminal` at its maximum timeout (60 s) so the first wait after an approval never
+/// regresses to the yellow it just answered; past it, an `enter` that answered nothing (a dialog left
+/// open, an empty field) stops being hidden from every wait that follows.
+const SUBMISSION_LIFT_WINDOW: std::time::Duration = std::time::Duration::from_millis(90_000);
+
 /// `notification_type` values that mean a BACKGROUND sub-agent COMPLETED — treated exactly
 /// like a `SubagentStop` (decrement the sub-agent counter, possibly settling a deferred
 /// turn-end). See the #21 deferral.
@@ -190,6 +211,22 @@ pub enum Activity {
     /// a permission/elicitation `Notification`. The yellow dot (`--warning`). Distinct
     /// from `Working` so the UI shows an "attention" affordance rather than a "busy" one.
     Waiting,
+}
+
+impl Activity {
+    /// The lowercase wire spelling — `idle` | `working` | `waiting`.
+    ///
+    /// ONE vocabulary for every surface that reads this store: the renderer's dot (through the
+    /// sidecar db-command), the MCP `list_terminals` / `read_terminal` / `wait_for_terminal`
+    /// answers, and the `until` set a caller waits on. Written here rather than at each call site
+    /// precisely so an agent's `until: ["idle"]` and the UI's blue dot cannot drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Activity::Idle => "idle",
+            Activity::Working => "working",
+            Activity::Waiting => "waiting",
+        }
+    }
 }
 
 /// The activity SNAPSHOT the host surfaces to the front for one terminal: the resolved
@@ -295,6 +332,12 @@ struct Entry {
     /// naming, and a `PostToolUse` cannot say WHICH tool returned, so the name is dropped when the
     /// counter reaches 0 rather than pretending to pair Posts with Pres.
     tool: Option<String>,
+    /// The instant nyx ITSELF submitted a turn into this terminal (an `enter` written by
+    /// `send_keys` / `send_to_terminal` while an agent session was active), and no hook has
+    /// landed since. See [`AgentActivityStore::note_prompt_submitted`] for what it is for; it is
+    /// read ONLY by [`AgentActivityStore::wait_activity`] and NEVER by [`Entry::resolve`], so the
+    /// dot is untouched by it.
+    submitted_at: Option<std::time::Instant>,
 }
 
 impl Entry {
@@ -313,6 +356,7 @@ impl Entry {
             plugin_outdated: false,
             waiting_on: None,
             tool: None,
+            submitted_at: None,
         }
     }
 
@@ -389,6 +433,77 @@ impl Entry {
             self.tool = None;
         }
     }
+
+    /// [`Self::resolve`] as a BOUNDED WAIT must read it once nyx has SUBMITTED a turn into this
+    /// terminal and no hook has landed since — the only difference being that a standing `Waiting`
+    /// is read as `Working`.
+    ///
+    /// # Why the `Waiting` is stale by construction here (#K5)
+    ///
+    /// A `Waiting` is entered by an `AskUserQuestion` or by a permission/elicitation
+    /// `Notification`: the agent is blocked ON THE USER. When nyx then writes an `enter` into that
+    /// terminal, nyx IS that user, and the block it was waiting on has just been answered — the
+    /// approval. No hook says so: the plugin registers no `PermissionRequest`, `PreToolUse` fires
+    /// BEFORE the dialog, and the approved tool's `PostToolUse` only lands when the tool ENDS. So
+    /// between the approval and that end — minutes, for a long tool — the store legitimately still
+    /// holds the `Waiting` of a block nobody is blocked on any more.
+    ///
+    /// Reading it verbatim is what made `wait_for_terminal` answer `resolved: true,
+    /// agent_activity: "waiting"` right after an approval: the default `until` (idle+waiting)
+    /// matched, the pilot concluded the agent was blocked, and sent ANOTHER `enter` — this one into
+    /// the input box of a session that was working, corrupting it. The lift is placed HERE, at the
+    /// same mark as the submission, because nyx is the only party that knows: it is the one that
+    /// answered.
+    ///
+    /// It is bounded twice. First by the SAME thing the arming mark is bounded by — any hook event
+    /// clears `submitted_at` ([`AgentActivityStore::apply`]), so the lift dies with the first thing
+    /// the agent says about itself. Second by [`SUBMISSION_LIFT_WINDOW`]
+    /// ([`AgentActivityStore::wait_activity`]): an `enter` that answered NOTHING — a dialog left
+    /// open, an empty free-text field — produces no hook at all, and without a ceiling the lift
+    /// would hide a real block from every wait that follows, forever. Past the ceiling the wait
+    /// reads the truth again; its worst case is one late `waiting` on an approved tool that ran
+    /// longer than the ceiling.
+    ///
+    /// And it does NOT apply while an `AskUserQuestion` is in flight (`ask_in_flight`): that tool
+    /// asks several questions in ONE call and ends with ONE `PostToolUse`, so an `enter` nyx wrote
+    /// on question 1 did not answer the block — question 2 is now waiting, and no hook will say so.
+    ///
+    /// It is read ONLY by [`AgentActivityStore::wait_activity`]: the dot ([`Self::snapshot`]) keeps
+    /// showing the yellow the hooks asserted, untouched.
+    fn resolve_after_submission(&self) -> Activity {
+        if self.ask_in_flight {
+            return self.resolve();
+        }
+        match self.resolve() {
+            Activity::Waiting => Activity::Working,
+            other => other,
+        }
+    }
+}
+
+/// What a BOUNDED WAIT reads on a terminal — the answer [`AgentActivityStore::wait_activity`]
+/// gives, and the state the `wait_for_terminal` poll loop compares against its `until` set.
+///
+/// # Why this is NOT just an [`Activity`] (#K3)
+///
+/// The submission arming window used to be expressed by RETURNING `Working`, which put a
+/// SUPPOSITION on the same footing as a hook-asserted fact: `until: ["working"]` was satisfied
+/// instantly by nyx's own guess, `waited_ms: 0`, on a terminal the store still read `idle` — and
+/// `list_terminals`, reading the real snapshot, contradicted the very same field name for the four
+/// seconds that followed.
+///
+/// The window's job is to stop the wait resolving on the state from BEFORE the caller's own
+/// submission. That is `Unconfirmed`: a value no `until` set can contain, so the wait keeps
+/// waiting whatever it was told to wait for, and no target is ever satisfied by a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitActivity {
+    /// nyx has submitted a turn into this terminal and no hook has confirmed it yet — the store's
+    /// value describes the state BEFORE that submission and must not resolve anything. Never a
+    /// member of an `until` set, by construction.
+    Unconfirmed,
+    /// The activity as the hooks left it (with the post-submission `Waiting` lift of
+    /// [`Entry::resolve_after_submission`] applied once the arming window has lapsed).
+    Observed(Activity),
 }
 
 /// The normalized activity event parsed from a Claude hook payload. Distinct from the
@@ -783,9 +898,116 @@ impl AgentActivityStore {
             }
         }
 
+        // ANY hook event DISARMS the submission window: the store has just been told the truth, so
+        // the optimistic "a turn is starting" guess has nothing left to cover. This is what makes
+        // the window a one-shot bridge rather than a delay — the ordinary case (`UserPromptSubmit`
+        // lands in a few hundred ms) spends only that time armed, not the whole
+        // [`SUBMISSION_ARMING_WINDOW`]. See [`AgentActivityStore::note_prompt_submitted`].
+        entry.submitted_at = None;
+
         let snapshot = entry.snapshot();
         map.insert(terminal_id.to_string(), entry);
         snapshot
+    }
+
+    /// ARM the submission window on `terminal_id`: nyx has just written an `enter` into a terminal
+    /// that hosts an ACTIVE agent session, so a turn is ABOUT to start even though no hook has said
+    /// so yet. Called by `send_keys` / `send_to_terminal`; read back ONLY by [`Self::wait_activity`].
+    ///
+    /// # The race it closes (measured, gate 2026-09-02)
+    ///
+    /// `send_keys(["<texte>","enter"])` followed immediately by `wait_for_terminal` used to come
+    /// back with `resolved: true`, `agent_activity: "idle"`, `waited_ms: 0`. Nothing was wrong with
+    /// either tool: the write returns as soon as the bytes are in the PTY, while Claude's
+    /// `UserPromptSubmit` hook is a node process that still has to start and POST — a few hundred
+    /// milliseconds during which the store legitimately still reads `Idle` from the PREVIOUS turn.
+    /// The default `until` (idle+waiting) therefore matched the state BEFORE the caller's own
+    /// action, and the caller was handed back an empty answer and had to poll after all — the exact
+    /// blind polling `wait_for_terminal` exists to remove.
+    ///
+    /// `wait_for_command` has no such race because starting a command mutates the run state
+    /// SYNCHRONOUSLY before the wait can read it. A terminal's activity is reported by a THIRD
+    /// party (the agent's hooks), so the equivalent synchronous mark has to be made here, by the
+    /// only party that knows a turn was submitted: nyx, at the moment it writes the `enter`.
+    ///
+    /// # Why this is not the time-based staleness the module refuses
+    ///
+    /// The 0-stale decision (module docs) is about never EXPIRING a `Working` the hooks asserted —
+    /// a long turn must not flicker to idle on a timer. This is the opposite direction and the
+    /// opposite risk: a BOUNDED reticence about a turn nobody has asserted yet, which any hook
+    /// event cancels and which lapses on its own after [`SUBMISSION_ARMING_WINDOW`]. It can make a
+    /// wait return LATE, NEVER EARLY — and that is now literally true rather than nearly true:
+    /// the window answers [`WaitActivity::Unconfirmed`], a value no `until` set can contain, so it
+    /// SATISFIES nothing and only ever withholds. It never invents a `Working` the UI shows (the
+    /// dot does not read this at all), and it cannot outlive its window. An `enter` that submits
+    /// nothing (an empty prompt box) costs the next waiter one window and then reads the truth
+    /// again.
+    ///
+    /// # The mark OUTLIVES the window, for the `Waiting` lift alone
+    ///
+    /// `submitted_at` stays set past [`SUBMISSION_ARMING_WINDOW`] until a hook clears it, because a
+    /// SECOND thing hangs off it: an `enter` that approved a permission dialog answered a `Waiting`
+    /// no hook will ever lift in time (see [`Entry::resolve_after_submission`]). Past the window the
+    /// wait reads the store again — with that one substitution, and nothing else.
+    ///
+    /// Idempotent; creates no entry when none exists, because the caller already established that
+    /// this terminal hosts an active agent session and a session always has an entry by then
+    /// (SessionStart) — and materialising one here would put an `Idle`-with-nothing-to-show entry
+    /// in the map that `snapshot_all` would have to filter.
+    pub fn note_prompt_submitted(&self, terminal_id: &str) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(terminal_id.to_string())
+            .or_insert_with(Entry::empty)
+            .submitted_at = Some(std::time::Instant::now());
+    }
+
+    /// The activity as a BOUNDED WAIT must read it — [`Self::snapshot`]'s resolved kind, with the
+    /// two things the submission mark changes and nothing else:
+    ///
+    ///   * a terminal ARMED by [`Self::note_prompt_submitted`] less than
+    ///     [`SUBMISSION_ARMING_WINDOW`] ago reads [`WaitActivity::Unconfirmed`] — a turn nyx just
+    ///     submitted has not given the hand back, and the store still describes the previous one,
+    ///     so NOTHING may resolve on it (not even an explicit `until: ["working"]`);
+    ///   * past that window, while no hook has landed yet, a standing `Waiting` reads `Working`
+    ///     because nyx itself answered the block ([`Entry::resolve_after_submission`]).
+    ///
+    /// This is the ONLY reader of the arming window. The dot ([`Self::snapshot`],
+    /// [`Self::snapshot_all`]) deliberately does NOT go through it: the UI shows what the hooks
+    /// asserted, never what nyx guessed.
+    pub fn wait_activity(&self, terminal_id: &str) -> WaitActivity {
+        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = map.get(terminal_id) else {
+            return WaitActivity::Observed(Activity::Idle);
+        };
+        let Some(at) = entry.submitted_at else {
+            return WaitActivity::Observed(entry.resolve());
+        };
+        let since = at.elapsed();
+        if since < SUBMISSION_ARMING_WINDOW {
+            return WaitActivity::Unconfirmed;
+        }
+        if since >= SUBMISSION_LIFT_WINDOW {
+            // The lift has a ceiling: past it, an `enter` that produced no hook at all is read
+            // as what it is — a block still standing — rather than hidden from every wait.
+            return WaitActivity::Observed(entry.resolve());
+        }
+        WaitActivity::Observed(entry.resolve_after_submission())
+    }
+
+    /// Whether nyx has SUBMITTED a turn into this terminal that no hook has confirmed yet — the
+    /// arming mark, exposed as its own answer rather than folded into an activity value.
+    ///
+    /// This is the honest form of the signal `wait_for_terminal` used to smuggle into its
+    /// `agent_activity` field: "nyx just submitted, and here is what it really knows". It is `true`
+    /// from [`Self::note_prompt_submitted`] until the first hook event on that terminal
+    /// ([`Self::apply`]) — so it stays `true` for the whole of an approved tool's run, which is
+    /// precisely the stretch during which the store's own value cannot be taken at face value.
+    pub fn submission_pending(&self, terminal_id: &str) -> bool {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(terminal_id)
+            .is_some_and(|entry| entry.submitted_at.is_some())
     }
 
     /// FORCE a terminal's activity to `Idle` and drop its "ready" notification — the
@@ -899,6 +1121,218 @@ mod tests {
             notification_type: Some(kind),
             ..HookFacts::default()
         }
+    }
+
+    /// BACK-DATE the arming marker of `terminal_id` so it reads as LAPSED, without sleeping out a
+    /// real [`SUBMISSION_ARMING_WINDOW`]. The store is the only thing under test here, and a unit
+    /// test that waits four real seconds is a unit test nobody runs.
+    fn lapse_arming_window(store: &AgentActivityStore, terminal_id: &str) {
+        let mut map = store.map.lock().unwrap();
+        let entry = map.get_mut(terminal_id).expect("the marker created an entry");
+        entry.submitted_at = std::time::Instant::now()
+            .checked_sub(SUBMISSION_ARMING_WINDOW + std::time::Duration::from_millis(1));
+        assert!(
+            entry.submitted_at.is_some(),
+            "the clock is far enough from its origin to back-date the marker"
+        );
+    }
+
+    /// Back-date the submission mark past [`SUBMISSION_LIFT_WINDOW`] — the ceiling of the
+    /// post-approval lift, not merely the arming window.
+    fn lapse_lift_window(store: &AgentActivityStore, terminal_id: &str) {
+        let mut map = store.map.lock().unwrap();
+        let entry = map.get_mut(terminal_id).expect("the marker created an entry");
+        entry.submitted_at = std::time::Instant::now()
+            .checked_sub(SUBMISSION_LIFT_WINDOW + std::time::Duration::from_millis(1));
+        assert!(entry.submitted_at.is_some(), "the clock can back-date past the lift ceiling");
+    }
+
+    /// THE LIFT HAS A CEILING. An `enter` that answered NOTHING — a dialog left open, an empty
+    /// free-text field — produces no hook at all, so nothing ever clears the mark; without a
+    /// ceiling the lift would hide that standing block from every wait that follows. Past
+    /// [`SUBMISSION_LIFT_WINDOW`] the wait reads the truth again.
+    #[test]
+    fn the_lift_stops_hiding_a_block_past_its_ceiling() {
+        let store = AgentActivityStore::new();
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        store.apply("t1", ActivityEvent::AttentionNeeded { permission: Some("dialog".into()) });
+        assert_eq!(store.wait_activity("t1"), WaitActivity::Observed(Activity::Waiting));
+
+        // nyx writes an enter that answers nothing. Within the lift, the Waiting is hidden…
+        store.note_prompt_submitted("t1");
+        lapse_arming_window(&store, "t1");
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Observed(Activity::Working),
+            "inside the lift window the answered block is not shown"
+        );
+
+        // …and past the ceiling, with still no hook, the block is real again.
+        lapse_lift_window(&store, "t1");
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Observed(Activity::Waiting),
+            "past the ceiling an unanswered block is no longer hidden from the wait"
+        );
+        assert!(store.submission_pending("t1"), "the mark itself still stands until a hook");
+    }
+
+    /// AN `AskUserQuestion` IN FLIGHT IS NOT LIFTED BY ONE ANSWER. The tool asks several questions
+    /// in ONE call and ends with ONE `PostToolUse`; nyx answering question 1 with an `enter` has
+    /// not answered the block — question 2 is now waiting, and no hook will say so. The lift must
+    /// leave the `Waiting` standing while `ask_in_flight`.
+    #[test]
+    fn an_ask_in_flight_is_not_lifted_by_answering_one_of_its_questions() {
+        let store = AgentActivityStore::new();
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        store.apply("t1", ActivityEvent::AskStarted { question: Some("Q1?".into()) });
+        store.apply("t1", ActivityEvent::AttentionNeeded { permission: Some("Q1?".into()) });
+        assert_eq!(store.wait_activity("t1"), WaitActivity::Observed(Activity::Waiting));
+
+        // nyx answers Q1. Past the arming window, with the ask still in flight, the wait must
+        // STILL read Waiting: Q2 is on screen and nothing has said otherwise.
+        store.note_prompt_submitted("t1");
+        lapse_arming_window(&store, "t1");
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Observed(Activity::Waiting),
+            "one answer inside a multi-question ask does not lift the block"
+        );
+
+        // The ask returns as a whole — THAT is what lifts it.
+        store.apply("t1", ActivityEvent::AskFinished);
+        assert!(!store.submission_pending("t1"));
+        assert_eq!(store.snapshot("t1").unwrap().activity, Activity::Working);
+    }
+
+    /// THE SUBMISSION ARMING WINDOW, at the store level — the three properties that make it safe:
+    /// a wait reads `Unconfirmed` while it is armed, the DOT does not see the window at all, and
+    /// the first hook cancels it.
+    ///
+    /// The dot half is the one worth pinning: the window is nyx's own reticence about a turn
+    /// nobody has asserted yet, so it must never reach the UI. `snapshot`/`snapshot_all` are the
+    /// UI's readers and they go on saying `idle`, which also keeps the boot-empty /
+    /// nothing-to-show invariant (`snapshot_all` omits an idle entry) exactly as it was.
+    #[test]
+    fn a_submitted_turn_is_unconfirmed_for_a_wait_and_invisible_to_the_dot() {
+        let store = AgentActivityStore::new();
+        // A session exists and its last turn is over — the state the 2026-09-01 run read for
+        // thirty seconds, and the one a wait must not mistake for "this turn is over".
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        store.apply("t1", ActivityEvent::TurnFinished);
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Observed(Activity::Idle)
+        );
+        assert!(!store.submission_pending("t1"));
+
+        // nyx writes the `enter` itself: the wait now refuses to answer on the previous turn…
+        store.note_prompt_submitted("t1");
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Unconfirmed,
+            "a turn nyx just submitted has not given the hand back"
+        );
+        assert!(store.submission_pending("t1"));
+        // …and the dot does NOT: the UI shows what the hooks asserted, never nyx's guess.
+        assert_eq!(store.snapshot("t1").unwrap().activity, Activity::Idle);
+
+        // The hook lands: the window is cancelled and the real state machine takes over. Reading
+        // `Working` here proves nothing on its own, so end the turn — an armed window would have
+        // withheld the answer past the `Stop`; it reads `Idle`, so it was cleared.
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        store.apply("t1", ActivityEvent::TurnFinished);
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Observed(Activity::Idle),
+            "any hook event disarms the window — it is a bridge, not a delay"
+        );
+        assert!(!store.submission_pending("t1"));
+
+        // A terminal the store never heard of stays `Idle` for a wait too (no entry, no window).
+        assert_eq!(
+            store.wait_activity("unknown"),
+            WaitActivity::Observed(Activity::Idle)
+        );
+        assert!(!store.submission_pending("unknown"));
+    }
+
+    /// The window LAPSES on its own. An `enter` that submitted nothing (an empty prompt box)
+    /// leaves a marker no hook will ever cancel; once [`SUBMISSION_ARMING_WINDOW`] has passed the
+    /// wait reads the truth again, so the worst case is one late answer and never a stuck one.
+    #[test]
+    fn the_arming_window_lapses_and_never_sticks() {
+        let store = AgentActivityStore::new();
+        store.note_prompt_submitted("t1");
+        assert_eq!(store.wait_activity("t1"), WaitActivity::Unconfirmed);
+
+        lapse_arming_window(&store, "t1");
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Observed(Activity::Idle),
+            "past the window the wait reads the real state again"
+        );
+    }
+
+    /// #K5 — AN `enter` THAT APPROVES A PERMISSION DIALOG LIFTS THE `Waiting` IT ANSWERED.
+    ///
+    /// The measured trap: `AttentionNeeded` (the `permission_prompt` Notification) puts the entry
+    /// on `Waiting`; nyx approves with `send_keys(["enter"])`; and NO hook lifts it — the plugin
+    /// registers no `PermissionRequest`, `PreToolUse` already fired BEFORE the dialog, and the
+    /// approved tool's `PostToolUse` only lands when the tool ENDS. So once the arming window
+    /// lapsed, `wait_for_terminal` answered `resolved: true, agent_activity: "waiting"` on an agent
+    /// that was working, and the pilot sent another `enter` into its input box.
+    ///
+    /// nyx is the party that answered the block, so the arming mark is what lifts it. The DOT is
+    /// untouched — the user's yellow is the hooks' business, not the wait's.
+    #[test]
+    fn approving_a_permission_lifts_the_waiting_for_the_wait_only() {
+        let store = AgentActivityStore::new();
+        store.apply("t1", ActivityEvent::PromptSubmitted);
+        store.apply(
+            "t1",
+            ActivityEvent::AttentionNeeded {
+                permission: Some("Bash(rm -rf .)".to_string()),
+            },
+        );
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Observed(Activity::Waiting),
+            "before nyx answers, the block is real and the wait must resolve on it"
+        );
+
+        // nyx approves — the `enter` arms the submission mark exactly as a prompt would.
+        store.note_prompt_submitted("t1");
+        assert_eq!(store.wait_activity("t1"), WaitActivity::Unconfirmed);
+
+        // PAST the window, with no hook in sight (the approved tool is still running): the wait
+        // must NOT read `Waiting` any more — that block was answered by nyx itself.
+        lapse_arming_window(&store, "t1");
+        assert_eq!(
+            store.wait_activity("t1"),
+            WaitActivity::Observed(Activity::Working),
+            "the permission nyx approved is not a block the caller is still waiting on"
+        );
+
+        // THE DOT KEEPS ITS CURRENT BEHAVIOUR: `snapshot`/`snapshot_all` never read the arming
+        // mark, so the UI still shows what the hooks asserted.
+        assert_eq!(store.snapshot("t1").unwrap().activity, Activity::Waiting);
+        assert_eq!(
+            store
+                .snapshot_all()
+                .iter()
+                .find(|(id, _)| id == "t1")
+                .expect("the terminal is in the map")
+                .1
+                .activity,
+            Activity::Waiting
+        );
+
+        // And the lift dies with the first hook: the tool returns, the state machine lifts the
+        // yellow on its own terms, and nothing of the submission mark survives.
+        store.apply("t1", ActivityEvent::ToolFinished);
+        assert!(!store.submission_pending("t1"));
+        assert_eq!(store.snapshot("t1").unwrap().activity, Activity::Working);
     }
 
     /// `from_hook` maps the per-turn hooks, reading the tool name / notification type to

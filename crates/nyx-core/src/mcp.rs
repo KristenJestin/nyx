@@ -255,6 +255,19 @@ pub const CLOSE_TERMINAL_TOOL: &str = "close_terminal";
 /// kept out of [`V1_TOOLS`] (same pattern as the other interactive-terminal tools).
 pub const READ_TERMINAL_TOOL: &str = "read_terminal";
 
+/// The `wait_for_terminal` tool name — the BOUNDED wait on a terminal's AGENT activity, the twin
+/// of [`WAIT_FOR_COMMAND_TOOL`] for the other thing nyx makes an agent wait on.
+///
+/// The asymmetry it closes was measured on the 2026-09-01 pilot run: a managed command has
+/// `wait_for_command`, a terminal had NOTHING — so an agent driving a second Claude session polled
+/// blind, paid one MCP round trip per attempt, and had no signal to poll anyway (`busy` was `null`
+/// and `exec_state` never moved for the whole session, since the agent is the foreground process
+/// throughout). The right signal existed all along in [`crate::agent_activity`]; this blocks on it.
+///
+/// Advertised in `tools/list`, kept OUT of [`V1_TOOLS`] for the SAME reason as `wait_for_command`:
+/// it is an observational convenience over an existing signal, not a frozen-contract tool.
+pub const WAIT_FOR_TERMINAL_TOOL: &str = "wait_for_terminal";
+
 /// The `agent_session_event` tool name (PRD-5 #4, ADR-0004 / ADR-0010). The channel
 /// a Claude Code `SessionStart`/`SessionEnd` hook of type `mcp_tool` reaches nyx on:
 /// it is addressed `mcp__nyx__agent_session_event` and carries the agent's raw hook
@@ -483,7 +496,16 @@ rename one, or change its settings with set_project_settings).";
 /// retrying a call it wrongly believes hung — into unbounded threads, which is a worse failure than
 /// the one being fixed. Four is sized on the only long operation there is: a gate holds one worker,
 /// and three stay free for everyone else.
-const REQUEST_WORKERS: usize = 4;
+///
+/// # A long operation that DEPENDS on an incoming request must not be able to fill this
+///
+/// `wait_for_terminal` is not like a gate: the signal that ends it (the agent's `Stop` hook) is a
+/// `POST /mcp` served by THIS pool, so four concurrent waits would deadlock themselves — the hook
+/// sits in the queue, gives up at its own 1 s timeout with no replay, and every wait times out on a
+/// turn that finished long before. That circularity is closed at the source rather than by growing
+/// this number ([`crate::mcp_tools_core::MAX_CONCURRENT_TERMINAL_WAITS`], which reads this and
+/// keeps one worker free for the short requests).
+pub(crate) const REQUEST_WORKERS: usize = 4;
 
 /// How many ACCEPTED requests wait for a free worker. Only reached once all [`REQUEST_WORKERS`] are
 /// busy; past it the accept loop itself blocks and the kernel's listen backlog holds the pending
@@ -699,14 +721,85 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
+/// What replaces a database's own sentence when one reaches [`RpcError::new`] — see
+/// [`without_sql_text`]. It says the two things the withheld text could have said and the caller can
+/// act on: the fault is in what was sent, and re-sending it unchanged will fail the same way.
+const SQL_TEXT_WITHHELD: &str = "the storage layer refused the operation. Its own message is \
+                                 withheld: it names schema internals you cannot act on. In \
+                                 practice this refusal means an argument is wrong — an id naming \
+                                 no row, or a value outside a field's accepted set — so re-read \
+                                 the arguments you sent rather than retrying the same call";
+
+/// The SENTENCES A DATABASE WRITES, which nothing renders to an agent.
+///
+/// The measured shape (2026-09-01): `task_add` with an unknown Spec answered `db error: FOREIGN KEY
+/// constraint failed`, and with a bad `kind`, `db error: CHECK constraint failed: kind IN
+/// ('slice','human','review')`. The right fix is upstream — the write path knows which argument is
+/// at fault and now refuses by name — and this is the NET under it, so that a path nobody has
+/// audited yet cannot put SQLite's prose on the wire. Every `RpcError` is built through
+/// [`RpcError::new`], which makes this the one place the guarantee can be stated once.
+///
+/// It CUTS rather than blanks: the caller's own lead-in (`create workspace failed: …`) says which
+/// operation died, which is useful and is not SQL; only the clause carrying the database's sentence
+/// is replaced.
+///
+/// # It runs on [`RpcCode::Internal`] ONLY (#K2)
+///
+/// The markers are SQLite's literal wordings, and the reasoning was that they do not occur in nyx's
+/// own refusals. That is true of nyx's PROSE and false of its refusals, because a good refusal
+/// QUOTES THE CALLER: `task_add(kind: "no such table")` answered `unknown kind 'no such table'
+/// (accepted: slice, human, review)`, whose marker sits before any `": "` — so the head was empty
+/// and the WHOLE message, list of accepted values and all, was replaced by a sentence about the
+/// storage layer that had never been consulted. Same for `get_command_output(grep: "syntax
+/// error(")`, where the regex parse error vanished into a false SQL diagnosis.
+///
+/// A message that carries a database's sentence is, by construction, an `internal` — nyx does not
+/// know what went wrong. `invalid_argument` / `invalid_id` / `invalid_state` are written by nyx
+/// ABOUT the caller's own input, which is exactly the text this net must not touch. So the net
+/// keeps everything it was built to catch and stops mutilating what it was never aimed at.
+fn without_sql_text(message: String) -> String {
+    const MARKERS: [&str; 6] = [
+        "constraint failed",
+        "no such table",
+        "no such column",
+        "sql logic error",
+        "syntax error",
+        "unrecognized token",
+    ];
+    let lower = message.to_ascii_lowercase();
+    let Some(hit) = MARKERS.iter().filter_map(|m| lower.find(m)).min() else {
+        return message;
+    };
+    // Everything before the clause the database's sentence sits in — `db error`,
+    // `create workspace failed`, … — is nyx's own words and stays.
+    let head = message[..hit]
+        .rsplit_once(": ")
+        .map(|(before, _)| before.trim())
+        .unwrap_or("");
+    if head.is_empty() {
+        SQL_TEXT_WITHHELD.to_string()
+    } else {
+        format!("{head}: {SQL_TEXT_WITHHELD}")
+    }
+}
+
 impl RpcError {
     /// Construct an error with the ADR-0003 D8 `code` and a message.
     /// Phase-2 tool implementations build their failures through this.
+    ///
+    /// An [`RpcCode::Internal`] message passes through [`without_sql_text`]: whatever a caller
+    /// assembles, an agent never receives a database's own sentence. The other codes are nyx's own
+    /// refusals ABOUT the caller's arguments — they quote the caller, never SQL, and go out
+    /// verbatim (see [`without_sql_text`] for the false positives that cost).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(code: RpcCode, message: impl Into<String>) -> Self {
+        let message = message.into();
         Self {
             code,
-            message: message.into(),
+            message: match code {
+                RpcCode::Internal => without_sql_text(message),
+                _ => message,
+            },
             data: None,
         }
     }
@@ -1012,14 +1105,7 @@ impl McpServer {
                 &format!("tool '{name}' not yet available (phase 2)"),
             ),
             Some(d) => match d.call_with_caller(name, &arguments, caller_terminal_id) {
-                Ok(result) => rpc_result_envelope(
-                    id,
-                    json!({
-                        "content": [{ "type": "text", "text": result.to_string() }],
-                        "structuredContent": result,
-                        "isError": false,
-                    }),
-                ),
+                Ok(result) => rpc_result_envelope(id, tool_result_envelope(result)),
                 Err(e) => {
                     let mut env = rpc_error_envelope(id, e.rpc_code(), &e.message);
                     // Carry the ADR-0003 D8 string code in `error.data.code`, plus any
@@ -1118,6 +1204,53 @@ fn authority_is_loopback(authority: &str) -> bool {
 /// workspace_id") or about what a required argument RESOLVES TO ("the run_id you pass names a run
 /// anchored on a workspace") — the two shapes the family actually has.
 const CONDITIONAL_ANCHOR_CLAUSE: &str = "ONLY when";
+
+/// THE SIZE BUDGET OF `tools/list`, IN BYTES OF SERIALIZED JSON.
+///
+/// Every agent that connects to nyx reads this catalogue before it has done anything. Measured on
+/// the 2026-09-01 reference journey it was 179 230 bytes for 111 tools — of the order of 45 000
+/// tokens, paid up front, by everyone. It had grown there unremarked because nothing anywhere
+/// stated what it was allowed to cost. This constant states it.
+///
+/// It is a CEILING, not a target, and the way to keep it is to write shorter, not to raise it.
+/// Raising it is a decision about what every agent pays on connection, so it belongs in a commit
+/// message with a reason — never in a "make the test pass" edit.
+///
+/// RAISED ONCE, 189 000 → 195 000, when two branches merged: the agent-piloting surface
+/// (`wait_for_terminal`, `spec_get`, `spec_list`, `task_list`) and the classification surface
+/// (`spec_set_category`) were authored in parallel, each trimmed to fit under the old ceiling on
+/// its own, and together they measure 192 208 bytes for 116 tools. The alternative was to cut
+/// prose that had already been cut once on both sides. The 9 exempted descriptors named in
+/// [`OVERSIZE_DESCRIPTORS`] still hold ~70 KB between them — that, not this ceiling, is where the
+/// next reduction is.
+pub(crate) const TOOLS_LIST_BUDGET_BYTES: usize = 195_000;
+
+/// The per-descriptor ceiling, in bytes of serialized JSON — the gate the whole-catalogue budget
+/// cannot provide on its own. A total says the catalogue is too big; it never says WHICH tool made
+/// it so, and 115 descriptors each growing 200 bytes look exactly like the total drifting on its
+/// own. This one names the offender the moment it is added.
+const TOOL_DESCRIPTOR_BUDGET_BYTES: usize = 4_000;
+
+/// The descriptors admitted ABOVE [`TOOL_DESCRIPTOR_BUDGET_BYTES`], each by name.
+///
+/// A list, and not a raised ceiling, because the cost of an exception should be paid in visibility:
+/// adding a name here is a deliberate act with a reviewer on the other side. The design/prototype
+/// subsystem holds five of these and the orchestration engine two — both are out of scope for the
+/// pass that set this budget, so they were measured and admitted rather than trimmed.
+///
+/// The guard test also refuses a STALE entry: a tool that came back under the ceiling must LEAVE
+/// this list, so it can never quietly cover a future one.
+const OVERSIZE_DESCRIPTORS: &[&str] = &[
+    "agent_context",
+    "design_inventory",
+    "design_preview",
+    "design_recipe",
+    "design_refresh_component",
+    "manage_command_group",
+    "nyx_next",
+    "proto_author_component",
+    "run_start",
+];
 
 /// The `tools/list` descriptors for the frozen v1 surface (ADR-0003). Phase-2 fills
 /// the per-tool argument schemas from the ADR's tool surface so a client can form
@@ -1237,14 +1370,14 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         json!({
             "type": "object",
             "additionalProperties": { "type": "string" },
-            "description": "optional per-run environment variables (KEY→VALUE string map) merged \
-                            onto the inherited environment for this run — e.g. {\"VAULT_ENV\":\"dev\"} \
-                            or values from a .env. Each value must be a string. Applied only to the \
-                            process this call spawns; on a no-op start (already running) it is ignored. \
-                            ON THE SYSTEM SCOPE this argument makes the call wait for the user's \
-                            approval, even for start_command which is otherwise free: an environment \
-                            changes what a fixed command line executes, so the user is shown the exact \
-                            map. Omit it to start a system command as it is defined, with no request.",
+            "description": "optional per-run environment variables (KEY→VALUE, every value a \
+                            string) merged onto the inherited environment for this run — e.g. \
+                            {\"VAULT_ENV\":\"dev\"}. Applied only to the process this call spawns, \
+                            and ignored on a no-op start (already running). ON THE SYSTEM SCOPE it \
+                            makes the call WAIT for the user's approval, otherwise free: an \
+                            environment changes what a fixed command line executes, so the user is \
+                            shown the exact map. Omit it to run a system command as defined, with \
+                            no request.",
         })
     };
     // The WHOLE-GROUP target (review 01M11WE6H9E5D5FCS6RT0ZXAXN, finding 01M11XVEFEQ524XRT9ARPQFGSV):
@@ -1257,8 +1390,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
              list_commands(project_id=…) `groups`. Requires `workspace_id` (a group holds command \
              TEMPLATES, which are project-scoped; running them is workspace-scoped), and is \
              mutually exclusive with instance_id/name. Every member of the group is {done} in that \
-             workspace, and the result is the group shape `{{ group_id, workspace_id, action, \
-             members[], running, total }}` instead of a single instance status.",
+             workspace; the answer is then the group shape described above, not a single instance \
+             status.",
         ))
     };
     // The PERSISTED `env` of a command TEMPLATE (v2.8 review N31): the environment stored WITH the
@@ -1289,7 +1422,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "start_command" => "Start a managed command (e.g. a dev server, build watcher, or test run) so nyx supervises it and captures its output. Identify it by `instance_id` from list_commands, or by `name` within a `workspace_id`. Starting an already-running command is a no-op (it does NOT launch a second process): the result reports `was_running:true, restarted:false` so you can tell — use relaunch_command to actually restart. Pass an optional `env` map (KEY→VALUE strings, e.g. {\"VAULT_ENV\":\"dev\"}) to add environment variables for this run, merged onto the inherited environment. After starting, read its output with get_command_output to see logs, errors, or a server URL. WHOLE GROUP: pass `group_id` (from list_commands(project_id=…) `groups`) together with `workspace_id` INSTEAD of an instance, and every member of that multi-pane group is started in that workspace — but ONLY the members that are not already running; a member already up is left strictly alone, neither restarted nor interrupted. The result is then `{ group_id, workspace_id, action, members[], running, total }`, one entry per member with its own status plus `was_running`/`acted`/`error`, and `running`/`total` as the group's aggregate. This is the exact same operation the user performs with the group's play button.",
             "stop_command" => "Stop a running managed command. Identify it by its `instance_id` from list_commands. The result reports `changed` (whether a live process was actually stopped) and `was_running`, so a stop on an already-idle command is a clear no-op rather than a false success. WHOLE GROUP: pass `group_id` together with `workspace_id` INSTEAD of `instance_id` to stop EVERY member of a multi-pane command group in that workspace (idempotent on the members already idle); the result is then the group shape `{ group_id, workspace_id, action, members[], running, total }`.",
             "relaunch_command" => "Restart a managed command in place (stop then start the same instance) — useful after a config or code change. This ALWAYS restarts (unlike start_command, which no-ops on a running command); the result reports `restarted:true`. Identify it by its `instance_id` from list_commands. Pass an optional `env` map (KEY→VALUE strings) to set environment variables for the fresh run, merged onto the inherited environment. WHOLE GROUP: pass `group_id` together with `workspace_id` INSTEAD of `instance_id` to restart a whole multi-pane command group in that workspace — the ACTIVE members are re-spawned and the INACTIVE ones are started, so the group ends fully active. All members are decided from one snapshot taken before anything runs (simultaneous, not one-after-another); the result is the group shape `{ group_id, workspace_id, action, members[], running, total }`.",
-            "get_command_output" => "Read a managed command's captured output (logs, errors, a dev server's URL, test results). Identify the command by `instance_id`, or by `name` within a `workspace_id`. Returns a token-safe tail by default, with terminal color/control codes already stripped (set strip_ansi:false for raw bytes). Use `grep` to return only matching lines (e.g. errors) or `tail_lines` for the last N lines. Reads are incremental: the result includes a `cursor` you can pass back as `since` to fetch only new output on the next read. Oversize handling: a request whose window exceeds the 1 MiB ceiling fails with a structured error carrying `error.data.code=\"output_too_large\"` plus `error.data.requested`/`error.data.limit` (bytes) — detect that code and retry with a smaller `tail_bytes` rather than guessing.",
+            "get_command_output" => "Read a managed command's captured output (logs, errors, a dev server's URL, test results). Identify the command by `instance_id`, or by `name` within a `workspace_id`. Returns a token-safe tail by default, with terminal color/control codes already stripped (set strip_ansi:false for raw bytes). Use `grep` to return only matching lines (e.g. errors) or `tail_lines` for the last N lines. Reads are incremental: the result includes a `cursor` you can pass back as `since` to fetch only new output on the next read. A window over the 1 MiB ceiling is refused — see `tail_bytes`.",
             "workspace_add" => "Register an EXISTING on-disk folder as a workspace under a project, so nyx tracks it and can run commands in it. The folder must already exist — a non-existent path or a file (not a directory) is rejected. Use create_workspace instead when nyx should CREATE the folder. Pass spec_id to ANCHOR a ready/in_progress Spec on the workspace in the same operation (the Spec's status is never changed). The result then carries the anchored Spec under `spec` next to `workspace`, so you do not need a second call to read it back; without spec_id the result is `{workspace}` alone.",
             "create_workspace" => "CREATE a new folder on disk (mkdir -p, including any missing parents) and register it as a workspace under a project. Use when the folder does not exist yet and the user wants nyx to start tracking a brand-new working folder. To register a folder that already exists, use workspace_add (which does NOT create anything). Pass spec_id to ANCHOR a ready/in_progress Spec on the workspace in the same operation (validated before the folder is created; the Spec's status is never changed). The result then carries the anchored Spec under `spec` next to `workspace`, so you do not need a second call to read it back; without spec_id the result is `{workspace}` alone.",
             _ => "",
@@ -1362,19 +1495,21 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         "name": str_prop("command name to resolve within workspace_id (alternative to instance_id; needs workspace_id)"),
                         "workspace_id": str_prop("workspace to resolve `name` in (required when using `name`)"),
                         "tail_bytes": int_prop("how many bytes to return from the tail of the output \
-                                               (default 12288, a token-safe window; max 1048576). Use this \
-                                               for the typical case. Semantics: effective window = \
-                                               min(tail_bytes, max_bytes)."),
+                                               (default 12288, a token-safe window). Use this for the \
+                                               typical case; the effective window is \
+                                               min(tail_bytes, max_bytes). Either above 1048576 fails \
+                                               with error.data.code=\"output_too_large\" plus \
+                                               error.data.requested/limit — detect that code and retry \
+                                               smaller rather than guessing."),
                         "since": int_prop("byte offset from a previous `cursor` for incremental polling. If the buffer was cleared since (your `since` is past the new end) the response carries `reset:true` and returns the fresh output from the start instead of an empty window"),
                         "max_bytes": int_prop("alternative hard ceiling on the returned window \
-                                              (default 1048576). If both tail_bytes and max_bytes are set, \
-                                              the smaller wins. Prefer tail_bytes for normal use; max_bytes \
-                                              is a safety guard. Either above 1048576 → output_too_large."),
+                                              (default 1048576) — a safety guard; prefer tail_bytes for \
+                                              normal use. Same 1048576 limit and same refusal."),
                         "strip_ansi": json!({ "type": "boolean", "description": "when true (the DEFAULT), `output` is the window with ANSI/terminal control sequences stripped — a single readable field. Set false to get the raw bytes in `output` instead. `cursor`/`total_bytes` are byte-exact either way." }),
                         "mark_read": json!({ "type": "boolean", "description": "when true, this read ALSO acknowledges the command's unseen result — flipping `unread` to false EXACTLY as a UI acknowledge does, while the factual outcome (state/exit_code) is left intact. Default false: a passive (polling) read NEVER consumes the `unread` notification. Only meaningful for the current run (a `previous`-selector read targets a settled prior run with no live `unread`)." }),
                         "grep": str_prop("optional regular expression; when set, `output` contains only the lines matching it (matched on the ANSI-stripped text). Use it to pull just the error lines instead of the whole tail."),
                         "tail_lines": int_prop("optional: keep only the last N lines of the window (applied after `grep`). A line-based alternative to tail_bytes for \"show me the last 20 lines\"."),
-                        "run": json!({ "description": "which run to read: 0/\"current\" (default, the latest run) or -1/\"previous\" (the one retained prior run, with its own exit_code/state). History is bounded to N=1; any other value is rejected. The result echoes `run`.", "oneOf": [ { "type": "integer" }, { "type": "string", "enum": ["current", "latest", "previous", "prev"] } ] }),
+                        "run": json!({ "description": "which run to read: 0/\"current\" (default, latest) or -1/\"previous\" (the retained prior run, with its own exit_code/state). History is bounded to N=1; anything else is refused by RANGE, never by type. The result echoes `run`.", "oneOf": [ { "type": "integer", "enum": [0, -1] }, { "type": "string", "enum": ["current", "latest", "previous", "prev"] } ] }),
                     }),
                     // instance_id OR (name + workspace_id); the tool validates.
                     vec![],
@@ -1438,11 +1573,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         the output produced AFTER this call (not the whole existing \
                         scrollback), with terminal control codes stripped. The returned \
                         `cursor` chains directly into get_command_output(since=cursor) so \
-                        you can fetch the new output with no gap or duplication. Oversize \
-                        handling: a tail_bytes/max_bytes request above the 1 MiB ceiling fails \
-                        with a structured error carrying `error.data.code=\"output_too_large\"` \
-                        plus `error.data.requested`/`error.data.limit` (bytes) — detect that code \
-                        and retry with a smaller `tail_bytes` rather than guessing.",
+                        you can fetch the new output with no gap or duplication. A \
+                        tail_bytes/max_bytes over the 1 MiB ceiling is refused — see `tail_bytes`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1454,8 +1586,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 }),
                 "timeout_ms": int_prop("max wait in ms before resolved:false (default 30000, clamped to ~60000 max)"),
                 "since": int_prop("byte offset from a previous get_command_output/wait_for_command `cursor`, so output_tail/cursor resume incrementally. OMIT on the first call: it defaults to the current end-of-buffer, so output_tail returns only output produced after this call (never the whole existing scrollback)."),
-                "tail_bytes": int_prop("how many bytes of new output to return in output_tail (default 12288, a token-safe window; max 1048576)"),
-                "max_bytes": int_prop("alternative hard ceiling on output_tail (default 1048576; the smaller of tail_bytes/max_bytes wins; either above 1048576 → output_too_large)"),
+                "tail_bytes": int_prop("how many bytes of new output to return in output_tail (default 12288, a token-safe window). Above 1048576 the call fails with error.data.code=\"output_too_large\" plus error.data.requested/limit — detect that code and retry smaller rather than guessing"),
+                "max_bytes": int_prop("alternative hard ceiling on output_tail (default 1048576; the smaller of tail_bytes/max_bytes wins). Same limit, same refusal"),
                 "strip_ansi": json!({ "type": "boolean", "description": "when true (the DEFAULT), output_tail has ANSI/terminal control sequences stripped; set false for raw bytes. cursor is byte-exact either way." }),
             },
             "required": ["instance_id"],
@@ -1570,11 +1702,10 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     // CRUD tools.
     descriptors.push(json!({
         "name": REMOVE_WORKSPACE_TOOL,
-        "description": "Remove a workspace from nyx. Deletes the workspace and its command \
-                        instances permanently. Terminals attached to the workspace are \
-                        detached (they become unattached terminals). Refused if any command \
-                        in the workspace is currently running — stop the commands first. \
-                        This action cannot be undone.",
+        "description": "Remove a workspace from nyx. This DETACHES it: its record, command \
+                        instances, terminals and agent sessions go permanently, and any running \
+                        command is stopped. THE FOLDER ON DISK IS NOT DELETED — the reply names \
+                        the path it kept under `folder_kept`. Cannot be undone.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1988,8 +2119,11 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "description": "Run a command in an EXISTING open terminal: types the command plus a \
                         newline into the terminal so the shell executes it. Identify the \
                         terminal by its `terminal_id` from list_terminals. The command's output \
-                        appears live in that terminal in nyx — read it there. Use create_terminal \
-                        first if no suitable terminal is open.",
+                        appears live in that terminal in nyx — read it with read_terminal. Use \
+                        create_terminal first if no suitable terminal is open. An interactive \
+                        terminal offers NO signal for \"that command has finished\": if you need \
+                        to know, define it as a managed command (add_command) and run it with \
+                        start_command + wait_for_command, which is what those tools are for.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2001,24 +2135,24 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     }));
     descriptors.push(json!({
         "name": SEND_KEYS_TOOL,
-        "description": "Send raw keystrokes to an open terminal to drive an interactive, \
-                        full-screen (raw-mode) program — a TUI menu, a pager, a prompt, an \
-                        editor — where send_to_terminal does not fit. Unlike send_to_terminal \
-                        (which types a shell COMMAND LINE and presses Enter for you), send_keys \
-                        writes EXACTLY the keys you list and adds NO newline, so you control \
-                        navigation, typing, and submitting yourself. Identify the terminal by \
-                        its `terminal_id` from list_terminals. Pass `keys`: an ARRAY processed \
-                        left to right where each element is EITHER literal text (typed verbatim, \
-                        no newline) OR a named key. Named keys (case-insensitive): \"enter\", \
-                        \"tab\", \"escape\"/\"esc\", \"backspace\", \"space\", \"up\", \"down\", \
-                        \"left\", \"right\", \"home\", \"end\", \"pageup\", \"pagedown\", \
-                        \"delete\", and control combos \"ctrl+c\", \"ctrl+d\", \"ctrl+u\", \
-                        \"ctrl+l\", \"ctrl+a\", \"ctrl+e\" (any \"ctrl+<letter>\" works). \
-                        Anything else is treated as literal text. Examples: [\"hello\", \
-                        \"enter\"] types \"hello\" then submits; [\"down\", \"down\", \"enter\"] \
-                        moves down a menu and selects; [\"ctrl+c\"] interrupts; [\"draft\"] types \
-                        without submitting. The result reports how many bytes were sent. Output \
-                        appears live in that terminal — read it with read_terminal.",
+        "description": "Send raw keystrokes to an open terminal (`terminal_id` from \
+                        list_terminals) to drive an interactive, full-screen (raw-mode) program — \
+                        a TUI menu, a pager, an editor — or an AGENT running there. Unlike \
+                        send_to_terminal (which types a shell COMMAND LINE and presses Enter for \
+                        you), send_keys writes EXACTLY the keys you list and adds NO newline, so \
+                        you control navigation, typing and submitting yourself. `keys` is an ARRAY \
+                        processed left to right; each element is EITHER literal text (typed \
+                        verbatim) OR a named key (case-insensitive): \"enter\", \"tab\", \
+                        \"escape\"/\"esc\", \"backspace\", \"space\", \"up\", \"down\", \"left\", \
+                        \"right\", \"home\", \"end\", \"pageup\", \"pagedown\", \"delete\", and \
+                        any \"ctrl+<letter>\" combo. Anything else is literal text. EACH ELEMENT \
+                        IS SENT AS ITS OWN PTY WRITE, so a full-screen app sees \"enter\" as a \
+                        real Enter and not as the tail of the text before it — [\"prompt\", \
+                        \"enter\"] in ONE call types AND submits. Examples: [\"down\", \"down\", \
+                        \"enter\"] walks a menu and selects; [\"ctrl+c\"] interrupts; [\"draft\"] \
+                        types without submitting. The result reports `bytes` sent and `writes` \
+                        (how many PTY writes it took). Then wait_for_terminal (for an agent's \
+                        answer) or read_terminal for what came out.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2038,31 +2172,28 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     }));
     descriptors.push(json!({
         "name": LIST_TERMINALS_TOOL,
-        "description": "List the terminals in nyx, each with its `terminal_id` \
-                        (the id you pass to send_to_terminal / close_terminal / read_terminal), its \
-                        working \
-                        directory, label, and workspace (if attached). Each entry also reports its \
-                        `status` (\"alive\" or \"closed\"), whether it is `live` (its shell has fully \
-                        started and can accept input) and its internal `pty_id`. By default only \
-                        OPEN terminals are listed; pass `include_closed:true` to ALSO list closed \
-                        ones — a closed terminal can no longer be written to, but read_terminal \
-                        still returns its last saved scrollback, so this is how you rediscover a \
-                        finished terminal's id to read its output. \
-                        Each entry ALSO reports `busy` (true while a command is running in the \
-                        foreground — the SAME live OS signal as the running dot the user sees; \
-                        false at an idle prompt, null if it cannot be derived), and the settled \
-                        result of the last command: `exec_state` (\"idle\"|\"running\"|\"success\"|\
-                        \"error\"), `exec_exit_code`, and `exec_state_updated_at` (epoch ms of the \
-                        last state change). \
-                        TO RELIABLY DETECT THAT A COMMAND YOU SENT HAS FINISHED: do NOT poll `busy` \
-                        alone — a very short command can start and finish between two polls, so you \
-                        could miss it and read `busy:false` as if nothing ran (a false negative). \
-                        Instead, capture `exec_state_updated_at` from list_terminals BEFORE calling \
-                        send_to_terminal, then poll list_terminals until that timestamp ADVANCES to \
-                        a settled state (`exec_state` becomes \"success\" or \"error\", with \
-                        `exec_exit_code`). The advancing timestamp is a monotone marker that catches \
-                        even an instantaneous command; once it settles, read_terminal returns that \
-                        command's output. Read-only.",
+        "description": "List the terminals in nyx. Each entry carries its `terminal_id` (what \
+                        send_to_terminal / send_keys / read_terminal / wait_for_terminal / \
+                        close_terminal take), its working directory, label, workspace (if \
+                        attached), `status` (\"alive\"|\"closed\"), `live` (its shell has started \
+                        and can accept input) and `pty_id`. Only OPEN terminals are listed by \
+                        default; `include_closed:true` also lists closed ones — a closed terminal \
+                        can no longer be written to, but read_terminal still returns its last \
+                        saved scrollback, so this is how you rediscover a finished terminal's id. \
+                        An entry hosting an AGENT (claude, codex, …) also carries \
+                        `agent_activity` — \"working\" (mid-turn), \"waiting\" (blocked on a \
+                        human: a question or a permission prompt), \"idle\" (between turns), null \
+                        when no agent session runs there — and `agent_session` { session_id, \
+                        agent_kind, external_session_id, state, transcript_path }: which agent \
+                        runs there, which of its sessions, and the transcript file it writes. \
+                        TO WAIT FOR SOMETHING, CALL THE TOOL THAT WAITS — never poll this one. \
+                        wait_for_terminal blocks on an agent's turn; wait_for_command blocks on a \
+                        managed command. The `busy` / `exec_state` (\"idle\"|\"running\"|\
+                        \"success\"|\"error\") / `exec_exit_code` / `exec_state_updated_at` fields \
+                        report the last foreground command the OS could see; they are BLIND to an \
+                        agent's turn — the agent is the foreground process for its whole life, so \
+                        they do not move while it answers — and `busy` is null wherever it cannot \
+                        be derived. Read-only.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2087,58 +2218,101 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     }));
     descriptors.push(json!({
         "name": READ_TERMINAL_TOOL,
-        "description": "Read the recent output (scrollback) of a terminal by its `terminal_id` \
-                        — the read counterpart to send_to_terminal. Get the id from list_terminals \
-                        (use list_terminals with include_closed:true to also find CLOSED \
-                        terminals) or from the create_terminal response (which you can keep \
-                        to read a terminal even AFTER it closes). Returns \
-                        a bounded tail of the terminal's text (~12 KB by default, ANSI colors \
-                        stripped), so after send_to_terminal you can read what the command \
-                        produced. Tune the window with `tail_bytes` / `max_bytes`, set \
-                        `strip_ansi:false` for raw output, and (for steady line output) page with \
-                        `since` (pass back the previous call's `cursor`). \
-                        FRESHNESS — READ THIS BEFORE TRUSTING THE TEXT: the read returns the LAST \
-                        scrollback nyx persisted for the terminal, and nyx only keeps that buffer \
-                        up to date while the terminal is MOUNTED in the app (debounced). A \
-                        terminal that is not on screen — another project is showing, or nyx \
-                        unloaded an idle agent session — keeps running while its saved buffer \
-                        stands still, so the text can be arbitrarily old. Every answer therefore \
-                        carries `live` (a shell is running behind this terminal right now) and \
-                        `stale`. `stale:false` is the ONLY case you may read as the terminal's \
-                        PRESENT state. `stale:true` means a PAST snapshot: either `live:false` (no \
-                        shell any more — a closed or unloaded terminal, so this is its final saved \
-                        output) or the shell has printed things nyx has not saved yet (not \
-                        mounted, or the save debounce still in flight right after a \
-                        send_to_terminal — retry to see the latest). To avoid \
-                        reading mid-command, first wait for the command to FINISH: poll \
-                        list_terminals until that terminal's `exec_state_updated_at` advances to a \
-                        settled `exec_state` (see list_terminals), then read. A \
-                        closed terminal still returns its last saved scrollback as long as nyx \
-                        remembers it (`stale:true`); an unknown id is an error. \
-                        INCREMENTAL READS ARE BEST-EFFORT: \
-                        scrollback is the re-serialized terminal grid, not an append-only log, so a \
-                        resize/reflow, a full-screen (alt-screen) app, a `clear`, or eviction can \
-                        rewrite it; an incremental read pages forward without dropping the head of \
-                        a burst, and if the buffer shrank below your cursor the result carries \
-                        `reset:true` with the fresh content (re-read WITHOUT `since` to resync). \
-                        FIDELITY: normal command output \
-                        (line-based echo) is reproduced faithfully; output from a full-screen \
-                        (alt-screen) TUI app is rendered by cursor positioning rather than literal \
-                        spaces, so reading it with strip_ansi may COALESCE runs of spaces (e.g. \
-                        adjacent words may join) — not a bug, just the limit of serializing a TUI \
-                        grid; pixel-perfect TUI capture is out of scope. Oversize handling: a \
-                        tail_bytes/max_bytes request above the 1 MiB ceiling fails with a \
-                        structured error carrying `error.data.code=\"output_too_large\"` plus \
-                        `error.data.requested`/`error.data.limit` (bytes) — detect that code and \
-                        retry with a smaller `tail_bytes` rather than guessing.",
+        "description": "Read a terminal's recent output (scrollback) by `terminal_id` — from \
+                        list_terminals (with include_closed:true to also find CLOSED terminals) or \
+                        from create_terminal. Returns a bounded tail (~12 KB by default, ANSI \
+                        stripped); tune it with `tail_bytes` / `max_bytes`, pass \
+                        `strip_ansi:false` for raw bytes, and page with `since` (the previous \
+                        call's `cursor`). An unknown id is an error. \
+                        WAIT FIRST, THEN READ — never read repeatedly to find out whether \
+                        something finished. wait_for_terminal blocks on the turn of an AGENT \
+                        running in the terminal (claude, codex, …) and hands back a `cursor` that \
+                        chains straight into `since` here; wait_for_command blocks on a managed \
+                        command. Polling `busy` / `exec_state` is the trap: they never move while \
+                        an agent answers. \
+                        FRESHNESS: nyx keeps the saved scrollback up to date only while the \
+                        terminal is MOUNTED in the app (debounced), so a terminal that is off \
+                        screen keeps running while its buffer stands still. Every answer carries \
+                        `live` (a shell is running behind it right now) and `stale`. \
+                        `stale:false` is the ONLY case you may read as the terminal's PRESENT \
+                        state; `stale:true` is a PAST snapshot — either `live:false` (closed or \
+                        unloaded: this is its final saved output) or output nyx has not saved yet \
+                        (retry). The answer also carries `agent_activity` \
+                        (\"working\"|\"waiting\"|\"idle\", null when no agent session runs there), \
+                        so you can tell whether the agent was still mid-turn when you read. \
+                        `since` IS BEST-EFFORT: scrollback is the re-serialized terminal grid, not \
+                        an append-only log, so a reflow, an alt-screen app, a `clear` or an \
+                        eviction can rewrite it. It pages forward without dropping the head of a \
+                        burst, but if the buffer shrank below your cursor the answer carries \
+                        `reset:true` with fresh content — re-read WITHOUT `since` to resync. \
+                        FIDELITY: line-based output is faithful; a full-screen (alt-screen) TUI is \
+                        drawn by cursor jumps, and the blank columns those stand for are restored \
+                        as spaces so words stay separated — but the layout is approximate. \
+                        A `tail_bytes`/`max_bytes` above the 1 MiB ceiling fails with \
+                        `error.data.code=\"output_too_large\"` plus `error.data.requested` / \
+                        `error.data.limit` — detect that code and retry smaller rather than \
+                        guessing.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "terminal_id": str_prop("id of the terminal to read (from list_terminals)"),
                 "tail_bytes": int_prop("how many bytes from the END of the scrollback to return (default 12288, a token-safe window). Capped by max_bytes; above 1048576 → output_too_large"),
-                "max_bytes": int_prop("alternative hard ceiling on the returned window (default 1048576; the smaller of tail_bytes/max_bytes wins; either above 1048576 → output_too_large)"),
-                "since": int_prop("byte offset to resume from (pass back a previous call's `cursor` to read only what is new); omit to read the tail. BEST-EFFORT for terminals — reliable for steady line output, but a reflow/clear can rewrite the scrollback; check `reset` in the response and re-read without `since` if it is true"),
+                "max_bytes": int_prop("alternative hard ceiling on the returned window (default 1048576; the smaller of tail_bytes/max_bytes wins). Same limit, same refusal"),
+                "since": int_prop("byte offset to resume from (a previous call's `cursor`); omit to read the tail. BEST-EFFORT — check `reset` in the answer"),
                 "strip_ansi": { "type": "boolean", "description": "strip ANSI escape sequences from the returned output (default true). false returns the raw bytes" },
+            },
+            "required": ["terminal_id"],
+        },
+    }));
+    // Append `wait_for_terminal`: the BOUNDED wait on a terminal's AGENT activity — the twin of
+    // `wait_for_command` for the other thing an agent waits on. Listed AFTER the v1 surface and
+    // kept out of [`V1_TOOLS`] for the same reason as `probe` / `wait_for_command`.
+    descriptors.push(json!({
+        "name": WAIT_FOR_TERMINAL_TOOL,
+        "description": "Wait for the AGENT running in a terminal (claude, codex, …) to finish its \
+                        turn — the tool to call right after you send it a prompt with send_keys, \
+                        instead of polling anything. Blocks up to `timeout_ms` (max ~60s) until \
+                        the terminal's `agent_activity` enters `until`, then returns \
+                        resolved:true; if the timeout elapses first it returns resolved:false — a \
+                        NORMAL outcome, not an error: call again to keep waiting. Read-only: it \
+                        sends nothing and changes nothing. \
+                        Activity: \"working\" (mid-turn), \"waiting\" (blocked on a human — a \
+                        question or a permission prompt), \"idle\" (between turns). The DEFAULT \
+                        `until` is [\"idle\",\"waiting\"] — \"the agent has given you the hand \
+                        back\" — which covers a finished answer and a blocked one alike. \
+                        `output_tail` carries, by default, only the output produced AFTER this \
+                        call (never the whole scrollback), ANSI-stripped, and the returned \
+                        `cursor` chains directly into read_terminal(since=cursor) so you fetch the \
+                        rest with no gap and no duplication. `agent_activity` is the same value \
+                        list_terminals reports — what the hooks said, never a guess. \
+                        `submission_pending:true` means nyx wrote an enter here and the agent has \
+                        not spoken since: with resolved:false, wait again rather than send \
+                        anything else. The answer also carries `agent_session` (which agent and \
+                        which of its sessions runs there) and the usual `live`/`stale` freshness \
+                        bits. \
+                        ON A TERMINAL WITH NO AGENT SESSION this is not an error: `agent_session` \
+                        is null and the activity is always \"idle\", so the default wait resolves \
+                        immediately — use wait_for_command for a managed command. At most 3 may \
+                        block at once (a worker must stay free for the hooks that end them); a 4th \
+                        is refused with `invalid_state` — let one return, or read_terminal. A \
+                        tail_bytes/max_bytes above the 1 MiB ceiling fails with \
+                        `error.data.code=\"output_too_large\"` plus `error.data.requested` / \
+                        `error.data.limit` — detect that code and retry smaller rather than \
+                        guessing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "terminal_id": str_prop("id of the OPEN terminal to wait on (from list_terminals)"),
+                "until": json!({
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["idle", "working", "waiting", "settled"] },
+                    "description": "activity states that resolve the wait (default: [\"idle\",\"waiting\"] — the agent gave the hand back). \"settled\" is an alias for idle+waiting.",
+                }),
+                "timeout_ms": int_prop("max wait in ms before resolved:false (default 30000, clamped to ~60000 max)"),
+                "since": int_prop("byte offset from a previous read_terminal/wait_for_terminal `cursor`, so output_tail/cursor resume incrementally. OMIT on the first call: it then defaults to the current end-of-buffer."),
+                "tail_bytes": int_prop("how many bytes of new output to return in output_tail (default 12288, a token-safe window); above 1048576 → output_too_large"),
+                "max_bytes": int_prop("alternative hard ceiling on output_tail (default 1048576; the smaller of tail_bytes/max_bytes wins). Same limit, same refusal"),
+                "strip_ansi": json!({ "type": "boolean", "description": "when true (the DEFAULT), output_tail has ANSI/terminal control sequences stripped; set false for raw bytes. cursor is byte-exact either way." }),
             },
             "required": ["terminal_id"],
         },
@@ -2179,16 +2353,18 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     // existing authorities, not part of the frozen contract).
     descriptors.push(json!({
         "name": WORKSPACE_RUNTIME_TOOL,
-        "description": "Get a workspace's LIVE runtime at a glance: its interactive terminals \
-                        (with the agent sessions running on them), the agent sessions anchored \
-                        to the workspace across all its terminals, and its managed-command \
-                        services with each one's current run state (idle/running/success/error) \
-                        and last exit code. Use it to see everything happening in a workspace \
-                        in one call. Pass the `workspace_id` (from list_workspaces). Read-only.",
+        "description": "A workspace's LIVE runtime: its terminals, its agent sessions and its \
+                        services. Pass the `workspace_id` (from list_workspaces). NO OUTPUT IS \
+                        INLINED: terminals, services and ended sessions report `scrollback_bytes` \
+                        / `transcript_path` instead — read them with read_terminal / \
+                        get_command_output. Sessions: LIVE FIRST, PAGED \
+                        (`agent_sessions_next_offset`).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "workspace_id": str_prop("the workspace whose live runtime to aggregate (from list_workspaces(project_id=…))"),
+                "limit": int_prop("max agent sessions (default 50, max 200)"),
+                "offset": int_prop("first agent session (0-based)"),
             },
             "required": ["workspace_id"],
         },
@@ -2242,13 +2418,16 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         sections (problem / solution / implementation_decisions / \
                         testing_decisions / user_stories / out_of_scope). The Spec is authored \
                         PROJECT-scoped and UNANCHORED — the dev workspace anchor is posed later, \
-                        at the ready→in_progress start transition (spec_transition), not here. \
+                        when nyx starts the Spec (ready→in_progress), not here. \
                         Optionally CLASSIFY it with `category` (the genre of work: bug, feature, \
                         refactor, chore, or any category of the project) — assigned in the SAME \
                         transaction, so the Spec is never created half-classified. Returns the \
                         created spec, revision and category. Use spec_update_section to fill \
-                        sections later, spec_set_category to reclassify, and spec_transition to \
-                        move its lifecycle.",
+                        sections later, and spec_set_category to reclassify. THERE IS NO LIFECYCLE \
+                        VERB ON THIS SURFACE, on purpose: nyx imposes each Spec transition (ready \
+                        / start / review / done / cancel) itself, at the workflow step built for \
+                        it — you reach that step by ticking nyx_next, and never move a Spec by \
+                        hand.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2384,15 +2563,34 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "project_id": str_prop("project the task belongs to (from list_projects)"),
                 "title": str_prop("the task's title"),
                 "spec_id": spec_ref_prop("optional Spec to attach the task to"),
-                "kind": str_prop("slice (default) | human | review"),
-                "type": str_prop("optional task type (defaults to implementation)"),
-                "priority": str_prop("optional priority (urgent | high | med | low; defaults to med)"),
-                "severity": str_prop("optional finding severity (for kind=review)"),
+                // THE FOUR CLOSED VOCABULARIES, advertised FROM the constants the write path
+                // refuses outside of (`db::TASK_*`), never from a hand-written paraphrase: an
+                // unknown value is an `invalid_argument` naming this very set, so the sentence an
+                // agent reads and the set it is checked against are one fact.
+                "kind": str_prop(&format!(
+                    "optional kind ({}); defaults to slice. slice is agent implementation work, \
+                     human is an action only the user can do (give it a verification_command), \
+                     review is a finding (carry a severity). Any other value is refused",
+                    crate::db::TASK_KINDS.join(" | ")
+                )),
+                "type": str_prop(&format!(
+                    "optional task type ({}); defaults to implementation. Any other value is refused",
+                    crate::db::TASK_TYPES.join(" | ")
+                )),
+                "priority": str_prop(&format!(
+                    "optional priority ({}); defaults to med. Any other value is refused",
+                    crate::db::TASK_PRIORITIES.join(" | ")
+                )),
+                "severity": str_prop(&format!(
+                    "optional finding severity ({}), for kind=review; omit it on any other kind. \
+                     Any other value is refused",
+                    crate::db::TASK_SEVERITIES.join(" | ")
+                )),
                 "description": str_prop("optional long-form body"),
                 "acceptance_criteria": str_prop("optional acceptance/done criteria"),
                 "verification_command": str_prop("how a kind=human action is verified (required to close a human task)"),
                 "parent_task_id": str_prop("optional parent task (subtask decomposition)"),
-                "phase": str_prop("optional phase NAME (needs spec_id). While the Spec is DRAFT nyx materializes its plan from the names, in first-seen order — that is how the plan is written. Once the Spec has left draft the plan is FROZEN: a name it does not already hold is refused, listing the ones it holds. Pass the NAME alone, never the '2 · Some phase' heading a manual renders. On a kind=review finding, OMIT IT — nyx anchors the finding on the phase under review itself"),
+                "phase": str_prop("optional phase NAME — a STRING, never a number (needs spec_id). An integer is REFUSED, not ignored, and so is an all-digits string (\"2\") — nyx NUMBERS the phases itself, so 3 names nothing. A name CONTAINING a digit ('Phase 2') is fine. While the Spec is DRAFT nyx materializes its plan from the names, in first-seen order — that is how the plan is written. Once the Spec has left draft the plan is FROZEN: a name it does not already hold is refused, listing the ones it holds. Pass the NAME alone, never the '2 · Some phase' heading a manual renders. NAME IN, RANK OUT: the created task's `phase` field is the 1-based RANK nyx assigned, not the name you sent — so the response also carries `phase_name`, echoing the name, and the two together are how you re-read your own write. On a kind=review finding, OMIT IT — nyx anchors the finding on the phase under review itself"),
                 "round": int_prop("rarely needed: the rework round of a kind=review finding. OMIT IT — nyx fills it from the Spec's own review pass (per-phase: 2.1, 4.1…), which it knows and you do not. Pass one only to attribute a finding to a pass other than the current one"),
             },
             "required": ["project_id", "title"],
@@ -2497,6 +2695,96 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
         "inputSchema": {
             "type": "object",
             "properties": { "spec_id": anchorless_spec_ref_prop("the Spec whose dependencies + badges to read") },
+            "required": ["spec_id"],
+        },
+    }));
+    // The v2.8 READ half of the Spec surface. It was WRITE-ONLY: an agent could author a Spec and
+    // its tasks and had no way to read any of it back — the only door was `agent_context`, which
+    // wraps the state in a ROLE MANUAL and refuses outright for coder/doc when no Spec resolves.
+    // Three plain reads close it: ONE Spec whole, the Specs of a project, the tasks of a Spec.
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_GET_TOOL,
+        "description": "READ one Spec whole — the way to re-read what you just wrote. Returns the \
+                        Spec (status, priority, mode, its workspace anchor, and `phases`: the \
+                        ordered plan as {number, name} entries), its ACTIVE revision (the six \
+                        structured sections: problem / solution / implementation_decisions / \
+                        testing_decisions / user_stories / out_of_scope), and its tasks — each \
+                        carrying `phase_name` beside the numeric `phase`, so a rank is readable \
+                        without a second call. The task list is PAGED (offset/limit): read \
+                        `tasks_next_offset` and call again while it is non-null, or use task_list \
+                        to filter. This needs no role and no run — unlike agent_context, which \
+                        renders a role manual around the state. An unknown Spec is invalid_id. \
+                        Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                // CONDITIONAL: `project_id` is the one anchor here and it is OPTIONAL, so `#N` / `N`
+                // resolve with it and cannot without — stated rather than left to be discovered.
+                "spec_id": conditional_spec_ref_prop(
+                    "the Spec to read",
+                    "you also pass project_id, the only project anchor this call carries",
+                ),
+                "project_id": str_prop("optional project the short '#N' / 'N' forms are counted in (from list_projects); not needed for a canonical id or a 'KEY-N'"),
+                "offset": int_prop("first task to return (0-based; defaults to 0) — page with the `tasks_next_offset` the answer carries"),
+                "limit": int_prop("how many tasks to return (defaults to 50, capped at 200)"),
+            },
+            "required": ["spec_id"],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_LIST_TOOL,
+        "description": "LIST the live Specs — how you FIND a Spec whose id you do not have. Returns \
+                        each Spec in board order with its canonical id, its human `key` (e.g. \
+                        NYX-3, the form spec_get and task_add also accept), title, status, \
+                        priority, number and phase plan. Archived Specs are excluded. project_id \
+                        is OPTIONAL: pass it to scope to one project, pass a workspace_id or a cwd \
+                        to have nyx resolve the project from where you are, or pass NOTHING to \
+                        list across every project — which is what you want when you do not know \
+                        which project a lost Spec is in — a project_id you DO pass must exist: an \
+                        unknown one is refused, not answered with an empty list. `status` narrows \
+                        to one lifecycle state (draft, ready, in_progress, in_review, …). OLDEST \
+                        FIRST per project: with a project_id your new Spec is LAST (offset = \
+                        total - 1); across projects use status:\"draft\". PAGED: read \
+                        `next_offset` and call again while it is non-null. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": str_prop("optional project to scope to (from list_projects); it must exist (an unknown id is refused). Omit it — with or without a workspace_id / cwd — to list across every project"),
+                "workspace_id": str_prop("optional: resolve the project from this workspace instead of naming it (from list_workspaces)"),
+                "cwd": str_prop("optional: resolve the project from a directory (the workspace whose root best matches this path)"),
+                "status": str_prop("optional lifecycle status to narrow to (draft | ready | in_progress | blocked | in_review | completed | cancelled)"),
+                "offset": int_prop("first Spec to return (0-based; defaults to 0) — page with the `next_offset` the answer carries, or jump to the newest with total - 1"),
+                "limit": int_prop("how many Specs to return (defaults to 50, capped at 200)"),
+            },
+            "required": [],
+        },
+    }));
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::TASK_LIST_TOOL,
+        "description": "LIST a Spec's tasks — its plan AND its review findings, which are the same \
+                        list (a finding is a task with kind=review). Each task carries \
+                        `phase_name` beside its numeric `phase`, and the answer repeats the Spec's \
+                        `phases` plan so a rank is never read without its name. Narrow with `kind` \
+                        (slice | human | review), `status`, or `phase` — the phase NAME, the same \
+                        word task_add takes, never its number. PAGED: read `next_offset` and call \
+                        again while it is non-null. An unknown Spec is invalid_id. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec_id": conditional_spec_ref_prop(
+                    "the Spec whose tasks to list",
+                    "you also pass project_id, the only project anchor this call carries",
+                ),
+                "project_id": str_prop("optional project the short '#N' / 'N' forms are counted in (from list_projects); not needed for a canonical id or a 'KEY-N'"),
+                "kind": str_prop(&format!(
+                    "optional kind to narrow to ({}); omit for every task",
+                    crate::db::TASK_KINDS.join(" | ")
+                )),
+                "status": str_prop("optional task status to narrow to (todo | ready | in_progress | blocked | in_review | done | cancelled)"),
+                "phase": str_prop("optional phase NAME to narrow to — a STRING, the same name task_add takes, never its rank. A name the plan does not hold returns no task rather than every task"),
+                "offset": int_prop("first task to return (0-based; defaults to 0) — page with the `next_offset` the answer carries"),
+                "limit": int_prop("how many tasks to return (defaults to 50, capped at 200)"),
+            },
             "required": ["spec_id"],
         },
     }));
@@ -3475,10 +3763,10 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         When the action carries child_run_id, the question comes from a sub-workflow: \
                         send the answer to nyx_next(run_id=child_run_id), NOT to this run. When it \
                         carries human_turn_required, the answer COMMITS the Spec (an engaging \
-                        transition: ready / done / cancel): nyx checks that the human actually took a \
-                        turn on this session between its question and your answer, and REFUSES an \
-                        answer with no such turn behind it — including one they told you in advance. \
-                        So ask them, wait for their reply, and report it on the tick after it. \
+                        transition: ready / done / cancel): nyx checks that the human actually SPOKE \
+                        on this session between its question and your answer, and REFUSES an answer \
+                        with no such turn behind it — including one they told you in advance. It \
+                        checks that they SPOKE, not what they said. Ask, wait, report next tick. \
                         produce — produce the artefact the current node asks for; report its reference. \
                         wait — pause; report {} to resume. \
                         sub_workflow[child_run_id, context] — a CHILD run was opened for you: do what \
@@ -4440,6 +4728,35 @@ fn rpc_result_envelope(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
+/// Wrap a tool's JSON answer in an MCP `CallToolResult` — **once**.
+///
+/// nyx used to ship every answer TWICE: serialized into `content[0].text` AND as
+/// `structuredContent`. On the reference journey's ordinary `list_terminals` reply that was
+/// 3 701 bytes of envelope for 1 686 bytes of payload — the duplicate being **46 % of everything
+/// the agent reads back** — and a loop driving a terminal pays it on every single read. Measured
+/// again here on that same shape: **3 868 B → 1 806 B, 53 % smaller** (the reproduction runs 1 755 B
+/// of payload rather than 1 686 B, same ratio). The MCP spec (2025-06-18) calls the text copy a
+/// backwards-compatibility SHOULD, not a requirement: `content` is required to be *present*, and an
+/// empty array satisfies that.
+///
+/// So the object answers — which is all of them but the degenerate case below — travel in
+/// `structuredContent` alone. Verified, not assumed, against the client that matters: Claude Code
+/// 2.1.246 driven headless over this exact envelope (`content: []` + `structuredContent`) received
+/// the payload in full and echoed it back verbatim. The other in-tree consumer, the session hook
+/// in `resources/claude-plugin/hooks/nyx-session-hook.cjs`, already reads
+/// `result.structuredContent` and never looked at the text block.
+///
+/// THE ONE PLACE THE TEXT FORM SURVIVES is a non-object answer: MCP types `structuredContent` as an
+/// object, so an array/string/number could not travel there and would leave the client with
+/// nothing at all. Those keep the text block — and only those.
+fn tool_result_envelope(result: Value) -> Value {
+    if result.is_object() {
+        json!({ "content": [], "structuredContent": result, "isError": false })
+    } else {
+        json!({ "content": [{ "type": "text", "text": result.to_string() }], "isError": false })
+    }
+}
+
 /// Build a JSON-RPC 2.0 error envelope.
 fn rpc_error_envelope(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
@@ -4476,6 +4793,142 @@ mod tests {
     /// since the process environment is shared. Each test that sets the var clears
     /// it before/after under this guard.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `tools/list` COSTS SOMETHING, AND THE NUMBER IS NOW WRITTEN DOWN.
+    ///
+    /// The catalogue is the first thing every agent reads and the one thing it cannot decline: on
+    /// the 2026-09-01 reference journey it was 179 230 bytes for 111 tools — of the order of
+    /// 45 000 tokens spent before a single call. It had drifted there because nothing stated what
+    /// it was allowed to cost, and a total nobody measures is a total that only grows.
+    ///
+    /// THREE ASSERTIONS, because a single global number would be a weak guard. The total pins the
+    /// bill. The per-descriptor ceiling names the tool that raised it, which the total never can —
+    /// 115 descriptors each gaining 200 bytes read exactly like drift. And the exemption list is
+    /// checked BOTH ways, so an admitted descriptor that later came back under the ceiling is
+    /// forced out of the list instead of staying there to shelter the next one.
+    #[test]
+    fn tools_list_stays_under_its_size_budget() {
+        let tools = tool_descriptors();
+        let total = serde_json::to_string(&json!({ "tools": tools }))
+            .expect("the catalogue serializes")
+            .len();
+        assert!(
+            total <= TOOLS_LIST_BUDGET_BYTES,
+            "tools/list is {total} bytes for {} tools — over the {TOOLS_LIST_BUDGET_BYTES}-byte \
+             budget every agent pays on connection. SHORTEN a description; raising the budget is a \
+             decision about what everyone pays, not a way to make this test pass",
+            tools.len()
+        );
+
+        let size = |name: &str| -> Option<usize> {
+            tools
+                .iter()
+                .find(|t| t["name"] == json!(name))
+                .map(|t| serde_json::to_string(t).expect("a descriptor serializes").len())
+        };
+
+        for tool in &tools {
+            let name = tool["name"].as_str().expect("every descriptor is named");
+            let len = serde_json::to_string(tool)
+                .expect("a descriptor serializes")
+                .len();
+            assert!(
+                len <= TOOL_DESCRIPTOR_BUDGET_BYTES || OVERSIZE_DESCRIPTORS.contains(&name),
+                "`{name}` weighs {len} bytes on its own, over the \
+                 {TOOL_DESCRIPTOR_BUDGET_BYTES}-byte per-tool ceiling. Trim it, or admit it by \
+                 name in OVERSIZE_DESCRIPTORS — deliberately, with a reviewer"
+            );
+        }
+
+        for admitted in OVERSIZE_DESCRIPTORS {
+            let len = size(admitted).unwrap_or_else(|| {
+                panic!("OVERSIZE_DESCRIPTORS names `{admitted}`, which no longer exists")
+            });
+            assert!(
+                len > TOOL_DESCRIPTOR_BUDGET_BYTES,
+                "`{admitted}` is down to {len} bytes, under the ceiling — take it OUT of \
+                 OVERSIZE_DESCRIPTORS, so the list keeps naming only real exceptions"
+            );
+        }
+    }
+
+    /// THE TERMINAL TOOLS TEACH THE GESTURE THAT WORKS, AND NO LONGER THE ONE THAT DOES NOT.
+    ///
+    /// `list_terminals` used to hand an agent a polling protocol — capture `exec_state_updated_at`,
+    /// call, then poll until it advances to a settled `exec_state` — and `read_terminal` sent the
+    /// reader to it. On the 2026-09-01 journey that protocol was measured against a real Claude
+    /// session: `busy` was `null` for its whole life and `exec_state_updated_at` did not move once
+    /// while the agent answered. A description that teaches a gesture which cannot work is worse
+    /// than a short one that teaches nothing — the agent follows it, and loops.
+    ///
+    /// Both halves are asserted, because either alone can be satisfied by a description that says
+    /// nothing: the retired formulations are gone AND the tool that actually waits is named.
+    #[test]
+    fn the_terminal_tools_send_you_to_wait_for_terminal_not_to_a_polling_loop() {
+        let descriptors = tool_descriptors();
+        let describe = |name: &str| -> String {
+            descriptors
+                .iter()
+                .find(|t| t["name"] == json!(name))
+                .unwrap_or_else(|| panic!("`{name}` is advertised"))["description"]
+                .as_str()
+                .expect("a description")
+                .to_string()
+        };
+
+        // The retired protocol, in the words it was written in. Any of them coming back means the
+        // loop came back with it.
+        const RETIRED: &[&str] = &[
+            "poll list_terminals",
+            "poll `busy`",
+            "timestamp ADVANCES",
+            "advances to a settled",
+            "exec_state_updated_at BEFORE",
+        ];
+        for tool in [
+            LIST_TERMINALS_TOOL,
+            READ_TERMINAL_TOOL,
+            WAIT_FOR_TERMINAL_TOOL,
+            SEND_KEYS_TOOL,
+            SEND_TO_TERMINAL_TOOL,
+        ] {
+            let desc = describe(tool);
+            for stale in RETIRED {
+                assert!(
+                    !desc.contains(stale),
+                    "`{tool}` still teaches the retired polling protocol (\"{stale}\") — it does \
+                     not work on a terminal running an agent, which is the case it was written \
+                     for: {desc}"
+                );
+            }
+        }
+
+        // …and the two READ tools name the tool that does the waiting, so an agent that must wait
+        // is not left to invent something.
+        for tool in [LIST_TERMINALS_TOOL, READ_TERMINAL_TOOL] {
+            let desc = describe(tool);
+            assert!(
+                desc.contains(WAIT_FOR_TERMINAL_TOOL),
+                "`{tool}` must name `{WAIT_FOR_TERMINAL_TOOL}` — telling an agent not to poll \
+                 without saying what to do instead only moves the problem: {desc}"
+            );
+        }
+
+        // `read_terminal` states the ORDER, which is the whole lesson: wait, then read.
+        let read = describe(READ_TERMINAL_TOOL);
+        assert!(
+            read.contains("WAIT FIRST, THEN READ"),
+            "read_terminal must state the order it exists to teach: {read}"
+        );
+
+        // And `send_keys` — the tool that submits a prompt to an agent — hands over to the wait
+        // rather than leaving the caller reading in a loop for an answer that is not there yet.
+        let keys = describe(SEND_KEYS_TOOL);
+        assert!(
+            keys.contains(WAIT_FOR_TERMINAL_TOOL),
+            "send_keys must point at the wait that follows a submitted prompt: {keys}"
+        );
+    }
 
     /// Send a raw HTTP request to `127.0.0.1:<port>` and return the (status_line,
     /// body) pair. A tiny hand-rolled client so the test needs no HTTP client dep.
@@ -5026,12 +5479,14 @@ mod tests {
              project_id / workspace_id / cwd / run_id, so a bare number has nothing to be counted in"
         );
         assert_eq!(
-            optional_anchor, 5,
+            optional_anchor, 7,
             "the CONDITIONAL fields — every one whose project can be absent at call time, whether \
              because its anchor may be omitted (`spec_update_section`, `spec_set_workspace`, \
-             `agent_context`, `run_start`) or because the anchor it REQUIRES may itself resolve to \
-             nothing (`run_bind_spec`, whose `run_id` names a run that may carry no workspace). One \
-             arriving here without its condition is exactly what this family exists to catch"
+             `agent_context`, `run_start`, and the v2.8 reads `spec_get` / `task_list`, whose \
+             `project_id` exists only to let a '#N' resolve) or because the anchor it REQUIRES may \
+             itself resolve to nothing (`run_bind_spec`, whose `run_id` names a run that may carry \
+             no workspace). One arriving here without its condition is exactly what this family \
+             exists to catch"
         );
         assert_eq!(
             required_anchor, 8,
@@ -5834,6 +6289,354 @@ mod tests {
         texts
     }
 
+    /// DONE-CRITERION (task `01M1F8X44HSK742EVVG8F94H6H`): **no message this server renders carries
+    /// a database's own sentence.**
+    ///
+    /// Measured 2026-09-01: `task_add` answered `-32000 internal` with `db error: FOREIGN KEY
+    /// constraint failed`, and `db error: CHECK constraint failed: kind IN
+    /// ('slice','human','review')`. The actionable refusals live upstream now (the write path knows
+    /// which argument is at fault); this pins the NET, so a path nobody has audited cannot put
+    /// SQLite's prose back on the wire — whatever string it assembles.
+    #[test]
+    fn no_rpc_error_message_carries_sql_text() {
+        // The database's sentences, as they really arrive — bare, and wrapped in a caller's lead-in.
+        for raw in [
+            "db error: FOREIGN KEY constraint failed",
+            "db error: CHECK constraint failed: kind IN ('slice','human','review')",
+            "FOREIGN KEY constraint failed",
+            "create workspace failed: UNIQUE constraint failed: workspaces.path",
+            "db error: no such table: app_settings",
+            "query spec_status: no such column: specs.bogus",
+        ] {
+            let err = RpcError::new(RpcCode::Internal, raw);
+            let lower = err.message.to_ascii_lowercase();
+            for marker in [
+                "constraint failed",
+                "foreign key",
+                "no such table",
+                "no such column",
+                "kind in (",
+            ] {
+                assert!(
+                    !lower.contains(marker),
+                    "the SQL marker {marker:?} survived redaction of {raw:?}: {}",
+                    err.message
+                );
+            }
+            // What is withheld is REPLACED by something the caller can act on, never blanked.
+            assert!(
+                err.message.contains("argument"),
+                "the replacement tells the caller where to look: {}",
+                err.message
+            );
+        }
+        // The caller's OWN lead-in survives — it says which operation died and is not SQL.
+        assert!(
+            RpcError::new(RpcCode::Internal, "create workspace failed: UNIQUE constraint failed")
+                .message
+                .starts_with("create workspace failed: "),
+            "the redaction cuts the database's clause, not the whole message"
+        );
+        // And a refusal that never touched a database is passed through UNCHANGED — the net must
+        // not rewrite the actionable errors it sits under.
+        let untouched = "missing or empty required argument 'project_id'";
+        assert_eq!(
+            RpcError::new(RpcCode::InvalidArgument, untouched).message,
+            untouched
+        );
+    }
+
+    /// #K2 — THE NET MUST NOT EAT A REFUSAL THAT QUOTES THE CALLER.
+    ///
+    /// A good refusal repeats the argument it is refusing, so an argument that happens to READ like
+    /// SQLite's prose used to be enough to have the whole sentence replaced by a diagnosis about a
+    /// storage layer nothing had consulted — and the accepted-values list, the only actionable part,
+    /// went with it. Both measurements are pinned here, on the exact messages the two tools build.
+    #[test]
+    fn an_argument_refusal_that_quotes_the_caller_survives_the_sql_net() {
+        // `task_add(kind: "no such table")` — `mcp_tools_spec::optional_enum_str`'s wording. The
+        // marker sits BEFORE any `": "`, so the redaction had no head to keep and blanked it all.
+        let kinds = crate::db::TASK_KINDS.join(", ");
+        let refusal = RpcError::new(
+            RpcCode::InvalidArgument,
+            format!("unknown kind 'no such table' (accepted: {kinds})"),
+        );
+        assert!(
+            refusal.message.contains(&kinds),
+            "the accepted values are the whole point of the refusal: {}",
+            refusal.message
+        );
+        assert!(
+            !refusal.message.contains("storage layer"),
+            "and nothing about a database nyx never consulted: {}",
+            refusal.message
+        );
+
+        // `get_command_output(grep: "syntax error(")` — `mcp_runtime::optional_regex`'s wording,
+        // where the regex crate's own parse detail is what tells the agent how to fix the pattern.
+        let parse_error = regex::Regex::new("syntax error(").unwrap_err().to_string();
+        let refusal = RpcError::new(
+            RpcCode::InvalidArgument,
+            format!("argument 'grep' is not a valid regex: {parse_error}"),
+        );
+        assert!(
+            refusal.message.contains("unclosed group"),
+            "the parse error must survive rather than become a false SQL diagnosis: {}",
+            refusal.message
+        );
+
+        // The two other caller-facing codes are covered by the same rule.
+        for code in [RpcCode::InvalidId, RpcCode::InvalidState] {
+            let raw = "unknown phase 'no such column' (accepted: 1, 2, 3)";
+            assert_eq!(RpcError::new(code, raw).message, raw);
+        }
+    }
+
+    /// Every agent-facing prose surface nyx SERVES, as `(surface, text)`: the `initialize`
+    /// instructions, every advertised tool description + property description, and every role
+    /// MANUAL `agent_context` renders. These are the only texts an agent reads before it forms a
+    /// call — so they are the exact set the "no phantom tool" guard below sweeps.
+    fn agent_facing_texts() -> Vec<(String, String)> {
+        let mut texts: Vec<(String, String)> = vec![(
+            "initialize instructions".to_string(),
+            SERVER_INSTRUCTIONS.to_string(),
+        )];
+        for (tool, field, text) in descriptor_texts() {
+            texts.push((format!("tool `{tool}` / {field}"), text));
+        }
+        for role in crate::mcp_context::AgentRole::ALL {
+            texts.push((
+                format!("agent_context manual {role:?}"),
+                crate::mcp_context::render_role_template(role),
+            ));
+        }
+        texts
+    }
+
+    /// The TOOL NAMES nyx's MCP layer declares anywhere in its own source — harvested from the
+    /// `*_TOOL: &str = "…"` constants of the MCP modules, read through [`const_declaration`] like
+    /// every other source scan here. This is the VOCABULARY the guard below checks the prose
+    /// against: a name in it that `tools/list` does not carry is a name that exists in the code and
+    /// NOT on the wire, which is exactly the shape of the phantom.
+    ///
+    /// Only the `mcp*` modules are scanned, deliberately: `agent_activity.rs` declares
+    /// `ASK_USER_QUESTION_TOOL`, which names CLAUDE CODE's own tool (a `PreToolUse` payload nyx
+    /// reads), not a tool nyx serves — it has no business being required in `tools/list`.
+    fn declared_tool_names() -> Vec<String> {
+        const SOURCES: [&str; 11] = [
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_authoring.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_context.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_engine.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_runtime.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_tools_annexe.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_tools_core.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_tools_spec.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_tools_design.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_tools_idea.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_tools_proto.rs")),
+        ];
+        let mut names: Vec<String> = Vec::new();
+        for src in SOURCES {
+            for line in src.lines() {
+                let Some(rest) = const_declaration(line) else {
+                    continue;
+                };
+                let Some((name, value)) = rest.split_once(": &str = ") else {
+                    continue;
+                };
+                if !name.trim().ends_with("_TOOL") {
+                    continue;
+                }
+                let value = value.trim().trim_end_matches(';');
+                let Some(literal) = value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .filter(|v| !v.is_empty())
+                else {
+                    continue;
+                };
+                names.push(literal.to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The snake_case identifiers a prose text writes in CALL SHAPE — `name(` — which is how this
+    /// surface's texts point at a tool an agent should reach for (`list_commands(project_id=…)`,
+    /// `task_transition(transition=skip)`). Everything else is punctuation-agnostic prose, and
+    /// filtering on the call shape is what keeps `spec_id` / `strip_ansi` / `css_slot` (arguments,
+    /// not tools) out of a tool-name guard.
+    fn call_shaped_identifiers(text: &str) -> Vec<String> {
+        let bytes: Vec<char> = text.chars().collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if !(bytes[i].is_ascii_lowercase()) {
+                i += 1;
+                continue;
+            }
+            // Do not start mid-identifier (`design_preview` must not also yield `preview`).
+            if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == '_') {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '_') {
+                i += 1;
+            }
+            let word: String = bytes[start..i].iter().collect();
+            if i < bytes.len() && bytes[i] == '(' && word.contains('_') {
+                out.push(word);
+            }
+        }
+        out
+    }
+
+    /// DONE-CRITERION (task `01M1F8X2WSPGJN75PEYYBVHD5K`): **no agent-facing text names a tool that
+    /// `tools/list` does not carry.**
+    ///
+    /// The defect this closes was measured live: `spec_create`'s description told an agent to "use
+    /// spec_transition to move its lifecycle", and the Spec role manual told it "you never call
+    /// spec_transition" — while `spec_transition` is DELIBERATELY absent from the advertised surface
+    /// (N17(b): nyx imposes every Spec transition at the graph node built for it). An agent that
+    /// followed the prose got `-32601 method_not_found` on a tool that does not exist, and a
+    /// session burned a round trip discovering it. Naming a phantom to FORBID it is the same defect
+    /// as naming one to recommend it: both teach that the verb exists.
+    ///
+    /// TWO NETS, because a phantom has two origins:
+    ///   * a name nyx's own code DECLARES but does not advertise ([`declared_tool_names`]) — the
+    ///     `spec_transition` shape, a tool retired from `tools/list` while the prose kept pointing
+    ///     at it. Checked wherever it appears, call shape or not, since that is how the two live
+    ///     occurrences were written.
+    ///   * a name written in CALL SHAPE ([`call_shaped_identifiers`]) that no tool answers — the
+    ///     invented verb, and the shape every "read it back with spec_get(…)" instinct takes.
+    #[test]
+    fn no_agent_facing_text_names_a_tool_that_is_not_advertised() {
+        let advertised: Vec<String> = tool_descriptors()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string))
+            .collect();
+        let declared = declared_tool_names();
+        assert!(
+            declared.len() > 50,
+            "the source scan must actually find the tool-name constants, got {declared:?}"
+        );
+        // The names the code declares and the wire does not carry — the phantom vocabulary.
+        let unadvertised: Vec<&String> = declared
+            .iter()
+            .filter(|n| !advertised.contains(n))
+            .collect();
+
+        // NO ALLOWLIST, and none is needed: on this surface a snake_case word followed by `(` is
+        // always a tool citation. Should a descriptor one day need to quote a CSS/JS call in that
+        // shape (`prefers_reduced_motion(…)`), the exception belongs here, named — never as a
+        // loosening of the net.
+        //
+        // THE TWO NETS MUST BE IN THE WATER, and that is asserted rather than assumed: a scan that
+        // silently matched nothing would be a green test guarding nothing at all.
+        assert!(
+            unadvertised.contains(&&crate::mcp_tools_spec::SPEC_TRANSITION_TOOL.to_string()),
+            "spec_transition is declared and NOT advertised — the phantom this guard was written \
+             for must be in the vocabulary it sweeps: {unadvertised:?}"
+        );
+        let mut call_shapes = 0usize;
+
+        for (surface, text) in agent_facing_texts() {
+            for phantom in &unadvertised {
+                assert!(
+                    !text.contains(phantom.as_str()),
+                    "{surface} names `{phantom}`, which nyx declares but does NOT advertise in \
+                     tools/list — an agent following this text gets method_not_found. Either \
+                     advertise the tool, or name the mechanism that really applies.\n{text}"
+                );
+            }
+            for candidate in call_shaped_identifiers(&text) {
+                call_shapes += 1;
+                assert!(
+                    advertised.contains(&candidate),
+                    "{surface} writes `{candidate}(…)` — a call shape naming no advertised tool. \
+                     Every tool name a text cites must exist in tools/list.\n{text}"
+                );
+            }
+        }
+        assert!(
+            call_shapes > 20,
+            "the call-shape net must actually see the surface's `tool(…)` citations, saw \
+             {call_shapes}"
+        );
+    }
+
+    /// DONE-CRITERION (task `01M1F8X7SE5B3BQTKSXCFQGTNY`): **no text this server renders names a
+    /// role that does not exist.**
+    ///
+    /// A role name is a word an agent SENDS — `agent_context(role: …)` refuses anything outside the
+    /// six — so prose naming a seventh sends a session into a refusal it cannot diagnose, and prose
+    /// omitting one hides a capability. The advertised vocabulary is therefore replayed through the
+    /// very parser that accepts it, in BOTH directions, and the words nyx has never had (a
+    /// "reviewer": the role that audits is `auditor`) are swept out of every agent-facing text.
+    ///
+    /// `prototyper` is deliberately NOT swept: it is a real WORKFLOW SCOPE (`run_start`,
+    /// `workflow_create`), and the role beside it is `prototype`. Two vocabularies, one syllable
+    /// apart — which is exactly why the ROLE half is pinned to its parser rather than to a list
+    /// someone keeps by eye.
+    #[test]
+    fn no_agent_facing_text_names_a_role_that_does_not_exist() {
+        use crate::mcp_context::AgentRole;
+        let role_desc = tool_descriptors()
+            .iter()
+            .find(|t| t["name"] == json!(crate::mcp_context::AGENT_CONTEXT_TOOL))
+            .map(|t| t["inputSchema"]["properties"]["role"]["description"].clone())
+            .expect("agent_context advertises a `role` argument");
+        let role_desc = role_desc.as_str().unwrap_or_default();
+        // The advertised vocabulary: the `a | b | c` head of the sentence.
+        let advertised: Vec<&str> = role_desc
+            .split('—')
+            .next()
+            .unwrap_or_default()
+            .split('|')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        // EVERY ADVERTISED NAME IS ONE THE PARSER ACCEPTS…
+        for name in &advertised {
+            assert!(
+                AgentRole::parse(name).is_some(),
+                "the `role` argument advertises '{name}', which agent_context refuses: {role_desc}"
+            );
+        }
+        // …AND EVERY ROLE THAT EXISTS IS ADVERTISED. Both directions, or the vocabulary drifts.
+        for role in AgentRole::ALL {
+            assert!(
+                advertised.contains(&role.slug()),
+                "the role '{}' exists and is advertised nowhere: {role_desc}",
+                role.slug()
+            );
+        }
+        assert_eq!(
+            advertised.len(),
+            AgentRole::ALL.len(),
+            "exactly the roles that exist, no more: {advertised:?}"
+        );
+
+        // …and the names nyx never had appear in NO agent-facing text — descriptions, property
+        // descriptions, the initialize instructions, and every role manual.
+        for (surface, text) in agent_facing_texts() {
+            let lower = text.to_lowercase();
+            for phantom in ["reviewer", "role=prototyper", "role: prototyper"] {
+                assert!(
+                    !lower.contains(phantom),
+                    "{surface} names '{phantom}', which is not a role nyx has (the six are \
+                     {:?})\n{text}",
+                    AgentRole::ALL.map(AgentRole::slug)
+                );
+            }
+        }
+    }
+
     /// THE SIX PARAM TYPES, MOORED TO THE FIXTURE — re-pointed (finding `01KZ3JTVM23C3MBATJZ3RYVPY6`,
     /// family 1). The list of accepted `type` words lives at three places: the constant the write
     /// path refuses outside of, the renderer's constant, and the PROSE an agent reads. That prose
@@ -5978,6 +6781,18 @@ mod tests {
         assert!(
             phase.contains("kind=review") && phase.contains("OMIT IT"),
             "…and an auditor names no phase at all — nyx anchors its finding: {phase}"
+        );
+        // DONE-CRITERION (task `01M1F8X5B1WJ40XY2QRJ5G4W17`): the field states its TYPE and the
+        // NAME↔RANK relation. Both were missing, and their absence compounded: an integer looked
+        // legitimate (every manual says "phase 1"), was silently dropped, and the number that DID
+        // come back was a rank the caller had never sent.
+        assert!(
+            phase.contains("STRING") && phase.contains("REFUSED"),
+            "the expected TYPE is stated, and an integer is refused rather than ignored: {phase}"
+        );
+        assert!(
+            phase.contains("RANK") && phase.contains("phase_name"),
+            "…and the name↔rank relation is stated, with the field that echoes the name: {phase}"
         );
         for gone in ["spec_set_phases", "1..N"] {
             assert!(
@@ -6328,12 +7143,13 @@ mod tests {
         assert_eq!(
             names.len(),
             V1_TOOLS.len()
-                // 28 since the Système approval protocol got its one status tool
-                // (system_approval_status); it was 27 when the scope got its dedicated discovery
-                // (list_system_commands), 26 when the command-LIST order was opened
+                // 29 since an agent driving another agent got its bounded wait
+                // (wait_for_terminal); it was 28 when the Système approval protocol got its one
+                // status tool (system_approval_status), 27 when the scope got its dedicated
+                // discovery (list_system_commands), 26 when the command-LIST order was opened
                 // (reorder_commands), and 25 when the multi-pane grouping landed
                 // (manage_command_group).
-                + 28
+                + 29
                 + 9
                 + 3
                 + crate::mcp_tools_spec::SPEC_TOOLS.len()
@@ -6348,6 +7164,7 @@ mod tests {
              manage_command_group + reorder_commands + list_system_commands + \
              system_approval_status + \
              create_terminal/send_to_terminal/send_keys/list_terminals/close_terminal/read_terminal + \
+             wait_for_terminal + \
              agent_session_event + set_project_settings + project_set_repos + workspace_runtime + \
              workspace_git + workspace_timeline + the spec authoring/transition tools \
              (incl. task_delete + the v2.6 spec_link/spec_unlink/spec_deps) + \
@@ -6394,6 +7211,56 @@ mod tests {
         assert_eq!(v["result"]["isError"], false);
         assert_eq!(v["result"]["structuredContent"]["tool"], "list_projects");
         assert_eq!(v["result"]["structuredContent"]["args"]["k"], 1);
+    }
+
+    /// An answer travels ONCE. nyx used to serialize every tool payload into `content[0].text`
+    /// *and* hand it over again as `structuredContent`; measured on an ordinary `list_terminals`
+    /// reply that was 3 701 envelope bytes for 1 686 bytes of payload — **+46 %** — paid on every
+    /// read of a loop that reads a terminal dozens of times.
+    ///
+    /// The assertion is on the FACT, not on a byte count: the payload appears in the envelope
+    /// exactly once. The size guard that follows is deliberately loose — it only has to fail if
+    /// the mirror ever comes back, and doubling is what coming back looks like.
+    #[test]
+    fn a_tool_answer_travels_once_not_twice() {
+        // The shape a terminal-driving loop actually reads back, in miniature.
+        let payload = json!({
+            "terminals": [
+                { "id": "01a05e7e", "label": "probe-claude", "agent_activity": "working" },
+                { "id": "01a05e7f", "label": "build", "agent_activity": "idle" },
+            ]
+        });
+        let envelope = tool_result_envelope(payload.clone());
+
+        assert_eq!(
+            envelope["content"],
+            json!([]),
+            "an object answer keeps NO text mirror — `content` is present (MCP requires the key) \
+             and empty: {envelope}"
+        );
+        assert_eq!(
+            envelope["structuredContent"], payload,
+            "…and the payload itself is intact in the one channel that carries it"
+        );
+        assert_eq!(envelope["isError"], json!(false));
+
+        let payload_len = serde_json::to_string(&payload).unwrap().len();
+        let envelope_len = serde_json::to_string(&envelope).unwrap().len();
+        assert!(
+            envelope_len < payload_len + payload_len / 2,
+            "the envelope costs {envelope_len} bytes for {payload_len} bytes of payload — the \
+             text mirror is back"
+        );
+
+        // THE ONE EXCEPTION, and it is a correctness one, not a size one: MCP types
+        // `structuredContent` as an OBJECT, so a non-object answer cannot travel there at all and
+        // would reach the client as nothing. Those — and only those — keep the text form.
+        let scalar = tool_result_envelope(json!([1, 2, 3]));
+        assert_eq!(scalar["content"][0]["text"], json!("[1,2,3]"));
+        assert!(
+            scalar.get("structuredContent").is_none(),
+            "a non-object answer never claims to be structured content: {scalar}"
+        );
     }
 
     /// A dispatcher whose `slow` tool PARKS inside the handler until the test releases it, and
@@ -6620,6 +7487,131 @@ mod tests {
             caller_terminal_id: Option<&str>,
         ) -> Result<Value, RpcError> {
             self.dispatch(name, arguments, caller_terminal_id)
+        }
+    }
+
+    /// #K18 — A BLOCKING WAIT MUST NOT EAT THE WORKER ITS OWN RESOLVER NEEDS.
+    ///
+    /// `wait_for_terminal` parks a worker for up to a minute, and the signal that ends it is the
+    /// agent's `Stop` hook — which reaches nyx as a `POST /mcp` served by THIS SAME pool. Four
+    /// concurrent waits (piloting four sessions, the whole point of these tools) therefore used to
+    /// deadlock themselves: the hook POSTs queued behind the waits, each hook abandoned at its own
+    /// 1 s timeout with no replay, and all four waits came back `resolved: false` after a minute on
+    /// turns that had ended immediately.
+    ///
+    /// The cap closes it at the source. This drives the REAL HTTP surface: `REQUEST_WORKERS`
+    /// simultaneous waits, of which the last is REFUSED BY NAME straight away — which is what frees
+    /// the worker that then serves a concurrent hook POST while the other three are still blocked.
+    #[test]
+    fn concurrent_terminal_waits_always_leave_a_worker_for_the_hook_that_ends_them() {
+        use crate::mcp_tools_core::MAX_CONCURRENT_TERMINAL_WAITS;
+        // The slot counter is process-global — take the same lock every other wait test takes.
+        let _g = crate::mcp_tools_core::tests::db_guard();
+
+        /// `wait` runs the REAL `wait_for_terminal` against a live in-memory DB; any other name is
+        /// the short request a hook is (it answers and gives its worker straight back).
+        struct WaitDispatcher {
+            db: crate::db::Db,
+            activity: Arc<crate::agent_activity::AgentActivityStore>,
+            terminal_id: String,
+        }
+        impl ToolDispatcher for WaitDispatcher {
+            fn call(&self, name: &str, _arguments: &Value) -> Result<Value, RpcError> {
+                if name != "wait" {
+                    return Ok(json!({ "served": name }));
+                }
+                // `until: ["working"]` on an idle store never resolves, so each accepted wait
+                // blocks for its whole timeout — the shape of a real wait on a turn in flight.
+                crate::mcp_tools_core::wait_for_terminal(
+                    &self.db,
+                    &crate::mcp_tools_core::NoTerminalHost,
+                    &self.activity,
+                    &json!({
+                        "terminal_id": self.terminal_id,
+                        "until": ["working"],
+                        "timeout_ms": 3_000,
+                    }),
+                )
+            }
+        }
+
+        let db = crate::db::Db::in_memory();
+        let activity = Arc::new(crate::agent_activity::AgentActivityStore::new());
+        let terminal_id = crate::mcp_tools_core::create_terminal(
+            &db,
+            &crate::mcp_tools_core::NoTerminalHost,
+            &json!({}),
+        )
+        .unwrap()
+        .result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (server, port) = start_test_server();
+        server.set_dispatcher(Arc::new(WaitDispatcher {
+            db,
+            activity,
+            terminal_id,
+        }) as Arc<dyn ToolDispatcher>);
+
+        // Fire ONE WAIT PER WORKER. Only `MAX_CONCURRENT_TERMINAL_WAITS` of them may block.
+        let waits: Vec<_> = (0..REQUEST_WORKERS)
+            .map(|i| tools_call_async(port, i as u32, "wait"))
+            .collect();
+
+        // Exactly one comes back FAST, and with a refusal that says what to do instead.
+        let mut refused: Option<Value> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while refused.is_none() && std::time::Instant::now() < deadline {
+            for w in &waits {
+                if let Ok(body) = w.recv_timeout(Duration::from_millis(50)) {
+                    refused = Some(serde_json::from_str(&body).unwrap());
+                    break;
+                }
+            }
+        }
+        let refused = refused.expect(
+            "with every worker taking a blocking wait, the one over the cap must be REFUSED \
+             immediately — it was still blocking, so the cap is not enforced",
+        );
+        let message = refused["error"]["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            refused["error"]["data"]["code"],
+            json!("invalid_state"),
+            "the refusal is a named domain error, not a timeout: {refused}"
+        );
+        assert!(
+            message.contains("too many blocking calls"),
+            "the refusal NAMES the cap: {message}"
+        );
+        assert!(
+            message.contains("read_terminal"),
+            "and tells the agent what to do instead: {message}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["limit"],
+            json!(MAX_CONCURRENT_TERMINAL_WAITS)
+        );
+
+        // THE POINT OF THE CAP: a hook POST is served WHILE the other waits are still blocked —
+        // well inside the 1 s the plugin's hook gives up after.
+        let hook = tools_call_async(port, 99, "agent_session_event");
+        let body = hook.recv_timeout(Duration::from_millis(900)).expect(
+            "the hook that ENDS these waits could not be served while they were blocking — the \
+             waits are starving their own resolver",
+        );
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["result"]["structuredContent"]["served"], "agent_session_event");
+
+        // And the accepted waits still return normally on their own timeout (a NORMAL outcome).
+        for w in waits {
+            if let Ok(body) = w.recv_timeout(Duration::from_secs(10)) {
+                let v: Value = serde_json::from_str(&body).unwrap();
+                if v.get("error").is_none() {
+                    assert_eq!(v["result"]["structuredContent"]["resolved"], json!(false));
+                }
+            }
         }
     }
 
@@ -7006,11 +7998,12 @@ mod tests {
         );
         let request_id = answer["request_id"].as_str().expect("request_id").to_string();
         assert!(answer["expires_at"].as_i64().is_some());
-        // THE WHOLE ANSWER IS READABLE PROSE, in the channel every client renders. That is the
-        // property the old protocol lacked, and no amount of correct `error.data` replaced it.
-        let text = v["result"]["content"][0]["text"]
-            .as_str()
-            .expect("a rendered text block");
+        // THE WHOLE ANSWER IS READABLE PROSE, in the channel every client renders: the tool
+        // RESULT. That is the property the old protocol lacked, and no amount of correct
+        // `error.data` replaced it. The prose lives IN the payload (`next`), so it rides the
+        // result whichever way the envelope carries it — since the de-duplication that is the
+        // whole point of `tool_result_envelope`, that way is `structuredContent`.
+        let text = answer["next"].as_str().expect("the rendered prose");
         assert!(text.contains(&request_id), "{text}");
         assert!(text.contains(SYSTEM_APPROVAL_STATUS_TOOL), "{text}");
         assert!(

@@ -710,14 +710,19 @@ pub const WAIT_MAX_TIMEOUT: Duration = Duration::from_millis(60_000);
 
 /// The outcome of a bounded [`poll_until`] wait: whether the target was reached, the
 /// state read on the final iteration, and how long the wait actually took.
+///
+/// Generic in the STATE so the same bounded-wait discipline serves the two things nyx makes an
+/// agent wait on — a managed command's [`RunState`] (`wait_for_command`) and a terminal's agent
+/// [`crate::agent_activity::Activity`] (`wait_for_terminal`). The default type parameter keeps
+/// every existing `WaitOutcome` naming the command flavour unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WaitOutcome {
+pub struct WaitOutcome<T = RunState> {
     /// `true` if `read_state()` returned a state in the target set before `timeout`;
     /// `false` if `timeout` elapsed first (a NORMAL result, not an error).
     pub resolved: bool,
     /// The state observed on the LAST read — the state that satisfied the wait when
     /// `resolved`, else the state at timeout.
-    pub state: RunState,
+    pub state: T,
     /// How long the wait actually blocked (≤ the clamped timeout).
     pub waited: Duration,
 }
@@ -736,13 +741,13 @@ pub struct WaitOutcome {
 /// reached, e.g. an already-finished command) before any sleep, then on each interval.
 /// `sleep` is injectable so the unit tests drive the loop deterministically without
 /// wall-clock delays.
-pub fn poll_until(
-    target: &[RunState],
+pub fn poll_until<T: Copy + PartialEq>(
+    target: &[T],
     timeout: Duration,
     interval: Duration,
-    mut read_state: impl FnMut() -> RunState,
+    mut read_state: impl FnMut() -> T,
     mut sleep: impl FnMut(Duration),
-) -> WaitOutcome {
+) -> WaitOutcome<T> {
     let start = Instant::now();
     loop {
         let state = read_state();
@@ -848,6 +853,15 @@ struct RunnerEntry {
     /// Shared (not owned by the pump) so a reader can observe it under the entries
     /// lock without racing the pump's own writes.
     live_scrollback: Arc<Mutex<String>>,
+    /// The CLEAR BOUNDARY the pump respects (review A4): a counter
+    /// [`CommandRunner::clear_output`] bumps, and the pump compares against its own copy
+    /// on every wake. Emptying `live_scrollback` alone was not a clear at all on a LIVE
+    /// process — the pump keeps its OWN accumulated byte buffer and OVERWRITES the shared
+    /// string from it on the next chunk, so the whole pre-clear scrollback came back on
+    /// the very next read, and the next debounced `persist` wrote it back to the row too.
+    /// A clear has to mark a point the writer starts from, not blank a buffer the writer
+    /// is about to rewrite.
+    clear_epoch: Arc<AtomicU64>,
 }
 
 /// One instance taken OUT of the runner map by phase 1 of a stop: the entry is already
@@ -1045,6 +1059,9 @@ impl<S: RunnerSink> CommandRunner<S> {
         // reads back via `live_output` while running. Shared with the pump so a
         // reader observes the true live tail, not the debounced DB row.
         let live_scrollback = Arc::new(Mutex::new(String::new()));
+        // The clear boundary this run's pump watches (A4). Fresh per run: a clear issued
+        // against the PREVIOUS run has nothing to say about this one's bytes.
+        let clear_epoch = Arc::new(AtomicU64::new(0));
 
         // Fresh run = fresh scrollback, but RETAIN the last completed run (v5): archive the prior
         // run's scrollback + outcome into the bounded `prev_*` columns (N=1), THEN reset the
@@ -1076,6 +1093,7 @@ impl<S: RunnerSink> CommandRunner<S> {
             pty,
             rx,
             Arc::clone(&live_scrollback),
+            Arc::clone(&clear_epoch),
         );
 
         entries.insert(
@@ -1092,6 +1110,7 @@ impl<S: RunnerSink> CommandRunner<S> {
                 generation,
                 pump: Some(pump),
                 live_scrollback,
+                clear_epoch,
             },
         );
         drop(entries);
@@ -1385,13 +1404,30 @@ impl<S: RunnerSink> CommandRunner<S> {
     /// The live buffer is reset under the SAME `entries` lock as [`Self::live_output`]
     /// so a reader cannot observe it mid-clear, then the sink is called OUTSIDE the lock
     /// (it touches the DB / event loop — never hold the entries mutex across that).
+    ///
+    /// # The boundary the pump respects (review A4)
+    ///
+    /// On a LIVE process, emptying the shared buffer was not a clear at all. The pump owns
+    /// its OWN accumulated byte buffer and, on every chunk, OVERWRITES the shared string
+    /// from it — so the entire pre-clear scrollback reappeared on the very next read, and
+    /// the next debounced `persist` wrote it back over the row the sink had just emptied.
+    /// The tool answered `cleared: true` to an agent trying to bound a growing output, and
+    /// nothing had been cleared. (On a FINISHED process there is no pump left to rewrite
+    /// anything, which is why the clear worked there and only there.)
+    ///
+    /// So the clear BUMPS `clear_epoch`, and the pump drops everything it has accumulated
+    /// the next time it wakes and sees the bump — BEFORE appending the chunk it woke for,
+    /// so output produced AFTER the clear is kept whole. What lands in the buffer, and in
+    /// the row on the next persist, is exactly the post-clear stream: no gap, no duplicate.
     pub fn clear_output(&self, instance_id: &str) {
         {
             let entries = self.entries.lock().unwrap();
             if let Some(entry) = entries.get(instance_id) {
-                // Empty the shared live tail in place; a running pump's next chunk
-                // appends onto the cleared buffer (the pump writes the same Arc).
+                // Empty the shared live tail in place, so a read landing before the pump
+                // next wakes already sees the clear…
                 entry.live_scrollback.lock().unwrap().clear();
+                // …and mark the boundary, so the pump does not undo it.
+                entry.clear_epoch.fetch_add(1, Ordering::SeqCst);
             }
         }
         // Persist the clear + emit the refresh OUTSIDE the entries lock.
@@ -1996,6 +2032,7 @@ fn spawn_command_pump<S: RunnerSink>(
     mut pty: CommandPty,
     rx: Receiver<Vec<u8>>,
     live_scrollback: Arc<Mutex<String>>,
+    clear_epoch: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("nyx-cmd-pump-{}", pty.id()))
@@ -2004,6 +2041,7 @@ fn spawn_command_pump<S: RunnerSink>(
             let mut scrollback: Vec<u8> = Vec::new();
             let mut last_flush = Instant::now();
             let mut dirty_since: Option<Instant> = None;
+            let mut seen_clear_epoch = clear_epoch.load(Ordering::SeqCst);
 
             let flush_output = |pending: &mut Vec<u8>| {
                 if pending.is_empty() {
@@ -2018,19 +2056,57 @@ fn spawn_command_pump<S: RunnerSink>(
                 sink.persist_scrollback(&instance_id, &text);
             };
 
+            // A4 — HONOUR A CLEAR ISSUED SINCE THE LAST WAKE. `clear_output` bumps the
+            // epoch; everything accumulated up to that point is what the caller asked to
+            // be rid of, so the pump DROPS it — its own byte buffer, the shared live tail,
+            // and the pending chunk it has not flushed. Called BEFORE the freshly received
+            // chunk is appended, so output produced AFTER the clear survives whole: the
+            // caller gets the post-clear stream with no gap and no duplicate.
+            // Returns the epoch this wake is now level with, so the publish below can check it
+            // has not moved AGAIN under the live-tail lock (see there).
+            let mut apply_clear = |scrollback: &mut Vec<u8>,
+                                   pending: &mut Vec<u8>,
+                                   dirty_since: &mut Option<Instant>|
+             -> u64 {
+                let current = clear_epoch.load(Ordering::SeqCst);
+                if current == seen_clear_epoch {
+                    return current;
+                }
+                seen_clear_epoch = current;
+                scrollback.clear();
+                pending.clear();
+                live_scrollback.lock().unwrap().clear();
+                // The row was emptied by the sink; nothing is owed to it until new bytes
+                // arrive, and a stale `dirty_since` would re-persist an empty buffer.
+                *dirty_since = None;
+                current
+            };
+
             loop {
                 let since = last_flush.elapsed();
                 let wait = OUTPUT_FLUSH_INTERVAL.saturating_sub(since);
                 match rx.recv_timeout(wait) {
                     Ok(chunk) => {
+                        let epoch = apply_clear(&mut scrollback, &mut pending, &mut dirty_since);
                         pending.extend_from_slice(&chunk);
                         scrollback.extend_from_slice(&chunk);
                         bound_live_scrollback(&mut scrollback);
                         // Publish the bounded tail to the shared live buffer so a
                         // mid-run `live_output` read sees it immediately, ahead of
                         // the debounced DB persist below.
-                        *live_scrollback.lock().unwrap() =
-                            String::from_utf8_lossy(&scrollback).into_owned();
+                        //
+                        // Re-checked UNDER the live-tail lock: `clear_output` empties that
+                        // tail and bumps the epoch under its own lock, and a clear landing
+                        // between `apply_clear` above and this publish would otherwise be
+                        // undone by our pre-clear buffer for up to one wake. If the epoch
+                        // moved, leave the (already emptied) tail alone — the next wake's
+                        // `apply_clear` drops our stale local buffer too.
+                        {
+                            let mut live = live_scrollback.lock().unwrap();
+                            if clear_epoch.load(Ordering::SeqCst) == epoch {
+                                *live = String::from_utf8_lossy(&scrollback).into_owned();
+                            }
+                        }
                         dirty_since.get_or_insert_with(Instant::now);
                         if last_flush.elapsed() >= OUTPUT_FLUSH_INTERVAL {
                             flush_output(&mut pending);
@@ -2038,6 +2114,7 @@ fn spawn_command_pump<S: RunnerSink>(
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
+                        apply_clear(&mut scrollback, &mut pending, &mut dirty_since);
                         flush_output(&mut pending);
                         last_flush = Instant::now();
                         // Debounced persistence: write the row when output has been
@@ -2051,6 +2128,9 @@ fn spawn_command_pump<S: RunnerSink>(
                     }
                     Err(RecvTimeoutError::Disconnected) => {
                         // Child exited / master closed: flush the tail + final persist.
+                        // The clear is honoured here too, or a command that ends right
+                        // after one would write the cleared bytes straight back to the row.
+                        apply_clear(&mut scrollback, &mut pending, &mut dirty_since);
                         flush_output(&mut pending);
                         persist(&scrollback);
                         let code = pty.wait();

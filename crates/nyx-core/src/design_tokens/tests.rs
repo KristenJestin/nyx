@@ -514,6 +514,93 @@ fn ingests_the_app_theme_stylesheet_by_reference_and_feeds_bg_primary() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A8 — A TOKEN NEVER COMES OUT OF THE INGEST REFERENCING ITSELF.
+///
+/// ORIGIN, MEASURED: the INGEST, not the source. `depot/src/web/styles/globals.css` declares the
+/// real value once in `:root` (`--radius-md: calc(var(--radius) - 2px)`, line 14) and bridges it
+/// once in `@theme inline` (`--radius-md: var(--radius-md)`, line 182) — which is Tailwind v4's
+/// documented way to expose a `:root` property into the theme namespace, resolved at build time.
+/// Both blocks are GLOBAL scope, so nyx flattened them into one map under the plain-CSS last-wins
+/// rule and the bridge overwrote the value. What the `/design` layer then handed every consumer was
+/// `--radius-md: var(--radius-md)`: a variable that resolves to empty while looking defined.
+///
+/// The sheet below carries the same shape — a value in `:root`, a bridge in `@theme inline`, in
+/// both orders, plus a bridge with NO backing value at all.
+#[test]
+fn a_theme_bridge_never_overwrites_the_value_it_bridges() {
+    let root = scratch_dir("selfref");
+    write_file(
+        &root,
+        "src/styles.css",
+        r#"
+:root {
+  --radius: 0.625rem;
+  --radius-md: calc(var(--radius) - 2px);
+  --background: oklch(1 0 0);
+  --primary: oklch(0.55 0.21 264.4);
+  --spacing: 4px;
+}
+@theme inline {
+  --radius-md: var(--radius-md);
+  --color-background: var(--background);
+  --orphan-token: var(--orphan-token);
+  --spacing-with-fallback: var(--spacing-with-fallback, 8px);
+}
+@theme inline {
+  --primary: var(--primary);
+}
+"#,
+    );
+
+    let mut conn = open_in_memory();
+    let (project, _ws) =
+        create_project(&mut conn, "sandbox", root.to_str().unwrap(), None).unwrap();
+    create_repository(&mut conn, &project.id, "web", ".", false).unwrap();
+    ingest_project_tokens(&mut conn, &project.id).unwrap();
+    let layer = project_token_layer(&mut conn, &project.id).unwrap();
+
+    // THE PROPERTY: not one rendered token references itself, in either scope.
+    for (scope, map) in [("light", &layer.variables), ("dark", &layer.dark)] {
+        for (name, value) in map.iter() {
+            assert_ne!(
+                value.trim(),
+                format!("var({name})"),
+                "{scope} token {name} references itself"
+            );
+        }
+    }
+
+    // …and the value the bridge was hiding is the one that survived — bridge AFTER the declaration…
+    assert_eq!(
+        layer.variables.get("--radius-md").map(String::as_str),
+        Some("calc(var(--radius) - 2px)")
+    );
+    // …and bridge in a LATER block, over a value declared earlier.
+    assert_eq!(
+        layer.variables.get("--primary").map(String::as_str),
+        Some("oklch(0.55 0.21 264.4)")
+    );
+    // A bridge to ANOTHER name is not a self-reference and is kept, as it always was: it is the
+    // alias that gives one identity two names.
+    assert_eq!(
+        layer.variables.get("--color-background").map(String::as_str),
+        Some("var(--background)")
+    );
+    // A bridge with no backing value is not rendered at all — an absent token is honest, a
+    // self-referencing one is not.
+    assert!(!layer.variables.contains_key("--orphan-token"));
+    // A self-reference WITH a fallback carries a real value, so it is left alone.
+    assert_eq!(
+        layer
+            .variables
+            .get("--spacing-with-fallback")
+            .map(String::as_str),
+        Some("var(--spacing-with-fallback, 8px)")
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn an_ingest_that_detects_nothing_never_erases_an_authored_theme() {
     let root = scratch_dir("greenfield");
@@ -1095,4 +1182,22 @@ fn to_json_emits_exactly_the_keys_the_renderer_reserves() {
         "every key `to_json` emits must be listed in contract/design-fixtures.json (and reserved by \
          theme-css.ts), and nothing else"
     );
+}
+
+/// A self-reference is one whatever CSS spelling carries it: the function name is case-insensitive,
+/// `!important` is not part of the value, and an EMPTY fallback (`var(--x,)`, Tailwind's "empty
+/// unless set") still resolves to nothing. Only a REAL fallback makes it a value.
+#[test]
+fn a_self_reference_is_caught_in_every_css_spelling() {
+    let is = |value: &str| super::is_self_reference("--radius-md", value);
+    assert!(is("var(--radius-md)"), "canonical");
+    assert!(is("var( --radius-md )"), "inner whitespace");
+    assert!(is("VAR(--radius-md)"), "function names are case-insensitive in CSS");
+    assert!(is("var(--radius-md,)"), "an empty fallback still resolves to nothing");
+    assert!(is("var(--radius-md, )"), "an empty fallback, spaced");
+    assert!(is("var(--radius-md) !important"), "!important is not part of the value");
+    assert!(!is("var(--radius-md, 8px)"), "a REAL fallback is a value");
+    assert!(!is("var(--radius)"), "another name is a real alias");
+    assert!(!is("calc(var(--radius-md) - 2px)"), "a use inside an expression is a value");
+    assert!(!is("var"), "too short to be a var() at all");
 }

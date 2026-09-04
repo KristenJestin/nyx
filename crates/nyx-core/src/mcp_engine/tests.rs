@@ -2412,6 +2412,82 @@ fn a_finished_run_is_evicted_from_the_registry() {
 // finished-run message (m3)
 // ---------------------------------------------------------------------------
 
+/// A6 — A DRAFT SPEC IS REFUSED AT THE DOOR, NOT THREE NODES IN.
+///
+/// Observed live: `run_start` on a draft Spec was ACCEPTED, the flow opened, noted "skipping the
+/// start", and only later died on `in_review is not legal from status draft` — an error about a
+/// transition the caller never asked for, arriving after a run had already been created. The
+/// precondition is knowable at call time; it is now checked at call time, and the refusal names the
+/// status the Spec has and the one the flow needs.
+///
+/// `nspec` stays free to run on a draft: authoring drafts is what it is for.
+#[test]
+fn run_start_refuses_a_draft_spec_before_opening_anything() {
+    let _g = db_guard();
+    let sandbox = temp_dir("runstart-draft");
+    let db = Db::in_memory();
+    let (project_id, _workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_draft(&db, &project_id);
+
+    let ndev = db.with_conn(|c| {
+        db::create_workflow(c, Some(&project_id), "ndev", db::WORKFLOW_SCOPE_NDEV, None)
+            .expect("wf")
+            .id
+    });
+    let root = add_node(&db, &ndev, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(
+        &db,
+        &ndev,
+        Some(&root),
+        0,
+        db::NODE_TYPE_SPAWN_SUBAGENT,
+        json!({ "agent_id": "coder" }),
+    );
+
+    let err = super::run_start(&db, &EngineRuntime::new(), &json!({ "spec_id": spec_id }))
+        .expect_err("a draft Spec is refused");
+    assert_eq!(err.code, RpcCode::InvalidState);
+    assert!(
+        err.message.contains(db::SPEC_STATUS_DRAFT),
+        "the refusal names the status the Spec HAS: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains(db::SPEC_STATUS_READY),
+        "…and the one the flow needs: {}",
+        err.message
+    );
+    let data = err.data.clone().expect("machine data");
+    assert_eq!(data["reason"], "spec_not_startable");
+    assert_eq!(data["spec_status"], db::SPEC_STATUS_DRAFT);
+    assert_eq!(data["expected_status"], db::SPEC_STATUS_READY);
+
+    // NOTHING WAS WRITTEN — no run row exists for that workflow at all.
+    let runs = db
+        .with_conn(|c| db::list_workflow_runs(c, &ndev))
+        .expect("list runs");
+    assert!(
+        runs.is_empty(),
+        "the refusal left no run behind: {} run(s)",
+        runs.len()
+    );
+
+    // …and an `nspec` flow on the same draft is untouched: authoring drafts is its whole job.
+    let nspec = db.with_conn(|c| {
+        db::create_workflow(c, Some(&project_id), "nspec", db::WORKFLOW_SCOPE_NSPEC, None)
+            .expect("wf")
+            .id
+    });
+    let nroot = add_node(&db, &nspec, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+    add_node(&db, &nspec, Some(&nroot), 0, db::NODE_TYPE_NOTE, json!({ "text": "author" }));
+    super::run_start(
+        &db,
+        &EngineRuntime::new(),
+        &json!({ "spec_id": spec_id, "scope": "nspec" }),
+    )
+    .expect("an nspec run on a draft Spec is legitimate");
+}
+
 /// B2 — `run_start` OPENS a drivable run the way `/ndev` does (a VERB, not a test INSERT): it
 /// resolves the project's OWN `ndev` workflow, binds the run to the resolved Spec, and the very next
 /// `nyx_next` drives it from the root. Before this verb existed, nothing produced a `run_id`, so the
@@ -8015,6 +8091,182 @@ fn a_sub_workflow_opens_an_isolated_child_and_folds_its_verified_result() {
     assert_eq!(advanced["action"]["notes"], json!(["child-ok"]));
     assert_eq!(advanced["blackboard_delta"]["child_status"], "in_progress");
     assert_eq!(advanced["blackboard_delta"]["sub_result"]["status"], "done");
+}
+
+// ---------------------------------------------------------------------------
+// A1 — a node type THIS BUILD has no interpreter for
+// ---------------------------------------------------------------------------
+
+/// Write a node whose `type` is one this build knows NOTHING about, the way a graph seeded by
+/// ANOTHER build of nyx sits in the shared database: the `type` CHECK of THIS schema would refuse it
+/// (that is the whole point — the other build shipped a migration that widened the vocabulary), so
+/// the row goes in with `ignore_check_constraints` on.
+///
+/// Deliberately NOT a new [`db::NODE_TYPES`] member: review A1 forbids teaching this build the type,
+/// which belongs to another branch's PRD. The test needs a type no interpreter here implements, and
+/// this is how one is obtained without inventing one.
+fn add_foreign_typed_node(db: &Db, workflow_id: &str, parent: Option<&str>, node_type: &str) -> String {
+    let id = format!("foreign-{node_type}");
+    let sql = format!(
+        "INSERT INTO nodes (id, workflow_id, parent_id, order_index, type, label, config, \
+         created_at, updated_at) VALUES ('{id}', '{workflow_id}', {}, 9, '{node_type}', \
+         '{node_type}', '{{}}', 0, 0)",
+        match parent {
+            Some(p) => format!("'{p}'"),
+            None => "NULL".to_string(),
+        }
+    );
+    db.with_conn(|c| {
+        use diesel::connection::SimpleConnection;
+        c.batch_execute(&format!(
+            "PRAGMA ignore_check_constraints = ON; {sql}; PRAGMA ignore_check_constraints = OFF;"
+        ))
+    })
+    .expect("seed a foreign-typed node");
+    id
+}
+
+/// A1 — A NODE TYPE THIS BUILD CANNOT INTERPRET REFUSES THE TICK BY NAME, IT DOES NOT JUST DIE.
+///
+/// Observed live: every `/ndev` and `/nspec` tick answered `unknown node type: set_category` and the
+/// run went nowhere. The sentence was true and useless — it named neither the node, nor the graph,
+/// nor the only thing that explains the situation: the rows were written by a SIBLING build sharing
+/// the same database, whose interpreter has a node type this one does not. Operators went hunting
+/// for a regression in `engine.rs`, which had not been touched.
+///
+/// The test stands on `set_milestone` rather than the observed `set_category`: that sibling build
+/// has since landed here, so its type is one THIS build reads. The property under test is "a type
+/// no interpreter in this binary knows", which needs a name no interpreter claims.
+///
+/// What the tick owes: the TYPE, the NODE, the workflow and its revision, and the fact that another
+/// build wrote these rows. Plus an explicit `failed` on the run — the refusal happens BEFORE any
+/// engine exists, so the walk's own failure write is never reached and the row used to stay
+/// `running` for a run that could never tick again.
+#[test]
+fn a_node_type_this_build_cannot_read_refuses_the_tick_by_name_and_fails_the_run() {
+    let _g = db_guard();
+    let db = Db::in_memory();
+
+    let (workflow_id, run_id) = workflow_run(&db, None, |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_foreign_typed_node(db, wf, Some(&root), "set_milestone");
+    });
+
+    let rt = EngineRuntime::new();
+    let err = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id })).unwrap_err();
+
+    assert_eq!(err.code, "invalid_state");
+    assert!(
+        err.message.contains("set_milestone"),
+        "the refusal NAMES the type it cannot read: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("foreign-set_milestone"),
+        "the refusal NAMES the node carrying it: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("DIFFERENT build"),
+        "the refusal tells the operator a graph written by another build is what they are looking \
+         at: {}",
+        err.message
+    );
+    let data = err.data.clone().expect("machine data");
+    assert_eq!(data["reason"], super::GRAPH_UNREADABLE_REASON);
+    assert_eq!(data["node_type"], "set_milestone");
+    assert_eq!(data["node_id"], "foreign-set_milestone");
+    assert_eq!(data["workflow_id"], workflow_id);
+
+    assert_eq!(
+        run_row(&db, &run_id).status,
+        db::RUN_STATUS_FAILED,
+        "the run is put in an EXPLICIT failure state rather than left `running` forever"
+    );
+
+    // And it is STILL the same refusal on the next call — never a panic, never a different story.
+    let again = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id })).unwrap_err();
+    assert_eq!(again.code, "invalid_state");
+}
+
+/// A1 — AN UNREADABLE CHILD GRAPH DOES NOT KILL THE PARENT, AND DOES NOT SPEND A HUMAN TURN.
+///
+/// The cascade the audit hit: the child's `build_engine` failed, the parent folded that as
+/// `SubResult{status: failed}` — the H4 fact its own selector is built to branch on — and ndev duly
+/// escalated to rework-or-abandon. A human was asked to decide the fate of a build that never ran,
+/// over a cause the branch had erased.
+///
+/// So the parent REFUSES instead, in the child's own words. The parent run stays alive (a refusal is
+/// not terminal), and the child carries the explicit failure.
+#[test]
+fn an_unreadable_child_graph_refuses_the_parent_tick_instead_of_killing_the_run() {
+    let _g = db_guard();
+    let sandbox = temp_dir("subwf-foreign");
+    let db = Db::in_memory();
+    let (project_id, workspace_id, _ws) = seed_project(&db, sandbox.path());
+    let spec_id = spec_in_progress(&db, &project_id, &workspace_id);
+
+    // A child this build reads perfectly well — the parent must be able to OPEN it.
+    let child_wf = child_workflow(&db, |db, wf| {
+        let root = add_node(db, wf, None, 0, db::NODE_TYPE_SEQUENCE, json!({}));
+        add_node(
+            db,
+            wf,
+            Some(&root),
+            0,
+            db::NODE_TYPE_QUERY,
+            json!({ "query": "spec_status", "write": "child_status" }),
+        );
+    });
+    let run_id = run_with_board(&db, &spec_id, json!({ "task_id": "T" }), parent_tree_with_sub(&child_wf));
+    db.with_conn(|c| db::set_run_workspace(c, &run_id, &workspace_id)).expect("anchor");
+
+    let rt = EngineRuntime::new();
+    let opened = tick(&db, &rt, &run_id, None);
+    assert_eq!(opened["action"]["type"], "sub_workflow");
+    let child_run_id = opened["action"]["child_run_id"].as_str().unwrap().to_string();
+
+    // NOW the sibling build seeds its node type into the child's graph — the state the audit found.
+    add_foreign_typed_node(&db, &child_wf, None, "set_milestone");
+
+    let err = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id })).unwrap_err();
+    assert!(
+        err.message.contains("set_milestone") && err.message.contains(&child_run_id),
+        "the parent's refusal carries the child's own diagnosis: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("rework or abandon"),
+        "and says explicitly that this is not a decision to put to a human: {}",
+        err.message
+    );
+    assert_eq!(
+        err.data.clone().unwrap()["reason"],
+        super::CHILD_GRAPH_UNREADABLE_REASON
+    );
+
+    assert_eq!(
+        run_row(&db, &run_id).status,
+        db::RUN_STATUS_RUNNING,
+        "the PARENT run is untouched — it is walkable, only its child's graph is not"
+    );
+    assert_eq!(
+        run_row(&db, &child_run_id).status,
+        db::RUN_STATUS_RUNNING,
+        "the CHILD stays `running` too: a `failed` child would be folded as an H4 verdict by the \
+         BLOCKED||FAILED arm on the very next tick, which is the escalation this refusal withholds"
+    );
+
+    // AND THE REFUSAL IS STICKY: the next tick refuses again in the same words instead of folding
+    // the child — the parent keeps re-opening it until the graph reads.
+    let again = super::nyx_next(&db, &rt, no_session(), &json!({ "run_id": run_id })).unwrap_err();
+    assert_eq!(
+        again.data.clone().unwrap()["reason"],
+        super::CHILD_GRAPH_UNREADABLE_REASON,
+        "second tick: still a refusal, not a verdict"
+    );
+    assert_eq!(run_row(&db, &run_id).status, db::RUN_STATUS_RUNNING);
+    assert_eq!(run_row(&db, &child_run_id).status, db::RUN_STATUS_RUNNING);
 }
 
 /// H3 — A LOOP WHOSE EXIT CANNOT BE SATISFIED DIES ON ITS FIRST ROUND, NOT ITS TWENTIETH. Observed

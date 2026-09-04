@@ -91,7 +91,7 @@ const TIMEOUT_MS = 1000;
  */
 const RUN_OPEN_TIMEOUT_MS = 8000;
 /** nyx's default MCP port — the last resort, and only ever right when ONE nyx runs (see below). */
-const DEFAULT_PORT = "8765";
+const DEFAULT_PORT = "8766";
 
 /**
  * The port of THE nyx that installed this plugin.
@@ -105,9 +105,14 @@ const DEFAULT_PORT = "8765";
  * the tools pointed at the SAME nyx, for one small read.
  *
  * The literal default comes last, and it is a trap on a machine running more than one nyx: they
- * all default to 8765, so a hook that reaches for it POSTs into whichever one bound the port
+ * all default to 8766, so a hook that reaches for it POSTs into whichever one bound the port
  * first — a DIFFERENT application, which answers `unknown tool` to calls meant for this one, and
  * does so silently. That is the case reading the sibling `.mcp.json` exists to avoid.
+ *
+ * That sibling read must match the port out of the descriptor's OWN url shape. nyx templates it as
+ * `http://127.0.0.1:${NYX_MCP_PORT:-8766}/mcp` (an env expansion the MCP client resolves, with the
+ * bound port as the literal fallback), so the fallback digits are what to take — falling back to a
+ * bare `:PORT/` for the older frozen form.
  */
 function resolvePort() {
   const injected = (process.env.NYX_MCP_PORT || "").trim();
@@ -118,7 +123,9 @@ function resolvePort() {
     const parsed = JSON.parse(fs.readFileSync(path.join(root, ".mcp.json"), "utf8"));
     for (const server of Object.values(parsed || {})) {
       const url = server && typeof server.url === "string" ? server.url : "";
-      const m = url.match(/:(\d+)\//);
+      // The templated form `${NYX_MCP_PORT:-8766}` first (this file is read raw, unexpanded), then
+      // the older frozen `:PORT/` literal.
+      const m = url.match(/\$\{NYX_MCP_PORT:-(\d+)\}/) || url.match(/:(\d+)\//);
       if (m) return m[1];
     }
   } catch (_e) {

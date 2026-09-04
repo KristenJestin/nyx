@@ -1005,7 +1005,10 @@ fn tree_reconstruction_rejects_malformed_graphs() {
     let bad_type = vec![node("r", None, 0, "frobnicate", "{}")];
     assert_eq!(
         Tree::from_rows(&bad_type, None).unwrap_err(),
-        EngineError::UnknownNodeType("frobnicate".into())
+        EngineError::UnknownNodeType {
+            node_id: "r".into(),
+            node_type: "frobnicate".into(),
+        }
     );
 
     // A child pointing at a parent that is not in the rows.

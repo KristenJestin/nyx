@@ -333,6 +333,10 @@ impl Runtime {
             );
         }
 
+        // SESSIONS WHOSE PROCESS DID NOT SURVIVE THE RESTART (#K4b) — see
+        // [`Runtime::sweep_sessions_without_a_live_agent`].
+        self.sweep_sessions_without_a_live_agent(events);
+
         // BOOT RESTORE (reprises): relaunch the commands that were running at the last
         // CLEAN shutdown and whose template opts into restart_on_startup, and normalize any
         // orphaned persisted-running. After a crash the reconcile above cleared the
@@ -343,6 +347,72 @@ impl Runtime {
                 "info",
                 format!("restored {} managed command(s) on boot", restored.len()),
             );
+        }
+    }
+
+    /// BOOT SWEEP (#K4b): flip every `agent_sessions` row still `active` whose terminal hosts NO
+    /// live agent process to `unknown` — "this row was live in a run that is over, and nothing has
+    /// confirmed it since".
+    ///
+    /// # The row that never expired
+    ///
+    /// `agent_sessions.state = 'active'` is the authority three MCP surfaces read to answer "does
+    /// this terminal host an agent": the write-shape choice and the submission arming in
+    /// `send_to_terminal` / `send_keys`, and the `agent_session` link of `read_terminal` /
+    /// `wait_for_terminal`. Nothing ever retired it: [`nyx_core::db::sweep_stale_active_sessions`]
+    /// existed with NO production caller (the v2.5.8 crash-UI revert removed the one it had), and
+    /// the boot reconcile deliberately flips nothing.
+    ///
+    /// So with `resume_agent_sessions` OFF — THE DEFAULT — a restart re-spawned the terminal as a
+    /// bare shell while its session row stayed `active` for the life of the record. Every
+    /// `send_to_terminal("ls")` on that shell then armed four seconds of fictitious activity, and
+    /// each following `wait_for_terminal` answered `resolved: true, idle, waited_ms ≈ 4000` — one
+    /// pointless four-second block per command, for ever.
+    ///
+    /// # Why the boot, and why `unknown`
+    ///
+    /// The database is made coherent ONCE, by the boot, rather than by every reader learning to
+    /// distrust it. And the sweep lands on `unknown`, not `ended`: `unknown` is the existing
+    /// "was active, state unconfirmed" state and stays a RESUME CANDIDATE (the resume scan reads
+    /// active OR unknown), so a `resume_agent_sessions`-ON project is untouched — its session is
+    /// resumed and the `SessionStart` hook puts the row straight back to `active`.
+    ///
+    /// # WHY A STALENESS THRESHOLD AND NOT A LIVENESS GUARD
+    ///
+    /// This swept EVERY active row at first, behind a guard that asked
+    /// [`pty::PtyManager::agent_alive_in_record`] whether anything was still running. At this point
+    /// in the boot the [`pty::PtyManager`] was built moments ago and has spawned nothing, so that
+    /// guard is FALSE for every record — a tautology, and the sweep was in truth unconditional.
+    /// Which reversed the v2.5.8 contract the reconcile above still states: a crash is treated
+    /// exactly like a clean shutdown, and NO session is flipped to `unknown`. A relaunch after a
+    /// kill lost its session icon and reported `uncertain: true` on a session nobody had killed.
+    ///
+    /// So the cut is the one the sweeper was built for: [`nyx_core::db::SESSION_STALE_AFTER_MS`]
+    /// since the row was last confirmed. A session that was live moments ago — the crash-relaunch
+    /// case — is younger than the threshold and survives untouched, which is what v2.5.8 asks. A row
+    /// still `active` from a run that ended long ago is what nothing ever retired, and it is the one
+    /// that armed four fictitious seconds on every `send_to_terminal` for the life of the record.
+    fn sweep_sessions_without_a_live_agent(&self, events: &EventSink) {
+        let swept = self
+            .db
+            .with_conn(|c| {
+                nyx_core::db::sweep_stale_active_sessions(c, nyx_core::db::SESSION_STALE_AFTER_MS)
+            })
+            .unwrap_or(0);
+        if swept > 0 {
+            // `eprintln!` and not `events.log`: the pipe's `log` event is DROPPED by the Electron
+            // main (`sidecar.ts`, "main's console, not a contract event" — it maps to `null`), so a
+            // boot-time state mutation reported through it is invisible to whoever is watching the
+            // app start. The neighbouring boot mutations that ARE visible ("resume INJECTED into
+            // terminal …") go out on stderr, which the supervisor forwards; this one belongs with
+            // them.
+            eprintln!(
+                "[nyx-sidecar] recovery: {swept} agent session(s) were still `active` with no live \
+                 process — marked `unknown` (still resumable; no longer reported as a live session)"
+            );
+            events.emit(Event::Changed {
+                topic: "agent-sessions".to_string(),
+            });
         }
     }
 
@@ -434,6 +504,21 @@ impl Runtime {
         };
 
         nyx_core::onboarding::reconcile_installed_providers(mcp_port, &state_path, resolve_plugin);
+
+        // AFTER the reconcile, re-read the descriptor an agent session really loads and say —
+        // in the boot log — if it still does not point at this nyx. The reconcile is
+        // conservative and best-effort (plugin absent → no-op; `claude` missing / failing → an
+        // eprintln), so it can leave the descriptor aimed elsewhere; without this line that
+        // reaches the agent as a bare `ConnectionRefused` naming nothing (task
+        // 01M1F8XMR4PRRCYMKYPVX7A0WG). Settings → Integrations shows the same sentence.
+        if let Some(mut install) = nyx_core::agent::ClaudeCodeAdapter
+            .plugin_install(self.resource_dir.as_deref(), Some(&self.data_dir))
+        {
+            install.mcp_port = mcp_port;
+            if let Some(d) = nyx_core::plugin::port_divergence(&install, mcp_port) {
+                eprintln!("[nyx-sidecar] Claude plugin port divergence: {}", d.message());
+            }
+        }
     }
 
     /// The shared SQLite pool. The runtime's single connection authority.
@@ -1044,5 +1129,144 @@ fn resume_command_for_candidate(
     match nyx_core::agent_resume::decide_resume(&inputs, adapter) {
         nyx_core::agent_resume::ResumeDecision::Resume { command, .. } => Some(command),
         nyx_core::agent_resume::ResumeDecision::Skip(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A fresh, isolated data dir for one test's SQLite file (the sidecar's `Db` is file-backed).
+    fn temp_data_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nyx-runtime-sweep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #K4b — A RESTART WITHOUT RESUME LEAVES NO `active` SESSION BEHIND.
+    ///
+    /// The trap: `agent_sessions.state = 'active'` is what four MCP verbs read to decide "this
+    /// terminal hosts an agent", and nothing ever retired it. With `resume_agent_sessions` OFF —
+    /// the DEFAULT — a restart re-spawns the terminal as a BARE SHELL while the row stays `active`
+    /// for the life of the record. Every `send_to_terminal("ls")` then armed the submission window
+    /// on a shell with no agent, and the next `wait_for_terminal` blocked the full four-second
+    /// window before answering `resolved: true, idle` — once per command, for ever.
+    ///
+    /// This drives the whole chain: seed the `active` row, boot a runtime whose PTY manager hosts
+    /// nothing (exactly a restart with no resume), and check the row, the arming and the wait.
+    #[test]
+    fn a_boot_without_resume_retires_the_active_session_of_a_bare_shell() {
+        let dir = temp_data_dir();
+        let db = Arc::new(Db::open(&dir.join("nyx.db")).expect("open db"));
+        let terminal = db
+            .with_conn(|c| nyx_core::db::create_terminal(c, "/work", None))
+            .expect("create terminal");
+        db.with_conn(|c| {
+            nyx_core::db::record_session_start(
+                c,
+                &terminal.id,
+                nyx_core::db::AGENT_KIND_CLAUDE_CODE,
+                nyx_core::db::SessionCapture {
+                    external_session_id: "sid-before-restart".to_string(),
+                    cwd: "/work".to_string(),
+                    ..Default::default()
+                },
+            )
+        })
+        .expect("seed the active session");
+        assert!(
+            db.with_conn(|c| nyx_core::db::active_session_for_terminal(c, &terminal.id))
+                .unwrap()
+                .is_some(),
+            "the row is `active` before the restart — that is the state the trap starts from"
+        );
+        // AGE IT past the staleness cut: the trap is a row still `active` from a run that ended
+        // long ago, NOT a session that was live moments before a crash (v2.5.8 keeps that one).
+        db.with_conn(|c| {
+            nyx_core::db::backdate_session_last_seen(
+                c,
+                &terminal.id,
+                nyx_core::db::SESSION_STALE_AFTER_MS + 60_000,
+            )
+        })
+        .expect("age the row past the staleness cut");
+
+        // THE RESTART: a fresh runtime, whose PTY manager has spawned nothing (no resume).
+        let runtime = Runtime::with_db(Arc::clone(&db));
+        let events = EventSink::new(Box::new(std::io::sink()));
+        runtime.sweep_sessions_without_a_live_agent(&events);
+
+        // 1. The row is no longer `active` — and it is `unknown`, not `ended`, so a
+        //    `resume_agent_sessions`-ON project can still bring it back.
+        assert!(
+            db.with_conn(|c| nyx_core::db::active_session_for_terminal(c, &terminal.id))
+                .unwrap()
+                .is_none(),
+            "a session whose terminal came back as a bare shell must not still be `active`"
+        );
+        let rows = db
+            .with_conn(|c| nyx_core::db::sessions_for_terminal(c, &terminal.id))
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the row is retired, not deleted");
+        assert_eq!(
+            rows[0].state,
+            nyx_core::db::SESSION_STATE_UNKNOWN,
+            "`unknown` keeps it a resume candidate; `ended` would not"
+        );
+
+        // 2. A `send_to_terminal` on that terminal no longer arms the submission window…
+        let host = nyx_core::mcp_tools_core::NoTerminalHost;
+        let activity = nyx_core::agent_activity::AgentActivityStore::new();
+        // (the write itself finds no live PTY — what matters is that nothing was armed)
+        let _ = nyx_core::mcp_tools_core::send_to_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": terminal.id, "command": "ls" }),
+        );
+        assert!(
+            !activity.submission_pending(&terminal.id),
+            "a bare shell has no turn to submit — nothing may be armed"
+        );
+
+        // 3. …so the wait comes straight back instead of paying the four-second window.
+        let waited = nyx_core::mcp_tools_core::wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": terminal.id, "timeout_ms": 5_000 }),
+        )
+        .expect("waiting on a live record is not an error");
+        assert_eq!(waited["resolved"], json!(true));
+        assert!(
+            waited["waited_ms"].as_u64().unwrap() < 500,
+            "the wait must not sit through the arming window on a shell with no agent: {waited}"
+        );
+        assert_eq!(waited["agent_session"], serde_json::Value::Null);
+    }
+
+    /// The GUARD half: the sweep is aimed at rows whose process is gone, so a runtime that DOES
+    /// host a live agent leaves everything alone. At boot the guard is a tautology (nothing has
+    /// spawned yet); it exists so a future boot that restores live agents first cannot retire one.
+    #[test]
+    fn the_sweep_is_a_no_op_when_there_is_no_active_session_at_all() {
+        let dir = temp_data_dir();
+        let db = Arc::new(Db::open(&dir.join("nyx.db")).expect("open db"));
+        let runtime = Runtime::with_db(Arc::clone(&db));
+        let events = EventSink::new(Box::new(std::io::sink()));
+        // No session rows at all: the sweep returns before touching the database.
+        runtime.sweep_sessions_without_a_live_agent(&events);
+        assert!(db
+            .with_conn(nyx_core::db::active_agent_sessions_full)
+            .unwrap()
+            .is_empty());
     }
 }

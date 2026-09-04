@@ -276,11 +276,7 @@ pub fn snapshot(
     // Collect the workspace-anchored sessions as we go, plus a set of the ids we have
     // already seen through a terminal so we do not double-count a loose-terminal session.
     let mut anchored: Vec<AgentSession> = Vec::new();
-    for terminal in db::list_terminals(conn)?
-        .into_iter()
-        .filter(|t| t.status == db::STATUS_ALIVE)
-        .filter(|t| t.workspace_id.as_deref() == Some(workspace_id))
-    {
+    for terminal in db::list_alive_terminals_for_workspace(conn, workspace_id)? {
         let sessions = db::sessions_for_terminal(conn, &terminal.id)?;
         for s in &sessions {
             if s.workspace_id.as_deref() == Some(workspace_id) {

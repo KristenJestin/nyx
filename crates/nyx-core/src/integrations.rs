@@ -43,6 +43,17 @@ pub struct IntegrationStatus {
     pub installed: bool,
     /// `true` when the provider is fully functional in v1; `false` = coming soon.
     pub available: bool,
+    /// A measured problem with an OTHERWISE-installed integration, in one actionable sentence —
+    /// `None` when there is nothing to say (the common case).
+    ///
+    /// The one this carries today is the port divergence
+    /// ([`plugin::PortDivergence`]): the agent plugin is GLOBAL to the machine while nyx
+    /// installs/worktrees are not, so the port an agent session will dial can be a port THIS nyx
+    /// is not listening on. Left unsaid, that surfaces to the agent as a bare `ConnectionRefused`
+    /// naming nothing — the failure this field exists to pre-empt (task
+    /// 01M1F8XMR4PRRCYMKYPVX7A0WG). `installed` stays `true`: the integration IS installed, it is
+    /// just pointed elsewhere.
+    pub diagnostic: Option<String>,
 }
 
 /// The integration status list (parity with the Tauri `integration_status_list`): the 4
@@ -50,19 +61,34 @@ pub struct IntegrationStatus {
 /// install flag is derived from Claude Code's REAL config ([`plugin::claude_plugin_enabled`]),
 /// so the list reflects reality, not nyx's own cached flag.
 pub fn status_list() -> Vec<IntegrationStatus> {
+    status_list_with(None, 0)
+}
+
+/// [`status_list`] plus the two things needed to DIAGNOSE an installed Claude integration that
+/// is pointed at the wrong nyx: the resolved plugin descriptor and the port nyx actually BOUND.
+///
+/// The caller that has both (the sidecar dispatch, which owns the runtime) passes them; the bare
+/// [`status_list`] passes `None`/`0` and reports no diagnostic. A `0` bound port means the MCP
+/// server never bound — a different failure, and not one to blame on the descriptor.
+pub fn status_list_with(
+    plugin_install: Option<&PluginInstall>,
+    bound_mcp_port: u16,
+) -> Vec<IntegrationStatus> {
     vec![
-        claude_status(),
+        claude_status(plugin_install, bound_mcp_port),
         IntegrationStatus {
             provider: "codex",
             label: "Codex",
             installed: false,
             available: false,
+            diagnostic: None,
         },
         IntegrationStatus {
             provider: "opencode",
             label: "OpenCode",
             installed: false,
             available: false,
+            diagnostic: None,
         },
         // `custom` is reserved for a future user-defined MCP server flow (no semantics in
         // v1 → coming soon, like codex/opencode). Listed so the UI shows all 4 providers.
@@ -71,35 +97,64 @@ pub fn status_list() -> Vec<IntegrationStatus> {
             label: "Custom",
             installed: false,
             available: false,
+            diagnostic: None,
         },
     ]
 }
 
 /// The `claude_code` integration status from Claude Code's REAL config (the authoritative
 /// signal — `enabledPlugins["nyx-v2-claude-integration@nyx-v2"] == true` in
-/// `~/.claude/settings.json`, honoring the `NYX_CLAUDE_SETTINGS` test seam).
-fn claude_status() -> IntegrationStatus {
+/// `~/.claude/settings.json`, honoring the `NYX_CLAUDE_SETTINGS` test seam), plus the port
+/// diagnostic when a descriptor + a bound port are available.
+fn claude_status(plugin_install: Option<&PluginInstall>, bound_mcp_port: u16) -> IntegrationStatus {
+    let installed = plugin::claude_plugin_enabled();
     IntegrationStatus {
         provider: "claude_code",
         label: "Claude Code",
-        installed: plugin::claude_plugin_enabled(),
+        installed,
         available: true,
+        // Only an INSTALLED integration can be pointed at the wrong nyx; an absent one has no
+        // descriptor to be wrong about.
+        diagnostic: installed
+            .then(|| port_diagnostic(plugin_install, bound_mcp_port))
+            .flatten(),
     }
+}
+
+/// The port-divergence diagnostic for an installed plugin, or `None` when there is nothing to
+/// report (no descriptor resolved, MCP not bound, or the port a session will dial already
+/// matches the bound one). Delegates the measurement to [`plugin::port_divergence`] and the
+/// wording to [`plugin::PortDivergence::message`] — this layer only decides WHEN to ask.
+fn port_diagnostic(plugin_install: Option<&PluginInstall>, bound_mcp_port: u16) -> Option<String> {
+    plugin::port_divergence(plugin_install?, bound_mcp_port).map(|d| d.message())
 }
 
 /// Same as [`claude_status`] but reads the REAL Claude `settings.json` at an EXPLICIT path
 /// instead of resolving the `NYX_CLAUDE_SETTINGS` seam. The install/remove cores report the
 /// post-mutation status from the very file the plugin CLI just wrote — keeping them testable
 /// against temp paths with no process-global env.
-fn claude_status_at(settings_path: &Path) -> IntegrationStatus {
+///
+/// The diagnostic is re-derived from the descriptor the mutation just wrote, so an install that
+/// could NOT repoint the plugin at this nyx says so on the very row it returns.
+fn claude_status_at(
+    settings_path: &Path,
+    plugin_install: Option<&PluginInstall>,
+) -> IntegrationStatus {
+    let installed =
+        plugin::plugin_enabled_in_settings(settings_path, &plugin::claude_plugin_install_id());
     IntegrationStatus {
         provider: "claude_code",
         label: "Claude Code",
-        installed: plugin::plugin_enabled_in_settings(
-            settings_path,
-            &plugin::claude_plugin_install_id(),
-        ),
+        installed,
         available: true,
+        diagnostic: installed
+            .then(|| {
+                // The descriptor's own `mcp_port` is what this nyx just templated in, so it IS
+                // the port to check the written descriptor against.
+                let install = plugin_install?;
+                port_diagnostic(Some(install), install.mcp_port)
+            })
+            .flatten(),
     }
 }
 
@@ -149,7 +204,10 @@ pub fn install(
     if let Err(e) = state.save(state_path) {
         eprintln!("integration_install: persisting install cache flag failed (non-fatal): {e}");
     }
-    Ok(claude_status_at(&claude_settings_path_for(plugin_install)))
+    Ok(claude_status_at(
+        &claude_settings_path_for(plugin_install),
+        plugin_install,
+    ))
 }
 
 /// Core of `integration_remove` (parity with the Tauri `do_integration_remove`). The mirror
@@ -184,7 +242,10 @@ pub fn remove(
     if let Err(e) = state.save(state_path) {
         eprintln!("integration_remove: persisting install cache flag failed (non-fatal): {e}");
     }
-    Ok(claude_status_at(&claude_settings_path_for(plugin_install)))
+    Ok(claude_status_at(
+        &claude_settings_path_for(plugin_install),
+        plugin_install,
+    ))
 }
 
 /// The integrations-state file path under `data_dir` (`<data_dir>/integrations.json`) — the
@@ -336,6 +397,46 @@ mod tests {
         );
         assert!(!IntegrationState::load(&state_path).is_installed("claude_code"));
         assert!(cli.calls.borrow().iter().any(|c| c == "uninstall"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The Settings row SAYS when the installed plugin does not point at THIS nyx (task
+    /// 01M1F8XMR4PRRCYMKYPVX7A0WG). Without this, the mismatch only ever surfaces inside an
+    /// agent, as a `ConnectionRefused` that names nothing — the failure mode the field exists
+    /// to pre-empt. Driven at the private seam so it needs no process-global settings env.
+    #[test]
+    fn port_diagnostic_speaks_only_when_the_plugin_points_at_another_nyx() {
+        let root = temp_dir("diag");
+        let descriptor = temp_descriptor(&root);
+        std::fs::create_dir_all(&descriptor.install_dir).unwrap();
+        let installed = plugin::installed_descriptor_path(&descriptor);
+
+        // No descriptor on disk yet → nothing measured, nothing said.
+        assert_eq!(port_diagnostic(Some(&descriptor), 8766), None);
+        // No descriptor resolved at all (a shell that could not resolve the paths) → silent.
+        assert_eq!(port_diagnostic(None, 8766), None);
+
+        // A descriptor that DISCOVERS the port, with a fallback equal to the bound port: the
+        // healthy state — silent.
+        std::fs::write(
+            &installed,
+            br#"{"nyx-v2":{"type":"http","url":"http://127.0.0.1:${NYX_MCP_PORT:-8766}/mcp"}}"#,
+        )
+        .unwrap();
+        assert_eq!(port_diagnostic(Some(&descriptor), 8766), None);
+        // MCP never bound → not the descriptor's fault; still silent.
+        assert_eq!(port_diagnostic(Some(&descriptor), 0), None);
+
+        // A descriptor another nyx froze on ITS port: every session dials 8787 while this nyx
+        // listens on 8766. Said out loud, with both ports.
+        std::fs::write(
+            &installed,
+            br#"{"nyx-v2":{"type":"http","url":"http://127.0.0.1:8787/mcp"}}"#,
+        )
+        .unwrap();
+        let msg = port_diagnostic(Some(&descriptor), 8766).expect("mismatch must be reported");
+        assert!(msg.contains("8787") && msg.contains("8766"), "{msg}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

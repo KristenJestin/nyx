@@ -586,6 +586,16 @@ export interface IntegrationStatus {
   readonly installed: boolean;
   /** `true` when the provider is fully functional; `false` = coming soon, no actions available. */
   readonly available: boolean;
+  /**
+   * A measured problem with an otherwise-INSTALLED integration, in one actionable sentence — absent
+   * (`null` / `undefined`) when there is nothing to say, which is the common case.
+   *
+   * The one it carries today is the MCP port divergence: the agent plugin is global to the machine
+   * while nyx installs and worktrees are not, so the port an agent session dials can be a port THIS
+   * nyx is not listening on. Unsaid, that reaches the agent as a bare `ConnectionRefused` naming
+   * nothing — which is why it is surfaced on the card rather than left to be discovered.
+   */
+  readonly diagnostic?: string | null;
 }
 
 // ---------------------------------------------------------------------------

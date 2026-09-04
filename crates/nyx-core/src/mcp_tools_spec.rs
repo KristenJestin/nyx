@@ -24,8 +24,9 @@ use serde_json::{json, Value};
 use crate::db::{self, Db};
 use crate::mcp::{RpcCode, RpcError};
 use crate::mcp_runtime::{
-    anchor_str, internal_db, map_content_write_err, optional_bool, optional_str, optional_usize,
-    require_str,
+    anchor_str, bounded_row, internal_db, json_len, map_content_write_err, optional_bool,
+    optional_str, optional_usize, require_str, under_response_budget_strict, MAX_RESPONSE_BYTES,
+    RESPONSE_ENVELOPE_BYTES,
 };
 use crate::mcp_tools_core::{ChangedTopic, ToolOutcome};
 
@@ -58,13 +59,33 @@ pub const SPEC_UNLINK_TOOL: &str = "spec_unlink";
 /// `spec_deps` — read a Spec's dependency view + the computable "bloquée par / débloque" badges.
 pub const SPEC_DEPS_TOOL: &str = "spec_deps";
 
+// --- The READ half (v2.8) --------------------------------------------------
+//
+// THE SURFACE WAS WRITE-ONLY, and that is not an omission an agent can work around. It could
+// `spec_create`, `spec_update_section`, `spec_fork`, `task_add`, `task_transition` — and then had no
+// way to READ any of it back. The only door was `agent_context`, which mixes the ROLE MANUAL with
+// the state, refuses outright for `coder`/`doc` when no Spec resolves, and costs a manual's worth of
+// tokens to answer "what did I just write". An agent that lost a Spec id had nothing at all
+// (measured 2026-09-01: `spec_get`, `spec_list`, `task_list`, `task_get` — all absent).
+//
+// Three reads close it, and no more: ONE Spec whole, the Specs of a project, the tasks of a Spec.
+// They are plain reads — no manual, no role, no run — so re-reading one's own write costs one call.
+
+/// `spec_get` — READ one Spec whole: the row, its ACTIVE revision's sections, its phase plan, its
+/// tasks.
+pub const SPEC_GET_TOOL: &str = "spec_get";
+/// `spec_list` — LIST the live Specs of a project (or of every project), to FIND one by title.
+pub const SPEC_LIST_TOOL: &str = "spec_list";
+/// `task_list` — LIST the tasks of a Spec (its plan and its findings).
+pub const TASK_LIST_TOOL: &str = "task_list";
+
 /// The Spec authoring tool names — advertised in `tools/list` and routed by [`dispatch_spec_tool`].
 /// A closed slice so a new tool is added in exactly one place. `spec_transition` is DELIBERATELY
 /// ABSENT from the agent surface (v2.8 review N17(b)): the four Spec lifecycle transitions are now
 /// imposed by NYX at the graph node built for each (ndev/nspec cover start/review/done/cancel and
 /// ready), so the effector never transitions a Spec — it only authors the draft. (`task_transition`
 /// STAYS: no graph covers task-level granularity — N17(d).)
-pub const SPEC_TOOLS: [&str; 12] = [
+pub const SPEC_TOOLS: [&str; 15] = [
     SPEC_CREATE_TOOL,
     SPEC_UPDATE_SECTION_TOOL,
     SPEC_FORK_TOOL,
@@ -77,7 +98,75 @@ pub const SPEC_TOOLS: [&str; 12] = [
     SPEC_LINK_TOOL,
     SPEC_UNLINK_TOOL,
     SPEC_DEPS_TOOL,
+    SPEC_GET_TOOL,
+    SPEC_LIST_TOOL,
+    TASK_LIST_TOOL,
 ];
+
+// --- The WIRE projection of a Spec -----------------------------------------
+
+/// A Spec as it leaves nyx ON THE MCP WIRE: the stored row, with `phases` DECODED into the ordered
+/// plan it has always been.
+///
+/// `specs.phases` is a TEXT column holding JSON (PDR-0022) and the row used to be serialized as-is,
+/// so `spec_create` answered `"phases": "[]"` — a STRING. Measured 2026-09-01: an agent testing the
+/// plan's length read 2 for an EMPTY plan, and every consumer had to know to parse a field that
+/// `structuredContent` declared as structured. The COLUMN is untouched (this is a projection, not a
+/// schema change), and this is the ONE function every Spec-returning tool serializes through, so the
+/// wire shape cannot drift from one tool to the next.
+pub(crate) fn spec_json(spec: &db::Spec) -> Value {
+    let mut value = serde_json::to_value(spec).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "phases".to_string(),
+            json!(db::parse_phase_plan(&spec.phases)),
+        );
+    }
+    value
+}
+
+/// A task as it leaves nyx ON THE MCP WIRE: the stored row, plus the `phase_name` its numeric
+/// `phase` stands for.
+///
+/// The column holds a RANK and the write path takes a NAME, so a row read back alone said "phase 2"
+/// to a caller that had written "Wiring" — the same asymmetry `task_add` now answers with
+/// `phase_name` (task `01M1F8X5B1WJ40XY2QRJ5G4W17`). The reads carry it too, or re-reading a task
+/// would put the ambiguity straight back. `plan` is the Spec's decoded plan, passed in so a list of
+/// N tasks costs ONE plan read instead of N.
+pub(crate) fn task_json(task: &db::Task, plan: &[db::SpecPhase]) -> Value {
+    let mut value = serde_json::to_value(task).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        let name = task
+            .phase
+            .and_then(|number| plan.iter().find(|p| p.number == number))
+            .map(|p| p.name.clone());
+        object.insert("phase_name".to_string(), json!(name));
+    }
+    value
+}
+
+/// [`task_json`] for a path that holds a `Task` without its Spec's plan in hand — the transition
+/// verbs, and the three review surfaces that hand back a finding. Resolves the plan from the task's
+/// own `spec_id` best-effort — a task with no Spec, or a Spec read that fails, yields
+/// `phase_name: null` rather than dropping the field, so the shape a caller re-reads after a
+/// transition matches the one `task_add`/`task_list` return.
+///
+/// `pub(crate)` because [`crate::mcp_tools_core`]'s `review_task_structure` /
+/// `review_submit_feedback` serialize a task too, and ONE form of a task on the wire is the whole
+/// point (#K13): a `db::Task` serialized raw carries the phase RANK and not the NAME the caller
+/// wrote, which is the ambiguity phase 3 closed.
+pub(crate) fn task_json_with_plan(db: &Db, task: &db::Task) -> Value {
+    let plan = match task.spec_id.as_deref() {
+        Some(spec_id) => db
+            .with_conn(|c| db::get_spec(c, spec_id))
+            .ok()
+            .flatten()
+            .map(|s| db::parse_phase_plan(&s.phases))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    task_json(task, &plan)
+}
 
 // --- Argument parsing helpers (the D8 vocabulary) --------------------------
 
@@ -101,6 +190,158 @@ fn parse_section(name: &str) -> Result<db::SpecSection, RpcError> {
             ),
         )),
     }
+}
+
+/// An OPTIONAL string argument constrained to a CLOSED vocabulary — the Rust-side twin of the SQL
+/// `CHECK (col IN (…))` the column carries.
+///
+/// WHY IT IS CHECKED HERE AND NOT LEFT TO SQLITE. Left to the database, `task_add(kind:"bogus")`
+/// answered `internal: db error: CHECK constraint failed: kind IN ('slice','human','review')`
+/// (measured 2026-09-01). Three things are wrong with that at once: the CODE says server fault about
+/// a caller's mistake, so an agent abandons or retries identically; the message is SQL, which asks
+/// the caller to reverse-engineer a schema it cannot see; and it names the accepted values only by
+/// accident of the constraint's body. The refusal built here is the shape the good errors of this
+/// surface already have — `unknown section 'bogus' (accepted: …)` — and it carries the accepted set
+/// in `data` too, so an agent can react without parsing prose.
+fn optional_enum_str<'a>(
+    args: &'a Value,
+    key: &str,
+    accepted: &[&str],
+) -> Result<Option<&'a str>, RpcError> {
+    let Some(value) = optional_str(args, key)? else {
+        return Ok(None);
+    };
+    if accepted.contains(&value) {
+        return Ok(Some(value));
+    }
+    Err(RpcError::new(
+        RpcCode::InvalidArgument,
+        format!(
+            "unknown {key} '{value}' (accepted: {})",
+            accepted.join(", ")
+        ),
+    )
+    .with_data(json!({
+        "reason": "unknown_value",
+        "argument": key,
+        "value": value,
+        "accepted": accepted,
+    })))
+}
+
+/// Read the OPTIONAL `phase` argument of `task_add`. It is a phase NAME — a STRING — and this is
+/// where the two traps that compound on it are stopped.
+///
+/// TRAP ONE: THE TYPE. Every manual, every heading, every conversation says "phase 1", "phase 2", so
+/// an integer is the natural thing to send. It used to be accepted and DROPPED — the task was
+/// created outside any phase while the caller believed it had filed it (measured 2026-09-01,
+/// `task_add(phase: 3)` → `phase: (empty)`). The generic "must be a string" refusal would stop the
+/// call but not the misunderstanding, so this one says what the field IS.
+///
+/// TRAP TWO: THE ASYMMETRY THE FIRST ONE HIDES. The input is a name and the OUTPUT is a rank, and
+/// nothing said so: `task_add(phase:"3")` answered `phase: 2`, because "3" was the second NAME that
+/// Spec had seen. A caller re-reading its own write sees a value it never sent. The refusal states
+/// the mechanism — nyx numbers the names, in first-seen order — and points at the `phase_name` the
+/// response now carries beside the rank, so learning it costs no second call.
+///
+/// Shared by the WRITE (`task_add`) and the READ FILTER (`task_list`), which is why the third trap
+/// — a name made only of digits — is NOT closed here but in [`phase_name_to_write`]: refusing to
+/// FILTER on `"2"` would make the already-corrupted plans this review deliberately leaves alone
+/// unreadable.
+fn optional_phase_name(args: &Value) -> Result<Option<String>, RpcError> {
+    match args.get("phase") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.to_string())),
+        Some(other) => Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "argument 'phase' must be a STRING — it is a phase NAME, not a rank. Received \
+                 {other}. nyx NUMBERS the phases itself, in the order their names are first seen \
+                 while the Spec is a draft, so a number names nothing here: 'phase 3' is simply \
+                 whichever name arrived third. Send the name you gave the phase (e.g. \
+                 \"Foundations\"). The response then carries BOTH: `task.phase` is the rank nyx \
+                 assigned, `phase_name` is the name you sent"
+            ),
+        )
+        .with_data(json!({
+            "reason": "phase_must_be_a_name",
+            "argument": "phase",
+            "expected_type": "string",
+            "received": other,
+        }))),
+    }
+}
+
+/// Whether a phase NAME is indistinguishable from a RANK — nothing but digits, once trimmed.
+///
+/// Deliberately narrow (review A5). It is not "contains a digit": "Phase 2" and "v2 socle" are real
+/// names a human wrote, and refusing them would push callers into naming phases things they do not
+/// mean. What cannot be allowed is a name that READS as a position in the very list where positions
+/// are the other axis.
+fn is_rank_shaped(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The `phase` argument as `task_add` may WRITE it — [`optional_phase_name`] plus the third trap.
+///
+/// TRAP THREE: THE FIRST TWO COME BACK THROUGH THE QUOTES (review A5). Refusing the INTEGER `2`
+/// while accepting the STRING `"2"` closes the type and leaves the misunderstanding wide open — a
+/// caller told "it must be a string" quotes the number and gets a phase literally NAMED `2`, whose
+/// rank is whatever position it happened to arrive in. That is the exact ambiguity `phase_name`
+/// exists to close, re-entering by the write side, and it is already materialised in stored plans:
+/// `["Socle", "2"]`, and Specs whose phases are named `1`, `3`, `2` in that order.
+///
+/// So a name that is nothing but digits is refused HERE, on the write. A name that CONTAINS digits
+/// ("Phase 2", "v2 socle") is a real name and stays accepted — the rule is about names
+/// indistinguishable from ranks, not about digits. Reading is untouched: `task_list(phase: "2")`
+/// still filters the plans already corrupted, which this review does not repair.
+fn phase_name_to_write(args: &Value) -> Result<Option<String>, RpcError> {
+    let name = optional_phase_name(args)?;
+    if let Some(n) = &name {
+        if is_rank_shaped(n) {
+            let n = n.trim();
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "argument 'phase' = \"{n}\" is a phase NAME made only of digits, which collides \
+                     with the RANK. nyx assigns the rank itself, in the order the names are first \
+                     seen, so a phase named \"{n}\" reads as position {n} to every human and every \
+                     tool that sees the plan — while its real rank is whatever position it arrived \
+                     in. Give the phase a name that says what it is (e.g. \"Socle\", \"Wiring\"); \
+                     the response carries BOTH, `task.phase` for the rank nyx assigned and \
+                     `phase_name` for your name"
+                ),
+            )
+            .with_data(json!({
+                "reason": "phase_name_collides_with_rank",
+                "argument": "phase",
+                "received": n,
+            })));
+        }
+    }
+    Ok(name)
+}
+
+/// The refusal a REFERENCE argument naming no row earns: `invalid_argument`, naming the ARGUMENT
+/// and quoting what was sent, plus where an existing value comes from.
+///
+/// `invalid_argument` rather than `invalid_id` is deliberate here: these are OPTIONAL attributes a
+/// caller composes into one write (link this task to that Spec, under that parent), and what the
+/// caller must change is the argument it passed, not the tool it reached for. Left to the FOREIGN
+/// KEY constraint, the same mistake came back as `internal: db error: FOREIGN KEY constraint
+/// failed` — which names neither the argument at fault nor the fact that the fault is the caller's.
+fn unknown_reference(key: &str, value: &str, where_from: &str) -> RpcError {
+    RpcError::new(
+        RpcCode::InvalidArgument,
+        format!("argument '{key}' names nothing: '{value}' does not exist ({where_from})"),
+    )
+    .with_data(json!({
+        "reason": "unknown_reference",
+        "argument": key,
+        "value": value,
+    }))
 }
 
 /// The six structured sections from OPTIONAL `problem` / `solution` / … string args (each
@@ -479,7 +720,7 @@ pub fn spec_create(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     );
     Ok(ToolOutcome::changed(
         json!({
-            "spec": spec,
+            "spec": spec_json(&spec),
             "revision": revision,
             "bound_run_id": bound_run_id,
             "category": category.as_ref().map(category_payload),
@@ -563,7 +804,7 @@ pub fn spec_set_category(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError>
 
     Ok(ToolOutcome::changed(
         json!({
-            "spec": spec,
+            "spec": spec_json(&spec),
             "category": category.as_ref().map(category_payload),
             "created": created,
         }),
@@ -687,7 +928,7 @@ pub fn spec_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
         })
         .map_err(map_spec_transition_err)?;
     Ok(ToolOutcome::changed(
-        json!({ "spec": spec }),
+        json!({ "spec": spec_json(&spec) }),
         ChangedTopic::Specs,
     ))
 }
@@ -720,7 +961,7 @@ pub fn spec_set_workspace(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError
         .with_conn(|c| db::set_spec_workspace(c, spec_id, workspace_id))
         .map_err(map_set_workspace_err)?;
     Ok(ToolOutcome::changed(
-        json!({ "spec": spec }),
+        json!({ "spec": spec_json(&spec) }),
         ChangedTopic::Specs,
     ))
 }
@@ -742,21 +983,65 @@ pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let title = require_str(args, "title")?;
 
     let mut input = db::NewTaskInput::default();
-    if let Some(kind) = optional_str(args, "kind")? {
+    // THE FOUR ENUMERATED ARGUMENTS, checked against the vocabulary the column's CHECK holds — ABOVE
+    // the database, so the refusal names the argument and its accepted set instead of surfacing the
+    // constraint body as an `internal` error.
+    if let Some(kind) = optional_enum_str(args, "kind", &db::TASK_KINDS)? {
         input.kind = kind.to_string();
     }
-    if let Some(type_) = optional_str(args, "type")? {
+    if let Some(type_) = optional_enum_str(args, "type", &db::TASK_TYPES)? {
         input.type_ = type_.to_string();
     }
-    if let Some(priority) = optional_str(args, "priority")? {
+    if let Some(priority) = optional_enum_str(args, "priority", &db::TASK_PRIORITIES)? {
         input.priority = priority.to_string();
     }
-    input.severity = optional_str(args, "severity")?.map(str::to_string);
+    input.severity = optional_enum_str(args, "severity", &db::TASK_SEVERITIES)?.map(str::to_string);
     input.description = optional_str(args, "description")?.map(str::to_string);
     input.acceptance_criteria = optional_str(args, "acceptance_criteria")?.map(str::to_string);
     input.verification_command = optional_str(args, "verification_command")?.map(str::to_string);
     input.spec_id = crate::mcp_context::optional_spec_arg(db, args, "spec_id")?;
     input.parent_task_id = optional_str(args, "parent_task_id")?.map(str::to_string);
+    // THE THREE REFERENCES, resolved BEFORE the insert rather than left to the FOREIGN KEY. Each
+    // one is an id the caller composed, and each one used to die as the same opaque
+    // `FOREIGN KEY constraint failed` — one sentence for three different mistakes, naming none of
+    // them. Read here, the refusal says which argument is wrong and where a good value comes from.
+    if db
+        .with_conn(|c| db::get_project(c, project_id))
+        .map_err(internal_db)?
+        .is_none()
+    {
+        return Err(unknown_reference(
+            "project_id",
+            project_id,
+            "use a project_id from list_projects",
+        ));
+    }
+    if let Some(spec_id) = input.spec_id.as_deref() {
+        if db
+            .with_conn(|c| db::get_spec(c, spec_id))
+            .map_err(internal_db)?
+            .is_none()
+        {
+            return Err(unknown_reference(
+                "spec_id",
+                spec_id,
+                "use a spec_id from spec_list(project_id=…), or omit it for a task with no Spec",
+            ));
+        }
+    }
+    if let Some(parent_task_id) = input.parent_task_id.as_deref() {
+        if db
+            .with_conn(|c| db::get_task(c, parent_task_id))
+            .map_err(internal_db)?
+            .is_none()
+        {
+            return Err(unknown_reference(
+                "parent_task_id",
+                parent_task_id,
+                "use a task id from task_list(spec_id=…), or omit it for a top-level task",
+            ));
+        }
+    }
     // ROUND (v2.5.11): the rework sub-phase a finding is rattached to (PER-PHASE, so it reads "2.1",
     // "4.1"…). OMITTED IS THE NORMAL CASE for a `kind=review` finding: `db::create_task` then fills
     // it from the Spec's own review pass, because the auditor raising the finding cannot know which
@@ -766,7 +1051,7 @@ pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     // `phase` is a phase NAME: nyx materializes the plan from the names in first-seen order while
     // the Spec is drafted, and refuses an unknown one after (`db::create_task`). It needs a Spec —
     // the plan lives on the Spec.
-    input.phase_name = optional_str(args, "phase")?.map(str::to_string);
+    input.phase_name = phase_name_to_write(args)?;
     if input.phase_name.is_some() && input.spec_id.is_none() {
         return Err(RpcError::new(
             RpcCode::InvalidArgument,
@@ -777,8 +1062,21 @@ pub fn task_add(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let task = db
         .with_conn(|c| db::create_task(c, project_id, title, input.clone()))
         .map_err(map_content_write_err)?;
+    // ECHO THE NAME BESIDE THE RANK. `task.phase` is a NUMBER — the rank nyx assigned — while the
+    // argument was a NAME, so a caller that sent `phase:"3"` read `phase: 2` back and had every
+    // reason to call that a corruption (measured 2026-09-01). It was not: "3" was the SECOND name
+    // this Spec had seen. The projection carries `phase_name` next to the rank, on the write AND on
+    // the reads, so the two are readable as what they are instead of one field contradicting itself.
+    let plan = match task.spec_id.as_deref() {
+        Some(spec_id) => db
+            .with_conn(|c| db::get_spec(c, spec_id))
+            .map_err(internal_db)?
+            .map(|s| db::parse_phase_plan(&s.phases))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     Ok(ToolOutcome::changed(
-        json!({ "task": task }),
+        json!({ "task": task_json(&task, &plan) }),
         ChangedTopic::Specs,
     ))
 }
@@ -799,7 +1097,7 @@ pub fn task_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
             .with_conn(|c| db::verify_human_task(c, task_id))
             .map_err(map_task_transition_err)?;
         return Ok(ToolOutcome::changed(
-            json!({ "task": task }),
+            json!({ "task": task_json_with_plan(db, &task) }),
             ChangedTopic::Specs,
         ));
     }
@@ -810,7 +1108,7 @@ pub fn task_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
         .with_conn(|c| db::transition_task(c, task_id, transition, reason))
         .map_err(map_task_transition_err)?;
     Ok(ToolOutcome::changed(
-        json!({ "task": task }),
+        json!({ "task": task_json_with_plan(db, &task) }),
         ChangedTopic::Specs,
     ))
 }
@@ -909,6 +1207,268 @@ pub fn spec_deps(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     Ok(ToolOutcome::read(json!(view)))
 }
 
+// --- The READ half: spec_get / spec_list / task_list ------------------------
+
+/// How many rows a paged read of this surface returns when the caller names no `limit`, and the
+/// ceiling it clamps an explicit one to. A naive call must be SAFE and USEFUL at once: 50 Specs (or
+/// tasks) is a whole board, and the byte budget below cuts in long before it hurts.
+const DEFAULT_PAGE: usize = 50;
+const MAX_PAGE: usize = 200;
+
+/// The `offset` / `limit` pair of a paged read, clamped. `limit` 0 (or absent) means
+/// [`DEFAULT_PAGE`]; anything above [`MAX_PAGE`] is clamped rather than refused — a caller asking
+/// for more than nyx will serve wants "as much as you can", not an error.
+pub(crate) fn page_args(args: &Value) -> Result<(usize, usize), RpcError> {
+    let offset = optional_usize(args, "offset")?.unwrap_or(0);
+    let limit = match optional_usize(args, "limit")? {
+        None | Some(0) => DEFAULT_PAGE,
+        Some(n) => n.min(MAX_PAGE),
+    };
+    Ok((offset, limit))
+}
+
+/// Emit one page of already-projected `rows` under BOTH the count bound and the byte budget, as the
+/// `{ items, total, returned, offset, next_offset, truncated }` shape every read here answers with.
+///
+/// TWO BOUNDS, because either alone leaves a hole: a count cannot stop 50 wide rows from blowing the
+/// transport, and a byte budget alone makes "how much did I get" unanswerable. `next_offset` is
+/// non-null exactly when rows remain, so a caller pages by following it and stops when it is null —
+/// no arithmetic, and no way to build a loop that never advances.
+pub(crate) fn page_of(
+    key: &str,
+    rows: Vec<Value>,
+    offset: usize,
+    limit: usize,
+    head_bytes: usize,
+) -> Value {
+    let total = rows.len();
+    let window: Vec<Value> = rows.into_iter().skip(offset).take(limit).collect();
+    let budget = MAX_RESPONSE_BYTES.saturating_sub(RESPONSE_ENVELOPE_BYTES + head_bytes);
+    let (kept, cut_by_bytes) = under_response_budget_strict(window, budget);
+    let returned = kept.len();
+    let next = offset + returned;
+    let more = next < total;
+    json!({
+        key: kept,
+        "total": total,
+        "returned": returned,
+        "offset": offset,
+        "next_offset": if more { json!(next) } else { Value::Null },
+        "truncated": more,
+        // Says WHICH bound cut, because the two call for different reactions: a byte cut means ask
+        // for fewer rows, a count cut means simply page on.
+        "truncated_by_size": cut_by_bytes,
+    })
+}
+
+/// `spec_get` — `{ spec_id, project_id? }` → `{ spec, revision, tasks, … }`. READ one Spec WHOLE:
+/// the row (with its `phases` plan decoded), its ACTIVE revision's six sections, and its tasks (each
+/// carrying `phase_name` beside the numeric `phase`).
+///
+/// THIS IS THE READ-BACK THE SURFACE DID NOT HAVE. An agent could author a Spec and had no way to
+/// re-read it: the only door was `agent_context`, which renders a ROLE MANUAL around the state, and
+/// refuses outright for `coder`/`doc` when no Spec resolves. Re-reading one's own write is not a
+/// role question, so it does not go through a role.
+///
+/// The task list is PAGED (`offset`/`limit`) like [`task_list`], and for the same reason: a Spec
+/// with a long plan must not make its own read unreadable. An unknown Spec is `invalid_id`, naming
+/// the read that finds one.
+pub fn spec_get(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let (offset, limit) = page_args(args)?;
+    let spec = db
+        .with_conn(|c| db::get_spec(c, &spec_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidId,
+                format!(
+                    "unknown spec {spec_id} (use spec_list(project_id=…) to find one, or the id \
+                     spec_create returned)"
+                ),
+            )
+        })?;
+    let revision = db
+        .with_conn(|c| db::get_active_revision(c, &spec.id))
+        .map_err(internal_db)?;
+    let tasks = db
+        .with_conn(|c| db::list_tasks_for_spec(c, &spec.id))
+        .map_err(internal_db)?;
+    let plan = db::parse_phase_plan(&spec.phases);
+    let head = json!({
+        "spec": spec_json(&spec),
+        "revision": revision.as_ref().map(|r| bounded_row(&json!(r))),
+    });
+    let rows: Vec<Value> = tasks
+        .iter()
+        .map(|t| bounded_row(&task_json(t, &plan)))
+        .collect();
+    let page = page_of("tasks", rows, offset, limit, json_len(&head));
+    let mut result = head;
+    if let (Some(result), Some(page)) = (result.as_object_mut(), page.as_object()) {
+        for (key, value) in page {
+            // The paging counters are about the TASKS here, and say so — `tasks_total` reads
+            // unambiguously beside a `spec` and a `revision`, where a bare `total` would not.
+            let key = if key == "tasks" {
+                key.clone()
+            } else {
+                format!("tasks_{key}")
+            };
+            result.insert(key, value.clone());
+        }
+    }
+    Ok(ToolOutcome::read(result))
+}
+
+/// `spec_list` — `{ project_id?, status?, offset?, limit? }` → the LIVE Specs in BOARD ORDER, each
+/// with its human `key` (`NYX-3`) beside its canonical id.
+///
+/// THE READ THAT FINDS AN ID NOBODY KEPT. `spec_create` returns an id once; an agent that lost it
+/// had no way back — no list, no search, nothing (measured 2026-09-01). `project_id` is OPTIONAL and
+/// the fallbacks are deliberate: absent, nyx resolves the project from the call's own anchors
+/// (`workspace_id` / `cwd`), and failing that lists EVERY project's Specs — because "I do not know
+/// which project" is precisely the state an agent looking for a lost id is in. A project_id that is
+/// PRESENT but names nothing is the opposite case and is refused by name: the agent named a project,
+/// so an empty list would read as "this project has no Spec" (#N4).
+///
+/// # THE ORDER IS OLDEST FIRST, and this doc used to say the reverse (#N7)
+///
+/// [`db::list_specs`] orders `(position asc, number asc, id asc)` — the BOARD's order, the same one
+/// the UI reads. `specs.position` is written exactly once, as `0` by `create_spec`, and there is no
+/// reorder path in the codebase that ever writes it again: every live Spec therefore sits in the
+/// same tier and the tie-break `number asc` decides, so the MOST RECENTLY CREATED Spec comes LAST.
+/// The doc claimed "newest board order first", which on a project with more than `limit` live Specs
+/// put the Spec an agent had just created on the last page — the exact case this tool advertises.
+///
+/// The prose is corrected rather than the order: this list IS the board, and reversing it here would
+/// either desynchronise the two readings of the same query or reorder the user's board to suit a
+/// lookup. TO FIND THE SPEC YOU JUST CREATED, do one of:
+///   * read `total` from the answer and re-call with `offset: total - 1` — the newest is last;
+///   * filter `status: "draft"`, which a freshly created Spec is;
+///   * or reference it by its human key, whose number is the highest in the project (`crate::spec_ref`).
+///
+/// `key` is computed here rather than stored: it is `projects.key || '-' || specs.number`, and it is
+/// what makes the `KEY-N` reference form usable from a list (`crate::spec_ref`).
+pub fn spec_list(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let project_id = match optional_str(args, "project_id")? {
+        // NAMED EXPLICITLY — so it must EXIST (#N4). Treated as a bare filter, a typo'd or stale id
+        // answered `{ specs: [], total: 0 }`, which reads as "that project has no Spec" and sends an
+        // agent looking for a lost id off in the wrong direction entirely. `task_add` already
+        // refuses the same argument by name; this says the same thing in the same words.
+        Some(id) => {
+            if db
+                .with_conn(|c| db::get_project(c, id))
+                .map_err(internal_db)?
+                .is_none()
+            {
+                return Err(unknown_reference(
+                    "project_id",
+                    id,
+                    "use a project_id from list_projects, or omit it to search every project",
+                ));
+            }
+            Some(id.to_string())
+        }
+        // The other anchors this call may carry — a workspace, a cwd — resolve a project the same
+        // way every other tool resolves one. Nothing resolved = every project. DELIBERATE, and NOT
+        // the case above: "I do not know which project" is precisely the state an agent looking for
+        // a lost id is in, and widening the search is the answer to it.
+        None => crate::mcp_context::resolve_project(db, args)?.map(|p| p.id),
+    };
+    let status = optional_str(args, "status")?.map(str::to_string);
+    let (offset, limit) = page_args(args)?;
+    let specs = db
+        .with_conn(|c| db::list_specs(c, project_id.as_deref()))
+        .map_err(internal_db)?;
+    // The project KEY of each Spec, read once per project rather than once per Spec.
+    let mut keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut rows: Vec<Value> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        if status.as_deref().is_some_and(|s| s != spec.status) {
+            continue;
+        }
+        let key = match keys.get(&spec.project_id) {
+            Some(key) => Some(key.clone()),
+            None => {
+                let key = db
+                    .with_conn(|c| db::get_project(c, &spec.project_id))
+                    .map_err(internal_db)?
+                    .map(|p| p.key);
+                if let Some(key) = key.clone() {
+                    keys.insert(spec.project_id.clone(), key);
+                }
+                key
+            }
+        };
+        let mut row = spec_json(spec);
+        if let (Some(object), Some(key)) = (row.as_object_mut(), key) {
+            object.insert("key".to_string(), json!(format!("{key}-{}", spec.number)));
+        }
+        rows.push(bounded_row(&row));
+    }
+    let head = json!({ "project_id": project_id });
+    let page = page_of("specs", rows, offset, limit, json_len(&head));
+    let mut result = page;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("project_id".to_string(), json!(project_id));
+    }
+    Ok(ToolOutcome::read(result))
+}
+
+/// `task_list` — `{ spec_id, project_id?, kind?, status?, phase?, offset?, limit? }` → the Spec's
+/// tasks, in board order, each carrying `phase_name` beside its numeric `phase`.
+///
+/// THE PLAN AND THE FINDINGS ARE THE SAME LIST (finding = task, PDR-0016), so `kind` is how a caller
+/// narrows to one or the other rather than a second tool. `phase` filters by NAME here too — the
+/// same word `task_add` takes — so an agent never has to convert a name into a rank to ask a
+/// question about a phase.
+pub fn task_list(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
+    let spec_id =
+        crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
+    let kind = optional_enum_str(args, "kind", &db::TASK_KINDS)?.map(str::to_string);
+    let status = optional_str(args, "status")?.map(str::to_string);
+    let phase = optional_phase_name(args)?;
+    let (offset, limit) = page_args(args)?;
+    let spec = db
+        .with_conn(|c| db::get_spec(c, &spec_id))
+        .map_err(internal_db)?
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidId,
+                format!("unknown spec {spec_id} (use spec_list(project_id=…) to find one)"),
+            )
+        })?;
+    let plan = db::parse_phase_plan(&spec.phases);
+    let tasks = db
+        .with_conn(|c| db::list_tasks_for_spec(c, &spec.id))
+        .map_err(internal_db)?;
+    let wanted_phase = phase.as_deref().map(|name| {
+        plan.iter()
+            .find(|p| p.name.trim() == name.trim())
+            .map(|p| p.number)
+    });
+    let rows: Vec<Value> = tasks
+        .iter()
+        .filter(|t| kind.as_deref().is_none_or(|k| k == t.kind))
+        .filter(|t| status.as_deref().is_none_or(|s| s == t.status))
+        // A `phase` naming nothing in the plan yields NO task rather than every task: the question
+        // was about one phase, and answering it with the whole list would read as an answer.
+        .filter(|t| wanted_phase.is_none_or(|number| number.is_some() && number == t.phase))
+        .map(|t| bounded_row(&task_json(t, &plan)))
+        .collect();
+    let head = json!({ "spec_id": spec.id, "phases": plan });
+    let page = page_of("tasks", rows, offset, limit, json_len(&head));
+    let mut result = page;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("spec_id".to_string(), json!(spec.id));
+        // The PLAN travels with the list, because a `phase` rank is unreadable without it and a
+        // caller that has the list should not need a second call to name what it is looking at.
+        object.insert("phases".to_string(), json!(plan));
+    }
+    Ok(ToolOutcome::read(result))
+}
+
 // --- Auto-map: the Spec a spec-scoped MUTATION worked on ---------------------
 
 /// The Spec id a successful spec-authoring tool call WORKED ON — the auto-map signal
@@ -996,6 +1556,10 @@ pub fn dispatch_spec_tool(
         SPEC_LINK_TOOL => Some(spec_link(db, args)),
         SPEC_UNLINK_TOOL => Some(spec_unlink(db, args)),
         SPEC_DEPS_TOOL => Some(spec_deps(db, args)),
+        // The READ half (v2.8) — plain reads, no role, no run.
+        SPEC_GET_TOOL => Some(spec_get(db, args)),
+        SPEC_LIST_TOOL => Some(spec_list(db, args)),
+        TASK_LIST_TOOL => Some(task_list(db, args)),
         _ => None,
     }
 }
@@ -2920,13 +3484,13 @@ mod tests {
     }
 
     /// DONE-CRITERION: the tool LIST carries the new verb. `SPEC_TOOLS` is the one closed slice the
-    /// advertisement, the dispatch and the surface count all read (`mcp::tests`), so a twelfth entry
-    /// that is not routed — or routed but not advertised, which makes it undispatchable (N17) —
-    /// fails here.
+    /// advertisement, the dispatch and the surface count all read (`mcp::tests`), so an entry that
+    /// is not routed — or routed but not advertised, which makes it undispatchable (N17) — fails
+    /// here.
     #[test]
-    fn the_category_verb_is_the_twelfth_spec_tool_and_it_is_routed() {
+    fn the_category_verb_is_a_spec_tool_and_it_is_routed() {
         let _g = db_guard();
-        assert_eq!(SPEC_TOOLS.len(), 12);
+        assert_eq!(SPEC_TOOLS.len(), 15);
         assert!(SPEC_TOOLS.contains(&SPEC_SET_CATEGORY_TOOL));
         let (db, project_id, _ws) = seeded_db();
         let sid = spec_id_of(
@@ -2940,6 +3504,800 @@ mod tests {
             )
             .is_some(),
             "every SPEC_TOOLS entry must be routed by the shared dispatcher"
+        );
+    }
+
+    /// The literal wordings SQLite writes. Nothing an agent reads may carry one — see
+    /// [`crate::mcp::RpcError::new`], where the guarantee is enforced, and the reason it exists.
+    fn assert_no_sql_text(what: &str, message: &str) {
+        let lower = message.to_ascii_lowercase();
+        for marker in [
+            "constraint failed",
+            "foreign key",
+            "check (",
+            "no such table",
+            "no such column",
+            "sql logic error",
+        ] {
+            assert!(
+                !lower.contains(marker),
+                "{what} leaks SQL text ({marker:?}): {message}"
+            );
+        }
+    }
+
+    /// DONE-CRITERION (task `01M1F8X44HSK742EVVG8F94H6H`): **a constraint the caller can fix is an
+    /// `invalid_argument` naming the argument, never an `internal` carrying SQL.**
+    ///
+    /// The two shapes measured live on 2026-09-01, both `-32000 internal`:
+    ///   * an unknown `spec_id` → `db error: FOREIGN KEY constraint failed`
+    ///   * `kind:"bogus"` → `db error: CHECK constraint failed: kind IN ('slice','human','review')`
+    ///
+    /// In both the fault is in the ARGUMENTS, and `internal` told the caller the opposite — so an
+    /// agent reading it concludes nyx is broken and either abandons or retries the identical call.
+    /// Each is now refused ABOVE the database, by name, and — for a closed vocabulary — with the set
+    /// it may pick from.
+    #[test]
+    fn task_add_refuses_a_bad_reference_and_a_bad_vocabulary_by_name() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+
+        // 1. AN UNKNOWN SPEC — the argument is named, and no FOREIGN KEY sentence survives.
+        let err = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "spec_id": "01NOPE" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument, "{}", err.message);
+        assert!(
+            err.message.contains("spec_id") && err.message.contains("01NOPE"),
+            "the refusal names the argument AND quotes what was sent: {}",
+            err.message
+        );
+        assert_no_sql_text("task_add(unknown spec_id)", &err.message);
+
+        // 2. AN UNKNOWN KIND — every accepted value is listed, in prose AND in `data`.
+        let err = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "kind": "bogus" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument, "{}", err.message);
+        for accepted in db::TASK_KINDS {
+            assert!(
+                err.message.contains(accepted),
+                "the refusal lists the accepted kind '{accepted}': {}",
+                err.message
+            );
+        }
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("accepted")).cloned(),
+            Some(json!(db::TASK_KINDS)),
+            "…and carries the set structurally, so an agent need not parse the prose"
+        );
+        assert_no_sql_text("task_add(bad kind)", &err.message);
+
+        // 3. THE OTHER THREE CLOSED VOCABULARIES answer the same way, from the same constants.
+        for (key, accepted) in [
+            ("type", &db::TASK_TYPES[..]),
+            ("priority", &db::TASK_PRIORITIES[..]),
+            ("severity", &db::TASK_SEVERITIES[..]),
+        ] {
+            let err = task_add(
+                &db,
+                &json!({ "project_id": project_id, "title": "t", key: "bogus" }),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, RpcCode::InvalidArgument, "{key}: {}", err.message);
+            assert!(
+                err.message.contains(key) && accepted.iter().all(|v| err.message.contains(v)),
+                "{key} refusal names the argument and its accepted set: {}",
+                err.message
+            );
+        }
+
+        // 4. AN UNKNOWN PARENT + AN UNKNOWN PROJECT — the other two references of this call.
+        let err = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "parent_task_id": "01NOPARENT" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument, "{}", err.message);
+        assert!(
+            err.message.contains("parent_task_id"),
+            "the refusal names parent_task_id: {}",
+            err.message
+        );
+        let err = task_add(&db, &json!({ "project_id": "01NOPROJECT", "title": "t" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument, "{}", err.message);
+        assert!(
+            err.message.contains("project_id"),
+            "the refusal names project_id: {}",
+            err.message
+        );
+
+        // 5. THE ALREADY-ACTIONABLE ERRORS ARE UNCHANGED — the non-goal of the task, asserted
+        // rather than assumed: the missing-argument refusal and the unknown-section refusal keep
+        // their exact wording and code.
+        let err = task_add(&db, &json!({})).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert_eq!(
+            err.message,
+            "missing or empty required argument 'project_id'"
+        );
+        let err = parse_section("bogus").unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.starts_with("unknown section 'bogus' (accepted: problem, solution,"),
+            "{}",
+            err.message
+        );
+
+        // …and a NOMINAL task still writes, so none of the pre-validation blocks the good path.
+        let ok = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "kind": "human",
+                     "verification_command": "check it", "priority": "high" }),
+        )
+        .expect("a well-formed task_add still writes");
+        assert_eq!(ok.result["task"]["kind"], "human");
+    }
+
+    /// #K2 — A REFUSAL THAT QUOTES THE CALLER SURVIVES THE ANTI-SQL NET — ON THE REAL TOOL.
+    ///
+    /// The net cut on SQLite's literal wordings wherever they appeared, for EVERY error code. But a
+    /// good refusal REPEATS the argument it is refusing, so `task_add(kind: "no such table")` built
+    /// `unknown kind 'no such table' (accepted: …)` — a marker with no `": "` in front of it, hence
+    /// an empty head, hence the WHOLE message replaced by a sentence about a storage layer nothing
+    /// had consulted. The accepted-values list, the only actionable part of the refusal, went with
+    /// it (it survived in `error.data`, which the client of the day did not render).
+    ///
+    /// [`crate::mcp`]'s own `an_argument_refusal_that_quotes_the_caller_survives_the_sql_net` pins
+    /// the NET, on the wording copied from here. This drives the TOOL, so the guarantee cannot go
+    /// on holding for a copy that has drifted from what `task_add` really builds — or for a code
+    /// this refusal no longer carries.
+    #[test]
+    fn task_add_kind_that_reads_like_sql_still_lists_its_accepted_values() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+
+        let err = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "kind": "no such table" }),
+        )
+        .unwrap_err();
+        // `invalid_argument`, NOT `internal` — which is what keeps it out of the net entirely.
+        assert_eq!(err.code, RpcCode::InvalidArgument, "{}", err.message);
+        for accepted in db::TASK_KINDS {
+            assert!(
+                err.message.contains(accepted),
+                "the accepted kind '{accepted}' must survive the net: {}",
+                err.message
+            );
+        }
+        assert!(
+            err.message.contains("no such table"),
+            "and the refusal still quotes what the caller actually sent: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("storage layer"),
+            "nothing about a database nyx never consulted: {}",
+            err.message
+        );
+    }
+
+    /// #N4 — A `project_id` THE CALLER NAMED MUST EXIST.
+    ///
+    /// Treated as a bare filter, `spec_list(project_id: "bogus")` answered `{ specs: [], total: 0 }`
+    /// — "this project has no Spec" — for an id that names nothing, while `task_add` refuses the
+    /// same argument by name. An agent hunting a lost Spec reads that empty list as an answer and
+    /// stops looking.
+    ///
+    /// The OTHER half of the tool's fallback is deliberate and untouched: with NO `project_id` and
+    /// nothing resolvable from the anchors, the search widens to every project, because "I do not
+    /// know which project" is exactly the state that reading is for.
+    #[test]
+    fn spec_list_refuses_a_project_id_that_names_nothing_but_still_widens_when_given_none() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        spec_create(&db, &json!({ "project_id": project_id, "title": "Une Spec" })).unwrap();
+
+        // NAMED and unknown → a named refusal, the same one `task_add` gives for the same argument.
+        let err = spec_list(&db, &json!({ "project_id": "bogus" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert_eq!(
+            err.data.as_ref().and_then(|d| d.get("reason")),
+            Some(&json!("unknown_reference")),
+            "the refusal is machine-readable: {err:?}"
+        );
+        assert!(
+            err.message.contains("bogus") && err.message.contains("project_id"),
+            "and it quotes the argument at fault: {}",
+            err.message
+        );
+
+        // ABSENT, with no resolvable anchor → the cross-project listing, unchanged.
+        let all = spec_list(&db, &json!({})).unwrap();
+        assert!(
+            all.result["specs"]
+                .as_array()
+                .expect("specs")
+                .iter()
+                .any(|s| s["title"] == json!("Une Spec")),
+            "an unscoped call still searches every project: {}",
+            all.result
+        );
+    }
+
+    /// #N7 — THE ORDER IS THE BOARD'S, AND THE PROSE NOW SAYS SO.
+    ///
+    /// TRACED FIRST, as the finding asked: `db::list_specs` orders `(position asc, number asc, id
+    /// asc)`; `specs.position` is written ONLY by `create_spec`, always as `0`, and NOTHING in the
+    /// codebase ever writes it again — there is no board reorder. So every live Spec shares one
+    /// tier, `number asc` decides, and the newest is LAST. The doc claimed "newest board order
+    /// first", which on a project past the default limit put the Spec an agent had just created on
+    /// the last page — the very case the tool advertises.
+    ///
+    /// The order is left alone (this list IS the board the UI reads) and the prose corrected, so
+    /// this test pins the REAL order and the documented way back to the newest Spec.
+    #[test]
+    fn spec_list_returns_the_board_order_oldest_first_and_the_newest_is_the_last_row() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let ids: Vec<String> = ["Premiere", "Deuxieme", "Troisieme"]
+            .iter()
+            .map(|title| {
+                spec_id_of(
+                    &spec_create(&db, &json!({ "project_id": project_id, "title": title })).unwrap(),
+                )
+            })
+            .collect();
+
+        let listed = spec_list(&db, &json!({ "project_id": project_id })).unwrap();
+        let rows = listed.result["specs"].as_array().expect("specs");
+        assert_eq!(
+            rows.iter().map(|s| s["id"].clone()).collect::<Vec<_>>(),
+            ids.iter().map(|id| json!(id)).collect::<Vec<_>>(),
+            "creation order, oldest first — NOT newest first: {}",
+            listed.result
+        );
+
+        // THE DOCUMENTED WAY BACK to the Spec you just created: `total - 1`.
+        let total = listed.result["total"].as_u64().expect("a total") as usize;
+        let newest = spec_list(
+            &db,
+            &json!({ "project_id": project_id, "offset": total - 1, "limit": 1 }),
+        )
+        .unwrap();
+        assert_eq!(
+            newest.result["specs"][0]["id"],
+            json!(ids.last().unwrap()),
+            "offset = total - 1 lands on the newest Spec: {}",
+            newest.result
+        );
+    }
+
+    /// DONE-CRITERION (task `01M1F8X7SE5B3BQTKSXCFQGTNY`): **an agent re-reads what it wrote, and
+    /// finds a Spec whose id it never kept — without `agent_context`.**
+    ///
+    /// The surface was WRITE-ONLY (measured 2026-09-01: `spec_get`, `spec_list`, `task_list`,
+    /// `task_get` all absent). The only door was `agent_context`, which renders a ROLE MANUAL around
+    /// the state and refuses outright for `coder`/`doc` when no Spec resolves — so "what did I just
+    /// write" had no answer at all. The whole journey is replayed here: author, slice, lose the id,
+    /// find it again by title, and read the Spec whole.
+    #[test]
+    fn the_specs_surface_can_be_read_back_without_agent_context() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "Pilotage agent",
+                     "problem": "an agent cannot re-read", "solution": "three reads" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        for (title, phase, kind) in [
+            ("slice one", "Foundations", "slice"),
+            ("slice two", "Foundations", "slice"),
+            ("a finding", "Wiring", "review"),
+        ] {
+            task_add(
+                &db,
+                &json!({ "project_id": project_id, "title": title, "spec_id": sid,
+                         "phase": phase, "kind": kind, "severity": "low" }),
+            )
+            .unwrap_or_else(|e| panic!("{title}: {}", e.message));
+        }
+
+        // 1. FIND AN ID NOBODY KEPT — by title, from the project alone. And with NO project either:
+        // "I do not know which project" is the state an agent looking for a lost id is really in.
+        for scope in [json!({ "project_id": project_id }), json!({})] {
+            let listed = spec_list(&db, &scope).unwrap();
+            let found = listed.result["specs"]
+                .as_array()
+                .expect("specs")
+                .iter()
+                .find(|s| s["title"] == json!("Pilotage agent"))
+                .unwrap_or_else(|| panic!("the Spec is listed under {scope}"));
+            assert_eq!(found["id"], json!(sid));
+            // …and the HUMAN key is there too, which is the other way to name it afterwards.
+            assert!(
+                found["key"]
+                    .as_str()
+                    .is_some_and(|k| k.ends_with(&format!("-{}", found["number"]))),
+                "the row carries the KEY-N form: {found}"
+            );
+        }
+
+        // 2. RE-READ IT WHOLE — the sections, the plan, and the tasks, in ONE call and with no role.
+        let read = spec_get(&db, &json!({ "spec_id": sid })).unwrap().result;
+        assert_eq!(read["spec"]["id"], json!(sid));
+        assert_eq!(read["revision"]["problem"], json!("an agent cannot re-read"));
+        assert_eq!(read["revision"]["solution"], json!("three reads"));
+        assert_eq!(
+            read["spec"]["phases"],
+            json!([
+                { "number": 1, "name": "Foundations" },
+                { "number": 2, "name": "Wiring" },
+            ])
+        );
+        assert_eq!(read["tasks_total"], json!(3));
+        assert_eq!(read["tasks"].as_array().map(Vec::len), Some(3));
+        assert_eq!(read["tasks_next_offset"], Value::Null, "nothing left to page");
+
+        // 3. THE TASKS ANSWER ON THEIR OWN TOO, narrowed by the words the write path takes.
+        let plan_only = task_list(&db, &json!({ "spec_id": sid, "kind": "slice" }))
+            .unwrap()
+            .result;
+        assert_eq!(plan_only["total"], json!(2));
+        let by_phase = task_list(&db, &json!({ "spec_id": sid, "phase": "Wiring" }))
+            .unwrap()
+            .result;
+        assert_eq!(by_phase["total"], json!(1));
+        assert_eq!(by_phase["tasks"][0]["phase_name"], json!("Wiring"));
+        // A phase NAME the plan does not hold answers NOTHING, never everything.
+        let ghost = task_list(&db, &json!({ "spec_id": sid, "phase": "Nowhere" }))
+            .unwrap()
+            .result;
+        assert_eq!(ghost["total"], json!(0));
+
+        // 4. AN UNKNOWN SPEC IS `invalid_id`, and the refusal names the read that finds one.
+        for read in [
+            spec_get(&db, &json!({ "spec_id": "01NOPE" })),
+            task_list(&db, &json!({ "spec_id": "01NOPE" })),
+        ] {
+            let err = read.unwrap_err();
+            assert_eq!(err.code, RpcCode::InvalidId, "{}", err.message);
+            assert!(
+                err.message.contains("spec_list"),
+                "the refusal points at the read that finds a Spec: {}",
+                err.message
+            );
+        }
+    }
+
+    /// PAGING IS A CONTRACT, not a hint: `next_offset` advances and ends on `null`, so a caller that
+    /// follows it reads every row exactly once and cannot build a loop that never terminates.
+    #[test]
+    fn the_specs_reads_page_by_following_next_offset_until_it_is_null() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let spec = spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).unwrap();
+        let sid = spec_id_of(&spec);
+        for i in 0..5 {
+            task_add(
+                &db,
+                &json!({ "project_id": project_id, "title": format!("t{i}"), "spec_id": sid }),
+            )
+            .unwrap();
+        }
+
+        let mut offset = json!(0);
+        let mut seen: Vec<String> = Vec::new();
+        let mut pages = 0usize;
+        while let Some(at) = offset.as_u64() {
+            let page = task_list(&db, &json!({ "spec_id": sid, "offset": at, "limit": 2 }))
+                .unwrap()
+                .result;
+            for task in page["tasks"].as_array().expect("tasks") {
+                seen.push(task["id"].as_str().expect("an id").to_string());
+            }
+            offset = page["next_offset"].clone();
+            pages += 1;
+            assert!(pages < 10, "the paging must terminate");
+        }
+        assert_eq!(pages, 3, "5 rows at 2 per page: two full pages plus the tail");
+        assert_eq!(seen.len(), 5, "every row is read exactly once: {seen:?}");
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 5, "…and none twice: {seen:?}");
+    }
+
+    /// A STRING THAT IS REALLY ENCODED JSON — an array or an object smuggled through a text field.
+    /// That is the shape `"phases": "[]"` had: a consumer measuring the field got the length of the
+    /// SOURCE (2), and `structuredContent` declared a type the payload did not have.
+    fn is_encapsulated_json(text: &str) -> bool {
+        let trimmed = text.trim();
+        let bracketed = (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            || (trimmed.starts_with('{') && trimmed.ends_with('}'));
+        bracketed
+            && serde_json::from_str::<Value>(trimmed)
+                .map(|v| v.is_array() || v.is_object())
+                .unwrap_or(false)
+    }
+
+    /// Walk a tool result and collect the paths whose STRING value is encoded JSON.
+    fn encapsulated_json_paths(value: &Value, path: &str, found: &mut Vec<String>) {
+        match value {
+            Value::String(text) if is_encapsulated_json(text) => {
+                found.push(format!("{path} = {text}"))
+            }
+            Value::Object(map) => {
+                for (key, child) in map {
+                    encapsulated_json_paths(child, &format!("{path}.{key}"), found);
+                }
+            }
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    encapsulated_json_paths(child, &format!("{path}[{i}]"), found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// DONE-CRITERION (task `01M1F8X6HGMHPT0V0743VAW50W`): **the Specs / tasks surface returns
+    /// structure as structure — no field carries JSON encapsulated in a string.**
+    ///
+    /// The measured case: `spec_create` answered `"phases": "[]"`, so an agent testing the plan's
+    /// length got 2 for an empty plan (2026-09-01). The fix is a WIRE PROJECTION ([`spec_json`]) —
+    /// the `specs.phases` column stays TEXT — and this test is the sweep that says the defect had no
+    /// siblings: every tool of the surface is called for real and its whole result tree is walked.
+    #[test]
+    fn no_specs_or_tasks_tool_returns_json_encapsulated_in_a_string() {
+        let _g = db_guard();
+        let (db, project_id, ws) = seeded_db();
+
+        let mut results: Vec<(&str, Value)> = Vec::new();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "S", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        results.push((SPEC_CREATE_TOOL, created.result.clone()));
+
+        // THE PLAN IS NON-EMPTY TOO: an empty plan would pass a projection that simply dropped the
+        // field, so the sweep runs on a Spec that really carries phases.
+        let task = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "spec_id": sid,
+                     "phase": "Foundations" }),
+        )
+        .unwrap();
+        let task_id = task.result["task"]["id"].as_str().unwrap().to_string();
+        results.push((TASK_ADD_TOOL, task.result.clone()));
+        let second = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "u", "spec_id": sid, "phase": "Wiring" }),
+        )
+        .unwrap();
+        let second_id = second.result["task"]["id"].as_str().unwrap().to_string();
+
+        results.push((
+            SPEC_UPDATE_SECTION_TOOL,
+            spec_update_section(
+                &db,
+                &json!({ "spec_id": sid, "section": "solution", "value": "s2" }),
+            )
+            .unwrap()
+            .result,
+        ));
+        results.push((
+            TASK_ADD_DEPENDENCY_TOOL,
+            task_add_dependency(
+                &db,
+                &json!({ "task_id": second_id, "depends_on_task_id": task_id }),
+            )
+            .unwrap()
+            .result,
+        ));
+        results.push((
+            TASK_TRANSITION_TOOL,
+            task_transition(&db, &json!({ "task_id": task_id, "transition": "start" }))
+                .unwrap()
+                .result,
+        ));
+        results.push((
+            SPEC_FORK_TOOL,
+            spec_fork(&db, &json!({ "spec_id": sid, "change_reason": "why" }))
+                .unwrap()
+                .result,
+        ));
+        results.push((
+            SPEC_DEPS_TOOL,
+            spec_deps(&db, &json!({ "spec_id": sid })).unwrap().result,
+        ));
+
+        // The ANCHOR path returns a Spec too — through the same projection.
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+        results.push((
+            SPEC_SET_WORKSPACE_TOOL,
+            spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws }))
+                .unwrap()
+                .result,
+        ));
+
+        // The READ half answers with the same shapes and must not re-introduce the defect.
+        results.push((
+            SPEC_GET_TOOL,
+            spec_get(&db, &json!({ "spec_id": sid })).unwrap().result,
+        ));
+        results.push((
+            SPEC_LIST_TOOL,
+            spec_list(&db, &json!({ "project_id": project_id }))
+                .unwrap()
+                .result,
+        ));
+        results.push((
+            TASK_LIST_TOOL,
+            task_list(&db, &json!({ "spec_id": sid })).unwrap().result,
+        ));
+
+        for (tool, result) in &results {
+            let mut found = Vec::new();
+            encapsulated_json_paths(result, "result", &mut found);
+            assert!(
+                found.is_empty(),
+                "tool `{tool}` returns JSON encapsulated in a string: {found:?}"
+            );
+        }
+
+        // …and the specific field the defect was measured on IS an array, carrying the plan.
+        let phases = &results[0].1["spec"]["phases"];
+        assert!(phases.is_array(), "spec_create returns a phases ARRAY: {phases}");
+        assert_eq!(phases.as_array().unwrap().len(), 0, "a fresh Spec has no phase yet");
+        let read_back = &results
+            .iter()
+            .find(|(tool, _)| *tool == SPEC_GET_TOOL)
+            .expect("spec_get was swept")
+            .1["spec"]["phases"];
+        assert_eq!(
+            read_back,
+            &json!([
+                { "number": 1, "name": "Foundations" },
+                { "number": 2, "name": "Wiring" },
+            ]),
+            "…and a sliced Spec carries its plan as {{number, name}} entries"
+        );
+    }
+
+    /// DONE-CRITERION (task `01M1F8X5B1WJ40XY2QRJ5G4W17`): **`phase` takes a NAME, refuses anything
+    /// else, and the response lets a caller re-read its own write.**
+    ///
+    /// The two traps, measured 2026-09-01 and reproduced here in the order they compound:
+    ///   * `task_add(phase: 3)` was ACCEPTED and the field DROPPED — the task landed outside every
+    ///     phase while the caller believed it had filed it;
+    ///   * `task_add(phase: "3")` answered `phase: 2`, because "3" was the second NAME the Spec had
+    ///     seen. Nothing in the response said the number was a RANK, so re-reading one's own write
+    ///     looked exactly like a corruption.
+    #[test]
+    fn task_add_phase_refuses_a_number_and_echoes_the_name_beside_the_rank() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let spec = spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).unwrap();
+        let spec_id = spec_id_of(&spec);
+
+        // TRAP ONE — an integer is REFUSED, and the refusal teaches the field rather than just the
+        // type: it says a NAME is expected and states how nyx numbers them.
+        let err = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "spec_id": spec_id, "phase": 3 }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument, "{}", err.message);
+        assert!(
+            err.message.contains("NAME") && err.message.contains("first seen"),
+            "the refusal names the expected type AND the first-appearance rule: {}",
+            err.message
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str),
+            Some("phase_must_be_a_name")
+        );
+        // …and nothing was written: the Spec's plan is still empty.
+        let plan = db
+            .with_conn(|c| db::get_spec(c, &spec_id))
+            .unwrap()
+            .expect("the spec");
+        assert_eq!(db::parse_phase_plan(&plan.phases), Vec::new());
+
+        // TRAP TWO — a NAME that CARRIES a number. It is the SECOND name this Spec sees, so the rank
+        // is 2 while the name says 3: the response carries both, unambiguously. (A name that is
+        // NOTHING BUT digits is a third trap, refused outright — see
+        // `task_add_refuses_a_phase_name_that_is_indistinguishable_from_a_rank`.)
+        for (name, expected_rank) in [("Foundations", 1), ("Phase 3", 2)] {
+            let out = task_add(
+                &db,
+                &json!({ "project_id": project_id, "title": "t", "spec_id": spec_id,
+                         "phase": name }),
+            )
+            .unwrap_or_else(|e| panic!("phase '{name}' must be accepted: {}", e.message));
+            assert_eq!(
+                out.result["task"]["phase"],
+                json!(expected_rank),
+                "`task.phase` is the RANK nyx assigned"
+            );
+            assert_eq!(
+                out.result["task"]["phase_name"],
+                json!(name),
+                "…and `phase_name` echoes the NAME that was sent, so the two are readable apart"
+            );
+        }
+
+        // A task with NO phase says so plainly on both fields.
+        let flat = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "flat", "spec_id": spec_id }),
+        )
+        .unwrap();
+        assert_eq!(flat.result["task"]["phase"], Value::Null);
+        assert_eq!(flat.result["task"]["phase_name"], Value::Null);
+
+        // THE SAME PAIR SURVIVES A RE-READ, which is what "re-read your own write" means: the read
+        // half answers with the very fields the write did.
+        let listed = task_list(&db, &json!({ "spec_id": spec_id })).unwrap();
+        let phased: Vec<(&Value, &Value)> = listed.result["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .map(|t| (&t["phase"], &t["phase_name"]))
+            .collect();
+        assert!(
+            phased.contains(&(&json!(1), &json!("Foundations")))
+                && phased.contains(&(&json!(2), &json!("Phase 3"))),
+            "task_list carries the same rank↔name pairing task_add answered with: {phased:?}"
+        );
+    }
+
+    /// A5 — A PHASE NAME MADE ONLY OF DIGITS IS REFUSED, AND ONE THAT MERELY CONTAINS DIGITS IS NOT.
+    ///
+    /// Refusing the INTEGER `2` while accepting the STRING `"2"` closed the type and left the
+    /// misunderstanding intact: a caller told "it must be a string" quotes the number and gets a
+    /// phase literally NAMED `2`, whose rank is whatever position it arrived in. Observed in stored
+    /// plans — `["Socle", "2"]`, and Specs whose phases are named `1`, `3`, `2` in that order — which
+    /// is exactly the rank/name ambiguity `phase_name` was introduced to close, coming back in
+    /// through the write.
+    ///
+    /// The line is drawn at "indistinguishable from a rank", not at "contains a digit": "Phase 2"
+    /// and "v2 socle" are names a human wrote and stay accepted. And READING is untouched — the
+    /// already-corrupted plans this review leaves alone must still be filterable.
+    #[test]
+    fn task_add_refuses_a_phase_name_that_is_indistinguishable_from_a_rank() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let spec = spec_create(&db, &json!({ "project_id": project_id, "title": "S" })).unwrap();
+        let spec_id = spec_id_of(&spec);
+
+        // REFUSED: nothing but digits, whitespace included.
+        for numeric in ["2", "1", "10", " 3 "] {
+            let err = task_add(
+                &db,
+                &json!({ "project_id": project_id, "title": "t", "spec_id": spec_id,
+                         "phase": numeric }),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("phase {numeric:?} must be refused"));
+            assert_eq!(err.code, RpcCode::InvalidArgument);
+            assert!(
+                err.message.contains("collides with the RANK"),
+                "the refusal explains the name/rank collision: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("nyx assigns the rank itself"),
+                "…and recalls that the rank is nyx's to assign: {}",
+                err.message
+            );
+            assert_eq!(
+                err.data
+                    .as_ref()
+                    .and_then(|d| d.get("reason"))
+                    .and_then(Value::as_str),
+                Some("phase_name_collides_with_rank")
+            );
+        }
+        // Nothing was written: the plan is still empty.
+        let plan = db
+            .with_conn(|c| db::get_spec(c, &spec_id))
+            .unwrap()
+            .expect("the spec");
+        assert_eq!(db::parse_phase_plan(&plan.phases), Vec::new());
+
+        // ACCEPTED: a name that merely CONTAINS a digit is a name.
+        for (name, rank) in [("Phase 2", 1), ("v2 socle", 2), ("2e passe", 3)] {
+            let out = task_add(
+                &db,
+                &json!({ "project_id": project_id, "title": "t", "spec_id": spec_id,
+                         "phase": name }),
+            )
+            .unwrap_or_else(|e| panic!("phase {name:?} must be accepted: {}", e.message));
+            assert_eq!(out.result["task"]["phase"], json!(rank));
+            assert_eq!(out.result["task"]["phase_name"], json!(name));
+        }
+
+        // The INTEGER refusal delivered in phase 3 of this PRD is untouched, with its own reason.
+        let int_err = task_add(
+            &db,
+            &json!({ "project_id": project_id, "title": "t", "spec_id": spec_id, "phase": 2 }),
+        )
+        .expect_err("an integer is still refused");
+        assert_eq!(
+            int_err
+                .data
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str),
+            Some("phase_must_be_a_name")
+        );
+
+        // READING is untouched: a plan already holding a numeric name stays filterable. Seeded
+        // through the DB, since the tool now refuses to CREATE one.
+        db.with_conn(|c| db::set_spec_phases(c, &spec_id, r#"["Socle","2"]"#))
+            .expect("seed a corrupted plan the way the audit found it");
+        assert!(
+            task_list(&db, &json!({ "spec_id": spec_id, "phase": "2" })).is_ok(),
+            "filtering an already-corrupted plan must keep working — this review does not repair \
+             stored plans, so it must not make them unreadable either"
+        );
+    }
+
+    /// THE ADVERTISED SET IS THE ENFORCED SET, moored to the LIVE SCHEMA rather than to the
+    /// migration's text: every value of each `db::TASK_*` slice is pushed through a real
+    /// `task_add`, so a vocabulary that drifted from its column's `CHECK` goes red here instead of
+    /// coming back as an `internal` on a caller that believed the description.
+    #[test]
+    fn every_advertised_task_vocabulary_value_is_one_the_schema_accepts() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let mut written = 0usize;
+        for (key, accepted) in [
+            ("kind", &db::TASK_KINDS[..]),
+            ("type", &db::TASK_TYPES[..]),
+            ("priority", &db::TASK_PRIORITIES[..]),
+            ("severity", &db::TASK_SEVERITIES[..]),
+        ] {
+            for value in accepted {
+                let mut args = json!({ "project_id": project_id, "title": "t", key: value });
+                // A `kind=human` task is verifiable by construction — the only extra the write
+                // path asks for, and not what this test is about.
+                if key == "kind" && *value == db::TASK_KIND_HUMAN {
+                    args["verification_command"] = json!("check it");
+                }
+                let out = task_add(&db, &args)
+                    .unwrap_or_else(|e| panic!("{key}='{value}' must be accepted: {}", e.message));
+                // `type` is `type_` in the serialized row (`type` is a Rust keyword).
+                let read_back = if key == "type" { "type_" } else { key };
+                assert_eq!(out.result["task"][read_back], json!(value));
+                written += 1;
+            }
+        }
+        assert_eq!(
+            written,
+            db::TASK_KINDS.len()
+                + db::TASK_TYPES.len()
+                + db::TASK_PRIORITIES.len()
+                + db::TASK_SEVERITIES.len(),
+            "every value of every vocabulary was exercised"
         );
     }
 }

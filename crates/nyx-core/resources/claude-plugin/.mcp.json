@@ -1,7 +1,7 @@
 {
   "nyx-v2": {
     "type": "http",
-    "url": "http://127.0.0.1:__NYX_MCP_PORT__/mcp",
+    "url": "http://127.0.0.1:${NYX_MCP_PORT:-__NYX_MCP_PORT__}/mcp",
     "headers": {
       "X-Nyx-Terminal-Id": "${NYX_TERMINAL_ID:-}"
     }

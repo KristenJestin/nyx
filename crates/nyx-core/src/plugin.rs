@@ -56,6 +56,60 @@
 //! content actually changed (the [`copy_tree`] change signal), so an unchanged boot does
 //! nothing (idempotent — no churn).
 //!
+//! ## What the agent really reads (measured against Claude Code 2.1.246)
+//!
+//! There are TWO on-disk copies of an installed plugin and it matters which one a session
+//! loads: the **registered marketplace directory** ([`PluginInstall::install_dir`], the one nyx
+//! re-templates) and Claude's **per-version cache**
+//! (`~/.claude/plugins/cache/<mkt>/<plugin>/<version>/`). It was long assumed the session reads
+//! the cache. It does not. Measured both ways on 2.1.246, with a live MCP server on 8799 and a
+//! dead port everywhere else, reading the session's own `system/init` report:
+//!
+//! - cache → live 8799, install dir → dead 8766 ⇒ `nyx-v2 = failed`
+//! - install dir → live 8799 ⇒ `nyx-v2 = connected`
+//!
+//! So the **install dir is authoritative** for the MCP endpoint, and it is exactly the dir the
+//! reconcile writes. (`claude mcp list` agrees — it reports the install dir's url, not the
+//! cache's.) [`installed_descriptor_path`] encodes that measurement; the stale-cache re-cache
+//! above still matters for the HOOKS, which are loaded from the cache.
+//!
+//! ## Discovering the port instead of freezing it
+//!
+//! Templating [`PluginInstall::mcp_port`] into the copied `.mcp.json` writes ONE port and
+//! freezes it until the next reconcile. That port is right for exactly one nyx, at exactly one
+//! moment — and the agent plugin is **global to the machine** while nyx installs, worktrees and
+//! dev builds are not. Two nyx up at once, or a dev build that bound a different port, and every
+//! session dials the loser. The failure mode is the worst possible one: silent on nyx's side, and
+//! on the agent's side a bare `ConnectionRefused` with nothing naming the port.
+//!
+//! That is what happened on 2026-09-01: `installed_plugins.json` recorded the nyx-v2 plugin
+//! installed at 14:52 UTC carrying `gitCommitSha abf72625` — a commit that belongs to a
+//! DIFFERENT, since-deleted worktree (`feat(system-scope): …`), unreachable from the branch that
+//! owned the app data dir. A second nyx, running from a second worktree, had reconciled the one
+//! global plugin to ITS own port (8787 — a value that exists nowhere in the tracked history and
+//! in no environment variable, i.e. a pure runtime value of that instance). No user action, no
+//! error, no way to see it.
+//!
+//! The fix is to stop writing an answer and write the QUESTION instead. The descriptor ships
+//!
+//! ```text
+//! "url": "http://127.0.0.1:${NYX_MCP_PORT:-__NYX_MCP_PORT__}/mcp"
+//! ```
+//!
+//! so the port is **resolved at session start** from [`MCP_PORT_DISCOVERY_ENV`] — the variable
+//! nyx already exports into every shell it spawns, straight from the bind
+//! ([`crate::pty::PtyManager`]). A Claude session opened from a nyx terminal therefore reaches
+//! THE nyx that spawned it, whichever other instances exist; the templated port survives only as
+//! the fallback for a session opened outside nyx. Verified on the real client 2.1.246, both
+//! branches: with `NYX_MCP_PORT=8799` (live) → `connected`; with it unset and the fallback dead →
+//! `failed`.
+//!
+//! What cannot be discovered is still DETECTED: [`port_divergence`] reads the descriptor a
+//! session really loads and reports, with [`PortDivergence::message`], when the port it will dial
+//! is not the port this nyx bound — including the multi-instance case, by name. The app surfaces
+//! it (`crate::integrations::IntegrationStatus::diagnostic`) instead of letting the agent
+//! discover it as a refused connection.
+//!
 //! ## Properties
 //! - **Idempotent**: both CLI subcommands are no-ops when already current (they exit 0
 //!   with a friendly "already installed" message); a moved stable dir is repaired by a
@@ -142,6 +196,153 @@ pub const MCP_PORT_PLACEHOLDER: &str = "__NYX_MCP_PORT__";
 /// from `plugin.json` (`"mcpServers": "./.mcp.json"`). This is the ONE file the port is
 /// templated into during the copy.
 pub const MCP_DESCRIPTOR_FILE: &str = ".mcp.json";
+
+/// The environment variable an agent session RESOLVES the live nyx MCP port from, at session
+/// start, inside the descriptor's `url` (`${NYX_MCP_PORT:-<fallback>}`). Same name nyx exports
+/// into every shell it spawns ([`crate::pty::NYX_MCP_PORT_ENV`], straight from the BIND), and the
+/// same one the bundled session hook reads first. Referenced here — rather than re-spelled — so
+/// the descriptor, the shell injection and the hook can never name three different variables.
+///
+/// This is the **port-discovery concept** (task 01M1F8XMR4PRRCYMKYPVX7A0WG): the descriptor does
+/// not FREEZE a port, it names the variable the port is discovered from. See the module doc,
+/// "Discovering the port instead of freezing it".
+pub const MCP_PORT_DISCOVERY_ENV: &str = crate::pty::NYX_MCP_PORT_ENV;
+
+/// How an installed MCP descriptor decides which port a session dials — the two shapes
+/// [`descriptor_port`] can read out of a `url`.
+///
+/// The distinction is the whole point of the port-discovery concept: a `Discovered` descriptor
+/// follows whichever nyx spawned the shell, a `Frozen` one is stuck on whatever the LAST
+/// reconcile wrote and is therefore wrong for every other nyx on the machine (and for every
+/// moment nyx is not listening on that exact port).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescriptorPort {
+    /// `http://127.0.0.1:${NYX_MCP_PORT:-<fallback>}/mcp` — the port is resolved from
+    /// [`MCP_PORT_DISCOVERY_ENV`] at SESSION START. A session opened from a nyx terminal
+    /// inherits that nyx's REAL bound port, so it reaches the nyx that spawned it whatever
+    /// else is installed on the machine. `fallback` is what a session opened OUTSIDE a nyx
+    /// terminal (no env var) falls back to.
+    Discovered { fallback: u16 },
+    /// `http://127.0.0.1:<port>/mcp` — a port FROZEN at install/reconcile time. Every session
+    /// dials this one, whichever nyx it was opened from. This is the pre-discovery shape, kept
+    /// readable so an install that predates the change is DETECTED rather than assumed current.
+    Frozen(u16),
+}
+
+impl DescriptorPort {
+    /// The port a session opened OUTSIDE a nyx terminal (no [`MCP_PORT_DISCOVERY_ENV`]) will
+    /// dial — the fallback for a `Discovered` descriptor, the frozen port otherwise.
+    pub fn fallback_port(&self) -> u16 {
+        match self {
+            DescriptorPort::Discovered { fallback } => *fallback,
+            DescriptorPort::Frozen(p) => *p,
+        }
+    }
+
+    /// Whether the port is discovered from the environment at session start (rather than
+    /// frozen at install time).
+    pub fn is_discovered(&self) -> bool {
+        matches!(self, DescriptorPort::Discovered { .. })
+    }
+}
+
+/// Read out of a `.mcp.json`'s bytes WHICH port an agent session will dial, and HOW it decides
+/// (see [`DescriptorPort`]). Pure over bytes so it is unit-testable and usable on any
+/// descriptor path — the installed one, the bundled source, or a copy.
+///
+/// Matches the loopback url nyx itself writes; a descriptor whose url is absent, non-loopback
+/// or unparseable reads as `None` (nothing to claim), never a panic.
+pub fn descriptor_port(raw: &[u8]) -> Option<DescriptorPort> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let root: Value = serde_json::from_str(text).ok()?;
+    // The descriptor is a map of `<server name> -> { url, ... }`; nyx ships exactly one entry,
+    // and we read the FIRST one that carries a loopback url rather than hard-coding the name.
+    let url = root
+        .as_object()?
+        .values()
+        .filter_map(|v| v.get("url").and_then(Value::as_str))
+        .find(|u| u.contains("127.0.0.1"))?;
+    // Everything between the loopback host and the next `/` is the port expression.
+    let after_host = url.split("127.0.0.1:").nth(1)?;
+    let expr = after_host.split('/').next()?;
+    let discovery = format!("${{{MCP_PORT_DISCOVERY_ENV}:-");
+    match expr.strip_prefix(&discovery) {
+        Some(rest) => {
+            let fallback = rest.strip_suffix('}')?.trim().parse().ok()?;
+            Some(DescriptorPort::Discovered { fallback })
+        }
+        None => expr.trim().parse().ok().map(DescriptorPort::Frozen),
+    }
+}
+
+/// A measured mismatch between the port nyx actually BOUND and the port an agent session will
+/// dial after reading the installed descriptor — the failure that surfaces to the agent as a
+/// bare `ConnectionRefused`, with nothing pointing at the port (task
+/// 01M1F8XMR4PRRCYMKYPVX7A0WG). Detected so the app can SAY it instead of letting it happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortDivergence {
+    /// The descriptor that was read — the file the agent really loads at session start.
+    pub descriptor: PathBuf,
+    /// What that descriptor makes a session dial when no nyx shell env is inherited.
+    pub declared: DescriptorPort,
+    /// The port THIS nyx bound.
+    pub bound: u16,
+}
+
+impl PortDivergence {
+    /// A one-line, actionable diagnostic for the app — it names the two ports, and names the
+    /// multi-instance case explicitly (several nyx on one machine share ONE global agent
+    /// plugin, so a frozen port can only ever be right for one of them).
+    pub fn message(&self) -> String {
+        match self.declared {
+            DescriptorPort::Discovered { fallback } => format!(
+                "Claude Code sessions opened from a nyx terminal reach this nyx (port {bound}), \
+                 but a session opened OUTSIDE nyx falls back to port {fallback}, where this nyx \
+                 is not listening. Open the session from a nyx terminal, or restart nyx on port \
+                 {fallback}.",
+                bound = self.bound,
+            ),
+            DescriptorPort::Frozen(port) => format!(
+                "The installed Claude Code plugin points at port {port}, but this nyx is \
+                 listening on {bound}. The plugin is global to the machine, so another nyx \
+                 instance (another install or worktree) last wrote that port and every session \
+                 will dial it. Reinstall the integration from this nyx to repoint it.",
+                bound = self.bound,
+            ),
+        }
+    }
+}
+
+/// The descriptor an agent session ACTUALLY reads at start-up: the `.mcp.json` inside the
+/// STABLE install dir, which is the directory the marketplace is registered at.
+///
+/// Measured, not assumed — see the module doc, "What the agent really reads". Claude Code
+/// 2.1.246 loads the plugin's MCP from the registered marketplace directory; the per-version
+/// copy under `~/.claude/plugins/cache/…` is NOT what a session dials.
+pub fn installed_descriptor_path(install: &PluginInstall) -> PathBuf {
+    install.install_dir.join(MCP_DESCRIPTOR_FILE)
+}
+
+/// Detect a [`PortDivergence`] for an installed plugin against the port nyx actually bound.
+/// `None` when there is nothing to report: the descriptor is unreadable/absent (nothing
+/// installed to be wrong), `bound_port` is 0 (the MCP server never bound — a different
+/// failure, and re-pointing a descriptor at a dead port would only entrench it), or the port
+/// a session will dial already matches the bound one.
+pub fn port_divergence(install: &PluginInstall, bound_port: u16) -> Option<PortDivergence> {
+    if bound_port == 0 {
+        return None;
+    }
+    let descriptor = installed_descriptor_path(install);
+    let declared = descriptor_port(&std::fs::read(&descriptor).ok()?)?;
+    if declared.fallback_port() == bound_port {
+        return None;
+    }
+    Some(PortDivergence {
+        descriptor,
+        declared,
+        bound: bound_port,
+    })
+}
 
 /// The three nyx slash-command stubs, COMPILED IN from the canonical source
 /// (`resources/claude-commands/`, deliberately OUTSIDE the plugin bundle so Claude Code
@@ -342,6 +543,33 @@ fn copy_tree(src: &Path, dst: &Path, port: u16) -> std::io::Result<bool> {
 /// Substitute every [`MCP_PORT_PLACEHOLDER`] occurrence in the bundled `.mcp.json` bytes
 /// with `port` (finding #44). Operates on bytes (the descriptor is small UTF-8 JSON) so a
 /// non-UTF-8 file is passed through untouched rather than panicking. Pure → unit-tested.
+///
+/// # SECURITY NOTE — an unvalidated env var sits in the URL's AUTHORITY (#N3, accepted risk)
+///
+/// The port this writes is the FALLBACK of a shell-expanded url:
+/// `http://127.0.0.1:${NYX_MCP_PORT:-<port>}/mcp`. Nothing constrains `NYX_MCP_PORT` to be
+/// numeric, and the position `host:${VAR}/` is inside the URL's AUTHORITY — so a value carrying an
+/// `@` re-parses the authority through the userinfo rule. `NYX_MCP_PORT=8766@evil.example` yields
+/// `http://127.0.0.1:8766@evil.example/mcp`, whose real host under WHATWG parsing (Node's `new
+/// URL`, i.e. what the Claude Code client uses) is `evil.example`, with `127.0.0.1:8766` demoted to
+/// userinfo. The session would then load a THIRD PARTY's tool catalogue and send it the
+/// `X-Nyx-Terminal-Id` header. Before the port-discovery change the url was a literal frozen at
+/// install time and carried no such position.
+///
+/// THE RISK IS ACCEPTED, deliberately and by the user's own arbitration:
+///   * the expansion is what the phase delivers — it is what lets ONE globally installed plugin
+///     serve SEVERAL nyx instances, each session reaching the nyx that spawned its shell rather
+///     than whichever port the last reconcile happened to write;
+///   * the vector presupposes that something else already sets environment variables in the user's
+///     shell, which is a broader compromise than this url: anything that can export
+///     `NYX_MCP_PORT` can equally export `PATH`.
+///
+/// WHAT WOULD CLOSE IT, if that arbitration ever changes: make the shell expansion unable to reach
+/// the authority — e.g. `${NYX_MCP_PORT:-<port>}` moved out of `host:` position (a full url in one
+/// variable is worse, not better), or the descriptor written by a launcher that validates the value
+/// as a `u16` before substituting it. Any such change must move the CLIENT's behaviour and the
+/// descriptor TOGETHER: validating on nyx's side alone would make the descriptor and what the
+/// Claude Code client actually dials diverge, which is a harder failure to see than this one.
 fn template_mcp_port(raw: &[u8], port: u16) -> Vec<u8> {
     match std::str::from_utf8(raw) {
         Ok(s) => s
@@ -785,15 +1013,16 @@ mod tests {
         )
         .unwrap();
         std::fs::write(plugin.join("hooks").join("hooks.json"), r#"{"hooks":{}}"#).unwrap();
-        std::fs::write(
-            plugin.join(MCP_DESCRIPTOR_FILE),
-            format!(
-                r#"{{"nyx-v2":{{"type":"http","url":"http://127.0.0.1:{MCP_PORT_PLACEHOLDER}/mcp"}}}}"#
-            ),
-        )
-        .unwrap();
+        // The REAL shipped descriptor bytes, not a hand-rolled lookalike: the port-discovery
+        // shape (`${NYX_MCP_PORT:-__NYX_MCP_PORT__}`) is the thing under test, so the fixture
+        // must not be free to drift away from what actually ships.
+        std::fs::write(plugin.join(MCP_DESCRIPTOR_FILE), BUNDLED_DESCRIPTOR).unwrap();
         plugin
     }
+
+    /// The descriptor nyx really ships, compiled in so every test below reads the same bytes a
+    /// user's install gets.
+    const BUNDLED_DESCRIPTOR: &str = include_str!("../resources/claude-plugin/.mcp.json");
 
     fn install_for(source: &Path, stable: &Path, settings: &Path) -> PluginInstall {
         install_for_port(source, stable, settings, 8765)
@@ -982,11 +1211,13 @@ mod tests {
         let cli = FakeCli::default();
         install_with(&inst, &cli).unwrap();
 
-        // Copied descriptor carries the real port; the placeholder is gone.
+        // Copied descriptor carries the real port as the FALLBACK of the discovery form; the
+        // placeholder is gone.
         let copied = std::fs::read_to_string(stable.join(MCP_DESCRIPTOR_FILE)).unwrap();
-        assert!(
-            copied.contains("127.0.0.1:9931/mcp"),
-            "live port templated in: {copied}"
+        assert_eq!(
+            descriptor_port(copied.as_bytes()),
+            Some(DescriptorPort::Discovered { fallback: 9931 }),
+            "live port templated in as the discovery fallback: {copied}"
         );
         assert!(
             !copied.contains(MCP_PORT_PLACEHOLDER),
@@ -998,6 +1229,120 @@ mod tests {
             src.contains(MCP_PORT_PLACEHOLDER),
             "bundled source stays port-agnostic"
         );
+    }
+
+    // --- port DISCOVERY, not port freezing (task 01M1F8XMR4PRRCYMKYPVX7A0WG) ---------------
+
+    /// The descriptor nyx SHIPS asks the environment for the port rather than declaring one:
+    /// once templated it reads back as [`DescriptorPort::Discovered`], with the templated port
+    /// only as the fallback. This is the guarantee the whole fix rests on — a frozen shape here
+    /// would silently reintroduce the bug for every nyx but the last one to reconcile.
+    #[test]
+    fn shipped_descriptor_discovers_the_port_from_the_environment() {
+        // Untemplated, the fallback is still the placeholder — nothing to claim.
+        assert_eq!(descriptor_port(BUNDLED_DESCRIPTOR.as_bytes()), None);
+        // Templated (what an install writes), it is a DISCOVERY with a numeric fallback.
+        let templated = template_mcp_port(BUNDLED_DESCRIPTOR.as_bytes(), 8766);
+        assert_eq!(
+            descriptor_port(&templated),
+            Some(DescriptorPort::Discovered { fallback: 8766 })
+        );
+        // And it names the SAME variable nyx exports into every shell it spawns.
+        assert_eq!(MCP_PORT_DISCOVERY_ENV, crate::pty::NYX_MCP_PORT_ENV);
+        assert!(
+            String::from_utf8_lossy(&templated).contains("${NYX_MCP_PORT:-8766}"),
+            "shipped url must resolve the port from the env at session start"
+        );
+    }
+
+    /// [`descriptor_port`] reads BOTH shapes — so an install that predates the discovery form
+    /// is recognized as frozen rather than mistaken for current — and refuses to guess on junk.
+    #[test]
+    fn descriptor_port_reads_both_shapes_and_refuses_junk() {
+        let frozen = br#"{"nyx-v2":{"type":"http","url":"http://127.0.0.1:8787/mcp"}}"#;
+        assert_eq!(descriptor_port(frozen), Some(DescriptorPort::Frozen(8787)));
+        assert_eq!(descriptor_port(frozen).unwrap().fallback_port(), 8787);
+        assert!(!descriptor_port(frozen).unwrap().is_discovered());
+
+        let discovered =
+            br#"{"nyx-v2":{"url":"http://127.0.0.1:${NYX_MCP_PORT:-8766}/mcp","type":"http"}}"#;
+        assert_eq!(
+            descriptor_port(discovered),
+            Some(DescriptorPort::Discovered { fallback: 8766 })
+        );
+        assert!(descriptor_port(discovered).unwrap().is_discovered());
+
+        // Nothing to read → None, never a panic and never a guess.
+        assert_eq!(descriptor_port(b"not json"), None);
+        assert_eq!(descriptor_port(br#"{"nyx-v2":{"type":"stdio"}}"#), None);
+        assert_eq!(
+            descriptor_port(br#"{"nyx-v2":{"url":"https://example.com/mcp"}}"#),
+            None
+        );
+        assert_eq!(
+            descriptor_port(br#"{"nyx-v2":{"url":"http://127.0.0.1:nope/mcp"}}"#),
+            None
+        );
+    }
+
+    /// The divergence the app surfaces: a descriptor pointing somewhere OTHER than the port this
+    /// nyx bound is reported (and its message names the multi-instance cause), while an aligned
+    /// one — and an unbound MCP — say nothing.
+    #[test]
+    fn port_divergence_reports_only_a_real_mismatch() {
+        let dir = temp_dir("divergence");
+        let source = write_bundled(&dir);
+        let stable = dir.join("stable");
+        let settings = dir.join("settings.json");
+        let inst = install_for_port(&source, &stable, &settings, 8766);
+        install_with(&inst, &FakeCli::default()).unwrap();
+
+        // Descriptor fallback (8766) == bound port → nothing to say.
+        assert_eq!(port_divergence(&inst, 8766), None);
+        // MCP never bound → not the descriptor's fault; stay quiet.
+        assert_eq!(port_divergence(&inst, 0), None);
+
+        // This nyx bound 9001 while the installed descriptor still falls back to 8766: a session
+        // opened OUTSIDE a nyx terminal misses. Reported, with both ports named.
+        let soft = port_divergence(&inst, 9001).expect("fallback mismatch is reported");
+        assert_eq!(soft.declared, DescriptorPort::Discovered { fallback: 8766 });
+        assert_eq!(soft.bound, 9001);
+        assert_eq!(soft.descriptor, stable.join(MCP_DESCRIPTOR_FILE));
+        assert!(soft.message().contains("8766") && soft.message().contains("9001"));
+
+        // A FROZEN descriptor (a pre-discovery install, or one another nyx wrote): every session
+        // dials the frozen port. The message must name the machine-global/multi-instance cause.
+        std::fs::write(
+            stable.join(MCP_DESCRIPTOR_FILE),
+            br#"{"nyx-v2":{"type":"http","url":"http://127.0.0.1:8787/mcp"}}"#,
+        )
+        .unwrap();
+        let hard = port_divergence(&inst, 8766).expect("frozen mismatch is reported");
+        assert_eq!(hard.declared, DescriptorPort::Frozen(8787));
+        let msg = hard.message();
+        assert!(msg.contains("8787") && msg.contains("8766"), "{msg}");
+        assert!(
+            msg.contains("another nyx instance"),
+            "the multi-instance case must be named, not implied: {msg}"
+        );
+    }
+
+    /// The descriptor an agent session really loads is the one in the STABLE install dir — the
+    /// registered marketplace directory — as measured against Claude Code 2.1.246 (module doc,
+    /// "What the agent really reads"). Pinned so a future refactor cannot quietly re-point the
+    /// check at the per-version cache, which is NOT what a session dials.
+    #[test]
+    fn installed_descriptor_is_the_registered_marketplace_dir() {
+        let dir = temp_dir("descriptor-path");
+        let source = write_bundled(&dir);
+        let stable = dir.join("stable");
+        let settings = dir.join("settings.json");
+        let inst = install_for(&source, &stable, &settings);
+        assert_eq!(
+            installed_descriptor_path(&inst),
+            inst.install_dir.join(MCP_DESCRIPTOR_FILE)
+        );
+        assert_ne!(installed_descriptor_path(&inst), source.join(MCP_DESCRIPTOR_FILE));
     }
 
     /// Re-installing with the SAME port is idempotent (the templated descriptor matches),
@@ -1024,8 +1369,9 @@ mod tests {
             PluginChange::Updated
         );
         let copied = std::fs::read_to_string(stable.join(MCP_DESCRIPTOR_FILE)).unwrap();
-        assert!(
-            copied.contains("127.0.0.1:7000/mcp"),
+        assert_eq!(
+            descriptor_port(copied.as_bytes()),
+            Some(DescriptorPort::Discovered { fallback: 7000 }),
             "descriptor re-templated to new port"
         );
         let calls = cli.calls.borrow().clone();

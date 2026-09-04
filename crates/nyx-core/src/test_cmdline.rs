@@ -163,6 +163,30 @@ impl Cmdline {
         self.push(part)
     }
 
+    /// BLOCK until `name` appears as a file in the command's cwd — the rendezvous that lets a test
+    /// decide WHEN a running command produces its next output, instead of racing a sleep.
+    ///
+    /// Bounded (~60 s) so a test that never drops the file cannot leave a process behind. Relative
+    /// on purpose, like [`Cmdline::requires_file`]: the name resolves against the command's own
+    /// working directory, which is the one the test controls.
+    pub(crate) fn waits_for_file(self, name: &str) -> Self {
+        let part = match self.shell {
+            Shell::Posix => format!(
+                "i=0; while [ ! -f '{name}' ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done"
+            ),
+            Shell::PowerShell => format!(
+                "$i=0; while (-not (Test-Path -LiteralPath '{name}') -and $i -lt 1200) \
+                 {{ Start-Sleep -Milliseconds 50; $i++ }}"
+            ),
+            // cmd has no sleep and no inline while: a bounded FOR whose body pings for ~1 s only
+            // while the file is still absent, so it costs nothing once it appears.
+            Shell::Cmd => {
+                format!("for /L %i in (1,1,60) do @(if not exist {name} ping -n 2 127.0.0.1 >nul)")
+            }
+        };
+        self.push(part)
+    }
+
     /// Sleep `seconds` — a command that outlives the budget measuring it.
     pub(crate) fn sleeps(self, seconds: u64) -> Self {
         let part = match self.shell {

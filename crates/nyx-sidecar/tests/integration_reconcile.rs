@@ -7,7 +7,8 @@
 //! `<data_dir>/claude-plugin/.mcp.json` kept a stale / placeholder port and Claude Code did
 //! not connect the nyx MCP. This test drives the SAME path production reaches
 //! (`sidecar.start()` → `sidecar.startMcp()` == the `McpStart` request) and asserts the target
-//! `.mcp.json` ends up carrying the REAL bound port with no `__NYX_MCP_PORT__` placeholder.
+//! `.mcp.json` ends up in the port-DISCOVERY shape (`${NYX_MCP_PORT:-<port>}`) whose fallback is
+//! the REAL bound port, with no `__NYX_MCP_PORT__` placeholder left.
 //!
 //! Everything is injected via env so NOTHING real is touched:
 //!   * `NYX_RECONCILE_CLAUDE_PLUGIN=1` — opt IN the boot reconcile (production sets it too),
@@ -297,9 +298,16 @@ fn mcp_start_reconciles_and_templates_the_installed_mcp_port() {
         "the reconcile copied the plugin's .mcp.json into the stable install dir"
     );
     let templated = std::fs::read_to_string(&mcp_json).unwrap();
-    assert!(
-        templated.contains(&format!("127.0.0.1:{}/mcp", h.mcp_port)),
-        "the installed .mcp.json points at the REAL bound MCP port: {templated}"
+    // The descriptor DISCOVERS the port from `NYX_MCP_PORT` at session start (the variable nyx
+    // exports into every shell it spawns), with the REAL bound port as the fallback for a
+    // session opened outside a nyx terminal. Asserted through the reader the app itself uses,
+    // so the two cannot drift.
+    assert_eq!(
+        nyx_core::plugin::descriptor_port(templated.as_bytes()),
+        Some(nyx_core::plugin::DescriptorPort::Discovered {
+            fallback: h.mcp_port
+        }),
+        "the installed .mcp.json discovers the port, falling back to the REAL bound one: {templated}"
     );
     assert!(
         !templated.contains("__NYX_MCP_PORT__"),
@@ -330,8 +338,11 @@ fn mcp_start_reconciles_and_templates_the_installed_mcp_port() {
     let bound_again = h.start_mcp();
     assert_eq!(bound_again, h.mcp_port, "start-once returns the same port");
     let still = std::fs::read_to_string(&mcp_json).unwrap();
-    assert!(
-        still.contains(&format!("127.0.0.1:{}/mcp", h.mcp_port)),
+    assert_eq!(
+        nyx_core::plugin::descriptor_port(still.as_bytes()),
+        Some(nyx_core::plugin::DescriptorPort::Discovered {
+            fallback: h.mcp_port
+        }),
         "the installed port is stable across a repeated McpStart"
     );
 

@@ -618,22 +618,25 @@ pub fn run_start(
     // "No Spec yet — author a NEW one from scratch", and the flow ordered a duplicate of the very
     // Spec the human had named. A run that never opens cannot do that; and a refusal that left a
     // run behind would be worse than the bug, so nothing above this point writes.
-    if let Some(sid) = spec_id.as_deref() {
-        if db
-            .with_conn(|c| db::get_spec(c, sid))
-            .map_err(internal_db)?
-            .is_none()
-        {
-            // `run_start` DOES take the three AND advertises the three, so it is honest here to
-            // offer them: what this sentence names, `tools/list` names too.
-            return Err(unknown_spec_refusal(
-                db,
-                project_id.as_deref(),
-                sid,
-                Some(RUN_START_ANCHOR_TRAILER),
-            )?);
-        }
-    }
+    let bound_spec = match spec_id.as_deref() {
+        Some(sid) => Some(
+            db.with_conn(|c| db::get_spec(c, sid))
+                .map_err(internal_db)?
+                .ok_or_else(|| -> RpcError {
+                    // `run_start` DOES take the three AND advertises the three, so it is honest
+                    // here to offer them: what this sentence names, `tools/list` names too.
+                    match unknown_spec_refusal(
+                        db,
+                        project_id.as_deref(),
+                        sid,
+                        Some(RUN_START_ANCHOR_TRAILER),
+                    ) {
+                        Ok(e) | Err(e) => e,
+                    }
+                })?,
+        ),
+        None => None,
+    };
     let workflow = match optional_str(args, "workflow_id")? {
         Some(wf_id) => db
             .with_conn(|c| db::get_workflow(c, wf_id))
@@ -676,6 +679,68 @@ pub fn run_start(
                 workflow.scope
             ),
         ));
+    }
+
+    // A6 — A SPEC-SCOPED FLOW REFUSES A **DRAFT** SPEC, HERE, BEFORE ANYTHING IS WRITTEN.
+    //
+    // Observed live: `run_start` on a draft Spec was ACCEPTED, the flow opened, noted "skipping the
+    // start", walked three nodes and only THEN died on `in_review is not legal from status draft`.
+    // The failure arrived mid-flight, with a run already created, and its sentence named a
+    // transition the caller had never asked for — the caller asked to start a flow, and was told
+    // about `in_review`. The precondition was knowable at call time and is checked at call time.
+    //
+    // ONLY `draft`, and only for the scopes that OPERATE ON a Spec. `nspec` authors drafts — it is
+    // excluded from `scope_requires_spec` for exactly that reason, and a caller continuing an
+    // authoring run on its own draft must not be refused. The later statuses are left alone
+    // deliberately: `ndoc` legitimately runs on a `completed` Spec, and narrowing that is a
+    // different decision than the one this finding made.
+    //
+    // Keyed on the RESOLVED workflow's scope, like the guard above, so an explicit `workflow_id`
+    // is judged on the flow it names rather than on the untouched `scope` default.
+    if let Some(spec) = &bound_spec {
+        // `draft` for every Spec-scoped flow, and the TERMINAL statuses too — `cancelled` always,
+        // `completed` for everything but `ndoc`, which legitimately documents a finished Spec. A
+        // terminal Spec used to sail past this guard on an explicit `spec_id` (nothing upstream
+        // filters status: `get_spec` is a bare find), open a run, route to the "not started" note
+        // and then, if the cancelled Spec still had open tasks, hand the build gate a coder
+        // sub-workflow on a Spec nobody can transition.
+        let terminal_for_scope = spec.status == db::SPEC_STATUS_CANCELLED
+            || (spec.status == db::SPEC_STATUS_COMPLETED
+                && workflow.scope != db::WORKFLOW_SCOPE_NDOC);
+        if scope_requires_spec(&workflow.scope)
+            && (spec.status == db::SPEC_STATUS_DRAFT || terminal_for_scope)
+        {
+            let remedy = if spec.status == db::SPEC_STATUS_DRAFT {
+                format!(
+                    "Finish authoring it and mark it ready (spec_transition spec_id='{}' \
+                     transition='ready'), then start this run",
+                    spec.id
+                )
+            } else {
+                "That status is TERMINAL: this Spec will not transition again, so open the run on \
+                 another Spec (or fork this one)"
+                    .to_string()
+            };
+            return Err(RpcError::new(
+                RpcCode::InvalidState,
+                format!(
+                    "Spec '{}' is `{}`, and '{}' works on a Spec it can still move: it opens with \
+                     the `start` transition, which is legal only from `{}`. {remedy}. Nothing was \
+                     created here — no run was opened for this call",
+                    spec.id,
+                    spec.status,
+                    workflow.scope,
+                    db::SPEC_STATUS_READY,
+                ),
+            )
+            .with_data(json!({
+                "reason": "spec_not_startable",
+                "spec_id": spec.id,
+                "spec_status": spec.status,
+                "expected_status": db::SPEC_STATUS_READY,
+                "scope": workflow.scope,
+            })));
+        }
     }
 
     // IDEMPOTENT (N20) and VERIFIED (M4): converge to AT MOST ONE live run per (workflow, spec) AND
@@ -1963,7 +2028,24 @@ pub fn nyx_next(
     // read-or-build atomic, so no other tick can be building a second engine for the same run.
     let slot = match runtime.slot(run_id) {
         Some(slot) => slot,
-        None => runtime.install(run_id, build_engine(db, &run)?),
+        None => {
+            let engine = build_engine(db, &run).inspect_err(|why| {
+                // A1: a graph that cannot be BUILT refuses here, before any engine exists — so the
+                // walk's own `persist(..., FAILED, ...)` is never reached and the row stayed
+                // `running` for a run that can never tick again. That holds for every build error
+                // whose cause is the GRAPH — an unreadable node type, a bad config, a cycle, a
+                // missing root — all final for this run against this database.
+                //
+                // NOT for `run_traversal_stale`: that corpse has its own recovery. A fresh parent
+                // (or `run_start`) DROPS the row and starts a replacement, and it recognises it by
+                // the row still being live — marking it `failed` here would make the parent fold it
+                // as an H4 verdict instead, which is the escalation A1 exists to prevent.
+                if !is_traversal_stale(why) {
+                    mark_run_graph_unreadable(db, &run);
+                }
+            })?;
+            runtime.install(run_id, engine)
+        }
     };
 
     let (outcome, finished) = {
@@ -1993,14 +2075,56 @@ pub fn nyx_next(
 }
 
 /// Whether a `drive` outcome is a TERMINAL engine failure — the [`map_engine_err`] marker (a
-/// malformed tree / a mis-authored loop), which re-ticking can only reproduce.
+/// malformed tree / a mis-authored loop) or the [`GRAPH_UNREADABLE_REASON`] one (a node type this
+/// build has no interpreter for), both of which re-ticking can only reproduce.
 fn outcome_is_fatal(outcome: &Result<ToolOutcome, RpcError>) -> bool {
     let Err(e) = outcome else { return false };
+    matches!(
+        error_reason(e),
+        Some("engine_error") | Some(GRAPH_UNREADABLE_REASON)
+    )
+}
+
+/// The machine `reason` marker carried in an [`RpcError`]'s `data`, when it has one.
+fn error_reason(e: &RpcError) -> Option<&str> {
     e.data
         .as_ref()
         .and_then(|d| d.get("reason"))
         .and_then(Value::as_str)
-        == Some("engine_error")
+}
+
+/// Whether this refusal is "the stored graph holds a node type this build cannot interpret"
+/// ([`GRAPH_UNREADABLE_REASON`]).
+fn is_graph_unreadable(e: &RpcError) -> bool {
+    error_reason(e) == Some(GRAPH_UNREADABLE_REASON)
+}
+
+/// Whether this refusal is "the run's persisted traversal no longer fits its tree" — the ONE build
+/// failure that must leave the row live, because a fresh parent / `run_start` recognises the corpse
+/// by its non-terminal status and replaces it (see [`mark_run_graph_unreadable`]'s caller).
+fn is_traversal_stale(e: &RpcError) -> bool {
+    error_reason(e) == Some("run_traversal_stale")
+}
+
+/// MARK `run` FAILED because its graph cannot be read at all (review A1).
+///
+/// The run row used to be left `running` — [`build_engine`] refuses BEFORE any engine exists, so the
+/// walk's own `persist(..., RUN_STATUS_FAILED, ...)` is never reached — which is how an unreadable
+/// graph produced a run that says "running" forever and can never tick. Written directly rather than
+/// through [`persist`] for exactly that reason: there is no engine here to serialize, so cursor,
+/// blackboard and traversal are left EXACTLY as they stand. Best-effort: the refusal the caller gets
+/// is the real answer, and losing the status write must not swallow it.
+fn mark_run_graph_unreadable(db: &Db, run: &db::WorkflowRun) {
+    let _ = db.with_conn(|c| {
+        db::update_workflow_run(
+            c,
+            &run.id,
+            run.current_node_id.as_deref(),
+            &run.blackboard,
+            db::RUN_STATUS_FAILED,
+            run.traversal.as_deref(),
+        )
+    });
 }
 
 /// Read `run`'s workflow tree from the DB — the LIVE authored graph, decoded configs and all.
@@ -2017,7 +2141,8 @@ fn load_tree(db: &Db, run: &db::WorkflowRun) -> Result<Tree, RpcError> {
     let nodes = db
         .with_conn(|c| db::list_nodes(c, &run.workflow_id))
         .map_err(internal_db)?;
-    Tree::from_rows(&nodes, workflow.root_node_id.as_deref()).map_err(map_engine_err)
+    Tree::from_rows(&nodes, workflow.root_node_id.as_deref())
+        .map_err(|e| map_tree_err(e, &workflow))
 }
 
 /// Hand the RESIDENT engine the tree as it stands NOW, so an edit made mid-run reaches the walk on its
@@ -3179,6 +3304,24 @@ fn walk(
                                 // the child resumes on its own persisted traversal) and re-suspend.
                                 Some(child) => {
                                     if let Err(why) = build_engine(db, &child) {
+                                        // A1 — an UNREADABLE child graph is NOT the H4 fact "the child
+                                        // failed". Folding it as `failed` handed the parent selector a
+                                        // verdict it is built to act on, and ndev duly escalated to
+                                        // rework-or-abandon: a human was asked to decide the fate of a
+                                        // build that never ran, over a cause the branch had erased. The
+                                        // parent REFUSES instead, in the child's own words. A refusal is
+                                        // not terminal (see `outcome_is_fatal`), so the parent run stays
+                                        // alive and re-ticks the moment the graph is readable again.
+                                        //
+                                        // The child row is deliberately NOT marked `failed` here: the
+                                        // `BLOCKED || FAILED` arm above runs BEFORE this one on the next
+                                        // tick, so a `failed` child would be folded as the very H4
+                                        // verdict this refusal exists to withhold — one tick late. Left
+                                        // `running`, the child is re-opened by this arm every tick until
+                                        // its graph reads again, which is what "sticky" means.
+                                        if is_graph_unreadable(&why) {
+                                            return Err(child_graph_unreadable(&child, &why));
+                                        }
                                         notes.push(child_died_note(&child, &why));
                                         result = Some(NodeResult::SubResult(
                                             json!({ "status": db::RUN_STATUS_FAILED }),
@@ -3509,6 +3652,39 @@ fn child_replaced_note(replaced: &ReplacedRun, fresh_id: &str) -> String {
 /// advanced: it is folded as `failed` rather than waited on forever, and the parent graph's own
 /// "child result?" selector takes it from there (H4). Same channel and same sentence-source as
 /// [`child_replaced_note`] — one death, said one way.
+/// A1 — the parent's REFUSAL when the child run it was waiting on sits on a graph THIS BUILD CANNOT
+/// READ. Distinct from [`child_died_note`], which folds a dead child as a `failed` result for the
+/// parent's own "child result?" selector to branch on: there is no verdict to branch on here, only a
+/// build that cannot interpret the rows, and letting the flow escalate to rework-or-abandon spends a
+/// human turn on a decision nothing supports.
+///
+/// Carries the child's refusal VERBATIM (it already names the node, the type, the graph and its
+/// revision) plus the child's identity, so the operator sees which run is stuck and which graph to
+/// fix. Its `reason` is deliberately NOT [`GRAPH_UNREADABLE_REASON`]: that code is TERMINAL
+/// ([`outcome_is_fatal`]) and it is the CHILD's graph that is unreadable, not the parent's — the
+/// parent is perfectly walkable and must stay resident so the refusal is sticky and the very next
+/// tick picks up where it left off.
+fn child_graph_unreadable(child: &db::WorkflowRun, why: &RpcError) -> RpcError {
+    RpcError::new(
+        RpcCode::InvalidState,
+        format!(
+            "the child run this step is waiting on ({}) cannot be advanced: {} — this run is NOT \
+             failed and nothing about it needs deciding, so nyx will not ask you to rework or \
+             abandon it. Fix the graph (or run the build that reads it) and call nyx_next again",
+            child.id, why.message,
+        ),
+    )
+    .with_data(json!({
+        "reason": CHILD_GRAPH_UNREADABLE_REASON,
+        "child_run_id": child.id,
+        "child_workflow_id": child.workflow_id,
+    }))
+}
+
+/// The machine `reason` a PARENT tick refuses with when its child's graph is unreadable — see
+/// [`child_graph_unreadable`] for why it is not [`GRAPH_UNREADABLE_REASON`].
+pub(crate) const CHILD_GRAPH_UNREADABLE_REASON: &str = "child_graph_unreadable";
+
 fn child_died_note(child: &db::WorkflowRun, why: &RpcError) -> String {
     format!(
         "The child run this step was waiting on ({}) can no longer be advanced: {}. It is reported \
@@ -3819,9 +3995,13 @@ fn consent_without_human_turn_error(
                             nothing stands behind this answer"
             .to_string(),
         // The honest one: a human HAS typed on that terminal, but not since the question was posed.
+        // "Since" is BOTH tests the guard makes (A11): a different turn from the one that stood at
+        // the asking, AND one submitted after it — an older prompt still sitting on the ledger is
+        // not an answer to a question it predates.
         (Some(_), Some(turn)) => format!(
-            "the last human prompt nyx has recorded on that session is still the one that stood \
-             when it asked ({}) — nobody has typed since, so the answer is not theirs to have given",
+            "the last human prompt nyx has recorded on that session ({}) does not come after the \
+             question — nobody has typed since it was asked, so the answer is not theirs to have \
+             given",
             quote_prompt(&turn.prompt)
         ),
     };
@@ -3954,9 +4134,11 @@ fn ask_human_json(
             "context".to_string(),
             Value::from(format!(
                 "This answer {}. Put the question to the human in the conversation, wait for THEIR \
-                 reply, and report it on the tick after it: nyx checks its own record of this \
-                 session's prompts and refuses an answer with no human turn behind it — including \
-                 one they told you in advance.",
+                 reply, and report it on the tick after it. What nyx verifies is that a human \
+                 SPOKE on this session AFTER it asked — it reads its own record of this session's \
+                 prompts, not their meaning, so it cannot tell whether what they said answers this \
+                 question. That last part is on you: relay what they actually decided. An answer \
+                 with no human turn behind it is refused, including one they told you in advance.",
                 commitment.what_it_commits()
             )),
         );
@@ -6678,6 +6860,52 @@ fn refuse_unattributable_consent(
 fn map_engine_err(e: EngineError) -> RpcError {
     RpcError::new(RpcCode::InvalidState, format!("workflow engine: {e}"))
         .with_data(json!({ "reason": "engine_error" }))
+}
+
+/// The machine `reason` marking "this build cannot READ the stored graph at all" — a node whose
+/// `type` no interpreter here implements. TERMINAL like [`map_engine_err`]'s `engine_error` (see
+/// [`outcome_is_fatal`]), and DISTINCT from it because the recovery is different in kind: nothing
+/// about the run or the authoring is wrong, the rows were written by a build that knows a node type
+/// this one does not.
+pub(crate) const GRAPH_UNREADABLE_REASON: &str = "graph_unreadable";
+
+/// Map a [`Tree::from_rows`] failure, naming the WORKFLOW it came out of.
+///
+/// An UNKNOWN NODE TYPE gets its own sentence and its own `reason`. The generic wording ("workflow
+/// engine: unknown node type: set_category") was true and unactionable: it named neither the node,
+/// nor the graph, nor the one thing that explains it — the rows in this shared database were written
+/// by ANOTHER build of nyx, whose interpreter has a type this one does not. That is the whole of
+/// review A1: a `set_category` seeded by a sibling worktree (same `userData`, same SQLite file) made
+/// every `/ndev` and `/nspec` tick die at the first node, and the message sent operators hunting for
+/// a regression in a file nobody had touched.
+fn map_tree_err(e: EngineError, workflow: &db::Workflow) -> RpcError {
+    let EngineError::UnknownNodeType { node_id, node_type } = &e else {
+        return map_engine_err(e);
+    };
+    let revision = match workflow.builtin_revision {
+        Some(r) => r.to_string(),
+        None => "unstamped".to_string(),
+    };
+    RpcError::new(
+        RpcCode::InvalidState,
+        format!(
+            "workflow '{}' (revision {revision}) cannot be read by this build of nyx: its node \
+             '{node_id}' has type '{node_type}', which this build implements no interpreter for. \
+             The stored graph was written by a DIFFERENT build — every checkout on this machine \
+             shares ONE database, so a sibling build that ships that node type seeds graphs this \
+             one cannot walk. Nothing is wrong with this run: either run the build that knows \
+             '{node_type}', or re-seed this workflow from a graph this build can read. nyx will \
+             NOT guess what '{node_type}' means",
+            workflow.name,
+        ),
+    )
+    .with_data(json!({
+        "reason": GRAPH_UNREADABLE_REASON,
+        "workflow_id": workflow.id,
+        "workflow_revision": workflow.builtin_revision,
+        "node_id": node_id,
+        "node_type": node_type,
+    }))
 }
 
 #[cfg(test)]

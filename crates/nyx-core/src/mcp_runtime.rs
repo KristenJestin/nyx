@@ -202,8 +202,74 @@ pub fn optional_bool(args: &Value, key: &str) -> Result<Option<bool>, RpcError> 
     }
 }
 
+/// Map a raw `diesel` failure onto the RPC vocabulary — THE seam every DB-backed tool routes its
+/// unexpected errors through.
+///
+/// TWO FAMILIES, AND ONLY ONE OF THEM IS NYX'S FAULT. A constraint the database refuses is, on the
+/// write paths of this surface, ALWAYS a statement about the caller's arguments: a FOREIGN KEY that
+/// does not resolve is an id naming nothing, a CHECK that fails is a value outside a closed
+/// vocabulary, a NOT NULL is a required field left empty. Those used to come back as
+/// `internal: db error: FOREIGN KEY constraint failed` — a code that says "server fault" about a
+/// mistake the caller can fix, so an agent reading it concludes nyx is broken and either abandons or
+/// retries the identical call (measured 2026-09-01, `task_add` with an unknown `spec_id`). They are
+/// `invalid_argument` here, and they say what to look at.
+///
+/// THE MESSAGE IS NOT THE SQL. `info.message()` is SQLite's own sentence — schema names, the literal
+/// `IN (…)` list, sometimes a column path — and handing it to an agent asks it to reverse-engineer a
+/// data model it cannot see. What each arm says instead is what the caller can act on. The tools
+/// that KNOW which argument is at fault refuse before ever reaching here (see
+/// `mcp_tools_spec::task_add`); this is the net under them, not the intended channel — a translation
+/// this generic means a write path did not pre-validate something it could have.
 pub fn internal_db(e: diesel::result::Error) -> RpcError {
-    RpcError::new(RpcCode::Internal, format!("db error: {e}"))
+    use diesel::result::{DatabaseErrorKind, Error as DieselError};
+    match &e {
+        DieselError::DatabaseError(DatabaseErrorKind::ForeignKeyViolation, _) => RpcError::new(
+            RpcCode::InvalidArgument,
+            "one of the ids this call references does not exist (a spec_id / project_id / \
+             parent_task_id / workspace_id naming no row). This is an ARGUMENT mistake, not a \
+             server fault: re-read the ids you sent and send existing ones — retrying the same \
+             call will fail identically",
+        ),
+        DieselError::DatabaseError(DatabaseErrorKind::CheckViolation, _) => RpcError::new(
+            RpcCode::InvalidArgument,
+            "one of the values this call sent is outside the closed vocabulary nyx accepts for \
+             that field (kind, type, priority, severity and their siblings each take a fixed set — \
+             the tool's own description lists them). This is an ARGUMENT mistake, not a server \
+             fault: retrying the same call will fail identically",
+        ),
+        DieselError::DatabaseError(DatabaseErrorKind::NotNullViolation, _) => RpcError::new(
+            RpcCode::InvalidArgument,
+            "a required field of this call was left empty. This is an ARGUMENT mistake, not a \
+             server fault: fill every required argument and send it again",
+        ),
+        DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, _) => RpcError::new(
+            RpcCode::InvalidState,
+            "a row with this identity already exists — the value you sent must be unique and is \
+             not",
+        ),
+        // A genuine nyx-side failure. It is named by CLASS, never by SQL text: what an agent can do
+        // about a corrupt statement or an unreachable file is the same in every case (report it),
+        // and the detail belongs in nyx's own logs, not on the wire.
+        _ => RpcError::new(RpcCode::Internal, format!("db error ({})", db_error_class(&e))),
+    }
+}
+
+/// The CLASS of a `diesel` failure, in nyx's words — what goes on the wire when [`internal_db`]
+/// has nothing actionable to say. Deliberately coarse and SQL-free: it tells an operator which
+/// half of the stack to look at without quoting a statement, a schema name or a constraint body.
+fn db_error_class(e: &diesel::result::Error) -> &'static str {
+    use diesel::result::Error as DieselError;
+    match e {
+        DieselError::NotFound => "row not found",
+        DieselError::DatabaseError(..) => "the database rejected the statement",
+        DieselError::RollbackTransaction | DieselError::AlreadyInTransaction => {
+            "transaction was rolled back"
+        }
+        DieselError::SerializationError(_) | DieselError::DeserializationError(_) => {
+            "stored value could not be decoded"
+        }
+        _ => "unexpected storage failure",
+    }
 }
 
 /// Map a [`crate::db::ContentWriteError`] onto the RPC vocabulary: a status refusal is a clean
@@ -942,7 +1008,8 @@ pub fn relaunch_command<S: RunnerSink>(
 }
 
 /// `get_command_output` — `{ instance_id | (name, workspace_id), tail_bytes?, max_bytes?,
-/// since?, run? ("current"|"previous"), strip_ansi?, grep?, tail_lines?, mark_read? }` →
+/// since?, run? (0|-1|"current"|"latest"|"previous"|"prev" — see [`parse_run_selector`]),
+/// strip_ansi?, grep?, tail_lines?, mark_read? }` →
 /// `{ instance_id, run, output, total_bytes, returned_bytes, truncated, reset, cursor,
 /// …status }`.
 ///
@@ -966,6 +1033,71 @@ pub fn relaunch_command<S: RunnerSink>(
 /// `output` string. So a follow-up `get_command_output(since=cursor)` resumes on the raw
 /// byte stream with no gap/dup even when knobs are set. (`returned_bytes` therefore counts
 /// the RAW window bytes, NOT the rendered `output` length, matching v1.)
+/// The number of PRIOR runs nyx retains per command instance: exactly one, the `prev_*` columns of
+/// the `command_instances` row. What makes `run: -1` the OLDEST addressable run, and `run: -2`
+/// something to refuse by RANGE rather than by type.
+pub const RETAINED_PRIOR_RUNS: usize = 1;
+
+/// The `run` selector of [`get_command_output`] — `true` = read the RETAINED PRIOR run.
+///
+/// ONE grammar for both spellings, which is the whole of review A2. The schema documents
+/// `oneOf integer|string` with the examples `0` and `-1`; the code read the argument with
+/// `optional_str`, so every integer bounced off `argument 'run' must be a string` — the schema an
+/// agent reads before calling and the validation it then meets said different things, and the
+/// INDEX form (the only way to name a run positionally) was the half that did not exist. The string
+/// enum was half-honoured too: `latest` and `prev` were listed and neither was recognised, so
+/// `run: "prev"` silently returned the CURRENT run.
+///
+/// An integer outside the retention is refused by RANGE, naming what is retained — never as a type
+/// error, which would send the caller back to a spelling that is not the problem.
+fn parse_run_selector(args: &Value) -> Result<bool, RpcError> {
+    let out_of_range = |asked: &str| {
+        RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "argument 'run' = {asked} is outside the runs nyx retains: history is bounded to \
+                 N={RETAINED_PRIOR_RUNS}, so the only addressable runs are 0 (\"current\", the \
+                 latest) and -1 (\"previous\", the one retained prior run). Older runs are not kept"
+            ),
+        )
+    };
+    match args.get("run") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(s)) if s.is_empty() => Ok(false),
+        Some(Value::String(s)) => match s.as_str() {
+            "current" | "latest" => Ok(false),
+            "previous" | "prev" => Ok(true),
+            other => Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                format!(
+                    "argument 'run' = '{other}' is not a run selector: pass 0 or \"current\" \
+                     (the latest run), or -1 or \"previous\" (the one retained prior run)"
+                ),
+            )),
+        },
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(0) => Ok(false),
+            Some(-1) => Ok(true),
+            Some(i) => Err(out_of_range(&i.to_string())),
+            // A non-integer number (2.5) — same RANGE refusal: no such run exists either.
+            None => Err(out_of_range(&n.to_string())),
+        },
+        Some(other) => Err(RpcError::new(
+            RpcCode::InvalidArgument,
+            format!(
+                "argument 'run' must be an integer (0 = current, -1 = previous) or one of \
+                 \"current\"/\"latest\"/\"previous\"/\"prev\" — got {}",
+                match other {
+                    Value::Bool(_) => "a boolean",
+                    Value::Array(_) => "an array",
+                    Value::Object(_) => "an object",
+                    _ => "an unsupported value",
+                }
+            ),
+        )),
+    }
+}
+
 pub fn get_command_output<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
@@ -1002,7 +1134,7 @@ pub fn get_command_output<S: RunnerSink>(
     let grep = optional_regex(args, "grep")?;
     let tail_lines = optional_usize(args, "tail_lines")?;
     let mark_read = optional_bool(args, "mark_read")?.unwrap_or(false);
-    let previous = matches!(optional_str(args, "run")?, Some("previous"));
+    let previous = parse_run_selector(args)?;
 
     let (full, status) = if previous {
         let inst = db
@@ -1175,6 +1307,13 @@ pub fn wait_for_command<S: RunnerSink>(
         None => current_output(db, runner, &instance_id)?.len(),
     };
 
+    // SHARES THE BLOCKING BUDGET with `wait_for_terminal`: this call parks a worker of the same
+    // 4-worker pool for the same minute, and the agent hooks that end a terminal wait arrive as
+    // requests on that pool. Counting only terminal waits left the reserved worker free to be
+    // taken here instead — the deadlock through the side door.
+    let Some(_slot) = crate::mcp_tools_core::TerminalWaitSlot::acquire() else {
+        return Err(crate::mcp_tools_core::too_many_terminal_waits_error());
+    };
     let outcome = poll_until(
         &until,
         timeout,
@@ -1466,7 +1605,11 @@ fn create_workspace_inner(
             crate::usecase::RegisterWorkspaceError::SystemScope(e) => RpcError::from(e),
         })?;
     match spec {
-        Some(spec) => Ok(json!({ "workspace": workspace, "spec": spec })),
+        // Through the SHARED wire projection, so the anchored Spec this call echoes carries the
+        // same decoded `phases` plan as the one `spec_create` returns.
+        Some(spec) => Ok(
+            json!({ "workspace": workspace, "spec": crate::mcp_tools_spec::spec_json(&spec) }),
+        ),
         None => Ok(json!({ "workspace": workspace })),
     }
 }
@@ -1972,6 +2115,38 @@ mod tests {
         assert_eq!(render_output(raw, false, None, None), raw);
     }
 
+    /// #K8 — A COMMAND'S OUTPUT IS NOT A TERMINAL FRAME: ITS TABS ARE DATA.
+    ///
+    /// `strip_ansi` used to detab unconditionally, and this render ALWAYS matches `grep` on the
+    /// cleaned form (even at `strip_ansi: false`), so a pattern carrying a `\t` could not match
+    /// anything. Measured on `git diff --numstat` with `^\d+\t\d+\t`: zero lines returned, while
+    /// the same pattern matched the raw bytes. And any TSV read with the DEFAULT came back with
+    /// its columns turned into runs of spaces — a silent contract change on a v1-frozen tool.
+    #[test]
+    fn render_output_keeps_the_tabs_a_grep_and_a_tsv_reader_depend_on() {
+        let numstat = "12\t3\tsrc/main.rs\nnot a numstat line\n0\t0\tREADME.md\n";
+        // The DEFAULT read (strip=true) hands back the tabs untouched — it is a byte stream, not
+        // a grid.
+        assert_eq!(render_output(numstat, true, None, None), numstat);
+        // And the grep that anchors on them matches again, at either `strip_ansi` setting.
+        let re = optional_regex(&json!({ "grep": r"^\d+\t\d+\t" }), "grep")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            render_output(numstat, true, Some(&re), None),
+            "12\t3\tsrc/main.rs\n0\t0\tREADME.md\n"
+        );
+        assert_eq!(
+            render_output(numstat, false, Some(&re), None),
+            "12\t3\tsrc/main.rs\n0\t0\tREADME.md\n"
+        );
+        // Colour is still stripped — the two behaviours are independent.
+        assert_eq!(
+            render_output("\u{1b}[31ma\tb\u{1b}[0m\n", true, None, None),
+            "a\tb\n"
+        );
+    }
+
     #[test]
     fn render_output_grep_keeps_only_matching_lines() {
         let raw = "start\nERROR: boom\ninfo: ok\nERROR: bang\n";
@@ -2037,6 +2212,30 @@ mod tests {
             .is_none());
         let err = optional_regex(&json!({ "grep": "(" }), "grep").unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidArgument);
+    }
+
+    /// #K2 — A `grep` WHOSE PARSE ERROR READS LIKE SQL KEEPS ITS DETAIL.
+    ///
+    /// This is where `get_command_output` builds its refusal for an invalid `grep`, and the regex
+    /// crate's own parse detail is the ONLY thing that tells an agent how to fix the pattern. The
+    /// anti-SQL net cut on the marker `syntax error` wherever it appeared, for every error code — so
+    /// `grep: "syntax error("` had that detail replaced by a false diagnosis about a storage layer
+    /// the call had never reached. The net runs on `internal` alone now; this pins the tool's side
+    /// of that, so the guarantee cannot survive a change of code on this refusal.
+    #[test]
+    fn a_grep_whose_parse_error_reads_like_sql_keeps_its_detail() {
+        let err = optional_regex(&json!({ "grep": "syntax error(" }), "grep").unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument, "{}", err.message);
+        assert!(
+            err.message.contains("unclosed group"),
+            "the parse detail is what the agent repairs the pattern with: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("storage layer"),
+            "and no diagnosis about a database this call never touched: {}",
+            err.message
+        );
     }
 
     /// max_bytes acts as an alternative byte ceiling: the effective window is
@@ -3438,5 +3637,495 @@ mod tests {
                 .code,
             RpcCode::InvalidArgument
         );
+    }
+
+    // --- A2: the `run` selector says the same thing as its schema --------------------------
+
+    /// An instance whose CURRENT run printed `current` and whose RETAINED PRIOR run printed
+    /// `earlier` and exited 7 — built through the real archive path
+    /// ([`db::archive_and_reset_for_relaunch`]), not by writing `prev_*` by hand.
+    fn db_with_a_prior_run() -> (Db, String) {
+        let db = Db::in_memory();
+        let instance_id = db.with_conn(|c| {
+            let (project, _ws) =
+                db::create_project(c, "P", "/tmp/mcp-run-selector", None).expect("project");
+            db::create_template(
+                c,
+                &project.id,
+                "dev",
+                "echo hi",
+                None,
+                db::CommandSource::default(),
+            )
+            .expect("template");
+            let id = db::instance_ids_for_project(c, &project.id)
+                .expect("instances")
+                .into_iter()
+                .next()
+                .expect("one instance");
+            // Run 1: output + a terminal outcome, then a relaunch rolls it into prev_*.
+            db::persist_instance_scrollback(c, &id, "earlier\n").expect("run 1 output");
+            db::set_run_state(c, &id, db::STATE_ERROR, Some(7)).expect("run 1 finished");
+            db::archive_and_reset_for_relaunch(c, &id).expect("archive");
+            // Run 2, the current one.
+            db::persist_instance_scrollback(c, &id, "current\n").expect("run 2 output");
+            db::set_run_state(c, &id, db::STATE_SUCCESS, Some(0)).expect("run 2 finished");
+            id
+        });
+        (db, instance_id)
+    }
+
+    fn selector_runner() -> CommandRunner<GroupNoopSink> {
+        CommandRunner::new(
+            GroupNoopSink,
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+    }
+
+    /// A2 — THE SCHEMA AND THE VALIDATION SAY THE SAME THING ABOUT `run`.
+    ///
+    /// The tool schema advertises `oneOf integer|string` with the examples `0` and `-1`; the code
+    /// read the argument with `optional_str`, so EVERY integer bounced off `argument 'run' must be
+    /// a string`. The half that did not exist was the INDEX form — the only way to name a run
+    /// positionally — and the schema is what an agent reads before it calls.
+    ///
+    /// All four forms are driven here: `0` and `"current"` must return exactly what each other
+    /// returns, and so must `-1` and `"previous"` — including the prior run's own exit code, which
+    /// is the thing that tells the two runs apart.
+    #[test]
+    fn the_run_selector_accepts_the_index_form_its_schema_advertises() {
+        let _g = db_guard();
+        let (db, instance_id) = db_with_a_prior_run();
+        let runner = selector_runner();
+        let read = |run: Value| {
+            let mut args = json!({ "instance_id": instance_id });
+            if !run.is_null() {
+                args.as_object_mut().unwrap().insert("run".into(), run);
+            }
+            get_command_output(&db, &runner, &args)
+        };
+
+        let word_current = read(json!("current")).expect("run=\"current\"");
+        let index_current = read(json!(0)).expect("run=0");
+        assert_eq!(
+            index_current, word_current,
+            "0 and \"current\" name the SAME run, field for field"
+        );
+        assert_eq!(word_current["run"], "current");
+        assert!(word_current["output"].as_str().unwrap().contains("current"));
+
+        let word_previous = read(json!("previous")).expect("run=\"previous\"");
+        let index_previous = read(json!(-1)).expect("run=-1");
+        assert_eq!(
+            index_previous, word_previous,
+            "-1 and \"previous\" name the SAME run, field for field"
+        );
+        assert_eq!(word_previous["run"], "previous");
+        assert!(word_previous["output"].as_str().unwrap().contains("earlier"));
+        assert_eq!(
+            word_previous["exit_code"],
+            json!(7),
+            "the prior run carries its OWN outcome — that is what makes it a different run"
+        );
+
+        // The two aliases the schema's string enum lists are honoured too: `prev` used to fall
+        // through to the CURRENT run in silence.
+        assert_eq!(read(json!("prev")).unwrap()["run"], "previous");
+        assert_eq!(read(json!("latest")).unwrap()["run"], "current");
+        // …and omitting it is still the current run.
+        assert_eq!(read(Value::Null).unwrap()["run"], "current");
+    }
+
+    /// A2 — AN INDEX OUTSIDE THE RETENTION IS REFUSED BY RANGE, NAMING THE RANGE — never as a type
+    /// error, which would send the caller back to a spelling that is not the problem.
+    #[test]
+    fn a_run_index_beyond_the_retention_is_refused_with_the_span_it_has() {
+        let _g = db_guard();
+        let (db, instance_id) = db_with_a_prior_run();
+        let runner = selector_runner();
+        for out_of_range in [json!(-2), json!(1), json!(-99)] {
+            let err = get_command_output(
+                &db,
+                &runner,
+                &json!({ "instance_id": instance_id, "run": out_of_range }),
+            )
+            .expect_err("outside the retention");
+            assert_eq!(err.code, RpcCode::InvalidArgument);
+            assert!(
+                err.message.contains("N=1") && err.message.contains("-1"),
+                "the refusal NAMES the span nyx retains: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("must be a string"),
+                "and never blames the TYPE: {}",
+                err.message
+            );
+        }
+
+        // A word that is not a selector is refused as a word, listing the vocabulary.
+        let bad_word = get_command_output(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "run": "yesterday" }),
+        )
+        .expect_err("not a selector");
+        assert!(
+            bad_word.message.contains("previous") && bad_word.message.contains("current"),
+            "the refusal lists what IS a selector: {}",
+            bad_word.message
+        );
+    }
+
+    // --- A3: the retained prior run is actually fed -----------------------------------------
+
+    /// The PRODUCTION [`RunnerSink`], minus the event bus: every callback writes the row the
+    /// sidecar's own sink writes (`crates/nyx-sidecar/src/runtime/command.rs`). Without it a test
+    /// drives the runner over a sink that persists NOTHING, which is exactly how "the retained prior
+    /// run is never fed" survived a green suite — every existing runner test asserts on the runner's
+    /// in-memory view, and the retention lives entirely in the row.
+    #[derive(Clone)]
+    struct DbBackedSink {
+        db: Db,
+    }
+    impl RunnerSink for DbBackedSink {
+        fn on_state(&self, instance_id: &str, state: RunState, exit_code: Option<i32>) {
+            let _ = self
+                .db
+                .with_conn(|c| db::set_run_state(c, instance_id, state.as_db_str(), exit_code));
+        }
+        fn on_acknowledge(&self, instance_id: &str) {
+            let _ = self
+                .db
+                .with_conn(|c| db::acknowledge_instance(c, instance_id));
+        }
+        fn on_output(&self, _: &str, _: &[u8]) {}
+        fn persist_scrollback(&self, instance_id: &str, serialized: &str) {
+            let _ = self
+                .db
+                .with_conn(|c| db::persist_instance_scrollback(c, instance_id, serialized));
+        }
+        fn archive_previous_run(&self, instance_id: &str) {
+            let _ = self
+                .db
+                .with_conn(|c| db::archive_and_reset_for_relaunch(c, instance_id));
+        }
+        fn clear_output(&self, instance_id: &str) {
+            let _ = self
+                .db
+                .with_conn(|c| db::clear_instance_scrollback(c, instance_id));
+        }
+    }
+
+    /// Poll `get_command_output` until its `output` contains `needle` (or give up).
+    fn wait_for_output(
+        db: &Db,
+        runner: &CommandRunner<DbBackedSink>,
+        instance_id: &str,
+        needle: &str,
+    ) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            let out = get_command_output(db, runner, &json!({ "instance_id": instance_id }))
+                .expect("read the current run");
+            last = out["output"].as_str().unwrap_or_default().to_string();
+            if last.contains(needle) {
+                return last;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("never saw '{needle}' in the output; last window was: {last:?}");
+    }
+
+    /// Wait until the instance ROW records `state` — the sink's write, not the runner's memory.
+    fn wait_for_row_state(db: &Db, instance_id: &str, state: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let row = db
+                .with_conn(|c| db::get_instance(c, instance_id))
+                .expect("row")
+                .expect("instance");
+            if row.last_state == state {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the row never reached state '{state}'");
+    }
+
+    /// A3 — THE RETAINED PRIOR RUN IS ACTUALLY FED, INCLUDING BY A RUN THE USER STOPPED.
+    ///
+    /// MEASURED before it was fixed: the READ side was fine (`prev_scrollback`/`prev_last_state` are
+    /// returned faithfully — `the_run_selector_accepts_the_index_form_its_schema_advertises` reads a
+    /// prior run seeded through the real archive writer and gets it back). The ARCHIVE side was the
+    /// missing half, and precisely its condition: [`db::archive_and_reset_for_relaunch`] retained a
+    /// run only when `last_state` was `success` or `error`. A STOP lands the row on `idle`
+    /// (`set_run_state`'s idle arm is deliberately outcome-free), so every stop/start cycle — the
+    /// audit's exact gesture, and the ordinary way a long-running command is replaced — threw the
+    /// outgoing run away. `run: "previous"` then read a row that had never been written: `""` and a
+    /// NULL `prev_last_state`, which the reader renders as 0 bytes and `state: idle`. Reported as
+    /// "the previous run produced nothing", indistinguishable from a real empty run.
+    ///
+    /// Driven over the REAL runner and the REAL row writer, because that gap is invisible to any
+    /// test whose sink persists nothing.
+    #[test]
+    fn a_stopped_run_is_retained_as_the_previous_run() {
+        let _g = db_guard();
+        // Long-lived on purpose: the run must be STOPPED, not left to finish.
+        let cmdline = crate::test_cmdline::Cmdline::new()
+            .prints_env("MARK=", "NYX_RUN_MARK", "")
+            .sleeps(30)
+            .exits(0);
+        let (db, instance_id, root) = db_with_command("prev-stop", &cmdline);
+        let sink = DbBackedSink { db: db.clone() };
+        let runner = CommandRunner::new(
+            sink,
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+
+        // RUN 1 — identifiable output, then STOPPED (never allowed to finish).
+        start_command(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "env": { "NYX_RUN_MARK": "one" } }),
+        )
+        .expect("run 1 starts");
+        wait_for_output(&db, &runner, &instance_id, "MARK=one");
+        stop_command(&db, &runner, &json!({ "instance_id": instance_id })).expect("run 1 stops");
+        wait_for_row_state(&db, &instance_id, db::STATE_IDLE);
+
+        // RUN 2 — a fresh run over the same instance.
+        start_command(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "env": { "NYX_RUN_MARK": "two" } }),
+        )
+        .expect("run 2 starts");
+        let current = wait_for_output(&db, &runner, &instance_id, "MARK=two");
+        assert!(
+            !current.contains("MARK=one"),
+            "the CURRENT run is not polluted by the stopped one: {current:?}"
+        );
+        // …and neither is the ROW a cold rehydrate would read. The archive and the reset share one
+        // transaction, so the refused archive used to roll the reset back with it and the fresh
+        // run's row started out holding the stopped run's bytes.
+        let row = db
+            .with_conn(|c| db::get_instance(c, &instance_id))
+            .expect("row")
+            .expect("instance");
+        assert!(
+            !row.scrollback.contains("MARK=one"),
+            "the fresh run's persisted row was reset: {:?}",
+            row.scrollback
+        );
+
+        // …and the stopped run is READABLE, with what it printed and the state it really ended in.
+        let previous = get_command_output(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "run": -1 }),
+        )
+        .expect("read the previous run");
+        assert!(
+            previous["output"].as_str().unwrap().contains("MARK=one"),
+            "the retained prior run carries what RUN 1 printed: {previous}"
+        );
+        assert!(
+            previous["total_bytes"].as_u64().unwrap_or(0) > 0,
+            "…and is not the 0-byte answer the audit got: {previous}"
+        );
+        assert_eq!(
+            previous["state"], "idle",
+            "its REAL terminal state: a stopped run ended idle, it did not succeed"
+        );
+
+        stop_command(&db, &runner, &json!({ "instance_id": instance_id })).ok();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A3 — A RUN THAT TERMINATED AND WHOSE SUCCESSOR IS NEVER LAUNCHED STAYS FULLY READABLE.
+    ///
+    /// The companion half of the retention: the roll-over happens on the NEXT launch, so nothing
+    /// about it may depend on a successor existing. A command left alone after it exits keeps its
+    /// bytes and its outcome under `run: 0`, and `run: -1` says plainly that no prior run is
+    /// retained rather than inventing one.
+    #[test]
+    fn a_finished_run_with_no_successor_is_still_readable() {
+        let _g = db_guard();
+        let cmdline = crate::test_cmdline::prints_then_exits("ONLY-RUN", 0);
+        let (db, instance_id, root) = db_with_command("prev-none", &cmdline);
+        let sink = DbBackedSink { db: db.clone() };
+        let runner = CommandRunner::new(
+            sink,
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+
+        start_command(&db, &runner, &json!({ "instance_id": instance_id })).expect("starts");
+        wait_for_output(&db, &runner, &instance_id, "ONLY-RUN");
+        wait_for_row_state(&db, &instance_id, db::STATE_SUCCESS);
+
+        // Nothing is relaunched. The finished run is the CURRENT one and reads whole.
+        let current =
+            get_command_output(&db, &runner, &json!({ "instance_id": instance_id, "run": 0 }))
+                .expect("read the finished run");
+        assert!(current["output"].as_str().unwrap().contains("ONLY-RUN"));
+        assert_eq!(current["state"], "success");
+        assert_eq!(current["exit_code"], json!(0));
+
+        // And `previous` is honestly empty — there has never been a prior run on this instance.
+        let previous =
+            get_command_output(&db, &runner, &json!({ "instance_id": instance_id, "run": -1 }))
+                .expect("read the (absent) prior run");
+        assert_eq!(previous["total_bytes"], json!(0));
+        assert_eq!(previous["state"], "idle");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- A4: a clear on a LIVE process actually clears ---------------------------------------
+
+    /// A4 — CLEARING A RUNNING COMMAND'S OUTPUT ACTUALLY CLEARS IT.
+    ///
+    /// `clear_command_output` answered `cleared: true` on a live process and the entire buffer —
+    /// pre-clear scrollback included — was back on the very next read. The pump owns its own
+    /// accumulated byte buffer and OVERWRITES the shared live tail from it on every chunk, so
+    /// emptying that tail was undone by the next line of output; the next debounced `persist` then
+    /// wrote the same bytes back over the row the sink had emptied. The lie was worst exactly where
+    /// the tool is useful: bounding an output that is still growing. (On a FINISHED process there is
+    /// no pump left to rewrite anything, which is why the clear worked there and only there.)
+    ///
+    /// The command prints, then WAITS on a sentinel file, then prints again — so the clear lands at
+    /// a point the test chooses rather than in a race with a sleep.
+    #[test]
+    fn clearing_a_running_command_drops_what_came_before_and_keeps_what_comes_after() {
+        let _g = db_guard();
+        let cmdline = crate::test_cmdline::Cmdline::new()
+            .prints("BEFORE-CLEAR")
+            .waits_for_file("go")
+            .prints("AFTER-CLEAR")
+            .sleeps(30)
+            .exits(0);
+        let (db, instance_id, root) = db_with_command("clear-live", &cmdline);
+        let sink = DbBackedSink { db: db.clone() };
+        let runner = CommandRunner::new(
+            sink,
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+
+        start_command(&db, &runner, &json!({ "instance_id": instance_id })).expect("starts");
+        wait_for_output(&db, &runner, &instance_id, "BEFORE-CLEAR");
+        let before = get_command_output(&db, &runner, &json!({ "instance_id": instance_id }))
+            .expect("read before the clear");
+        let cursor_before = before["cursor"].as_u64().expect("a cursor");
+        assert!(cursor_before > 0, "there is something to clear");
+
+        // CLEAR, while the process is very much alive.
+        let cleared = crate::mcp_tools_core::clear_command_output(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id }),
+        )
+        .expect("clear");
+        assert_eq!(cleared.result["cleared"], json!(true));
+
+        let after_clear = get_command_output(&db, &runner, &json!({ "instance_id": instance_id }))
+            .expect("read right after the clear");
+        assert_eq!(
+            after_clear["total_bytes"],
+            json!(0),
+            "the clear emptied the buffer: {after_clear}"
+        );
+
+        // Release the command so it prints AGAIN — the bytes that must survive the clear.
+        std::fs::write(root.join("go"), b"").expect("drop the sentinel");
+        let after = wait_for_output(&db, &runner, &instance_id, "AFTER-CLEAR");
+        assert!(
+            !after.contains("BEFORE-CLEAR"),
+            "what was printed BEFORE the clear is gone for good — the pump did not write it \
+             back: {after:?}"
+        );
+        assert_eq!(
+            after.matches("AFTER-CLEAR").count(),
+            1,
+            "…and what was printed AFTER is there exactly once — no gap, no duplicate: {after:?}"
+        );
+
+        // The cursor taken before the clear is now past the end, so a caller paging with it is
+        // told RESET rather than handed a silent empty window.
+        let resumed = get_command_output(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id, "since": cursor_before }),
+        )
+        .expect("resume on the stale cursor");
+        assert_eq!(
+            resumed["reset"],
+            json!(true),
+            "the stale cursor is reported as a reset: {resumed}"
+        );
+        assert!(resumed["output"].as_str().unwrap().contains("AFTER-CLEAR"));
+
+        stop_command(&db, &runner, &json!({ "instance_id": instance_id })).ok();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A4 — AND THE FINISHED-PROCESS CASE, WHICH ALREADY WORKED, STILL DOES.
+    #[test]
+    fn clearing_a_finished_command_still_empties_its_persisted_output() {
+        let _g = db_guard();
+        let cmdline = crate::test_cmdline::prints_then_exits("FINISHED-OUTPUT", 0);
+        let (db, instance_id, root) = db_with_command("clear-done", &cmdline);
+        let sink = DbBackedSink { db: db.clone() };
+        let runner = CommandRunner::new(
+            sink,
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        );
+
+        start_command(&db, &runner, &json!({ "instance_id": instance_id })).expect("starts");
+        wait_for_output(&db, &runner, &instance_id, "FINISHED-OUTPUT");
+        wait_for_row_state(&db, &instance_id, db::STATE_SUCCESS);
+
+        crate::mcp_tools_core::clear_command_output(
+            &db,
+            &runner,
+            &json!({ "instance_id": instance_id }),
+        )
+        .expect("clear");
+
+        let after = get_command_output(&db, &runner, &json!({ "instance_id": instance_id }))
+            .expect("read after the clear");
+        assert_eq!(after["total_bytes"], json!(0), "{after}");
+        assert_eq!(
+            after["state"], "success",
+            "a clear wipes the BYTES, never the run result"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

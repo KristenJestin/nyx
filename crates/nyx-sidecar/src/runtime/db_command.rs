@@ -641,6 +641,15 @@ impl Ctx<'_> {
     /// resolved dirs (the v1 `claude_plugin`): the bundled plugin SOURCE (via
     /// `resource_dir`), the STABLE install dir (under `data_dir`), and the `claude plugin`
     /// CLI driver. Each is `None` when its paths cannot be resolved.
+    ///
+    /// The descriptor's `mcp_port` is OVERRIDDEN with the port the MCP server actually BOUND
+    /// (`bound_mcp_port`), exactly as the boot reconcile does
+    /// ([`Runtime::reconcile_claude_plugin`](super::Runtime)). The adapter's own default is
+    /// `mcp::resolve_port()` — the port nyx *intends* to take — and an Install clicked in
+    /// Settings would otherwise template that GUESS into the descriptor, pointing the plugin at
+    /// a port this nyx may not hold (task 01M1F8XMR4PRRCYMKYPVX7A0WG). A `0` (never bound)
+    /// leaves the adapter's value alone: a descriptor is better templated with the intended
+    /// port than with a dead 0.
     fn claude_plugin(
         &self,
     ) -> (
@@ -650,10 +659,24 @@ impl Ctx<'_> {
         use nyx_core::agent::AgentAdapter;
         let resource_dir = self.runtime.resource_dir();
         let app_data_dir = self.runtime.data_dir().to_path_buf();
-        let install =
-            nyx_core::agent::ClaudeCodeAdapter.plugin_install(resource_dir, Some(&app_data_dir));
+        let install = nyx_core::agent::ClaudeCodeAdapter
+            .plugin_install(resource_dir, Some(&app_data_dir))
+            .map(|mut i| {
+                let bound = self.bound_mcp_port();
+                if bound != 0 {
+                    i.mcp_port = bound;
+                }
+                i
+            });
         let cli = nyx_core::agent::ClaudeCodeAdapter.plugin_cli();
         (install, cli)
+    }
+
+    /// The port the MCP HTTP server actually BOUND (0 when it never started). The source of
+    /// truth for "which nyx is this" — the value the shells nyx spawns export as
+    /// `NYX_MCP_PORT` and the value the plugin descriptor is checked against.
+    fn bound_mcp_port(&self) -> u16 {
+        self.runtime.mcp().map(|m| m.bound_port()).unwrap_or(0)
     }
 
     /// Install the integration for `provider` (parity with the v1 `integration_install`):
@@ -1940,10 +1963,19 @@ impl Ctx<'_> {
                             &seed,
                             severity.as_deref(),
                         )?;
+                        // The Spec's plan, so the finding carries the `phase_name` its rank
+                        // stands for (#K13) — empty when it has no Spec.
+                        let plan = task
+                            .spec_id
+                            .as_deref()
+                            .and_then(|sid| nyx_core::db::get_spec(c, sid).ok().flatten())
+                            .map(|s| nyx_core::db::parse_phase_plan(&s.phases))
+                            .unwrap_or_default();
                         Ok(nyx_core::db::ReviewFinding::from_task(
                             &task,
                             &comment.workspace_id,
                             &comment.repository_id,
+                            &plan,
                         ))
                     })
                     .map_err(Self::db_err)?;
@@ -1959,15 +1991,30 @@ impl Ctx<'_> {
                 let repository_id = self.arg_str("repositoryId")?;
                 let spec_id = self.arg_opt_str("specId");
                 let findings: Vec<nyx_core::db::ReviewFinding> = match spec_id {
-                    Some(sid) => self
-                        .db()
-                        .with_conn(|c| nyx_core::db::list_grilled_findings_for_spec(c, &sid))
-                        .map_err(Self::db_err)?
-                        .iter()
-                        .map(|t| {
-                            nyx_core::db::ReviewFinding::from_task(t, &workspace_id, &repository_id)
-                        })
-                        .collect(),
+                    Some(sid) => {
+                        // ONE plan read for the whole list, so every finding carries the
+                        // `phase_name` its numeric rank stands for (#K13).
+                        let plan = self
+                            .db()
+                            .with_conn(|c| nyx_core::db::get_spec(c, &sid))
+                            .ok()
+                            .flatten()
+                            .map(|s| nyx_core::db::parse_phase_plan(&s.phases))
+                            .unwrap_or_default();
+                        self.db()
+                            .with_conn(|c| nyx_core::db::list_grilled_findings_for_spec(c, &sid))
+                            .map_err(Self::db_err)?
+                            .iter()
+                            .map(|t| {
+                                nyx_core::db::ReviewFinding::from_task(
+                                    t,
+                                    &workspace_id,
+                                    &repository_id,
+                                    &plan,
+                                )
+                            })
+                            .collect()
+                    }
                     None => Vec::new(),
                 };
                 Self::json(&findings)
@@ -2517,7 +2564,17 @@ impl Ctx<'_> {
             //     install/uninstall as v1, at parity. install/remove SHELL OUT to `claude`. --
             // (crash-UI reverted in v2.5.8: the `recovery_snapshot` db-command is gone — a crash
             // is treated as a clean shutdown, so there is no interrupted set to surface.)
-            "integration_list" => Self::json(&nyx_core::integrations::status_list()),
+            // `integration_list` carries the PORT DIAGNOSTIC: the descriptor an agent session
+            // really reads is checked against the port this nyx BOUND, so a plugin pointed at
+            // another nyx is said out loud in Settings instead of surfacing to the agent as a
+            // bare `ConnectionRefused` (task 01M1F8XMR4PRRCYMKYPVX7A0WG).
+            "integration_list" => {
+                let (install, _) = self.claude_plugin();
+                Self::json(&nyx_core::integrations::status_list_with(
+                    install.as_ref(),
+                    self.bound_mcp_port(),
+                ))
+            }
             "integration_install" => {
                 let provider = self.arg_str("provider")?;
                 self.integration_install(&provider)
@@ -4171,12 +4228,9 @@ impl Ctx<'_> {
 /// Flatten the runtime [`Activity`](nyx_core::agent_activity::Activity) to the lowercase
 /// string the renderer reads (`working` | `waiting` | `idle`).
 fn activity_str(activity: nyx_core::agent_activity::Activity) -> &'static str {
-    use nyx_core::agent_activity::Activity;
-    match activity {
-        Activity::Idle => "idle",
-        Activity::Working => "working",
-        Activity::Waiting => "waiting",
-    }
+    // ONE vocabulary, owned by the enum: the renderer's dot and an agent's MCP read of the same
+    // store must not be able to spell the same state differently.
+    activity.as_str()
 }
 
 /// The template-MUTATING DB commands — each broadcasts `commands://changed` on success

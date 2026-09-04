@@ -120,6 +120,17 @@ function ProviderCard({ status, onRefresh }: ProviderCardProps) {
           ))}
       </div>
 
+      {/* A measured problem with an INSTALLED integration — today, the MCP port divergence: the
+          agent plugin is global to the machine, so it can be pointed at another nyx. Shown as a
+          warning (not an error): the integration IS installed, it is just aimed elsewhere. This is
+          the only place that mismatch is visible before it reaches an agent as ConnectionRefused. */}
+      {status.diagnostic && (
+        <p className="mt-2 flex items-start gap-1 text-xs text-warning">
+          <AlertTriangleIcon className="mt-px size-3 shrink-0" />
+          <span>{status.diagnostic}</span>
+        </p>
+      )}
+
       {error && (
         <p className="mt-2 flex items-center gap-1 text-xs text-destructive">
           <XCircleIcon className="size-3 shrink-0" />

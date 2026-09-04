@@ -311,6 +311,41 @@ describe("<SettingsDialog> — Integrations", () => {
     expect(screen.getByRole("button", { name: "Install" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Install" })).not.toBeDisabled();
   });
+
+  // --- the port diagnostic (task 01M1F8XMR4PRRCYMKYPVX7A0WG) -----------------------------
+  //
+  // The agent plugin is GLOBAL to the machine while nyx installs and worktrees are not, so an
+  // installed integration can point at another nyx. Unsaid, that reaches the agent as a bare
+  // `ConnectionRefused` naming nothing. This card is where it becomes visible BEFORE that.
+
+  it("shows the backend diagnostic on an installed card, while keeping it installed", async () => {
+    const diagnostic =
+      "The installed Claude Code plugin points at port 8787, but this nyx is listening on 8766.";
+    mockIPC((cmd) => {
+      if (cmd !== "integration_list") return null;
+      return [
+        { provider: "claude_code", label: "Claude Code", installed: true, available: true, diagnostic },
+        { provider: "codex", label: "Codex", installed: false, available: false },
+        { provider: "opencode", label: "OpenCode", installed: false, available: false },
+        { provider: "custom", label: "Custom", installed: false, available: false },
+      ] satisfies IntegrationStatus[];
+    });
+    render(<OpenSettings />);
+
+    // Said verbatim — the two ports are the whole point, so nothing may reword it.
+    await waitFor(() => expect(screen.getByText(diagnostic)).toBeInTheDocument());
+    // Still INSTALLED: the integration is not broken, it is aimed elsewhere.
+    expect(screen.getByText("Installed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Uninstall" })).toBeInTheDocument();
+  });
+
+  it("says nothing when the backend reports no diagnostic", async () => {
+    mockBackend(true);
+    render(<OpenSettings />);
+
+    await waitFor(() => expect(screen.getByText("Installed")).toBeInTheDocument());
+    expect(screen.queryByText(/listening on/)).not.toBeInTheDocument();
+  });
 });
 
 describe("<SettingsDialog> — section rail navigation", () => {

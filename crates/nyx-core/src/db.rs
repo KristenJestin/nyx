@@ -300,6 +300,48 @@ pub const TASK_SEVERITY_HIGH: &str = "high";
 #[cfg_attr(not(test), allow(dead_code))]
 pub const TASK_SEVERITY_CRITICAL: &str = "critical";
 
+// --- The CLOSED vocabularies, as SETS a caller can be checked against ------
+//
+// Each of the four `tasks` enumerated columns carries a SQL `CHECK (col IN (…))`, and until now the
+// only thing that ever read that closed set was SQLite itself. A `task_add(kind:"bogus")` therefore
+// travelled all the way down and came back as `internal: db error: CHECK constraint failed: kind IN
+// ('slice','human','review')` — a code that tells the caller "server fault" about a mistake it made
+// in its own arguments, wrapped in SQL it has no business reading (measured 2026-09-01). These
+// slices are the SAME vocabulary, readable from Rust, so a write path can refuse ABOVE the DB and
+// NAME what it accepts. They are ordered as the migration's CHECK lists them, and adding a value
+// means touching both — which is the point: the vocabulary is one fact.
+
+/// The closed `tasks.kind` vocabulary (migration v14 `CHECK (kind IN …)`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const TASK_KINDS: [&str; 3] = [TASK_KIND_SLICE, TASK_KIND_HUMAN, TASK_KIND_REVIEW];
+/// The closed `tasks.type` vocabulary (migration v14 `CHECK (type IN …)`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const TASK_TYPES: [&str; 5] = [
+    TASK_TYPE_IMPLEMENTATION,
+    TASK_TYPE_INVESTIGATION,
+    TASK_TYPE_VALIDATION,
+    TASK_TYPE_DOCUMENTATION,
+    TASK_TYPE_MIGRATION,
+];
+/// The closed `tasks.priority` vocabulary (migration v14 `CHECK (priority IN …)`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub const TASK_PRIORITIES: [&str; 4] = [
+    TASK_PRIORITY_URGENT,
+    TASK_PRIORITY_HIGH,
+    TASK_PRIORITY_MED,
+    TASK_PRIORITY_LOW,
+];
+/// The closed `tasks.severity` vocabulary (migration v14 `CHECK (severity IS NULL OR severity IN
+/// …)`); absent severity is legal and means "not a finding".
+#[cfg_attr(not(test), allow(dead_code))]
+pub const TASK_SEVERITIES: [&str; 5] = [
+    TASK_SEVERITY_INFO,
+    TASK_SEVERITY_LOW,
+    TASK_SEVERITY_MEDIUM,
+    TASK_SEVERITY_HIGH,
+    TASK_SEVERITY_CRITICAL,
+];
+
 /// `task_dependencies.type` — a hard ordering edge (the default): the prerequisite must
 /// be done before the dependent can proceed.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2274,6 +2316,13 @@ pub fn get_spec(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Spe
 ///
 /// The `id` tiebreak only matters in the cross-project scope, where `(position, number)` is no
 /// longer unique (it is per project); inside one project it changes nothing.
+///
+/// WHAT `position` IS WORTH TODAY (#N7): `create_spec` writes `0` and nothing else in the codebase
+/// ever writes the column again — there is no board reorder. So in practice every live Spec sits in
+/// the same tier and `number asc` decides: THE ORDER IS OLDEST FIRST, and the most recently created
+/// Spec is LAST. Callers that advertise a "find the Spec I just made" reading must say so (see the
+/// MCP `spec_list`, whose doc claimed the reverse). The `position` ordering stays first so a board
+/// reorder, when one exists, takes effect here without touching any caller.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn list_specs(
     conn: &mut SqliteConnection,
@@ -2826,6 +2875,43 @@ pub(crate) struct PhaseEntry {
     pub(crate) number: i64,
     #[serde(default)]
     pub(crate) name: String,
+}
+
+/// A phase plan entry as it CROSSES A BOUNDARY: the 1-based `number` nyx assigned (the RANK) and
+/// the `name` its author gave. Same shape as the stored [`PhaseEntry`] — `specs.phases` remains the
+/// JSON text column — but DECODED, so a read surface hands out a plan instead of a string a
+/// consumer has to parse (and mis-measure: `"[]".len()` is 2, not 0).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpecPhase {
+    /// The 1-based rank, in first-seen order. This is what a task's `phase` column holds.
+    pub number: i32,
+    /// The NAME the author wrote — what `task_add(phase=…)` takes.
+    pub name: String,
+}
+
+/// Decode a `specs.phases` column into the ordered plan.
+///
+/// A blank / `[]` / MALFORMED column yields an EMPTY plan rather than an error: the plan is
+/// authored incrementally, and a reader must not fail because a Spec has not been sliced yet. The
+/// coherence of a plan is the `ready` gate's business ([`validate_phase_plan`]), which does report
+/// a malformed column — that responsibility is not duplicated here.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn parse_phase_plan(phases_json: &str) -> Vec<SpecPhase> {
+    let trimmed = phases_json.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<PhaseEntry>>(trimmed)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|e| SpecPhase {
+                    number: e.number as i32,
+                    name: e.name,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Run the PRE-READY VALIDATIONS on a Spec and return the list of failures (empty = the
@@ -4448,6 +4534,14 @@ pub struct ReviewFinding {
     pub status: String,
     pub round: Option<i32>,
     pub phase: Option<i32>,
+    /// The NAME the numeric [`Self::phase`] rank stands for, resolved from the Spec's plan —
+    /// `None` when the finding has no phase, no Spec, or a plan that does not carry that rank.
+    ///
+    /// It is here for the same reason `task_json` grew it (#K13): the column holds a RANK and the
+    /// write path takes a NAME, so a finding read back alone said "phase 2" to a caller that had
+    /// written "Wiring". Every other task-shaped payload on the wire carries the pair; this struct
+    /// copied `phase` alone and was the one surface that did not.
+    pub phase_name: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -4457,8 +4551,17 @@ impl ReviewFinding {
     /// `(workspace, repository)` the read was scoped to. `grill_state` falls back to `proposed`
     /// and `from_comment_id` to empty only defensively — the viewer list only ever carries grilled
     /// findings promoted from a comment (both fields present).
+    ///
+    /// `plan` is the Spec's decoded phase plan, so a list of N findings costs ONE plan read rather
+    /// than N; an empty slice yields `phase_name: null`, which is the honest answer for a finding
+    /// whose Spec could not be read.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn from_task(task: &Task, workspace_id: &str, repository_id: &str) -> Self {
+    pub fn from_task(
+        task: &Task,
+        workspace_id: &str,
+        repository_id: &str,
+        plan: &[SpecPhase],
+    ) -> Self {
         Self {
             id: task.id.clone(),
             workspace_id: workspace_id.to_string(),
@@ -4475,6 +4578,10 @@ impl ReviewFinding {
             status: task.status.clone(),
             round: task.round,
             phase: task.phase,
+            phase_name: task
+                .phase
+                .and_then(|number| plan.iter().find(|p| p.number == number))
+                .map(|p| p.name.clone()),
             created_at: task.created_at,
             updated_at: task.updated_at,
         }
@@ -6768,6 +6875,24 @@ pub fn list_terminals(conn: &mut SqliteConnection) -> QueryResult<Vec<Terminal>>
         .load(conn)
 }
 
+/// The ALIVE terminals of ONE workspace, same order as [`list_terminals`].
+///
+/// Filtered in SQL rather than in Rust after the fact: every `Terminal` row carries its
+/// `scrollback` (up to [`MAX_SCROLLBACK_BYTES`] each), so loading the whole table to keep one
+/// workspace's live rows pulled every closed terminal of every other workspace across the FFI —
+/// measured at 868 KB read to emit 8 KB on a workspace runtime snapshot.
+pub fn list_alive_terminals_for_workspace(
+    conn: &mut SqliteConnection,
+    workspace_id: &str,
+) -> QueryResult<Vec<Terminal>> {
+    terminals::table
+        .filter(terminals::status.eq(STATUS_ALIVE))
+        .filter(terminals::workspace_id.eq(workspace_id))
+        .order((terminals::order_index.asc(), terminals::id.asc()))
+        .select(Terminal::as_select())
+        .load(conn)
+}
+
 /// Mark a terminal `closed` (it is no longer re-spawned at launch), stamping
 /// `closed_at` (and bumping `updated_at`) with the current epoch-ms. Returns the
 /// number of `terminals` rows updated (0 if the id is unknown).
@@ -8370,9 +8495,40 @@ pub fn update_template(
 
 /// Delete a template. Its `command_instances` cascade away (ON DELETE CASCADE on
 /// `command_instances.command_id`). Returns rows deleted (0 if the id is unknown).
+///
+/// AND ITS GROUP DISSOLVES IF THE DELETION EMPTIES IT (review A9). "A group has at least
+/// two members, or it does not exist" was enforced on every path that MOVES a membership
+/// ([`detach_from_group`], reached by joining, leaving and being pulled into another
+/// group) and on none that DESTROYS a member: deleting the command simply took its row
+/// away, `managed_commands.group_id` went with it, and the group row stayed — with one
+/// member, or none. Observed live: a group named "Statique" sitting at 0 members while
+/// the rule tested green everywhere it was armed. The rule was never wrong; this was the
+/// side door around it.
+///
+/// The whole thing is ONE transaction, so no reader ever sees the deleted command's group
+/// under its minimum.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn delete_template(conn: &mut SqliteConnection, id: &str) -> QueryResult<usize> {
-    diesel::delete(managed_commands::table.find(id)).execute(conn)
+    conn.transaction(|conn| {
+        // The group the command is IN must be read BEFORE the delete: after it, the column
+        // that named it is gone and the fact is unrecoverable.
+        let group_id = managed_commands::table
+            .find(id)
+            .select(managed_commands::group_id)
+            .first::<Option<String>>(conn)
+            .optional()?
+            .flatten();
+        let deleted = diesel::delete(managed_commands::table.find(id)).execute(conn)?;
+        if let Some(group_id) = group_id {
+            if command_group_member_ids(conn, &group_id)?.len() < COMMAND_GROUP_MIN_MEMBERS {
+                // Releases whatever member is left (never deletes it) and drops the group row —
+                // the SAME dissolution every other path uses, so there is one definition of what
+                // dissolving means.
+                dissolve_command_group_rows(conn, &group_id)?;
+            }
+        }
+        Ok(deleted)
+    })
 }
 
 /// Set each template's `order` to its position in `ids` (0-based), bumping
@@ -9179,8 +9335,26 @@ pub fn set_run_state(
                 command_instances::updated_at.eq(now),
             ))
             .execute(conn),
-        // idle (or any other state): touch only last_state — a stop/normalize is not
-        // a completed run, so it carries no outcome and clears no unread flag.
+        // idle (or any other state): no outcome and no unread flag — a stop/normalize is not a
+        // completed run. But a run that was RUNNING and is now idle has ENDED, and `ended_at` is
+        // the only mark that says so: without it a stopped run whose output was empty (killed
+        // before its first byte, or cleared then killed) leaves a row byte-for-byte identical to a
+        // never-run one, and `archive_and_reset_for_relaunch` cannot tell them apart — it kept the
+        // run BEFORE, so `run:-1` answered with the wrong run's bytes and outcome.
+        STATE_IDLE => {
+            let was_running = get_instance(conn, id)?.is_some_and(|i| i.last_state == STATE_RUNNING);
+            if was_running {
+                diesel::update(command_instances::table.find(id))
+                    .set((
+                        command_instances::last_state.eq(state),
+                        command_instances::ended_at.eq(Some(now)),
+                        command_instances::updated_at.eq(now),
+                    ))
+                    .execute(conn)
+            } else {
+                set_last_state(conn, id, state)
+            }
+        }
         _ => set_last_state(conn, id, state),
     }
 }
@@ -9205,10 +9379,34 @@ pub fn acknowledge_instance(conn: &mut SqliteConnection, id: &str) -> QueryResul
 /// production runner sink calls on `start` (BEFORE the new run's first persist).
 ///
 /// Bounded to ONE prior run (N=1): the prior `prev_*` are OVERWRITTEN, never appended,
-/// so history can never grow without limit. The archive only happens when the CURRENT
-/// `last_state` is a finished run (`success`|`error`) — a start over an idle / running
-/// / never-run instance has no completed run to keep, so `prev_*` are left untouched
-/// (the very first launch keeps them at their `''`/NULL defaults).
+/// so history can never grow without limit.
+///
+/// WHAT COUNTS AS A RUN TO RETAIN (review A3). A run that FINISHED (`success`|`error`),
+/// **or one that left any captured output behind**. The second half is the fix: the
+/// condition used to be the finished states alone, and a STOPPED run lands on `idle`
+/// ([`set_run_state`]'s idle arm is deliberately outcome-free — a stop is not a
+/// completion). So every stop/start cycle — the ordinary way a long-running command is
+/// replaced — discarded the outgoing run, and `get_command_output(run:"previous")`
+/// answered from columns nothing had ever written: `""` and a NULL `prev_last_state`,
+/// which the reader renders as 0 bytes and `state: idle`. An agent following the tool's
+/// contract read that as "the previous run produced nothing", indistinguishable from a
+/// real empty run. A run the user killed is still a run, and its bytes are the ones
+/// worth keeping.
+///
+/// A PRISTINE instance — never launched, nothing captured, no outcome — still retains
+/// nothing, so the very first launch keeps `prev_*` at their `''`/NULL defaults.
+///
+/// A stopped run is archived with its BYTES and NULL outcome columns, because the v5
+/// CHECK on `prev_last_state` admits only `NULL | 'success' | 'error'` and a stop
+/// reached neither. That is not a workaround: NULL is what the reader already renders
+/// as `idle`, the state a stopped run really ends in. It does mean the archive cannot
+/// SPELL "stopped" in the row; widening the CHECK would take a full SQLite table
+/// rebuild, which is a schema change of its own and not what this repair needed.
+///
+/// The archive and the reset share ONE transaction, so a refused archive used to take
+/// the reset down with it: the CHECK violation that blocked a stopped run also rolled
+/// back the `scrollback=''`, and the FRESH run's row started out holding the previous
+/// run's bytes. That is the second half of what review A3 measured.
 ///
 /// In one transaction it:
 ///  - copies `scrollback`→`prev_scrollback`, `last_exit_code`→`prev_exit_code`,
@@ -9232,18 +9430,45 @@ pub fn archive_and_reset_for_relaunch(conn: &mut SqliteConnection, id: &str) -> 
             return Ok(0);
         };
 
-        // Archive the current run into prev_* ONLY when it actually FINISHED
-        // (success|error). A running / idle / never-run instance has no completed run
-        // to retain, so prev_* are left untouched (the very first launch keeps them at
-        // their ''/NULL defaults). Bounded to ONE prior run: prev_* are OVERWRITTEN,
-        // never appended, so retained history can never grow without limit.
-        if inst.last_state == STATE_SUCCESS || inst.last_state == STATE_ERROR {
+        // Archive the current run into prev_* when it actually RAN. Bounded to ONE prior
+        // run: prev_* are OVERWRITTEN, never appended, so retained history can never grow
+        // without limit.
+        let finished = inst.last_state == STATE_SUCCESS || inst.last_state == STATE_ERROR;
+        if finished {
+            // A run that reached a completion outcome: its bytes AND its outcome.
             diesel::update(command_instances::table.find(id))
                 .set((
                     command_instances::prev_scrollback.eq(&inst.scrollback),
                     command_instances::prev_exit_code.eq(inst.last_exit_code),
                     command_instances::prev_ended_at.eq(inst.ended_at),
                     command_instances::prev_last_state.eq(Some(&inst.last_state)),
+                ))
+                .execute(conn)?;
+        } else if !inst.scrollback.is_empty() || inst.ended_at.is_some() {
+            // A run the user STOPPED (review A3): its row reads `idle`, so the
+            // finished-only condition above threw it away — bytes and all — and
+            // `run:"previous"` answered from never-written columns. It is a run, and its
+            // bytes are the ones worth keeping.
+            //
+            // The OUTCOME columns are cleared to NULL rather than carried: a stop is not a
+            // completion (`set_run_state`'s idle arm records no code and no `ended_at`),
+            // and leaving them would make the stopped run inherit the outcome of the run
+            // BEFORE it. NULL is also what the v5 CHECK on `prev_last_state` admits — it
+            // accepts only NULL|success|error — and it is what the reader
+            // (`mcp_runtime::get_command_output`) already renders as `idle`, which is
+            // exactly the state a stopped run ends in.
+            //
+            // The condition takes `ended_at` as well as the bytes: a run killed before it printed
+            // anything — or cleared and then killed — has an EMPTY scrollback, and on the bytes
+            // alone it was indistinguishable from an instance that never ran, so `prev_*` kept the
+            // run before it and `run:-1` answered with a stranger's outcome. `set_run_state` stamps
+            // `ended_at` when a RUNNING row goes idle, which is precisely "this one ran".
+            diesel::update(command_instances::table.find(id))
+                .set((
+                    command_instances::prev_scrollback.eq(&inst.scrollback),
+                    command_instances::prev_exit_code.eq::<Option<i32>>(None),
+                    command_instances::prev_ended_at.eq::<Option<i64>>(None),
+                    command_instances::prev_last_state.eq::<Option<String>>(None),
                 ))
                 .execute(conn)?;
         }
@@ -10167,16 +10392,50 @@ pub struct ActiveAgentSession {
 /// unique index), so the sidebar reads this once on mount and on the
 /// `agent-sessions://changed` event to know which terminal rows should swap to the
 /// agent's icon. Ordered by terminal for deterministic iteration/tests.
+///
+/// WITHIN a terminal the order is OLDEST FIRST, and that is load-bearing: the sidebar folds these
+/// rows into a `Map` keyed by terminal, where the LAST row wins. Oldest-first therefore leaves the
+/// most recently started session in the map — the same one
+/// [`active_session_for_terminal`] hands the MCP surfaces (`started_at desc`, first wins). Ordering
+/// by `agent_kind` instead, as this did, made the sidebar name one agent while `list_terminals`
+/// named another on a terminal hosting two.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn active_agent_sessions(conn: &mut SqliteConnection) -> QueryResult<Vec<ActiveAgentSession>> {
     agent_sessions::table
         .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
         .order((
             agent_sessions::terminal_id.asc(),
-            agent_sessions::agent_kind.asc(),
+            agent_sessions::started_at.asc(),
+            agent_sessions::id.asc(),
         ))
         .select((agent_sessions::terminal_id, agent_sessions::agent_kind))
         .load::<ActiveAgentSession>(conn)
+}
+
+/// Every `active` agent session across ALL terminals, as FULL rows — the read behind the MCP
+/// `list_terminals` answer's `agent_session` field.
+///
+/// The reduced [`active_agent_sessions`] above answers the sidebar's one question ("which icon"),
+/// but an agent DRIVING a session needs the identity of the session it is driving: its
+/// `external_session_id` (what a resume is built from), its `state`, its `transcript_path`. Same
+/// filter — one query for the whole list rather than one per terminal row.
+///
+/// ORDERED SO THE FIRST ROW OF EACH TERMINAL IS THE ONE [`active_session_for_terminal`] RESOLVES
+/// (#K6): the partial-unique index forbids two `active` rows per (terminal, agent_kind) but NOT two
+/// KINDS on one terminal, so "the session of this terminal" needs a tie-break and there must be
+/// exactly ONE in the crate. It is `started_at` desc (the most recently started wins), with `id`
+/// desc so two sessions started in the same millisecond still order deterministically. A caller
+/// folding this into a per-terminal map keeps the FIRST row it sees.
+pub fn active_agent_sessions_full(conn: &mut SqliteConnection) -> QueryResult<Vec<AgentSession>> {
+    agent_sessions::table
+        .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
+        .order((
+            agent_sessions::terminal_id.asc(),
+            agent_sessions::started_at.desc(),
+            agent_sessions::id.desc(),
+        ))
+        .select(AgentSession::as_select())
+        .load(conn)
 }
 
 // --- HOME read model: the four joined queries behind the synthesis pages ---------------
@@ -10583,8 +10842,23 @@ pub fn mark_session_resume_failed(conn: &mut SqliteConnection, id: &str) -> Quer
 /// a probable kill (state unconfirmed). 30 minutes is generous — a live Claude
 /// session refreshes `last_seen_at` on every SessionStart (incl. resume), so a row
 /// only goes stale when the terminal/app was killed without a clean `SessionEnd`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub const SESSION_STALE_AFTER_MS: i64 = 30 * 60 * 1000;
+
+/// Back-date a terminal's ACTIVE session `last_seen_at` by `by_ms` — the seam a test needs to put a
+/// row on the far side of [`SESSION_STALE_AFTER_MS`] without sleeping through it.
+pub fn backdate_session_last_seen(
+    conn: &mut SqliteConnection,
+    terminal_id: &str,
+    by_ms: i64,
+) -> QueryResult<usize> {
+    diesel::update(
+        agent_sessions::table
+            .filter(agent_sessions::terminal_id.eq(terminal_id))
+            .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE)),
+    )
+    .set(agent_sessions::last_seen_at.eq(now_millis() - by_ms))
+    .execute(conn)
+}
 
 /// Sweep `active` sessions whose `last_seen_at` is older than `now - threshold_ms`
 /// to `unknown` (probable kill, state unconfirmed). Idempotent: a row already
@@ -10593,12 +10867,14 @@ pub const SESSION_STALE_AFTER_MS: i64 = 30 * 60 * 1000;
 /// candidate (the resume flow reads active OR unknown); this only records the doubt.
 /// Returns the number of rows flipped.
 ///
-/// WIRING: currently has NO production caller. The v2.5.8 crash-UI revert removed the
-/// boot crash-reconcile that used to run this on each boot/scan, so nothing in prod
-/// flips a killed-then-relaunched `active` row to `unknown` today (a "crash" here is a
-/// clean shutdown). Retained as the canonical active→unknown staleness authority (hence
-/// the `#[cfg_attr(not(test), allow(dead_code))]`) and reached only by tests; re-wire it
-/// into a periodic/boot scan if that reconcile is reinstated.
+/// WIRING (#K4b): the sidecar's boot calls this, with a threshold of `-1` (= every `active` row),
+/// once it has established through the process-liveness authority that NO record hosts a live agent
+/// — see `nyx_sidecar::runtime::Runtime::sweep_sessions_without_a_live_agent`. Before that it had
+/// no production caller at all (the v2.5.8 crash-UI revert removed the boot reconcile that used to
+/// run it), so a row left `active` by a kill or by a restart with `resume_agent_sessions` OFF stayed
+/// `active` for the life of its terminal — and three MCP surfaces read that column as "this terminal
+/// hosts an agent". It remains the canonical active→unknown staleness authority: re-use it, do not
+/// grow a second one.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn sweep_stale_active_sessions(
     conn: &mut SqliteConnection,
@@ -10709,11 +10985,21 @@ pub fn specs_for_session(conn: &mut SqliteConnection, session_id: &str) -> Query
         .load(conn)
 }
 
-/// The single live (`active`) session hosted by `terminal_id`, of ANY agent kind — the
-/// GENERIC "which session is this terminal running" resolver (no provider named). At most one
-/// `active` row exists per (terminal, agent_kind); across kinds the MOST RECENTLY started wins
-/// (`started_at` desc). `None` when the terminal hosts no live session. This is the anchor of
-/// the terminal→Specs resolution and the auto-map's session lookup.
+/// The live (`active`) session hosted by `terminal_id`, of ANY agent kind — THE GENERIC "which
+/// session is this terminal running" resolver (no provider named), and the ONLY one in the crate.
+///
+/// It does not promise that a terminal hosts at most one session, because the schema does not: the
+/// partial-unique index forbids two `active` rows per (terminal, agent_kind), and two rows of
+/// DIFFERENT kinds on one terminal are legal (two tests consecrate exactly that). So this RESOLVES
+/// rather than asserts — the MOST RECENTLY started wins (`started_at` desc, `id` desc as the
+/// same-millisecond tie-break) — and every surface that asks the question goes through it: the MCP
+/// `read_terminal` / `wait_for_terminal` / `send_to_terminal` / `send_keys`, the auto-map's session
+/// lookup, the terminal→Specs overlay, and (via [`active_agent_sessions_full`]'s matching order)
+/// `list_terminals`. Three resolvers with three different tie-breaks used to answer it, so the same
+/// terminal could be reported as running two different sessions by two tools in the same breath
+/// (#K6).
+///
+/// `None` when the terminal hosts no live session.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn active_session_for_terminal(
     conn: &mut SqliteConnection,
@@ -10722,7 +11008,10 @@ pub fn active_session_for_terminal(
     agent_sessions::table
         .filter(agent_sessions::terminal_id.eq(terminal_id))
         .filter(agent_sessions::state.eq(SESSION_STATE_ACTIVE))
-        .order(agent_sessions::started_at.desc())
+        .order((
+            agent_sessions::started_at.desc(),
+            agent_sessions::id.desc(),
+        ))
         .select(AgentSession::as_select())
         .first(conn)
         .optional()
@@ -15893,9 +16182,15 @@ pub enum ConsentClose {
 /// tick decides that this answer needs a human behind it
 /// ([`crate::engine::Tree::ask_human_commitment`]); this decides whether one is.
 ///
-/// The comparison itself is unchanged: the last turn on the terminal the question was POSED to, and
-/// its IDENTITY against the one that stood at the asking. A receipt naming no terminal has no ledger
-/// to read and can be satisfied by nothing — which is why nyx refuses to open one.
+/// The comparison: the last turn on the terminal the question was POSED to, its IDENTITY against the
+/// one that stood at the asking, AND its submission time against the asking time (review A11 — the
+/// identity alone accepted a turn that predated the question). A receipt naming no terminal has no
+/// ledger to read and can be satisfied by nothing — which is why nyx refuses to open one.
+///
+/// WHAT IT PROVES, STATED PLAINLY: that a human SPOKE on the asked session after being asked, and
+/// that nobody else has spent those words. NOT that they answered the question — nyx does not read
+/// the turn's meaning, and a guard that tried would be a judge in disguise. See the comparison site
+/// for what that costs and why it is the right trade.
 pub fn close_run_consent(
     conn: &mut SqliteConnection,
     run_id: &str,
@@ -15912,10 +16207,32 @@ pub fn close_run_consent(
             Some(terminal_id) => last_human_turn(conn, terminal_id)?,
             None => None,
         };
-        // A turn nyx knows of, and NOT the one that stood when the question was posed: somebody typed
-        // in between. That is the H6 verification, and it stays exactly this — two identities.
+        // A turn nyx knows of, NOT the one that stood when the question was posed, AND submitted
+        // after the question was put. Two conditions, and the second is what review A11 added.
+        //
+        // WHAT THIS CHECKS, AND WHAT IT DOES NOT. It checks that a human SPOKE, on the session that
+        // was asked, after being asked. It does NOT check that what they said ANSWERS the question —
+        // no guard can, and one that tried would be an LLM judge in disguise, failing opaquely. The
+        // audit accepted an `abandon` backed by a turn reading "reprend"; that is the structural
+        // limit, and it is named in the prose rather than papered over.
+        //
+        // What WAS wrong is that the identity comparison alone let an ANTERIOR turn through: it
+        // answers "is this a different turn from the reference?", and the reference can be stale or
+        // absent (a receipt re-armed onto a session nyx had never seen a prompt from carries
+        // `human_turn_at_ask = None`, which any turn already on the ledger differs from). Comparing
+        // the SUBMISSION TIME to the ASKING TIME is verifiable, cheap, and says exactly the thing the
+        // guard is named for.
+        //
+        // `>=` and not `>`: both stamps come from `now_millis()`, and a turn recorded in the same
+        // millisecond as the asking is one the asking's own ledger read did not see — so it is after
+        // it. The identity check remains the tiebreaker for that millisecond.
         let turn = match last {
-            Some(turn) if Some(&turn.turn_id) != consent.human_turn_at_ask.as_ref() => turn,
+            Some(turn)
+                if Some(&turn.turn_id) != consent.human_turn_at_ask.as_ref()
+                    && turn.submitted_at >= consent.asked_at =>
+            {
+                turn
+            }
             other => return Ok(ConsentClose::NoTurnSince(other)),
         };
         // …and those words must still be UNSPENT. Read in THIS transaction and marked in it, so the
@@ -30736,6 +31053,89 @@ mod tests {
         run.id
     }
 
+    /// A11 — THE TURN MUST COME AFTER THE QUESTION, NOT MERELY DIFFER FROM A REFERENCE.
+    ///
+    /// The guard compared the last turn's IDENTITY against the one that stood at the asking. That
+    /// answers "is this a different turn from the reference?", which is not the same question as
+    /// "did a human speak since we asked?" — and when the reference is absent (a receipt opened on a
+    /// session nyx had never seen a prompt from), a prompt ALREADY sitting on the ledger differs from
+    /// it and let an anterior turn pay for the commitment.
+    ///
+    /// What is NOT attempted here, deliberately: judging whether the turn ANSWERS the question. The
+    /// audit's own case — an `abandon` backed by a turn reading "reprend" — stays acceptable, because
+    /// no guard can read intent and one that tried would fail opaquely. What the guard promises is
+    /// now what it verifies, in the code and in its prose.
+    #[test]
+    fn a_human_turn_from_before_the_question_does_not_answer_it() {
+        let mut conn = open_in_memory();
+        let terminal = "term-anterior";
+
+        // A prompt on the ledger BEFORE any question is posed, and older than the asking.
+        record_human_turn(&mut conn, terminal, Some("turn-old"), "reprend").unwrap();
+        diesel::update(human_turns::table.find(terminal))
+            .set(human_turns::submitted_at.eq(now_millis() - 60_000))
+            .execute(&mut conn)
+            .expect("age the turn");
+
+        // The question is opened with NO reference — the shape a re-armed receipt carries, and the
+        // one the identity comparison alone could not tell from a fresh turn.
+        let (project, _ws) =
+            create_project(&mut conn, "P", "/tmp/consent-anterior", None).expect("project");
+        let (spec, _rev) =
+            create_spec(&mut conn, &project.id, "S", SpecSections::empty()).expect("spec");
+        let wf =
+            create_workflow(&mut conn, None, "wf", WORKFLOW_SCOPE_CUSTOM, None).expect("workflow");
+        let ask = create_node(&mut conn, &wf.id, None, 0, NODE_TYPE_ASK_HUMAN, "ask", "{}")
+            .expect("ask_human node");
+        let run = create_workflow_run(&mut conn, &wf.id, Some(&spec.id), Some(&ask.id), "{}")
+            .expect("run");
+        open_run_consent(
+            &mut conn,
+            &run.id,
+            &ask.id,
+            "commit it?",
+            &["yes".to_string()],
+            terminal,
+            None,
+        )
+        .expect("open the consent");
+
+        // THE ANTERIOR TURN DOES NOT PAY.
+        match close_run_consent(&mut conn, &run.id, "yes").unwrap() {
+            ConsentClose::NoTurnSince(Some(turn)) => {
+                assert_eq!(
+                    turn.turn_id, "turn-old",
+                    "the refusal carries the stale turn it refused to count"
+                );
+            }
+            other => panic!("a turn from before the question paid for it: {other:?}"),
+        }
+        assert!(
+            get_workflow_run(&mut conn, &run.id)
+                .unwrap()
+                .unwrap()
+                .pending_consent
+                .is_some(),
+            "the question stays open — nothing was written"
+        );
+        assert_eq!(
+            last_human_turn(&mut conn, terminal)
+                .unwrap()
+                .unwrap()
+                .consumed_by,
+            None,
+            "…and the stale turn was not spent"
+        );
+
+        // A POSTERIOR turn does pay, exactly as before.
+        record_human_turn(&mut conn, terminal, Some("turn-new"), "abandonne").unwrap();
+        let ConsentClose::Accepted(paid) = close_run_consent(&mut conn, &run.id, "yes").unwrap()
+        else {
+            panic!("a turn taken after the question must be accepted");
+        };
+        assert_eq!(paid.turn_id, "turn-new");
+    }
+
     /// ONE HUMAN TURN AUTHORISES ONE COMMITMENT, at the level the guarantee actually lives: the turn
     /// that pays for a consent is MARKED as it pays, in the same transaction, so the next question
     /// reaching the ledger on the same turn finds it spent and is told SO — a distinct verdict, not
@@ -33607,6 +34007,52 @@ mod tests {
             .expect("get")
             .expect("some");
         assert_eq!(solo.group_id, None);
+    }
+
+    /// A9 — DELETING A MEMBER DISSOLVES THE GROUP, LIKE EVERY OTHER WAY OF LEAVING ONE.
+    ///
+    /// "At least two members, or the group does not exist" was enforced on every path that MOVES a
+    /// membership and on none that DESTROYS a member: `delete_template` took the command's row away,
+    /// `group_id` went with it, and the group row stayed behind — at one member, then at zero.
+    /// Observed live as a group named "Statique" sitting at 0 members while the rule tested green
+    /// everywhere it was armed. The rule was never wrong; this was the side door around it.
+    #[test]
+    fn deleting_a_member_dissolves_the_group_it_leaves_under_the_minimum() {
+        let mut conn = open_in_memory();
+        let (project_id, ids) = project_with_commands(&mut conn, 3);
+        let group = create_command_group(&mut conn, &project_id, &ids[0..3].to_vec())
+            .expect("a group of three");
+
+        // THREE → TWO: still a group, and the survivors keep their membership.
+        assert_eq!(delete_template(&mut conn, &ids[0]).unwrap(), 1);
+        let listed = list_command_groups(&mut conn, &project_id).expect("list");
+        assert_eq!(listed.len(), 1, "a group of two survives: {listed:?}");
+        assert_eq!(listed[0].command_ids, vec![ids[1].clone(), ids[2].clone()]);
+
+        // TWO → ONE: the group DISSOLVES, and the survivor is RELEASED, never deleted.
+        assert_eq!(delete_template(&mut conn, &ids[1]).unwrap(), 1);
+        assert!(
+            list_command_groups(&mut conn, &project_id)
+                .expect("list")
+                .is_empty(),
+            "the group is gone once a deletion leaves it with one member"
+        );
+        let survivor = get_template(&mut conn, &ids[2])
+            .expect("get")
+            .expect("the survivor is still there");
+        assert_eq!(survivor.group_id, None, "…and it is solo, not orphaned");
+        assert!(
+            get_command_group(&mut conn, &group.id).expect("get").is_none(),
+            "the group row itself is deleted"
+        );
+
+        // And the ZERO-member shape the audit found can no longer be reached: deleting the last two
+        // members of a pair leaves nothing behind at any point.
+        let (p2, ids2) = project_with_commands(&mut conn, 2);
+        create_command_group(&mut conn, &p2, &ids2.clone()).expect("a pair");
+        delete_template(&mut conn, &ids2[0]).unwrap();
+        delete_template(&mut conn, &ids2[1]).unwrap();
+        assert!(list_command_groups(&mut conn, &p2).expect("list").is_empty());
     }
 
     /// Fewer than two members is refused OUTRIGHT — including when the caller repeats the same id

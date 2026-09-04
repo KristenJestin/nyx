@@ -87,9 +87,23 @@ pub enum AgentRole {
 }
 
 impl AgentRole {
+    /// EVERY role, in the order the `role` argument advertises them. The ONE list a sweep can walk:
+    /// a role added to the enum and forgotten here is caught by the guard that replays it through
+    /// [`AgentRole::parse`], and a name the prose invents (nyx has never had a "reviewer" — the role
+    /// is `auditor`) is caught by the same guard reading the other way (task
+    /// `01M1F8X7SE5B3BQTKSXCFQGTNY`).
+    pub(crate) const ALL: [AgentRole; 6] = [
+        AgentRole::Spec,
+        AgentRole::Dev,
+        AgentRole::Coder,
+        AgentRole::Auditor,
+        AgentRole::Doc,
+        AgentRole::Prototype,
+    ];
+
     /// Parse the `role` argument. An unknown role → `None` (the caller maps it to
     /// `invalid_argument`).
-    fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         match name {
             "spec" => Some(AgentRole::Spec),
             "dev" => Some(AgentRole::Dev),
@@ -115,7 +129,7 @@ impl AgentRole {
 
     /// The lowercase role SLUG, used to name a role-scoped rule (`role:coder`) in the resolved
     /// `{{rules}}` block and its lineage note. Mirrors [`AgentRole::parse`].
-    fn slug(self) -> &'static str {
+    pub(crate) fn slug(self) -> &'static str {
         match self {
             AgentRole::Spec => "spec",
             AgentRole::Dev => "dev",
@@ -170,8 +184,9 @@ You never:
 
 - implement code;
 - transition the Spec's lifecycle (ready / start / review / done / cancel) — nyx imposes EACH
-  transition at the graph node built for it: you never call spec_transition, and never ask nyx to
-  (v2.8 review N17);
+  transition at the graph node built for it, the node the dispatcher reaches by ticking nyx_next.
+  No lifecycle verb exists on the tool surface: there is nothing to call, and you never ask nyx to
+  transition either (v2.8 review N17);
 - launch a prototype — you FLAG a graphical subject in your handback, with the design question;
   nyx asks the human and runs the prototyper itself;
 - validate in the human's place: the human validates the SPEC, you decide the TASKS;
@@ -2955,7 +2970,11 @@ pub(crate) fn resolve_workspace_for_start(
 ///
 /// Returns `Ok(None)` when none resolves — the caller renders a graceful "select a project"
 /// authoring manual, NEVER an error (that is the whole point of the /nspec project-scoping).
-fn resolve_project(db: &Db, args: &Value) -> Result<Option<db::Project>, RpcError> {
+///
+/// `pub(crate)` since v2.8: `spec_list` resolves its optional scope through the SAME anchors, so an
+/// agent that lists Specs from a workspace or a `cwd` gets the project the rest of the surface would
+/// have given it — one resolution, not a second one written beside it.
+pub(crate) fn resolve_project(db: &Db, args: &Value) -> Result<Option<db::Project>, RpcError> {
     if let Some(project_id) = optional_str(args, "project_id")? {
         let project = db
             .with_conn(|c| db::get_project(c, project_id))

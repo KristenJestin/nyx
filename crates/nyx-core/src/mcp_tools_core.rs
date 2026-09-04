@@ -57,6 +57,17 @@ pub const DEFAULT_TAIL_BYTES: usize = 12 * 1024;
 /// refused with `output_too_large` rather than served.
 pub const MAX_TAIL_BYTES: usize = 1024 * 1024;
 
+/// The pause a [`TerminalHost`] leaves BETWEEN two consecutive `send_keys` chunks.
+///
+/// Segmenting the writes is only half the fix: a `write`+`flush` pair issued immediately after
+/// another can still land in the SAME `read()` on the child side (both the Unix line discipline
+/// and ConPTY hand over whatever has accumulated), which glues `"texte"` and `"\r"` back into the
+/// one chunk Ink misreads as a paste. A short gap makes the child's read return between them.
+///
+/// Sized to be invisible to a human (a 3-element `keys` array costs ~2× this) while being an
+/// eternity for a process that is already parked in `read()`.
+pub const KEY_CHUNK_PACING: std::time::Duration = std::time::Duration::from_millis(12);
+
 /// The coarse `changed` topic a mutating tool asks the shell to broadcast so the front
 /// re-pulls (the same closed set as `nyx_core::frontier::ChangedTopic`). Mirrors the
 /// `*://changed` events the Tauri dispatcher emits after a successful mutation.
@@ -190,14 +201,31 @@ pub trait TerminalHost: Send + Sync {
     /// no live PTY (unknown/closed/not-yet-spawned), or `Err` on a real write failure.
     fn send_to_terminal(&self, terminal_id: &str, command: &str) -> Result<bool, String>;
 
-    /// Write RAW `bytes` into the terminal's live shell WITHOUT any appended newline (the
-    /// `send_keys` path). The byte sequence the caller already resolved from literal text and
-    /// named keys is delivered verbatim, so it can drive a raw-mode TUI (arrows, Esc, Ctrl+C,
-    /// typing without submitting). Returns `Ok(true)` when written, `Ok(false)` when the
-    /// terminal has no live PTY (unknown/closed/not-yet-spawned), or `Err` on a real write
-    /// failure. Same liveness contract as [`Self::send_to_terminal`]; the ONLY difference is
-    /// no forced `\r`.
-    fn send_keys(&self, terminal_id: &str, bytes: &[u8]) -> Result<bool, String>;
+    /// Write the RAW key `chunks` into the terminal's live shell WITHOUT any appended newline
+    /// (the `send_keys` path). Returns `Ok(true)` when written, `Ok(false)` when the terminal
+    /// has no live PTY (unknown/closed/not-yet-spawned), or `Err` on a real write failure. Same
+    /// liveness contract as [`Self::send_to_terminal`]; the ONLY difference is no forced `\r`.
+    ///
+    /// # Why a LIST of chunks and not one flat buffer (the submit bug)
+    ///
+    /// A raw-mode TUI does not read bytes, it reads **chunks**: Ink (Claude Code, and every
+    /// other Ink app) classifies each `data` event from stdin AS A WHOLE — a chunk that is not
+    /// exactly one known key sequence is treated as PASTED TEXT, and a `\r` at the end of it
+    /// becomes a literal newline inside the input box instead of a submit. So a single
+    /// `write_all(b"texte\r")` types the prompt and never sends it, while a `\r` arriving ALONE
+    /// (a one-byte chunk) submits immediately — measured on the 2026-09-01 pilot run, where
+    /// `send_keys(["texte","enter"])` answered `sent:true` and left the text sitting in the box.
+    ///
+    /// The FIX is therefore about GRANULARITY, not about the bytes: [`send_keys`] resolves the
+    /// `keys` array into one chunk PER ELEMENT, and a host writes each chunk with its own
+    /// `write` + `flush` so the named keys reach the application on their own. Delivery is
+    /// still verbatim and nothing is added — `enter` is still `\r` (0x0D), never `\n`.
+    ///
+    /// A host must also **space the writes out** by [`KEY_CHUNK_PACING`]: two flushes issued
+    /// back to back can still be coalesced into ONE `read()` on the child side, which would put
+    /// the flat buffer back together and re-open the very bug. The pacing is the host's job
+    /// because only the host owns the real PTY (the DB half of the tool has no I/O to pace).
+    fn send_keys(&self, terminal_id: &str, chunks: &[Vec<u8>]) -> Result<bool, String>;
 
     /// Kill the terminal's live PTY if one is registered (the SAME path as `pty_close`),
     /// and drop any parked opening command. Idempotent — a no-op when nothing is live.
@@ -250,7 +278,7 @@ impl TerminalHost for NoTerminalHost {
     fn send_to_terminal(&self, _terminal_id: &str, _command: &str) -> Result<bool, String> {
         Ok(false)
     }
-    fn send_keys(&self, _terminal_id: &str, _bytes: &[u8]) -> Result<bool, String> {
+    fn send_keys(&self, _terminal_id: &str, _chunks: &[Vec<u8>]) -> Result<bool, String> {
         Ok(false)
     }
     fn close_terminal_pty(&self, _terminal_id: &str) {}
@@ -845,20 +873,168 @@ pub fn workspace_runtime<S: RunnerSink>(
     args: &Value,
 ) -> Result<Value, RpcError> {
     let workspace_id = require_str(args, "workspace_id")?;
+    let (offset, limit) = crate::mcp_tools_spec::page_args(args)?;
     let overlay = |instance_id: &str| runner.outcome(instance_id);
     let snapshot = db
         .with_conn(|c| crate::workspace_runtime::snapshot(c, workspace_id, &overlay))
         .map_err(internal_db)?;
-    match snapshot {
-        Some(runtime) => Ok(json!({ "runtime": runtime })),
-        None => Err(RpcError::new(
+    let Some(runtime) = snapshot else {
+        return Err(RpcError::new(
             RpcCode::InvalidId,
             format!(
                 "unknown workspace {workspace_id} (use a workspace_id from \
                  list_workspaces(project_id=…))"
             ),
-        )),
+        ));
+    };
+    Ok(json!({ "runtime": runtime_for_agent(&runtime, offset, limit) }))
+}
+
+/// PROJECT the shared runtime snapshot for an AGENT — review A10.
+///
+/// The snapshot is a UI read model and the UI is right to want it whole: it renders one workspace on
+/// screen and holds the bytes anyway. An MCP caller pays for every byte of it in context, and what it
+/// was handed was the entire history inline — ~35 TERMINATED agent sessions, each terminal record's
+/// full `scrollback` (up to 256 KiB apiece), each service's `scrollback` and its retained prior run —
+/// with no bound and no way to ask for less. Measured on the audit's workspace: a single call cost
+/// more than the whole of `tools/list`.
+///
+/// This is the discipline phase 4 posed for `tools/list` and `read_terminal`, applied here:
+///
+///   * NO SCROLLBACK IS INLINED. Not a terminal's, not a service's, not a retained prior run's. Each
+///     is replaced by its BYTE LENGTH, so a caller can see there is output and knows whether it is
+///     worth a read — and the reads that serve it (`read_terminal`, `get_command_output`) are one
+///     call away, bounded, resumable, and are what phase 4 rewrote around the gesture that works.
+///   * WHAT IS LIVE COMES FIRST. Agent sessions are ordered active-first, so a default call — one
+///     page, no arguments — is about the workspace as it stands, not about its archaeology.
+///   * AN ENDED SESSION CARRIES ITS POINTER, NOT ITS PAYLOAD. `transcript_path` (phase 1) already
+///     names the file holding its full output; `metadata_json` is an adapter bag nobody reads from a
+///     runtime view, so it is dropped for a session that has ended and kept for a live one.
+///   * THE REST IS PAGED with the SAME grammar as every other paged read of this surface —
+///     [`crate::mcp_tools_spec::page_of`] itself, not a lookalike: `offset` / `limit` in,
+///     `agent_sessions_total` / `_returned` / `_next_offset` / `_truncated` out.
+fn runtime_for_agent(
+    runtime: &crate::workspace_runtime::WorkspaceRuntimeSnapshot,
+    offset: usize,
+    limit: usize,
+) -> Value {
+    let terminals: Vec<Value> = runtime
+        .terminals
+        .iter()
+        .map(|t| {
+            json!({
+                "terminal_id": t.terminal.id,
+                "label": t.terminal.label,
+                "cwd": t.terminal.cwd,
+                "status": t.terminal.status,
+                "exec_state": t.terminal.exec_state,
+                "exec_exit_code": t.terminal.exec_exit_code,
+                "exec_state_unread": t.terminal.exec_state_unread,
+                // NULL, not `false`: this snapshot carries no live overlay (only the UI bridge
+                // applies `apply_terminal_live_overlay`), so the OS busy bit is UNKNOWN here — the
+                // same `null` list_terminals reports, never a negative asserted as a fact.
+                "busy": Value::Null,
+                "detected_agent_kind": Value::Null,
+                // The BYTES, not the bytes: read_terminal(terminal_id=…) serves them bounded.
+                "scrollback_bytes": t.terminal.scrollback.len(),
+                "live_sessions": t
+                    .sessions
+                    .iter()
+                    .filter(|s| s.state == db::SESSION_STATE_ACTIVE)
+                    .count(),
+            })
+        })
+        .collect();
+    let services: Vec<Value> = runtime
+        .services
+        .iter()
+        .map(|s| {
+            json!({
+                "instance_id": s.instance.id,
+                "name": s.instance.name,
+                "command": s.instance.command,
+                "run_state": s.run_state,
+                "exit_code": s.exit_code,
+                "unread": s.unread,
+                "group_id": s.instance.group_id,
+                // Same rule as a terminal's: get_command_output(instance_id=…) serves them.
+                "scrollback_bytes": s.instance.scrollback.len(),
+            })
+        })
+        .collect();
+
+    // LIVE FIRST, then the ended ones most-recently-started first: a default page is about now.
+    let mut sessions: Vec<&db::AgentSession> = runtime.agent_sessions.iter().collect();
+    sessions.sort_by(|a, b| {
+        let live = |s: &db::AgentSession| s.state == db::SESSION_STATE_ACTIVE;
+        live(b)
+            .cmp(&live(a))
+            .then_with(|| b.started_at.cmp(&a.started_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    // Every row goes through `bounded_row`: `page_of` pages under the STRICT budget, whose "at
+    // least one item fits" guarantee — and so "the paging can never stall" — holds only when each
+    // item is itself bounded. A live session's `metadata_json` is caller-supplied text.
+    let rows: Vec<Value> = sessions
+        .iter()
+        .map(|s| {
+            let live = s.state == db::SESSION_STATE_ACTIVE;
+            crate::mcp_runtime::bounded_row(&json!({
+                "session_id": s.id,
+                "terminal_id": s.terminal_id,
+                "agent_kind": s.agent_kind,
+                "external_session_id": s.external_session_id,
+                "state": s.state,
+                "cwd": s.cwd,
+                "started_at": s.started_at,
+                "ended_at": s.ended_at,
+                "last_seen_at": s.last_seen_at,
+                // The POINTER to the full output, always — this is what phase 1 exposed it for.
+                "transcript_path": s.transcript_path,
+                // The adapter bag is carried only while the session is LIVE: on an ended one it is
+                // history nobody reads from a runtime view, and there are dozens of them.
+                "metadata_json": if live { json!(s.metadata_json) } else { Value::Null },
+            }))
+        })
+        .collect();
+
+    let head = json!({
+        "workspace": {
+            "workspace_id": runtime.workspace.id,
+            "project_id": runtime.workspace.project_id,
+            "name": runtime.workspace.name,
+            "root_path": runtime.workspace.root_path,
+            "is_root": runtime.workspace.is_root,
+        },
+        "terminals": terminals,
+        "services": services,
+        "live_agent_sessions": runtime
+            .agent_sessions
+            .iter()
+            .filter(|s| s.state == db::SESSION_STATE_ACTIVE)
+            .count(),
+    });
+    let page = crate::mcp_tools_spec::page_of(
+        "agent_sessions",
+        rows,
+        offset,
+        limit,
+        crate::mcp_runtime::json_len(&head),
+    );
+    let mut result = head;
+    if let (Some(result), Some(page)) = (result.as_object_mut(), page.as_object()) {
+        for (key, value) in page {
+            // Prefixed for the same reason `spec_get` prefixes its own: a bare `total` beside a
+            // workspace, its terminals and its services says nothing about WHAT was counted.
+            let key = if key == "agent_sessions" {
+                key.clone()
+            } else {
+                format!("agent_sessions_{key}")
+            };
+            result.insert(key, value.clone());
+        }
     }
+    result
 }
 
 /// `workspace_git` — `{ workspace_id }` → `{ git }`. The v2.2 Git CHANGES read model
@@ -1117,12 +1293,21 @@ pub fn review_task_list(db: &Db, args: &Value) -> Result<Value, RpcError> {
     let spec_id = crate::mcp_context::optional_spec_arg(db, args, "spec_id")?;
     let spec_id = spec_id.as_deref();
     let tasks: Vec<crate::db::ReviewFinding> = match spec_id {
-        Some(sid) => db
-            .with_conn(|c| crate::db::list_grilled_findings_for_spec(c, sid))
-            .map_err(internal_db)?
-            .iter()
-            .map(|t| crate::db::ReviewFinding::from_task(t, workspace_id, repository_id))
-            .collect(),
+        Some(sid) => {
+            // The Spec's plan, read ONCE for the whole list, so each finding can carry the
+            // `phase_name` its numeric rank stands for (#K13) at the cost of a single read.
+            let plan = db
+                .with_conn(|c| crate::db::get_spec(c, sid))
+                .ok()
+                .flatten()
+                .map(|s| crate::db::parse_phase_plan(&s.phases))
+                .unwrap_or_default();
+            db.with_conn(|c| crate::db::list_grilled_findings_for_spec(c, sid))
+                .map_err(internal_db)?
+                .iter()
+                .map(|t| crate::db::ReviewFinding::from_task(t, workspace_id, repository_id, &plan))
+                .collect()
+        }
         None => Vec::new(),
     };
     Ok(json!({ "tasks": tasks }))
@@ -1159,7 +1344,10 @@ pub fn review_task_structure(db: &Db, args: &Value) -> Result<ToolOutcome, RpcEr
             )
         })?;
     Ok(ToolOutcome::changed_many(
-        json!({ "task": task }),
+        // Through `task_json_with_plan`, like every other task on the wire (#K13): a raw `db::Task`
+        // carries the phase RANK and no `phase_name`, so an agent that had just written "Wiring"
+        // read `phase: 2` back and `phase_name: undefined`.
+        json!({ "task": crate::mcp_tools_spec::task_json_with_plan(db, &task) }),
         vec![ChangedTopic::Repos, ChangedTopic::Specs],
     ))
 }
@@ -1231,7 +1419,12 @@ pub fn review_submit_feedback(db: &Db, args: &Value) -> Result<ToolOutcome, RpcE
         .map_err(map_content_write_err)?;
 
     Ok(ToolOutcome::changed_many(
-        json!({ "comment": comment, "finding": finding }),
+        // The finding goes out through `task_json_with_plan` — one form of a task on the wire,
+        // `phase_name` included (#K13).
+        json!({
+            "comment": comment,
+            "finding": crate::mcp_tools_spec::task_json_with_plan(db, &finding),
+        }),
         vec![ChangedTopic::Repos, ChangedTopic::Specs],
     ))
 }
@@ -1822,6 +2015,20 @@ pub fn remove_workspace<S: RunnerSink>(
     args: &Value,
 ) -> Result<ToolOutcome, RpcError> {
     let workspace_id = require_str(args, "workspace_id")?;
+    // A12 — THE FOLDER STAYS ON DISK, AND THE ANSWER SAYS SO, BY PATH.
+    //
+    // Detaching never touches the contents: nyx does not destroy the user's work, and that is the
+    // right behaviour. It was simply IMPLICIT — the response said `removed: true` and named nothing,
+    // so an agent that detached a scratch workspace had no way to know it had left bytes behind, nor
+    // where. Observed in the audit as a `_worktrees/audit-k9-ws` cleaned up by hand.
+    //
+    // Read BEFORE the delete: after it, the row carrying `root_path` is gone. Best-effort — a
+    // workspace that does not resolve is the use case's refusal to make, not this read's.
+    let retained_path = db
+        .with_conn(|c| db::get_workspace(c, workspace_id))
+        .ok()
+        .flatten()
+        .map(|ws| ws.root_path);
     // RUNTIME kill owned by this adapter: STOP every running command instance + CLOSE every
     // interactive terminal PTY of the workspace BEFORE the delete. The runner + PTY host are
     // the live-process authorities (not the DB), unreachable from the nyx-core use case's
@@ -1867,7 +2074,14 @@ pub fn remove_workspace<S: RunnerSink>(
         crate::usecase::RemoveWorkspaceError::Db(e) => internal_db(e),
     })?;
     Ok(ToolOutcome::changed(
-        json!({ "removed": true, "removed_instances": removed_instances }),
+        json!({
+            "removed": true,
+            "removed_instances": removed_instances,
+            // A12 — WHAT WAS *NOT* REMOVED. The folder and everything in it are still there; the
+            // path is named so the caller can act on it (or tell the human to), instead of
+            // discovering it later.
+            "folder_kept": retained_path,
+        }),
         ChangedTopic::Workspaces,
     ))
 }
@@ -2924,11 +3138,30 @@ fn resolve_attach_for_new_terminal(
 }
 
 /// `send_to_terminal` — `{ terminal_id, command }` → `{ terminal_id, sent: true }`.
-/// Validates the alive record, then writes `command + "\r"` into the live shell via the
-/// shell's [`TerminalHost`]. Parity with the Tauri `send_to_terminal`.
+/// Validates the alive record, then writes `command` + a carriage return into the live shell via
+/// the shell's [`TerminalHost`]. Parity with the Tauri `send_to_terminal`.
+///
+/// # ONE write for a shell, TWO for an agent (#K4a)
+///
+/// On a terminal that hosts NO agent session the command goes out as a single write, exactly as it
+/// always has: a line-mode shell reads bytes, not chunks, and gluing the `\r` to the command is
+/// what a paste into `bash` looks like anyway.
+///
+/// On a terminal that DOES host an active agent session the same single write is the measured
+/// submit bug: an Ink TUI classifies each stdin chunk AS A WHOLE, so `"commande\r"` arriving as one
+/// chunk is read as PASTED TEXT whose trailing CR is a literal newline — the prompt is typed into
+/// the box and never sent (see [`TerminalHost::send_keys`], where the same measurement is written
+/// up for `send_keys`). This tool nevertheless ARMED the submission window on that write, so a
+/// following `wait_for_terminal` answered `resolved: true` on a turn that had not started: a
+/// prompt asleep in the input box, indistinguishable from a fast answer.
+///
+/// So an agent-hosting terminal takes the SAME segmented path `send_keys` takes — `[commande]`
+/// then `[CR]`, two writes spaced by the host's pacing. The arming condition is untouched; what
+/// changes is that the write it stands for can now actually produce the submission it claims.
 pub fn send_to_terminal(
     db: &Db,
     host: &dyn TerminalHost,
+    activity: &AgentActivityStore,
     args: &Value,
 ) -> Result<ToolOutcome, RpcError> {
     let terminal_id = require_str(args, "terminal_id")?;
@@ -2947,9 +3180,19 @@ pub fn send_to_terminal(
         Some(r) if r.status == db::STATUS_ALIVE => {}
         _ => return Err(bad_terminal_id_error(terminal_id)),
     }
-    let written = host
-        .send_to_terminal(terminal_id, command)
-        .map_err(|e| RpcError::new(RpcCode::Internal, format!("write to terminal failed: {e}")))?;
+    // WHICH WRITE SHAPE — decided BEFORE the write, from the same fact that decides the arming, so
+    // the two can never disagree: an agent-hosting terminal gets the segmented submit, a plain
+    // shell the single write it has always had.
+    let hosts_agent = hosts_active_agent_session(db, terminal_id)?;
+    let written = if hosts_agent {
+        host.send_keys(
+            terminal_id,
+            &[command.as_bytes().to_vec(), SUBMIT_CHUNK.to_vec()],
+        )
+    } else {
+        host.send_to_terminal(terminal_id, command)
+    }
+    .map_err(|e| RpcError::new(RpcCode::Internal, format!("write to terminal failed: {e}")))?;
     if !written {
         return Err(RpcError::new(
             RpcCode::InvalidState,
@@ -2959,9 +3202,41 @@ pub fn send_to_terminal(
             ),
         ));
     }
+    // A `send_to_terminal` ALWAYS submits, so on an agent-hosting terminal it is always a turn
+    // submission — arm the wait window (see `hosts_active_agent_session`).
+    if hosts_agent {
+        activity.note_prompt_submitted(terminal_id);
+    }
     Ok(ToolOutcome::read(
         json!({ "terminal_id": terminal_id, "sent": true }),
     ))
+}
+
+/// The bytes that SUBMIT a turn, written on their own. `\r` (0x0D) — the same byte `send_keys`
+/// resolves `"enter"` to, and never `\n`: what a raw-mode TUI recognises as Enter is a lone CR
+/// arriving as its own chunk.
+const SUBMIT_CHUNK: &[u8] = b"\r";
+
+/// Whether `terminal_id` hosts an ACTIVE agent session — the fact both the write shape and the
+/// submission arming hang off. Shared by `send_to_terminal` and `send_keys`.
+///
+/// # Why the session check is not optional
+///
+/// The arming window makes a subsequent `wait_for_terminal` withhold its answer
+/// ([`crate::agent_activity::AgentActivityStore::note_prompt_submitted`]). On a PLAIN terminal —
+/// a shell with no agent — there is no turn to wait for and no hook will ever come, so arming
+/// would buy nothing and cost the next waiter a full window against a state that was already
+/// final. The check keeps the reticence where it has a payer: a terminal whose activity is reported
+/// by somebody else's hooks.
+///
+/// A DB error here is surfaced rather than swallowed: it is the same connection the caller already
+/// read the terminal record on, so a failure means something the caller needs to hear about, not a
+/// missing nicety.
+fn hosts_active_agent_session(db: &Db, terminal_id: &str) -> Result<bool, RpcError> {
+    Ok(db
+        .with_conn(|c| db::active_session_for_terminal(c, terminal_id))
+        .map_err(internal_db)?
+        .is_some())
 }
 
 /// Resolve ONE `keys` array element to the control bytes it injects. An element is treated
@@ -3010,26 +3285,45 @@ fn resolve_key_element(element: &str) -> Vec<u8> {
     named.to_vec()
 }
 
-/// Resolve a `keys` array (left-to-right) into ONE raw byte sequence: each element is either
-/// LITERAL text (written verbatim) or a NAMED KEY resolved to its control bytes (see
+/// Resolve a `keys` array (left-to-right) into ONE raw byte CHUNK PER ELEMENT: each element is
+/// either LITERAL text (written verbatim) or a NAMED KEY resolved to its control bytes (see
 /// [`resolve_key_element`]). NO trailing `\r` is ever appended — the caller asks for `enter`
 /// explicitly when it wants to submit. Pure (testable) companion to [`send_keys`].
-fn resolve_keys(elements: &[String]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for element in elements {
-        out.extend_from_slice(&resolve_key_element(element));
-    }
-    out
+///
+/// # Why a Vec of chunks rather than one concatenated buffer
+///
+/// The chunk boundary IS the fix (see [`TerminalHost::send_keys`]): a raw-mode TUI classifies each
+/// stdin `data` event as a whole, so `"texte" + "\r"` delivered as ONE chunk reads as a paste whose
+/// trailing CR is a literal newline — the prompt gets typed and never submitted. Keeping one chunk
+/// per element is what lets the host write `\r` ALONE, which is what Ink recognises as Enter.
+///
+/// An EMPTY element resolves to no bytes and is dropped rather than kept as a zero-length write:
+/// a `write_all(&[])` is a no-op that would only cost the host a pacing gap.
+fn resolve_keys(elements: &[String]) -> Vec<Vec<u8>> {
+    elements
+        .iter()
+        .map(|element| resolve_key_element(element))
+        .filter(|chunk| !chunk.is_empty())
+        .collect()
 }
 
 /// `send_keys` — `{ terminal_id, keys }` (keys: an ARRAY of literal-text / named-key
-/// strings) → `{ terminal_id, sent: true, bytes }`. Validates the alive record, resolves
-/// `keys` to RAW bytes (named keys → control bytes; literal text → verbatim), then writes
-/// them into the live shell WITHOUT any appended `\r` via the shell's [`TerminalHost`]. The
-/// raw-key counterpart to `send_to_terminal` (which always appends a newline): this drives a
-/// raw-mode TUI (arrows, Esc, Ctrl+C, typing without submitting). Same liveness /
-/// `invalid_state` semantics as `send_to_terminal`.
-pub fn send_keys(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<ToolOutcome, RpcError> {
+/// strings) → `{ terminal_id, sent: true, bytes, writes }`. Validates the alive record, resolves
+/// `keys` to RAW bytes (named keys → control bytes; literal text → verbatim) as ONE CHUNK PER
+/// ELEMENT, then writes those chunks into the live shell — one PTY write each, no appended `\r` —
+/// via the shell's [`TerminalHost`]. The raw-key counterpart to `send_to_terminal` (which always
+/// appends a newline): this drives a raw-mode TUI (arrows, Esc, Ctrl+C, typing without
+/// submitting). Same liveness / `invalid_state` semantics as `send_to_terminal`.
+///
+/// `writes` reports how many PTY writes the call produced; `bytes` stays the TOTAL across them,
+/// so the answer says the thing the 2026-09-01 run could not see — that `["texte","enter"]` is
+/// two writes and not one (see [`TerminalHost::send_keys`] for why that is the whole fix).
+pub fn send_keys(
+    db: &Db,
+    host: &dyn TerminalHost,
+    activity: &AgentActivityStore,
+    args: &Value,
+) -> Result<ToolOutcome, RpcError> {
     let terminal_id = require_str(args, "terminal_id")?;
     let keys = require_str_vec(args, "keys")?;
     // Same rule as `send_to_terminal`: raw keystrokes into a Système terminal are the human's.
@@ -3044,9 +3338,10 @@ pub fn send_keys(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<ToolO
         Some(r) if r.status == db::STATUS_ALIVE => {}
         _ => return Err(bad_terminal_id_error(terminal_id)),
     }
-    let bytes = resolve_keys(&keys);
+    let chunks = resolve_keys(&keys);
+    let total_bytes: usize = chunks.iter().map(Vec::len).sum();
     let written = host
-        .send_keys(terminal_id, &bytes)
+        .send_keys(terminal_id, &chunks)
         .map_err(|e| RpcError::new(RpcCode::Internal, format!("write to terminal failed: {e}")))?;
     if !written {
         return Err(RpcError::new(
@@ -3057,17 +3352,84 @@ pub fn send_keys(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<ToolO
             ),
         ));
     }
+    // A `keys` array that carries a SUBMIT chunk (`enter`, or a literal string containing a
+    // newline) is a turn submission on an agent-hosting terminal — arm the wait window. A pure
+    // navigation/edit burst (`["up"]`, `["escape"]`, text with no `enter`) submits nothing and is
+    // deliberately NOT armed: it must not make the next `wait_for_terminal` block on a turn that
+    // was never started.
+    if chunks
+        .iter()
+        .any(|c| c.iter().any(|b| *b == b'\r' || *b == b'\n'))
+        && hosts_active_agent_session(db, terminal_id)?
+    {
+        activity.note_prompt_submitted(terminal_id);
+    }
     Ok(ToolOutcome::read(json!({
         "terminal_id": terminal_id,
         "sent": true,
-        "bytes": bytes.len(),
+        "bytes": total_bytes,
+        "writes": chunks.len(),
     })))
 }
 
+/// The AGENT half of a terminal row: the live `agent_activity` and the `agent_session` link, or
+/// two `null`s when this terminal hosts no agent session.
+///
+/// # What this fixes
+///
+/// The 2026-09-01 pilot run measured that NEITHER of the two signals `list_terminals` already
+/// carried can say whether an agent is mid-turn: on Windows `busy` is `null` for the whole
+/// session, and `exec_state` never leaves `idle` with an `exec_state_updated_at` that does not
+/// move once — because `claude` IS the foreground process from the moment it starts to the moment
+/// it exits, so the OS bit cannot separate "generating" from "sitting at its prompt" (the project's
+/// own spike, `tests/agent_activity_signal_spike.rs`, had already concluded this).
+///
+/// nyx nevertheless HOLDS the right signal: [`AgentActivityStore`], fed by the session's own hooks,
+/// is what drives the coloured dot in the UI. This surfaces the SAME value to an agent, read-only.
+///
+/// # Read, never written — the anti-phantom contract is untouched
+///
+/// The store is RUNTIME-ONLY by design (a persisted `working` would be a dot stuck forever on a
+/// session that died mid-turn), and nothing here changes that: no column, no migration, no write.
+/// A terminal the store has never heard of — including one revived from the DB at boot — reads
+/// `idle`, and the PTY-death / `SessionEnd` clear drops the entry, so the value can never outlive
+/// the process it describes.
+fn agent_fields_for(
+    activity: &AgentActivityStore,
+    session: Option<&db::AgentSession>,
+) -> (Value, Value) {
+    let Some(session) = session else {
+        // NO agent session on this terminal: both fields are explicitly null rather than absent,
+        // so a reader tells "not an agent terminal" from "an agent terminal that is idle".
+        return (Value::Null, Value::Null);
+    };
+    // A session with no store entry is `Idle` — the boot state, and the state after a clear.
+    let current = activity
+        .snapshot(&session.terminal_id)
+        .map(|s| s.activity)
+        .unwrap_or(crate::agent_activity::Activity::Idle);
+    (
+        json!(current.as_str()),
+        json!({
+            "session_id": session.id,
+            "agent_kind": session.agent_kind,
+            "external_session_id": session.external_session_id,
+            "state": session.state,
+            "transcript_path": session.transcript_path,
+        }),
+    )
+}
+
 /// `list_terminals` — `{ include_closed? }` → `{ terminals }`. Lists records + the live
-/// `live`/`busy` bits from the shell's [`TerminalHost`]. Parity with the Tauri
+/// `live`/`busy` bits from the shell's [`TerminalHost`], plus the agent half of each row
+/// (`agent_activity` / `agent_session`, see [`agent_fields_for`]). Parity with the Tauri
 /// `list_terminals`.
-pub fn list_terminals(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<Value, RpcError> {
+pub fn list_terminals(
+    db: &Db,
+    host: &dyn TerminalHost,
+    activity: &AgentActivityStore,
+    args: &Value,
+) -> Result<Value, RpcError> {
     let include_closed = optional_bool(args, "include_closed")?.unwrap_or(false);
     // The Système workspace's id, read ONCE, so the filter below is a string comparison per row
     // rather than a join per row. `None` when the scope is not bootstrapped — nothing to exclude.
@@ -3077,6 +3439,22 @@ pub fn list_terminals(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<
         })
         .map_err(internal_db)?;
     let records = db.with_conn(db::list_terminals).map_err(internal_db)?;
+    // The ACTIVE agent sessions, read ONCE for the whole list and keyed by host terminal — a
+    // per-row query would cost one round trip per terminal for a link that is a single scan.
+    //
+    // FIRST ROW PER TERMINAL WINS, and the query's order is the one
+    // [`db::active_session_for_terminal`] applies (`started_at` desc, `id` desc) — so the session
+    // this list names for a terminal is the SAME one `read_terminal` and `wait_for_terminal` name
+    // for it (#K6). Collecting into the map with `collect()` used to let the LAST row win, i.e. the
+    // highest `agent_kind`, which is a THIRD answer to a question that has one.
+    let mut sessions: std::collections::HashMap<String, db::AgentSession> =
+        std::collections::HashMap::new();
+    for session in db
+        .with_conn(db::active_agent_sessions_full)
+        .map_err(internal_db)?
+    {
+        sessions.entry(session.terminal_id.clone()).or_insert(session);
+    }
     let terminals: Vec<Value> = records
         .into_iter()
         // A SYSTÈME terminal is not offered to the agent. ERGONOMICS, not the defense: the four
@@ -3094,6 +3472,8 @@ pub fn list_terminals(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<
         .filter(|t| include_closed || t.status == db::STATUS_ALIVE)
         .map(|t| {
             let (live, busy) = host.terminal_liveness(&t.id);
+            let (agent_activity, agent_session) =
+                agent_fields_for(activity, sessions.get(t.id.as_str()));
             json!({
                 "terminal_id": t.id,
                 "cwd": t.cwd,
@@ -3105,6 +3485,8 @@ pub fn list_terminals(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<
                 "exec_state": t.exec_state,
                 "exec_exit_code": t.exec_exit_code,
                 "exec_state_updated_at": t.exec_state_updated_at,
+                "agent_activity": agent_activity,
+                "agent_session": agent_session,
             })
         })
         .collect();
@@ -3158,7 +3540,16 @@ pub fn close_terminal(
 ///
 /// `stale: false` is therefore the only reading a caller may treat as "this is what the terminal
 /// shows now"; anything else is a past snapshot, said out loud rather than passed off as current.
-pub fn read_terminal(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<Value, RpcError> {
+///
+/// When the terminal HOSTS an agent session the answer also carries `agent_activity` — so a caller
+/// that has just read the screen can tell, in the SAME round trip, whether the agent was still
+/// mid-turn while it read (see [`agent_fields_for`]). `null` on a terminal with no session.
+pub fn read_terminal(
+    db: &Db,
+    host: &dyn TerminalHost,
+    activity: &AgentActivityStore,
+    args: &Value,
+) -> Result<Value, RpcError> {
     let terminal_id = require_str(args, "terminal_id")?;
     // A Système terminal's scrollback is not an agent read: refused before the buffer is loaded.
     if let Some(refusal) = refuse_system_terminal(db, terminal_id, crate::mcp::READ_TERMINAL_TOOL) {
@@ -3181,13 +3572,20 @@ pub fn read_terminal(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<V
         }
     };
     let window = crate::mcp_runtime::bound_output(&scrollback, effective_tail, since);
+    // The FRAME reading (`strip_ansi_frame`, not `strip_ansi`): a terminal's scrollback is a
+    // re-serialized GRID, so the blanks a `\t` skipped over are part of what the screen showed
+    // (#K8).
     let output = if strip {
-        crate::ansi::strip_ansi(&window.output)
+        crate::ansi::strip_ansi_frame(&window.output)
     } else {
         window.output.clone()
     };
     let (live, _busy) = host.terminal_liveness(terminal_id);
     let stale = !live || host.scrollback_is_behind(terminal_id);
+    let session = db
+        .with_conn(|c| db::active_session_for_terminal(c, terminal_id))
+        .map_err(internal_db)?;
+    let (agent_activity, _agent_session) = agent_fields_for(activity, session.as_ref());
     Ok(json!({
         "terminal_id": terminal_id,
         "output": output,
@@ -3196,6 +3594,361 @@ pub fn read_terminal(db: &Db, host: &dyn TerminalHost, args: &Value) -> Result<V
         "truncated": window.truncated,
         "reset": window.reset,
         "cursor": window.cursor,
+        "live": live,
+        "stale": stale,
+        "agent_activity": agent_activity,
+        // The SAME honesty as wait_for_terminal: `agent_activity` above is the hooks' word, and
+        // while nyx has just written an enter no hook has confirmed, that word describes the
+        // PREVIOUS turn. A poller refused a blocking wait is sent here — it must see this bit.
+        "submission_pending": activity.submission_pending(terminal_id),
+    }))
+}
+
+/// Parse the OPTIONAL `until` argument of [`wait_for_terminal`] into the set of
+/// [`crate::agent_activity::Activity`] values that resolve the wait — the activity twin of
+/// `mcp_runtime::parse_until`, down to the alias.
+///
+/// The DEFAULT is `idle` + `waiting`, i.e. **the agent has given you the hand back**: a turn that
+/// finished normally lands on `idle`, one that stopped to ask a question or for a permission lands
+/// on `waiting`, and a caller that waited only for `idle` would sit through the whole timeout on a
+/// session that is blocked and will not move until a human answers. `"settled"` names that same
+/// pair explicitly, the way `"exited"` names success+error for a command.
+fn parse_activity_until(args: &Value) -> Result<Vec<crate::agent_activity::Activity>, RpcError> {
+    use crate::agent_activity::Activity;
+    let default = || vec![Activity::Idle, Activity::Waiting];
+    let raw = match args.get("until") {
+        None | Some(Value::Null) => return Ok(default()),
+        Some(Value::Array(items)) if items.is_empty() => return Ok(default()),
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            return Err(RpcError::new(
+                RpcCode::InvalidArgument,
+                "argument 'until' must be an array of activity strings \
+                 (idle|working|waiting|settled)",
+            ))
+        }
+    };
+    let mut states: Vec<Activity> = Vec::new();
+    let push = |s: Activity, states: &mut Vec<Activity>| {
+        if !states.contains(&s) {
+            states.push(s);
+        }
+    };
+    for item in raw {
+        let s = item.as_str().ok_or_else(|| {
+            RpcError::new(
+                RpcCode::InvalidArgument,
+                "each 'until' entry must be an activity string (idle|working|waiting|settled)",
+            )
+        })?;
+        match s.trim().to_ascii_lowercase().as_str() {
+            "idle" => push(Activity::Idle, &mut states),
+            "working" => push(Activity::Working, &mut states),
+            "waiting" => push(Activity::Waiting, &mut states),
+            "settled" => {
+                push(Activity::Idle, &mut states);
+                push(Activity::Waiting, &mut states);
+            }
+            other => {
+                return Err(RpcError::new(
+                    RpcCode::InvalidArgument,
+                    format!(
+                        "unknown 'until' activity '{other}' \
+                         (accepted: idle|working|waiting|settled)"
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(states)
+}
+
+/// The ceiling [`wait_for_terminal`] gives the persisted scrollback to catch up with a terminal
+/// whose turn has just ended (see the call site for why it has to).
+///
+/// It bounds ONE latency: the debounced SAVE of `terminals.scrollback`. The sidecar's pump saves a
+/// view-less terminal every 750 ms, and a mounted one is saved by the renderer on a debounce of
+/// the same order, so two seconds clears both with room for a loaded machine — while staying far
+/// under the shortest wait a caller would think of setting. It is a CEILING, not a delay: the loop
+/// ends the instant `scrollback_is_behind` clears, which for a terminal that has stopped printing
+/// is the first read.
+const SCROLLBACK_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_000);
+
+/// How many `wait_for_terminal` calls may BLOCK at once, process-wide (#K18).
+///
+/// The MCP surface serves requests on a fixed pool of [`crate::mcp::REQUEST_WORKERS`] threads, and
+/// a blocking wait parks one of them for up to [`crate::command::WAIT_MAX_TIMEOUT`] plus
+/// [`SCROLLBACK_SETTLE_BUDGET`]. That is fine for `wait_for_command`, whose signal comes from the
+/// in-process runner — but a terminal's activity is reported by the agent's own hooks, which reach
+/// nyx as a `POST /mcp` served by THAT SAME POOL. So a wait can only be resolved by a request that
+/// needs a worker the wait itself is holding.
+///
+/// Piloting several sessions at once — the very thing these tools exist for — reaches that in four
+/// calls: the hook POSTs queue behind the waits, each hook abandons at its own 1 s timeout with no
+/// replay, and all four waits come back `resolved: false` after a minute on turns that ended
+/// immediately. Raising [`crate::mcp::REQUEST_WORKERS`] would only move the number at which it
+/// happens; keeping one worker permanently free for short requests removes the circularity.
+///
+/// THE BUDGET COVERS EVERY LONG BLOCK ON THIS POOL, not just terminal waits. `wait_for_command`
+/// blocks the same way for the same minute, and a `nyx_next` gate runs INLINE for up to 90 s; a cap
+/// that counted only `wait_for_terminal` left the free worker to be taken by either of them, and
+/// the deadlock came back through the side door. One budget, shared.
+pub(crate) const MAX_CONCURRENT_TERMINAL_WAITS: usize = crate::mcp::REQUEST_WORKERS - 1;
+
+/// How many LONG BLOCKING CALLS are in flight RIGHT NOW, process-wide. Paired with
+/// [`TerminalWaitSlot`], which is the only thing that touches it.
+static LIVE_TERMINAL_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One of the [`MAX_CONCURRENT_TERMINAL_WAITS`] blocking slots, held for the duration of the block
+/// and released on EVERY exit path (including a panic) by its `Drop`.
+pub(crate) struct TerminalWaitSlot;
+
+impl TerminalWaitSlot {
+    /// Take a slot, or `None` when the process is already blocking on
+    /// [`MAX_CONCURRENT_TERMINAL_WAITS`] terminals. A compare-and-swap loop rather than a
+    /// fetch-add-then-check: an over-increment would be visible to a concurrent caller as a
+    /// refusal it did not earn.
+    pub(crate) fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut live = LIVE_TERMINAL_WAITS.load(Ordering::Acquire);
+        loop {
+            if live >= MAX_CONCURRENT_TERMINAL_WAITS {
+                return None;
+            }
+            match LIVE_TERMINAL_WAITS.compare_exchange_weak(
+                live,
+                live + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(actual) => live = actual,
+            }
+        }
+    }
+}
+
+impl Drop for TerminalWaitSlot {
+    fn drop(&mut self) {
+        LIVE_TERMINAL_WAITS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The refusal a caller gets instead of a slot — NAMED and actionable, which is the whole point of
+/// the cap: the alternative was a wait that looked accepted and came back `resolved: false` a
+/// minute later having observed nothing.
+pub(crate) fn too_many_terminal_waits_error() -> RpcError {
+    RpcError::new(
+        RpcCode::InvalidState,
+        format!(
+            "too many blocking calls at once (limit {MAX_CONCURRENT_TERMINAL_WAITS}): one \
+             nyx worker must stay free to receive the agent hooks that END these waits, so a \
+             {n}th concurrent block (wait_for_terminal, wait_for_command or a nyx_next gate) \
+             would only starve the others. Let one of them return first, or poll with \
+             read_terminal / get_command_output — and while a terminal's submission_pending \
+             is true, its agent_activity still describes the PREVIOUS turn: keep polling.",
+            n = MAX_CONCURRENT_TERMINAL_WAITS + 1
+        ),
+    )
+    .with_data(json!({
+        "waits_in_flight": MAX_CONCURRENT_TERMINAL_WAITS,
+        "limit": MAX_CONCURRENT_TERMINAL_WAITS,
+    }))
+}
+
+/// Block until this terminal's persisted scrollback is level with its shell again, or until
+/// [`SCROLLBACK_SETTLE_BUDGET`] runs out. Returns how long that took (zero when it was already
+/// level, which is the common case).
+///
+/// Reuses [`crate::command::WAIT_POLL_INTERVAL`] so the settle has the same resolution as the wait
+/// it extends, and returns EARLY the moment the bit clears — the budget is only spent on a
+/// terminal that keeps printing.
+fn settle_scrollback(host: &dyn TerminalHost, terminal_id: &str) -> std::time::Duration {
+    let start = std::time::Instant::now();
+    while host.scrollback_is_behind(terminal_id) {
+        if start.elapsed() >= SCROLLBACK_SETTLE_BUDGET {
+            break;
+        }
+        std::thread::sleep(crate::command::WAIT_POLL_INTERVAL);
+    }
+    start.elapsed()
+}
+
+/// `wait_for_terminal` — `{ terminal_id, until?, timeout_ms?, since?, tail_bytes?, max_bytes?,
+/// strip_ansi? }` → `{ terminal_id, resolved, agent_activity, submission_pending, agent_session,
+/// waited_ms, cursor, reset, output_tail, live, stale }`. A BOUNDED, observational long-poll on a
+/// terminal's AGENT activity — the twin of `wait_for_command`, built the same way and with the same
+/// vocabulary.
+///
+/// # `agent_activity` is the SNAPSHOT, and only the snapshot (#K3)
+///
+/// The field carries what the agent's own hooks asserted — the SAME value `list_terminals` and
+/// `read_terminal` report for that terminal, read after the wait. It never carries the submission
+/// arming window's supposition: that lives inside the poll loop, where its only power is to WITHHOLD
+/// a resolution (see [`crate::agent_activity::WaitActivity`]), and it is reported separately as
+/// `submission_pending`.
+///
+/// # The asymmetry it closes
+///
+/// A managed command had `wait_for_command`; a terminal had nothing, so an agent driving a second
+/// Claude session polled blind — one MCP round trip per attempt, over a signal that could not
+/// answer: on the 2026-09-01 run ten probes across thirty seconds showed `busy: null` and an
+/// `exec_state` frozen on `idle` the entire time the session was generating, because the agent IS
+/// the foreground process from start to exit. Worse, the fallback of grepping the screen for a
+/// sentinel matched on the FIRST read — the prompt that had just been SENT was on screen too, and
+/// nothing distinguishes it from the answer. This waits on the one signal that means what it says.
+///
+/// # Timeout is an OUTCOME, not an error
+///
+/// `resolved: false` after `timeout_ms` (default 30 s, clamped to [`crate::command::WAIT_MAX_TIMEOUT`])
+/// is a normal answer: call again to keep waiting. Nothing is consumed by a wait — it is a pure
+/// reader, so any number of callers may wait the same terminal and none of them acknowledges
+/// anything.
+///
+/// # No agent session is not an error either
+///
+/// A terminal hosting no agent session reads `Idle` forever (the store has no entry), so the
+/// default `until` resolves immediately with `agent_session: null`. That is deliberate: refusing
+/// would make the tool unusable in exactly the moment a caller cannot yet know whether a session
+/// has registered, and the null link says what happened far better than an error code.
+pub fn wait_for_terminal(
+    db: &Db,
+    host: &dyn TerminalHost,
+    activity: &AgentActivityStore,
+    args: &Value,
+) -> Result<Value, RpcError> {
+    let terminal_id = require_str(args, "terminal_id")?;
+    // Same rule as the other terminal verbs: a Système terminal is the human's.
+    if let Some(refusal) =
+        refuse_system_terminal(db, terminal_id, crate::mcp::WAIT_FOR_TERMINAL_TOOL)
+    {
+        return Err(refusal);
+    }
+    // The id must name an ALIVE record: waiting on a closed terminal can only ever time out.
+    match db
+        .with_conn(|c| db::get_terminal(c, terminal_id))
+        .map_err(internal_db)?
+    {
+        Some(r) if r.status == db::STATUS_ALIVE => {}
+        _ => return Err(bad_terminal_id_error(terminal_id)),
+    }
+
+    let until = parse_activity_until(args)?;
+    let timeout_ms = optional_usize(args, "timeout_ms")?.unwrap_or(
+        crate::mcp_runtime::DEFAULT_WAIT_TIMEOUT_MS as usize,
+    );
+    let timeout =
+        std::time::Duration::from_millis(timeout_ms as u64).min(crate::command::WAIT_MAX_TIMEOUT);
+    let (effective_tail, since_arg, strip) = parse_window_knobs(args)?;
+
+    // The scrollback as it stands RIGHT NOW, read once so a first call (no `since`) can bound its
+    // window to what appears AFTER it — the same first-call bounding `wait_for_command` applies,
+    // and the reason `output_tail` is never the whole existing buffer.
+    let scrollback_now = |db: &Db| -> Result<String, RpcError> {
+        Ok(db
+            .with_conn(|c| db::get_terminal(c, terminal_id))
+            .map_err(internal_db)?
+            .map(|r| r.scrollback)
+            .unwrap_or_default())
+    };
+    let since = match since_arg {
+        Some(s) => s,
+        None => scrollback_now(db)?.len(),
+    };
+
+    // The target set, lifted into the wait's own vocabulary: every `until` state is something the
+    // STORE must have OBSERVED. `WaitActivity::Unconfirmed` — nyx submitted and no hook has
+    // confirmed — is by construction absent from this vector, which is the whole of the #K3 fix:
+    // the arming window can WITHHOLD a resolution but can never PRODUCE one, so `until: ["working"]`
+    // waits for a hook-asserted `working` instead of resolving instantly on nyx's own guess.
+    let until: Vec<crate::agent_activity::WaitActivity> = until
+        .into_iter()
+        .map(crate::agent_activity::WaitActivity::Observed)
+        .collect();
+    // TAKE A BLOCKING SLOT (#K18) — refused, by name, rather than accepted into a pool where this
+    // wait would starve the hook that ends it. Held across the poll AND the scrollback settle (both
+    // block a worker), released by `Drop` on every exit path below.
+    let Some(_slot) = TerminalWaitSlot::acquire() else {
+        return Err(too_many_terminal_waits_error());
+    };
+
+    let outcome = crate::command::poll_until(
+        &until,
+        timeout,
+        crate::command::WAIT_POLL_INTERVAL,
+        // `wait_activity`, NOT `snapshot`: it is the one reader that honours the submission
+        // arming window, so a turn nyx just wrote an `enter` for reads `Unconfirmed` until its
+        // `UserPromptSubmit` hook lands. Without it this wait resolved on the PREVIOUS turn's
+        // `Idle` — `resolved: true`, `waited_ms: 0`, an empty `output_tail` (gate 2026-09-02).
+        || activity.wait_activity(terminal_id),
+        std::thread::sleep,
+    );
+
+    // THE TURN IS OVER — THE RECORD IS NOT YET LEVEL WITH IT. The activity signal comes from the
+    // agent's `Stop` hook; the `output_tail` below comes from `terminals.scrollback`, which a
+    // view-less terminal saves on its own debounce (750 ms in the sidecar's pump). Measured on the
+    // gate run of 2026-09-02: the wait resolved on the real end of turn, and for the next ~780 ms
+    // `read_terminal` answered `stale: true` with the answer still missing — so a caller that did
+    // the obvious thing got an EMPTY tail and had to read again. That second read is exactly the
+    // catch-up call this tool exists to remove, so the wait absorbs the lag itself.
+    //
+    // `scrollback_is_behind` is an EXACT bit, not a timestamp guess (the pump sets it on every
+    // chunk, whichever save clears it), so this loop ends as soon as the save lands — for a quiet
+    // terminal, immediately. The budget is the ceiling for the case where it never clears: a shell
+    // that never stops printing (a `tail -f`) is never level, and waiting on it forever would turn
+    // a bounded tool into an unbounded one. Past the budget the answer goes out as it is, with
+    // `stale: true` saying so.
+    //
+    // Only on a RESOLVED wait: a timeout means "call me back", and adding a settle to it would
+    // only make giving up slower.
+    let settled_for = if outcome.resolved {
+        settle_scrollback(host, terminal_id)
+    } else {
+        std::time::Duration::ZERO
+    };
+
+    // Everything below is read AFTER the wait, so the answer describes the terminal as it is when
+    // the caller gets it back — not as it was when the wait started.
+    let window =
+        crate::mcp_runtime::bound_output(&scrollback_now(db)?, effective_tail, Some(since));
+    // Same FRAME reading as `read_terminal` — this tail comes from the same scrollback (#K8).
+    let output_tail = if strip {
+        crate::ansi::strip_ansi_frame(&window.output)
+    } else {
+        window.output.clone()
+    };
+    let (live, _busy) = host.terminal_liveness(terminal_id);
+    let stale = !live || host.scrollback_is_behind(terminal_id);
+    let session = db
+        .with_conn(|c| db::active_session_for_terminal(c, terminal_id))
+        .map_err(internal_db)?;
+    let (_activity_json, agent_session) = agent_fields_for(activity, session.as_ref());
+    // THE STORE'S OWN VALUE, not the wait's internal reading (#K3). `outcome.state` carries the
+    // `Unconfirmed` sentinel and, before this fix, the window's SUPPOSED `Working` — a guess put on
+    // the wire under the same field name `list_terminals` and `read_terminal` use for the SNAPSHOT,
+    // so two tools contradicted each other on one terminal for four seconds. The wait's optimism
+    // belongs to the wait; what goes out is what the hooks asserted, read here exactly as
+    // [`agent_fields_for`] reads it.
+    let observed = activity
+        .snapshot(terminal_id)
+        .map(|s| s.activity)
+        .unwrap_or(crate::agent_activity::Activity::Idle);
+
+    Ok(json!({
+        "terminal_id": terminal_id,
+        "resolved": outcome.resolved,
+        "agent_activity": observed.as_str(),
+        // The arming mark, said OUT LOUD instead of smuggled into `agent_activity`: nyx submitted a
+        // turn into this terminal and no hook has confirmed it yet. `true` alongside a
+        // `resolved: false` is the honest reading of "the enter went in, the agent has not spoken".
+        "submission_pending": activity.submission_pending(terminal_id),
+        "agent_session": agent_session,
+        // The WHOLE call, the activity wait plus the scrollback settle — what the caller actually
+        // spent, not the part of it that was spent on the agent.
+        "waited_ms": (outcome.waited + settled_for).as_millis() as u64,
+        "cursor": window.cursor,
+        "reset": window.reset,
+        "output_tail": output_tail,
         "live": live,
         "stale": stale,
     }))
@@ -3495,11 +4248,12 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         )),
         // Interactive-terminal tools (DB-record half + the shell's TerminalHost).
         crate::mcp::CREATE_TERMINAL_TOOL => Some(create_terminal(db, host, args)),
-        crate::mcp::SEND_TO_TERMINAL_TOOL => Some(send_to_terminal(db, host, args)),
-        crate::mcp::SEND_KEYS_TOOL => Some(send_keys(db, host, args)),
-        crate::mcp::LIST_TERMINALS_TOOL => read(list_terminals(db, host, args)),
+        crate::mcp::SEND_TO_TERMINAL_TOOL => Some(send_to_terminal(db, host, activity, args)),
+        crate::mcp::SEND_KEYS_TOOL => Some(send_keys(db, host, activity, args)),
+        crate::mcp::LIST_TERMINALS_TOOL => read(list_terminals(db, host, activity, args)),
         crate::mcp::CLOSE_TERMINAL_TOOL => Some(close_terminal(db, host, args)),
-        crate::mcp::READ_TERMINAL_TOOL => read(read_terminal(db, host, args)),
+        crate::mcp::READ_TERMINAL_TOOL => read(read_terminal(db, host, activity, args)),
+        crate::mcp::WAIT_FOR_TERMINAL_TOOL => read(wait_for_terminal(db, host, activity, args)),
         // The v2.4 Phase-5 tools (routed by their own sub-dispatchers so a Spec/context tool
         // is added in exactly one place): the Spec authoring + transition tools
         // (create/update/fork/transition Spec, add/transition/depend tasks) and the
@@ -3561,7 +4315,7 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use portable_pty::PtySize;
 
@@ -3589,7 +4343,12 @@ mod tests {
         )
     }
 
-    fn db_guard() -> std::sync::MutexGuard<'static, ()> {
+    /// SERIALIZE the tests that touch process-global state: the in-memory `Db` singleton, and the
+    /// [`LIVE_TERMINAL_WAITS`] slot counter every `wait_for_terminal` competes for. `pub(crate)`
+    /// because the #K18 pool test lives with the HTTP harness in [`crate::mcp`] and must take the
+    /// SAME lock — it parks blocking waits for seconds, and any wait running beside it would be
+    /// refused a slot it had every right to.
+    pub(crate) fn db_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -3765,18 +4524,16 @@ mod tests {
         let runner = noop_runner();
         let res = workspace_runtime(&db, &runner, &json!({ "workspace_id": ws.id })).unwrap();
         let runtime = &res["runtime"];
-        assert_eq!(runtime["workspace"]["id"], json!(ws.id));
-        // Terminal + its session.
+        assert_eq!(runtime["workspace"]["workspace_id"], json!(ws.id));
+        // Terminal (A10: identified and stated, its bytes not inlined).
         let terminals = runtime["terminals"].as_array().unwrap();
         assert_eq!(terminals.len(), 1);
-        assert_eq!(terminals[0]["id"], json!(term.id));
-        assert_eq!(
-            terminals[0]["sessions"][0]["external_session_id"],
-            json!("sess-mcp")
-        );
+        assert_eq!(terminals[0]["terminal_id"], json!(term.id));
+        assert_eq!(terminals[0]["live_sessions"], json!(1));
         // Cross-terminal agent view.
         let sessions = runtime["agent_sessions"].as_array().unwrap();
         assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["external_session_id"], json!("sess-mcp"));
         // Service with its (persisted-idle) run state.
         let services = runtime["services"].as_array().unwrap();
         assert_eq!(services.len(), 1);
@@ -3786,6 +4543,260 @@ mod tests {
         // An unknown workspace id is a D8 invalid_id error (not an empty snapshot).
         let err = workspace_runtime(&db, &runner, &json!({ "workspace_id": "nope" })).unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidId);
+    }
+
+    /// A10 — THE RUNTIME VIEW IS BOUNDED ON WHAT IS LIVE, AND THE HISTORY IS PAGED.
+    ///
+    /// The shared snapshot is a UI read model, and the UI is right to want it whole. An MCP caller
+    /// pays for every byte of it in context, and what it got was the entire history inline: ~35
+    /// TERMINATED agent sessions, every terminal record's full `scrollback`, every service's too,
+    /// with no bound and no way to ask for less.
+    ///
+    /// MEASURED HERE, before and after, on the shape the audit met: 12 finished sessions over 12
+    /// terminals each holding 64 KiB of scrollback, plus a service with 64 KiB of its own. The
+    /// assertion is the ratio and the cap, not a fixed number — the point is that a naive call is
+    /// safe by construction.
+    #[test]
+    fn workspace_runtime_does_not_inline_the_history_and_pages_it() {
+        use crate::usecase::{self, test_support::RecordingEventSink, DomainEventSource};
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let sink = RecordingEventSink::new();
+        let (project, _root) = db
+            .with_conn(|c| {
+                usecase::create_project(c, &sink, "P", "/tmp/wr-big", None, DomainEventSource::Mcp)
+            })
+            .unwrap();
+        let ws = db
+            .with_conn(|c| {
+                usecase::register_workspace(
+                    c,
+                    &sink,
+                    &project.id,
+                    "wt",
+                    "/tmp/wr-big-wt",
+                    DomainEventSource::Mcp,
+                )
+            })
+            .unwrap();
+
+        // A service carrying real output.
+        db.with_conn(|c| {
+            db::create_template(
+                c,
+                &project.id,
+                "dev",
+                "npm run dev",
+                None,
+                db::CommandSource::default(),
+            )
+        })
+        .unwrap();
+        let instance = db
+            .with_conn(|c| db::instance_ids_for_workspace(c, &ws.id))
+            .unwrap()
+            .pop()
+            .expect("one instance");
+        let fat = "s".repeat(64 * 1024);
+        db.with_conn(|c| db::persist_instance_scrollback(c, &instance, &fat))
+            .unwrap();
+
+        // Twelve terminals, each with 64 KiB of scrollback and one ENDED agent session.
+        for i in 0..12 {
+            let term = db
+                .with_conn(|c| db::create_terminal(c, "/tmp/wr-big-wt", None))
+                .unwrap();
+            db.with_conn(|c| db::attach_terminal(c, &term.id, &ws.id, "auto"))
+                .unwrap();
+            db.with_conn(|c| db::persist_scrollback(c, &term.id, &fat))
+                .unwrap();
+            let session = db
+                .with_conn(|c| {
+                    db::record_session_start(
+                        c,
+                        &term.id,
+                        "claude_code",
+                        db::SessionCapture {
+                            workspace_id: Some(ws.id.clone()),
+                            external_session_id: format!("sess-{i}"),
+                            cwd: "/tmp/wr-big-wt".to_string(),
+                            transcript_path: Some(format!("/tmp/transcripts/{i}.jsonl")),
+                            metadata_json: Some("{\"noise\":\"x\"}".to_string()),
+                        },
+                    )
+                })
+                .unwrap();
+            db.with_conn(|c| db::mark_session_ended(c, &session.id))
+                .unwrap();
+        }
+
+        // BEFORE: the raw shared snapshot, the shape the tool used to echo verbatim.
+        let raw = db
+            .with_conn(|c| {
+                crate::workspace_runtime::snapshot(
+                    c,
+                    &ws.id,
+                    &crate::workspace_runtime::NoRunStateOverlay,
+                )
+            })
+            .unwrap()
+            .expect("snapshot");
+        let before = crate::mcp_runtime::json_len(&json!({ "runtime": raw }));
+
+        // AFTER: the tool's own answer, with no arguments at all.
+        let runner = noop_runner();
+        let res = workspace_runtime(&db, &runner, &json!({ "workspace_id": ws.id })).unwrap();
+        let after = crate::mcp_runtime::json_len(&res);
+
+        // CONSIGNED, the way phase 4 consigned its own: run this test with `--nocapture` to read it.
+        eprintln!("A10 workspace_runtime — before: {before} bytes, after: {after} bytes");
+        assert!(
+            before > 800_000,
+            "the raw snapshot really is the elephant this finding measured: {before} bytes"
+        );
+        assert!(
+            after < crate::mcp_runtime::MAX_RESPONSE_BYTES,
+            "a naive call fits the response budget: {after} bytes (was {before})"
+        );
+        assert!(
+            after * 20 < before,
+            "…and by a wide margin, not a haircut: {after} bytes vs {before}"
+        );
+
+        // NOT ONE BYTE OF SCROLLBACK IS INLINED — the whole payload holds no run of the filler.
+        let serialized = serde_json::to_string(&res).unwrap();
+        assert!(
+            !serialized.contains(&"s".repeat(1024)),
+            "no scrollback is carried inline"
+        );
+        let runtime = &res["runtime"];
+        assert_eq!(
+            runtime["terminals"][0]["scrollback_bytes"],
+            json!(64 * 1024),
+            "…but its SIZE is stated, so a caller knows whether a read_terminal is worth it"
+        );
+        assert_eq!(runtime["services"][0]["scrollback_bytes"], json!(64 * 1024));
+
+        // The ENDED sessions carry their POINTER, never their bag.
+        let page = runtime["agent_sessions"].as_array().unwrap();
+        assert!(!page.is_empty());
+        for s in page {
+            assert_eq!(s["state"], "ended");
+            assert!(
+                s["transcript_path"].is_string(),
+                "an ended session names the file holding its full output: {s}"
+            );
+            assert_eq!(
+                s["metadata_json"],
+                Value::Null,
+                "…and drops the adapter bag nobody reads from a runtime view: {s}"
+            );
+        }
+
+        // PAGED with the SAME grammar as the other paged reads of this surface.
+        assert_eq!(runtime["agent_sessions_total"], json!(12));
+        assert_eq!(runtime["agent_sessions_offset"], json!(0));
+        assert_eq!(runtime["live_agent_sessions"], json!(0));
+        let one = workspace_runtime(
+            &db,
+            &runner,
+            &json!({ "workspace_id": ws.id, "limit": 5 }),
+        )
+        .unwrap();
+        let one = &one["runtime"];
+        assert_eq!(one["agent_sessions"].as_array().unwrap().len(), 5);
+        assert_eq!(one["agent_sessions_returned"], json!(5));
+        assert_eq!(one["agent_sessions_truncated"], json!(true));
+        assert_eq!(one["agent_sessions_next_offset"], json!(5));
+        let two = workspace_runtime(
+            &db,
+            &runner,
+            &json!({ "workspace_id": ws.id, "limit": 5, "offset": 5 }),
+        )
+        .unwrap();
+        assert_eq!(two["runtime"]["agent_sessions_next_offset"], json!(10));
+        let three = workspace_runtime(
+            &db,
+            &runner,
+            &json!({ "workspace_id": ws.id, "limit": 5, "offset": 10 }),
+        )
+        .unwrap();
+        assert_eq!(
+            three["runtime"]["agent_sessions_next_offset"],
+            Value::Null,
+            "following next_offset terminates"
+        );
+    }
+
+    /// A10 — A LIVE SESSION COMES FIRST AND KEEPS WHAT A LIVE SESSION IS FOR.
+    #[test]
+    fn workspace_runtime_puts_the_live_sessions_first() {
+        use crate::usecase::{self, test_support::RecordingEventSink, DomainEventSource};
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let sink = RecordingEventSink::new();
+        let (project, _root) = db
+            .with_conn(|c| {
+                usecase::create_project(c, &sink, "P", "/tmp/wr-live", None, DomainEventSource::Mcp)
+            })
+            .unwrap();
+        let ws = db
+            .with_conn(|c| {
+                usecase::register_workspace(
+                    c,
+                    &sink,
+                    &project.id,
+                    "wt",
+                    "/tmp/wr-live-wt",
+                    DomainEventSource::Mcp,
+                )
+            })
+            .unwrap();
+        let start = |external: &str, end: bool| {
+            let term = db
+                .with_conn(|c| db::create_terminal(c, "/tmp/wr-live-wt", None))
+                .unwrap();
+            db.with_conn(|c| db::attach_terminal(c, &term.id, &ws.id, "auto"))
+                .unwrap();
+            let session = db
+                .with_conn(|c| {
+                    db::record_session_start(
+                        c,
+                        &term.id,
+                        "claude_code",
+                        db::SessionCapture {
+                            workspace_id: Some(ws.id.clone()),
+                            external_session_id: external.to_string(),
+                            cwd: "/tmp/wr-live-wt".to_string(),
+                            transcript_path: None,
+                            metadata_json: Some("{\"live\":true}".to_string()),
+                        },
+                    )
+                })
+                .unwrap();
+            if end {
+                db.with_conn(|c| db::mark_session_ended(c, &session.id))
+                    .unwrap();
+            }
+        };
+        // Three ended sessions opened BEFORE the live one, so ordering by time alone would bury it.
+        start("dead-1", true);
+        start("dead-2", true);
+        start("dead-3", true);
+        start("alive", false);
+
+        let res =
+            workspace_runtime(&db, &noop_runner(), &json!({ "workspace_id": ws.id })).unwrap();
+        let sessions = res["runtime"]["agent_sessions"].as_array().unwrap();
+        assert_eq!(
+            sessions[0]["external_session_id"], "alive",
+            "the LIVE session leads the page: a default read is about now, not archaeology"
+        );
+        assert_eq!(
+            sessions[0]["metadata_json"], "{\"live\":true}",
+            "…and a live session keeps its bag"
+        );
+        assert_eq!(res["runtime"]["live_agent_sessions"], json!(1));
     }
 
     /// DONE-CRITERION (task 01KWHPV33EGTB3Z41J0RQR1BAK): the MCP `workspace_git` tool
@@ -4684,6 +5695,97 @@ mod tests {
         );
     }
 
+    /// #K13 — A FINDING CARRIES ITS PHASE **NAME** ON EVERY REVIEW SURFACE.
+    ///
+    /// `task_json` is the single wire projection of a task, and what closes the rank/name ambiguity:
+    /// the column holds a RANK, the write path takes a NAME, so a task read back raw says "phase 2"
+    /// to a caller that wrote "Wiring". The three review surfaces handed back the `db::Task` (or, for
+    /// `review_task_list`, a `ReviewFinding` that copied `phase` alone) — so an agent that structured
+    /// a finding and re-read it got `phase_name: undefined`.
+    ///
+    /// This writes a phase by NAME, then walks all three surfaces and requires the SAME pair back.
+    #[test]
+    fn every_review_surface_returns_the_phase_name_the_finding_was_written_on() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+
+        // A Spec whose plan carries a NAMED phase 2 (a task written on "Wiring" makes it exist).
+        let (spec_id, ws_id) = db
+            .with_conn(|c| -> Result<(String, String), crate::db::ContentWriteError> {
+                let (project, root) = crate::db::create_project(c, "Proj", "/work", None)?;
+                let (spec, _) =
+                    crate::db::create_spec(c, &project.id, "Spec", crate::db::SpecSections::empty())?;
+                for phase in ["Socle", "Wiring"] {
+                    crate::db::create_task(
+                        c,
+                        &project.id,
+                        phase,
+                        crate::db::NewTaskInput {
+                            spec_id: Some(spec.id.clone()),
+                            phase_name: Some(phase.to_string()),
+                            ..crate::db::NewTaskInput::slice()
+                        },
+                    )?;
+                }
+                Ok((spec.id, root.id))
+            })
+            .unwrap();
+
+        // 1. `review_submit_feedback` — the finding it hands back names its phase.
+        let submitted = review_submit_feedback(
+            &db,
+            &json!({
+                "workspace_id": ws_id,
+                "repository_id": "repo",
+                "spec_id": spec_id,
+                "body": "le wiring ne branche pas le sweeper",
+                "phase": 2,
+            }),
+        )
+        .expect("submit");
+        let finding = &submitted.result["finding"];
+        assert_eq!(finding["phase"], json!(2));
+        assert_eq!(
+            finding["phase_name"],
+            json!("Wiring"),
+            "the phase the caller NAMED comes back named: {finding}"
+        );
+        let finding_id = finding["id"].as_str().expect("the finding has an id").to_string();
+
+        // 2. `review_task_structure` — the same pair after the grill's structuring step.
+        let structured = review_task_structure(
+            &db,
+            &json!({ "id": finding_id, "title": "Brancher le sweeper au boot" }),
+        )
+        .expect("structure");
+        assert_eq!(structured.result["task"]["phase"], json!(2));
+        assert_eq!(
+            structured.result["task"]["phase_name"],
+            json!("Wiring"),
+            "structuring a finding must not drop the name: {}",
+            structured.result
+        );
+
+        // 3. `review_task_list` — and the same pair on the read that lists them.
+        let listed = review_task_list(
+            &db,
+            &json!({ "workspace_id": ws_id, "repository_id": "repo", "spec_id": spec_id }),
+        )
+        .expect("list");
+        let row = listed["tasks"]
+            .as_array()
+            .expect("an array of findings")
+            .iter()
+            .find(|t| t["id"] == json!(finding_id))
+            .expect("the finding is listed");
+        assert_eq!(row["phase"], json!(2));
+        assert_eq!(
+            row["phase_name"],
+            json!("Wiring"),
+            "the list carries the name too — one form of a task on the wire: {row}"
+        );
+    }
+
     /// DONE-CRITERION (task 01KXN0HTAXXMXF3GXF4ACM2970): "Creer/editer un Spec via MCP l'ajoute
     /// au set ; une lecture ne l'ajoute pas ; N Specs travailles = set de N". The auto-map:
     /// `dispatch_extension_tool`, given the CALLER TERMINAL, attributes a spec-scoped mutation
@@ -5421,12 +6523,13 @@ mod tests {
         let _g = db_guard();
         let db = Db::in_memory();
         let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
         // Create a loose terminal.
         let created = create_terminal(&db, &host, &json!({ "label": "t1" })).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
         assert_eq!(created.effects, vec![ChangedTopic::Terminals]);
         // It lists as alive.
-        let listed = list_terminals(&db, &host, &json!({})).unwrap();
+        let listed = list_terminals(&db, &host, &activity, &json!({})).unwrap();
         let arr = listed["terminals"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["terminal_id"], json!(tid));
@@ -5436,7 +6539,7 @@ mod tests {
         assert_eq!(closed.result["closed"], json!(true));
         assert_eq!(closed.effects, vec![ChangedTopic::Terminals]);
         // Default list (alive only) is now empty.
-        let after = list_terminals(&db, &host, &json!({})).unwrap();
+        let after = list_terminals(&db, &host, &activity, &json!({})).unwrap();
         assert_eq!(after["terminals"].as_array().unwrap().len(), 0);
     }
 
@@ -5492,8 +6595,13 @@ mod tests {
         let created = create_terminal(&db, &host, &json!({})).unwrap();
         let tid = created.result["terminal_id"].as_str().unwrap().to_string();
         // The record exists (alive) but no live PTY → invalid_state, NOT method_not_found.
-        let err = send_to_terminal(&db, &host, &json!({ "terminal_id": tid, "command": "ls" }))
-            .unwrap_err();
+        let err = send_to_terminal(
+            &db,
+            &host,
+            &AgentActivityStore::new(),
+            &json!({ "terminal_id": tid, "command": "ls" }),
+        )
+        .unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidState);
     }
 
@@ -5505,6 +6613,7 @@ mod tests {
         let err = send_to_terminal(
             &db,
             &host,
+            &AgentActivityStore::new(),
             &json!({ "terminal_id": "nope", "command": "ls" }),
         )
         .unwrap_err();
@@ -5564,27 +6673,151 @@ mod tests {
     }
 
     #[test]
-    fn resolve_keys_mixed_array_concatenates_and_adds_no_forced_newline() {
-        // ["my message", "enter"] → the text bytes THEN a single \r (the explicit submit) —
-        // and NOTHING else: no second/forced \r is appended by the resolver.
-        let bytes = resolve_keys(&["my message".to_string(), "enter".to_string()]);
-        assert_eq!(bytes, b"my message\r");
+    fn resolve_keys_mixed_array_segments_and_adds_no_forced_newline() {
+        // ["my message", "enter"] → TWO chunks: the text, then a `\r` ALONE (the explicit
+        // submit) — and NOTHING else: no second/forced \r is appended by the resolver.
+        let chunks = resolve_keys(&["my message".to_string(), "enter".to_string()]);
+        assert_eq!(chunks, vec![b"my message".to_vec(), b"\r".to_vec()]);
 
-        // A bare keystroke array carries only that key's bytes (no newline).
-        assert_eq!(resolve_keys(&["up".to_string()]), b"\x1b[A");
-        assert_eq!(resolve_keys(&["ctrl+c".to_string()]), b"\x03");
+        // A bare keystroke array carries only that key's bytes (no newline), in one chunk.
+        assert_eq!(resolve_keys(&["up".to_string()]), vec![b"\x1b[A".to_vec()]);
+        assert_eq!(resolve_keys(&["ctrl+c".to_string()]), vec![b"\x03".to_vec()]);
 
         // Typing WITHOUT submitting: literal text alone never gains a trailing newline.
-        assert_eq!(resolve_keys(&["draft".to_string()]), b"draft");
+        assert_eq!(resolve_keys(&["draft".to_string()]), vec![b"draft".to_vec()]);
 
-        // A richer mix resolves left-to-right into one contiguous sequence.
-        let bytes = resolve_keys(&[
+        // A richer mix resolves left-to-right, ONE chunk per element and in order.
+        let chunks = resolve_keys(&[
             "ab".to_string(),
             "left".to_string(),
             "X".to_string(),
             "enter".to_string(),
         ]);
-        assert_eq!(bytes, b"ab\x1b[DX\r");
+        assert_eq!(
+            chunks,
+            vec![
+                b"ab".to_vec(),
+                b"\x1b[D".to_vec(),
+                b"X".to_vec(),
+                b"\r".to_vec(),
+            ]
+        );
+        // The BYTES are unchanged from the flat era — only the granularity moved.
+        assert_eq!(chunks.concat(), b"ab\x1b[DX\r");
+
+        // An EMPTY element writes nothing at all rather than costing a zero-length write.
+        assert_eq!(
+            resolve_keys(&["".to_string(), "enter".to_string()]),
+            vec![b"\r".to_vec()]
+        );
+    }
+
+    /// A [`TerminalHost`] that records the exact CHUNKS `send_keys` handed it — the shape of the
+    /// PTY traffic, which is the whole subject of the submit fix — AND, separately, the command
+    /// LINES that took the single-write [`TerminalHost::send_to_terminal`] path, so a test can tell
+    /// the two write shapes apart rather than only counting bytes.
+    #[derive(Default)]
+    struct KeyRecordingHost {
+        writes: std::sync::Mutex<Vec<Vec<u8>>>,
+        lines: std::sync::Mutex<Vec<String>>,
+    }
+    impl TerminalHost for KeyRecordingHost {
+        fn park_opening_command(&self, _: &str, _: &str) {}
+        fn open_terminal_shell(&self, _: &str, _: &str) {}
+        fn send_to_terminal(&self, _: &str, command: &str) -> Result<bool, String> {
+            self.lines.lock().unwrap().push(command.to_string());
+            Ok(true)
+        }
+        fn send_keys(&self, _: &str, chunks: &[Vec<u8>]) -> Result<bool, String> {
+            self.writes.lock().unwrap().extend(chunks.iter().cloned());
+            Ok(true)
+        }
+        fn close_terminal_pty(&self, _: &str) {}
+        fn terminal_liveness(&self, _: &str) -> (bool, Option<bool>) {
+            (true, None)
+        }
+        fn scrollback_is_behind(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// THE SUBMIT BUG (2026-09-01 pilot run) — `send_keys(["texte","enter"])` in ONE call must
+    /// produce SEVERAL PTY writes, and the `\r` must leave in a write that contains NOTHING else.
+    ///
+    /// The flat era wrote `"texte\r"` in a single `write_all`, and Ink classified that whole chunk
+    /// as a paste: the prompt was typed and the CR became a literal newline inside the input box,
+    /// while the tool answered `sent:true`. A lone `\r` (a one-byte chunk) is recognised and
+    /// submits — which is why this asserts on the SHAPE of the traffic, not on its bytes.
+    #[test]
+    fn send_keys_writes_the_text_and_the_enter_separately() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = KeyRecordingHost::default();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let out = send_keys(
+            &db,
+            &host,
+            &AgentActivityStore::new(),
+            &json!({ "terminal_id": tid, "keys": ["texte", "enter"] }),
+        )
+        .expect("a live host accepts the keys");
+
+        let writes = host.writes.lock().unwrap().clone();
+        assert!(
+            writes.len() > 1,
+            "one call must produce SEVERAL PTY writes, got {writes:?}"
+        );
+        assert_eq!(writes, vec![b"texte".to_vec(), b"\r".to_vec()]);
+        assert_eq!(
+            writes.last().unwrap(),
+            b"\r",
+            "the submit leaves ALONE — and as \\r (0x0D), never \\n"
+        );
+        // The answer says the granularity out loud, so a caller can see the fix landed.
+        assert_eq!(out.result["writes"], json!(2));
+        assert_eq!(out.result["bytes"], json!(6));
+        assert_eq!(out.result["sent"], json!(true));
+    }
+
+    /// NON-REGRESSION on the keystroke half: `ctrl+c` and the navigation keys still go out — each
+    /// as its own write, so a TUI sees them as the discrete keypresses they are rather than as one
+    /// pasted blob.
+    #[test]
+    fn send_keys_keeps_ctrl_and_navigation_keys_isolated() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = KeyRecordingHost::default();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let activity = AgentActivityStore::new();
+        send_keys(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "keys": ["ctrl+c"] }),
+        )
+        .unwrap();
+        send_keys(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "keys": ["down", "down", "enter"] }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *host.writes.lock().unwrap(),
+            vec![
+                b"\x03".to_vec(),
+                b"\x1b[B".to_vec(),
+                b"\x1b[B".to_vec(),
+                b"\r".to_vec(),
+            ],
+            "ctrl+c and each arrow keep their own write, and enter is still a lone \\r"
+        );
     }
 
     #[test]
@@ -6064,8 +7297,13 @@ mod tests {
     fn read_terminal_unknown_id_is_invalid_id() {
         let _g = db_guard();
         let db = Db::in_memory();
-        let err =
-            read_terminal(&db, &NoTerminalHost, &json!({ "terminal_id": "nope" })).unwrap_err();
+        let err = read_terminal(
+            &db,
+            &NoTerminalHost,
+            &AgentActivityStore::new(),
+            &json!({ "terminal_id": "nope" }),
+        )
+        .unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidId);
     }
 
@@ -6634,6 +7872,1054 @@ mod tests {
         assert!(
             activity.snapshot(&tid).is_none(),
             "SessionEnd clears the live dot"
+        );
+    }
+
+    /// THE BLIND-PILOT FIX (2026-09-01 pilot run, PRD annex §2 and §7) — `list_terminals` states
+    /// the agent's LIVE activity and the session it belongs to, for a terminal that hosts one.
+    ///
+    /// The run measured that the two signals the row already carried are mute here: `busy` was
+    /// `null` for the whole session and `exec_state` never left `idle` while `claude` was
+    /// answering — because the agent IS the foreground process throughout. Meanwhile nyx held the
+    /// right answer in [`AgentActivityStore`] (it drives the UI dot) and `tools/list` mentioned
+    /// `agent_activity` exactly ZERO times. This walks the whole loop: a session starts, a turn
+    /// runs, a turn ends, the session ends — and the row says so each time, without one row of
+    /// anything being persisted.
+    #[test]
+    fn list_terminals_states_the_agent_activity_and_its_session_link() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+
+        // Two terminals: one will host an agent session, the other never does.
+        let agent_tid = create_terminal(&db, &host, &json!({ "label": "probe-claude" }))
+            .unwrap()
+            .result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plain_tid = create_terminal(&db, &host, &json!({ "label": "shell" }))
+            .unwrap()
+            .result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let row_of = |listed: &Value, id: &str| -> Value {
+            listed["terminals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["terminal_id"] == json!(id))
+                .expect("the terminal is listed")
+                .clone()
+        };
+
+        // BEFORE any session: BOTH fields are explicitly null on both rows — "not an agent
+        // terminal" is said, not left to be inferred from an absent key.
+        let listed = list_terminals(&db, &host, &activity, &json!({})).unwrap();
+        for id in [&agent_tid, &plain_tid] {
+            let row = row_of(&listed, id);
+            assert_eq!(row["agent_activity"], Value::Null);
+            assert_eq!(row["agent_session"], Value::Null);
+            // …and the pre-existing shape is untouched.
+            assert_eq!(row["status"], json!("alive"));
+            assert!(row.get("busy").is_some() && row.get("exec_state").is_some());
+        }
+
+        // A session starts. The row now carries the LINK — which agent, which of its sessions —
+        // and an activity of `idle`: the store has no entry yet, and a session between turns is
+        // idle, not "unknown".
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "42d90a62-5f73-4a60-b55c-a48568b3e185",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": agent_tid,
+            }),
+        )
+        .unwrap();
+        let row = row_of(
+            &list_terminals(&db, &host, &activity, &json!({})).unwrap(),
+            &agent_tid,
+        );
+        assert_eq!(row["agent_activity"], json!("idle"));
+        assert_eq!(row["agent_session"]["agent_kind"], json!("claude_code"));
+        assert_eq!(
+            row["agent_session"]["external_session_id"],
+            json!("42d90a62-5f73-4a60-b55c-a48568b3e185")
+        );
+        assert_eq!(row["agent_session"]["state"], json!("active"));
+        assert!(row["agent_session"]["session_id"].is_string());
+
+        // A TURN RUNS — the exact window the pilot could not see. `working` here is the whole
+        // point: nothing else on the row moves.
+        session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": agent_tid }),
+        )
+        .unwrap();
+        let listed = list_terminals(&db, &host, &activity, &json!({})).unwrap();
+        assert_eq!(row_of(&listed, &agent_tid)["agent_activity"], json!("working"));
+        // The terminal with NO session is unaffected — its behaviour is exactly what it was.
+        assert_eq!(row_of(&listed, &plain_tid)["agent_activity"], Value::Null);
+        assert_eq!(row_of(&listed, &plain_tid)["agent_session"], Value::Null);
+
+        // Blocked on the human (a permission prompt) → `waiting`, distinct from `working`.
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "Notification",
+                "notification_type": "permission_prompt",
+                "NYX_TERMINAL_ID": agent_tid,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            row_of(
+                &list_terminals(&db, &host, &activity, &json!({})).unwrap(),
+                &agent_tid
+            )["agent_activity"],
+            json!("waiting")
+        );
+
+        // The turn ends → back to `idle`. This is what `wait_for_terminal` waits on.
+        session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "Stop", "NYX_TERMINAL_ID": agent_tid }),
+        )
+        .unwrap();
+        assert_eq!(
+            row_of(
+                &list_terminals(&db, &host, &activity, &json!({})).unwrap(),
+                &agent_tid
+            )["agent_activity"],
+            json!("idle")
+        );
+
+        // `read_terminal` says the same thing, so a caller that has just read the screen knows in
+        // the SAME round trip whether the agent was still mid-turn while it read.
+        let read = read_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": agent_tid }),
+        )
+        .unwrap();
+        assert_eq!(read["agent_activity"], json!("idle"));
+        let read_plain = read_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": plain_tid }),
+        )
+        .unwrap();
+        assert_eq!(read_plain["agent_activity"], Value::Null);
+
+        // NOTHING WAS PERSISTED — the anti-phantom contract holds. A brand-new store (what a
+        // restart gives you) reads the SAME terminal as `idle`, never as a stuck `working`.
+        session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": agent_tid }),
+        )
+        .unwrap();
+        let fresh = AgentActivityStore::new();
+        assert_eq!(
+            row_of(
+                &list_terminals(&db, &host, &fresh, &json!({})).unwrap(),
+                &agent_tid
+            )["agent_activity"],
+            json!("idle"),
+            "a store rebuilt at boot reads idle — no dot survives a restart"
+        );
+    }
+
+    /// THE ASYMMETRY CLOSED (PRD annex §2) — `wait_for_terminal` hands the caller back the moment
+    /// the agent's turn ends, with NO polling on the caller's side.
+    ///
+    /// The wait is armed while the agent is `working`; a background thread ends the turn ~150 ms
+    /// later; the call returns `resolved:true` having actually BLOCKED for that time. The timeout
+    /// is a full 10 s, so a return at all is the proof: nothing here polls, and nothing here spent
+    /// a round trip per attempt the way the 2026-09-01 run had to.
+    #[test]
+    fn wait_for_terminal_returns_when_the_agent_turn_ends() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = std::sync::Arc::new(AgentActivityStore::new());
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-wait",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        // A turn is running: the default `until` (idle+waiting) is NOT satisfied yet.
+        activity.apply(&tid, crate::agent_activity::ActivityEvent::PromptSubmitted);
+
+        // …and it ends while we are blocked, from another thread — the agent's `Stop` hook.
+        let ender = {
+            let activity = std::sync::Arc::clone(&activity);
+            let tid = tid.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                activity.apply(&tid, crate::agent_activity::ActivityEvent::TurnFinished);
+            })
+        };
+
+        let out = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 10_000 }),
+        )
+        .unwrap();
+        ender.join().unwrap();
+
+        assert_eq!(out["resolved"], json!(true), "the wait resolved: {out}");
+        assert_eq!(out["agent_activity"], json!("idle"));
+        assert!(
+            out["waited_ms"].as_u64().unwrap() >= 100,
+            "it really BLOCKED rather than returning on the first read: {out}"
+        );
+        // The link travels with the answer: one call says what finished, and whose turn it was.
+        assert_eq!(out["agent_session"]["external_session_id"], json!("sid-wait"));
+        assert_eq!(out["agent_session"]["state"], json!("active"));
+    }
+
+    /// THE RACE THE GATE FOUND (2026-09-02) — `send_keys([…,"enter"])` then `wait_for_terminal`,
+    /// back to back, must NOT resolve on the state that predates the submission.
+    ///
+    /// On the real run the pair came back `resolved:true`, `agent_activity:"idle"`, `waited_ms:0`
+    /// and an EMPTY `output_tail`: the write returns as soon as the bytes are in the PTY, while
+    /// Claude's `UserPromptSubmit` hook is a `node` process that still has to start and POST. In
+    /// that gap the store legitimately reads the PREVIOUS turn's `Idle`, the default `until`
+    /// matches it, and the caller is handed back "the agent is done" about a turn that had not
+    /// begun — then has to poll after all, which is the one thing this tool exists to remove.
+    ///
+    /// The submission arming window closes it: `send_keys` marks the terminal, and the wait reads
+    /// `Working` until a hook lands. Here the hook NEVER lands within the short timeout, so the
+    /// wait gives up honestly (`resolved:false`) instead of lying — and the SECOND call, after the
+    /// hook, behaves exactly as before.
+    #[test]
+    fn wait_for_terminal_does_not_resolve_on_the_state_before_the_send_keys() {
+        use crate::agent_activity::ActivityEvent;
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = KeyRecordingHost::default();
+        let activity = std::sync::Arc::new(AgentActivityStore::new());
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-race",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        // The state the 2026-09-01 run measured for thirty seconds: idle, and nothing else to read.
+        assert_eq!(
+            list_terminals(&db, &host, &activity, &json!({})).unwrap()["terminals"][0]
+                ["agent_activity"],
+            json!("idle")
+        );
+
+        // ONE send_keys — the whole prompt and its `enter` — and then straight into the wait, with
+        // NO hook in between. That is the real sequence, and the one that used to answer instantly.
+        send_keys(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "keys": ["Resume ce projet", "enter"] }),
+        )
+        .unwrap();
+        let armed = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 120 }),
+        )
+        .unwrap();
+        assert_eq!(
+            armed["resolved"],
+            json!(false),
+            "the turn we just submitted has not given the hand back: {armed}"
+        );
+        // WHAT THE ANSWER SAYS ABOUT IT (#K3). `agent_activity` is the SNAPSHOT — the same `idle`
+        // `list_terminals` reports, because no hook has said anything yet — and the reason the wait
+        // did not resolve on that `idle` is stated in its own field rather than smuggled in as a
+        // `working` nobody asserted.
+        assert_eq!(
+            armed["agent_activity"],
+            json!("idle"),
+            "the field carries what the hooks said, not what the window guessed: {armed}"
+        );
+        assert_eq!(
+            armed["agent_activity"],
+            list_terminals(&db, &host, &activity, &json!({})).unwrap()["terminals"][0]
+                ["agent_activity"],
+            "and it agrees with list_terminals on the same terminal, at the same moment"
+        );
+        assert_eq!(
+            armed["submission_pending"],
+            json!(true),
+            "the reason the wait held is named: nyx submitted, the agent has not spoken: {armed}"
+        );
+
+        // The hook lands (disarming the window), the turn runs, and the NEXT wait resolves on the
+        // REAL end of turn — the ordinary behaviour, unchanged.
+        activity.apply(&tid, ActivityEvent::PromptSubmitted);
+        let ender = {
+            let activity = std::sync::Arc::clone(&activity);
+            let tid = tid.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                activity.apply(&tid, ActivityEvent::TurnFinished);
+            })
+        };
+        let done = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 10_000 }),
+        )
+        .unwrap();
+        ender.join().unwrap();
+        assert_eq!(done["resolved"], json!(true));
+        assert_eq!(done["agent_activity"], json!("idle"));
+        assert!(
+            done["waited_ms"].as_u64().unwrap() >= 100,
+            "it blocked on the turn rather than on the window: {done}"
+        );
+    }
+
+    /// THE OTHER HALF OF THE ARMING RULE — only a SUBMIT arms it, and only on a terminal that
+    /// hosts an agent. A navigation burst (`["down"]`) types nothing to answer, and a plain shell
+    /// has nobody to answer, so in both cases the very next wait must come straight back rather
+    /// than sit through the window. Without this the fix would tax every non-prompt keystroke.
+    #[test]
+    fn send_keys_arms_the_wait_only_for_a_submit_on_an_agent_terminal() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = KeyRecordingHost::default();
+        let activity = AgentActivityStore::new();
+        let agent_tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plain_tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-arm",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": agent_tid,
+            }),
+        )
+        .unwrap();
+
+        // A navigation key on the AGENT terminal: no `\r`, nothing submitted, nothing armed.
+        send_keys(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": agent_tid, "keys": ["down"] }),
+        )
+        .unwrap();
+        let nav = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": agent_tid, "timeout_ms": 5_000 }),
+        )
+        .unwrap();
+        assert_eq!(nav["resolved"], json!(true), "nothing was submitted: {nav}");
+        assert!(
+            nav["waited_ms"].as_u64().unwrap() < 1_000,
+            "and the caller was not taxed the arming window: {nav}"
+        );
+
+        // A full submit on the PLAIN terminal: no agent session, so no turn to wait for.
+        send_keys(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": plain_tid, "keys": ["ls", "enter"] }),
+        )
+        .unwrap();
+        let plain = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": plain_tid, "timeout_ms": 5_000 }),
+        )
+        .unwrap();
+        assert_eq!(plain["resolved"], json!(true));
+        assert_eq!(plain["agent_session"], Value::Null);
+        assert!(
+            plain["waited_ms"].as_u64().unwrap() < 1_000,
+            "a shell with no agent is never armed: {plain}"
+        );
+    }
+
+    /// #K6 — ONE TERMINAL, ONE ANSWER TO "WHICH SESSION RUNS HERE".
+    ///
+    /// Three resolvers used to answer that question with three different tie-breaks:
+    /// `list_terminals` collected `active_agent_sessions_full` (ordered by `agent_kind` asc) into a
+    /// `HashMap`, where the LAST insert wins; `read_terminal` / `wait_for_terminal` /
+    /// the submission arming used `active_agent_session_of_terminal`, where the FIRST by kind wins;
+    /// and the auto-map used `active_session_for_terminal`, ordered by `started_at` desc. The
+    /// partial-unique index only forbids two `active` rows per (terminal, AGENT KIND), and two
+    /// tests consecrate two kinds coexisting on one terminal — so the disagreement is reachable,
+    /// and the surfaces would name two different sessions for the same terminal in one breath.
+    ///
+    /// There is now ONE resolver. `read_terminal` exposes no `session_id` (only the activity, which
+    /// is keyed by terminal), so what it proves here is that it resolved a session AT ALL through
+    /// that same path.
+    #[test]
+    fn every_surface_names_the_same_session_for_a_terminal_hosting_two_kinds() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = KeyRecordingHost::default();
+        let activity = AgentActivityStore::new();
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let start = |kind: &str, external: &str| {
+            db.with_conn(|c| {
+                db::record_session_start(
+                    c,
+                    &tid,
+                    kind,
+                    db::SessionCapture {
+                        external_session_id: external.to_string(),
+                        cwd: "/work".to_string(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .expect("seed session")
+        };
+        start(db::AGENT_KIND_CLAUDE_CODE, "sid-claude");
+        // Two DISTINCT `started_at` values, so "the most recently started" is unambiguous.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newest = start(db::AGENT_KIND_CODEX, "sid-codex");
+
+        let resolved = db
+            .with_conn(|c| db::active_session_for_terminal(c, &tid))
+            .unwrap()
+            .expect("the terminal hosts a live session");
+        assert_eq!(
+            resolved.id, newest.id,
+            "the single resolver takes the most recently started"
+        );
+
+        let listed = list_terminals(&db, &host, &activity, &json!({})).unwrap();
+        assert_eq!(
+            listed["terminals"][0]["agent_session"]["session_id"],
+            json!(resolved.id),
+            "list_terminals must name the SAME session as the unit verbs: {listed}"
+        );
+
+        let waited = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 50 }),
+        )
+        .unwrap();
+        assert_eq!(
+            waited["agent_session"]["session_id"],
+            json!(resolved.id),
+            "and so must wait_for_terminal: {waited}"
+        );
+
+        let read = read_terminal(&db, &host, &activity, &json!({ "terminal_id": tid })).unwrap();
+        assert_eq!(
+            read["agent_activity"],
+            json!("idle"),
+            "read_terminal resolved a session through the same path (a null would mean it found \
+             none): {read}"
+        );
+    }
+
+    /// #K3 — THE ARMING WINDOW WITHHOLDS, IT NEVER SATISFIES.
+    ///
+    /// `until: ["working"]` used to resolve INSTANTLY on a freshly armed terminal (`waited_ms` ~ 0)
+    /// because the window expressed itself by RETURNING `Working` — a supposition, handed to a
+    /// caller that had explicitly asked to wait for the real thing, under the same field name
+    /// `list_terminals` uses for the hook-asserted snapshot. Two tools, two answers, one terminal.
+    ///
+    /// Now the window answers a value no `until` set can contain, so it can only ever hold the wait
+    /// open — and the answer's `agent_activity` is the snapshot, provably the same one
+    /// `list_terminals` reports at the same moment.
+    #[test]
+    fn an_armed_submission_never_satisfies_an_explicit_until_working() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = KeyRecordingHost::default();
+        let activity = AgentActivityStore::new();
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-until-working",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+
+        send_keys(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "keys": ["un prompt", "enter"] }),
+        )
+        .unwrap();
+
+        let out = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "until": ["working"], "timeout_ms": 250 }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            out["resolved"],
+            json!(false),
+            "no hook has asserted `working`, so nothing may resolve a wait for it: {out}"
+        );
+        assert!(
+            out["waited_ms"].as_u64().unwrap() >= 200,
+            "it BLOCKED for its timeout instead of resolving on the window: {out}"
+        );
+        // The two surfaces agree, under the same field name, at the same moment.
+        let listed = list_terminals(&db, &host, &activity, &json!({})).unwrap();
+        assert_eq!(out["agent_activity"], json!("idle"));
+        assert_eq!(out["agent_activity"], listed["terminals"][0]["agent_activity"]);
+        assert_eq!(out["submission_pending"], json!(true));
+    }
+
+    /// #K4a — `send_to_terminal` SEGMENTS ITS SUBMIT ON AN AGENT TERMINAL, AND ONLY THERE.
+    ///
+    /// This tool arms the submission window unconditionally, on the grounds that it "always appends
+    /// a newline". The host wrote `commande + CR` in ONE `write_to_record` — exactly the shape this
+    /// branch measured as "types the prompt and never submits it" on an Ink TUI. So the window was
+    /// armed for a turn that had not started and `wait_for_terminal` answered `resolved: true` on a
+    /// prompt asleep in the input box.
+    ///
+    /// On an agent terminal the write now takes the same segmented path `send_keys` takes; on a
+    /// plain shell it is the single write it has always been, byte for byte.
+    #[test]
+    fn send_to_terminal_segments_the_submit_only_on_an_agent_terminal() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = KeyRecordingHost::default();
+        let activity = AgentActivityStore::new();
+        let agent_tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let plain_tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-send-to",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": agent_tid,
+            }),
+        )
+        .unwrap();
+
+        // AGENT TERMINAL — several PTY writes, and the CR leaves ALONE.
+        send_to_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": agent_tid, "command": "resume ce projet" }),
+        )
+        .unwrap();
+        let writes = host.writes.lock().unwrap().clone();
+        assert!(
+            writes.len() > 1,
+            "an agent-hosting terminal must get the segmented submit, got {writes:?}"
+        );
+        assert_eq!(writes, vec![b"resume ce projet".to_vec(), b"\r".to_vec()]);
+        assert_eq!(
+            writes.last().unwrap(),
+            b"\r",
+            "the submit leaves as a LONE carriage return — the only chunk Ink reads as Enter"
+        );
+        assert!(
+            host.lines.lock().unwrap().is_empty(),
+            "and it did NOT take the single-write shell path"
+        );
+        // Which is what makes the arming honest: this write really can submit the turn.
+        assert!(activity.submission_pending(&agent_tid));
+
+        // PLAIN SHELL — the single write, unchanged, and nothing armed.
+        host.writes.lock().unwrap().clear();
+        send_to_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": plain_tid, "command": "ls" }),
+        )
+        .unwrap();
+        assert_eq!(
+            *host.lines.lock().unwrap(),
+            vec!["ls".to_string()],
+            "a shell with no agent keeps the ONE write it has always had"
+        );
+        assert!(
+            host.writes.lock().unwrap().is_empty(),
+            "no segmentation on a line-mode shell — it reads bytes, not chunks"
+        );
+        assert!(!activity.submission_pending(&plain_tid));
+    }
+
+    /// A TIMEOUT IS AN OUTCOME, NOT AN ERROR — and a second call picks the wait back up.
+    ///
+    /// Also pins the OTHER half of the `until` default: a turn that stops to ask the human
+    /// (`waiting`) resolves the wait too. A caller that waited only for `idle` would sit through
+    /// its whole timeout on a session that is blocked and cannot move without an answer.
+    #[test]
+    fn wait_for_terminal_times_out_without_erroring_and_resumes() {
+        use crate::agent_activity::ActivityEvent;
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        activity.apply(&tid, ActivityEvent::PromptSubmitted); // working
+
+        // A short wait on a turn that does not end: `resolved:false`, NO error.
+        let timed_out = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 60 }),
+        )
+        .expect("a timeout is a normal answer, not an Err");
+        assert_eq!(timed_out["resolved"], json!(false));
+        assert_eq!(
+            timed_out["agent_activity"],
+            json!("working"),
+            "it reports the state it gave up on, not a null"
+        );
+
+        // The agent now blocks on a permission prompt. A NEW call continues the wait and
+        // resolves — `waiting` is part of "the agent gave you the hand back".
+        activity.apply(
+            &tid,
+            ActivityEvent::AttentionNeeded {
+                permission: Some("Claude needs your permission to use Bash".into()),
+            },
+        );
+        let resumed = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 60 }),
+        )
+        .unwrap();
+        assert_eq!(resumed["resolved"], json!(true));
+        assert_eq!(resumed["agent_activity"], json!("waiting"));
+
+        // `until` can name the states explicitly, including the `settled` alias…
+        let explicit = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "until": ["settled"], "timeout_ms": 0 }),
+        )
+        .unwrap();
+        assert_eq!(explicit["resolved"], json!(true));
+        // …and an unknown one is an actionable invalid_argument, never a silent default.
+        let err = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "until": ["finished"] }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("idle|working|waiting|settled"),
+            "the refusal names the vocabulary: {}",
+            err.message
+        );
+    }
+
+    /// THE CURSOR CHAINS — `wait_for_terminal`'s `cursor` goes straight into
+    /// `read_terminal(since=…)` with no gap and no duplication, exactly as `wait_for_command`'s
+    /// does into `get_command_output`.
+    ///
+    /// It also pins the FIRST-CALL BOUNDING: with no `since`, the window starts at the current end
+    /// of the buffer, so `output_tail` carries what appeared AFTER the call and never the whole
+    /// existing scrollback (the thing that made every "incremental" read of the pilot run return
+    /// the entire history).
+    #[test]
+    fn wait_for_terminal_cursor_chains_into_read_terminal() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // What the terminal had shown BEFORE the wait — the prompt we sent, among other things.
+        db.with_conn(|c| db::persist_scrollback(c, &tid, "OLD-HISTORY\n"))
+            .unwrap();
+
+        // No agent session and no activity ⇒ idle ⇒ the default wait resolves at once. The point
+        // here is the WINDOW, so a zero-length wait is what we want.
+        let waited = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 0 }),
+        )
+        .unwrap();
+        assert_eq!(waited["resolved"], json!(true));
+        assert_eq!(
+            waited["output_tail"], json!(""),
+            "a first call returns what came AFTER it, not the existing scrollback: {waited}"
+        );
+        let cursor = waited["cursor"].as_u64().unwrap();
+        assert_eq!(cursor, "OLD-HISTORY\n".len() as u64);
+
+        // The answer lands.
+        db.with_conn(|c| db::persist_scrollback(c, &tid, "OLD-HISTORY\nANSWER-ONE\n"))
+            .unwrap();
+
+        // The cursor chains into read_terminal: exactly the new bytes, once.
+        let read = read_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "since": cursor }),
+        )
+        .unwrap();
+        assert_eq!(read["output"], json!("ANSWER-ONE\n"));
+        assert_eq!(read["reset"], json!(false));
+        let next = read["cursor"].as_u64().unwrap();
+
+        // …and chains ONWARD through a second wait, still with no gap and no duplicate.
+        db.with_conn(|c| db::persist_scrollback(c, &tid, "OLD-HISTORY\nANSWER-ONE\nANSWER-TWO\n"))
+            .unwrap();
+        let again = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "since": next, "timeout_ms": 0 }),
+        )
+        .unwrap();
+        assert_eq!(again["output_tail"], json!("ANSWER-TWO\n"));
+        assert_eq!(again["reset"], json!(false));
+    }
+
+    /// THE SECOND HALF OF THE SAME GATE FINDING (2026-09-02) — resolving on the end of the turn is
+    /// not enough if the ANSWER has not been saved yet.
+    ///
+    /// The activity comes from the agent's `Stop` hook; `output_tail` comes from
+    /// `terminals.scrollback`, which the sidecar saves on a 750 ms debounce. Measured on the real
+    /// run: the wait returned on the true end of turn, and for the next ~780 ms `read_terminal`
+    /// answered `stale: true` with an EMPTY delta — so the caller read again, which is the
+    /// catch-up call this tool exists to remove. The wait now absorbs that lag itself.
+    ///
+    /// The host here says "behind" until a background thread saves the answer, exactly as the pump
+    /// does; the assertion is that the ANSWER is in the tool's own reply, with no second read.
+    #[test]
+    fn wait_for_terminal_waits_for_the_answer_to_be_saved_before_returning_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        /// A host whose scrollback is behind until `saved` flips — the pump's exact bit.
+        struct LaggingHost {
+            saved: std::sync::Arc<AtomicBool>,
+        }
+        impl TerminalHost for LaggingHost {
+            fn park_opening_command(&self, _: &str, _: &str) {}
+            fn open_terminal_shell(&self, _: &str, _: &str) {}
+            fn send_to_terminal(&self, _: &str, _: &str) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn send_keys(&self, _: &str, _: &[Vec<u8>]) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn close_terminal_pty(&self, _: &str) {}
+            fn terminal_liveness(&self, _: &str) -> (bool, Option<bool>) {
+                (true, None)
+            }
+            fn scrollback_is_behind(&self, _: &str) -> bool {
+                !self.saved.load(Ordering::SeqCst)
+            }
+        }
+
+        let _g = db_guard();
+        let db = std::sync::Arc::new(Db::in_memory());
+        let saved = std::sync::Arc::new(AtomicBool::new(false));
+        let host = LaggingHost {
+            saved: std::sync::Arc::clone(&saved),
+        };
+        let activity = AgentActivityStore::new();
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        db.with_conn(|c| db::persist_scrollback(c, &tid, "PROMPT\n"))
+            .unwrap();
+
+        // The debounced save lands a moment after the turn ended.
+        let saver = {
+            let db = std::sync::Arc::clone(&db);
+            let saved = std::sync::Arc::clone(&saved);
+            let tid = tid.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                db.with_conn(|c| db::persist_scrollback(c, &tid, "PROMPT\nLA REPONSE\n"))
+                    .unwrap();
+                saved.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // The turn is already over for the ACTIVITY (no session ⇒ idle), so without the settle this
+        // would return instantly with an empty tail — which is precisely what the run measured.
+        let out = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "since": "PROMPT\n".len(), "timeout_ms": 0 }),
+        )
+        .unwrap();
+        saver.join().unwrap();
+
+        assert_eq!(out["resolved"], json!(true));
+        assert_eq!(
+            out["output_tail"],
+            json!("LA REPONSE\n"),
+            "the answer travels with the wait — no second read: {out}"
+        );
+        assert_eq!(
+            out["stale"],
+            json!(false),
+            "and it is not handed back as a snapshot known to be behind: {out}"
+        );
+        assert!(
+            out["waited_ms"].as_u64().unwrap() >= 150,
+            "waited_ms covers the whole call, settle included: {out}"
+        );
+    }
+
+    /// The settle is a CEILING, not a delay: a terminal that never stops printing is never level,
+    /// and the wait must still come back. It returns past [`SCROLLBACK_SETTLE_BUDGET`] saying
+    /// `stale: true` rather than blocking on a bit that will never clear.
+    #[test]
+    fn a_terminal_that_never_settles_still_returns_and_says_it_is_stale() {
+        struct AlwaysBehindHost;
+        impl TerminalHost for AlwaysBehindHost {
+            fn park_opening_command(&self, _: &str, _: &str) {}
+            fn open_terminal_shell(&self, _: &str, _: &str) {}
+            fn send_to_terminal(&self, _: &str, _: &str) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn send_keys(&self, _: &str, _: &[Vec<u8>]) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn close_terminal_pty(&self, _: &str) {}
+            fn terminal_liveness(&self, _: &str) -> (bool, Option<bool>) {
+                (true, None)
+            }
+            fn scrollback_is_behind(&self, _: &str) -> bool {
+                true
+            }
+        }
+
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = AlwaysBehindHost;
+        let activity = AgentActivityStore::new();
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let started = std::time::Instant::now();
+        let out = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 0 }),
+        )
+        .unwrap();
+        let spent = started.elapsed();
+
+        assert_eq!(out["resolved"], json!(true));
+        assert_eq!(out["stale"], json!(true), "it says what it handed back: {out}");
+        assert!(
+            spent >= SCROLLBACK_SETTLE_BUDGET,
+            "it did give the save its budget: {spent:?}"
+        );
+        assert!(
+            spent < SCROLLBACK_SETTLE_BUDGET * 3,
+            "…and stopped there rather than blocking on a bit that never clears: {spent:?}"
+        );
+    }
+
+    /// A TERMINAL WITH NO AGENT SESSION stays usable — the tool answers `agent_session: null` and
+    /// an `idle` activity instead of refusing, so a caller that cannot yet know whether a session
+    /// registered gets a fact rather than an error code. An UNKNOWN id, on the other hand, is the
+    /// same actionable `invalid_id` the other terminal verbs give.
+    #[test]
+    fn wait_for_terminal_on_a_plain_terminal_is_usable_and_on_an_unknown_id_is_actionable() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let out = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": tid, "timeout_ms": 0 }),
+        )
+        .expect("a terminal without an agent session is not an error");
+        assert_eq!(out["resolved"], json!(true));
+        assert_eq!(out["agent_activity"], json!("idle"));
+        assert_eq!(out["agent_session"], Value::Null);
+
+        let err = wait_for_terminal(
+            &db,
+            &host,
+            &activity,
+            &json!({ "terminal_id": "nope", "timeout_ms": 0 }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidId);
+    }
+
+    /// NO PHANTOM AFTER THE FACT — the activity falls back to `idle` the moment the PTY dies or
+    /// the session ends, whichever comes first. Both are the SAME clear, and both are asserted
+    /// THROUGH `list_terminals` (the surface an agent reads), not on the store alone.
+    #[test]
+    fn list_terminals_activity_falls_back_to_idle_on_pty_death_and_session_end() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let tid = create_terminal(&db, &host, &json!({})).unwrap().result["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let activity_of = |store: &AgentActivityStore| -> Value {
+            list_terminals(&db, &host, store, &json!({})).unwrap()["terminals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["terminal_id"] == json!(tid))
+                .unwrap()["agent_activity"]
+                .clone()
+        };
+
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "sid-phantom",
+                "cwd": "/work",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        assert_eq!(activity_of(&activity), json!("working"));
+
+        // PTY DEATH — the host's anti-phantom clear (the same call the shell makes when a shell
+        // exits or a terminal closes). No `Stop` ever arrived, and yet nothing stays `working`.
+        activity.clear(&tid);
+        assert_eq!(
+            activity_of(&activity),
+            json!("idle"),
+            "a killed agent that never sent Stop leaves no working dot behind"
+        );
+
+        // SESSION END — the same fallback, through the hook this time. The session row flips to
+        // `ended`, so the LINK goes away with it and the row is a plain terminal again.
+        session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "UserPromptSubmit", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        assert_eq!(activity_of(&activity), json!("working"));
+        session_event(
+            &db,
+            &activity,
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "sid-phantom",
+                "reason": "logout",
+                "NYX_TERMINAL_ID": tid,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            activity_of(&activity),
+            Value::Null,
+            "an ended session is no longer an agent terminal at all"
         );
     }
 
@@ -7925,7 +10211,7 @@ mod tests {
         fn send_to_terminal(&self, _: &str, _: &str) -> Result<bool, String> {
             Ok(false)
         }
-        fn send_keys(&self, _: &str, _: &[u8]) -> Result<bool, String> {
+        fn send_keys(&self, _: &str, _: &[Vec<u8>]) -> Result<bool, String> {
             Ok(false)
         }
         fn close_terminal_pty(&self, terminal_id: &str) {
@@ -8031,6 +10317,56 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the workspace's terminal row was deleted (not detached into the loose bucket)"
+        );
+    }
+
+    /// A12 — THE ANSWER NAMES THE FOLDER IT DID NOT DELETE.
+    ///
+    /// Detaching leaves the directory and everything in it exactly where they are, which is right —
+    /// nyx does not destroy the user's work — but it was IMPLICIT: the reply said `removed: true`
+    /// and named nothing, so an agent that detached a scratch workspace had no way to know it had
+    /// left bytes behind, nor where. The audit found `_worktrees/audit-k9-ws` by hand.
+    #[test]
+    fn remove_workspace_names_the_folder_it_leaves_on_disk() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, _root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/rmw-path", None))
+            .unwrap();
+        let ws = db
+            .with_conn(|c| db::create_workspace(c, &project.id, "scratch", "/tmp/rmw-path-scratch"))
+            .unwrap();
+
+        let host = NoTerminalHost;
+        let outcome = remove_workspace(
+            &db,
+            &noop_runner(),
+            &host,
+            &json!({ "workspace_id": ws.id }),
+        )
+        .expect("remove");
+
+        assert_eq!(outcome.result["removed"], json!(true));
+        // Compared against the STORED `root_path` (nyx normalizes separators per platform), so the
+        // assertion is "the reply names the folder", not "the reply spells it the way I typed it".
+        assert_eq!(
+            outcome.result["folder_kept"], ws.root_path,
+            "the reply names the path that is STILL THERE: {}",
+            outcome.result
+        );
+        // …and the tool's own description says so, so a caller knows before it calls.
+        let listed = crate::mcp::tool_descriptors();
+        let described = listed
+            .iter()
+            .find(|t| t["name"] == crate::mcp::REMOVE_WORKSPACE_TOOL)
+            .expect("remove_workspace is advertised")["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            described.contains("FOLDER ON DISK IS NOT DELETED")
+                && described.contains("folder_kept"),
+            "the description states that the folder survives, and names the field: {described}"
         );
     }
 

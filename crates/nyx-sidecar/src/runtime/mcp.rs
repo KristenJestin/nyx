@@ -100,13 +100,32 @@ impl TerminalHost for SidecarTerminalHost {
         Ok(self.pty.write_to_record(terminal_id, &bytes))
     }
 
-    fn send_keys(&self, terminal_id: &str, bytes: &[u8]) -> Result<bool, String> {
-        // SAME liveness gate; the payload is the RAW pre-resolved bytes (NO appended
-        // newline) the v1 host wrote verbatim.
+    fn send_keys(&self, terminal_id: &str, chunks: &[Vec<u8>]) -> Result<bool, String> {
+        // SAME liveness gate; the payload is the RAW pre-resolved bytes (NO appended newline)
+        // the v1 host wrote verbatim.
         if !self.is_live(terminal_id) {
             return Ok(false);
         }
-        Ok(self.pty.write_to_record(terminal_id, bytes))
+        // ONE PTY WRITE PER CHUNK, spaced by `KEY_CHUNK_PACING` — the whole point of the fix
+        // (see `TerminalHost::send_keys`): a raw-mode TUI classifies each stdin chunk as a
+        // whole, so `enter` must arrive as a lone `\r` rather than glued to the text before it.
+        // `write_to_record` already does `write_all` + `flush` per call, so the segmentation is
+        // exactly the loop; the pause is what stops the child's next `read()` from re-gluing
+        // two flushes that landed in the same buffer.
+        let mut all_written = true;
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i > 0 {
+                std::thread::sleep(mcp_tools_core::KEY_CHUNK_PACING);
+            }
+            if !self.pty.write_to_record(terminal_id, chunk) {
+                // The PTY went away mid-sequence (it was live at the gate). Stop rather than
+                // keep hammering a dead record, and report the failure as the caller's
+                // `invalid_state` — the same answer it would have got one call earlier.
+                all_written = false;
+                break;
+            }
+        }
+        Ok(all_written)
     }
 
     fn close_terminal_pty(&self, terminal_id: &str) {
