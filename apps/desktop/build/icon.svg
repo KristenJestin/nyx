@@ -1,0 +1,9 @@
+<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+  <!-- The nyx mark at rest (nyx-site `the-mark`, state `idle`): chevron eyes at (9,14) and (23,14), line mouth at (16,22). -->
+  <rect width="32" height="32" rx="7" fill="#1f1c22"/>
+  <g stroke="#e879d8" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M4.4 10.4 L9 14.8 L13.6 10.4" stroke-width="2.9"/>
+    <path d="M18.4 10.4 L23 14.8 L27.6 10.4" stroke-width="2.9"/>
+    <path d="M13 22 L16 22 L19 22" stroke-width="2.4"/>
+  </g>
+</svg>

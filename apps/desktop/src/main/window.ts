@@ -19,6 +19,7 @@
  * OS gives an undecorated window no controls at all, so it is the only thing standing
  * between the user and a window they cannot move or close.
  */
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { BrowserWindow, shell, type App } from "electron";
 
@@ -52,7 +53,12 @@ export function confirmWindowClose(win: BrowserWindow): void {
  * @param app the Electron `app` singleton (for `isPackaged` / resource resolution).
  */
 export function createMainWindow(app: App): BrowserWindow {
+  // The nyx face, staged by `scripts/copy-resources.cjs` from `build/icon.png`. Linux X11 and
+  // Windows read the window icon from here (Wayland takes it from the `.desktop` entry, macOS
+  // from the bundle). Optional so a dev tree without the staged resources still opens.
+  const icon = join(__dirname, "..", "resources", "icon.png");
   const win = new BrowserWindow({
+    ...(existsSync(icon) ? { icon } : {}),
     // Mirror the Tauri window: nyx-v2, 800×600, frameless. The title is the v2-distinct
     // identity so the window is never confused with a running v1 `nyx`.
     title: "nyx-v2",

@@ -62,3 +62,14 @@ fs.rmSync(dest, { recursive: true, force: true });
 fs.mkdirSync(path.dirname(dest), { recursive: true });
 fs.cpSync(src, dest, { recursive: true });
 console.log(`[copy-resources] staged ${src} -> ${dest}`);
+
+// The app icon (the nyx face from nyx-site, `build/icon.png`). electron-builder reads it
+// from `build/` for the installers, but the RUNNING window needs it too (Linux X11 taskbar,
+// Windows title bar/taskbar): `main/window.ts` sets `BrowserWindow({ icon })` from
+// `dist/resources/icon.png`, so stage it next to the plugin. Optional: no icon, no window icon.
+const iconSrc = path.resolve(__dirname, "..", "build", "icon.png");
+if (fs.existsSync(iconSrc)) {
+  const iconDest = path.resolve(__dirname, "..", "dist", "resources", "icon.png");
+  fs.copyFileSync(iconSrc, iconDest);
+  console.log(`[copy-resources] staged ${iconSrc} -> ${iconDest}`);
+}
